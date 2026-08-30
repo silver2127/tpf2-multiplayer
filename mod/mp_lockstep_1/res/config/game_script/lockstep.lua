@@ -514,7 +514,13 @@ local scheduleLocal   -- forward: called by the line registry above its definiti
 local STRICT_OPS = { VREV = true }   -- strict-safe only: UI must not wait for a result (buy crashed -- see hook)
 
 local warnedNoEdges = false
-local nodePosCache = {}     -- node id -> "x,y" ; nodes do not move once placed
+-- node id -> "x,y", valid for ONE hash pass only. Ids are recycled: a node that
+-- is bulldozed hands its id to whatever is built next, so a cache kept across
+-- passes reports the dead node's position for the live one -- a phantom desync
+-- with two provably identical worlds behind it (2026-08-30: the desync counter
+-- kept climbing after the last real difference was repaired). Within one pass
+-- the cache still pays for itself: every node is asked for by both its edges.
+local nodePosCache = {}
 
 -- ---------- world hash, id-free ----------
 --
@@ -581,6 +587,7 @@ local function worldHash()
 	table.sort(cons)
 
 	-- edges by geometry
+	nodePosCache = {}
 	local edges = collectEdges()
 	local egeo = {}
 	for _, eid in ipairs(edges) do
@@ -1852,6 +1859,147 @@ end
 -- so the removal-detector must not ship it straight back.
 local expectedDemolish = {}
 
+-- Rejoin a road at a node our replay split, when nothing is attached there any
+-- more.
+--
+-- A construction's own split belongs to the construction: the engine froze it,
+-- so removing the depot heals the road back into one edge. Our replayed split is
+-- a plain pair of street edges that no construction owns, so a peer that splits
+-- for a depot which then fails, gets rolled back or is demolished keeps a
+-- degree-2 node forever -- and every world hash from then on differs by exactly
+-- those edges. Measured 2026-08-30 on a live two-machine session: four such
+-- nodes on the peer, 1193 edges against the host's 1189, desyncs climbing on
+-- every hash tick with nothing left actually diverging.
+--
+-- Only ever touches a plain mid-road node: exactly two street edges, no track,
+-- nothing else hanging off it. Anything else is left alone and logged.
+local function healNodeAt(x, y, why)
+	local healed = false
+	pcall(function()
+		local nid = findNodeNear(false, x, y, 1.5)
+		if not nid then return end
+		local tm
+		pcall(function() tm = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+		if tm and tm[nid] then
+			for _ in pairs(tm[nid]) do
+				log(string.format("HEAL(%s): node %d carries track too -- left alone", why, nid)); return
+			end
+		end
+		local m
+		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+		local ids = {}
+		if m and m[nid] then for _, eid in pairs(m[nid]) do ids[#ids + 1] = eid end end
+		if #ids ~= 2 then
+			log(string.format("HEAL(%s): node %d has %d street edge(s), not 2 -- left alone", why, nid, #ids))
+			return
+		end
+		-- Far endpoints, and the tangent at each pointing along far1 -> far2.
+		-- Tangents in a BaseEdge always run node0 -> node1, so a half whose node0
+		-- is the split node has to be read backwards.
+		local far, tng, len = {}, {}, {}
+		for i, eid in ipairs(ids) do
+			local comp, a, b, ta, tb = edgeGeomT(eid)
+			if not comp then return end
+			local fn, fp, ft
+			if comp.node0 == nid then
+				fn, fp, ft = comp.node1, b, tb
+				if i == 1 then ft = { -ft[1], -ft[2], -ft[3] } end   -- far1: point back at the split
+			else
+				fn, fp, ft = comp.node0, a, ta
+				if i == 2 then ft = { -ft[1], -ft[2], -ft[3] } end   -- far2: point away from the split
+			end
+			far[i], tng[i] = { fn, fp }, ft
+			local dx, dy, dz = b[1] - a[1], b[2] - a[2], b[3] - a[3]
+			len[i] = math.sqrt(dx * dx + dy * dy + dz * dz)
+		end
+		if far[1][1] == far[2][1] then
+			log(string.format("HEAL(%s): node %d joins one edge to itself -- left alone", why, nid)); return
+		end
+		-- Splitting an edge at parameter u scales the halves' tangents by u and
+		-- (1-u). Undo that so the rejoined edge keeps the road's curve instead of
+		-- straightening it; u is recovered from the halves' lengths.
+		local total = (len[1] or 0) + (len[2] or 0)
+		local u = (total > 0.001) and (len[1] / total) or 0.5
+		local s1 = (u > 0.01) and (1.0 / u) or 1.0
+		local s2 = ((1 - u) > 0.01) and (1.0 / (1 - u)) or 1.0
+		local sp = api.type.SimpleProposal.new()
+		local e = api.type.SegmentAndEntity.new()
+		e.entity = -1
+		e.comp.node0 = far[1][1]
+		e.comp.node1 = far[2][1]
+		e.comp.tangent0 = api.type.Vec3f.new(tng[1][1] * s1, tng[1][2] * s1, tng[1][3] * s1)
+		e.comp.tangent1 = api.type.Vec3f.new(tng[2][1] * s2, tng[2][2] * s2, tng[2][3] * s2)
+		e.comp.type = 0
+		e.comp.typeIndex = -1
+		e.type = 0
+		copyEdgeProps(e, ids[1], false, nil)
+		sp.streetProposal.edgesToAdd[1] = e
+		sp.streetProposal.edgesToRemove[1] = ids[1]
+		sp.streetProposal.edgesToRemove[2] = ids[2]
+		-- The node has to go with them. Dropping only the two edges leaves the
+		-- engine to reconcile an orphan node and it refuses the whole proposal
+		-- with critical=true and 'Internal error (see console for details)'
+		-- (measured on the live peer, 2026-08-30).
+		sp.streetProposal.nodesToRemove[1] = nid
+		local cmd = api.cmd.make.buildProposal(sp, nil, true)
+		if not cmd then return end
+		healed = true
+		api.cmd.sendCommand(cmd, function(res, ok2)
+			local extra = ""
+			if not ok2 then
+				pcall(function()
+					local es = res.resultProposalData and res.resultProposalData.errorState
+					if es then
+						extra = " critical=" .. tostring(es.critical)
+						for i = 1, #es.messages do extra = extra .. " '" .. tostring(es.messages[i]) .. "'" end
+					end
+				end)
+			end
+			log(string.format("HEAL(%s): node %d at %.1f,%.1f rejoined: %s%s",
+				why, nid, x, y, tostring(ok2), extra))
+		end)
+	end)
+	return healed
+end
+
+-- Every node a replay of ours cut into a road, with the tick it was cut at.
+local splitWatch = {}
+local function watchSplit(x, y)
+	splitWatch[string.format("%.1f/%.1f", x, y)] = { x, y, ticks }
+end
+
+-- Sweep the watched splits. A split that is doing its job carries the
+-- construction's access as a third edge; one left with exactly two is a scar
+-- from a construction that never landed, was rolled back, or has since been
+-- demolished, and the other instance does not have it. Healing is symmetric --
+-- both instances watch their own splits -- so the worlds converge either way.
+--
+-- The delay keeps the sweep off builds that are still in flight; a construction
+-- and its split always arrive in one proposal, but a retry may be queued behind.
+local SPLIT_SETTLE = 300      -- ticks (~5 s at 60/s) before a scar counts as one
+local function sweepSplits()
+	for k, w in pairs(splitWatch) do
+		if ticks - w[3] > SPLIT_SETTLE then
+			local nid = findNodeNear(false, w[1], w[2], 1.5)
+			local n = 0
+			if nid then
+				local m
+				pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+				if m and m[nid] then for _ in pairs(m[nid]) do n = n + 1 end end
+			end
+			if not nid then
+				splitWatch[k] = nil                       -- already gone
+			elseif n ~= 2 then
+				splitWatch[k] = nil                       -- in use: this is a real junction
+			else
+				splitWatch[k] = nil
+				healNodeAt(w[1], w[2], "orphaned split")
+			end
+		end
+	end
+end
+
+
 local function execDemolish(c)
 	-- The originator already bulldozed its own construction (the removal
 	-- detector fired BECAUSE it was gone locally); only the peer replays.
@@ -2766,6 +2914,10 @@ execConX = function(c)
 						nRm = nRm + 1
 						sp.streetProposal.edgesToRemove[nRm] = eid
 						splitEdgeOf[X] = eid
+						-- Watch the node this cut creates. Nothing owns a replayed split,
+						-- so if the construction it was cut for never lands (or is later
+						-- removed) the node stays behind for good -- see healNodeAt.
+						watchSplit(p[1], p[2])
 					end
 				end
 			else
@@ -4987,7 +5139,12 @@ local function pollInject()
 
 			-- ROADN n x0 y0 x1 y1 ...   (written by slice_hook from a captured
 			-- player build; carries every tessellated node)
-			if o == "EVAL" then
+			if o == "HEAL" then
+				-- Manual repair: rejoin a road at x,y if a scar from a replayed
+				-- split is all that is left there. Same rules as the sweep.
+				healNodeAt(tonumber(w[2]) or 0, tonumber(w[3]) or 0, "manual")
+
+			elseif o == "EVAL" then
 				-- Diagnostic probe: run a chunk from the inject file, log the
 				-- result. Exists so questions like "is the frozen mouth node in
 				-- node2StreetEdgeMap on B?" cost one file append, not a rebuild
@@ -5769,6 +5926,9 @@ function data()
 				end
 			end
 			if ticks % REMOVAL_POLL_EVERY == 0 then pollConstructionRemovals() end
+			-- Cheap: the watch list is empty unless a replay has cut a road, and
+			-- each entry is looked at once, SPLIT_SETTLE ticks after the cut.
+			if ticks % 60 == 0 and not conxBusy then sweepSplits() end
 			if ticks % CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
 
 			if ticks % HEARTBEAT_EVERY == 0 then
