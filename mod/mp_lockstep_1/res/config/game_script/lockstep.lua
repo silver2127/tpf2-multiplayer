@@ -25,7 +25,60 @@
 -- MUST NOT run alongside MP Bridge: that mod replicates state and the two would
 -- fight over the same world.
 
-local BASE = "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/"
+-- ---------- runtime data directory ----------
+-- Every runtime file (identity, events, captures, injects, status, logs) lives
+-- in ONE directory shared with the bridge and slice DLLs; bridge/src/datadir.h
+-- is the C++ half of this contract and resolves the same candidates in the same
+-- order:
+--   1. $TPF2MP_DATADIR             (the dev harness pins the old workshop out dir)
+--   2. $LOCALAPPDATA/tpf2mp/data/  (shipping layout: Program Files is read-only
+--                                   for the game process, LOCALAPPDATA is not)
+--   3. the workshop literal        (the dev rig before the data dir existed)
+-- The FIRST candidate holding tpf2_instance.txt wins: the bridge writes that
+-- file at game start, so its presence proves the DLLs settled on that dir. If
+-- none has it yet, prefer 2 when the environment was readable, else 3.
+-- The game's Lua may lack 'os' entirely, hence the pcall around every getenv.
+-- No new top-level locals (the chunk sits at Lua 5.1's 200-local limit): the
+-- discovery is an immediately-invoked function and its bookkeeping lives in CM
+-- (CM.baseSource = which candidate won, CM.baseCandidates = every candidate
+-- dir, for readers that must look where a peer may have landed).
+local CM = {}   -- the one catch-all state table; documented at its former home below
+local BASE = (function()
+	local function env(name)
+		local ok, v = pcall(function() return os.getenv(name) end)
+		if ok and type(v) == "string" and #v > 0 then return v end
+		return nil
+	end
+	local function dir(p)
+		p = p:gsub("\\", "/")
+		if p:sub(-1) ~= "/" then p = p .. "/" end
+		return p
+	end
+	local cands = {}
+	local function add(source, p)
+		if p then cands[#cands + 1] = { source = source, path = dir(p) } end
+	end
+	add("TPF2MP_DATADIR", env("TPF2MP_DATADIR"))
+	local lad = env("LOCALAPPDATA")
+	add("LOCALAPPDATA", lad and (lad .. "/tpf2mp/data"))
+	add("workshop", "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/")
+	CM.baseCandidates = {}
+	for _, c in ipairs(cands) do CM.baseCandidates[#CM.baseCandidates + 1] = c.path end
+	for _, c in ipairs(cands) do
+		local f = io.open(c.path .. "tpf2_instance.txt", "r")
+		if f then
+			f:close()
+			CM.baseSource = c.source .. " (identity file found)"
+			return c.path
+		end
+	end
+	-- no identity anywhere yet: the shipping default when the environment was
+	-- readable, otherwise the workshop literal (always last in the list)
+	local pick = cands[#cands]
+	for _, c in ipairs(cands) do if c.source == "LOCALAPPDATA" then pick = c end end
+	CM.baseSource = pick.source .. " (no identity file yet)"
+	return pick.path
+end)()
 local IDENTITY_FILE = BASE .. "tpf2_instance.txt"
 
 local INSTANCE  = nil
@@ -201,6 +254,12 @@ local function detectInstance()
 	local f2 = io.open(INJECT_FILE, "r")
 	if f2 then injectOffset = f2:seek("end"); f2:close() end
 	log("identity " .. INSTANCE .. " (peer " .. PEER .. ")")
+	if not CM.baseLogged then
+		-- once, and on disk: stdout is buffered until exit, cmLog is not
+		CM.baseLogged = true
+		local out = CM.cmLog or log
+		out("  base " .. BASE .. "  [" .. tostring(CM.baseSource) .. "]")
+	end
 	log("  send -> " .. CAPTURE_FILE)
 	log("  recv <- " .. EVENTS_FILE)
 	log("  inject <- " .. INJECT_FILE)
@@ -226,7 +285,8 @@ end
 -- ONE table for all companies-mode state/fns: Lua 5.1 allows only 200
 -- top-level locals per chunk and this file sits right at it (a 19-local batch
 -- crashed both instances at script load with "too many local variables").
-local CM = {}
+-- The table itself is declared at the top of the file so the BASE discovery
+-- can record into it; everything companies-mode starts here.
 CM.CM_CFG_FILE = BASE .. "mp_company_cfg.txt"
 -- The game buffers stdout until exit, so print()-only logging is invisible while
 -- a live test runs. Companies-mode diagnostics go to their own file on disk.
@@ -5077,15 +5137,19 @@ function data()
 					statusWin = api.gui.comp.Window.new("Multiplayer", statusText)
 					statusWin:setPosition(20, 120)
 				end
-				-- B's writes land in the sandbox OVERLAY; the host (A) cannot
-				-- see them at the host path but CAN read the overlay directory
-				-- directly. Try both locations per row (measured 2026-08-29:
-				-- status_a host-side, status_b overlay-side).
-				local OVERLAY = "C:/Sandbox/" .. ((os and os.getenv and os.getenv("USERNAME")) or "user") .. "/GameAgent/drive/C/" .. BASE:sub(4)
+				-- Both rows come from the shared data dir. Try BASE first, then
+				-- every other discovery candidate, so a peer whose DLLs settled
+				-- on a different candidate (harness-pinned vs shipping default)
+				-- still shows. Same resolution as BASE itself -- no separate
+				-- sandbox/username-derived path lives here any more.
+				local bases = { BASE }
+				for _, p in ipairs(CM.baseCandidates or {}) do
+					if p ~= BASE then bases[#bases + 1] = p end
+				end
 				local lines = {}
 				for _, inst in ipairs({ "a", "b" }) do
 					local s
-					for _, base in ipairs({ BASE, OVERLAY }) do
+					for _, base in ipairs(bases) do
 						local f = io.open(base .. "lockstep_status_" .. inst .. ".txt", "r")
 						if f then
 							local r = f:read("*l")

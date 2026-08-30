@@ -46,6 +46,8 @@ static const wchar_t* FALLBACK_DIR =
 // Resolve a shipped file by name: %LOCALAPPDATA%\tpf2mp\<name>, then next to THIS
 // proxy dll (the game dir), then the dev workshop path. Writes the first that
 // exists (or the fallback if none) into out.
+#include "datadir.h"
+
 static void resolveShipped(const wchar_t* name, wchar_t* out, size_t cch)
 {
     wchar_t buf[MAX_PATH];
@@ -67,7 +69,12 @@ static void resolveShipped(const wchar_t* name, wchar_t* out, size_t cch)
 
 static void Log(const char* fmt, ...)
 {
-    wchar_t path[MAX_PATH]; resolveShipped(L"tpf2_proxy.log", path, MAX_PATH);
+    // The log lives in the runtime data dir (%LOCALAPPDATA%\tpf2mp\data), like
+    // every other log. Resolving it through resolveShipped sent it to the dev
+    // workshop path on a fresh machine (no such dir -> log silently dropped).
+    wchar_t path[MAX_PATH];
+    if (!Tpf2mpDataDirW(path, MAX_PATH, (const void*)&resolveShipped)) return;
+    wcscat_s(path, MAX_PATH, L"tpf2_proxy.log");
     FILE* f = nullptr;
     if (_wfopen_s(&f, path, L"ab") != 0 || !f) return;
     va_list ap; va_start(ap, fmt);
@@ -81,15 +88,21 @@ static void Log(const char* fmt, ...)
 // built -- the exe has not even reached its entry point yet.
 static DWORD WINAPI LoadBridge(LPVOID)
 {
-    wchar_t bridgePath[MAX_PATH], menuPath[MAX_PATH];
+    wchar_t bridgePath[MAX_PATH], menuPath[MAX_PATH], slicePath[MAX_PATH];
     resolveShipped(L"tpf2_bridge_mp.dll", bridgePath, MAX_PATH);
     resolveShipped(L"tpf2_menu.dll",      menuPath,   MAX_PATH);
+    resolveShipped(L"tpf2_slice.dll",     slicePath,  MAX_PATH);
     HMODULE h = LoadLibraryW(bridgePath);
     Log("[proxy] pid=%lu bridge load %s (err %lu) from %ls\n",
         GetCurrentProcessId(), h ? "OK" : "FAILED", h ? 0 : GetLastError(), bridgePath);
     HMODULE hm = LoadLibraryW(menuPath);
     Log("[proxy] pid=%lu menu load %s (err %lu) from %ls\n",
         GetCurrentProcessId(), hm ? "OK" : "FAILED", hm ? 0 : GetLastError(), menuPath);
+    // The slice dll (command capture/replay) is optional: a missing file just
+    // means no replication this run, the menu + bridge still come up.
+    HMODULE hs = LoadLibraryW(slicePath);
+    Log("[proxy] pid=%lu slice load %s (err %lu) from %ls\n",
+        GetCurrentProcessId(), hs ? "OK" : "FAILED", hs ? 0 : GetLastError(), slicePath);
     return 0;
 }
 

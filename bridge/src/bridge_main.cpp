@@ -2,7 +2,22 @@
 //   - tails  tpf2_capture_<inst>.txt  (Lua writes local build events here)
 //   - sends new lines via reliable UDP to the peer
 //   - writes received lines to tpf2_events_<inst>.txt (Lua replays from here)
-// Config: tpf2_mp_<dllbasename>.cfg (falls back to tpf2_mp.cfg)
+// Config: tpf2_mp_<dllbasename>.cfg (falls back to tpf2_mp.cfg), looked up in
+// the DLL's own directory (CFGDIR, where the installer puts it) and then in
+// the data dir (user override).
+//
+// Two directories, deliberately:
+//   CFGDIR  = the directory this DLL lives in (game dir; may be read-only)
+//   DATADIR = Tpf2mpDataDirW (%LOCALAPPDATA%\tpf2mp\data, or TPF2MP_DATADIR)
+// Every file written at run time -- log, identity, events, captures, buy
+// probe, control file -- lives in DATADIR. Nothing is ever written to CFGDIR.
+//
+// Runtime control: DATADIR\tpf2_bridge_ctl.txt, polled every 500 ms, lines
+//   instance=a|b        re-identify (rewrite identity, new events file, retarget tail)
+//   peer=<ipv4>:<port>  repoint the UDP peer without restarting the socket
+// The cfg keys instance=/peer_ip=/peer_port= stay the initial values.
+// Identity: DATADIR\tpf2_instance.txt, lines '<a|b>', 'pid=<pid>',
+// 'port=<bound UDP port>' (line 3 is what the lobby routes peer frames to).
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
@@ -10,9 +25,11 @@
 #include <cstring>
 #include <string>
 #include <memory>
+#include <mutex>
 #include <fcntl.h>
 #include <io.h>
 #include "net.h"
+#include "datadir.h"
 #include "savexfer.h"
 #include "simhook.h"
 #include "buyhook.h"
@@ -30,16 +47,53 @@ static void Log(const char* fmt, ...)
 }
 
 static FILE* g_events = nullptr;   // peer events out (Lua reads)
+static std::mutex g_eventsMtx;     // OnPeerLine (net thread) vs re-identify (ctl thread)
 static FILE* g_fileOut = nullptr;  // file-relay target (tail writes here when set)
 static void OnPeerLine(const char* line)
 {
     Log("[net] peer (%zu b): %.200s\n", strlen(line), line);
+    std::lock_guard<std::mutex> lk(g_eventsMtx);
     if (g_events) {
         // NOTE: stream is binary, so this is a bare LF. The Lua side seeks by
         // byte offset; a CRLF here would desync its offset by one per line.
         fprintf(g_events, "%s\n", line);
         fflush(g_events);
     }
+}
+
+// DATADIR with trailing backslash (datadir.h contract). Set once in InitThread
+// before any thread that formats paths is started.
+static std::wstring g_dataDir;
+
+// Mutable runtime identity/peer, owned by the control-file poller. The
+// initial values come from the cfg (+ auto election); the control file may
+// change them later.
+struct Runtime {
+    std::mutex  mtx;
+    std::string instance;   // "a" | "b"
+    std::string peerIp;
+    int         peerPort = 0;
+};
+static Runtime g_rt;
+
+// Tail target. TailThread re-reads this every pass; bumping the generation
+// makes it treat the new file like a fresh start (skip history).
+static std::mutex   g_tailMtx;
+static std::wstring g_tailPath;
+static unsigned     g_tailGen = 0;
+static bool         g_tailFixed = false;   // cfg tail_file= override: never retarget
+
+static void SetTailPath(const std::wstring& p)
+{
+    std::lock_guard<std::mutex> lk(g_tailMtx);
+    if (g_tailPath == p) return;
+    g_tailPath = p;
+    g_tailGen++;
+}
+
+static std::wstring CapturePathFor(const std::string& inst)
+{
+    return g_dataDir + L"tpf2_capture_" + std::wstring(inst.begin(), inst.end()) + L".txt";
 }
 
 struct Config {
@@ -72,12 +126,17 @@ static std::string BaseName(const wchar_t* path)
     return std::string(b.begin(), b.end());
 }
 
-static void LoadConfig(const wchar_t* dllPath, Config& cfg)
+// cfg lookup order: every candidate name in CFGDIR (the DLL's own directory,
+// where the installer drops tpf2_bridge_mp.cfg), then the same names in
+// DATADIR (a user override that survives reinstalls). `dataDir` carries a
+// trailing backslash (datadir.h contract).
+static void LoadConfig(const wchar_t* dllPath, const wchar_t* dataDir, Config& cfg)
 {
     wchar_t dir[MAX_PATH];
     wcscpy_s(dir, dllPath);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = 0;
+    const std::wstring dirs[] = { std::wstring(dir) + L"\\", std::wstring(dataDir) };
 
     // Sidecar lookup. This used to build only "tpf2_mp_<basename>.cfg", which
     // for a dll named tpf2_bridge_a6.dll means "tpf2_mp_tpf2_bridge_a6.cfg" --
@@ -104,17 +163,20 @@ static void LoadConfig(const wchar_t* dllPath, Config& cfg)
     wchar_t path[MAX_PATH];
     FILE* f = nullptr;
     std::string used;
-    for (const std::string& c : candidates) {
-        swprintf(path, MAX_PATH, L"%s\\%S", dir, c.c_str());
-        _wfopen_s(&f, path, L"rb");
-        if (f) { used = c; break; }
+    const wchar_t* usedDir = L"";
+    for (int d = 0; d < 2 && !f; ++d) {
+        for (const std::string& c : candidates) {
+            swprintf(path, MAX_PATH, L"%s%S", dirs[d].c_str(), c.c_str());
+            _wfopen_s(&f, path, L"rb");
+            if (f) { used = c; usedDir = d == 0 ? L"cfg dir" : L"data dir"; break; }
+        }
     }
     if (!f) {
-        Log("[cfg] NO CFG FOUND -- using built-in defaults (inst=%s local=%d)\n",
-            cfg.instance.c_str(), cfg.localPort);
+        Log("[cfg] NO CFG FOUND in cfg dir or data dir -- using built-in defaults "
+            "(inst=%s local=%d)\n", cfg.instance.c_str(), cfg.localPort);
         return;
     }
-    Log("[cfg] loaded %s\n", used.c_str());
+    Log("[cfg] loaded %s from %S\n", used.c_str(), usedDir);
     if (used == "tpf2_mp.cfg") {
         Log("[cfg] WARNING: fell back to the shared cfg; per-dll settings "
             "(instance, tail_file, relay_out) are NOT in effect\n");
@@ -150,17 +212,117 @@ static FILE* OpenShared(const wchar_t* path, const wchar_t* mode, int osfFlags)
     return fd >= 0 ? _fdopen(fd, "r+b") : nullptr;
 }
 
-// tail thread: forward new lines from the capture file to the peer
-struct TailJob { const wchar_t* path; };
-static DWORD WINAPI TailThread(LPVOID arg)
+// identity file: the (single) bridge mod reads this to learn which instance
+// it is. Lives in DATADIR -- inside a sandbox this lands in the overlay,
+// which is exactly the view the mod shares. `warnMismatch` = complain if the
+// file already names a different instance (only meaningful at startup; a
+// control-file re-identify differs by definition).
+static void WriteIdentity(const std::string& inst, bool warnMismatch)
 {
-    std::wstring capPath = (const wchar_t*)arg;
-    delete[] (const wchar_t*)arg;
+    std::wstring idPath = g_dataDir + L"tpf2_instance.txt";
+
+    // If this file already names a DIFFERENT instance, we are almost
+    // certainly injected into the wrong process (the a/b DLLs share a
+    // directory, and the mod latches identity from here). Say so loudly:
+    // a silent overwrite points the other instance at the wrong pair of
+    // capture/event files and looks exactly like "the bridge is dead".
+    if (warnMismatch) {
+        char prev[64] = {0};
+        HANDLE ph = CreateFileW(idPath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (ph != INVALID_HANDLE_VALUE) {
+            DWORD got = 0;
+            ReadFile(ph, prev, sizeof(prev) - 1, &got, nullptr);
+            CloseHandle(ph);
+            char* nl = strpbrk(prev, "\r\n");
+            if (nl) *nl = 0;
+            if (prev[0] && inst != prev) {
+                Log("[m5] WARNING: identity file said '%s', now claiming '%s' "
+                    "-- wrong process? (pid %lu)\n",
+                    prev, inst.c_str(), GetCurrentProcessId());
+            }
+        }
+    }
+
+    HANDLE ih = CreateFileW(idPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (ih != INVALID_HANDLE_VALUE) {
+        // line 1 = instance (all the mod reads); line 2 = owning pid, so a
+        // mixed-up injection is diagnosable after the fact; line 3 = the UDP
+        // port the bridge actually bound, which the lobby reads to know where
+        // to deliver relayed peer frames. Line 3 is only present once the
+        // socket is up (Net_LocalPort() == 0 before Net_Init). The mod and the
+        // slice read lines 1-2 only, so those two stay byte-identical.
+        char buf[128];
+        int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s\npid=%lu\n",
+                            inst.c_str(), GetCurrentProcessId());
+        if (n < 0) n = 0;
+        uint16_t port = Net_LocalPort();
+        if (port) {
+            int m = _snprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, "port=%u\n", port);
+            if (m > 0) n += m;
+        }
+        DWORD written;
+        WriteFile(ih, buf, (DWORD)n, &written, nullptr);
+        CloseHandle(ih);
+    } else {
+        Log("[m5] identity file write FAILED (%lu)\n", GetLastError());
+    }
+}
+
+// events file (peer -> Lua) for the given instance; truncated on open so stale
+// events from previous runs don't replay (they already happened once). Any
+// previously open events file is closed first.
+static void OpenEventsFile(const std::string& inst)
+{
+    std::wstring evPath = g_dataDir + L"tpf2_events_"
+        + std::wstring(inst.begin(), inst.end()) + L".txt";
+    FILE* nf = nullptr;
+    HANDLE eh = CreateFileW(evPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (eh != INVALID_HANDLE_VALUE) {
+        // _O_BINARY, not _O_TEXT: the Lua side tracks a byte offset into this
+        // file, and CRLF translation made every line one byte shorter on read
+        // than on disk, so the offset drifted backwards and replayed garbage.
+        int fd = _open_osfhandle((intptr_t)eh, _O_RDWR | _O_BINARY);
+        if (fd >= 0) nf = _fdopen(fd, "r+b");
+        if (!nf) CloseHandle(eh);
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_eventsMtx);
+        if (g_events) fclose(g_events);
+        g_events = nf;
+    }
+    Log("[m5] events file tpf2_events_%s.txt: %s\n", inst.c_str(),
+        nf ? "open (truncated)" : "FAILED");
+}
+
+// tail thread: forward new lines from the capture file to the peer. The path
+// comes from g_tailPath; a generation bump (re-identify) restarts the tail on
+// the new file, skipping whatever history it already holds.
+static DWORD WINAPI TailThread(LPVOID)
+{
+    std::wstring capPath;
+    unsigned gen = ~0u;
     uint64_t offset = 0;
     bool started = false;
     std::string line;
     for (;;) {
         Sleep(25);
+        {
+            std::lock_guard<std::mutex> lk(g_tailMtx);
+            if (gen != g_tailGen) {
+                gen = g_tailGen;
+                capPath = g_tailPath;
+                offset = 0;
+                started = false;
+                Log("[tail] target: %S\n", capPath.c_str());
+            }
+        }
+        if (capPath.empty()) continue;
         FILE* f = nullptr;
         _wfopen_s(&f, capPath.c_str(), L"rb");
         if (!f) continue;
@@ -209,6 +371,123 @@ static DWORD WINAPI TailThread(LPVOID arg)
     return 0;
 }
 
+// ---- runtime control file ---------------------------------------------------
+// DATADIR\tpf2_bridge_ctl.txt, written by the lobby once roles are decided.
+// Whole-file read; a partially written file just parses to fewer lines and the
+// remainder is picked up on the next poll.
+static bool ReadSmallFile(const std::wstring& path, std::string& out)
+{
+    out.clear();
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char buf[4096];
+    DWORD got = 0;
+    bool ok = ReadFile(h, buf, sizeof(buf), &got, nullptr) != 0;
+    CloseHandle(h);
+    if (ok) out.assign(buf, got);
+    return ok;
+}
+
+// Switch letters at run time. Order matters for the Lua contract (it re-reads
+// the identity file every 60 ticks and then swaps its own capture/events
+// paths): the new events file must exist before the identity flips, and the
+// tail must be on the new capture file before the Lua starts writing to it.
+static void Reidentify(const std::string& inst)
+{
+    std::string old;
+    {
+        std::lock_guard<std::mutex> lk(g_rt.mtx);
+        old = g_rt.instance;
+        g_rt.instance = inst;
+    }
+    Log("[ctl] instance %s -> %s: re-identifying (pid %lu)\n",
+        old.c_str(), inst.c_str(), GetCurrentProcessId());
+    OpenEventsFile(inst);
+    if (!g_tailFixed) SetTailPath(CapturePathFor(inst));
+    else Log("[ctl] tail_file= override in effect, tail not retargeted\n");
+    WriteIdentity(inst, false);
+    Log("[ctl] now instance %s (identity rewritten, events truncated, tail -> capture_%s)\n",
+        inst.c_str(), inst.c_str());
+}
+
+static void ApplyControl(const std::string& text)
+{
+    std::string wantInst, wantIp;
+    int wantPort = 0;
+    bool havePeer = false;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t nl = text.find('\n', pos);
+        std::string ln = text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+        pos = (nl == std::string::npos) ? text.size() : nl + 1;
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ' || ln.back() == '\t')) ln.pop_back();
+        if (ln.empty() || ln[0] == '#') continue;
+        char ip[64] = {0};
+        int port = 0;
+        unsigned long ctlPid = 0;
+        if (ln == "instance=a" || ln == "instance=b") {
+            wantInst = ln.substr(9);
+        } else if (sscanf(ln.c_str(), "peer=%63[0-9.]:%d", ip, &port) == 2) {
+            wantIp = ip; wantPort = port; havePeer = true;
+        } else if (sscanf(ln.c_str(), "pid=%lu", &ctlPid) == 1) {
+            // Addressed to a specific bridge: a second instance sharing this
+            // data dir (sandbox read-through) must not apply our role.
+            if (ctlPid != 0 && ctlPid != GetCurrentProcessId()) {
+                Log("[ctl] control file is for pid %lu, not us (%lu) -- ignored\n", ctlPid, GetCurrentProcessId());
+                return;
+            }
+        } else {
+            Log("[ctl] ignored line: %.100s\n", ln.c_str());
+        }
+    }
+
+    if (!wantInst.empty()) {
+        bool differs;
+        {
+            std::lock_guard<std::mutex> lk(g_rt.mtx);
+            differs = wantInst != g_rt.instance;
+        }
+        if (differs) Reidentify(wantInst);
+    }
+    if (havePeer) {
+        bool differs;
+        std::string oldIp; int oldPort;
+        {
+            std::lock_guard<std::mutex> lk(g_rt.mtx);
+            oldIp = g_rt.peerIp; oldPort = g_rt.peerPort;
+            differs = wantIp != g_rt.peerIp || wantPort != g_rt.peerPort;
+        }
+        if (differs) {
+            if (Net_SetPeer(wantIp.c_str(), wantPort)) {
+                std::lock_guard<std::mutex> lk(g_rt.mtx);
+                g_rt.peerIp = wantIp; g_rt.peerPort = wantPort;
+                Log("[ctl] peer %s:%d -> %s:%d\n", oldIp.c_str(), oldPort,
+                    wantIp.c_str(), wantPort);
+            } else {
+                Log("[ctl] peer=%s:%d REJECTED (not a dotted IPv4:port), keeping %s:%d\n",
+                    wantIp.c_str(), wantPort, oldIp.c_str(), oldPort);
+            }
+        }
+    }
+}
+
+static DWORD WINAPI CtlThread(LPVOID)
+{
+    const std::wstring path = g_dataDir + L"tpf2_bridge_ctl.txt";
+    std::string last, cur;
+    for (;;) {
+        Sleep(500);
+        if (!ReadSmallFile(path, cur)) cur.clear();   // missing = nothing requested
+        if (cur == last) continue;
+        last = cur;
+        Log("[ctl] control file changed (%zu b)\n", cur.size());
+        ApplyControl(cur);
+    }
+    return 0;
+}
+
 static DWORD WINAPI InitThread(LPVOID)
 {
     wchar_t dllPath[MAX_PATH] = {0};
@@ -218,17 +497,27 @@ static DWORD WINAPI InitThread(LPVOID)
                        (LPCWSTR)&InitThread, &self);
     GetModuleFileNameW(self, dllPath, MAX_PATH);
 
-    wchar_t dir[MAX_PATH];
-    wcscpy_s(dir, dllPath);
-    wchar_t* slash = wcsrchr(dir, L'\\');
+    // CFGDIR: where this DLL (and the installer's cfg) lives. Read-only use.
+    wchar_t cfgDir[MAX_PATH];
+    wcscpy_s(cfgDir, dllPath);
+    wchar_t* slash = wcsrchr(cfgDir, L'\\');
     if (slash) *slash = 0;
+
+    // DATADIR: everything written at run time. Trailing backslash included.
+    wchar_t dataDir[MAX_PATH] = L"";
+    if (!Tpf2mpDataDirW(dataDir, MAX_PATH, (const void*)&InitThread)) {
+        // datadir.h only fails if even the module path is unreadable; fall
+        // back to CFGDIR so the bridge at least keeps its old behaviour.
+        swprintf(dataDir, MAX_PATH, L"%s\\", cfgDir);
+    }
+    g_dataDir = dataDir;
 
     // Both instances can share this directory (the alut proxy loads the same
     // bridge into both games), and fopen("a") on Windows is seek-then-write,
     // not an atomic append -- two processes silently overwrite each other's
     // lines. FILE_APPEND_DATA appends atomically, so interleaving is safe.
     wchar_t logPath[MAX_PATH];
-    swprintf(logPath, MAX_PATH, L"%s\\tpf2_bridge.log", dir);
+    swprintf(logPath, MAX_PATH, L"%stpf2_bridge.log", dataDir);
     g_log = nullptr;
     {
         HANDLE lh = CreateFileW(logPath, FILE_APPEND_DATA,
@@ -249,7 +538,7 @@ static DWORD WINAPI InitThread(LPVOID)
     strcpy_s(cfg.peerIp, "127.0.0.1");
     Log("[cfg] hardcoded B\n");
 #else
-    LoadConfig(dllPath, cfg);
+    LoadConfig(dllPath, dataDir, cfg);
 #endif
     // Auto identity. With the alut proxy the *same* dll loads into both games,
     // so identity can no longer come from which file was injected where --
@@ -275,69 +564,34 @@ static DWORD WINAPI InitThread(LPVOID)
     Log("[m5] bridge init: inst=%s local=%d peer=%s:%d pid=%lu\n",
         cfg.instance.c_str(), cfg.localPort, cfg.peerIp, cfg.peerPort,
         GetCurrentProcessId());
-    // The mod's BASE constant must resolve to this same directory, otherwise
-    // the two halves talk past each other. Log it so a mismatch is obvious.
-    Log("[m5] data dir: %S\n", dir);
+    // The Lua and slice halves must resolve the same data dir (datadir.h /
+    // TPF2MP_DATADIR / LOCALAPPDATA), otherwise the halves talk past each
+    // other. Log both dirs so a mismatch is obvious.
+    Log("[m5] cfg dir: %S data dir: %S\n", cfgDir, dataDir);
 
-    // identity file: the (single) bridge mod reads this to learn which
-    // instance it is. Written into the dll's dir — inside a sandbox this
-    // lands in the overlay, which is exactly the view the mod shares.
     {
-        wchar_t idPath[MAX_PATH];
-        swprintf(idPath, MAX_PATH, L"%s\\tpf2_instance.txt", dir);
+        std::lock_guard<std::mutex> lk(g_rt.mtx);
+        g_rt.instance = cfg.instance;
+        g_rt.peerIp   = cfg.peerIp;
+        g_rt.peerPort = cfg.peerPort;
+    }
 
-        // If this file already names a DIFFERENT instance, we are almost
-        // certainly injected into the wrong process (the a/b DLLs share a
-        // directory, and the mod latches identity from here). Say so loudly:
-        // a silent overwrite points the other instance at the wrong pair of
-        // capture/event files and looks exactly like "the bridge is dead".
-        char prev[64] = {0};
-        HANDLE ph = CreateFileW(idPath, GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (ph != INVALID_HANDLE_VALUE) {
-            DWORD got = 0;
-            ReadFile(ph, prev, sizeof(prev) - 1, &got, nullptr);
-            CloseHandle(ph);
-            char* nl = strpbrk(prev, "\r\n");
-            if (nl) *nl = 0;
-            if (prev[0] && cfg.instance != prev) {
-                Log("[m5] WARNING: identity file said '%s', now claiming '%s' "
-                    "-- wrong process? (pid %lu)\n",
-                    prev, cfg.instance.c_str(), GetCurrentProcessId());
-            }
-        }
-
-        HANDLE ih = CreateFileW(idPath, GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (ih != INVALID_HANDLE_VALUE) {
-            // line 1 = instance (all the mod reads); line 2 = owning pid, so a
-            // mixed-up injection is diagnosable after the fact
-            char buf[128];
-            int n = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%s\npid=%lu\n",
-                                cfg.instance.c_str(), GetCurrentProcessId());
-            DWORD written;
-            WriteFile(ih, buf, (DWORD)n, &written, nullptr);
-            CloseHandle(ih);
+    // A control file left over from a previous session must not be replayed
+    // into this one (its instance letter may contradict the election we just
+    // did). Consume it: anything that appears from now on is a real request.
+    {
+        std::wstring ctl = g_dataDir + L"tpf2_bridge_ctl.txt";
+        std::string stale;
+        if (ReadSmallFile(ctl, stale)) {
+            Log("[ctl] removing stale control file (%zu b) from previous session\n", stale.size());
+            if (!DeleteFileW(ctl.c_str()))
+                Log("[ctl] WARNING: could not delete stale control file (%lu)\n", GetLastError());
         }
     }
 
-    // events file (peer -> Lua); truncate per session so stale events from
-    // previous runs don't replay (they already happened once)
-    wchar_t evPath[MAX_PATH];
-    swprintf(evPath, MAX_PATH, L"%s\\tpf2_events_%S.txt", dir, cfg.instance.c_str());
-    HANDLE eh = CreateFileW(evPath, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (eh != INVALID_HANDLE_VALUE) {
-        // _O_BINARY, not _O_TEXT: the Lua side tracks a byte offset into this
-        // file, and CRLF translation made every line one byte shorter on read
-        // than on disk, so the offset drifted backwards and replayed garbage.
-        int fd = _open_osfhandle((intptr_t)eh, _O_RDWR | _O_BINARY);
-        if (fd >= 0) g_events = _fdopen(fd, "r+b");
-    }
-    Log("[m5] events file: %s\n", g_events ? "open (truncated)" : "FAILED");
+    // (identity file is written after Net_Init below, so it can carry the
+    // port the socket really bound)
+    OpenEventsFile(cfg.instance);
 
     // file-relay mode: tail writes directly to a peer events file (no UDP)
     if (!cfg.relayOut.empty()) {
@@ -360,6 +614,12 @@ static DWORD WINAPI InitThread(LPVOID)
         }
     }
     Log("[m5] net up (local %d)\n", cfg.localPort);
+
+    // Identity goes out now that the bound port is known: the lobby reads
+    // line 3 (port=) to learn where to hand relayed peer frames to.
+    WriteIdentity(cfg.instance, true);
+    Log("[m5] identity written: inst=%s port=%u\n", cfg.instance.c_str(),
+        (unsigned)Net_LocalPort());
 
     // ---- save transfer -----------------------------------------------------
     // The host serves its world so the joiner can start from the same map.
@@ -429,26 +689,30 @@ static DWORD WINAPI InitThread(LPVOID)
     // in-depot vehicle is not a world entity -- so this is the only place the
     // event can be observed.
     if (cfg.buyHook) {
+        // Path is latched by the hook at install; a later re-identify does
+        // not move it (the probe is a dev diagnostic, not a replication path).
         wchar_t buyPath[MAX_PATH];
-        swprintf(buyPath, MAX_PATH, L"%s\\tpf2_buy_%S.txt", dir, cfg.instance.c_str());
+        swprintf(buyPath, MAX_PATH, L"%stpf2_buy_%S.txt", dataDir, cfg.instance.c_str());
         BuyHook_Install(Log, buyPath);
         Log("[buy] purchases -> %S\n", buyPath);
     } else {
         Log("[buy] disabled (buy_hook=0)\n");
     }
 
-    // capture file tail (Lua -> peer)
-    std::wstring capPath;
+    // capture file tail (Lua -> peer). tail_file= is an absolute override
+    // (relay mode) and is never retargeted by the control file.
     if (!cfg.tailFile.empty()) {
-        capPath = std::wstring(cfg.tailFile.begin(), cfg.tailFile.end());
+        g_tailFixed = true;
+        SetTailPath(std::wstring(cfg.tailFile.begin(), cfg.tailFile.end()));
     } else {
-        capPath = std::wstring(dir) + L"\\tpf2_capture_"
-            + std::wstring(cfg.instance.begin(), cfg.instance.end()) + L".txt";
+        SetTailPath(CapturePathFor(cfg.instance));
     }
-    wchar_t* arg = new wchar_t[capPath.size() + 1];
-    wcscpy_s(arg, capPath.size() + 1, capPath.c_str());
-    CreateThread(nullptr, 0, TailThread, arg, 0, nullptr);
+    CreateThread(nullptr, 0, TailThread, nullptr, 0, nullptr);
     Log("[m5] tailing capture file\n");
+
+    // runtime control file poller (instance= / peer= changes from the lobby)
+    CreateThread(nullptr, 0, CtlThread, nullptr, 0, nullptr);
+    Log("[ctl] polling %Stpf2_bridge_ctl.txt every 500 ms\n", dataDir);
     return 0;
 }
 

@@ -38,3 +38,7 @@ tools/shots/
 backup/
 .claude/
 *.orig
+
+# installer build output and PyInstaller work dir
+installer/out/
+netpunch/build/

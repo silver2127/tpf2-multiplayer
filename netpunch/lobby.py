@@ -30,11 +30,24 @@ Lobby message types (the ``"t"`` field):
     join    {t:join, name}                       joiner -> host
     welcome {t:welcome, you, host}               host -> one joiner (your final,
                                                   de-duplicated, username)
-    roster  {t:roster, players[sorted], host}    host -> all
+    roster  {t:roster, players[sorted], host,
+             started, start_save}                 host -> all (also the ~2 s heal).
+                                                  ``started`` is PER PEER: true only
+                                                  if THAT joiner was included in a
+                                                  start, so a joiner that missed the
+                                                  start burst catches up from the
+                                                  heal; ``start_save`` mirrors the
+                                                  start's save flag.
     chat    {t:chat, from, text, ts, cid}        host -> all (relayed + stamped)
     chat    {t:chat, text}                        joiner -> host (host stamps it)
     ping    {t:ping}                              joiner -> host (fast keepalive)
-    start   {t:start}                             host -> all
+    start   {t:start, save}                       host -> all (save=true when a save
+                                                  transfer completed for that peer
+                                                  this session; false = legacy
+                                                  no-save start)
+    status  {t:status, state, detail}             host -> one joiner (advisory; e.g.
+                                                  a late joiner learns the game has
+                                                  already started)
     leave   {t:leave}                             joiner -> host
     reject  {t:reject, reason}                    host -> one joiner (lobby full)
     bye     {t:bye}                               host -> all (lobby closing)
@@ -48,7 +61,24 @@ All three files live in the process CWD (override with --io-dir).
       {"type":"status","state":"waiting|connected|failed","detail":"..."}
       {"type":"roster","players":["alice","bob"],"you":"alice","host":"alice"}
       {"type":"chat","from":"bob","text":"hi","ts":<unix>}
-      {"type":"start"}
+      {"type":"start","save":true|false}
+          save=true  -> load incoming_save.* (a save transfer completed);
+          save=false -> legacy no-save start.
+          A JOINER emits this ONLY when save==false, or save==true AND its
+          receiver completed this session (it emitted save_ready). Any other
+          start is logged and ignored WITHOUT latching 'started', so a later
+          retried START GAME still works.
+      {"type":"transfer","role":"send|recv",...}         (progress; per-peer on
+          the host: "peer","pct" or "state":"done|failed|dropped")
+      {"type":"save_ready","name":"incoming_save","dir":...,"files":[...]}
+      {"type":"status","state":"failed",
+       "detail":"save transfer failed for <names> -- press START GAME to retry"}
+          (host, when ANY peer's transfer failed: the host does NOT broadcast
+          start and clears the transfer so START GAME can be pressed again)
+      {"type":"status","state":"connected",
+       "detail":"game already started -- ask the host to press START GAME again"}
+          (a LATE joiner -- one that joins after a start -- gets this instead
+          of a start)
   lobby_state.json  a SINGLE JSON object, overwritten, mirroring the latest
       roster/state for easy polling:
       {"state","code","players","you","host","started"}
@@ -56,17 +86,52 @@ All three files live in the process CWD (override with --io-dir).
       byte offset, processes only new whole lines) and acts on:
       {"cmd":"chat","text":"..."}     -> send CHAT
       {"cmd":"name","name":"..."}     -> change own username, re-JOIN/broadcast
-      {"cmd":"start"}                 -> host broadcasts START (no-op on a client)
+      {"cmd":"start"}                 -> host broadcasts START save=false
+                                         (no-op on a client)
+      {"cmd":"start","save":<path>}   -> host pushes the save to every joiner,
+                                         then broadcasts START save=true; with
+                                         zero joiners it emits a status ('no
+                                         players to share with') and does NOT
+                                         start
       {"cmd":"quit"}                  -> leave cleanly
 
-On startup both jsonl files are TRUNCATED so stale lines aren't reprocessed.
+On startup both jsonl files are TRUNCATED so stale lines aren't reprocessed. A
+JOINER also DELETES any stale incoming_save.sav / .sav.lua / .jpg in its io dir
+before joining, so a previous session's save can never be mistaken for this one.
+
+GAME RELAY (lockstep frames over the punched socket)
+----------------------------------------------------
+The lockstep bridge (tpf2_bridge_mp.dll) speaks plain point-to-point UDP to ONE
+fixed peer address. To run it between two machines behind NAT with no new NAT
+code, the menu points the bridge at 127.0.0.1:<game relay port> and the lobby
+carries its frames over the socket it has ALREADY punched:
+
+  bridge --UDP--> 127.0.0.1:P (this lobby) --NP1 DATA 'g'+frame--> peer lobby
+         --UDP--> 127.0.0.1:L (the peer's bridge)
+
+Enabled with ``--game-relay-port P --game-local-port L``:
+  * a UDP socket is bound to 127.0.0.1:P; every datagram arriving there (from
+    the local bridge) is forwarded over the lobby transport as a BINARY DATA
+    payload whose first byte is ``GAME_RELAY_MAGIC`` (b'g' -- distinct from the
+    '{' of JSON messages and the 'N' of CHUNK_MAGIC save chunks). The host
+    forwards to every joiner; a joiner forwards to the host only.
+  * any 'g' payload arriving from the transport is unwrapped and sent to
+    127.0.0.1:L from that same socket.
+  * frames over ``GAME_RELAY_MAX`` bytes are dropped with a stderr warning; a
+    stats line (forwarded / delivered counts) goes to stderr every 10 s.
+No ARQ here -- the bridge has its own. Without the flags nothing changes.
+The menu passes P=7773 for HOST / 7774 for JOIN (distinct so two instances on
+one machine can both run) and L = the port the bridge reported it bound.
 
 CLI
 ---
     python lobby.py host --name <username>          # observe, print CODE=, serve
     python lobby.py join <CODE> --name <username>   # dial host, participate
     python lobby.py --selftest                      # 1 host + 2 joiners, loopback
-Optional: --local-port 29471, --timeout 40, --io-dir <dir>.
+    python lobby.py --selftest-transfer             # reliable save transfer
+    python lobby.py --selftest-relay                # game relay both ways
+Optional: --local-port 29471, --timeout 40, --io-dir <dir>,
+          --game-relay-port <P> --game-local-port <L> (see GAME RELAY).
 """
 
 from __future__ import annotations
@@ -259,6 +324,147 @@ def _send_data(sock, addr, msg):
 
 
 # --------------------------------------------------------------------------- #
+# Game relay: carry the lockstep bridge's UDP frames over the punched socket
+# --------------------------------------------------------------------------- #
+GAME_RELAY_MAGIC = b"g"     # first byte of a relayed-frame DATA payload. JSON
+                            # lobby messages start with '{' and save chunks with
+                            # CHUNK_MAGIC ('N'), so one byte tells them apart.
+GAME_RELAY_MAX = 1400       # largest bridge frame we relay (bytes). The bridge's
+                            # Packet is ~1.05 KB; NP1(5)+'g'(1)+1400 stays under
+                            # the 1500 MTU. Bigger frames are dropped + warned.
+GAME_RELAY_DRAIN = 256      # loopback datagrams drained per ready cycle.
+GAME_RELAY_STATS = 10.0     # seconds between stderr stats lines.
+GAME_RELAY_WARN_EVERY = 5.0 # rate limit for the oversize warning.
+GAME_LOCAL_PORT_DEFAULT = 7771   # the bridge's port if the menu passes none.
+
+
+def _open_loopback_udp(port):
+    """A non-blocking UDP socket bound to 127.0.0.1:``port`` -- loopback ONLY,
+    the relay must never be reachable from the network. Windows' UDP
+    'connection reset' on ICMP-unreachable is switched off where available so
+    a bridge that isn't listening yet can't poison later recvs."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if hasattr(socket, "SIO_UDP_CONNRESET"):  # Windows only
+        try:
+            s.ioctl(socket.SIO_UDP_CONNRESET, struct.pack("I", 0))
+        except OSError:
+            pass
+    s.bind(("127.0.0.1", port))
+    s.setblocking(False)
+    _boost_socket_buffers(s)
+    return s
+
+
+class GameRelay:
+    """Loopback <-> lobby-transport relay for the bridge's lockstep frames.
+
+    Owns ONE UDP socket bound to 127.0.0.1:``relay_port``. Whoever runs the
+    lobby loop (host or client) does two things with it:
+
+      * ``pump_outbound(forward)`` -- drain frames the LOCAL bridge sent to the
+        relay port and hand each, prefixed with GAME_RELAY_MAGIC, to
+        ``forward(payload)`` which puts it on the transport (host: to every
+        joiner; joiner: to the host). ``forward`` returns how many peers it
+        reached.
+      * ``deliver(payload)`` -- a 'g' payload came in from the transport: strip
+        the tag and send the frame to the local bridge at 127.0.0.1:``local_port``
+        (from this same socket, so the bridge sees one stable source).
+
+    ``tick(now)`` prints a stats line every GAME_RELAY_STATS seconds. The host
+    folds ``sock`` into its select(); the client (whose transport is a
+    queue-fed ``Connection``, not a select loop) runs ``pump_loop`` on a
+    thread. No ARQ: the bridge has its own.
+    """
+
+    def __init__(self, relay_port, local_port, log=_log):
+        self.relay_port = int(relay_port)
+        self.local_addr = ("127.0.0.1", int(local_port))
+        self.log = log
+        self.sock = _open_loopback_udp(self.relay_port)
+        self.forwarded = 0          # loopback -> transport (frames)
+        self.delivered = 0          # transport -> loopback (frames)
+        self.no_peer = 0            # local frames with nobody to send to
+        self.oversize = 0           # local frames dropped for size
+        self._last_warn = 0.0
+        self._last_stats = time.time()
+        self._last_counts = (0, 0)
+        self.log(f"[relay] game relay up: bridge -> 127.0.0.1:{self.relay_port} "
+                 f"-> transport -> peer; peer -> 127.0.0.1:{self.local_addr[1]}")
+
+    @staticmethod
+    def is_game(payload):
+        return payload[:1] == GAME_RELAY_MAGIC
+
+    def pump_outbound(self, forward):
+        """Drain up to GAME_RELAY_DRAIN local frames; returns how many were read."""
+        n = 0
+        while n < GAME_RELAY_DRAIN:
+            try:
+                data, _src = self.sock.recvfrom(65535)
+            except BlockingIOError:
+                break
+            except ConnectionResetError:
+                continue                     # Windows ICMP echo of our own send
+            except OSError:
+                break
+            n += 1
+            if len(data) > GAME_RELAY_MAX:
+                self.oversize += 1
+                now = time.time()
+                if now - self._last_warn >= GAME_RELAY_WARN_EVERY:
+                    self._last_warn = now
+                    self.log(f"[relay] WARNING: dropped {len(data)}-byte frame "
+                             f"from the bridge (cap {GAME_RELAY_MAX} bytes; "
+                             f"{self.oversize} dropped so far)")
+                continue
+            try:
+                reached = forward(GAME_RELAY_MAGIC + data)
+            except (RuntimeError, OSError):
+                reached = 0
+            if reached:
+                self.forwarded += 1
+            else:
+                self.no_peer += 1
+        return n
+
+    def deliver(self, payload):
+        """A 'g' payload from the transport -> the local bridge."""
+        try:
+            self.sock.sendto(payload[1:], self.local_addr)
+        except OSError:
+            return
+        self.delivered += 1
+
+    def tick(self, now):
+        if now - self._last_stats < GAME_RELAY_STATS:
+            return
+        dt = now - self._last_stats
+        self._last_stats = now
+        f0, d0 = self._last_counts
+        self._last_counts = (self.forwarded, self.delivered)
+        self.log(f"[relay] stats: forwarded={self.forwarded} "
+                 f"(+{self.forwarded - f0}) delivered={self.delivered} "
+                 f"(+{self.delivered - d0}) in {dt:.0f}s; "
+                 f"no_peer={self.no_peer} oversize={self.oversize}")
+
+    def pump_loop(self, forward, stop):
+        """Client-side pump: select() on the loopback socket until ``stop``."""
+        while not stop.is_set():
+            try:
+                ready, _, _ = select.select([self.sock], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            if ready:
+                self.pump_outbound(forward)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Reliable save transfer (host -> every joiner), layered on the DATA channel
 # --------------------------------------------------------------------------- #
 # Wire additions (all inside NP1 DATA frames):
@@ -401,6 +607,19 @@ class _HostSaveTransfer:
             p["last_advance"] = now
             if p["next"] < base:
                 p["next"] = base
+        elif base < p["base"]:
+            # REWIND: the receiver restarted from scratch (hash mismatch ->
+            # whole-file re-request). Without this the host would filter every
+            # re-reported hole as "below base" and never resend -- the peer
+            # would just sit there until PEER_XFER_TIMEOUT. Honour the new base,
+            # re-stream from it, and drop the now-meaningless pending holes.
+            self.log(f"[host] {p['name']} rewound save cursor "
+                     f"{p['base']} -> {base} (receiver re-requested the file)")
+            p["base"] = base
+            p["next"] = base
+            p["nack"] = []
+            p["last_advance"] = now
+            p["last_pct"] = -1
         # Merge the reported holes with any still-pending ones (all >= base).
         holes = {s for s in msg.get("nack", [])
                  if isinstance(s, int) and p["base"] <= s < self.total_chunks}
@@ -421,9 +640,12 @@ class _HostSaveTransfer:
         elif msg.get("final"):
             if p["state"] == "active":
                 p["state"] = "failed"
-                self.io.emit({"type": "status", "state": "failed",
-                              "detail": f"save transfer: {p['name']} could "
-                                        f"not verify the file"})
+                # Per-peer outcome is a 'transfer' event (like "done"); the
+                # single failed STATUS comes from the host loop once every
+                # peer has resolved, naming all failures.
+                self.io.emit({"type": "transfer", "role": "send",
+                              "peer": p["name"], "state": "failed",
+                              "detail": "could not verify the file"})
                 self.log(f"[host] {p['name']} FAILED save (receiver gave up)")
         # A non-final ok:false means the receiver is retrying -> keep serving.
 
@@ -431,9 +653,9 @@ class _HostSaveTransfer:
         p = self.peers.get(addr)
         if p and p["state"] == "active":
             p["state"] = "dropped"
-            self.io.emit({"type": "status", "state": "failed",
-                          "detail": f"save transfer: {p['name']} dropped "
-                                    f"mid-transfer"})
+            self.io.emit({"type": "transfer", "role": "send",
+                          "peer": p["name"], "state": "dropped",
+                          "detail": "dropped mid-transfer"})
             self.log(f"[host] {p['name']} dropped mid-transfer -- skipping")
 
     # -- the pump (one slice of work per peer) ----------------------------- #
@@ -443,8 +665,9 @@ class _HostSaveTransfer:
                 continue
             if now - p["last_advance"] > PEER_XFER_TIMEOUT:
                 p["state"] = "failed"
-                self.io.emit({"type": "status", "state": "failed",
-                              "detail": f"save transfer: {p['name']} timed out"})
+                self.io.emit({"type": "transfer", "role": "send",
+                              "peer": p["name"], "state": "failed",
+                              "detail": "timed out"})
                 self.log(f"[host] {p['name']} save transfer TIMED OUT")
                 continue
             if not p["ready"] or self.total_chunks == 0:
@@ -476,6 +699,15 @@ class _HostSaveTransfer:
     def all_resolved(self):
         return all(p["state"] in ("done", "failed", "dropped")
                    for p in self.peers.values())
+
+    def failed_names(self):
+        """Names of peers whose transfer FAILED (verify/timeout). 'dropped'
+        peers have already left the lobby and never block a start."""
+        return [p["name"] for p in self.peers.values()
+                if p["state"] == "failed"]
+
+    def done_count(self):
+        return sum(1 for p in self.peers.values() if p["state"] == "done")
 
 
 class _ClientSaveReceiver:
@@ -520,11 +752,27 @@ class _ClientSaveReceiver:
         except (RuntimeError, OSError):
             pass
 
+    def _fail(self, detail):
+        """Give up on this session: tell the menu AND the host (fdone ok:false
+        final) so the host resolves us as failed NOW rather than after
+        PEER_XFER_TIMEOUT."""
+        self.failed = True
+        self.io.emit({"type": "status", "state": "failed",
+                      "detail": f"save transfer failed: {detail}"})
+        self._send({"t": "fdone", "sid": self.sid, "ok": False, "final": True})
+
     # -- inbound ----------------------------------------------------------- #
     def on_begin(self, msg):
         sid = msg.get("sid")
         if sid == self.sid:
-            self._send({"t": "fbegin_ack", "sid": sid})   # duplicate -> re-ack
+            if self.failed:
+                # The host missed our final fdone and is still re-sending
+                # fbegin: repeat the verdict (never re-ack, or it would start
+                # streaming at a receiver that can't take the file).
+                self._send({"t": "fdone", "sid": sid, "ok": False,
+                            "final": True})
+            else:
+                self._send({"t": "fbegin_ack", "sid": sid})  # duplicate -> re-ack
             return
         # A brand-new session (first ever, or a later transfer): (re)allocate.
         self.sid = sid
@@ -533,13 +781,13 @@ class _ClientSaveReceiver:
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = msg.get("files", [])
         self.overall_sha = msg.get("sha256")
+        self.buf = None
+        self.have = None
+        self.complete = False
         try:
             self.buf = bytearray(self.total_bytes)
         except (MemoryError, OverflowError):
-            self.failed = True
-            self.io.emit({"type": "status", "state": "failed",
-                          "detail": "save transfer failed: cannot allocate "
-                                    f"{self.total_bytes} bytes"})
+            self._fail(f"cannot allocate {self.total_bytes} bytes")
             return
         self.have = bytearray(self.total_chunks)
         self.base = 0
@@ -644,11 +892,7 @@ class _ClientSaveReceiver:
                 self.last_pct = -1
                 self._send_fack()
                 return
-            self.failed = True
-            self.io.emit({"type": "status", "state": "failed",
-                          "detail": "save transfer failed: hash mismatch"})
-            self._send({"t": "fdone", "sid": self.sid, "ok": False,
-                        "final": True})
+            self._fail("hash mismatch")
             return
         written = []
         try:
@@ -658,11 +902,7 @@ class _ClientSaveReceiver:
                     f.write(parts[name])
                 written.append(name)
         except OSError as e:
-            self.failed = True
-            self.io.emit({"type": "status", "state": "failed",
-                          "detail": f"save transfer failed: write error: {e}"})
-            self._send({"t": "fdone", "sid": self.sid, "ok": False,
-                        "final": True})
+            self._fail(f"write error: {e}")
             return
         self.complete = True
         self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
@@ -672,24 +912,46 @@ class _ClientSaveReceiver:
         self._maybe_send_done(force=True)
 
 
+def _clear_stale_incoming(directory, log=_log):
+    """Delete a previous session's incoming_save.* from ``directory``.
+
+    A joiner runs this BEFORE joining: a stale file from an earlier lobby must
+    never be picked up as this session's save (the DLL loads incoming_save.*
+    on a start with save=true, and we only emit that after save_ready).
+    """
+    for suffix in (".sav", ".sav.lua", ".jpg"):
+        path = os.path.join(directory, INCOMING_BASENAME + suffix)
+        try:
+            os.remove(path)
+            log(f"[client] removed stale {path}")
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log(f"[client] WARNING: could not remove stale {path}: {e}")
+
+
 # --------------------------------------------------------------------------- #
 # HOST: single socket, N peers, authority for roster + chat relay
 # --------------------------------------------------------------------------- #
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
-             log=_log):
+             log=_log, relay=None):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``sock`` is a bound UDP socket (the observe/game socket for the real CLI, a
     plain loopback socket for the self-test). ``io`` is a :class:`LobbyIO`.
+    ``relay`` is an optional :class:`GameRelay`: local bridge frames fan out
+    to every joiner, joiners' 'g' frames go to the local bridge.
     """
     stop = stop or threading.Event()
     sock.setblocking(False)
     _boost_socket_buffers(sock)             # help bursty save-transfer traffic
 
     host_name = _dedupe(my_name, set())     # reassigned by the 'name' command
-    peers = collections.OrderedDict()       # addr -> {"name":str, "last":float}
+    peers = collections.OrderedDict()       # addr -> {"name":str, "last":float,
+                                            #          "started":bool}
     cid_counter = [0]                       # host-authoritative chat id
     started = [False]
+    start_save = [False]                    # save flag of the last broadcast start
     last_emitted_roster = [None]
     transfer = [None]                       # the active _HostSaveTransfer, or None
 
@@ -708,9 +970,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
     def send_roster_packets():
-        msg = {"t": "roster", "players": roster_players(), "host": host_name}
-        for a in list(peers):
-            _send_data(sock, a, msg)
+        # Doubles as the start self-heal: a joiner that lost the whole start
+        # burst sees started:true here (~2 s later) and starts. The flag is
+        # PER PEER so a late joiner (not included in the start) never starts
+        # off a heal -- it needs the host to press START GAME again.
+        players = roster_players()
+        for a, p in list(peers.items()):
+            _send_data(sock, a, {"t": "roster", "players": players,
+                                 "host": host_name,
+                                 "started": bool(p.get("started")),
+                                 "start_save": start_save[0]})
 
     def emit_roster():
         players = roster_players()
@@ -737,16 +1006,26 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 _send_data(sock, a, msg)
         io.emit({"type": "chat", "from": frm, "text": text, "ts": ts})
 
-    def broadcast_start():
+    def broadcast_start(save):
+        """Start everyone currently in the lobby. ``save`` is True when a save
+        transfer just completed for every peer (they load incoming_save.*),
+        False for a legacy no-save start."""
         started[0] = True
+        start_save[0] = bool(save)
+        msg = {"t": "start", "save": start_save[0]}
+        for a in list(peers):
+            peers[a]["started"] = True      # heal roster carries started:true
         for _ in range(CHAT_BURST):
             for a in list(peers):
-                _send_data(sock, a, {"t": "start"})
-        io.emit({"type": "start"})
+                _send_data(sock, a, msg)
+        io.emit({"type": "start", "save": start_save[0]})
         io.write_state(started=True)
+        log(f"[host] START broadcast (save={start_save[0]}) to "
+            f"{len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
     def do_join(addr, name):
+        late = False
         if addr in peers:                                   # rename in place
             peers[addr]["name"] = _dedupe(name, all_names(exclude_addr=addr))
         else:                                               # brand-new joiner
@@ -755,16 +1034,45 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[host] rejected {addr} (lobby full)")
                 return
             assigned = _dedupe(name, all_names())
-            peers[addr] = {"name": assigned, "last": time.time()}
-            log(f"[host] JOIN {addr} as {assigned!r}")
+            peers[addr] = {"name": assigned, "last": time.time(),
+                           "started": False}
+            late = started[0]
+            log(f"[host] JOIN {addr} as {assigned!r}"
+                + (" (late -- game already started)" if late else ""))
         peers[addr]["last"] = time.time()
         _send_data(sock, addr, {"t": "welcome",
                                 "you": peers[addr]["name"], "host": host_name})
         roster_changed()
-        if started[0]:                                      # late joiner catch-up
-            _send_data(sock, addr, {"t": "start"})
+        if late:
+            # A late joiner is NOT started: it has no save (a save start) and
+            # nobody is in the lobby to sync with. Tell it why; the host has to
+            # press START GAME again to bring it in.
+            _send_data(sock, addr, {"t": "status", "state": "connected",
+                                    "detail": "game already started -- ask the "
+                                              "host to press START GAME again"})
+
+    def relay_forward(payload):
+        """Host side of the game relay: a local bridge frame -> every joiner.
+        Returns how many joiners it was sent to."""
+        frame = _pack(TYPE_DATA, payload)
+        n = 0
+        for a in list(peers):
+            try:
+                sock.sendto(frame, a)
+                n += 1
+            except OSError:
+                pass
+        return n
 
     def handle_data(addr, payload):
+        if GameRelay.is_game(payload):
+            # A joiner's bridge frame (binary, never JSON): straight to our
+            # bridge. Only from a peer that has joined -- strays are dropped.
+            if addr in peers:
+                peers[addr]["last"] = time.time()
+                if relay is not None:
+                    relay.deliver(payload)
+            return
         try:
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -803,11 +1111,20 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
         Runs entirely off the main loop: this only builds the transfer object;
         pump()/ACK-routing happen in the serve loop so pings/roster keep flowing.
-        Once every peer has verified (or dropped/timed out), the loop broadcasts
-        the normal 'start'. On a read error we emit failed and do NOT start.
+        Once every peer has verified (or dropped), the loop broadcasts
+        'start' with save=true. If any peer FAILED, or on a read error, we emit
+        a failed status and do NOT start (START GAME can be pressed again).
         """
         if transfer[0] is not None:
             log("[host] start(save) ignored -- a transfer is already running")
+            return
+        if not peers:
+            # Nobody to share the save with: do NOT latch 'started' (that would
+            # turn every subsequent joiner into a 'late' one). Just say so.
+            log("[host] start(save): no joiners connected -- not starting")
+            io.emit({"type": "status", "state": "connected",
+                     "detail": "no players to share with -- wait for a player "
+                               "to join, then press START GAME"})
             return
         try:
             blob, files_meta = _read_save_files(save_path)
@@ -815,10 +1132,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             io.emit({"type": "status", "state": "failed",
                      "detail": f"save transfer failed: {e}"})
             log(f"[host] save read failed: {e}")
-            return
-        if not peers:
-            log("[host] start(save): no joiners connected -- starting immediately")
-            broadcast_start()
             return
         sid = int(time.time() * 1000) & 0xFFFFFFFF
         targets = [(a, peers[a]["name"]) for a in peers]
@@ -840,9 +1153,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if transfer[0] is not None:
                 log("[host] start ignored -- a save transfer is in progress")
             elif save:
-                begin_save_transfer(save)         # broadcasts start when done
+                begin_save_transfer(save)         # start(save=True) when done
             else:
-                broadcast_start()                 # legacy start, no transfer
+                broadcast_start(save=False)       # legacy start, no transfer
         elif c == "quit":
             stop.set()
 
@@ -853,13 +1166,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     log(f"[host] serving as {host_name!r} on udp/{sock.getsockname()[1]}")
 
     last_heal = last_drop = 0.0
+    # The game relay's loopback socket joins the select set so a bridge frame
+    # wakes the loop immediately (lockstep latency) instead of on the next tick.
+    rlist = [sock] if relay is None else [sock, relay.sock]
     try:
         while not stop.is_set():
             # While a transfer runs, poll fast so we pump chunks + absorb ACKs
             # promptly; otherwise idle at 0.2 s to keep the loop cheap.
             timeout = XFER_SELECT_TIMEOUT if transfer[0] is not None else 0.2
             try:
-                ready, _, _ = select.select([sock], [], [], timeout)
+                ready, _, _ = select.select(rlist, [], [], timeout)
             except (OSError, ValueError):
                 break
             now = time.time()
@@ -867,7 +1183,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # Drain up to HOST_DRAIN datagrams this cycle -- a busy transfer can
             # deliver a burst of facks/pings, and one-per-iteration would let the
             # kernel recv buffer overflow (self-inflicted loss).
-            if ready:
+            if sock in ready:
                 for _ in range(HOST_DRAIN):
                     try:
                         data, addr = sock.recvfrom(65535)
@@ -892,6 +1208,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     elif ptype == TYPE_DATA:
                         handle_data(addr, payload)
 
+            # Game relay: local bridge frames -> every joiner.
+            if relay is not None and relay.sock in ready:
+                relay.pump_outbound(relay_forward)
+
             if now - last_drop >= 1.0:
                 last_drop = now
                 dead = [a for a, p in peers.items()
@@ -911,15 +1231,39 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             for cmd in io.poll_commands():
                 handle_command(cmd)
 
-            # Pump the save transfer (if any) and, once every peer has verified
-            # or been skipped, broadcast the normal 'start' so all begin together.
+            if relay is not None:
+                relay.tick(now)                             # 10 s stats line
+
+            # Pump the save transfer (if any). Once every peer has resolved:
+            #   all done (dropped peers don't block) -> start with save=true;
+            #   any FAILED -> failed status naming them, NO start, and the
+            #   transfer is cleared so START GAME can simply be pressed again.
             if transfer[0] is not None:
                 try:
                     transfer[0].pump(now)
                     if transfer[0].all_resolved():
-                        log("[host] all save transfers resolved -- starting")
-                        transfer[0] = None
-                        broadcast_start()
+                        xfer, transfer[0] = transfer[0], None
+                        failed = xfer.failed_names()
+                        if failed:
+                            detail = (f"save transfer failed for "
+                                      f"{', '.join(failed)} -- press START "
+                                      f"GAME to retry")
+                            log(f"[host] {detail}")
+                            io.emit({"type": "status", "state": "failed",
+                                     "detail": detail})
+                        elif xfer.done_count() == 0:
+                            # Every target dropped mid-transfer: nobody holds
+                            # the save, so (as with zero joiners) don't start.
+                            log("[host] every peer dropped mid-transfer -- "
+                                "not starting")
+                            io.emit({"type": "status", "state": "connected",
+                                     "detail": "no players to share with -- "
+                                               "wait for a player to join, "
+                                               "then press START GAME"})
+                        else:
+                            log("[host] all save transfers resolved -- "
+                                "starting")
+                            broadcast_start(save=True)
                 except Exception as e:                     # never crash the lobby
                     log(f"[host] save transfer error: {e!r}")
                     io.emit({"type": "status", "state": "failed",
@@ -933,6 +1277,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         io.emit({"type": "status", "state": "failed",
                  "detail": "lobby closed"})
         io.write_state(state="failed")
+        if relay is not None:
+            relay.close()
         try:
             sock.close()
         except OSError:
@@ -943,14 +1289,21 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 # CLIENT: one Connection to the host; participate
 # --------------------------------------------------------------------------- #
 def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
-               log=_log):
-    """Participate in the lobby over a connected ``punch.Connection`` (blocks)."""
+               log=_log, receiver_cls=_ClientSaveReceiver, relay=None):
+    """Participate in the lobby over a connected ``punch.Connection`` (blocks).
+
+    ``receiver_cls`` is the save-receive implementation (the self-test swaps in
+    a deliberately corrupting one to prove the failure path). ``relay`` is an
+    optional :class:`GameRelay`: local bridge frames go to the host only, the
+    host's 'g' frames go to the local bridge.
+    """
     stop = stop or threading.Event()
 
     desired = [my_name]     # what we asked to be called
     assigned = [my_name]    # what the host actually named us (from 'welcome')
     started = [False]
     last_roster = [None]
+    last_ignored_start = [None]     # (save, sid) of the last start we refused
     seen_cids = collections.deque(maxlen=512)
     seen_set = set()
 
@@ -958,7 +1311,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         _boost_socket_buffers(conn.sock)    # help bursty save-transfer traffic
     except AttributeError:
         pass
-    receiver = _ClientSaveReceiver(conn, io, log)   # save-transfer receive side
+    _clear_stale_incoming(io.dir, log)      # never trust a previous session's save
+    receiver = receiver_cls(conn, io, log)  # save-transfer receive side
 
     io.emit({"type": "status", "state": "connected",
              "detail": f"joined host {conn.peer_str}"})
@@ -970,9 +1324,35 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         except (RuntimeError, OSError):
             pass
 
+    def apply_start(save, via):
+        """The save-flag rule: emit start only if save==false, or save==true
+        AND our receiver completed this session (it emitted save_ready). An
+        unsatisfiable start is ignored WITHOUT latching started, so a retried
+        START GAME (after the host re-sends the save) still works."""
+        if started[0]:
+            return
+        save = bool(save)
+        if save and not receiver.complete:
+            key = (save, receiver.sid)
+            if last_ignored_start[0] != key:      # log once per situation
+                last_ignored_start[0] = key
+                log(f"[client] start(save=True) via {via} ignored -- no "
+                    f"verified save this session (receiver "
+                    f"{'failed' if receiver.failed else 'incomplete'})")
+            return
+        started[0] = True
+        io.emit({"type": "start", "save": save})
+        io.write_state(started=True)
+        log(f"[client] START (save={save}) via {via}")
+
     def handle_msg(raw):
-        # Binary save-transfer chunks are NOT JSON: a DATA payload starting with
-        # CHUNK_MAGIC is a chunk frame; everything else is a JSON lobby message.
+        # Two binary payload kinds are NOT JSON: a relayed bridge frame (first
+        # byte GAME_RELAY_MAGIC) and a save chunk (CHUNK_MAGIC); everything
+        # else is a JSON lobby message.
+        if GameRelay.is_game(raw):
+            if relay is not None:
+                relay.deliver(raw)
+            return
         if raw[:4] == CHUNK_MAGIC:
             if len(raw) >= 12:
                 sid, seq = struct.unpack("!II", raw[4:12])
@@ -999,6 +1379,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
                                started=started[0])
+            # Start self-heal: the host's roster carries started:true for us
+            # once we were included in a start -- catches a lost start burst.
+            if m.get("started") is True:
+                apply_start(m.get("start_save", False), via="roster")
         elif t == "chat":
             cid = m.get("cid")
             if cid in seen_set:
@@ -1010,10 +1394,13 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             io.emit({"type": "chat", "from": m.get("from"),
                      "text": m.get("text"), "ts": m.get("ts")})
         elif t == "start":
-            if not started[0]:
-                started[0] = True
-                io.emit({"type": "start"})
-                io.write_state(started=True)
+            apply_start(m.get("save", False), via="start")
+        elif t == "status":
+            # Advisory from the host (e.g. late joiner: game already started).
+            io.emit({"type": "status",
+                     "state": str(m.get("state", "connected")),
+                     "detail": str(m.get("detail", ""))})
+            log(f"[client] host says: {m.get('detail', '')}")
         elif t == "reject":
             io.emit({"type": "status", "state": "failed",
                      "detail": m.get("reason", "rejected")})
@@ -1036,6 +1423,23 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "leave"})
             io.emit({"type": "status", "state": "failed", "detail": "left lobby"})
             stop.set()
+
+    # Game relay, outbound half: the client's transport is a queue-fed
+    # Connection (no select loop to join), so the loopback socket gets its own
+    # select() thread that wraps each local bridge frame and sends it to the
+    # host. The inbound half rides the normal inbox path (handle_msg above).
+    relay_stop = threading.Event()
+    relay_thread = None
+    if relay is not None:
+        def relay_forward(payload):
+            conn.send(payload)          # RuntimeError (no peer yet) -> pump
+            return 1
+
+        relay_thread = threading.Thread(target=relay.pump_loop,
+                                        name="game-relay",
+                                        args=(relay_forward, relay_stop),
+                                        daemon=True)
+        relay_thread.start()
 
     send({"t": "join", "name": desired[0]})                 # announce ourselves
     last_ping = 0.0
@@ -1068,22 +1472,49 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 send({"t": "ping"})
             for cmd in io.poll_commands():
                 handle_command(cmd)
+            if relay is not None:
+                relay.tick(now)                             # 10 s stats line
     except KeyboardInterrupt:
         send({"t": "leave"})
     finally:
+        relay_stop.set()
+        if relay_thread is not None:
+            relay_thread.join(timeout=1.0)  # its select() wakes within 0.2 s
+        if relay is not None:
+            relay.close()
         conn.close()
 
 
 # --------------------------------------------------------------------------- #
 # CLI commands
 # --------------------------------------------------------------------------- #
+def _make_relay(args):
+    """Build the :class:`GameRelay` from --game-relay-port / --game-local-port,
+    or None when the menu didn't ask for one (legacy behaviour, unchanged).
+
+    A bind failure does NOT kill the lobby -- roster/chat/save still work --
+    but it is shouted on stderr because lockstep will not connect.
+    """
+    port = getattr(args, "game_relay_port", None)
+    if not port:
+        return None
+    local = getattr(args, "game_local_port", None) or GAME_LOCAL_PORT_DEFAULT
+    try:
+        return GameRelay(port, local)
+    except OSError as e:
+        _log(f"[relay] WARNING: cannot bind game relay 127.0.0.1:{port}: {e} "
+             f"-- bridge frames will NOT be relayed this session")
+        return None
+
+
 def cmd_host(args):
     io = LobbyIO(args.io_dir or os.getcwd())
     io.emit({"type": "status", "state": "waiting", "detail": "observing NAT"})
     io.write_state(state="waiting")
+    relay = _make_relay(args)               # bind early so a clash shows up now
     # observe + print the single CODE= line (reused from connect.py).
     sock, _profile, code = _observe_and_announce(args.local_port)
-    run_host(sock, args.name, io, code=code)
+    run_host(sock, args.name, io, code=code, relay=relay)
     return 0
 
 
@@ -1100,6 +1531,7 @@ def cmd_join(args):
         return 2
     if peer.get("stale"):
         _log(f"[join] WARNING: code is {peer['age']}s old -- may be stale")
+    relay = _make_relay(args)               # bind early so a clash shows up now
     # Star model: the host is open, so we simply DIAL its v4 candidates. This
     # reuses connect.py's race (role='dial', v4 only -> single socket).
     sock = open_socket(args.local_port, socket.AF_INET)
@@ -1110,9 +1542,11 @@ def cmd_join(args):
                  "detail": "could not reach host"})
         io.write_state(state="failed")
         _log("[join] FAILED to reach host")
+        if relay is not None:
+            relay.close()
         return 1
     _log(f"[join] connected to host {conn.peer_str}")
-    run_client(conn, args.name, io)
+    run_client(conn, args.name, io, relay=relay)
     return 0
 
 
@@ -1154,17 +1588,41 @@ def _wait_until(predicate, timeout=12.0, interval=0.15):
     return predicate()
 
 
+def _has_start(path, save=None):
+    """True if lobby_out.jsonl at ``path`` has a start event (optionally with
+    the given ``save`` flag)."""
+    return any(e.get("type") == "start"
+               and (save is None or e.get("save") is save)
+               for e in _read_events(path))
+
+
+def _dial_loopback(port, host_port, timeout):
+    """Dial a loopback host with the connect race; returns a Connection/None."""
+    peer = {"candidates": {"public_v4": f"127.0.0.1:{host_port}",
+                           "lan_v4": None, "v6": None},
+            "flags": {"open": True, "v6": False}}
+    s = open_socket(port, socket.AF_INET)
+    return race(s, peer, "dial", port, timeout, my_has_v6=False)
+
+
 def selftest():
-    HP, P1, P2 = 29520, 29521, 29522
+    HP, P1, P2, P3 = 29520, 29521, 29522, 29523
     names = {"host": "alice", "j1": "bob", "j2": "carol"}
+    late_name = "dave"                        # joins AFTER the start (case d)
     expected = sorted(names.values())
     base = tempfile.mkdtemp(prefix="lobby_selftest_")
-    dirs = {k: os.path.join(base, k) for k in names}
+    dirs = {k: os.path.join(base, k) for k in list(names) + ["j3"]}
     ios = {k: LobbyIO(dirs[k]) for k in names}
     stop = threading.Event()
     conns = []
     print(f"[selftest] scratch dir: {base}")
-    print(f"[selftest] host udp/{HP}  joiners udp/{P1},{P2}")
+    print(f"[selftest] host udp/{HP}  joiners udp/{P1},{P2}  late udp/{P3}")
+
+    # A stale save from "a previous session" in j1's io dir: the joiner must
+    # delete it before joining (case e).
+    stale = os.path.join(dirs["j1"], INCOMING_BASENAME + ".sav")
+    with open(stale, "wb") as f:
+        f.write(b"stale save from an earlier lobby")
 
     ok = True
     try:
@@ -1223,6 +1681,67 @@ def selftest():
             print("[selftest] FAIL (b): chat did not reach all three")
         else:
             print(f"[selftest] OK (b): chat reached host + both joiners")
+
+        # (c) a legacy (no-save) START from the host -> everyone emits
+        #     {"type":"start","save":false}
+        with open(ios["host"].in_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cmd": "start"}) + "\n")
+
+        def started_everywhere():
+            return all(_has_start(ios[k].out_path, save=False) for k in names)
+
+        if not _wait_until(started_everywhere, timeout=12):
+            ok = False
+            for k in names:
+                print(f"[selftest]   {k} start(save=false): "
+                      f"{_has_start(ios[k].out_path, save=False)}")
+            print("[selftest] FAIL (c): legacy start did not reach all three")
+        else:
+            print("[selftest] OK (c): legacy start save=false reached all three")
+
+        # (d) a LATE joiner (after the start) must NOT be started -- not by a
+        #     start message, and not by the periodic roster heal either -- and
+        #     must be told why.
+        ios["j3"] = LobbyIO(dirs["j3"])
+        conn = _dial_loopback(P3, HP, 10)
+        if not conn:
+            print(f"[selftest] FAIL (d): late joiner {late_name} could not connect")
+            ok = False
+        else:
+            conns.append(conn)
+            threading.Thread(target=run_client, name="j3",
+                             args=(conn, late_name, ios["j3"]),
+                             kwargs={"stop": stop}, daemon=True).start()
+
+            def late_notified():
+                return any(e.get("type") == "status"
+                           and "game already started" in e.get("detail", "")
+                           for e in _read_events(ios["j3"].out_path))
+
+            if not _wait_until(late_notified, timeout=12):
+                ok = False
+                print("[selftest] FAIL (d): late joiner never got the "
+                      "'game already started' status")
+            else:
+                # Outlast a couple of roster heals to prove they don't start it.
+                time.sleep(ROSTER_HEAL * 1.5)
+                if _has_start(ios["j3"].out_path):
+                    ok = False
+                    print("[selftest] FAIL (d): late joiner was started")
+                elif not (_latest_roster(ios["host"].out_path) and late_name in
+                          _latest_roster(ios["host"].out_path)["players"]):
+                    ok = False
+                    print("[selftest] FAIL (d): late joiner not in host roster")
+                else:
+                    print("[selftest] OK (d): late joiner told 'game already "
+                          "started', not started, in roster")
+
+        # (e) the stale incoming_save.sav in j1's io dir was deleted on startup
+        if os.path.exists(stale):
+            ok = False
+            print("[selftest] FAIL (e): stale incoming_save.sav survived join")
+        else:
+            print("[selftest] OK (e): stale incoming_save.sav removed before join")
     finally:
         stop.set()
         time.sleep(0.3)
@@ -1400,7 +1919,7 @@ def _run_transfer_once(loss, size_bytes, tag):
                 print(f"[xfer:{tag}] FAIL: {k} save_ready shape = {sr[-1]}")
                 ok = False
 
-        # (3) host per-peer done x2, and start AFTER both done events
+        # (3) host per-peer done x2, and start(save=true) AFTER both done events
         hev = _read_events(ios["host"].out_path)
         done_idx = [i for i, e in enumerate(hev)
                     if e.get("type") == "transfer" and e.get("role") == "send"
@@ -1412,15 +1931,18 @@ def _run_transfer_once(loss, size_bytes, tag):
         if not start_idx:
             print(f"[xfer:{tag}] FAIL: host never broadcast start")
             ok = False
+        elif hev[start_idx[-1]].get("save") is not True:
+            print(f"[xfer:{tag}] FAIL: host start lacks save:true: "
+                  f"{hev[start_idx[-1]]}")
+            ok = False
         if done_idx and start_idx and start_idx[-1] < max(done_idx):
             print(f"[xfer:{tag}] FAIL: start was broadcast BEFORE transfers done")
             ok = False
 
-        # (4) both joiners actually started
+        # (4) both joiners actually started, with save:true
         for k in ("j1", "j2"):
-            if not any(e.get("type") == "start"
-                       for e in _read_events(ios[k].out_path)):
-                print(f"[xfer:{tag}] FAIL: {k} never received start")
+            if not _has_start(ios[k].out_path, save=True):
+                print(f"[xfer:{tag}] FAIL: {k} never received start(save=true)")
                 ok = False
     finally:
         stop.set()
@@ -1440,9 +1962,162 @@ def _run_transfer_once(loss, size_bytes, tag):
     return ok
 
 
+def _run_transfer_failure(tag, size_bytes=4 * 1024 * 1024):
+    # NB: size must exceed SEND_WINDOW chunks (~2.4 MB) so the host has SEEN
+    # an advanced base before the receiver re-requests from 0 -- that is the
+    # only way the rewind path is actually exercised.
+    """One joiner's receiver FAILS (its copy of chunk 0 is corrupted, so every
+    hash check fails until it gives up with fdone ok:false final); then the
+    host is asked to START again with the corruption gone.
+
+    Asserts, round 1: the failing joiner emits status failed and NO start; the
+    healthy joiner (verified its copy) gets NO start either; the host emits
+    the 'save transfer failed for <name> -- press START GAME to retry' status
+    and NO start -- all well inside PEER_XFER_TIMEOUT, which proves the host
+    honoured the receiver's base REWIND on each re-request.
+    Round 2 (retry): both joiners save_ready + start(save=true), host start.
+    """
+    HP, P1, P2 = 29520, 29521, 29522
+    names = {"host": "alice", "j1": "bob", "j2": "carol"}
+    base = tempfile.mkdtemp(prefix="lobby_xferfail_")
+    dirs = {k: os.path.join(base, k) for k in names}
+    ios = {k: LobbyIO(dirs[k]) for k in names}
+    stop = threading.Event()
+    conns = []
+    corrupt = [True]                          # flipped off before the retry
+
+    class _CorruptingReceiver(_ClientSaveReceiver):
+        """Zeroes chunk 0 while ``corrupt`` is set -> per-file SHA mismatch."""
+        def on_chunk(self, sid, seq, data):
+            if seq == 0 and corrupt[0]:
+                data = bytes(len(data))
+            super().on_chunk(sid, seq, data)
+
+    save_path = os.path.join(base, "world.sav")
+    with open(save_path, "wb") as f:
+        f.write(os.urandom(size_bytes))
+    src_sha = _sha256_file(save_path)
+
+    ok = True
+    t0 = time.time()
+    try:
+        hsock = open_socket(HP, socket.AF_INET)
+        threading.Thread(target=run_host, name="xferfail-host",
+                         args=(hsock, names["host"], ios["host"]),
+                         kwargs={"code": "XFERFAIL", "stop": stop},
+                         daemon=True).start()
+        time.sleep(0.4)
+
+        for port, key, cls in ((P1, "j1", _ClientSaveReceiver),
+                               (P2, "j2", _CorruptingReceiver)):
+            conn = _dial_loopback(port, HP, 12)
+            if not conn:
+                print(f"[xfer:{tag}] FAIL: joiner {names[key]} could not connect")
+                return False
+            conns.append(conn)
+            threading.Thread(target=run_client, name=key,
+                             args=(conn, names[key], ios[key]),
+                             kwargs={"stop": stop, "receiver_cls": cls},
+                             daemon=True).start()
+
+        def all_joined():
+            for k in names:
+                r = _latest_roster(ios[k].out_path)
+                if not r or len(r.get("players", [])) < 3:
+                    return False
+            return True
+
+        if not _wait_until(all_joined, timeout=15):
+            print(f"[xfer:{tag}] FAIL: not all three joined")
+            return False
+
+        def host_failed_status():
+            return [e for e in _read_events(ios["host"].out_path)
+                    if e.get("type") == "status" and e.get("state") == "failed"
+                    and "press START GAME to retry" in e.get("detail", "")]
+
+        # ---- round 1: carol's receiver cannot verify -> nobody starts ------ #
+        with open(ios["host"].in_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cmd": "start", "save": save_path}) + "\n")
+
+        # Must resolve WELL before PEER_XFER_TIMEOUT (30 s): each re-request
+        # only completes because the host rewinds its cursor to the new base.
+        if not _wait_until(host_failed_status, timeout=PEER_XFER_TIMEOUT - 10):
+            print(f"[xfer:{tag}] FAIL: host never emitted the retry status "
+                  f"(receiver rewind not honoured?)")
+            ok = False
+        else:
+            detail = host_failed_status()[-1]["detail"]
+            if detail != ("save transfer failed for carol -- press START GAME "
+                          "to retry"):
+                print(f"[xfer:{tag}] FAIL: unexpected failed detail: {detail!r}")
+                ok = False
+        time.sleep(0.5)                       # let any stray start land (none may)
+        if _has_start(ios["host"].out_path):
+            print(f"[xfer:{tag}] FAIL: host broadcast start despite a failure")
+            ok = False
+        for k in ("j1", "j2"):
+            if _has_start(ios[k].out_path):
+                print(f"[xfer:{tag}] FAIL: {k} started despite a failed transfer")
+                ok = False
+        if not any(e.get("type") == "status" and e.get("state") == "failed"
+                   and "hash mismatch" in e.get("detail", "")
+                   for e in _read_events(ios["j2"].out_path)):
+            print(f"[xfer:{tag}] FAIL: j2 never reported the hash mismatch")
+            ok = False
+        if any(e.get("type") == "save_ready"
+               for e in _read_events(ios["j2"].out_path)):
+            print(f"[xfer:{tag}] FAIL: j2 emitted save_ready for a bad file")
+            ok = False
+        if not any(e.get("type") == "save_ready"
+                   for e in _read_events(ios["j1"].out_path)):
+            print(f"[xfer:{tag}] FAIL: j1 (healthy) never emitted save_ready")
+            ok = False
+        if ok:
+            print(f"[xfer:{tag}] round 1 OK: failure surfaced, nobody started "
+                  f"({time.time() - t0:.1f}s)")
+
+        # ---- round 2: fix carol, press START GAME again -> all start ------- #
+        corrupt[0] = False
+        with open(ios["host"].in_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cmd": "start", "save": save_path}) + "\n")
+
+        def retry_settled():
+            return (_has_start(ios["host"].out_path, save=True)
+                    and all(_has_start(ios[k].out_path, save=True)
+                            for k in ("j1", "j2")))
+
+        if not _wait_until(retry_settled, timeout=30):
+            print(f"[xfer:{tag}] FAIL: retry did not start everyone")
+            for k in names:
+                print(f"[xfer:{tag}]   {k} start(save=true): "
+                      f"{_has_start(ios[k].out_path, save=True)}")
+            ok = False
+        for k in ("j1", "j2"):
+            p = os.path.join(ios[k].dir, INCOMING_BASENAME + ".sav")
+            if not os.path.isfile(p) or _sha256_file(p) != src_sha:
+                print(f"[xfer:{tag}] FAIL: {k} incoming_save.sav wrong after retry")
+                ok = False
+    finally:
+        stop.set()
+        time.sleep(0.5)
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        shutil.rmtree(base, ignore_errors=True)
+
+    print(f"[xfer:{tag}] {'OK' if ok else 'FAIL'}  "
+          f"(failed peer -> retry status, then successful retry, "
+          f"{time.time() - t0:.1f}s)")
+    return ok
+
+
 def selftest_transfer():
     """Run the save-transfer self-test several times (clean + lossy) so it
-    proves both correctness and non-flakiness, and exercises retransmit."""
+    proves both correctness and non-flakiness, and exercises retransmit;
+    then the failure + retry case."""
     print("[selftest-transfer] reliable host -> 2-joiner save transfer")
     runs = [
         ("clean-1", 0.00, 20 * 1024 * 1024),
@@ -1453,8 +2128,188 @@ def selftest_transfer():
     allok = True
     for tag, loss, size in runs:
         allok = _run_transfer_once(loss, size, tag) and allok
+    allok = _run_transfer_failure("fail-retry") and allok
     print(f"[selftest-transfer] {'PASS' if allok else 'FAIL'}")
     return allok
+
+
+# --------------------------------------------------------------------------- #
+# Self-test: GAME RELAY -- two stand-in bridges exchange frames via host+joiner
+# --------------------------------------------------------------------------- #
+def selftest_relay():
+    """1 host + 1 joiner on loopback, each with a game relay; two plain UDP
+    sockets stand in for the two bridges (bound to the --game-local-ports).
+
+    (a) 200 numbered 900-byte frames go EACH way in through the relay ports and
+        must all arrive, byte-exact, at the OTHER stand-in (reordering allowed;
+        loopback loses nothing).
+    (b) an oversize frame is dropped (counted + warned), never delivered.
+    (c) lobby chat still flows after the relay traffic.
+    (d) the relay counters agree with (a).
+    """
+    HP, P1 = 29530, 29531                       # lobby transport ports
+    RELAY_HOST, RELAY_JOIN = 7783, 7784         # --game-relay-port (per role)
+    LOCAL_HOST, LOCAL_JOIN = 7781, 7782         # --game-local-port (the bridges)
+    N, SIZE = 200, 900
+    names = {"host": "alice", "j1": "bob"}
+    base = tempfile.mkdtemp(prefix="lobby_relay_")
+    ios = {k: LobbyIO(os.path.join(base, k)) for k in names}
+    stop = threading.Event()
+    conns, relays, standins = [], [], []
+    ok = True
+    print(f"[selftest-relay] host udp/{HP}: relay {RELAY_HOST} -> bridge "
+          f"{LOCAL_HOST};  joiner udp/{P1}: relay {RELAY_JOIN} -> bridge "
+          f"{LOCAL_JOIN}")
+
+    def frame(tag, i):
+        head = tag + struct.pack("!I", i)
+        return head + bytes((i * 7 + j) & 0xFF for j in range(SIZE - len(head)))
+
+    try:
+        # The two "bridges": plain UDP sockets on the local ports.
+        bridge_a = _open_loopback_udp(LOCAL_HOST)     # host machine's bridge
+        bridge_b = _open_loopback_udp(LOCAL_JOIN)     # joiner machine's bridge
+        standins += [bridge_a, bridge_b]
+        relay_h = GameRelay(RELAY_HOST, LOCAL_HOST)
+        relay_j = GameRelay(RELAY_JOIN, LOCAL_JOIN)
+        relays += [relay_h, relay_j]
+
+        hsock = open_socket(HP, socket.AF_INET)
+        threading.Thread(target=run_host, name="relay-host",
+                         args=(hsock, names["host"], ios["host"]),
+                         kwargs={"code": "RELAYCODE", "stop": stop,
+                                 "relay": relay_h}, daemon=True).start()
+        time.sleep(0.4)
+        conn = _dial_loopback(P1, HP, 10)
+        if not conn:
+            print("[selftest-relay] FAIL: joiner could not connect")
+            return False
+        conns.append(conn)
+        threading.Thread(target=run_client, name="relay-j1",
+                         args=(conn, names["j1"], ios["j1"]),
+                         kwargs={"stop": stop, "relay": relay_j},
+                         daemon=True).start()
+
+        def both_joined():
+            for k in names:
+                r = _latest_roster(ios[k].out_path)
+                if not r or sorted(r.get("players", [])) != sorted(names.values()):
+                    return False
+            return True
+
+        if not _wait_until(both_joined, timeout=12):
+            print("[selftest-relay] FAIL: lobby did not form")
+            return False
+        print("[selftest-relay] lobby formed; sending frames")
+
+        # (a) N frames each way, interleaved, lightly paced (bursts are what a
+        #     real bridge does too, but we're proving routing, not buffers).
+        for i in range(N):
+            bridge_a.sendto(frame(b"A", i), ("127.0.0.1", RELAY_HOST))
+            bridge_b.sendto(frame(b"B", i), ("127.0.0.1", RELAY_JOIN))
+            if i % 20 == 19:
+                time.sleep(0.002)
+
+        got = {b"A": set(), b"B": set()}          # tag -> indices received
+        bad = 0
+        deadline = time.time() + 15.0
+        while (time.time() < deadline
+               and (len(got[b"A"]) < N or len(got[b"B"]) < N)):
+            try:
+                ready, _, _ = select.select([bridge_a, bridge_b], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            for s in ready:
+                for _ in range(GAME_RELAY_DRAIN):
+                    try:
+                        data, _src = s.recvfrom(65535)
+                    except (BlockingIOError, ConnectionResetError, OSError):
+                        break
+                    tag = data[:1]
+                    if tag not in got or len(data) < 5:
+                        bad += 1
+                        continue
+                    idx = struct.unpack("!I", data[1:5])[0]
+                    # A-frames left bridge_a and must land on bridge_b; B the
+                    # other way. Anything else is misrouted or corrupt.
+                    expect = bridge_b if tag == b"A" else bridge_a
+                    if s is not expect or data != frame(tag, idx):
+                        bad += 1
+                        continue
+                    got[tag].add(idx)
+
+        for tag, dst in ((b"A", "joiner"), (b"B", "host")):
+            missing = sorted(set(range(N)) - got[tag])
+            if missing:
+                ok = False
+                print(f"[selftest-relay] FAIL (a): {len(missing)}/{N} "
+                      f"{tag.decode()} frames never reached the {dst}'s bridge "
+                      f"(first missing {missing[:5]})")
+            else:
+                print(f"[selftest-relay] OK (a): all {N} {tag.decode()} frames "
+                      f"reached the {dst}'s bridge")
+        if bad:
+            ok = False
+            print(f"[selftest-relay] FAIL (a): {bad} corrupt/misrouted frames")
+
+        # (b) an oversize frame is dropped, never delivered.
+        bridge_a.sendto(b"X" * (GAME_RELAY_MAX + 100), ("127.0.0.1", RELAY_HOST))
+        time.sleep(0.5)
+        leaked = False
+        while True:
+            try:
+                data, _src = bridge_b.recvfrom(65535)
+            except (BlockingIOError, ConnectionResetError, OSError):
+                break
+            if data[:1] == b"X":
+                leaked = True
+        if leaked or relay_h.oversize != 1:
+            ok = False
+            print(f"[selftest-relay] FAIL (b): oversize frame leaked={leaked} "
+                  f"oversize_count={relay_h.oversize}")
+        else:
+            print("[selftest-relay] OK (b): oversize frame dropped (warned)")
+
+        # (c) the lobby still works around the relay traffic: chat from joiner.
+        chat_text = "still chatting after relay"
+        with open(ios["j1"].in_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cmd": "chat", "text": chat_text}) + "\n")
+        if not _wait_until(lambda: all(_has_chat(ios[k].out_path, chat_text)
+                                       for k in names), timeout=10):
+            ok = False
+            print("[selftest-relay] FAIL (c): chat broken after relay traffic")
+        else:
+            print("[selftest-relay] OK (c): chat still flows")
+
+        # (d) counters: each relay forwarded N and delivered N.
+        counts = (relay_h.forwarded, relay_h.delivered,
+                  relay_j.forwarded, relay_j.delivered)
+        if counts != (N, N, N, N):
+            ok = False
+            print(f"[selftest-relay] FAIL (d): counters host(fwd,del)="
+                  f"{counts[:2]} joiner(fwd,del)={counts[2:]} (want {N} each)")
+        else:
+            print(f"[selftest-relay] OK (d): counters host/joiner fwd={N} "
+                  f"delivered={N}")
+    finally:
+        stop.set()
+        time.sleep(0.5)
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        for r in relays:
+            r.close()                     # idempotent; the loops close too
+        for s in standins:
+            try:
+                s.close()
+            except OSError:
+                pass
+        shutil.rmtree(base, ignore_errors=True)
+
+    print(f"[selftest-relay] {'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 # --------------------------------------------------------------------------- #
@@ -1476,19 +2331,34 @@ def main(argv=None):
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
+    ap.add_argument("--selftest-relay", action="store_true",
+                    help="run the game-relay self-test (host + joiner, two "
+                         "stand-in bridges, frames both ways) and exit")
+    ap.add_argument("--game-relay-port", type=int, default=None,
+                    help="bind 127.0.0.1:<port> and relay the lockstep "
+                         "bridge's UDP frames over the lobby transport "
+                         "(the menu passes 7773 for host, 7774 for join)")
+    ap.add_argument("--game-local-port", type=int,
+                    default=GAME_LOCAL_PORT_DEFAULT,
+                    help="the local bridge's UDP port that relayed frames are "
+                         "delivered to (the menu reads it from "
+                         "tpf2_instance.txt; default %(default)s)")
     args = ap.parse_args(argv)
 
     if args.selftest:
         return 0 if selftest() else 1
     if args.selftest_transfer:
         return 0 if selftest_transfer() else 1
+    if args.selftest_relay:
+        return 0 if selftest_relay() else 1
     if args.mode == "host":
         return cmd_host(args)
     if args.mode == "join":
         if not args.code:
             ap.error("join requires a CODE argument")
         return cmd_join(args)
-    ap.error("give a mode: host / join / --selftest")
+    ap.error("give a mode: host / join / --selftest / --selftest-transfer / "
+             "--selftest-relay")
     return 2
 
 

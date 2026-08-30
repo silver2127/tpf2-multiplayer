@@ -49,6 +49,22 @@
 #include <cmath>
 #include <share.h>
 #include "hook.h"
+#include "datadir.h"
+
+// ---------------------------------------------------------------------------
+// GAME BUILD GUARD. Every RVA below was measured on ONE build of
+// TransportFever2.exe. Patching those offsets into any other build writes a
+// jmp into the middle of whatever instruction happens to live there, which
+// is a crash at best and a silently corrupted command at worst. So the PE
+// header of the running exe is compared against the build the RVAs belong
+// to before a single byte is patched; on mismatch the DLL logs and stays
+// inert. Both values come from the installed exe's IMAGE_NT_HEADERS
+// (FileHeader.TimeDateStamp at nt+0x08, OptionalHeader.SizeOfImage at
+// nt+0x50 for PE32+) and change on every rebuild of the game.
+// ---------------------------------------------------------------------------
+static const DWORD GAME_BUILD_NUMBER      = 35924;        // Transport Fever 2 build the RVAs were measured on
+static const DWORD GAME_EXE_TIMEDATESTAMP = 0x675abcc6;   // IMAGE_FILE_HEADER.TimeDateStamp
+static const DWORD GAME_EXE_SIZEOFIMAGE   = 0x046ce000;   // IMAGE_OPTIONAL_HEADER64.SizeOfImage
 
 // BuildProposal: steal 19, the size args_probe already runs against this
 // function. CommandList::Add: 8 pushes (13 bytes) + lea rbp,[rsp-0x78] (5) = 18,
@@ -111,8 +127,15 @@ static volatile LONG g_pendingNoCb = 0;
 
 extern "C" void DeferRelay();
 
-static const char* OUT_DIR =
-    "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/";
+// Runtime data directory (trailing backslash), resolved once at attach via
+// datadir.h: TPF2MP_DATADIR, else %LOCALAPPDATA%\tpf2mp\data, else this DLL's
+// directory. Every file this DLL reads or writes at run time -- the log, the
+// identity file, the inject files -- lives here. Empty until Init fills it.
+static char g_dataDir[MAX_PATH] = "";
+// This DLL's own directory (trailing backslash). The installer drops
+// tpf2_slice.cfg next to the DLL, so the cfg is looked up here FIRST and in
+// the data dir second.
+static char g_dllDir[MAX_PATH] = "";
 
 static FILE* g_log = nullptr;
 static uintptr_t g_base = 0;
@@ -151,17 +174,44 @@ static bool Readable(const void* p, size_t n)
 // replicated, giving the player a duplicate. Getting back to normal single-player
 // behaviour meant marking the inject file read-only, which is not a control a
 // user should have to know about.
+//
+// Lookup order for tpf2_slice.cfg: the copy next to this DLL (where the
+// installer puts it), then the data dir, then built-in defaults if neither
+// exists. First file found wins. Lines whose first non-blank character is
+// '#' or ';' are comments and can never flip a switch -- the matching is a
+// substring test, so without this a commented-out "# suppress=1" would still
+// cancel builds.
+static FILE* OpenCfg()
+{
+    char p[MAX_PATH];
+    if (g_dllDir[0]) {
+        snprintf(p, sizeof(p), "%stpf2_slice.cfg", g_dllDir);
+        FILE* f = _fsopen(p, "r", _SH_DENYNO);
+        if (f) return f;
+    }
+    if (g_dataDir[0]) {
+        snprintf(p, sizeof(p), "%stpf2_slice.cfg", g_dataDir);
+        return _fsopen(p, "r", _SH_DENYNO);
+    }
+    return nullptr;
+}
+
+static bool CfgLineIsComment(const char* line)
+{
+    while (*line == ' ' || *line == '\t') line++;
+    return *line == '#' || *line == ';';
+}
+
 static void ReadCfg(bool* enabled, bool* suppress, bool* groundtruth)
 {
     *enabled = true;      // default on; the DLL is only present if asked for
     *suppress = false;    // but never cancel a build unless explicitly told to
     if (groundtruth) *groundtruth = false;
-    char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%stpf2_slice.cfg", OUT_DIR);
-    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    FILE* f = OpenCfg();
     if (!f) return;
     char line[128];
     while (fgets(line, sizeof(line), f)) {
+        if (CfgLineIsComment(line)) continue;
         if (strstr(line, "enabled=0"))     *enabled = false;
         if (strstr(line, "suppress=1"))    *suppress = true;
         if (groundtruth && strstr(line, "groundtruth=1")) *groundtruth = true;
@@ -183,7 +233,7 @@ static void ReadCfg(bool* enabled, bool* suppress, bool* groundtruth)
 static void ReadInstance()
 {
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%stpf2_instance.txt", OUT_DIR);
+    snprintf(p, sizeof(p), "%stpf2_instance.txt", g_dataDir);
     FILE* f = _fsopen(p, "r", _SH_DENYNO);
     if (!f) return;
     if (fgets(g_instance, sizeof(g_instance), f)) {
@@ -453,7 +503,7 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
 
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", OUT_DIR, g_instance);
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
     // ROADE <N> <edgeType> <streetType> <trackType> <M>
@@ -509,7 +559,7 @@ static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int 
     if (!g_instance[0]) ReadInstance();
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", OUT_DIR, g_instance);
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
     fprintf(f, "ROADC %d %d %d %d %d %d %d",
@@ -750,13 +800,14 @@ static bool GroundTruthSample(uint64_t a2, uint64_t a3)
 
 static bool CfgHas(const char* key)
 {
-    char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%stpf2_slice.cfg", OUT_DIR);
-    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    FILE* f = OpenCfg();
     if (!f) return false;
     char line[128], want[64]; bool on = false;
     snprintf(want, sizeof(want), "%s=1", key);
-    while (fgets(line, sizeof(line), f)) if (strstr(line, want)) on = true;
+    while (fgets(line, sizeof(line), f)) {
+        if (CfgLineIsComment(line)) continue;
+        if (strstr(line, want)) on = true;
+    }
     fclose(f);
     return on;
 }
@@ -1082,7 +1133,7 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
     if (!g_instance[0]) ReadInstance();
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", OUT_DIR, g_instance);
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
     fprintf(f, "VBUY %d %d", (int)(int32_t)depot, units);
@@ -1132,7 +1183,7 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
     if (!g_instance[0]) ReadInstance();
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", OUT_DIR, g_instance);
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
     if (fid == 3) {
@@ -1871,16 +1922,84 @@ static bool Install(uint8_t* blob, uintptr_t rva, int steal, int id, const char*
     return true;
 }
 
+// The directory this DLL was loaded from, with a trailing backslash. Used
+// only for the cfg lookup; everything written at run time goes to g_dataDir.
+static void ResolveDllDir()
+{
+    HMODULE h = nullptr;
+    wchar_t w[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)&ResolveDllDir, &h) ||
+        !GetModuleFileNameW(h, w, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(w, L'\\');
+    if (!slash) return;
+    slash[1] = 0;                                   // keep the backslash
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, g_dllDir, (int)sizeof(g_dllDir),
+                            nullptr, nullptr) <= 0)
+        g_dllDir[0] = 0;
+}
+
+// Compare the running exe's PE header against the build the RVAs were
+// measured on. Reads IMAGE_DOS_HEADER -> e_lfanew -> IMAGE_NT_HEADERS64 in
+// the mapped image, guarded by Readable() so a hostile or truncated header
+// fails the check instead of faulting the attach thread. Reports what it
+// found so a mismatch log names the actual build the player is running.
+static bool GameBuildMatches(uintptr_t base, DWORD* stamp, DWORD* size)
+{
+    *stamp = 0; *size = 0;
+    if (!base || !Readable((const void*)base, sizeof(IMAGE_DOS_HEADER))) return false;
+    IMAGE_DOS_HEADER dos;
+    memcpy(&dos, (const void*)base, sizeof(dos));
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) return false;
+    uintptr_t nt = base + (uintptr_t)dos.e_lfanew;
+    if (!Readable((const void*)nt, sizeof(IMAGE_NT_HEADERS64))) return false;
+    IMAGE_NT_HEADERS64 hdr;
+    memcpy(&hdr, (const void*)nt, sizeof(hdr));
+    if (hdr.Signature != IMAGE_NT_SIGNATURE) return false;
+    if (hdr.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
+    *stamp = hdr.FileHeader.TimeDateStamp;
+    *size  = hdr.OptionalHeader.SizeOfImage;
+    return *stamp == GAME_EXE_TIMEDATESTAMP && *size == GAME_EXE_SIZEOFIMAGE;
+}
+
 static DWORD WINAPI Init(LPVOID)
 {
     HANDLE once = CreateMutexA(nullptr, TRUE, "tpf2_slice_hook_single_instance");
     if (once == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
+    // Directories first: nothing below can open a file until both are known.
+    ResolveDllDir();
+    if (!Tpf2mpDataDirA(g_dataDir, sizeof(g_dataDir), (const void*)&Init)) {
+        g_dataDir[0] = 0;
+        return 0;                                   // nowhere to log, nowhere to write
+    }
+
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%stpf2_slice.log", OUT_DIR);
+    snprintf(path, sizeof(path), "%stpf2_slice.log", g_dataDir);
     g_log = _fsopen(path, "w", _SH_DENYWR);
     if (!g_log) return 0;
     g_base = (uintptr_t)GetModuleHandleW(nullptr);
+    Log("[slice] data dir=%s\n", g_dataDir);
+    Log("[slice] dll dir=%s\n", g_dllDir[0] ? g_dllDir : "?");
+
+    // BUILD GUARD -- before any RVA is patched.
+    {
+        DWORD stamp = 0, size = 0;
+        if (!GameBuildMatches(g_base, &stamp, &size)) {
+            Log("[slice] game build mismatch (stamp/size) -- hooks NOT installed: "
+                "exe stamp=%08lx size=%08lx, RVAs measured on build %lu "
+                "(stamp=%08lx size=%08lx)\n",
+                (unsigned long)stamp, (unsigned long)size,
+                (unsigned long)GAME_BUILD_NUMBER,
+                (unsigned long)GAME_EXE_TIMEDATESTAMP,
+                (unsigned long)GAME_EXE_SIZEOFIMAGE);
+            return 0;
+        }
+        Log("[slice] game build ok: stamp=%08lx size=%08lx (build %lu)\n",
+            (unsigned long)stamp, (unsigned long)size, (unsigned long)GAME_BUILD_NUMBER);
+    }
+
     ReadInstance();
     bool en = true, sup = false, gt = false;
     ReadCfg(&en, &sup, &gt);

@@ -1,0 +1,3 @@
+# build output: the MSI, the custom-action DLL and its objects, wix pdb
+out/
+*.wixpdb

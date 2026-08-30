@@ -18,6 +18,7 @@
 #define VK_NO_PROTOTYPES
 #include "vk/vulkan_core.h"
 #include "hook.h"
+#include "datadir.h"
 
 static const uintptr_t RVA_CREATEPAGE = 0x663370;
 static const int       STEAL_CREATEPAGE = 20;
@@ -70,6 +71,15 @@ static uintptr_t g_base = 0;
 // working even when discovery finds nothing.
 static wchar_t g_saveDirW[600] = L"";   // resolved TF2 userdata save folder
 static wchar_t g_netDirW[600]  = L"";   // resolved netpunch/lobby working dir
+static wchar_t g_dataDirW[MAX_PATH] = L"";   // runtime data dir shared with the bridge (trailing '\')
+
+// Game-relay ports (see lobby.py --game-relay-port). The bridge sends its
+// lockstep frames to 127.0.0.1:<relay port> and lobby.py forwards them over the
+// punched socket. Host and joiner use DIFFERENT ports so two instances on one
+// machine can both run.
+static const int GAME_RELAY_PORT_HOST = 7773;
+static const int GAME_RELAY_PORT_JOIN = 7774;
+static const int BRIDGE_PORT_DEFAULT  = 7771;   // if tpf2_instance.txt has no port= line
 
 // Directory holding this dll (trailing backslash). Logs + siblings live here.
 static const char* ourDirA()
@@ -139,15 +149,32 @@ static void resolveSaveDir(wchar_t* out, int cch)
     wcscpy_s(out, cch, L"C:\\Program Files (x86)\\Steam\\userdata\\0\\1066780\\local\\save");
 }
 
-// netpunch working dir. Portable target: %LOCALAPPDATA%\tpf2mp\netpunch (writable
-// everywhere, sandbox-safe) IF lobby.py has been deployed there; else the repo.
+// True if `dir` holds a runnable lobby: the frozen netpunch.exe OR lobby.py.
+static bool netDirUsable(const wchar_t* dir)
+{
+    static const wchar_t* const probes[] = { L"netpunch.exe", L"lobby.py" };
+    for (const wchar_t* nm : probes) {
+        wchar_t probe[MAX_PATH]; _snwprintf_s(probe, _TRUNCATE, L"%s\\%s", dir, nm);
+        if (GetFileAttributesW(probe) != INVALID_FILE_ATTRIBUTES) return true;
+    }
+    return false;
+}
+
+// netpunch working dir, in order of preference:
+//   %LOCALAPPDATA%\tpf2mp\netpunch   portable, writable everywhere, sandbox-safe
+//   <dir of this dll>\netpunch        where the installer drops netpunch.exe
+//   %USERPROFILE%\tpf2-multiplayer\netpunch   dev checkout fallback
+// A candidate counts if it holds either lobby.py or the frozen netpunch.exe.
 static void resolveNetDir(wchar_t* out, int cch)
 {
     wchar_t la[MAX_PATH];
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH)) {
         wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%s\\tpf2mp\\netpunch", la);
-        wchar_t probe[MAX_PATH]; _snwprintf_s(probe, _TRUNCATE, L"%s\\lobby.py", cand);
-        if (GetFileAttributesW(probe) != INVALID_FILE_ATTRIBUTES) { wcscpy_s(out, cch, cand); return; }
+        if (netDirUsable(cand)) { wcscpy_s(out, cch, cand); return; }
+    }
+    {
+        wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%snetpunch", ourDirW());   // ourDirW has a trailing '\'
+        if (netDirUsable(cand)) { wcscpy_s(out, cch, cand); return; }
     }
     // dev checkout: %USERPROFILE%\tpf2-multiplayer\netpunch
     wchar_t up[MAX_PATH];
@@ -251,7 +278,19 @@ static DWORD WINAPI KbHookThread(LPVOID);
 static void LobbySend(const char* jsonLine);
 static void ClipboardSet(const char* utf8);
 static bool newestSave(wchar_t* out, int cch);
-static void doStartLoad(const wchar_t* srcSav);
+static bool doStartLoad(const wchar_t* srcSav);
+// Lobby lifecycle flags (all cleared in StartLobby):
+//  g_lobbyReady -- set when the FIRST event line is read from lobby_out.jsonl.
+//    lobby.py truncates lobby_in.jsonl at startup, so a command appended before
+//    that first event would be silently lost; START GAME / chat wait for it.
+//  g_saveReady  -- joiner: the 'save_ready' event arrived this session, i.e. the
+//    incoming_save.* files are complete and a 'start' with save=true may load them.
+//  g_lobbyAbort -- set by a teardown (LEAVE / re-HOST) so a LobbyThread parked in
+//    the wait-for-title-screen / click loop gives up instead of clicking later.
+static volatile LONG g_lobbyReady = 0;
+static volatile LONG g_saveReady  = 0;
+static volatile LONG g_lobbyAbort = 0;
+static CRITICAL_SECTION g_lobbyCs; static bool g_lobbyCsInit = false;   // guards g_lobbyProc handle use vs close
 
 template <class T> static T rget(const char* n) { return (T)g_origGdpa(g_dev, n); }
 
@@ -680,6 +719,9 @@ static void OnHit(int id)
     case 3: StartLobby(1); break;   // JOIN  -> lobby (join)
     case 5: LeaveLobby(); break;                                    // LEAVE lobby
     case 6: if (InterlockedCompareExchange(&g_isHost,0,0)) {   // START GAME (host): share newest save, then start
+        // lobby.py truncates lobby_in.jsonl when it starts: a command appended
+        // before its first event line would be lost. Wait for that first line.
+        if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
         if (newestSave(g_startSaveW, 600)) {
             char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
             char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
@@ -861,7 +903,29 @@ static void jsonStr(const char* s, const char* key, char* dst, int dsz)
                          if (*q == '"') last = q + 1; }
         p += plen;
     }
-    if (!last) return; int i = 0; while (last[i] && last[i] != '"' && i < dsz - 1) { dst[i] = last[i]; i++; } dst[i] = 0;
+    if (!last) return;
+    // Copy up to the closing (unescaped) quote, decoding the escapes json.dumps
+    // emits for our payloads: \\ -> \, \" -> ", \/ -> /. Anything else (\uXXXX,
+    // \n ...) is left verbatim -- the backslash is copied and the next character
+    // follows on the next iteration.
+    int i = 0; const char* r = last;
+    while (*r && *r != '"' && i < dsz - 1) {
+        if (*r == '\\' && (r[1] == '\\' || r[1] == '"' || r[1] == '/')) { dst[i++] = r[1]; r += 2; }
+        else dst[i++] = *r++;
+    }
+    dst[i] = 0;
+}
+
+// Extract a boolean for `key` (e.g. start "save"). Absent/unparseable -> dflt.
+static bool jsonBool(const char* s, const char* key, bool dflt)
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(s, pat); if (!p) return dflt; p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++; if (*p != ':') return dflt; p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "true", 4) == 0) return true;
+    if (strncmp(p, "false", 5) == 0) return false;
+    return dflt;
 }
 
 // Extract an integer value for `key` (e.g. transfer "pct"). -1 if absent.
@@ -912,15 +976,85 @@ static void LobbySend(const char* jsonLine)   // append a command to lobby_in.js
     HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     SetFilePointer(h, 0, nullptr, FILE_END);
-    DWORD w; char line[512]; int L = snprintf(line, sizeof(line), "%s\n", jsonLine);
+    DWORD w; char line[1600]; int L = snprintf(line, sizeof(line), "%s\n", jsonLine);   // start lines carry a full save path
     WriteFile(h, line, L, &w, nullptr); CloseHandle(h);
 }
 static void SendChat(const char* text)
 {
+    if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); return; }   // see g_lobbyReady
     // escape quotes/backslashes minimally
     char esc[400]; int j = 0; for (int i = 0; text[i] && j < 390; i++) { char c = text[i]; if (c == '"' || c == '\\') esc[j++] = '\\'; esc[j++] = c; } esc[j] = 0;
     char line[512]; snprintf(line, sizeof(line), "{\"cmd\":\"chat\",\"text\":\"%s\"}", esc);
     LobbySend(line);
+}
+
+// ---- bridge handshake via DATADIR (see bridge_main.cpp [ctl]) ----
+// The bridge writes DATADIR\tpf2_instance.txt at init:
+//   <letter>\npid=<pid>\nport=<bound UDP port>\n
+// Line 3 is the port lobby.py must deliver the peer's frames to. Read it fresh
+// right before every lobby launch (the bridge may have re-bound). Any line that
+// starts with "port=" counts, so a file without it (older bridge) -> default.
+static int readBridgePort()
+{
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_instance.txt", g_dataDirW);
+    char buf[512];
+    if (!ReadFileText(p, buf, sizeof(buf))) { Log("[menu] %ls unreadable -> bridge port default %d\n", p, BRIDGE_PORT_DEFAULT); return BRIDGE_PORT_DEFAULT; }
+    const char* q = buf;
+    while (q && *q) {
+        int v = 0;
+        if (sscanf_s(q, "port=%d", &v) == 1 && v > 0 && v < 65536) return v;
+        q = strchr(q, '\n'); if (q) q++;
+    }
+    Log("[menu] no port= line in tpf2_instance.txt -> bridge port default %d\n", BRIDGE_PORT_DEFAULT);
+    return BRIDGE_PORT_DEFAULT;
+}
+
+// Tell the bridge its role and where to send frames. Written atomically (tmp +
+// replace) so the bridge's 500 ms poll never reads a half-written file. Skipped
+// when the content is unchanged (the bridge ignores no-op rewrites anyway, but
+// this keeps the log quiet).
+//   host   -> instance=a, peer=127.0.0.1:7773
+//   joiner -> instance=b, peer=127.0.0.1:7774
+// The bridge's pid (line 2 of tpf2_instance.txt, 'pid=<n>'); 0 if unknown.
+static unsigned long readBridgePid()
+{
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_instance.txt", g_dataDirW);
+    char buf[512];
+    if (!ReadFileText(p, buf, sizeof(buf))) return 0;
+    const char* q = buf;
+    while (q && *q) {
+        unsigned long v = 0;
+        if (sscanf_s(q, "pid=%lu", &v) == 1 && v) return v;
+        q = strchr(q, '\n'); if (q) q++;
+    }
+    return 0;
+}
+
+static void writeBridgeCtl(bool isHost)
+{
+    static char last[128] = "";
+    char content[128];
+    // pid= addresses the ctl to OUR bridge. Two instances sharing a data dir
+    // (a sandboxed second instance reads through to the real dir until it has
+    // its own copy) otherwise apply each other's role for a moment.
+    unsigned long bpid = readBridgePid();
+    snprintf(content, sizeof(content), "instance=%c\npeer=127.0.0.1:%d\npid=%lu\n",
+             isHost ? 'a' : 'b', isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN, bpid);
+    if (strcmp(content, last) == 0) return;
+    wchar_t path[MAX_PATH], tmp[MAX_PATH];
+    _snwprintf_s(path, _TRUNCATE, L"%stpf2_bridge_ctl.txt", g_dataDirW);
+    _snwprintf_s(tmp,  _TRUNCATE, L"%stpf2_bridge_ctl.txt.tmp", g_dataDirW);
+    HANDLE h = CreateFileW(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { Log("[menu] bridge ctl: cannot create %ls (err %lu)\n", tmp, GetLastError()); return; }
+    DWORD w = 0; BOOL ok = WriteFile(h, content, (DWORD)strlen(content), &w, nullptr);
+    CloseHandle(h);
+    if (!ok || w != strlen(content)) { Log("[menu] bridge ctl: write failed (err %lu)\n", GetLastError()); DeleteFileW(tmp); return; }
+    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        Log("[menu] bridge ctl: replace failed (err %lu)\n", GetLastError()); DeleteFileW(tmp); return;
+    }
+    strcpy_s(last, content);
+    Log("[menu] bridge ctl -> %ls: instance=%c peer=127.0.0.1:%d\n",
+        path, isHost ? 'a' : 'b', isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN);
 }
 
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
@@ -941,7 +1075,13 @@ static void applyRoster(const char* s)
     char v[40];
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
+    // Role is decided by the roster: you==host -> instance a, else b. Re-evaluated
+    // on every roster (a host change re-points the bridge); writeBridgeCtl is a
+    // no-op when nothing changed.
+    bool roleKnown = g_you[0] && g_host[0];
+    bool isHost = roleKnown && strcmp(g_you, g_host) == 0;
     LeaveCriticalSection(&g_modelCs); InterlockedExchange(&g_panelDirty, 1);
+    if (roleKnown) writeBridgeCtl(isHost);
 }
 
 // ---------------- START GAME: place the shared save + load it in place ----------------
@@ -951,19 +1091,24 @@ static void applyRoster(const char* s)
 static const wchar_t* SAVE_DIR =   // placeholder: resolveSaveDir() replaces it at init
     L"C:\\Program Files (x86)\\Steam\\userdata\\0\\1066780\\local\\save";
 
-// newest *.sav in SAVE_DIR (full path). Returns false if none.
+// newest *.sav in SAVE_DIR (full path). Returns false if none. mp_shared.sav is
+// OUR OWN placed copy (always stamped newest by placeSaveNewest), so it is skipped
+// unless it is the only save there -- otherwise every START would re-share the
+// previous session's copy instead of the player's real latest save.
 static bool newestSave(wchar_t* out, int cch)
 {
     wchar_t pat[700]; _snwprintf_s(pat, _TRUNCATE, L"%s\\*.sav", SAVE_DIR);
     WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return false;
-    ULONGLONG best = 0; wchar_t bestName[300] = L"";
+    ULONGLONG best = 0; wchar_t bestName[300] = L""; wchar_t sharedName[300] = L"";
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (_wcsicmp(fd.cFileName, L"mp_shared.sav") == 0) { wcscpy_s(sharedName, fd.cFileName); continue; }
         ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
         if (t > best) { best = t; wcscpy_s(bestName, fd.cFileName); }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
+    if (!bestName[0] && sharedName[0]) wcscpy_s(bestName, sharedName);   // nothing else: fall back to our copy
     if (!bestName[0]) return false;
     _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", SAVE_DIR, bestName);
     return true;
@@ -978,29 +1123,69 @@ static void stampNow(const wchar_t* path)
 
 // Copy srcSav (+ its .sav.lua / .jpg sidecars) into SAVE_DIR as mp_shared.* and
 // stamp them NEWEST, so the game's Continue (loads most-recent save) loads it.
-static void placeSaveNewest(const wchar_t* srcSav)
+// Returns false if the .sav itself could not be placed (the caller must NOT click
+// Continue then -- it would load whatever unrelated save happens to be newest).
+static bool placeSaveNewest(const wchar_t* srcSav)
 {
     wchar_t dst[700]; _snwprintf_s(dst, _TRUNCATE, L"%s\\mp_shared.sav", SAVE_DIR);
-    if (!CopyFileW(srcSav, dst, FALSE)) { Log("[menu] placeSave copy failed err=%lu src=%ls\n", GetLastError(), srcSav); return; }
-    stampNow(dst);
     // sidecars: <src>.sav.lua and <src minus .sav>.jpg
     wchar_t lua[700], jpg[700], dl[700], dj[700];
     _snwprintf_s(lua, _TRUNCATE, L"%s.lua", srcSav);
     wcscpy_s(jpg, srcSav); { size_t n = wcslen(jpg); if (n > 4) wcscpy_s(jpg + n - 4, 700 - (n - 4), L".jpg"); }
     _snwprintf_s(dl, _TRUNCATE, L"%s\\mp_shared.sav.lua", SAVE_DIR);
     _snwprintf_s(dj, _TRUNCATE, L"%s\\mp_shared.jpg", SAVE_DIR);
-    if (CopyFileW(lua, dl, FALSE)) stampNow(dl);
-    if (CopyFileW(jpg, dj, FALSE)) stampNow(dj);
+
+    // src == dst (the host is sharing mp_shared.sav itself, e.g. the only save
+    // present): CopyFileW onto itself fails with ERROR_SHARING_VIOLATION and
+    // would wrongly abort the start. Compare the normalised paths first.
+    wchar_t fs[700], fdst[700]; bool same = false;
+    if (GetFullPathNameW(srcSav, 700, fs, nullptr) && GetFullPathNameW(dst, 700, fdst, nullptr)) same = _wcsicmp(fs, fdst) == 0;
+    else same = _wcsicmp(srcSav, dst) == 0;
+    if (!same && !CopyFileW(srcSav, dst, FALSE)) {
+        DWORD e = GetLastError();
+        if (e == ERROR_SHARING_VIOLATION && _wcsicmp(srcSav, dst) == 0) same = true;
+        else { Log("[menu] placeSave copy failed err=%lu src=%ls\n", e, srcSav); return false; }
+    }
+    if (same) {   // already in place: just make sure it (and its sidecars) are newest
+        stampNow(dst);
+        if (GetFileAttributesW(dl) != INVALID_FILE_ATTRIBUTES) stampNow(dl);
+        if (GetFileAttributesW(dj) != INVALID_FILE_ATTRIBUTES) stampNow(dj);
+        Log("[menu] shared save already in place -> %ls (stamped newest)\n", dst);
+        return true;
+    }
+    stampNow(dst);
+    // Sidecars follow the source: copy when present, otherwise delete the stale
+    // one left by a previous share so the game never pairs it with this save.
+    if (GetFileAttributesW(lua) != INVALID_FILE_ATTRIBUTES) { if (CopyFileW(lua, dl, FALSE)) stampNow(dl); }
+    else DeleteFileW(dl);
+    if (GetFileAttributesW(jpg) != INVALID_FILE_ATTRIBUTES) { if (CopyFileW(jpg, dj, FALSE)) stampNow(dj); }
+    else DeleteFileW(dj);
     Log("[menu] placed shared save -> %ls (newest)\n", dst);
+    return true;
 }
 
 // Click the title-menu Continue button (loads the newest save) on our own window.
 // The overlay is post-present pixels (not a window), so the game's Continue stays
 // hittable at its measured position; we collapse the overlay first for clarity.
-static void clickContinueLoad()
+// Returns true once the click took the game off the title menu (load started).
+static bool clickContinueLoad()
 {
+    // Continue only exists on the title page. If the user is in Settings / Load
+    // Game (page >= 3 => overlay hidden) wait for them to come back, up to 60 s.
+    if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) {
+        SetStatus("Return to the title screen to load the shared save…");
+        Log("[menu] clickContinue: not on title screen, waiting up to 60 s\n");
+        bool visible = false;
+        for (int i = 0; i < 120; i++) {   // 60 s, 500 ms poll
+            if (InterlockedCompareExchange(&g_lobbyAbort, 0, 0)) { Log("[menu] clickContinue: aborted (lobby torn down)\n"); return false; }
+            if (InterlockedCompareExchange(&g_showOverlay, 0, 0)) { visible = true; break; }
+            Sleep(500);
+        }
+        if (!visible) { SetStatus("Timed out waiting for the title screen -- press Continue to load the shared save"); Log("[menu] clickContinue: gave up waiting for title screen\n"); return false; }
+        Sleep(400);   // let the page settle before clicking
+    }
     if (!g_gameWnd || !IsWindow(g_gameWnd)) { g_gameWnd = nullptr; EnumWindows(FindGameWnd, (LPARAM)&g_gameWnd); }
-    if (!g_gameWnd) { Log("[menu] clickContinue: no game window\n"); return; }
+    if (!g_gameWnd) { Log("[menu] clickContinue: no game window\n"); return false; }
     RECT wr; GetWindowRect(g_gameWnd, &wr);
     int W = wr.right - wr.left, H = wr.bottom - wr.top;
     struct C { int w, h, x, y; };
@@ -1012,28 +1197,51 @@ static void clickContinueLoad()
         for (const C& c : T) { double e = ((double)c.w / W - 1); if (e < 0) e = -e; double e2 = ((double)c.h / H - 1); if (e2 < 0) e2 = -e2; e += e2; if (e < be) { be = e; bc = &c; } }
         if (bc && be < 0.05) { ox = (int)((double)bc->x * W / bc->w); oy = (int)((double)bc->y * H / bc->h); }
     }
-    if (ox < 0) { Log("[menu] clickContinue: no offset for %dx%d\n", W, H); return; }
+    if (ox < 0) { Log("[menu] clickContinue: no offset for %dx%d\n", W, H); return false; }
     int sx = wr.left + ox, sy = wr.top + oy;
     Log("[menu] clickContinue at %d,%d (win %dx%d)\n", sx, sy, W, H);
     POINT saved; GetCursorPos(&saved);
+    bool started = false;
+    // Click FIRST, then test: the overlay is visible at entry (checked above), so a
+    // pre-click test could never distinguish "load started" from "not yet clicked".
     for (int i = 0; i < 14; i++) {
-        if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) break;  // left the menu => load started
+        if (InterlockedCompareExchange(&g_lobbyAbort, 0, 0)) break;
         SetForegroundWindow(g_gameWnd);
         SetCursorPos(sx, sy); Sleep(60);
         mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0); Sleep(40);
         mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         Sleep(700);
+        if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) { started = true; break; }  // left the menu => load started
     }
     SetCursorPos(saved.x, saved.y);
+    Log("[menu] clickContinue: %s\n", started ? "load started" : "menu never left");
+    return started;
 }
 
-static void doStartLoad(const wchar_t* srcSav)
+// Place the shared save and click Continue. Returns true once a load was kicked
+// off; false (with a status) if the save could not be placed or the click failed.
+static bool doStartLoad(const wchar_t* srcSav)
 {
-    if (!srcSav || !srcSav[0]) { Log("[menu] doStartLoad: empty src\n"); return; }
-    placeSaveNewest(srcSav);
+    if (!srcSav || !srcSav[0]) { Log("[menu] doStartLoad: empty src\n"); SetStatus("No save to load."); return false; }
+    if (!placeSaveNewest(srcSav)) { SetStatus("Couldn't place the shared save -- not loading"); return false; }
     InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1);   // clear overlay off Continue
     Sleep(400);
-    clickContinueLoad();
+    // Host-side delay: on one machine both instances share the cursor, and a
+    // synthetic click lands on whichever window is foreground. The joiner clicks
+    // first; the host waits so the two click bursts never interleave.
+    if (InterlockedCompareExchange(&g_isHost, 0, 0)) Sleep(4000);
+    return clickContinueLoad();
+}
+
+// Ask lobby.py to quit, give it up to waitMs to exit cleanly, then kill it. The
+// caller must hold a valid process handle (LobbyThread owns pi.hProcess; other
+// threads read g_lobbyProc under g_lobbyCs so it cannot be closed under them).
+static void QuitLobbyProc(HANDLE proc, int waitMs)
+{
+    if (!proc) return;
+    LobbySend("{\"cmd\":\"quit\"}");
+    if (WaitForSingleObject(proc, waitMs) == WAIT_OBJECT_0) Log("[menu] lobby.py exited on quit\n");
+    else { TerminateProcess(proc, 0); Log("[menu] lobby.py did not exit within %d ms -- terminated\n", waitMs); }
 }
 
 struct LobbyArg { int join; char code[160]; char name[40]; };
@@ -1042,7 +1250,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
     wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
-    wchar_t cmd[700];
+    wchar_t cmd[1024];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
     // the target machine); fall back to `python lobby.py` for the dev checkout.
     wchar_t exe[600]; _snwprintf_s(exe, _TRUNCATE, L"%s\\netpunch.exe", NETDIR);
@@ -1054,14 +1262,28 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     // the open host, so its port needn't be pre-agreed, and this avoids colliding
     // with the host's fixed 29471 when host+joiner share one machine's network
     // stack (the local two-instance test; Sandboxie does not virtualise the net).
+    // Game relay: lobby.py listens on 127.0.0.1:<relay port> for the local
+    // bridge's lockstep frames and forwards them over the punched socket; frames
+    // from the peer are delivered to 127.0.0.1:<bridge port>. The relay port is
+    // fixed by role (HOST 7773 / JOIN 7774, known at launch); the bridge port is
+    // whatever the bridge reports it bound (re-read now, not cached).
+    int relayPort  = a->join ? GAME_RELAY_PORT_JOIN : GAME_RELAY_PORT_HOST;
+    int bridgePort = readBridgePort();
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
-                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0", base, wc, wname); }
-    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s", base, wname);
+                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d",
+                                base, wc, wname, relayPort, bridgePort); }
+    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d",
+                      base, wname, relayPort, bridgePort);
+    Log("[menu] lobby cmd: %ls\n", cmd);
 
     wchar_t outPath[512]; _snwprintf_s(outPath, _TRUNCATE, L"%s\\lobby_out.jsonl", NETDIR);
     wchar_t inPath[512];  _snwprintf_s(inPath,  _TRUNCATE, L"%s\\lobby_in.jsonl", NETDIR);
     wchar_t logPath[512]; _snwprintf_s(logPath, _TRUNCATE, L"%s\\lobby_proc.log", NETDIR);
     DeleteFileW(outPath); DeleteFileW(inPath);
+    if (a->join) {   // never let last session's transfer pass for this one (lobby.py does this too)
+        static const wchar_t* const stale[] = { L"incoming_save.sav", L"incoming_save.sav.lua", L"incoming_save.jpg" };
+        for (const wchar_t* nm : stale) { wchar_t f[560]; _snwprintf_s(f, _TRUNCATE, L"%s\\%s", NETDIR, nm); DeleteFileW(f); }
+    }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1075,18 +1297,20 @@ static DWORD WINAPI LobbyThread(LPVOID param)
 
     // tail lobby_out.jsonl line by line
     LARGE_INTEGER off = { 0 }; char rem[2048]; int remLen = 0; char buf[8192];
+    bool stop = false;   // set once the game load is under way: lobby.py is done, end the tail
     for (;;) {
         HANDLE h = CreateFileW(outPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
         if (h != INVALID_HANDLE_VALUE) {
             SetFilePointerEx(h, off, nullptr, FILE_BEGIN);
             DWORD got = 0;
-            while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+            while (!stop && ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
                 off.QuadPart += got;
-                for (DWORD i = 0; i < got; i++) {
+                for (DWORD i = 0; i < got && !stop; i++) {
                     char c = buf[i];
                     if (c == '\n') {
                         rem[remLen] = 0;
                         // dispatch one event line
+                        InterlockedExchange(&g_lobbyReady, 1);   // lobby.py is up and has truncated lobby_in.jsonl
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) { strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
                         else if (strcmp(ty, "roster") == 0) applyRoster(rem);
@@ -1099,12 +1323,37 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             else if (strcmp(st, "done") == 0) SetStatus("Save sent.");
                             else if (pct >= 0) { snprintf(msg, sizeof(msg), "Sending save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); }
                         }
-                        else if (strcmp(ty, "save_ready") == 0) SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6");
+                        else if (strcmp(ty, "save_ready") == 0) { InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "start") == 0) {
-                            wchar_t src[600];
-                            if (InterlockedCompareExchange(&g_isHost, 0, 0)) { wcscpy_s(src, g_startSaveW[0] ? g_startSaveW : L""); if (!src[0]) newestSave(src, 600); }
-                            else _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
-                            SetStatus("Loading shared save…"); Sleep(400); doStartLoad(src);
+                            // {"type":"start","save":true|false}: save=true means a save
+                            // transfer completed for this peer this session; absent => true.
+                            bool withSave = jsonBool(rem, "save", true);
+                            bool saveReady = InterlockedCompareExchange(&g_saveReady, 0, 0) != 0;
+                            wchar_t src[600] = L""; bool go = true;
+                            if (InterlockedCompareExchange(&g_isHost, 0, 0)) {
+                                wcscpy_s(src, g_startSaveW[0] ? g_startSaveW : L""); if (!src[0]) newestSave(src, 600);
+                            } else if (withSave) {
+                                if (!saveReady) {   // the transfer never completed here: loading would pick a stale/unrelated save
+                                    Log("[menu] start(save=true) but no save_ready this session -- ignoring\n");
+                                    SetStatus("Start received but no save arrived -- ask the host to START again"); go = false;
+                                } else _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
+                            } else {
+                                // legacy no-save start: load what this side has (a received save if any, else our newest)
+                                if (saveReady) _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
+                                else if (!newestSave(src, 600)) { SetStatus("No save to load."); go = false; }
+                            }
+                            if (go) {
+                                SetStatus("Loading shared save…"); Sleep(400);
+                                if (doStartLoad(src)) {
+                                    // The game is loading. The lobby process STAYS ALIVE: since the
+                                    // game-frame relay (--game-relay-port) the lobby IS the lockstep
+                                    // transport between machines -- quitting it here left both bridges
+                                    // pointed at relay ports that no longer existed (peer=? on both
+                                    // sides, 2026-08-30). It is torn down only by LEAVE / re-HOST /
+                                    // process exit. Keep tailing lobby_out (roster heals, relay stats).
+                                    Log("[menu] game loading -- lobby kept alive as the game transport\n");
+                                }
+                            }
                         }
                         remLen = 0;
                     } else if (remLen < (int)sizeof(rem) - 1) rem[remLen++] = c;
@@ -1112,11 +1361,34 @@ static DWORD WINAPI LobbyThread(LPVOID param)
             }
             CloseHandle(h);
         }
-        if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+        if (stop || WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
         Sleep(200);
     }
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); g_lobbyProc = nullptr; free(a);
+    // Close under g_lobbyCs so a concurrent LeaveLobby/StartLobby never waits on
+    // or terminates a handle that has just been closed (and possibly reused).
+    if (g_lobbyCsInit) EnterCriticalSection(&g_lobbyCs);
+    if (g_lobbyProc == pi.hProcess) g_lobbyProc = nullptr;
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    if (g_lobbyCsInit) LeaveCriticalSection(&g_lobbyCs);
+    free(a);
+    Log("[menu] lobby tail thread exit\n");
     return 0;
+}
+
+// Tear down the running lobby: quit/kill lobby.py, and optionally join the tail
+// thread (StartLobby must, so the new thread's lobby_out/in reset cannot race the
+// old tail; LeaveLobby runs on the present thread and only kills the process).
+static HANDLE g_lobbyThread = nullptr;
+static void TeardownLobby(int waitMs, bool joinThread)
+{
+    InterlockedExchange(&g_lobbyAbort, 1);   // unpark a thread waiting for the title screen / clicking
+    if (g_lobbyCsInit) EnterCriticalSection(&g_lobbyCs);
+    QuitLobbyProc(g_lobbyProc, waitMs);
+    if (g_lobbyCsInit) LeaveCriticalSection(&g_lobbyCs);
+    if (joinThread && g_lobbyThread) {
+        if (WaitForSingleObject(g_lobbyThread, 3000) != WAIT_OBJECT_0) Log("[menu] lobby tail thread did not exit in time\n");
+        CloseHandle(g_lobbyThread); g_lobbyThread = nullptr;
+    }
 }
 
 static void StartLobby(int join)
@@ -1131,15 +1403,21 @@ static void StartLobby(int join)
         char* s = a->code; while (*s == ' ' || *s == '\r' || *s == '\n' || *s == '\t') memmove(s, s + 1, strlen(s));
         int L = (int)strlen(s); while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\r' || s[L-1] == '\n' || s[L-1] == '\t')) s[--L] = 0;
     }
+    // A previous lobby.py still up (LEAVE not pressed, or a tail thread still
+    // finishing) would fight the new one over lobby_in/out.jsonl: tear it down first.
+    if (g_lobbyProc || g_lobbyThread) TeardownLobby(1500, true);
+    InterlockedExchange(&g_lobbyAbort, 0);
+    InterlockedExchange(&g_lobbyReady, 0);
+    InterlockedExchange(&g_saveReady, 0);
     InterlockedExchange(&g_isHost, join ? 0 : 1);
     InterlockedExchange(&g_uiState, 2); InterlockedExchange(&g_panelDirty, 1);
     g_chatCount = 0; g_chatHead = 0; g_playerCount = 0;
-    CreateThread(nullptr, 0, LobbyThread, a, 0, nullptr);
+    g_lobbyThread = CreateThread(nullptr, 0, LobbyThread, a, 0, nullptr);
+    if (!g_lobbyThread) { free(a); SetStatus("Couldn't start the lobby thread."); }
 }
 static void LeaveLobby()
 {
-    LobbySend("{\"cmd\":\"quit\"}");
-    if (g_lobbyProc) { Sleep(150); TerminateProcess(g_lobbyProc, 0); }
+    TeardownLobby(1500, false);   // quit, wait up to 1.5 s for a clean exit, then kill
     InterlockedExchange(&g_uiState, 1); InterlockedExchange(&g_panelDirty, 1);
 }
 
@@ -1224,11 +1502,14 @@ static DWORD WINAPI Init(LPVOID)
     g_base = (uintptr_t)GetModuleHandleW(nullptr);
     resolveSaveDir(g_saveDirW, 600); SAVE_DIR = g_saveDirW;   // discovered, not hardcoded
     resolveNetDir(g_netDirW, 600);   NETDIR   = g_netDirW;
+    // the runtime data dir the bridge uses for tpf2_instance.txt / tpf2_bridge_ctl.txt
+    if (!Tpf2mpDataDirW(g_dataDirW, MAX_PATH, (const void*)&Init)) wcscpy_s(g_dataDirW, ourDirW());
     InitializeCriticalSection(&g_statusCs); g_csInit = true;
     InitializeCriticalSection(&g_modelCs); g_modelCsInit = true;
+    InitializeCriticalSection(&g_lobbyCs); g_lobbyCsInit = true;
     CreateThread(nullptr, 0, KbHookThread, nullptr, 0, nullptr);  // chat keyboard capture/swallow
-    Log("[menu] attached, base=%llx  save=%ls  net=%ls  our=%ls\n",
-        (unsigned long long)g_base, g_saveDirW, g_netDirW, ourDirW());
+    Log("[menu] attached, base=%llx  save=%ls  net=%ls  data=%ls  our=%ls\n",
+        (unsigned long long)g_base, g_saveDirW, g_netDirW, g_dataDirW, ourDirW());
 
     void* tramp = nullptr;
     if (!InstallHook(g_base + RVA_CREATEPAGE, (void*)&MyCreatePage,

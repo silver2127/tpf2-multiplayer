@@ -30,6 +30,18 @@ bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
 void Net_QueueLine(const char* line);      // thread-safe; chunks as needed
 void Net_Shutdown();
 
+// Repoint the peer address without touching the socket or the net thread
+// (the lobby decides who we talk to after the game is already running).
+// Thread-safe. Liveness is reset and the unacked backlog dropped: those
+// packets were for the old peer and the new one starts from a transferred
+// save anyway. Returns false (and changes nothing) if `ip` is not a dotted
+// IPv4 address or the port is out of range.
+bool Net_SetPeer(const char* ip, int port);
+
+// The UDP port the socket actually bound (queried from the socket, so it is
+// right even after a retry on another port). 0 until Net_Init has succeeded.
+uint16_t Net_LocalPort();
+
 // Diagnostics: lines discarded because no peer was alive, lines discarded
 // because the peer stopped acking, packets awaiting ack, current liveness.
 void Net_Stats(uint64_t* droppedNoPeer, uint64_t* droppedOverflow,

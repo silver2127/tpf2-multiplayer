@@ -30,8 +30,12 @@ struct Packet {
 #pragma pack(pop)
 
 static SOCKET g_sock = INVALID_SOCKET;
+// g_peer has its own lock: SendRaw runs both with and without g_mtx held
+// (g_mtx is not recursive), and Net_SetPeer may swap the address at any time.
 static sockaddr_in g_peer{};
+static std::mutex g_peerMtx;
 static bool g_peerSet = false;
+static uint16_t g_localPort = 0;   // set once in Net_Init, after a successful bind
 static void (*g_deliver)(const char*) = nullptr;
 static std::string g_rxAccum;   // partial line being reassembled from chunks
 
@@ -89,8 +93,13 @@ static void SendRaw(uint32_t seq, uint32_t type, const NetEvent* ev)
     p.h.ackBits = g_receivedBits;
     p.h.type = (uint8_t)type;
     if (ev) p.ev = *ev;
+    sockaddr_in peer;
+    {
+        std::lock_guard<std::mutex> lk(g_peerMtx);
+        peer = g_peer;
+    }
     sendto(g_sock, (const char*)&p, ev ? sizeof(p) : sizeof(Header), 0,
-           (sockaddr*)&g_peer, sizeof(g_peer));
+           (sockaddr*)&peer, sizeof(peer));
 }
 
 static void ProcessAck(uint32_t ack, uint32_t bits)
@@ -272,11 +281,24 @@ bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
         g_sock = INVALID_SOCKET;
         return false;
     }
+    {
+        // ask the socket rather than trusting the argument: this is what the
+        // lobby has to send to, so it must be the port that really got bound
+        sockaddr_in bound{}; int boundLen = sizeof(bound);
+        if (getsockname(g_sock, (sockaddr*)&bound, &boundLen) == 0)
+            g_localPort = ntohs(bound.sin_port);
+        else
+            g_localPort = localPort;
+    }
 
-    g_peer.sin_family = AF_INET;
-    g_peer.sin_port = htons(peerPort);
-    inet_pton(AF_INET, peerIp, &g_peer.sin_addr);
-    g_peerSet = true;
+    {
+        std::lock_guard<std::mutex> lk(g_peerMtx);
+        g_peer = sockaddr_in{};
+        g_peer.sin_family = AF_INET;
+        g_peer.sin_port = htons(peerPort);
+        inet_pton(AF_INET, peerIp, &g_peer.sin_addr);
+        g_peerSet = true;
+    }
     g_deliver = deliverCb;
     g_session = (uint32_t)(GetTickCount64() ^ (uintptr_t)&g_session);
     g_running = true;
@@ -308,6 +330,35 @@ void Net_QueueLine(const char* line)
         ev.text[n] = 0;
         g_outQueue.push(ev);
     }
+}
+
+bool Net_SetPeer(const char* ip, int port)
+{
+    if (!ip || port <= 0 || port > 0xFFFF) return false;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_peerMtx);
+        g_peer = a;
+        g_peerSet = true;
+    }
+    {
+        // Same reasoning as the overflow path in NetThread: the backlog was
+        // addressed to the old peer, and a hole is not allowed in the ordered
+        // stream, so the whole thing goes. Keepalives rediscover the new peer.
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_pending.clear();
+        g_lastSent.clear();
+        g_peerEverSeen = false;
+    }
+    return true;
+}
+
+uint16_t Net_LocalPort()
+{
+    return g_localPort;
 }
 
 void Net_Shutdown()

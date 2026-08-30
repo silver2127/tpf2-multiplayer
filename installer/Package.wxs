@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TpF2 Multiplayer - per-machine x64 MSI.
+
+  Build: installer\build_msi.ps1, or from this directory
+    wix build -arch x64 -ext WixToolset.UI.wixext -o out\TpF2Multiplayer.msi Package.wxs
+
+  Layout (bridge\src\datadir.h is the shared definition):
+    game folder  INSTALLFOLDER            binaries + cfg + mod tree      <- this package
+    data folder  %LOCALAPPDATA%\tpf2mp\data\  everything written at run time  <- created by the DLLs
+  The package never touches the data folder, so uninstalling leaves logs and
+  captures alone and never has to run as the player.
+
+  INSTALLFOLDER defaults to the Transport Fever 2 folder Steam registered
+  (Steam App 1066780 / InstallLocation), then to the folder remembered by a
+  previous install, then to the stock Steam library path. The folder must hold
+  TransportFever2.exe: the folder dialog refuses to continue without it and a
+  silent install fails at RequireGameDir with the same message.
+
+  alut.dll: the game's own copy is kept as alut_real.dll before our proxy goes
+  in (PreserveStockAlut) and moved back on uninstall (RestoreStockAlut). See
+  ca\tpf2ca.cpp for the exact rules, including rollback.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <!-- Source overrides: pass -d Name=value to wix. build_msi.ps1 sets MenuDll /
+       SliceDll to the newest suffixed build when the plain name is locked. -->
+  <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
+  <?ifndef BridgeOut ?><?define BridgeOut = "..\bridge\out" ?><?endif?>
+  <?ifndef ProxyDll ?><?define ProxyDll = "$(BridgeOut)\alut.dll" ?><?endif?>
+  <?ifndef BridgeDll ?><?define BridgeDll = "$(BridgeOut)\tpf2_bridge_mp.dll" ?><?endif?>
+  <?ifndef MenuDll ?><?define MenuDll = "$(BridgeOut)\tpf2_menu.dll" ?><?endif?>
+  <?ifndef SliceDll ?><?define SliceDll = "$(BridgeOut)\tpf2_slice.dll" ?><?endif?>
+  <?ifndef NetpunchExe ?><?define NetpunchExe = "..\netpunch\dist\netpunch.exe" ?><?endif?>
+  <?ifndef ModSource ?><?define ModSource = "..\mod\mp_lockstep_1" ?><?endif?>
+  <?ifndef CaDll ?><?define CaDll = "out\tpf2ca.dll" ?><?endif?>
+
+  <Package Name="TpF2 Multiplayer"
+           Manufacturer="silver2127"
+           Version="$(ProductVersion)"
+           UpgradeCode="80DBF679-F058-410E-9BAD-87731AC96633"
+           Language="1033"
+           Codepage="1252"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="TpF2 Multiplayer $(ProductVersion)" Manufacturer="silver2127" />
+
+    <!-- AllowSameVersionUpgrades: a rebuilt 0.1.0 replaces an installed 0.1.0
+         instead of landing beside it (the ProductCode is regenerated per build). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Repair stays available on purpose: Steam's "verify integrity" puts the
+         stock alut.dll back over the proxy, and a Repair reinstalls it. -->
+    <Property Id="ARPCOMMENTS" Value="Lockstep multiplayer for Transport Fever 2. Uninstalling restores the game's own alut.dll." />
+
+    <!-- Public properties that may arrive on the msiexec command line; Secure
+         lets them cross into the elevated half of a UAC-prompted install. -->
+    <Property Id="TPF2_SKIP_GAMEDIR_CHECK" Secure="yes" />
+
+    <!-- Default install folder. AppSearch rows for one property run in
+         Signature order, last hit wins, hence the 1/2 prefixes: a folder
+         remembered from an earlier install beats Steam's registration. -->
+    <Property Id="INSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="Search1SteamAppInstallLocation"
+                      Root="HKLM"
+                      Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780"
+                      Name="InstallLocation"
+                      Type="directory"
+                      Bitness="always64" />
+      <RegistrySearch Id="Search2RememberedInstallFolder"
+                      Root="HKLM"
+                      Key="SOFTWARE\silver2127\TpF2 Multiplayer"
+                      Name="InstallFolder"
+                      Type="directory"
+                      Bitness="always64" />
+    </Property>
+
+    <!-- Stock Steam library layout as the last resort (32-bit Program Files:
+         Steam itself is a 32-bit application). -->
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Name="Steam">
+        <Directory Name="steamapps">
+          <Directory Name="common">
+            <Directory Id="INSTALLFOLDER" Name="Transport Fever 2">
+              <Directory Id="NetpunchFolder" Name="netpunch" />
+              <Directory Id="ModsFolder" Name="mods">
+                <Directory Id="ModFolder" Name="mp_lockstep_1" />
+              </Directory>
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="TpF2 Multiplayer" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="GameFolderFiles" />
+      <ComponentGroupRef Id="ModFiles" />
+    </Feature>
+
+    <!-- ===== custom actions (installer\ca\tpf2ca.cpp) ===== -->
+    <Binary Id="Tpf2CustomActions" SourceFile="$(CaDll)" />
+
+    <CustomAction Id="CheckGameDir"      BinaryRef="Tpf2CustomActions" DllEntry="CheckGameDir"      Execute="immediate" Return="ignore" />
+    <CustomAction Id="RequireGameDir"    BinaryRef="Tpf2CustomActions" DllEntry="RequireGameDir"    Execute="immediate" Return="check" />
+    <CustomAction Id="PreserveStockAlut" BinaryRef="Tpf2CustomActions" DllEntry="PreserveStockAlut" Execute="deferred"  Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackStockAlut" BinaryRef="Tpf2CustomActions" DllEntry="RollbackStockAlut" Execute="rollback"  Impersonate="no" Return="ignore" />
+    <CustomAction Id="RestoreStockAlut"  BinaryRef="Tpf2CustomActions" DllEntry="RestoreStockAlut"  Execute="deferred"  Impersonate="no" Return="ignore" />
+
+    <!-- Deferred actions cannot read properties; hand them the folder as CustomActionData. -->
+    <SetProperty Id="PreserveStockAlut" Value="[INSTALLFOLDER]" Sequence="execute" Before="PreserveStockAlut" />
+    <SetProperty Id="RollbackStockAlut" Value="[INSTALLFOLDER]" Sequence="execute" Before="RollbackStockAlut" />
+    <SetProperty Id="RestoreStockAlut"  Value="[INSTALLFOLDER]" Sequence="execute" Before="RestoreStockAlut" />
+
+    <InstallExecuteSequence>
+      <!-- $ProxyAlut=3: the alut.dll component is being installed (first
+           install, upgrade, repair). $ProxyAlut=2: it is being removed.
+           UPGRADINGPRODUCTCODE is set only in the old product's uninstall leg
+           of a major upgrade; the stock file stays parked as alut_real.dll
+           for the new proxy in that case. TPF2_SKIP_GAMEDIR_CHECK=1 on the
+           msiexec command line bypasses the exe check (test rigs only). -->
+      <Custom Action="RequireGameDir"    After="CostFinalize"        Condition="NOT Installed AND NOT TPF2_SKIP_GAMEDIR_CHECK" />
+      <Custom Action="RollbackStockAlut" Before="PreserveStockAlut"  Condition="$ProxyAlut=3" />
+      <Custom Action="PreserveStockAlut" Before="InstallFiles"       Condition="$ProxyAlut=3" />
+      <Custom Action="RestoreStockAlut"  After="RemoveFiles"         Condition="$ProxyAlut=2 AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <!-- ===== UI ===== -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <UIRef Id="WixUI_InstallDir_Tpf2" />
+  </Package>
+
+  <!-- ===== files ===== -->
+  <Fragment>
+    <ComponentGroup Id="GameFolderFiles" Directory="INSTALLFOLDER">
+      <!-- The proxy. Fixed GUID: PreserveStockAlut/RestoreStockAlut key off
+           this component's action state, so it must keep its identity across
+           versions. -->
+      <Component Id="ProxyAlut" Guid="F7DC2819-9B08-4477-B651-A8AAA406270D">
+        <File Id="alut.dll" Name="alut.dll" Source="$(ProxyDll)" KeyPath="yes" />
+      </Component>
+      <Component Id="BridgeDll">
+        <File Id="tpf2_bridge_mp.dll" Name="tpf2_bridge_mp.dll" Source="$(BridgeDll)" />
+      </Component>
+      <Component Id="MenuDll">
+        <File Id="tpf2_menu.dll" Name="tpf2_menu.dll" Source="$(MenuDll)" />
+      </Component>
+      <Component Id="SliceDll">
+        <File Id="tpf2_slice.dll" Name="tpf2_slice.dll" Source="$(SliceDll)" />
+      </Component>
+      <Component Id="BridgeCfg">
+        <File Id="tpf2_bridge_mp.cfg" Name="tpf2_bridge_mp.cfg" Source="cfg\tpf2_bridge_mp.cfg" />
+      </Component>
+      <Component Id="SliceCfg">
+        <File Id="tpf2_slice.cfg" Name="tpf2_slice.cfg" Source="cfg\tpf2_slice.cfg" />
+      </Component>
+      <Component Id="NetpunchExe" Directory="NetpunchFolder">
+        <File Id="netpunch.exe" Name="netpunch.exe" Source="$(NetpunchExe)" />
+      </Component>
+      <!-- Remembered folder for upgrades/uninstall (read back by Search2RememberedInstallFolder). -->
+      <Component Id="RememberInstallFolder" Guid="68615E50-B3D1-4EF1-9966-89EC1379F83A">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Multiplayer" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Multiplayer" Name="Version" Type="string" Value="$(ProductVersion)" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- The Lua mod, whole tree, one component per file. -->
+    <ComponentGroup Id="ModFiles" Directory="ModFolder">
+      <Files Include="$(ModSource)\**" />
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- ===== WixUI_InstallDir with a game-folder check =====
+       A copy of the extension's WixUI_InstallDir (v7 layout) whose folder
+       dialog runs CheckGameDir between CheckTargetPath and SetTargetPath and
+       only moves on when TPF2_GAMEDIR_OK is not "0". The stock set cannot be
+       extended in place: its Next-button events carry no condition, so a
+       DoAction added beside them could never stop the wizard. -->
+  <Fragment>
+    <UI Id="WixUI_InstallDir_Tpf2">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="ARPNOMODIFY" Value="1" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Condition="LicenseAccepted = &quot;1&quot;" />
+
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="DoAction" Value="CheckGameDir" Order="2" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <Publish Dialog="BrowseDlg" Control="OK" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>
