@@ -1665,6 +1665,26 @@ static bool MergeTemplateStreet(uint64_t r8)
     return true;
 }
 
+// CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into
+// its second argument, and the caller destroys that handle as soon as Add
+// returns. Cancelling the call leaves the caller's stack slot holding whatever
+// was there before -- and the destructor (exe+0x2357910) reads *handle, checks
+// it against null only, then dereferences handle[1]. A leftover
+// 0xfffffffffffffffe passes the null check and faults reading address 6: the
+// game crashed on a plane's "turn around" while it was flying to a depot
+// (2026-08-30, access violation at exe+0x235791e, rbx = -2). Earlier cancels
+// survived only because that slot happened to hold zero. Zeroing the out handle
+// makes the caller's destructor a no-op.
+static void ZeroAddResult(uint64_t rdx)
+{
+    if (!rdx) return;
+    __try {
+        *(volatile uint64_t*)rdx = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[slice] could not zero the Add out-handle at %llx\n", (unsigned long long)rdx);
+    }
+}
+
 // rax: 0 = let the original run, 1 = cancel it
 extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9,
                                  uint64_t id, uint64_t retAddr, uint64_t calleeRsp)
@@ -1748,6 +1768,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     // the callback, so suppress cleanly. This is what makes the
                     // originator apply at the STAMP instead of at click time.
                     g_suppressed++;
+                    ZeroAddResult(rdx);
                     Log("[slice] CANCEL fire-and-forget (caller_rva=%llx), no callback "
                         "needed -- now owned by lockstep\n", (unsigned long long)caller);
                     return 1;
@@ -1759,6 +1780,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             }
             InterlockedExchange(&g_pendingNoCb, 0);
             g_suppressed++;
+            ZeroAddResult(rdx);
             Log("[slice] CANCEL local build (caller_rva=%llx), completion callback "
                 "fired -- now owned by lockstep\n", (unsigned long long)caller);
             return 1;

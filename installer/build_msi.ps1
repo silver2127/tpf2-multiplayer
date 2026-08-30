@@ -85,7 +85,10 @@ function Fail($m) { Write-Host "[msi] $m" -ForegroundColor Red; exit 1 }
 # not recognized' line on machines without a full Visual Studio; hide it.
 function Run-Bat([string]$bat, [string]$arg = "") {
     if (-not (Test-Path $bat)) { Fail "missing build script: $bat" }
-    cmd /c "`"$bat`" $arg" 2>&1 | Where-Object { "$_" -notmatch "vswhere|operable program or batch file" } | ForEach-Object { Write-Host "    $_" }
+    # Redirect INSIDE cmd. PowerShell 5.1's own 2>&1 on a native command wraps
+    # every stderr line in an ErrorRecord, which under ErrorActionPreference=Stop
+    # aborts the build on vcvars64's harmless 'vswhere.exe is not recognized'.
+    cmd /c "`"$bat`" $arg 2>&1" | Where-Object { "$_" -notmatch "vswhere|operable program or batch file" } | ForEach-Object { Write-Host "    $_" }
     return $LASTEXITCODE
 }
 
