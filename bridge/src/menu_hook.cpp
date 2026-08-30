@@ -378,6 +378,18 @@ static bool InitRender(VkSwapchainKHR sc)
 // screen-space button rect (matches the menu column position)
 // ---- multiplayer panel state ----
 static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lobby
+// Low-level keyboard hook. While the lobby chat is open (state 2) and the game is
+// focused, route typing into the chat box and SWALLOW the key so the game's own
+// bindings never fire -- crucially Enter, which on the title menu opens Load Game.
+// Passive polling (GetAsyncKeyState) can read keys but cannot stop the game from
+// also receiving them, so a real hook is required to consume the input.
+// Once the save is placed and the player has been told to load it, the lobby is
+// finished and MUST stop eating keystrokes. The hook used to be released as a side
+// effect of doStartLoad resetting g_uiState before it clicked Continue; when that
+// click was replaced by "open Load Game yourself", the reset went with it, the panel
+// stayed in lobby state and every key in the loaded game was swallowed -- the game
+// looked like it had lost the keyboard completely.
+static volatile LONG g_lobbyDone = 0;
 static char g_status[256] = "";
 // lobby model (fed from lobby_out.jsonl)
 static char g_players[8][40]; static int g_playerCount = 0;
@@ -941,6 +953,28 @@ static int jsonInt(const char* s, const char* key)
 
 // ---- lobby.py: N-player host-relay lobby with roster + chat ----
 static HANDLE g_lobbyProc = nullptr;
+// The lobby must never outlive the game. Quitting cleanly is handled by
+// TeardownLobby, but a crash, a kill from Task Manager or Steam closing the game
+// runs no cleanup at all -- and the orphan keeps UDP 29471 and the relay ports,
+// so the NEXT session's lobby cannot bind them and the player gets a game that
+// silently never connects. A job object with KILL_ON_JOB_CLOSE is the only
+// mechanism that survives every one of those paths: when the game process dies
+// its handles close, the job goes with them and Windows terminates whatever is
+// inside. PyInstaller's onefile bootloader spawns a child; the child inherits
+// the job, so both go.
+static HANDLE g_lobbyJob = nullptr;
+static void EnsureLobbyJob()
+{
+    if (g_lobbyJob) return;
+    g_lobbyJob = CreateJobObjectW(nullptr, nullptr);
+    if (!g_lobbyJob) { Log("[menu] CreateJobObject failed (err %lu) -- the lobby will not be killed automatically\n", GetLastError()); return; }
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li = {};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(g_lobbyJob, JobObjectExtendedLimitInformation, &li, sizeof(li))) {
+        Log("[menu] SetInformationJobObject failed (err %lu)\n", GetLastError());
+        CloseHandle(g_lobbyJob); g_lobbyJob = nullptr;
+    }
+}
 static char   g_username[40] = "";
 // Random two-word username ("BraveOtter"), generated once per game session.
 // The Windows account name was the old default: it leaks the player's real
@@ -1234,6 +1268,7 @@ static bool doStartLoad(const wchar_t* srcSav)
     // is placed and stamped newest either way, so asking for one click always works.
     // clickContinueLoad() is kept below, unused, until the proper fix lands: calling
     // the menu's own load action (docs/re/LOAD_SAVE.md).
+    InterlockedExchange(&g_lobbyDone, 1);   // release the keyboard: the lobby's work is done
     Log("[menu] shared save placed as mp_shared -- the player loads it from LOAD GAME\n");
     SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
     return true;
@@ -1313,6 +1348,9 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, NETDIR, &si, &pi);
     if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
     if (!ok) { SetStatus("Couldn't start Python — is it on PATH?"); free(a); return 0; }
+    EnsureLobbyJob();
+    if (g_lobbyJob && !AssignProcessToJobObject(g_lobbyJob, pi.hProcess))
+        Log("[menu] AssignProcessToJobObject failed (err %lu) -- the lobby may outlive a crash\n", GetLastError());
     g_lobbyProc = pi.hProcess;
 
     // tail lobby_out.jsonl line by line
@@ -1444,6 +1482,7 @@ static void StartLobby(int join)
     InterlockedExchange(&g_lobbyReady, 0);
     InterlockedExchange(&g_saveReady, 0);
     InterlockedExchange(&g_isHost, join ? 0 : 1);
+    InterlockedExchange(&g_lobbyDone, 0);   // a new lobby captures typing again
     InterlockedExchange(&g_uiState, 2); InterlockedExchange(&g_panelDirty, 1);
     g_chatCount = 0; g_chatHead = 0; g_playerCount = 0;
     g_lobbyThread = CreateThread(nullptr, 0, LobbyThread, a, 0, nullptr);
@@ -1472,16 +1511,14 @@ static char vkToChar(int vk, bool shift)
     }
     return 0;
 }
-// Low-level keyboard hook. While the lobby chat is open (state 2) and the game is
-// focused, route typing into the chat box and SWALLOW the key so the game's own
-// bindings never fire -- crucially Enter, which on the title menu opens Load Game.
-// Passive polling (GetAsyncKeyState) can read keys but cannot stop the game from
-// also receiving them, so a real hook is required to consume the input.
 static HHOOK g_kbHook = nullptr;
 static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
 {
     if (code == HC_ACTION &&
-        InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && gameHasFocus())
+        InterlockedCompareExchange(&g_uiState, 0, 0) == 2 &&
+        InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0 &&
+        InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 &&
+        gameHasFocus())
     {
         KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lp;
         DWORD vk = k->vkCode;
@@ -1612,6 +1649,11 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
         CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        // Orderly shutdown: ask the lobby to quit. Nothing may block here (the
+        // loader lock is held), so no waiting and no thread joins -- the job
+        // object above is what guarantees the kill if this never runs.
+        if (g_lobbyProc) { LobbySend("{\"cmd\":\"quit\"}"); }
     }
     return TRUE;
 }

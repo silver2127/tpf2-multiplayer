@@ -39,8 +39,12 @@ After building, extract the MSI with msiexec /a into a temp folder and list it.
 Pass --acceptEula wix7 to wix for this run.
 
 .PARAMETER Version
-Package version (three-part). Default 0.1.0. Also becomes the ProductVersion
-preprocessor variable in Package.wxs.
+Package version (three-part). Defaults to the contents of installer\VERSION, which
+is the single source of truth for what a release is called -- every 0.1.x MSI up to
+2026-08-30 shipped as ProductVersion 0.1.0 because this defaulted to a literal, so
+Windows showed the same version for every build and could not tell an upgrade from
+a reinstall. Bump installer\VERSION when cutting a release. Also becomes the
+ProductVersion preprocessor variable in Package.wxs.
 
 .EXAMPLE
 pwsh installer\build_msi.ps1 -SkipFreeze -Validate -AcceptWixEula
@@ -52,12 +56,18 @@ param(
     [switch]$Validate,
     [switch]$AcceptWixEula,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "0.1.0"
+    [string]$Version
 )
 
 $ErrorActionPreference = "Stop"
 
 $Installer = $PSScriptRoot
+if (-not $Version) {
+    $vf = Join-Path $PSScriptRoot "VERSION"
+    if (-not (Test-Path $vf)) { throw "installer\VERSION is missing and no -Version was given" }
+    $Version = (Get-Content $vf -Raw).Trim()
+    if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "installer\VERSION does not contain a three-part version: '$Version'" }
+}
 $Repo      = Split-Path -Parent $Installer
 $Bridge    = Join-Path $Repo "bridge"
 $BridgeOut = Join-Path $Bridge "out"

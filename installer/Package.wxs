@@ -152,10 +152,16 @@
       <Component Id="SliceDll">
         <File Id="tpf2_slice.dll" Name="tpf2_slice.dll" Source="$(SliceDll)" />
       </Component>
-      <Component Id="BridgeCfg">
+      <!-- The two cfg files are the only installed files a player is meant to EDIT
+           (ports, peer address, capture switches). NeverOverwrite keeps an existing
+           copy through an upgrade or repair, so tuning survives the next version,
+           while a fresh install still gets the defaults. Without it the upgrade
+           deletes them on the way out and lays down defaults on the way in,
+           silently reverting whatever the player had set. -->
+      <Component Id="BridgeCfg" NeverOverwrite="yes">
         <File Id="tpf2_bridge_mp.cfg" Name="tpf2_bridge_mp.cfg" Source="cfg\tpf2_bridge_mp.cfg" />
       </Component>
-      <Component Id="SliceCfg">
+      <Component Id="SliceCfg" NeverOverwrite="yes">
         <File Id="tpf2_slice.cfg" Name="tpf2_slice.cfg" Source="cfg\tpf2_slice.cfg" />
       </Component>
       <Component Id="NetpunchExe" Directory="NetpunchFolder">

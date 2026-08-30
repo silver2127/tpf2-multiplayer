@@ -187,3 +187,39 @@ the plain name; `build_proxy.bat` does not, so close the game for that step.
 | `ca\tpf2ca.cpp`, `ca\build_ca.bat` | Custom actions: game-folder check, `alut.dll` preserve / rollback / restore. |
 | `cfg\tpf2_bridge_mp.cfg`, `cfg\tpf2_slice.cfg` | The shipped configuration files. |
 | `License.rtf` | MIT license text shown by the wizard. |
+
+## Updating
+
+The package upgrades in place: install the new MSI over the old one, no uninstall
+first. What that guarantees:
+
+- **One entry in Apps.** Every build carries a fresh ProductCode under one fixed
+  UpgradeCode, and `MajorUpgrade` removes the previous product in the same
+  transaction, so versions never stack up side by side.
+- **The version you see is the version you have.** `installer\VERSION` is the single
+  source of truth; `build_msi.ps1` reads it and stamps ProductVersion. (Every 0.1.x
+  MSI up to 2026-08-30 shipped as 0.1.0 because the build script defaulted to a
+  literal -- Windows could not tell one build from another. Bump `VERSION` when
+  cutting a release.)
+- **Your `alut.dll` is never wrapped twice.** The stock library is kept as
+  `alut_real.dll` on the first install only; later installs see it already there,
+  drop the old proxy and lay down the new one. Uninstall moves the stock file back
+  -- and is skipped during an upgrade's removal leg, so the file is not restored
+  and re-stolen mid-transaction.
+- **Edited cfg files survive.** `tpf2_bridge_mp.cfg` and `tpf2_slice.cfg` are marked
+  NeverOverwrite: a fresh install writes the defaults, an upgrade leaves your copy
+  alone.
+- **Runtime data is untouched.** Nothing under `%LOCALAPPDATA%	pf2mp` belongs to
+  the installer; logs, identity and captures are left as they are.
+
+Downgrades are refused with a message rather than silently mangling the install.
+
+To verify all of the above against a real msiexec transaction without touching your
+game folder, run from an **elevated** PowerShell with the game closed:
+
+    powershell -ExecutionPolicy Bypass -File installer	est_upgrade.ps1
+
+It installs, upgrades and uninstalls into a throwaway folder whose "stock" alut.dll
+has known content, and checks after every step -- including that `alut_real.dll` is
+still the stock library after an upgrade, which is the failure that would break
+audio and leave the game unable to start.
