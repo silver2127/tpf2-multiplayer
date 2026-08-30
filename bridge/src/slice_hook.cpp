@@ -1403,19 +1403,32 @@ static bool MergeTemplateStreet(uint64_t r8)
     auto nodeId  = [&](int i) { int32_t v; memcpy(&v, N + i * 24 + 0x14, 4); return v; };
     auto nodeFl  = [&](int i) { uint32_t v; memcpy(&v, N + i * 24 + 0x0c, 4); return v; };
 
-    // ours = everything before the first template (0x7f00) node
-    int firstT = -1;
-    for (int i = 0; i < n; i++) if (nodeFl(i) == NODE_FLAGS_TEMPLATE) { firstT = i; break; }
-    if (firstT <= 0) {
-        Log("[merge] nodes=%d segs=%d firstTemplate=%d -- nothing to merge\n", n, m, firstT);
+    // Template nodes = the placeholder endpoints of construction-OWNED segments
+    // (+0x74 == 1). Node FLAGS are not a discriminator: for a TRACK template the
+    // conversion stamps 0x7f00 on OUR node as well (rail depot dump 2026-08-30:
+    // our -1 at index 0 already 0x7f00), so "first 0x7f00 node" saw no nodes of
+    // ours and every rail depot replayed with the raw apron beside ours.
+    bool isT[64] = {}; int nT = 0;
+    for (int s = 0; s < m; s++) {
+        uint32_t owned; memcpy(&owned, S + s * 120 + 0x74, 4);
+        if (owned != 1) continue;
+        int32_t a, b; memcpy(&a, S + s * 120 + 0x08, 4); memcpy(&b, S + s * 120 + 0x0c, 4);
+        for (int i = 0; i < n; i++)
+            if (!isT[i] && (nodeId(i) == a || nodeId(i) == b) && nodeId(i) < 0) { isT[i] = true; nT++; }
+    }
+    int oursN = n - nT;
+    if (nT == 0 || oursN == 0) {
+        Log("[merge] nodes=%d segs=%d template=%d ours=%d -- nothing to merge\n", n, m, nT, oursN);
         return false;
     }
-    int oursN = firstT;
+    (void)nodeFl;
     // template outer = the template node nearest to any of ours (within 2 m)
     int X = -1, Tout = -1; float bestD = 4.0f;
-    for (int o = 0; o < oursN; o++) {
+    for (int o = 0; o < n; o++) {
+        if (isT[o]) continue;
         float ox, oy; memcpy(&ox, N + o * 24, 4); memcpy(&oy, N + o * 24 + 4, 4);
-        for (int t = firstT; t < n; t++) {
+        for (int t = 0; t < n; t++) {
+            if (!isT[t]) continue;
             float tx, ty; memcpy(&tx, N + t * 24, 4); memcpy(&ty, N + t * 24 + 4, 4);
             float d = (ox - tx) * (ox - tx) + (oy - ty) * (oy - ty);
             if (d < bestD) { bestD = d; X = o; Tout = t; }
@@ -1437,7 +1450,7 @@ static bool MergeTemplateStreet(uint64_t r8)
     // segmentsBefore to our segment's index, copy the tag, and drop the
     // template's two nodes + apron -- all LAST records, so no index shifts.
     // (+0x188 construction-edge set is empty in every UI dump: size @+0x198.)
-    if (Tout == n - 2 && n >= 3 && nodeFl(n - 1) == NODE_FLAGS_TEMPLATE) {
+    if (Tout == n - 2 && n >= 3 && isT[n - 1]) {
         int inner = Tout, outer = n - 1;
         int32_t xid = nodeId(X), inId = nodeId(inner), outId = nodeId(outer);
         int a = -1, o = -1; int32_t J = 0;
@@ -1514,7 +1527,7 @@ static bool MergeTemplateStreet(uint64_t r8)
     }
     int32_t xid = nodeId(X), tid = nodeId(Tout);
     // our nodes get the flags the UI's carry
-    for (int o = 0; o < oursN; o++) { uint32_t fl = NODE_FLAGS_TEMPLATE; memcpy(N + o * 24 + 0x0c, &fl, 4); }
+    for (int o = 0; o < n; o++) { if (isT[o]) continue; uint32_t fl = NODE_FLAGS_TEMPLATE; memcpy(N + o * 24 + 0x0c, &fl, 4); }
 
     // template segments touching Tout -> X, straight tangents from the inner end
     int repointed = 0;

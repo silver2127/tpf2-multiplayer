@@ -10,10 +10,10 @@ vector summaries for each side so vector counts can be compared.
     python tools/dumpprop_diff.py [path\\to\\tpf2_slice.log] [-b]
       -b  use the sandboxed (instance B) log
 """
-import re, struct, sys
+import os, re, struct, sys
 
-REAL = r"C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out\tpf2_slice.log"
-OVL  = r"C:\Sandbox\" + os.environ.get("USERNAME", "user") + r"\GameAgent\drive\C\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out\tpf2_slice.log"
+REAL = os.path.join(os.environ.get("LOCALAPPDATA", ""), "tpf2mp", "data", "tpf2_slice.log")   # instance A (shipping layout)
+OVL  = os.path.join("C:\Sandbox", os.environ.get("USERNAME", "user"), "GameAgent", "user", "current", "AppData", "Local", "tpf2mp", "data", "tpf2_slice.log")   # sandboxed instance B
 
 def load(path):
     with open(path, "r", errors="replace") as f:
