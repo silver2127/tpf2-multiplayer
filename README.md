@@ -48,8 +48,10 @@ world hash matched over the test runs -- the detector is reliable for short sess
   lobby's hole-punched socket (`netpunch.exe --game-relay-port`), so the game itself
   needs no port forwarding -- only the host's UDP 29471 has to be reachable (UPnP is
   attempted). Verified between two machines on 2026-08-30: roles handed to both bridges
-  through `tpf2_bridge_ctl.txt`, clocks in step, `desyncs=0`. Two players only, and that
-  test was over a LAN -- a NAT-to-NAT session has not been run yet.
+  through `tpf2_bridge_ctl.txt`, clocks in step, `desyncs=0`. Confirmed again on
+  2026-08-30 between a phone hotspot and a separate home network -- two genuinely
+  different networks, relay carrying ~43 frames each way per 10 s, no desyncs.
+  Two players only.
 - The installer is an **alpha** ([Releases](https://github.com/silver2127/tpf2-multiplayer/releases)):
   it installs everything, but two-machine play has only been exercised as far as
   the transport (see below).
