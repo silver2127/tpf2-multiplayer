@@ -26,6 +26,7 @@ world hash matched over the test runs -- the detector is reliable for short sess
 | Constructions | Stations, depots, modular terminals: placement (snapped and connected to the road) and demolition; a station placed over town buildings clears the town buildings inside the same footprint on every peer (approximate footprint, tuned for the modular station) |
 | Vehicles | Buy, sell, send to depot, reverse; vehicles are matched across peers by purchase key, never by entity id |
 | Lines | Create, update, delete, assign a vehicle to a line; stops are resolved by station position |
+| Two machines | Lobby (code exchange, chat), save transfer, and the lockstep transport itself all run between separate PCs -- the game's frames are relayed over the lobby's hole-punched socket, so the game needs no port forwarding |
 
 **Implemented, verification still in progress**
 
@@ -43,11 +44,12 @@ world hash matched over the test runs -- the detector is reliable for short sess
 
 **Known limitations**
 
-- **Internet play between two machines is not wired up.** The lobby punches a hole and
-  transfers the save, but the lockstep transport's peer address still defaults to
-  loopback (`bridge_main.cpp`, `peerIp = "127.0.0.1"`). The bridge now polls a control
-  file (`tpf2_bridge_ctl.txt`, `peer=<ipv4>:<port>`) for exactly this hand-off, but
-  nothing writes it yet. See [docs/PORTABILITY.md](docs/PORTABILITY.md), item 6.
+- **Play across networks works, with caveats.** The game's lockstep frames ride the
+  lobby's hole-punched socket (`netpunch.exe --game-relay-port`), so the game itself
+  needs no port forwarding -- only the host's UDP 29471 has to be reachable (UPnP is
+  attempted). Verified between two machines on 2026-08-30: roles handed to both bridges
+  through `tpf2_bridge_ctl.txt`, clocks in step, `desyncs=0`. Two players only, and that
+  test was over a LAN -- a NAT-to-NAT session has not been run yet.
 - The installer is an **alpha** ([Releases](https://github.com/silver2127/tpf2-multiplayer/releases)):
   it installs everything, but two-machine play has only been exercised as far as
   the transport (see below) and the shared-save auto-load still depends on the
@@ -248,12 +250,13 @@ menu DLL knows. Without `netpunch.exe` it runs `python lobby.py` from that direc
    stamped newest on all machines, and each game clicks **Continue** to load it. A joiner
    whose transfer failed is told to have the host press START GAME again.
 
-What the harness still does by hand after the save has loaded: inject the slice DLL into
-each game process with `injector\injector.exe <pid> bridge\out\tpf2_slice.dll`, with a
-`tpf2_slice.cfg` (`suppress=1` for real lockstep) next to `tpf2_slice.dll` or in the data
-directory. `tools\mp_launch.ps1` does both for the two-instance rig. The bridge's peer
-address (`peer_ip=`/`peer_port=` in `tpf2_bridge_mp.cfg`, or `peer=` in the control file)
-is the part that is not wired to the lobby yet.
+The MSI layout needs none of this by hand: the proxy loads the slice DLL at process start
+and `tpf2_slice.cfg` sits next to it (`suppress=1` for real lockstep). For the
+two-instance dev rig `tools\mp_launch.ps1` still injects `injector\injector.exe <pid>
+bridge\out\tpf2_slice.dll` after the save loads. The bridge's peer address now comes from
+the lobby at runtime: the menu writes `instance=`/`peer=` into `tpf2_bridge_ctl.txt` once
+roles are known and the bridge re-points its socket live, so `peer_ip=`/`peer_port=` in
+`tpf2_bridge_mp.cfg` are only the pre-lobby defaults.
 
 ## Developing
 
