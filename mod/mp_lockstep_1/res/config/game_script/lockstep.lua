@@ -964,6 +964,20 @@ local function execPolyline(c)
 		local welds = {}
 		for tok in tostring(c.weld or ""):gmatch("[^,]+") do welds[#welds + 1] = tonumber(tok) end
 		local nw = math.floor(#welds / 3)
+		-- UPGRADE removals (upgrade tool: change road/track type, add catenary).
+		-- That tool REPLACES edges in place -- nodesToAdd=0, edgesToAdd=N,
+		-- edgesToRemove=N, every endpoint an existing node -- so unlike a split,
+		-- the peer cannot regenerate the removal from geometry: nothing about the
+		-- world says "this edge was upgraded". The removals therefore travel, as
+		-- endpoint POSITIONS like everything else on this wire:
+		--   rm = "x0,y0,x1,y1;x0,y0,x1,y1;..."   (one entry per removed edge)
+		-- and each is matched to THIS peer's own edge below.
+		local rms = {}
+		for tok in tostring(c.rm or ""):gmatch("[^;]+") do
+			local f = {}
+			for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+			if #f == 4 then rms[#rms + 1] = f end
+		end
 		-- np may be 0: a road joining two existing junctions carries only edges,
 		-- whose endpoints are all positive existing ids resolved by realPos().
 		-- ne may ALSO be 0 when the command is pure WELDs: a depot placed with
@@ -983,6 +997,63 @@ local function execPolyline(c)
 		local sp = api.type.SimpleProposal.new()
 		local addNodes, addEdges, removeEdges, removeNodes = {}, {}, {}, {}
 		local resolved = {}
+
+		-- ONE removal per edge, ever. A split (regenerated here) and a shipped
+		-- upgrade removal can name the same edge, and two removals of one entity
+		-- make the engine reject the ENTIRE proposal -- the same failure the
+		-- double-split guard exists for. Every removal goes through here.
+		local removeSet = {}
+		local function dropEdge(eid)
+			if removeSet[eid] then return false end
+			removeSet[eid] = true
+			removeEdges[#removeEdges + 1] = eid
+			return true
+		end
+
+		-- Match each shipped removal to a LOCAL edge: a node within 1.5 m of each
+		-- endpoint (same kind as the command, exactly as resolve() snaps), then
+		-- the edge that joins EXACTLY those two nodes. Ids never travel, so this
+		-- is the only way a peer can name the edge the originator removed.
+		--
+		-- An unmatched removal aborts the whole command. Adding an upgrade's new
+		-- edges without removing the old ones leaves two edges between the same
+		-- pair of nodes -- a doubled road that no later command can clean up --
+		-- and that is strictly worse than the upgrade simply not happening.
+		for _, r in ipairs(rms) do
+			local nA = findNodeNear(isTrack, r[1], r[2], 1.5)
+			local nB = findNodeNear(isTrack, r[3], r[4], 1.5)
+			local eid
+			if nA and nB and nA ~= nB then
+				local mm
+				if isTrack then
+					pcall(function() mm = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+				else
+					pcall(function() mm = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+				end
+				for _, cand in pairs((mm and mm[nA]) or {}) do
+					local be
+					pcall(function() be = api.engine.getComponent(cand, api.type.ComponentType.BASE_EDGE) end)
+					if be and ((be.node0 == nA and be.node1 == nB)
+					           or (be.node0 == nB and be.node1 == nA)) then
+						eid = cand
+						break
+					end
+				end
+			end
+			if not eid then
+				local msg = string.format("ROADP seq=%s: removal (%.1f,%.1f)-(%.1f,%.1f) matched no "
+					.. "local %s edge (endpoint nodes %s / %s) -- COMMAND SKIPPED (building the "
+					.. "replacement without the removal would double the edge)",
+					tostring(c.seq), r[1], r[2], r[3], r[4], isTrack and "track" or "street",
+					tostring(nA), tostring(nB))
+				log(msg)
+				CM.cmLog(msg)
+				return
+			end
+			dropEdge(eid)
+			log(string.format("ROADP: removal (%.1f,%.1f)-(%.1f,%.1f) -> local edge %d (nodes %d/%d)",
+				r[1], r[2], r[3], r[4], eid, nA, nB))
+		end
 
 		local function newNodeAt(x, y, z)
 			nextNew = nextNew + 1
@@ -1033,7 +1104,7 @@ local function execPolyline(c)
 			local pm = hermitePos(a, ta, b, tb, u)
 			local tm = hermiteTangent(a, ta, b, tb, u)
 			local mid = newNodeAt(pm[1], pm[2], pm[3])
-			removeEdges[#removeEdges + 1] = eid
+			dropEdge(eid)
 			local function half(nA, nB, tA, tB, sc)
 				if nA == nB then return end
 				if sc < 0.02 then return end   -- a half under ~2% of the edge is degenerate; never emit it
@@ -1124,7 +1195,7 @@ local function execPolyline(c)
 				if comp then
 					local tm = hermiteTangent(a, ta, b, tb, u)
 					local X = newNodeAt(wx, wy, wz)
-					removeEdges[#removeEdges + 1] = eid
+					dropEdge(eid)
 					local function halfW(nA, nB, tA, tB, sc)
 						local h = newEdge()
 						h.comp.node0 = nA
@@ -1153,7 +1224,7 @@ local function execPolyline(c)
 						local raw = {}
 						for _, reid in pairs(lst or {}) do raw[#raw + 1] = reid end
 						if #raw == 1 then
-							removeEdges[#removeEdges + 1] = raw[1]
+							dropEdge(raw[1])
 							removeNodes[#removeNodes + 1] = Mout
 							log(string.format("WELD: replacing raw apron edge %d + node %d",
 								raw[1], Mout))
@@ -1498,9 +1569,9 @@ local function execPolyline(c)
 					end
 				end
 				log(string.format("EXEC ROADP seq=%s origin=%s at=%s pts=%d edges=%d " ..
-					"split=%d %s=%d success=%s",
+					"removed=%d (shipped rm=%d) %s=%d success=%s",
 					tostring(c.seq), tostring(c.origin), tostring(c.at), np, #addEdges,
-					#removeEdges, isTrack and "trackType" or "streetType",
+					#removeEdges, #rms, isTrack and "trackType" or "streetType",
 					isTrack and (tonumber(c.ttype) or 1) or stype, tostring(success)))
 				if not success then
 					-- best-effort: surface WHY. "success=false" alone cost a
@@ -2271,6 +2342,57 @@ local function execVehCmd(c)
 	if not ok then log(string.format("exec%s error: %s", tostring(c.op), tostring(err))) end
 end
 
+-- The TransportVehicleConfig a command carries, rebuilt on this instance.
+--
+-- VBUY and VREPL ship the SAME encoding (name~loads~colour~autoloads;... plus a
+-- vehicleGroups list), so they decode it with the same code: a second copy of
+-- this would drift the moment one op learned about a new field, and a wrong
+-- config is a wrong vehicle in a depot -- an uncatchable native assert away.
+-- A global (not a `local function`): the chunk is at Lua 5.1's 200-local limit.
+--
+-- RAISES on a part this peer cannot build (unknown model, malformed spec). Both
+-- callers run it inside their pcall, so the command is logged and skipped
+-- instead of half-applied.
+function buildVehConfig(c)
+	local config = api.type.TransportVehicleConfig.new()
+	local u = 0
+	for spec in tostring(c.parts or ""):gmatch("[^;]+") do
+		local name, loads, col, autos = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+		if not name then error("bad part spec: " .. spec) end
+		local mid = tonumber(name:match("^#(%-?%d+)$") or "")
+		if not mid then pcall(function() mid = api.res.modelRep.find(name) end) end
+		if not mid or mid < 0 then error("model not found on this peer: " .. name) end
+		local part = api.type.VehiclePart.new()
+		part.modelId = mid
+		local lc = part.loadConfig
+		local n = 0
+		for v in loads:gmatch("[^/]+") do n = n + 1; lc[n] = tonumber(v) or 0 end
+		part.loadConfig = lc
+		part.reversed = false     -- offset not yet decoded; TODO sweep
+		local r, g, b = col:match("^([^,]+),([^,]+),([^,]+)$")
+		part.color = api.type.Vec3f.new(tonumber(r) or -1, tonumber(g) or -1, tonumber(b) or -1)
+		part.logo = ""
+		local tvp = api.type.TransportVehiclePart.new()
+		tvp.purchaseTime = 0
+		tvp.maintenanceState = 1.0
+		tvp.targetMaintenanceState = 0
+		local alc = tvp.autoLoadConfig
+		n = 0
+		for v in autos:gmatch("[^/]+") do n = n + 1; alc[n] = tonumber(v) or 0 end
+		tvp.autoLoadConfig = alc
+		tvp.part = part
+		u = u + 1
+		config.vehicles[u] = tvp
+	end
+	if u == 0 then error("no parts") end
+	local grp = config.vehicleGroups
+	local ng = 0
+	for v in tostring(c.groups or ""):gmatch("[^/]+") do ng = ng + 1; grp[ng] = tonumber(v) or 1 end
+	if ng == 0 then grp[1] = u end
+	config.vehicleGroups = grp
+	return config, u
+end
+
 local function execVBuy(c)
 	if c.origin == INSTANCE and not STRICT_OPS.VBUY then
 		log(string.format("VBUY seq=%s: originator already bought locally, skipping", tostring(c.seq)))
@@ -2323,42 +2445,7 @@ local function execVBuy(c)
 			log(string.format("EXEC VBUY seq=%s: construction %d has no depot child -- vehicle NOT bought", tostring(c.seq), depot))
 			return
 		end
-		local config = api.type.TransportVehicleConfig.new()
-		local u = 0
-		for spec in tostring(c.parts or ""):gmatch("[^;]+") do
-			local name, loads, col, autos = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
-			if not name then error("bad part spec: " .. spec) end
-			local mid = tonumber(name:match("^#(%-?%d+)$") or "")
-			if not mid then pcall(function() mid = api.res.modelRep.find(name) end) end
-			if not mid or mid < 0 then error("model not found on this peer: " .. name) end
-			local part = api.type.VehiclePart.new()
-			part.modelId = mid
-			local lc = part.loadConfig
-			local n = 0
-			for v in loads:gmatch("[^/]+") do n = n + 1; lc[n] = tonumber(v) or 0 end
-			part.loadConfig = lc
-			part.reversed = false     -- offset not yet decoded; TODO sweep
-			local r, g, b = col:match("^([^,]+),([^,]+),([^,]+)$")
-			part.color = api.type.Vec3f.new(tonumber(r) or -1, tonumber(g) or -1, tonumber(b) or -1)
-			part.logo = ""
-			local tvp = api.type.TransportVehiclePart.new()
-			tvp.purchaseTime = 0
-			tvp.maintenanceState = 1.0
-			tvp.targetMaintenanceState = 0
-			local alc = tvp.autoLoadConfig
-			n = 0
-			for v in autos:gmatch("[^/]+") do n = n + 1; alc[n] = tonumber(v) or 0 end
-			tvp.autoLoadConfig = alc
-			tvp.part = part
-			u = u + 1
-			config.vehicles[u] = tvp
-		end
-		if u == 0 then error("no parts") end
-		local grp = config.vehicleGroups
-		local ng = 0
-		for v in tostring(c.groups or ""):gmatch("[^/]+") do ng = ng + 1; grp[ng] = tonumber(v) or 1 end
-		if ng == 0 then grp[1] = u end
-		config.vehicleGroups = grp
+		local config, u = buildVehConfig(c)
 		local seq, origin, at = c.seq, c.origin, c.at
 		local okM, cmd = pcall(function() return api.cmd.make.buyVehicle(api.engine.util.getPlayer(), target, config) end)
 		if not okM or not cmd then
@@ -2372,6 +2459,74 @@ local function execVBuy(c)
 		end)
 	end)
 	if not ok then log("execVBuy error: " .. tostring(err)) end
+end
+
+-- ---------- vehicles: ReplaceVehicle ----------
+--
+-- The vehicle window's "replace" (command factory 4: r8 = the vehicle, r9 = a
+-- TransportVehicleConfig with the layout VBUY already serialises) swaps a
+-- vehicle's configuration in place.
+--
+-- OPTIMISTIC, like BuyVehicle and for the same reason: the UI waits for the
+-- command's result, and cancelling a vehicle command that the UI is waiting on
+-- is exactly what wedged the build tool. So the originator's replace applies
+-- natively at T0, the peers apply at the stamp, and the originator skips its
+-- own replay.
+--
+-- Identity: the vehicle travels as a cross-peer KEY (VSELL/VDEPOT/VREV all do
+-- this), never an entity id. If the engine mints a NEW entity for the replaced
+-- vehicle, the key must follow it or every later command for that vehicle
+-- resolves to a dead id -- hence the re-registration in the callback.
+--
+-- A global, not a `local function`: the chunk is at Lua 5.1's 200-local limit.
+function execVReplace(c)
+	if c.origin == INSTANCE and not STRICT_OPS.VREPL then
+		log(string.format("VREPL seq=%s: originator already replaced locally, skipping",
+			tostring(c.seq)))
+		return
+	end
+	local ok, err = pcall(function()
+		local key = tostring(c.veh or "")
+		local veh = vehIdFor(key)
+		if not veh then
+			log(string.format("EXEC VREPL seq=%s: unknown vehicle key %s -- replace NOT applied",
+				tostring(c.seq), key))
+			return
+		end
+		local config, u = buildVehConfig(c)
+		local seq, origin, at = c.seq, c.origin, c.at
+		local okM, cmd = pcall(function() return api.cmd.make.replaceVehicle(veh, config) end)
+		if not okM or not cmd then
+			log(string.format("EXEC VREPL seq=%s: make.replaceVehicle refused: %s",
+				tostring(seq), tostring(cmd)))
+			return
+		end
+		-- TODO companies mode: a replace bills the executing player, so the cost
+		-- has to move to c.company the way VBUY does it (balance delta captured
+		-- around the apply, then CM.cmTransferCost). Not wired yet -- in coop this
+		-- is a no-op, in companies mode the buyer's company is under-charged.
+		api.cmd.sendCommand(cmd, function(res, success)
+			-- The replace may hand back a NEW entity. Take it from the result
+			-- rather than assume either way; both shapes have been seen for
+			-- entity-returning commands.
+			local nid
+			pcall(function()
+				local r = res and res.resultEntity
+				if type(r) == "number" then nid = r
+				elseif r ~= nil then nid = tonumber(tostring(r)) end
+			end)
+			log(string.format("EXEC VREPL seq=%s origin=%s at=%s %s vehicle=%s parts=%d "
+				.. "result=%s success=%s",
+				tostring(seq), tostring(origin), tostring(at), key, tostring(veh), u,
+				tostring(nid), tostring(success)))
+			if success and nid and nid > 0 and nid ~= veh then
+				forgetVehicle(veh)          -- the old id is dead; ids get reused
+				registerVehKey(key, nid)
+				log(string.format("VREPL: key %s now names entity %d (was %d)", key, nid, veh))
+			end
+		end)
+	end)
+	if not ok then log("execVReplace error: " .. tostring(err)) end
 end
 
 -- ---------- constructions: NATIVE replay (CONP / CONX) ----------
@@ -3002,6 +3157,7 @@ local function execute(c)
 	elseif c.op == "CON" then execCon(c)
 	elseif c.op == "DEMOLISH" then execDemolish(c)
 	elseif c.op == "VBUY" then execVBuy(c)
+	elseif c.op == "VREPL" then execVReplace(c)
 	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then execVehCmd(c)
 	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then execLine(c)
 	else log("unknown op: " .. tostring(c.op)) end
@@ -4425,11 +4581,17 @@ local function pollInject()
 			elseif o == "GT" and #w >= 2 then
 				runGroundTruth(w[2])
 
-			-- ROADE <N> <etype> <stype> <ttype> <M> <id x y>*N <n0 n1>*M
+			-- ROADE <N> <etype> <stype> <ttype> <cat> <M> <rn> <re>
+			--       <id x y z>*N <a1 a2 t0x t0y t0z t1x t1y t1z>*M
+			--       <rmnodeid>*rn <a1 a2 t0x t0y t0z t1x t1y t1z>*re
+			--       [<btype bidx>*M]
 			-- Carries real edge topology, so a road CONNECTING to existing
 			-- infrastructure replicates. Negative endpoints are the proposal's
 			-- own placeholders; positive ones are real entities in the world.
-			-- ROADE <N> <etype> <stype> <ttype> <M> <rn> <re> <id x y>*N <n0 n1>*M
+			-- Removed EDGES are full 8-token records now (same shape ROADC uses),
+			-- which is what makes the UPGRADE tool (caller 4790fc: N=0 added nodes,
+			-- M added edges, M removed edges, every endpoint an existing node)
+			-- replicable at all -- see the rm list built below.
 			--
 			-- Converted here into a purely POSITIONAL command. This runs on the
 			-- originating peer, which still has every entity the capture refers
@@ -4450,7 +4612,14 @@ local function pollInject()
 				local m     = tonumber(w[7]) or 0
 				local rn    = tonumber(w[8]) or 0
 				local re    = tonumber(w[9]) or 0
-				local ok = (n >= 1 and m >= 1 and #w >= 9 + n * 4 + m * 8 + rn + re)
+				-- n may be 0: an UPGRADE adds no nodes at all (it replaces edges
+				-- between nodes that already exist). Requiring n >= 1 is what made
+				-- an upgrade look like a malformed line.
+				-- rn / re are also floors, not just lengths: a negative count would
+				-- SHRINK the required width and then walk the bridge/tunnel tail off
+				-- into the removal records.
+				local ok = (n >= 0 and m >= 1 and rn >= 0 and re >= 0
+				            and #w >= 9 + n * 4 + m * 8 + rn + re * 8)
 
 				local posOf, order = {}, {}
 				if ok then
@@ -4481,10 +4650,23 @@ local function pollInject()
 						raw[#raw + 1] = { a1, a2, t, 0, -1 }
 					end
 				end
+				-- Removed EDGES, 8-token records like the added ones. Only the two
+				-- endpoint ids are used (the removal is named by POSITION on the
+				-- wire); the tangents are consumed to keep the offsets right.
+				local rmv = {}
+				if ok then
+					local b = 9 + n * 4 + m * 8 + rn
+					for i = 1, re do
+						local o = b + (i - 1) * 8
+						local a1, a2 = tonumber(w[o + 1]), tonumber(w[o + 2])
+						if not (a1 and a2) then ok = false; break end
+						rmv[#rmv + 1] = { a1, a2 }
+					end
+				end
 				-- Bridge/tunnel tail: <type idx> per added edge, appended AFTER the
 				-- legacy payload (old captures simply lack it -> ground).
 				if ok then
-					local tb = 9 + n * 4 + m * 8 + rn + re
+					local tb = 9 + n * 4 + m * 8 + rn + re * 8
 					if #w >= tb + m * 2 then
 						for i = 1, m do
 							raw[i][4] = tonumber(w[tb + (i - 1) * 2 + 1]) or 0
@@ -4591,17 +4773,69 @@ local function pollInject()
 						end
 					end
 
-					if #links >= 2 then
+					-- ---------- removals -> positional rm list ----------
+					--
+					-- Only removals the peer CANNOT regenerate travel. A removal
+					-- whose two endpoints are the ends of the edge some new node
+					-- sits on is a SPLIT PARENT: execPolyline splits its own copy of
+					-- that edge and removes it there, so shipping the removal too
+					-- would remove one entity twice and the engine rejects the whole
+					-- proposal. What is left is the UPGRADE case -- an edge replaced
+					-- in place between two existing nodes, invisible to any
+					-- geometric test the peer could run.
+					--
+					-- The build was CANCELLED here, so every id in the capture still
+					-- resolves; positions are read now and ids never leave.
+					local rmpos, rmbad, rmskip = {}, nil, 0
+					for _, r in ipairs(rmv) do
+						local isSplitParent = false
+						for _, ends in pairs(splitNode) do
+							if (ends[1] == r[1] and ends[2] == r[2])
+							   or (ends[1] == r[2] and ends[2] == r[1]) then
+								isSplitParent = true
+								break
+							end
+						end
+						if isSplitParent then
+							rmskip = rmskip + 1
+						else
+							local q1 = (r[1] < 0) and posOf[r[1]] or realPos(r[1])
+							local q2 = (r[2] < 0) and posOf[r[2]] or realPos(r[2])
+							if q1 and q2 then
+								rmpos[#rmpos + 1] = string.format("%.4f,%.4f,%.4f,%.4f",
+									q1[1], q1[2], q2[1], q2[2])
+							else
+								rmbad = string.format("removed edge %d->%d has no resolvable "
+									.. "endpoint position on this instance", r[1], r[2])
+								break
+							end
+						end
+					end
+
+					if rmbad then
+						-- Ship nothing. An upgrade whose removal is missing replays as
+						-- a pure ADD on the peer: a second edge between the same two
+						-- nodes, permanently diverged.
+						log("ROADE: " .. rmbad .. " -- command NOT replicated")
+					elseif #links >= 2 then
 						if dropped > 0 then
 							log(string.format("ROADE: dropped %d split half/halves " ..
 								"-- the peer regenerates them locally", dropped))
 						end
-						scheduleLocal("ROADP", { pts = table.concat(pts, ","),
-						                         links = table.concat(links, ","),
-						                         tans = table.concat(tans, ","),
-						                         bt = table.concat(bts, ","),
-						                         etype = etype, stype = stype, ttype = ttype,
-						                         cat = cat })
+						if #rmpos > 0 or rmskip > 0 then
+							log(string.format("ROADE: %d removal(s) shipped as positions, "
+								.. "%d left to the peer's own split", #rmpos, rmskip))
+						end
+						local sargs = { pts = table.concat(pts, ","),
+						                links = table.concat(links, ","),
+						                tans = table.concat(tans, ","),
+						                bt = table.concat(bts, ","),
+						                etype = etype, stype = stype, ttype = ttype,
+						                cat = cat }
+						-- omitted entirely when there is nothing to remove: an empty
+						-- 'rm=' token would not survive decodeCmd's key=value scan
+						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
+						scheduleLocal("ROADP", sargs)
 					else
 						log("inject: ROADE produced no usable edges: " .. line:sub(1, 70))
 					end
@@ -4707,11 +4941,19 @@ local function pollInject()
 					log("inject: bad ROADC line: " .. line:sub(1, 70))
 				end
 
-			elseif o == "VBUY" and #w >= 3 then
-				-- A player's BuyVehicle, from the hook. Convert NOW, on this
-				-- instance, while the ids still mean something: depot id ->
-				-- position + file, model ids -> file names.
-				local depot = tonumber(w[2])
+			elseif (o == "VBUY" or o == "VREPL") and #w >= 3 then
+				-- A player's BuyVehicle or ReplaceVehicle, from the hook. Convert
+				-- NOW, on this instance, while the ids still mean something: depot
+				-- id -> position + file, vehicle id -> cross-peer key, model ids ->
+				-- file names.
+				--
+				--   VBUY  <depotChild>    <n> <model nl loads.. r g b na autos..>*n [ng groups..]
+				--   VREPL <vehicleEntity> <n> <model nl loads.. r g b na autos..>*n [ng groups..]
+				--
+				-- The config encoding is byte-identical after the first field, so
+				-- both ops share this parser: two copies of it drifted apart the
+				-- moment one of them learned about vehicleGroups.
+				local depot = tonumber(w[2])   -- VBUY: the depot child; VREPL: the vehicle
 				local n = tonumber(w[3]) or 0
 				local i = 4
 				local parts, ok = {}, (depot ~= nil and n >= 1)
@@ -4736,68 +4978,101 @@ local function pollInject()
 				local groups = {}
 				for j = 1, ng do groups[j] = tonumber(w[i]) or 0; i = i + 1 end
 				if ok and #parts >= 1 then
-					-- The command's depot is the VEHICLE_DEPOT CHILD entity, not the
-					-- construction (measured: r9=281727, no CONSTRUCTION component).
-					-- Find the parent construction -- the one whose depots list
-					-- holds the child -- and ship ITS position and file.
-					local dx, dy, dfile, dparent
-					pcall(function()
-						local parent
-						for _, rec in pairs(consByKey) do
-							local co = api.engine.getComponent(rec.id, api.type.ComponentType.CONSTRUCTION)
-							if co and co.depots then
-								for i = 1, #co.depots do
-									if co.depots[i] == depot then parent = rec.id; break end
-								end
-							end
-							if parent then break end
+					-- Model ids are per-instance resource indices; the wire carries
+					-- file names. Encoded once here for whichever op we are in.
+					local enc = {}
+					for _, p in ipairs(parts) do
+						local name
+						pcall(function() name = api.res.modelRep.getName(p.model) end)
+						if type(name) ~= "string" or name == "" then name = "#" .. p.model end
+						enc[#enc + 1] = table.concat({ name,
+							table.concat(p.loads, "/"),
+							string.format("%.4f,%.4f,%.4f", p.color[1], p.color[2], p.color[3]),
+							table.concat(p.autos, "/") }, "~")
+					end
+
+					if o == "VREPL" then
+						-- ReplaceVehicle: the first field is the VEHICLE, so it maps
+						-- to a cross-peer key exactly like VSELL / VDEPOT / VREV do.
+						-- Without a key the peer cannot name the vehicle either, so
+						-- the replace stays local and the worlds diverge -- say so
+						-- loudly rather than ship a guess.
+						--
+						-- OPEN ITEM (needs a two-instance run to settle, not a
+						-- guess): if the engine mints a NEW entity for a replaced
+						-- vehicle, the PEER rebinds the key from its command result
+						-- (execVReplace) but the ORIGINATOR -- whose replace applied
+						-- natively, outside our command -- has no result to rebind
+						-- from, and its key would still name the dead id. The log
+						-- lines to compare are 'EXEC VREPL ... result=' on the peer
+						-- and the next 'veh: local vehicle N has no cross-peer key'
+						-- here. Do not paper over it with a poll until the capture
+						-- shows the id actually changes.
+						local k = vehKeyFor(depot)
+						if k then
+							log(string.format("VREPL: %s, %d part(s): %s", k, #parts, enc[1]:sub(1, 60)))
+							scheduleLocal("VREPL", { veh = k,
+							                         parts = table.concat(enc, ";"),
+							                         groups = table.concat(groups, "/"),
+							                         skipOrigin = 1 })
+						else
+							log(string.format("VREPL: vehicle %d has no cross-peer key -- "
+								.. "the replace stays LOCAL (divergence)", depot))
 						end
-						if not parent then
-							-- construction not in our table (e.g. from the save):
-							-- scan every construction once
-							local list = game.interface.getEntities({ radius = 999999 },
-								{ type = "CONSTRUCTION", includeData = false }) or {}
-							for _, id in pairs(list) do
-								local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+					else
+						-- The command's depot is the VEHICLE_DEPOT CHILD entity, not the
+						-- construction (measured: r9=281727, no CONSTRUCTION component).
+						-- Find the parent construction -- the one whose depots list
+						-- holds the child -- and ship ITS position and file.
+						local dx, dy, dfile, dparent
+						pcall(function()
+							local parent
+							for _, rec in pairs(consByKey) do
+								local co = api.engine.getComponent(rec.id, api.type.ComponentType.CONSTRUCTION)
 								if co and co.depots then
 									for i = 1, #co.depots do
-										if co.depots[i] == depot then parent = id; break end
+										if co.depots[i] == depot then parent = rec.id; break end
 									end
 								end
 								if parent then break end
 							end
+							if not parent then
+								-- construction not in our table (e.g. from the save):
+								-- scan every construction once
+								local list = game.interface.getEntities({ radius = 999999 },
+									{ type = "CONSTRUCTION", includeData = false }) or {}
+								for _, id in pairs(list) do
+									local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+									if co and co.depots then
+										for i = 1, #co.depots do
+											if co.depots[i] == depot then parent = id; break end
+										end
+									end
+									if parent then break end
+								end
+							end
+							if parent then
+								dparent = parent
+								local co = api.engine.getComponent(parent, api.type.ComponentType.CONSTRUCTION)
+								if co and co.transf then dx, dy = co.transf[13], co.transf[14] end
+								if co and co.fileName then dfile = tostring(co.fileName) end
+							end
+						end)
+						if not (dx and dy) then
+							log(string.format("VBUY: depot %d has no position -- NOT replicated", depot))
+						else
+							log(string.format("VBUY: depot %d at %.1f,%.1f (%s), %d part(s): %s",
+								depot, dx, dy, tostring(dfile), #parts, enc[1]:sub(1, 60)))
+							scheduleLocal("VBUY", { x = dx, y = dy, file = dfile or "?",
+							                        parts = table.concat(enc, ";"),
+							                        groups = table.concat(groups, "/"),
+							                        skipOrigin = 1 })
+							-- our own new vehicle gets the same key the peer will use
+							expectVehicle(INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
 						end
-						if parent then
-							dparent = parent
-							local co = api.engine.getComponent(parent, api.type.ComponentType.CONSTRUCTION)
-							if co and co.transf then dx, dy = co.transf[13], co.transf[14] end
-							if co and co.fileName then dfile = tostring(co.fileName) end
-						end
-					end)
-					if not (dx and dy) then
-						log(string.format("VBUY: depot %d has no position -- NOT replicated", depot))
-					else
-						local enc = {}
-						for _, p in ipairs(parts) do
-							local name
-							pcall(function() name = api.res.modelRep.getName(p.model) end)
-							if type(name) ~= "string" or name == "" then name = "#" .. p.model end
-							enc[#enc + 1] = table.concat({ name,
-								table.concat(p.loads, "/"),
-								string.format("%.4f,%.4f,%.4f", p.color[1], p.color[2], p.color[3]),
-								table.concat(p.autos, "/") }, "~")
-						end
-						log(string.format("VBUY: depot %d at %.1f,%.1f (%s), %d part(s): %s",
-							depot, dx, dy, tostring(dfile), #parts, enc[1]:sub(1, 60)))
-						scheduleLocal("VBUY", { x = dx, y = dy, file = dfile or "?",
-						                        parts = table.concat(enc, ";"),
-						                        groups = table.concat(groups, "/"),
-						                        skipOrigin = 1 })
-						-- our own new vehicle gets the same key the peer will use
-						expectVehicle(INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
 					end
 				else
-					log("inject: bad VBUY line: " .. line:sub(1, 70))
+					log("inject: bad " .. tostring(o) .. " line: " .. line:sub(1, 70))
 				end
 
 			elseif o == "VSELL" and #w >= 2 then

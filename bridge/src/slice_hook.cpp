@@ -79,6 +79,18 @@ static const int       STEAL_CMDADD = 18;
 // The two return addresses inside StreetBuilder::UpdateEngine.
 static const uintptr_t CALLER_BUILDPROPOSAL = 0x459e97;
 static const uintptr_t CALLER_CMDADD        = 0x459eb7;
+// The street/track UPGRADE tool (construction_util_street_upgrade: change road
+// or track type, add/remove catenary). It submits its own BuildProposal from a
+// different return address than the builder, with the replace-in-place shape
+// nodesToAdd=0, edgesToAdd=N, edgesToRemove=N -- every endpoint is an EXISTING
+// node, so every id in the proposal is positive (proposal dumps 2026-08-30).
+// Until now this landed in the "not the road path -- ignored" branch, so an
+// upgrade applied locally and never replicated. Captured, cancelled and
+// replayed exactly like the road path; the only differences are that the
+// removed edges have to travel (an upgrade with no removal list would build a
+// SECOND edge on top of the old one on the peer) and that there is nothing to
+// log about new nodes, because there are none.
+static const uintptr_t CALLER_UPGRADE       = 0x4790fc;
 // UI::Bulldozer::Apply's BuildProposal return address (r4_recon_dem.md A1:
 // call at 0x3eb222, return addr 0x3eb227). This caller is classified and
 // LOGGED only -- never cancelled, never injected, in this commit.
@@ -495,8 +507,15 @@ static void DumpFirstEdge(uint64_t a2)
 // ROADN carries every node, not just the endpoints. Collapsing a drawn road to
 // first-and-last would replicate a straight line where the player drew a curve
 // and still pass a hash check, because both peers would agree on the wrong road.
+//
+// Removed EDGES travel as full 8-token RECORDS (endpoints + tangents), the same
+// shape ROADC already ships, not as entity ids: an id is meaningless on the peer
+// (each instance numbers its own entities), while the two endpoint ids are
+// positive existing nodes the Lua side can resolve to POSITIONS and look up
+// again on the far end. Removed NODES stay ids and rn stays 0 -- no channel
+// needs them yet.
 static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
-                        const int32_t* rmNode, int rn, const int32_t* rmEdge, int re,
+                        const int32_t* rmNode, int rn, const Edge* rmEdge, int re,
                         const EdgeType& et)
 {
     if (!g_instance[0]) ReadInstance();
@@ -506,8 +525,14 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    // ROADE <N> <edgeType> <streetType> <trackType> <M>
-    //       <id0 x0 y0> ... <idN xN yN>   <e0.node0 e0.node1> ... <eM..>
+    // ROADE <N> <etype> <stype> <ttype> <cat> <M> <rn> <re>
+    //       <id x y z>*N
+    //       <a1 a2 t0x t0y t0z t1x t1y t1z>*M
+    //       <rmnodeid>*rn
+    //       <a1 a2 t0x t0y t0z t1x t1y t1z>*re
+    //       [<btype bidx>*M]
+    // The Lua length check is  #w >= 9 + n*4 + m*8 + rn + re*8  (+ the optional
+    // bridge tail). Both owners move together or the parser misreads the line.
     //
     // Node ids travel because edges reference them, and edge endpoints travel
     // verbatim because a positive value is a REAL entity in the existing world.
@@ -530,7 +555,11 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
                 edges[i].t0[0], edges[i].t0[1], edges[i].t0[2],
                 edges[i].t1[0], edges[i].t1[1], edges[i].t1[2]);
     for (int i = 0; i < rn; i++) fprintf(f, " %d", rmNode[i]);
-    for (int i = 0; i < re; i++) fprintf(f, " %d", rmEdge[i]);
+    for (int i = 0; i < re; i++)
+        fprintf(f, " %d %d %.4f %.4f %.4f %.4f %.4f %.4f",
+                rmEdge[i].node0, rmEdge[i].node1,
+                rmEdge[i].t0[0], rmEdge[i].t0[1], rmEdge[i].t0[2],
+                rmEdge[i].t1[0], rmEdge[i].t1[1], rmEdge[i].t1[2]);
     // Bridge/tunnel TAIL, one <type idx> pair per added edge, APPENDED after the
     // whole legacy payload: the Lua length checks are ">=", so an old parser
     // ignores it and the new one reads it at the offset it computes itself.
@@ -1116,27 +1145,37 @@ static void LogBulldoze(uint64_t r8)
 // side on THIS instance turns it into a position and the model ids into file
 // names before anything crosses to the peer. Never cancelled.
 //   VBUY <depot> <nParts> { <model> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <nGroups> <group..>
-static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
+//
+// The config half is shared with VREPL (ReplaceVehicle takes the SAME
+// TransportVehicleConfig), so validation and encoding live in these two helpers
+// rather than being written twice: one builder on the Lua side parses both
+// lines, so the two encoders drifting apart would be a silent wire break.
+//
+// VCfgParts validates the config and hands back the parts vector; it returns -1
+// when the struct cannot be trusted, and NOTHING may be written in that case --
+// a half-written line would corrupt every command after it in the inject file.
+static int VCfgParts(uint64_t cfg, uint64_t* partsBase, const char* tag)
 {
     if (!IsHeapPtr(cfg) || !Readable((void*)cfg, 0x30)) {
-        Log("[slice] VBUY: config pointer unreadable -- not shipped\n");
-        return;
+        Log("[slice] %s: config pointer unreadable -- not shipped\n", tag);
+        return -1;
     }
     uint64_t ub = 0;
     uint64_t uspan = ReadVec(cfg + 0x00, &ub, 0x80 * 64);
     if (!uspan || uspan % 0x80 != 0) {
-        Log("[slice] VBUY: parts span %llu not a multiple of 0x80 -- not shipped\n",
-            (unsigned long long)uspan);
-        return;
+        Log("[slice] %s: parts span %llu not a multiple of 0x80 -- not shipped\n",
+            tag, (unsigned long long)uspan);
+        return -1;
     }
-    int units = (int)(uspan / 0x80);
-    if (!g_instance[0]) ReadInstance();
-    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
-    char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
-    FILE* f = _fsopen(p, "a", _SH_DENYNO);
-    if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    fprintf(f, "VBUY %d %d", (int)(int32_t)depot, units);
+    *partsBase = ub;
+    return (int)(uspan / 0x80);
+}
+
+// Everything after the leading entity field: the part count, one record per
+// part, then the vehicle groups. Returns the group count (for the log line).
+static int WriteVehicleConfig(FILE* f, uint64_t cfg, uint64_t ub, int units)
+{
+    fprintf(f, " %d", units);
     for (int k = 0; k < units; k++) {
         uint64_t u = ub + (uint64_t)k * 0x80;
         int32_t model = 0;
@@ -1167,6 +1206,22 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
     for (int j = 0; j < ng; j++) {
         int32_t v = 0; memcpy(&v, (void*)(gb + 4 * j), 4); fprintf(f, " %d", v);
     }
+    return ng;
+}
+
+static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
+{
+    uint64_t ub = 0;
+    int units = VCfgParts(cfg, &ub, "VBUY");
+    if (units < 0) return;
+    if (!g_instance[0]) ReadInstance();
+    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] cannot open %s\n", p); return; }
+    fprintf(f, "VBUY %d", (int)(int32_t)depot);
+    int ng = WriteVehicleConfig(f, cfg, ub, units);
     fprintf(f, "\n");
     fclose(f);
     Log("[slice] VBUY shipped: depot=%d parts=%d groups=%d\n", (int)(int32_t)depot, units, ng);
@@ -1178,6 +1233,12 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
 //   VSELL  <n> <id..>            SellVehicle  (r8 = &vector<Entity>)
 //   VDEPOT <vehicle> <sell01>    SendToDepot  (r8 = Entity, r9 = bool)
 //   VLINE  <vehicle> <line> <stopIndex>   SetLine (r8, r9 = Entity, st[0] = int)
+//   VREPL  <vehicle> <config..>  ReplaceVehicle (r8 = Entity, r9 = config*)
+// VREPL's payload after the vehicle is byte-for-byte what VBUY writes after the
+// depot -- the same TransportVehicleConfig, the same encoder -- so the Lua side
+// builds the config for both lines with one function. Optimistic like the other
+// vehicle commands: the UI waits for the replacement's result entity, so this is
+// never cancelled and the originator skips its own replay.
 static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
 {
     if (!g_instance[0]) ReadInstance();
@@ -1194,6 +1255,19 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
         for (int i = 0; i < n; i++) { int32_t v = 0; memcpy(&v, (void*)(b + 4 * i), 4); fprintf(f, " %d", v); }
         fprintf(f, "\n");
         Log("[slice] VSELL shipped: %d vehicle(s)\n", n);
+    } else if (fid == 4) {
+        // ReplaceVehicle: r8 = the vehicle being replaced, r9 = the new
+        // TransportVehicleConfig (a pointer, unlike BuyVehicle's by-value copy
+        // on the caller's stack). A config that fails validation writes NOTHING
+        // -- the line is only opened, never begun, so the file stays parseable.
+        uint64_t ub = 0;
+        int units = VCfgParts(r9, &ub, "VREPL");
+        if (units >= 0) {
+            fprintf(f, "VREPL %d", (int)(int32_t)r8);
+            WriteVehicleConfig(f, r9, ub, units);
+            fprintf(f, "\n");
+            Log("[slice] VREPL shipped: vehicle=%d parts=%d\n", (int)(int32_t)r8, units);
+        }
     } else if (fid == 5) {
         fprintf(f, "VDEPOT %d %d\n", (int)(int32_t)r8, (int)(r9 & 1));
         Log("[slice] VDEPOT shipped: vehicle=%d sell=%d\n", (int)(int32_t)r8, (int)(r9 & 1));
@@ -1235,11 +1309,13 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
 
     // Real player buy (not a sweep): ship it. r9 = depot entity (value),
     // st[0] = pointer to the by-value config copy on the caller's stack.
-    // Sell / SendToDepot / SetLine. The scripting layer's wrappers (our own
-    // replays on the peer) live in one block, 0xcec000..0xcf2000 (ced378 =
+    // Sell / Replace / SendToDepot / SetLine. The scripting layer's wrappers (our
+    // own replays on the peer) live in one block, 0xcec000..0xcf2000 (ced378 =
     // buildProposal, cee710 = SetVehicleManualDeparture, ceefae = buyVehicle);
-    // anything else is the UI.
-    if (!groundtruth && (f.id == 3 || f.id == 5 || f.id == 6 || f.id == 7 || f.id == 8 || f.id == 9 || f.id == 10)) {
+    // anything else is the UI. ReplaceVehicle (4) joins the list: it was hooked
+    // for the ground-truth sweep only, so a player's "replace with this model"
+    // reached the wire nowhere and the peer kept the old vehicle.
+    if (!groundtruth && (f.id == 3 || f.id == 4 || f.id == 5 || f.id == 6 || f.id == 7 || f.id == 8 || f.id == 9 || f.id == 10)) {
         bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
@@ -1802,7 +1878,13 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         return 0;
     }
 
-    if (caller != CALLER_BUILDPROPOSAL) {
+    // The street/track UPGRADE tool takes the SAME path as the builder from here
+    // on: same proposal struct, same decoders, same cancel-and-replay. Its shape
+    // is the only difference (0 new nodes, N adds, N removals), and the branches
+    // below say so where it matters.
+    const bool isUpgrade = (caller == CALLER_UPGRADE);
+
+    if (caller != CALLER_BUILDPROPOSAL && !isUpgrade) {
         // Log and move on. The previous version returned here in silence, so a
         // player reporting "I can't build anything" left NO trace at all -- there
         // was no way to tell a station attempt from a bulldoze from nothing
@@ -1826,12 +1908,14 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // The ROADE->ROADP converter already resolves positive endpoints to
         // positions via realPos(), so a 0-new-node road rebuilds on the peer.
         if (m < 1) {
-            Log("[slice] road capture: no edges (n=%d m=%d) -- not a build, "
-                "letting it proceed\n", n, m);
+            Log("[slice] %s capture: no edges (n=%d m=%d) -- not a build, "
+                "letting it proceed\n", isUpgrade ? "upgrade" : "road", n, m);
             return 0;
         }
         g_captured++;
-        if (n >= 1)
+        if (isUpgrade)
+            Log("[slice] #%ld captured UPGRADE, %d edges replaced\n", g_captured, m);
+        else if (n >= 1)
             Log("[slice] #%ld captured road, %d nodes %d edges, first=(%.2f,%.2f) last=(%.2f,%.2f)\n",
                 g_captured, n, m, nodes[0].x, nodes[0].y, nodes[n - 1].x, nodes[n - 1].y);
         else
@@ -1845,10 +1929,14 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // 120-byte record became "30 removals"). DecodeNodes/DecodeEdges take a
         // base whose vector triplets sit at +0x00/+0x18, so passing r8+0x30
         // addresses exactly the two removal vectors.
+        // rmEdges is 512 like the add vector: DecodeEdges silently CAPS at maxOut,
+        // so a 64-slot buffer on an upgrade drag covering more than 64 segments
+        // would ship every add against a truncated removal list -- the peer would
+        // add edges on top of the ones it never removed.
         Node rmNodes[64];
-        Edge rmEdges[64];
+        Edge rmEdges[512];
         int rn = DecodeNodes(r8 + 0x30, rmNodes, 64);
-        int re = DecodeEdges(r8 + 0x30, rmEdges, 64);
+        int re = DecodeEdges(r8 + 0x30, rmEdges, 512);
         EdgeType et = DecodeEdgeType(r8);
         Log("[slice]   type=%s streetType=%d trackType=%d%s\n",
             et.type == 1 ? "TRACK" : "street", et.streetType, et.trackType,
@@ -1885,15 +1973,44 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // "Never cancel on an error" was already the rule in the fault handler
         // below. It just was not applied to the case where the code works fine
         // and the DATA is unusable, which is the more likely failure by far.
+        //
+        // An UPGRADE with no decodable removals is the same class of failure.
+        // It replaces edges in place, so the adds are only half the command:
+        // shipping them alone would lay a second edge over every upgraded one on
+        // the peer, and cancelling would delete the player's upgrade locally to
+        // buy that. Empty removal list -> not usable, so it stays local too.
         if (suppress && !et.ok) {
             Log("[slice]   NOT cancelling: type decode failed, so this build "
                 "cannot be replicated faithfully -- it stays local\n");
+        } else if (suppress && isUpgrade && re < 1) {
+            Log("[slice]   NOT cancelling: upgrade with %d added edge(s) decoded "
+                "0 removals -- replaying the adds alone would duplicate every "
+                "edge on the peer, so it stays local\n", m);
+        } else if (suppress && isUpgrade && re < m) {
+            // Fewer removals than adds means the peer would ADD edges over ones it
+            // never removed (a decode cap, or a shape we have not seen). Never
+            // cancel on data we cannot replay faithfully -- the same rule as a
+            // failed type decode.
+            Log("[slice]   NOT cancelling: upgrade has %d add(s) but only %d "
+                "removal(s) -- would duplicate edges on the peer, stays local\n", m, re);
         } else if (suppress) {
-            // The ROADE wire tail still ships rn=0 re=0: the Lua parser's
-            // length check (lockstep.lua) is unchanged in this commit, and the
-            // format and the parser must only ever move together (r10
-            // CONFLICTS). The stride-correct counts live in the log above.
-            WriteInject(nodes, n, edges, m, nullptr, 0, nullptr, 0, et);
+            // Removed edges travel for the UPGRADE path only. The road tool's
+            // splits are still shipped as re=0 and re-derived on each peer
+            // (execPolyline splits its own copy); turning that on here would
+            // change a working channel's behaviour in the same commit that adds
+            // a new one, and a removal the peer cannot match now SKIPS the whole
+            // command. Flip it once upgrades have proven the matcher.
+            int shipRe = isUpgrade ? re : 0;
+            WriteInject(nodes, n, edges, m, nullptr, 0, rmEdges, shipRe, et);
+            if (isUpgrade && re > m)
+                Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
+                    "more removals than adds, watch the peer\n", m, re);
+            // Arm the cancel. The Add hook matches on the COMMAND POINTER, not
+            // on a caller RVA, so the upgrade tool's own CommandList::Add call
+            // site is recognised with no extra constant -- and its completion
+            // callback is fired there like the build tool's (g_pendingNoCb stays
+            // 0: this tool waits on the callback, so swallowing it would wedge
+            // the upgrade cursor for the rest of the session).
             InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
         } else {
             Log("[slice]   suppress=0: observe-only, build proceeds normally "
