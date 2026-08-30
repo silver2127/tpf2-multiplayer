@@ -289,6 +289,25 @@ def observe(local_port=DEFAULT_PORT, sock=None, do_upnp=True, keep_upnp=False):
         except ValueError:
             pass
 
+    # --- STUN down? fall back to the UPnP mapping ---
+    # STUN is how the public ip:port is normally learned, but both servers can
+    # time out (measured 2026-08-30: 4 s no-response from each, while UPnP was
+    # perfectly healthy). Without a public candidate the shared code offers only
+    # a LAN address and a 6to4 v6, so a friend on another network has nothing to
+    # dial -- the lobby just never connects. A successful UPnP mapping already
+    # tells us the WAN IP, and the mapping is port-preserving by construction, so
+    # wan_ip:local_port IS the public candidate. Flagged in the profile so the
+    # diagnosis stays honest about where the address came from.
+    public_from_upnp = False
+    if not public_ip and upnp["open"] and upnp["wan_ip"]:
+        try:
+            addr = ipaddress.ip_address(upnp["wan_ip"])
+            if not (addr.is_private or addr in _CGNAT_NET):
+                public_ip, public_port = upnp["wan_ip"], local_port
+                public_from_upnp = True
+        except ValueError:
+            pass
+
     # --- IPv6 ---
     v6_best, v6_all = enumerate_v6()
 
@@ -307,6 +326,7 @@ def observe(local_port=DEFAULT_PORT, sock=None, do_upnp=True, keep_upnp=False):
             "v6": v6_best is not None,
         },
         "local_port": local_port,
+        "public_from_upnp": public_from_upnp,
         "stun": {
             "answers": stun_answers,
             "log": stun_log,

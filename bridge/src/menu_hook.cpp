@@ -1293,7 +1293,21 @@ static DWORD WINAPI LobbyThread(LPVOID param)
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
     HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    STARTUPINFOW si = { sizeof(si) }; si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = hLog; si.hStdError = hLog;
+    STARTUPINFOW si = { sizeof(si) };
+    // Redirect the lobby's output ONLY if the log actually opened. Handing
+    // CreateProcess an INVALID_HANDLE_VALUE as stdout/stderr gives the child a
+    // broken stdout: the first print() throws and the lobby dies seconds after
+    // start, having bound its ports but written no roster -- the menu then waits
+    // forever for events that never come, while the peer's own lobby is fine
+    // (the save still transfers, lobby-to-lobby). That is exactly the shape of
+    // the 2026-08-30 cross-network session on this machine: process alive, ports
+    // owned, lobby_proc.log untouched since the previous run.
+    if (hLog != INVALID_HANDLE_VALUE) {
+        si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = hLog; si.hStdError = hLog;
+    } else {
+        Log("[menu] cannot open %ls (err %lu) -- launching the lobby WITHOUT output capture\n",
+            logPath, GetLastError());
+    }
     PROCESS_INFORMATION pi = {};
     SetStatus(a->join ? "Joining lobby…" : "Starting lobby…");
     BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, NETDIR, &si, &pi);
@@ -1369,6 +1383,20 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         }
         if (stop || WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
         Sleep(200);
+    }
+    // Say why the tail ended. A lobby that exits on its own -- rather than after
+    // a start or a LEAVE -- left the player staring at "Starting lobby..." with no
+    // explanation; the exit code and whether any event was ever read narrow it to
+    // the process dying vs the file IPC never producing anything.
+    {
+        DWORD code = STILL_ACTIVE;
+        GetExitCodeProcess(pi.hProcess, &code);
+        if (!stop) {
+            Log("[menu] lobby process exited (code %lu) after %ld event line(s)\n",
+                code, InterlockedCompareExchange(&g_lobbyReady, 0, 0));
+            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0))
+                SetStatus("The lobby stopped before it reported anything -- see tpf2_menu.log");
+        }
     }
     // Close under g_lobbyCs so a concurrent LeaveLobby/StartLobby never waits on
     // or terminates a handle that has just been closed (and possibly reused).
