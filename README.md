@@ -222,10 +222,10 @@ menu appears. Revert with `tools\install_proxy.ps1 -Uninstall`, or use Steam's
 (the leftover `alut_real.dll` can be deleted by hand).
 
 **4. Deploy the Lua mod** with `tools\deploy_mod.ps1` (add `-Marker <string-in-the-new-code>`
-to verify the copy landed). The game reads mods from more than one directory, so the
-script copies `mod\mp_lockstep_1` to both `<game>\mods\mp_lockstep_1` and
-`<Steam>\userdata\<id>\1066780\local\mods\mp_lockstep_1`. Mods are read at load, so
-restart any running instance. Then enable **MP Lockstep** in the save's mod list
+to verify the copy landed). It copies `mod\mp_lockstep_1` to `<game>\mods\mp_lockstep_1`
+only, and deletes any copy under `userdata\<id>\1066780\local\mods` (a mod loaded from
+there gets a different id, `!mp_lockstep`, and taints every save). Mods are read at load,
+so restart any running instance. Then enable **MP Lockstep** in the save's mod list
 in-game. Never run it alongside **MP Bridge**.
 
 **5. Stage netpunch** with `tools\install_portable.ps1` (`-WhatIfOnly` for discovery only).
