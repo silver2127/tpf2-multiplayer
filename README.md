@@ -52,12 +52,11 @@ world hash matched over the test runs -- the detector is reliable for short sess
   test was over a LAN -- a NAT-to-NAT session has not been run yet.
 - The installer is an **alpha** ([Releases](https://github.com/silver2127/tpf2-multiplayer/releases)):
   it installs everything, but two-machine play has only been exercised as far as
-  the transport (see below) and the shared-save auto-load still depends on the
-  screen-coordinate click.
-- The shared-save auto-load clicks the title menu's **Continue** button at measured
-  screen coordinates (`menu_hook.cpp`, `clickContinueLoad`: four measured window sizes,
-  scaled if yours is within 5% of one). Otherwise the click is skipped and the save has
-  to be loaded by hand (PORTABILITY item 1).
+  the transport (see below).
+- After START GAME the shared save is placed in your save folder as `mp_shared` and
+  each player opens **Load Game** and picks it. An earlier build synthesised a click
+  on Continue; it depended on a table of measured button positions and missed on any
+  other resolution, so the one manual click is the reliable path for now.
 - The host must be reachable: netpunch tries UPnP, STUN and IPv6 and reports which
   worked, but the lobby is host-as-relay and assumes an open or mappable NAT. START GAME
   does nothing with zero joiners.

@@ -1498,8 +1498,14 @@ static bool MergeTemplateStreet(uint64_t r8)
         return false;
     }
     (void)nodeFl;
-    // template outer = the template node nearest to any of ours (within 2 m)
-    int X = -1, Tout = -1; float bestD = 4.0f;
+    // Template outer = the template node nearest to any of ours. Tolerance 15 m,
+    // not 2 m: the peer nudges a split point a few metres along the road when the
+    // originator's position would leave a stub (execConX STUB NUDGE), and at 2 m the
+    // pairing failed -- "no template node within 2 m of ours" -- so the raw template
+    // apron stayed put and the depot's driveway never met the road (2026-08-30, two
+    // depots visibly unconnected). The template offers only its inner and outer node,
+    // metres apart, so a wider radius still picks the same one.
+    int X = -1, Tout = -1; float bestD = 225.0f;
     for (int o = 0; o < n; o++) {
         if (isT[o]) continue;
         float ox, oy; memcpy(&ox, N + o * 24, 4); memcpy(&oy, N + o * 24 + 4, 4);
@@ -1510,7 +1516,7 @@ static bool MergeTemplateStreet(uint64_t r8)
             if (d < bestD) { bestD = d; X = o; Tout = t; }
         }
     }
-    if (X < 0) { Log("[merge] no template node within 2 m of ours -- untouched\n"); return false; }
+    if (X < 0) { Log("[merge] no template node within 15 m of ours -- untouched\n"); return false; }
 
     // ENDPOINT WELD (2026-08-29, road depot at a junction). When the UI snapped
     // the apron's outer node onto an EXISTING node J (t in {0,1}: no split, no

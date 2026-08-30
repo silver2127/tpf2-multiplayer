@@ -2547,13 +2547,41 @@ end
 -- async commands, so an immediate retry validates against a world where the
 -- buildings STILL EXIST (measured: 'cleared 3 -- retrying' then an instant
 -- second Collision, while the later diagnostic scan found the footprint empty).
-local pendingConxRetries = {}
+-- ONE construction replay in flight at a time. Placements are asynchronous: a
+-- batch dropped in the same tick has every proposal validated against the world
+-- as it was at submit time, so two depots splitting the same road (or adjacent
+-- pieces of it) fight -- the second removes an edge the first has already
+-- replaced and the engine rejects it with critical=true and NO message.
+-- Measured 2026-08-30: five depots all stamped at=6.8, numbers 1, 2 and 5 built,
+-- 3 and 4 did not. Queueing costs a few tenths of a game unit and the peer's
+-- world ends up identical either way.
+local conxBusy, conxBusyAt = false, nil
+-- Construction replays run STRICTLY IN ORDER, oldest first. They used to share the
+-- retry table, which the pump drained back-to-front, so a batch queued as 12,13,14,15
+-- replayed 15,14,13,12 and every retry landed after later depots had already built --
+-- each one then validated against a world its predecessor had not shaped yet, and the
+-- engine rejected it with critical=true and no message ("builds land out of order",
+-- 2026-08-30). Entries are { c = command, notBefore = game time }; a retry goes to the
+-- FRONT so nothing newer overtakes it.
+local conxQueue = {}
 local execConX
 execConX = function(c)
 	if c.origin == INSTANCE then
 		log(string.format("%s seq=%d: originator already built it locally, skipping", tostring(c.op), c.seq))
 		return
 	end
+	local nowB = gameTime() or 0
+	if conxBusy and conxBusyAt and (nowB - conxBusyAt) > 3.0 then
+		log(string.format("CONX: previous replay never reported back (%.1f units) -- releasing the queue", nowB - conxBusyAt))
+		conxBusy = false
+	end
+	if conxBusy then
+		conxQueue[#conxQueue + 1] = { c = c, notBefore = nowB }
+		log(string.format("%s seq=%s: another construction replay is in flight -- queued (%d waiting)",
+			tostring(c.op), tostring(c.seq), #conxQueue))
+		return
+	end
+	conxBusy, conxBusyAt = true, nowB
 	local ok, err = pcall(function()
 		local t = {}
 		for tok in tostring(c.t or ""):gmatch("[^,]+") do t[#t + 1] = tonumber(tok) end
@@ -2613,6 +2641,12 @@ execConX = function(c)
 
 		local idmap, nRm = {}, 0
 		local splitEdgeOf = {}    -- split node id -> the peer edge it splits
+		-- Kept empty: snapping a split onto an existing node was tried and reverted
+		-- (see the STUB NUDGE note below). The lookups downstream are no-ops now and
+		-- are left in place only so the intent -- 'a split node may alias an existing
+		-- one' -- stays visible if the idea is ever revisited with a way to keep the
+		-- originator's topology.
+		local snapNode = {}
 		for _, r in ipairs(rms) do
 			-- the split node: the new node with added edges to BOTH endpoints
 			local X
@@ -2628,16 +2662,111 @@ execConX = function(c)
 			local eid
 			if p then pcall(function() eid = findEdgeContaining(isTrack, p[1], p[2]) end) end
 			if eid then
-				local comp, a, b = edgeGeomT(eid)
+				local comp, a, b, ta, tb = edgeGeomT(eid)
 				if comp then
 					-- orient: the removed edge's start tangent points from r[1]
 					-- toward r[2]; our edge runs a -> b.
 					local dot = (b[1] - a[1]) * r[3] + (b[2] - a[2]) * r[4]
 					if dot >= 0 then idmap[r[1]], idmap[r[2]] = comp.node0, comp.node1
 					else idmap[r[1]], idmap[r[2]] = comp.node1, comp.node0 end
-					nRm = nRm + 1
-					sp.streetProposal.edgesToRemove[nRm] = eid
-					splitEdgeOf[X] = eid
+					-- STUB GUARD. The originator split ITS road; this peer's road is
+					-- nodded differently (town growth drifts the two worlds apart), so
+					-- the same world position can land a metre or two from an existing
+					-- node here. Splitting there leaves a 1-4 m stub and the engine
+					-- rejects the whole proposal with critical=true and NO message --
+					-- every failed depot measured on 2026-08-30 was exactly this
+					-- (stubs of 1.2, 1.7, 1.9, 2.6, 3.1, 3.9 m). Snap to that node
+					-- instead: no split, no halves, no removal, and the depot's own
+					-- connector is re-pointed at it below -- the shape the UI itself
+					-- produces when you place a depot next to a junction.
+					-- Same rule, same reason as execPolyline's XING_END_SNAP.
+					-- STUB NUDGE. The originator split ITS road; this peer's road can be
+					-- nodded differently (town roads drift between the two worlds), so the
+					-- same world position can land a metre or two from an existing node
+					-- here and the split would leave a stub the engine refuses -- rejecting
+					-- the whole proposal with critical=true and NO message.
+					--
+					-- SNAPPING to that node was tried first and is WRONG (2026-08-30): it
+					-- skips a split the originator made, so the peer ends up with fewer
+					-- road nodes, the worlds drift further, and the NEXT depot lands even
+					-- closer to a node -- failures multiplied instead of stopping. Keep the
+					-- topology identical (same nodes, same edges, same removal) and move
+					-- the split point along the edge until both halves clear MIN_STUB.
+					-- A couple of metres of driveway is invisible; a missing node is not.
+					-- 12 m, not 6: two failures measured 2026-08-30 had their split clamped
+					-- to EXACTLY 6.0 m from a node and the engine still answered
+					-- 'Construction not possible' (harvested by the strict probe below),
+					-- so the engine's own minimum is above that. If the peer's edge is too
+					-- short to host a 12 m stub at both ends there is no valid split at all
+					-- -- fall back to snapping the connector onto the nearer node, which
+					-- costs one road node of topology but leaves a depot that is connected
+					-- rather than absent.
+					-- EXPERIMENT 2026-08-30: nudging is OFF (0 = keep the originator's exact
+					-- split point). Every threshold tried so far -- 6 m, then 12 m -- still
+					-- produced 'Construction not possible', and the last failure was a split
+					-- the originator put 11.1 m from a node that the 12 m rule moved by
+					-- 0.9 m: the rule was creating the mismatch it was meant to avoid (it
+					-- also shifts the node's height off the depot's platform level). Replay
+					-- the position as sent and measure the true failure rate before adding
+					-- any correction back.
+					local MIN_STUB = 0.0
+					local function at(u) return hermitePos(a, ta, b, tb, u) end
+					local total = 0
+					do
+						local prev = at(0)
+						for k = 1, 40 do
+							local q = at(k / 40)
+							total = total + math.sqrt((q[1] - prev[1]) ^ 2 + (q[2] - prev[2]) ^ 2)
+							prev = q
+						end
+					end
+					if total <= 2 * MIN_STUB + 1 then
+						local dA0 = math.sqrt((p[1] - a[1]) ^ 2 + (p[2] - a[2]) ^ 2)
+						local dB0 = math.sqrt((p[1] - b[1]) ^ 2 + (p[2] - b[2]) ^ 2)
+						snapNode[X] = (dA0 < dB0) and comp.node0 or comp.node1
+						log(string.format("CONX: peer edge %d is only %.0f m -- no room for a %.0f m stub either side, snapping the connector to node %d",
+							eid, total, MIN_STUB, snapNode[X]))
+					end
+					if not snapNode[X] and total > 2 * MIN_STUB + 1 then
+						local uLo, uHi = MIN_STUB / total, 1 - MIN_STUB / total
+						local bestU, bestD
+						for k = 0, 200 do
+							local u = k / 200
+							local q = at(u)
+							local d = (q[1] - p[1]) ^ 2 + (q[2] - p[2]) ^ 2
+							if not bestD or d < bestD then bestD, bestU = d, u end
+						end
+						local uu = math.max(uLo, math.min(uHi, bestU or 0.5))
+						-- Cap how far the split may move. The depot's driveway still starts
+						-- at the mouth the originator chose, so moving the road end of it
+						-- stretches and skews that driveway: nudges of 0.9-3 m replayed
+						-- fine, 11 m ones were refused ('Construction not possible', merge
+						-- pairing distance d=11.17 m, 2026-08-30). Beyond the cap there is
+						-- no faithful placement on this peer -- attempt the original split
+						-- and let it fail loudly rather than build something distorted.
+						local MAX_NUDGE = 3.0
+						do
+							local q = at(uu)
+							if math.sqrt((q[1] - p[1]) ^ 2 + (q[2] - p[2]) ^ 2) > MAX_NUDGE then
+								log(string.format("CONX: peer edge %d would need a %.1f m nudge (cap %.0f m) -- this peer's road is nodded differently, replaying the split as sent",
+									eid, math.sqrt((q[1] - p[1]) ^ 2 + (q[2] - p[2]) ^ 2), MAX_NUDGE))
+								uu = bestU or uu
+							end
+						end
+						if math.abs(uu - (bestU or uu)) > 0.0001 then
+							local q = at(uu)
+							log(string.format("CONX: split point was %.1f m from an end of peer edge %d -- nudged %.1f m along it to keep both halves >= %.0f m",
+								math.min(math.sqrt((p[1]-a[1])^2 + (p[2]-a[2])^2), math.sqrt((p[1]-b[1])^2 + (p[2]-b[2])^2)),
+								eid, math.sqrt((q[1]-p[1])^2 + (q[2]-p[2])^2), MIN_STUB))
+							p[1], p[2], p[3] = q[1], q[2], q[3]
+							nodes[X] = p
+						end
+					end
+					if not snapNode[X] then
+						nRm = nRm + 1
+						sp.streetProposal.edgesToRemove[nRm] = eid
+						splitEdgeOf[X] = eid
+					end
 				end
 			else
 				log(string.format("CONX: removed edge %d->%d: no peer edge under its split -- removal skipped", r[1], r[2]))
@@ -2667,14 +2796,26 @@ execConX = function(c)
 		-- the depot's apron. Open-ground stations succeed exactly this way.)
 		local used = {}
 		local skippedApron = 0
+		-- A snapped split node (see the STUB GUARD above) behaves like an EXISTING
+		-- node from here on: the depot's own connector keeps it as its far end (that
+		-- is the weld shape the merge adopts), while the two halves of the split that
+		-- never happened are dropped along with their removal.
+		local function isNew(id) return id < 0 and not snapNode[id] end
+		local droppedHalves = 0
 		for i = #adds, 1, -1 do
 			local e = adds[i]
-			if e[1] < 0 and e[2] < 0 then
+			if snapNode[e[1]] and e[2] >= 0 or snapNode[e[2]] and e[1] >= 0 then
+				table.remove(adds, i); droppedHalves = droppedHalves + 1
+			elseif isNew(e[1]) and isNew(e[2]) then
 				table.remove(adds, i); skippedApron = skippedApron + 1
 			else
 				used[e[1]] = true; used[e[2]] = true
 			end
 		end
+		if droppedHalves > 0 then
+			log(string.format("CONX: dropped %d half/halves of a split that snapped to an existing node", droppedHalves))
+		end
+		for x, _ in pairs(snapNode) do nodes[x] = nil end
 		for id, _ in pairs(nodes) do if not used[id] then nodes[id] = nil end end
 		if skippedApron > 0 then
 			log(string.format("CONX: %d apron edge(s) left to the template; shipping split node + halves", skippedApron))
@@ -2696,9 +2837,9 @@ execConX = function(c)
 		-- :897). Continue the UI's numbering: segments right after the nodes.
 		local ei, dropped = 0, 0
 		for _, e in ipairs(adds) do
-			local n0 = (e[1] < 0) and e[1] or idmap[e[1]]
-			local n1 = (e[2] < 0) and e[2] or idmap[e[2]]
-			if n0 and n1 then
+			local n0 = snapNode[e[1]] or ((e[1] < 0) and e[1] or idmap[e[1]])
+			local n1 = snapNode[e[2]] or ((e[2] < 0) and e[2] or idmap[e[2]])
+			if n0 and n1 and n0 ~= n1 then
 				ei = ei + 1
 				local s = api.type.SegmentAndEntity.new()
 				s.entity = minId - ei
@@ -2729,11 +2870,55 @@ execConX = function(c)
 				-- construction's: the UI's halves carry the town road's type
 				-- 16 while the apron is 29.
 				local se = splitEdgeOf[e[1]] or splitEdgeOf[e[2]]
-				if se then copyEdgeProps(s, se, isTrack, stype) end
+				if se then
+					copyEdgeProps(s, se, isTrack, stype)
+					-- ...and its TANGENTS come from THIS peer's copy of the split edge,
+					-- never from the originator's. The shipped tangents describe the
+					-- originator's edge, and the two worlds' town roads drift apart
+					-- (different node spacing). Measured 2026-08-30: A split a 55 m
+					-- edge, the peer's matching edge was 28 m, so the second half was
+					-- 7 m long carrying 12 m tangents -- a Hermite that doubles back on
+					-- itself. The engine rejected the whole proposal with critical=true
+					-- and an EMPTY message list, so a depot placed near another one
+					-- silently never appeared on the peer. Re-deriving from the local
+					-- curve is identical when the worlds agree, and right when they do not.
+					pcall(function()
+						local xid = splitEdgeOf[e[1]] and e[1] or e[2]
+						local xp = nodes[xid]
+						local comp, aP, bP, taP, tbP = edgeGeomT(se)
+						if not (comp and xp) then return end
+						local bestU, bestD
+						for k = 0, 200 do
+							local u = k / 200
+							local q = hermitePos(aP, taP, bP, tbP, u)
+							local d = (q[1] - xp[1]) ^ 2 + (q[2] - xp[2]) ^ 2
+							if not bestD or d < bestD then bestD, bestU = d, u end
+						end
+						if not bestU or bestU <= 0.001 or bestU >= 0.999 then return end
+						-- Parameter of each endpoint along the peer's curve. The
+						-- difference carries the sign, so a half stored end-to-start
+						-- gets correctly negated tangents.
+						local function uOf(nid)
+							if nid == xid then return bestU end
+							if nid == comp.node0 then return 0 end
+							if nid == comp.node1 then return 1 end
+							return nil
+						end
+						local u0, u1 = uOf(n0), uOf(n1)
+						if not (u0 and u1) then return end
+						local sc = u1 - u0
+						if math.abs(sc) < 0.001 then return end
+						local t0 = hermiteTangent(aP, taP, bP, tbP, u0)
+						local t1 = hermiteTangent(aP, taP, bP, tbP, u1)
+						s.comp.tangent0 = api.type.Vec3f.new(t0[1] * sc, t0[2] * sc, t0[3] * sc)
+						s.comp.tangent1 = api.type.Vec3f.new(t1[1] * sc, t1[2] * sc, t1[3] * sc)
+					end)
+				end
 				sp.streetProposal.edgesToAdd[ei] = s
 			else
 				dropped = dropped + 1
-				log(string.format("CONX: edge %d->%d has an unmapped endpoint -- dropped", e[1], e[2]))
+				log(string.format("CONX: edge %d->%d dropped (%s)", e[1], e[2],
+					(n0 and n1) and "both ends resolve to the same node" or "an endpoint is unmapped"))
 			end
 		end
 
@@ -2752,6 +2937,27 @@ execConX = function(c)
 		-- exactly what its footprint collides with; ignoreErrors lets the engine do
 		-- the same here, and the real-BOUNDING_VOLUME sweep after success catches
 		-- anything modular layouts leave under the floor.
+		-- The engine's octree pre-check (street_builder_util.cpp CheckGraph ->
+		-- FUN_1421e2330, see docs/re/STREET_PROPOSAL_VALIDATION.md) queries a
+		-- +-0.01 m box around EVERY added node and fails SILENTLY -- no message, just
+		-- critical=true -- when something is already there. Log how close each added
+		-- node sits to an existing one so a rejection can be attributed instead of
+		-- guessed at. 1 cm is the engine's own tolerance; anything under a metre is
+		-- worth seeing.
+		pcall(function()
+			for i = 1, ni do
+				local nn = sp.streetProposal.nodesToAdd[i]
+				local px, py = nn.comp.position.x, nn.comp.position.y
+				local near = findNodeNear(isTrack, px, py, 1.0)
+				if near then
+					local nc = api.engine.getComponent(near, api.type.ComponentType.BASE_NODE)
+					local d = nc and math.sqrt((nc.position.x - px) ^ 2 + (nc.position.y - py) ^ 2) or -1
+					log(string.format("%s seq=%s: added node %s at (%.2f,%.2f) is %.3f m from EXISTING node %d%s",
+						tostring(c.op), tostring(c.seq), tostring(nn.entity), px, py, d, near,
+						(d >= 0 and d < 0.01) and "  <-- inside the engine's 0.01 m octree box, this alone refuses the build" or ""))
+				end
+			end
+		end)
 		local okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, nil, true) end)
 		if not okMake or not cmd then
 			-- Fallback: the old template path. Loses street integration but
@@ -2764,14 +2970,23 @@ execConX = function(c)
 				pcall(function() game.interface.setPlayer(newId, api.engine.util.getPlayer()) end)
 			else
 				expectedCons[key] = nil
+				-- Even the template fallback could not place it: this peer will never
+				-- have the building, so the originator must not keep its copy.
+				scheduleLocal("CONFAIL", { target = tostring(c.origin), x = t[13], y = t[14],
+				                           file = tostring(c.file), failedSeq = tostring(c.seq) })
+				log(string.format("CONX seq=%s: fallback failed too -- asked %s to roll its copy back",
+					tostring(c.seq), tostring(c.origin)))
 			end
 			log(string.format("EXEC %s seq=%s origin=%s at=%s file=%s ok=%s id=%s (fallback)",
 				tostring(c.op), tostring(c.seq), tostring(c.origin), tostring(c.at),
 				tostring(c.file), tostring(built and newId ~= nil), tostring(newId)))
+			conxBusy = false
 			return
 		end
 		local seq, origin, at, file, op = c.seq, c.origin, c.at, c.file, c.op
 		api.cmd.sendCommand(cmd, function(res, success)
+			-- The engine has answered: the next queued construction may go.
+			conxBusy = false
 			local ent = "?"
 			pcall(function() ent = tostring(res.resultEntities[1]) end)
 			log(string.format("EXEC %s seq=%s origin=%s at=%s file=%s nodes=%d edges=%d rm=%d dropped=%d success=%s ent=%s",
@@ -3004,6 +3219,134 @@ execConX = function(c)
 			end
 			if not success then
 				expectedCons[key] = nil
+				-- Dump what we actually submitted. A depot replay that fails with
+				-- critical=true and an EMPTY message list (2026-08-30) leaves no
+				-- other evidence, and every theory about WHY has to be checked
+				-- against the proposal rather than guessed from the outcome.
+				pcall(function()
+					log(string.format("%s seq=%s PROPOSAL: %d node(s) %d edge(s) %d removal(s), dropped=%d",
+						tostring(op), tostring(seq), ni, ei, nRm, dropped))
+					for i = 1, ni do
+						local nn = sp.streetProposal.nodesToAdd[i]
+						log(string.format("  node[%d] id=%s pos=(%.2f,%.2f,%.2f)", i, tostring(nn.entity),
+							nn.comp.position.x, nn.comp.position.y, nn.comp.position.z))
+					end
+					for i = 1, ei do
+						local se2 = sp.streetProposal.edgesToAdd[i]
+						log(string.format("  edge[%d] id=%s %s->%s type=%s streetType=%s", i, tostring(se2.entity),
+							tostring(se2.comp.node0), tostring(se2.comp.node1), tostring(se2.type),
+							tostring(se2.streetEdge and se2.streetEdge.streetType)))
+					end
+					for i = 1, nRm do
+						local reid = sp.streetProposal.edgesToRemove[i]
+						local rc = reid and api.engine.getComponent(reid, api.type.ComponentType.BASE_EDGE)
+						local p0 = rc and api.engine.getComponent(rc.node0, api.type.ComponentType.BASE_NODE)
+						local p1 = rc and api.engine.getComponent(rc.node1, api.type.ComponentType.BASE_NODE)
+						-- Is this edge FROZEN into a construction (its apron, or a piece a
+						-- previous depot's weld adopted)? A plain street proposal cannot
+						-- remove a construction-owned edge, and the engine rejects it with
+						-- critical=true and NO message -- the exact shape seen when two
+						-- depots are placed close together (2026-08-30).
+						local owner, ownerFile = nil, nil
+						pcall(function()
+							local ax = p0 and p0.position.x or (rc and 0) or 0
+							local ay = p0 and p0.position.y or 0
+							for _, cid in pairs(game.interface.getEntities({ pos = { ax, ay }, radius = 80 },
+									{ type = "CONSTRUCTION", includeData = false }) or {}) do
+								local cc = api.engine.getComponent(cid, api.type.ComponentType.CONSTRUCTION)
+								if cc and cc.frozenEdges then
+									for _, fe in pairs(cc.frozenEdges) do
+										if fe == reid then owner = cid; ownerFile = tostring(cc.fileName) end
+									end
+								end
+							end
+						end)
+						if owner then
+							log(string.format("  remove[%d] edge=%s is FROZEN into construction %s (%s) -- a street proposal cannot remove it",
+								i, tostring(reid), tostring(owner), tostring(ownerFile)))
+						end
+						log(string.format("  remove[%d] edge=%s n0=%s%s n1=%s%s", i, tostring(reid),
+							tostring(rc and rc.node0),
+							p0 and string.format("(%.1f,%.1f)", p0.position.x, p0.position.y) or "",
+							tostring(rc and rc.node1),
+							p1 and string.format("(%.1f,%.1f)", p1.position.x, p1.position.y) or ""))
+					end
+				end)
+				-- LAST RESORT + BISECTION. When even the retry failed, rebuild the SAME
+				-- construction with NO street payload at all. Two things come out of it:
+				-- the player gets their depot (unconnected, but present, instead of the
+				-- building silently missing on this peer), and the result localises the
+				-- fault -- if the construction alone builds, the rejection is in the
+				-- street vectors we ship, not in the construction or its template.
+				-- (docs/re/STREET_PROPOSAL_VALIDATION.md narrows it to "something we add
+				-- already exists and we did not remove it"; this says which half.)
+				if c.retried and not c.bare then
+					pcall(function()
+						local sp2 = api.type.SimpleProposal.new()
+						local ce2 = api.type.SimpleProposal.ConstructionEntity.new()
+						ce2.fileName = tostring(c.file)
+						ce2.params = params
+						ce2.transf = api.type.Mat4f.new(
+							api.type.Vec4f.new(t[1], t[2], t[3], t[4]),
+							api.type.Vec4f.new(t[5], t[6], t[7], t[8]),
+							api.type.Vec4f.new(t[9], t[10], t[11], t[12]),
+							api.type.Vec4f.new(t[13], t[14], t[15], t[16]))
+						ce2.playerEntity = api.engine.util.getPlayer()
+						ce2.name = unescName(c.name)
+						sp2.constructionsToAdd[1] = ce2
+						local cmd2 = api.cmd.make.buildProposal(sp2, nil, true)
+						if not cmd2 then return end
+						expectedCons[key] = true
+						api.cmd.sendCommand(cmd2, function(res3, ok3)
+							local e3 = "?"
+							pcall(function() e3 = tostring(res3.resultEntities[1]) end)
+							log(string.format("%s seq=%s BARE probe (construction only, no street payload): success=%s ent=%s -- %s",
+								tostring(op), tostring(seq), tostring(ok3), e3,
+								ok3 and "the STREET payload is what the engine refuses" or "the CONSTRUCTION itself is refused here"))
+							if not ok3 then
+								expectedCons[key] = nil
+								-- Nothing of this placement exists here. Tell the originator to
+								-- undo its own copy so the worlds stay identical; it is the only
+								-- side that can, and leaving it standing diverges us forever.
+								scheduleLocal("CONFAIL", { target = tostring(origin), x = t[13], y = t[14],
+								                           file = tostring(c.file), failedSeq = tostring(seq) })
+								log(string.format("%s seq=%s: asked %s to roll its copy back",
+									tostring(op), tostring(seq), tostring(origin)))
+							else
+								-- The bare construction stands but WITHOUT its road connection,
+								-- while the originator has the connector edges: still a
+								-- divergence, just a visible one. Roll both sides back.
+								pcall(function() game.interface.bulldoze(tonumber(e3)) end)
+								expectedCons[key] = nil
+								scheduleLocal("CONFAIL", { target = tostring(origin), x = t[13], y = t[14],
+								                           file = tostring(c.file), failedSeq = tostring(seq) })
+								log(string.format("%s seq=%s: bare copy removed again and %s asked to roll back -- an unconnected depot on one side only is still a divergence",
+									tostring(op), tostring(seq), tostring(origin)))
+							end
+						end)
+					end)
+				end
+				-- WHY did it fail? The first attempt runs with ignoreErrors=TRUE, and in
+				-- that mode the engine returns critical=true with an EMPTY message list,
+				-- which tells us nothing. Re-submit the identical proposal with
+				-- ignoreErrors=FALSE purely to harvest the message -- stricter than the
+				-- attempt that already failed, so it cannot build anything by accident.
+				pcall(function()
+					local strict = api.cmd.make.buildProposal(sp, nil, false)
+					if not strict then return end
+					api.cmd.sendCommand(strict, function(res2, ok2)
+						local msgs = ""
+						pcall(function()
+							local es2 = res2.resultProposalData and res2.resultProposalData.errorState
+							if es2 then
+								for i = 1, #es2.messages do msgs = msgs .. " '" .. tostring(es2.messages[i]) .. "'" end
+								for i = 1, #(es2.warnings or {}) do msgs = msgs .. " warn:'" .. tostring(es2.warnings[i]) .. "'" end
+								msgs = msgs .. " critical=" .. tostring(es2.critical)
+							end
+						end)
+						log(string.format("%s seq=%s STRICT probe: success=%s%s", tostring(op), tostring(seq), tostring(ok2), msgs))
+					end)
+				end)
 				local collided = false
 				pcall(function()
 					local es = res.resultProposalData and res.resultProposalData.errorState
@@ -3025,7 +3368,19 @@ execConX = function(c)
 				-- (town) constructions overlapping the footprint, then retry once.
 				-- Only unowned ones, and only on a Collision, so this can never
 				-- eat a player's building.
-				if collided and not c.retried then
+				-- Retry on ANY failure, not just a "Collision" message. The first
+				-- attempt already runs with ignoreErrors=true, so a failure here is
+				-- a hard reject -- and a road depot dropped where the peer still had
+				-- two ASSET_GROUPs under the footprint failed with critical=true and
+				-- an EMPTY message list (2026-08-30), so the Collision-only gate did
+				-- nothing at all and the depot never appeared on the peer. The clear
+				-- itself is unchanged and stays conservative: unowned, non-survivor,
+				-- inside the station-local footprint box, once.
+				if not c.retried then
+					if not collided then
+						log(string.format("%s seq=%s: failure carried no 'Collision' message -- clearing the footprint anyway",
+							tostring(op), tostring(seq)))
+					end
 					-- Clear by FOOTPRINT, not a fixed disc: a modular station
 					-- extends far beyond 40 m of its centre, and with many
 					-- buildings under it the outer ones survived the old clear,
@@ -3103,18 +3458,28 @@ execConX = function(c)
 							end
 						end
 					end)
+					-- Retry once EVEN IF nothing was cleared. Builds and bulldozes are
+					-- async: two depots placed in the same tick split the same road, and
+					-- the second proposal is validated against a world where the first
+					-- split has not landed yet -- it removes an edge that is already
+					-- gone and fails with critical=true and no message (measured
+					-- 2026-08-30: seq=3 and seq=4 both stamped t=41, the first built,
+					-- the second did not). Re-running rebuilds the proposal from the
+					-- CURRENT world, so the retry resolves the edge that actually
+					-- exists by then.
 					if cleared > 0 then
 						log(string.format("%s seq=%s: cleared %d town obstacle(s) under the footprint -- retry in 1.5",
 							tostring(op), tostring(seq), cleared))
 						CM.cmLog(string.format("STN: %s seq=%s pre-clear: %d obstacle(s) bulldozed, %d survivor(s) protected (box %.0fx%.0f m)",
 							tostring(op), tostring(seq), cleared, #survPts, 2 * limU, 2 * limV))
-						local again = {}
-						for k, v in pairs(c) do again[k] = v end
-						again.retried = 1
-						pendingConxRetries[#pendingConxRetries + 1] = { c = again, at = (gameTime() or 0) + 1.5 }
 					else
-						log(string.format("%s seq=%s: Collision but nothing unowned to clear", tostring(op), tostring(seq)))
+						log(string.format("%s seq=%s: nothing to clear -- retrying anyway in case the world was mid-change",
+							tostring(op), tostring(seq)))
 					end
+					local again = {}
+					for k, v in pairs(c) do again[k] = v end
+					again.retried = 1
+					table.insert(conxQueue, 1, { c = again, notBefore = (gameTime() or 0) + 1.5 })
 				end
 				-- Diagnostic: what player/town constructions sit near the footprint?
 				-- A station placed over town buildings auto-demolishes them on the
@@ -3146,7 +3511,68 @@ execConX = function(c)
 			end
 		end)
 	end)
-	if not ok then log("execConX error: " .. tostring(err)) end
+	-- Any early return inside the body (bad transf, no command built) leaves the
+	-- gate held; the watchdog above would clear it after 3 units, but releasing
+	-- it here keeps the queue moving. A live sendCommand has already cleared it.
+	if not ok then log("execConX error: " .. tostring(err)); conxBusy = false end
+end
+
+-- The peer could not build a construction this instance placed: undo it here so
+-- the two worlds stay identical. Sent by the peer as CONFAIL with target = the
+-- ORIGINATING instance's letter; only that instance acts on it. Without this a
+-- refused replay left the building standing on one side forever -- a permanent,
+-- silent divergence that every later command near it inherited.
+local function execConFail(c)
+	if tostring(c.target) ~= INSTANCE then return end
+	local ok, err = pcall(function()
+		local key = conKey(c.x, c.y)
+		-- EXACT match only. The first version took the nearest player construction
+		-- within 5 m, and with depots placed a few metres apart it rolled back a
+		-- NEIGHBOUR that the peer had built fine -- so the peer kept that depot and
+		-- its road split while this side lost both (edge counts 1116 vs 1114 with
+		-- construction counts equal, 2026-08-30). The originator placed this exact
+		-- construction from this exact transform, so its own copy is at the position
+		-- the peer echoed back, to the centimetre. Prefer our own registry entry;
+		-- otherwise accept only a same-file construction within 1 m. No candidate
+		-- means it is already gone -- never guess at a neighbour.
+		local best, bestD
+		local rec = consByKey[key]
+		local recAlive = false
+		if rec and rec.id then pcall(function() recAlive = api.engine.entityExists(rec.id) end) end
+		if recAlive then
+			best, bestD = rec.id, 0
+		else
+			for _, id in pairs(game.interface.getEntities({ pos = { c.x, c.y }, radius = 5 },
+					{ type = "CONSTRUCTION", includeData = false }) or {}) do
+				local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+				local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
+				if co and po and co.transf and (not c.file or tostring(co.fileName) == tostring(c.file)) then
+					local dx, dy = co.transf[13] - c.x, co.transf[14] - c.y
+					local d = dx * dx + dy * dy
+					if d < 1.0 and (not bestD or d < bestD) then best, bestD = id, d end
+				end
+			end
+		end
+		if not best then
+			log(string.format("EXEC CONFAIL seq=%s: no %s of ours within 1 m of %.1f,%.1f -- already gone, nothing rolled back",
+				tostring(c.seq), tostring(c.file), c.x, c.y))
+			return
+		end
+		-- Our own removal detector must not echo this back to the peer as a
+		-- player demolish: mark the spot first, exactly as execDemolish does.
+		expectedDemolish[key] = true
+		consByKey[key] = nil
+		if CM.cmMode == "companies" then
+			local hasCon = false
+			pcall(function() hasCon = api.engine.getComponent(best, api.type.ComponentType.CONSTRUCTION) ~= nil end)
+			if hasCon then pcall(game.interface.setBulldozeable, best, true) end
+		end
+		local done = pcall(game.interface.bulldoze, best)
+		log(string.format("EXEC CONFAIL seq=%s: %s rolled back locally (entity %d at %.1f,%.1f) -- the peer refused it",
+			tostring(c.seq), tostring(c.file), best, c.x, c.y))
+		if not done then log(string.format("EXEC CONFAIL seq=%s: bulldoze REFUSED -- worlds now differ", tostring(c.seq))) end
+	end)
+	if not ok then log("execConFail error: " .. tostring(err)) end
 end
 
 local function execute(c)
@@ -3156,6 +3582,7 @@ local function execute(c)
 	elseif c.op == "ROAD" or c.op == "RAIL" then execEdge(c)
 	elseif c.op == "CON" then execCon(c)
 	elseif c.op == "DEMOLISH" then execDemolish(c)
+	elseif c.op == "CONFAIL" then execConFail(c)
 	elseif c.op == "VBUY" then execVBuy(c)
 	elseif c.op == "VREPL" then execVReplace(c)
 	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then execVehCmd(c)
@@ -5333,13 +5760,12 @@ function data()
 			pollVehKeys()
 			primeLineKeys()
 			pollLineKeys()
-			if #pendingConxRetries > 0 then
-				local nowG = gameTime()
-				for i = #pendingConxRetries, 1, -1 do
-					if nowG and nowG >= pendingConxRetries[i].at then
-						local e = table.remove(pendingConxRetries, i)
-						execConX(e.c)
-					end
+			if not conxBusy and #conxQueue > 0 then
+				local nowG = gameTime() or 0
+				local head = conxQueue[1]
+				if not head.notBefore or nowG >= head.notBefore then
+					table.remove(conxQueue, 1)
+					execConX(head.c)
 				end
 			end
 			if ticks % REMOVAL_POLL_EVERY == 0 then pollConstructionRemovals() end

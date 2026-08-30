@@ -1168,6 +1168,8 @@ static bool placeSaveNewest(const wchar_t* srcSav)
 // The overlay is post-present pixels (not a window), so the game's Continue stays
 // hittable at its measured position; we collapse the overlay first for clarity.
 // Returns true once the click took the game off the title menu (load started).
+// UNUSED since 2026-08-30 -- doStartLoad now asks the player to load the save.
+// Kept for reference until the menu's own load action is called directly.
 static bool clickContinueLoad()
 {
     // Continue only exists on the title page. If the user is in Settings / Load
@@ -1224,13 +1226,17 @@ static bool doStartLoad(const wchar_t* srcSav)
 {
     if (!srcSav || !srcSav[0]) { Log("[menu] doStartLoad: empty src\n"); SetStatus("No save to load."); return false; }
     if (!placeSaveNewest(srcSav)) { SetStatus("Couldn't place the shared save -- not loading"); return false; }
-    InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1);   // clear overlay off Continue
-    Sleep(400);
-    // Host-side delay: on one machine both instances share the cursor, and a
-    // synthetic click lands on whichever window is foreground. The joiner clicks
-    // first; the host waits so the two click bursts never interleave.
-    if (InterlockedCompareExchange(&g_isHost, 0, 0)) Sleep(4000);
-    return clickContinueLoad();
+    // THE PLAYER LOADS IT. Synthesising a click on the title menu's Continue button
+    // needed a table of measured button positions per window size, missed entirely on
+    // any resolution not in it (2880x1801 on the test laptop), fought the other
+    // instance for the one system cursor when two games ran on a single machine, and
+    // did nothing at all if the player happened to be on another menu page. The save
+    // is placed and stamped newest either way, so asking for one click always works.
+    // clickContinueLoad() is kept below, unused, until the proper fix lands: calling
+    // the menu's own load action (docs/re/LOAD_SAVE.md).
+    Log("[menu] shared save placed as mp_shared -- the player loads it from LOAD GAME\n");
+    SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
+    return true;
 }
 
 // Ask lobby.py to quit, give it up to waitMs to exit cleanly, then kill it. The
