@@ -1,0 +1,60 @@
+==============================================================================
+## string: 'MainMenu'
+   at 0x14301f878: 1 rip-rel reference(s)
+     ref 0x140668ccd -> func 0x140667bc0 [0x140667bc0-0x14066a23f, 9855 bytes]
+==============================================================================
+## string: 'UI::CMenuUI::CreatePageMain'
+   (not found)
+==============================================================================
+## string: 'void __cdecl UI::CMenuUI::CreatePage(enum UI::CMenuUI::Page)'
+   at 0x14301f5f8: 1 rip-rel reference(s)
+     ref 0x140663e57 -> func 0x140663370 [0x140663370-0x140663ebc, 2892 bytes]
+
+==============================================================================
+## candidate functions, identified by the strings they reference
+
+### func 0x140663370  (matched: void __cdecl UI::CMenuUI::CreatePage(enum UI::CMenuUI::Page))
+    size 2892 bytes, 20 direct caller(s)
+      str: '_urbangames_deluxe_pack'
+      str: '_urbangames_preorder_pack'
+      str: 'Mods changed, recreating data...'
+      str: 'void __cdecl UI::CMenuUI::CreatePage(enum UI::CMenuUI::Page)'
+      str: 'C:\\GitLab-Runner\\builds\\1BJoMpBZ\\0\\ug\\urban_games\\train_fever\\src\\Game\\UI\\Components\\MenuUI.cpp'
+      str: '!climates.empty()'
+
+### func 0x140667bc0  (matched: MainMenu)
+    size 9855 bytes, 1 direct caller(s)
+      str: 'Free Game'
+      str: 'Campaign'
+      str: 'Load Game'
+      str: 'Map Editor'
+      str: 'Settings'
+      str: 'Mod Browser'
+      str: 'Exit'
+      str: 'Button'
+      str: 'Credits'
+      str: 'credits-button'
+      str: 'MainMenu'
+      str: 'continue'
+      str: 'list-item'
+      str: 'ui/icons/game-menu/user.tga'
+      str: 'See your achievements'
+      str: 'platform-pc'
+      str: 'username-button'
+      str: 'ui/icons/game-menu/installed_dlcs.tga'
+      str: 'See Deluxe Edition info'
+      str: 'edition-wrap'
+      str: 'bottom-right-wrap'
+      str: 'ui/warning_big.tga'
+      str: 'intel-hd-warning'
+      str: 'An integrated graphic chip is active. For best performance, make sure to:'
+      str: '  - activate your dedicated graphics card (if available)'
+      str: '  - install the latest graphics drivers'
+      str: 'This warning can be deactivated in the settings Advanced tab.'
+      str: 'opaque50'
+      str: 'main-menu'
+      str: 'ui/menu_document.tga'
+      str: 'Accept!'
+      str: 'Cancel'
+      str: 'Keep resolution?'
+      str: 'keep-resolution'

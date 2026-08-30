@@ -1,0 +1,41 @@
+# Drives one of each construction type past the applyProposal probe.
+#
+# The question this answers is NOT "does the game build things" -- it is
+# whether SCRIPT-issued builds (game.interface / api.cmd, which is how our
+# replay works) reach the same native choke point as UI builds.
+#
+#   they do     -> one tap sees every action from either origin. Echo
+#                  suppression becomes one "this is a remote apply" flag
+#                  instead of the 12 shadow tables and 10 TTLs we have now.
+#   they do not -> capture and replay stay separate paths, and the tap only
+#                  replaces the CAPTURE half. Still worth doing, worth less.
+#
+# Read tpf2_probe_apply.log alongside this: each COMMIT block prints the
+# proposal pointer, the transform, and every resource path reachable from the
+# proposal -- which is what tells a depot apart from a modular station.
+
+SNAPSHOT before
+
+LOG road: the simplest proposal
+ROAD 400 -5200 500 -5200
+WAIT 30
+
+LOG rail: different edge type, same proposal machinery
+RAIL 400 -5400 500 -5400
+WAIT 30
+
+LOG depot: a construction with params
+DEPOT 700 -5200
+WAIT 40
+
+LOG station edit: upgradeConstruction on a MODULAR rail station (9 modules).
+LOG This is the case that has been failing, so its proposal is the one to read.
+SELFUPGRADE station/rail/modular_station
+WAIT 40
+
+LOG demolish path, for completeness
+DELROAD 400 -5200 500 -5200
+WAIT 30
+
+SNAPSHOT after
+END

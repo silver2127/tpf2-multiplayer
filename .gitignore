@@ -1,0 +1,40 @@
+# build output (DLLs, objects, import libs) -- rebuild with bridge/build_*.bat
+bridge/out/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+injector/*.exe
+
+# frozen lobby exe -- rebuild with PyInstaller, see docs/PORTABILITY.md
+netpunch/dist/
+netpunch/build/
+*.spec.bak
+
+# python
+__pycache__/
+*.pyc
+
+# runtime state written by the lobby / harness / game hooks
+netpunch/lobby_in.jsonl
+netpunch/lobby_out.jsonl
+netpunch/lobby_state.json
+netpunch/lobby_proc.log
+netpunch/*_out.txt
+netpunch/*_err.txt
+netpunch/netpunch_status.txt
+netpunch/incoming_save.*
+tools/.autotest_offset
+tools/shots/
+*.log
+*.lastsession
+
+# game saves are never committed
+*.sav
+*.sav.lua
+
+# local scratch
+backup/
+.claude/
+*.orig

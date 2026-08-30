@@ -1,0 +1,24 @@
+# Tests the CONMOD channel: editing a construction IN PLACE.
+#
+# An edit creates no entity and destroys none -- it rewrites the construction's
+# params. The old capture only asked "is this id new?", so edits were invisible
+# and "only some of the edits carried over" (the ones that happened to also
+# spawn edges). Replay is game.interface.upgradeConstruction, the same call the
+# shipped constructionupgrader.lua makes.
+#
+# Expect: one CONMOD line captured, shipped, and replayed ok=true on the joiner.
+#
+# autotest.ps1 shifts every X here onto virgin ground per run.
+
+SNAPSHOT before
+
+LOG place a depot to edit
+DEPOT -1800 -3400
+WAIT 30
+
+LOG edit it in place -- changes params, no new entity
+CONEDIT -1800 -3400 paramX 1
+WAIT 80
+
+SNAPSHOT after
+END

@@ -1,0 +1,6 @@
+1406785c0 StartSavegame
+1406410b0 continue_lambda_main
+14067d130 loadgame_caller
+142471830 GetSavegameInfo
+1402e5ec0 LoadGame_fn
+140640980 menu_load_lambda

@@ -1,0 +1,29 @@
+# ACTION MAP verification batch. RVAs; image base 0x140000000.
+#
+# Everything here was identified WITHOUT decompiling -- from __FUNCSIG__ assert
+# strings, __FILE__ anchors, RTTI vftable slots and the direct call graph. This
+# batch exists to check those inferences against the actual code, because the
+# project has already lost hours to three confident-but-wrong diagnoses reached
+# by a single method.
+
+# --- the two claimed choke points. If these are not what the name-inference
+# says, the whole map is built on sand.
+9dc750  make_cmd_BuildProposal      # inferred: alphabetical gap Book<?<BuyVehicle, and 17 builder callers
+9d2a00  CommandList_Add             # inferred: commandlist.cpp, 81 callers, every UI command path
+
+# --- one commit function per UI tool, all of which call the two above
+4310d0  ProposalAction_commit       # terraform / terrain paint / asset brush
+419aa0  ConstructionBuilder_MousePressed
+42b810  ModuleBuilder_MousePressed
+3eaeb0  Bulldozer_Apply
+478d70  TrackModifier_Build
+460a30  StreetTerminalBuilder_commit
+4b6f00  AddModuleComp_commit
+4705c0  TownBuilder_commit
+
+# --- the tool-specific hop into ProposalAction_commit (vftable slot 14)
+4684a0  TerrainModifier_slot14
+
+# --- non-construction commands, to confirm the same CommandList path
+215c180 line_util_CreateLine
+88afd0  vehicle_button_util_SetLineAllDo

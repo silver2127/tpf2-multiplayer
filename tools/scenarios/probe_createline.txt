@@ -1,0 +1,16 @@
+# Discovery only -- builds nothing.
+#
+# Finds createLine's signature by CONSTRUCTING the command object and never
+# dispatching it. An arity mismatch raises a catchable Lua error; actually
+# sending a malformed command is what has hard-crashed this game before
+# (empty loadConfig -> SIGABRT, missing vehicleGroups -> hang, neither
+# catchable from Lua).
+#
+# Also confirms a Line object can be assembled at all from the shape measured
+# by `PROBE fields`.
+
+LOG createLine signature
+PROBE createline
+WAIT 5
+
+END

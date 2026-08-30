@@ -1,0 +1,5 @@
+# apply-side taps: the command executor and the construction command handler.
+# Both are inferred from source-file attribution plus one call edge each, so
+# they are the two claims in the map that most need reading the actual code.
+9da290  apply_command_ApplyCommands
+9d6e20  apply_command_BuildProposalVisitor

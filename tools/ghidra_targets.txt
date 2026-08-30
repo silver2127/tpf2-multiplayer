@@ -1,0 +1,36 @@
+# Targets for DecompileTargets.py. RVAs; image base is 0x140000000.
+#
+# Chosen to answer ONE question: what does a proposal contain, and can we build
+# one? Everything else in this 138k-function binary is out of scope until that
+# is settled. Provenance for each address is M1 (static) or M2 (live-hit), so
+# a "NO FUNCTION" result means the address moved on this build, not that the
+# script is broken.
+
+# ---- the commit choke point (M2: 102 paired hits per depot build; re-confirmed
+# firing on build 35924 by bridge/src/probe_apply.cpp, incl. for SCRIPT builds).
+# rdx = the proposal. The live capture found construction params reachable at
+# proposal+0xe8, so this function's field accesses are the thing to read.
+9e76e0  applyProposal
+
+# secondary apply path (M2 found the same proposal ptr passed rdx->rcx)
+9ee4f0  applyProposal_secondary
+
+# ---- make_proposal chain: these WRITE the proposal, so their field offsets
+# name what the commit later reads. Highest value for deriving the layout.
+a16d00  make_proposal_transform
+a18ca0  make_proposal_params
+
+# ---- the script boundary. api.cmd.* goes sol2 -> here -> CommandList, and our
+# replay uses exactly this path. If we ever want to CONSTRUCT a proposal rather
+# than parse one, this is where to learn how.
+83110   sol2_trampoline
+
+# ---- CommandList: script-facing per M2, not the UI path, but it is how a
+# remote command would be injected (REPORT.md 5.3 step 3).
+9d54a0  apply_command_0
+9dc5e0  make_command_0
+
+# ---- the native vehicle-purchase factory already hooked in buyhook.cpp;
+# included as a CONTROL. Its layout is known and working, so if the decompiler
+# renders this one sensibly the output for the unknown targets can be trusted.
+9dca00  buyVehicle_factory

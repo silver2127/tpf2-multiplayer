@@ -1,0 +1,1 @@
+40b4c0 addchild  # FUN_14040b4c0(dest,src,handler) -- the real attach

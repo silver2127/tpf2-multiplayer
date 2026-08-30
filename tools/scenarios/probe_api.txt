@@ -1,0 +1,27 @@
+# Discovery only -- builds nothing, so it is safe to run on any save and does
+# not consume virgin ground.
+#
+# Asks the live sol2 bindings what they actually expose, instead of guessing.
+# Guessing at these signatures has hard-crashed the game twice (an empty
+# loadConfig SIGABRTs; a missing vehicleGroups hangs) and neither is catchable
+# from Lua, so the cost of a wrong guess is a process kill and a reload.
+#
+# Read the answers out of mp_test_results_<inst>.txt.
+
+LOG what commands exist
+PROBE cmd
+WAIT 5
+
+LOG line and stop types
+PROBE line
+WAIT 5
+
+LOG vehicle config types
+PROBE veh
+WAIT 5
+
+LOG what the world already contains
+PROBE world
+WAIT 5
+
+END

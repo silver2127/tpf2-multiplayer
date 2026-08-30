@@ -1,0 +1,18 @@
+# Reads only -- dispatches nothing, so it cannot wedge the sim. Every other
+# approach to the buyVehicle problem so far has cost an instance.
+#
+# ESTABLISHED: the fault is the TransportVehicleConfig, not the command family
+# and not the call site. setLine (ids only, no config) works fine from the GUI
+# state and the sim keeps ticking; buyVehicle from the same place wedges it.
+#
+# I had thought a known-good config required a manual UI purchase with the
+# native hook logging it. It does not: this save is full of vehicles the GAME
+# built, and their configs are the reference. This dumps one field by field
+# next to what the harness constructs, so the offending field can be read off
+# the diff.
+
+LOG reference config from a game-built vehicle, vs ours
+PROBE vehcfg
+WAIT 5
+
+END

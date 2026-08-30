@@ -1,0 +1,4 @@
+# Menu RE round 3: the action binding + a handler
+21c930 action_reg     # FUN_14221c930(ctx,"Free Game") -- button-with-action factory
+677d00 handler_newgame # a CreatePage-caller: per-action handler
+67cb70 handler_b       # another CreatePage caller cluster member

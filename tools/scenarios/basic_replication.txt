@@ -1,0 +1,46 @@
+# WAIT is in script ticks. MEASURED: update() runs at 10 Hz, so 10 ticks = 1 s.
+#
+# COORDINATES: do not hand-edit these for freshness. autotest.ps1 shifts every
+# X in this file by an offset that advances each run (tools/.autotest_offset), so
+# each run lands on virgin ground. Re-running on used ground fails everything:
+# buildConstruction trips `!proposalData.errorState.critical' (fatal assert,
+# caught by pcall but it still writes a minidump) and the edges collide.
+#
+# EXPECTED RESULT as of the last run:
+#   depot           -> builds and replicates
+#   road pair       -> both build, both replicate
+#   rail 1 and 3    -> build and replicate
+#   rail 2 (middle) -> FAILS ON THE HOST, success=false. This is task 13:
+#                      mptest.actEdge always creates fresh nodes instead of
+#                      reusing the node an adjacent segment already put there,
+#                      so any segment touching an existing endpoint is rejected.
+#                      It is left in deliberately -- it is the regression marker
+#                      for node reuse. When task 13 lands this should go green.
+
+SNAPSHOT before
+
+LOG placing a road depot
+DEPOT -1800 -3300
+WAIT 20
+
+# Kept 100 m clear of the depot. At 10 m the first segment starts inside the
+# depot's own footprint and the game rejects it, which looked like a
+# replication failure but was the host refusing to build at all.
+LOG two connected road segments
+ROAD -1790 -3200 -1750 -3200
+WAIT 10
+ROAD -1750 -3200 -1710 -3200
+WAIT 20
+
+# Rail as a CHAIN sharing an endpoint -- the shape that used to deadlock replay,
+# and the shape that exposed rails being built as roads (e.type was never set).
+LOG three chained rail segments
+RAIL -1790 -3250 -1740 -3250
+WAIT 10
+RAIL -1740 -3250 -1690 -3250
+WAIT 10
+RAIL -1690 -3250 -1640 -3250
+WAIT 40
+
+SNAPSHOT after
+END

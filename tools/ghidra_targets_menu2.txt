@@ -1,0 +1,4 @@
+# Menu RE round 2: the page factory and the button helper
+663370 createpage      # UI::CMenuUI::CreatePage(enum Page) -- rebuilds on nav
+7c5d30 menubutton      # called 9x from the main-page builder; label as arg
+677d00 newgame_caller  # example of a page-transition caller

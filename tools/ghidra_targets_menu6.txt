@@ -1,0 +1,1 @@
+4c0f40 bind_seed  # FUN_1404c0f40(&out,param_3) seeds the binding temp

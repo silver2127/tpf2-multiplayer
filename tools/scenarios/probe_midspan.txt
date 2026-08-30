@@ -1,0 +1,31 @@
+# PROBE: does buildProposal split an existing edge when a new edge's endpoint
+# lands mid-span, or does it reject the proposal?
+#
+# The interactive track tool splits automatically. Whether a raw SimpleProposal
+# does the same is the whole question -- if it does, mid-span junctions need no
+# code at all; if it does not, the harness (and possibly replay) has to remove
+# the old edge and add both halves itself.
+#
+# Read the edge counts:
+#   after-branch = after-first + 2   -> the game SPLIT (1 edge became 2, +1 new)
+#   after-branch = after-first + 1   -> new edge built but NO split (just a
+#                                       crossing, not a junction)
+#   after-branch = after-first       -> REJECTED
+#
+# The branch comes in at 45 deg; a perpendicular join would risk being refused
+# for track geometry reasons and confuse the result.
+
+SNAPSHOT before
+
+LOG one long rail
+RAIL -1790 -3100 -1690 -3100
+WAIT 25
+
+SNAPSHOT after-first
+
+LOG branch whose endpoint is the MIDPOINT of that rail
+RAIL -1790 -3050 -1740 -3100
+WAIT 40
+
+SNAPSHOT after-branch
+END

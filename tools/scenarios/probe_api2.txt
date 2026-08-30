@@ -1,0 +1,21 @@
+# Discovery only -- builds nothing, dispatches nothing.
+#
+# WHERE WE GOT TO: api.cmd.make.createLine is a TABLE, not a function, and
+# calling it reports
+#     stack index 3, expected userdata, received sol.ecs::component::Line
+#     (bad argument into 'std::variant<CmdData::SetGameSpeed, ...,
+#      CmdData::CreateLine, ...>')
+# so the shape is (name:string, <CmdData payload:userdata>) and the payload is
+# its OWN type -- a raw Line component is not it. This finds where that type
+# lives, then batches the remaining pipeline signatures into the same run,
+# because a launch-and-load cycle costs about ten minutes.
+
+LOG where does the command payload type live
+PROBE cmdshape
+WAIT 5
+
+LOG remaining pipeline signatures
+PROBE api2
+WAIT 5
+
+END

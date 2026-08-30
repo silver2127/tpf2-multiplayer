@@ -1,0 +1,23 @@
+# Buys ONE vehicle unit. Deliberately minimal.
+#
+# The previous attempt copied a sample vehicle's whole 26-part consist and
+# WEDGED THE SIM THREAD of the host: sim-hook ticks froze at 452 while the
+# process kept answering the UI and reported Responding=True for minutes, and
+# pcall never returned so nothing was logged after the dispatch. A single unit
+# is the smallest thing that proves the channel works.
+#
+# The model is still copied from a vehicle already running in this save rather
+# than guessed, so the modelId and compartment count are real. actBuyVehicle
+# refuses to dispatch an incomplete config and caps at 4 units regardless.
+#
+# autotest.ps1 watches the sim-hook tick counter (NOT Process.Responding, which
+# is useless here) and kills the instance if the sim stalls.
+
+SNAPSHOT before
+
+LOG buy a single unit, model copied from an existing vehicle
+BUYVEH 1
+WAIT 80
+
+SNAPSHOT after
+END

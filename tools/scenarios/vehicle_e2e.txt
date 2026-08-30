@@ -1,0 +1,27 @@
+# The full chain: buy a vehicle, put it on a line, let it run -- and replicate
+# the purchase to the joiner.
+#
+# This was blocked for the whole project by a sim wedge whose cause turned out
+# to be sol2 returning vector members BY VALUE: `tvp.autoLoadConfig[c] = 1`
+# mutated a temporary, leaving a NULL vector the engine then iterated. Found by
+# diffing the raw bytes of a manual UI purchase against a script-built one via
+# the native buyVehicle hook. Every vector member is now read-modify-written.
+#
+# Expect:
+#   buyVehicle callback success=true (+ an entity id)
+#   setLine    callback success=true
+#   a VEH line captured, shipped, and replayed on the joiner
+#   vehicles count rises, and the sim keeps ticking throughout
+
+SNAPSHOT before
+
+LOG buy one unit, model copied from an existing vehicle
+BUYVEH 1
+WAIT 60
+
+LOG put it on a line so it actually starts running
+ASSIGN
+WAIT 80
+
+SNAPSHOT after
+END

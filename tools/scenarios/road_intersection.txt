@@ -1,0 +1,27 @@
+# THE ROAD INTERSECTION BUG.
+#
+# This drives the case a PLAYER hits, which the old midspan test never did:
+# the host attaches a road to an existing road, so the HOST splits nothing
+# (it snaps onto geometry it already has, capturing no EDGEDEL) and the PEER
+# receives an edge whose endpoint lands mid-span on its copy.
+#
+# Until now replayEdge had no splitting, so the peer tried to plant a bare node
+# mid-span and buildProposal refused it -- success=false on 7 of 8 road edges in
+# the field. replayEdge can now split: remove the original, re-add both halves
+# around a new node, all in one proposal.
+#
+# PASS = joiner logs "edge replay (road): split <id>@<u>" and success=true,
+#        and its sim keeps ticking.
+
+SNAPSHOT before
+
+LOG a straight road for the junction to attach to
+ROAD -1800 -3600 -1700 -3600
+WAIT 40
+
+LOG a second road ending on the MIDDLE of the first -- this is the junction
+ROAD -1750 -3550 -1750 -3600
+WAIT 60
+
+SNAPSHOT after
+END

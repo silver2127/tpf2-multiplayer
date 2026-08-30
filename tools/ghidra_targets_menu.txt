@@ -1,0 +1,6 @@
+# Main-menu UI reverse engineering (Multiplayer button)
+# 569f00 = menu builder (refs mainMenuLeft/RightLayout, MainMenuBottomBar)
+569f00 menu_builder
+667bc0 mainmenu_ref
+51fc00 newgame_tab
+62ed20 loadgame_settings

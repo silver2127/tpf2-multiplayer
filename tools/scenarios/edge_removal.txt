@@ -1,0 +1,28 @@
+# Exercises the removal half of the edge channel (task 15).
+#
+# Until the channel became a set diff it only ever noticed NEW entity ids, so a
+# demolished edge produced nothing at all on the wire and the peer kept the
+# track forever. This builds two isolated segments and then deletes one of
+# them, which should produce exactly one EDGEDEL and leave the other standing.
+#
+# Deleting only ONE of the two matters: it proves the removal is matched by
+# geometry rather than "something vanished, remove anything nearby".
+#
+# autotest.ps1 shifts every X here onto virgin ground per run.
+
+SNAPSHOT before
+
+LOG two separate rail segments, well apart
+RAIL -1790 -3150 -1740 -3150
+WAIT 15
+RAIL -1650 -3150 -1600 -3150
+WAIT 30
+
+SNAPSHOT after-build
+
+LOG remove only the FIRST one
+DELRAIL -1790 -3150 -1740 -3150
+WAIT 40
+
+SNAPSHOT after-delete
+END

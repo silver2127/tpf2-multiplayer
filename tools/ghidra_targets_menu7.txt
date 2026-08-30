@@ -1,0 +1,3 @@
+# CORRECT RVAs for the insertion helpers (0x22xxxxx / 0x23xxxxx were truncated)
+22518f0 layout_add_real   # FUN_1422518f0 -- the ACTUAL add-to-container
+2357910 add_cleanup_real  # FUN_142357910

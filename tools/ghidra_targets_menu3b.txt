@@ -1,0 +1,5 @@
+# Menu RE round 3b: CORRECT full RVAs (0x22xxxxx were truncated before)
+221c930 action_factory  # FUN_14221c930(&str,"Free Game") -- makes the action-keyed entry
+227ca40 action_bind      # FUN_14227ca40(btn,&handler,actionId) -- the click binding
+227a1e0 set_name         # FUN_14227a1e0(widget,&nameStr)
+227f880 finalize         # FUN_14227f880(widget,4) -- add to layout

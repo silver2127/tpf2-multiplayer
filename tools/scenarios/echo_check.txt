@@ -1,0 +1,28 @@
+# REGRESSION TEST for the echo storm that destroyed real track.
+#
+# What happened: the host built a station; the joiner replayed it; the
+# construction spawned its own edges; the joiner's sweep saw those as fresh
+# LOCAL builds and shipped them BACK -- 139 edges from an instance that built
+# nothing. Worse, its diff also emitted EDGEDEL, which the host executed,
+# deleting the player's real rails.
+#
+# Two fixes are under test:
+#   1. a replayed construction ADOPTS the edges it creates, so they are never
+#      mistaken for local builds
+#   2. edge removals are never originated by a side that replayed anything in
+#      the last 30 s -- a redundant add is harmless, a wrong delete is not
+#
+# PASS = the joiner's own capture gains ~no EDGE lines and ZERO EDGEDEL.
+
+SNAPSHOT before
+
+LOG a depot, which spawns its own access road
+DEPOT -1800 -3500
+WAIT 60
+
+LOG some rail nearby
+RAIL -1750 -3450 -1700 -3450
+WAIT 60
+
+SNAPSHOT after
+END

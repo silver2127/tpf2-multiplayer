@@ -1,0 +1,14 @@
+# Discovery only. sol2 usertypes refuse pairs(), so component members cannot be
+# listed -- but they can be READ BY NAME. This probes a candidate list against a
+# REAL line from the running world (this save has two), which also shows values
+# and container lengths that a blank .new() never would.
+#
+# What we need out of this: the exact shape of a Line and its stops, so
+# createLine can be handed something valid instead of a guess. Guessing here has
+# hard-crashed the game before.
+
+LOG line / stop / vehicle field shapes
+PROBE fields
+WAIT 5
+
+END

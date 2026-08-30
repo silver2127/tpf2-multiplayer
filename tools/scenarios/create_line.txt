@@ -1,0 +1,20 @@
+# Creates a line between the first two station groups on the map.
+#
+# SIGNATURE (official docs, api.cmd):
+#   createLine(name, color, playerEntity, line)
+# Argument 2 is a Vec3f COLOUR. That is what black-box probing could never have
+# guessed -- it got as far as "arg 2 must be userdata", and passing the obvious
+# candidate (a CmdData::CreateLine) was rejected as "does not properly reflect
+# the desired type". The docs answered it in one fetch.
+#
+# Builds nothing, so it needs no virgin ground. The save already has 33 station
+# groups and 26 lines, so a new line is easy to spot.
+
+SNAPSHOT before
+
+LOG create a line between two existing station groups
+LINE MP Test Line
+WAIT 60
+
+SNAPSHOT after
+END

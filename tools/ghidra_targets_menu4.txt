@@ -1,0 +1,4 @@
+# Menu RE round 4: the primitives for building a button from injected code
+83270 str_assign    # std::string assign/ctor used before every UI call
+2518f0 layout_add    # FUN_1422518f0(widget,&a,&b) -- add button to layout
+63e6e0 mk_arg        # FUN_14063e6e0(&a,&b) -- builds an arg for layout_add

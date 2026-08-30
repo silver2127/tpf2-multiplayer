@@ -1,0 +1,30 @@
+# Two things in one launch cycle, because each costs ~10 minutes.
+#
+# 1. DISCOVERY: api.type.CreateLine exists and has .new() -- that is the
+#    CmdData payload createLine wants as argument 2. Find its members, then try
+#    the real call (still only CONSTRUCTING the command, never dispatching).
+#
+# 2. TEST: the CONMOD channel. Editing a construction rewrites its params in
+#    place -- no entity created, none destroyed -- which is precisely why edits
+#    were invisible to a capture that only asked "is this id new?". Replay is
+#    game.interface.upgradeConstruction, the same call shipped
+#    constructionupgrader.lua makes.
+#
+# Expect for (2): one CONMOD captured, shipped, and replayed ok=true.
+
+LOG CreateLine payload shape
+PROBE createline2
+WAIT 5
+
+SNAPSHOT before
+
+LOG place a depot to edit
+DEPOT -1800 -3400
+WAIT 30
+
+LOG edit it in place -- params change, no new entity
+CONEDIT -1800 -3400 paramX 1
+WAIT 40
+
+SNAPSHOT after
+END

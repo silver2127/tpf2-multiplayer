@@ -1,0 +1,12 @@
+# Reads only. Is this instance able to afford anything?
+#
+# Replication charges BOTH sides: every construction replayed from the peer is
+# paid for locally too. A joiner that has mirrored hundreds of the host's builds
+# can be deep in debt and simply unable to build -- which presents exactly as
+# "my builds are not replicating".
+
+LOG finances and world size
+PROBE money
+WAIT 5
+
+END

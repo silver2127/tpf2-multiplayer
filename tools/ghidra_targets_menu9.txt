@@ -1,0 +1,1 @@
+4c0f40 seed_real  # FUN_1404c0f40(&out, param_3) -- what it builds into 'out'

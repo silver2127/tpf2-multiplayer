@@ -1,0 +1,25 @@
+# DIAGNOSTIC, not a retry.
+#
+# Established so far:
+#   - buyVehicle from the ENGINE state wedges the sim (twice, 26 units and 1)
+#   - buyVehicle from the GUI state does NOT deadlock the caller
+#     (sendCommand returns ok=true) but the sim STILL wedges processing it
+# So the fault is the command/config, not the call site.
+#
+# This asks the discriminating question: does a vehicle command with NO config
+# at all also wedge? setLine takes only entity ids.
+#
+#   setLine survives  -> the TransportVehicleConfig is what is wrong
+#   setLine wedges    -> the whole vehicle command family is unusable from a
+#                        script and purchase replay has to be native
+#
+# Reassigning an existing vehicle between two existing lines is reversible.
+
+SNAPSHOT before
+
+LOG setLine on an EXISTING vehicle -- no config involved
+SETLINEPROBE
+WAIT 100
+
+SNAPSHOT after
+END

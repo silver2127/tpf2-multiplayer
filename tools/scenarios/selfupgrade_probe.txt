@@ -1,0 +1,37 @@
+# Why do modular rail station edits fail on the joiner?
+#
+# Every CONMOD for station/rail/modular_station replays as
+#   station edit replay id=281678 ok=false err=internal error
+# while depot edits on the same instance return ok=true. The first failure
+# happens BEFORE any platform track is replayed, so "bare track is in the way"
+# is not the explanation.
+#
+# SELFUPGRADE re-applies a construction's own params to itself. That is a no-op
+# edit, so it must succeed on anything the engine is willing to upgrade -- which
+# takes our wire params out of the picture entirely.
+#
+# Run this on BOTH sides. The host's station was placed by the interactive tool;
+# the joiner's was created by our BUILD replay via buildConstruction, which does
+# NOT perform the network integration the tool does.
+#
+#   host ok, joiner ok    -> the construction is fine; our CONMOD params are the
+#                            problem (serialization round trip / modules table)
+#   host ok, joiner FAILS -> the joiner's station is un-upgradable however it is
+#                            asked. The bug is in how we CREATE it, and no work
+#                            on the CONMOD path will fix it.
+#   both FAIL             -> modular stations cannot be upgraded via
+#                            game.interface at all; CONMOD needs a different
+#                            mechanism for them.
+#
+# The depot line is the control: it is known to work, so a failure there means
+# the probe itself is broken rather than the station.
+
+LOG control - depot should upgrade cleanly
+SELFUPGRADE depot/road_depot_era_a.con
+WAIT 20
+
+LOG the case under test - modular rail station
+SELFUPGRADE station/rail/modular_station
+WAIT 20
+
+END
