@@ -48,10 +48,10 @@ world hash matched over the test runs -- the detector is reliable for short sess
   loopback (`bridge_main.cpp`, `peerIp = "127.0.0.1"`). The bridge now polls a control
   file (`tpf2_bridge_ctl.txt`, `peer=<ipv4>:<port>`) for exactly this hand-off, but
   nothing writes it yet. See [docs/PORTABILITY.md](docs/PORTABILITY.md), item 6.
-- No installer yet. An MSI is in progress; today the install is a developer procedure
-  (scripts under `tools/`, see [Installing](#installing-today-a-developer-procedure)).
-  `tools/friendkit/` is a preview PowerShell installer for the lobby and save sharing
-  only (no bridge, no slice) and expects the built binaries next to it.
+- The installer is an **alpha** ([Releases](https://github.com/silver2127/tpf2-multiplayer/releases)):
+  it installs everything, but two-machine play has only been exercised as far as
+  the transport (see below) and the shared-save auto-load still depends on the
+  screen-coordinate click.
 - The shared-save auto-load clicks the title menu's **Continue** button at measured
   screen coordinates (`menu_hook.cpp`, `clickContinueLoad`: four measured window sizes,
   scaled if yours is within 5% of one). Otherwise the click is skipped and the save has
@@ -155,10 +155,25 @@ The reverse-engineering that made those hook points safe is written up in `docs/
 | `docs/` | `PORTABILITY.md`, `SLICE_STATUS.md`, `COMPANIES_INTEGRATION.md`, `DEV_STATUS.md`, `CANCEL_POINT.md`, milestone reports `M1`..`M10` |
 | `THIRD_PARTY_NOTICES.md` | Third-party licenses |
 
-## Installing (today: a developer procedure)
+## Installing
 
-Everything below is what the scripts in `tools/` do; read each one before running it.
-They modify a file in your game folder and copy files into your Steam directories.
+**Players:** download `TpF2Multiplayer.msi` from the
+[latest release](https://github.com/silver2127/tpf2-multiplayer/releases), close the
+game, run it. It finds the game folder from Steam's registry entry, installs the
+proxy `alut.dll` (the original is kept as `alut_real.dll`), the lockstep DLLs and
+their cfgs, the `mp_lockstep_1` mod into `<game>\mods`, and the frozen lobby into
+`<game>
+etpunch`. Runtime files go to `%LOCALAPPDATA%	pf2mp\data`. Uninstall from
+*Apps* (restores `alut.dll`); Steam's *Verify integrity of game files* also undoes it.
+
+Never copy the mod into `userdata\<id>F6780\local\mods`: the game treats a mod
+loaded from there as a different mod (`!mp_lockstep`), and saves made with it refuse to
+load on machines that installed it normally.
+
+**Developers** -- everything below is what the scripts in `tools/` do; read each one
+before running it. They modify a file in your game folder and copy files into your
+Steam directories. `tools/deploy_shipping.ps1` lays the game folder out exactly as the
+MSI does, from the build outputs.
 
 **Prerequisites**
 
