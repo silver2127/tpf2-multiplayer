@@ -166,7 +166,7 @@ their cfgs, the `mp_lockstep_1` mod into `<game>\mods`, and the frozen lobby int
 etpunch`. Runtime files go to `%LOCALAPPDATA%	pf2mp\data`. Uninstall from
 *Apps* (restores `alut.dll`); Steam's *Verify integrity of game files* also undoes it.
 
-Never copy the mod into `userdata\<id>F6780\local\mods`: the game treats a mod
+Never copy the mod into `userdata\<id>\1066780\local\mods`: the game treats a mod
 loaded from there as a different mod (`!mp_lockstep`), and saves made with it refuse to
 load on machines that installed it normally.
 
