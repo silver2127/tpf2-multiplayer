@@ -141,6 +141,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import random
 import select
 import shutil
@@ -215,9 +216,41 @@ def _boost_socket_buffers(sock):
             pass
 
 
+# Everything below /24 is masked out of the logs. These files get pasted into
+# bug reports and screenshots, and a player's home IP has no business travelling
+# with them: "[host] JOIN ('203.0.113.47', 51299)" identifies a person's house,
+# while "203.0.113.x" still tells you which peer a line is about and whether two
+# lines are the same peer. Set TPF2MP_LOG_IPS=1 when you genuinely need the full
+# address to debug a NAT problem.
+_IPV4_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.(\d{1,3})\b")
+_SHOW_IPS = os.environ.get("TPF2MP_LOG_IPS", "") == "1"
+
+
+def redact(text):
+    """Mask the host part of every IPv4 address in ``text``.
+
+    Loopback and the RFC1918 ranges are left alone -- 127.0.0.1 and 192.168.x.y
+    identify nobody, and masking them makes local debugging harder for no gain.
+    """
+    if _SHOW_IPS:
+        return text
+
+    def mask(m):
+        head, tail = m.group(1), m.group(2)
+        if head.startswith(("127.", "10.", "192.168.")) or head.startswith("169.254."):
+            return m.group(0)
+        if head.startswith("172."):
+            second = int(head.split(".")[1] or 0)
+            if 16 <= second <= 31:
+                return m.group(0)
+        return head + ".x"
+
+    return _IPV4_RE.sub(mask, str(text))
+
+
 def _log(msg):
     """Diagnostics go to stderr; stdout is reserved for the single CODE= line."""
-    print(msg, file=sys.stderr, flush=True)
+    print(redact(msg), file=sys.stderr, flush=True)
 
 
 def _dedupe(name, taken):

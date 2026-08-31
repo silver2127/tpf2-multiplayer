@@ -784,7 +784,7 @@ local function vec3t(v)
 end
 
 -- Full position of a node, height included -- the wire needs all three.
-local function nodePosXYZ(nid)
+function CM.nodePosXYZ(nid)
 	local c = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
 	if not c or not c.position then return nil end
 	local p = c.position
@@ -992,12 +992,12 @@ LS = { findNodeNear = findNodeNear, findEdgeContaining = findEdgeContaining,
 --                     "i,S,px,py,pz,ax,ay,bx,by"         split the edge a--b at p
 --   xh = per-LINK:    "k,N,x,y,z,u"                      route through that node
 --                     "k,S,px,py,pz,ax,ay,bx,by,u"       split the edge a--b at p
-local function planEncode(items)
+function CM.planEncode(items)
 	if not items or #items == 0 then return nil end
 	return table.concat(items, ";")
 end
 
-local function planDecode(str)
+function CM.planDecode(str)
 	local out = {}
 	for entry in tostring(str or ""):gmatch("[^;]+") do
 		local f = {}
@@ -1015,7 +1015,7 @@ end
 
 -- Find THIS instance's edge with the given endpoint positions. Orientation is
 -- not part of the identity: node0/node1 order is per-instance.
-local function findEdgeByEnds(isTrack, ax, ay, bx, by, eps)
+function CM.findEdgeByEnds(isTrack, ax, ay, bx, by, eps)
 	eps = eps or 1.5
 	local m
 	if isTrack then
@@ -1044,7 +1044,7 @@ end
 -- Where along an edge a point sits. The originator ships the split POINT rather
 -- than its u, because u is a property of that instance's curve; the point is a
 -- place in the world both agree on.
-local function uOnEdge(eid, x, y)
+function CM.uOnEdge(eid, x, y)
 	local comp, a, b, ta, tb = edgeGeomT(eid)
 	if not comp then return nil end
 	local bestU, bestD
@@ -1067,8 +1067,8 @@ local function execPolyline(c, planOnly)
 		return
 	end
 	local planV, planH = {}, {}          -- what THIS pass decided, for the wire
-	local usePlanV = planDecode(c.xv)    -- what the originator decided, if it said
-	local usePlanH = planDecode(c.xh)
+	local usePlanV = CM.planDecode(c.xv)    -- what the originator decided, if it said
+	local usePlanH = CM.planDecode(c.xh)
 	local ok, err = pcall(function()
 		local isTrack = (tonumber(c.etype) or 0) == 1
 		local stype = tonumber(c.stype) or 16
@@ -1296,10 +1296,10 @@ local function execPolyline(c, planOnly)
 					end
 					CM.cmLog(string.format("PLAN: vertex %d: no node at %.1f,%.1f -- deriving locally", i, told[1], told[2]))
 				elseif told.kind == "S" then
-					local eid = findEdgeByEnds(false, told[4], told[5], told[6], told[7])
-						or findEdgeByEnds(true, told[4], told[5], told[6], told[7])
+					local eid = CM.findEdgeByEnds(false, told[4], told[5], told[6], told[7])
+						or CM.findEdgeByEnds(true, told[4], told[5], told[6], told[7])
 					if eid then
-						local u = uOnEdge(eid, told[1], told[2])
+						local u = CM.uOnEdge(eid, told[1], told[2])
 						if u then
 							local mid = splitEdgeAt(eid, u, "vertex " .. i .. " (originator's split)", told[3])
 							if mid then
@@ -1645,9 +1645,9 @@ local function execPolyline(c, planOnly)
 							if n then hits[#hits + 1] = { node = n, u = told[4] or 0.5 }
 							else CM.cmLog(string.format("PLAN: link %d crossing node %.1f,%.1f absent here -- skipped", k, told[1], told[2])) end
 						elseif told.kind == "S" then
-							local eid = findEdgeByEnds(false, told[4], told[5], told[6], told[7])
+							local eid = CM.findEdgeByEnds(false, told[4], told[5], told[6], told[7])
 							if eid then
-								local ru = uOnEdge(eid, told[1], told[2])
+								local ru = CM.uOnEdge(eid, told[1], told[2])
 								if ru then hits[#hits + 1] = { eid = eid, ru = ru, u = told[8] or 0.5, zWant = told[3] } end
 							else CM.cmLog(string.format("PLAN: link %d crossing edge %.1f,%.1f--%.1f,%.1f absent here -- skipped", k, told[4], told[5], told[6], told[7])) end
 						end
@@ -1663,7 +1663,7 @@ local function execPolyline(c, planOnly)
 						if h.node then
 							chain[#chain + 1] = { node = h.node, u = h.u }      -- existing road node
 							xingNodes[#xingNodes + 1] = h.node
-							local np2 = nodePosXYZ(h.node)
+							local np2 = CM.nodePosXYZ(h.node)
 							if np2 then planH[#planH + 1] = string.format("%d,N,%.2f,%.2f,%.2f,%.4f", k, np2[1], np2[2], np2[3], h.u or 0.5) end
 						else
 							local mid = splitRoadAt(h.eid, h.ru)
@@ -1851,7 +1851,7 @@ local function execPolyline(c, planOnly)
 	end
 	-- What this pass decided, for the originator to put on the wire. Empty on a
 	-- peer that just followed a plan -- it has nothing to tell anyone.
-	return planEncode(planV), planEncode(planH)
+	return CM.planEncode(planV), CM.planEncode(planH)
 end
 
 -- ---------- constructions: HYBRID replication ----------
@@ -2087,7 +2087,7 @@ local expectedDemolish = {}
 --
 -- Only ever touches a plain mid-road node: exactly two street edges, no track,
 -- nothing else hanging off it. Anything else is left alone and logged.
-local function healNodeAt(x, y, why)
+function CM.healNodeAt(x, y, why)
 	local healed = false
 	pcall(function()
 		local nid = findNodeNear(false, x, y, 1.5)
@@ -2177,9 +2177,9 @@ local function healNodeAt(x, y, why)
 end
 
 -- Every node a replay of ours cut into a road, with the tick it was cut at.
-local splitWatch = {}
-local function watchSplit(x, y)
-	splitWatch[string.format("%.1f/%.1f", x, y)] = { x, y, ticks }
+CM.splitWatch = {}
+function CM.watchSplit(x, y)
+	CM.splitWatch[string.format("%.1f/%.1f", x, y)] = { x, y, ticks }
 end
 
 -- Sweep the watched splits. A split that is doing its job carries the
@@ -2190,10 +2190,10 @@ end
 --
 -- The delay keeps the sweep off builds that are still in flight; a construction
 -- and its split always arrive in one proposal, but a retry may be queued behind.
-local SPLIT_SETTLE = 300      -- ticks (~5 s at 60/s) before a scar counts as one
-local function sweepSplits()
-	for k, w in pairs(splitWatch) do
-		if ticks - w[3] > SPLIT_SETTLE then
+CM.SPLIT_SETTLE = 300      -- ticks (~5 s at 60/s) before a scar counts as one
+function CM.sweepSplits()
+	for k, w in pairs(CM.splitWatch) do
+		if ticks - w[3] > CM.SPLIT_SETTLE then
 			local nid = findNodeNear(false, w[1], w[2], 1.5)
 			local n = 0
 			if nid then
@@ -2202,12 +2202,12 @@ local function sweepSplits()
 				if m and m[nid] then for _ in pairs(m[nid]) do n = n + 1 end end
 			end
 			if not nid then
-				splitWatch[k] = nil                       -- already gone
+				CM.splitWatch[k] = nil                       -- already gone
 			elseif n ~= 2 then
-				splitWatch[k] = nil                       -- in use: this is a real junction
+				CM.splitWatch[k] = nil                       -- in use: this is a real junction
 			else
-				splitWatch[k] = nil
-				healNodeAt(w[1], w[2], "orphaned split")
+				CM.splitWatch[k] = nil
+				CM.healNodeAt(w[1], w[2], "orphaned split")
 			end
 		end
 	end
@@ -3131,7 +3131,7 @@ execConX = function(c)
 						-- Watch the node this cut creates. Nothing owns a replayed split,
 						-- so if the construction it was cut for never lands (or is later
 						-- removed) the node stays behind for good -- see healNodeAt.
-						watchSplit(p[1], p[2])
+						CM.watchSplit(p[1], p[2])
 					end
 				end
 			else
@@ -5376,7 +5376,7 @@ local function pollInject()
 			if o == "HEAL" then
 				-- Manual repair: rejoin a road at x,y if a scar from a replayed
 				-- split is all that is left there. Same rules as the sweep.
-				healNodeAt(tonumber(w[2]) or 0, tonumber(w[3]) or 0, "manual")
+				CM.healNodeAt(tonumber(w[2]) or 0, tonumber(w[3]) or 0, "manual")
 
 			elseif o == "EVAL" then
 				-- Diagnostic probe: run a chunk from the inject file, log the
@@ -6087,49 +6087,49 @@ local MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
 --
 -- The player's own speed choice is preserved: whatever speed they are running at
 -- when the clocks agree is the speed restored after a catch-up.
-local CATCHUP_BEHIND = 0.8    -- units behind before we run faster
-local CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
+CM.CATCHUP_BEHIND = 0.8    -- units behind before we run faster
+CM.CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
 -- The engine's speeds are 0..3 (0 = paused), so catching up means ONE notch up
 -- from whatever the player picked, and there is no room at all at 3. A notch is
 -- enough: at speed 2 the clock gains on a peer at speed 1 about as fast as the
 -- gap opened in the first place, and 1 -> 3 would be a visible lurch.
-local MAX_SPEED      = 3
-local catchingUp  = false
-local baseSpeed   = nil       -- the player's speed, sampled while in step
-local pacedTopWarned = false  -- log the "no notch left" case once, not per tick
+CM.MAX_SPEED      = 3
+CM.catchingUp  = false
+CM.baseSpeed   = nil       -- the player's speed, sampled while in step
+CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 
-local function pace(ahead)
+function CM.pace(ahead)
 	if paused then return end                       -- the barrier owns the speed
 	local behind = -ahead
 	local s
 	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
 	if s == 0 then                                   -- player paused on purpose
-		catchingUp = false
+		CM.catchingUp = false
 		return
 	end
-	if not catchingUp then
-		if behind > CATCHUP_BEHIND and s < MAX_SPEED then
-			baseSpeed = s
-			catchingUp = true
+	if not CM.catchingUp then
+		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED then
+			CM.baseSpeed = s
+			CM.catchingUp = true
 			local up = s + 1
 			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(up)) end)
 			log(string.format("PACE: %.2f behind the peer -- speed %s -> %d to catch up",
 				behind, tostring(s), up))
-		elseif behind > CATCHUP_BEHIND then
+		elseif behind > CM.CATCHUP_BEHIND then
 			-- Already at the top speed: the peer must come down to us, which the
 			-- barrier does at BARRIER_AHEAD. Nothing to do but say so.
-			if not pacedTopWarned then
-				pacedTopWarned = true
+			if not CM.pacedTopWarned then
+				CM.pacedTopWarned = true
 				log(string.format("PACE: %.2f behind at speed %s -- no notch left, "
 					.. "waiting for the barrier", behind, tostring(s)))
 			end
 		else
-			baseSpeed = s                            -- in step: this is the player's choice
-			pacedTopWarned = false
+			CM.baseSpeed = s                            -- in step: this is the player's choice
+			CM.pacedTopWarned = false
 		end
-	elseif behind <= CATCHUP_DONE then
-		local back = baseSpeed or 1
-		catchingUp = false
+	elseif behind <= CM.CATCHUP_DONE then
+		local back = CM.baseSpeed or 1
+		CM.catchingUp = false
 		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(back)) end)
 		log(string.format("PACE: caught up (%.2f behind) -- speed back to %s", behind, tostring(back)))
 	end
@@ -6163,7 +6163,7 @@ local function applyBarrier(now)
 	end
 
 	local ahead = now - peerTime
-	pace(ahead)
+	CM.pace(ahead)
 	if ahead > BARRIER_AHEAD and not paused then
 		paused = true
 		pausedSince = ticks
@@ -6172,8 +6172,8 @@ local function applyBarrier(now)
 	elseif ahead <= BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
-		catchingUp = false
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(baseSpeed or 1)) end)
+		CM.catchingUp = false
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(CM.baseSpeed or 1)) end)
 		log(string.format("BARRIER release: %.2f ahead", ahead))
 	end
 end
@@ -6254,8 +6254,8 @@ function data()
 			end
 			if ticks % REMOVAL_POLL_EVERY == 0 then pollConstructionRemovals() end
 			-- Cheap: the watch list is empty unless a replay has cut a road, and
-			-- each entry is looked at once, SPLIT_SETTLE ticks after the cut.
-			if ticks % 60 == 0 and not conxBusy then sweepSplits() end
+			-- each entry is looked at once, CM.SPLIT_SETTLE ticks after the cut.
+			if ticks % 60 == 0 and not conxBusy then CM.sweepSplits() end
 			if ticks % CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
 
 			if ticks % HEARTBEAT_EVERY == 0 then

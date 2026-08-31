@@ -46,6 +46,33 @@ static void Log(const char* fmt, ...)
     fflush(g_log);
 }
 
+// Mask the host part of a public IPv4 for the log. tpf2_bridge.log gets pasted
+// into bug reports and screenshots, and a player's home address has no business
+// travelling with it -- "203.0.113.x" still says which peer a line is about.
+// Loopback and the RFC1918 ranges are left readable: they identify nobody and
+// masking them would only make local debugging harder. TPF2MP_LOG_IPS=1 keeps
+// the full address for a NAT problem that genuinely needs it.
+static const char* RedactIp(const char* ip)
+{
+    static char buf[4][64];
+    static int slot = 0;
+    if (!ip || !*ip) return "";
+    static int show = -1;
+    if (show < 0) {
+        char v[8] = {0}; DWORD n = GetEnvironmentVariableA("TPF2MP_LOG_IPS", v, sizeof(v));
+        show = (n > 0 && v[0] == '1') ? 1 : 0;
+    }
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (show || sscanf(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
+        return ip;
+    const bool priv = (a == 127) || (a == 10) || (a == 192 && b == 168)
+                   || (a == 169 && b == 254) || (a == 172 && b >= 16 && b <= 31);
+    if (priv) return ip;
+    slot = (slot + 1) % 4;
+    _snprintf_s(buf[slot], sizeof(buf[slot]), _TRUNCATE, "%u.%u.%u.x", a, b, c);
+    return buf[slot];
+}
+
 static FILE* g_events = nullptr;   // peer events out (Lua reads)
 static std::mutex g_eventsMtx;     // OnPeerLine (net thread) vs re-identify (ctl thread)
 static FILE* g_fileOut = nullptr;  // file-relay target (tail writes here when set)
@@ -463,11 +490,11 @@ static void ApplyControl(const std::string& text)
             if (Net_SetPeer(wantIp.c_str(), wantPort)) {
                 std::lock_guard<std::mutex> lk(g_rt.mtx);
                 g_rt.peerIp = wantIp; g_rt.peerPort = wantPort;
-                Log("[ctl] peer %s:%d -> %s:%d\n", oldIp.c_str(), oldPort,
-                    wantIp.c_str(), wantPort);
+                Log("[ctl] peer %s:%d -> %s:%d\n", RedactIp(oldIp.c_str()), oldPort,
+                    RedactIp(wantIp.c_str()), wantPort);
             } else {
                 Log("[ctl] peer=%s:%d REJECTED (not a dotted IPv4:port), keeping %s:%d\n",
-                    wantIp.c_str(), wantPort, oldIp.c_str(), oldPort);
+                    RedactIp(wantIp.c_str()), wantPort, RedactIp(oldIp.c_str()), oldPort);
             }
         }
     }
@@ -562,7 +589,7 @@ static DWORD WINAPI InitThread(LPVOID)
     }
 
     Log("[m5] bridge init: inst=%s local=%d peer=%s:%d pid=%lu\n",
-        cfg.instance.c_str(), cfg.localPort, cfg.peerIp, cfg.peerPort,
+        cfg.instance.c_str(), cfg.localPort, RedactIp(cfg.peerIp), cfg.peerPort,
         GetCurrentProcessId());
     // The Lua and slice halves must resolve the same data dir (datadir.h /
     // TPF2MP_DATADIR / LOCALAPPDATA), otherwise the halves talk past each
