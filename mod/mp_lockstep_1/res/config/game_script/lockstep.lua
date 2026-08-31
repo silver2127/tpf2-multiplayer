@@ -128,6 +128,11 @@ local EXEC_DELAY = 0.6
 -- up. That is a measurement, not a guess.
 local BARRIER_AHEAD = 5.0
 
+-- The most peer lead a command's stamp will pay for. Bigger than BARRIER_AHEAD
+-- on purpose: the barrier only starts acting AT that threshold, so real skew
+-- overshoots it before coming back.
+local MAX_LEAD = 15.0
+
 -- Heartbeats cross between instances through a FILE RELAY (B is sandboxed), so
 -- they are not free. At every 2 ticks the relay fell behind and instance A was
 -- reading peer times ~13 units stale while B saw A correctly -- both then paused
@@ -145,6 +150,7 @@ local injectOffset = -1
 local seqNo        = 0
 local peerTime     = nil        -- last game time the peer reported
 local peerSeen     = false
+local lateCount    = 0   -- commands whose game-time stamp had already passed here
 local queue        = {}         -- pending commands
 local executed     = {}         -- key -> true, so a command runs at most once
 local lastHashAt   = nil
@@ -4150,7 +4156,13 @@ function scheduleLocal(op, args)
 	if peerTime and peerTimeAt and (ticks - peerTimeAt) <= PEER_STALE_TICKS then
 		lead = peerTime - now
 		if lead < 0 then lead = 0 end
-		if lead > BARRIER_AHEAD then lead = BARRIER_AHEAD end   -- the barrier caps real skew
+		-- Capping this at BARRIER_AHEAD was wrong. The barrier is a backstop that
+		-- acts only once a peer is 5 units ahead, and it takes time to bite -- a
+		-- live session was seen 9.2 units apart. A command stamped 5.6 out then
+		-- still lands in the peer's past and is applied out of step. Cap high
+		-- enough to cover any gap the barrier tolerates in practice; the delay is
+		-- felt by the player, so it is not unbounded either.
+		if lead > MAX_LEAD then lead = MAX_LEAD end
 	end
 	local delay = EXEC_DELAY + lead
 	if lead > 0 then
@@ -4241,9 +4253,18 @@ local function onLine(line)
 				-- hash mismatch later.
 				local now = gameTime()
 				if now and c.at < math.floor(now) then
-					log(string.format("!! LATE %s seq=%d at=%d but now=%d " ..
-						"-- will execute out of step (raise EXEC_DELAY above %d)",
-						tostring(c.op), c.seq, c.at, math.floor(now), BARRIER_AHEAD))
+					-- A command is meant to be applied at a GAME TIME both sides
+					-- agree on. This one's moment has already passed here, so it
+					-- will be applied on arrival instead: the build still appears
+					-- on both machines -- which is why a session with bad skew
+					-- looks like it is working -- but the two sims performed it at
+					-- different points in their own histories. Everything that
+					-- depends on when it happened (what a town had grown to, where
+					-- a vehicle was) can differ from here on.
+					lateCount = lateCount + 1
+					log(string.format("!! LATE %s seq=%d at=%d but now=%d (%d so far) " ..
+						"-- applied out of step; the worlds agree on the build, not on when",
+						tostring(c.op), c.seq, c.at, math.floor(now), lateCount))
 				end
 				log(string.format("RECV %s seq=%d at=%d from %s", tostring(c.op), c.seq, c.at, c.origin))
 			end
@@ -6290,6 +6311,10 @@ CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 function CM.pace(ahead)
 	if paused then return end                       -- the barrier owns the speed
 	local behind = -ahead
+	-- A gap this size is not pacing: it is two instances on different saves, or
+	-- one still loading. Seen live at 55156 units. Speeding up cannot fix that
+	-- and pretending otherwise just runs somebody's game at double speed.
+	if behind > 60 or behind < -60 then return end
 	local s
 	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
 	if s == 0 then                                   -- player paused on purpose
@@ -6486,10 +6511,10 @@ function data()
 				pcall(function()
 					local f = io.open(BASE .. "lockstep_status_" .. INSTANCE .. ".txt", "w")
 					if f then
-						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  queued=%d%s",
+						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  queued=%d%s",
 							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
 							peerTime and string.format("%+.1f", now - peerTime) or "?",
-							desyncs, #queue, paused and "  PAUSED" or ""))
+							desyncs, lateCount, #queue, paused and "  PAUSED" or ""))
 						f:close()
 					end
 				end)
