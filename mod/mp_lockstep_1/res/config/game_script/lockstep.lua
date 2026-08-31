@@ -575,13 +575,40 @@ local function nodePos(nid)
 end
 
 local function worldHash()
-	-- vehicles: count
+	-- Vehicles: a count, and -- separately -- where they are.
+	--
+	-- The count alone answers "did a purchase replicate", which is not what
+	-- lockstep is for. Two worlds running the same commands at the same game
+	-- times should have every vehicle in the same PLACE; a train that is 40 m
+	-- further along on one machine is the simulations diverging, and it is the
+	-- first thing a command applied at the wrong moment disturbs. It is also the
+	-- one measure that drifts on its own if the clocks are not truly in step.
+	--
+	-- Positions ride in the DETAIL line only, never in the verdict, until we have
+	-- watched how well they actually track. They are continuous and quantised to
+	-- a metre here: if it turns out two honest instances differ by a metre in
+	-- normal play, that must not start reporting desyncs -- it is a measurement
+	-- to read, not a verdict, until the evidence says otherwise.
 	local nv = 0
+	local vpos = {}
 	pcall(function()
 		local t = game.interface.getEntities({ radius = 999999 },
 			{ type = "VEHICLE", includeData = false }) or {}
-		for _ in pairs(t) do nv = nv + 1 end
+		for _, vid in pairs(t) do
+			nv = nv + 1
+			pcall(function()
+				local e = game.interface.getEntity(vid)
+				local p = e and e.position
+				if p then
+					-- sorted below, so this says nothing about WHICH vehicle is
+					-- where -- ids differ between instances and always will
+					vpos[#vpos + 1] = string.format("%.0f,%.0f,%.0f",
+						p[1] or p.x or 0, p[2] or p.y or 0, p[3] or p.z or 0)
+				end
+			end)
+		end
 	end)
+	table.sort(vpos)
 
 	-- constructions: player-owned by content, everything else counted
 	local cons, nt = {}, 0
@@ -645,8 +672,11 @@ local function worldHash()
 	local he = hashStr(table.concat(egeo, "|"))
 	-- The verdict hash covers ONLY the components lockstep controls.
 	local verdict = hashStr("v" .. nv .. "|" .. hc .. "|" .. he)
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,t%d",
-		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")), nt)
+	-- p: is the vehicle-position lane. #vpos can be less than nv when a vehicle
+	-- has no position to read (in a depot, mid-load), so it carries its own count.
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d:%s,t%d",
+		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
+		#vpos, hashStr(table.concat(vpos, "|")), nt)
 	return verdict, detail
 end
 
