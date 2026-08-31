@@ -600,7 +600,7 @@ local function worldHash()
 	-- edges by geometry
 	nodePosCache = {}
 	local edges = collectEdges()
-	local egeo = {}
+	local egeo, egeoZ = {}, {}
 	for _, eid in ipairs(edges) do
 		local ok, c = pcall(function()
 			return api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
@@ -609,9 +609,18 @@ local function worldHash()
 			local a, b = nodePos(c.node0), nodePos(c.node1)
 			if a > b then a, b = b, a end     -- direction-independent
 			egeo[#egeo + 1] = a .. ">" .. b
+			-- A second lane carrying ONLY the heights. The verdict hash already
+			-- covers z (it is part of nodePos), but when the worlds disagree it
+			-- matters whether they disagree about WHERE the rails are or only
+			-- about how high: the first is a missing build, the second is a
+			-- crossing or terrain problem. Detail-only -- never a verdict of
+			-- its own.
+			local za, zb = a:match("[^,]+,[^,]+,([^>]+)"), b:match("[^,]+,[^,]+,(.+)")
+			egeoZ[#egeoZ + 1] = (za or "?") .. ">" .. (zb or "?")
 		end
 	end
 	table.sort(egeo)
+	table.sort(egeoZ)
 
 	if #edges == 0 and not warnedNoEdges then
 		warnedNoEdges = true
@@ -625,7 +634,8 @@ local function worldHash()
 	local he = hashStr(table.concat(egeo, "|"))
 	-- The verdict hash covers ONLY the components lockstep controls.
 	local verdict = hashStr("v" .. nv .. "|" .. hc .. "|" .. he)
-	local detail = string.format("v%d,c%d:%s,e%d:%s,t%d", nv, #cons, hc, #egeo, he, nt)
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,t%d",
+		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")), nt)
 	return verdict, detail
 end
 
@@ -719,6 +729,13 @@ local function execEdge(c)
 		end
 		sp.streetProposal.edgesToAdd[1] = e
 
+		-- PLAN PASS. The originator runs this same code once at schedule time
+		-- purely to find out what it will do, so the decisions can travel with
+		-- the command. Nothing is built here: same resolution, same splits, no
+		-- proposal. Running the real path rather than a parallel "planner" is
+		-- deliberate -- a second implementation would drift from this one.
+		if planOnly then return end
+
 		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), false),
 			function(res, success)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s success=%s",
@@ -764,6 +781,14 @@ end
 local function vec3t(v)
 	if not v then return { 0, 0, 0 } end
 	return { v.x or v[1] or 0, v.y or v[2] or 0, v.z or v[3] or 0 }
+end
+
+-- Full position of a node, height included -- the wire needs all three.
+local function nodePosXYZ(nid)
+	local c = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
+	if not c or not c.position then return nil end
+	local p = c.position
+	return { p.x or p[1], p.y or p[2], p.z or p[3] or 0 }
 end
 
 local function edgeGeomT(eid)
@@ -946,7 +971,93 @@ LS = { findNodeNear = findNodeNear, findEdgeContaining = findEdgeContaining,
 -- an existing road splits nothing and captures no removal list, so there was
 -- never one to send -- which is why looking for edgesToRemove in the proposal
 -- found only garbage.
-local function execPolyline(c)
+-- ---------- the originator's plan ----------
+--
+-- Both instances used to re-derive a road/rail build from the shipped polyline:
+-- each hunted for crossings, chose which edge to split and where, against its
+-- OWN copy of the world. Identical code over identical worlds gives identical
+-- answers, but it has no tolerance for a world that has drifted even slightly,
+-- and it turns one drift into a cascade. Measured 2026-08-30: from a state whose
+-- hashes agreed on every tick, seq=12 (2 points, 1 edge, no removals) was
+-- accepted on the originator and refused on the peer, and every later build
+-- failed too, because by then the two were resolving against different worlds.
+--
+-- So the originator decides, once, and ships the decisions. Positions, never
+-- ids -- entity ids are per-instance, positions are the shared language this
+-- wire already speaks (see the rm= removals). A peer that cannot match an entry
+-- says so and falls back to deriving that one itself, which is strictly no
+-- worse than the old behaviour.
+--
+--   xv = per-VERTEX:  "i,N,x,y,z"                        resolve to the node there
+--                     "i,S,px,py,pz,ax,ay,bx,by"         split the edge a--b at p
+--   xh = per-LINK:    "k,N,x,y,z,u"                      route through that node
+--                     "k,S,px,py,pz,ax,ay,bx,by,u"       split the edge a--b at p
+local function planEncode(items)
+	if not items or #items == 0 then return nil end
+	return table.concat(items, ";")
+end
+
+local function planDecode(str)
+	local out = {}
+	for entry in tostring(str or ""):gmatch("[^;]+") do
+		local f = {}
+		for tok in entry:gmatch("[^,]+") do f[#f + 1] = tok end
+		local idx = tonumber(f[1])
+		if idx and f[2] then
+			local e = { kind = f[2] }
+			for i = 3, #f do e[#e + 1] = tonumber(f[i]) end
+			out[idx] = out[idx] or {}
+			out[idx][#out[idx] + 1] = e
+		end
+	end
+	return out
+end
+
+-- Find THIS instance's edge with the given endpoint positions. Orientation is
+-- not part of the identity: node0/node1 order is per-instance.
+local function findEdgeByEnds(isTrack, ax, ay, bx, by, eps)
+	eps = eps or 1.5
+	local m
+	if isTrack then
+		pcall(function() m = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+	else
+		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+	end
+	local best, bestD, seen = nil, nil, {}
+	for _, list in pairs(m or {}) do
+		for _, eid in pairs(list) do
+			if not seen[eid] then
+				seen[eid] = true
+				local comp, p, q = edgeGeomT(eid)
+				if comp then
+					local d1 = (p[1]-ax)^2 + (p[2]-ay)^2 + (q[1]-bx)^2 + (q[2]-by)^2
+					local d2 = (p[1]-bx)^2 + (p[2]-by)^2 + (q[1]-ax)^2 + (q[2]-ay)^2
+					local d = math.min(d1, d2)
+					if d < (eps * eps) * 2 and (not bestD or d < bestD) then best, bestD = eid, d end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- Where along an edge a point sits. The originator ships the split POINT rather
+-- than its u, because u is a property of that instance's curve; the point is a
+-- place in the world both agree on.
+local function uOnEdge(eid, x, y)
+	local comp, a, b, ta, tb = edgeGeomT(eid)
+	if not comp then return nil end
+	local bestU, bestD
+	for i = 1, 399 do
+		local u = i / 400
+		local q = hermitePos(a, ta, b, tb, u)
+		local d = (q[1]-x)^2 + (q[2]-y)^2
+		if not bestD or d < bestD then bestU, bestD = u, d end
+	end
+	return bestU, bestD and math.sqrt(bestD) or nil
+end
+
+local function execPolyline(c, planOnly)
 	-- ROADC companion: the ORIGINATOR's engine integrated the street as part of
 	-- the construction placement itself, so replaying here would double-build
 	-- the connector. Peers execute; the originator skips -- same shape as CONP.
@@ -955,6 +1066,9 @@ local function execPolyline(c)
 			tostring(c.seq)))
 		return
 	end
+	local planV, planH = {}, {}          -- what THIS pass decided, for the wire
+	local usePlanV = planDecode(c.xv)    -- what the originator decided, if it said
+	local usePlanH = planDecode(c.xh)
 	local ok, err = pcall(function()
 		local isTrack = (tonumber(c.etype) or 0) == 1
 		local stype = tonumber(c.stype) or 16
@@ -1101,6 +1215,7 @@ local function execPolyline(c)
 		-- so nothing splits that edge twice. Single shared node: the form that
 		-- builds a real crossing at a road end (user-verified).
 		local XING_END_SNAP = 2.5   -- a split this close to an end node IS that node
+		local splitShape = {}   -- split node -> {px,py,pz, ax,ay, bx,by} for the wire
 		local function splitEdgeAt(eid, u, why, zWant)
 			if splitRoads[eid] then return splitRoads[eid] end
 			local comp, a, b, ta, tb = edgeGeomT(eid)
@@ -1137,6 +1252,9 @@ local function execPolyline(c)
 				zAt = zWant
 			end
 			local mid = newNodeAt(pm[1], pm[2], zAt)
+			-- Keep the shape of this split in world terms (the point, and the
+			-- edge it cut named by its endpoints) so it can travel to the peer.
+			splitShape[mid] = { pm[1], pm[2], zAt, a[1], a[2], b[1], b[2] }
 			dropEdge(eid)
 			local function half(nA, nB, tA, tB, sc)
 				if nA == nB then return end
@@ -1165,8 +1283,40 @@ local function execPolyline(c)
 			if resolved[i] then return resolved[i] end
 			local x, y, z = pts[i * 3 - 2], pts[i * 3 - 1], pts[i * 3]
 
+			-- The originator already decided this one. Follow it rather than
+			-- deriving our own answer from a world that may have drifted.
+			local told = usePlanV[i] and usePlanV[i][1]
+			if told then
+				if told.kind == "N" then
+					local n = findNodeNear(isTrack, told[1], told[2], 1.5)
+						or findNodeNear(not isTrack, told[1], told[2], 1.5)
+					if n then
+						CM.cmLog(string.format("PLAN: vertex %d -> node %d at %.1f,%.1f (as the originator resolved it)", i, n, told[1], told[2]))
+						resolved[i] = n; return n
+					end
+					CM.cmLog(string.format("PLAN: vertex %d: no node at %.1f,%.1f -- deriving locally", i, told[1], told[2]))
+				elseif told.kind == "S" then
+					local eid = findEdgeByEnds(false, told[4], told[5], told[6], told[7])
+						or findEdgeByEnds(true, told[4], told[5], told[6], told[7])
+					if eid then
+						local u = uOnEdge(eid, told[1], told[2])
+						if u then
+							local mid = splitEdgeAt(eid, u, "vertex " .. i .. " (originator's split)", told[3])
+							if mid then
+								CM.cmLog(string.format("PLAN: vertex %d -> split edge %d at %.1f,%.1f z=%.2f (as the originator did)", i, eid, told[1], told[2], told[3]))
+								resolved[i] = mid; return mid
+							end
+						end
+					end
+					CM.cmLog(string.format("PLAN: vertex %d: no edge %.1f,%.1f--%.1f,%.1f here -- deriving locally", i, told[4], told[5], told[6], told[7]))
+				end
+			end
+
 			local existing = findNodeNear(isTrack, x, y, 1.5)
-			if existing then resolved[i] = existing; return existing end
+			if existing then
+				planV[#planV + 1] = string.format("%d,N,%.2f,%.2f,%.2f", i, x, y, z)
+				resolved[i] = existing; return existing
+			end
 
 			-- LEVEL CROSSING (rail over road). The build tool splits the RAIL at
 			-- the crossing, so the crossing is always a rail VERTEX sitting on the
@@ -1180,13 +1330,18 @@ local function execPolyline(c)
 				if rnode then
 					log(string.format("ROADP: level crossing -- rail vertex %d shares road node %d", i, rnode))
 					CM.cmLog(string.format("XING: vertex %d snapped to road node %d (%.1f,%.1f)", i, rnode, x, y))
+					planV[#planV + 1] = string.format("%d,N,%.2f,%.2f,%.2f", i, x, y, z)
 					resolved[i] = rnode; return rnode
 				end
 				local reid, ru
 				pcall(function() reid, ru = findEdgeContaining(false, x, y) end)
 				if reid then
 					local mid = splitEdgeAt(reid, ru, "rail vertex " .. i .. " on road", z)
-					if mid then resolved[i] = mid; return mid end
+					if mid then
+						local sh = splitShape[mid]
+						if sh then planV[#planV + 1] = string.format("%d,S,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", i, sh[1], sh[2], sh[3], sh[4], sh[5], sh[6], sh[7]) end
+						resolved[i] = mid; return mid
+					end
 				end
 			end
 
@@ -1194,7 +1349,11 @@ local function execPolyline(c)
 			local okFind = pcall(function() eid, u = findEdgeContaining(isTrack, x, y) end)
 			if okFind and eid then
 				local mid = splitEdgeAt(eid, u, "vertex " .. i .. " mid-span")
-				if mid then resolved[i] = mid; return mid end
+				if mid then
+					local sh = splitShape[mid]
+					if sh then planV[#planV + 1] = string.format("%d,S,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", i, sh[1], sh[2], sh[3], sh[4], sh[5], sh[6], sh[7]) end
+					resolved[i] = mid; return mid
+				end
 			end
 
 			local id = newNodeAt(x, y, z)
@@ -1474,7 +1633,29 @@ local function execPolyline(c)
 				local tb0 = (k - 1) * 6
 				local T0 = tans[tb0 + 6] and { tans[tb0+1], tans[tb0+2], tans[tb0+3] } or { x1 - x0, y1 - y0, z1 - z0 }
 				local T1 = tans[tb0 + 6] and { tans[tb0+4], tans[tb0+5], tans[tb0+6] } or { x1 - x0, y1 - y0, z1 - z0 }
-				local hits = crossingsFor(k, n0, n1, x0, y0, z0, x1, y1, z1, T0, T1)
+				local hits
+				if usePlanH[k] then
+					-- The originator already found this segment's crossings. Match
+					-- each to a local edge/node by position; anything we cannot
+					-- place, we simply do not invent.
+					hits = {}
+					for _, told in ipairs(usePlanH[k]) do
+						if told.kind == "N" then
+							local n = findNodeNear(false, told[1], told[2], 1.5)
+							if n then hits[#hits + 1] = { node = n, u = told[4] or 0.5 }
+							else CM.cmLog(string.format("PLAN: link %d crossing node %.1f,%.1f absent here -- skipped", k, told[1], told[2])) end
+						elseif told.kind == "S" then
+							local eid = findEdgeByEnds(false, told[4], told[5], told[6], told[7])
+							if eid then
+								local ru = uOnEdge(eid, told[1], told[2])
+								if ru then hits[#hits + 1] = { eid = eid, ru = ru, u = told[8] or 0.5, zWant = told[3] } end
+							else CM.cmLog(string.format("PLAN: link %d crossing edge %.1f,%.1f--%.1f,%.1f absent here -- skipped", k, told[4], told[5], told[6], told[7])) end
+						end
+					end
+					CM.cmLog(string.format("PLAN: link %d -> %d crossing(s) from the originator", k, #hits))
+				else
+					hits = crossingsFor(k, n0, n1, x0, y0, z0, x1, y1, z1, T0, T1)
+				end
 				if #hits > 0 then
 					local chain = { { node = n0, u = 0 } }
 					local railLen = math.sqrt((x1 - x0) ^ 2 + (y1 - y0) ^ 2)
@@ -1482,11 +1663,15 @@ local function execPolyline(c)
 						if h.node then
 							chain[#chain + 1] = { node = h.node, u = h.u }      -- existing road node
 							xingNodes[#xingNodes + 1] = h.node
+							local np2 = nodePosXYZ(h.node)
+							if np2 then planH[#planH + 1] = string.format("%d,N,%.2f,%.2f,%.2f,%.4f", k, np2[1], np2[2], np2[3], h.u or 0.5) end
 						else
 							local mid = splitRoadAt(h.eid, h.ru)
 							if mid then
 								chain[#chain + 1] = { node = mid, u = math.max(0.001, math.min(0.999, h.u)) }
 								xingNodes[#xingNodes + 1] = mid
+								local sh = splitShape[mid]
+								if sh then planH[#planH + 1] = string.format("%d,S,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f", k, sh[1], sh[2], sh[3], sh[4], sh[5], sh[6], sh[7], h.u or 0.5) end
 							end
 						end
 					end
@@ -1664,6 +1849,9 @@ local function execPolyline(c)
 		-- after seg 1 with no error on disk (2026-08-29). Name it.
 		CM.cmLog("XING: execPolyline ERROR: " .. tostring(err))
 	end
+	-- What this pass decided, for the originator to put on the wire. Empty on a
+	-- peer that just followed a plan -- it has nothing to tell anyone.
+	return planEncode(planV), planEncode(planH)
 end
 
 -- ---------- constructions: HYBRID replication ----------
@@ -5465,6 +5653,32 @@ local function pollInject()
 						-- omitted entirely when there is nothing to remove: an empty
 						-- 'rm=' token would not survive decodeCmd's key=value scan
 						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
+						-- Decide HERE, once, and put the decisions on the wire.
+						-- This runs the real replay in plan-only mode: same
+						-- resolution, same splits, nothing built. Both instances
+						-- then execute the originator's answer at the stamp instead
+						-- of each re-deriving one against its own world.
+						local okPlan, xv, xh = pcall(function()
+							return execPolyline({ pts = sargs.pts, links = sargs.links,
+								tans = sargs.tans, bt = sargs.bt, etype = sargs.etype,
+								stype = sargs.stype, ttype = sargs.ttype, cat = sargs.cat,
+								rm = sargs.rm, seq = "plan" }, true)
+						end)
+						if okPlan then
+							-- pcall folds multiple returns; re-run shape: xv is the
+							-- first value, xh the second (nil when there is nothing).
+							if xv then sargs.xv = xv end
+							if xh then sargs.xh = xh end
+							local function entries(str)
+								local n = 0
+								for _ in tostring(str or ""):gmatch("[^;]+") do n = n + 1 end
+								return n
+							end
+							log(string.format("ROADP plan: %d vertex decision(s), %d crossing decision(s) shipped",
+								entries(xv), entries(xh)))
+						else
+							log("ROADP plan pass failed (" .. tostring(xv) .. ") -- peers will derive their own")
+						end
 						scheduleLocal("ROADP", sargs)
 					else
 						log("inject: ROADE produced no usable edges: " .. line:sub(1, 70))
