@@ -131,7 +131,7 @@ local BARRIER_AHEAD = 5.0
 -- The most peer lead a command's stamp will pay for. Bigger than BARRIER_AHEAD
 -- on purpose: the barrier only starts acting AT that threshold, so real skew
 -- overshoots it before coming back.
-local MAX_LEAD = 15.0
+CM.MAX_LEAD = 15.0
 
 -- Heartbeats cross between instances through a FILE RELAY (B is sandboxed), so
 -- they are not free. At every 2 ticks the relay fell behind and instance A was
@@ -150,7 +150,7 @@ local injectOffset = -1
 local seqNo        = 0
 local peerTime     = nil        -- last game time the peer reported
 local peerSeen     = false
-local lateCount    = 0   -- commands whose game-time stamp had already passed here
+CM.lateCount    = 0   -- commands whose game-time stamp had already passed here
 local queue        = {}         -- pending commands
 local executed     = {}         -- key -> true, so a command runs at most once
 local lastHashAt   = nil
@@ -4162,7 +4162,7 @@ function scheduleLocal(op, args)
 		-- still lands in the peer's past and is applied out of step. Cap high
 		-- enough to cover any gap the barrier tolerates in practice; the delay is
 		-- felt by the player, so it is not unbounded either.
-		if lead > MAX_LEAD then lead = MAX_LEAD end
+		if lead > CM.MAX_LEAD then lead = CM.MAX_LEAD end
 	end
 	local delay = EXEC_DELAY + lead
 	if lead > 0 then
@@ -4261,10 +4261,10 @@ local function onLine(line)
 					-- different points in their own histories. Everything that
 					-- depends on when it happened (what a town had grown to, where
 					-- a vehicle was) can differ from here on.
-					lateCount = lateCount + 1
+					CM.lateCount = CM.lateCount + 1
 					log(string.format("!! LATE %s seq=%d at=%d but now=%d (%d so far) " ..
 						"-- applied out of step; the worlds agree on the build, not on when",
-						tostring(c.op), c.seq, c.at, math.floor(now), lateCount))
+						tostring(c.op), c.seq, c.at, math.floor(now), CM.lateCount))
 				end
 				log(string.format("RECV %s seq=%d at=%d from %s", tostring(c.op), c.seq, c.at, c.origin))
 			end
@@ -5507,10 +5507,10 @@ end
 -- Between them, the two halves mean an installed copy of this mod changes
 -- nothing at all in a single-player game: the build is not cancelled and not
 -- replayed, and the player gets stock behaviour.
-local warnedSolo = false
-local function soloDrop(line)
-	if not warnedSolo then
-		warnedSolo = true
+CM.warnedSolo = false
+function CM.soloDrop(line)
+	if not CM.warnedSolo then
+		CM.warnedSolo = true
 		log("inject: no peer in this session -- captures dropped ("
 			.. tostring(line):sub(1, 40) .. "...); single player is left to the engine")
 	end
@@ -5531,7 +5531,7 @@ local function pollInject()
 			-- Diagnostics (EVAL, HEAL, BUYTEST) always run; a CAPTURE is dropped
 			-- when nobody is playing with us, because the engine already built it.
 			if not peerSeen and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" then
-				soloDrop(line)
+				CM.soloDrop(line)
 				return
 			end
 			-- Same protection pollEvents has had all along: one malformed line
@@ -6317,11 +6317,11 @@ CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 -- player wins: the pacer adopts it as the new normal and stops chasing. Second,
 -- a change of ours starts a cooldown, so the controller can never flap faster
 -- than a person can react to what it did.
-local PACE_COOLDOWN = 180        -- ticks (~3 s) between changes we make
+CM.PACE_COOLDOWN = 180        -- ticks (~3 s) between changes we make
 
-local function setSpeed(v, why)
+function CM.setSpeed(v, why)
 	CM.lastSetSpeed = v
-	CM.paceQuietUntil = ticks + PACE_COOLDOWN
+	CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
 	pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(v)) end)
 	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
 end
@@ -6348,7 +6348,7 @@ function CM.pace(ahead)
 		CM.baseSpeed = s
 		CM.catchingUp = false
 		CM.lastSetSpeed = nil
-		CM.paceQuietUntil = ticks + PACE_COOLDOWN
+		CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
 		return
 	end
 	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
@@ -6356,7 +6356,7 @@ function CM.pace(ahead)
 		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED then
 			CM.baseSpeed = s
 			CM.catchingUp = true
-			setSpeed(s + 1, string.format("%.2f behind the peer", behind))
+			CM.setSpeed(s + 1, string.format("%.2f behind the peer", behind))
 		elseif behind > CM.CATCHUP_BEHIND then
 			-- Already at the top speed: the peer must come down to us, which the
 			-- barrier does at BARRIER_AHEAD. Nothing to do but say so.
@@ -6371,14 +6371,14 @@ function CM.pace(ahead)
 		end
 	elseif behind <= CM.CATCHUP_DONE then
 		CM.catchingUp = false
-		setSpeed(CM.baseSpeed or 1, string.format("caught up, %.2f behind", behind))
+		CM.setSpeed(CM.baseSpeed or 1, string.format("caught up, %.2f behind", behind))
 	end
 end
 
 -- Undo a hold that WE placed. If the speed is no longer the 0 we set, the
 -- player has taken the lever back (they paused, or unpaused us) -- leave it
 -- alone rather than yanking the game back to speed under their hands.
-local function releaseSpeed(why)
+function CM.releaseSpeed(why)
 	local s0
 	pcall(function() s0 = game.interface.getGameSpeed() end)
 	if s0 ~= nil and s0 ~= 0 then
@@ -6386,7 +6386,7 @@ local function releaseSpeed(why)
 		CM.lastSetSpeed = nil
 		return
 	end
-	setSpeed(CM.baseSpeed or 1, why)
+	CM.setSpeed(CM.baseSpeed or 1, why)
 end
 
 local function applyBarrier(now)
@@ -6396,7 +6396,7 @@ local function applyBarrier(now)
 	if paused and pausedSince and (ticks - pausedSince) > MAX_PAUSE_TICKS then
 		paused = false
 		pausedSince = nil
-		releaseSpeed("watchdog")
+		CM.releaseSpeed("watchdog")
 		log(string.format("!! BARRIER WATCHDOG: held %d ticks, forcing release " ..
 			"(now=%.2f peer=%.2f). Sync is not guaranteed while this fires.",
 			MAX_PAUSE_TICKS, now, peerTime))
@@ -6410,7 +6410,7 @@ local function applyBarrier(now)
 		if paused then
 			paused = false
 			pausedSince = nil
-			releaseSpeed("peer time stale")
+			CM.releaseSpeed("peer time stale")
 			log("BARRIER release: peer time is stale, not holding against it")
 		end
 		return
@@ -6421,13 +6421,13 @@ local function applyBarrier(now)
 	if ahead > BARRIER_AHEAD and not paused then
 		paused = true
 		pausedSince = ticks
-		setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
+		CM.setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
 		log(string.format("BARRIER hold: %.2f ahead of peer (peer=%.2f)", ahead, peerTime))
 	elseif ahead <= BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
 		CM.catchingUp = false
-		releaseSpeed("peer caught up")
+		CM.releaseSpeed("peer caught up")
 		log(string.format("BARRIER release: %.2f ahead", ahead))
 	end
 end
@@ -6554,7 +6554,7 @@ function data()
 						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  queued=%d%s",
 							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
 							peerTime and string.format("%+.1f", now - peerTime) or "?",
-							desyncs, lateCount, #queue, paused and "  PAUSED" or ""))
+							desyncs, CM.lateCount, #queue, paused and "  PAUSED" or ""))
 						f:close()
 					end
 				end)
