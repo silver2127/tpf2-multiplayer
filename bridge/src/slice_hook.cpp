@@ -217,15 +217,33 @@ static bool CfgLineIsComment(const char* line)
 static void ReadCfg(bool* enabled, bool* suppress, bool* groundtruth)
 {
     *enabled = true;      // default on; the DLL is only present if asked for
-    *suppress = false;    // but never cancel a build unless explicitly told to
+    *suppress = false;    // see the no-cfg case below: that means lockstep
     if (groundtruth) *groundtruth = false;
     FILE* f = OpenCfg();
-    if (!f) return;
+    if (!f) {
+        // NO CFG AT ALL. This fell through to suppress=0, which is observe
+        // mode: the build happens locally AND replicates, so that peer
+        // silently runs a different protocol from every other one. Measured
+        // 2026-08-31 on a joiner with no cfg installed -- it applied its own
+        // builds at click time while the host cancelled and replayed at the
+        // stamp, and the two worlds could not stay together. A missing file is
+        // not a request for a debugging mode: real multiplayer is the default,
+        // and the log says so once.
+        *suppress = true;
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            Log("[slice] no tpf2_slice.cfg found -- defaulting to suppress=1 "
+                "(real lockstep); put a cfg next to the DLL to change it\n");
+        }
+        return;
+    }
     char line[128];
     while (fgets(line, sizeof(line), f)) {
         if (CfgLineIsComment(line)) continue;
         if (strstr(line, "enabled=0"))     *enabled = false;
         if (strstr(line, "suppress=1"))    *suppress = true;
+        if (strstr(line, "suppress=0"))    *suppress = false;   // explicit observe mode
         if (groundtruth && strstr(line, "groundtruth=1")) *groundtruth = true;
     }
     fclose(f);
@@ -242,6 +260,17 @@ static void ReadCfg(bool* enabled, bool* suppress, bool* groundtruth)
 // GetCurrentProcessId turns that silent loss into a loud refusal: g_instance
 // stays empty, the attach line prints instance=?, and WriteInject refuses
 // ("no instance letter -- cannot inject").
+// RE-READ, NEVER CACHED. The joiner's bridge picks its letter from which
+// local port is free, so on a machine running one game it claims 'a' and
+// writes that into tpf2_instance.txt. The LOBBY then hands it the joiner
+// role and the bridge and Lua both become 'b' -- but a slice that read the
+// letter once at attach keeps writing captures into lockstep_inject_a.txt,
+// which nothing on that machine reads. Everything the joining player does
+// is then dropped in silence: measured 2026-08-31, a vehicle purchase and
+// every build on the joiner never reached the host, while the host's own
+// commands replayed there perfectly (inject_a.txt fresh, inject_b.txt eight
+// hours stale, Lua logging [ls-b] the whole time). The file is 22 bytes and
+// a capture happens when a player clicks, so re-reading costs nothing.
 static void ReadInstance()
 {
     char p[MAX_PATH];
@@ -518,7 +547,7 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
                         const int32_t* rmNode, int rn, const Edge* rmEdge, int re,
                         const EdgeType& et)
 {
-    if (!g_instance[0]) ReadInstance();
+    ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
 
     char p[MAX_PATH];
@@ -585,7 +614,7 @@ static long g_conroad = 0;
 static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int m,
                                const Edge* rme, int re, const EdgeType& et)
 {
-    if (!g_instance[0]) ReadInstance();
+    ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
@@ -1214,7 +1243,7 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
     uint64_t ub = 0;
     int units = VCfgParts(cfg, &ub, "VBUY");
     if (units < 0) return;
-    if (!g_instance[0]) ReadInstance();
+    ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
@@ -1241,7 +1270,7 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
 // never cancelled and the originator skips its own replay.
 static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
 {
-    if (!g_instance[0]) ReadInstance();
+    ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
