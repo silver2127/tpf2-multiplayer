@@ -5853,9 +5853,14 @@ local MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
 -- when the clocks agree is the speed restored after a catch-up.
 local CATCHUP_BEHIND = 0.8    -- units behind before we run faster
 local CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
-local CATCHUP_SPEED  = 2      -- multiplier while catching up
+-- The engine's speeds are 0..3 (0 = paused), so catching up means ONE notch up
+-- from whatever the player picked, and there is no room at all at 3. A notch is
+-- enough: at speed 2 the clock gains on a peer at speed 1 about as fast as the
+-- gap opened in the first place, and 1 -> 3 would be a visible lurch.
+local MAX_SPEED      = 3
 local catchingUp  = false
 local baseSpeed   = nil       -- the player's speed, sampled while in step
+local pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 
 local function pace(ahead)
 	if paused then return end                       -- the barrier owns the speed
@@ -5867,14 +5872,24 @@ local function pace(ahead)
 		return
 	end
 	if not catchingUp then
-		if behind > CATCHUP_BEHIND then
+		if behind > CATCHUP_BEHIND and s < MAX_SPEED then
 			baseSpeed = s
 			catchingUp = true
-			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(CATCHUP_SPEED)) end)
+			local up = s + 1
+			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(up)) end)
 			log(string.format("PACE: %.2f behind the peer -- speed %s -> %d to catch up",
-				behind, tostring(s), CATCHUP_SPEED))
+				behind, tostring(s), up))
+		elseif behind > CATCHUP_BEHIND then
+			-- Already at the top speed: the peer must come down to us, which the
+			-- barrier does at BARRIER_AHEAD. Nothing to do but say so.
+			if not pacedTopWarned then
+				pacedTopWarned = true
+				log(string.format("PACE: %.2f behind at speed %s -- no notch left, "
+					.. "waiting for the barrier", behind, tostring(s)))
+			end
 		else
 			baseSpeed = s                            -- in step: this is the player's choice
+			pacedTopWarned = false
 		end
 	elseif behind <= CATCHUP_DONE then
 		local back = baseSpeed or 1
