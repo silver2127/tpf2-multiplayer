@@ -42,8 +42,13 @@
 -- discovery is an immediately-invoked function and its bookkeeping lives in CM
 -- (CM.baseSource = which candidate won, CM.baseCandidates = every candidate
 -- dir, for readers that must look where a peer may have landed).
+-- Constants and the per-instance file paths live here rather than as two
+-- dozen more top-level locals: Lua allows 200 per chunk, and this file has
+-- already hit that ceiling once, where the mod silently fails to load.
+local K = {}
+
 local CM = {}   -- the one catch-all state table; documented at its former home below
-local BASE = (function()
+K.BASE = (function()
 	local function env(name)
 		local ok, v = pcall(function() return os.getenv(name) end)
 		if ok and type(v) == "string" and #v > 0 then return v end
@@ -79,11 +84,11 @@ local BASE = (function()
 	CM.baseSource = pick.source .. " (no identity file yet)"
 	return pick.path
 end)()
-local IDENTITY_FILE = BASE .. "tpf2_instance.txt"
+K.IDENTITY_FILE = K.BASE .. "tpf2_instance.txt"
 
-local INSTANCE  = nil
-local PEER      = nil
-local CAPTURE_FILE, EVENTS_FILE, INJECT_FILE
+K.INSTANCE  = nil
+K.PEER      = nil
+-- (was: local K.CAPTURE_FILE, K.EVENTS_FILE, K.INJECT_FILE) -- fields of K now, nil until set
 local guiTick, statusWin, statusText = 0, nil, nil   -- gui-state only
 
 -- UNITS. getGameTime().time is NOT seconds: comparing a live reading (t=55234)
@@ -98,37 +103,37 @@ local guiTick, statusWin, statusText = 0, nil, nil   -- gui-state only
 -- MEASURED: 1 game-time unit is ~1.1s of wall clock at speed 1 (300 ticks took
 -- 56s and advanced 50 units), so this delay IS the felt latency of a build.
 --
--- EXEC_DELAY must exceed BARRIER_AHEAD, not trail it. A peer is allowed to run
--- up to BARRIER_AHEAD units ahead; if a command is stamped only EXEC_DELAY ahead
+-- K.EXEC_DELAY must exceed K.BARRIER_AHEAD, not trail it. A peer is allowed to run
+-- up to K.BARRIER_AHEAD units ahead; if a command is stamped only K.EXEC_DELAY ahead
 -- of the ORIGINATOR and the peer is further ahead than that, the stamp is
 -- already in the peer's past and it executes early -- a desync, not a delay.
 -- The original 4-vs-10 had that backwards.
-local EXEC_DELAY = 0.6
+K.EXEC_DELAY = 0.6
 
 -- Pause if we are more than this far ahead of the peer. This is the tick
 -- barrier: the sim cannot be blocked from Lua, but it can be paused, which
 -- achieves the same thing -- nobody runs past a peer who has not caught up, so
 -- no command can arrive too late to execute at its stamp. Must be comfortably
--- larger than EXEC_DELAY or the barrier fights normal scheduling.
+-- larger than K.EXEC_DELAY or the barrier fights normal scheduling.
 -- MEASURED: the game clock is FRACTIONAL, advancing in steps of exactly 0.2
 -- units (~0.22s wall clock) -- so sub-second stamps are possible. A single
 -- sample at load read 55234.000000 and looked integer; it was just a round
 -- value from the save. Step size is what settles resolution, not one reading.
 --
 -- CORRECTION to the rule above. Latency does NOT have to clear this threshold.
--- What correctness needs is EXEC_DELAY > the peers' ACTUAL skew; the barrier is
+-- What correctness needs is K.EXEC_DELAY > the peers' ACTUAL skew; the barrier is
 -- only a backstop against one instance stalling badly. Treating it as a latency
 -- budget forced the delay up, and then tightening it to buy the delay back
 -- deadlocked both games.
 --
 -- So: keep the barrier LOOSE enough that it almost never fires (5.0 = ~5.5s of
 -- drift, which two instances on one machine do not reach in normal play), and
--- keep EXEC_DELAY small for latency. The !! LATE warning measures the real skew
--- -- if it starts firing, actual drift exceeds EXEC_DELAY and the delay must go
+-- keep K.EXEC_DELAY small for latency. The !! LATE warning measures the real skew
+-- -- if it starts firing, actual drift exceeds K.EXEC_DELAY and the delay must go
 -- up. That is a measurement, not a guess.
-local BARRIER_AHEAD = 5.0
+K.BARRIER_AHEAD = 5.0
 
--- The most peer lead a command's stamp will pay for. Bigger than BARRIER_AHEAD
+-- The most peer lead a command's stamp will pay for. Bigger than K.BARRIER_AHEAD
 -- on purpose: the barrier only starts acting AT that threshold, so real skew
 -- overshoots it before coming back.
 CM.MAX_LEAD = 15.0
@@ -137,12 +142,12 @@ CM.MAX_LEAD = 15.0
 -- they are not free. At every 2 ticks the relay fell behind and instance A was
 -- reading peer times ~13 units stale while B saw A correctly -- both then paused
 -- against bad data. 5 ticks is a rate the relay keeps up with.
-local HEARTBEAT_EVERY = 5     -- ticks between LSTICK broadcasts (~0.93s)
+K.HEARTBEAT_EVERY = 5     -- ticks between LSTICK broadcasts (~0.93s)
 
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the barrier section.
-local PEER_STALE_TICKS = 25
-local HASH_EVERY_GAMETIME = 4 -- ~2 game days between desync checks
+K.PEER_STALE_TICKS = 25
+K.HASH_EVERY_GAMETIME = 4 -- ~2 game days between desync checks
 
 local ticks        = 0
 local eventsOffset = -1
@@ -163,7 +168,7 @@ local pausedSince  = nil        -- tick the barrier engaged, for the watchdog
 local peerTimeAt   = nil        -- tick peerTime was last refreshed
 local desyncs      = 0
 
-local function log(s) print("[ls-" .. (INSTANCE or "?") .. "] " .. s) end
+local function log(s) print("[ls-" .. (K.INSTANCE or "?") .. "] " .. s) end
 
 -- ---------- exact hashing (two Lehmer lanes, products stay under 2^53) ----------
 -- Same construction as the M3 probe. A weaker hash silently collides and
@@ -238,18 +243,18 @@ local function readFrom(path, offset)
 end
 
 local function detectInstance()
-	local f = io.open(IDENTITY_FILE, "r")
+	local f = io.open(K.IDENTITY_FILE, "r")
 	if not f then return false end
 	local s = f:read("*l")
 	f:close()
 	if not s or #s == 0 then return false end
 	local inst = s:gsub("%s", "")
-	if inst == INSTANCE then return true end
-	INSTANCE = inst
-	PEER = (inst == "a") and "b" or "a"
-	CAPTURE_FILE = BASE .. "tpf2_capture_" .. INSTANCE .. ".txt"
-	EVENTS_FILE  = BASE .. "tpf2_events_" .. INSTANCE .. ".txt"
-	INJECT_FILE  = BASE .. "lockstep_inject_" .. INSTANCE .. ".txt"
+	if inst == K.INSTANCE then return true end
+	K.INSTANCE = inst
+	K.PEER = (inst == "a") and "b" or "a"
+	K.CAPTURE_FILE = K.BASE .. "tpf2_capture_" .. K.INSTANCE .. ".txt"
+	K.EVENTS_FILE  = K.BASE .. "tpf2_events_" .. K.INSTANCE .. ".txt"
+	K.INJECT_FILE  = K.BASE .. "lockstep_inject_" .. K.INSTANCE .. ".txt"
 	-- events: -1 means "seek to end", which is right -- peer traffic from before
 	-- we loaded is stale and replaying it would apply commands whose stamps have
 	-- long passed.
@@ -261,18 +266,18 @@ local function detectInstance()
 	-- events file, where the joiner primed to end-of-file and reported
 	-- consumed=0 while holding every line.
 	injectOffset = 0
-	local f2 = io.open(INJECT_FILE, "r")
+	local f2 = io.open(K.INJECT_FILE, "r")
 	if f2 then injectOffset = f2:seek("end"); f2:close() end
-	log("identity " .. INSTANCE .. " (peer " .. PEER .. ")")
+	log("identity " .. K.INSTANCE .. " (peer " .. K.PEER .. ")")
 	if not CM.baseLogged then
 		-- once, and on disk: stdout is buffered until exit, cmLog is not
 		CM.baseLogged = true
 		local out = CM.cmLog or log
-		out("  base " .. BASE .. "  [" .. tostring(CM.baseSource) .. "]")
+		out("  base " .. K.BASE .. "  [" .. tostring(CM.baseSource) .. "]")
 	end
-	log("  send -> " .. CAPTURE_FILE)
-	log("  recv <- " .. EVENTS_FILE)
-	log("  inject <- " .. INJECT_FILE)
+	log("  send -> " .. K.CAPTURE_FILE)
+	log("  recv <- " .. K.EVENTS_FILE)
+	log("  inject <- " .. K.INJECT_FILE)
 	return true
 end
 
@@ -295,14 +300,14 @@ end
 -- ONE table for all companies-mode state/fns: Lua 5.1 allows only 200
 -- top-level locals per chunk and this file sits right at it (a 19-local batch
 -- crashed both instances at script load with "too many local variables").
--- The table itself is declared at the top of the file so the BASE discovery
+-- The table itself is declared at the top of the file so the K.BASE discovery
 -- can record into it; everything companies-mode starts here.
-CM.CM_CFG_FILE = BASE .. "mp_company_cfg.txt"
+CM.CM_CFG_FILE = K.BASE .. "mp_company_cfg.txt"
 -- The game buffers stdout until exit, so print()-only logging is invisible while
 -- a live test runs. Companies-mode diagnostics go to their own file on disk.
 function CM.cmLog(s)
 	log(s)
-	local f = io.open(BASE .. "mp_company_" .. tostring(INSTANCE or "?") .. ".log", "a")
+	local f = io.open(K.BASE .. "mp_company_" .. tostring(K.INSTANCE or "?") .. ".log", "a")
 	if f then f:write(s, "\n"); f:close() end
 end
 CM.cmMode       = "coop"
@@ -521,7 +526,7 @@ end
 -- reference would resolve to a nil global at call time -- the groundAt bug.
 local ser, deepcopy, isPlayerConstruction
 local scheduleLocal   -- forward: called by the line registry above its definition
-local STRICT_OPS = { VREV = true }   -- strict-safe only: UI must not wait for a result (buy crashed -- see hook)
+K.STRICT_OPS = { VREV = true }   -- strict-safe only: UI must not wait for a result (buy crashed -- see hook)
 
 local warnedNoEdges = false
 -- node id -> "x,y", valid for ONE hash pass only. Ids are recycled: a node that
@@ -810,9 +815,9 @@ local function edgeGeomT(eid)
 	return comp, a, b, vec3t(comp.tangent0), vec3t(comp.tangent1)
 end
 
-local SPLIT_EPS = 5.0   -- was 3.0; a rail touching a road's EDGE sits ~4.5 m off its centreline
-local SPLIT_MIN_U = 0.08   -- nearer an end than this IS the endpoint, not a split
-local SPLIT_MIN_DIST = 0.3  -- metres from an end node: closer than this IS the node
+K.SPLIT_EPS = 5.0   -- was 3.0; a rail touching a road's EDGE sits ~4.5 m off its centreline
+K.SPLIT_MIN_U = 0.08   -- nearer an end than this IS the endpoint, not a split
+K.SPLIT_MIN_DIST = 0.3  -- metres from an end node: closer than this IS the node
 
 local function edgeMaps()
 	local maps = {}
@@ -853,7 +858,7 @@ end
 local function findEdgeContaining(isTrack, x, y, skipNode)
 	-- Sampling is by DISTANCE, not by a fixed 19 points: a 77 m town road
 	-- sampled every 7.7 m misses a point that is on it. And the end
-	-- exclusion is by distance (SPLIT_MIN_DIST), not by fraction: the UI
+	-- exclusion is by distance (K.SPLIT_MIN_DIST), not by fraction: the UI
 	-- happily splits 1.0 m from an end node (measured: a depot snapped at
 	-- u=0.013 of a 76.9 m edge), and 8% of a long edge is many metres.
 	local best, bestD, bestU, bestGeom, seen = nil, nil, nil, nil, {}
@@ -884,7 +889,7 @@ local function findEdgeContaining(isTrack, x, y, skipNode)
 							local u = i / steps
 							local q = hermitePos(a, ta, b, tb, u)
 							local d = (q[1]-x)^2 + (q[2]-y)^2
-							if d < SPLIT_EPS*SPLIT_EPS and (not bestD or d < bestD) then
+							if d < K.SPLIT_EPS*K.SPLIT_EPS and (not bestD or d < bestD) then
 								best, bestD, bestU = eid, d, u
 								bestGeom = { a, ta, b, tb, steps }
 							end
@@ -910,7 +915,7 @@ local function findEdgeContaining(isTrack, x, y, skipNode)
 	-- too close to an end IS the end node, not a split
 	local dA = math.sqrt((q[1]-a[1])^2 + (q[2]-a[2])^2)
 	local dB = math.sqrt((q[1]-b[1])^2 + (q[2]-b[2])^2)
-	if dA < SPLIT_MIN_DIST or dB < SPLIT_MIN_DIST then return nil end
+	if dA < K.SPLIT_MIN_DIST or dB < K.SPLIT_MIN_DIST then return nil end
 	return best, u
 end
 
@@ -1067,7 +1072,7 @@ local function execPolyline(c, planOnly)
 	-- ROADC companion: the ORIGINATOR's engine integrated the street as part of
 	-- the construction placement itself, so replaying here would double-build
 	-- the connector. Peers execute; the originator skips -- same shape as CONP.
-	if tonumber(c.skipOrigin or 0) == 1 and c.origin == INSTANCE then
+	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then
 		log(string.format("ROADP seq=%s: skipOrigin -- placement already integrated here",
 			tostring(c.seq)))
 		return
@@ -1915,7 +1920,7 @@ end
 --   1. the ORIGINATOR lets the build happen locally (the hook does not cancel
 --      caller 419f62), then reads fileName / params / transf back off the
 --      resulting entity and schedules a CONP command carrying all three;
---   2. every PEER replays it at the stamp with game.interface.buildConstruction
+--   2. every K.PEER replays it at the stamp with game.interface.buildConstruction
 --      + setPlayer -- the path mp_bridge measured live, including a 16-module
 --      modular station -- and the originator skips its own command.
 --
@@ -1923,14 +1928,14 @@ end
 -- not strict lockstep for constructions. Entity ids may differ across peers as
 -- a result, which is consistent with the rest of the design: nothing addresses
 -- a construction by id on the wire.
-local MAX_SER_DEPTH = 8
+K.MAX_SER_DEPTH = 8
 function ser(v, depth)
 	depth = depth or 0
 	local t = type(v)
 	if t == "number" or t == "boolean" then return tostring(v) end
 	if t == "string" then return string.format("%q", v) end
 	if t == "table" then
-		if depth >= MAX_SER_DEPTH then return "{}" end
+		if depth >= K.MAX_SER_DEPTH then return "{}" end
 		-- Sorted keys: the same table always serialises to the same text.
 		local keys = {}
 		for k in pairs(v) do keys[#keys + 1] = k end
@@ -1976,7 +1981,7 @@ end
 local expectedCons = {}      -- posKey -> true: our own replay is about to land here
 -- Pairing buffers for CONX: the hook's ROADC street payload arrives within a
 -- tick of the placement; the construction itself is noticed by a poll up to
--- CON_POLL_EVERY ticks later. Whichever comes first waits for the other.
+-- K.CON_POLL_EVERY ticks later. Whichever comes first waits for the other.
 local pendingRoadc = {}      -- { at, posOf, adds, rms, spos, etype, stype, ttype, cat }
 local pendingCons  = {}      -- { at, file, t, params, x, y }
 
@@ -1984,7 +1989,7 @@ local pendingCons  = {}      -- { at, file, t, params, x, y }
 local function conKey(x, y) return string.format("%.1f/%.1f", x, y) end
 
 local function execConP(c)
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("CONP seq=%d: originator already built it locally, skipping", c.seq))
 		return
 	end
@@ -2042,7 +2047,7 @@ local function findConNear(file, x, y, maxDist)
 end
 
 local function execConU(c)
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("CONU seq=%d: originator already applied it, skipping", c.seq))
 		return
 	end
@@ -2267,7 +2272,7 @@ end
 local function execDemolish(c)
 	-- The originator already bulldozed its own construction (the removal
 	-- detector fired BECAUSE it was gone locally); only the peer replays.
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("DEMOLISH seq=%s: originator already bulldozed locally, skipping", tostring(c.seq)))
 		return
 	end
@@ -2390,7 +2395,7 @@ end
 
 -- Prime knownVeh from every player depot once constructions are primed.
 local function primeVehKeys()
-	-- consByKey fills at PRIME_PER_TICK per tick after consPrimed; priming the
+	-- consByKey fills at K.PRIME_PER_TICK per tick after consPrimed; priming the
 	-- depot lists before that drained saw an empty table ('primed 0'), and a
 	-- purchase would then have resolved to an OLD parked vehicle. Wait for the
 	-- queue, and treat every save vehicle as known regardless.
@@ -2596,7 +2601,7 @@ local function pollLineKeys()
 	if not now then return end
 	local fresh = {}
 	for _, lid in ipairs(allLines()) do if not knownLines[lid] then fresh[#fresh + 1] = lid end end
-	-- PEER FIRST, matched by CONTENT: a replayed line is the fresh one whose
+	-- K.PEER FIRST, matched by CONTENT: a replayed line is the fresh one whose
 	-- stops signature equals the LCREATE we replayed. This is the discriminator
 	-- the vehicle path gets from the depot -- without it, a line created
 	-- locally on the same instance that is also replaying a peer's line could
@@ -2623,7 +2628,7 @@ local function pollLineKeys()
 		if snap then
 			scheduleLocal("LCREATE", { name = snap.name, color = snap.color, wait = snap.wait,
 			                           stops = snap.stops, skipOrigin = 1 })
-			registerLineKey(INSTANCE .. ":" .. tostring(seqNo), lid)
+			registerLineKey(K.INSTANCE .. ":" .. tostring(seqNo), lid)
 		else
 			knownLines[lid] = true
 			log(string.format("line: new line %d could not be read back -- not replicated", lid))
@@ -2669,7 +2674,7 @@ local function buildLineObject(c)
 end
 
 local function execLine(c)
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
 		return
 	end
@@ -2724,13 +2729,13 @@ local function targetFor(kind, key)
 			if alive then return rec.id end
 		end
 		local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
-		if kx then return constructionAt(tonumber(kx), tonumber(ky)) end
+		if kx then return CM.constructionAt(tonumber(kx), tonumber(ky)) end
 	end
 	return nil
 end
 
 local function execSetName(c)
-	if tonumber(c.skipOrigin or 0) == 1 and c.origin == INSTANCE then return end
+	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
 	local ok, err = pcall(function()
 		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
 		if not id then
@@ -2748,7 +2753,7 @@ local function execSetName(c)
 end
 
 local function execSetColor(c)
-	if tonumber(c.skipOrigin or 0) == 1 and c.origin == INSTANCE then return end
+	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
 	local ok, err = pcall(function()
 		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
 		if not id then
@@ -2766,11 +2771,11 @@ local function execSetColor(c)
 end
 
 local function execVehCmd(c)
-	if c.origin == INSTANCE and not STRICT_OPS[c.op] then
+	if c.origin == K.INSTANCE and not K.STRICT_OPS[c.op] then
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
 		return
 	end
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("%s seq=%s: STRICT -- originator replaying at stamp (local was cancelled)", c.op, tostring(c.seq)))
 	end
 	local ok, err = pcall(function()
@@ -2864,11 +2869,11 @@ function buildVehConfig(c)
 end
 
 local function execVBuy(c)
-	if c.origin == INSTANCE and not STRICT_OPS.VBUY then
+	if c.origin == K.INSTANCE and not K.STRICT_OPS.VBUY then
 		log(string.format("VBUY seq=%s: originator already bought locally, skipping", tostring(c.seq)))
 		return
 	end
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("VBUY seq=%s: STRICT -- originator replaying buy at stamp (local was cancelled)", tostring(c.seq)))
 	end
 	local ok, err = pcall(function()
@@ -2950,7 +2955,7 @@ end
 --
 -- A global, not a `local function`: the chunk is at Lua 5.1's 200-local limit.
 function execVReplace(c)
-	if c.origin == INSTANCE and not STRICT_OPS.VREPL then
+	if c.origin == K.INSTANCE and not K.STRICT_OPS.VREPL then
 		log(string.format("VREPL seq=%s: originator already replaced locally, skipping",
 			tostring(c.seq)))
 		return
@@ -3036,7 +3041,7 @@ local conxBusy, conxBusyAt = false, nil
 local conxQueue = {}
 local execConX
 execConX = function(c)
-	if c.origin == INSTANCE then
+	if c.origin == K.INSTANCE then
 		log(string.format("%s seq=%d: originator already built it locally, skipping", tostring(c.op), c.seq))
 		return
 	end
@@ -3997,7 +4002,7 @@ end
 -- refused replay left the building standing on one side forever -- a permanent,
 -- silent divergence that every later command near it inherited.
 local function execConFail(c)
-	if tostring(c.target) ~= INSTANCE then return end
+	if tostring(c.target) ~= K.INSTANCE then return end
 	local ok, err = pcall(function()
 		local key = conKey(c.x, c.y)
 		-- EXACT match only. The first version took the nearest player construction
@@ -4074,7 +4079,7 @@ end
 
 -- ---------- wire ----------
 local function broadcast(line)
-	if CAPTURE_FILE then appendLine(CAPTURE_FILE, line) end
+	if K.CAPTURE_FILE then appendLine(K.CAPTURE_FILE, line) end
 end
 
 -- Field order on the wire is FIXED (sorted), not pairs() order.
@@ -4137,26 +4142,26 @@ function scheduleLocal(op, args)
 	seqNo = seqNo + 1
 	-- No math.floor. Flooring `now` before adding the delay discarded up to a
 	-- whole game-time unit -- about 1.1s of wall clock, more than the entire
-	-- latency budget -- and made the actual delay vary between EXEC_DELAY-1 and
-	-- EXEC_DELAY. Stamps are carried in the command, so they never needed to be
+	-- latency budget -- and made the actual delay vary between K.EXEC_DELAY-1 and
+	-- K.EXEC_DELAY. Stamps are carried in the command, so they never needed to be
 	-- integers to agree.
 	-- Round to the wire precision at CREATION: encodeCmd ships at as %.4f, so
 	-- without this the originator holds a full-precision stamp and the peer a
 	-- rounded one -- two commands within ~1e-4 could sort differently per peer.
-	-- The stamp has to be in the PEER's future, not just ours. EXEC_DELAY alone
+	-- The stamp has to be in the K.PEER's future, not just ours. K.EXEC_DELAY alone
 	-- assumes the two clocks are together; when the peer is running ahead by more
 	-- than the delay, our command arrives already due and it executes at once
 	-- while we still wait -- the two sims then apply the same command at
 	-- different game times. That is what "builds sometimes land out of order"
 	-- was. Measured on a live session: skew sat at +2 to +4 units against an
-	-- EXEC_DELAY of 0.6, so EVERY command from the trailing side landed in the
+	-- K.EXEC_DELAY of 0.6, so EVERY command from the trailing side landed in the
 	-- leader's past. Pay the peer's lead plus a margin when there is one; when
-	-- the clocks are together this is exactly EXEC_DELAY again.
+	-- the clocks are together this is exactly K.EXEC_DELAY again.
 	local lead = 0
-	if peerTime and peerTimeAt and (ticks - peerTimeAt) <= PEER_STALE_TICKS then
+	if peerTime and peerTimeAt and (ticks - peerTimeAt) <= K.PEER_STALE_TICKS then
 		lead = peerTime - now
 		if lead < 0 then lead = 0 end
-		-- Capping this at BARRIER_AHEAD was wrong. The barrier is a backstop that
+		-- Capping this at K.BARRIER_AHEAD was wrong. The barrier is a backstop that
 		-- acts only once a peer is 5 units ahead, and it takes time to bite -- a
 		-- live session was seen 9.2 units apart. A command stamped 5.6 out then
 		-- still lands in the peer's past and is applied out of step. Cap high
@@ -4164,14 +4169,14 @@ function scheduleLocal(op, args)
 		-- felt by the player, so it is not unbounded either.
 		if lead > CM.MAX_LEAD then lead = CM.MAX_LEAD end
 	end
-	local delay = EXEC_DELAY + lead
+	local delay = K.EXEC_DELAY + lead
 	if lead > 0 then
 		log(string.format("stamp: peer is %.2f ahead -- scheduling %.2f out instead of %.2f",
-			lead, delay, EXEC_DELAY))
+			lead, delay, K.EXEC_DELAY))
 	end
 	local at = tonumber(string.format("%.4f",
 		now + delay + (tonumber(args and args.delay or 0) or 0)))
-	local c = { op = op, at = at, origin = INSTANCE, seq = seqNo }
+	local c = { op = op, at = at, origin = K.INSTANCE, seq = seqNo }
 	for k, v in pairs(args) do c[k] = v end
 	-- companies mode: stamp the originating company so the peer can attribute the
 	-- resulting entity. No-op in coop => the wire form is unchanged there.
@@ -4243,12 +4248,12 @@ local function onLine(line)
 		local c = decodeCmd(line)
 		if c then
 			-- our own command coming back off the wire; already queued
-			if c.origin ~= INSTANCE then
+			if c.origin ~= K.INSTANCE then
 				queue[#queue + 1] = c
 				-- A command whose stamp has already passed here will execute at a
 				-- DIFFERENT sim time than it did on the originator, which is a
 				-- desync rather than a late delivery. It is the exact failure
-				-- EXEC_DELAY > BARRIER_AHEAD exists to prevent, so say so loudly
+				-- K.EXEC_DELAY > K.BARRIER_AHEAD exists to prevent, so say so loudly
 				-- if it ever happens instead of letting it look like a mystery
 				-- hash mismatch later.
 				local now = gameTime()
@@ -4292,8 +4297,8 @@ local function onLine(line)
 end
 
 local function pollEvents()
-	if not EVENTS_FILE then return end
-	local data, newOff = readFrom(EVENTS_FILE, eventsOffset)
+	if not K.EVENTS_FILE then return end
+	local data, newOff = readFrom(K.EVENTS_FILE, eventsOffset)
 	eventsOffset = newOff
 	if not data then return end
 	for line in data:gmatch("[^\r\n]+") do
@@ -4317,11 +4322,11 @@ end
 --
 -- Samples are self-identifying: node 0's X carries 900000 + testId*1000 + index,
 -- so every capture is labelled in-band and nothing depends on matching by order.
-local GT_BASE_X = 900000
+K.GT_BASE_X = 900000
 
 local function gtProposal(testId, index, isTrack, streetType, trackType, catenary)
 	local sp = api.type.SimpleProposal.new()
-	local x = GT_BASE_X + testId * 1000 + index
+	local x = K.GT_BASE_X + testId * 1000 + index
 	local n0 = api.type.NodeAndEntity.new()
 	n0.entity = -900001
 	n0.comp.position = api.type.Vec3f.new(x, 0, 0)
@@ -4371,7 +4376,7 @@ end
 -- Factory only, no sendCommand: nothing touches the world, so used-ground and
 -- seed hazards do not apply.
 local function gtLoadStationParams()
-	local f = io.open(BASE .. "gt_station_params.lua", "r")
+	local f = io.open(K.BASE .. "gt_station_params.lua", "r")
 	if not f then return nil, "no gt_station_params.lua" end
 	local s = f:read("*a"); f:close()
 	local fn, err = load("return " .. s)
@@ -4397,7 +4402,7 @@ end
 
 -- One construction proposal through the factory. Returns (fired?, detail).
 local function gtConFile(testId, index, params, mutate, fileName)
-	local x = GT_BASE_X + testId * 1000 + index
+	local x = K.GT_BASE_X + testId * 1000 + index
 	local y, z = -7890.25, 33.125          -- odd values: cannot be confused with anything else
 	local steps = {}
 	local function step(name, fn)
@@ -4620,7 +4625,7 @@ local function runGroundTruthVeh()
 				if not cfg then return false end
 				return step("make.buyVehicle", function()
 					api.cmd.make.buyVehicle(api.engine.util.getPlayer(),
-						GT_BASE_X + test * 1000 + i, cfg)
+						K.GT_BASE_X + test * 1000 + i, cfg)
 				end)
 			end) then fired = fired + 1 end
 		end
@@ -4642,7 +4647,7 @@ local function runGroundTruthVeh()
 	local f38 = 0
 	for i = 0, 7 do
 		local ok, err = pcall(function()
-			api.cmd.make.sellVehicle(GT_BASE_X + 38 * 1000 + i)
+			api.cmd.make.sellVehicle(K.GT_BASE_X + 38 * 1000 + i)
 		end)
 		if ok then f38 = f38 + 1 else log("GT veh t38." .. i .. " FAIL: " .. tostring(err)) end
 	end
@@ -4651,7 +4656,7 @@ local function runGroundTruthVeh()
 	local f39 = 0
 	for i = 0, 7 do
 		local ok, err = pcall(function()
-			api.cmd.make.sendToDepot(GT_BASE_X + 39 * 1000 + i, i % 2 == 1)
+			api.cmd.make.sendToDepot(K.GT_BASE_X + 39 * 1000 + i, i % 2 == 1)
 		end)
 		if ok then f39 = f39 + 1 else log("GT veh t39." .. i .. " FAIL: " .. tostring(err)) end
 	end
@@ -4670,7 +4675,7 @@ local function runGroundTruthVeh()
 				local cfg = gtVehConfig(step, mid, nComp, 1, {})
 				if not cfg then return false end
 				return step("make.replaceVehicle", function()
-					mkRep(GT_BASE_X + 40 * 1000 + i, cfg)
+					mkRep(K.GT_BASE_X + 40 * 1000 + i, cfg)
 				end)
 			end) then f40 = f40 + 1 end
 		end
@@ -4713,7 +4718,7 @@ local function runGroundTruthLine()
 					waitFor and waitFor(i) or nil, mutFor and mutFor(i) or nil)
 				if not line then return false end
 				return step("make.updateLine", function()
-					api.cmd.make.updateLine(GT_BASE_X + test * 1000 + i, line)
+					api.cmd.make.updateLine(K.GT_BASE_X + test * 1000 + i, line)
 				end)
 			end) then fired = fired + 1 end
 		end
@@ -4769,7 +4774,7 @@ local function runGroundTruthLine()
 	-- deleteLine/setLine sentinels (args register-visible in [cap], no dump).
 	local f18 = 0
 	for i = 0, 7 do
-		local sent = GT_BASE_X + 18 * 1000 + i
+		local sent = K.GT_BASE_X + 18 * 1000 + i
 		if gtSweepSample("line", 18, i, function(step)
 			local line = gtLineObject(step, 1)
 			if not line then return false end
@@ -4797,7 +4802,7 @@ end
 -- r30+0x14==sentinel; t6 span1e0==4, r1e0[0]==sentinel or 'refused'.
 local function gtDemol(test, i, mut)
 	return gtSweepSample("demolish", test, i, function(step)
-		local x = GT_BASE_X + test * 1000 + i
+		local x = K.GT_BASE_X + test * 1000 + i
 		local sp
 		if not step("SimpleProposal.new", function() sp = api.type.SimpleProposal.new() end) then
 			return false
@@ -4943,9 +4948,9 @@ function isPlayerConstruction(id, fileName)
 	return false
 end
 
-local CON_POLL_EVERY = 10
-local CON_EDIT_SCAN_EVERY = 30
-local PRIME_PER_TICK = 100
+K.CON_POLL_EVERY = 10
+K.CON_EDIT_SCAN_EVERY = 30
+K.PRIME_PER_TICK = 100
 
 -- Record (or refresh) what we know about a live construction at its position.
 -- Returns the previous record at that position, if any.
@@ -5234,7 +5239,7 @@ local function primeConstructions()
 	if #primeQueue == 0 then return end
 	local ok, err = pcall(function()
 		local n = 0
-		while #primeQueue > 0 and n < PRIME_PER_TICK do
+		while #primeQueue > 0 and n < K.PRIME_PER_TICK do
 			local id = table.remove(primeQueue)
 			n = n + 1
 			local alive = false
@@ -5269,7 +5274,7 @@ end
 -- edit) -- skip. If no, it is a demolish -- but require TWO consecutive misses
 -- a few ticks apart so a one-frame remove/re-add gap is not read as a demolish.
 local demolishMiss = {}   -- conKey -> consecutive scans seen gone-with-nothing-there
-local REMOVAL_POLL_EVERY = 3
+K.REMOVAL_POLL_EVERY = 3
 
 -- Is a PLAYER construction still standing here? Used to tell an upgrade (the
 -- old entity vanishes, a new one appears in its place) from a demolish (nothing
@@ -5283,7 +5288,7 @@ local REMOVAL_POLL_EVERY = 3
 -- player constructions to the joiner's 7, seq 1..51 arrived from the joiner with
 -- no gaps and not one DEMOLISH among them -- nothing was lost in flight, the
 -- detector simply never fired.
-local function constructionAt(x, y)
+function CM.constructionAt(x, y)
 	local found
 	pcall(function()
 		local list = game.interface.getEntities({ pos = { x, y }, radius = 6 },
@@ -5309,7 +5314,7 @@ local function pollConstructionRemovals()
 			else
 				local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
 				local x, y = tonumber(kx), tonumber(ky)
-				if x and constructionAt(x, y) then
+				if x and CM.constructionAt(x, y) then
 					-- something is still there: an upgrade replacement; let
 					-- pollNewConstructions re-adopt it. Not a demolish.
 					demolishMiss[key] = nil
@@ -5517,8 +5522,8 @@ function CM.soloDrop(line)
 end
 
 local function pollInject()
-	if not INJECT_FILE then return end
-	local data, newOff = readFrom(INJECT_FILE, injectOffset)
+	if not K.INJECT_FILE then return end
+	local data, newOff = readFrom(K.INJECT_FILE, injectOffset)
 	injectOffset = newOff
 	if not data then return end
 
@@ -6011,7 +6016,7 @@ local function pollInject()
 						--
 						-- OPEN ITEM (needs a two-instance run to settle, not a
 						-- guess): if the engine mints a NEW entity for a replaced
-						-- vehicle, the PEER rebinds the key from its command result
+						-- vehicle, the K.PEER rebinds the key from its command result
 						-- (execVReplace) but the ORIGINATOR -- whose replace applied
 						-- natively, outside our command -- has no result to rebind
 						-- from, and its key would still name the dead id. The log
@@ -6079,7 +6084,7 @@ local function pollInject()
 							                        groups = table.concat(groups, "/"),
 							                        skipOrigin = 1 })
 							-- our own new vehicle gets the same key the peer will use
-							expectVehicle(INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
+							expectVehicle(K.INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
 						end
 					end
 				else
@@ -6265,7 +6270,7 @@ end
 
 -- ---------- barrier ----------
 --
--- DEADLOCK. The barrier pauses whoever is more than BARRIER_AHEAD in front. With
+-- DEADLOCK. The barrier pauses whoever is more than K.BARRIER_AHEAD in front. With
 -- heartbeats every 20 ticks, each side's view of the peer was ~3.7s stale --
 -- about 3.3 game units -- while the threshold was 0.4. Both instances read a
 -- stale peer time, both concluded they were ahead, and both paused. With both
@@ -6274,18 +6279,18 @@ end
 --
 -- Three independent defences, because a barrier that can freeze BOTH games is a
 -- worse failure than the desync it exists to prevent:
---   1. heartbeat far more often than the threshold (see HEARTBEAT_EVERY)
+--   1. heartbeat far more often than the threshold (see K.HEARTBEAT_EVERY)
 --   2. never hold on a STALE peer time -- a silent peer is not a slow peer
 --   3. a watchdog that force-releases, so any residual deadlock self-heals
-local MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
+K.MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
 
 -- ---------- catch-up pacing ----------
 --
--- The barrier is a wall: it does nothing until one side is BARRIER_AHEAD (5
+-- The barrier is a wall: it does nothing until one side is K.BARRIER_AHEAD (5
 -- units) in front, then pauses it dead. Between those extremes the two clocks
 -- are free to drift, and they do -- whichever instance renders faster pulls
 -- ahead, and a live session sat at +2 to +4 units for its whole length. Skew
--- that size is not cosmetic: it is larger than EXEC_DELAY, so commands from the
+-- that size is not cosmetic: it is larger than K.EXEC_DELAY, so commands from the
 -- trailing side arrive in the leader's past (see scheduleLocal).
 --
 -- So pace continuously instead of only at the wall: whoever is BEHIND runs its
@@ -6359,7 +6364,7 @@ function CM.pace(ahead)
 			CM.setSpeed(s + 1, string.format("%.2f behind the peer", behind))
 		elseif behind > CM.CATCHUP_BEHIND then
 			-- Already at the top speed: the peer must come down to us, which the
-			-- barrier does at BARRIER_AHEAD. Nothing to do but say so.
+			-- barrier does at K.BARRIER_AHEAD. Nothing to do but say so.
 			if not CM.pacedTopWarned then
 				CM.pacedTopWarned = true
 				log(string.format("PACE: %.2f behind at speed %s -- no notch left, "
@@ -6393,19 +6398,19 @@ local function applyBarrier(now)
 	if not peerSeen or not peerTime then return end
 
 	-- Watchdog first, so it runs even when the conditions below would hold.
-	if paused and pausedSince and (ticks - pausedSince) > MAX_PAUSE_TICKS then
+	if paused and pausedSince and (ticks - pausedSince) > K.MAX_PAUSE_TICKS then
 		paused = false
 		pausedSince = nil
 		CM.releaseSpeed("watchdog")
 		log(string.format("!! BARRIER WATCHDOG: held %d ticks, forcing release " ..
 			"(now=%.2f peer=%.2f). Sync is not guaranteed while this fires.",
-			MAX_PAUSE_TICKS, now, peerTime))
+			K.MAX_PAUSE_TICKS, now, peerTime))
 		return
 	end
 
 	-- A peer that has not reported recently may itself be paused or gone.
 	-- Holding against a stale reading is exactly how both sides deadlock.
-	local stale = (peerTimeAt == nil) or ((ticks - peerTimeAt) > PEER_STALE_TICKS)
+	local stale = (peerTimeAt == nil) or ((ticks - peerTimeAt) > K.PEER_STALE_TICKS)
 	if stale then
 		if paused then
 			paused = false
@@ -6418,12 +6423,12 @@ local function applyBarrier(now)
 
 	local ahead = now - peerTime
 	CM.pace(ahead)
-	if ahead > BARRIER_AHEAD and not paused then
+	if ahead > K.BARRIER_AHEAD and not paused then
 		paused = true
 		pausedSince = ticks
 		CM.setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
 		log(string.format("BARRIER hold: %.2f ahead of peer (peer=%.2f)", ahead, peerTime))
-	elseif ahead <= BARRIER_AHEAD / 2 and paused then
+	elseif ahead <= K.BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
 		CM.catchingUp = false
@@ -6461,7 +6466,7 @@ end
 
 -- ---------- desync check ----------
 local function checkHash(now)
-	local stamp = math.floor(now / HASH_EVERY_GAMETIME) * HASH_EVERY_GAMETIME
+	local stamp = math.floor(now / K.HASH_EVERY_GAMETIME) * K.HASH_EVERY_GAMETIME
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
 	local h, detail = worldHash()
@@ -6477,10 +6482,10 @@ function data()
 	return {
 		update = function()
 			ticks = ticks + 1
-			if ticks % 60 == 0 or not INSTANCE then
+			if ticks % 60 == 0 or not K.INSTANCE then
 				if not detectInstance() then return end
 			end
-			if not INSTANCE then return end
+			if not K.INSTANCE then return end
 
 			local now = gameTime()
 			if not now then return end
@@ -6490,7 +6495,7 @@ function data()
 			-- tick is far cheaper than that.
 			pollEvents()
 			pollInject()
-			if ticks % CON_POLL_EVERY == 0 then pollNewConstructions() end
+			if ticks % K.CON_POLL_EVERY == 0 then pollNewConstructions() end
 			flushConPairs()
 			buytestPoll()
 			primeConstructions()
@@ -6506,13 +6511,13 @@ function data()
 					execConX(head.c)
 				end
 			end
-			if ticks % REMOVAL_POLL_EVERY == 0 then pollConstructionRemovals() end
+			if ticks % K.REMOVAL_POLL_EVERY == 0 then pollConstructionRemovals() end
 			-- Cheap: the watch list is empty unless a replay has cut a road, and
 			-- each entry is looked at once, CM.SPLIT_SETTLE ticks after the cut.
 			if ticks % 60 == 0 and not conxBusy then CM.sweepSplits() end
-			if ticks % CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
+			if ticks % K.CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
 
-			if ticks % HEARTBEAT_EVERY == 0 then
+			if ticks % K.HEARTBEAT_EVERY == 0 then
 				broadcast(string.format("LSTICK t=%d", math.floor(now)))
 			end
 
@@ -6538,7 +6543,7 @@ function data()
 			end
 
 			-- EVERY tick, not every 50th: checkHash itself dedupes to one hash
-			-- per HASH_EVERY_GAMETIME stamp. Sampling on a tick modulus put each
+			-- per K.HASH_EVERY_GAMETIME stamp. Sampling on a tick modulus put each
 			-- instance on its own phase of the stamp grid (A hashed t%20 in {0,8},
 			-- B in {4,12}) so the stamp sets were DISJOINT: one SYNC verdict in an
 			-- entire session, and a real 3-edge divergence sat invisible behind it.
@@ -6549,7 +6554,7 @@ function data()
 				-- runs in a separate Lua state, so a file IS the channel --
 				-- same as the whole wire)
 				pcall(function()
-					local f = io.open(BASE .. "lockstep_status_" .. INSTANCE .. ".txt", "w")
+					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
 					if f then
 						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  queued=%d%s",
 							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
@@ -6579,14 +6584,14 @@ function data()
 					statusWin = api.gui.comp.Window.new("Multiplayer", statusText)
 					statusWin:setPosition(20, 120)
 				end
-				-- Both rows come from the shared data dir. Try BASE first, then
+				-- Both rows come from the shared data dir. Try K.BASE first, then
 				-- every other discovery candidate, so a peer whose DLLs settled
 				-- on a different candidate (harness-pinned vs shipping default)
-				-- still shows. Same resolution as BASE itself -- no separate
+				-- still shows. Same resolution as K.BASE itself -- no separate
 				-- sandbox/username-derived path lives here any more.
-				local bases = { BASE }
+				local bases = { K.BASE }
 				for _, p in ipairs(CM.baseCandidates or {}) do
-					if p ~= BASE then bases[#bases + 1] = p end
+					if p ~= K.BASE then bases[#bases + 1] = p end
 				end
 				local lines = {}
 				for _, inst in ipairs({ "a", "b" }) do
