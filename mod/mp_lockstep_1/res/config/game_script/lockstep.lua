@@ -5478,17 +5478,41 @@ local function buytestPoll()
 	log("BUYTEST READBACK depot order = [" .. table.concat(ord, ",") .. "]")
 end
 
+-- SOLO IS SOLO. The slice leaves a build alone when no peer is playing (see
+-- SessionLive in slice_hook.cpp), so the engine has already built it -- replaying
+-- it here would build it a second time. Reading the file and dropping the lines
+-- keeps the offset moving, so nothing is replayed later when somebody does join.
+--
+-- Between them, the two halves mean an installed copy of this mod changes
+-- nothing at all in a single-player game: the build is not cancelled and not
+-- replayed, and the player gets stock behaviour.
+local warnedSolo = false
+local function soloDrop(line)
+	if not warnedSolo then
+		warnedSolo = true
+		log("inject: no peer in this session -- captures dropped ("
+			.. tostring(line):sub(1, 40) .. "...); single player is left to the engine")
+	end
+end
+
 local function pollInject()
 	if not INJECT_FILE then return end
 	local data, newOff = readFrom(INJECT_FILE, injectOffset)
 	injectOffset = newOff
 	if not data then return end
+
 	for line in data:gmatch("[^\r\n]+") do
 		line = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if line ~= "" and line:sub(1, 1) ~= "#" then
 			local w = {}
 			for tok in line:gmatch("%S+") do w[#w + 1] = tok end
 			local o = w[1]
+			-- Diagnostics (EVAL, HEAL, BUYTEST) always run; a CAPTURE is dropped
+			-- when nobody is playing with us, because the engine already built it.
+			if not peerSeen and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" then
+				soloDrop(line)
+				return
+			end
 			-- Same protection pollEvents has had all along: one malformed line
 			-- (or one bug in a parser branch) must cost that line, not the tick.
 			local okLine, errLine = pcall(function()

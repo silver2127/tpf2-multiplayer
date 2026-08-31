@@ -300,6 +300,66 @@ static void ReadInstance()
     }
     fclose(f);
 }
+// ---------------------------------------------------------------------------
+// IS A MULTIPLAYER SESSION ACTUALLY RUNNING?
+//
+// Cancelling a build is only safe because something replays it. Nothing else in
+// this DLL checks that anything will: install the MSI, load a save with the mod
+// switched off, and every build would be cancelled by a hook whose replay half
+// is not there -- the player simply cannot build. A mod that breaks the base
+// game when it is not in use is not acceptable, so the cancel is gated on
+// evidence that the other half is alive.
+//
+// The evidence is already on disk: the Lua writes lockstep_status_<letter>.txt
+// every tick, carrying its own game time and the peer's. Fresh file = the mod
+// is running. A peer time in it = somebody is actually playing with us. Solo
+// with the mod on is therefore ALSO native: nothing needs replaying, so nothing
+// is cancelled, and the build behaves exactly as it does in a stock game.
+//
+// Cached for a second: this is asked once per player action, not per frame.
+static bool SessionLive()
+{
+    static ULONGLONG lastCheck = 0;
+    static bool cached = false;
+    const ULONGLONG now = GetTickCount64();
+    if (lastCheck && now - lastCheck < 1000) return cached;
+    lastCheck = now;
+    cached = false;
+
+    ReadInstance();
+    if (!g_instance[0]) return cached;   // no identity yet: nothing can replay
+
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_status_%s.txt", g_dataDir, g_instance);
+
+    // Freshness first: a stale file is a mod that is not running (or a save
+    // loaded without it).
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return cached;
+    FILETIME ftNow; GetSystemTimeAsFileTime(&ftNow);
+    ULARGE_INTEGER a, b;
+    a.LowPart = fa.ftLastWriteTime.dwLowDateTime; a.HighPart = fa.ftLastWriteTime.dwHighDateTime;
+    b.LowPart = ftNow.dwLowDateTime;             b.HighPart = ftNow.dwHighDateTime;
+    if (b.QuadPart < a.QuadPart) return cached;
+    const ULONGLONG ageMs = (b.QuadPart - a.QuadPart) / 10000ULL;
+    if (ageMs > 3000) return cached;
+
+    // Then a peer: "t=1759  peer=1760  skew=-1.0 ...". No peer field, or the
+    // Lua reporting none, means a solo game -- let the engine build natively.
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return cached;
+    char line[256] = {0};
+    if (fgets(line, sizeof(line), f)) {
+        const char* pk = strstr(line, "peer=");
+        if (pk) {
+            double pt = 0.0;
+            if (sscanf(pk + 5, "%lf", &pt) == 1 && pt > 0.0) cached = true;
+        }
+    }
+    fclose(f);
+    return cached;
+}
+
 
 // ---------------------------------------------------------------------------
 // Node decode. Established live and cross-validated: a2 == a3 + 0x70, the node
@@ -1438,10 +1498,12 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         }
     }
 
-    if (cancel) {
+    if (cancel && SessionLive()) {
         InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
         InterlockedExchange(&g_pendingNoCb, 1);   // vehicle/line: no callback to honour
         Log("[slice] armed cancel: %s cmd=%llx (no-callback)\n", f.name, (unsigned long long)rcx);
+    } else if (cancel) {
+        Log("[slice] %s: no live session -- left alone, the game handles it\n", f.name);
     }
 }
 
@@ -2111,7 +2173,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // callback is fired there like the build tool's (g_pendingNoCb stays
             // 0: this tool waits on the callback, so swallowing it would wedge
             // the upgrade cursor for the rest of the session).
-            InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+            if (SessionLive()) InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+            else Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
         } else {
             Log("[slice]   suppress=0: observe-only, build proceeds normally "
                 "and was NOT replicated\n");
