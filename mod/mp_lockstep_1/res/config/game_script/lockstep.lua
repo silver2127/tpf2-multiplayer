@@ -268,6 +268,11 @@ local function detectInstance()
 	injectOffset = 0
 	local f2 = io.open(K.INJECT_FILE, "r")
 	if f2 then injectOffset = f2:seek("end"); f2:close() end
+	-- A status file for the letter we are NOT is last session's, and it looks
+	-- alive: "desyncs=832" from a previous run was read as this session's count
+	-- (2026-08-31, after the two instances swapped letters on restart). Remove it
+	-- so only one status file exists and it is always the live one.
+	pcall(function() os.remove(K.BASE .. "lockstep_status_" .. K.PEER .. ".txt") end)
 	log("identity " .. K.INSTANCE .. " (peer " .. K.PEER .. ")")
 	if not CM.baseLogged then
 		-- once, and on disk: stdout is buffered until exit, cmLog is not
@@ -6417,6 +6422,15 @@ function CM.pace(ahead)
 		CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
 		return
 	end
+	-- The cooldown exists to stop us raising the speed over and over. Coming
+	-- back down is the opposite: delaying it by three seconds at double speed
+	-- overshot the peer by 3.8 units, which made the OTHER instance the one
+	-- behind, and the two took turns chasing each other.
+	if CM.catchingUp and behind <= CM.CATCHUP_DONE then
+		CM.catchingUp = false
+		CM.setSpeed(CM.baseSpeed or 1, string.format("caught up, %.2f behind", behind))
+		return
+	end
 	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
 	if not CM.catchingUp then
 		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED then
@@ -6432,12 +6446,13 @@ function CM.pace(ahead)
 					.. "waiting for the barrier", behind, tostring(s)))
 			end
 		else
-			CM.baseSpeed = s                            -- in step: this is the player's choice
+			-- In step. Only adopt this as the player's speed if it is not one WE
+			-- set: recording our own catch-up 2 as "the player wants 2" is what
+			-- made the barrier release to 2, race ahead, hold at 5.2, release to
+			-- 2 again -- the loop seen live at 02:30.
+			if not CM.lastSetSpeed then CM.baseSpeed = s end
 			CM.pacedTopWarned = false
 		end
-	elseif behind <= CM.CATCHUP_DONE then
-		CM.catchingUp = false
-		CM.setSpeed(CM.baseSpeed or 1, string.format("caught up, %.2f behind", behind))
 	end
 end
 
