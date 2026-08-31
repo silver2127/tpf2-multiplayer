@@ -133,6 +133,10 @@ local BARRIER_AHEAD = 5.0
 -- reading peer times ~13 units stale while B saw A correctly -- both then paused
 -- against bad data. 5 ticks is a rate the relay keeps up with.
 local HEARTBEAT_EVERY = 5     -- ticks between LSTICK broadcasts (~0.93s)
+
+-- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
+-- because scheduleLocal consults it too, long before the barrier section.
+local PEER_STALE_TICKS = 25
 local HASH_EVERY_GAMETIME = 4 -- ~2 game days between desync checks
 
 local ticks        = 0
@@ -3819,8 +3823,28 @@ function scheduleLocal(op, args)
 	-- Round to the wire precision at CREATION: encodeCmd ships at as %.4f, so
 	-- without this the originator holds a full-precision stamp and the peer a
 	-- rounded one -- two commands within ~1e-4 could sort differently per peer.
+	-- The stamp has to be in the PEER's future, not just ours. EXEC_DELAY alone
+	-- assumes the two clocks are together; when the peer is running ahead by more
+	-- than the delay, our command arrives already due and it executes at once
+	-- while we still wait -- the two sims then apply the same command at
+	-- different game times. That is what "builds sometimes land out of order"
+	-- was. Measured on a live session: skew sat at +2 to +4 units against an
+	-- EXEC_DELAY of 0.6, so EVERY command from the trailing side landed in the
+	-- leader's past. Pay the peer's lead plus a margin when there is one; when
+	-- the clocks are together this is exactly EXEC_DELAY again.
+	local lead = 0
+	if peerTime and peerTimeAt and (ticks - peerTimeAt) <= PEER_STALE_TICKS then
+		lead = peerTime - now
+		if lead < 0 then lead = 0 end
+		if lead > BARRIER_AHEAD then lead = BARRIER_AHEAD end   -- the barrier caps real skew
+	end
+	local delay = EXEC_DELAY + lead
+	if lead > 0 then
+		log(string.format("stamp: peer is %.2f ahead -- scheduling %.2f out instead of %.2f",
+			lead, delay, EXEC_DELAY))
+	end
 	local at = tonumber(string.format("%.4f",
-		now + EXEC_DELAY + (tonumber(args and args.delay or 0) or 0)))
+		now + delay + (tonumber(args and args.delay or 0) or 0)))
 	local c = { op = op, at = at, origin = INSTANCE, seq = seqNo }
 	for k, v in pairs(args) do c[k] = v end
 	-- companies mode: stamp the originating company so the peer can attribute the
@@ -5807,8 +5831,58 @@ end
 --   1. heartbeat far more often than the threshold (see HEARTBEAT_EVERY)
 --   2. never hold on a STALE peer time -- a silent peer is not a slow peer
 --   3. a watchdog that force-releases, so any residual deadlock self-heals
-local PEER_STALE_TICKS = 25     -- ~4.6s without a heartbeat = do not trust it
 local MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
+
+-- ---------- catch-up pacing ----------
+--
+-- The barrier is a wall: it does nothing until one side is BARRIER_AHEAD (5
+-- units) in front, then pauses it dead. Between those extremes the two clocks
+-- are free to drift, and they do -- whichever instance renders faster pulls
+-- ahead, and a live session sat at +2 to +4 units for its whole length. Skew
+-- that size is not cosmetic: it is larger than EXEC_DELAY, so commands from the
+-- trailing side arrive in the leader's past (see scheduleLocal).
+--
+-- So pace continuously instead of only at the wall: whoever is BEHIND runs its
+-- own clock faster until it has caught up. Speed is local pacing, not simulated
+-- state -- the same lever the barrier already pulls when it pauses a peer -- and
+-- it is the SAFE direction to be wrong in: if both sides wrongly believe they
+-- are behind (stale heartbeats), both speed up and nothing deadlocks, which is
+-- not true of both wrongly pausing.
+--
+-- The player's own speed choice is preserved: whatever speed they are running at
+-- when the clocks agree is the speed restored after a catch-up.
+local CATCHUP_BEHIND = 0.8    -- units behind before we run faster
+local CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
+local CATCHUP_SPEED  = 2      -- multiplier while catching up
+local catchingUp  = false
+local baseSpeed   = nil       -- the player's speed, sampled while in step
+
+local function pace(ahead)
+	if paused then return end                       -- the barrier owns the speed
+	local behind = -ahead
+	local s
+	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
+	if s == 0 then                                   -- player paused on purpose
+		catchingUp = false
+		return
+	end
+	if not catchingUp then
+		if behind > CATCHUP_BEHIND then
+			baseSpeed = s
+			catchingUp = true
+			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(CATCHUP_SPEED)) end)
+			log(string.format("PACE: %.2f behind the peer -- speed %s -> %d to catch up",
+				behind, tostring(s), CATCHUP_SPEED))
+		else
+			baseSpeed = s                            -- in step: this is the player's choice
+		end
+	elseif behind <= CATCHUP_DONE then
+		local back = baseSpeed or 1
+		catchingUp = false
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(back)) end)
+		log(string.format("PACE: caught up (%.2f behind) -- speed back to %s", behind, tostring(back)))
+	end
+end
 
 local function applyBarrier(now)
 	if not peerSeen or not peerTime then return end
@@ -5838,6 +5912,7 @@ local function applyBarrier(now)
 	end
 
 	local ahead = now - peerTime
+	pace(ahead)
 	if ahead > BARRIER_AHEAD and not paused then
 		paused = true
 		pausedSince = ticks
@@ -5846,7 +5921,8 @@ local function applyBarrier(now)
 	elseif ahead <= BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
+		catchingUp = false
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(baseSpeed or 1)) end)
 		log(string.format("BARRIER release: %.2f ahead", ahead))
 	end
 end
