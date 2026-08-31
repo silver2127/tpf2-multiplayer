@@ -1330,6 +1330,25 @@ local function execPolyline(c, planOnly)
 				if rnode then
 					log(string.format("ROADP: level crossing -- rail vertex %d shares road node %d", i, rnode))
 					CM.cmLog(string.format("XING: vertex %d snapped to road node %d (%.1f,%.1f)", i, rnode, x, y))
+					-- SHARING A NODE MEANS SHARING ITS HEIGHT, and the road's height
+					-- is not the rail's. Measured 2026-08-31: the shipped vertex sat
+					-- at z=27.17 and the road node 0.8 m away at z=29.20, so the rail
+					-- had to climb 3.07 m over 31.6 m (9.7%) into it instead of
+					-- 1.04 m (3.3%) -- 'Too much slope', and the player's build
+					-- vanished on their own screen. The originator's engine moves the
+					-- road to meet the rail at a crossing; the shipped z IS the
+					-- height its build settled on, so ask for the same move by
+					-- carrying the existing node into the proposal at the rail's
+					-- height. Small differences are left alone: re-heighting every
+					-- crossing by a centimetre is churn the engine does not need.
+					local rp = CM.nodePosXYZ(rnode)
+					if rp and math.abs(rp[3] - z) > 0.25 then
+						local mv = api.type.NodeAndEntity.new()
+						mv.entity = rnode                     -- an EXISTING id: move, not add
+						mv.comp.position = api.type.Vec3f.new(rp[1], rp[2], z)
+						addNodes[#addNodes + 1] = mv
+						CM.cmLog(string.format("XING: road node %d re-heighted %.2f -> %.2f to meet the rail", rnode, rp[3], z))
+					end
 					planV[#planV + 1] = string.format("%d,N,%.2f,%.2f,%.2f", i, x, y, z)
 					resolved[i] = rnode; return rnode
 				end
