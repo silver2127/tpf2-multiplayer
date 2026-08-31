@@ -1764,6 +1764,31 @@ local function execPolyline(c, planOnly)
 			end
 		end
 
+		-- NO TWO EDGES BETWEEN THE SAME PAIR OF NODES. Splitting an edge emits
+		-- its two halves; if the polyline then runs from the split point back to
+		-- the node one of those halves already reaches, the proposal carries the
+		-- same connection twice and the engine refuses the whole thing with
+		-- 'Construction not possible'. Measured 2026-08-31 on both machines at
+		-- once: edge[1] 47902->mid and edge[2] mid->47903 (the halves), then
+		-- edge[3] mid->47902 -- the same pair as edge[1], reversed. It happens
+		-- when a rail branches off an existing track just too far from a node to
+		-- snap to it, so the vertex splits the edge instead.
+		local seenPair, keep = {}, {}
+		for _, e in ipairs(addEdges) do
+			local a, b
+			pcall(function() a, b = e.comp.node0, e.comp.node1 end)
+			local key = nil
+			if a and b then key = (a < b) and (a .. ":" .. b) or (b .. ":" .. a) end
+			if key and seenPair[key] then
+				CM.cmLog(string.format("XING: dropped a second edge between nodes %s and %s "
+					.. "-- the split halves already connect them", tostring(a), tostring(b)))
+			else
+				if key then seenPair[key] = true end
+				keep[#keep + 1] = e
+			end
+		end
+		addEdges = keep
+
 		for i, n in ipairs(addNodes) do sp.streetProposal.nodesToAdd[i] = n end
 		for i, e in ipairs(addEdges) do sp.streetProposal.edgesToAdd[i] = e end
 		-- Removals go in the SAME proposal as the halves that replace them.
@@ -2674,6 +2699,64 @@ local function execLine(c)
 		end
 	end)
 	if not ok then log(string.format("exec%s error: %s", tostring(c.op), tostring(err))) end
+end
+
+-- ---------- names and colours ----------
+--
+-- SetName and SetColor take an entity, and an entity id means nothing on the
+-- other machine -- so what travels is the same key the vehicle and line channels
+-- already use, or a position for a construction. kind says which registry to ask,
+-- because a vehicle and a line can hold the same number.
+local function targetFor(kind, key)
+	if kind == "veh" then return vehIdFor(key) end
+	if kind == "line" then return lineIdFor(key) end
+	if kind == "con" then
+		local rec = consByKey[key]
+		if rec and rec.id then
+			local alive = false
+			pcall(function() alive = api.engine.entityExists(rec.id) end)
+			if alive then return rec.id end
+		end
+		local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
+		if kx then return constructionAt(tonumber(kx), tonumber(ky)) end
+	end
+	return nil
+end
+
+local function execSetName(c)
+	if tonumber(c.skipOrigin or 0) == 1 and c.origin == INSTANCE then return end
+	local ok, err = pcall(function()
+		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
+		if not id then
+			log(string.format("VNAME seq=%s: no local %s for key %s -- skipped",
+				tostring(c.seq), tostring(c.kind), tostring(c.key)))
+			return
+		end
+		local name = unescName(tostring(c.name or ""))
+		api.cmd.sendCommand(api.cmd.make.setName(id, name), function(_, okc)
+			log(string.format("EXEC VNAME seq=%s %s %s -> %d name=%q success=%s",
+				tostring(c.seq), tostring(c.kind), tostring(c.key), id, name, tostring(okc)))
+		end)
+	end)
+    if not ok then log("exec VNAME error: " .. tostring(err)) end
+end
+
+local function execSetColor(c)
+	if tonumber(c.skipOrigin or 0) == 1 and c.origin == INSTANCE then return end
+	local ok, err = pcall(function()
+		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
+		if not id then
+			log(string.format("VCOLOR seq=%s: no local %s for key %s -- skipped",
+				tostring(c.seq), tostring(c.kind), tostring(c.key)))
+			return
+		end
+		local r, g, b = tonumber(c.r) or 0, tonumber(c.g) or 0, tonumber(c.b) or 0
+		api.cmd.sendCommand(api.cmd.make.setColor(id, api.type.Vec3f.new(r, g, b)), function(_, okc)
+			log(string.format("EXEC VCOLOR seq=%s %s %s -> %d rgb=%.2f,%.2f,%.2f success=%s",
+				tostring(c.seq), tostring(c.kind), tostring(c.key), id, r, g, b, tostring(okc)))
+		end)
+	end)
+	if not ok then log("exec VCOLOR error: " .. tostring(err)) end
 end
 
 local function execVehCmd(c)
@@ -3971,6 +4054,8 @@ local function execute(c)
 	elseif c.op == "VBUY" then execVBuy(c)
 	elseif c.op == "VREPL" then execVReplace(c)
 	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then execVehCmd(c)
+	elseif c.op == "VNAME" then execSetName(c)
+	elseif c.op == "VCOLOR" then execSetColor(c)
 	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then execLine(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
@@ -5165,12 +5250,30 @@ end
 local demolishMiss = {}   -- conKey -> consecutive scans seen gone-with-nothing-there
 local REMOVAL_POLL_EVERY = 3
 
+-- Is a PLAYER construction still standing here? Used to tell an upgrade (the
+-- old entity vanishes, a new one appears in its place) from a demolish (nothing
+-- replaces it).
+--
+-- PLAYER-owned only, and that is the whole point. Town buildings are
+-- CONSTRUCTION entities too, and a truck station sits in a town surrounded by
+-- them -- so with a bare type filter, demolishing one found a house within 6 m,
+-- called it an upgrade, and never shipped the DEMOLISH. The peer kept the
+-- station forever. Measured 2026-08-31 in a live game: the host's world had 8
+-- player constructions to the joiner's 7, seq 1..51 arrived from the joiner with
+-- no gaps and not one DEMOLISH among them -- nothing was lost in flight, the
+-- detector simply never fired.
 local function constructionAt(x, y)
 	local found
 	pcall(function()
 		local list = game.interface.getEntities({ pos = { x, y }, radius = 6 },
 			{ type = "CONSTRUCTION", includeData = false }) or {}
-		for _, id in pairs(list) do found = found or id end
+		for _, id in pairs(list) do
+			if not found then
+				local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+				local fn = co and co.fileName and tostring(co.fileName) or ""
+				if isPlayerConstruction(id, fn) then found = id end
+			end
+		end
 	end)
 	return found
 end
@@ -5952,6 +6055,49 @@ local function pollInject()
 					for i = 1, n do local id = tonumber(w[2 + i]); if id then forgetVehicle(id) end end
 				else
 					log(string.format("VSELL: %d id(s) but none shippable -- the sale stays LOCAL (divergence)", n))
+				end
+
+			elseif (o == "VNAME" and #w >= 3) or (o == "VCOLOR" and #w >= 5) then
+				-- The slice ships a LOCAL entity id. Work out what kind of thing it
+				-- is here, while we can still ask the engine, and put the shared key
+				-- on the wire instead: a vehicle key, a line key, or a position for
+				-- a construction. Anything else (a town building, an industry) is
+				-- not ours to rename.
+				local id = tonumber(w[2])
+				local kind, key
+				if id then
+					key = vehKeyOf[id] and vehKeyFor(id) or nil
+					if key then kind = "veh" end
+					if not key then
+						key = lineKeyOf[id] and lineKeyFor(id) or nil
+						if key then kind = "line" end
+					end
+					if not key then
+						local co
+						pcall(function() co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION) end)
+						if co and co.transf then
+							local ck = conKey(co.transf[13], co.transf[14])
+							if consByKey[ck] then key, kind = ck, "con" end
+						end
+					end
+					-- last resort for a vehicle or line that came out of the save
+					if not key then
+						key = vehKeyFor(id)
+						if key then kind = "veh" end
+					end
+				end
+				if key then
+					if o == "VNAME" then
+						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
+						scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = 1 })
+					else
+						log(string.format("VCOLOR: %s %s = %s,%s,%s", kind, key, w[3], w[4], w[5]))
+						scheduleLocal("VCOLOR", { kind = kind, key = key,
+							r = tonumber(w[3]), g = tonumber(w[4]), b = tonumber(w[5]), skipOrigin = 1 })
+					end
+				else
+					log(string.format("%s: entity %s is not a tracked vehicle, line or construction -- not shipped",
+						o, tostring(w[2])))
 				end
 
 			elseif o == "VREV" and #w >= 2 then

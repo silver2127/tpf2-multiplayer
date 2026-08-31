@@ -121,6 +121,8 @@ static const Factory FACTORIES[] = {
     { 0x9df4e0, 19, 8, "UpdateLine",     "line"    },
     { 0x9dd190, 20, 9, "DeleteLine",     "line"    },
     { 0x9ddfe0, 20, 10, "Reverse",        "vehicle" },  // steal from COMMAND_MAP.md
+    { 0x9de8a0, 20, 13, "SetColor",       "sync"    },  // r9 -> CVec3f*, 3 floats
+    { 0x9deb70, 15, 14, "SetName",        "sync"    },  // r9 -> std::string*, MSVC SSO
 };
 static const int NUM_FACTORIES = (int)(sizeof(FACTORIES) / sizeof(FACTORIES[0]));
 
@@ -1317,6 +1319,47 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
     } else if (fid == 10) {
         fprintf(f, "VREV %d\n", (int)(int32_t)r8);
         Log("[slice] VREV shipped: vehicle=%d\n", (int)(int32_t)r8);
+    } else if (fid == 13) {
+        // SetColor(entity, Vec3f const&): r9 points at three floats, 0..1 each.
+        float col[3] = { -1.0f, -1.0f, -1.0f };
+        if (Readable((void*)r9, 12)) memcpy(col, (void*)r9, 12);
+        if (col[0] >= 0.0f) {
+            fprintf(f, "VCOLOR %d %.4f %.4f %.4f\n", (int)(int32_t)r8, col[0], col[1], col[2]);
+            Log("[slice] VCOLOR shipped: entity=%d rgb=%.3f,%.3f,%.3f\n",
+                (int)(int32_t)r8, col[0], col[1], col[2]);
+        } else {
+            Log("[slice] VCOLOR: colour at %llx unreadable -- not shipped\n", (unsigned long long)r9);
+        }
+    } else if (fid == 14) {
+        // SetName(entity, std::string const&). MSVC layout: a 16-byte buffer,
+        // size at +0x10, capacity at +0x18. The text sits inline while capacity
+        // is 15 or less; past that, +0x00 is a pointer to it.
+        char name[256]; name[0] = 0;
+        if (Readable((void*)r9, 32)) {
+            uint64_t len = 0, cap = 0;
+            memcpy(&len, (void*)(r9 + 0x10), 8);
+            memcpy(&cap, (void*)(r9 + 0x18), 8);
+            const char* src = (const char*)r9;
+            if (cap > 15) { uint64_t ptr = 0; memcpy(&ptr, (void*)r9, 8); src = (const char*)ptr; }
+            if (len < sizeof(name) && src && Readable((void*)src, (size_t)len + 1)) {
+                memcpy(name, src, (size_t)len); name[len] = 0;
+            }
+        }
+        if (name[0]) {
+            // Percent-encode: the wire is split on whitespace, and a player
+            // names things "Coal Line 2".
+            char enc[768]; size_t o = 0;
+            for (size_t i = 0; name[i] && o + 4 < sizeof(enc); i++) {
+                unsigned char ch = (unsigned char)name[i];
+                if (ch > 32 && ch < 127 && ch != '%') enc[o++] = (char)ch;
+                else { sprintf(enc + o, "%%%02X", ch); o += 3; }
+            }
+            enc[o] = 0;
+            fprintf(f, "VNAME %d %s\n", (int)(int32_t)r8, enc);
+            Log("[slice] VNAME shipped: entity=%d name='%s'\n", (int)(int32_t)r8, name);
+        } else {
+            Log("[slice] VNAME: name at %llx unreadable or empty -- not shipped\n", (unsigned long long)r9);
+        }
     }
     fclose(f);
 }
@@ -1819,7 +1862,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         return 0;
     }
 
-    if (id >= 2 && id <= 10) {
+    if ((id >= 2 && id <= 10) || id == 13 || id == 14) {
         ReadCfg(&enabled, &suppress, &groundtruth);
         if (!enabled) return 0;
         const Factory* f = nullptr;
