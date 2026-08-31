@@ -6308,6 +6308,24 @@ CM.catchingUp  = false
 CM.baseSpeed   = nil       -- the player's speed, sampled while in step
 CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 
+-- WHO OWNS THE SPEED CONTROL. The pacer and the player share one lever, and
+-- without an owner they fight over it: the pacer sets 2 to catch up, the player
+-- presses 1 because their game is running away, the pacer sets 2 again on the
+-- next tick, and the game stutters between them (reported from a live session).
+--
+-- Two rules settle it. First, a speed we did not set is the PLAYER's, and the
+-- player wins: the pacer adopts it as the new normal and stops chasing. Second,
+-- a change of ours starts a cooldown, so the controller can never flap faster
+-- than a person can react to what it did.
+local PACE_COOLDOWN = 180        -- ticks (~3 s) between changes we make
+
+local function setSpeed(v, why)
+	CM.lastSetSpeed = v
+	CM.paceQuietUntil = ticks + PACE_COOLDOWN
+	pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(v)) end)
+	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
+end
+
 function CM.pace(ahead)
 	if paused then return end                       -- the barrier owns the speed
 	local behind = -ahead
@@ -6321,14 +6339,24 @@ function CM.pace(ahead)
 		CM.catchingUp = false
 		return
 	end
+	-- The player moved the lever: that is now the speed they want. Adopt it,
+	-- stop any catch-up in progress, and do not argue.
+	if CM.lastSetSpeed and s ~= CM.lastSetSpeed then
+		if CM.catchingUp then
+			log(string.format("PACE: player set speed %s while catching up -- theirs wins", tostring(s)))
+		end
+		CM.baseSpeed = s
+		CM.catchingUp = false
+		CM.lastSetSpeed = nil
+		CM.paceQuietUntil = ticks + PACE_COOLDOWN
+		return
+	end
+	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
 	if not CM.catchingUp then
 		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED then
 			CM.baseSpeed = s
 			CM.catchingUp = true
-			local up = s + 1
-			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(up)) end)
-			log(string.format("PACE: %.2f behind the peer -- speed %s -> %d to catch up",
-				behind, tostring(s), up))
+			setSpeed(s + 1, string.format("%.2f behind the peer", behind))
 		elseif behind > CM.CATCHUP_BEHIND then
 			-- Already at the top speed: the peer must come down to us, which the
 			-- barrier does at BARRIER_AHEAD. Nothing to do but say so.
@@ -6342,11 +6370,23 @@ function CM.pace(ahead)
 			CM.pacedTopWarned = false
 		end
 	elseif behind <= CM.CATCHUP_DONE then
-		local back = CM.baseSpeed or 1
 		CM.catchingUp = false
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(back)) end)
-		log(string.format("PACE: caught up (%.2f behind) -- speed back to %s", behind, tostring(back)))
+		setSpeed(CM.baseSpeed or 1, string.format("caught up, %.2f behind", behind))
 	end
+end
+
+-- Undo a hold that WE placed. If the speed is no longer the 0 we set, the
+-- player has taken the lever back (they paused, or unpaused us) -- leave it
+-- alone rather than yanking the game back to speed under their hands.
+local function releaseSpeed(why)
+	local s0
+	pcall(function() s0 = game.interface.getGameSpeed() end)
+	if s0 ~= nil and s0 ~= 0 then
+		log("BARRIER release: the player already changed the speed (" .. why .. ") -- theirs kept")
+		CM.lastSetSpeed = nil
+		return
+	end
+	setSpeed(CM.baseSpeed or 1, why)
 end
 
 local function applyBarrier(now)
@@ -6356,7 +6396,7 @@ local function applyBarrier(now)
 	if paused and pausedSince and (ticks - pausedSince) > MAX_PAUSE_TICKS then
 		paused = false
 		pausedSince = nil
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
+		releaseSpeed("watchdog")
 		log(string.format("!! BARRIER WATCHDOG: held %d ticks, forcing release " ..
 			"(now=%.2f peer=%.2f). Sync is not guaranteed while this fires.",
 			MAX_PAUSE_TICKS, now, peerTime))
@@ -6370,7 +6410,7 @@ local function applyBarrier(now)
 		if paused then
 			paused = false
 			pausedSince = nil
-			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
+			releaseSpeed("peer time stale")
 			log("BARRIER release: peer time is stale, not holding against it")
 		end
 		return
@@ -6381,13 +6421,13 @@ local function applyBarrier(now)
 	if ahead > BARRIER_AHEAD and not paused then
 		paused = true
 		pausedSince = ticks
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(0)) end)
+		setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
 		log(string.format("BARRIER hold: %.2f ahead of peer (peer=%.2f)", ahead, peerTime))
 	elseif ahead <= BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
 		CM.catchingUp = false
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(CM.baseSpeed or 1)) end)
+		releaseSpeed("peer caught up")
 		log(string.format("BARRIER release: %.2f ahead", ahead))
 	end
 end
