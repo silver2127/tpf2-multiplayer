@@ -1094,7 +1094,7 @@ local function execPolyline(c)
 		-- so nothing splits that edge twice. Single shared node: the form that
 		-- builds a real crossing at a road end (user-verified).
 		local XING_END_SNAP = 2.5   -- a split this close to an end node IS that node
-		local function splitEdgeAt(eid, u, why)
+		local function splitEdgeAt(eid, u, why, zWant)
 			if splitRoads[eid] then return splitRoads[eid] end
 			local comp, a, b, ta, tb = edgeGeomT(eid)
 			if not comp then return nil end
@@ -1114,7 +1114,22 @@ local function execPolyline(c)
 			pcall(function() crossedIsTrack = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil end)
 			local pm = hermitePos(a, ta, b, tb, u)
 			local tm = hermiteTangent(a, ta, b, tb, u)
-			local mid = newNodeAt(pm[1], pm[2], pm[3])
+			-- HEIGHT AT A LEVEL CROSSING. x,y come from the crossed edge, but the
+			-- HEIGHT must not: at a crossing the originator's node is shared by the
+			-- road and the rail, and it is the RAIL that dictates the height there.
+			-- Taking the road's interpolated z put the node metres above the rail
+			-- line it belongs to -- node z=29.6 between rail vertices at 19.9 and
+			-- 24.1 -- and the engine refused the whole proposal with 'Too much
+			-- slope' (seq=10, 2026-08-30). Every later replay then referenced
+			-- geometry the peer did not have, so one refusal cost five.
+			-- zWant is the height the ORIGINATOR's own vertex ended up at, shipped
+			-- in the polyline, so using it reproduces A's node exactly.
+			local zAt = pm[3]
+			if zWant and math.abs(zWant - pm[3]) > 0.05 then
+				CM.cmLog(string.format("XING: crossing node z %.2f (road) -> %.2f (shipped rail vertex)", pm[3], zWant))
+				zAt = zWant
+			end
+			local mid = newNodeAt(pm[1], pm[2], zAt)
 			dropEdge(eid)
 			local function half(nA, nB, tA, tB, sc)
 				if nA == nB then return end
@@ -1163,7 +1178,7 @@ local function execPolyline(c)
 				local reid, ru
 				pcall(function() reid, ru = findEdgeContaining(false, x, y) end)
 				if reid then
-					local mid = splitEdgeAt(reid, ru, "rail vertex " .. i .. " on road")
+					local mid = splitEdgeAt(reid, ru, "rail vertex " .. i .. " on road", z)
 					if mid then resolved[i] = mid; return mid end
 				end
 			end
