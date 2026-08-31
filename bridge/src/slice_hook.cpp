@@ -1447,7 +1447,11 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
     // anything else is the UI. ReplaceVehicle (4) joins the list: it was hooked
     // for the ground-truth sweep only, so a player's "replace with this model"
     // reached the wire nowhere and the peer kept the old vehicle.
-    if (!groundtruth && (f.id == 3 || f.id == 4 || f.id == 5 || f.id == 6 || f.id == 7 || f.id == 8 || f.id == 9 || f.id == 10)) {
+    // 13/14 (SetColor/SetName) ship through the same writer. Leaving them out
+    // of this list meant the hook CAPTURED a rename -- '[cap] SetName' is in
+    // the log -- and then wrote nothing, so renaming a line looked like a
+    // replication failure when it never reached the wire at all.
+    if (!groundtruth && ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14)) {
         bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",

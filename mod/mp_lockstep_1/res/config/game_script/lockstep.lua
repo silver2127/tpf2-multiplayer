@@ -2829,10 +2829,41 @@ local function execVehCmd(c)
 		elseif c.op == "VLINE" then
 			local id = resolve(c.key)
 			local line = lineIdFor(c.line)
+			-- A line the peer has not finished building yet is not a lost cause:
+			-- LCREATE and its LUPDATE stops can still be in flight, or waiting on
+			-- a station that has not replicated. Retry for a while instead of
+			-- dropping the assignment, which leaves that vehicle unassigned on
+			-- this instance for good (seen live 2026-08-31: the line's stop could
+			-- not be resolved, the line was dropped, and every VLINE for it then
+			-- failed).
+			if id and not line then
+				c.tries = (tonumber(c.tries) or 0) + 1
+				if c.tries <= 20 then
+					local nowG = gameTime() or 0
+					c.at = nowG + 1.0
+					queue[#queue + 1] = c
+					if c.tries == 1 or c.tries % 10 == 0 then
+						log(string.format("VLINE seq=%s: line %s not here yet -- retry %d",
+							tostring(c.seq), tostring(c.line), c.tries))
+					end
+				else
+					log(string.format("VLINE seq=%s: line %s never arrived -- vehicle %s left unassigned (DIVERGENCE)",
+						tostring(c.seq), tostring(c.line), tostring(c.key)))
+				end
+				return
+			end
 			if id and line then
-				cmds[#cmds + 1] = { api.cmd.make.setLine(id, line, tonumber(c.stop) or 0), "setLine " .. tostring(c.key) }
-			elseif id then
-				log(string.format("VLINE seq=%s: unknown line key %s", tostring(c.seq), tostring(c.line)))
+				-- Types, because a wrong one here surfaced as an unreadable Lua
+				-- error ("execVLINE error: function: 0000018D4AC0FF60") with
+				-- nothing to say which argument was wrong.
+				local okMake, made = pcall(api.cmd.make.setLine, id, line, tonumber(c.stop) or 0)
+				if okMake and made then
+					cmds[#cmds + 1] = { made, "setLine " .. tostring(c.key) }
+				else
+					log(string.format("VLINE seq=%s: setLine(%s:%s, %s:%s, %s) refused by the maker: %s",
+						tostring(c.seq), type(id), tostring(id), type(line), tostring(line),
+						tostring(tonumber(c.stop) or 0), tostring(made)))
+				end
 			end
 		end
 		for _, pair in ipairs(cmds) do
