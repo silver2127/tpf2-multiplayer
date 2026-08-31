@@ -549,7 +549,14 @@ local function nodePos(nid)
 	local ok, c = pcall(function() return api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE) end)
 	if ok and c and c.position then
 		local p = c.position
-		s = string.format("%.1f,%.1f", p.x or p[1], p.y or p[2])
+		-- HEIGHT IS PART OF IDENTITY. x,y alone let two worlds hash equal while
+		-- their nodes sat at different heights -- and height is exactly what the
+		-- engine's slope check reads. On 2026-08-30 the hashes agreed right up to
+		-- the build before the divergence, then the same one-edge proposal was
+		-- accepted on one instance and refused on the other: the detector was
+		-- blind to the only dimension that could still differ. Same 0.1 m
+		-- resolution as x,y.
+		s = string.format("%.1f,%.1f,%.1f", p.x or p[1], p.y or p[2], p.z or p[3] or 0)
 		nodePosCache[nid] = s
 		return s
 	end
