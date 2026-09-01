@@ -241,6 +241,7 @@ static PFN_vkGetImageSubresourceLayout pImgSubLayout = nullptr;
 static PFN_vkCmdCopyImage       pCmdCopyImage = nullptr;
 static PFN_vkCmdPipelineBarrier pCmdBarrier   = nullptr;
 static PFN_vkFlushMappedMemoryRanges pFlush   = nullptr;
+static PFN_vkInvalidateMappedMemoryRanges pInvalidate = nullptr;
 
 // panel: a host-visible linear image holding the GDI-rendered UI, copied onto
 // the swapchain each frame.
@@ -325,6 +326,7 @@ static bool InitRender(VkSwapchainKHR sc)
     pCmdCopyImage= rget<PFN_vkCmdCopyImage>("vkCmdCopyImage");
     pCmdBarrier  = rget<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
     pFlush       = rget<PFN_vkFlushMappedMemoryRanges>("vkFlushMappedMemoryRanges");
+    pInvalidate  = rget<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges");
     void* need[] = { (void*)pGetImages,(void*)pCreateView,(void*)pCreateRP,(void*)pCreateFB,
                      (void*)pCreatePool,(void*)pAllocCB,(void*)pBeginCB,(void*)pCmdBeginRP,
                      (void*)pCmdClear,(void*)pCmdEndRP,(void*)pEndCB,(void*)pSubmit,
@@ -415,6 +417,57 @@ struct Hit { int x, y, w, h; int id; };   // id: 1=multiplayer/host-toggle, 2=HO
 static Hit g_hits[6]; static int g_hitCount = 0;
 static void addHit(int x,int y,int w,int h,int id){ if(g_hitCount<6){g_hits[g_hitCount++]={x,y,w,h,id};} }
 
+// ---------------- A/B test flags (tpf2_menu_flags.txt next to this dll) ----------------
+// Two candidate looks for the collapsed Multiplayer button, both live at once so
+// they can be compared in one launch:
+//   overlay=native   GDI overlay restyled to res/config/style_sheet/main-menu.lua:
+//                    transparent, Lato 24 uppercase white, padding 8/15, hover =
+//                    white @50/255, pressed = white @100/255 (alpha-blended over a
+//                    readback of the game frame -- the swapchain has TRANSFER_SRC).
+//   overlay=classic  the previous filled Settings-dialog style.
+//   native=1         ALSO insert a REAL UI::Button into the title menu's "MainMenu"
+//                    list (hook the page builder, add via the list's own add call,
+//                    connect a click slot). It appends after the game's last entry.
+//   scale=<f>        UI scale for the overlay (default = screen height / 1080).
+//   ox=<f> oy=<f>    overlay top-left as a fraction of the screen (default .05/.30).
+//   fontpx=<n>       override the overlay label pixel size (default 24*scale).
+static int   g_flagOverlayNative = 1;
+static int   g_flagNativeBtn     = 1;
+static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.30f;
+static int   g_flagFontPx = 0;
+static bool  g_latoLoaded = false;
+static int   g_hover = 0, g_active = 0;     // hit id under the cursor / pressed (native overlay look)
+static void ReadFlags()
+{
+    char p[MAX_PATH]; snprintf(p, sizeof(p), "%stpf2_menu_flags.txt", ourDirA());
+    FILE* f = fopen(p, "r"); if (!f) { Log("[menu] flags: no %s (defaults overlay=native native=1)\n", p); return; }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
+        if (!strcmp(line, "overlay")) g_flagOverlayNative = strncmp(v, "classic", 7) != 0;
+        else if (!strcmp(line, "native")) g_flagNativeBtn = atoi(v);
+        else if (!strcmp(line, "scale")) g_flagScale = (float)atof(v);
+        else if (!strcmp(line, "ox")) g_flagOx = (float)atof(v);
+        else if (!strcmp(line, "oy")) g_flagOy = (float)atof(v);
+        else if (!strcmp(line, "fontpx")) g_flagFontPx = atoi(v);
+    }
+    fclose(f);
+    Log("[menu] flags: overlay=%s native=%d scale=%.2f ox=%.3f oy=%.3f fontpx=%d\n",
+        g_flagOverlayNative ? "native" : "classic", g_flagNativeBtn, g_flagScale, g_flagOx, g_flagOy, g_flagFontPx);
+}
+// The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
+// process-private so GDI can select "Lato" without touching the system font table.
+static void LoadLato()
+{
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    wchar_t* s = wcsrchr(exe, L'\\'); if (s) s[1] = 0;
+    wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%sres\\fonts\\Lato2OFL\\Lato-Regular.ttf", exe);
+    int n = AddFontResourceExW(path, FR_PRIVATE, nullptr);
+    g_latoLoaded = n > 0;
+    Log("[menu] font: %ls -> %d faces\n", path, n);
+}
+static float UiScale() { return g_flagScale > 0.f ? g_flagScale : (g_scExtent.height ? g_scExtent.height / 1080.f : 1.f); }
+
 // TF2 palette (flat, cool blue-grey; matches the Settings dialog)
 #define TF_PANEL    RGB(52, 66, 84)
 #define TF_PANEL_BD RGB(96, 112, 134)
@@ -429,6 +482,61 @@ static HFONT mkFont(int px, int weight, bool mono = false)
 {
     return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        CLEARTYPE_QUALITY, 0, mono ? L"Consolas" : L"Segoe UI");
+}
+// the menu face, grayscale-antialiased (coverage is read back as alpha, so no ClearType fringes)
+static HFONT mkLato(int px)
+{
+    return CreateFontW(-px, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                       ANTIALIASED_QUALITY, 0, g_latoLoaded ? L"Lato" : L"Segoe UI");
+}
+static void flatRect(HDC dc, int x, int y, int w, int h, COLORREF fill, COLORREF border);
+static void textIn(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, COLORREF col, UINT fmt, int track);
+// coverage mask for the native-look collapsed button (0..255 per pixel, w*h), plus
+// the label box inside it. Rebuilt on dirty; composed over the frame every present.
+static unsigned char* g_cov = nullptr; static int g_covW = 0, g_covH = 0;
+static int g_nativeFontPx() { int px = g_flagFontPx ? g_flagFontPx : (int)(24 * UiScale() + .5f); return px < 8 ? 8 : px; }
+// size of the native-look button = label extent + stylesheet padding {8,15,8,15} * scale
+static void MeasureNative(int* w, int* h)
+{
+    float s = UiScale(); int px = g_nativeFontPx();
+    HDC dc = GetDC(nullptr); HFONT f = mkLato(px); HGDIOBJ of = SelectObject(dc, f);
+    SIZE sz = { 0, 0 }; GetTextExtentPoint32W(dc, L"MULTIPLAYER", 11, &sz);
+    SelectObject(dc, of); DeleteObject(f); ReleaseDC(nullptr, dc);
+    *w = sz.cx + (int)(30 * s + .5f); *h = sz.cy + (int)(16 * s + .5f);
+    if (*w > g_panelW) *w = g_panelW; if (*h > g_panelH) *h = g_panelH;
+}
+static void RenderNativeCoverage(int w, int h)
+{
+    if (g_covW != w || g_covH != h) { free(g_cov); g_cov = (unsigned char*)calloc((size_t)w * h, 1); g_covW = w; g_covH = h; }
+    HDC screen = GetDC(nullptr); HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr; HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HGDIOBJ oldbm = SelectObject(mem, dib);
+    flatRect(mem, 0, 0, w, h, RGB(0, 0, 0), CLR_INVALID);          // white-on-black = coverage
+    HFONT f = mkLato(g_nativeFontPx());
+    textIn(mem, 0, 0, w, h, L"MULTIPLAYER", f, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0);
+    DeleteObject(f);
+    const unsigned char* src = (const unsigned char*)bits;
+    for (int i = 0; i < w * h; i++) { unsigned char r = src[i * 4], g = src[i * 4 + 1], b = src[i * 4 + 2];
+        unsigned char m = r > g ? r : g; g_cov[i] = m > b ? m : b; }
+    SelectObject(mem, oldbm); DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
+}
+// out = bg + (255-bg)*a, a = hoverFill + text*(1-hoverFill); both the fill and the
+// text are white, exactly like Button:hover / Button:active in default.lua.
+static void ComposeNative(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h)
+{
+    int fill = g_active ? 100 : (g_hover ? 50 : 0);
+    for (int y = 0; y < h; y++) {
+        const unsigned char* s = bg + y * bgPitch; unsigned char* d = (unsigned char*)dst + y * pitch;
+        for (int x = 0; x < w; x++) {
+            int cov = g_cov ? g_cov[y * w + x] : 0;
+            int a = fill + cov * (255 - fill) / 255;
+            for (int c = 0; c < 3; c++) { int v = s[x * 4 + c]; d[x * 4 + c] = (unsigned char)(v + (255 - v) * a / 255); }
+            d[x * 4 + 3] = 255;
+        }
+    }
 }
 static void flatRect(HDC dc, int x, int y, int w, int h, COLORREF fill, COLORREF border)
 {
@@ -638,9 +746,86 @@ static bool BuildPanelImage()
     return true;
 }
 
+// backdrop: a second host-visible linear image the game frame is copied INTO under
+// the button, so the native-look overlay can alpha-blend instead of overwrite.
+static VkImage        g_bdImg = VK_NULL_HANDLE;
+static VkDeviceMemory g_bdMem = VK_NULL_HANDLE;
+static void*          g_bdPtr = nullptr;
+static size_t         g_bdPitch = 0;
+static bool           g_bdBuilt = false, g_bdFail = false;
+static bool BuildBackdropImage()
+{
+    if (g_bdBuilt) return true; if (g_bdFail) return false;
+    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = g_scFormat;
+    ici.extent = { (uint32_t)g_panelW, (uint32_t)g_panelH, 1 };
+    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_LINEAR; ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+    if (pCreateImage(g_dev, &ici, nullptr, &g_bdImg) != VK_SUCCESS) { g_bdFail = true; Log("[menu] vk: backdrop image create failed\n"); return false; }
+    VkMemoryRequirements mr; pImgMemReq(g_dev, g_bdImg, &mr);
+    bool ok = false;
+    for (uint32_t ti = 0; ti < 32 && !ok; ti++) {
+        if (!(mr.memoryTypeBits & (1u << ti))) continue;
+        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.allocationSize = mr.size; mai.memoryTypeIndex = ti;
+        VkDeviceMemory m = VK_NULL_HANDLE;
+        if (pAllocMem(g_dev, &mai, nullptr, &m) != VK_SUCCESS) continue;
+        void* ptr = nullptr;
+        if (pMapMem(g_dev, m, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS && ptr) { g_bdMem = m; g_bdPtr = ptr; ok = true; }
+    }
+    if (!ok) { g_bdFail = true; Log("[menu] vk: no mappable memory for backdrop\n"); return false; }
+    pBindImgMem(g_dev, g_bdImg, g_bdMem, 0);
+    VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+    VkSubresourceLayout sl; pImgSubLayout(g_dev, g_bdImg, &sub, &sl);
+    g_bdPitch = (size_t)sl.rowPitch;
+    VkCommandBuffer cb = g_cmd[0]; pResetCB(cb, 0);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pBeginCB(cb, &bi);
+    barrierImage(cb, g_bdImg, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    pEndCB(cb);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    pResetFences(g_dev, 1, &g_fence); pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence);
+    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    g_bdBuilt = true;
+    Log("[menu] vk: backdrop image ready pitch=%zu\n", g_bdPitch);
+    return true;
+}
+// Pull the region under the button out of this frame's swapchain image (usage has
+// TRANSFER_SRC) so the CPU can blend the label over it.
+static void CopyBackdrop(VkQueue q, uint32_t imgIndex)
+{
+    VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    pBeginCB(cb, &bi);
+    barrierImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageCopy region = {};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.srcSubresource.layerCount = 1;
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.dstSubresource.layerCount = 1;
+    region.srcOffset = { g_panelX, g_panelY, 0 };
+    region.extent = { (uint32_t)g_copyW, (uint32_t)g_copyH, 1 };
+    pCmdCopyImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_bdImg, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    barrierImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0);
+    barrierImage(cb, g_bdImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    pEndCB(cb);
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
+    pResetFences(g_dev, 1, &g_fence); pSubmit(q, 1, &si, g_fence);
+    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    if (pInvalidate) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_bdMem; r.size = VK_WHOLE_SIZE; pInvalidate(g_dev, 1, &r); }
+}
+static bool nativeLookActive() { return g_flagOverlayNative && InterlockedCompareExchange(&g_uiState, 0, 0) == 0; }
+
 static void PanelLayout()
 {
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) {
+    if (nativeLookActive()) {
+        // collapsed, native look: sized to the label like a real MainMenu Button,
+        // placed by the ox/oy flags (default 5vw in, like the stylesheet's margin)
+        MeasureNative(&g_copyW, &g_copyH);
+        g_panelX = (int)(g_scExtent.width * g_flagOx);
+        g_panelY = (int)(g_scExtent.height * g_flagOy);
+        if (g_panelX + g_copyW > (int)g_scExtent.width)  g_panelX = (int)g_scExtent.width - g_copyW;
+        if (g_panelY + g_copyH > (int)g_scExtent.height) g_panelY = (int)g_scExtent.height - g_copyH;
+    } else if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) {
         // collapsed: small button in the menu's left column
         g_copyW = 300; g_copyH = 60;
         g_panelX = (int)(g_scExtent.width * 0.062f);
@@ -658,7 +843,20 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
     if (imgIndex >= g_scImgCount) return;
     if (!BuildPanelImage()) return;
     PanelLayout();
-    if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 && g_panelPtr) {
+    if (nativeLookActive() && BuildBackdropImage()) {
+        // native look: readback the frame under the button, blend the label over
+        // it on the CPU, then the usual copy puts the blended block back.
+        if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 || g_covW != g_copyW || g_covH != g_copyH)
+            RenderNativeCoverage(g_copyW, g_copyH);
+        g_hitCount = 0; addHit(0, 0, g_copyW, g_copyH, 1);
+        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+        CopyBackdrop(q, imgIndex);
+        ComposeNative((const unsigned char*)g_bdPtr, g_bdPitch, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
+        if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
+        QueryPerformanceCounter(&t1);
+        static int n = 0; if (++n % 600 == 1) Log("[menu] native-look blend %dx%d hover=%d active=%d %.2f ms\n",
+            g_copyW, g_copyH, g_hover, g_active, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
+    } else if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 && g_panelPtr) {
         RenderPanelGDI(g_panelPtr, g_panelPitch, g_copyW, g_copyH);
         if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
     }
@@ -700,6 +898,19 @@ static void PollClick()
     static bool prevDown = false;
     static ULONGLONG lastFire = 0;
     bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    // hover / pressed tracking for the native-look overlay (Button:hover / :active)
+    {
+        int hv = 0;
+        if (gameHasFocus()) {
+            POINT pt; GetCursorPos(&pt);
+            if (!g_gameWnd || !IsWindow(g_gameWnd)) { g_gameWnd = nullptr; EnumWindows(FindGameWnd, (LPARAM)&g_gameWnd); }
+            POINT origin = { 0, 0 }; if (g_gameWnd) ClientToScreen(g_gameWnd, &origin);
+            int lx = pt.x - origin.x - g_panelX, ly = pt.y - origin.y - g_panelY;
+            for (int i = 0; i < g_hitCount; i++) { const Hit& hh = g_hits[i];
+                if (lx >= hh.x && lx < hh.x + hh.w && ly >= hh.y && ly < hh.y + hh.h) { hv = hh.id; break; } }
+        }
+        g_hover = hv; g_active = (hv && down) ? hv : 0;
+    }
     if (down && !prevDown && gameHasFocus()) {
         POINT pt; GetCursorPos(&pt);
         if (!g_gameWnd || !IsWindow(g_gameWnd)) { g_gameWnd = nullptr; EnumWindows(FindGameWnd, (LPARAM)&g_gameWnd); }
@@ -858,6 +1069,90 @@ static void ProbeWidget()
         Log("[menu] widget probe FAULTED (exc=%lx) at step -- signature/ctx off\n",
             GetExceptionCode());
     }
+}
+
+// ---------------- native title-menu button (A/B test, flag native=1) ----------------
+// What the page builder 667bc0 really does per entry (decompiled, mainmenu_ref.c):
+//   btn = 7c5d30(221c930(&s, "Load Game"), &empty, &empty)   build the Button
+//   227a1e0(btn, &"continue")                                 style class (optional)
+//   2518f0(btn, &connOut, &std::function<void()>)             connect the click slot
+//   227f880(btn, 4)                                           prepare
+//   2d99e0(list, btn, &"list-item")                           ADD TO THE "MainMenu" LIST
+// The list (a 0x508-byte widget named "MainMenu") is a local of the builder, so we
+// hook the list's add call and remember the list pointer while the builder runs;
+// after it returns we run the same five steps for our own entry. The click slot is
+// an MSVC std::function whose in-place impl vtable is {Copy, Move, DoCall,
+// TargetType, DeleteThis} (docs/M6_MENU_UI.md) -- we supply a static one.
+static const uintptr_t RVA_LIST_ADD = 0x22d99e0;  static const int STEAL_LIST_ADD = 15;   // push rdi; sub rsp,60; mov [rsp+20],-2
+static const uintptr_t RVA_SETNAME  = 0x227a1e0;
+static const uintptr_t RVA_PREP     = 0x227f880;
+typedef void* (*ListAddFn)(void* list, void* widget, void* styleStr);
+typedef void  (*SetNameFn)(void* widget, void* str);
+typedef void  (*PrepFn)(void* widget, int flags);
+static ListAddFn g_origListAdd = nullptr;
+static SetNameFn g_setName = nullptr;
+static PrepFn    g_prep = nullptr;
+static volatile LONG g_inMainBuild = 0;
+static void* g_mainList = nullptr;
+static int   g_mainListAdds = 0;
+static void OnHit(int id);
+
+struct FuncBase { const void* const* vptr; void* capture; };
+static FuncBase* __fastcall MpCopy(const FuncBase* self, void* dest) { FuncBase* d = (FuncBase*)dest; d->vptr = self->vptr; d->capture = self->capture; return d; }
+static FuncBase* __fastcall MpMove(FuncBase* self, void* dest)       { FuncBase* d = (FuncBase*)dest; d->vptr = self->vptr; d->capture = self->capture; return d; }
+static void      __fastcall MpDoCall(FuncBase*)
+{
+    Log("[menu] NATIVE BUTTON CLICKED -> expanding the overlay panel\n");
+    InterlockedExchange(&g_uiState, 1); InterlockedExchange(&g_panelDirty, 1);
+}
+static const void* __fastcall MpTargetType(const FuncBase* self) { return self; }   // never consulted by the signal
+static void      __fastcall MpDeleteThis(FuncBase*, bool)          { }              // 16-byte impl is always in-place
+static const void* const g_mpFuncVtbl[5] = { (const void*)&MpCopy, (const void*)&MpMove, (const void*)&MpDoCall, (const void*)&MpTargetType, (const void*)&MpDeleteThis };
+struct GFunc { FuncBase impl; void* pad[5]; void* ptr; };   // MSVC std::function: 64 B, impl ptr at +0x38
+static_assert(sizeof(GFunc) == 64, "std::function layout");
+
+static void* MyListAdd(void* list, void* widget, void* style)
+{
+    if (InterlockedCompareExchange(&g_inMainBuild, 0, 0)) { g_mainList = list; g_mainListAdds++; }
+    return g_origListAdd(list, widget, style);
+}
+
+static void NativeInsert()
+{
+    __try {
+        if (!g_mainList) { Log("[menu] native: builder made no list adds -- nothing to append to\n"); return; }
+        alignas(16) unsigned char ctxBuf[128]; memset(ctxBuf, 0, sizeof(ctxBuf));
+        void* text = g_actionCtx(ctxBuf, "Multiplayer");
+        GString iconA, iconB; GStringInit(&iconA); GStringInit(&iconB);
+        void* btn = g_btn(text ? text : ctxBuf, &iconA, &iconB);
+        Log("[menu] native: list=%p (%d adds) button=%p vtbl=%p\n", g_mainList, g_mainListAdds, btn, btn ? *(void**)btn : nullptr);
+        if (!btn) return;
+        GString cls; GStringInit(&cls); g_strAssign(&cls, "multiplayer", 11);
+        g_setName(btn, &cls);
+        GFunc fn; memset(&fn, 0, sizeof(fn));
+        fn.impl.vptr = g_mpFuncVtbl; fn.impl.capture = nullptr; fn.ptr = &fn.impl;
+        void* conn[4] = { nullptr, nullptr, nullptr, nullptr };
+        g_add(btn, conn, &fn);
+        g_clean(conn);
+        Log("[menu] native: click slot connected\n");
+        g_prep(btn, 4);
+        GString li; GStringInit(&li); g_strAssign(&li, "list-item", 9);
+        g_origListAdd(g_mainList, btn, &li);
+        g_myButton = btn;
+        Log("[menu] native: BUTTON APPENDED to the MainMenu list -- look below the game's last entry\n");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[menu] native: FAULTED exc=%lx (button not inserted; set native=0 in tpf2_menu_flags.txt if the menu is unstable)\n", GetExceptionCode());
+    }
+}
+
+static void MyMainBuild(uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4)
+{
+    g_mainList = nullptr; g_mainListAdds = 0;
+    InterlockedExchange(&g_inMainBuild, 1);
+    g_origMainBuild(p1, p2, p3, p4);
+    InterlockedExchange(&g_inMainBuild, 0);
+    Log("[menu] main-page builder ran (list=%p adds=%d)\n", g_mainList, g_mainListAdds);
+    if (g_flagNativeBtn) NativeInsert();
 }
 
 // ---------------- game-window helpers ----------------
@@ -1641,6 +1936,38 @@ static DWORD WINAPI Init(LPVOID)
     g_origCreatePage = (CreatePageFn)tramp;
     Log("[menu] hooked CreatePage rva=%llx steal=%d tramp=%p -- overlay thread started\n",
         (unsigned long long)RVA_CREATEPAGE, STEAL_CREATEPAGE, tramp);
+
+    // ---- A/B test: native-look overlay + real list-inserted button ----
+    ReadFlags();
+    LoadLato();
+    g_strAssign = (StrAssignFn)(g_base + RVA_STR_ASSIGN);
+    g_actionCtx = (ActionCtxFn)(g_base + RVA_ACTION_CTX);
+    g_btn       = (BtnFn)(g_base + RVA_BTN);
+    g_add       = (AddFn)(g_base + RVA_ADD);
+    g_clean     = (CleanFn)(g_base + RVA_CLEAN);
+    g_setName   = (SetNameFn)(g_base + RVA_SETNAME);
+    g_prep      = (PrepFn)(g_base + RVA_PREP);
+    if (g_flagNativeBtn) {
+        // verify both prologues before patching: a game update moves everything.
+        static const unsigned char kMainBuild[14] = { 0x48,0x8b,0xc4,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57 };
+        static const unsigned char kListAdd[15]   = { 0x40,0x57,0x48,0x83,0xec,0x60,0x48,0xc7,0x44,0x24,0x20,0xfe,0xff,0xff,0xff };
+        bool okA = memcmp((void*)(g_base + RVA_MAINBUILD), kMainBuild, 14) == 0;
+        bool okB = memcmp((void*)(g_base + RVA_LIST_ADD),  kListAdd, 15) == 0;
+        if (!okA || !okB) {
+            Log("[menu] native: prologue mismatch (mainbuild=%d listadd=%d) -- native button disabled\n", okA, okB);
+            g_flagNativeBtn = 0;
+        } else {
+            void* tA = nullptr; void* tB = nullptr;
+            if (InstallHook(g_base + RVA_LIST_ADD, (void*)&MyListAdd, STEAL_LIST_ADD, &tB) &&
+                InstallHook(g_base + RVA_MAINBUILD, (void*)&MyMainBuild, STEAL_MAINBUILD, &tA)) {
+                g_origListAdd = (ListAddFn)tB; g_origMainBuild = (MainBuildFn)tA;
+                Log("[menu] native: hooked list-add %llx (steal %d) and main builder %llx (steal %d)\n",
+                    (unsigned long long)RVA_LIST_ADD, STEAL_LIST_ADD, (unsigned long long)RVA_MAINBUILD, STEAL_MAINBUILD);
+            } else {
+                Log("[menu] native: InstallHook FAILED -- native button disabled\n"); g_flagNativeBtn = 0;
+            }
+        }
+    }
     return 0;
 }
 

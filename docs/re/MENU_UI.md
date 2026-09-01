@@ -233,3 +233,41 @@ std::string + widget construction from injected code -- all proven and reusable.
 ## Menu button text (deferred 2026-08-29): swapchain usage flag
 
 TRANSFER_DST=1 -> GDI bitmap -> vkCmdCopyImage per frame. =0 -> font-atlas pipeline.
+
+## Layout attach FOUND + native/overlay A/B test built (2026-09-01)
+
+The "architectural wall" above was wrong about the attach. Re-reading the full
+builder decompile (C:\tools\ghidra_out\decomp\mainmenu_ref.c):
+
+- The page's entries live in a LIST widget: `puVar14 = 2d8540(alloc(0x508), 0,1,2)`,
+  named "MainMenu" (widget+0x20). Every button is attached with
+  `FUN_1422d99e0(list, button, &std::string("list-item"))` after `227f880(btn,4)`.
+  That is the "addChild" we were missing. `2d9ad0` inserts (Exit), `2da460` sets
+  the list's selection callback (lambda(void,int) -> remembers the index at
+  menu+0x337*8), `2da030`/`2da650` = count/select.
+- `2518f0(button, &connOut, std::function<void()>*)` is `button->clickSignal
+  (+0x450).connect(std::move(fn))` -- arg2 is the OUTPUT connection, destroyed
+  right after by `357910`. Nothing to do with the page container (local_500 was
+  reused stack). The std::function is the plain MSVC 64-byte object: in-place impl
+  at +0, impl ptr at +0x38, impl vtable {Copy, Move, DoCall, TargetType,
+  DeleteThis} (M6_MENU_UI.md). Our slot is a static vtable + 16-byte impl.
+- Hooks: main builder 667bc0 (steal 14) + list-add 22d99e0 (steal 15:
+  `40 57 48 83 ec 60 48 c7 44 24 20 fe ff ff ff`). The list pointer is captured
+  while the builder runs; after it returns we build/name/connect/prep/add ours.
+
+Test build (bridge/src/menu_hook.cpp, flags in tpf2_menu_flags.txt next to the
+dll -- see bridge/tpf2_menu_flags.example.txt):
+  overlay=native|classic  restyle the GDI overlay to main-menu.lua (Lato 24
+                          uppercase white, padding 8/15, hover white@50, pressed
+                          white@100, alpha-blended over a swapchain readback --
+                          usage 0x13 has TRANSFER_SRC)
+  native=1|0              append a real UI::Button to the MainMenu list
+Both default ON so one launch shows them side by side. Log lines to read:
+  [menu] font: ... -> 1 faces            Lato loaded
+  [menu] native: hooked list-add ...     both prologues matched, hooks live
+  [menu] main-page builder ran (list=... adds=N)
+  [menu] native: BUTTON APPENDED ...     or "native: FAULTED exc=..."
+  [menu] native-look blend WxH ... ms    per-frame readback+blend cost
+  [menu] NATIVE BUTTON CLICKED           the std::function slot fired
+If the menu crashes at startup set native=0 (the render of an un-parented
+button is the one thing SEH cannot guard).
