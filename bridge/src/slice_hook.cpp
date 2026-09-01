@@ -1984,6 +1984,16 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // NOT to wait. CreateLine(7)/UpdateLine(8) can never be cancelled either.
         if (!luaPath && id == 10)
             cancel = CfgHas("cancel_vehicle");
+        // SetLine (6) too. Measured 2026-08-31 with the APPLY log: every command
+        // was issued on the identical sim step on both instances, yet the one
+        // train's last departure differed by 0.8 s -- because the originator
+        // assigned the line at CLICK time (optimistic) while the peer did it at
+        // the stamp. A vehicle carries that offset for the rest of the game.
+        // Strict here means both sides assign at the same step. The Lua only
+        // replays on the originator when ARMED says the cancel happened, so a
+        // cfg with this off stays consistent.
+        else if (!luaPath && id == 6)
+            cancel = CfgHas("cancel_line");
         __try {
             CaptureFactory(*f, rcx, rdx, r8, r9, calleeRsp, caller, groundtruth, cancel);
         } __except (EXCEPTION_EXECUTE_HANDLER) {

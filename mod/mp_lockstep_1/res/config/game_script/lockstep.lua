@@ -531,7 +531,7 @@ end
 -- reference would resolve to a nil global at call time -- the groundAt bug.
 local ser, deepcopy, isPlayerConstruction
 local scheduleLocal   -- forward: called by the line registry above its definition
-K.STRICT_OPS = { VREV = true }   -- strict-safe only: UI must not wait for a result (buy crashed -- see hook)
+K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 
 local warnedNoEdges = false
 -- node id -> "x,y", valid for ONE hash pass only. Ids are recycled: a node that
@@ -6302,7 +6302,7 @@ local function pollInject()
 				local lk = line and lineKeyFor(line)
 				if k and lk then
 					log(string.format("VLINE: %s -> line %s stop %d", k, lk, stop))
-					scheduleLocal("VLINE", { key = k, line = lk, stop = stop, skipOrigin = 1 })
+					scheduleLocal("VLINE", { key = k, line = lk, stop = stop, armed = CM.lastArmed or 0 })
 				end
 
 			elseif o == "LCREATE" then
@@ -6434,11 +6434,11 @@ K.MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
 -- when the clocks agree is the speed restored after a catch-up.
 CM.CATCHUP_BEHIND = 0.8    -- units behind before we run faster
 CM.CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
--- The engine's speeds are 0..3 (0 = paused), so catching up means ONE notch up
--- from whatever the player picked, and there is no room at all at 3. A notch is
--- enough: at speed 2 the clock gains on a peer at speed 1 about as fast as the
--- gap opened in the first place, and 1 -> 3 would be a visible lurch.
-CM.MAX_SPEED      = 3
+-- The engine's speeds are 0, 1, 2, 4 -- it reported 4 live (2026-08-31), so
+-- the ladder is not consecutive. Catching up means ONE notch up from whatever
+-- the player picked (1 -> 2, 2 -> 4), and there is no room at all at 4.
+CM.SPEED_UP = { [1] = 2, [2] = 4, [3] = 4 }
+CM.MAX_SPEED      = 4
 CM.catchingUp  = false
 CM.baseSpeed   = nil       -- the player's speed, sampled while in step
 CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
@@ -6518,10 +6518,10 @@ function CM.pace(ahead)
 	end
 	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
 	if not CM.catchingUp then
-		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED then
+		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED and CM.SPEED_UP[s] then
 			CM.baseSpeed = s
 			CM.catchingUp = true
-			CM.setSpeed(s + 1, string.format("%.2f behind the peer", behind))
+			CM.setSpeed(CM.SPEED_UP[s], string.format("%.2f behind the peer", behind))
 		elseif behind > CM.CATCHUP_BEHIND then
 			-- Already at the top speed: the peer must come down to us, which the
 			-- barrier does at K.BARRIER_AHEAD. Nothing to do but say so.
