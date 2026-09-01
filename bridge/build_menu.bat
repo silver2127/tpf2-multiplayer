@@ -11,3 +11,6 @@ REM auto-deploy to the workshop out dir the proxy loads from (non-fatal: skipped
 REM silently if the game is running and holds the dll open).
 set "DEST=C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out\tpf2_menu.dll"
 copy /y "out\tpf2_menu%1.dll" "%DEST%" >nul 2>&1 && (echo DEPLOYED to workshop out) || (echo DEPLOY SKIPPED ^(dll locked by running game -- redeploy after relaunch^))
+REM the installed proxy (alut.dll) loads tpf2_menu.dll from the GAME dir and logs there too.
+set "GAMEDEST=C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\tpf2_menu.dll"
+copy /y "out\tpf2_menu%1.dll" "%GAMEDEST%" >nul 2>&1 && (echo DEPLOYED to game dir) || (echo GAME-DIR DEPLOY SKIPPED ^(dll locked by running game -- close the game and rerun build_menu.bat^))
