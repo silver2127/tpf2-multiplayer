@@ -429,11 +429,11 @@ static void addHit(int x,int y,int w,int h,int id){ if(g_hitCount<6){g_hits[g_hi
 //                    list (hook the page builder, add via the list's own add call,
 //                    connect a click slot). It appends after the game's last entry.
 //   scale=<f>        UI scale for the overlay (default = screen height / 1080).
-//   ox=<f> oy=<f>    overlay top-left as a fraction of the screen (default .05/.30).
+//   ox=<f> oy=<f>    overlay top-left as a fraction of the screen (default .05/.60).
 //   fontpx=<n>       override the overlay label pixel size (default 24*scale).
 static int   g_flagOverlayNative = 1;
 static int   g_flagNativeBtn     = 1;
-static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.30f;
+static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.60f;
 static int   g_flagFontPx = 0;
 static bool  g_latoLoaded = false;
 static int   g_hover = 0, g_active = 0;     // hit id under the cursor / pressed (native overlay look)
@@ -525,18 +525,25 @@ static void RenderNativeCoverage(int w, int h)
 }
 // out = bg + (255-bg)*a, a = hoverFill + text*(1-hoverFill); both the fill and the
 // text are white, exactly like Button:hover / Button:active in default.lua.
+static unsigned char* g_stage = nullptr; static size_t g_stageSz = 0;
 static void ComposeNative(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h)
 {
+    // The mapped images are uncached/write-combined: byte-wise reads of them cost
+    // ~20 ms per frame. Row-memcpy into ordinary RAM, blend there, row-memcpy out.
+    size_t need = (size_t)w * 4 * h;
+    if (g_stageSz < need) { free(g_stage); g_stage = (unsigned char*)malloc(need); g_stageSz = need; }
+    for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, bg + y * bgPitch, (size_t)w * 4);
     int fill = g_active ? 100 : (g_hover ? 50 : 0);
     for (int y = 0; y < h; y++) {
-        const unsigned char* s = bg + y * bgPitch; unsigned char* d = (unsigned char*)dst + y * pitch;
+        unsigned char* d = g_stage + (size_t)y * w * 4;
         for (int x = 0; x < w; x++) {
             int cov = g_cov ? g_cov[y * w + x] : 0;
             int a = fill + cov * (255 - fill) / 255;
-            for (int c = 0; c < 3; c++) { int v = s[x * 4 + c]; d[x * 4 + c] = (unsigned char)(v + (255 - v) * a / 255); }
+            for (int c = 0; c < 3; c++) { int v = d[x * 4 + c]; d[x * 4 + c] = (unsigned char)(v + (255 - v) * a / 255); }
             d[x * 4 + 3] = 255;
         }
     }
+    for (int y = 0; y < h; y++) memcpy((unsigned char*)dst + y * pitch, g_stage + (size_t)y * w * 4, (size_t)w * 4);
 }
 static void flatRect(HDC dc, int x, int y, int w, int h, COLORREF fill, COLORREF border)
 {
@@ -1111,10 +1118,19 @@ static const void* const g_mpFuncVtbl[5] = { (const void*)&MpCopy, (const void*)
 struct GFunc { FuncBase impl; void* pad[5]; void* ptr; };   // MSVC std::function: 64 B, impl ptr at +0x38
 static_assert(sizeof(GFunc) == 64, "std::function layout");
 
+static void NativeInsert();
+// Inserting AFTER the builder returned appended cleanly but never rendered (the
+// list had already been laid out and attached). Now we insert DURING the build,
+// right after the game's first add, so ours is laid out with the rest -- it should
+// appear as the second entry of the column.
 static void* MyListAdd(void* list, void* widget, void* style)
 {
-    if (InterlockedCompareExchange(&g_inMainBuild, 0, 0)) { g_mainList = list; g_mainListAdds++; }
-    return g_origListAdd(list, widget, style);
+    void* r = g_origListAdd(list, widget, style);
+    if (InterlockedCompareExchange(&g_inMainBuild, 0, 0)) {
+        g_mainList = list; g_mainListAdds++;
+        if (g_mainListAdds == 1 && g_flagNativeBtn) NativeInsert();
+    }
+    return r;
 }
 
 static void NativeInsert()
@@ -1139,7 +1155,7 @@ static void NativeInsert()
         GString li; GStringInit(&li); g_strAssign(&li, "list-item", 9);
         g_origListAdd(g_mainList, btn, &li);
         g_myButton = btn;
-        Log("[menu] native: BUTTON APPENDED to the MainMenu list -- look below the game's last entry\n");
+        Log("[menu] native: BUTTON INSERTED into the MainMenu list during the build -- look for the 2nd entry of the column\n");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[menu] native: FAULTED exc=%lx (button not inserted; set native=0 in tpf2_menu_flags.txt if the menu is unstable)\n", GetExceptionCode());
     }
@@ -1151,8 +1167,7 @@ static void MyMainBuild(uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4)
     InterlockedExchange(&g_inMainBuild, 1);
     g_origMainBuild(p1, p2, p3, p4);
     InterlockedExchange(&g_inMainBuild, 0);
-    Log("[menu] main-page builder ran (list=%p adds=%d)\n", g_mainList, g_mainListAdds);
-    if (g_flagNativeBtn) NativeInsert();
+    Log("[menu] main-page builder ran (list=%p adds=%d, ours inserted after add #1)\n", g_mainList, g_mainListAdds);
 }
 
 // ---------------- game-window helpers ----------------
