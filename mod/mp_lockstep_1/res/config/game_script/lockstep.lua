@@ -6705,6 +6705,19 @@ function data()
 						local k = cmdKey(c)
 						if not executed[k] then
 							executed[k] = true
+							-- MEASUREMENT: how far past its stamp is a command actually
+							-- issued? update() runs per frame while the clock moves in
+							-- 0.2-unit sim steps, so at speed 2-3 the first frame past a
+							-- stamp can be several steps late -- and differently late on
+							-- each instance. Logged on every command, worst case kept in
+							-- the status line (applylag=). If this is routinely > 0 the
+							-- sim-step gate is justified.
+							local lag = now - c.at
+							if lag > (CM.applyLagMax or 0) then CM.applyLagMax = lag end
+							CM.applyCount = (CM.applyCount or 0) + 1
+							if lag > 0.01 then CM.applyLate = (CM.applyLate or 0) + 1 end
+							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f",
+								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag))
 							execute(c)
 						end
 					else
@@ -6728,10 +6741,11 @@ function data()
 				pcall(function()
 					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
 					if f then
-						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  queued=%d%s",
+						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d%s",
 							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
 							peerTime and string.format("%+.1f", now - peerTime) or "?",
-							desyncs, CM.lateCount, #queue, paused and "  PAUSED" or ""))
+							desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
+							#queue, paused and "  PAUSED" or ""))
 						f:close()
 					end
 				end)
