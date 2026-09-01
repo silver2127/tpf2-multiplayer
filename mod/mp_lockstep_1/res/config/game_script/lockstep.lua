@@ -697,6 +697,115 @@ local function nodePos(nid)
 	return "?"
 end
 
+-- ---------- vehicle drift metric ----------
+-- The p lane of the hash answers "are the vehicles in the same places" with a
+-- yes/no. This measures the DISTANCE. At every hash stamp each peer ships its
+-- vehicle positions (LSVPOS, chunked to stay under a bridge frame); the
+-- receiver pairs each of its own vehicles with the nearest peer vehicle and
+-- keeps the mean and max of those distances per stamp. Ids differ between
+-- instances, so nearest-neighbour is the pairing: while the worlds are close
+-- it is exact, and once they are far apart the number is large either way.
+-- Only samples taken at the SAME sim time are compared (a train moves ~5 m per
+-- 0.2-unit step); others are counted as skipped. A running history says
+-- whether the drift GROWS (the sims are diverging) or stays flat (a constant
+-- offset, e.g. one late apply) -- that trend is the point of this metric.
+K.VPOS_PER_PART = 30
+K.VPOS_KEEP = 24
+CM.vposMine = {}      -- stamp -> { s = simtime, pts = {{x,y},...} }
+CM.vposPeer = {}      -- letter -> stamp -> { s=, n=, m=, got=, pts= }
+CM.vposHist = {}      -- letter -> { {t=, mean=, max=}, ... }
+CM.vposSkipped = 0
+CM.vposDone = {}      -- letter..":"..stamp -> true
+
+local function vposPrune(tbl, keep)
+	local ks = {}
+	for k in pairs(tbl) do ks[#ks + 1] = k end
+	if #ks <= keep then return end
+	table.sort(ks)
+	for i = 1, #ks - keep do tbl[ks[i]] = nil end
+end
+
+function CM.vposCompare(stamp, o)
+	local key = o .. ":" .. tostring(stamp)
+	if CM.vposDone[key] then return end
+	local mine, theirs = CM.vposMine[stamp], CM.vposPeer[o] and CM.vposPeer[o][stamp]
+	if not mine or not theirs or theirs.got < theirs.m then return end
+	CM.vposDone[key] = true
+	if math.abs((mine.s or -1) - (theirs.s or -2)) > 0.05 then
+		CM.vposSkipped = CM.vposSkipped + 1
+		log(string.format("VPOS t=%d vs %s: sampled at different sim times (%.1f vs %.1f) -- skipped (%d so far)",
+			stamp, o, mine.s or -1, theirs.s or -1, CM.vposSkipped))
+		return
+	end
+	local a, b = mine.pts, theirs.pts
+	if #a == 0 or #b == 0 then
+		log(string.format("VPOS t=%d vs %s: n=%d/%d -- nothing to pair", stamp, o, #a, #b))
+		return
+	end
+	local sum, mx, over1, over10 = 0, 0, 0, 0
+	for i = 1, #a do
+		local ax, ay = a[i][1], a[i][2]
+		local best = nil
+		for j = 1, #b do
+			local dx, dy = b[j][1] - ax, b[j][2] - ay
+			local d = dx * dx + dy * dy
+			if not best or d < best then best = d end
+		end
+		local d = math.sqrt(best)
+		sum = sum + d
+		if d > mx then mx = d end
+		if d > 1 then over1 = over1 + 1 end
+		if d > 10 then over10 = over10 + 1 end
+	end
+	local mean = sum / #a
+	local h = CM.vposHist[o] or {}
+	CM.vposHist[o] = h
+	h[#h + 1] = { t = stamp, mean = mean, max = mx }
+	while #h > 60 do table.remove(h, 1) end
+	local trend = ""
+	if #h >= 10 then
+		local n = #h
+		local half = math.floor(n / 2)
+		local s1, s2 = 0, 0
+		for i = 1, half do s1 = s1 + h[i].mean end
+		for i = half + 1, n do s2 = s2 + h[i].mean end
+		local m1, m2 = s1 / half, s2 / (n - half)
+		local word = "flat"
+		if m2 > m1 * 1.25 + 0.2 then word = "GROWING" elseif m2 < m1 * 0.8 - 0.2 then word = "shrinking" end
+		trend = string.format(" | trend over %d samples: %.2f -> %.2f m (%s)", n, m1, m2, word)
+	end
+	CM.vposLast = CM.vposLast or {}
+	CM.vposLast[o] = { mean = mean, max = mx, t = stamp, n = #a }
+	log(string.format("VPOS t=%d vs %s @%.1f: n=%d/%d mean=%.2f m max=%.2f m over1m=%d over10m=%d%s",
+		stamp, o, mine.s, #a, #b, mean, mx, over1, over10, trend))
+end
+
+
+function CM.vposRecv(line)
+	local stamp = tonumber(line:match(" t=(%-?%d+)"))
+	local st = tonumber(line:match(" s=([%-%d%.]+)"))
+	local o = line:match(" o=(%a)")
+	local i, m, n = tonumber(line:match(" i=(%d+)")), tonumber(line:match(" m=(%d+)")), tonumber(line:match(" n=(%d+)"))
+	local d = line:match(" d=(%S*)")
+	if not (stamp and st and o and i and m) then return end
+	CM.vposPeer[o] = CM.vposPeer[o] or {}
+	local rec = CM.vposPeer[o][stamp]
+	if not rec then
+		rec = { s = st, n = n or 0, m = m, got = 0, pts = {}, seen = {} }
+		CM.vposPeer[o][stamp] = rec
+		vposPrune(CM.vposPeer[o], K.VPOS_KEEP)
+	end
+	if rec.seen[i] then return end
+	rec.seen[i] = true
+	rec.got = rec.got + 1
+	if d and d ~= "-" then
+		for x, y in d:gmatch("([%-%d%.]+),([%-%d%.]+)") do
+			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0 }
+		end
+	end
+	CM.vposCompare(stamp, o)
+end
+
 local function worldHash(now)
 	-- Vehicles: a count, and -- separately -- where they are.
 	--
@@ -721,6 +830,7 @@ local function worldHash(now)
 		-- lane that never decides anything (review, 2026-08-31).
 		local t = game.interface.getEntities({ radius = 999999 },
 			{ type = "VEHICLE", includeData = true }) or {}
+		local raw = {}
 		for vid, e in pairs(t) do
 			nv = nv + 1
 			local p = type(e) == "table" and e.position or nil
@@ -729,8 +839,12 @@ local function worldHash(now)
 				-- where -- ids differ between instances and always will
 				vpos[#vpos + 1] = string.format("%.0f,%.0f,%.0f",
 					p[1] or p.x or 0, p[2] or p.y or 0, p[3] or p.z or 0)
+				raw[#raw + 1] = { p[1] or p.x or 0, p[2] or p.y or 0 }
 			end
 		end
+		-- the raw positions feed the drift METRIC (CM.vposShip / CM.vposCompare):
+		-- the hash says equal-or-not, the metric says by how many metres
+		CM.lastVposRaw, CM.lastVposT = raw, now
 	end)
 	table.sort(vpos)
 
@@ -4608,6 +4722,8 @@ local function onLine(line)
 		else
 			log("undecodable command: " .. line:sub(1, 80))
 		end
+	elseif op == "LSVPOS" then
+		pcall(CM.vposRecv, line)
 	elseif op == "LSHASH" then
 		local t = tonumber(line:match("t=(%-?%d+)"))
 		local h = line:match("h=(%S+)")
@@ -7244,6 +7360,26 @@ function compareAt(stamp)
 	end
 end
 
+-- Defined here, after broadcast(): a CM function above it would bind a nil
+-- global of that name (luacheck's use-before-definition class of bug).
+-- called from checkHash right after the hash is broadcast
+function CM.vposShip(stamp)
+	local pts, st = CM.lastVposRaw or {}, CM.lastVposT or -1
+	CM.vposMine[stamp] = { s = st, pts = pts }
+	vposPrune(CM.vposMine, K.VPOS_KEEP)
+	local m = math.max(1, math.ceil(#pts / K.VPOS_PER_PART))
+	for i = 1, m do
+		local seg = {}
+		for j = (i - 1) * K.VPOS_PER_PART + 1, math.min(i * K.VPOS_PER_PART, #pts) do
+			seg[#seg + 1] = string.format("%.1f,%.1f", pts[j][1], pts[j][2])
+		end
+		broadcast(string.format("LSVPOS t=%d s=%.1f o=%s i=%d m=%d n=%d d=%s",
+			stamp, st, K.INSTANCE, i, m, #pts, #seg > 0 and table.concat(seg, ";") or "-"))
+	end
+	-- a peer's parts may already be waiting
+	for o in pairs(CM.vposPeer) do CM.vposCompare(stamp, o) end
+end
+
 local function checkHash(now)
 	local stamp = math.floor(now / K.HASH_EVERY_GAMETIME) * K.HASH_EVERY_GAMETIME
 	if lastHashAt == stamp then return end
@@ -7252,6 +7388,7 @@ local function checkHash(now)
 	myHashes[stamp] = h
 	myDetails[stamp] = detail
 	broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
+	pcall(CM.vposShip, stamp)
 	CM.dashLastDetail = detail
 	-- verdict is set by compareAt; a fresh agreeing tick clears it there
 	-- One shared comparison, used from here and from the LSHASH handler, so the
@@ -7369,6 +7506,15 @@ function data()
 							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
 							desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
 							#queue, paused and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
+						-- vehicle drift: worst peer's latest mean/max, plus skipped count
+						local vd = "-"
+						if CM.vposLast then
+							local parts = {}
+							for o, r in pairs(CM.vposLast) do parts[#parts + 1] = string.format("%s:%.1f/%.1fm", o, r.mean, r.max) end
+							table.sort(parts)
+							if #parts > 0 then vd = table.concat(parts, " ") end
+						end
+						f:write("vdrift=" .. vd .. "\n")
 						for _, ev in ipairs(CM.dashEvents) do f:write("ev=" .. ev .. "\n") end
 						f:close()
 					end
@@ -7432,9 +7578,10 @@ function data()
 					CM.dash = D
 					D.cols = present
 					D.colsKey = colsKey
-					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied" }
+					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "vdrift" }
 					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "held by barrier",
-					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied" }
+					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied",
+					             vdrift = "vehicle drift mean/max" }
 					D.cells = {}
 					D.table = api.gui.comp.Table.new(1 + #D.cols, "NONE")
 					local head = { api.gui.comp.TextView.new("") }
