@@ -5358,11 +5358,33 @@ function CM.pollStops()
 			log(string.format("stops: primed %d roadside stop(s) from the save", n))
 			return
 		end
-		-- new ones
+		-- Whenever a stop is added to or removed from an edge, the engine
+		-- REBUILDS the edge and every stop on it gets a new entity id. A stop
+		-- that "vanished" and a stop that "appeared" within a metre of it in the
+		-- same poll are the same stop: move the id and say nothing, or every
+		-- placement on a shared edge would ship a STOPDEL + STOPADD for each
+		-- neighbour (measured live, 2026-08-31).
+		local gone = {}
+		for eo, pos in pairs(CM.knownStop) do
+			if not m[eo] then gone[eo] = pos end
+		end
+		local fresh = {}
 		for eo, eid in pairs(m) do
-			if not CM.knownStop[eo] and isPlayerStop(eo) then
-				local d = describeStop(eo, eid)
-				if d then
+			if not CM.knownStop[eo] and isPlayerStop(eo) then fresh[#fresh + 1] = { eo, eid } end
+		end
+		for _, pair in ipairs(fresh) do
+			local eo, eid = pair[1], pair[2]
+			local d = describeStop(eo, eid)
+			if d then
+				local rebound = nil
+				for geo, pos in pairs(gone) do
+					if (pos[1] - d.x) ^ 2 + (pos[2] - d.y) ^ 2 < 1.0 then rebound = geo; break end
+				end
+				if rebound then
+					gone[rebound] = nil
+					CM.knownStop[rebound] = nil
+					CM.knownStop[eo] = { d.x, d.y }
+				else
 					CM.knownStop[eo] = { d.x, d.y }
 					local k = stopKey(d.x, d.y)
 					if CM.expectStop[k] then
@@ -5380,21 +5402,112 @@ function CM.pollStops()
 				end
 			end
 		end
-		-- gone ones
-		for eo, pos in pairs(CM.knownStop) do
-			if not m[eo] then
-				CM.knownStop[eo] = nil
-				local k = stopKey(pos[1], pos[2])
-				if CM.expectStopDel[k] then
-					CM.expectStopDel[k] = nil
-				else
-					scheduleLocal("STOPDEL", { x = pos[1], y = pos[2], skipOrigin = 1 })
-					log(string.format("stops: roadside stop at %.1f,%.1f removed -> STOPDEL", pos[1], pos[2]))
-				end
+		-- genuinely gone (nothing reappeared at the same spot)
+		for eo, pos in pairs(gone) do
+			CM.knownStop[eo] = nil
+			local k = stopKey(pos[1], pos[2])
+			if CM.expectStopDel[k] then
+				CM.expectStopDel[k] = nil
+			else
+				scheduleLocal("STOPDEL", { x = pos[1], y = pos[2], skipOrigin = 1 })
+				log(string.format("stops: roadside stop at %.1f,%.1f removed -> STOPDEL", pos[1], pos[2]))
 			end
 		end
 	end)
 	if not ok then log("stops poll error: " .. tostring(err)) end
+end
+
+-- Rebuild a street edge with a given set of stops on it. This is how the game
+-- itself does it, and the only shape it accepts (measured 2026-08-31, four
+-- variants): an edge object belongs to its edge, so a stop cannot be attached
+-- to an EXISTING edge entity -- the proposal removes the edge and re-adds a
+-- copy as entity -1 carrying the object list, and every stop on it is re-added
+-- with it. Edge objects have their own negative numbering: the k-th entry of
+-- edgeObjectsToAdd is entity -k, and the edge lists it as {-k, 1} (kind 1 is a
+-- stop; EdgeObjectType.SIGNAL is 2). Listing the object under any other id, or
+-- leaving it off the edge, fails silently -- or asserts inside CalcNodeIndex,
+-- which walks that very list looking for the object and writes a crash dump.
+--
+-- stops: list of { u=, left=, model=, name= } relative to node0 -> node1.
+local function rebuildEdgeWithStops(eid, stops, why, onDone)
+	local comp, a, b, ta, tb = edgeGeomT(eid)
+	if not comp then return false, "edge gone" end
+	-- An object we cannot describe (not a stop) would be destroyed with the
+	-- edge. Refuse rather than delete something silently.
+	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
+	for eo, e2 in pairs(m) do
+		if e2 == eid and not isPlayerStop(eo) then
+			return false, string.format("edge %d carries edge object %d that is not a stop", eid, eo)
+		end
+	end
+	table.sort(stops, function(p, q) return p.u < q.u end)
+	local sp = api.type.SimpleProposal.new()
+	local e = api.type.SegmentAndEntity.new()
+	e.entity = -1
+	e.comp.node0 = comp.node0
+	e.comp.node1 = comp.node1
+	e.comp.tangent0 = api.type.Vec3f.new(ta[1], ta[2], ta[3])
+	e.comp.tangent1 = api.type.Vec3f.new(tb[1], tb[2], tb[3])
+	e.comp.type = comp.type or 0
+	e.comp.typeIndex = comp.typeIndex or -1
+	e.type = 0
+	copyEdgeProps(e, eid, false, nil)
+	local objs = {}
+	for k, st in ipairs(stops) do objs[#objs + 1] = { -k, 1 } end
+	e.comp.objects = objs
+	sp.streetProposal.edgesToAdd[1] = e
+	sp.streetProposal.edgesToRemove[1] = eid
+	for k, st in ipairs(stops) do
+		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
+		eo.edgeEntity = -1
+		eo.param = st.u
+		eo.oneWay = false
+		eo.left = st.left and true or false
+		eo.model = st.model
+		eo.playerEntity = api.engine.util.getPlayer()
+		eo.name = st.name or ""
+		sp.streetProposal.edgeObjectsToAdd[k] = eo
+	end
+	-- Every stop on this edge comes back with a new entity id; the poller must
+	-- not read that as remove + add. Announce each position both ways.
+	for _, st in ipairs(stops) do
+		if st.x then
+			CM.expectStop[stopKey(st.x, st.y)] = true
+			CM.expectStopDel[stopKey(st.x, st.y)] = true
+		end
+	end
+	local cmd = api.cmd.make.buildProposal(sp, buildContext(), true)
+	api.cmd.sendCommand(cmd, function(res, success)
+		local msg = ""
+		if not success then
+			pcall(function()
+				local es = res.resultProposalData and res.resultProposalData.errorState
+				if es then
+					msg = " critical=" .. tostring(es.critical)
+					for i = 1, #es.messages do msg = msg .. " '" .. tostring(es.messages[i]) .. "'" end
+				end
+			end)
+			for _, st in ipairs(stops) do
+				if st.x then CM.expectStop[stopKey(st.x, st.y)] = nil; CM.expectStopDel[stopKey(st.x, st.y)] = nil end
+			end
+		end
+		log(string.format("EXEC %s: edge %d rebuilt with %d stop(s) success=%s%s", why, eid, #stops, tostring(success), msg))
+		if onDone then onDone(success) end
+	end)
+	return true
+end
+
+-- The stops already on an edge, described relative to that edge.
+local function stopsOnEdge(eid)
+	local list = {}
+	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
+	for eo, e2 in pairs(m) do
+		if e2 == eid and isPlayerStop(eo) then
+			local d = describeStop(eo, eid)
+			if d then list[#list + 1] = { eo = eo, u = d.u, left = d.left, model = d.model, name = d.name, x = d.x, y = d.y } end
+		end
+	end
+	return list
 end
 
 function CM.execStopAdd(c)
@@ -5413,33 +5526,17 @@ function CM.execStopAdd(c)
 		local da = (a[1] - c.ax) ^ 2 + (a[2] - c.ay) ^ 2
 		local db = (a[1] - c.bx) ^ 2 + (a[2] - c.by) ^ 2
 		if db < da then u = 1 - u; left = not left end
-		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
-		eo.edgeEntity = eid
-		eo.param = u
-		eo.oneWay = false
-		eo.left = left
-		eo.model = unescName(c.model)
-		eo.playerEntity = api.engine.util.getPlayer()
-		eo.name = unescName(c.name)
-		local sp = api.type.SimpleProposal.new()
-		sp.streetProposal.edgeObjectsToAdd[1] = eo
-		CM.expectStop[stopKey(c.x, c.y)] = true
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), true), function(res, success)
-			log(string.format("EXEC STOPADD seq=%s origin=%s %s '%s' on edge %d u=%.3f left=%s success=%s",
-				tostring(c.seq), tostring(c.origin), unescName(c.model), unescName(c.name),
-				eid, u, tostring(left), tostring(success)))
-			if not success then
-				CM.expectStop[stopKey(c.x, c.y)] = nil
-				pcall(function()
-					local es = res.resultProposalData and res.resultProposalData.errorState
-					if es then
-						local msgs = ""
-						for i = 1, #es.messages do msgs = msgs .. " '" .. tostring(es.messages[i]) .. "'" end
-						log("STOPADD FAIL detail: critical=" .. tostring(es.critical) .. msgs)
-					end
-				end)
+		local stops = stopsOnEdge(eid)
+		for _, st in ipairs(stops) do
+			if (st.x - c.x) ^ 2 + (st.y - c.y) ^ 2 < 1.0 then
+				log(string.format("STOPADD seq=%s: a stop already stands at %.1f,%.1f -- nothing to do", tostring(c.seq), c.x, c.y))
+				return
 			end
-		end)
+		end
+		stops[#stops + 1] = { u = u, left = left, model = unescName(c.model), name = unescName(c.name), x = c.x, y = c.y }
+		local ok2, why = rebuildEdgeWithStops(eid, stops, string.format("STOPADD seq=%s origin=%s '%s'",
+			tostring(c.seq), tostring(c.origin), unescName(c.name)))
+		if not ok2 then log(string.format("STOPADD seq=%s: %s -- skipped", tostring(c.seq), tostring(why))) end
 	end)
 	if not ok then log("exec STOPADD error: " .. tostring(err)) end
 end
@@ -5463,14 +5560,18 @@ function CM.execStopDel(c)
 				tostring(c.seq), c.x, c.y))
 			return
 		end
-		local sp = api.type.SimpleProposal.new()
-		sp.streetProposal.edgeObjectsToRemove[1] = best
+		local eid = m[best]
+		local keep = {}
+		for _, st in ipairs(stopsOnEdge(eid)) do
+			if st.eo ~= best then keep[#keep + 1] = st end
+		end
 		CM.expectStopDel[stopKey(c.x, c.y)] = true
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), true), function(_, success)
-			log(string.format("EXEC STOPDEL seq=%s origin=%s eo=%d at %.1f,%.1f success=%s",
-				tostring(c.seq), tostring(c.origin), best, c.x, c.y, tostring(success)))
-			if not success then CM.expectStopDel[stopKey(c.x, c.y)] = nil end
-		end)
+		local ok2, why = rebuildEdgeWithStops(eid, keep, string.format("STOPDEL seq=%s origin=%s", tostring(c.seq), tostring(c.origin)),
+			function(success) if not success then CM.expectStopDel[stopKey(c.x, c.y)] = nil end end)
+		if not ok2 then
+			CM.expectStopDel[stopKey(c.x, c.y)] = nil
+			log(string.format("STOPDEL seq=%s: %s -- skipped", tostring(c.seq), tostring(why)))
+		end
 	end)
 	if not ok then log("exec STOPDEL error: " .. tostring(err)) end
 end
