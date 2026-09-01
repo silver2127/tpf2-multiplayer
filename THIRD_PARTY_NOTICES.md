@@ -26,3 +26,11 @@ bundled into the frozen `netpunch.exe` by PyInstaller)
   This project is not affiliated with or endorsed by Urban Games.
 - `alut.dll` shipped with the game is **freealut** (LGPL). The proxy forwards
   every export to the original library and contains no freealut code.
+
+## Acknowledgements (no code included)
+
+- **"Multiplayer Companies" by Swiss** (Steam Workshop item 3710243057). Reading
+  this hot-seat mod taught us how the engine's multi-company API behaves
+  (runtime players, per-player journal booking, ownership reassignment and
+  its crash guards). No code from it is included; our companies mode is an
+  independent implementation. Thank you.
