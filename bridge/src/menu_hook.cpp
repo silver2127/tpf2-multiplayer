@@ -11,6 +11,7 @@
 //   48 81 ec ...                          sub rsp,imm
 // All position-independent (pushes + rsp-relative lea, no RIP-relative), so a
 // 20-byte (0x14) steal is a safe trampoline.
+#include <share.h>
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
