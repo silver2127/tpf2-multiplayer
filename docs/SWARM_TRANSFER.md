@@ -51,7 +51,20 @@ Wire additions, all inside NP1 DATA and all gated behind a `--swarm` flag (off
 - `srelay` — `SWARM_RELAY_MAGIC ('s')` + a JSON `{to, frm, ...}` envelope (or a
   wrapped chunk). The host forwards it between two joiners that could not punch.
 
-## The one real blocker: direct joiner<->joiner sockets
+## The direct joiner<->joiner socket problem -- SOLVED by netpunch/mesh.py (2026-09-01)
+
+`MeshNode` keeps the joiner's ONE observed socket and demultiplexes by source
+address into per-peer links with the stock NP1 handshake, i.e. option (A)
+below. Joiners self-observe (STUN, no UPnP) in `cmd_join`, send their profile in
+`join`, the host puts every profile + each joiner's direct-link list in the
+roster, and joiners punch each other pairwise. Bridge frames now fan out
+DIRECTLY, with an `'r'` envelope via the host (or any peer that has a direct
+link to the destination) for pairs that fail to punch. Legacy `--no-mesh`
+joiners keep the star. `python lobby.py --selftest-mesh` = PASS. The swarm's
+`PeerLink.raw_send` can now be `mesh.send(name, payload)` -- that wiring is the
+remaining swarm step.
+
+### (historical) the blocker as first identified
 
 `punch.Connection` owns its socket exclusively (one reader thread). A joiner's
 main socket is already owned by its link to the host. A NAT mapping is
@@ -84,3 +97,12 @@ uses the relay fallback that already exists.
 Compression is NOT available: the .sav starts with the zstd magic (`28 b5 2f fd`)
 and is already compressed (zlib gets ~9%). For rejoins, a binary delta against
 the joiner's previous copy is a big win and stacks with the swarm.
+
+## Open item after the mesh: is the bridge N-way?
+
+The transport now delivers every participant's frames to every other
+participant exactly once. The lockstep bridge DLL still speaks to ONE local
+port and the Lua layer keys commands by `origin`, so the Lua side is N-aware;
+whether the DLL's UDP framing/ARQ copes with frames from several origins on
+one port is unverified live. Two-instance play is unchanged (host<->joiner is
+the same path as before).

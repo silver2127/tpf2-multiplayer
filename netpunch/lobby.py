@@ -158,7 +158,8 @@ from punch import (
     TYPE_DATA, _pack, _unpack, open_socket,
 )
 # Reuse the code exchange + the connect race + observe/announce.
-from connect import decode_code, race, _observe_and_announce
+from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4
+from mesh import MeshNode
 
 # --------------------------------------------------------------------------- #
 # Tunables
@@ -369,6 +370,89 @@ GAME_RELAY_DRAIN = 256      # loopback datagrams drained per ready cycle.
 GAME_RELAY_STATS = 10.0     # seconds between stderr stats lines.
 GAME_RELAY_WARN_EVERY = 5.0 # rate limit for the oversize warning.
 GAME_LOCAL_PORT_DEFAULT = 7771   # the bridge's port if the menu passes none.
+
+# --------------------------------------------------------------------------- #
+# Mesh: joiners punch each other on their ONE observed socket (mesh.py) and
+# fan their bridge frames out DIRECTLY; a pair with no direct path sends an
+# envelope through a relay -- the host, or any peer that has a direct link to
+# the destination. Exactly one copy reaches every participant either way.
+# --------------------------------------------------------------------------- #
+MESH_RELAY_MAGIC = b"r"     # 'r' + len(to) + to + len(frm) + frm + payload
+MESH_LINKS_INTERVAL = 2.0   # joiner -> host: report my direct links this often
+MESH_HI_INTERVAL = 0.5      # re-send mesh_hi on an unnamed connected link
+
+
+def _relay_wrap(to, frm, payload):
+    tb, fb = to.encode("utf-8"), frm.encode("utf-8")
+    return (MESH_RELAY_MAGIC + bytes([len(tb)]) + tb + bytes([len(fb)]) + fb
+            + payload)
+
+
+def _relay_unwrap(data):
+    """-> (to, frm, payload) or None."""
+    try:
+        i = 1
+        lt = data[i]; i += 1
+        to = data[i:i + lt].decode("utf-8"); i += lt
+        lf = data[i]; i += 1
+        frm = data[i:i + lf].decode("utf-8"); i += lf
+        return to, frm, data[i:]
+    except (IndexError, UnicodeDecodeError):
+        return None
+
+
+class _MeshHostLink:
+    """A punch.Connection-shaped view of the HOST link inside a MeshNode, so
+    run_client's host handling is unchanged. Traffic from any OTHER address is
+    handed to ``on_peer(addr, payload)`` (set by run_client)."""
+
+    def __init__(self, mesh, host_addr):
+        self.mesh = mesh
+        self.peer = host_addr
+        self.sock = mesh.sock
+        self.on_peer = lambda _a, _p: None
+
+    @property
+    def peer_str(self):
+        return f"{self.peer[0]}:{self.peer[1]}"
+
+    def send(self, data):
+        if not self.mesh.send(self.peer, data):
+            raise RuntimeError("host link send failed")
+
+    def recv(self, timeout=None):
+        end = None if timeout is None else time.time() + timeout
+        while True:
+            rem = None if end is None else max(0.0, end - time.time())
+            r = self.mesh.recv(rem)
+            if r is None:
+                return None
+            addr, payload = r
+            if addr == self.peer:
+                return payload
+            try:
+                self.on_peer(addr, payload)
+            except Exception as e:                       # never die on one msg
+                _log(f"[mesh] peer message error: {e!r}")
+            if end is not None and time.time() >= end:
+                return None
+
+    def last_seen_age(self):
+        return self.mesh.last_seen_age(self.peer)
+
+    def close(self):
+        self.mesh.close()
+
+
+def _mesh_from_conn(conn, log=_log):
+    """Take the connect race's socket away from its single-peer Connection
+    and put a MeshNode on it, with the host link adopted as connected."""
+    conn._stop.set()                       # stop the reader without closing
+    if conn._thread.is_alive():
+        conn._thread.join(timeout=1.0)
+    mesh = MeshNode(conn.sock, log=log, name="joiner")
+    mesh.adopt(conn.peer, "host", connected=True)
+    return mesh, _MeshHostLink(mesh, conn.peer)
 
 
 def _open_loopback_udp(port):
@@ -981,7 +1065,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     host_name = _dedupe(my_name, set())     # reassigned by the 'name' command
     peers = collections.OrderedDict()       # addr -> {"name":str, "last":float,
-                                            #          "started":bool}
+                                            #          "started":bool,
+                                            #          "profile":code|None,
+                                            #          "links":[names]}
     cid_counter = [0]                       # host-authoritative chat id
     started = [False]
     start_save = [False]                    # save flag of the last broadcast start
@@ -1008,11 +1094,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # PER PEER so a late joiner (not included in the start) never starts
         # off a heal -- it needs the host to press START GAME again.
         players = roster_players()
+        profiles = {p["name"]: p["profile"] for p in peers.values()
+                    if p.get("profile")}
+        links = {p["name"]: p.get("links", []) for p in peers.values()}
         for a, p in list(peers.items()):
             _send_data(sock, a, {"t": "roster", "players": players,
                                  "host": host_name,
                                  "started": bool(p.get("started")),
-                                 "start_save": start_save[0]})
+                                 "start_save": start_save[0],
+                                 "profiles": profiles, "links": links})
 
     def emit_roster():
         players = roster_players()
@@ -1057,10 +1147,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             f"{len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
-    def do_join(addr, name):
+    def do_join(addr, name, profile=None, is_mesh=False):
         late = False
         if addr in peers:                                   # rename in place
             peers[addr]["name"] = _dedupe(name, all_names(exclude_addr=addr))
+            if profile:
+                peers[addr]["profile"] = profile
+            peers[addr]["mesh"] = bool(is_mesh)
         else:                                               # brand-new joiner
             if len(peers) + 1 >= CAP:
                 _send_data(sock, addr, {"t": "reject", "reason": "lobby full"})
@@ -1068,7 +1161,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return
             assigned = _dedupe(name, all_names())
             peers[addr] = {"name": assigned, "last": time.time(),
-                           "started": False}
+                           "started": False, "profile": profile,
+                           "links": [], "mesh": bool(is_mesh)}
             late = started[0]
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))
@@ -1098,6 +1192,31 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return n
 
     def handle_data(addr, payload):
+        if payload[:1] == MESH_RELAY_MAGIC:
+            # A relay envelope: for us -> deliver the inner frame; for another
+            # joiner -> forward verbatim (the host is the default relay).
+            if addr not in peers:
+                return
+            peers[addr]["last"] = time.time()
+            env = _relay_unwrap(payload)
+            if env is None:
+                return
+            to, _frm, inner = env
+            if to == host_name:
+                if GameRelay.is_game(inner) and relay is not None:
+                    relay.deliver(inner)
+                return
+            for a, p in peers.items():
+                if p["name"] == to:
+                    # a mesh joiner unwraps envelopes itself; a legacy (star)
+                    # joiner only understands plain frames
+                    out = payload if p.get("mesh") else inner
+                    try:
+                        sock.sendto(_pack(TYPE_DATA, out), a)
+                    except OSError:
+                        pass
+                    return
+            return
         if GameRelay.is_game(payload):
             # A joiner's bridge frame (binary, never JSON): straight to our
             # bridge. Only from a peer that has joined -- strays are dropped.
@@ -1105,6 +1224,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 peers[addr]["last"] = time.time()
                 if relay is not None:
                     relay.deliver(payload)
+                if not peers[addr].get("mesh"):
+                    # legacy star joiner: it cannot reach the others itself
+                    frame = _pack(TYPE_DATA, payload)
+                    for a in list(peers):
+                        if a != addr:
+                            try:
+                                sock.sendto(frame, a)
+                            except OSError:
+                                pass
             return
         try:
             msg = json.loads(payload.decode("utf-8"))
@@ -1114,7 +1242,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if addr in peers:
             peers[addr]["last"] = time.time()
         if t == "join":
-            do_join(addr, msg.get("name", "player"))
+            do_join(addr, msg.get("name", "player"), msg.get("profile"),
+                    msg.get("mesh", False))
+        elif t == "links":
+            if addr in peers:
+                new = [str(x) for x in msg.get("direct", [])][:CAP]
+                if new != peers[addr].get("links"):
+                    peers[addr]["links"] = new
+                    send_roster_packets()          # let everyone re-plan relays
+        elif t == "mesh_hi":
+            pass                                    # names are host-assigned
         elif t == "chat":
             if addr in peers:
                 broadcast_chat(peers[addr]["name"], str(msg.get("text", "")))
@@ -1322,7 +1459,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 # CLIENT: one Connection to the host; participate
 # --------------------------------------------------------------------------- #
 def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
-               log=_log, receiver_cls=_ClientSaveReceiver, relay=None):
+               log=_log, receiver_cls=_ClientSaveReceiver, relay=None,
+               mesh=None, profile_code=None):
     """Participate in the lobby over a connected ``punch.Connection`` (blocks).
 
     ``receiver_cls`` is the save-receive implementation (the self-test swaps in
@@ -1336,6 +1474,13 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     assigned = [my_name]    # what the host actually named us (from 'welcome')
     started = [False]
     last_roster = [None]
+    host_name = [None]
+    participants = [[]]     # every player name, from the roster
+    roster_links = [{}]     # name -> [names it has direct links to]
+    roster_profiles = [{}]  # name -> profile code (how to punch it)
+    last_hi = {}            # addr -> when we last sent mesh_hi on it
+    last_links_report = [0.0]
+    reported_links = [None]
     last_ignored_start = [None]     # (save, sid) of the last start we refused
     seen_cids = collections.deque(maxlen=512)
     seen_set = set()
@@ -1378,6 +1523,122 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         io.write_state(started=True)
         log(f"[client] START (save={save}) via {via}")
 
+    # ---- mesh: direct links to the other joiners, relay for the rest -------- #
+    def mesh_plan_dials():
+        """Dial every other joiner we have a profile for and no link to yet."""
+        if mesh is None:
+            return
+        me = assigned[0]
+        for nm, code in roster_profiles[0].items():
+            if nm == me or nm == host_name[0] or not code:
+                continue
+            if mesh.by_name(nm) or mesh.dial_pending(nm) or mesh.dial_failed(nm):
+                continue
+            try:
+                prof = decode_code(code)
+            except ValueError:
+                continue
+            mesh.dial(nm, _targets_v4(prof))
+
+    def mesh_send_hi(addr):
+        try:
+            mesh.send(addr, json.dumps({"t": "mesh_hi", "name": assigned[0]}).encode("utf-8"))
+        except Exception:
+            pass
+
+    def mesh_housekeeping(now):
+        if mesh is None:
+            return
+        # name freshly connected links (both sides say hi; duplicates harmless)
+        for ln in list(mesh.links.values()):
+            if ln.connected and ln.name is None and now - last_hi.get(ln.addr, 0.0) >= MESH_HI_INTERVAL:
+                last_hi[ln.addr] = now
+                mesh_send_hi(ln.addr)
+        # a failed dial may succeed later (NAT state changes): retry per roster
+        # heal by forgetting failures every 30 s
+        for nm in list(mesh.dials):
+            d = mesh.dials[nm]
+            if d.failed and now - d.started > 30.0:
+                mesh.forget_dial(nm)
+        mesh_plan_dials()
+        # tell the host who we reach directly (it goes into everyone's roster)
+        if now - last_links_report[0] >= MESH_LINKS_INTERVAL:
+            last_links_report[0] = now
+            direct = [n for n in mesh.direct_names() if n != "host"]
+            if direct != reported_links[0]:
+                reported_links[0] = direct
+                send({"t": "links", "direct": direct})
+
+    def mesh_relay_via(dest):
+        """Who forwards our envelope to ``dest``: the host if it is alive, else
+        any direct peer that reports a direct link to ``dest``."""
+        if conn.last_seen_age() < host_gone_after:
+            return conn.peer
+        for nm in mesh.direct_names():
+            if dest in roster_links[0].get(nm, []):
+                ln = mesh.by_name(nm)
+                if ln:
+                    return ln.addr
+        return None
+
+    def mesh_forward(payload):
+        """A local bridge frame -> every OTHER participant exactly once:
+        direct where we have a link, else one envelope via a relay."""
+        me = assigned[0]
+        n = 0
+        for nm in participants[0]:
+            if nm == me:
+                continue
+            if nm == host_name[0]:
+                if mesh.send(conn.peer, payload):
+                    n += 1
+                continue
+            if mesh.by_name(nm):
+                if mesh.send(nm, payload):
+                    n += 1
+                continue
+            via = mesh_relay_via(nm)
+            if via is not None and mesh.send(via, _relay_wrap(nm, me, payload)):
+                n += 1
+        return n
+
+    def handle_peer(addr, payload):
+        """Traffic from a NON-host address: a direct peer's bridge frame, a
+        relay envelope (for us, or to forward), or a mesh_hi."""
+        if payload[:1] == MESH_RELAY_MAGIC:
+            env = _relay_unwrap(payload)
+            if env is None:
+                return
+            to, frm, inner = env
+            if to == assigned[0]:
+                if GameRelay.is_game(inner) and relay is not None:
+                    relay.deliver(inner)
+            elif mesh.by_name(to):
+                mesh.send(to, payload)          # we are the relay for this pair
+            return
+        if GameRelay.is_game(payload):
+            ln = mesh.link(addr)
+            if ln is not None and ln.connected and relay is not None:
+                relay.deliver(payload)
+            return
+        try:
+            m = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        if m.get("t") == "mesh_hi":
+            nm = str(m.get("name", ""))
+            if nm and nm != assigned[0]:
+                ln = mesh.link(addr)
+                fresh = ln is None or ln.name != nm
+                mesh.name_link(addr, nm)
+                mesh.forget_dial(nm)
+                if fresh:
+                    mesh_send_hi(addr)          # make sure they can name us too
+                    last_links_report[0] = 0.0  # report the new link promptly
+
+    if mesh is not None and hasattr(conn, "on_peer"):
+        conn.on_peer = handle_peer
+
     def handle_msg(raw):
         # Two binary payload kinds are NOT JSON: a relayed bridge frame (first
         # byte GAME_RELAY_MAGIC) and a save chunk (CHUNK_MAGIC); everything
@@ -1385,6 +1646,14 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         if GameRelay.is_game(raw):
             if relay is not None:
                 relay.deliver(raw)
+            return
+        if raw[:1] == MESH_RELAY_MAGIC:
+            if mesh is not None:
+                handle_peer(conn.peer, raw)
+            else:
+                env = _relay_unwrap(raw)
+                if env and env[0] == assigned[0] and GameRelay.is_game(env[2]) and relay is not None:
+                    relay.deliver(env[2])
             return
         if raw[:4] == CHUNK_MAGIC:
             if len(raw) >= 12:
@@ -1401,10 +1670,16 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             return
         if t == "welcome":
             assigned[0] = m.get("you", desired[0])
+            host_name[0] = m.get("host")
             io.write_state(you=assigned[0], host=m.get("host"))
             log(f"[client] host named us {assigned[0]!r}")
         elif t == "roster":
             players = m.get("players", [])
+            host_name[0] = m.get("host", host_name[0])
+            participants[0] = list(players)
+            roster_links[0] = m.get("links", {}) or {}
+            roster_profiles[0] = m.get("profiles", {}) or {}
+            mesh_plan_dials()
             if tuple(players) != last_roster[0]:
                 last_roster[0] = tuple(players)
                 io.emit({"type": "roster", "players": players,
@@ -1449,7 +1724,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "chat", "text": str(cmd.get("text", ""))})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
-            send({"t": "join", "name": desired[0]})         # host re-dedupes
+            m2 = {"t": "join", "name": desired[0], "mesh": mesh is not None}
+            if profile_code:
+                m2["profile"] = profile_code
+            send(m2)
         elif c == "start":
             log("[client] 'start' ignored -- only the host can start")
         elif c == "quit":
@@ -1465,6 +1743,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     relay_thread = None
     if relay is not None:
         def relay_forward(payload):
+            if mesh is not None:
+                return mesh_forward(payload)
             conn.send(payload)          # RuntimeError (no peer yet) -> pump
             return 1
 
@@ -1474,7 +1754,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                                         daemon=True)
         relay_thread.start()
 
-    send({"t": "join", "name": desired[0]})                 # announce ourselves
+    join_msg = {"t": "join", "name": desired[0], "mesh": mesh is not None}
+    if profile_code:
+        join_msg["profile"] = profile_code
+    send(join_msg)                                          # announce ourselves
     last_ping = 0.0
     try:
         while not stop.is_set():
@@ -1499,6 +1782,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                     break
                 raw = conn.recv(timeout=0.0)
             now = time.time()
+            mesh_housekeeping(now)
             receiver.tick(now)                              # facks / fdone cadence
             if now - last_ping >= PING_INTERVAL:
                 last_ping = now
@@ -1568,6 +1852,18 @@ def cmd_join(args):
     # Star model: the host is open, so we simply DIAL its v4 candidates. This
     # reuses connect.py's race (role='dial', v4 only -> single socket).
     sock = open_socket(args.local_port, socket.AF_INET)
+    # Mesh: learn our OWN public mapping on this same socket first (STUN, no
+    # UPnP), so the host can hand the other joiners a code that punches us.
+    profile_code = None
+    if not getattr(args, "no_mesh", False):
+        try:
+            from observe import observe
+            prof = observe(args.local_port, sock=sock, do_upnp=False)
+            profile_code = encode_profile(prof)
+            _log(f"[join] self-observed candidates={prof['candidates']} "
+                 f"flags={prof['flags']}")
+        except Exception as e:                            # noqa: BLE001
+            _log(f"[join] self-observe failed: {e} -- peers will reach us via relay")
     conn = race(sock, peer, "dial", args.local_port, args.timeout,
                 my_has_v6=False)
     if not conn:
@@ -1579,7 +1875,12 @@ def cmd_join(args):
             relay.close()
         return 1
     _log(f"[join] connected to host {conn.peer_str}")
-    run_client(conn, args.name, io, relay=relay)
+    mesh = None
+    if not getattr(args, "no_mesh", False):
+        mesh, conn = _mesh_from_conn(conn)
+        _log("[join] mesh: direct links to other joiners enabled")
+    run_client(conn, args.name, io, relay=relay, mesh=mesh,
+               profile_code=profile_code)
     return 0
 
 
@@ -2346,6 +2647,168 @@ def selftest_relay():
 
 
 # --------------------------------------------------------------------------- #
+# Self-test: host + 3 joiners; j1<->j2 punch directly, j3 is relay-only
+# --------------------------------------------------------------------------- #
+def selftest_mesh():
+    """Every participant's bridge frames must reach every OTHER participant's
+    bridge EXACTLY once. j1 and j2 carry loopback profiles, so they must end up
+    with a direct link; j3 joins with no mesh (the old star), so everything to
+    and from it is relayed through the host. Also proves the host still gets
+    one copy (not a duplicate) of each joiner frame."""
+    HP = 29570
+    JP = {"j1": 29571, "j2": 29572, "j3": 29573}
+    RELAY = {"host": 7793, "j1": 7794, "j2": 7795, "j3": 7796}   # bridge -> lobby
+    LOCAL = {"host": 7783, "j1": 7784, "j2": 7785, "j3": 7786}   # lobby -> bridge
+    names = {"host": "alice", "j1": "bob", "j2": "carol", "j3": "dave"}
+    N, SIZE = 60, 600
+    base = tempfile.mkdtemp(prefix="lobby_mesh_")
+    ios = {k: LobbyIO(os.path.join(base, k)) for k in names}
+    stop = threading.Event()
+    conns, relays, standins, meshes = [], [], [], {}
+    ok = True
+
+    def frame(tag, i):
+        head = tag + struct.pack("!I", i)
+        return head + bytes((i * 3 + j) & 0xFF for j in range(SIZE - len(head)))
+
+    try:
+        bridges = {k: _open_loopback_udp(LOCAL[k]) for k in names}
+        standins += list(bridges.values())
+        rel = {k: GameRelay(RELAY[k], LOCAL[k]) for k in names}
+        relays += list(rel.values())
+
+        hsock = open_socket(HP, socket.AF_INET)
+        threading.Thread(target=run_host, name="mesh-host",
+                         args=(hsock, names["host"], ios["host"]),
+                         kwargs={"code": "MESHCODE", "stop": stop,
+                                 "relay": rel["host"]}, daemon=True).start()
+        time.sleep(0.4)
+
+        for key in ("j1", "j2", "j3"):
+            port = JP[key]
+            peer = {"candidates": {"public_v4": f"127.0.0.1:{HP}",
+                                   "lan_v4": None, "v6": None},
+                    "flags": {"open": True, "v6": False}}
+            s = open_socket(port, socket.AF_INET)
+            conn = race(s, peer, "dial", port, 10, my_has_v6=False)
+            if not conn:
+                print(f"[selftest-mesh] FAIL: {names[key]} could not connect")
+                return False
+            conns.append(conn)
+            mesh = None
+            code = None
+            if key != "j3":
+                code = encode_profile({"candidates": {"lan_v4": f"127.0.0.1:{port}",
+                                                      "public_v4": None, "v6": None},
+                                       "flags": {"open": True}})
+                mesh, conn = _mesh_from_conn(conn, log=lambda m, k=key: print(f"  [{k}] {m}"))
+                meshes[key] = mesh
+            threading.Thread(target=run_client, name=f"mesh-{key}",
+                             args=(conn, names[key], ios[key]),
+                             kwargs={"stop": stop, "relay": rel[key],
+                                     "mesh": mesh, "profile_code": code},
+                             daemon=True).start()
+
+        def all_joined():
+            for k in names:
+                r = _latest_roster(ios[k].out_path)
+                if not r or sorted(r.get("players", [])) != sorted(names.values()):
+                    return False
+            return True
+
+        if not _wait_until(all_joined, timeout=15):
+            print("[selftest-mesh] FAIL: lobby did not form")
+            return False
+
+        # (a) j1 <-> j2 must become a direct link; j3 has none
+        def linked():
+            return (meshes["j1"].by_name(names["j2"]) is not None
+                    and meshes["j2"].by_name(names["j1"]) is not None)
+        if not _wait_until(linked, timeout=12):
+            ok = False
+            print("[selftest-mesh] FAIL (a): j1<->j2 did not link directly")
+        else:
+            print("[selftest-mesh] OK (a): j1<->j2 direct link on their own sockets")
+        time.sleep(1.0)                      # let 'links' reports reach the roster
+
+        # (b) frames from every bridge reach every other bridge exactly once
+        tags = {"host": b"H", "j1": b"1", "j2": b"2", "j3": b"3"}
+        for i in range(N):
+            for k in names:
+                bridges[k].sendto(frame(tags[k], i), ("127.0.0.1", RELAY[k]))
+            if i % 10 == 9:
+                time.sleep(0.003)
+        got = {k: {t: collections.Counter() for t in tags.values()} for k in names}
+        deadline = time.time() + 15.0
+        def complete():
+            for k in names:
+                for src, t in tags.items():
+                    if src != k and len(got[k][t]) < N:
+                        return False
+            return True
+        while time.time() < deadline and not complete():
+            try:
+                ready, _, _ = select.select(list(bridges.values()), [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            for s in ready:
+                k = next(kk for kk, ss in bridges.items() if ss is s)
+                for _ in range(GAME_RELAY_DRAIN):
+                    try:
+                        data, _src = s.recvfrom(65535)
+                    except (BlockingIOError, ConnectionResetError, OSError):
+                        break
+                    t = data[:1]
+                    if t in got[k] and len(data) >= 5:
+                        got[k][t][struct.unpack("!I", data[1:5])[0]] += 1
+        time.sleep(0.5)                      # catch late duplicates, if any
+        for s in bridges.values():
+            while True:
+                try:
+                    data, _src = s.recvfrom(65535)
+                except (BlockingIOError, ConnectionResetError, OSError):
+                    break
+                k = next(kk for kk, ss in bridges.items() if ss is s)
+                t = data[:1]
+                if t in got[k] and len(data) >= 5:
+                    got[k][t][struct.unpack("!I", data[1:5])[0]] += 1
+        for k in names:
+            for src, t in tags.items():
+                if src == k:
+                    if got[k][t]:
+                        ok = False
+                        print(f"[selftest-mesh] FAIL (b): {k} received its own frames")
+                    continue
+                c = got[k][t]
+                missing = N - len(c)
+                dups = sum(v - 1 for v in c.values() if v > 1)
+                if missing or dups:
+                    ok = False
+                    print(f"[selftest-mesh] FAIL (b): {src}->{k}: missing={missing} duplicates={dups}")
+        if ok:
+            print(f"[selftest-mesh] OK (b): {N} frames from each of 4 bridges reached "
+                  f"the other 3 exactly once (direct j1<->j2, relayed j3)")
+    finally:
+        stop.set()
+        time.sleep(0.5)
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        for r in relays:
+            r.close()
+        for s in standins:
+            try:
+                s.close()
+            except OSError:
+                pass
+        shutil.rmtree(base, ignore_errors=True)
+    print(f"[selftest-mesh] {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv=None):
@@ -2364,6 +2827,12 @@ def main(argv=None):
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
+    ap.add_argument("--no-mesh", action="store_true",
+                    help="joiner: do not punch other joiners directly; keep "
+                         "every frame on the host relay (the pre-mesh star)")
+    ap.add_argument("--selftest-mesh", action="store_true",
+                    help="run the mesh self-test (host + 3 joiners, two of "
+                         "them directly linked, one relay-only) and exit")
     ap.add_argument("--selftest-relay", action="store_true",
                     help="run the game-relay self-test (host + joiner, two "
                          "stand-in bridges, frames both ways) and exit")
@@ -2384,6 +2853,8 @@ def main(argv=None):
         return 0 if selftest_transfer() else 1
     if args.selftest_relay:
         return 0 if selftest_relay() else 1
+    if args.selftest_mesh:
+        return 0 if selftest_mesh() else 1
     if args.mode == "host":
         return cmd_host(args)
     if args.mode == "join":
