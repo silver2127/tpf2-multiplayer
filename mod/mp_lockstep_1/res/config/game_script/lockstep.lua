@@ -168,7 +168,27 @@ local pausedSince  = nil        -- tick the barrier engaged, for the watchdog
 local peerTimeAt   = nil        -- tick peerTime was last refreshed
 local desyncs      = 0
 
-local function log(s) print("[ls-" .. (K.INSTANCE or "?") .. "] " .. s) end
+-- The in-game dashboard (guiUpdate, a separate Lua state) can only read files,
+-- so notable events are harvested HERE, at the one point every message passes,
+-- and written out with the status. Nothing else needs to know a dashboard exists.
+CM.dashEvents = {}
+CM.dashVerdict = "-"
+local function dashNote(line)
+	local keep = line:find("success=false", 1, true) or line:find("DESYNC", 1, true)
+		or line:find("LATE", 1, true) or line:find("FAIL", 1, true) or line:find("DIVERGENCE", 1, true)
+		or line:find("captured", 1, true) or line:find("EXEC ", 1, true) or line:find("PACE:", 1, true)
+		or line:find("SPEED:", 1, true) or line:find("BARRIER", 1, true) or line:find("error", 1, true)
+	if not keep then return end
+	if line:find("SYNC t=", 1, true) and not line:find("DESYNC", 1, true) then return end
+	local stamp = os.date("%H:%M:%S")
+	local ev = CM.dashEvents
+	ev[#ev + 1] = stamp .. "  " .. line:sub(1, 110)
+	while #ev > 8 do table.remove(ev, 1) end
+end
+local function log(s)
+	print("[ls-" .. (K.INSTANCE or "?") .. "] " .. s)
+	pcall(dashNote, s)
+end
 
 -- ---------- exact hashing (two Lehmer lanes, products stay under 2^53) ----------
 -- Same construction as the M3 probe. A weaker hash silently collides and
@@ -4329,6 +4349,7 @@ function compareAt(stamp)
 	if mine == theirs then
 		mismatchStreak = 0
 		log(string.format("SYNC t=%d hash=%s", stamp, mine))
+		CM.dashVerdict = "SYNC"
 	else
 		-- A 1-2 stamp mismatch right after a build is expected: commands
 		-- execute up to ~2 units apart under real relay latency and additions
@@ -4352,6 +4373,13 @@ function compareAt(stamp)
 		if dm and dt then
 			log("   mine " .. dm)
 			log("   peer " .. dt)
+			local diffLanes = {}
+			for comp in dm:gmatch("[^,]+") do
+				local name = comp:match("^(%a+)")
+				local other = dt:match("(" .. name .. "[^,]*)")
+				if other and other ~= comp and name ~= "t" then diffLanes[#diffLanes + 1] = name end
+			end
+			CM.dashVerdict = "DESYNC " .. (#diffLanes > 0 and table.concat(diffLanes, "+") or "?")
 			for comp in dm:gmatch("[^,]+") do
 				local name = comp:match("^(%a+)")
 				local other = dt:match("(" .. name .. "[^,]*)")
@@ -7019,6 +7047,8 @@ local function checkHash(now)
 	myHashes[stamp] = h
 	myDetails[stamp] = detail
 	broadcast(string.format("LSHASH t=%d h=%s d=%s", stamp, h, detail or "-"))
+	CM.dashLastDetail = detail
+	-- verdict is set by compareAt; a fresh agreeing tick clears it there
 	-- One shared comparison, used from here and from the LSHASH handler, so the
 	-- check fires whichever side's hash lands second.
 	compareAt(stamp)
@@ -7121,6 +7151,22 @@ function data()
 			checkHash(now)
 
 			if ticks % 15 == 0 then
+				-- The dashboard file: one key=value per line, then the recent
+				-- events. Read by guiUpdate in the GUI Lua state.
+				pcall(function()
+					local f = io.open(K.BASE .. "lockstep_dash_" .. K.INSTANCE .. ".txt", "w")
+					if f then
+						local sp = "?"
+						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
+						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
+							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
+							peerTime and string.format("%+.1f", now - peerTime) or "?",
+							desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
+							#queue, paused and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
+						for _, ev in ipairs(CM.dashEvents) do f:write("ev=" .. ev .. "\n") end
+						f:close()
+					end
+				end)
 				-- status for the in-game MP panel (guiUpdate reads it; the gui
 				-- runs in a separate Lua state, so a file IS the channel --
 				-- same as the whole wire)
@@ -7151,11 +7197,70 @@ function data()
 			guiTick = guiTick + 1
 			if guiTick % 30 ~= 0 then return end
 			local ok = pcall(function()
-				if not statusWin then
-					statusText = api.gui.comp.TextView.new("lockstep: waiting for status...")
-					statusWin = api.gui.comp.Window.new("Multiplayer", statusText)
-					statusWin:setPosition(20, 120)
+				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
+				-- (Window, Table, TextView, BoxLayout), so the dashboard is built
+				-- from those rather than one text blob: a metrics table with a
+				-- column per instance, a verdict line naming the lanes that
+				-- differ, and the last few notable events harvested from the log.
+				-- Everything comes from lockstep_dash_<a|b>.txt, written every
+				-- 15 ticks by the game-script state.
+				local D = CM.dash
+				if not D or not D.win then
+					D = {}
+					CM.dash = D
+					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied" }
+					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "held by barrier",
+					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied" }
+					D.cells = {}
+					D.table = api.gui.comp.Table.new(3, "NONE")
+					D.table:addRow({ api.gui.comp.TextView.new(""), api.gui.comp.TextView.new("A"), api.gui.comp.TextView.new("B") })
+					for _, key in ipairs(D.rows) do
+						local ca, cb = api.gui.comp.TextView.new("-"), api.gui.comp.TextView.new("-")
+						D.cells[key] = { a = ca, b = cb }
+						D.table:addRow({ api.gui.comp.TextView.new(D.labels[key]), ca, cb })
+					end
+					D.verdict = api.gui.comp.TextView.new("verdict: -")
+					D.events = api.gui.comp.TextView.new("")
+					local box = api.gui.layout.BoxLayout.new("VERTICAL")
+					box:addItem(D.table)
+					box:addItem(D.verdict)
+					box:addItem(api.gui.comp.TextView.new("recent"))
+					box:addItem(D.events)
+					local body = api.gui.comp.Component.new("mpDashboard")
+					body:setLayout(box)
+					D.win = api.gui.comp.Window.new("Multiplayer", body)
+					D.win:setPosition(20, 120)
+					statusWin = D.win     -- keep the old handle alive for the close/rebuild path
 				end
+				local function readDash(inst)
+					local bases = { K.BASE }
+					for _, p in ipairs(CM.baseCandidates or {}) do if p ~= K.BASE then bases[#bases + 1] = p end end
+					for _, base in ipairs(bases) do
+						local f = io.open(base .. "lockstep_dash_" .. inst .. ".txt", "r")
+						if f then
+							local kv, ev = {}, {}
+							for line in f:lines() do
+								local k, v = line:match("^(%w+)=(.*)$")
+								if k == "ev" then ev[#ev + 1] = v elseif k then kv[k] = v end
+							end
+							f:close()
+							if next(kv) then return kv, ev end
+						end
+					end
+					return nil
+				end
+				local da, ea = readDash("a")
+				local db, eb = readDash("b")
+				for _, key in ipairs(D.rows) do
+					D.cells[key].a:setText(da and da[key] or "-")
+					D.cells[key].b:setText(db and db[key] or "-")
+				end
+				local mine = (K.INSTANCE == "b") and db or da
+				local v = mine and mine.verdict or "-"
+				D.verdict:setText("verdict: " .. v .. ((mine and mine.detail and mine.detail ~= "-") and ("   " .. mine.detail) or ""))
+				local evs = (K.INSTANCE == "b") and eb or ea
+				D.events:setText(evs and #evs > 0 and table.concat(evs, string.char(10)) or "(nothing notable yet)")
+				if true then return end
 				-- Both rows come from the shared data dir. Try K.BASE first, then
 				-- every other discovery candidate, so a peer whose DLLs settled
 				-- on a different candidate (harness-pinned vs shipping default)
