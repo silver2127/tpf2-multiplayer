@@ -108,3 +108,26 @@ Networked-specific validations that still need a LIVE game:
    live with two instances.
 3. Then generalize to vehicles/lines; drop the shared-lockstep determinism
    machinery that this model no longer needs.
+
+## Lobby company assignment -- BUILT (2026-09-01)
+
+Any grouping is just a company id per player (1..6), chosen in the lobby:
+
+- **Lobby protocol:** `{t:"company", player, id}` (a joiner sets its own; the
+  host's menu command `{"cmd":"company","player","id"}` sets anyone's). The
+  roster carries `companies: {name: id}`. Everyone starts on 1, so a lobby
+  where nobody clicks is plain co-op, byte-identical to before.
+- **Lobby page:** a coloured, numbered chip beside each name. Click your own
+  (the host: anyone's) to cycle 1..6. Same number = one company together;
+  different numbers = separate companies; 2-on-1 + 2-on-2 etc. fall out.
+- **At START every machine writes** `<data>\mp_company_cfg.txt` from the
+  roster it already agrees on: mode (`companies` iff >1 distinct id), my id,
+  the distinct ids, and line 4 `a=1,b=2,...` -- the origin letter per player
+  by the same rule writeBridgeCtl uses (host 'a', joiners b.. in roster order).
+  lockstep.lua treats line 4 as authoritative (a remote command's own company
+  stamp is overridden), and its existing rule "cid == mine -> skip reassign,
+  no cost transfer" already makes same-company peers plain co-op.
+- **Known limits:** teammates' copies of a shared company's wallet drift the
+  way co-op always did (a periodic balance broadcast from the company's first
+  member is the planned fix); N-way lockstep itself (K.PEER is still 2-player
+  in 8 places) is unverified live beyond two machines.

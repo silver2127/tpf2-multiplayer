@@ -397,6 +397,8 @@ static volatile LONG g_lobbyDone = 0;
 static char g_status[256] = "";
 // lobby model (fed from lobby_out.jsonl)
 static char g_players[8][40]; static int g_playerCount = 0;
+static int  g_companies[8] = {1,1,1,1,1,1,1,1};   // company id per roster entry (1..6)
+static const COLORREF CO_COLOR[6] = { RGB(220,80,80), RGB(80,140,230), RGB(90,190,110), RGB(230,180,60), RGB(180,100,220), RGB(80,200,200) };
 static char g_you[40] = ""; static char g_host[40] = "";
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
 static char g_chatInput[200] = ""; static int g_chatLen = 0;
@@ -749,9 +751,19 @@ static void RenderPanelLayer(int w, int h)
             wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, 64);
             bool isYou = strcmp(g_players[i], g_you) == 0, isHost = strcmp(g_players[i], g_host) == 0;
             int ry = cy + S(30) + i * S(26);
-            layerText(pad, ry, listW - S(50), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            // company chip: colour + number; click your own (the host: anyone's) to cycle 1..6
+            int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > 6 ? 6 : g_companies[i]);
+            layerRect(pad, ry + S(4), S(22), S(16), CO_COLOR[cid - 1], 220);
+            wchar_t wc[4]; _snwprintf_s(wc, _TRUNCATE, L"%d", cid);
+            layerText(pad, ry + S(4), S(22), S(16), wc, fs, RGB(0, 0, 0), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            bool amHost = strcmp(g_you, g_host) == 0;
+            if (isYou || amHost) addHit(pad, ry + S(2), S(24), S(20), 20 + i, true);
+            layerText(pad + S(30), ry, listW - S(80), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
         }
+        { HFONT fl = mkLato(S(11));
+          layerText(pad, cy + S(30) + 8 * S(26) + S(6), listW, S(40), L"Same number = one company together. Different numbers = separate companies. Click a chip to change.",
+                    fl, MW_DIM, DT_LEFT | DT_TOP | DT_WORDBREAK, 170); DeleteObject(fl); }
         DeleteObject(fr); DeleteObject(fs);
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
         // chat
@@ -1054,6 +1066,11 @@ static void OnHit(int id)
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
+    case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27: {   // company chip
+        int i = id - 20; char name[40] = ""; int cur = 1;
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < g_playerCount) { strcpy_s(name, g_players[i]); cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
+        if (name[0]) { int next = (cur % 6) + 1; char line[160]; snprintf(line, sizeof(line), "{\"cmd\":\"company\",\"player\":\"%s\",\"id\":%d}", name, next); LobbySend(line); }
+    } break;
     case 8: {   // code field: focus; if empty, paste the clipboard
         InterlockedExchange(&g_joinFocus, 1);
         if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
@@ -1526,6 +1543,47 @@ static void writeBridgeCtl(bool isHost)
         path, isHost ? 'a' : 'b', isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN);
 }
 
+// The origin letter each machine's bridge uses: the host is 'a', joiners take
+// b, c, ... in roster order skipping the host (same rule as writeBridgeCtl).
+static char originLetterFor(const char* name)
+{
+    if (strcmp(name, g_host) == 0) return 'a';
+    int idx = 0;
+    for (int i = 0; i < g_playerCount; i++) {
+        if (strcmp(g_players[i], g_host) == 0) continue;
+        if (strcmp(g_players[i], name) == 0) break;
+        idx++;
+    }
+    if (idx > 6) idx = 6;
+    return (char)('b' + idx);
+}
+
+// mp_company_cfg.txt for the game script (lockstep.lua companies mode):
+//   line 1  coop | companies      (companies when more than one distinct id)
+//   line 2  my company id
+//   line 3  all distinct company ids, comma-separated
+//   line 4  origin=company map, e.g. a=1,b=2,c=1  -- authoritative on every peer
+// Written at START from the roster every machine already agrees on.
+static void writeCompanyCfg()
+{
+    char l3[64] = "", l4[256] = ""; int mine = 1, distinct = 0; bool seen[7] = {};
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    for (int i = 0; i < g_playerCount; i++) {
+        int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > 6 ? 6 : g_companies[i]);
+        if (strcmp(g_players[i], g_you) == 0) mine = cid;
+        if (!seen[cid]) { seen[cid] = true; distinct++; }
+        char e[24]; snprintf(e, sizeof(e), "%s%c=%d", l4[0] ? "," : "", originLetterFor(g_players[i]), cid); strcat_s(l4, e);
+    }
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    for (int c = 1; c <= 6; c++) if (seen[c]) { char e[8]; snprintf(e, sizeof(e), "%s%d", l3[0] ? "," : "", c); strcat_s(l3, e); }
+    char content[512]; snprintf(content, sizeof(content), "%s\n%d\n%s\n%s\n", distinct > 1 ? "companies" : "coop", mine, l3, l4);
+    wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { Log("[menu] company cfg: cannot write %ls\n", path); return; }
+    DWORD w = 0; WriteFile(h, content, (DWORD)strlen(content), &w, nullptr); CloseHandle(h);
+    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3, l4);
+}
+
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
 static void applyRoster(const char* s)
 {
@@ -1541,6 +1599,15 @@ static void applyRoster(const char* s)
                 g_players[g_playerCount][k] = 0; g_playerCount++;
                 if (*q == '"') q++;
             } } }
+    // "companies":{"name":id,...} -> g_companies[i] for each roster entry (default 1)
+    const char* co = strstr(s, "\"companies\"");
+    for (int i = 0; i < g_playerCount; i++) {
+        g_companies[i] = 1;
+        if (!co) continue;
+        char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+        const char* k = strstr(co, keyq);
+        if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= 6) g_companies[i] = id; }
+    }
     char v[40];
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
@@ -1847,6 +1914,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 else if (!newestSave(src, 600)) { SetStatus("No save to load."); go = false; }
                             }
                             if (go) {
+                                writeCompanyCfg();
                                 SetStatus("Loading shared save…"); Sleep(400);
                                 if (doStartLoad(src)) {
                                     // The game is loading. The lobby process STAYS ALIVE: since the

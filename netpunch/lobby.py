@@ -166,6 +166,7 @@ from mesh import MeshNode
 # Tunables
 # --------------------------------------------------------------------------- #
 CAP = 8                 # max players in a lobby, INCLUDING the host
+MAX_COMPANIES = 6       # company ids 1..6 (the engine-side companies mode's limit)
 PING_INTERVAL = 3.0     # joiner -> host lobby keepalive cadence
 DROP_AFTER = 10.0       # host drops a peer unheard-from for this long
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
@@ -1196,7 +1197,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     peers = collections.OrderedDict()       # addr -> {"name":str, "last":float,
                                             #          "started":bool,
                                             #          "profile":code|None,
-                                            #          "links":[names]}
+                                            #          "links":[names],
+                                            #          "company":1..6}
+    host_company = [1]                      # the host's own company id
     cid_counter = [0]                       # host-authoritative chat id
     started = [False]
     start_save = [False]                    # save flag of the last broadcast start
@@ -1223,6 +1226,31 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     def roster_players():
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
+    def roster_companies():
+        """name -> company id. Same id = same company (co-op); different ids =
+        separate companies. Everyone starts on 1, so nothing changes until
+        someone clicks a chip."""
+        m = {host_name: host_company[0]}
+        for p in peers.values():
+            m[p["name"]] = int(p.get("company", 1))
+        return m
+
+    def set_company(name, cid):
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            return False
+        if not 1 <= cid <= MAX_COMPANIES:
+            return False
+        if name == host_name:
+            host_company[0] = cid
+            return True
+        for p in peers.values():
+            if p["name"] == name:
+                p["company"] = cid
+                return True
+        return False
+
     def send_roster_packets():
         # Doubles as the start self-heal: a joiner that lost the whole start
         # burst sees started:true here (~2 s later) and starts. The flag is
@@ -1232,26 +1260,30 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         profiles = {p["name"]: p["profile"] for p in peers.values()
                     if p.get("profile")}
         links = {p["name"]: p.get("links", []) for p in peers.values()}
+        companies = roster_companies()
         for a, p in list(peers.items()):
             _send_data(sock, a, {"t": "roster", "players": players,
                                  "host": host_name,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
-                                 "profiles": profiles, "links": links})
+                                 "profiles": profiles, "links": links,
+                                 "companies": companies})
 
     def emit_roster():
         players = roster_players()
         io.emit({"type": "roster", "players": players,
-                 "you": host_name, "host": host_name})
+                 "you": host_name, "host": host_name,
+                 "companies": roster_companies()})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=host_name, started=started[0])
-        last_emitted_roster[0] = tuple(players)
 
     def roster_changed(broadcast=True):
         """Push the roster to peers, and emit an event only if it changed."""
         if broadcast:
             send_roster_packets()
-        if last_emitted_roster[0] != tuple(roster_players()):
+        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())))
+        if last_emitted_roster[0] != key:
+            last_emitted_roster[0] = key
             emit_roster()
 
     def broadcast_chat(frm, text):
@@ -1297,7 +1329,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             assigned = _dedupe(name, all_names())
             peers[addr] = {"name": assigned, "last": time.time(),
                            "started": False, "profile": profile,
-                           "links": [], "mesh": bool(is_mesh)}
+                           "links": [], "mesh": bool(is_mesh), "company": 1}
             late = started[0]
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))
@@ -1385,6 +1417,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if new != peers[addr].get("links"):
                     peers[addr]["links"] = new
                     send_roster_packets()          # let everyone re-plan relays
+        elif t == "company":
+            # a joiner may set ITS OWN company; only the host sets anyone's
+            if addr in peers:
+                target = str(msg.get("player") or peers[addr]["name"])
+                if target == peers[addr]["name"] and set_company(target, msg.get("id")):
+                    log(f"[host] {target} -> company {msg.get('id')}")
+                    roster_changed()
         elif t == "mesh_hi":
             pass                                    # names are host-assigned
         elif t == "log":
@@ -1473,6 +1512,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             host_name = _dedupe(str(cmd.get("name", "player")),
                                 {p["name"] for p in peers.values()})
             roster_changed()
+        elif c == "company":
+            target = str(cmd.get("player") or host_name)
+            if set_company(target, cmd.get("id")):
+                log(f"[host] {target} -> company {cmd.get('id')} (set by host)")
+                roster_changed()
         elif c == "start":
             save = cmd.get("save")
             if transfer[0] is not None:
@@ -1862,10 +1906,13 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             roster_links[0] = m.get("links", {}) or {}
             roster_profiles[0] = m.get("profiles", {}) or {}
             mesh_plan_dials()
-            if tuple(players) != last_roster[0]:
-                last_roster[0] = tuple(players)
+            companies = m.get("companies", {}) or {}
+            key = (tuple(players), tuple(sorted(companies.items())))
+            if key != last_roster[0]:
+                last_roster[0] = key
                 io.emit({"type": "roster", "players": players,
-                         "you": assigned[0], "host": m.get("host")})
+                         "you": assigned[0], "host": m.get("host"),
+                         "companies": companies})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
                                started=started[0])
@@ -1904,6 +1951,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         c = cmd.get("cmd")
         if c == "chat":
             send({"t": "chat", "text": str(cmd.get("text", ""))})
+        elif c == "company":
+            send({"t": "company", "player": assigned[0], "id": cmd.get("id")})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
             m2 = {"t": "join", "name": desired[0], "mesh": mesh is not None}
@@ -2220,6 +2269,21 @@ def selftest():
             print("[selftest] FAIL (a): all three not in every roster")
         else:
             print(f"[selftest] OK (a): every roster = {expected}")
+
+        # (a1) bob picks company 2: every roster carries companies {bob: 2}
+        with open(ios["j1"].in_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cmd": "company", "id": 2}) + "\n")
+        def companies_ok():
+            for k in names:
+                r = _latest_roster(ios[k].out_path)
+                if not r or (r.get("companies") or {}).get("bob") != 2:
+                    return False
+            return True
+        if not _wait_until(companies_ok, timeout=8):
+            ok = False
+            print("[selftest] FAIL (a1): company choice did not reach every roster")
+        else:
+            print("[selftest] OK (a1): bob -> company 2 visible in every roster")
 
         # (a2) every joiner's log lines reach the host's merged log, tagged
         merged = os.path.join(dirs["host"], PEERS_LOG_NAME)
