@@ -284,7 +284,13 @@ class LogForwarder:
         self.q = collections.deque(maxlen=LOG_QUEUE_MAX)
         self.tails = []                          # [path, tag, offset]
         for path in tail_paths:
-            self.tails.append([path, os.path.basename(path), None])
+            # a file that already exists is tailed from its END (this session's
+            # lines only); one that appears later is read from its start
+            try:
+                start = os.path.getsize(path)
+            except OSError:
+                start = 0
+            self.tails.append([path, os.path.basename(path), start])
         self.last_flush = 0.0
         self.dropped = 0
         self._lock = threading.Lock()
@@ -306,9 +312,6 @@ class LogForwarder:
             try:
                 size = os.path.getsize(path)
             except OSError:
-                continue
-            if off is None:
-                t[2] = size                       # start at the end: new lines only
                 continue
             if size < off:
                 t[2] = 0                          # truncated/rotated: restart

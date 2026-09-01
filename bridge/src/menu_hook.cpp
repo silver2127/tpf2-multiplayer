@@ -1703,7 +1703,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
     wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
-    wchar_t cmd[1024];
+    wchar_t cmd[2048];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
     // the target machine); fall back to `python lobby.py` for the dev checkout.
     wchar_t exe[600]; _snwprintf_s(exe, _TRUNCATE, L"%s\\netpunch.exe", NETDIR);
@@ -1722,11 +1722,19 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     // whatever the bridge reports it bound (re-read now, not cached).
     int relayPort  = a->join ? GAME_RELAY_PORT_JOIN : GAME_RELAY_PORT_HOST;
     int bridgePort = readBridgePort();
+    // Every per-machine log rides to the host's merged lobby_peers.log: the
+    // lobby's own lines go automatically; these files are tailed (new lines
+    // only for ones that already exist; a file that appears later from its start).
+    wchar_t fwd[900];
+    _snwprintf_s(fwd, _TRUNCATE,
+                 L"--forward-log \"%stpf2_bridge.log\" --forward-log \"%stpf2_menu.log\" "
+                 L"--forward-log \"%smp_company_a.log\" --forward-log \"%smp_company_b.log\"",
+                 g_dataDirW, ourDirW(), g_dataDirW, g_dataDirW);
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
-                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d",
-                                base, wc, wname, relayPort, bridgePort); }
-    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d",
-                      base, wname, relayPort, bridgePort);
+                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s",
+                                base, wc, wname, relayPort, bridgePort, fwd); }
+    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s",
+                      base, wname, relayPort, bridgePort, fwd);
     Log("[menu] lobby cmd: %ls\n", cmd);
 
     wchar_t outPath[512]; _snwprintf_s(outPath, _TRUNCATE, L"%s\\lobby_out.jsonl", NETDIR);
