@@ -644,10 +644,11 @@ local function worldHash(now)
 	pcall(function()
 		local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
 		for eo, _ in pairs(m) do
-			local st, po
+			local st, sg, po
 			pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
+			pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL) end)
 			pcall(function() po = api.engine.getComponent(eo, api.type.ComponentType.PLAYER_OWNED) end)
-			if st and po then
+			if (st or sg) and po then
 				local mil = api.engine.getComponent(eo, api.type.ComponentType.MODEL_INSTANCE_LIST)
 				local fi = mil and mil.fatInstances[1]
 				if fi then
@@ -5312,6 +5313,10 @@ CM.expectStopDel = {}    -- "x/y" -> true : a replay is about to remove one here
 local function stopKey(x, y) return string.format("%.0f/%.0f", x, y) end
 
 -- Everything the wire needs about one edge object, from this instance's world.
+-- KIND is what the edge lists the object as, and the engine is strict about
+-- it: measured on a live world, a truck stop is {id, 0} and a bus stop {id, 1}
+-- (STATION.cargo decides), a signal is {id, 2} (EdgeObjectType.SIGNAL). Listing
+-- a truck stop as 1 took the game down in StreetGeometry::CreateLanes.
 local function describeStop(eo, eid)
 	local d = {}
 	local ok = pcall(function()
@@ -5321,6 +5326,31 @@ local function describeStop(eo, eid)
 		d.model = api.res.modelRep.getName(fi.modelId)
 		local nm = api.engine.getComponent(eo, api.type.ComponentType.NAME)
 		d.name = nm and nm.name or ""
+		local st, sg
+		pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
+		pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL) end)
+		if st then
+			d.kind = st.cargo and 0 or 1
+		elseif sg then
+			d.kind = 2
+			-- SignalType: SIGNAL=0, WAYPOINT=2; 1 is the one-way signal. The
+			-- raw fields are logged on first sight so the schema can be checked
+			-- against a real one rather than assumed.
+			pcall(function() d.stype = sg.type end)
+			d.oneWay = (tonumber(d.stype) == 1)
+			if not CM.signalSchemaLogged then
+				CM.signalSchemaLogged = true
+				local fs = {}
+				for _, k in ipairs({ "type", "oneWay", "left", "state", "edgePr", "signalType" }) do
+					local okk, v = pcall(function() return sg[k] end)
+					if okk and v ~= nil then fs[#fs + 1] = k .. "=" .. tostring(v) end
+				end
+				log("signals: SIGNAL component fields on eo " .. eo .. ": " .. table.concat(fs, " "))
+			end
+		else
+			d.kind = 1
+		end
+		pcall(function() d.track = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil end)
 		local comp, a, b, ta, tb = edgeGeomT(eid)
 		d.ax, d.ay, d.bx, d.by = a[1], a[2], b[1], b[2]
 		local u = CM.uOnEdge(eid, d.x, d.y) or 0.5
@@ -5335,9 +5365,10 @@ local function describeStop(eo, eid)
 end
 
 local function isPlayerStop(eo)
-	local st, po
+	local st, sg, po
 	pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
-	if not st then return false end
+	pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL) end)
+	if not st and not sg then return false end
 	pcall(function() po = api.engine.getComponent(eo, api.type.ComponentType.PLAYER_OWNED) end)
 	return po ~= nil
 end
@@ -5393,11 +5424,12 @@ function CM.pollStops()
 						scheduleLocal("STOPADD", {
 							ax = d.ax, ay = d.ay, bx = d.bx, by = d.by,
 							u = d.u, left = d.left and 1 or 0,
-							x = d.x, y = d.y,
+							x = d.x, y = d.y, kind = d.kind, track = d.track and 1 or 0,
+							oneWay = d.oneWay and 1 or 0,
 							model = escName(d.model), name = escName(d.name),
 							skipOrigin = 1 })
-						log(string.format("stops: captured %s '%s' at %.1f,%.1f u=%.3f left=%s -> STOPADD",
-							d.model, d.name, d.x, d.y, d.u, tostring(d.left)))
+						log(string.format("stops: captured %s '%s' kind=%d %s at %.1f,%.1f u=%.3f left=%s -> STOPADD",
+							d.model, d.name, d.kind, d.track and "track" or "street", d.x, d.y, d.u, tostring(d.left)))
 					end
 				end
 			end
@@ -5432,6 +5464,8 @@ end
 local function rebuildEdgeWithStops(eid, stops, why, onDone)
 	local comp, a, b, ta, tb = edgeGeomT(eid)
 	if not comp then return false, "edge gone" end
+	local isTrack = false
+	pcall(function() isTrack = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil end)
 	-- An object we cannot describe (not a stop) would be destroyed with the
 	-- edge. Refuse rather than delete something silently.
 	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
@@ -5450,10 +5484,10 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 	e.comp.tangent1 = api.type.Vec3f.new(tb[1], tb[2], tb[3])
 	e.comp.type = comp.type or 0
 	e.comp.typeIndex = comp.typeIndex or -1
-	e.type = 0
-	copyEdgeProps(e, eid, false, nil)
+	e.type = isTrack and 1 or 0
+	copyEdgeProps(e, eid, isTrack, nil)
 	local objs = {}
-	for k, st in ipairs(stops) do objs[#objs + 1] = { -k, 1 } end
+	for k, st in ipairs(stops) do objs[#objs + 1] = { -k, tonumber(st.kind) or 1 } end
 	e.comp.objects = objs
 	sp.streetProposal.edgesToAdd[1] = e
 	sp.streetProposal.edgesToRemove[1] = eid
@@ -5461,7 +5495,7 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
 		eo.edgeEntity = -1
 		eo.param = st.u
-		eo.oneWay = false
+		eo.oneWay = st.oneWay and true or false
 		eo.left = st.left and true or false
 		eo.model = st.model
 		eo.playerEntity = api.engine.util.getPlayer()
@@ -5491,7 +5525,7 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 				if st.x then CM.expectStop[stopKey(st.x, st.y)] = nil; CM.expectStopDel[stopKey(st.x, st.y)] = nil end
 			end
 		end
-		log(string.format("EXEC %s: edge %d rebuilt with %d stop(s) success=%s%s", why, eid, #stops, tostring(success), msg))
+		log(string.format("EXEC %s: %s edge %d rebuilt with %d object(s) success=%s%s", why, isTrack and "track" or "street", eid, #stops, tostring(success), msg))
 		if onDone then onDone(success) end
 	end)
 	return true
@@ -5504,7 +5538,7 @@ local function stopsOnEdge(eid)
 	for eo, e2 in pairs(m) do
 		if e2 == eid and isPlayerStop(eo) then
 			local d = describeStop(eo, eid)
-			if d then list[#list + 1] = { eo = eo, u = d.u, left = d.left, model = d.model, name = d.name, x = d.x, y = d.y } end
+			if d then list[#list + 1] = { eo = eo, u = d.u, left = d.left, model = d.model, name = d.name, x = d.x, y = d.y, kind = d.kind, oneWay = d.oneWay } end
 		end
 	end
 	return list
@@ -5513,10 +5547,11 @@ end
 function CM.execStopAdd(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
 	local ok, err = pcall(function()
-		local eid = CM.findEdgeByEnds(false, c.ax, c.ay, c.bx, c.by, 2.0)
+		local wantTrack = tonumber(c.track) == 1
+		local eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0)
 		if not eid then
-			log(string.format("STOPADD seq=%s: no street edge %.1f,%.1f--%.1f,%.1f here -- skipped",
-				tostring(c.seq), c.ax, c.ay, c.bx, c.by))
+			log(string.format("STOPADD seq=%s: no %s edge %.1f,%.1f--%.1f,%.1f here -- skipped",
+				tostring(c.seq), wantTrack and "track" or "street", c.ax, c.ay, c.bx, c.by))
 			return
 		end
 		-- The wire's u and side are relative to the originator's node0 -> node1.
@@ -5533,7 +5568,8 @@ function CM.execStopAdd(c)
 				return
 			end
 		end
-		stops[#stops + 1] = { u = u, left = left, model = unescName(c.model), name = unescName(c.name), x = c.x, y = c.y }
+		stops[#stops + 1] = { u = u, left = left, model = unescName(c.model), name = unescName(c.name), x = c.x, y = c.y,
+			kind = tonumber(c.kind) or 1, oneWay = tonumber(c.oneWay) == 1 }
 		local ok2, why = rebuildEdgeWithStops(eid, stops, string.format("STOPADD seq=%s origin=%s '%s'",
 			tostring(c.seq), tostring(c.origin), unescName(c.name)))
 		if not ok2 then log(string.format("STOPADD seq=%s: %s -- skipped", tostring(c.seq), tostring(why))) end
