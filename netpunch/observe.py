@@ -248,6 +248,33 @@ def upnp_map(game_port, keep=False):
 # --------------------------------------------------------------------------- #
 # Top-level profile
 # --------------------------------------------------------------------------- #
+def upnp_unmap(game_port):
+    """Remove the UDP mapping ``upnp_map(..., keep=True)`` left on the router.
+    Best-effort, never raises; returns True if a delete was issued."""
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 1000
+        if u.discover() > 0:
+            u.selectigd()
+            try:
+                u.deleteportmapping(game_port, "UDP")
+                return True
+            except Exception:                            # noqa: BLE001
+                return False
+    except Exception:                                    # noqa: BLE001
+        pass
+    exe = shutil.which("upnpc") or shutil.which("upnpc.exe")
+    if exe:
+        try:
+            subprocess.run([exe, "-d", str(game_port), "UDP"],
+                           capture_output=True, text=True, timeout=8)
+            return True
+        except Exception:                                # noqa: BLE001
+            return False
+    return False
+
+
 def _fmt(ip, port):
     if ip is None:
         return None

@@ -374,9 +374,19 @@ CM.cmCfgStamp   = nil
 
 function CM.cmReadConfig()
 	local f = io.open(CM.CM_CFG_FILE, "r")
-	if not f then CM.cmMode = "coop"; return end
+	if not f then CM.cmMode = "coop"; CM.cmOriginCompany = CM.cmOriginCompany or {}; return end
 	local mode = f:read("*l"); local mine = f:read("*l"); local roster = f:read("*l")
+	local omap = f:read("*l")
 	f:close()
+	-- line 4 (optional): "a=1,b=2,..." -- the LOBBY-assigned company per origin
+	-- instance. When present it is authoritative: a remote command's own
+	-- company stamp is replaced by it, so a peer cannot act as a company the
+	-- lobby did not give it (it can still only forge its origin letter, which
+	-- the sealed transport ties to a lobby member).
+	CM.cmOriginCompany = {}
+	if omap then
+		for o, cid in omap:gmatch("(%a+)%s*=%s*(%d+)") do CM.cmOriginCompany[o] = tonumber(cid) end
+	end
 	CM.cmMode = (mode and mode:gsub("%s", "")) or "coop"
 	CM.cmMyCompany = mine and tonumber(mine)
 	CM.cmRoster = nil
@@ -4460,6 +4470,15 @@ local function onLine(line)
 		if c then
 			-- our own command coming back off the wire; already queued
 			if c.origin ~= K.INSTANCE then
+				-- companies mode: the lobby's assignment wins over the sender's stamp
+				if CM.cmOriginCompany == nil then CM.cmReadConfig() end
+				local lc = CM.cmOriginCompany and CM.cmOriginCompany[c.origin]
+				if lc then
+					if c.company and tonumber(c.company) ~= lc then
+						CM.cmLog(string.format("CM: origin %s claimed company %s but the lobby assigned %d -- overriding", tostring(c.origin), tostring(c.company), lc))
+					end
+					c.company = lc
+				end
 				queue[#queue + 1] = c
 				-- A command whose stamp has already passed here will execute at a
 				-- DIFFERENT sim time than it did on the originator, which is a

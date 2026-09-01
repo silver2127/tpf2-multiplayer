@@ -672,7 +672,8 @@ static void drawBtn(HDC dc, int x, int y, int w, int h, const wchar_t* label, in
 #define MW_TEXT   RGB(255, 255, 255)
 #define MW_DIM    RGB(190, 205, 218)
 #define MW_YOU    RGB(150, 210, 170)
-static char g_joinCode[128] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;
+static char g_joinCode[128] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
+static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
 
 static void mwButton(int x, int y, int w, int h, const wchar_t* label, int id)
 {
@@ -786,6 +787,11 @@ static void RenderPanelLayer(int w, int h)
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0, L"Click to paste the code", 8);
         mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
+        // optional password: mixed into the session key, so the host and every
+        // joiner must type the same one. Shown masked.
+        mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD (optional -- everyone must enter the same one)");
+        { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
+          mwField(pad, cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
         mwStatus(w, h);
     }
 }
@@ -930,7 +936,7 @@ static void PanelLayout()
 {
     g_s = UiScale();
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
-    else                                                     { g_copyW = S(700); g_copyH = S(250); }
+    else                                                     { g_copyW = S(700); g_copyH = S(300); }
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
@@ -1047,6 +1053,7 @@ static void OnHit(int id)
         } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
+    case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
     case 8: {   // code field: focus; if empty, paste the clipboard
         InterlockedExchange(&g_joinFocus, 1);
         if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 120; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
@@ -1713,7 +1720,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     else { TerminateProcess(proc, 0); Log("[menu] lobby.py did not exit within %d ms -- terminated\n", waitMs); }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; };
+struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -1746,12 +1753,15 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                  L"--forward-log \"%stpf2_bridge.log\" --forward-log \"%stpf2_menu.log\" "
                  L"--forward-log \"%smp_company_a.log\" --forward-log \"%smp_company_b.log\"",
                  g_dataDirW, ourDirW(), g_dataDirW, g_dataDirW);
+    wchar_t wpass[96] = L"";
+    if (a->password[0]) { wchar_t wp[40]; MultiByteToWideChar(CP_UTF8, 0, a->password, -1, wp, 40); _snwprintf_s(wpass, _TRUNCATE, L" --password %s", wp); }
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
-                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s",
-                                base, wc, wname, relayPort, bridgePort, fwd); }
-    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s",
-                      base, wname, relayPort, bridgePort, fwd);
-    Log("[menu] lobby cmd: %ls\n", cmd);
+                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
+                                base, wc, wname, relayPort, bridgePort, fwd, wpass); }
+    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s",
+                      base, wname, relayPort, bridgePort, fwd, wpass);
+    { wchar_t shown[2048]; wcscpy_s(shown, cmd); wchar_t* pp = wcsstr(shown, L" --password "); if (pp) wcscpy_s(pp, 2048 - (pp - shown), L" --password ***");
+      Log("[menu] lobby cmd: %ls\n", shown); }
 
     wchar_t outPath[512]; _snwprintf_s(outPath, _TRUNCATE, L"%s\\lobby_out.jsonl", NETDIR);
     wchar_t inPath[512];  _snwprintf_s(inPath,  _TRUNCATE, L"%s\\lobby_in.jsonl", NETDIR);
@@ -1903,7 +1913,7 @@ static void StartLobby(int join)
 {
     ensureUsername();
     LobbyArg* a = (LobbyArg*)calloc(1, sizeof(LobbyArg)); if (!a) return;
-    a->join = join; strcpy_s(a->name, g_username);
+    a->join = join; strcpy_s(a->name, g_username); strcpy_s(a->password, g_passCode);
     if (join) {
         if (g_joinLen >= 8) strcpy_s(a->code, g_joinCode);
         else if (!ClipboardGet(a->code, sizeof(a->code)) || strlen(a->code) < 8) {
@@ -1981,7 +1991,9 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
         }
     }
     LONG st = InterlockedCompareExchange(&g_uiState, 0, 0);
-    bool codeField = st == 1 && InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0;
+    LONG focus = InterlockedCompareExchange(&g_joinFocus, 0, 0);
+    bool codeField = st == 1 && focus != 0;
+    bool passField = st == 1 && focus == 2;
     bool chatField = st == 2 && InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0;
     if (code == HC_ACTION && (codeField || chatField) &&
         InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 &&
@@ -1997,7 +2009,16 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
             vk == VK_LWIN || vk == VK_RWIN)
             return CallNextHookEx(g_kbHook, code, wp, lp);
-        if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && codeField) {
+        if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && passField) {
+            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (vk == VK_BACK) { if (g_passLen > 0) { g_passCode[--g_passLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+            else if (vk == VK_RETURN) { InterlockedExchange(&g_joinFocus, 0); InterlockedExchange(&g_panelDirty, 1); }
+            else { char c = vkToChar((int)vk, shift);
+                   // the password becomes a command-line argument: letters, digits, - _ . only
+                   bool okc = c && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.');
+                   if (okc && g_passLen < 32) { g_passCode[g_passLen++] = c; g_passCode[g_passLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+        }
+        else if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && codeField) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             if (vk == VK_BACK) { if (g_joinLen > 0) { g_joinCode[--g_joinLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }

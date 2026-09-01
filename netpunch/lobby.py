@@ -155,8 +155,9 @@ import time
 # Reuse the transport verbatim -- do NOT reinvent the framing/handshake.
 from punch import (
     DEFAULT_PORT, TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE,
-    TYPE_DATA, _pack, _unpack, open_socket,
+    TYPE_DATA, TYPE_EDATA, _pack, _unpack, open_socket,
 )
+from seal import Sealer, derive_key, SECRET_LEN
 # Reuse the code exchange + the connect race + observe/announce.
 from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4
 from mesh import MeshNode
@@ -459,10 +460,26 @@ class LobbyIO:
         return cmds
 
 
+# --------------------------------------------------------------------------- #
+# Sealing: when the lobby code carried a session secret, every DATA frame this
+# process sends is encrypted + authenticated (seal.py) and goes out as 'E'.
+# Plain 'D' frames are then refused, except the host's plain "wrong password"
+# reject so a joiner learns why it is being ignored.
+# --------------------------------------------------------------------------- #
+SEAL = [None]               # the process-wide seal.Sealer, or None (plaintext)
+REJECT_PLAIN_EVERY = 2.0    # host: rate limit for the plain reject per address
+
+
+def _pack_data(payload):
+    if SEAL[0] is not None:
+        return _pack(TYPE_EDATA, SEAL[0].seal(payload))
+    return _pack(TYPE_DATA, payload)
+
+
 def _send_data(sock, addr, msg):
     """Wrap a lobby message dict in an ``NP1:`` DATA frame and fire it at addr."""
     try:
-        sock.sendto(_pack(TYPE_DATA, json.dumps(msg).encode("utf-8")), addr)
+        sock.sendto(_pack_data(json.dumps(msg).encode("utf-8")), addr)
     except OSError:
         # Windows spits ICMP-port-unreachable back as an exception when a peer
         # has gone away; the drop-timer will evict it. Ignore.
@@ -562,7 +579,7 @@ def _mesh_from_conn(conn, log=_log):
     conn._stop.set()                       # stop the reader without closing
     if conn._thread.is_alive():
         conn._thread.join(timeout=1.0)
-    mesh = MeshNode(conn.sock, log=log, name="joiner")
+    mesh = MeshNode(conn.sock, log=log, name="joiner", cipher=getattr(conn, "cipher", None))
     mesh.adopt(conn.peer, "host", connected=True)
     return mesh, _MeshHostLink(mesh, conn.peer)
 
@@ -810,7 +827,7 @@ class _HostSaveTransfer:
         data = self.blob[off:off + self.chunk]
         frame = CHUNK_MAGIC + struct.pack("!II", self.sid, seq) + data
         try:
-            self.sock.sendto(_pack(TYPE_DATA, frame), addr)
+            self.sock.sendto(_pack_data(frame), addr)
         except OSError:
             pass                      # kernel buffer full etc.; ARQ will re-send
 
@@ -1299,7 +1316,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     def relay_forward(payload):
         """Host side of the game relay: a local bridge frame -> every joiner.
         Returns how many joiners it was sent to."""
-        frame = _pack(TYPE_DATA, payload)
+        frame = _pack_data(payload)
         n = 0
         for a in list(peers):
             try:
@@ -1330,7 +1347,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     # joiner only understands plain frames
                     out = payload if p.get("mesh") else inner
                     try:
-                        sock.sendto(_pack(TYPE_DATA, out), a)
+                        sock.sendto(_pack_data(out), a)
                     except OSError:
                         pass
                     return
@@ -1344,7 +1361,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     relay.deliver(payload)
                 if not peers[addr].get("mesh"):
                     # legacy star joiner: it cannot reach the others itself
-                    frame = _pack(TYPE_DATA, payload)
+                    frame = _pack_data(payload)
                     for a in list(peers):
                         if a != addr:
                             try:
@@ -1474,6 +1491,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     log(f"[host] serving as {host_name!r} on udp/{sock.getsockname()[1]}")
 
     last_heal = last_drop = 0.0
+    reject_sent = {}                        # addr -> when we last sent a plain reject
     # The game relay's loopback socket joins the select set so a bridge frame
     # wakes the loop immediately (lockstep latency) instead of on the next tick.
     rlist = [sock] if relay is None else [sock, relay.sock]
@@ -1513,8 +1531,23 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     elif ptype == TYPE_KEEPALIVE:
                         if addr in peers:
                             peers[addr]["last"] = now
+                    elif ptype == TYPE_EDATA:
+                        if SEAL[0] is None:
+                            continue                        # we run plaintext
+                        plain = SEAL[0].open(payload)
+                        if plain is not None:
+                            handle_data(addr, plain)
+                        elif addr not in peers and now - reject_sent.get(addr, 0.0) >= REJECT_PLAIN_EVERY:
+                            # wrong password (or wrong code): say so in the clear
+                            reject_sent[addr] = now
+                            try:
+                                sock.sendto(_pack(TYPE_DATA, json.dumps(
+                                    {"t": "reject", "reason": "wrong password"}).encode("utf-8")), addr)
+                            except OSError:
+                                pass
                     elif ptype == TYPE_DATA:
-                        handle_data(addr, payload)
+                        if SEAL[0] is None:
+                            handle_data(addr, payload)      # plaintext session
 
             # Game relay: local bridge frames -> every joiner.
             if relay is not None and relay.sock in ready:
@@ -1989,10 +2022,24 @@ def cmd_host(args):
     io.emit({"type": "status", "state": "waiting", "detail": "observing NAT"})
     io.write_state(state="waiting")
     relay = _make_relay(args)               # bind early so a clash shows up now
-    # observe + print the single CODE= line (reused from connect.py).
-    sock, _profile, code = _observe_and_announce(args.local_port)
-    run_host(sock, args.name, io, code=code, relay=relay,
-             forward_logs=args.forward_log or ())
+    # observe + print the single CODE= line (reused from connect.py). The code
+    # carries a fresh session secret: whoever has the code can talk to us,
+    # nobody else can read or inject; --password layers on top of it.
+    secret = os.urandom(SECRET_LEN)
+    SEAL[0] = Sealer(derive_key(secret, args.password or ""))
+    sock, _profile, code = _observe_and_announce(args.local_port, secret=secret)
+    _log("[host] frames are sealed (session key from the code"
+         + (" + password)" if args.password else ")"))
+    try:
+        run_host(sock, args.name, io, code=code, relay=relay,
+                 forward_logs=args.forward_log or ())
+    finally:
+        try:
+            from observe import upnp_unmap
+            if upnp_unmap(args.local_port):
+                _log(f"[host] UPnP mapping for udp/{args.local_port} removed")
+        except Exception as e:                            # noqa: BLE001
+            _log(f"[host] UPnP unmap skipped: {e}")
     return 0
 
 
@@ -2009,6 +2056,13 @@ def cmd_join(args):
         return 2
     if peer.get("stale"):
         _log(f"[join] WARNING: code is {peer['age']}s old -- may be stale")
+    if peer.get("secret"):
+        SEAL[0] = Sealer(derive_key(peer["secret"], args.password or ""))
+        _log("[join] frames are sealed (session key from the code"
+             + (" + password)" if args.password else ")"))
+    else:
+        _log("[join] WARNING: this code carries no session secret -- the lobby "
+             "is PLAINTEXT and unauthenticated (old host?)")
     relay = _make_relay(args)               # bind early so a clash shows up now
     # Star model: the host is open, so we simply DIAL its v4 candidates. This
     # reuses connect.py's race (role='dial', v4 only -> single socket).
@@ -2036,6 +2090,7 @@ def cmd_join(args):
             relay.close()
         return 1
     _log(f"[join] connected to host {conn.peer_str}")
+    conn.cipher = SEAL[0]
     mesh = None
     if not getattr(args, "no_mesh", False):
         mesh, conn = _mesh_from_conn(conn)
@@ -2841,6 +2896,10 @@ def selftest_mesh():
     stop = threading.Event()
     conns, relays, standins, meshes = [], [], [], {}
     ok = True
+    # the whole test runs SEALED: one process-wide sealer stands in for the key
+    # every member would derive from the code
+    KEY = derive_key(b"selftest-secret!"[:SECRET_LEN], "pw")
+    SEAL[0] = Sealer(KEY)                # the host's instance (own replay window)
 
     def frame(tag, i):
         head = tag + struct.pack("!I", i)
@@ -2870,6 +2929,7 @@ def selftest_mesh():
                 print(f"[selftest-mesh] FAIL: {names[key]} could not connect")
                 return False
             conns.append(conn)
+            conn.cipher = Sealer(KEY)    # one instance per member, like real processes
             mesh = None
             code = None
             if key != "j3":
@@ -2979,7 +3039,9 @@ def selftest_mesh():
             except OSError:
                 pass
         shutil.rmtree(base, ignore_errors=True)
-    print(f"[selftest-mesh] {'PASS' if ok else 'FAIL'}")
+        SEAL[0] = None
+    print(f"[selftest-mesh] {'PASS' if ok else 'FAIL'}"
+          + (" (all frames sealed)" if ok else ""))
     return ok
 
 
@@ -3002,6 +3064,9 @@ def main(argv=None):
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
+    ap.add_argument("--password", default="",
+                    help="optional lobby password: mixed into the session key, "
+                         "so everyone must enter the same one (host + joiners)")
     ap.add_argument("--forward-log", action="append", default=None,
                     metavar="PATH",
                     help="also tail this file and ship its new lines to the "

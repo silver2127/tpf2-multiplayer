@@ -51,6 +51,7 @@ TYPE_ACK = b"A"                      # payload = the token we just received
 TYPE_CONNECTED = b"C"               # payload = our token (informational)
 TYPE_KEEPALIVE = b"K"              # payload = our token
 TYPE_DATA = b"D"                     # payload = application bytes
+TYPE_EDATA = b"E"                    # payload = sealed application bytes (seal.py)
 
 DEFAULT_PORT = 29471
 HELLO_INTERVAL = 0.10                # seconds between HELLO bursts
@@ -127,6 +128,7 @@ class Connection:
         self.log = log or (lambda *_a, **_k: None)
 
         self.peer = None                       # most-recent source address
+        self.cipher = None                     # seal.Sealer: DATA goes out as 'E'
         self.connected = threading.Event()     # set when our token is echoed
         self._stop = stop_event or threading.Event()
         self._owns_stop = stop_event is None
@@ -206,8 +208,16 @@ class Connection:
                              f"{addr[0]}:{addr[1]}")
             elif ptype == TYPE_KEEPALIVE:
                 pass  # last_seen already refreshed above
+            elif ptype == TYPE_EDATA:
+                if self.cipher is not None:
+                    plain = self.cipher.open(payload)
+                    if plain is not None:
+                        self._inbox.put(plain)
             elif ptype == TYPE_DATA:
-                self._inbox.put(payload)
+                # a sealed session refuses plaintext, except the host's plain
+                # "wrong password" reject so the user learns why nothing works
+                if self.cipher is None or payload.startswith(b'{"t": "reject"'):
+                    self._inbox.put(payload)
 
     # -- public API -------------------------------------------------------- #
     def wait(self, timeout=None) -> bool:
@@ -217,7 +227,10 @@ class Connection:
     def send(self, data: bytes):
         if self.peer is None:
             raise RuntimeError("no peer resolved yet")
-        self._send_to(TYPE_DATA, data, self.peer)
+        if self.cipher is not None:
+            self._send_to(TYPE_EDATA, self.cipher.seal(data), self.peer)
+        else:
+            self._send_to(TYPE_DATA, data, self.peer)
 
     def recv(self, timeout=None):
         """Return the next application datagram, or None on timeout/close."""

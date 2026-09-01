@@ -38,7 +38,7 @@ import threading
 import time
 
 from punch import (
-    TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE, TYPE_DATA,
+    TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE, TYPE_DATA, TYPE_EDATA,
     _pack, _unpack, HELLO_INTERVAL, KEEPALIVE_INTERVAL, TOKEN_LEN,
 )
 
@@ -72,8 +72,9 @@ class Dial:
 
 
 class MeshNode:
-    def __init__(self, sock, token=None, log=None, name="mesh"):
+    def __init__(self, sock, token=None, log=None, name="mesh", cipher=None):
         self.sock = sock
+        self.cipher = cipher                 # seal.Sealer: DATA goes out as 'E'
         self.token = token or os.urandom(TOKEN_LEN)
         self.log = log or (lambda *_a, **_k: None)
         self.name = name
@@ -178,6 +179,8 @@ class MeshNode:
             addr = ln.addr
         else:
             addr = to
+        if self.cipher is not None:
+            return self._send_to(TYPE_EDATA, self.cipher.seal(payload), addr)
         return self._send_to(TYPE_DATA, payload, addr)
 
     def recv(self, timeout=None):
@@ -252,8 +255,14 @@ class MeshNode:
                         self.log(f"[mesh] connected (peer-driven) {addr[0]}:{addr[1]}")
                 elif ptype == TYPE_KEEPALIVE:
                     pass
+                elif ptype == TYPE_EDATA:
+                    if self.cipher is not None:
+                        plain = self.cipher.open(payload)
+                        if plain is not None:
+                            self.inbox.put((addr, plain))
                 elif ptype == TYPE_DATA:
-                    self.inbox.put((addr, payload))
+                    if self.cipher is None or payload.startswith(b'{"t": "reject"'):
+                        self.inbox.put((addr, payload))
 
     def close(self):
         self._stop.set()

@@ -60,6 +60,8 @@ _P_LAN = 0x08
 _P_PUB = 0x10
 _P_V6 = 0x20
 _V6_6TO4 = 0x40
+_P_SEC = 0x80          # a 12-byte session secret follows (seal.py session key)
+SECRET_LEN = 12
 
 
 # --------------------------------------------------------------------------- #
@@ -91,8 +93,10 @@ def parse_hostport(s):
 # --------------------------------------------------------------------------- #
 # code encode / decode
 # --------------------------------------------------------------------------- #
-def encode_profile(profile):
-    """Serialize a profile dict (from observe) to a short base32 code."""
+def encode_profile(profile, secret=None):
+    """Serialize a profile dict (from observe) to a short base32 code.
+    ``secret`` (12 bytes) makes the code also carry the session key material:
+    everyone who has the code can seal frames; nobody else can read or inject."""
     cand = profile["candidates"]
     flags = profile["flags"]
     lan = parse_hostport(cand.get("lan_v4"))
@@ -127,6 +131,11 @@ def encode_profile(profile):
             chunk += v6bytes              # full 128 bits
         body += chunk
 
+    if secret:
+        if len(secret) != SECRET_LEN:
+            raise ValueError("secret must be 12 bytes")
+        b0 |= _P_SEC
+        body += bytes(secret)
     blob = bytes([b0]) + struct.pack("!I", int(time.time())) + body
     return base64.b32encode(blob).decode("ascii").rstrip("=")
 
@@ -175,8 +184,10 @@ def decode_code(code):
             v6bytes = take(16)
         v6 = f"[{socket.inet_ntop(socket.AF_INET6, v6bytes)}]:{port}"
 
+    secret = take(SECRET_LEN) if b0 & _P_SEC else None
     age = int(time.time()) - ts
     return {
+        "secret": secret,
         "candidates": {"lan_v4": lan, "public_v4": pub, "v6": v6},
         "flags": {
             "open": bool(b0 & _F_OPEN),
@@ -298,12 +309,14 @@ def race(sock_v4, peer, role, local_port, timeout, my_has_v6):
 # --------------------------------------------------------------------------- #
 # host / join commands
 # --------------------------------------------------------------------------- #
-def _observe_and_announce(local_port):
-    """Observe on a fresh game socket, print our CODE= line, return (sock, profile, code)."""
+def _observe_and_announce(local_port, secret=None):
+    """Observe on a fresh game socket, print our CODE= line, return (sock, profile, code).
+    ``secret`` (12 bytes) is embedded in the code so every member derives the
+    session key (seal.py)."""
     sock_v4 = open_socket(local_port, socket.AF_INET)
     profile = observe(local_port=local_port, sock=sock_v4, do_upnp=True,
                       keep_upnp=True)
-    code = encode_profile(profile)
+    code = encode_profile(profile, secret=secret)
     log(f"[observe] flags={profile['flags']} "
         f"candidates={profile['candidates']} "
         f"stun_elapsed_ms={profile['stun']['elapsed_ms']} "
