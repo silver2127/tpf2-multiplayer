@@ -1484,8 +1484,24 @@ static void writeBridgeCtl(bool isHost)
     // (a sandboxed second instance reads through to the real dir until it has
     // its own copy) otherwise apply each other's role for a moment.
     unsigned long bpid = readBridgePid();
+    // Letters for N players: the host is 'a'; joiners take b, c, d... in roster
+    // order, skipping the host. Every client derives the same assignment from
+    // the same roster, so nobody has to be told.
+    char letter = 'a';
+    if (!isHost) {
+        int idx = 0;
+        if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+        for (int i = 0; i < g_playerCount; i++) {
+            if (strcmp(g_players[i], g_host) == 0) continue;
+            if (strcmp(g_players[i], g_you) == 0) break;
+            idx++;
+        }
+        if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+        if (idx > 6) idx = 6;
+        letter = (char)('b' + idx);
+    }
     snprintf(content, sizeof(content), "instance=%c\npeer=127.0.0.1:%d\npid=%lu\n",
-             isHost ? 'a' : 'b', isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN, bpid);
+             letter, isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN, bpid);
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%stpf2_bridge_ctl.txt", g_dataDirW);

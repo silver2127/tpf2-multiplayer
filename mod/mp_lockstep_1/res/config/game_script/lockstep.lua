@@ -153,19 +153,42 @@ local ticks        = 0
 local eventsOffset = -1
 local injectOffset = -1
 local seqNo        = 0
-local peerTime     = nil        -- last game time the peer reported
+-- EVERY PEER, keyed by its letter. The lockstep core was written for exactly
+-- two players (one peer, letters a/b); this table is what makes N work. The
+-- rules that used to read "the peer" now read over all of them: the barrier
+-- holds against the SLOWEST, a command's stamp clears the FASTEST, the pacer
+-- chases the fastest, and a stamp is SYNC only when every peer that reported
+-- agrees. A peer is "fresh" while its last tick is within K.PEER_STALE_TICKS.
+CM.peers = {}   -- origin -> { time=, at=, hashes={[stamp]=h}, details={[stamp]=d}, streak=n }
+local function peerFor(o)
+	local pr = CM.peers[o]
+	if not pr then pr = { hashes = {}, details = {}, streak = 0 }; CM.peers[o] = pr end
+	return pr
+end
+local function peerBounds()
+	local minT, maxT
+	for _, pr in pairs(CM.peers) do
+		if pr.time and pr.at and (ticks - pr.at) <= K.PEER_STALE_TICKS then
+			if not minT or pr.time < minT then minT = pr.time end
+			if not maxT or pr.time > maxT then maxT = pr.time end
+		end
+	end
+	return minT, maxT
+end
+-- Letter -> 0..7, for anything that needs a per-origin namespace.
+function CM.originIdx(o)
+	local b = string.byte(tostring(o or "a"), 1) or 97
+	return math.max(0, math.min(7, b - 97))
+end
 local peerSeen     = false
 CM.lateCount    = 0   -- commands whose game-time stamp had already passed here
 local queue        = {}         -- pending commands
 local executed     = {}         -- key -> true, so a command runs at most once
 local lastHashAt   = nil
-local peerHashes   = {}         -- [stamp] = hash reported by peer
 local myHashes     = {}         -- [stamp] = our own hash
-local peerDetails  = {}         -- [stamp] = peer's per-component breakdown
 local myDetails    = {}         -- [stamp] = our own per-component breakdown
 local paused       = false
 local pausedSince  = nil        -- tick the barrier engaged, for the watchdog
-local peerTimeAt   = nil        -- tick peerTime was last refreshed
 local desyncs      = 0
 
 -- The in-game dashboard (guiUpdate, a separate Lua state) can only read files,
@@ -292,7 +315,12 @@ local function detectInstance()
 	-- alive: "desyncs=832" from a previous run was read as this session's count
 	-- (2026-08-31, after the two instances swapped letters on restart). Remove it
 	-- so only one status file exists and it is always the live one.
-	pcall(function() os.remove(K.BASE .. "lockstep_status_" .. K.PEER .. ".txt") end)
+	for letter in ("abcdefgh"):gmatch(".") do
+		if letter ~= inst then
+			pcall(function() os.remove(K.BASE .. "lockstep_status_" .. letter .. ".txt") end)
+			pcall(function() os.remove(K.BASE .. "lockstep_dash_" .. letter .. ".txt") end)
+		end
+	end
 	log("identity " .. K.INSTANCE .. " (peer " .. K.PEER .. ")")
 	if not CM.baseLogged then
 		-- once, and on disk: stdout is buffered until exit, cmLog is not
@@ -781,7 +809,7 @@ local function execEdge(c)
 		-- differs between peers, so each would build the same road with
 		-- different placeholder ids. Deriving them from (origin, seq) makes both
 		-- peers compute identical values while staying unique per command.
-		local base = -(200000 + ((c.origin == "a") and 0 or 100000) + c.seq * 10)
+		local base = -(200000 + CM.originIdx(c.origin) * 100000 + c.seq * 10)   -- one namespace per origin (a..h)
 		local nid0, nid1, eid = base, base - 1, base - 2
 
 		local sp = api.type.SimpleProposal.new()
@@ -1211,7 +1239,7 @@ local function execPolyline(c, planOnly)
 		-- = two removals of one entity = the ENGINE REJECTS THE WHOLE PROPOSAL
 		-- (trace: "vertex 3 split road 182049" then "seg 5 ... 182049 CROSSING",
 		-- then build success=false). Second hit reuses the first split's node.
-		local base = -(1000000 + ((c.origin == "a") and 0 or 10000000) + c.seq * 1000)
+		local base = -(1000000 + CM.originIdx(c.origin) * 10000000 + c.seq * 1000)
 		local nextNew, nextEdge = 0, 0
 		local sp = api.type.SimpleProposal.new()
 		local addNodes, addEdges, removeEdges, removeNodes = {}, {}, {}, {}
@@ -4302,8 +4330,9 @@ function scheduleLocal(op, args)
 	-- leader's past. Pay the peer's lead plus a margin when there is one; when
 	-- the clocks are together this is exactly K.EXEC_DELAY again.
 	local lead = 0
-	if peerTime and peerTimeAt and (ticks - peerTimeAt) <= K.PEER_STALE_TICKS then
-		lead = peerTime - now
+	local _, fastT = peerBounds()
+	if fastT then
+		lead = fastT - now
 		if lead < 0 then lead = 0 end
 		-- Capping this at K.BARRIER_AHEAD was wrong. The barrier is a backstop that
 		-- acts only once a peer is 5 units ahead, and it takes time to bite -- a
@@ -4340,36 +4369,37 @@ end
 -- resolves to a nil global at the call site, which is how an entire sweep in
 -- mpbridge silently aborted for hours (see the lastReplayTick note there).
 local comparedAt = {}
-local mismatchStreak = 0
-function compareAt(stamp)
-	if comparedAt[stamp] then return end
-	local mine, theirs = myHashes[stamp], peerHashes[stamp]
+-- One peer's hash for one stamp against ours. compareAt (below) runs this for
+-- every peer that has reported the stamp, once each.
+local function compareOne(stamp, origin, theirs, dt)
+	local mine = myHashes[stamp]
 	if not mine or not theirs then return end
-	comparedAt[stamp] = true
+	local pr = peerFor(origin)
 	if mine == theirs then
-		mismatchStreak = 0
-		log(string.format("SYNC t=%d hash=%s", stamp, mine))
-		CM.dashVerdict = "SYNC"
+		pr.streak = 0
+		log(string.format("SYNC t=%d hash=%s (%s)", stamp, mine, origin))
+		if not (comparedAt[stamp] and comparedAt[stamp].bad) then CM.dashVerdict = "SYNC" end
 	else
 		-- A 1-2 stamp mismatch right after a build is expected: commands
 		-- execute up to ~2 units apart under real relay latency and additions
 		-- self-correct. Only a mismatch that PERSISTS is a divergence.
-		mismatchStreak = mismatchStreak + 1
-		if mismatchStreak < 3 then
-			log(string.format("~~ LAG t=%d (mismatch %d/3, waiting for convergence)",
-				stamp, mismatchStreak))
+		pr.streak = pr.streak + 1
+		if pr.streak < 3 then
+			log(string.format("~~ LAG t=%d vs %s (mismatch %d/3, waiting for convergence)",
+				stamp, origin, pr.streak))
 			return
 		end
 		desyncs = desyncs + 1
-		log(string.format("!! DESYNC t=%d mine=%s peer=%s (total %d)",
-			stamp, mine, theirs, desyncs))
+		comparedAt[stamp].bad = true
+		log(string.format("!! DESYNC t=%d mine=%s peer %s=%s (total %d)",
+			stamp, mine, origin, theirs, desyncs))
 		-- WHICH component diverged. A single opaque number proves the worlds
 		-- differ but says nothing about where, and the two candidate causes need
 		-- opposite responses: a real divergence in the simulation is a bug in
 		-- replication, whereas a difference confined to entity IDs means the
 		-- worlds agree and the DETECTOR is over-sensitive. Reporting per-component
 		-- counts and hashes separates them on sight.
-		local dm, dt = myDetails[stamp], peerDetails[stamp]
+		local dm = myDetails[stamp]
 		if dm and dt then
 			log("   mine " .. dm)
 			log("   peer " .. dt)
@@ -4379,7 +4409,7 @@ function compareAt(stamp)
 				local other = dt:match("(" .. name .. "[^,]*)")
 				if other and other ~= comp and name ~= "t" then diffLanes[#diffLanes + 1] = name end
 			end
-			CM.dashVerdict = "DESYNC " .. (#diffLanes > 0 and table.concat(diffLanes, "+") or "?")
+			CM.dashVerdict = "DESYNC " .. (#diffLanes > 0 and table.concat(diffLanes, "+") or "?") .. " vs " .. tostring(origin)
 			for comp in dm:gmatch("[^,]+") do
 				local name = comp:match("^(%a+)")
 				local other = dt:match("(" .. name .. "[^,]*)")
@@ -4405,7 +4435,12 @@ local function onLine(line)
 	local op = line:match("^(%u+)")
 	if op == "LSTICK" then
 		local t = tonumber(line:match("t=([%d%.%-]+)"))
-		if t then peerTime = t; peerSeen = true; peerTimeAt = ticks end
+		if t then
+			local o = line:match(" o=(%a)") or "?"
+			local pr = peerFor(o)
+			pr.time = t; pr.at = ticks
+			peerSeen = true
+		end
 	elseif op == "LSSPEED" then
 		-- The other player moved the speed lever: follow. Speed is local pacing,
 		-- not simulated state, so it is applied on arrival, not at a stamp.
@@ -4456,8 +4491,10 @@ local function onLine(line)
 		local t = tonumber(line:match("t=(%-?%d+)"))
 		local h = line:match("h=(%S+)")
 		if t and h then
-			peerHashes[t] = h
-			peerDetails[t] = line:match("d=(%S+)")
+			local o = line:match(" o=(%a)") or "?"
+			local pr = peerFor(o)
+			pr.hashes[t] = h
+			pr.details[t] = line:match("d=(%S+)")
 			-- Compare HERE as well as when we compute our own.
 			--
 			-- Doing it only at compute time silently made the detector
@@ -6880,7 +6917,7 @@ function CM.shareSpeed()
 	if CM.lastSetSpeed ~= nil and s == CM.lastSetSpeed then return end   -- ours, not the player's
 	CM.baseSpeed = s
 	CM.catchingUp = false
-	broadcast(string.format("LSSPEED v=%d", s))
+	broadcast(string.format("LSSPEED v=%d o=%s", s, K.INSTANCE))
 	log(string.format("SPEED: player set %d -- shared with the peer", s))
 end
 
@@ -6977,7 +7014,9 @@ function CM.releaseSpeed(why)
 end
 
 local function applyBarrier(now)
-	if not peerSeen or not peerTime then return end
+	local slowT, fastT = peerBounds()
+	CM.slowT, CM.fastT = slowT, fastT
+	if not peerSeen then return end
 
 	-- Watchdog first, so it runs even when the conditions below would hold.
 	if paused and pausedSince and (ticks - pausedSince) > K.MAX_PAUSE_TICKS then
@@ -6986,13 +7025,13 @@ local function applyBarrier(now)
 		CM.releaseSpeed("watchdog")
 		log(string.format("!! BARRIER WATCHDOG: held %d ticks, forcing release " ..
 			"(now=%.2f peer=%.2f). Sync is not guaranteed while this fires.",
-			K.MAX_PAUSE_TICKS, now, peerTime))
+			K.MAX_PAUSE_TICKS, now, slowT or -1))
 		return
 	end
 
 	-- A peer that has not reported recently may itself be paused or gone.
 	-- Holding against a stale reading is exactly how both sides deadlock.
-	local stale = (peerTimeAt == nil) or ((ticks - peerTimeAt) > K.PEER_STALE_TICKS)
+	local stale = (slowT == nil)   -- nobody fresh: do not hold against silence
 	if stale then
 		if paused then
 			paused = false
@@ -7003,14 +7042,14 @@ local function applyBarrier(now)
 		return
 	end
 
-	local ahead = now - peerTime
+	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
 	CM.shareSpeed()
-	CM.pace(ahead)
+	CM.pace(now - fastT)               -- the pacer chases the FASTEST
 	if ahead > K.BARRIER_AHEAD and not paused then
 		paused = true
 		pausedSince = ticks
 		CM.setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
-		log(string.format("BARRIER hold: %.2f ahead of peer (peer=%.2f)", ahead, peerTime))
+		log(string.format("BARRIER hold: %.2f ahead of the slowest peer (%.2f)", ahead, slowT))
 	elseif ahead <= K.BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
@@ -7048,6 +7087,18 @@ local function ensureRunning()
 end
 
 -- ---------- desync check ----------
+function compareAt(stamp)
+	comparedAt[stamp] = comparedAt[stamp] or {}
+	if not myHashes[stamp] then return end
+	for o, pr in pairs(CM.peers) do
+		local h = pr.hashes[stamp]
+		if h and not comparedAt[stamp][o] then
+			comparedAt[stamp][o] = true
+			compareOne(stamp, o, h, pr.details[stamp])
+		end
+	end
+end
+
 local function checkHash(now)
 	local stamp = math.floor(now / K.HASH_EVERY_GAMETIME) * K.HASH_EVERY_GAMETIME
 	if lastHashAt == stamp then return end
@@ -7055,7 +7106,7 @@ local function checkHash(now)
 	local h, detail = worldHash(now)
 	myHashes[stamp] = h
 	myDetails[stamp] = detail
-	broadcast(string.format("LSHASH t=%d h=%s d=%s", stamp, h, detail or "-"))
+	broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
 	CM.dashLastDetail = detail
 	-- verdict is set by compareAt; a fresh agreeing tick clears it there
 	-- One shared comparison, used from here and from the LSHASH handler, so the
@@ -7104,7 +7155,7 @@ function data()
 			if ticks % K.CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
 
 			if ticks % K.HEARTBEAT_EVERY == 0 then
-				broadcast(string.format("LSTICK t=%d", math.floor(now)))
+				broadcast(string.format("LSTICK t=%d o=%s", math.floor(now), K.INSTANCE))
 			end
 
 			applyBarrier(now)
@@ -7168,8 +7219,8 @@ function data()
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
-							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
-							peerTime and string.format("%+.1f", now - peerTime) or "?",
+							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
+							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
 							desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
 							#queue, paused and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
 						for _, ev in ipairs(CM.dashEvents) do f:write("ev=" .. ev .. "\n") end
@@ -7183,8 +7234,8 @@ function data()
 					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
 					if f then
 						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d%s",
-							math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
-							peerTime and string.format("%+.1f", now - peerTime) or "?",
+							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
+							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
 							desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
 							#queue, paused and "  PAUSED" or ""))
 						f:close()
@@ -7193,7 +7244,7 @@ function data()
 			end
 			if ticks % 300 == 0 then
 				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d paused=%s",
-					math.floor(now), tostring(peerTime and math.floor(peerTime) or "?"),
+					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 					#queue, desyncs, tostring(paused)))
 			end
 		end,
@@ -7213,20 +7264,45 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
+				-- which instances are on this machine's data dirs right now
+				local present = {}
+				for letter in ("abcdefgh"):gmatch(".") do
+					local bases = { K.BASE }
+					for _, pth in ipairs(CM.baseCandidates or {}) do if pth ~= K.BASE then bases[#bases + 1] = pth end end
+					for _, base in ipairs(bases) do
+						local ff = io.open(base .. "lockstep_dash_" .. letter .. ".txt", "r")
+						if ff then ff:close(); present[#present + 1] = letter; break end
+					end
+				end
+				if #present == 0 then present = { K.INSTANCE or "a" } end
+				local colsKey = table.concat(present)
 				local D = CM.dash
+				if D and D.win and D.colsKey ~= colsKey then
+					pcall(function() D.win:setVisible(false, false) end)   -- the set of players changed: rebuild
+					CM.dash = nil; D = nil
+				end
 				if not D or not D.win then
 					D = {}
 					CM.dash = D
+					D.cols = present
+					D.colsKey = colsKey
 					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied" }
 					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "held by barrier",
 					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied" }
 					D.cells = {}
-					D.table = api.gui.comp.Table.new(3, "NONE")
-					D.table:addRow({ api.gui.comp.TextView.new(""), api.gui.comp.TextView.new("A"), api.gui.comp.TextView.new("B") })
+					D.table = api.gui.comp.Table.new(1 + #D.cols, "NONE")
+					local head = { api.gui.comp.TextView.new("") }
+					for _, letter in ipairs(D.cols) do head[#head + 1] = api.gui.comp.TextView.new(string.upper(letter)) end
+					D.table:addRow(head)
 					for _, key in ipairs(D.rows) do
-						local ca, cb = api.gui.comp.TextView.new("-"), api.gui.comp.TextView.new("-")
-						D.cells[key] = { a = ca, b = cb }
-						D.table:addRow({ api.gui.comp.TextView.new(D.labels[key]), ca, cb })
+						local row = { api.gui.comp.TextView.new(D.labels[key]) }
+						D.cells[key] = {}
+						for _, letter in ipairs(D.cols) do
+							local cell = api.gui.comp.TextView.new("-")
+							D.cells[key][letter] = cell
+							row[#row + 1] = cell
+						end
+						D.table:addRow(row)
 					end
 					D.verdict = api.gui.comp.TextView.new("verdict: -")
 					local box = api.gui.layout.BoxLayout.new("VERTICAL")
@@ -7255,13 +7331,15 @@ function data()
 					end
 					return nil
 				end
-				local da, ea = readDash("a")
-				local db, eb = readDash("b")
+				local dashes = {}
+				for _, letter in ipairs(D.cols) do dashes[letter] = readDash(letter) end
 				for _, key in ipairs(D.rows) do
-					D.cells[key].a:setText(da and da[key] or "-")
-					D.cells[key].b:setText(db and db[key] or "-")
+					for _, letter in ipairs(D.cols) do
+						local dd = dashes[letter]
+						D.cells[key][letter]:setText(dd and dd[key] or "-")
+					end
 				end
-				local mine = (K.INSTANCE == "b") and db or da
+				local mine = dashes[K.INSTANCE or "a"]
 				-- just the verdict and the lane names; the hash detail is in the log
 				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-"))
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a

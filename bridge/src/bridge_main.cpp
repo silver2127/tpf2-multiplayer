@@ -454,7 +454,7 @@ static void ApplyControl(const std::string& text)
         char ip[64] = {0};
         int port = 0;
         unsigned long ctlPid = 0;
-        if (ln == "instance=a" || ln == "instance=b") {
+        if (ln.size() == 10 && ln.rfind("instance=", 0) == 0 && ln[9] >= 'a' && ln[9] <= 'h') {   // a..h: up to eight players
             wantInst = ln.substr(9);
         } else if (sscanf(ln.c_str(), "peer=%63[0-9.]:%d", ip, &port) == 2) {
             wantIp = ip; wantPort = port; havePeer = true;
