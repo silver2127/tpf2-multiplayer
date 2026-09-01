@@ -275,6 +275,8 @@ LOG_BATCH_BYTES = 1000     # keep a 'log' message under one datagram
 LOG_LINE_MAX = 240
 LOG_FLUSH_INTERVAL = 0.5
 LOG_QUEUE_MAX = 2000       # oldest lines are dropped beyond this (never blocks)
+LOG_MSGS_PER_SEC = 8       # host: inbound 'log' messages accepted per peer per second
+LOG_BYTES_PER_PEER = 20 * 1024 * 1024   # host: merged-log bytes accepted per peer per session
 
 
 class LogForwarder:
@@ -1369,10 +1371,25 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "mesh_hi":
             pass                                    # names are host-assigned
         elif t == "log":
+            # Untrusted input from a peer, written to our disk: cap the volume
+            # per peer (bytes per session, messages per second) and strip
+            # control characters so a line cannot forge another peer's tag or
+            # fill the drive.
             if addr in peers:
-                lines = [str(x)[:LOG_LINE_MAX] for x in msg.get("lines", [])][:64]
+                p = peers[addr]
+                nowt = time.time()
+                if nowt - p.get("log_win", 0.0) >= 1.0:
+                    p["log_win"], p["log_n"] = nowt, 0
+                p["log_n"] = p.get("log_n", 0) + 1
+                if p["log_n"] > LOG_MSGS_PER_SEC or p.get("log_bytes", 0) > LOG_BYTES_PER_PEER:
+                    return
+                lines = []
+                for x in msg.get("lines", [])[:64]:
+                    x = "".join(ch if ch >= " " else " " for ch in str(x))[:LOG_LINE_MAX]
+                    lines.append(x)
+                    p["log_bytes"] = p.get("log_bytes", 0) + len(x) + 1
                 if lines:
-                    peers_log.write(peers[addr]["name"], lines)
+                    peers_log.write(p["name"], lines)
         elif t == "chat":
             if addr in peers:
                 broadcast_chat(peers[addr]["name"], str(msg.get("text", "")))

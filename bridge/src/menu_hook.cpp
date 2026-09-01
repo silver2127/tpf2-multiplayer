@@ -1894,6 +1894,11 @@ static void StartLobby(int join)
             SetStatus("Paste or type your host's code in the field first."); free(a); return;
         }
         char* s = a->code; while (*s == ' ' || *s == '\r' || *s == '\n' || *s == '\t') memmove(s, s + 1, strlen(s));
+        // The code becomes a netpunch.exe argument. It is base32 by construction,
+        // so refuse anything else: a crafted "code" from Discord must never be
+        // able to smuggle extra arguments (e.g. --forward-log <any file>) in.
+        { int k = 0; for (; a->code[k]; k++) { char c = a->code[k]; if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7') || c == '=')) break; }
+          if (a->code[k] || k > 120) { SetStatus("That is not a valid code (letters A-Z and digits 2-7 only)."); free(a); return; } }
         int L = (int)strlen(s); while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\r' || s[L-1] == '\n' || s[L-1] == '\t')) s[--L] = 0;
     }
     // A previous lobby.py still up (LEAVE not pressed, or a tail thread still
