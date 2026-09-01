@@ -342,7 +342,11 @@ static bool SessionLive()
     b.LowPart = ftNow.dwLowDateTime;             b.HighPart = ftNow.dwHighDateTime;
     if (b.QuadPart < a.QuadPart) return cached;
     const ULONGLONG ageMs = (b.QuadPart - a.QuadPart) / 10000ULL;
-    if (ageMs > 3000) return cached;
+    // The Lua writes this file every 15 ticks, about 2.8 s at the usual tick
+    // rate -- so a 3 s freshness window was a coin flip, and losing it means a
+    // build runs natively, un-replicated, with no error (review, 2026-08-31).
+    // 15 s still notices a mod that is not running long before it matters.
+    if (ageMs > 15000) return cached;
 
     // Then a peer: "t=1759  peer=1760  skew=-1.0 ...". No peer field, or the
     // Lua reporting none, means a solo game -- let the engine build natively.

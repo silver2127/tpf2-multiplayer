@@ -54,8 +54,8 @@ static void Log(const char* fmt, ...)
 // the full address for a NAT problem that genuinely needs it.
 static const char* RedactIp(const char* ip)
 {
-    static char buf[4][64];
-    static int slot = 0;
+    thread_local char buf[4][64];   // Log runs on the tail, ctl and init threads
+    thread_local int slot = 0;
     if (!ip || !*ip) return "";
     static int show = -1;
     if (show < 0) {

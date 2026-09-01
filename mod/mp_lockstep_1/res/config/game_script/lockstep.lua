@@ -2846,7 +2846,13 @@ local function execVehCmd(c)
 				if c.tries <= 20 then
 					local nowG = gameTime() or 0
 					c.at = nowG + 1.0
-					queue[#queue + 1] = c
+					-- NOT straight back onto `queue`: this runs from inside the
+					-- pump's loop over that table, which rebuilds it afterwards
+					-- (`queue = keep`) and would discard the append -- and the
+					-- pump also remembers this seq as executed. The retry list is
+					-- merged in, and the seq forgiven, at the top of the next pump.
+					CM.retryQueue = CM.retryQueue or {}
+					CM.retryQueue[#CM.retryQueue + 1] = c
 					if c.tries == 1 or c.tries % 10 == 0 then
 						log(string.format("VLINE seq=%s: line %s not here yet -- retry %d",
 							tostring(c.seq), tostring(c.line), c.tries))
@@ -5599,15 +5605,19 @@ local function pollInject()
 			local w = {}
 			for tok in line:gmatch("%S+") do w[#w + 1] = tok end
 			local o = w[1]
+			-- Same protection pollEvents has had all along: one malformed line
+			-- (or one bug in a parser branch) must cost that line, not the tick.
+			local okLine, errLine = pcall(function()
 			-- Diagnostics (EVAL, HEAL, BUYTEST) always run; a CAPTURE is dropped
 			-- when nobody is playing with us, because the engine already built it.
+			-- Inside the per-line pcall on purpose: a `return` here skips THIS
+			-- line. Outside it, the first dropped capture abandoned every line
+			-- after it in the same read -- a diagnostic queued behind a build
+			-- never ran (review, 2026-08-31).
 			if not peerSeen and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" then
 				CM.soloDrop(line)
 				return
 			end
-			-- Same protection pollEvents has had all along: one malformed line
-			-- (or one bug in a parser branch) must cost that line, not the tick.
-			local okLine, errLine = pcall(function()
 
 			-- ROADN n x0 y0 x1 y1 ...   (written by slice_hook from a captured
 			-- player build; carries every tessellated node)
@@ -6392,6 +6402,8 @@ CM.PACE_COOLDOWN = 180        -- ticks (~3 s) between changes we make
 
 function CM.setSpeed(v, why)
 	CM.lastSetSpeed = v
+	CM.paceSetTick = ticks
+	CM.paceApplied = false
 	CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
 	pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(v)) end)
 	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
@@ -6410,9 +6422,18 @@ function CM.pace(ahead)
 		CM.catchingUp = false
 		return
 	end
+	-- setGameSpeed is a COMMAND: the engine applies it a tick or more after we
+	-- send it. On the tick in between, the speed still reads the old value --
+	-- which the check below would take for the player moving the lever, adopt
+	-- as their choice, and cancel the very catch-up we just started. So a
+	-- mismatch only counts as the player's once our own change has been seen
+	-- to land, or after a grace period in case it never does (review,
+	-- 2026-08-31).
+	if CM.lastSetSpeed and s == CM.lastSetSpeed then CM.paceApplied = true end
+	local settled = CM.paceApplied or (ticks > (CM.paceSetTick or 0) + 20)
 	-- The player moved the lever: that is now the speed they want. Adopt it,
 	-- stop any catch-up in progress, and do not argue.
-	if CM.lastSetSpeed and s ~= CM.lastSetSpeed then
+	if CM.lastSetSpeed and settled and s ~= CM.lastSetSpeed then
 		if CM.catchingUp then
 			log(string.format("PACE: player set speed %s while catching up -- theirs wins", tostring(s)))
 		end
@@ -6599,6 +6620,17 @@ function data()
 
 			applyBarrier(now)
 			ensureRunning()
+
+			-- Commands that asked to be tried again (a VLINE whose line has not
+			-- arrived yet). They were executed once as far as the pump knows, so
+			-- that mark is lifted before they go back in.
+			if CM.retryQueue and #CM.retryQueue > 0 then
+				for _, rc in ipairs(CM.retryQueue) do
+					executed[cmdKey(rc)] = nil
+					queue[#queue + 1] = rc
+				end
+				CM.retryQueue = {}
+			end
 
 			-- run everything due, in the agreed order
 			if #queue > 0 then
