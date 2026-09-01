@@ -278,6 +278,7 @@ static void LeaveLobby();
 static DWORD WINAPI KbHookThread(LPVOID);
 static void LobbySend(const char* jsonLine);
 static void ClipboardSet(const char* utf8);
+static bool ClipboardGet(char* out, int outsz);
 static bool newestSave(wchar_t* out, int cch);
 static bool doStartLoad(const wchar_t* srcSav);
 // Lobby lifecycle flags (all cleared in StartLobby):
@@ -413,9 +414,11 @@ static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSecti
     strncpy_s(g_status, s, _TRUNCATE); LeaveCriticalSection(&g_statusCs); InterlockedExchange(&g_panelDirty, 1); }
 
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
-struct Hit { int x, y, w, h; int id; };   // id: 1=multiplayer/host-toggle, 2=HOST, 3=JOIN, 4=back
-static Hit g_hits[6]; static int g_hitCount = 0;
-static void addHit(int x,int y,int w,int h,int id){ if(g_hitCount<6){g_hits[g_hitCount++]={x,y,w,h,id};} }
+static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
+struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field; btn = hover wash
+static Hit g_hits[12]; static int g_hitCount = 0;
+static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount<12){g_hits[g_hitCount++]={x,y,w,h,id,btn};} }
+static const Hit* hoveredHit(){ for(int i=0;i<g_hitCount;i++) if(g_hits[i].btn && g_hits[i].id==g_hover) return &g_hits[i]; return nullptr; }
 
 // ---------------- A/B test flags (tpf2_menu_flags.txt next to this dll) ----------------
 // Two candidate looks for the collapsed Multiplayer button, both live at once so
@@ -435,8 +438,8 @@ static int   g_flagOverlayNative = 1;
 static int   g_flagNativeBtn     = 1;
 static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.60f;
 static int   g_flagFontPx = 0;
+static int   g_flagSlot = 0;
 static bool  g_latoLoaded = false;
-static int   g_hover = 0, g_active = 0;     // hit id under the cursor / pressed (native overlay look)
 static void ReadFlags()
 {
     char p[MAX_PATH]; snprintf(p, sizeof(p), "%stpf2_menu_flags.txt", ourDirA());
@@ -450,10 +453,10 @@ static void ReadFlags()
         else if (!strcmp(line, "ox")) g_flagOx = (float)atof(v);
         else if (!strcmp(line, "oy")) g_flagOy = (float)atof(v);
         else if (!strcmp(line, "fontpx")) g_flagFontPx = atoi(v);
+        else if (!strcmp(line, "slot")) g_flagSlot = atoi(v);
     }
     fclose(f);
-    Log("[menu] flags: overlay=%s native=%d scale=%.2f ox=%.3f oy=%.3f fontpx=%d\n",
-        g_flagOverlayNative ? "native" : "classic", g_flagNativeBtn, g_flagScale, g_flagOx, g_flagOy, g_flagFontPx);
+    Log("[menu] flags: native=%d slot=%d scale=%.2f\n", g_flagNativeBtn, g_flagSlot, g_flagScale);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -489,59 +492,86 @@ static HFONT mkLato(int px)
     return CreateFontW(-px, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
                        ANTIALIASED_QUALITY, 0, g_latoLoaded ? L"Lato" : L"Segoe UI");
 }
-static void flatRect(HDC dc, int x, int y, int w, int h, COLORREF fill, COLORREF border);
-static void textIn(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, COLORREF col, UINT fmt, int track);
-// coverage mask for the native-look collapsed button (0..255 per pixel, w*h), plus
-// the label box inside it. Rebuilt on dirty; composed over the frame every present.
-static unsigned char* g_cov = nullptr; static int g_covW = 0, g_covH = 0;
-static int g_nativeFontPx() { int px = g_flagFontPx ? g_flagFontPx : (int)(24 * UiScale() + .5f); return px < 8 ? 8 : px; }
-// size of the native-look button = label extent + stylesheet padding {8,15,8,15} * scale
-static void MeasureNative(int* w, int* h)
+
+// ---------------- software compositing layer ----------------
+// The panel is drawn into a straight-alpha BGRA layer (rect fills with alpha, GDI
+// text rendered white-on-black and used as coverage), then composited over a
+// readback of the game frame every present. That is what lets it look like a
+// MenuWindow (window.lua): a translucent (5,25,40) sheet, transparent buttons
+// whose hover/press is a white wash, black@50 text fields.
+struct Layer { int w, h; unsigned char* px; };
+static Layer g_layer = { 0, 0, nullptr };
+static float g_s = 1.f;                                  // UI scale = screen height / 1080
+static int S(float v) { return (int)(v * g_s + 0.5f); }
+static void layerBegin(int w, int h)
 {
-    float s = UiScale(); int px = g_nativeFontPx();
-    HDC dc = GetDC(nullptr); HFONT f = mkLato(px); HGDIOBJ of = SelectObject(dc, f);
-    SIZE sz = { 0, 0 }; GetTextExtentPoint32W(dc, L"MULTIPLAYER", 11, &sz);
-    SelectObject(dc, of); DeleteObject(f); ReleaseDC(nullptr, dc);
-    *w = sz.cx + (int)(30 * s + .5f); *h = sz.cy + (int)(16 * s + .5f);
-    if (*w > g_panelW) *w = g_panelW; if (*h > g_panelH) *h = g_panelH;
+    if (g_layer.w != w || g_layer.h != h) { free(g_layer.px); g_layer.px = (unsigned char*)malloc((size_t)w * h * 4); g_layer.w = w; g_layer.h = h; }
+    memset(g_layer.px, 0, (size_t)w * h * 4);
 }
-static void RenderNativeCoverage(int w, int h)
+static inline void pxOver(unsigned char* d, int r, int g, int b, int a)
 {
-    if (g_covW != w || g_covH != h) { free(g_cov); g_cov = (unsigned char*)calloc((size_t)w * h, 1); g_covW = w; g_covH = h; }
+    if (a <= 0) return;
+    int da = d[3];
+    if (a >= 255 || da == 0) { d[0] = (unsigned char)b; d[1] = (unsigned char)g; d[2] = (unsigned char)r; d[3] = (unsigned char)a; return; }
+    int k = da * (255 - a) / 255, outA = a + k; if (outA <= 0) return;
+    d[0] = (unsigned char)((b * a + d[0] * k) / outA);
+    d[1] = (unsigned char)((g * a + d[1] * k) / outA);
+    d[2] = (unsigned char)((r * a + d[2] * k) / outA);
+    d[3] = (unsigned char)outA;
+}
+static void layerRect(int x, int y, int w, int h, COLORREF c, int a)
+{
+    int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    int x1 = x + w > g_layer.w ? g_layer.w : x + w, y1 = y + h > g_layer.h ? g_layer.h : y + h;
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    for (int yy = y0; yy < y1; yy++) { unsigned char* d = g_layer.px + ((size_t)yy * g_layer.w + x0) * 4; for (int xx = x0; xx < x1; xx++, d += 4) pxOver(d, r, g, b, a); }
+}
+static void layerText(int x, int y, int w, int h, const wchar_t* s, HFONT f, COLORREF c, UINT fmt, int alpha = 255)
+{
+    if (w <= 0 || h <= 0) return;
     HDC screen = GetDC(nullptr); HDC mem = CreateCompatibleDC(screen);
     BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr; HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ oldbm = SelectObject(mem, dib);
-    flatRect(mem, 0, 0, w, h, RGB(0, 0, 0), CLR_INVALID);          // white-on-black = coverage
-    HFONT f = mkLato(g_nativeFontPx());
-    textIn(mem, 0, 0, w, h, L"MULTIPLAYER", f, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE, 0);
-    DeleteObject(f);
+    RECT rc = { 0, 0, w, h }; HBRUSH bk = CreateSolidBrush(RGB(0, 0, 0)); FillRect(mem, &rc, bk); DeleteObject(bk);
+    HGDIOBJ of = SelectObject(mem, f); SetBkMode(mem, TRANSPARENT); SetTextColor(mem, RGB(255, 255, 255));
+    DrawTextW(mem, s, -1, &rc, fmt); SelectObject(mem, of);
     const unsigned char* src = (const unsigned char*)bits;
-    for (int i = 0; i < w * h; i++) { unsigned char r = src[i * 4], g = src[i * 4 + 1], b = src[i * 4 + 2];
-        unsigned char m = r > g ? r : g; g_cov[i] = m > b ? m : b; }
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    for (int yy = 0; yy < h; yy++) { int ly = y + yy; if (ly < 0 || ly >= g_layer.h) continue;
+        for (int xx = 0; xx < w; xx++) { int lx = x + xx; if (lx < 0 || lx >= g_layer.w) continue;
+            const unsigned char* q = src + ((size_t)yy * w + xx) * 4; int m = q[0] > q[1] ? q[0] : q[1]; if (q[2] > m) m = q[2];
+            if (m) pxOver(g_layer.px + ((size_t)ly * g_layer.w + lx) * 4, r, g, b, m * alpha / 255); } }
     SelectObject(mem, oldbm); DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
 }
-// out = bg + (255-bg)*a, a = hoverFill + text*(1-hoverFill); both the fill and the
-// text are white, exactly like Button:hover / Button:active in default.lua.
-static unsigned char* g_stage = nullptr; static size_t g_stageSz = 0;
-static void ComposeNative(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h)
+static int textW(const wchar_t* s, HFONT f)
 {
-    // The mapped images are uncached/write-combined: byte-wise reads of them cost
-    // ~20 ms per frame. Row-memcpy into ordinary RAM, blend there, row-memcpy out.
+    HDC dc = GetDC(nullptr); HGDIOBJ of = SelectObject(dc, f); SIZE sz = { 0, 0 };
+    GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz); SelectObject(dc, of); ReleaseDC(nullptr, dc); return sz.cx;
+}
+// Composite: game frame (readback) -> hover wash under the hovered button
+// (Button:hover white@50, :active white@100) -> the layer, src-over. The mapped
+// images are write-combined, so rows are staged through ordinary RAM.
+struct Hit; static const Hit* hoveredHit();
+static unsigned char* g_stage = nullptr; static size_t g_stageSz = 0;
+static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h)
+{
     size_t need = (size_t)w * 4 * h;
     if (g_stageSz < need) { free(g_stage); g_stage = (unsigned char*)malloc(need); g_stageSz = need; }
     for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, bg + y * bgPitch, (size_t)w * 4);
-    int fill = g_active ? 100 : (g_hover ? 50 : 0);
+    const Hit* hv = hoveredHit();
+    if (hv) {
+        int fill = g_active ? 100 : 50;
+        int x0 = *(const int*)hv, y0 = *((const int*)hv + 1), x1 = x0 + *((const int*)hv + 2), y1 = y0 + *((const int*)hv + 3);
+        if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 > w) x1 = w; if (y1 > h) y1 = h;
+        for (int y = y0; y < y1; y++) { unsigned char* d = g_stage + ((size_t)y * w + x0) * 4;
+            for (int x = x0; x < x1; x++, d += 4) for (int c = 0; c < 3; c++) d[c] = (unsigned char)(d[c] + (255 - d[c]) * fill / 255); }
+    }
     for (int y = 0; y < h; y++) {
-        unsigned char* d = g_stage + (size_t)y * w * 4;
-        for (int x = 0; x < w; x++) {
-            int cov = g_cov ? g_cov[y * w + x] : 0;
-            int a = fill + cov * (255 - fill) / 255;
-            for (int c = 0; c < 3; c++) { int v = d[x * 4 + c]; d[x * 4 + c] = (unsigned char)(v + (255 - v) * a / 255); }
-            d[x * 4 + 3] = 255;
-        }
+        unsigned char* d = g_stage + (size_t)y * w * 4; const unsigned char* l = g_layer.px + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++, d += 4, l += 4) { int a = l[3]; if (!a) continue;
+            for (int c = 0; c < 3; c++) d[c] = (unsigned char)((d[c] * (255 - a) + l[c] * a) / 255); }
     }
     for (int y = 0; y < h; y++) memcpy((unsigned char*)dst + y * pitch, g_stage + (size_t)y * w * 4, (size_t)w * 4);
 }
@@ -569,130 +599,128 @@ static void drawBtn(HDC dc, int x, int y, int w, int h, const wchar_t* label, in
     DeleteObject(f);
 }
 
-// GDI-render the current panel into a top-down BGRA buffer, TF2 flat style.
-static void RenderPanelGDI(void* dst, size_t pitch, int w, int h)
-{
-    HDC screen = GetDC(nullptr); HDC mem = CreateCompatibleDC(screen);
-    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
-    void* bits = nullptr; HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HGDIOBJ oldbm = SelectObject(mem, dib);
+// ---------------- the Multiplayer window (MenuWindow look) ----------------
+#define MW_BG     RGB(5, 25, 40)        // Window, MenuWindow backgroundColor
+#define MW_BG_A   190                   //   (175 in the sheet; a touch more without the blur)
+#define MW_TEXT   RGB(255, 255, 255)
+#define MW_DIM    RGB(190, 205, 218)
+#define MW_YOU    RGB(150, 210, 170)
+static char g_joinCode[128] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;
 
-    g_hitCount = 0;
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) {
-        // collapsed: a flat menu-toned bar with a light tracked label + accent
-        flatRect(mem, 0, 0, w, h, TF_FIELD, TF_FIELD_BD);
-        HBRUSH a = CreateSolidBrush(TF_ACCENT); RECT ln = { 0, 0, 4, h }; FillRect(mem, &ln, a); DeleteObject(a);
-        textIn(mem, 16, 0, w - 16, h, L"MULTIPLAYER", mkFont(24, FW_NORMAL), TF_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 4);
-        addHit(0, 0, w, h, 1);
-    } else if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) {
-        // ---- LOBBY view ----
-        flatRect(mem, 0, 0, w, h, TF_PANEL, TF_PANEL_BD);
-        textIn(mem, 30, 22, w - 200, 38, L"MULTIPLAYER LOBBY", mkFont(28, FW_NORMAL), TF_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 5);
-        { HBRUSH a = CreateSolidBrush(TF_ACCENT); RECT u = { 30, 62, 30 + 330, 64 }; FillRect(mem, &u, a); DeleteObject(a); }
-        // close
-        flatRect(mem, w - 50, 22, 30, 30, TF_FIELD, TF_FIELD_BD);
-        textIn(mem, w - 50, 20, 30, 30, L"×", mkFont(20, FW_NORMAL), TF_TEXT_DIM, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        addHit(w - 50, 22, 30, 30, 5);   // close lobby == LEAVE (tear down lobby.py)
-        // room-code strip: the host has a code to share (auto-copied); click to re-copy.
-        int contentY = 80;
+static void mwButton(int x, int y, int w, int h, const wchar_t* label, int id)
+{
+    HFONT f = mkLato(S(13));
+    layerText(x, y, w, h, label, f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DeleteObject(f); addHit(x, y, w, h, id, true);
+}
+static int mwButtonW(const wchar_t* label) { HFONT f = mkLato(S(13)); int w = textW(label, f) + S(2 * 10); DeleteObject(f); return w; }
+static void mwHeader(int x, int y, int w, const wchar_t* text)
+{
+    HFONT f = mkLato(S(13)); layerText(x, y, w, S(22), text, f, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
+}
+static void mwBody(int x, int y, int w, int h, const wchar_t* text, COLORREF c = MW_TEXT)
+{
+    HFONT f = mkLato(S(13)); layerText(x, y, w, h, text, f, c, DT_LEFT | DT_TOP | DT_WORDBREAK); DeleteObject(f);
+}
+// TextInputField: black@50, padding {5,10}; caret while focused
+static void mwField(int x, int y, int w, int h, const char* utf8, bool focused, const wchar_t* placeholder, int id)
+{
+    layerRect(x, y, w, h, RGB(0, 0, 0), focused ? 90 : 50);
+    wchar_t wt[256]; MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wt, 256);
+    wchar_t shown[260];
+    if (wt[0] || focused) _snwprintf_s(shown, _TRUNCATE, L"%s%s", wt, (focused && (GetTickCount64() / 500) % 2 == 0) ? L"|" : L"");
+    else wcscpy_s(shown, placeholder);
+    HFONT f = mkLato(S(13));
+    layerText(x + S(10), y, w - S(20), h, shown, f, wt[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, wt[0] ? 255 : 160);
+    DeleteObject(f); addHit(x, y, w, h, id);
+}
+static void mwClose(int w, int id)
+{
+    int sz = S(32), x = w - S(25) - sz + S(8), y = S(8);
+    HFONT f = mkLato(S(20)); layerText(x, y, sz, sz, L"×", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
+    addHit(x, y, sz, sz, id, true);
+}
+static void mwTitle(const wchar_t* t) { HFONT f = mkLato(S(18)); layerText(S(25), S(8), S(400), S(32), t, f, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f); }
+static void mwStatus(int w, int h)
+{
+    char st[256]; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
+    wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
+    HFONT f = mkLato(S(12)); layerText(S(25), h - S(34), w - S(50), S(24), wst, f, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
+}
+
+// Build the layer + hit rects for the current page. Called only when dirty.
+static void RenderPanelLayer(int w, int h)
+{
+    g_s = UiScale(); layerBegin(w, h); g_hitCount = 0;
+    layerRect(0, 0, w, h, MW_BG, MW_BG_A);
+    int pad = S(25), cy = S(56);
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) {
+        // ---------------- LOBBY ----------------
+        mwTitle(L"LOBBY"); mwClose(w, 5);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
-            int cy = 70, ch = 34;
-            flatRect(mem, 30, cy, w - 60, ch, TF_INSET, TF_FIELD_BD);
-            textIn(mem, 44, cy, 96, ch, L"ROOM CODE", mkFont(13, FW_NORMAL), TF_ACCENT, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 2);
+            // room code beside the title, click to copy
             wchar_t wcode[160]; MultiByteToWideChar(CP_UTF8, 0, g_code, -1, wcode, 160);
-            textIn(mem, 146, cy, w - 60 - 146 - 150, ch, wcode, mkFont(16, FW_NORMAL, true), TF_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            textIn(mem, w - 30 - 150, cy, 138, ch, L"click to copy", mkFont(13, FW_NORMAL), TF_TEXT_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-            addHit(30, cy, w - 60, ch, 7);   // re-copy the code to the clipboard
-            contentY = 116;
+            HFONT fm = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Consolas");
+            int cw = textW(wcode, fm) + S(20), cx = S(25) + S(90);
+            layerRect(cx, S(11), cw, S(26), RGB(0, 0, 0), 50);
+            layerText(cx + S(10), S(11), cw, S(26), wcode, fm, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fm);
+            HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
+            addHit(cx, S(11), cw, S(26), 7, true);
         }
-        int contentH = h - contentY - 118;
-        // left: player list
-        int listW = 240;
-        flatRect(mem, 30, contentY, listW, contentH, TF_INSET, TF_FIELD_BD);
-        char hdr[48];
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", g_playerCount); }
-        else snprintf(hdr, sizeof(hdr), "PLAYERS");
+        int bottom = h - S(44);
+        int listW = S(220), chatX = pad + listW + S(20), chatW = w - chatX - pad;
+        int contentH = bottom - cy - S(12);
+        // players
+        char hdr[48]; int n = 0;
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); n = g_playerCount; }
+        snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", n);
         wchar_t whdr[48]; MultiByteToWideChar(CP_UTF8, 0, hdr, -1, whdr, 48);
-        textIn(mem, 46, contentY + 12, listW - 24, 22, whdr, mkFont(14, FW_NORMAL), TF_ACCENT, DT_LEFT | DT_TOP | DT_SINGLELINE, 2);
-        for (int i = 0; i < g_playerCount && i < 8; i++) {
+        mwHeader(pad, cy, listW, whdr);
+        HFONT fr = mkLato(S(14)), fs = mkLato(S(11));
+        for (int i = 0; i < n && i < 8; i++) {
             wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, 64);
-            bool isYou = strcmp(g_players[i], g_you) == 0;
-            bool isHost = strcmp(g_players[i], g_host) == 0;
-            COLORREF c = isYou ? RGB(150, 210, 170) : TF_TEXT;
-            HBRUSH dot = CreateSolidBrush(isHost ? TF_ACCENT : RGB(90, 108, 130));
-            RECT dr = { 48, contentY + 44 + i * 30 + 6, 56, contentY + 44 + i * 30 + 14 }; FillRect(mem, &dr, dot); DeleteObject(dot);
-            wchar_t line[80]; _snwprintf_s(line, _TRUNCATE, L"%s%s", wn, isYou ? L"  (you)" : L"");
-            textIn(mem, 64, contentY + 44 + i * 30, listW - 40, 26, line, mkFont(16, FW_NORMAL), c, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            bool isYou = strcmp(g_players[i], g_you) == 0, isHost = strcmp(g_players[i], g_host) == 0;
+            int ry = cy + S(30) + i * S(26);
+            layerText(pad, ry, listW - S(50), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
         }
+        DeleteObject(fr); DeleteObject(fs);
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-        // right: chat log
-        int chatX = 30 + listW + 16, chatW = w - chatX - 30;
-        flatRect(mem, chatX, contentY, chatW, contentH, TF_INSET, TF_FIELD_BD);
+        // chat
+        int inH = S(30), logH = contentH - inH - S(8);
+        layerRect(chatX, cy, chatW, logH, RGB(0, 0, 0), 50);
         if (g_modelCsInit) {
             EnterCriticalSection(&g_modelCs);
-            int n = g_chatCount, ly = contentY + 12;
-            for (int i = 0; i < n; i++) {
+            HFONT fc = mkLato(S(13)); int lh = S(22), maxLines = (logH - S(16)) / lh, cnt = g_chatCount;
+            int first = cnt > maxLines ? cnt - maxLines : 0, ly = cy + S(8);
+            for (int i = first; i < cnt; i++) {
                 wchar_t wl[220]; MultiByteToWideChar(CP_UTF8, 0, g_chatLog[(g_chatHead + i) % 14], -1, wl, 220);
-                textIn(mem, chatX + 14, ly, chatW - 28, 24, wl, mkFont(15, FW_NORMAL), TF_TEXT_DIM, DT_LEFT | DT_TOP | DT_SINGLELINE);
-                ly += 24;
+                layerText(chatX + S(10), ly, chatW - S(20), lh, wl, fc, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); ly += lh;
             }
-            LeaveCriticalSection(&g_modelCs);
+            DeleteObject(fc); LeaveCriticalSection(&g_modelCs);
         }
-        // chat input line
-        int inY = contentY + contentH + 10;
-        flatRect(mem, chatX, inY, chatW, 40, RGB(30, 40, 54), TF_FIELD_BD);
-        wchar_t wi[220]; MultiByteToWideChar(CP_UTF8, 0, g_chatInput, -1, wi, 220);
-        wchar_t withcaret[224]; _snwprintf_s(withcaret, _TRUNCATE, L"%s%s", wi, (GetTickCount64() / 500) % 2 ? L"|" : L" ");
-        const wchar_t* shown = g_chatLen ? withcaret : L"type a message and press Enter…";
-        textIn(mem, chatX + 12, inY, chatW - 24, 40, shown, mkFont(15, FW_NORMAL), g_chatLen ? TF_TEXT : RGB(120, 138, 160), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        // bottom buttons: LEAVE (all), START (host)
-        int by = h - 60;
-        drawBtn(mem, 30, by, 150, 40, L"LEAVE", 18, false); addHit(30, by, 150, 40, 5);
-        if (InterlockedCompareExchange(&g_isHost, 0, 0)) { drawBtn(mem, w - 30 - 180, by, 180, 40, L"START GAME", 18, true); addHit(w - 30 - 180, by, 180, 40, 6); }
-        // status (small, center-bottom)
+        mwField(chatX, cy + logH + S(8), chatW, inH, g_chatInput, true, L"Type a message and press Enter", 9);
+        // button row: LEAVE left, START GAME right (host)
+        int bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5);
+        if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6); }
+        // status between them
         char st[256]; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
         wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-        textIn(mem, 200, by + 8, w - 420, 24, wst, mkFont(13, FW_NORMAL), TF_TEXT_DIM, DT_CENTER | DT_TOP | DT_SINGLELINE);
+        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - S(160), S(30), wst, fst, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fst);
     } else {
-        // host/join choice card, TF2 Settings-dialog styling
-        flatRect(mem, 0, 0, w, h, TF_PANEL, TF_PANEL_BD);
-        // title (uppercase, tracked) + accent underline, like SETTINGS
-        textIn(mem, 34, 26, w - 120, 40, L"MULTIPLAYER", mkFont(30, FW_NORMAL), TF_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 6);
-        { HBRUSH a = CreateSolidBrush(TF_ACCENT); RECT u = { 34, 70, 34 + 260, 72 }; FillRect(mem, &u, a); DeleteObject(a); }
-        textIn(mem, 36, 84, w - 72, 24, L"Direct peer-to-peer, no servers.  Share the code over Discord.",
-               mkFont(15, FW_NORMAL), TF_TEXT_DIM, DT_LEFT | DT_TOP | DT_SINGLELINE);
-        // close (flat, top-right)
-        flatRect(mem, w - 54, 24, 30, 30, TF_FIELD, TF_FIELD_BD);
-        textIn(mem, w - 54, 22, 30, 30, L"×", mkFont(20, FW_NORMAL), TF_TEXT_DIM, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        addHit(w - 54, 24, 30, 30, 4);
-        // HOST / JOIN (flat fields)
-        int bw = (w - 88) / 2, bh = 64, by = 124;
-        drawBtn(mem, 36, by, bw, bh, L"HOST", 24, true);              addHit(36, by, bw, bh, 2);
-        drawBtn(mem, w - 36 - bw, by, bw, bh, L"JOIN", 24, true);     addHit(w - 36 - bw, by, bw, bh, 3);
-        textIn(mem, 36, by + bh + 8, bw, 22, L"create a game, share your code", mkFont(14, FW_NORMAL), TF_TEXT_DIM, DT_CENTER | DT_TOP | DT_SINGLELINE);
-        textIn(mem, w - 36 - bw, by + bh + 8, bw, 22, L"paste friend's code, connect", mkFont(14, FW_NORMAL), TF_TEXT_DIM, DT_CENTER | DT_TOP | DT_SINGLELINE);
-        // code box (recessed, like a value field)
-        int cy = by + bh + 42;
-        flatRect(mem, 36, cy, w - 72, 92, TF_INSET, TF_FIELD_BD);
-        textIn(mem, 52, cy + 12, w - 104, 20, L"YOUR CODE", mkFont(13, FW_NORMAL), TF_ACCENT, DT_LEFT | DT_TOP | DT_SINGLELINE, 3);
-        wchar_t wcode[160];
-        if (InterlockedCompareExchange(&g_haveCode, 0, 0)) MultiByteToWideChar(CP_UTF8, 0, g_code, -1, wcode, 160);
-        else wcscpy_s(wcode, L"— press HOST to generate —");
-        textIn(mem, 52, cy + 34, w - 104, 30, wcode, mkFont(19, FW_NORMAL, true), TF_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        if (InterlockedCompareExchange(&g_haveCode, 0, 0))
-            textIn(mem, 52, cy + 66, w - 104, 20, L"copied to clipboard", mkFont(13, FW_NORMAL), TF_TEXT_DIM, DT_LEFT | DT_TOP | DT_SINGLELINE);
-        // status line
-        char st[256]; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
-        wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-        textIn(mem, 36, cy + 108, w - 72, 60, wst, mkFont(15, FW_NORMAL), TF_TEXT_DIM, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        // ---------------- HOST / JOIN ----------------
+        mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
+        int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
+        layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
+        mwHeader(lx, cy, colW, L"HOST A GAME");
+        mwBody(lx, cy + S(28), colW, S(60), L"Opens a lobby and shares your newest save with everyone who joins. You get a code to hand out.");
+        mwButton(lx, cy + S(96), mwButtonW(L"HOST GAME"), S(30), L"HOST GAME", 2);
+        mwHeader(rx, cy, colW, L"JOIN A GAME");
+        mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
+        mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0, L"Click to paste the code", 8);
+        mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
+        mwStatus(w, h);
     }
-
-    const unsigned char* src = (const unsigned char*)bits;
-    for (int row = 0; row < h; row++)
-        memcpy((unsigned char*)dst + row * pitch, src + row * (w * 4), w * 4);
-    SelectObject(mem, oldbm); DeleteObject(dib); DeleteDC(mem); ReleaseDC(nullptr, screen);
 }
 
 static void barrierImage(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
@@ -711,6 +739,8 @@ static bool BuildPanelImage()
 {
     if (g_panelBuilt) return true;
     if (!pCreateImage || !pAllocMem || !pMapMem) return false;
+    g_s = UiScale(); g_panelW = S(800); g_panelH = S(560);
+    if (g_panelW > (int)g_scExtent.width) g_panelW = (int)g_scExtent.width; if (g_panelH > (int)g_scExtent.height) g_panelH = (int)g_scExtent.height;
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ici.imageType = VK_IMAGE_TYPE_2D; ici.format = g_scFormat;
     ici.extent = { (uint32_t)g_panelW, (uint32_t)g_panelH, 1 };
@@ -820,53 +850,33 @@ static void CopyBackdrop(VkQueue q, uint32_t imgIndex)
     pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
     if (pInvalidate) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_bdMem; r.size = VK_WHOLE_SIZE; pInvalidate(g_dev, 1, &r); }
 }
-static bool nativeLookActive() { return g_flagOverlayNative && InterlockedCompareExchange(&g_uiState, 0, 0) == 0; }
-
 static void PanelLayout()
 {
-    if (nativeLookActive()) {
-        // collapsed, native look: sized to the label like a real MainMenu Button,
-        // placed by the ox/oy flags (default 5vw in, like the stylesheet's margin)
-        MeasureNative(&g_copyW, &g_copyH);
-        g_panelX = (int)(g_scExtent.width * g_flagOx);
-        g_panelY = (int)(g_scExtent.height * g_flagOy);
-        if (g_panelX + g_copyW > (int)g_scExtent.width)  g_panelX = (int)g_scExtent.width - g_copyW;
-        if (g_panelY + g_copyH > (int)g_scExtent.height) g_panelY = (int)g_scExtent.height - g_copyH;
-    } else if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) {
-        // collapsed: small button in the menu's left column
-        g_copyW = 300; g_copyH = 60;
-        g_panelX = (int)(g_scExtent.width * 0.062f);
-        g_panelY = (int)(g_scExtent.height * 0.40f);
-    } else {
-        // expanded: the full card, centered on screen
-        g_copyW = g_panelW; g_copyH = g_panelH;
-        g_panelX = ((int)g_scExtent.width - g_panelW) / 2;
-        g_panelY = ((int)g_scExtent.height - g_panelH) / 2;
-    }
+    g_s = UiScale();
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
+    else                                                     { g_copyW = S(700); g_copyH = S(250); }
+    if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
+    g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
+    g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
 }
 
 static void DrawButton(VkQueue q, uint32_t imgIndex)
 {
     if (imgIndex >= g_scImgCount) return;
-    if (!BuildPanelImage()) return;
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) { g_hitCount = 0; return; }   // collapsed: the native list entry IS the button
+    if (!BuildPanelImage() || !BuildBackdropImage()) return;
     PanelLayout();
-    if (nativeLookActive() && BuildBackdropImage()) {
-        // native look: readback the frame under the button, blend the label over
-        // it on the CPU, then the usual copy puts the blended block back.
-        if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 || g_covW != g_copyW || g_covH != g_copyH)
-            RenderNativeCoverage(g_copyW, g_copyH);
-        g_hitCount = 0; addHit(0, 0, g_copyW, g_copyH, 1);
-        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-        CopyBackdrop(q, imgIndex);
-        ComposeNative((const unsigned char*)g_bdPtr, g_bdPitch, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
-        if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
-        QueryPerformanceCounter(&t1);
-        static int n = 0; if (++n % 600 == 1) Log("[menu] native-look blend %dx%d hover=%d active=%d %.2f ms\n",
-            g_copyW, g_copyH, g_hover, g_active, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
-    } else if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 && g_panelPtr) {
-        RenderPanelGDI(g_panelPtr, g_panelPitch, g_copyW, g_copyH);
-        if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
+    // the caret blinks and chat arrives asynchronously: re-render the layer at most 2x/s when not dirty
+    static ULONGLONG lastRender = 0; ULONGLONG now = GetTickCount64();
+    if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 || g_layer.w != g_copyW || g_layer.h != g_copyH || now - lastRender > 500) {
+        RenderPanelLayer(g_copyW, g_copyH); lastRender = now;
     }
+    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    CopyBackdrop(q, imgIndex);
+    ComposeLayer((const unsigned char*)g_bdPtr, g_bdPitch, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
+    if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
+    QueryPerformanceCounter(&t1);
+    static int n = 0; if (++n % 600 == 1) Log("[menu] panel blend %dx%d hover=%d %.2f ms\n", g_copyW, g_copyH, g_hover, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
     VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     pBeginCB(cb, &bi);
@@ -928,6 +938,7 @@ static void PollClick()
         int ly = pt.y - origin.y - g_panelY;
         ULONGLONG now = GetTickCount64();
         if (now - lastFire > 400) {
+            InterlockedExchange(&g_joinFocus, 0);
             for (int i = 0; i < g_hitCount; i++) {
                 const Hit& hh = g_hits[i];
                 if (lx >= hh.x && lx < hh.x + hh.w && ly >= hh.y && ly < hh.y + hh.h) {
@@ -960,6 +971,11 @@ static void OnHit(int id)
         } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
+    case 8: {   // code field: focus; if empty, paste the clipboard
+        InterlockedExchange(&g_joinFocus, 1);
+        if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 120; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
+        InterlockedExchange(&g_panelDirty, 1); } break;
+    case 9: break;   // chat field is always focused in the lobby
     }
 }
 
@@ -1083,7 +1099,7 @@ static void ProbeWidget()
 //   btn = 7c5d30(221c930(&s, "Load Game"), &empty, &empty)   build the Button
 //   227a1e0(btn, &"continue")                                 style class (optional)
 //   2518f0(btn, &connOut, &std::function<void()>)             connect the click slot
-//   227f880(btn, 4)                                           prepare
+//   227f880(btn, 4, 1)                                        set widget flag 4 (Exit clears it)
 //   2d99e0(list, btn, &"list-item")                           ADD TO THE "MainMenu" LIST
 // The list (a 0x508-byte widget named "MainMenu") is a local of the builder, so we
 // hook the list's add call and remember the list pointer while the builder runs;
@@ -1095,7 +1111,7 @@ static const uintptr_t RVA_SETNAME  = 0x227a1e0;
 static const uintptr_t RVA_PREP     = 0x227f880;
 typedef void* (*ListAddFn)(void* list, void* widget, void* styleStr);
 typedef void  (*SetNameFn)(void* widget, void* str);
-typedef void  (*PrepFn)(void* widget, int flags);
+typedef void  (*PrepFn)(void* widget, int flagBit, char value);   // 227f880 = setWidgetFlag(bit, on); the builder sets bit 4 on every entry (Exit clears it)
 static ListAddFn g_origListAdd = nullptr;
 static SetNameFn g_setName = nullptr;
 static PrepFn    g_prep = nullptr;
@@ -1125,11 +1141,13 @@ static void NativeInsert();
 // appear as the second entry of the column.
 static void* MyListAdd(void* list, void* widget, void* style)
 {
+    bool inBuild = InterlockedCompareExchange(&g_inMainBuild, 0, 0) != 0;
+    // slot=N: insert ours before the game's N-th add (0 = before the first entry,
+    // which is CONTINUE when a save exists and otherwise the next one -- so we sit
+    // at the top of the column either way).
+    if (inBuild && g_mainListAdds == g_flagSlot && g_flagNativeBtn) { g_mainList = list; NativeInsert(); }
     void* r = g_origListAdd(list, widget, style);
-    if (InterlockedCompareExchange(&g_inMainBuild, 0, 0)) {
-        g_mainList = list; g_mainListAdds++;
-        if (g_mainListAdds == 1 && g_flagNativeBtn) NativeInsert();
-    }
+    if (inBuild) { g_mainList = list; g_mainListAdds++; Log("[menu] list add #%d list=%p widget=%p\n", g_mainListAdds, list, widget); }
     return r;
 }
 
@@ -1151,11 +1169,11 @@ static void NativeInsert()
         g_add(btn, conn, &fn);
         g_clean(conn);
         Log("[menu] native: click slot connected\n");
-        g_prep(btn, 4);
+        g_prep(btn, 4, 1);
         GString li; GStringInit(&li); g_strAssign(&li, "list-item", 9);
         g_origListAdd(g_mainList, btn, &li);
         g_myButton = btn;
-        Log("[menu] native: BUTTON INSERTED into the MainMenu list during the build -- look for the 2nd entry of the column\n");
+        Log("[menu] native: BUTTON INSERTED into the MainMenu list during the build -- it goes at the top of the column\n");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[menu] native: FAULTED exc=%lx (button not inserted; set native=0 in tpf2_menu_flags.txt if the menu is unstable)\n", GetExceptionCode());
     }
@@ -1167,7 +1185,7 @@ static void MyMainBuild(uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4)
     InterlockedExchange(&g_inMainBuild, 1);
     g_origMainBuild(p1, p2, p3, p4);
     InterlockedExchange(&g_inMainBuild, 0);
-    Log("[menu] main-page builder ran (list=%p adds=%d, ours inserted after add #1)\n", g_mainList, g_mainListAdds);
+    Log("[menu] main-page builder ran (list=%p adds=%d, ours inserted before add #%d)\n", g_mainList, g_mainListAdds, g_flagSlot);
 }
 
 // ---------------- game-window helpers ----------------
@@ -1779,8 +1797,9 @@ static void StartLobby(int join)
     LobbyArg* a = (LobbyArg*)calloc(1, sizeof(LobbyArg)); if (!a) return;
     a->join = join; strcpy_s(a->name, g_username);
     if (join) {
-        if (!ClipboardGet(a->code, sizeof(a->code)) || strlen(a->code) < 8) {
-            SetStatus("Copy your friend's code first, then press JOIN."); free(a); return;
+        if (g_joinLen >= 8) strcpy_s(a->code, g_joinCode);
+        else if (!ClipboardGet(a->code, sizeof(a->code)) || strlen(a->code) < 8) {
+            SetStatus("Paste or type your host's code in the field first."); free(a); return;
         }
         char* s = a->code; while (*s == ' ' || *s == '\r' || *s == '\n' || *s == '\t') memmove(s, s + 1, strlen(s));
         int L = (int)strlen(s); while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\r' || s[L-1] == '\n' || s[L-1] == '\t')) s[--L] = 0;
@@ -1824,9 +1843,10 @@ static char vkToChar(int vk, bool shift)
 static HHOOK g_kbHook = nullptr;
 static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
 {
-    if (code == HC_ACTION &&
-        InterlockedCompareExchange(&g_uiState, 0, 0) == 2 &&
-        InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0 &&
+    LONG st = InterlockedCompareExchange(&g_uiState, 0, 0);
+    bool codeField = st == 1 && InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0;
+    bool chatField = st == 2 && InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0;
+    if (code == HC_ACTION && (codeField || chatField) &&
         InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 &&
         gameHasFocus())
     {
@@ -1840,7 +1860,15 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
             vk == VK_LWIN || vk == VK_RWIN)
             return CallNextHookEx(g_kbHook, code, wp, lp);
-        if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
+        if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && codeField) {
+            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            if (vk == VK_BACK) { if (g_joinLen > 0) { g_joinCode[--g_joinLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+            else if (vk == VK_RETURN) { InterlockedExchange(&g_joinFocus, 0); OnHit(3); }
+            else if (ctrl && vk == 'V') { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = g_joinLen; for (int i = 0; buf[i] && j < 120; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; InterlockedExchange(&g_panelDirty, 1); } }
+            else { char c = vkToChar((int)vk, shift); if (c && c > 32 && g_joinLen < 120) { g_joinCode[g_joinLen++] = c; g_joinCode[g_joinLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+        }
+        else if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             if (vk == VK_BACK) { if (g_chatLen > 0) { g_chatInput[--g_chatLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
             else if (vk == VK_RETURN) { if (g_chatLen > 0) { SendChat(g_chatInput); g_chatInput[0] = 0; g_chatLen = 0; InterlockedExchange(&g_panelDirty, 1); } }

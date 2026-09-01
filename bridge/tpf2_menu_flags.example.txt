@@ -1,4 +1,2 @@
-overlay=native
 native=1
-ox=0.05
-oy=0.60
+slot=0

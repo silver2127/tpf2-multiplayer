@@ -1,4 +1,6 @@
-# Menu RE round 4: the primitives for building a button from injected code
-83270 str_assign    # std::string assign/ctor used before every UI call
-2518f0 layout_add    # FUN_1422518f0(widget,&a,&b) -- add button to layout
-63e6e0 mk_arg        # FUN_14063e6e0(&a,&b) -- builds an arg for layout_add
+# Menu RE round 4: the MainMenu list widget -- how entries are ordered
+22d99e0 list_add        # 2d99e0(list, widget, &"list-item") -- the builder's attach for every button
+22d9ad0 list_insert     # 2d9ad0(list, &{widget,0}, &"list-item") -- how Exit is added
+22d8540 list_ctor       # 2d8540(alloc(0x508), 0, 1, 2) -- the list widget constructor
+227f880 widget_prep     # 227f880(btn, 4) called before every list add
+22da460 list_selcb      # sets the list's selection callback (lambda void(int))

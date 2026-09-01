@@ -271,3 +271,23 @@ Both default ON so one launch shows them side by side. Log lines to read:
   [menu] NATIVE BUTTON CLICKED           the std::function slot fired
 If the menu crashes at startup set native=0 (the render of an un-parented
 button is the one thing SEH cannot guard).
+
+## Round 4 (2026-09-01): list internals + the panel rework
+
+- Post-build append rendered NOTHING; inserting DURING the builder (inside the
+  list-add hook) renders. The user saw the entry below EXIT with an
+  insert-after-add-#1 build, which does not match plain append order -- the
+  per-add log (`[menu] list add #N`) plus `slot=` in the flags file settle it.
+- `2d99e0(list, w, &style)` = `24baf0(list+0x488, w, 1)` then `227a1e0(w, style)`
+  (moves the string) -- so 227a1e0 is addStyleClass, and every entry carries
+  "list-item"; ours also carries "multiplayer" for a stylesheet hook.
+- `2d9ad0` (Exit) is the same add taking a unique_ptr; no positional argument.
+- `227f880(w, bit, on)` = setWidgetFlag; the builder sets bit 4 on every entry
+  and CLEARS it on Exit. We now pass (4, 1) explicitly (r8 was uninitialised).
+- Panel: the GDI overlay is gone. menu_hook.cpp draws the host/join and lobby
+  pages into a straight-alpha layer (rect fills + GDI text coverage) and
+  composites it over a swapchain readback each present, styled to window.lua
+  (MenuWindow bg 5/25/40, transparent buttons with white@50/100 hover/press,
+  TextInputField black@50, Lato). The code field is clickable (paste), typeable
+  (LL hook while focused), Ctrl+V, Enter = join. The collapsed overlay button no
+  longer exists; the native list entry opens the window.
