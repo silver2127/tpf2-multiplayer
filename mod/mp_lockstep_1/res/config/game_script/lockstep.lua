@@ -4357,6 +4357,20 @@ local function onLine(line)
 	if op == "LSTICK" then
 		local t = tonumber(line:match("t=([%d%.%-]+)"))
 		if t then peerTime = t; peerSeen = true; peerTimeAt = ticks end
+	elseif op == "LSSPEED" then
+		-- The other player moved the speed lever: follow. Speed is local pacing,
+		-- not simulated state, so it is applied on arrival, not at a stamp.
+		local v = tonumber(line:match("v=(%d+)"))
+		if v then
+			local s0
+			pcall(function() s0 = game.interface.getGameSpeed() end)
+			if s0 ~= v then
+				CM.baseSpeed = v
+				CM.catchingUp = false
+				CM.lastSeenSpeed = v      -- so shareSpeed does not echo it back
+				CM.setSpeed(v, "the other player set it")
+			end
+		end
 	elseif op == "LSCMD" then
 		local c = decodeCmd(line)
 		if c then
@@ -6463,6 +6477,30 @@ function CM.setSpeed(v, why)
 	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
 end
 
+-- ONE SPEED FOR THE SESSION. Each instance used to run at whatever its player
+-- chose, and the barrier and pacer then fought to keep two clocks together that
+-- were being driven apart on purpose: one side at 4 racing ahead, the other at 1
+-- being paused and released in turn. A speed change the PLAYER makes is now
+-- shared, and the other side adopts it -- so both clocks run at the same rate
+-- and the pacer is left with only the small drift it was built for.
+--
+-- Only the player's changes travel. Ours (a catch-up notch, a barrier hold, a
+-- release, or a speed we adopted from the peer) are recognised because setSpeed
+-- recorded them, and are never re-broadcast -- that is what stops the two
+-- instances echoing one change back and forth forever.
+function CM.shareSpeed()
+	local s
+	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
+	local prev = CM.lastSeenSpeed
+	CM.lastSeenSpeed = s
+	if prev == nil or s == prev then return end
+	if CM.lastSetSpeed ~= nil and s == CM.lastSetSpeed then return end   -- ours, not the player's
+	CM.baseSpeed = s
+	CM.catchingUp = false
+	broadcast(string.format("LSSPEED v=%d", s))
+	log(string.format("SPEED: player set %d -- shared with the peer", s))
+end
+
 function CM.pace(ahead)
 	if paused then return end                       -- the barrier owns the speed
 	local behind = -ahead
@@ -6583,6 +6621,7 @@ local function applyBarrier(now)
 	end
 
 	local ahead = now - peerTime
+	CM.shareSpeed()
 	CM.pace(ahead)
 	if ahead > K.BARRIER_AHEAD and not paused then
 		paused = true
