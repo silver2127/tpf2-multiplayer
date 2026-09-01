@@ -28,7 +28,7 @@ piece protocol, (2) pairwise peer connections, (3) relay fallback.
     assemble a byte-identical blob; seed upload drops from 3.0 copies to **1.78**
     with the majority of data traded peer-to-peer.
 
-## Lobby integration (designed; the direct-link socket work is the open piece)
+## Lobby integration of the swarm (designed; mesh transport now available)
 
 Wire additions, all inside NP1 DATA and all gated behind a `--swarm` flag (off
 = today's star transfer, byte-identical):
