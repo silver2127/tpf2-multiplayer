@@ -579,7 +579,7 @@ local function nodePos(nid)
 	return "?"
 end
 
-local function worldHash()
+local function worldHash(now)
 	-- Vehicles: a count, and -- separately -- where they are.
 	--
 	-- The count alone answers "did a purchase replicate", which is not what
@@ -680,9 +680,17 @@ local function worldHash()
 	local verdict = hashStr("v" .. nv .. "|" .. hc .. "|" .. he)
 	-- p: is the vehicle-position lane. #vpos can be less than nv when a vehicle
 	-- has no position to read (in a depot, mid-load), so it carries its own count.
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d:%s,t%d",
+	-- WHEN the vehicles were sampled travels with the lane. The hash fires on
+	-- the first update() after the clock crosses a 4-unit stamp, but the clock
+	-- moves in 0.2-unit sim steps and update() is per frame: at speed 2 or 3
+	-- several sim steps pass between frames, so one instance's first look is at
+	-- 1648.0 and the other's at 1648.4 -- and a train at 53 mph has moved ~10 m
+	-- in between. Two samples from different sim times are not comparable, and
+	-- until now the lane compared them anyway. The comparison below only calls
+	-- p a difference when both sides sampled the SAME sim time.
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,t%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
-		#vpos, hashStr(table.concat(vpos, "|")), nt)
+		#vpos, now or -1, hashStr(table.concat(vpos, "|")), nt)
 	return verdict, detail
 end
 
@@ -4327,7 +4335,17 @@ function compareAt(stamp)
 				local name = comp:match("^(%a+)")
 				local other = dt:match("(" .. name .. "[^,]*)")
 				if other and other ~= comp then
-					log(string.format("   -> %s DIFFERS: %s vs %s", name, comp, other))
+					if name == "p" then
+						-- vehicles: only a difference if both looked at the same sim time
+						local tm, tp = comp:match("@([%-%d%.]+):"), other:match("@([%-%d%.]+):")
+						if tm and tp and tm ~= tp then
+							log(string.format("   -> p sampled at different sim times (%s vs %s) -- not comparable", tm, tp))
+						else
+							log(string.format("   -> p DIFFERS at sim time %s: %s vs %s", tostring(tm), comp, other))
+						end
+					else
+						log(string.format("   -> %s DIFFERS: %s vs %s", name, comp, other))
+					end
 				end
 			end
 		end
@@ -6612,7 +6630,7 @@ local function checkHash(now)
 	local stamp = math.floor(now / K.HASH_EVERY_GAMETIME) * K.HASH_EVERY_GAMETIME
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
-	local h, detail = worldHash()
+	local h, detail = worldHash(now)
 	myHashes[stamp] = h
 	myDetails[stamp] = detail
 	broadcast(string.format("LSHASH t=%d h=%s d=%s", stamp, h, detail or "-"))
