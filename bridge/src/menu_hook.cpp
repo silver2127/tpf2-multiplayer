@@ -555,11 +555,77 @@ static int textW(const wchar_t* s, HFONT f)
 // images are write-combined, so rows are staged through ordinary RAM.
 struct Hit; static const Hit* hoveredHit();
 static unsigned char* g_stage = nullptr; static size_t g_stageSz = 0;
+// MenuWindow has blurRadius = 64 behind its sheet (main-menu-windows.lua). Same
+// look here, cheaply: average the readback down 4x, two running-sum box blurs
+// (radius 16 at quarter size ~= 64 full-size), bilinear back up. ~1-2 ms at 4K.
+static unsigned char* g_blurA = nullptr; static unsigned char* g_blurB = nullptr; static size_t g_blurSz = 0;
+static void boxBlurH(const unsigned char* src, unsigned char* dst, int w, int h, int r)
+{
+    for (int y = 0; y < h; y++) {
+        const unsigned char* s = src + (size_t)y * w * 4; unsigned char* d = dst + (size_t)y * w * 4;
+        for (int c = 0; c < 3; c++) {
+            int sum = 0, n = 0;
+            for (int x = 0; x <= r && x < w; x++) { sum += s[x * 4 + c]; n++; }
+            for (int x = 0; x < w; x++) {
+                d[x * 4 + c] = (unsigned char)(sum / n);
+                int add = x + r + 1, sub = x - r;
+                if (add < w) { sum += s[add * 4 + c]; n++; }
+                if (sub >= 0) { sum -= s[sub * 4 + c]; n--; }
+            }
+        }
+    }
+}
+static void boxBlurV(const unsigned char* src, unsigned char* dst, int w, int h, int r)
+{
+    for (int x = 0; x < w; x++) {
+        for (int c = 0; c < 3; c++) {
+            int sum = 0, n = 0;
+            for (int y = 0; y <= r && y < h; y++) { sum += src[((size_t)y * w + x) * 4 + c]; n++; }
+            for (int y = 0; y < h; y++) {
+                dst[((size_t)y * w + x) * 4 + c] = (unsigned char)(sum / n);
+                int add = y + r + 1, sub = y - r;
+                if (add < h) { sum += src[((size_t)add * w + x) * 4 + c]; n++; }
+                if (sub >= 0) { sum -= src[((size_t)sub * w + x) * 4 + c]; n--; }
+            }
+        }
+    }
+}
+static void BlurStage(int w, int h)
+{
+    const int D = 4; int sw = w / D, sh = h / D; if (sw < 2 || sh < 2) return;
+    size_t need = (size_t)sw * sh * 4;
+    if (g_blurSz < need) { free(g_blurA); free(g_blurB); g_blurA = (unsigned char*)malloc(need); g_blurB = (unsigned char*)malloc(need); g_blurSz = need; }
+    // downsample: 4x4 box average
+    for (int y = 0; y < sh; y++) for (int x = 0; x < sw; x++) {
+        int acc[3] = { 0, 0, 0 };
+        for (int yy = 0; yy < D; yy++) { const unsigned char* s = g_stage + (((size_t)(y * D + yy)) * w + x * D) * 4;
+            for (int xx = 0; xx < D; xx++, s += 4) { acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2]; } }
+        unsigned char* d = g_blurA + ((size_t)y * sw + x) * 4; d[0] = (unsigned char)(acc[0] / 16); d[1] = (unsigned char)(acc[1] / 16); d[2] = (unsigned char)(acc[2] / 16);
+    }
+    int r = (int)(16 * g_s / 2 + 0.5f); if (r < 4) r = 4;   // 64px full-size at 1080p, scaled
+    boxBlurH(g_blurA, g_blurB, sw, sh, r); boxBlurV(g_blurB, g_blurA, sw, sh, r);
+    boxBlurH(g_blurA, g_blurB, sw, sh, r); boxBlurV(g_blurB, g_blurA, sw, sh, r);
+    // bilinear upsample back into the stage
+    for (int y = 0; y < h; y++) {
+        float fy = ((y + 0.5f) / D) - 0.5f; int y0 = (int)fy; if (y0 < 0) { y0 = 0; fy = 0; } int y1 = y0 + 1 < sh ? y0 + 1 : y0; float ty = fy - y0; if (ty < 0) ty = 0;
+        unsigned char* d = g_stage + (size_t)y * w * 4;
+        for (int x = 0; x < w; x++, d += 4) {
+            float fx = ((x + 0.5f) / D) - 0.5f; int x0 = (int)fx; if (x0 < 0) { x0 = 0; fx = 0; } int x1 = x0 + 1 < sw ? x0 + 1 : x0; float tx = fx - x0; if (tx < 0) tx = 0;
+            const unsigned char* a = g_blurA + ((size_t)y0 * sw + x0) * 4; const unsigned char* b = g_blurA + ((size_t)y0 * sw + x1) * 4;
+            const unsigned char* c2 = g_blurA + ((size_t)y1 * sw + x0) * 4; const unsigned char* e = g_blurA + ((size_t)y1 * sw + x1) * 4;
+            for (int c = 0; c < 3; c++) {
+                float top = a[c] + (b[c] - a[c]) * tx, bot = c2[c] + (e[c] - c2[c]) * tx;
+                d[c] = (unsigned char)(top + (bot - top) * ty + 0.5f);
+            }
+        }
+    }
+}
 static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h)
 {
     size_t need = (size_t)w * 4 * h;
     if (g_stageSz < need) { free(g_stage); g_stage = (unsigned char*)malloc(need); g_stageSz = need; }
     for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, bg + y * bgPitch, (size_t)w * 4);
+    BlurStage(w, h);
     const Hit* hv = hoveredHit();
     if (hv) {
         int fill = g_active ? 100 : 50;
