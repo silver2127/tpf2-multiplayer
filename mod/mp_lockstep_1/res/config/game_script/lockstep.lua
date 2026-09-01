@@ -597,20 +597,21 @@ local function worldHash()
 	local nv = 0
 	local vpos = {}
 	pcall(function()
+		-- includeData=true hands back every vehicle's record in ONE call. The
+		-- first version did a getEntity per vehicle inside its own closure --
+		-- thousands of serialisations per hash tick on a late-game map, for a
+		-- lane that never decides anything (review, 2026-08-31).
 		local t = game.interface.getEntities({ radius = 999999 },
-			{ type = "VEHICLE", includeData = false }) or {}
-		for _, vid in pairs(t) do
+			{ type = "VEHICLE", includeData = true }) or {}
+		for vid, e in pairs(t) do
 			nv = nv + 1
-			pcall(function()
-				local e = game.interface.getEntity(vid)
-				local p = e and e.position
-				if p then
-					-- sorted below, so this says nothing about WHICH vehicle is
-					-- where -- ids differ between instances and always will
-					vpos[#vpos + 1] = string.format("%.0f,%.0f,%.0f",
-						p[1] or p.x or 0, p[2] or p.y or 0, p[3] or p.z or 0)
-				end
-			end)
+			local p = type(e) == "table" and e.position or nil
+			if p then
+				-- sorted below, so this says nothing about WHICH vehicle is
+				-- where -- ids differ between instances and always will
+				vpos[#vpos + 1] = string.format("%.0f,%.0f,%.0f",
+					p[1] or p.x or 0, p[2] or p.y or 0, p[3] or p.z or 0)
+			end
 		end
 	end)
 	table.sort(vpos)
@@ -774,13 +775,6 @@ local function execEdge(c)
 			e.streetEdge.tramTrackType = 0
 		end
 		sp.streetProposal.edgesToAdd[1] = e
-
-		-- PLAN PASS. The originator runs this same code once at schedule time
-		-- purely to find out what it will do, so the decisions can travel with
-		-- the command. Nothing is built here: same resolution, same splits, no
-		-- proposal. Running the real path rather than a parallel "planner" is
-		-- deliberate -- a second implementation would drift from this one.
-		if planOnly then return end
 
 		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), false),
 			function(res, success)
@@ -1845,6 +1839,14 @@ local function execPolyline(c, planOnly)
 		for i, rid in ipairs(removeEdges) do sp.streetProposal.edgesToRemove[i] = rid end
 		for i, rid in ipairs(removeNodes) do sp.streetProposal.nodesToRemove[i] = rid end
 
+		-- PLAN PASS. The originator runs this same code once at schedule time
+		-- purely to find out what it will do, so the decisions can travel with
+		-- the command. Nothing is built here: same resolution, same splits, no
+		-- proposal. (This guard first landed in execEdge by a replace-first
+		-- mistake, where it was dead -- and the plan pass BUILT the road at
+		-- click time. Review, 2026-08-31.)
+		if planOnly then return end
+
 		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), false),
 			function(res, success)
 				-- LEVEL-CROSSING PROBE. The engine models a crossing as its own ECS
@@ -1955,7 +1957,7 @@ end
 --   1. the ORIGINATOR lets the build happen locally (the hook does not cancel
 --      caller 419f62), then reads fileName / params / transf back off the
 --      resulting entity and schedules a CONP command carrying all three;
---   2. every K.PEER replays it at the stamp with game.interface.buildConstruction
+--   2. every peer replays it at the stamp with game.interface.buildConstruction
 --      + setPlayer -- the path mp_bridge measured live, including a 16-module
 --      modular station -- and the originator skips its own command.
 --
@@ -2280,7 +2282,16 @@ end
 --
 -- The delay keeps the sweep off builds that are still in flight; a construction
 -- and its split always arrive in one proposal, but a retry may be queued behind.
-CM.SPLIT_SETTLE = 300      -- ticks (~5 s at 60/s) before a scar counts as one
+CM.SPLIT_SETTLE = 27       -- ticks before a scar counts as one: ~0.19 s each, so ~5 s
+-- Something was demolished at x,y: every split we ever cut nearby goes back
+-- under watch, so a scar it leaves is healed by the next sweep.
+function CM.rearmSplitsNear(x, y)
+	for k, site in pairs(CM.splitSites or {}) do
+		local dx, dy = site[1] - x, site[2] - y
+		if dx * dx + dy * dy < 60 * 60 then CM.splitWatch[k] = { site[1], site[2], ticks } end
+	end
+end
+
 function CM.sweepSplits()
 	for k, w in pairs(CM.splitWatch) do
 		if ticks - w[3] > CM.SPLIT_SETTLE then
@@ -2294,7 +2305,13 @@ function CM.sweepSplits()
 			if not nid then
 				CM.splitWatch[k] = nil                       -- already gone
 			elseif n ~= 2 then
-				CM.splitWatch[k] = nil                       -- in use: this is a real junction
+				-- In use today. But the construction it serves can be demolished
+				-- later, and on this instance nothing owns the split -- keep the
+				-- site, and re-arm the watch whenever something near it is
+				-- demolished (review, 2026-08-31: the sweep forgot it forever).
+				CM.splitSites = CM.splitSites or {}
+				CM.splitSites[k] = { w[1], w[2] }
+				CM.splitWatch[k] = nil
 			else
 				CM.splitWatch[k] = nil
 				CM.healNodeAt(w[1], w[2], "orphaned split")
@@ -2350,6 +2367,7 @@ local function execDemolish(c)
 			else unlocked = "skipped(noCON)" end
 		end
 		local dok, derr = pcall(game.interface.bulldoze, best)
+		CM.rearmSplitsNear(c.x, c.y)
 		log(string.format("EXEC DEMOLISH seq=%s origin=%s at=%s id=%d success=%s",
 			tostring(c.seq), tostring(c.origin), tostring(c.at), best, tostring(dok)))
 		CM.cmLog(string.format("CM: DEMOLISH seq=%s id=%d owner=%s unlock=%s bulldoze ok=%s err=%s",
@@ -2636,7 +2654,7 @@ local function pollLineKeys()
 	if not now then return end
 	local fresh = {}
 	for _, lid in ipairs(allLines()) do if not knownLines[lid] then fresh[#fresh + 1] = lid end end
-	-- K.PEER FIRST, matched by CONTENT: a replayed line is the fresh one whose
+	-- PEER FIRST, matched by CONTENT: a replayed line is the fresh one whose
 	-- stops signature equals the LCREATE we replayed. This is the discriminator
 	-- the vehicle path gets from the depot -- without it, a line created
 	-- locally on the same instance that is also replaying a peer's line could
@@ -2806,7 +2824,10 @@ local function execSetColor(c)
 end
 
 local function execVehCmd(c)
-	if c.origin == K.INSTANCE and not K.STRICT_OPS[c.op] then
+	-- Strict ops replay on the originator ONLY if the slice actually cancelled
+	-- the local command (armed=1). A Reverse left to run natively and then
+	-- replayed is a toggle applied twice.
+	if c.origin == K.INSTANCE and (not K.STRICT_OPS[c.op] or tonumber(c.armed or 1) == 0) then
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
 		return
 	end
@@ -4201,7 +4222,9 @@ local function decodeCmd(line)
 	if p then c.params = p; head = line:gsub("%s*params=.*$", "") end
 	for k, v in head:gmatch("(%w+)=([^%s]+)") do
 		if c[k] == nil then
-			local n = tonumber(v)
+			-- A name is text even when it looks like a number: a line called
+			-- "007" arrived as 7, "1e3" as 1000 (review, 2026-08-31).
+			local n = (k ~= "name") and tonumber(v) or nil
 			c[k] = (n ~= nil) and n or v
 		end
 	end
@@ -5408,6 +5431,7 @@ local function pollConstructionRemovals()
 						else
 							consByKey[key] = nil
 							if x and y then
+								CM.rearmSplitsNear(x, y)
 								scheduleLocal("DEMOLISH", { x = x, y = y })
 								log(string.format("con: DEMOLISH captured at %.1f,%.1f (%s)", x, y, tostring(rec.file)))
 							else
@@ -5614,7 +5638,12 @@ local function pollInject()
 			-- line. Outside it, the first dropped capture abandoned every line
 			-- after it in the same read -- a diagnostic queued behind a build
 			-- never ran (review, 2026-08-31).
-			if not peerSeen and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" then
+			-- The slice says, per capture, whether it cancelled the local build.
+			if o == "ARMED" then CM.lastArmed = tonumber(w[2]) or 0; return end
+			-- A capture whose local build was CANCELLED must always be replayed,
+			-- peer or no peer -- dropping it deletes the player's own work.
+			if not peerSeen and (CM.lastArmed or 0) == 0
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" then
 				CM.soloDrop(line)
 				return
 			end
@@ -5927,6 +5956,9 @@ local function pollInject()
 						else
 							log("ROADP plan pass failed (" .. tostring(xv) .. ") -- peers will derive their own")
 						end
+						-- Not cancelled here (no live session at the time): the engine
+						-- built it natively, so this instance must not replay it.
+						if (CM.lastArmed or 1) == 0 then sargs.skipOrigin = 1 end
 						scheduleLocal("ROADP", sargs)
 					else
 						log("inject: ROADE produced no usable edges: " .. line:sub(1, 70))
@@ -6206,10 +6238,14 @@ local function pollInject()
 							if consByKey[ck] then key, kind = ck, "con" end
 						end
 					end
-					-- last resort for a vehicle or line that came out of the save
-					if not key then
-						key = vehKeyFor(id)
-						if key then kind = "veh" end
+					-- a vehicle or line that came out of the save: primed, not registered.
+					-- Lines first -- forgetVehicle does not clear primedVeh, so a stale
+					-- vehicle id could otherwise shadow a live line (review, 2026-08-31).
+					if not key and primedLines[id] then
+						key = lineKeyFor(id); if key then kind = "line" end
+					end
+					if not key and primedVeh[id] then
+						key = vehKeyFor(id); if key then kind = "veh" end
 					end
 				end
 				if key then
@@ -6231,7 +6267,7 @@ local function pollInject()
 				local k = id and vehKeyFor(id)
 				if k then
 					log("VREV: " .. k)
-					scheduleLocal("VREV", { key = k, skipOrigin = 1 })
+					scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
 				end
 
 			elseif o == "VDEPOT" and #w >= 3 then
@@ -6398,7 +6434,7 @@ CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 -- player wins: the pacer adopts it as the new normal and stops chasing. Second,
 -- a change of ours starts a cooldown, so the controller can never flap faster
 -- than a person can react to what it did.
-CM.PACE_COOLDOWN = 180        -- ticks (~3 s) between changes we make
+CM.PACE_COOLDOWN = 16         -- ticks between changes we make: a tick is ~0.19 s, so ~3 s
 
 function CM.setSpeed(v, why)
 	CM.lastSetSpeed = v
@@ -6419,7 +6455,17 @@ function CM.pace(ahead)
 	local s
 	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
 	if s == 0 then                                   -- player paused on purpose
+		-- If we were mid-catch-up, the game will come back at OUR 2, not the
+		-- player's speed; remember to hand it back the moment it does.
+		if CM.catchingUp then CM.restoreAfterPause = CM.baseSpeed or 1 end
 		CM.catchingUp = false
+		CM.lastSetSpeed = nil
+		return
+	end
+	if CM.restoreAfterPause then
+		local back = CM.restoreAfterPause
+		CM.restoreAfterPause = nil
+		CM.setSpeed(back, "player's speed restored after their pause")
 		return
 	end
 	-- setGameSpeed is a COMMAND: the engine applies it a tick or more after we
@@ -6430,7 +6476,7 @@ function CM.pace(ahead)
 	-- to land, or after a grace period in case it never does (review,
 	-- 2026-08-31).
 	if CM.lastSetSpeed and s == CM.lastSetSpeed then CM.paceApplied = true end
-	local settled = CM.paceApplied or (ticks > (CM.paceSetTick or 0) + 20)
+	local settled = CM.paceApplied or (ticks > (CM.paceSetTick or 0) + 8)   -- ~1.5 s
 	-- The player moved the lever: that is now the speed they want. Adopt it,
 	-- stop any catch-up in progress, and do not argue.
 	if CM.lastSetSpeed and settled and s ~= CM.lastSetSpeed then

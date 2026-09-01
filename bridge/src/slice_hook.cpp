@@ -925,7 +925,12 @@ static bool GroundTruthSample(uint64_t a2, uint64_t a3)
 static bool CfgHas(const char* key)
 {
     FILE* f = OpenCfg();
-    if (!f) return false;
+    // No cfg = the shipped defaults. ReadCfg already treats a missing file as
+    // suppress=1; the switches here must agree, or a joiner with no cfg gets
+    // suppress=1 but cancel_vehicle=0 -- its Reverse runs natively AND the Lua,
+    // which hard-codes VREV as strict, replays it on top: a toggle applied twice
+    // (review, 2026-08-31).
+    if (!f) return strcmp(key, "cancel_vehicle") == 0 || strcmp(key, "merge") == 0;
     char line[128], want[64]; bool on = false;
     snprintf(want, sizeof(want), "%s=1", key);
     while (fgets(line, sizeof(line), f)) {
@@ -1334,6 +1339,25 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
 // builds the config for both lines with one function. Optimistic like the other
 // vehicle commands: the UI waits for the replacement's result entity, so this is
 // never cancelled and the originator skips its own replay.
+// Written just before a capture: was the local build CANCELLED (1), so the
+// originator must replay it at the stamp, or left to run natively (0), so the
+// originator must NOT replay it. The Lua used to infer this from its own
+// peer-seen flag while the slice decided from the status file; the two could
+// disagree for a few seconds after a join, and the originator then built the
+// road natively AND replayed it (review, 2026-08-31). One decision, written
+// down, read by both halves.
+static void WriteArmed(bool armed)
+{
+    ReadInstance();
+    if (!g_instance[0]) return;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) return;
+    fprintf(f, "ARMED %d\n", armed ? 1 : 0);
+    fclose(f);
+}
+
 static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
 {
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
@@ -1415,7 +1439,7 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             char enc[768]; size_t o = 0;
             for (size_t i = 0; name[i] && o + 4 < sizeof(enc); i++) {
                 unsigned char ch = (unsigned char)name[i];
-                if (ch > 32 && ch < 127 && ch != '%') enc[o++] = (char)ch;
+                if (ch > 32 && ch < 127 && ch != '%' && ch != '=') enc[o++] = (char)ch;
                 else { sprintf(enc + o, "%%%02X", ch); o += 3; }
             }
             enc[o] = 0;
@@ -1461,6 +1485,7 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
                 f.name, (unsigned long long)caller);
         } else {
+            WriteArmed(cancel && SessionLive());
             __try { WriteInjectVehicleCmd(f.id, r8, r9, st[0]); }
             __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] %s decode fault -- not shipped\n", f.name); }
         }
@@ -2171,6 +2196,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // a new one, and a removal the peer cannot match now SKIPS the whole
             // command. Flip it once upgrades have proven the matcher.
             int shipRe = isUpgrade ? re : 0;
+            const bool live = SessionLive();
+            WriteArmed(live);
             WriteInject(nodes, n, edges, m, nullptr, 0, rmEdges, shipRe, et);
             if (isUpgrade && re > m)
                 Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
@@ -2181,7 +2208,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // callback is fired there like the build tool's (g_pendingNoCb stays
             // 0: this tool waits on the callback, so swallowing it would wedge
             // the upgrade cursor for the rest of the session).
-            if (SessionLive()) InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+            if (live) InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
             else Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
         } else {
             Log("[slice]   suppress=0: observe-only, build proceeds normally "
