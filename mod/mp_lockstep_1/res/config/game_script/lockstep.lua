@@ -839,7 +839,10 @@ local function worldHash(now)
 				-- where -- ids differ between instances and always will
 				vpos[#vpos + 1] = string.format("%.0f,%.0f,%.0f",
 					p[1] or p.x or 0, p[2] or p.y or 0, p[3] or p.z or 0)
-				raw[#raw + 1] = { p[1] or p.x or 0, p[2] or p.y or 0 }
+				-- quantised exactly as it ships (0.1 m), so a peer's copy of an
+				-- identical world compares at 0.00 and not at the rounding floor
+				-- (measured 0.04-0.05 m before this)
+				raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10 }
 			end
 		end
 		-- the raw positions feed the drift METRIC (CM.vposShip / CM.vposCompare):
