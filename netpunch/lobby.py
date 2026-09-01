@@ -249,9 +249,116 @@ def redact(text):
     return _IPV4_RE.sub(mask, str(text))
 
 
+_log_sinks = []       # callables(line): the log forwarder taps every line
+
+
 def _log(msg):
-    """Diagnostics go to stderr; stdout is reserved for the single CODE= line."""
-    print(redact(msg), file=sys.stderr, flush=True)
+    """Diagnostics go to stderr; stdout is reserved for the single CODE= line.
+    Every line is also offered to the registered sinks (see LogForwarder), so a
+    joiner's lobby/mesh/relay diagnostics reach the host's merged log."""
+    line = redact(msg)
+    print(line, file=sys.stderr, flush=True)
+    for sink in list(_log_sinks):
+        try:
+            sink(line)
+        except Exception:          # noqa: BLE001 -- logging must never raise
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Log forwarding: every joiner ships its log lines to the host, which merges
+# them (tagged per peer) into <io-dir>/lobby_peers.log. Extra files can be
+# tailed with --forward-log PATH (e.g. the bridge log) and ride the same way.
+# --------------------------------------------------------------------------- #
+PEERS_LOG_NAME = "lobby_peers.log"
+LOG_BATCH_BYTES = 1000     # keep a 'log' message under one datagram
+LOG_LINE_MAX = 240
+LOG_FLUSH_INTERVAL = 0.5
+LOG_QUEUE_MAX = 2000       # oldest lines are dropped beyond this (never blocks)
+
+
+class LogForwarder:
+    """Collects log lines (own + tailed files) for shipping in small batches."""
+
+    def __init__(self, tail_paths=()):
+        self.q = collections.deque(maxlen=LOG_QUEUE_MAX)
+        self.tails = []                          # [path, tag, offset]
+        for path in tail_paths:
+            self.tails.append([path, os.path.basename(path), None])
+        self.last_flush = 0.0
+        self.dropped = 0
+        self._lock = threading.Lock()
+
+    def add(self, line, tag=None):
+        if tag:
+            line = f"[{tag}] {line}"
+        if len(line) > LOG_LINE_MAX:
+            line = line[:LOG_LINE_MAX - 3] + "..."
+        with self._lock:
+            if len(self.q) == self.q.maxlen:
+                self.dropped += 1
+            self.q.append(line)
+
+    def poll_tails(self):
+        """Read whatever appended to each tailed file since last time."""
+        for t in self.tails:
+            path, tag, off = t
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if off is None:
+                t[2] = size                       # start at the end: new lines only
+                continue
+            if size < off:
+                t[2] = 0                          # truncated/rotated: restart
+                off = 0
+            if size == off:
+                continue
+            try:
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    data = f.read(min(size - off, 64 * 1024))
+            except OSError:
+                continue
+            t[2] = off + len(data)
+            for raw in data.splitlines():
+                line = raw.decode("utf-8", "replace").rstrip()
+                if line:
+                    self.add(line, tag)
+
+    def drain(self, now):
+        """A batch of lines to send now, or [] (rate-limited, size-capped)."""
+        if now - self.last_flush < LOG_FLUSH_INTERVAL:
+            return []
+        self.last_flush = now
+        out, size = [], 0
+        with self._lock:
+            if self.dropped:
+                out.append(f"[log] {self.dropped} lines dropped (queue full)")
+                self.dropped = 0
+            while self.q and size + len(self.q[0]) + 4 <= LOG_BATCH_BYTES:
+                line = self.q.popleft()
+                out.append(line)
+                size += len(line) + 4
+        return out
+
+
+class PeersLog:
+    """The host's merged log: one file, every line tagged with who logged it."""
+
+    def __init__(self, directory):
+        self.path = os.path.join(directory, PEERS_LOG_NAME)
+        self._lock = threading.Lock()
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("# merged lobby log, started " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+
+    def write(self, who, lines):
+        stamp = time.strftime("%H:%M:%S")
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(stamp + " [" + who + "] " + line + "\n")
 
 
 def _dedupe(name, taken):
@@ -1051,7 +1158,7 @@ def _clear_stale_incoming(directory, log=_log):
 # HOST: single socket, N peers, authority for roster + chat relay
 # --------------------------------------------------------------------------- #
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
-             log=_log, relay=None):
+             log=_log, relay=None, forward_logs=()):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``sock`` is a bound UDP socket (the observe/game socket for the real CLI, a
@@ -1076,6 +1183,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     if code:
         io.emit({"type": "code", "code": code})
+
+    # merged log: our own lines + every joiner's, tagged; extra files tailed
+    peers_log = PeersLog(io.dir)
+    own_fwd = LogForwarder(forward_logs)
+    _log_sinks.append(own_fwd.add)
+    log(f"[host] merged log -> {peers_log.path}")
 
     # ---- roster helpers ---------------------------------------------------- #
     def all_names(exclude_addr=None):
@@ -1252,6 +1365,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     send_roster_packets()          # let everyone re-plan relays
         elif t == "mesh_hi":
             pass                                    # names are host-assigned
+        elif t == "log":
+            if addr in peers:
+                lines = [str(x)[:LOG_LINE_MAX] for x in msg.get("lines", [])][:64]
+                if lines:
+                    peers_log.write(peers[addr]["name"], lines)
         elif t == "chat":
             if addr in peers:
                 broadcast_chat(peers[addr]["name"], str(msg.get("text", "")))
@@ -1404,6 +1522,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
 
+            own_fwd.poll_tails()
+            own_lines = own_fwd.drain(now)
+            if own_lines:
+                peers_log.write(host_name, own_lines)
+
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
             #   any FAILED -> failed status naming them, NO start, and the
@@ -1442,6 +1565,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            _log_sinks.remove(own_fwd.add)
+        except ValueError:
+            pass
         for a in list(peers):
             _send_data(sock, a, {"t": "bye"})
         io.emit({"type": "status", "state": "failed",
@@ -1460,7 +1587,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 # --------------------------------------------------------------------------- #
 def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                log=_log, receiver_cls=_ClientSaveReceiver, relay=None,
-               mesh=None, profile_code=None):
+               mesh=None, profile_code=None, forward_logs=()):
     """Participate in the lobby over a connected ``punch.Connection`` (blocks).
 
     ``receiver_cls`` is the save-receive implementation (the self-test swaps in
@@ -1491,6 +1618,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         pass
     _clear_stale_incoming(io.dir, log)      # never trust a previous session's save
     receiver = receiver_cls(conn, io, log)  # save-transfer receive side
+    fwd = LogForwarder(forward_logs)        # our log lines -> the host's merged log
+    _log_sinks.append(fwd.add)
 
     io.emit({"type": "status", "state": "connected",
              "detail": f"joined host {conn.peer_str}"})
@@ -1791,9 +1920,20 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 handle_command(cmd)
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
+            fwd.poll_tails()
+            lines = fwd.drain(now)
+            if lines:
+                send({"t": "log", "lines": lines})
     except KeyboardInterrupt:
         send({"t": "leave"})
     finally:
+        lines = fwd.drain(time.time() + LOG_FLUSH_INTERVAL)   # last words
+        if lines:
+            send({"t": "log", "lines": lines})
+        try:
+            _log_sinks.remove(fwd.add)
+        except ValueError:
+            pass
         relay_stop.set()
         if relay_thread is not None:
             relay_thread.join(timeout=1.0)  # its select() wakes within 0.2 s
@@ -1831,7 +1971,8 @@ def cmd_host(args):
     relay = _make_relay(args)               # bind early so a clash shows up now
     # observe + print the single CODE= line (reused from connect.py).
     sock, _profile, code = _observe_and_announce(args.local_port)
-    run_host(sock, args.name, io, code=code, relay=relay)
+    run_host(sock, args.name, io, code=code, relay=relay,
+             forward_logs=args.forward_log or ())
     return 0
 
 
@@ -1880,7 +2021,7 @@ def cmd_join(args):
         mesh, conn = _mesh_from_conn(conn)
         _log("[join] mesh: direct links to other joiners enabled")
     run_client(conn, args.name, io, relay=relay, mesh=mesh,
-               profile_code=profile_code)
+               profile_code=profile_code, forward_logs=args.forward_log or ())
     return 0
 
 
@@ -1998,6 +2139,20 @@ def selftest():
             print("[selftest] FAIL (a): all three not in every roster")
         else:
             print(f"[selftest] OK (a): every roster = {expected}")
+
+        # (a2) every joiner's log lines reach the host's merged log, tagged
+        merged = os.path.join(dirs["host"], PEERS_LOG_NAME)
+        def merged_has_all():
+            try:
+                txt = open(merged, encoding="utf-8").read()
+            except OSError:
+                return False
+            return all(("[" + names[k] + "] ") in txt for k in ("j1", "j2", "host"))
+        if not _wait_until(merged_has_all, timeout=8):
+            ok = False
+            print(f"[selftest] FAIL (a2): merged log lacks a peer's lines: {merged}")
+        else:
+            print("[selftest] OK (a2): host merged log has lines from bob, carol and itself")
 
         # (b) a chat from j1 must reach all three via their lobby_out.jsonl
         chat_text = "hello lobby from bob"
@@ -2827,6 +2982,11 @@ def main(argv=None):
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
+    ap.add_argument("--forward-log", action="append", default=None,
+                    metavar="PATH",
+                    help="also tail this file and ship its new lines to the "
+                         "host's merged lobby_peers.log (repeatable; e.g. the "
+                         "bridge log)")
     ap.add_argument("--no-mesh", action="store_true",
                     help="joiner: do not punch other joiners directly; keep "
                          "every frame on the host relay (the pre-mesh star)")
