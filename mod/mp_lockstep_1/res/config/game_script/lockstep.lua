@@ -439,8 +439,9 @@ end
 -- Companies mod seeds inactive companies' AI players with it). Chunked because
 -- TpF2 silently drops very large single journal amounts (mod-measured).
 CM.CM_JOURNAL_CHUNK = 10000000
-function CM.cmBookJournal(pid, amount)
+function CM.cmBookJournal(pid, amount, jtype)
 	if not pid or not amount or amount == 0 then return true end
+	jtype = jtype or K.JOURNAL_TRANSFER
 	amount = math.floor(amount + 0.5)
 	local sign = amount >= 0 and 1 or -1
 	local remaining = math.abs(amount)
@@ -449,7 +450,7 @@ function CM.cmBookJournal(pid, amount)
 	while remaining > 0 and chunks < 1000 do
 		local chunk = math.min(remaining, CM.CM_JOURNAL_CHUNK)
 		local ok, err = pcall(function()
-			local cat = api.type.JournalEntryCategory.new(); cat.type = 0
+			local cat = api.type.JournalEntryCategory.new(); cat.type = jtype
 			local entry = api.type.JournalEntry.new()
 			entry.amount = sign * chunk; entry.category = cat; entry.time = -1
 			api.cmd.sendCommand(api.cmd.make.bookJournalEntry(pid, entry, api.type.Vec3f.new(0, 0, 0)))
@@ -464,6 +465,58 @@ function CM.cmBalance(pid)
 	local bal = nil
 	pcall(function() local e = game.interface.getEntity(pid); if e and e.balance then bal = e.balance end end)
 	return bal
+end
+
+-- A replayed road/rail proposal was built as OUR player (buildContext), so our
+-- wallet paid and our player owns the new edges. The proposal result says what
+-- it cost (resultProposalData.costs -- measured present on ProposalData) and
+-- which entities it made (resultEntities). Hand the entities to the origin
+-- company and move the cost there. Constructions and vehicles settle by balance
+-- delta elsewhere; edges use the proposal's own figure, which is exact and does
+-- not care what else changed the balance meanwhile.
+function CM.cmSettleBuild(c, res, success, what)
+	if not success or not c or not c.company then return end
+	CM.cmEnsure()
+	if CM.cmMode ~= "companies" then return end
+	local cid = tonumber(c.company)
+	if not cid then return end
+	local cost = nil
+	pcall(function() cost = res and res.resultProposalData and res.resultProposalData.costs end)
+	cost = tonumber(cost)
+	local n, owned = 0, 0
+	if cid ~= CM.cmMyCompany then
+		-- resultEntities is empty for a street/track proposal (measured: a road
+		-- build returns costs=1000 but entities=0), so the new edge is found by
+		-- its endpoints instead -- the same locator the stop channel uses. Single
+		-- edges (ROAD/RAIL) carry their coords on the command; a polyline (ROADP)
+		-- is multi-segment and only its cost is settled, ownership left as-is.
+		pcall(function()
+			if (what == "ROAD" or what == "RAIL") and c.x0 and c.x1 then
+				local eid = CM.findEdgeByEnds(what == "RAIL", c.x0, c.y0, c.x1, c.y1, 2.0)
+				if eid then
+					n = 1
+					local po = nil
+					pcall(function() po = api.engine.getComponent(eid, api.type.ComponentType.PLAYER_OWNED) end)
+					if po then owned = 1; CM.cmReassignEntity(eid, cid, what) end
+				end
+			else
+				local ents = res and res.resultEntities
+				if not ents then return end
+				for i = 1, #ents do
+					local eid = ents[i]
+					if eid and eid > 0 then
+						n = n + 1
+						local po = nil
+						pcall(function() po = api.engine.getComponent(eid, api.type.ComponentType.PLAYER_OWNED) end)
+						if po then owned = owned + 1; CM.cmReassignEntity(eid, cid, what) end
+					end
+				end
+			end
+		end)
+	end
+	CM.cmLog(string.format("CM: settle %s seq=%s origin=%s co%d cost=%s entities=%d owned=%d",
+		tostring(what), tostring(c.seq), tostring(c.origin), cid, tostring(cost), n, owned))
+	if cid ~= CM.cmMyCompany and cost and cost > 0 then CM.cmTransferCost(cid, cost, what) end
 end
 
 -- Transfer `cost` from the origin company to us (refund local, charge origin).
@@ -589,6 +642,13 @@ end
 -- reference would resolve to a nil global at call time -- the groundAt bug.
 local ser, deepcopy, isPlayerConstruction
 local scheduleLocal   -- forward: called by the line registry above its definition
+-- JournalEntryCategory.type, MEASURED live (2026-09-01, EVAL probe: ten entries
+-- of 1000*2^t booked with type t): every type adds to the balance, and type 0
+-- ALSO adds to the loan. So 0 is the loan category and 6 (the constructor's
+-- default) is a plain balance movement. Cost transfers used 0 until today and
+-- were quietly changing both players' loans by the transferred amount.
+K.JOURNAL_LOAN = 0
+K.JOURNAL_TRANSFER = 6
 K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 
 local warnedNoEdges = false
@@ -865,6 +925,7 @@ local function execEdge(c)
 			function(res, success)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s success=%s",
 					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(success)))
+				pcall(CM.cmSettleBuild, c, res, success, c.op)   -- companies: owner + cost
 			end)
 	end)
 	if not ok then log("exec error: " .. tostring(err)) end
@@ -1934,6 +1995,7 @@ local function execPolyline(c, planOnly)
 
 		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), false),
 			function(res, success)
+				pcall(CM.cmSettleBuild, c, res, success, "ROADP")   -- companies: owner + cost
 				-- LEVEL-CROSSING PROBE. The engine models a crossing as its own ECS
 				-- component (RAILROAD_CROSSING, added by construction_util_engine).
 				-- Log whether the node we routed the rail through actually got it,
@@ -4232,6 +4294,45 @@ local function execConFail(c)
 	if not ok then log("execConFail error: " .. tostring(err)) end
 end
 
+-- LOAN v=<absolute loan of the origin company>. Loans are money and money is
+-- world state, but there is no slice hook for the finances window: the loan is
+-- POLLED instead (CM.pollLoan, every 15 ticks) and a change ships the new
+-- absolute value. Each peer books the difference to whichever player stands for
+-- that company here -- the origin's AI player in companies mode, the shared
+-- player in co-op -- as a loan-category journal entry, which the engine treats
+-- as taking/repaying a loan (measured: loan and balance both move). Absolute,
+-- not delta, so a lost or doubled command converges instead of compounding. The
+-- originator's own copy finds delta 0 and does nothing.
+local function execLoan(c)
+	local v = tonumber(c.v)
+	if not v then log("LOAN: no value"); return end
+	CM.cmEnsure()
+	local me = api.engine.util.getPlayer()
+	local pid = me
+	if CM.cmMode == "companies" then pid = CM.cmCompanyPid[tonumber(c.company)] end
+	if not pid then log("LOAN: no player for company " .. tostring(c.company)); return end
+	local cur = nil
+	pcall(function() cur = tonumber(game.interface.getEntity(pid).loan) end)
+	if not cur then log("LOAN: cannot read loan of pid " .. tostring(pid)); return end
+	local delta = math.floor(v - cur + 0.5)
+	if pid == me then
+		-- our own loan is about to change under us: the poll must not ship it
+		-- back as a player action. Hold two polls, then re-baseline.
+		CM.lastLoan = v
+		CM.loanHold = 2
+	end
+	if delta == 0 then
+		log(string.format("EXEC LOAN seq=%s origin=%s co%s: already %d", tostring(c.seq), tostring(c.origin), tostring(c.company), v))
+		return
+	end
+	local ok, err = CM.cmBookJournal(pid, delta, K.JOURNAL_LOAN)
+	local after = nil
+	pcall(function() after = tonumber(game.interface.getEntity(pid).loan) end)
+	log(string.format("EXEC LOAN seq=%s origin=%s co%s pid=%s: %d -> %d (delta %+d) ok=%s%s now=%s",
+		tostring(c.seq), tostring(c.origin), tostring(c.company), tostring(pid), cur, v, delta,
+		tostring(ok), err and (" " .. tostring(err)) or "", tostring(after)))
+end
+
 local function execute(c)
 	if c.op == "CONP" or c.op == "CONX" then execConX(c)
 	elseif c.op == "CONU" then execConU(c)
@@ -4248,6 +4349,7 @@ local function execute(c)
 	elseif c.op == "VNAME" then execSetName(c)
 	elseif c.op == "VCOLOR" then execSetColor(c)
 	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then execLine(c)
+	elseif c.op == "LOAN" then execLoan(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
 
@@ -5446,6 +5548,30 @@ local function isPlayerStop(eo)
 	if not st and not sg then return false end
 	pcall(function() po = api.engine.getComponent(eo, api.type.ComponentType.PLAYER_OWNED) end)
 	return po ~= nil
+end
+
+-- Own loan, every 15 ticks. The first reading is the baseline (a loaded save's
+-- loan is known, not new); any later change is the player at the finances
+-- window and ships as LOAN. A change WE applied from a peer's LOAN is held out
+-- by execLoan (loanHold) so it is re-baselined, not echoed.
+function CM.pollLoan()
+	local ok, err = pcall(function()
+		local e = game.interface.getEntity(api.engine.util.getPlayer())
+		local v = e and tonumber(e.loan)
+		if not v then return end
+		if (CM.loanHold or 0) > 0 then
+			CM.loanHold = CM.loanHold - 1
+			if CM.loanHold == 0 then CM.lastLoan = v end
+			return
+		end
+		if CM.lastLoan == nil then CM.lastLoan = v; return end
+		if v ~= CM.lastLoan then
+			log(string.format("loan: %d -> %d (player) -> LOAN", CM.lastLoan, v))
+			CM.lastLoan = v
+			scheduleLocal("LOAN", { v = v })
+		end
+	end)
+	if not ok then log("loan poll error: " .. tostring(err)) end
 end
 
 function CM.pollStops()
@@ -7152,6 +7278,7 @@ function data()
 			pollInject()
 			if ticks % K.CON_POLL_EVERY == 0 then pollNewConstructions() end
 			if ticks % K.CON_POLL_EVERY == 3 then CM.pollStops() end
+			if ticks % 15 == 7 then CM.pollLoan() end
 			flushConPairs()
 			buytestPoll()
 			primeConstructions()
