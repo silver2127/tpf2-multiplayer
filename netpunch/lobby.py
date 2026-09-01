@@ -2027,7 +2027,13 @@ def cmd_host(args):
     # nobody else can read or inject; --password layers on top of it.
     secret = os.urandom(SECRET_LEN)
     SEAL[0] = Sealer(derive_key(secret, args.password or ""))
-    sock, _profile, code = _observe_and_announce(args.local_port, secret=secret)
+    sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
+                                                 password=args.password or None)
+    if args.password:
+        _log("[host] the code is LOCKED: without the password it reveals nothing")
+    else:
+        _log("[host] the code is plain: anyone who sees it can read your address "
+             "-- set a password to lock it")
     _log("[host] frames are sealed (session key from the code"
          + (" + password)" if args.password else ")"))
     try:
@@ -2048,7 +2054,7 @@ def cmd_join(args):
     io.emit({"type": "status", "state": "waiting", "detail": "dialing host"})
     io.write_state(state="waiting")
     try:
-        peer = decode_code(args.code)
+        peer = decode_code(args.code, password=args.password or None)
     except ValueError as e:
         io.emit({"type": "status", "state": "failed", "detail": f"bad code: {e}"})
         io.write_state(state="failed")

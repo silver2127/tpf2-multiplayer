@@ -10,10 +10,19 @@ read chat/game traffic or inject lockstep commands.
   lobby code (`connect.encode_profile(..., secret=)`, flag 0x80). Everyone who
   has the code derives the same key (`seal.derive_key`). The code is therefore
   the credential: share it privately.
-- **Optional password.** Typed in the menu's PASSWORD field (host and every
-  joiner must match) or `--password` on the CLI; mixed into the key. A joiner
-  with the wrong password gets a plain "wrong password" reject from the host
-  (the only plaintext the sealed session accepts).
+- **Optional password, and it LOCKS the code.** Typed in the menu's PASSWORD
+  field (host and every joiner must match) or `--password` on the CLI. It is
+  mixed into the session key, and the code itself is encrypted under
+  PBKDF2-HMAC-SHA256 (600k iterations, ~0.15 s) + HMAC: `0xFF | ts | ct | tag`.
+  A locked code reveals only that it is a code and when it was made; the
+  address and the session secret are inside the ciphertext. A joiner with the
+  wrong password is told so (the only plaintext a sealed session accepts).
+  **Limit, stated plainly:** if the password is posted in the same channel as
+  the code, anyone reading the channel can decode it -- the lock is friction
+  (pair code with password, run the slow KDF per guess), not a wall. The only
+  ways a code carries nothing doxxable are a non-public address (a tailnet
+  or VPN) or a rendezvous service that forgets the address after the session;
+  both were considered and deliberately not built for now.
 - **Every DATA frame sealed** (`seal.py`, stdlib only): NP1 type 'E' =
   nonce(8) + ciphertext + HMAC tag(16); SHA256-CTR keystream, encrypt-then-MAC
   with separate sub-keys, per-sender 64-frame replay window. Applies to the

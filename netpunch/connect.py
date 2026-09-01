@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -50,6 +52,56 @@ from observe import observe
 
 STATUS_FILE = "netpunch_status.txt"
 CODE_TTL = 600          # seconds; codes older than this warn "stale"
+
+# Locked codes. A plain code IS the host's address, so a chat channel full of
+# old codes is a list of IPs. With a password the whole body (candidates +
+# session secret) is encrypted under a slow key derivation and authenticated:
+#   code = 0xFF | ts(4) | ciphertext | tag(16)
+#   key  = PBKDF2-HMAC-SHA256(password, "tpf2mp-code|" + ts, LOCK_ITERS)
+# Without the password an old code reveals only that it is a code and when it
+# was made. The slow KDF (~0.2 s) makes offline guessing of a decent password
+# impractical; a 4-digit PIN is still crackable in under an hour -- say so.
+LOCK_MAGIC = 0xFF
+LOCK_ITERS = 600_000
+LOCK_TAG = 16
+
+
+class LockedCode(ValueError):
+    """The code is locked and no/incorrect password was given."""
+
+
+def _lock_key(password, ts):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               b"tpf2mp-code|" + struct.pack("!I", ts), LOCK_ITERS)
+
+
+def _lock_stream(key, n):
+    out = bytearray(); i = 0
+    while len(out) < n:
+        out += hashlib.sha256(key + b"|ks|" + struct.pack("!I", i)).digest(); i += 1
+    return bytes(out[:n])
+
+
+def _lock(body, ts, password):
+    key = _lock_key(password, ts)
+    ct = bytes(a ^ b for a, b in zip(body, _lock_stream(key, len(body))))
+    tag = hmac.new(key, struct.pack("!I", ts) + ct, hashlib.sha256).digest()[:LOCK_TAG]
+    return bytes([LOCK_MAGIC]) + struct.pack("!I", ts) + ct + tag
+
+
+def _unlock(blob, password):
+    if len(blob) < 1 + 4 + LOCK_TAG:
+        raise ValueError("locked code too short")
+    ts = struct.unpack("!I", blob[1:5])[0]
+    ct, tag = blob[5:-LOCK_TAG], blob[-LOCK_TAG:]
+    if not password:
+        raise LockedCode("this code is locked -- enter the lobby password")
+    key = _lock_key(password, ts)
+    want = hmac.new(key, struct.pack("!I", ts) + ct, hashlib.sha256).digest()[:LOCK_TAG]
+    if not hmac.compare_digest(want, tag):
+        raise LockedCode("wrong password for this code")
+    body = bytes(a ^ b for a, b in zip(ct, _lock_stream(key, len(ct))))
+    return body, ts
 DEFAULT_TIMEOUT = 40    # seconds to keep punching before giving up
 
 # byte-0 bit flags
@@ -93,7 +145,7 @@ def parse_hostport(s):
 # --------------------------------------------------------------------------- #
 # code encode / decode
 # --------------------------------------------------------------------------- #
-def encode_profile(profile, secret=None):
+def encode_profile(profile, secret=None, password=None):
     """Serialize a profile dict (from observe) to a short base32 code.
     ``secret`` (12 bytes) makes the code also carry the session key material:
     everyone who has the code can seal frames; nobody else can read or inject."""
@@ -136,11 +188,15 @@ def encode_profile(profile, secret=None):
             raise ValueError("secret must be 12 bytes")
         b0 |= _P_SEC
         body += bytes(secret)
-    blob = bytes([b0]) + struct.pack("!I", int(time.time())) + body
+    ts = int(time.time())
+    if password:
+        blob = _lock(bytes([b0]) + body, ts, password)
+    else:
+        blob = bytes([b0]) + struct.pack("!I", ts) + body
     return base64.b32encode(blob).decode("ascii").rstrip("=")
 
 
-def decode_code(code):
+def decode_code(code, password=None):
     """base32 code -> profile-like dict with candidates, flags, ts, age, stale.
 
     Raises ValueError on a malformed code.
@@ -154,6 +210,10 @@ def decode_code(code):
     if len(blob) < 5:
         raise ValueError("code too short")
 
+    locked = blob[0] == LOCK_MAGIC
+    if locked:
+        body, ts = _unlock(blob, password)      # raises LockedCode
+        blob = bytes([body[0]]) + struct.pack("!I", ts) + body[1:]
     b0 = blob[0]
     ts = struct.unpack("!I", blob[1:5])[0]
     off = 5
@@ -188,6 +248,7 @@ def decode_code(code):
     age = int(time.time()) - ts
     return {
         "secret": secret,
+        "locked": locked,
         "candidates": {"lan_v4": lan, "public_v4": pub, "v6": v6},
         "flags": {
             "open": bool(b0 & _F_OPEN),
@@ -309,14 +370,14 @@ def race(sock_v4, peer, role, local_port, timeout, my_has_v6):
 # --------------------------------------------------------------------------- #
 # host / join commands
 # --------------------------------------------------------------------------- #
-def _observe_and_announce(local_port, secret=None):
+def _observe_and_announce(local_port, secret=None, password=None):
     """Observe on a fresh game socket, print our CODE= line, return (sock, profile, code).
     ``secret`` (12 bytes) is embedded in the code so every member derives the
     session key (seal.py)."""
     sock_v4 = open_socket(local_port, socket.AF_INET)
     profile = observe(local_port=local_port, sock=sock_v4, do_upnp=True,
                       keep_upnp=True)
-    code = encode_profile(profile, secret=secret)
+    code = encode_profile(profile, secret=secret, password=password)
     log(f"[observe] flags={profile['flags']} "
         f"candidates={profile['candidates']} "
         f"stun_elapsed_ms={profile['stun']['elapsed_ms']} "

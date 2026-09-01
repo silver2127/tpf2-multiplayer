@@ -672,7 +672,7 @@ static void drawBtn(HDC dc, int x, int y, int w, int h, const wchar_t* label, in
 #define MW_TEXT   RGB(255, 255, 255)
 #define MW_DIM    RGB(190, 205, 218)
 #define MW_YOU    RGB(150, 210, 170)
-static char g_joinCode[128] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
+static char g_joinCode[256] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
 static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
 
 static void mwButton(int x, int y, int w, int h, const wchar_t* label, int id)
@@ -789,7 +789,7 @@ static void RenderPanelLayer(int w, int h)
         mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
-        mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD (optional -- everyone must enter the same one)");
+        mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD  --  locks the code: without it, anyone who sees the code can read your address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
           mwField(pad, cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
         mwStatus(w, h);
@@ -1056,7 +1056,7 @@ static void OnHit(int id)
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
     case 8: {   // code field: focus; if empty, paste the clipboard
         InterlockedExchange(&g_joinFocus, 1);
-        if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 120; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
+        if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 9: break;   // chat field is always focused in the lobby
     }
@@ -1924,7 +1924,7 @@ static void StartLobby(int join)
         // so refuse anything else: a crafted "code" from Discord must never be
         // able to smuggle extra arguments (e.g. --forward-log <any file>) in.
         { int k = 0; for (; a->code[k]; k++) { char c = a->code[k]; if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7') || c == '=')) break; }
-          if (a->code[k] || k > 120) { SetStatus("That is not a valid code (letters A-Z and digits 2-7 only)."); free(a); return; } }
+          if (a->code[k] || k > 200) { SetStatus("That is not a valid code (letters A-Z and digits 2-7 only)."); free(a); return; } }
         int L = (int)strlen(s); while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\r' || s[L-1] == '\n' || s[L-1] == '\t')) s[--L] = 0;
     }
     // A previous lobby.py still up (LEAVE not pressed, or a tail thread still
@@ -2023,8 +2023,8 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
             if (vk == VK_BACK) { if (g_joinLen > 0) { g_joinCode[--g_joinLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
             else if (vk == VK_RETURN) { InterlockedExchange(&g_joinFocus, 0); OnHit(3); }
-            else if (ctrl && vk == 'V') { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = g_joinLen; for (int i = 0; buf[i] && j < 120; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; InterlockedExchange(&g_panelDirty, 1); } }
-            else { char c = vkToChar((int)vk, shift); if (c && c > 32 && g_joinLen < 120) { g_joinCode[g_joinLen++] = c; g_joinCode[g_joinLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+            else if (ctrl && vk == 'V') { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = g_joinLen; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; InterlockedExchange(&g_panelDirty, 1); } }
+            else { char c = vkToChar((int)vk, shift); if (c && c > 32 && g_joinLen < 200) { g_joinCode[g_joinLen++] = c; g_joinCode[g_joinLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
         }
         else if (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
