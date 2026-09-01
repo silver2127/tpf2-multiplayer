@@ -646,7 +646,7 @@ local function worldHash(now)
 		for eo, _ in pairs(m) do
 			local st, sg, po
 			pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
-			pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL) end)
+			pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL_LIST) end)
 			pcall(function() po = api.engine.getComponent(eo, api.type.ComponentType.PLAYER_OWNED) end)
 			if (st or sg) and po then
 				local mil = api.engine.getComponent(eo, api.type.ComponentType.MODEL_INSTANCE_LIST)
@@ -5328,25 +5328,16 @@ local function describeStop(eo, eid)
 		d.name = nm and nm.name or ""
 		local st, sg
 		pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
-		pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL) end)
+		pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL_LIST) end)
 		if st then
 			d.kind = st.cargo and 0 or 1
 		elseif sg then
 			d.kind = 2
-			-- SignalType: SIGNAL=0, WAYPOINT=2; 1 is the one-way signal. The
-			-- raw fields are logged on first sight so the schema can be checked
-			-- against a real one rather than assumed.
-			pcall(function() d.stype = sg.type end)
+			-- SIGNAL_LIST carries one signal per edge object. Measured on a live
+			-- pair (2026-08-31): signals[1].type is 0 for a normal signal and 1
+			-- for a one-way one (SignalType: SIGNAL=0, WAYPOINT=2).
+			pcall(function() d.stype = sg.signals[1].type end)
 			d.oneWay = (tonumber(d.stype) == 1)
-			if not CM.signalSchemaLogged then
-				CM.signalSchemaLogged = true
-				local fs = {}
-				for _, k in ipairs({ "type", "oneWay", "left", "state", "edgePr", "signalType" }) do
-					local okk, v = pcall(function() return sg[k] end)
-					if okk and v ~= nil then fs[#fs + 1] = k .. "=" .. tostring(v) end
-				end
-				log("signals: SIGNAL component fields on eo " .. eo .. ": " .. table.concat(fs, " "))
-			end
 		else
 			d.kind = 1
 		end
@@ -5367,7 +5358,7 @@ end
 local function isPlayerStop(eo)
 	local st, sg, po
 	pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
-	pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL) end)
+	pcall(function() sg = api.engine.getComponent(eo, api.type.ComponentType.SIGNAL_LIST) end)
 	if not st and not sg then return false end
 	pcall(function() po = api.engine.getComponent(eo, api.type.ComponentType.PLAYER_OWNED) end)
 	return po ~= nil
@@ -5567,6 +5558,17 @@ function CM.execStopAdd(c)
 				log(string.format("STOPADD seq=%s: a stop already stands at %.1f,%.1f -- nothing to do", tostring(c.seq), c.x, c.y))
 				return
 			end
+		end
+		-- TWO OBJECTS ON ONE EDGE is not yet understood. With the kinds right the
+		-- engine still asserts in StreetGeometry::CreateLanes
+		-- (edgeObjects[0].second == -1) on a second object, and one form of that
+		-- assert was fatal. Refuse loudly until the rule is read out of the
+		-- decompile: a stop the peer lacks is a visible c-lane difference, a
+		-- crashed game is not.
+		if #stops > 0 then
+			log(string.format("STOPADD seq=%s: edge %d already carries %d object(s) -- a second is NOT supported yet, skipped (DIVERGENCE)",
+				tostring(c.seq), eid, #stops))
+			return
 		end
 		stops[#stops + 1] = { u = u, left = left, model = unescName(c.model), name = unescName(c.name), x = c.x, y = c.y,
 			kind = tonumber(c.kind) or 1, oneWay = tonumber(c.oneWay) == 1 }
