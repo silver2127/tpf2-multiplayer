@@ -13,6 +13,8 @@
 // 20-byte (0x14) steal is a safe trampoline.
 #include <share.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -80,6 +82,40 @@ static wchar_t g_dataDirW[MAX_PATH] = L"";   // runtime data dir shared with the
 // machine can both run.
 static const int GAME_RELAY_PORT_HOST = 7773;
 static const int GAME_RELAY_PORT_JOIN = 7774;
+// The relay port this instance actually uses. The host's is fixed (7773). A
+// joiner's used to be fixed too (7774), which is fine for one joiner per
+// machine and silently mutes the second: Sandboxie does not virtualise the
+// network stack, so two boxed joiners on one PC both tried to bind 7774 and the
+// loser's lobby ran without a relay. Now a joiner takes the first free port
+// from 7774 upward, decided once when the lobby is launched, and the bridge
+// ctl is written with that same number (2026-09-01, three-instance test rig).
+static int g_relayPort = 0;
+static bool udpPortInUse(int port)
+{
+    ULONG sz = 0;
+    if (GetUdpTable(nullptr, &sz, FALSE) != ERROR_INSUFFICIENT_BUFFER || sz == 0) return false;
+    MIB_UDPTABLE* t = (MIB_UDPTABLE*)malloc(sz);
+    if (!t) return false;
+    bool used = false;
+    if (GetUdpTable(t, &sz, FALSE) == NO_ERROR) {
+        for (DWORD i = 0; i < t->dwNumEntries; i++)
+            if ((int)((((t->table[i].dwLocalPort) & 0xff) << 8) | ((t->table[i].dwLocalPort >> 8) & 0xff)) == port) { used = true; break; }
+    }
+    free(t);
+    return used;
+}
+static int pickRelayPort(bool join)
+{
+    if (!join) return GAME_RELAY_PORT_HOST;
+    for (int p = GAME_RELAY_PORT_JOIN; p < GAME_RELAY_PORT_JOIN + 32; p++)
+        if (!udpPortInUse(p)) return p;
+    return GAME_RELAY_PORT_JOIN;
+}
+static int relayPortFor(bool isHost)
+{
+    if (g_relayPort) return g_relayPort;
+    return isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN;
+}
 static const int BRIDGE_PORT_DEFAULT  = 7771;   // if tpf2_instance.txt has no port= line
 
 // Directory holding this dll (trailing backslash). Logs + siblings live here.
@@ -1525,7 +1561,7 @@ static void writeBridgeCtl(bool isHost)
         letter = (char)('b' + idx);
     }
     snprintf(content, sizeof(content), "instance=%c\npeer=127.0.0.1:%d\npid=%lu\n",
-             letter, isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN, bpid);
+             letter, relayPortFor(isHost), bpid);
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%stpf2_bridge_ctl.txt", g_dataDirW);
@@ -1540,7 +1576,7 @@ static void writeBridgeCtl(bool isHost)
     }
     strcpy_s(last, content);
     Log("[menu] bridge ctl -> %ls: instance=%c peer=127.0.0.1:%d\n",
-        path, isHost ? 'a' : 'b', isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN);
+        path, letter, relayPortFor(isHost));
 }
 
 // The origin letter each machine's bridge uses: the host is 'a', joiners take
@@ -1810,7 +1846,9 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     // from the peer are delivered to 127.0.0.1:<bridge port>. The relay port is
     // fixed by role (HOST 7773 / JOIN 7774, known at launch); the bridge port is
     // whatever the bridge reports it bound (re-read now, not cached).
-    int relayPort  = a->join ? GAME_RELAY_PORT_JOIN : GAME_RELAY_PORT_HOST;
+    int relayPort  = pickRelayPort(a->join);
+    g_relayPort = relayPort;
+    if (a->join && relayPort != GAME_RELAY_PORT_JOIN) Log("[menu] relay port %d is taken (another joiner on this machine) -> using %d\n", GAME_RELAY_PORT_JOIN, relayPort);
     int bridgePort = readBridgePort();
     // Every per-machine log rides to the host's merged lobby_peers.log: the
     // lobby's own lines go automatically; these files are tailed (new lines

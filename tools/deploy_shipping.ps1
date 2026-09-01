@@ -49,7 +49,8 @@ Put "$Repo\netpunch\dist\netpunch.exe"    (Join-Path $Game 'netpunch\netpunch.ex
 
 if ($Clean) {
     foreach ($d in @((Join-Path $env:LOCALAPPDATA 'tpf2mp\data'),
-                     "C:\Sandbox\$env:USERNAME\GameAgent\user\current\AppData\Local\tpf2mp\data")) {
+                     "C:\Sandbox\$env:USERNAME\GameAgent\user\current\AppData\Local\tpf2mp\data",
+                     "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\AppData\Local\tpf2mp\data")) {
         if (Test-Path $d) { Remove-Item "$d\*" -Recurse -Force -EA SilentlyContinue; Write-Host "[ship] cleaned $d" }
     }
 }
