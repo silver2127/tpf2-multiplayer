@@ -1907,8 +1907,32 @@ static char vkToChar(int vk, bool shift)
     return 0;
 }
 static HHOOK g_kbHook = nullptr;
+// Ctrl+Shift+D toggles the in-game Multiplayer dashboard. The dashboard lives in
+// the game's GUI Lua state, which has no key input of its own, so the toggle is
+// a one-byte file it polls: 1 = shown, 0 = hidden. The chord is not bound by the
+// game, and it is swallowed here so the game never sees it either.
+static volatile LONG g_dashShown = 1;
+static void WriteDashFlag()
+{
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2mp_dash.txt", g_dataDirW);
+    FILE* f = _wfsopen(p, L"w", _SH_DENYNO);
+    if (!f) return;
+    fputs(InterlockedCompareExchange(&g_dashShown, 0, 0) ? "1" : "0", f);
+    fclose(f);
+}
+
 static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
 {
+    if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && gameHasFocus()) {
+        KBDLLHOOKSTRUCT* k0 = (KBDLLHOOKSTRUCT*)lp;
+        if (k0->vkCode == 'D' && (GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) {
+            LONG now = InterlockedCompareExchange(&g_dashShown, 0, 0) ? 0 : 1;
+            InterlockedExchange(&g_dashShown, now);
+            WriteDashFlag();
+            Log("[menu] dashboard %s (Ctrl+Shift+D)\n", now ? "shown" : "hidden");
+            return 1;
+        }
+    }
     LONG st = InterlockedCompareExchange(&g_uiState, 0, 0);
     bool codeField = st == 1 && InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0;
     bool chatField = st == 2 && InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0;

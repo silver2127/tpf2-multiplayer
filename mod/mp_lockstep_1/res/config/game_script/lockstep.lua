@@ -7255,6 +7255,18 @@ function data()
 				local mine = (K.INSTANCE == "b") and db or da
 				-- just the verdict and the lane names; the hash detail is in the log
 				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-"))
+				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
+				-- one-byte file; no file means shown.
+				local shown = true
+				local ff = io.open(K.BASE .. "tpf2mp_dash.txt", "r")
+				if ff then
+					local v = ff:read("*l"); ff:close()
+					shown = (v ~= "0")
+				end
+				if D.shown ~= shown then
+					D.shown = shown
+					D.win:setVisible(shown, false)
+				end
 				if true then return end
 				-- Both rows come from the shared data dir. Try K.BASE first, then
 				-- every other discovery candidate, so a peer whose DLLs settled
