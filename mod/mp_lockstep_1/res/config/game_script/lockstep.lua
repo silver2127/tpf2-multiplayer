@@ -7220,12 +7220,9 @@ function data()
 						D.table:addRow({ api.gui.comp.TextView.new(D.labels[key]), ca, cb })
 					end
 					D.verdict = api.gui.comp.TextView.new("verdict: -")
-					D.events = api.gui.comp.TextView.new("")
 					local box = api.gui.layout.BoxLayout.new("VERTICAL")
 					box:addItem(D.table)
 					box:addItem(D.verdict)
-					box:addItem(api.gui.comp.TextView.new("recent"))
-					box:addItem(D.events)
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
@@ -7256,10 +7253,8 @@ function data()
 					D.cells[key].b:setText(db and db[key] or "-")
 				end
 				local mine = (K.INSTANCE == "b") and db or da
-				local v = mine and mine.verdict or "-"
-				D.verdict:setText("verdict: " .. v .. ((mine and mine.detail and mine.detail ~= "-") and ("   " .. mine.detail) or ""))
-				local evs = (K.INSTANCE == "b") and eb or ea
-				D.events:setText(evs and #evs > 0 and table.concat(evs, string.char(10)) or "(nothing notable yet)")
+				-- just the verdict and the lane names; the hash detail is in the log
+				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-"))
 				if true then return end
 				-- Both rows come from the shared data dir. Try K.BASE first, then
 				-- every other discovery candidate, so a peer whose DLLs settled
