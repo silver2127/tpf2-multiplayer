@@ -54,11 +54,11 @@ SWARM_RELAY_MAGIC = b"s"          # first byte of a host-relayed swarm envelope
 # --------------------------------------------------------------------------- #
 # Tunables
 # --------------------------------------------------------------------------- #
-PIECE_BYTES = 2 * 1024 * 1024     # 2 MB pieces: 230 MB save -> ~115 pieces, so
-                                  # the manifest hash list is ~7 KB and a piece
-                                  # is coarse enough that per-piece bookkeeping
-                                  # is cheap, fine enough to trade usefully.
 CHUNK_DATA = 1200                 # must match lobby.CHUNK_DATA (bytes per chunk)
+PIECE_CHUNKS = 1748               # chunks per piece = ~2 MB / 1200. Pieces are a
+                                  # WHOLE number of chunks so a piece boundary is
+                                  # always a chunk boundary (no chunk straddles
+                                  # two pieces); 230 MB -> ~110 pieces.
 REQUEST_PIPELINE = 4              # pieces requested-ahead per peer (each piece is
                                   # many chunks, so this is plenty of in-flight)
 REQUEST_TIMEOUT = 4.0             # re-request a piece if it hasn't completed
@@ -76,62 +76,60 @@ RELAY_BYTE_BUDGET = 8 * 1024 * 1024   # max bytes one link will pull via the hos
 class PieceManifest:
     """The fixed division of a save blob into hashed pieces.
 
-    Pieces are ``piece_bytes`` each (the last is short). Chunk ``seq`` maps to a
-    piece by ``seq * chunk // piece_bytes``; a piece owns the contiguous seq
-    range ``[first_chunk(p), first_chunk(p+1))``. The manifest is what the host
+    A piece is ``piece_chunks`` consecutive chunks (the last piece may hold
+    fewer), so every piece boundary falls exactly on a chunk boundary and no
+    chunk is ever shared between two pieces. The manifest is what the host
     advertises and what a receiver verifies against.
     """
 
-    def __init__(self, total_bytes, piece_bytes=PIECE_BYTES, chunk=CHUNK_DATA,
+    def __init__(self, total_bytes, piece_chunks=PIECE_CHUNKS, chunk=CHUNK_DATA,
                  piece_sha=None, overall_sha=None):
         self.total_bytes = int(total_bytes)
-        self.piece_bytes = int(piece_bytes)
         self.chunk = int(chunk)
+        self.piece_chunks = int(piece_chunks)
+        if self.piece_chunks < 1:
+            raise ValueError("piece_chunks must be >= 1")
         self.total_chunks = (self.total_bytes + self.chunk - 1) // self.chunk
-        self.piece_count = (self.total_bytes + self.piece_bytes - 1) // self.piece_bytes
+        self.piece_count = (self.total_chunks + self.piece_chunks - 1) // self.piece_chunks
+        self.piece_bytes = self.piece_chunks * self.chunk   # nominal (last short)
         self.piece_sha = list(piece_sha) if piece_sha else None
         self.overall_sha = overall_sha
-        # chunks per full piece (the last piece may hold fewer)
-        self.chunks_per_piece = self.piece_bytes // self.chunk
-        if self.chunks_per_piece < 1:
-            raise ValueError("piece_bytes must be >= chunk")
 
     @classmethod
-    def from_blob(cls, blob, piece_bytes=PIECE_BYTES, chunk=CHUNK_DATA):
-        m = cls(len(blob), piece_bytes, chunk)
+    def from_blob(cls, blob, piece_chunks=PIECE_CHUNKS, chunk=CHUNK_DATA):
+        m = cls(len(blob), piece_chunks, chunk)
         m.piece_sha = []
         for p in range(m.piece_count):
-            off = p * m.piece_bytes
-            m.piece_sha.append(hashlib.sha256(blob[off:off + m.piece_bytes]).hexdigest())
+            a, b = m.piece_byte_range(p)
+            m.piece_sha.append(hashlib.sha256(blob[a:b]).hexdigest())
         m.overall_sha = hashlib.sha256(blob).hexdigest()
         return m
 
-    def piece_byte_range(self, p):
-        off = p * self.piece_bytes
-        return off, min(off + self.piece_bytes, self.total_bytes)
-
     def piece_chunk_range(self, p):
         """[first_seq, last_seq) of chunks that make up piece ``p``."""
-        first = (p * self.piece_bytes) // self.chunk
-        end_byte = min((p + 1) * self.piece_bytes, self.total_bytes)
-        last = (end_byte + self.chunk - 1) // self.chunk
+        first = p * self.piece_chunks
+        last = min(first + self.piece_chunks, self.total_chunks)
         return first, last
 
+    def piece_byte_range(self, p):
+        first, last = self.piece_chunk_range(p)
+        return first * self.chunk, min(last * self.chunk, self.total_bytes)
+
     def piece_of_chunk(self, seq):
-        return (seq * self.chunk) // self.piece_bytes
+        return seq // self.piece_chunks
 
     def verify_piece(self, p, data):
         return (self.piece_sha is not None
                 and hashlib.sha256(data).hexdigest() == self.piece_sha[p])
 
     def to_meta(self):
-        return {"total_bytes": self.total_bytes, "piece_bytes": self.piece_bytes,
+        return {"total_bytes": self.total_bytes, "piece_chunks": self.piece_chunks,
                 "chunk": self.chunk, "piece_count": self.piece_count,
                 "piece_sha": self.piece_sha, "sha256": self.overall_sha}
 
     @classmethod
     def from_meta(cls, m):
-        return cls(m["total_bytes"], m["piece_bytes"], m["chunk"],
+        return cls(m["total_bytes"], m["piece_chunks"], m["chunk"],
                    piece_sha=m.get("piece_sha"), overall_sha=m.get("sha256"))
 
 
@@ -221,12 +219,16 @@ class SwarmState:
     peers to kill the tail.
     """
 
-    def __init__(self, manifest: PieceManifest):
+    def __init__(self, manifest: PieceManifest, seed_names=(), spread=0):
         self.m = manifest
         self.peer_have = {}              # name -> bytearray bitfield
         self.inflight = {}               # piece -> (peer_name, t_requested)
         self.warmup = True
         self._warmup_left = 4
+        self.seed_names = set(seed_names)   # holders to use only as a last resort
+        # per-member rotation so two leechers do not fetch the SAME pieces from
+        # the seed in lockstep -- they diverge, then trade the difference.
+        self.spread = spread % max(1, self.m.piece_count)
 
     def set_peer_bitfield(self, name, bits):
         n = self.m.piece_count
@@ -276,7 +278,8 @@ class SwarmState:
         if self.warmup and self._warmup_left > 0:
             random.shuffle(need)
         else:
-            need.sort(key=lambda p: (rarity[p], p))
+            n = self.m.piece_count
+            need.sort(key=lambda p: (rarity[p], (p + self.spread) % n))
         plan = {}
         outstanding = dict.fromkeys(self.peer_have, 0)
         for p in need:
@@ -290,9 +293,13 @@ class SwarmState:
                 for nm in holders:
                     plan.setdefault(nm, []).append(p)
             else:
-                # give it to the least-loaded holder
-                holders.sort(key=lambda nm: outstanding.get(nm, 0))
-                nm = holders[0]
+                # prefer a NON-seed holder (a fellow leecher) so the seed only
+                # has to originate each piece once; fall back to the seed only
+                # when no peer holds it yet.
+                peers_first = [nm for nm in holders if nm not in self.seed_names]
+                pool = peers_first or holders
+                pool.sort(key=lambda nm: outstanding.get(nm, 0))
+                nm = pool[0]
                 if outstanding.get(nm, 0) >= pipeline:
                     continue
                 plan.setdefault(nm, []).append(p)
@@ -361,16 +368,18 @@ class SwarmMember:
     """
 
     def __init__(self, sid, manifest: PieceManifest, store: PieceStore,
-                 links: dict, on_piece=None, log=None):
+                 links: dict, on_piece=None, log=None, seed_names=(), spread=0):
         self.sid = sid
         self.m = manifest
         self.store = store
         self.links = links                       # name -> PeerLink
-        self.sched = SwarmState(manifest)
+        self.sched = SwarmState(manifest, seed_names=seed_names, spread=spread)
         self.on_piece = on_piece or (lambda p: None)
         self.log = log or (lambda *_a, **_k: None)
         self._last_gossip = 0.0
+        self._last_request = 0.0
         self._serve_q = []                        # (link_name, seq) to send
+        self._serve_pending = set()               # dedupe: (name, seq) queued
         self.served_chunks = 0
         self.recv_from = {}                       # name -> chunks received (stats)
 
@@ -386,7 +395,10 @@ class SwarmMember:
                 if 0 <= p < self.m.piece_count and self.store.have[p]:
                     first, last = self.m.piece_chunk_range(p)
                     for s in range(first, last):
-                        self._serve_q.append((from_name, s))
+                        key = (from_name, s)
+                        if key not in self._serve_pending:
+                            self._serve_pending.add(key)
+                            self._serve_q.append(key)
 
     def on_chunk(self, from_name, sid, seq, data):
         if sid != self.sid:
@@ -409,6 +421,7 @@ class SwarmMember:
         sent = 0
         while self._serve_q and sent < budget:
             name, seq = self._serve_q.pop(0)
+            self._serve_pending.discard((name, seq))
             link = self.links.get(name)
             if not link or not link.usable():
                 continue
@@ -426,8 +439,10 @@ class SwarmMember:
             self._announce_have()
         # 2) serve queued chunk requests
         self._serve(serve_budget)
-        # 3) request pieces we still need, rarest-first
-        if not self.store.is_complete():
+        # 3) request pieces we still need, rarest-first (rate-limited so we do
+        #    not re-flood requests every tick while chunks are in flight)
+        if not self.store.is_complete() and now - self._last_request >= 0.2:
+            self._last_request = now
             plan = self.sched.plan(self.store, now)
             for name, pieces in plan.items():
                 link = self.links.get(name)
@@ -448,7 +463,7 @@ def _selftest_topology(direct_between_leechers=True, size=6 * 1024 * 1024,
     leechers can only reach the seed + relay through it (worst case)."""
     random.seed(1234)
     blob = os.urandom(size)
-    manifest = PieceManifest.from_blob(blob, piece_bytes=512 * 1024)
+    manifest = PieceManifest.from_blob(blob, piece_chunks=200)
     sid = 0xABCD
 
     names = ["seed", "l1", "l2", "l3"]
@@ -473,10 +488,13 @@ def _selftest_topology(direct_between_leechers=True, size=6 * 1024 * 1024,
                 mode = "direct" if direct_between_leechers else "relay"
             linkmap[a][b] = make_link(a, b, mode)
 
+    spreads = {"seed": 0, "l1": 0, "l2": manifest.piece_count // 3,
+               "l3": 2 * manifest.piece_count // 3}
     for nm in names:
         seed_blob = blob if nm == "seed" else None
         store = PieceStore(manifest, seed_blob=seed_blob)
-        members[nm] = SwarmMember(sid, manifest, store, linkmap[nm])
+        members[nm] = SwarmMember(sid, manifest, store, linkmap[nm],
+                                  seed_names={"seed"}, spread=spreads[nm])
 
     # relay hop: in "relay" mode a leecher->leecher link would in reality go
     # through the host. Here the in-process raw_send already delivers directly;

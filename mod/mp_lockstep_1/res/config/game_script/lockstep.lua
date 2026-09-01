@@ -5400,7 +5400,7 @@ function CM.pollStops()
 			for eo, eid in pairs(m) do
 				if isPlayerStop(eo) then
 					local d = describeStop(eo, eid)
-					CM.knownStop[eo] = d and { d.x, d.y } or { 0, 0 }
+					CM.knownStop[eo] = d and { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay } or { 0, 0 }
 				end
 			end
 			CM.stopPrimed = true
@@ -5426,16 +5426,21 @@ function CM.pollStops()
 			local eo, eid = pair[1], pair[2]
 			local d = describeStop(eo, eid)
 			if d then
+				-- Same spot AND same object: an in-place edit (one-way toggled, model
+				-- changed) is a remove + add, not a rebind (review, 2026-09-01).
 				local rebound = nil
 				for geo, pos in pairs(gone) do
-					if (pos[1] - d.x) ^ 2 + (pos[2] - d.y) ^ 2 < 1.0 then rebound = geo; break end
+					if (pos[1] - d.x) ^ 2 + (pos[2] - d.y) ^ 2 < 1.0
+					   and (pos.model == nil or pos.model == d.model)
+					   and (pos.kind == nil or pos.kind == d.kind)
+					   and (pos.oneWay == nil or pos.oneWay == d.oneWay) then rebound = geo; break end
 				end
 				if rebound then
 					gone[rebound] = nil
 					CM.knownStop[rebound] = nil
-					CM.knownStop[eo] = { d.x, d.y }
+					CM.knownStop[eo] = { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay }
 				else
-					CM.knownStop[eo] = { d.x, d.y }
+					CM.knownStop[eo] = { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay }
 					local k = stopKey(d.x, d.y)
 					if CM.expectStop[k] then
 						CM.expectStop[k] = nil          -- our own replay landing
@@ -5566,6 +5571,10 @@ end
 function CM.execStopAdd(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
 	local ok, err = pcall(function()
+		if c.kind == nil then
+			log(string.format("STOPADD seq=%s: no kind on the wire (older peer build) -- skipped rather than guessed", tostring(c.seq)))
+			return
+		end
 		local wantTrack = tonumber(c.track) == 1
 		local eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0)
 		if not eid then

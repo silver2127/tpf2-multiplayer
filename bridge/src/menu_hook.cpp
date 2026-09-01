@@ -845,6 +845,9 @@ static bool BuildPanelImage()
     pEndCB(cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
     pResetFences(g_dev, 1, &g_fence); pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence);
+    // Wait: BuildBackdropImage runs next and resets this very command buffer and
+    // fence, which is invalid while this submission is pending (review, 2026-09-01).
+    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
     g_panelBuilt = true;
     Log("[menu] vk: panel image ready %dx%d pitch=%zu\n", g_panelW, g_panelH, g_panelPitch);
     return true;
@@ -857,9 +860,15 @@ static VkDeviceMemory g_bdMem = VK_NULL_HANDLE;
 static void*          g_bdPtr = nullptr;
 static size_t         g_bdPitch = 0;
 static bool           g_bdBuilt = false, g_bdFail = false;
+static VkImageUsageFlags g_scUsage = 0;   // from myCreateSwapchain: the backdrop copy needs TRANSFER_SRC
 static bool BuildBackdropImage()
 {
     if (g_bdBuilt) return true; if (g_bdFail) return false;
+    if (g_scUsage && !(g_scUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        g_bdFail = true;
+        Log("[menu] vk: swapchain has no TRANSFER_SRC (usage=0x%x) -- panel backdrop disabled\n", g_scUsage);
+        return false;
+    }
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ici.imageType = VK_IMAGE_TYPE_2D; ici.format = g_scFormat;
     ici.extent = { (uint32_t)g_panelW, (uint32_t)g_panelH, 1 };
@@ -1080,8 +1089,15 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
 {
     VkResult r = g_origCreateSc(dev, ci, a, sc);
     if (r == VK_SUCCESS && ci) {
-        g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent;
+        g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent; g_scUsage = ci->imageUsage;
         g_rInit = false; g_rFail = false;   // rebuild on next present
+        // The panel and backdrop images were created against the OLD format and
+        // size; a graphics-settings change recreates the swapchain and left them
+        // stale -- copies between mismatched formats, which is the corrupted
+        // button texture reported after changing settings. The old images are
+        // not freed (a rare event, and freeing under an in-flight present is the
+        // riskier bug); they are simply rebuilt on the next present.
+        g_panelBuilt = false; g_bdBuilt = false; g_bdFail = false;
         Log("[menu] swapchain created fmt=%d %ux%u usage=0x%x (TRANSFER_DST=%d)\n",
             (int)ci->imageFormat, ci->imageExtent.width, ci->imageExtent.height,
             ci->imageUsage, (ci->imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ? 1 : 0);
@@ -1213,6 +1229,7 @@ static void* MyListAdd(void* list, void* widget, void* style)
     // which is CONTINUE when a save exists and otherwise the next one -- so we sit
     // at the top of the column either way).
     if (inBuild && g_mainListAdds == g_flagSlot && g_flagNativeBtn) { g_mainList = list; NativeInsert(); }
+    if (!g_origListAdd) return nullptr;   // hook live before its trampoline was recorded: never call address 0
     void* r = g_origListAdd(list, widget, style);
     if (inBuild) { g_mainList = list; g_mainListAdds++; Log("[menu] list add #%d list=%p widget=%p\n", g_mainListAdds, list, widget); }
     return r;
@@ -2091,10 +2108,21 @@ static DWORD WINAPI Init(LPVOID)
             Log("[menu] native: prologue mismatch (mainbuild=%d listadd=%d) -- native button disabled\n", okA, okB);
             g_flagNativeBtn = 0;
         } else {
+            // ORDER MATTERS. The moment InstallHook returns, the game's list-add
+            // jumps into MyListAdd -- on the UI thread, while this runs on ours.
+            // The trampoline pointer must therefore be assigned before the next
+            // statement, not after a second hook has also succeeded; and if that
+            // second hook fails, the first must not be left live calling null
+            // (review, 2026-09-01). The builder hook goes first: it is harmless
+            // on its own, the list-add hook is not.
             void* tA = nullptr; void* tB = nullptr;
-            if (InstallHook(g_base + RVA_LIST_ADD, (void*)&MyListAdd, STEAL_LIST_ADD, &tB) &&
-                InstallHook(g_base + RVA_MAINBUILD, (void*)&MyMainBuild, STEAL_MAINBUILD, &tA)) {
-                g_origListAdd = (ListAddFn)tB; g_origMainBuild = (MainBuildFn)tA;
+            bool okHook = InstallHook(g_base + RVA_MAINBUILD, (void*)&MyMainBuild, STEAL_MAINBUILD, &tA);
+            if (okHook) g_origMainBuild = (MainBuildFn)tA;
+            if (okHook) {
+                okHook = InstallHook(g_base + RVA_LIST_ADD, (void*)&MyListAdd, STEAL_LIST_ADD, &tB);
+                if (okHook) g_origListAdd = (ListAddFn)tB;
+            }
+            if (okHook) {
                 Log("[menu] native: hooked list-add %llx (steal %d) and main builder %llx (steal %d)\n",
                     (unsigned long long)RVA_LIST_ADD, STEAL_LIST_ADD, (unsigned long long)RVA_MAINBUILD, STEAL_MAINBUILD);
             } else {
