@@ -1219,7 +1219,8 @@ local function findNodeNear(isTrack, x, y, eps)
 	return best
 end
 
-local function findEdgeContaining(isTrack, x, y, skipNode)
+local function findEdgeContaining(isTrack, x, y, skipNode, eps)
+	local tol = eps or K.SPLIT_EPS
 	-- Sampling is by DISTANCE, not by a fixed 19 points: a 77 m town road
 	-- sampled every 7.7 m misses a point that is on it. And the end
 	-- exclusion is by distance (K.SPLIT_MIN_DIST), not by fraction: the UI
@@ -1253,7 +1254,7 @@ local function findEdgeContaining(isTrack, x, y, skipNode)
 							local u = i / steps
 							local q = hermitePos(a, ta, b, tb, u)
 							local d = (q[1]-x)^2 + (q[2]-y)^2
-							if d < K.SPLIT_EPS*K.SPLIT_EPS and (not bestD or d < bestD) then
+							if d < tol * tol and (not bestD or d < bestD) then
 								best, bestD, bestU = eid, d, u
 								bestGeom = { a, ta, b, tb, steps }
 							end
@@ -1430,6 +1431,21 @@ function CM.uOnEdge(eid, x, y)
 		if not bestD or d < bestD then bestU, bestD = u, d end
 	end
 	return bestU, bestD and math.sqrt(bestD) or nil
+end
+
+-- The same, refined below the 1/400 grid (ternary search on distance).
+function CM.uOnEdgeFine(eid, x, y)
+	local comp, a, b, ta, tb = edgeGeomT(eid)
+	if not comp then return nil end
+	local u0 = CM.uOnEdge(eid, x, y)
+	if not u0 then return nil end
+	local lo, hi = math.max(0, u0 - 1 / 400), math.min(1, u0 + 1 / 400)
+	for _ = 1, 12 do
+		local u1, u2 = lo + (hi - lo) / 3, hi - (hi - lo) / 3
+		local q1, q2 = hermitePos(a, ta, b, tb, u1), hermitePos(a, ta, b, tb, u2)
+		if (q1[1] - x) ^ 2 + (q1[2] - y) ^ 2 < (q2[1] - x) ^ 2 + (q2[2] - y) ^ 2 then hi = u2 else lo = u1 end
+	end
+	return (lo + hi) / 2
 end
 
 local function execPolyline(c, planOnly)
@@ -6085,6 +6101,7 @@ K.STOPS_NATIVE = CM.cfgFlag("stops_native", true)
 -- rewrites the lines and the station group before the entity dies, exactly as
 -- when the player bulldozes it; measured on the rig before this defaulted on.
 K.STOPS_DEL_ON_LINE = CM.cfgFlag("stops_del_on_line", true)
+K.STOP_EDGE_EPS = 14.0   -- stop model to road centreline, widest town road with margin
 
 -- Everything the wire needs about one edge object, from this instance's world.
 -- SIDE is what the edge lists the object as -- {entity, EdgeObjectType} with
@@ -6795,12 +6812,22 @@ function CM.execStopAdd(c)
 	local ok, err = pcall(function()
 		local tag = string.format("%s seq=%s", c.rx and "STOPREP" or "STOPADD", tostring(c.seq))
 		local wantTrack = tonumber(c.track) == 1
-		-- the edge under the stop's WORLD position: the peer's town road may be
-		-- nodded differently, so never by the shipped endpoints or entity
-		local eid, u = findEdgeContaining(wantTrack, c.x, c.y)
+		-- Which edge: the originator's own edge if we have it (both endpoints
+		-- within 2 m), else the nearest centreline to the stop's WORLD position
+		-- (the peer's town road may be nodded differently). The shipped position
+		-- is the SHELTER model, which stands at the kerb -- 6-8 m off the
+		-- centreline of a medium town road -- so the search must be wide: the
+		-- 5 m split tolerance found nothing for five stops in a row (2026-09-02).
+		local eid, u
+		if c.ax and c.bx then eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0) end
+		if eid then
+			u = CM.uOnEdgeFine(eid, c.x, c.y)
+			if not u then eid = nil end
+		end
+		if not eid then eid, u = findEdgeContaining(wantTrack, c.x, c.y, nil, K.STOP_EDGE_EPS) end
 		if not eid then
-			log(string.format("%s: no %s edge under %.1f,%.1f on this instance -- skipped (DIVERGENCE)",
-				tag, wantTrack and "track" or "street", c.x, c.y))
+			log(string.format("%s: no %s edge within %.0f m of %.1f,%.1f on this instance -- skipped (DIVERGENCE)",
+				tag, wantTrack and "track" or "street", K.STOP_EDGE_EPS, c.x, c.y))
 			return
 		end
 		local comp, a, b = edgeGeomT(eid)
