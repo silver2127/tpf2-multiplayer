@@ -6143,7 +6143,14 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 		eo.edgeEntity = -1
 		eo.param = st.u
 		eo.oneWay = st.oneWay and true or false
-		eo.left = st.left and true or false
+		-- MEASURED 2026-09-02: every caller's st.left is the GEOMETRIC side
+		-- (cross(tangent, offset) > 0, describeStop's rule); the engine's
+		-- EdgeObject.left is the OPPOSITE side. A stop 6 m west of a northbound
+		-- road (geometric left=true) rebuilt with left=true landed 6 m east, same
+		-- u, same node order -- "building on the wrong side of the street".
+		-- Invert once, here, so the new stop and every re-added existing stop
+		-- land where they were described.
+		eo.left = not (st.left and true or false)
 		eo.model = st.model
 		eo.playerEntity = api.engine.util.getPlayer()
 		eo.name = st.name or ""
