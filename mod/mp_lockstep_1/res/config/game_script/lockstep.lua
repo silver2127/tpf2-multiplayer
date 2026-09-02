@@ -3761,6 +3761,20 @@ execConX = function(c)
 				if n then idmap[id] = n end
 			end
 		end
+		-- A shipped edge that ends on an EXISTING node the originator has and we
+		-- do not (the topologies already differ -- a healed split, a town road
+		-- that grew differently) cannot be built here. Building it anyway put a
+		-- nil endpoint into the proposal and killed both peers on an engine
+		-- assert (2026-09-02, depot attached to a node the peers had merged
+		-- away). A missing depot is a visible c-lane divergence; a dead game is not.
+		for id, p in pairs(spos) do
+			if not idmap[id] then
+				log(string.format("CONX seq=%s: existing node at %.1f,%.1f is not on this instance -- placement SKIPPED (DIVERGENCE, topology differs)",
+					tostring(c.seq), p[1], p[2]))
+				conxBusy = false
+				return
+			end
+		end
 
 		-- Drop OUR copy of the template's own connector, because the template
 		-- rebuilds it on the peer and shipping both duplicates it ('Collision').
@@ -5785,6 +5799,32 @@ local function shipConxPair(cn, rc)
 	                        snodes = table.concat(sn, ";"), sedges = table.concat(se, ";"),
 	                        srm = table.concat(sr, ";"), spos = table.concat(spz, ";"),
 	                        etype = rc.etype, stype = rc.stype, ttype = rc.ttype, cat = rc.cat })
+	-- Arm OUR split site too. The orphan-split heal (CM.sweepSplits) only knew
+	-- the splits a REPLAY made, so after a demolish the peer healed the split
+	-- and the originator never did: A kept the node and two halves, the peer
+	-- merged them (e1082 vs e1081, 2026-09-02), and the next depot attached to
+	-- that node on A had nothing to attach to on the peers -- fatal. The split
+	-- node is the added node that lies on a removed edge's segment.
+	pcall(function()
+		for _, r in ipairs(rc.rms) do
+			-- a removed-edge record is { node0, node1, tangents[6] }; the endpoint
+			-- POSITIONS are the existing nodes' entries in rc.spos
+			local pa, pb = rc.spos[r[1]], rc.spos[r[2]]
+			if not (pa and pb) then return end
+			local ax, ay, bx, by = pa[1], pa[2], pb[1], pb[2]
+			local vx, vy = bx - ax, by - ay
+			local L2 = vx * vx + vy * vy
+			if L2 > 1 then
+				for _, q in pairs(rc.posOf) do
+					local t = ((q[1] - ax) * vx + (q[2] - ay) * vy) / L2
+					if t > 0.02 and t < 0.98 then
+						local px, py = ax + t * vx, ay + t * vy
+						if (q[1] - px) ^ 2 + (q[2] - py) ^ 2 < 2.25 then CM.watchSplit(q[1], q[2]) end
+					end
+				end
+			end
+		end
+	end)
 	log(string.format("con: captured %s + street (%d nodes, %d edges, %d removals) -> CONX",
 		cn.file, #sn, #se, #sr))
 end
@@ -6167,11 +6207,27 @@ function CM.execStopAdd(c)
 		end
 		-- The wire's u and side are relative to the originator's node0 -> node1.
 		-- Ours may run the other way.
-		local comp, a = edgeGeomT(eid)
-		local u, left = tonumber(c.u) or 0.5, tonumber(c.left) == 1
-		local da = (a[1] - c.ax) ^ 2 + (a[2] - c.ay) ^ 2
-		local db = (a[1] - c.bx) ^ 2 + (a[2] - c.by) ^ 2
-		if db < da then u = 1 - u; left = not left end
+		local comp, a, b, ta, tb = edgeGeomT(eid)
+		-- u and left are measured along THIS instance's node0->node1, which need
+		-- not match the originator's: applying the shipped u/left (even with the
+		-- endpoint-flip heuristic) put a stop 12 m along the edge on the other
+		-- side (2026-09-02, 'Am Sportplatz' 1240 -> 1252). Project the shipped
+		-- world position onto our edge and take the side from the cross product,
+		-- exactly as describeStop does at capture. Positions in, positions out.
+		local u = CM.uOnEdge(eid, c.x, c.y)
+		local left = tonumber(c.left) == 1
+		if u then
+			local q = hermitePos(a, ta, b, tb, u)
+			local tg = hermiteTangent(a, ta, b, tb, u)
+			local cross = tg[1] * (c.y - q[2]) - tg[2] * (c.x - q[1])
+			left = cross > 0
+		else
+			u = tonumber(c.u) or 0.5
+			local da = (a[1] - c.ax) ^ 2 + (a[2] - c.ay) ^ 2
+			local db = (a[1] - c.bx) ^ 2 + (a[2] - c.by) ^ 2
+			if db < da then u = 1 - u; left = not left end
+			log(string.format("STOPADD seq=%s: projection failed, fell back to shipped u/left", tostring(c.seq)))
+		end
 		local stops = stopsOnEdge(eid)
 		for _, st in ipairs(stops) do
 			if (st.x - c.x) ^ 2 + (st.y - c.y) ^ 2 < 1.0 then
