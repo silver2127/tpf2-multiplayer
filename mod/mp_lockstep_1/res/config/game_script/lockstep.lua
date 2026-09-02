@@ -4788,6 +4788,35 @@ local function compareOne(stamp, origin, theirs, dt)
 	local mine = myHashes[stamp]
 	if not mine or not theirs then return end
 	local pr = peerFor(origin)
+	-- MONEY / LOAN ride in the DETAIL, not the verdict: balances can diverge with
+	-- no geometry difference at all (a stop that cost the originator its native
+	-- price but a peer only its cheaper edge-rebuild, a delivery timed slightly
+	-- differently). The verdict then says SYNC while the wallets drift apart
+	-- silently. Compare them here on EVERY stamp and log only when the GAP
+	-- CHANGES, so each event that widens or closes the split is timestamped --
+	-- which is what tells a stop-cost asymmetry from a vehicle-income one.
+	do
+		local dm = myDetails[stamp]
+		if dm and dt then
+			CM.moneyGap = CM.moneyGap or {}
+			for lane, tag in pairs({ m = "MONEY", l = "LOAN" }) do
+				local a = dm:match(lane .. ":(%-?%d+)")
+				local b = dt:match(lane .. ":(%-?%d+)")
+				if a and b and a ~= "-" and b ~= "-" then
+					local d = (tonumber(a) or 0) - (tonumber(b) or 0)
+					local gkey = lane .. origin
+					if CM.moneyGap[gkey] ~= d then
+						local was = CM.moneyGap[gkey]
+						CM.moneyGap[gkey] = d
+						if d ~= 0 or (was ~= nil and was ~= 0) then
+							log(string.format("$$ %s t=%d vs %s: %s vs %s (gap %+d, was %s)",
+								tag, stamp, origin, a, b, d, was ~= nil and tostring(was) or "0"))
+						end
+					end
+				end
+			end
+		end
+	end
 	if mine == theirs then
 		pr.streak = 0
 		pr.verdict = "SYNC"
