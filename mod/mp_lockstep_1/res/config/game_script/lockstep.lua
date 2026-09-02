@@ -960,9 +960,23 @@ local function worldHash(now)
 	-- in between. Two samples from different sim times are not comparable, and
 	-- until now the lane compared them anyway. The comparison below only calls
 	-- p a difference when both sides sampled the SAME sim time.
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,t%d",
+	-- m/l: balance and loan of the shared company (co-op). Money is world state
+	-- and drifts silently -- a delivery that happened on one side and not yet the
+	-- other -- so it rides in the detail with its VALUE, which makes the compare
+	-- log say by how much and at which stamp. Detail-only: not in the verdict.
+	-- In companies mode each instance's own player is a different company, so
+	-- the lane is blank there rather than a permanent false difference.
+	local mBal, mLoan = "-", "-"
+	if CM.cmMode ~= "companies" then
+		pcall(function()
+			local e = game.interface.getEntity(api.engine.util.getPlayer())
+			if e then mBal = string.format("%d", e.balance or 0); mLoan = string.format("%d", e.loan or 0) end
+		end)
+	end
+	CM.dashMoney, CM.dashLoan = mBal, mLoan
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
-		#vpos, now or -1, hashStr(table.concat(vpos, "|")), nt)
+		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt)
 	return verdict, detail
 end
 
@@ -2698,7 +2712,10 @@ local function depotVehicles(constructionId)
 			if ok and tv and accept[tv.depot] then ids[#ids + 1] = v end
 		end
 	end)
-	table.sort(ids)
+	-- NOT sorted by id. Entity ids come from each instance's own free list, so
+	-- id order is not creation order and differs per instance (measured
+	-- 2026-09-01: a batch of 8 trucks bound key a:5 to entity 42827 on A and
+	-- key a:4 to 42827 on the peer). The engine's enumeration order is kept.
 	return ids
 end
 
@@ -2758,13 +2775,44 @@ local function pollVehKeys()
 	for i = 1, #pendingVehKeys do
 		local p = pendingVehKeys[i]
 		local fresh, total = {}, 0
-		for _, v in ipairs(depotVehicles(p.depot)) do
+		local ents = {}
+		for idx, v in ipairs(depotVehicles(p.depot)) do
 			total = total + 1
-			if not knownVeh[v] then fresh[#fresh + 1] = v end
+			if not knownVeh[v] then
+				local pt = nil
+				pcall(function()
+					local tv = api.engine.getComponent(v, api.type.ComponentType.TRANSPORT_VEHICLE)
+					local v0 = tv and tv.transportVehicleConfig and tv.transportVehicleConfig.vehicles and tv.transportVehicleConfig.vehicles[1]
+					if v0 then pt = tonumber(v0.purchaseTime) end
+				end)
+				ents[#ents + 1] = { id = v, idx = idx, pt = pt or 0 }
+			end
 		end
-		table.sort(fresh)
+		-- WHICH new vehicle is this key? The key names the N-th purchase, so it
+		-- must bind to the N-th CREATED vehicle on every instance -- the same
+		-- physical truck in the same depot slot. Ascending entity id was wrong
+		-- (ids are recycled differently per instance). Order of preference:
+		--   1. the entity the buy command itself returned (peer replay; exact),
+		--   2. purchase time, then the engine's enumeration order (originator's
+		--      native buys; creation order as far as the API shows it).
+		if p.hint and not knownVeh[p.hint] then
+			local hinted = nil
+			for _, e in ipairs(ents) do if e.id == p.hint then hinted = e end end
+			if hinted then ents = { hinted } end
+		end
+		table.sort(ents, function(a, b)
+			if a.pt ~= b.pt then return a.pt < b.pt end
+			return a.idx < b.idx
+		end)
+		for _, e in ipairs(ents) do fresh[#fresh + 1] = e.id end
+		if #ents > 1 then
+			local parts = {}
+			for _, e in ipairs(ents) do parts[#parts + 1] = string.format("%d@%s#%d", e.id, tostring(e.pt), e.idx) end
+			log(string.format("VEHORDER %s: %d candidates [id@purchaseTime#enum] %s -> %d%s", p.key, #ents,
+				table.concat(parts, " "), fresh[1], p.hint and (" (hint " .. tostring(p.hint) .. ")") or ""))
+		end
 		if #fresh >= 1 then
-			registerVehKey(p.key, fresh[1])       -- oldest new id first
+			registerVehKey(p.key, fresh[1])
 			-- companies mode: a remote company's purchase landed on our player;
 			-- hand the vehicle over and move the cost (balance delta since apply).
 			if p.company then
@@ -2799,12 +2847,12 @@ local function forgetVehicle(vid)
 	vehKeyOf[vid] = nil
 end
 
-local function expectVehicle(key, depotChild, company)
+local function expectVehicle(key, depotChild, company, hint)
 	-- companies mode: remember the origin company and our balance BEFORE the
 	-- purchase lands, so the bind step can hand the vehicle over and move the
 	-- exact cost (balance delta) to that company.
 	local bal0 = company and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
-	pendingVehKeys[#pendingVehKeys + 1] = { key = key, depot = depotChild, since = gameTime() or 0, company = company, bal0 = bal0 }
+	pendingVehKeys[#pendingVehKeys + 1] = { key = key, depot = depotChild, since = gameTime() or 0, company = company, bal0 = bal0, hint = hint }
 end
 
 -- ---------- vehicles: BuyVehicle replication ----------
@@ -3305,7 +3353,17 @@ local function execVBuy(c)
 		api.cmd.sendCommand(cmd, function(res, success)
 			log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s",
 				tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success)))
-			if success then expectVehicle(tostring(origin) .. ":" .. tostring(seq), depot, c.company and tonumber(c.company) or nil) end
+			if success then
+				-- buyVehicle is entity-returning (same shape VREPL reads): bind
+				-- this key to THAT entity, not to whichever new id sorts first
+				local nid = nil
+				pcall(function()
+					local r = res and res.resultEntity
+					if type(r) == "number" then nid = r elseif r ~= nil then nid = tonumber(tostring(r)) end
+				end)
+				if not (nid and nid > 0) then nid = nil end
+				expectVehicle(tostring(origin) .. ":" .. tostring(seq), depot, c.company and tonumber(c.company) or nil, nid)
+			end
 		end)
 	end)
 	if not ok then log("execVBuy error: " .. tostring(err)) end
@@ -7637,6 +7695,7 @@ function data()
 							if #parts > 0 then vd = table.concat(parts, " ") end
 						end
 						f:write("vdrift=" .. vd .. "\n")
+						f:write("money=" .. tostring(CM.dashMoney or "-") .. " / loan " .. tostring(CM.dashLoan or "-") .. "\n")
 						-- The GUI used to decide which columns exist by which
 						-- lockstep_dash_<x>.txt files it could open. That is wrong
 						-- across Sandboxie: each boxed instance writes its own copy and
@@ -7776,10 +7835,10 @@ function data()
 					CM.dash = D
 					D.cols = present
 					D.colsKey = colsKey
-					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "vdrift" }
+					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "vdrift", "money" }
 					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "held by barrier",
 					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied",
-					             vdrift = "vehicle drift mean/max" }
+					             vdrift = "vehicle drift mean/max", money = "balance / loan" }
 					D.cells = {}
 					D.table = api.gui.comp.Table.new(1 + #D.cols, "NONE")
 					local head = { api.gui.comp.TextView.new("") }
