@@ -2702,7 +2702,19 @@ local function execDemolish(c)
 				unlocked = tostring(okU) .. (errU and (" " .. tostring(errU)) or "")
 			else unlocked = "skipped(noCON)" end
 		end
+		-- Refund attribution. A demolish is OPTIMISTIC: the originator bulldozes
+		-- natively at click, the peer replays here ~a few game-units later, so the
+		-- balance moves at different sim-times and any refund difference is a
+		-- lasting coop money gap (measured 2026-09-02: two depot demolishes opened
+		-- a ~175k split). Measure the peer's refund so the exact asymmetry vs the
+		-- money lane is known; the real fix is strict demolish (cancel + replay at
+		-- the stamp on every instance) -- see the ticket.
+		local bal0 = CM.cmBalance(api.engine.util.getPlayer())
 		local dok, derr = pcall(game.interface.bulldoze, best)
+		local bal1 = CM.cmBalance(api.engine.util.getPlayer())
+		if bal0 and bal1 then
+			log(string.format("DEMOLISH seq=%s: refund on this peer = %+d (%d -> %d)", tostring(c.seq), bal1 - bal0, bal0, bal1))
+		end
 		CM.rearmSplitsNear(c.x, c.y)
 		log(string.format("EXEC DEMOLISH seq=%s origin=%s at=%s id=%d success=%s",
 			tostring(c.seq), tostring(c.origin), tostring(c.at), best, tostring(dok)))
