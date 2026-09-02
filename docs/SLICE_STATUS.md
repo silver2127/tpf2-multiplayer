@@ -623,3 +623,27 @@ post-build sweep using the built station's bounding volume (probe P33).
   instances' rows in an api.gui Window ('Multiplayer'), self-heals if closed.
 - Next: UI actions (resync button -> signal file -> host-side watcher runs
   mp_launch -Save), save-on-demand from the host.
+
+## Roadside stops -- native-shape replay (2026-09-02, verification pending)
+
+Decompiled (workflow, 8 agents): the stop tool and the bulldozer BOTH rebuild
+the edge (remove + re-add as entity -1) -- but carry every untouched object in
+the new segment's `objects` list under its POSITIVE id (UpdateEngine: id>=0 =
+re-parent, entity/station group/lines kept; -k = edgeObjectsToAdd[k]) and put
+a removed object in `edgeObjectsToRemove` (Apply rewrites lines + group before
+it dies). Our rebuild re-created neighbours as -k and never listed removals:
+that -- not the rebuild -- left lines on dead ids (fatal assert, both peers).
+
+Now (`CM.nativeStopProposal`): survivors by id; edgeObjectsToRemove for
+deletes; STOPREP (remove+add in one proposal) for the host's same-edge
+same-side replace, followed by an LUPDATE of every affected line; stop ops
+serialized through the construction queue, line ops queued behind them.
+The objects pair's second value is the SIDE (STOP_LEFT=0 / STOP_RIGHT=1 /
+SIGNAL=2), not cargo; one object per side per edge (CreateLanes). The host
+measures the engine's left-vs-geometry convention from the stop it ships
+(`conv`), the peer derives `left` and side from its OWN geometry. Line stops
+ship the station position (fields 8-9) and resolve the station index by it.
+Proof to grep for on B/C: `EXEC STOPADD ... survivors kept n/n`,
+`stops: left convention: engine-left IS/is NOT geometric-left`.
+Switches (tpf2_slice.cfg): `stops_native=0` (old rebuild + guards),
+`stops_del_on_line=0` (refuse to remove a stop a line uses).

@@ -2993,8 +2993,65 @@ local function findStationGroupNear(x, y)
 	return best
 end
 
+-- World position of a station entity (a roadside stop or a construction's
+-- station): the interface first, the model transform as the fallback.
+function CM.stationPos(st)
+	local okE, e = pcall(game.interface.getEntity, st)
+	if okE and e and e.position then return e.position[1] or e.position.x, e.position[2] or e.position.y end
+	local okM, x, y = pcall(function()
+		local mil = api.engine.getComponent(st, api.type.ComponentType.MODEL_INSTANCE_LIST)
+		local fi = mil.fatInstances[1]
+		return fi.transf[13], fi.transf[14]
+	end)
+	if okM and x then return x, y end
+	return nil
+end
+function CM.stationPosInGroup(sg, idx)
+	local x, y
+	pcall(function()
+		local gc = api.engine.getComponent(sg, api.type.ComponentType.STATION_GROUP)
+		local st = gc and gc.stations and gc.stations[(tonumber(idx) or 0) + 1]
+		if st then x, y = CM.stationPos(st) end
+	end)
+	return x, y
+end
+
+-- Two stop signatures name the same stops when every group (and station, when
+-- shipped) is within 2 m and the other fields match. A string compare is too
+-- strict: positions come from each instance's own geometry.
+function CM.stopsSigEqual(a, b)
+	if a == b then return true end
+	local ok, same = pcall(function()
+		local function parse(s)
+			local recs = {}
+			for rec in tostring(s or ""):gmatch("[^;]+") do
+				local f = {}
+				for v in rec:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+				recs[#recs + 1] = f
+			end
+			return recs
+		end
+		local ra, rb = parse(a), parse(b)
+		if #ra ~= #rb then return false end
+		for i = 1, #ra do
+			local p, q = ra[i], rb[i]
+			if (p[1] - q[1]) ^ 2 + (p[2] - q[2]) ^ 2 > 4 then return false end
+			for k = 4, 7 do if p[k] ~= q[k] then return false end end
+			if p[8] and q[8] then
+				if (p[8] - q[8]) ^ 2 + (p[9] - q[9]) ^ 2 > 4 then return false end
+			elseif p[3] ~= q[3] then return false end
+		end
+		return true
+	end)
+	return ok and same or false
+end
+
 -- name / colour / wait / stops of a line, ready for the wire; nil if a stop
--- cannot be located (it would be unreplayable anyway)
+-- cannot be located (it would be unreplayable anyway). Each stop carries the
+-- station GROUP's position, the station index inside it, and (fields 8-9) the
+-- station's own position: the index is edge-frame data -- a merged pair lists
+-- [right-side, left-side] relative to the edge's node order, which differs per
+-- instance -- so the peer resolves the station by where it stands.
 local function lineSnapshot(lid)
 	local snap
 	pcall(function()
@@ -3005,9 +3062,11 @@ local function lineSnapshot(lid)
 			local s = lc.stops[i]
 			local x, y = stationGroupPos(s.stationGroup)
 			if not x then return end
+			local sx, sy = CM.stationPosInGroup(s.stationGroup, s.station)
 			stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y,
 				tonumber(s.station) or 0, tonumber(s.terminal) or 0, tonumber(s.loadMode) or 0,
 				tonumber(s.minWaitingTime) or 0, tonumber(s.maxWaitingTime) or 180)
+				.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 		end
 		local name = ""
 		pcall(function() name = game.interface.getName(lid) or "" end)
@@ -3046,7 +3105,7 @@ local function pollLineKeys()
 		local hit
 		for fi = 1, #fresh do
 			local snap = lineSnapshot(fresh[fi])
-			if snap and (not p.sig or snap.stops == p.sig) then hit = fi; break end
+			if snap and (not p.sig or CM.stopsSigEqual(snap.stops, p.sig)) then hit = fi; break end
 		end
 		if hit then
 			registerLineKey(p.key, fresh[hit])
@@ -3095,9 +3154,28 @@ local function buildLineObject(c)
 		if #f < 7 then error("bad stop record " .. rec) end
 		local sg = findStationGroupNear(f[1], f[2])
 		if not sg then error(string.format("no station group within 20 m of %.1f,%.1f", f[1], f[2])) end
+		local idx = f[3]
+		if f[8] and f[9] then
+			-- resolve the station inside the group by position (see lineSnapshot)
+			local okG, gc = pcall(api.engine.getComponent, sg, api.type.ComponentType.STATION_GROUP)
+			if okG and gc and gc.stations then
+				local best, bestD
+				for k = 1, #gc.stations do
+					local px, py = CM.stationPos(gc.stations[k])
+					if px then
+						local d = (px - f[8]) ^ 2 + (py - f[9]) ^ 2
+						if d < 100 and (not bestD or d < bestD) then best, bestD = k - 1, d end
+					end
+				end
+				if best and best ~= idx then
+					log(string.format("line: station index %d -> %d in group %d (resolved by position %.1f,%.1f)", idx, best, sg, f[8], f[9]))
+				end
+				if best then idx = best end
+			end
+		end
 		local s = api.type.Line.Stop.new()
 		s.stationGroup = sg
-		s.station = f[3]
+		s.station = idx
 		s.terminal = f[4]
 		s.loadMode = f[5]
 		s.minWaitingTime = f[6]
@@ -4641,11 +4719,18 @@ local function execute(c)
 	elseif c.op == "VBUY" then execVBuy(c)
 	elseif c.op == "VREPL" then execVReplace(c)
 	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then execVehCmd(c)
-	elseif c.op == "STOPADD" then CM.execStopAdd(c)
-	elseif c.op == "STOPDEL" then CM.execStopDel(c)
+	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
 	elseif c.op == "VNAME" then execSetName(c)
 	elseif c.op == "VCOLOR" then execSetColor(c)
-	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then execLine(c)
+	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then
+		-- behind any stop / construction replay still in flight: a line update
+		-- that re-adds a replaced stop must find that stop already there
+		if conxBusy or #conxQueue > 0 then
+			conxQueue[#conxQueue + 1] = { c = c, notBefore = gameTime() or 0 }
+			log(string.format("%s seq=%s: a replay is in flight -- queued behind it (%d waiting)", tostring(c.op), tostring(c.seq), #conxQueue))
+		else
+			execLine(c)
+		end
 	elseif c.op == "LOAN" then execLoan(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
@@ -5944,18 +6029,71 @@ end
 -- through SimpleStreetProposal.edgeObjectsToAdd, the same API a Lua mod would
 -- use to place a signal. The wire carries positions, never ids: the edge by its
 -- two endpoints, the stop by its parameter along that edge and which side.
-CM.knownStop   = {}      -- edge-object entity -> {x, y} while it exists
+CM.knownStop   = {}      -- edge-object entity -> {x, y, model, kind, oneWay, side} while it exists
 CM.stopPrimed  = false
-CM.expectStop  = {}      -- "x/y" -> true : a replay is about to create one here
-CM.expectStopDel = {}    -- "x/y" -> true : a replay is about to remove one here
+CM.expectStop  = {}      -- { {x, y, t}, ... }: a replay is about to create one near here
+CM.expectStopDel = {}    -- same, about to remove one
 
-local function stopKey(x, y) return string.format("%.0f/%.0f", x, y) end
+-- Announcements are matched by DISTANCE (2 m), not by a rounded-coordinate key:
+-- the replay projects the shipped position onto this instance's own edge and
+-- lands a little off, and a missed match ships a phantom STOPADD back. Entries
+-- expire after 8 game units so a failed replay cannot swallow a later real one.
+function CM.expectAdd(list, x, y) list[#list + 1] = { x, y, t = gameTime() or 0 } end
+function CM.expectFind(list, x, y)
+	local now = gameTime() or 0
+	for i = #list, 1, -1 do
+		if now - (list[i].t or now) > 8 then table.remove(list, i) end
+	end
+	local best, bestD
+	for i = 1, #list do
+		local e = list[i]
+		local d = (e[1] - x) ^ 2 + (e[2] - y) ^ 2
+		if d < 4 and (not bestD or d < bestD) then best, bestD = i, d end
+	end
+	return best
+end
+function CM.expectTake(list, x, y)
+	local i = CM.expectFind(list, x, y)
+	if i then table.remove(list, i); return true end
+	return false
+end
+function CM.expectDrop(list, x, y) CM.expectTake(list, x, y) end
+
+-- Optional switches from tpf2_slice.cfg in the game folder (the game-script
+-- CWD; the same file the slice reads): key=value lines, 1/0.
+function CM.cfgFlag(key, default)
+	if CM.cfgCache == nil then
+		CM.cfgCache = {}
+		pcall(function()
+			local f = io.open("tpf2_slice.cfg", "r")
+			if not f then return end
+			for line in f:lines() do
+				local k, v = tostring(line):match("^%s*([%w_]+)%s*=%s*(%S+)")
+				if k then CM.cfgCache[k] = v end
+			end
+			f:close()
+		end)
+	end
+	local v = CM.cfgCache[key]
+	if v == nil then return default end
+	return v == "1" or v == "true" or v == "yes"
+end
+-- stops_native=0: the old edge rebuild (every neighbour re-created as a new
+-- entity; its guards refuse anything under a line or a second object).
+K.STOPS_NATIVE = CM.cfgFlag("stops_native", true)
+-- stops_del_on_line=0: refuse to remove a stop a line uses. Natively the apply
+-- rewrites the lines and the station group before the entity dies, exactly as
+-- when the player bulldozes it; measured on the rig before this defaulted on.
+K.STOPS_DEL_ON_LINE = CM.cfgFlag("stops_del_on_line", true)
 
 -- Everything the wire needs about one edge object, from this instance's world.
--- KIND is what the edge lists the object as, and the engine is strict about
--- it: measured on a live world, a truck stop is {id, 0} and a bus stop {id, 1}
--- (STATION.cargo decides), a signal is {id, 2} (EdgeObjectType.SIGNAL). Listing
--- a truck stop as 1 took the game down in StreetGeometry::CreateLanes.
+-- SIDE is what the edge lists the object as -- {entity, EdgeObjectType} with
+-- STOP_LEFT=0 / STOP_RIGHT=1 / SIGNAL=2 (sol enum registration, decompiled
+-- 2026-09-02). It is the same bool as the record's `left` in another encoding,
+-- NOT passenger/cargo: the earlier "STATION.cargo decides" reading was a
+-- single-sample coincidence (a left truck stop and a right bus stop). The
+-- engine keys the terminal lane, the CreateLanes slot (one object per value
+-- per edge) and replacement on this value.
 local function describeStop(eo, eid)
 	local d = {}
 	local ok = pcall(function()
@@ -5990,6 +6128,30 @@ local function describeStop(eo, eid)
 		local t = hermiteTangent(a, ta, b, tb, u)
 		local cross = t[1] * (d.y - q[2]) - t[2] * (d.x - q[1])
 		d.left = cross > 0
+		pcall(function()
+			local objs = comp.objects
+			for i = 1, #objs do
+				local o = objs[i]
+				if tonumber(o[1]) == eo then d.side = tonumber(o[2]); break end
+			end
+		end)
+		if d.side == 0 or d.side == 1 then
+			-- engine-left (STOP_LEFT) against the geometric cross sign: the
+			-- engine's convention, read off this very object. It travels with
+			-- the stop, so a peer never has to guess it.
+			d.conv = ((d.side == 0) == d.left)
+			if CM.leftConv ~= d.conv then
+				CM.leftConvFlips = (CM.leftConvFlips or 0) + 1
+				log(string.format("stops: left convention: engine-left %s geometric-left (stop %d side=%d cross>0=%s%s)",
+					d.conv and "IS" or "is NOT", eo, d.side, tostring(d.left),
+					CM.leftConvFlips > 1 and string.format(" -- CHANGED, %d flip(s): side is not a pure function of geometry?", CM.leftConvFlips - 1) or ""))
+				CM.leftConv = d.conv
+			end
+		end
+		pcall(function()
+			local sc = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
+			if sc then d.stname = api.res.streetTypeRep.getName(sc.streetType) end
+		end)
 	end)
 	return ok and d.model and d
 end
@@ -6035,7 +6197,7 @@ function CM.pollStops()
 			for eo, eid in pairs(m) do
 				if isPlayerStop(eo) then
 					local d = describeStop(eo, eid)
-					CM.knownStop[eo] = d and { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay } or { 0, 0 }
+					CM.knownStop[eo] = d and { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay, side = d.side } or { 0, 0 }
 				end
 			end
 			CM.stopPrimed = true
@@ -6070,25 +6232,66 @@ function CM.pollStops()
 					   and (pos.kind == nil or pos.kind == d.kind)
 					   and (pos.oneWay == nil or pos.oneWay == d.oneWay) then rebound = geo; break end
 				end
+				local rec = { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay, side = d.side }
 				if rebound then
 					gone[rebound] = nil
 					CM.knownStop[rebound] = nil
-					CM.knownStop[eo] = { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay }
+					CM.knownStop[eo] = rec
 				else
-					CM.knownStop[eo] = { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay }
-					local k = stopKey(d.x, d.y)
-					if CM.expectStop[k] then
-						CM.expectStop[k] = nil          -- our own replay landing
+					CM.knownStop[eo] = rec
+					if CM.expectTake(CM.expectStop, d.x, d.y) then
+						-- our own replay landing
 					else
-						scheduleLocal("STOPADD", {
+						-- REPLACE: dropping a compatible stop on the same side of an
+						-- edge that already has one MOVES it -- natively ONE proposal
+						-- (old in edgeObjectsToRemove, new added, every line through
+						-- it re-pointed). Seen here as a gone + a fresh on one edge,
+						-- same side. Ship it as one op so the peer removes and adds
+						-- in one proposal too.
+						local rep, repPos = nil, nil
+						if d.side == 0 or d.side == 1 then
+							for geo, pos in pairs(gone) do
+								if pos.side == d.side and not CM.expectFind(CM.expectStopDel, pos[1], pos[2]) then
+									local _, dist = CM.uOnEdge(eid, pos[1], pos[2])
+									if dist and dist < 3.0 then rep, repPos = geo, pos; break end
+								end
+							end
+						end
+						local convW = -1
+						if d.conv ~= nil then convW = d.conv and 1 or 0
+						elseif CM.leftConv ~= nil then convW = CM.leftConv and 1 or 0 end
+						local fields = {
 							ax = d.ax, ay = d.ay, bx = d.bx, by = d.by,
-							u = d.u, left = d.left and 1 or 0,
+							u = d.u, left = d.left and 1 or 0, side = d.side or -1, conv = convW,
 							x = d.x, y = d.y, kind = d.kind, track = d.track and 1 or 0,
-							oneWay = d.oneWay and 1 or 0,
+							oneWay = d.oneWay and 1 or 0, stname = escName(d.stname or ""),
 							model = escName(d.model), name = escName(d.name),
-							skipOrigin = 1 })
-						log(string.format("stops: captured %s '%s' kind=%d %s at %.1f,%.1f u=%.3f left=%s -> STOPADD",
-							d.model, d.name, d.kind, d.track and "track" or "street", d.x, d.y, d.u, tostring(d.left)))
+							skipOrigin = 1 }
+						if rep then
+							gone[rep] = nil
+							CM.knownStop[rep] = nil
+							fields.rx, fields.ry = repPos[1], repPos[2]
+							scheduleLocal("STOPREP", fields)
+							log(string.format("stops: %s '%s' replaced the stop at %.1f,%.1f -> now at %.1f,%.1f side=%s conv=%d -> STOPREP",
+								d.model, d.name, repPos[1], repPos[2], d.x, d.y, tostring(d.side), convW))
+							-- The engine re-pointed every line through that station to
+							-- the new one (old2newEdgeObjects, which a Lua proposal cannot
+							-- carry); the peers' lines lose the stop instead. Send them
+							-- each such line as it is now -- queued behind the STOPREP.
+							for _, lid in ipairs(CM.linesUsingStation(eo)) do
+								local lk = lineKeyFor(lid)
+								local snap = lk and lineSnapshot(lid)
+								if snap then
+									scheduleLocal("LUPDATE", { key = lk, name = snap.name, color = snap.color, wait = snap.wait,
+									                           stops = snap.stops, skipOrigin = 1 })
+									log(string.format("stops: line %s re-shipped after the replace -> LUPDATE", lk))
+								end
+							end
+						else
+							scheduleLocal("STOPADD", fields)
+							log(string.format("stops: captured %s '%s' kind=%d side=%s %s at %.1f,%.1f u=%.3f left=%s conv=%d -> STOPADD",
+								d.model, d.name, d.kind, tostring(d.side), d.track and "track" or "street", d.x, d.y, d.u, tostring(d.left), convW))
+						end
 					end
 				end
 			end
@@ -6096,9 +6299,8 @@ function CM.pollStops()
 		-- genuinely gone (nothing reappeared at the same spot)
 		for eo, pos in pairs(gone) do
 			CM.knownStop[eo] = nil
-			local k = stopKey(pos[1], pos[2])
-			if CM.expectStopDel[k] then
-				CM.expectStopDel[k] = nil
+			if CM.expectTake(CM.expectStopDel, pos[1], pos[2]) then
+				-- our own replay
 			else
 				scheduleLocal("STOPDEL", { x = pos[1], y = pos[2], skipOrigin = 1 })
 				log(string.format("stops: roadside stop at %.1f,%.1f removed -> STOPDEL", pos[1], pos[2]))
@@ -6108,16 +6310,14 @@ function CM.pollStops()
 	if not ok then log("stops poll error: " .. tostring(err)) end
 end
 
--- Rebuild a street edge with a given set of stops on it. This is how the game
--- itself does it, and the only shape it accepts (measured 2026-08-31, four
--- variants): an edge object belongs to its edge, so a stop cannot be attached
--- to an EXISTING edge entity -- the proposal removes the edge and re-adds a
--- copy as entity -1 carrying the object list, and every stop on it is re-added
--- with it. Edge objects have their own negative numbering: the k-th entry of
--- edgeObjectsToAdd is entity -k, and the edge lists it as {-k, 1} (kind 1 is a
--- stop; EdgeObjectType.SIGNAL is 2). Listing the object under any other id, or
--- leaving it off the edge, fails silently -- or asserts inside CalcNodeIndex,
--- which walks that very list looking for the object and writes a crash dump.
+-- LEGACY (stops_native=0): rebuild a street edge with a given set of stops on
+-- it, every one of them RE-CREATED through edgeObjectsToAdd as entity -k. That
+-- is the lossy part: the native tool carries the untouched neighbours under
+-- their real ids (see CM.nativeStopProposal). Kept, with its guards, as the
+-- fallback. Edge objects have their own negative numbering: the k-th entry of
+-- edgeObjectsToAdd is entity -k, and the edge lists it as {-k, side}. Listing
+-- the object under any other id, or leaving it off the edge, asserts inside
+-- CalcNodeIndex, which walks that very list looking for the object.
 --
 -- stops: list of { u=, left=, model=, name= } relative to node0 -> node1.
 -- Every station entity some LINE stops at (via its station group), plus the
@@ -6235,8 +6435,8 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 	-- not read that as remove + add. Announce each position both ways.
 	for _, st in ipairs(stops) do
 		if st.x then
-			CM.expectStop[stopKey(st.x, st.y)] = true
-			CM.expectStopDel[stopKey(st.x, st.y)] = true
+			CM.expectAdd(CM.expectStop, st.x, st.y)
+			CM.expectAdd(CM.expectStopDel, st.x, st.y)
 		end
 	end
 	local cmd = api.cmd.make.buildProposal(sp, buildContext(), true)
@@ -6251,7 +6451,7 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 				end
 			end)
 			for _, st in ipairs(stops) do
-				if st.x then CM.expectStop[stopKey(st.x, st.y)] = nil; CM.expectStopDel[stopKey(st.x, st.y)] = nil end
+				if st.x then CM.expectDrop(CM.expectStop, st.x, st.y); CM.expectDrop(CM.expectStopDel, st.x, st.y) end
 			end
 		end
 		log(string.format("EXEC %s: %s edge %d rebuilt with %d object(s) success=%s%s", why, isTrack and "track" or "street", eid, #stops, tostring(success), msg))
@@ -6273,8 +6473,7 @@ local function stopsOnEdge(eid)
 	return list
 end
 
-function CM.execStopAdd(c)
-	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+function CM.execStopAddLegacy(c)
 	local ok, err = pcall(function()
 		if c.kind == nil then
 			log(string.format("STOPADD seq=%s: no kind on the wire (older peer build) -- skipped rather than guessed", tostring(c.seq)))
@@ -6337,8 +6536,7 @@ function CM.execStopAdd(c)
 	if not ok then log("exec STOPADD error: " .. tostring(err)) end
 end
 
-function CM.execStopDel(c)
-	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+function CM.execStopDelLegacy(c)
 	local ok, err = pcall(function()
 		local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
 		local best, bestD
@@ -6361,15 +6559,392 @@ function CM.execStopDel(c)
 		for _, st in ipairs(stopsOnEdge(eid)) do
 			if st.eo ~= best then keep[#keep + 1] = st end
 		end
-		CM.expectStopDel[stopKey(c.x, c.y)] = true
+		CM.expectAdd(CM.expectStopDel, c.x, c.y)
 		local ok2, why = rebuildEdgeWithStops(eid, keep, string.format("STOPDEL seq=%s origin=%s", tostring(c.seq), tostring(c.origin)),
-			function(success) if not success then CM.expectStopDel[stopKey(c.x, c.y)] = nil end end)
+			function(success) if not success then CM.expectDrop(CM.expectStopDel, c.x, c.y) end end)
 		if not ok2 then
-			CM.expectStopDel[stopKey(c.x, c.y)] = nil
+			CM.expectDrop(CM.expectStopDel, c.x, c.y)
 			log(string.format("STOPDEL seq=%s: %s -- skipped", tostring(c.seq), tostring(why)))
 		end
 	end)
 	if not ok then log("exec STOPDEL error: " .. tostring(err)) end
+end
+
+-- ====================== NATIVE-SHAPE STOP REPLAY ======================
+--
+-- What the street tool and the bulldozer actually submit (decompiled
+-- 2026-09-02: street_util::MakeEdgeObjectProposal 0x21ef7d0 and
+-- MakeRemoveEdgeObjectsProposal 0x21f0c60, confirmed by the game's own
+-- res/scripts/mission/proposalutil.lua): the edge IS removed and re-added as
+-- entity -1 -- but its object list is carried over VERBATIM, every untouched
+-- object under its REAL id. street_util::UpdateEngine treats id >= 0 in an
+-- added segment's objects as an update (re-parented, entity kept, station group
+-- and lines untouched) and only -k as edgeObjectsToAdd[k]. A removed object
+-- goes in edgeObjectsToRemove, and Apply rewrites every line and the station
+-- group BEFORE that entity dies. The old rebuild re-added the neighbours as
+-- fresh -k entities and never listed the removed one: THAT left lines on dead
+-- ids (fatal assert on both peers) -- not the rebuild itself.
+--
+-- The objects pair's second value is the SIDE (STOP_LEFT=0, STOP_RIGHT=1,
+-- SIGNAL=2), the same bool as the record's `left`; StreetGeometry::CreateLanes
+-- keeps one slot per value per edge -- two stops on opposite sides are legal,
+-- two on one side are the fatal assert. Both are derived HERE from this
+-- instance's own geometry (they must agree with each other and with our node
+-- order); the wire only says which convention the engine used on the host.
+-- A station MERGE (a stop joining a nearby station group) is not in the
+-- proposal at all: Apply decides it by distance, so the same placement gets
+-- the same merge on every peer for free.
+
+-- All edge objects on an edge as the edge lists them: { {id, side}, ... }, or
+-- nil (with the count) when the list could not be read -- never a partial
+-- list, which would drop the missing objects with the edge.
+function CM.objectsOnEdge(eid)
+	local list, n = {}, 0
+	pcall(function()
+		local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+		local objs = be and be.objects
+		if not objs then return end
+		n = #objs
+		for i = 1, n do
+			local o = objs[i]
+			local id, side = tonumber(o[1]), tonumber(o[2])
+			if id then list[#list + 1] = { id, side or 1 } end
+		end
+	end)
+	if #list ~= n then return nil, n end
+	return list, n
+end
+
+-- Is this edge frozen into a construction (an apron)? A plain street proposal
+-- cannot remove it -- the engine answers critical=true with no message.
+function CM.frozenOwnerOf(eid)
+	local owner
+	pcall(function()
+		local comp, a = edgeGeomT(eid)
+		if not comp then return end
+		for _, cid in pairs(game.interface.getEntities({ pos = { a[1], a[2] }, radius = 80 },
+				{ type = "CONSTRUCTION", includeData = false }) or {}) do
+			local cc = api.engine.getComponent(cid, api.type.ComponentType.CONSTRUCTION)
+			if cc and cc.frozenEdges then
+				for _, fe in pairs(cc.frozenEdges) do if fe == eid then owner = cid end end
+			end
+		end
+	end)
+	return owner
+end
+
+-- A copy of an edge as the tool makes it: placeholder entity, same nodes,
+-- tangents, type and street/track props. The caller sets comp.objects.
+function CM.nativeEdgeCopy(eid, isTrack, ent)
+	local comp, a, b, ta, tb = edgeGeomT(eid)
+	if not comp then return nil end
+	local e = api.type.SegmentAndEntity.new()
+	e.entity = ent or -1
+	e.comp.node0 = comp.node0
+	e.comp.node1 = comp.node1
+	e.comp.tangent0 = api.type.Vec3f.new(ta[1], ta[2], ta[3])
+	e.comp.tangent1 = api.type.Vec3f.new(tb[1], tb[2], tb[3])
+	e.comp.type = comp.type or 0
+	e.comp.typeIndex = comp.typeIndex or -1
+	e.type = isTrack and 1 or 0
+	copyEdgeProps(e, eid, isTrack, nil)
+	return e
+end
+
+-- Every line that stops at this station (through its station group).
+function CM.linesUsingStation(st)
+	local out = {}
+	pcall(function()
+		local ls = api.engine.system.lineSystem.getLines()
+		for i = 1, #ls do
+			local lc = api.engine.getComponent(ls[i], api.type.ComponentType.LINE)
+			local hit = false
+			if lc and lc.stops then
+				for j = 1, #lc.stops do
+					local sg = lc.stops[j].stationGroup
+					if sg and sg ~= -1 then
+						pcall(function()
+							local gc = api.engine.getComponent(sg, api.type.ComponentType.STATION_GROUP)
+							if gc and gc.stations then
+								for k = 1, #gc.stations do if gc.stations[k] == st then hit = true end end
+							end
+						end)
+					end
+				end
+			end
+			if hit then out[#out + 1] = ls[i] end
+		end
+	end)
+	return out
+end
+
+-- The nearest player stop / signal within eps of a point: entity, its edge.
+function CM.findStopNear(x, y, eps)
+	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
+	local best, bestD
+	for eo, eid in pairs(m) do
+		if isPlayerStop(eo) then
+			local d = describeStop(eo, eid)
+			if d then
+				local dd = (d.x - x) ^ 2 + (d.y - y) ^ 2
+				if dd < eps * eps and (not bestD or dd < bestD) then best, bestD = eo, dd end
+			end
+		end
+	end
+	return best, best and m[best] or nil
+end
+
+-- Which side of an edge a point is on, in THIS instance's frame: the
+-- geometric left (cross sign along node0 -> node1) and the engine's `left`
+-- byte. conv is the convention measured on the originator from the very
+-- object being shipped (true: engine-left is geometric-left); nil falls back
+-- to the decompile's reading of the stop tool (engine-left = cross < 0).
+function CM.sideOnEdge(eid, u, x, y, conv)
+	local comp, a, b, ta, tb = edgeGeomT(eid)
+	local q = hermitePos(a, ta, b, tb, u)
+	local tg = hermiteTangent(a, ta, b, tb, u)
+	local cross = tg[1] * (y - q[2]) - tg[2] * (x - q[1])
+	local geoL = cross > 0
+	local engL
+	if conv == nil then engL = not geoL else engL = conv and geoL or (not geoL) end
+	return geoL, engL
+end
+
+-- Submit ONE native-shape proposal. add = { eid, u, left, side, model, name,
+-- oneWay, x, y } or nil; remove = { eo, eid, x, y } or nil (either or both).
+-- Returns true when a command went out (onDone(success) follows), else
+-- false, why.
+function CM.nativeStopProposal(add, remove, why, onDone)
+	local edges = {}                      -- the add's edge is entity -1 (edgeEntity = -1)
+	if add then edges[#edges + 1] = add.eid end
+	if remove and remove.eid ~= (add and add.eid) then edges[#edges + 1] = remove.eid end
+	local sp = api.type.SimpleProposal.new()
+	local survivors = {}
+	for k, eid in ipairs(edges) do
+		local owner = CM.frozenOwnerOf(eid)
+		if owner then return false, string.format("edge %d is frozen into construction %d -- refused (DIVERGENCE)", eid, owner) end
+		local isTrack = false
+		pcall(function() isTrack = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil end)
+		local e = CM.nativeEdgeCopy(eid, isTrack, -k)
+		if not e then return false, string.format("edge %d gone", eid) end
+		local objs, n = CM.objectsOnEdge(eid)
+		if not objs then return false, string.format("edge %d: could not read its %d object(s) -- refused rather than drop them", eid, n or -1) end
+		local list = {}
+		for _, o in ipairs(objs) do
+			if not (remove and o[1] == remove.eo) then
+				list[#list + 1] = { o[1], o[2] }
+				survivors[#survivors + 1] = o[1]
+			end
+		end
+		if add and eid == add.eid then list[#list + 1] = { -1, add.side } end
+		e.comp.objects = list
+		sp.streetProposal.edgesToAdd[k] = e
+		sp.streetProposal.edgesToRemove[k] = eid
+	end
+	if remove then sp.streetProposal.edgeObjectsToRemove[1] = remove.eo end
+	if add then
+		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
+		eo.edgeEntity = -1
+		eo.param = add.u
+		eo.left = add.left and true or false
+		eo.oneWay = add.oneWay and true or false
+		eo.model = add.model
+		eo.playerEntity = api.engine.util.getPlayer()
+		eo.name = add.name or ""
+		sp.streetProposal.edgeObjectsToAdd[1] = eo
+	end
+	-- only the NEW and the REMOVED object are events for the poller; the
+	-- survivors keep their ids and it never sees them change
+	if add then CM.expectAdd(CM.expectStop, add.x, add.y) end
+	if remove then CM.expectAdd(CM.expectStopDel, remove.x, remove.y) end
+	local cmd = api.cmd.make.buildProposal(sp, buildContext(), true)
+	api.cmd.sendCommand(cmd, function(res, success)
+		local msg = ""
+		if not success then
+			pcall(function()
+				local es = res.resultProposalData and res.resultProposalData.errorState
+				if es then
+					msg = " critical=" .. tostring(es.critical)
+					for i = 1, #es.messages do msg = msg .. " '" .. tostring(es.messages[i]) .. "'" end
+				end
+			end)
+			if add then CM.expectDrop(CM.expectStop, add.x, add.y) end
+			if remove then CM.expectDrop(CM.expectStopDel, remove.x, remove.y) end
+		end
+		-- the proof: every survivor still maps to an edge under the SAME id
+		local kept, lost = 0, {}
+		pcall(function()
+			local m2 = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
+			for _, id in ipairs(survivors) do
+				if m2[id] then kept = kept + 1 else lost[#lost + 1] = tostring(id) end
+			end
+		end)
+		log(string.format("EXEC %s: %d edge(s)%s%s success=%s%s; survivors kept %d/%d%s", why, #edges,
+			add and " +add" or "", remove and (" -rm " .. tostring(remove.eo)) or "", tostring(success), msg,
+			kept, #survivors, #lost > 0 and (" LOST [" .. table.concat(lost, ",") .. "]") or ""))
+		if onDone then onDone(success) end
+	end)
+	return true
+end
+
+-- STOPADD and STOPREP (c.rx/c.ry = the stop the originator's placement
+-- replaced). Returns true when a proposal went out.
+function CM.execStopAdd(c)
+	if not K.STOPS_NATIVE then CM.execStopAddLegacy(c); return false end
+	local sent = false
+	local ok, err = pcall(function()
+		local tag = string.format("%s seq=%s", c.rx and "STOPREP" or "STOPADD", tostring(c.seq))
+		local wantTrack = tonumber(c.track) == 1
+		-- the edge under the stop's WORLD position: the peer's town road may be
+		-- nodded differently, so never by the shipped endpoints or entity
+		local eid, u = findEdgeContaining(wantTrack, c.x, c.y)
+		if not eid then
+			log(string.format("%s: no %s edge under %.1f,%.1f on this instance -- skipped (DIVERGENCE)",
+				tag, wantTrack and "track" or "street", c.x, c.y))
+			return
+		end
+		local comp, a, b = edgeGeomT(eid)
+		local sameEnds = false
+		if c.ax then
+			local function near(pt, x, y) return (pt[1] - x) ^ 2 + (pt[2] - y) ^ 2 < 4 end
+			sameEnds = (near(a, c.ax, c.ay) and near(b, c.bx, c.by)) or (near(a, c.bx, c.by) and near(b, c.ax, c.ay))
+		end
+		-- side and left, in OUR frame, with the convention the host measured
+		local hostSide = tonumber(c.side)
+		local conv
+		if tonumber(c.conv) == 1 then conv = true
+		elseif tonumber(c.conv) == 0 then conv = false
+		elseif hostSide == 0 or hostSide == 1 then conv = ((hostSide == 0) == (tonumber(c.left) == 1))
+		else conv = CM.leftConv end
+		local geoL, engL = CM.sideOnEdge(eid, u, c.x, c.y, conv)
+		local side = (hostSide == 2 or tonumber(c.kind) == 2) and 2 or (engL and 0 or 1)
+		local objs, n = CM.objectsOnEdge(eid)
+		if not objs then
+			log(string.format("%s: edge %d: could not read its %d object(s) -- skipped (DIVERGENCE)", tag, eid, n or -1))
+			return
+		end
+		-- REPLACE: the object the originator's tool removed with this placement
+		local rm = nil
+		if c.rx then
+			local old, oldEid = CM.findStopNear(tonumber(c.rx), tonumber(c.ry), 2.0)
+			if old then
+				rm = { eo = old, eid = oldEid, x = tonumber(c.rx), y = tonumber(c.ry) }
+				local lines = CM.linesUsingStation(old)
+				if #lines > 0 then
+					if not K.STOPS_DEL_ON_LINE then
+						log(string.format("%s: replaced stop %d is used by %d line(s) and stops_del_on_line=0 -- refused (DIVERGENCE)", tag, old, #lines))
+						return
+					end
+					log(string.format("%s: replaced stop %d is used by %d line(s) -- the engine rewrites them, the LUPDATE behind this restores the stop", tag, old, #lines))
+				end
+			else
+				log(string.format("%s: the replaced stop near %.1f,%.1f is not here -- placing the new one only", tag, tonumber(c.rx), tonumber(c.ry)))
+			end
+		end
+		-- guards, ignoring the object being replaced: duplicate, same side
+		-- (one object per side per edge -- the CreateLanes rule), and a road of
+		-- another type already carrying something (its lane layout is unknown)
+		local stname = ""
+		pcall(function()
+			local sc = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
+			if sc then stname = api.res.streetTypeRep.getName(sc.streetType) or "" end
+		end)
+		local hostSt = unescName(c.stname or "")
+		for _, o in ipairs(objs) do
+			if not (rm and o[1] == rm.eo) then
+				local d = describeStop(o[1], eid)
+				if d and (d.x - c.x) ^ 2 + (d.y - c.y) ^ 2 < 1.0 then
+					log(string.format("%s: a stop already stands at %.1f,%.1f -- nothing to do", tag, c.x, c.y))
+					return
+				end
+				if o[2] == side then
+					log(string.format("%s: edge %d already carries object %d on side %d -- one per side per edge, skipped (DIVERGENCE)",
+						tag, eid, o[1], side))
+					return
+				end
+				if hostSt ~= "" and stname ~= "" and stname ~= hostSt then
+					log(string.format("%s: edge %d is '%s' here, '%s' on the originator, and already carries an object -- lane layout unknown, skipped (DIVERGENCE)",
+						tag, eid, stname, hostSt))
+					return
+				end
+			end
+		end
+		log(string.format("%s: edge %d (%s) u=%.3f geoLeft=%s conv=%s -> left=%s side=%d, %d object(s) on it%s",
+			tag, eid, sameEnds and "same ends" or "drifted ends", u, tostring(geoL), tostring(conv), tostring(engL), side, #objs,
+			rm and (", replacing " .. tostring(rm.eo)) or ""))
+		local okB, why = CM.nativeStopProposal(
+			{ eid = eid, u = u, left = engL, side = side, model = unescName(c.model), name = unescName(c.name),
+			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y },
+			rm, string.format("%s origin=%s '%s'", tag, tostring(c.origin), unescName(c.name)),
+			function() conxBusy = false end)
+		if okB then sent = true else log(string.format("%s: %s -- skipped", tag, tostring(why))) end
+	end)
+	if not ok then log("exec STOPADD error: " .. tostring(err)) end
+	return sent
+end
+
+function CM.execStopDel(c)
+	if not K.STOPS_NATIVE then CM.execStopDelLegacy(c); return false end
+	local sent = false
+	local ok, err = pcall(function()
+		local tag = string.format("STOPDEL seq=%s", tostring(c.seq))
+		local best, eid = CM.findStopNear(c.x, c.y, 2.0)
+		if not best then
+			log(string.format("%s: no roadside stop within 2 m of %.1f,%.1f -- skipped", tag, c.x, c.y))
+			return
+		end
+		local lines = CM.linesUsingStation(best)
+		if #lines > 0 then
+			if not K.STOPS_DEL_ON_LINE then
+				log(string.format("%s: stop %d is used by %d line(s) and stops_del_on_line=0 -- refused (DIVERGENCE)", tag, best, #lines))
+				return
+			end
+			log(string.format("%s: stop %d is used by %d line(s) -- removed natively, the engine rewrites the lines first", tag, best, #lines))
+		end
+		local okB, why = CM.nativeStopProposal(nil, { eo = best, eid = eid, x = c.x, y = c.y },
+			string.format("%s origin=%s", tag, tostring(c.origin)), function() conxBusy = false end)
+		if okB then sent = true else log(string.format("%s: %s -- skipped", tag, tostring(why))) end
+	end)
+	if not ok then log("exec STOPDEL error: " .. tostring(err)) end
+	return sent
+end
+
+-- Stop replays run ONE AT A TIME through the construction queue, and each
+-- re-reads the edge and its objects when it actually runs. Two stops on one
+-- edge in the same stamp used to build from the same pre-apply world: the
+-- second listed an edge the first had already replaced and, by positive id, an
+-- object the first had removed -- a dead reference handed to the engine.
+function CM.stopRun(c)
+	conxBusy, conxBusyAt = true, gameTime() or 0
+	local sent = false
+	local ok, err = pcall(function()
+		if c.op == "STOPDEL" then sent = CM.execStopDel(c) else sent = CM.execStopAdd(c) end
+	end)
+	if not ok then log(string.format("%s seq=%s: error %s", tostring(c.op), tostring(c.seq), tostring(err))) end
+	if not sent then conxBusy = false end
+end
+
+function CM.stopEnqueue(c)
+	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+	local nowB = gameTime() or 0
+	if conxBusy and conxBusyAt and (nowB - conxBusyAt) > 3.0 then
+		log(string.format("%s: previous replay never reported back (%.1f units) -- releasing the queue", tostring(c.op), nowB - conxBusyAt))
+		conxBusy = false
+	end
+	if conxBusy or #conxQueue > 0 then
+		conxQueue[#conxQueue + 1] = { c = c, notBefore = nowB }
+		log(string.format("%s seq=%s: a replay is in flight -- queued (%d waiting)", tostring(c.op), tostring(c.seq), #conxQueue))
+		return
+	end
+	CM.stopRun(c)
+end
+
+-- The queue pump's dispatcher: constructions, stops and the line ops that
+-- were held behind them.
+function CM.runQueued(c)
+	if c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopRun(c)
+	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then execLine(c)
+	else execConX(c) end
 end
 
 local function pollNewConstructions()
@@ -7862,7 +8437,7 @@ function data()
 				local head = conxQueue[1]
 				if not head.notBefore or nowG >= head.notBefore then
 					table.remove(conxQueue, 1)
-					execConX(head.c)
+					CM.runQueued(head.c)
 				end
 			end
 			if ticks % K.REMOVAL_POLL_EVERY == 0 then pollConstructionRemovals() end
