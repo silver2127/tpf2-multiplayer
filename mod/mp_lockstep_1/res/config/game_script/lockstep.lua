@@ -6120,6 +6120,35 @@ end
 -- which walks that very list looking for the object and writes a crash dump.
 --
 -- stops: list of { u=, left=, model=, name= } relative to node0 -> node1.
+-- Every station entity some LINE stops at (via its station group), plus the
+-- groups' positions for a proximity fallback. Rebuilding an edge REPLACES its
+-- edge objects with new entities, so a stop a line references would be left
+-- as a dead entity in that line -- an uncatchable engine assert the next time
+-- the line or one of its vehicles is touched (both peers, 2026-09-02: a merged
+-- station's old stop deleted from under a bus line).
+local function stationsOnLines()
+	local ents, groups = {}, {}
+	pcall(function()
+		local ls = api.engine.system.lineSystem.getLines()
+		for i = 1, #ls do
+			local lc = api.engine.getComponent(ls[i], api.type.ComponentType.LINE)
+			if lc and lc.stops then
+				for j = 1, #lc.stops do
+					local sg = lc.stops[j].stationGroup
+					if sg and sg ~= -1 and not groups[sg] then
+						groups[sg] = true
+						pcall(function()
+							local gc = api.engine.getComponent(sg, api.type.ComponentType.STATION_GROUP)
+							if gc and gc.stations then for k = 1, #gc.stations do ents[gc.stations[k]] = true end end
+						end)
+					end
+				end
+			end
+		end
+	end)
+	return ents, groups
+end
+
 local function rebuildEdgeWithStops(eid, stops, why, onDone)
 	local comp, a, b, ta, tb = edgeGeomT(eid)
 	if not comp then return false, "edge gone" end
@@ -6131,6 +6160,30 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 	for eo, e2 in pairs(m) do
 		if e2 == eid and not isPlayerStop(eo) then
 			return false, string.format("edge %d carries edge object %d that is not a stop", eid, eo)
+		end
+	end
+	-- Never rebuild under a line. See stationsOnLines: the objects come back as
+	-- NEW entities and the line keeps the old id -> fatal. Refuse (DIVERGENCE):
+	-- a stop that stays or is missing shows in the c-lane; a crash shows nothing.
+	do
+		local onLine, groups = stationsOnLines()
+		for eo, e2 in pairs(m) do
+			if e2 == eid then
+				local used = onLine[eo] or false
+				if not used and next(groups) then
+					-- fallback by proximity: a group centred within 5 m of this stop
+					local d = describeStop(eo, eid)
+					if d then
+						for sg in pairs(groups) do
+							local gx, gy = stationGroupPos(sg)
+							if gx and (gx - d.x) ^ 2 + (gy - d.y) ^ 2 < 25 then used = true; break end
+						end
+					end
+				end
+				if used then
+					return false, string.format("edge %d carries stop %d that a LINE uses -- rebuilding would leave the line on a dead entity (fatal engine assert), refused (DIVERGENCE)", eid, eo)
+				end
+			end
 		end
 	end
 	-- TWO OBJECTS ON ONE EDGE IS A FATAL ENGINE ASSERT. StreetGeometry::CreateLanes
