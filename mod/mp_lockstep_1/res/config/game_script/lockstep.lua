@@ -7626,7 +7626,16 @@ local function checkHash(now)
 	local stamp = math.floor(now / K.HASH_EVERY_GAMETIME) * K.HASH_EVERY_GAMETIME
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
+	local ph0 = os.clock()
 	local h, detail = worldHash(now)
+	do  -- PERF: the hash walks every vehicle, construction and edge -- the one
+		-- O(world) cost the mod adds; measured, not estimated, so a big map's
+		-- hitch is visible in the log as ms per stamp
+		local dt = (os.clock() - ph0) * 1000
+		local pf = CM.perfHash or { n = 0, sum = 0, max = 0 }
+		pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
+		CM.perfHash = pf
+	end
 	myHashes[stamp] = h
 	myDetails[stamp] = detail
 	broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
@@ -7649,6 +7658,7 @@ function data()
 
 			local now = gameTime()
 			if not now then return end
+			local upd0 = os.clock()
 
 			-- Both every tick. pollInject at every 10th tick added up to 1.9s of
 			-- pure dead time before a build was even scheduled; a file stat per
@@ -7776,6 +7786,12 @@ function data()
 			-- B in {4,12}) so the stamp sets were DISJOINT: one SYNC verdict in an
 			-- entire session, and a real 3-edge divergence sat invisible behind it.
 			checkHash(now)
+			do  -- PERF: whole per-tick script cost (file polls, queue, apply, hash check)
+				local dt = (os.clock() - upd0) * 1000
+				local pf = CM.perfUpd or { n = 0, sum = 0, max = 0 }
+				pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
+				CM.perfUpd = pf
+			end
 
 			if ticks % 15 == 0 then
 				-- The dashboard file: one key=value per line, then the recent
@@ -7859,6 +7875,14 @@ function data()
 					end
 					table.sort(parts)
 					if #parts > 0 then log("STEPS: " .. table.concat(parts, " | ")) end
+				end)
+				pcall(function()
+					local u, h = CM.perfUpd, CM.perfHash
+					if u and u.n > 0 then
+						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps",
+							u.sum / u.n, u.max, u.n, h and h.n > 0 and h.sum / h.n or 0, h and h.max or 0, h and h.n or 0))
+					end
+					CM.perfUpd, CM.perfHash = nil, nil
 				end)
 				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d paused=%s",
 					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
