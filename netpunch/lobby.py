@@ -1719,7 +1719,9 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     _log_sinks.append(fwd.add)
 
     io.emit({"type": "status", "state": "connected",
-             "detail": f"joined host {conn.peer_str}"})
+             # no address in the panel: a joiner's screen (or a stream of it)
+             # must not show the host's IP. The redacted log still has it.
+             "detail": "joined the host"})
     io.write_state(state="connected", you=desired[0], started=False)
 
     def send(msg):
