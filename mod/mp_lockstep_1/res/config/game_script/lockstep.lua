@@ -656,6 +656,12 @@ K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, 
 -- of its own recently-sent commands; a receiver that sees a gap in an origin's
 -- contiguous seq numbers NACKs it and the origin rebroadcasts. Duplicates are
 -- already harmless (executed[cmdKey] dedups at apply time).
+-- The simulation advances in fixed steps of 0.2 game units (GameSim::Step, 5 Hz
+-- at speed 1; measured 2026-08-07). A command stamp is therefore a STEP, not a
+-- time: stamps are snapped to the step grid, application is decided in steps,
+-- and lag is counted in whole steps. This is the unit the delivery buffer will
+-- be sized in.
+K.SIM_STEP = 0.2
 K.CMD_RING = 256          -- own commands kept for resend
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
 K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
@@ -4493,6 +4499,8 @@ local function broadcast(line)
 	if K.CAPTURE_FILE then appendLine(K.CAPTURE_FILE, line) end
 end
 
+function CM.stepOf(t) return math.floor((t or 0) / K.SIM_STEP + 0.5) end
+
 -- ---------- command reliability (NACK + resend) ----------
 CM.sentRing = {}       -- our seq -> encoded LSCMD line
 CM.rx = {}             -- origin letter -> receive-side tracking
@@ -4666,8 +4674,11 @@ function scheduleLocal(op, args)
 		log(string.format("stamp: peer is %.2f ahead -- scheduling %.2f out instead of %.2f",
 			lead, delay, K.EXEC_DELAY))
 	end
-	local at = tonumber(string.format("%.4f",
-		now + delay + (tonumber(args and args.delay or 0) or 0)))
+	-- snap to the NEXT step boundary: a stamp between two steps names no
+	-- simulation state, and the lead term (an integer peer time) took stamps
+	-- off the grid before this
+	local rawAt = now + delay + (tonumber(args and args.delay or 0) or 0)
+	local at = tonumber(string.format("%.4f", math.ceil(rawAt / K.SIM_STEP - 1e-6) * K.SIM_STEP))
 	local c = { op = op, at = at, origin = K.INSTANCE, seq = seqNo }
 	for k, v in pairs(args) do c[k] = v end
 	-- companies mode: stamp the originating company so the peer can attribute the
@@ -7548,7 +7559,7 @@ function data()
 			if ticks % K.CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
 
 			if ticks % K.HEARTBEAT_EVERY == 0 then
-				broadcast(string.format("LSTICK t=%d o=%s", math.floor(now), K.INSTANCE))
+				broadcast(string.format("LSTICK t=%d o=%s s=%d", math.floor(now), K.INSTANCE, CM.stepOf(now)))
 			end
 
 			applyBarrier(now)
@@ -7570,7 +7581,7 @@ function data()
 				table.sort(queue, cmdLess)
 				local keep = {}
 				for _, c in ipairs(queue) do
-					if c.at <= now then
+					if CM.stepOf(c.at) <= CM.stepOf(now) then
 						local k = cmdKey(c)
 						if not executed[k] then
 							executed[k] = true
@@ -7582,11 +7593,12 @@ function data()
 							-- the status line (applylag=). If this is routinely > 0 the
 							-- sim-step gate is justified.
 							local lag = now - c.at
+							local lagSteps = CM.stepOf(now) - CM.stepOf(c.at)
 							if lag > (CM.applyLagMax or 0) then CM.applyLagMax = lag end
 							CM.applyCount = (CM.applyCount or 0) + 1
-							if lag > 0.01 then CM.applyLate = (CM.applyLate or 0) + 1 end
-							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f",
-								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag))
+							if lagSteps > 0 then CM.applyLate = (CM.applyLate or 0) + 1 end
+							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f step=%d late=%d",
+								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag, CM.stepOf(now), lagSteps))
 							execute(c)
 						end
 					else
@@ -7662,7 +7674,29 @@ function data()
 					end
 				end)
 			end
+			do
+				local st = CM.stepOf(now)
+				local d = CM.lastStepSeen and (st - CM.lastStepSeen) or 0
+				CM.lastStepSeen = st
+				local sp = -1
+				pcall(function() sp = game.interface.getGameSpeed() or -1 end)
+				CM.stepHist = CM.stepHist or {}
+				local h = CM.stepHist[sp] or {}
+				CM.stepHist[sp] = h
+				if d > 9 then d = 9 end
+				h[d] = (h[d] or 0) + 1
+			end
 			if ticks % 300 == 0 then
+				pcall(function()
+					local parts = {}
+					for sp, h in pairs(CM.stepHist or {}) do
+						local cells, tot, skip = {}, 0, 0
+						for d = 0, 9 do if h[d] then cells[#cells + 1] = d .. ":" .. h[d]; tot = tot + h[d]; if d >= 2 then skip = skip + h[d] end end end
+						parts[#parts + 1] = string.format("speed %s -> steps/update {%s} skipped %.1f%%", tostring(sp), table.concat(cells, " "), tot > 0 and 100 * skip / tot or 0)
+					end
+					table.sort(parts)
+					if #parts > 0 then log("STEPS: " .. table.concat(parts, " | ")) end
+				end)
 				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d paused=%s",
 					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 					#queue, desyncs, tostring(paused)))
