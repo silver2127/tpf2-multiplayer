@@ -1908,6 +1908,23 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             //
             // _Do_call(this, Command const&) -> rcx = r9, rdx = the Command,
             // which is r8 at this call site.
+            // FIRE-AND-FORGET FIRST. SetLine (6) and Reverse (10) are armed
+            // with g_pendingNoCb=1: nothing waits on their callback, and
+            // FIRING it here with the command's success byte still 0 makes the
+            // UI take its FAILURE branch -- SetLine then pops "unable to find a
+            // path to a stop", a false alarm since the Lua replays the
+            // assignment at the stamp on every instance (review, 2026-09-01).
+            // So suppress WITHOUT firing. Only the build/upgrade tools
+            // (g_pendingNoCb==0) fall through to fire their callback, which
+            // they DO wait on (cancel-at-commandlist-add-wedges-the-ui).
+            if (InterlockedCompareExchange(&g_pendingNoCb, 0, 0)) {
+                InterlockedExchange(&g_pendingNoCb, 0);
+                g_suppressed++;
+                ZeroAddResult(rdx);
+                Log("[slice] CANCEL fire-and-forget (caller_rva=%llx), callback "
+                    "NOT fired -- avoids the false no-path toast\n", (unsigned long long)caller);
+                return 1;
+            }
             bool fired = false;
             if (Readable((void*)r9, 8) && Readable((void*)r8, 8)) {
                 uint64_t vft = 0;
