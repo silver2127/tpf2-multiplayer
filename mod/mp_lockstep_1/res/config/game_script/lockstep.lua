@@ -2683,18 +2683,6 @@ local vehKeyOf, vehIdOf = {}, {}       -- localId -> key, key -> localId
 local knownVeh = {}                    -- every vehicle id seen in a depot so far
 local primedVeh = {}                   -- vehicles that existed at load: same ids on both peers
 local pendingVehKeys = {}              -- { key=, depot=<child>, since= }
--- SERIAL BUY QUEUE (peers only). A batch buy stamps N VBUYs at one game-time;
--- applying all N in one update() fired N buyVehicle calls on the sim thread
--- (which wedged a peer, 2026-09-01) and dropped N fresh vehicles into the depot
--- at once, so the key->vehicle pairing fell back to per-instance enumeration
--- order and bound different physical trucks per instance -> position blip + a
--- lasting coop money split. Instead the peer issues ONE buy at a time and does
--- not issue the next until that one's vehicle has bound: exactly one fresh
--- vehicle exists at bind time, unambiguous on every instance.
-CM.buyQueue = {}
-CM.buyInFlight = nil        -- key of the buy awaiting its vehicle, or nil
-CM.buyInFlightSince = 0
-K.BUY_INFLIGHT_MAX = 40     -- ticks before a stuck buy releases the queue (> the 6-unit pending-key timeout)
 local vehPrimed = false
 
 -- Vehicles parked in a construction's depot. NOT game.interface.getDepotVehicles:
@@ -2825,7 +2813,6 @@ local function pollVehKeys()
 		end
 		if #fresh >= 1 then
 			registerVehKey(p.key, fresh[1])
-			if CM.buyInFlight == p.key then CM.buyInFlight = nil end   -- serial gate: next buy may issue
 			-- companies mode: a remote company's purchase landed on our player;
 			-- hand the vehicle over and move the cost (balance delta since apply).
 			if p.company then
@@ -2847,7 +2834,6 @@ local function pollVehKeys()
 		elseif now - p.since > 6 then
 			log(string.format("veh: key %s never produced a vehicle in depot %s (%d listed) -- dropped",
 				p.key, tostring(p.depot), total))
-			if CM.buyInFlight == p.key then CM.buyInFlight = nil end   -- serial gate: do not stall the queue
 			resolved[#resolved + 1] = i
 		end
 	end
@@ -3178,6 +3164,29 @@ local function execVehCmd(c)
 	if c.origin == K.INSTANCE then
 		log(string.format("%s seq=%s: STRICT -- originator replaying at stamp (local was cancelled)", c.op, tostring(c.seq)))
 	end
+	-- A VLINE whose vehicle key is not bound yet (its buy is still draining one
+	-- per tick, or its buy callback has not fired) must WAIT, not skip: skipping
+	-- left the vehicle unassigned on the peer while the host assigned it, and a
+	-- setLine on the unresolved id crashed both peers on GetComponentDataIndex
+	-- (2026-09-01). Same retry the "line not here yet" path uses.
+	if c.op == "VLINE" and c.origin ~= K.INSTANCE then
+		local haveAll = true
+		if c.key and not vehIdFor(c.key) then haveAll = false end
+		if not haveAll then
+			c.tries = (c.tries or 0) + 1
+			if c.tries <= 30 then
+				c.at = (gameTime() or 0) + 1.0
+				CM.retryQueue = CM.retryQueue or {}
+				CM.retryQueue[#CM.retryQueue + 1] = c
+				if c.tries == 1 or c.tries % 10 == 0 then
+					log(string.format("VLINE seq=%s: vehicle key not bound yet -- retry %d", tostring(c.seq), c.tries))
+				end
+				return
+			end
+			log(string.format("VLINE seq=%s: vehicle key never bound after %d tries -- left unassigned (DIVERGENCE)", tostring(c.seq), c.tries))
+			return
+		end
+	end
 	local ok, err = pcall(function()
 		local function resolve(key)
 			local id = vehIdFor(key)
@@ -3305,10 +3314,14 @@ function buildVehConfig(c)
 	return config, u
 end
 
--- Issue ONE buy now; returns the vehicle key if a buyVehicle was actually sent
--- (so the caller can gate on it binding), else nil.
-function CM.issueBuy(c)
-	local issuedKey = nil
+local function execVBuy(c)
+	if c.origin == K.INSTANCE and not K.STRICT_OPS.VBUY then
+		log(string.format("VBUY seq=%s: originator already bought locally, skipping", tostring(c.seq)))
+		return
+	end
+	if c.origin == K.INSTANCE then
+		log(string.format("VBUY seq=%s: STRICT -- originator replaying buy at stamp (local was cancelled)", tostring(c.seq)))
+	end
 	local ok, err = pcall(function()
 		local x, y = tonumber(c.x), tonumber(c.y)
 		if not (x and y) then log("VBUY: no depot position"); return end
@@ -3360,7 +3373,6 @@ function CM.issueBuy(c)
 			log(string.format("EXEC VBUY seq=%s: make.buyVehicle refused: %s", tostring(seq), tostring(cmd)))
 			return
 		end
-		issuedKey = tostring(origin) .. ":" .. tostring(seq)
 		api.cmd.sendCommand(cmd, function(res, success)
 			log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s",
 				tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success)))
@@ -3378,40 +3390,6 @@ function CM.issueBuy(c)
 		end)
 	end)
 	if not ok then log("execVBuy error: " .. tostring(err)) end
-	return issuedKey
-end
-
--- Peers replay buys through the serial queue; the originator bought natively and
--- skips (its own key is registered from its capture, expectVehicle at the inject
--- VBUY site). Only peers reach here.
-local function execVBuy(c)
-	if c.origin == K.INSTANCE and not K.STRICT_OPS.VBUY then
-		log(string.format("VBUY seq=%s: originator already bought locally, skipping", tostring(c.seq)))
-		return
-	end
-	CM.buyQueue[#CM.buyQueue + 1] = c
-end
-
--- Drain the serial buy queue: one outstanding buy at a time. Called every tick.
-function CM.drainBuys()
-	if CM.buyInFlight then
-		if (ticks - (CM.buyInFlightSince or ticks)) > K.BUY_INFLIGHT_MAX then
-			log(string.format("veh: buy %s did not bind in %d ticks -- releasing the queue (%d waiting)",
-				tostring(CM.buyInFlight), K.BUY_INFLIGHT_MAX, #CM.buyQueue))
-			CM.buyInFlight = nil
-		else
-			return
-		end
-	end
-	if #CM.buyQueue == 0 then return end
-	local c = table.remove(CM.buyQueue, 1)
-	local key = CM.issueBuy(c)
-	if key then
-		CM.buyInFlight = key
-		CM.buyInFlightSince = ticks
-	end
-	-- key==nil: the buy could not be issued (no depot / wrong kind / refused);
-	-- leave the gate open so the next queued buy issues on the following tick.
 end
 
 -- ---------- vehicles: ReplaceVehicle ----------
@@ -7645,7 +7623,6 @@ function data()
 			primeConstructions()
 			primeVehKeys()
 			pollVehKeys()
-			CM.drainBuys()
 			primeLineKeys()
 			pollLineKeys()
 			if not conxBusy and #conxQueue > 0 then
@@ -7684,11 +7661,29 @@ function data()
 			if #queue > 0 then
 				table.sort(queue, cmdLess)
 				local keep = {}
+				-- At most ONE buy applied per tick. A batch buy stamps N VBUYs at
+				-- one game-time; firing N buyVehicle in a single update() wedged
+				-- the sim thread (2026-09-01) and dropped N fresh vehicles at once
+				-- (ambiguous key binding -> money split). Once a second due buy is
+				-- reached, DEFER it AND everything sorted after it, so a command
+				-- that depends on an earlier buy (a VLINE for that vehicle) can
+				-- never run before it. Ordering is by (at, origin, seq), and buys
+				-- carry lower seq than the line-assigns of the same batch, so this
+				-- drains buys one-per-tick then the line-assigns, in order.
+				local buysThisTick = 0
+				local deferRest = false
 				for _, c in ipairs(queue) do
-					if CM.stepOf(c.at) <= CM.stepOf(now) then
+					if deferRest then
+						keep[#keep + 1] = c
+					elseif CM.stepOf(c.at) <= CM.stepOf(now) then
+						if c.op == "VBUY" and buysThisTick >= 1 and not executed[cmdKey(c)] then
+							deferRest = true
+							keep[#keep + 1] = c
+						else
 						local k = cmdKey(c)
 						if not executed[k] then
 							executed[k] = true
+							if c.op == "VBUY" then buysThisTick = buysThisTick + 1 end
 							-- MEASUREMENT: how far past its stamp is a command actually
 							-- issued? update() runs per frame while the clock moves in
 							-- 0.2-unit sim steps, so at speed 2-3 the first frame past a
@@ -7704,6 +7699,7 @@ function data()
 							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f step=%d late=%d",
 								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag, CM.stepOf(now), lagSteps))
 							execute(c)
+						end
 						end
 					else
 						keep[#keep + 1] = c
