@@ -1028,6 +1028,32 @@ local function buildContext()
 	return nil
 end
 
+-- The Context a NATIVE construction placement runs under (measured 2026-08-28:
+-- checkTerrainAlignment=1, cleanupStreetGraph=1). The replay used nil, and the
+-- open item since then was a one-edge / heights divergence around every
+-- replayed depot: the engine re-graded and cleaned the street graph on the
+-- originator and not on the peer (today: A e1081 vs peers e1082, z differs, on
+-- the very first depot). With the player set the peer is also charged the way
+-- the originator was, which is the construction half of the coop money gap.
+-- Gated, with a nil fallback if make refuses, so the worst case is today's
+-- behaviour.
+K.CONX_UI_CONTEXT = true
+function CM.conxContext()
+	if not K.CONX_UI_CONTEXT then return nil end
+	local ok, ctx = pcall(function()
+		local c = api.type.Context:new()
+		c.checkTerrainAlignment = true
+		c.cleanupStreetGraph    = true
+		c.gatherBuildings       = false
+		c.gatherFields          = true
+		c.player                = api.engine.util.getPlayer()
+		return c
+	end)
+	if ok and ctx then return ctx end
+	log("CONX: could not build the UI context -- using nil")
+	return nil
+end
+
 local function execEdge(c)
 	local isRail = (c.op == "RAIL")
 	local ok, err = pcall(function()
@@ -3905,7 +3931,14 @@ execConX = function(c)
 				end
 			end
 		end)
-		local okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, nil, true) end)
+		local ctx = CM.conxContext()
+		local okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, ctx, true) end)
+		if (not okMake or not cmd) and ctx then
+			log(string.format("CONX seq=%s: make.buildProposal refused with the UI context (%s) -- retrying with nil", tostring(c.seq), tostring(cmd)))
+			okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, nil, true) end)
+		elseif ctx then
+			log(string.format("CONX seq=%s: built with the UI context (terrain align + graph cleanup, charged)", tostring(c.seq)))
+		end
 		if not okMake or not cmd then
 			-- Fallback: the old template path. Loses street integration but
 			-- still puts the building down; logged loudly so it is visible.
