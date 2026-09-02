@@ -4606,6 +4606,7 @@ local function compareOne(stamp, origin, theirs, dt)
 	local pr = peerFor(origin)
 	if mine == theirs then
 		pr.streak = 0
+		pr.verdict = "SYNC"
 		log(string.format("SYNC t=%d hash=%s (%s)", stamp, mine, origin))
 		if not (comparedAt[stamp] and comparedAt[stamp].bad) then CM.dashVerdict = "SYNC" end
 	else
@@ -4619,6 +4620,7 @@ local function compareOne(stamp, origin, theirs, dt)
 			return
 		end
 		desyncs = desyncs + 1
+		pr.verdict = "DESYNC"
 		comparedAt[stamp].bad = true
 		log(string.format("!! DESYNC t=%d mine=%s peer %s=%s (total %d)",
 			stamp, mine, origin, theirs, desyncs))
@@ -7518,6 +7520,23 @@ function data()
 							if #parts > 0 then vd = table.concat(parts, " ") end
 						end
 						f:write("vdrift=" .. vd .. "\n")
+						-- The GUI used to decide which columns exist by which
+						-- lockstep_dash_<x>.txt files it could open. That is wrong
+						-- across Sandboxie: each boxed instance writes its own copy and
+						-- reads through to the native dir, so the native A never saw
+						-- c, and a stale file from an earlier session showed a dead b
+						-- for minutes. The peer set travels HERE instead, from the
+						-- LSTICK table, with a wall clock so a leftover file can be
+						-- told from a live one.
+						f:write("wall=" .. tostring(os.time()) .. "\n")
+						local ps = {}
+						for o, pr in pairs(CM.peers) do
+							if pr.time and pr.at and (ticks - pr.at) <= K.PEER_STALE_TICKS then
+								ps[#ps + 1] = string.format("%s:%d:%+.1f:%s", o, math.floor(pr.time), now - pr.time, pr.verdict or "-")
+							end
+						end
+						table.sort(ps)
+						f:write("peers=" .. (#ps > 0 and table.concat(ps, ",") or "-") .. "\n")
 						for _, ev in ipairs(CM.dashEvents) do f:write("ev=" .. ev .. "\n") end
 						f:close()
 					end
@@ -7559,17 +7578,53 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
-				-- which instances are on this machine's data dirs right now
-				local present = {}
-				for letter in ("abcdefgh"):gmatch(".") do
+				local function readDash(inst)
 					local bases = { K.BASE }
-					for _, pth in ipairs(CM.baseCandidates or {}) do if pth ~= K.BASE then bases[#bases + 1] = pth end end
+					for _, p in ipairs(CM.baseCandidates or {}) do if p ~= K.BASE then bases[#bases + 1] = p end end
 					for _, base in ipairs(bases) do
-						local ff = io.open(base .. "lockstep_dash_" .. letter .. ".txt", "r")
-						if ff then ff:close(); present[#present + 1] = letter; break end
+						local f = io.open(base .. "lockstep_dash_" .. inst .. ".txt", "r")
+						if f then
+							local kv, ev = {}, {}
+							for line in f:lines() do
+								local k, v = line:match("^(%w+)=(.*)$")
+								if k == "ev" then ev[#ev + 1] = v elseif k then kv[k] = v end
+							end
+							f:close()
+							if next(kv) then return kv, ev end
+						end
+					end
+					return nil
+				end
+				-- Which instances are in the session: ourselves, every peer our own
+				-- game-script state hears LSTICKs from (the peers= line), and any
+				-- other instance whose dash file on this machine is FRESH (its wall
+				-- clock within 30 s of ours). Not "whatever files exist": across
+				-- Sandboxie each box has its own copy of the data dir, so the native
+				-- instance never sees a boxed one's file, and a stale file is a dead
+				-- session (review, 2026-09-01: A showed a+b, B and C showed a+b+c).
+				local own = K.INSTANCE or "a"
+				local ownKv = readDash(own)
+				local ownWall = ownKv and tonumber(ownKv.wall) or nil
+				local peerInfo = {}
+				if ownKv and ownKv.peers and ownKv.peers ~= "-" then
+					for o, pt, sk, vd in ownKv.peers:gmatch("(%a):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
+						peerInfo[o] = { t = pt, skew = sk, verdict = vd }
 					end
 				end
-				if #present == 0 then present = { K.INSTANCE or "a" } end
+				local present, fresh = {}, {}
+				for letter in ("abcdefgh"):gmatch(".") do
+					local isPresent = (letter == own) or (peerInfo[letter] ~= nil)
+					local kv = (letter == own) and ownKv or readDash(letter)
+					if kv then
+						local w = tonumber(kv.wall)
+						if letter == own or (w and ownWall and math.abs(ownWall - w) <= 30) then
+							fresh[letter] = kv
+							isPresent = true
+						end
+					end
+					if isPresent then present[#present + 1] = letter end
+				end
+				if #present == 0 then present = { own } end
 				local colsKey = table.concat(present)
 				local D = CM.dash
 				if D and D.win and D.colsKey ~= colsKey then
@@ -7610,34 +7665,27 @@ function data()
 					D.win:setPosition(20, 120)
 					statusWin = D.win     -- keep the old handle alive for the close/rebuild path
 				end
-				local function readDash(inst)
-					local bases = { K.BASE }
-					for _, p in ipairs(CM.baseCandidates or {}) do if p ~= K.BASE then bases[#bases + 1] = p end end
-					for _, base in ipairs(bases) do
-						local f = io.open(base .. "lockstep_dash_" .. inst .. ".txt", "r")
-						if f then
-							local kv, ev = {}, {}
-							for line in f:lines() do
-								local k, v = line:match("^(%w+)=(.*)$")
-								if k == "ev" then ev[#ev + 1] = v elseif k then kv[k] = v end
-							end
-							f:close()
-							if next(kv) then return kv, ev end
-						end
-					end
-					return nil
-				end
-				local dashes = {}
-				for _, letter in ipairs(D.cols) do dashes[letter] = readDash(letter) end
+				-- A column with a fresh local file shows everything. A peer known only
+				-- over the wire shows what we know of it: its game time, our skew to
+				-- it, and our verdict against it.
 				for _, key in ipairs(D.rows) do
 					for _, letter in ipairs(D.cols) do
-						local dd = dashes[letter]
-						D.cells[key][letter]:setText(dd and dd[key] or "-")
+						local dd = fresh[letter]
+						local v = dd and dd[key]
+						if not v and peerInfo[letter] then
+							if key == "t" then v = peerInfo[letter].t
+							elseif key == "skew" then v = peerInfo[letter].skew
+							elseif key == "peer" then v = own end
+						end
+						D.cells[key][letter]:setText(v or "-")
 					end
 				end
-				local mine = dashes[K.INSTANCE or "a"]
-				-- just the verdict and the lane names; the hash detail is in the log
-				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-"))
+				local mine = fresh[own]
+				-- the verdict and, per peer, our verdict against that peer
+				local vs = {}
+				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
+				table.sort(vs)
+				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-") .. (#vs > 0 and ("   [" .. table.concat(vs, ", ") .. "]") or ""))
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
 				-- one-byte file; no file means shown.
 				local shown = true
