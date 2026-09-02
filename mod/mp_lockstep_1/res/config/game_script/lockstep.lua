@@ -3332,7 +3332,12 @@ function buildVehConfig(c)
 		part.color = api.type.Vec3f.new(tonumber(r) or -1, tonumber(g) or -1, tonumber(b) or -1)
 		part.logo = ""
 		local tvp = api.type.TransportVehiclePart.new()
-		tvp.purchaseTime = 0
+		-- purchaseTime is game-time in ms (measured on a native buy: 2771200 at
+		-- t=2771.2). Zero is what every replayed vehicle carried, and every
+		-- replayed buy produced a non-fatal engine assert + an ~800 KB minidump
+		-- (the visible stall on a buy). The stamp is identical on every peer, so
+		-- it is deterministic; it is also within a second of the originator's.
+		tvp.purchaseTime = math.floor((tonumber(c.at) or 0) * 1000)
 		tvp.maintenanceState = 1.0
 		tvp.targetMaintenanceState = 0
 		local alc = tvp.autoLoadConfig
