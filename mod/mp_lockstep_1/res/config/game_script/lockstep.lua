@@ -650,6 +650,18 @@ local scheduleLocal   -- forward: called by the line registry above its definiti
 K.JOURNAL_LOAN = 0
 K.JOURNAL_TRANSFER = 6
 K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+-- Command reliability. LSCMD ships as fire-and-forget UDP; a fully-dropped
+-- command silently desyncs the peer that missed it (measured 2026-09-01: one
+-- instance never got a VBUY and ran a truck short). Each instance keeps a ring
+-- of its own recently-sent commands; a receiver that sees a gap in an origin's
+-- contiguous seq numbers NACKs it and the origin rebroadcasts. Duplicates are
+-- already harmless (executed[cmdKey] dedups at apply time).
+K.CMD_RING = 256          -- own commands kept for resend
+K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
+K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
+K.NACK_MAX = 10           -- give up on one seq after this many NACKs
+K.NACK_PER_SCAN = 12      -- cap NACKs sent per scan so a big gap does not flood
+K.RESEND_MIN_GAP = 5      -- ticks: do not rebroadcast the same seq more often
 
 local warnedNoEdges = false
 -- node id -> "x,y", valid for ONE hash pass only. Ids are recycled: a node that
@@ -4481,6 +4493,84 @@ local function broadcast(line)
 	if K.CAPTURE_FILE then appendLine(K.CAPTURE_FILE, line) end
 end
 
+-- ---------- command reliability (NACK + resend) ----------
+CM.sentRing = {}       -- our seq -> encoded LSCMD line
+CM.rx = {}             -- origin letter -> receive-side tracking
+CM.resendAt = {}       -- our seq -> tick we last rebroadcast it
+CM.nackSent = 0
+CM.nackAnswered = 0
+CM.recovered = 0
+
+function CM.recordSent(seq, line)
+	CM.sentRing[seq] = line
+	local drop = seq - K.CMD_RING
+	if drop > 0 and CM.sentRing[drop] then CM.sentRing[drop] = nil end
+end
+
+-- an LSCMD arrived from origin o with sequence number seq
+function CM.rxNote(o, seq)
+	if o == K.INSTANCE then return end
+	local r = CM.rx[o]
+	if not r then
+		-- firstSeq is the earliest seq we ever hear from o: commands issued
+		-- before we joined (or before this baseline) are not ours to demand.
+		r = { seen = {}, maxSeq = seq, firstSeq = seq, missSince = {}, nackAt = {}, nackN = {} }
+		CM.rx[o] = r
+	end
+	r.seen[seq] = true
+	r.missSince[seq] = nil; r.nackAt[seq] = nil; r.nackN[seq] = nil
+	if seq > r.maxSeq then
+		-- any interior seq not yet seen becomes a candidate gap, timed from now
+		for g = r.maxSeq + 1, seq - 1 do
+			if not r.seen[g] and not r.missSince[g] then r.missSince[g] = ticks end
+		end
+		r.maxSeq = seq
+	end
+end
+
+-- periodic: NACK gaps that have persisted past the reorder grace
+function CM.nackScan()
+	local sent = 0
+	for o, r in pairs(CM.rx) do
+		if o ~= K.INSTANCE then
+			for g = r.firstSeq + 1, r.maxSeq - 1 do
+				if sent >= K.NACK_PER_SCAN then break end
+				if not r.seen[g] and r.missSince[g] then
+					local last = r.nackAt[g] or (r.missSince[g] - K.NACK_EVERY)
+					local due = (ticks - r.missSince[g] >= K.NACK_GRACE) and (ticks - last >= K.NACK_EVERY)
+					if due and (r.nackN[g] or 0) < K.NACK_MAX then
+						broadcast(string.format("LSNACK o=%s seq=%d by=%s", o, g, K.INSTANCE))
+						r.nackAt[g] = ticks
+						r.nackN[g] = (r.nackN[g] or 0) + 1
+						CM.nackSent = CM.nackSent + 1
+						sent = sent + 1
+						if (r.nackN[g] or 0) == 1 then
+							log(string.format("NACK %s seq=%d (missing, gap below %d)", o, g, r.maxSeq))
+						elseif (r.nackN[g] or 0) >= K.NACK_MAX then
+							log(string.format("NACK %s seq=%d GAVE UP after %d tries -- desync will stand until resync", o, g, K.NACK_MAX))
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- someone asked us (or another origin) to resend a command
+function CM.onNack(o, seq)
+	if o ~= K.INSTANCE then return end          -- only the origin answers
+	local line = CM.sentRing[seq]
+	if not line then
+		log(string.format("NACK for our seq=%d but it is no longer in the ring (>%d old)", seq, K.CMD_RING))
+		return
+	end
+	if CM.resendAt[seq] and ticks - CM.resendAt[seq] < K.RESEND_MIN_GAP then return end
+	CM.resendAt[seq] = ticks
+	CM.nackAnswered = CM.nackAnswered + 1
+	broadcast(line)
+	log(string.format("RESEND seq=%d (answering a NACK)", seq))
+end
+
 -- Field order on the wire is FIXED (sorted), not pairs() order.
 --
 -- pairs() iteration order is not guaranteed and can differ between the two
@@ -4589,7 +4679,9 @@ function scheduleLocal(op, args)
 	-- everyone else -- that is the whole point. Applying locally and shipping a
 	-- copy is what the old state-diff design did, and it is why the two worlds
 	-- were never actually in step.
-	broadcast(encodeCmd(c))
+	local wire = encodeCmd(c)
+	CM.recordSent(seqNo, wire)
+	broadcast(wire)
 	log(string.format("SCHED %s seq=%d at=%.4f (now=%.4f)", op, seqNo, at, now))
 end
 
@@ -4686,9 +4778,21 @@ local function onLine(line)
 				CM.setSpeed(v, "the other player set it")
 			end
 		end
+	elseif op == "LSNACK" then
+		local o = line:match(" o=(%a)")
+		local seq = tonumber(line:match(" seq=(%d+)"))
+		if o and seq then pcall(CM.onNack, o, seq) end
 	elseif op == "LSCMD" then
 		local c = decodeCmd(line)
 		if c then
+			-- track the origin's sequence for gap detection + resend
+			if c.origin and c.seq then pcall(CM.rxNote, c.origin, c.seq) end
+			-- a resent command may arrive after its stamp; it still executes
+			-- (LATE) so the entity exists and the world converges
+			if c.origin ~= K.INSTANCE and CM.rx[c.origin] and CM.rx[c.origin].nackN and CM.rx[c.origin].nackN[c.seq] then
+				CM.recovered = CM.recovered + 1
+				log(string.format("RECOVERED %s seq=%d from %s (a NACK was answered)", tostring(c.op), c.seq, c.origin))
+			end
 			-- our own command coming back off the wire; already queued
 			if c.origin ~= K.INSTANCE then
 				-- companies mode: the lobby's assignment wins over the sender's stamp
@@ -7421,6 +7525,7 @@ function data()
 			if ticks % K.CON_POLL_EVERY == 0 then pollNewConstructions() end
 			if ticks % K.CON_POLL_EVERY == 3 then CM.pollStops() end
 			if ticks % 15 == 7 then CM.pollLoan() end
+			if ticks % 10 == 5 then CM.nackScan() end
 			flushConPairs()
 			buytestPoll()
 			primeConstructions()
@@ -7529,6 +7634,7 @@ function data()
 						-- LSTICK table, with a wall clock so a leftover file can be
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
+						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
 						local ps = {}
 						for o, pr in pairs(CM.peers) do
 							if pr.time and pr.at and (ticks - pr.at) <= K.PEER_STALE_TICKS then
