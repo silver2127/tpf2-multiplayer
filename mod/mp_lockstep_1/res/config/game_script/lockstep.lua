@@ -462,6 +462,11 @@ function CM.cmBookJournal(pid, amount, jtype)
 end
 
 function CM.cmBalance(pid)
+	-- getEntity(nil) is an ENGINE assert (scripting::ReadNonNegativeEntity):
+	-- pcall catches the Lua side, but the game has already written an ~800 KB
+	-- minidump on its assert handler -- the stall felt on every buy and depot in
+	-- co-op (2026-09-02: 18 dumps for 5 buys + 2 depots, 2 per action). Guard.
+	if type(pid) ~= "number" or pid < 0 then return nil end
 	local bal = nil
 	pcall(function() local e = game.interface.getEntity(pid); if e and e.balance then bal = e.balance end end)
 	return bal
@@ -2371,7 +2376,7 @@ local function execConP(c)
 		params.seed = nil
 		local key = conKey(t[13], t[14])
 		expectedCons[key] = true
-		if c.company then CM.cmExpectedCompany[key] = tonumber(c.company); CM.cmEnsure(); CM.cmExpectedBal0[key] = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
+		if c.company and CM.cmMode == "companies" then CM.cmExpectedCompany[key] = tonumber(c.company); CM.cmEnsure(); CM.cmExpectedBal0[key] = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
 			CM.cmLog(string.format("CM: CONP bal0 snapshot key=%s mePid=%s bal0=%s", key, tostring(CM.cmCompanyPid[CM.cmMyCompany]), tostring(CM.cmExpectedBal0[key]))) end
 		local built, newId = pcall(game.interface.buildConstruction, c.file, params, t)
 		if built and newId then
@@ -2850,7 +2855,7 @@ local function pollVehKeys()
 			registerVehKey(p.key, fresh[1])
 			-- companies mode: a remote company's purchase landed on our player;
 			-- hand the vehicle over and move the cost (balance delta since apply).
-			if p.company then
+			if p.company and CM.cmMode == "companies" then
 				-- A vehicle ON A LINE inherits its line's owner; setPlayer on it
 				-- trips a FATAL engine assert (interface.cpp:2340, seen live). The
 				-- Companies mod's rule (v10 followsLine): reassign the LINE, skip the
@@ -2886,7 +2891,7 @@ local function expectVehicle(key, depotChild, company, hint)
 	-- companies mode: remember the origin company and our balance BEFORE the
 	-- purchase lands, so the bind step can hand the vehicle over and move the
 	-- exact cost (balance delta) to that company.
-	local bal0 = company and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+	local bal0 = (company and CM.cmMode == "companies") and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
 	pendingVehKeys[#pendingVehKeys + 1] = { key = key, depot = depotChild, since = gameTime() or 0, company = company, bal0 = bal0, hint = hint }
 end
 
@@ -3901,7 +3906,7 @@ execConX = function(c)
 		end
 
 		expectedCons[key] = true
-		if c.company then CM.cmExpectedCompany[key] = tonumber(c.company); CM.cmEnsure(); CM.cmExpectedBal0[key] = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
+		if c.company and CM.cmMode == "companies" then CM.cmExpectedCompany[key] = tonumber(c.company); CM.cmEnsure(); CM.cmExpectedBal0[key] = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
 			CM.cmLog(string.format("CM: CONX bal0 snapshot key=%s mePid=%s bal0=%s", key, tostring(CM.cmCompanyPid[CM.cmMyCompany]), tostring(CM.cmExpectedBal0[key]))) end
 		-- Context: nil, like the one native placement that has APPLIED (probe
 		-- E2c). buildContext() forces checkTerrainAlignment=false; the UI's
@@ -4968,7 +4973,7 @@ local function onLine(line)
 			if c.origin ~= K.INSTANCE then
 				-- companies mode: the lobby's assignment wins over the sender's stamp
 				if CM.cmOriginCompany == nil then CM.cmReadConfig() end
-				local lc = CM.cmOriginCompany and CM.cmOriginCompany[c.origin]
+				local lc = CM.cmMode == "companies" and CM.cmOriginCompany and CM.cmOriginCompany[c.origin]
 				if lc then
 					if c.company and tonumber(c.company) ~= lc then
 						CM.cmLog(string.format("CM: origin %s claimed company %s but the lobby assigned %d -- overriding", tostring(c.origin), tostring(c.company), lc))
