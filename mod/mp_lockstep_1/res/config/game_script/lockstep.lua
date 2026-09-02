@@ -662,6 +662,15 @@ K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, 
 -- and lag is counted in whole steps. This is the unit the delivery buffer will
 -- be sized in.
 K.SIM_STEP = 0.2
+-- Batch buys: departures must land on the SAME sim-step everywhere. A buy's
+-- dependent line-assign is held until the batch's last buy plus this many
+-- steps (bind latency of the async buy callback + pollVehKeys), and a VLINE
+-- still waiting for its key advances in fixed steps, never by local wall/game
+-- time. Both derive only from the agreed stamp, so they are identical on every
+-- instance (a frame-tick count is not: ticks map to instance-specific game-time,
+-- which is what drifted departures -- review, 2026-09-01).
+K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
+K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
 K.CMD_RING = 256          -- own commands kept for resend
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
 K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
@@ -3175,11 +3184,14 @@ local function execVehCmd(c)
 		if not haveAll then
 			c.tries = (c.tries or 0) + 1
 			if c.tries <= 30 then
-				c.at = (gameTime() or 0) + 1.0
+				-- advance by a FIXED number of steps from this command's own
+				-- (agreed) target, never from local game-time: the retry schedule
+				-- is then the same sim-steps on every instance
+				c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
 				CM.retryQueue = CM.retryQueue or {}
 				CM.retryQueue[#CM.retryQueue + 1] = c
 				if c.tries == 1 or c.tries % 10 == 0 then
-					log(string.format("VLINE seq=%s: vehicle key not bound yet -- retry %d", tostring(c.seq), c.tries))
+					log(string.format("VLINE seq=%s: vehicle key not bound yet -- retry %d (step %d)", tostring(c.seq), c.tries, c.notBeforeStep))
 				end
 				return
 			end
@@ -7690,21 +7702,41 @@ function data()
 			if #queue > 0 then
 				table.sort(queue, cmdLess)
 				local keep = {}
-				-- At most ONE buy applied per tick. A batch buy stamps N VBUYs at
-				-- one game-time; firing N buyVehicle in a single update() wedged
-				-- the sim thread (2026-09-01) and dropped N fresh vehicles at once
-				-- (ambiguous key binding -> money split). Once a second due buy is
-				-- reached, DEFER it AND everything sorted after it, so a command
-				-- that depends on an earlier buy (a VLINE for that vehicle) can
-				-- never run before it. Ordering is by (at, origin, seq), and buys
-				-- carry lower seq than the line-assigns of the same batch, so this
-				-- drains buys one-per-tick then the line-assigns, in order.
+				-- PRE-PASS: DETERMINISTIC targets for a batch. Spreading buys by a
+				-- frame-tick count made departures drift: ticks map to instance-
+				-- specific game-time (review, 2026-09-01). Instead every batched buy
+				-- gets an explicit apply STEP derived only from its agreed stamp and
+				-- its position in the agreed (at, origin, seq) order -- one step
+				-- apart -- and any command stamped at or before the last such buy
+				-- (the batch's line-assigns, lower in the sort) is held until that
+				-- buy plus K.BIND_GUARD_STEPS. Identical on every instance, host
+				-- included (its skipOrigin buys take the same targets, so its
+				-- departures wait for the same step). Targets are sticky per
+				-- command; a NACK resend recomputes the same value from the stamp.
+				do
+					local lastBuyStep = nil
+					for _, c in ipairs(queue) do
+						if not executed[cmdKey(c)] then
+							local st = CM.stepOf(c.at)
+							if c.op == "VBUY" then
+								if not c.notBeforeStep then
+									c.notBeforeStep = math.max(st, (lastBuyStep or (st - 1)) + 1)
+								end
+								if not lastBuyStep or c.notBeforeStep > lastBuyStep then lastBuyStep = c.notBeforeStep end
+							elseif lastBuyStep and not c.notBeforeStep and st <= lastBuyStep then
+								c.notBeforeStep = lastBuyStep + K.BIND_GUARD_STEPS
+							end
+						end
+					end
+				end
+				-- The per-tick cap below is now only WEDGE protection (never N
+				-- buyVehicle in one update); ordering safety comes from the targets.
 				local buysThisTick = 0
 				local deferRest = false
 				for _, c in ipairs(queue) do
 					if deferRest then
 						keep[#keep + 1] = c
-					elseif CM.stepOf(c.at) <= CM.stepOf(now) then
+					elseif (c.notBeforeStep or CM.stepOf(c.at)) <= CM.stepOf(now) then
 						if c.op == "VBUY" and buysThisTick >= 1 and not executed[cmdKey(c)] then
 							deferRest = true
 							keep[#keep + 1] = c
@@ -7725,8 +7757,9 @@ function data()
 							if lag > (CM.applyLagMax or 0) then CM.applyLagMax = lag end
 							CM.applyCount = (CM.applyCount or 0) + 1
 							if lagSteps > 0 then CM.applyLate = (CM.applyLate or 0) + 1 end
-							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f step=%d late=%d",
-								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag, CM.stepOf(now), lagSteps))
+							log(string.format("APPLY %s seq=%s origin=%s at=%.1f now=%.1f lag=%.1f step=%d late=%d%s",
+								tostring(c.op), tostring(c.seq), tostring(c.origin), c.at, now, lag, CM.stepOf(now), lagSteps,
+								c.notBeforeStep and string.format(" target=%d", c.notBeforeStep) or ""))
 							execute(c)
 						end
 						end
