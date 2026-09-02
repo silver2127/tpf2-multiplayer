@@ -6133,6 +6133,18 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 			return false, string.format("edge %d carries edge object %d that is not a stop", eid, eo)
 		end
 	end
+	-- TWO OBJECTS ON ONE EDGE IS A FATAL ENGINE ASSERT. StreetGeometry::CreateLanes
+	-- requires the interleaved edgeObjects list to end in a -1 sentinel and rejects
+	-- a second object with edgeObjects[0].second == -1 -- an UNCATCHABLE C++ assert
+	-- that killed both peers on a STOPDEL rebuild (2026-09-02): the peer's road graph
+	-- differs from the originator's (town growth, wrong-side placement), so two of
+	-- the originator's stops mapped onto one peer edge, and rebuilding it with both
+	-- crashed the game. A missing/extra stop is a visible c-lane divergence; a dead
+	-- game is not. Refuse to build more than one object on an edge here too, the same
+	-- rule execStopAdd already enforces before a build.
+	if #stops > 1 then
+		return false, string.format("edge %d would carry %d objects -- a second is a fatal engine assert, refused (DIVERGENCE)", eid, #stops)
+	end
 	table.sort(stops, function(p, q) return p.u < q.u end)
 	local sp = api.type.SimpleProposal.new()
 	local e = api.type.SegmentAndEntity.new()
@@ -6155,14 +6167,12 @@ local function rebuildEdgeWithStops(eid, stops, why, onDone)
 		eo.edgeEntity = -1
 		eo.param = st.u
 		eo.oneWay = st.oneWay and true or false
-		-- MEASURED 2026-09-02: every caller's st.left is the GEOMETRIC side
-		-- (cross(tangent, offset) > 0, describeStop's rule); the engine's
-		-- EdgeObject.left is the OPPOSITE side. A stop 6 m west of a northbound
-		-- road (geometric left=true) rebuilt with left=true landed 6 m east, same
-		-- u, same node order -- "building on the wrong side of the street".
-		-- Invert once, here, so the new stop and every re-added existing stop
-		-- land where they were described.
-		eo.left = not (st.left and true or false)
+		-- st.left is the GEOMETRIC side computed on THIS instance's edge (execStopAdd
+		-- projects the shipped world position onto the peer's own edge). A blanket
+		-- inversion here was wrong -- it flipped exactly the edges the projection
+		-- already had right (inconsistent side, 2026-09-02). Pass it straight; the
+		-- verify-and-flip below corrects whatever the engine's convention actually is.
+		eo.left = st.left and true or false
 		eo.model = st.model
 		eo.playerEntity = api.engine.util.getPlayer()
 		eo.name = st.name or ""
