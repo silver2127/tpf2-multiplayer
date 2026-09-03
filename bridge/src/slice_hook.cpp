@@ -2144,6 +2144,35 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             Log("[slice] #%ld captured road, 0 new nodes %d edges (connects existing junctions)\n",
                 g_captured, m);
         DumpFirstEdge(r8);
+        // STREET PROPERTY PROBE (log only, upgrades are rare so it is free).
+        // A street's bus lane (hasBus) and its tram track (tramTrackType,
+        // which also encodes electrification) live in BaseEdgeStreet beside
+        // streetType, but DecodeEdgeType never reads them for a street -- it
+        // forces trackType and returns. So adding a tram way or a bus lane
+        // cannot travel on the wire, and since the upgrade is cancelled and
+        // replayed from what IS on the wire, the road came back plain on every
+        // instance including the originator (2026-09-03).
+        //
+        // streetType sits at record +0x4c and trackType at +0x60, so both
+        // fields are somewhere in between. Capture this window for one upgrade
+        // WITH a tram/bus lane and one without: the byte that differs names the
+        // offset. Do NOT hardcode an offset from a single sample.
+        if (isUpgrade) {
+            uint64_t pbegin = 0, pend = 0;
+            if (Readable((void*)(r8 + 0x18), 16)) {
+                memcpy(&pbegin, (void*)(r8 + 0x18), 8);
+                memcpy(&pend, (void*)(r8 + 0x20), 8);
+                if (pbegin >= 0x10000 && pend > pbegin
+                    && (pend - pbegin) % 120 == 0 && Readable((void*)pbegin, 120)) {
+                    const uint8_t* pb = (const uint8_t*)pbegin;
+                    char hex[128];
+                    int o = 0;
+                    for (int i = 0x48; i < 0x6c && o + 4 < (int)sizeof(hex); i++)
+                        o += snprintf(hex + o, sizeof(hex) - o, "%02x ", pb[i]);
+                    Log("[slice]   STREETPROBE rec+0x48..0x6b: %s\n", hex);
+                }
+            }
+        }
         // Stride-correct removal counts, for the LOG only. removedNodes at
         // r8+0x30 are 24-byte node records and removedSegments at r8+0x48 are
         // 120-byte SegmentAndEntity records (r9_analysis_dem.md 1, DECOMPILED;
