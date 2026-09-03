@@ -9156,6 +9156,9 @@ end
 K.MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
 -- LOAD GATE. Ticks are ~5.4 Hz (300 ticks measured over 56 s), so these are
 -- ~11 s and ~2.8 min.
+-- How soon the gate may act. Long enough for game.interface to answer, short
+-- enough that an instance is not simulating alone while the others load.
+K.LOADGATE_MIN_TICKS = 5
 K.LOADGATE_SETTLE    = 60    -- ticks with no NEW peer before the roster counts as complete
 K.LOADGATE_MAX_TICKS = 900   -- absolute cap: a session must never hang forever
 
@@ -9580,7 +9583,14 @@ end
 
 local function ensureRunning()
 	if didInitialUnpause or paused then return end
-	if ticks < 100 then return end            -- let the world finish loading
+	-- The 100-tick "let the world finish loading" grace used to sit HERE, ahead
+	-- of everything. That is ~18 s during which this instance simulates at the
+	-- save's own speed with no gate at all -- and 18 s is longer than the gap
+	-- between two players loading, so by the first time the gate looked, the
+	-- others were already in and it released without ever holding
+	-- ("LOADGATE: 2 peer(s) in -- releasing", straight after load). The grace
+	-- now applies only to the ordinary unpause path, below.
+	if ticks < K.LOADGATE_MIN_TICKS then return end
 	local s
 	local ok = pcall(function() s = game.interface.getGameSpeed() end)
 	if not ok or s == nil then return end
@@ -9598,30 +9608,47 @@ local function ensureRunning()
 	-- roster filling up, K.LOADGATE_MAX_TICKS expiring, and the player taking
 	-- the lever back.
 	if not CM.loadGateReady() then
-		if s ~= 0 then
-			if not CM.lgHeld then
-				CM.lgResumeSpeed = s        -- remember ONCE: the save's own speed
-				CM.lgHeld, CM.lgHeldAt, CM.lgHolding = true, ticks, true
-				pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(0)) end)
-				log(string.format("LOADGATE: pausing (was speed %d) until the other players are in", s))
-			elseif (ticks - (CM.lgHeldAt or 0)) > 12 then
-				-- We asked for 0 and it is still running well past the command
-				-- latency: the player pressed play. Their lever wins.
-				didInitialUnpause = true
-				CM.lgHolding = false
-				log(string.format("LOADGATE: game started manually at speed %d -- releasing", s))
-			end
+		if s == 0 then
+			CM.lgSawZero = true         -- our pause landed; anything else now is the player
+		elseif not CM.lgHeld then
+			CM.lgResumeSpeed = s        -- remember ONCE: the save's own speed
+			CM.lgHeld, CM.lgHeldAt, CM.lgHolding = true, ticks, true
+			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(0)) end)
+			log(string.format("LOADGATE: pausing (was speed %d) until the other players are in", s))
+		elseif CM.lgSawZero then
+			-- We held it at 0, saw that take effect, and it is running again:
+			-- the player pressed play. Their lever wins.
+			didInitialUnpause = true
+			CM.lgHolding = false
+			log(string.format("LOADGATE: game started manually at speed %d -- releasing", s))
+		elseif (ticks - (CM.lgHeldAt or 0)) > 12 then
+			-- Never saw it reach 0, so the command was lost rather than
+			-- overridden. Re-send rather than mistaking this for the player.
+			CM.lgHeldAt = ticks
+			pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(0)) end)
+			log("LOADGATE: pause did not take -- re-sending")
 		end
 		return
 	end
 
+	-- Everybody is in. If WE paused, give the speed back at once -- the world
+	-- has plainly finished loading by now, and making a held game sit out the
+	-- rest of the 100-tick grace would be a second, pointless freeze.
+	if CM.lgHeld then
+		didInitialUnpause = true
+		CM.lgHolding = false
+		local want = CM.lgResumeSpeed or 1
+		if want == 0 then want = 1 end
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(want)) end)
+		log(string.format("LOADGATE: releasing -- speed %d restored", want))
+		return
+	end
+	if ticks < 100 then return end            -- let the world finish loading
 	didInitialUnpause = true
 	CM.lgHolding = false
-	local want = CM.lgResumeSpeed or s
-	if want == 0 then want = 1 end
-	if s ~= want then
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(want)) end)
-		log(string.format("initial unpause (speed %d -> %d); speed is yours from here", s, want))
+	if s == 0 then
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
+		log("initial unpause (speed 0 -> 1); speed is yours from here")
 	else
 		log("already running at speed " .. tostring(s))
 	end
