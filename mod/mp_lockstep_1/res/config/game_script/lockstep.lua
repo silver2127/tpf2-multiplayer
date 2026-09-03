@@ -9156,6 +9156,32 @@ CM.CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
 -- the player picked (1 -> 2, 2 -> 4), and there is no room at all at 4.
 CM.SPEED_UP = { [1] = 2, [2] = 4, [3] = 4 }
 CM.MAX_SPEED      = 4
+-- THE DOWN LADDER. The pacer used to have only an UP actuator: it could push a
+-- TRAILING instance one notch faster, and when it was already at the top it
+-- logged "no notch left, waiting for the barrier" and did nothing. So the only
+-- brake in the whole system was the barrier's setSpeed(0), which is why a
+-- faster instance sawtoothed between speed 4 and a dead stop:
+--
+--   BARRIER hold: 5.20 ahead -> PACE: speed -> 0
+--   PACE: speed -> 4 (peer caught up) -> BARRIER release: 1.80 ahead   (repeat)
+--
+-- This is a missing actuator, not a gain that needs tuning.
+--
+-- IT STOPS AT 1, NEVER 0. That is the single most important property here.
+-- CM.pace is reached ONLY from applyBarrier, and applyBarrier RETURNS EARLY
+-- when no peer is fresh -- before the pacer call. So a pacer that could command
+-- 0 would stop the game with paused=false, where K.MAX_PAUSE_TICKS cannot see
+-- it and nothing would ever re-command a speed: a permanent freeze one dropped
+-- peer away. Only the barrier may command 0, because only the barrier sets
+-- paused and is therefore covered by the watchdog.
+CM.SPEED_DOWN = { [4] = 2, [2] = 1 }   -- deliberately no [1]: 1 is the floor
+-- Throttle well before the barrier would fire (K.BARRIER_AHEAD = 5.0), and let
+-- go at a clearly lower lead so the two thresholds cannot chatter against each
+-- other. Both are measured against the SLOWEST peer, because that is the
+-- quantity the barrier actually trips on -- the pacer's old "behind" reading
+-- chases the FASTEST peer, which is the wrong end for braking.
+CM.THROTTLE_AHEAD = 2.5
+CM.THROTTLE_DONE  = 1.0
 CM.catchingUp  = false
 CM.baseSpeed   = nil       -- the player's speed, sampled while in step
 CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
@@ -9204,7 +9230,10 @@ function CM.shareSpeed()
 	log(string.format("SPEED: player set %d -- shared with the peer", s))
 end
 
-function CM.pace(ahead)
+-- `ahead` is the lead over the FASTEST peer (the catch-up signal, unchanged).
+-- `lead` is the lead over the SLOWEST peer -- the quantity K.BARRIER_AHEAD
+-- fires on, and therefore the only correct signal for braking.
+function CM.pace(ahead, lead)
 	if paused then return end                       -- the barrier owns the speed
 	local behind = -ahead
 	-- A gap this size is not pacing: it is two instances on different saves, or
@@ -9244,6 +9273,7 @@ function CM.pace(ahead)
 		end
 		CM.baseSpeed = s
 		CM.catchingUp = false
+		CM.throttled = false      -- their lever outranks our braking too
 		CM.lastSetSpeed = nil
 		CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
 		return
@@ -9258,6 +9288,36 @@ function CM.pace(ahead)
 		return
 	end
 	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
+	-- BRAKING, against the slowest peer. Placed after the cooldown check so it
+	-- inherits the same rate limit as the catch-up and cannot chatter; placed
+	-- before the catch-up block because the two are opposites and must never
+	-- both act on one tick.
+	if lead and not CM.catchingUp then
+		if CM.throttled and lead <= CM.THROTTLE_DONE then
+			CM.throttled = false
+			CM.setSpeed(CM.baseSpeed or 1, string.format("back in step, %.2f ahead", lead))
+			return
+		end
+		if lead > CM.THROTTLE_AHEAD and CM.SPEED_DOWN[s] then
+			-- Remember the player's speed on the FIRST notch down only, so a
+			-- second notch does not record our own throttle as their choice.
+			if not CM.throttled then CM.baseSpeed = s end
+			CM.throttled = true
+			CM.setSpeed(CM.SPEED_DOWN[s], string.format("%.2f ahead of the slowest peer", lead))
+			return
+		end
+		if lead > CM.THROTTLE_AHEAD and not CM.SPEED_DOWN[s] then
+			-- At the floor and still ahead: the peer is simply slower than we
+			-- are at speed 1. The barrier takes it from here, which is correct
+			-- and is the one case where the game is allowed to stop.
+			if not CM.pacedFloorWarned then
+				CM.pacedFloorWarned = true
+				log(string.format("pace: %.2f ahead at speed %s -- at the floor, the barrier has it", lead, tostring(s)))
+			end
+		else
+			CM.pacedFloorWarned = false
+		end
+	end
 	if not CM.catchingUp then
 		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED and CM.SPEED_UP[s] then
 			CM.baseSpeed = s
@@ -9327,7 +9387,7 @@ local function applyBarrier(now)
 
 	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
 	CM.shareSpeed()
-	CM.pace(now - fastT)               -- the pacer chases the FASTEST
+	CM.pace(now - fastT, ahead)        -- chases the FASTEST, brakes on the SLOWEST
 	-- COMPLETENESS HOLD (cfg strict_barrier, default OFF).
 	--
 	-- The clock barrier above only keeps the instances CLOSE in time. It

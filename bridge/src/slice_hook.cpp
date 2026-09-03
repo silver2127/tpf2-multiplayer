@@ -2320,6 +2320,48 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 "addNodes=%d addEdges=%d rmNodes=%d rmEdges=%d -- a UI path we do not "
                 "handle; what the player just did did NOT reach the peers\n",
                 (unsigned long long)caller, an, ae, rn, re);
+            // NODE DIFFERENTIAL. An in-place node edit REMOVES the node and
+            // ADDS it back changed, so one capture already contains its own
+            // control: the removed record is the before-state and the added
+            // record the after-state, same node, same position, differing only
+            // in the property the player just changed. Dumping both is how the
+            // double-slip-switch bit gets identified WITHOUT a guess and
+            // without a contrived sweep whose sample index correlates with the
+            // value being probed.
+            //
+            // Record layout (docs/re/PROPOSAL_STRUCTURE.md): 24 bytes,
+            // x,y,z at +0x00, flags u32 at +0x0c, type at +0x10, id at +0x14.
+            // Log only. Nothing is cancelled and nothing is shipped: with the
+            // carrying bit still unknown, replaying this proposal would rebuild
+            // the crossing WITHOUT the property and destroy the edit on the
+            // instance that made it.
+            if (an >= 1 || rn >= 1) {
+                __try {
+                    uint64_t ab = 0, rb = 0;
+                    ReadVec(r8 + 0x00, &ab, 0x20000);
+                    ReadVec(r8 + 0x30, &rb, 0x20000);
+                    for (int k = 0; k < 2; k++) {
+                        uint64_t base = k ? rb : ab;
+                        int cnt = k ? rn : an;
+                        if (!base || cnt < 1) continue;
+                        for (int i = 0; i < cnt && i < 4; i++) {
+                            const uint8_t* b2 = (const uint8_t*)base + (size_t)i * 24;
+                            if (!Readable((void*)b2, 24)) break;
+                            float x, y, z; uint32_t fl; int32_t ty, id2;
+                            memcpy(&x, b2 + 0x00, 4); memcpy(&y, b2 + 0x04, 4);
+                            memcpy(&z, b2 + 0x08, 4); memcpy(&fl, b2 + 0x0c, 4);
+                            memcpy(&ty, b2 + 0x10, 4); memcpy(&id2, b2 + 0x14, 4);
+                            char hex[64]; int o2 = 0;
+                            for (int j = 0; j < 24 && o2 < (int)sizeof(hex) - 3; j++)
+                                o2 += snprintf(hex + o2, sizeof(hex) - o2, "%02x", b2[j]);
+                            Log("[slice]   %sNode[%d] pos=(%.2f,%.2f,%.2f) flags=0x%08x type=%d id=%d hex=%s\n",
+                                k ? "rm" : "add", i, x, y, z, fl, ty, id2, hex);
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    Log("[slice]   node dump faulted -- ignored\n");
+                }
+            }
         }
         return 0;
     }
