@@ -3917,7 +3917,7 @@ local conxBusy, conxBusyAt = false, nil
 local conxQueue = {}
 local execConX
 execConX = function(c)
-	if c.origin == K.INSTANCE and not CM.cfgFlag("conx_strict", false) then
+	if c.origin == K.INSTANCE and not CM.cfgFlag("conx_strict", true) then
 		log(string.format("%s seq=%d: originator already built it locally, skipping", tostring(c.op), c.seq))
 		return
 	end
@@ -3944,7 +3944,7 @@ execConX = function(c)
 		-- proposal validates against the post-bulldoze world (bulldoze is async;
 		-- an immediate rebuild would collide). Second pass (strictPhase set):
 		-- fall through and build exactly like a peer.
-		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", false) and c.strictPhase ~= "rebuilt" then
+		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", true) and c.strictPhase ~= "rebuilt" then
 			-- NEVER strict-replay a construction that REMOVES road edges (a depot
 			-- splits the road it sits on; its payload carries removals). Bulldozing
 			-- the native copy heals that split, so the shipped removal no longer
