@@ -3904,6 +3904,10 @@ execConX = function(c)
 			log(string.format("CONX STRICT seq=%s: bulldozed native construction %d (ok=%s, bal=%s) -- replaying scripted at +0.6", tostring(c.seq), rec.id, tostring(bok), bal0))
 			return
 		end
+		if c.origin == K.INSTANCE and c.strictPhase == "rebuilt" and c.strictBalMid == nil then
+			-- balance right after our bulldoze and before the rebuild charge
+			pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then c.strictBalMid = tonumber(e.balance) end end)
+		end
 		local isTrack = (tonumber(c.etype) or 0) == 1
 		local stype = tonumber(c.stype) or 16
 
@@ -4326,6 +4330,8 @@ execConX = function(c)
 		end
 		local seq, origin, at, file, op = c.seq, c.origin, c.at, c.file, c.op
 		local strictBalPre = c.strictBalPre     -- nil unless this is our strict self-rebuild
+		local strictBal0   = CM.conBal0[key]    -- balance before the native build
+		local strictBalMid = c.strictBalMid     -- balance after our bulldoze
 		api.cmd.sendCommand(cmd, function(res, success)
 			-- The engine has answered: the next queued construction may go.
 			conxBusy = false
@@ -4340,18 +4346,29 @@ execConX = function(c)
 			-- pre-bulldoze value (= the peers' balance). Balance-only journal
 			-- (type 6), local, never shipped. A small window of unrelated income
 			-- between the two reads rides along -- refined later if it matters.
+			-- Refund EXACTLY what the native copy wasted: (balance before the
+			-- native build) - (balance after the bulldoze) = native cost minus
+			-- whatever the bulldoze gave back. The host is then left having paid
+			-- only the SCRIPTED cost, the same as the peers. Crediting back to the
+			-- pre-bulldoze balance was wrong: it refunded the scripted cost too,
+			-- leaving the host richer by (scripted - native) -- measured +16054.
 			if success and strictBalPre then
 				pcall(function()
-					local e = game.interface.getEntity(api.engine.util.getPlayer())
-					local now = e and tonumber(e.balance)
-					if now then
-						local credit = strictBalPre - now
-						if credit ~= 0 then
-							CM.cmBookJournal(api.engine.util.getPlayer(), credit, K.JOURNAL_TRANSFER)
-							log(string.format("CONX STRICT seq=%s: money reconciled %+d (host %d -> %d = pre-bulldoze)",
-								tostring(seq), credit, now, strictBalPre))
-						end
+					if not (strictBal0 and strictBalMid) then
+						log(string.format("CONX STRICT seq=%s: cannot reconcile money (bal0=%s mid=%s) -- host keeps a divergence",
+							tostring(seq), tostring(strictBal0), tostring(strictBalMid)))
+						return
 					end
+					local credit = strictBal0 - strictBalMid
+					local cost = nil
+					pcall(function() cost = tonumber(res.resultProposalData.costs) end)
+					if credit ~= 0 then
+						CM.cmBookJournal(api.engine.util.getPlayer(), credit, K.JOURNAL_TRANSFER)
+					end
+					local e = game.interface.getEntity(api.engine.util.getPlayer())
+					log(string.format("CONX STRICT seq=%s: money reconciled %+d (native waste); bal0=%s mid=%s scriptedCost=%s now=%s",
+						tostring(seq), credit, tostring(strictBal0), tostring(strictBalMid),
+						tostring(cost), tostring(e and e.balance)))
 				end)
 			end
 			if success then
@@ -6141,6 +6158,9 @@ local function gatherSurvivors(cx, cy, selfId)
 end
 
 local function queueConCapture(fn, key, pstr, transf, id)
+	-- balance before this construction existed (previous poll), so the strict
+	-- path can refund exactly what the native copy cost
+	if CM.balPrevConPoll then CM.conBal0[key] = CM.balPrevConPoll end
 	local t = {}
 	for i = 1, 16 do t[i] = string.format("%.4f", transf[i]) end
 	-- The UI names a construction as part of placing it ("<town> Train
@@ -7260,7 +7280,16 @@ function CM.runQueued(c)
 	else execConX(c) end
 end
 
+-- Balance as of the previous construction poll. A player's native build lands
+-- between two polls, so this is the balance BEFORE it -- the only way to learn
+-- what the native copy cost, which the strict reconciliation needs (the scripted
+-- rebuild costs a DIFFERENT amount: it grades the terrain differently, measured
+-- 16054 more on one depot).
+CM.balPrevConPoll = nil
+CM.conBal0 = {}          -- conKey -> balance before that construction was built
 local function pollNewConstructions()
+	local balAtEntry = nil
+	pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then balAtEntry = tonumber(e.balance) end end)
 	local ok, err = pcall(function()
 		local list = game.interface.getEntities({ radius = 999999 },
 			{ type = "CONSTRUCTION", includeData = false }) or {}
@@ -7351,6 +7380,7 @@ local function pollNewConstructions()
 		end
 	end)
 	if not ok then log("con poll error: " .. tostring(err)) end
+	if balAtEntry then CM.balPrevConPoll = balAtEntry end
 end
 
 -- Classify a slice of the primed ids each tick.
