@@ -758,6 +758,12 @@ K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
 -- Long enough that ordinary UDP reordering never stutters the game, short
 -- enough that we cannot simulate far past a command we are owed.
 K.GAP_GRACE_TICKS = 5
+-- How close a peer's node must be to a shipped demolish endpoint to be
+-- accepted as the same node, SQUARED. Nodes come from identically replayed
+-- proposals so they agree to well under a centimetre; a metre is generous
+-- enough to absorb float drift and still far too tight to select a
+-- neighbouring junction and bulldoze the wrong road.
+K.EDEMO_TOL_SQ = 1.0
 K.NACK_MAX = 10           -- give up on one seq after this many NACKs
 K.NACK_PER_SCAN = 12      -- cap NACKs sent per scan so a big gap does not flood
 K.RESEND_MIN_GAP = 5      -- ticks: do not rebroadcast the same seq more often
@@ -2939,6 +2945,195 @@ local function execDemolish(c)
 			tostring(c.seq), best, tostring(owner), unlocked, tostring(dok), tostring(derr)))
 	end)
 	if not ok then log("exec DEMOLISH error: " .. tostring(err)) end
+end
+
+-- ---------- EDEMO: a bulldozed road/rail EDGE ----------
+--
+-- The gap this closes: every replicated op ADDED or edited. The only removals
+-- that crossed were constructions, vehicles, lines and stops -- never a road.
+-- The slice saw the bulldozer ("BULLDOZE re=1 ... edge-demolish shape") and
+-- only wrote it to the log, so demolishing a road was a silent LOCAL edit. The
+-- originator's road vanished, every peer kept theirs, and the e and z lanes
+-- diverged on the spot. It reads as a lag artifact -- "I demolished during lag
+-- and the crossing did not form" -- but lag only widens the window in which the
+-- player does it. The demolish never replicated at any speed (2026-09-03).
+--
+-- Nothing here names an edge by ID. c.params carries the removed edges as
+-- ENDPOINT POSITIONS, "x0,y0,z0,x1,y1,z1;..." -- the peer finds the node
+-- nearest each end and takes the edge BETWEEN them. Positions are identical
+-- across instances (same save, same replayed proposals) while entity ids are
+-- not, and a bulldoze aimed by a divergent id would destroy the wrong road with
+-- nothing to rebuild it from. See [[replicate-positions-not-entity-ids]].
+-- "x0,y0,z0,x1,y1,z1,kind;..." -> { {x0,y0,z0,x1,y1,z1,kind}, ... }
+local function edemoPairs(params)
+	local out = {}
+	for rec in tostring(params or ""):gmatch("[^;]+") do
+		local v = {}
+		for f in rec:gmatch("[^,]+") do v[#v + 1] = tonumber(f) end
+		if #v >= 7 then out[#out + 1] = v end
+	end
+	return out
+end
+
+-- Nearest node to each endpoint, searching ONLY the map of that endpoint's own
+-- KIND. A road node and a rail node can sit at the same spot and are different
+-- nodes; matching across kinds is how findNodeNear once welded track to street,
+-- and here it would bulldoze the road beside a level crossing instead of the
+-- rail the player actually removed.
+--
+-- One pass per map covering ALL endpoints, rather than a scan per endpoint: a
+-- dragged bulldoze removes many edges at once and a scan each would be tens of
+-- thousands of component reads. It runs on a player action, never on a tick.
+local function edemoMatchNodes(want)
+	local byKind = {}
+	pcall(function() byKind[0] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+	pcall(function() byKind[1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+	local best, bestD = {}, {}
+	for kind = 0, 1 do
+		local m = byKind[kind]
+		if m then
+			for nid in pairs(m) do
+				-- fetched at most once per node, and only if some endpoint of
+				-- this kind is still looking
+				local pos = nil
+				for i, w in ipairs(want) do
+					if w[4] == kind then
+						if pos == nil then pos = CM.nodePosXYZ(nid) or false end
+						if pos then
+							local dx, dy = pos[1] - w[1], pos[2] - w[2]
+							local d = dx * dx + dy * dy
+							-- ties broken by the lower id so every peer agrees
+							if d <= K.EDEMO_TOL_SQ and (not bestD[i] or d < bestD[i]
+									or (d == bestD[i] and nid < best[i])) then
+								best[i], bestD[i] = nid, d
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return best, byKind
+end
+
+local function execEdgeDemolish(c)
+	if not CM.cfgFlag("road_demolish", false) then
+		log(string.format("EDEMO seq=%s: road_demolish not enabled on this instance -- IGNORED (this peer keeps the road and will diverge)",
+			tostring(c.seq)))
+		return
+	end
+	-- NO originator skip. The slice CANCELS the player's bulldoze at
+	-- CommandList::Add and this replays it at the stamp, so all three instances
+	-- remove the road at the same game-time -- the same cancel-and-replay
+	-- architecture as roads, upgrades, vehicles and lines. Compare execDemolish
+	-- above, which does skip: a CONSTRUCTION demolish is found by a poll AFTER
+	-- it has already happened locally, so there is nothing left to replay here.
+	--
+	-- If the cancel could not be honoured (the slice cannot fire the bulldozer's
+	-- completion callback and lets it run rather than wedge the tool) the road
+	-- is already gone on this instance. That is not an error: nothing matches
+	-- and it logs "nothing to remove". Replay is idempotent by construction.
+	local ok, err = pcall(function()
+		local prs = edemoPairs(c.params)
+		if #prs == 0 then
+			log(string.format("EDEMO seq=%s: no endpoint pairs in params", tostring(c.seq)))
+			return
+		end
+		-- flatten both ends of every edge into one match list
+		-- want[i] = {x, y, z, kind}; two entries per removed edge
+		local want = {}
+		for _, v in ipairs(prs) do
+			local kind = (v[7] == 1) and 1 or 0
+			want[#want + 1] = { v[1], v[2], v[3], kind }
+			want[#want + 1] = { v[4], v[5], v[6], kind }
+		end
+		local nodes, byKind = edemoMatchNodes(want)
+
+		local rmSet, rmList, unmatched = {}, {}, 0
+		for i = 1, #prs do
+			local a, b = nodes[i * 2 - 1], nodes[i * 2]
+			if not (a and b) then
+				unmatched = unmatched + 1
+				log(string.format("EDEMO seq=%s: edge %d unmatched (endpoint node missing: a=%s b=%s)",
+					tostring(c.seq), i, tostring(a), tostring(b)))
+			else
+				-- the edge between them = the intersection of their edge
+				-- lists, taken in THIS edge's own map only
+				local found
+				local m = byKind[(prs[i][7] == 1) and 1 or 0]
+				local ea, eb = m and m[a], m and m[b]
+				if ea and eb then
+					local inA = {}
+					for _, e in pairs(ea) do inA[e] = true end
+					for _, e in pairs(eb) do
+						if inA[e] and (not found or e < found) then found = e end
+					end
+				end
+				if found then
+					if not rmSet[found] then
+						rmSet[found] = true
+						rmList[#rmList + 1] = found
+					end
+				else
+					unmatched = unmatched + 1
+					log(string.format("EDEMO seq=%s: edge %d: nodes %d/%d matched but no edge between them",
+						tostring(c.seq), i, a, b))
+				end
+			end
+		end
+		if #rmList == 0 then
+			log(string.format("EDEMO seq=%s: nothing to remove (%d unmatched)", tostring(c.seq), unmatched))
+			return
+		end
+
+		-- A node left with no edges at all makes the engine refuse the whole
+		-- proposal as critical ("Internal error"), so orphans go WITH the edges.
+		-- Derived here rather than shipped: what is orphaned depends on this
+		-- world's edge lists, and the originator's answer need not be ours.
+		local orphans, orphSet = {}, {}
+		for i = 1, #want do
+			local nid = nodes[i]
+			if nid and not orphSet[nid] then
+				local total, killed = 0, 0
+				for k = 0, 1 do
+					local m = byKind[k]
+					for _, e in pairs((m and m[nid]) or {}) do
+						total = total + 1
+						if rmSet[e] then killed = killed + 1 end
+					end
+				end
+				if total > 0 and killed == total then
+					orphSet[nid] = true
+					orphans[#orphans + 1] = nid
+				end
+			end
+		end
+
+		local sp = api.type.SimpleProposal.new()
+		for i, eid in ipairs(rmList) do sp.streetProposal.edgesToRemove[i] = eid end
+		for i, nid in ipairs(orphans) do sp.streetProposal.nodesToRemove[i] = nid end
+		local cmd = api.cmd.make.buildProposal(sp, nil, true)
+		if not cmd then
+			log(string.format("EDEMO seq=%s: buildProposal returned nil", tostring(c.seq)))
+			return
+		end
+		local nEdges, nOrph = #rmList, #orphans
+		api.cmd.sendCommand(cmd, function(res, ok2)
+			local extra = ""
+			if not ok2 then
+				pcall(function()
+					local es = res.resultProposalData and res.resultProposalData.errorState
+					if es then
+						extra = string.format(" critical=%s msg=%s", tostring(es.critical),
+							tostring(es.messages and es.messages[1]))
+					end
+				end)
+			end
+			log(string.format("EXEC EDEMO seq=%s origin=%s at=%s: removed %d edge(s) + %d orphan node(s) success=%s%s",
+				tostring(c.seq), tostring(c.origin), tostring(c.at), nEdges, nOrph, tostring(ok2), extra))
+		end)
+	end)
+	if not ok then log("exec EDEMO error: " .. tostring(err)) end
 end
 
 -- ---------- vehicles: cross-peer identity ----------
@@ -5203,6 +5398,7 @@ local function execute(c)
 	elseif c.op == "ROAD" or c.op == "RAIL" then execEdge(c)
 	elseif c.op == "CON" then execCon(c)
 	elseif c.op == "DEMOLISH" then execDemolish(c)
+	elseif c.op == "EDEMO" then execEdgeDemolish(c)
 	elseif c.op == "CONFAIL" then execConFail(c)
 	elseif c.op == "VBUY" then execVBuy(c)
 	elseif c.op == "VREPL" then execVReplace(c)
@@ -8694,6 +8890,64 @@ local function pollInject()
 				local x, y = tonumber(w[3]), tonumber(w[4])
 				if x and y then
 					scheduleLocal("CON", { file = w[2], x = x, y = y, z = groundAt(x, y) })
+				end
+
+			-- EDEMO <re> <rn> [<node0> <node1> <kind>]*re [<id> <x> <y> <z>]*rn
+			-- The slice ships node IDS because they are only ever resolved HERE,
+			-- on the instance that did the bulldozing. Endpoint nodes survive an
+			-- edge-only demolish, so they are still readable on this tick even
+			-- though the bulldoze has already applied; nodes the bulldozer also
+			-- removed are gone, and travel with their positions instead.
+			elseif o == "EDEMO" and #w >= 3 then
+				local re, rn = tonumber(w[2]), tonumber(w[3])
+				if re and rn and #w >= 3 + re * 3 + rn * 4 then
+					local gone = {}
+					local base = 3 + re * 3
+					for i = 0, rn - 1 do
+						local id = tonumber(w[base + i * 4 + 1])
+						local x  = tonumber(w[base + i * 4 + 2])
+						local y  = tonumber(w[base + i * 4 + 3])
+						local z  = tonumber(w[base + i * 4 + 4])
+						if id and x and y then gone[id] = { x, y, z or 0 } end
+					end
+					-- A node the bulldozer removed is checked against `gone`
+					-- FIRST and never reaches the engine. The entityExists guard
+					-- covers the rest: calling a component getter on a dead id
+					-- writes an ~800 KB minidump per call, and pcall does NOT
+					-- stop it (nil-entity-api-call-writes-a-minidump).
+					local function posOf(nid)
+						if gone[nid] then return gone[nid] end
+						local alive = false
+						pcall(function() alive = api.engine.entityExists(nid) end)
+						if not alive then return nil end
+						local ok, pos = pcall(CM.nodePosXYZ, nid)
+						if ok then return pos end
+						return nil
+					end
+					local recs, lost = {}, 0
+					for i = 0, re - 1 do
+						local n0   = tonumber(w[3 + i * 3 + 1])
+						local n1   = tonumber(w[3 + i * 3 + 2])
+						local kind = tonumber(w[3 + i * 3 + 3]) or 0
+						local p0 = n0 and posOf(n0)
+						local p1 = n1 and posOf(n1)
+						if p0 and p1 then
+							recs[#recs + 1] = string.format("%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d",
+								p0[1], p0[2], p0[3], p1[1], p1[2], p1[3], (kind == 1) and 1 or 0)
+						else
+							-- Never silent: an endpoint we cannot place is a road
+							-- the peers will keep, which is a divergence.
+							lost = lost + 1
+							log(string.format("EDEMO capture: edge %d dropped, endpoint unresolved (n0=%s p0=%s n1=%s p1=%s)",
+								i, tostring(n0), tostring(p0 and "ok"), tostring(n1), tostring(p1 and "ok")))
+						end
+					end
+					if #recs > 0 then
+						scheduleLocal("EDEMO", { params = table.concat(recs, ";") })
+						log(string.format("EDEMO captured: %d edge(s) shipped, %d dropped", #recs, lost))
+					else
+						log(string.format("EDEMO captured: nothing shipped (%d dropped)", lost))
+					end
 				end
 
 			-- DEMOLISH x y

@@ -693,6 +693,71 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
     fclose(f);
 }
 
+// EDEMO: a road/rail edge the player BULLDOZED.
+//
+// Until this existed the bulldozer was capture-only ("log only, never
+// cancelled"): every other channel ADDS or edits, and the only removals that
+// crossed the wire were constructions, vehicles, lines and stops. Demolishing a
+// road was therefore a silent local-only edit -- the originator's road vanished
+// and every peer kept theirs forever, which is an immediate e+z divergence. It
+// was misread as a lag artifact because lag only widens the window in which the
+// player does it; the demolish never replicated at any speed (2026-09-03).
+//
+// What travels is the removed edge's two ENDPOINT NODE IDS, not its entity id
+// and not its geometry. The far end does not remove "edge 12345" -- it finds
+// the node nearest each endpoint POSITION and takes the edge between them, so a
+// divergent entity id cannot bulldoze the wrong road. The ids are resolved to
+// positions by the Lua on THIS instance, which is why they can be ids here:
+// they are only ever read locally.
+//
+// Endpoint nodes SURVIVE an edge-only demolish (rn == 0), so the Lua resolves
+// them on its next tick even though the bulldoze has applied by then. When the
+// bulldoze also removes nodes, those nodes are gone before the Lua looks -- so
+// their positions are decoded HERE, while the proposal still describes them,
+// and travel on the same line for the Lua to substitute.
+static bool WriteBulldozeInject(uint64_t nb, int rn, uint64_t eb, int re)
+{
+    if (re < 1) return false;
+    ReadInstance();
+    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
+
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] cannot open %s\n", p); return false; }
+    // EDEMO <re> <rn> [<node0> <node1> <kind>]*re [<id> <x> <y> <z>]*rn
+    //
+    // The KIND (+0x48: 0 street, 1 track) is not decoration. A road node and a
+    // rail node can sit at the SAME spot and are different nodes, and the far
+    // end matches by position -- so without it a demolished rail endpoint can
+    // snap onto the road node beside it and bulldoze the road instead. That is
+    // exactly the geometry in play, since this was found demolishing roads at a
+    // rail/road crossing. findNodeNear carries the same scar: it searched both
+    // maps and welded track to street.
+    fprintf(f, "EDEMO %d %d", re, rn);
+    for (int i = 0; i < re; i++) {
+        const uint8_t* b = (const uint8_t*)eb + (size_t)i * 120;
+        int32_t n0 = 0, n1 = 0, kind = 0;
+        memcpy(&n0, b + 0x08, 4);
+        memcpy(&n1, b + 0x0c, 4);
+        memcpy(&kind, b + 0x48, 4);
+        fprintf(f, " %d %d %d", n0, n1, kind ? 1 : 0);
+    }
+    for (int i = 0; i < rn; i++) {
+        const uint8_t* b = (const uint8_t*)nb + (size_t)i * 24;
+        float x, y, z; int32_t nid = 0;
+        memcpy(&x, b + 0x00, 4);
+        memcpy(&y, b + 0x04, 4);
+        memcpy(&z, b + 0x08, 4);
+        memcpy(&nid, b + 0x14, 4);
+        fprintf(f, " %d %.4f %.4f %.4f", nid, x, y, z);
+    }
+    fprintf(f, "\n");
+    fclose(f);
+    Log("[slice] EDEMO shipped: %d edge(s), %d removed node(s)\n", re, rn);
+    return true;
+}
+
 // ROADC: the STREET part of a CONSTRUCTION placement proposal (caller 419f62).
 // A depot/station snapped to a road integrates with the network inside the one
 // placement command -- split of the snapped street plus connector edges. The
@@ -1193,8 +1258,9 @@ static void GtFactoryDumps(const Factory& f, uint64_t rdx, uint64_t r8, uint64_t
 //            addedSegments, sweep test 4 confirms)
 //   r8+0x1e0 toRemove vector<Entity>, r8+0x1f8 toAdd stride 0x8e0
 //            (r9 2, decompile only -- UNVERIFIED by any sweep)
-static void LogBulldoze(uint64_t r8)
+static bool LogBulldoze(uint64_t r8)
 {
+    bool shipped = false;
     __try {
         uint64_t nb = 0, eb = 0, tb = 0;
         uint64_t nspan = ReadVec(r8 + 0x30, &nb, 0x20000);
@@ -1222,8 +1288,19 @@ static void LogBulldoze(uint64_t r8)
                 "to the con poll, not a demolish\n");
         else if (nrem >= 1)
             Log("[slice]   construction-demolish shape\n");
-        else if (re >= 1 || rn >= 1)
+        else if (re >= 1 || rn >= 1) {
             Log("[slice]   edge-demolish shape\n");
+            // Gated OFF by default. A removal is not self-correcting the way an
+            // addition is: a road that fails to appear is a visible missing
+            // road, but a road removed on the wrong instance is destroyed work
+            // with nothing to rebuild it from. It ships only once the player
+            // has opted in with road_demolish=1.
+            if (CfgHas("road_demolish"))
+                shipped = WriteBulldozeInject(nb, rn, eb, re);
+            else
+                Log("[slice]   (road_demolish not set -- NOT shipped; peers keep "
+                    "this road and will diverge)\n");
+        }
         else
             Log("[slice]   empty removal shape -- nothing decoded\n");
         char line[560];
@@ -1259,7 +1336,9 @@ static void LogBulldoze(uint64_t r8)
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] BULLDOZE classification faulted -- ignored, build proceeds\n");
+        return false;   // never cancel on a failed decode
     }
+    return shipped;
 }
 
 // Generic capture for the vehicle and line factories. Observe-only unless the
@@ -2078,7 +2157,38 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // before everything else so a bulldoze can never be mistaken for a road
     // capture or a ground-truth sample. Never cancelled in this commit.
     if (caller == CALLER_BULLDOZE) {
-        LogBulldoze(r8);
+        bool shipped = LogBulldoze(r8);
+        // STRICT LOCKSTEP, same shape as the build and upgrade tools: cancel
+        // the player's own bulldoze and let the Lua replay it at the agreed
+        // stamp, so every instance removes the road at the SAME game-time
+        // instead of the originator removing it at click time and the peers
+        // some fraction of a second later.
+        //
+        // g_pendingNoCb stays 0 deliberately. The bulldozer is a TOOL and it
+        // WAITS on its completion callback, so it must be fired at Add exactly
+        // as the build tool's is; swallowing it wedges the cursor for the rest
+        // of the session (cancel-at-commandlist-add-wedges-the-ui). If the fire
+        // fails the Add hook lets the bulldoze run rather than wedging the
+        // tool, and the replay simply finds the road already gone -- the same
+        // optimistic behaviour as before, not a new failure.
+        //
+        // Only armed when something was actually SHIPPED. Cancelling a bulldoze
+        // whose payload never reached the wire would delete the road on nobody:
+        // the player's own removal suppressed, no command to replay it.
+        if (shipped) {
+            bool bEnabled = true, bSuppress = false;
+            ReadCfg(&bEnabled, &bSuppress, nullptr);
+            if (bEnabled && bSuppress && SessionLive()) {
+                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                InterlockedExchange(&g_pendingNoCb, 0);
+                Log("[slice] armed cancel: bulldoze cmd=%llx -- now owned by "
+                    "lockstep, replays at the stamp\n", (unsigned long long)rcx);
+            } else {
+                Log("[slice] bulldoze shipped but not cancelled (enabled=%d "
+                    "suppress=%d live=%d) -- it runs natively here and replays "
+                    "on the peers\n", (int)bEnabled, (int)bSuppress, (int)SessionLive());
+            }
+        }
         return 0;
     }
 
