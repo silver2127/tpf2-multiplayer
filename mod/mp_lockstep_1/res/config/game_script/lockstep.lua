@@ -1143,8 +1143,8 @@ local function execEdge(c)
 		else
 			e.streetEdge = api.type.BaseEdgeStreet.new()
 			e.streetEdge.streetType = c.stype or 16
-			e.streetEdge.hasBus = false
-			e.streetEdge.tramTrackType = 0
+			e.streetEdge.hasBus, e.streetEdge.tramTrackType =
+				CM.streetProps(c, c.x0, c.y0, c.x1, c.y1)
 		end
 		sp.streetProposal.edgesToAdd[1] = e
 
@@ -1320,6 +1320,39 @@ local function findEdgeContaining(isTrack, x, y, skipNode, eps)
 	local dB = math.sqrt((q[1]-b[1])^2 + (q[2]-b[2])^2)
 	if dA < K.SPLIT_MIN_DIST or dB < K.SPLIT_MIN_DIST then return nil end
 	return best, u
+end
+
+-- Bus lane and tram track for a street edge we are about to BUILD.
+--
+-- These live in BASE_EDGE_STREET next to streetType, but the slice's edge
+-- decode skips them for a street (it forces trackType and never reads them),
+-- so they are NOT on the wire. Every street rebuild hardcoded
+-- hasBus=false / tramTrackType=0, which DESTROYED them: a road that had a bus
+-- lane or a tram track lost both the moment anything replayed it -- and since a
+-- street upgrade is cancelled and replayed from these values, that included the
+-- ORIGINATOR, so adding a tram way or a bus lane looked like it did nothing at
+-- all (2026-09-03).
+--
+-- Prefer the wire when it carries them (c.bus / c.tram, for when the capture
+-- side learns to ship them); otherwise inherit from the edge this one replaces,
+-- located by its endpoints. With nothing to inherit it falls back to a plain
+-- street, which is the old behaviour.
+function CM.streetProps(c, x0, y0, x1, y1)
+	local bus, tram = false, 0
+	local wb, wt = (c and c.bus), (c and c.tram)
+	if wb ~= nil then bus = tonumber(wb) == 1 end
+	if wt ~= nil then tram = tonumber(wt) or 0 end
+	if wb == nil or wt == nil then
+		pcall(function()
+			local old = CM.findEdgeByEnds(false, x0, y0, x1, y1, 2.0)
+			if not old then return end
+			local sc = api.engine.getComponent(old, api.type.ComponentType.BASE_EDGE_STREET)
+			if not sc then return end
+			if wb == nil then bus = sc.hasBus and true or false end
+			if wt == nil then tram = tonumber(sc.tramTrackType) or 0 end
+		end)
+	end
+	return bus, tram
 end
 
 local function copyEdgeProps(dst, srcEid, isTrack, stype)
@@ -2191,8 +2224,8 @@ local function execPolyline(c, planOnly)
 				else
 					e.streetEdge = api.type.BaseEdgeStreet.new()
 					e.streetEdge.streetType = stype
-					e.streetEdge.hasBus = false
-					e.streetEdge.tramTrackType = 0
+					e.streetEdge.hasBus, e.streetEdge.tramTrackType =
+						CM.streetProps(c, x0, y0, x1, y1)
 				end
 				addEdges[#addEdges + 1] = e
 				end   -- (no crossings: the original single-edge build)
