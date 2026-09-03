@@ -951,6 +951,22 @@ local function worldHash(now)
 	end
 	table.sort(egeo)
 	table.sort(egeoZ)
+	-- Offline diff for the rail-station height desync (cfg dump_egeo=1, default
+	-- off): write the EXACT sorted strings the e-lane hashes to a per-instance
+	-- side file, rolling latest. After placing one station, egeo_a.txt vs
+	-- egeo_b.txt shows which edges differ and whether only the z field moved
+	-- (native-vs-replay height path) or x,y too (topology/weld). The hashed
+	-- arrays are untouched.
+	if CM.cfgFlag("dump_egeo", false) then
+		pcall(function()
+			local f = io.open("egeo_" .. tostring(K.INSTANCE or "x") .. ".txt", "w")
+			if f then
+				f:write(string.format("stamp=%.1f nedges=%d\n", now or -1, #egeo))
+				for i = 1, #egeo do f:write(egeo[i] .. "\n") end
+				f:close()
+			end
+		end)
+	end
 
 	if #edges == 0 and not warnedNoEdges then
 		warnedNoEdges = true
