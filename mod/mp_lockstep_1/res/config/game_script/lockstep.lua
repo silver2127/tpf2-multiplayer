@@ -655,6 +655,9 @@ local scheduleLocal   -- forward: called by the line registry above its definiti
 K.JOURNAL_LOAN = 0
 K.JOURNAL_TRANSFER = 6
 K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+-- CONX/CONP have no slice cancel (the construction's module params cannot be
+-- read from the proposal); the originator instead deletes its native copy and
+-- replays, gated by K.CONX_STRICT rather than ARMED. See execConX.
 -- Command reliability. LSCMD ships as fire-and-forget UDP; a fully-dropped
 -- command silently desyncs the peer that missed it (measured 2026-09-01: one
 -- instance never got a VBUY and ran a truck short). Each instance keeps a ring
@@ -1059,6 +1062,18 @@ end
 -- Gated, with a nil fallback if make refuses, so the worst case is today's
 -- behaviour.
 K.CONX_UI_CONTEXT = true
+-- PROTOTYPE (cfg conx_strict=1, default OFF): the host keeps its native
+-- station placement, but its interactive builder grades the terrain 0.1 m
+-- higher than the scripted buildProposal the peers replay (measured
+-- 2026-09-02: host z=4.5, peers z=4.4, z-only). Extracting params to cancel
+-- the native build in the DLL is impossible (the module map is consumed
+-- into geometry before the command exists). So DELETE-AND-REPLAY instead:
+-- the originator builds native (params readable), then bulldozes its own
+-- copy and rebuilds through the SAME scripted path as the peers, so all
+-- three grade identically. Money (native charge + bulldoze refund +
+-- recharge) is not reconciled yet -- this prototype proves the GEOMETRY
+-- converges (dump_egeo) before that is solved.
+K.CONX_STRICT = CM.cfgFlag("conx_strict", false)
 function CM.conxContext()
 	if not K.CONX_UI_CONTEXT then return nil end
 	-- EXPERIMENT (cfg conx_terrain_align=0): the host's interactive builder
@@ -3821,7 +3836,7 @@ local conxBusy, conxBusyAt = false, nil
 local conxQueue = {}
 local execConX
 execConX = function(c)
-	if c.origin == K.INSTANCE then
+	if c.origin == K.INSTANCE and not K.CONX_STRICT then
 		log(string.format("%s seq=%d: originator already built it locally, skipping", tostring(c.op), c.seq))
 		return
 	end
@@ -3843,6 +3858,30 @@ execConX = function(c)
 		if #t ~= 16 then log("CONX: bad transf, " .. #t .. " numbers"); return end
 		local params = deserParams(c.params) or {}
 		local key = conKey(t[13], t[14])
+		-- STRICT delete-and-replay on the ORIGINATOR (see K.CONX_STRICT). First
+		-- pass: bulldoze our native copy and re-queue the build so the scripted
+		-- proposal validates against the post-bulldoze world (bulldoze is async;
+		-- an immediate rebuild would collide). Second pass (strictPhase set):
+		-- fall through and build exactly like a peer.
+		if c.origin == K.INSTANCE and K.CONX_STRICT and c.strictPhase ~= "rebuilt" then
+			local rec = consByKey[key]
+			if not (rec and rec.id and api.engine.entityExists(rec.id)) then
+				log(string.format("CONX STRICT seq=%s: no native construction at %s to replace -- keeping native, no strict this time", tostring(c.seq), key))
+				conxBusy = false
+				return
+			end
+			local bal0 = "-"
+			pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then bal0 = tostring(e.balance) end end)
+			expectedDemolish[key] = true     -- our own bulldoze: do not ship a DEMOLISH
+			expectedCons[key] = true         -- our rebuild will re-appear: not a new build
+			local bok = pcall(game.interface.bulldoze, rec.id)
+			consByKey[key] = nil
+			c.strictPhase = "rebuilt"
+			conxBusy = false
+			conxQueue[#conxQueue + 1] = { c = c, notBefore = (gameTime() or 0) + 0.6 }
+			log(string.format("CONX STRICT seq=%s: bulldozed native construction %d (ok=%s, bal=%s) -- replaying scripted at +0.6", tostring(c.seq), rec.id, tostring(bok), bal0))
+			return
+		end
 		local isTrack = (tonumber(c.etype) or 0) == 1
 		local stype = tonumber(c.stype) or 16
 
