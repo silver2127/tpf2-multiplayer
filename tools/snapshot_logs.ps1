@@ -30,8 +30,16 @@ $sources = @(
     @{ name = "GameAgent2"; stdout = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$stdoutRel"; data = "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\$dataRel"; game = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$gameRel" }
 )
 $gameFiles = @("egeo_*.txt", "tpf2_slice.cfg")
+# tpf2_instance.txt and mp_company_cfg.txt are two lines each and they are what
+# makes a snapshot SELF-DESCRIBING. Without the identity file nothing afterwards
+# can say which LETTER a box held -- and a box's folder contains several
+# instances' dashboards, because Sandboxie shows it the real filesystem under
+# its own writes. Without the company cfg, "the balances differ" cannot be told
+# from "this was companies mode, where they are supposed to". Both were missing,
+# and tools\soak.ps1 -FromSnapshot has to guess when they are.
 $dataFiles = @("lockstep_dash_*.txt", "lockstep_status_*.txt", "tpf2_events_*.txt", "lockstep_inject_*.txt",
-               "tpf2_slice.log", "tpf2_capture_*.txt", "mp_company_*.log")
+               "tpf2_slice.log", "tpf2_capture_*.txt", "mp_company_*.log",
+               "tpf2_instance.txt", "mp_company_cfg.txt")
 
 $n = 0
 foreach ($s in $sources) {

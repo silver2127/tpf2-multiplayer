@@ -15,8 +15,68 @@
 --                  <BASE>mp_test_results_<inst>.txt
 --   driver reads both instances' results and decides pass/fail.
 
-local BASE = "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/"
+-- ---------- runtime data directory ----------
+-- The SAME contract as mpbridge.lua, lockstep.lua and bridge/src/datadir.h,
+-- resolved in the same order, because all of them have to land on one directory
+-- or they read and write past each other:
+--   1. $TPF2MP_DATADIR             (the dev harness pins the old workshop dir)
+--   2. $LOCALAPPDATA/tpf2mp/data/  (shipping layout)
+--   3. the workshop literal        (the dev rig before the data dir existed)
+-- The FIRST candidate holding tpf2_instance.txt wins.
+--
+-- This used to be candidate 3 alone, hardcoded -- the same defect mpbridge.lua
+-- was fixed for. It is worse here than it looks: that workshop directory still
+-- CONTAINS a tpf2_instance.txt, left over from 2026-08-29, so detectInstance
+-- succeeded and bound this harness to whatever letter that stale file happened
+-- to name, then read scenarios from and wrote results to a directory no live
+-- instance has touched in days. The runner reported "actor captured nothing"
+-- and looked like a replication failure.
+-- The game's Lua may lack 'os' entirely, hence the pcall around every getenv.
+local BASE = (function()
+	local function env(name)
+		local ok, v = pcall(function() return os.getenv(name) end)
+		if ok and type(v) == "string" and #v > 0 then return v end
+		return nil
+	end
+	local function dir(p)
+		p = p:gsub("\\", "/")
+		if p:sub(-1) ~= "/" then p = p .. "/" end
+		return p
+	end
+	local cands = {}
+	local function add(p) if p then cands[#cands + 1] = dir(p) end end
+	add(env("TPF2MP_DATADIR"))
+	local lad = env("LOCALAPPDATA")
+	add(lad and (lad .. "/tpf2mp/data"))
+	add("C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/")
+	for _, p in ipairs(cands) do
+		local f = io.open(p .. "tpf2_instance.txt", "r")
+		if f then f:close() return p end
+	end
+	return cands[#cands]
+end)()
 local IDENTITY_FILE = BASE .. "tpf2_instance.txt"
+
+-- ---------- refuse to run alongside mp_lockstep_1 ----------
+-- This harness drives actions through api.cmd from a game script. mp_bridge
+-- replicates by POLLING the world, so it sees those actions and ships them --
+-- which is why scenarios test mp_bridge properly.
+--
+-- mp_lockstep does not work that way. It replicates the PLAYER's native command,
+-- captured by the slice DLL on the CALLER'S RETURN ADDRESS, and a call from Lua
+-- has the wrong caller: slice_hook.cpp logs "BuildProposal from caller_rva=...
+-- (not the road path) -- ignored" and drops it. So with lockstep loaded, a
+-- scenario builds in THIS world and no other -- it manufactures a desync in a
+-- session that had none, and the harness then reports it as a product failure.
+--
+-- Detected through lockstep's global LS, which it assigns at top level, so it
+-- exists from the moment that mod loads (game scripts share one Lua state).
+local lockstepPresent = false
+local function checkLockstep()
+	if lockstepPresent then return true end
+	if type(LS) == "table" and LS.findNodeNear ~= nil then lockstepPresent = true end
+	return lockstepPresent
+end
 
 local INSTANCE, SCENARIO_FILE, RESULT_FILE
 local ticks = 0
@@ -1641,6 +1701,22 @@ function data()
 
 		update = function()
 			ticks = ticks + 1
+			-- Latching, and BEFORE anything else: with lockstep loaded, running a
+			-- scenario is worse than running nothing -- it changes one world only.
+			-- Loud and repeated, because a one-shot line scrolls away long before
+			-- anyone looks and the symptom (a "desync" the harness caused) gives
+			-- no hint of the cause.
+			if checkLockstep() then
+				if ticks % 200 == 0 then
+					log("!! DISABLED -- mp_lockstep_1 is loaded in this Lua state.")
+					log("!! Scenario actions are issued from Lua; lockstep captures the PLAYER's"
+						.. " native command by caller address and deliberately ignores the Lua path,"
+						.. " so a scenario would build in THIS world and no other -- a desync this"
+						.. " harness invented. Use tools\\soak.ps1 for lockstep instead.")
+				end
+				steps = nil
+				return
+			end
 			if ticks % 60 == 0 then pcall(detectInstance) end
 			if not INSTANCE then return end
 			if ticks % 30 == 0 then pcall(loadScenario) end
@@ -1682,6 +1758,9 @@ function data()
 		guiUpdate = function()
 			guiTicks = guiTicks + 1
 			if guiTicks % 10 ~= 0 then return end
+			-- Same gate as update(). The buy/assign drains dispatch api.cmd from
+			-- the GUI state, which lockstep ignores just the same.
+			if checkLockstep() then return end
 			pcall(detectInstance)
 			if not INSTANCE then return end
 			pcall(drainBuyRequest)
