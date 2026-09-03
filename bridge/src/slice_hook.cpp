@@ -1604,6 +1604,11 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         Log("[slice] VBUY from the Lua path (caller=%llx) -- a replay, not shipped\n",
             (unsigned long long)caller);
     } else if (f.id == 2 && !groundtruth) {
+        // ARMED first, exactly as the other vehicle commands do. The originator
+        // replays its OWN buy only when this says the cancel actually happened;
+        // without it a strict_buy=1 cfg with no live session would buy natively
+        // AND replay, i.e. buy the vehicle twice.
+        WriteArmed(cancel && SessionLive());
         __try {
             WriteInjectVBuy(r9, st[0]);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1642,8 +1647,21 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
 
     if (cancel && SessionLive()) {
         InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-        InterlockedExchange(&g_pendingNoCb, 1);   // vehicle/line: no callback to honour
-        Log("[slice] armed cancel: %s cmd=%llx (no-callback)\n", f.name, (unsigned long long)rcx);
+        // BuyVehicle is the one vehicle command whose UI WAITS: the depot window
+        // expects the new entity back, and cancelling it fire-and-forget crashed
+        // the client on an assert (2026-08-28, caller 74fda9). That is why the
+        // buy was left optimistic and why it is the last host-only asymmetry in
+        // a vehicle's life. So it takes the BUILD TOOL's route instead --
+        // g_pendingNoCb = 0, meaning the Add hook fires the completion callback
+        // before cancelling, and if it cannot fire it lets the buy run rather
+        // than wedge the window. Every other vehicle/line command genuinely has
+        // nothing waiting and stays fire-and-forget.
+        const bool waitsForResult = (f.id == 2);
+        InterlockedExchange(&g_pendingNoCb, waitsForResult ? 0 : 1);
+        Log("[slice] armed cancel: %s cmd=%llx (%s)\n", f.name,
+            (unsigned long long)rcx,
+            waitsForResult ? "callback WILL be fired -- the depot window waits on it"
+                           : "no-callback");
     } else if (cancel) {
         Log("[slice] %s: no live session -- left alone, the game handles it\n", f.name);
     }
@@ -2120,6 +2138,16 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // cfg with this off stays consistent.
         else if (!luaPath && id == 6)
             cancel = CfgHas("cancel_line");
+        // BuyVehicle (2). Off by default: this is the command with a recorded
+        // client crash when cancelled, so it stays opt-in until the callback
+        // route above is proven on a live rig. What it buys is the last
+        // asymmetry in a vehicle's life -- with it off the originator creates
+        // the entity at CLICK time while every peer creates it at the stamp,
+        // and that ~3-step head start is a permanent position offset (measured
+        // 2026-09-03: host vs both peers plateauing near 37 m while the peers
+        // sat identical to each other).
+        else if (!luaPath && id == 2)
+            cancel = CfgHas("strict_buy");
         __try {
             CaptureFactory(*f, rcx, rdx, r8, r9, calleeRsp, caller, groundtruth, cancel);
         } __except (EXCEPTION_EXECUTE_HANDLER) {

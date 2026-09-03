@@ -6943,6 +6943,15 @@ function CM.cfgFlag(key, default)
 end
 -- stops_native=0: the old edge rebuild (every neighbour re-created as a new
 -- entity; its guards refuse anything under a line or a second object).
+-- STRICT BUY (cfg strict_buy, default off). Set HERE rather than at the
+-- K.STRICT_OPS literal above, because CM.cfgFlag is not defined yet at that
+-- point -- calling it there is the nil-at-load crash from 2cefc5a.
+--
+-- execVBuy already carries both branches; this is the switch that selects the
+-- strict one. The slice only actually cancels when it can fire the depot
+-- window's completion callback, and it ships ARMED=0 when it could not, so a
+-- buy that ran natively is still skipped rather than applied twice.
+K.STRICT_OPS.VBUY = CM.cfgFlag("strict_buy", false)
 K.STOPS_NATIVE = CM.cfgFlag("stops_native", true)
 -- stops_del_on_line=0: refuse to remove a stop a line uses. Natively the apply
 -- rewrites the lines and the station group before the entity dies, exactly as
@@ -8818,13 +8827,27 @@ local function pollInject()
 						else
 							log(string.format("VBUY: depot %d at %.1f,%.1f (%s), %d part(s): %s",
 								depot, dx, dy, tostring(dfile), #parts, enc[1]:sub(1, 60)))
-							-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
-							CM.parkedBuys[#CM.parkedBuys + 1] = {
-								args = { x = dx, y = dy, file = dfile or "?",
-								         parts = table.concat(enc, ";"),
-								         groups = table.concat(groups, "/"),
-								         skipOrigin = 1 },
-								depot = dparent or depot, since = gameTime() or 0 }
+							local bargs = { x = dx, y = dy, file = dfile or "?",
+							                parts = table.concat(enc, ";"),
+							                groups = table.concat(groups, "/"),
+							                skipOrigin = 1 }
+							-- STRICT: the slice cancelled the buy, so no vehicle
+							-- will ever appear in the depot to wait for. Parking
+							-- it would stall 1.5 s and then ship anyway without a
+							-- purchaseTime. Ship at once and let THIS instance
+							-- replay at the stamp like every peer -- which is the
+							-- whole point: the entity is then created on the same
+							-- sim-step everywhere.
+							if K.STRICT_OPS.VBUY and tonumber(CM.lastArmed or 0) == 1 then
+								scheduleLocal("VBUY", bargs)
+								expectVehicle(K.INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
+								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp")
+							else
+								-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
+								CM.parkedBuys[#CM.parkedBuys + 1] = {
+									args = bargs, depot = dparent or depot,
+									since = gameTime() or 0 }
+							end
 						end
 					end
 				else
