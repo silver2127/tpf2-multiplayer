@@ -1313,6 +1313,16 @@ local function edgeGeomT(eid)
 end
 
 K.SPLIT_EPS = 5.0   -- was 3.0; a rail touching a road's EDGE sits ~4.5 m off its centreline
+-- ...but that 4.5 m is a ROAD's half-width, and applying it to rail-against-rail
+-- is far too generous: standard parallel track spacing is about the same 5 m, so
+-- a new track laid alongside an existing one has its endpoint inside the
+-- tolerance of its NEIGHBOUR and gets welded to it -- "building parallel track
+-- sometimes joins the ends". A track has no width to speak of; its centreline is
+-- the thing, so the match has to be tight enough to fit between two tracks.
+-- REASONED from the constant and the game's track spacing, not yet measured
+-- against a capture: findEdgeContaining logs the distance of every TRACK match
+-- so the next occurrence either confirms this or names the real number.
+K.SPLIT_EPS_TRACK = 2.0
 K.SPLIT_MIN_U = 0.08   -- nearer an end than this IS the endpoint, not a split
 K.SPLIT_MIN_DIST = 0.3  -- metres from an end node: closer than this IS the node
 
@@ -1352,8 +1362,61 @@ local function findNodeNear(isTrack, x, y, eps)
 	return best
 end
 
+-- Is this node a STRAIGHT-THROUGH, i.e. may a rail be routed through it to
+-- fuse a level crossing?
+--
+-- The engine's own invariant, from the assert that freezes the game:
+--   Crossing.cpp:232  Angle(m_ctxs[0].curve[2], m_ctxs[2].curve[2]) > PI - ANGLE_TOL
+--   Crossing.cpp:233  Angle(m_ctxs[1].curve[2], m_ctxs[3].curve[2]) > PI - ANGLE_TOL
+-- A four-arm crossing must be two straight lines passing through each other:
+-- arm 0 opposite arm 2, arm 1 opposite arm 3. Route a rail through a node where
+-- the ROAD turns a corner and the road's own pair is not anti-parallel, and the
+-- assert fires inside StreetGeometry -- which is a native crash, not something
+-- pcall or ignoreErrors can catch (host freeze building a track crossover,
+-- 2026-09-03).
+--
+-- A node created by SPLITTING an edge is always straight-through: both halves
+-- carry the parent's tangent at the cut. A node that already existed may be a
+-- junction or a corner, and those are the ones that must be refused.
+--
+-- Returns ok, angleDegrees, edgeCount.
+K.XING_STRAIGHT_TOL_DEG = 10.0   -- how far from 180 deg still counts as straight
+function CM.nodeIsStraightThrough(nid)
+	if not nid then return false, nil, 0 end
+	local alive = false
+	pcall(function() alive = api.engine.entityExists(nid) end)
+	if not alive then return false, nil, 0 end
+	local ids, seen = {}, {}
+	for _, m in ipairs(edgeMaps()) do
+		for _, eid in pairs((m and m[nid]) or {}) do
+			if not seen[eid] then seen[eid] = true; ids[#ids + 1] = eid end
+		end
+	end
+	-- 1 edge = a dead end, 3+ = a junction. Neither is a line passing through.
+	if #ids ~= 2 then return false, nil, #ids end
+	-- Direction of each arm LEAVING the node: +tangent0 at node0, -tangent1 at
+	-- node1 (the Hermite derivative points along increasing u).
+	local dirs = {}
+	for _, eid in ipairs(ids) do
+		local comp, ea, eb, t0, t1 = edgeGeomT(eid)
+		if not comp then return false, nil, #ids end
+		local d
+		if comp.node0 == nid then d = { t0[1], t0[2], t0[3] }
+		elseif comp.node1 == nid then d = { -t1[1], -t1[2], -t1[3] }
+		else return false, nil, #ids end
+		local n = math.sqrt(d[1] * d[1] + d[2] * d[2] + d[3] * d[3])
+		if n < 1e-6 then return false, nil, #ids end
+		dirs[#dirs + 1] = { d[1] / n, d[2] / n, d[3] / n }
+		local _ = ea, eb
+	end
+	local dot = dirs[1][1] * dirs[2][1] + dirs[1][2] * dirs[2][2] + dirs[1][3] * dirs[2][3]
+	if dot < -1 then dot = -1 elseif dot > 1 then dot = 1 end
+	local deg = math.deg(math.acos(dot))
+	return deg >= (180 - K.XING_STRAIGHT_TOL_DEG), deg, #ids
+end
+
 local function findEdgeContaining(isTrack, x, y, skipNode, eps)
-	local tol = eps or K.SPLIT_EPS
+	local tol = eps or (isTrack and K.SPLIT_EPS_TRACK or K.SPLIT_EPS)
 	-- Sampling is by DISTANCE, not by a fixed 19 points: a 77 m town road
 	-- sampled every 7.7 m misses a point that is on it. And the end
 	-- exclusion is by distance (K.SPLIT_MIN_DIST), not by fraction: the UI
@@ -1414,6 +1477,12 @@ local function findEdgeContaining(isTrack, x, y, skipNode, eps)
 	local dA = math.sqrt((q[1]-a[1])^2 + (q[2]-a[2])^2)
 	local dB = math.sqrt((q[1]-b[1])^2 + (q[2]-b[2])^2)
 	if dA < K.SPLIT_MIN_DIST or dB < K.SPLIT_MIN_DIST then return nil end
+	-- Distance of the match, logged for TRACKS because welding a new track to the
+	-- one running parallel to it is the failure mode this tolerance controls.
+	if isTrack then
+		CM.cmLog(string.format("SPLIT: track edge %d matched at u=%.3f, %.2f m from the point (tol %.2f)",
+			best, u, math.sqrt((q[1]-x)^2 + (q[2]-y)^2), tol))
+	end
 	return best, u
 end
 
@@ -2050,6 +2119,13 @@ local function execPolyline(c, planOnly)
 		-- directly from the node->edge map, sample the ROAD's Hermite curve finely,
 		-- and find the closest approach between the two curves. Accept when they
 		-- come within CROSS_BAND, interior to both.
+		-- How close the rail must pass to an EXISTING node before we will route
+		-- it through that node. CROSS_BAND below is deliberately wide (a road's
+		-- half-width plus margin) so a rail crossing a road's centreline is
+		-- still found; this is the much tighter test for "and it actually meets
+		-- this node". Sampling is ~0.5 m, so sub-metre is as tight as the
+		-- measurement supports.
+		K.XING_NODE_TOUCH = 0.75
 		local CROSS_BAND, CROSS_END_MIN = 5.0, 4.0   -- band = road half-width + margin: A and B both measured the rail 4.5 m off the centreline at a real crossing (2026-08-29)
 		local xingNodes = {}   -- nodes the rail was routed through as level crossings (probe below)
 
@@ -2159,7 +2235,32 @@ local function execPolyline(c, planOnly)
 							-- edge over the node without sharing it = no crossing (seen
 							-- live on A and B: closest 0.00 m at road u=0.01/0.99).
 							local nid = (dA < dB) and comp.node0 or comp.node1
-							hits[#hits + 1] = { node = nid, u = bestU }; reason = "CROSSING at road node " .. tostring(nid)
+							-- TWO conditions before routing the rail through an
+							-- EXISTING node, both learned from a host freeze.
+							--
+							-- (a) The rail must actually TOUCH the node. This
+							-- branch was built for a measured "closest 0.00 m at
+							-- road u=0.01/0.99"; it also fired at 1.06 m and at
+							-- 4.04 m, which are near-misses beside a junction,
+							-- not crossings. Routing the rail through a node it
+							-- passes four metres from drags it off its own path.
+							--
+							-- (b) The node must be a straight-through. The engine
+							-- asserts that a crossing's opposite arms are
+							-- anti-parallel, so a rail routed through a road
+							-- CORNER or junction crashes StreetGeometry outright.
+							local straight, deg, nEdges = CM.nodeIsStraightThrough(nid)
+							if dist > K.XING_NODE_TOUCH then
+								reason = string.format("near road node %s but the rail passes %.2f m from it -- a near-miss, not a crossing",
+									tostring(nid), dist)
+							elseif not straight then
+								reason = string.format("at road node %s but that node is not a straight-through (%s edge(s), arms %s deg) -- routing a rail through it trips the engine's crossing assert",
+									tostring(nid), tostring(nEdges), deg and string.format("%.1f", deg) or "?")
+							else
+								hits[#hits + 1] = { node = nid, u = bestU }
+								reason = string.format("CROSSING at road node %s (arms %.1f deg, rail %.2f m)",
+									tostring(nid), deg or -1, dist)
+							end
 						else hits[#hits + 1] = { eid = eid, ru = bestRu, u = bestU }; reason = "CROSSING (mid-edge split)" end
 					end
 					CM.cmLog(string.format("XING: seg %d vs street edge %d: closest %.2f m (road u=%.2f, rail u=%.2f) -> %s",
