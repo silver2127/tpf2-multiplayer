@@ -1604,10 +1604,13 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         Log("[slice] VBUY from the Lua path (caller=%llx) -- a replay, not shipped\n",
             (unsigned long long)caller);
     } else if (f.id == 2 && !groundtruth) {
-        // ARMED first, exactly as the other vehicle commands do. The originator
-        // replays its OWN buy only when this says the cancel actually happened;
-        // without it a strict_buy=1 cfg with no live session would buy natively
-        // AND replay, i.e. buy the vehicle twice.
+        // ARMED, exactly as the other vehicle commands do. `cancel` is false
+        // for the buy (see the decision above), so this reliably ships 0 and
+        // the originator never replays its own purchase. Note the general
+        // hazard this exposed: WriteArmed runs at CAPTURE time, before the Add
+        // hook decides whether the cancel can actually be honoured, so it
+        // states an INTENTION. That is safe only while the intention cannot be
+        // refused -- which is exactly why the buy no longer arms one.
         WriteArmed(cancel && SessionLive());
         __try {
             WriteInjectVBuy(r9, st[0]);
@@ -2138,16 +2141,26 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // cfg with this off stays consistent.
         else if (!luaPath && id == 6)
             cancel = CfgHas("cancel_line");
-        // BuyVehicle (2). Off by default: this is the command with a recorded
-        // client crash when cancelled, so it stays opt-in until the callback
-        // route above is proven on a live rig. What it buys is the last
-        // asymmetry in a vehicle's life -- with it off the originator creates
-        // the entity at CLICK time while every peer creates it at the stamp,
-        // and that ~3-step head start is a permanent position offset (measured
-        // 2026-09-03: host vs both peers plateauing near 37 m while the peers
-        // sat identical to each other).
-        else if (!luaPath && id == 2)
-            cancel = CfgHas("strict_buy");
+        // BuyVehicle (2) is NOT cancellable, and this is now measured rather
+        // than assumed. The build tool's route was tried -- fire the completion
+        // callback, then cancel -- and the fire FAILS every single time:
+        //
+        //   armed cancel: BuyVehicle (callback WILL be fired -- the window waits)
+        //   callback NOT fired -- letting the build run (caller_rva=74fda9)
+        //
+        // The Add hook then correctly lets the purchase run rather than wedge
+        // the depot window. But WriteArmed had already told the Lua the cancel
+        // happened, so the originator replayed on top of a native purchase and
+        // the player got TWO vehicles for one click, paid for twice (2026-09-03).
+        //
+        // Arming a cancel we cannot honour is worse than not arming one, so the
+        // buy stays optimistic. The vehicle drift this was meant to fix is real
+        // and still open; it needs a route that does not require suppressing a
+        // command whose UI waits for a result.
+        else if (!luaPath && id == 2 && CfgHas("strict_buy"))
+            Log("[slice] strict_buy is set but BuyVehicle cannot be cancelled "
+                "(its completion callback cannot be fired at 74fda9) -- the buy "
+                "runs natively; NOT arming a cancel we cannot honour\n");
         __try {
             CaptureFactory(*f, rcx, rdx, r8, r9, calleeRsp, caller, groundtruth, cancel);
         } __except (EXCEPTION_EXECUTE_HANDLER) {

@@ -4130,8 +4130,17 @@ function buildVehConfig(c)
 end
 
 local function execVBuy(c)
-	if c.origin == K.INSTANCE and not K.STRICT_OPS.VBUY then
-		log(string.format("VBUY seq=%s: originator already bought locally, skipping", tostring(c.seq)))
+	-- The originator replays its own purchase ONLY if the buy was actually
+	-- cancelled here. Both conditions are required and neither is sufficient:
+	-- K.STRICT_OPS.VBUY is read from cfg ONCE at load, so it can outlive a
+	-- config change, and c.armed is per-command truth from the slice. Replaying
+	-- on top of a purchase that really happened buys the vehicle TWICE and
+	-- charges for both -- observed live 2026-09-03 when the slice armed a
+	-- cancel whose completion callback then could not be fired.
+	if c.origin == K.INSTANCE
+			and (not K.STRICT_OPS.VBUY or tonumber(c.armed or 0) ~= 1) then
+		log(string.format("VBUY seq=%s: originator already bought locally, skipping (strict=%s armed=%s)",
+			tostring(c.seq), tostring(K.STRICT_OPS.VBUY and true or false), tostring(c.armed)))
 		return
 	end
 	if c.origin == K.INSTANCE then
@@ -8838,6 +8847,10 @@ local function pollInject()
 							-- replay at the stamp like every peer -- which is the
 							-- whole point: the entity is then created on the same
 							-- sim-step everywhere.
+							-- carry the slice's ARMED verdict ON the command, so the
+							-- replay guard reads per-command truth rather than a cfg
+							-- flag cached at load
+							bargs.armed = tonumber(CM.lastArmed or 0)
 							if K.STRICT_OPS.VBUY and tonumber(CM.lastArmed or 0) == 1 then
 								-- NO expectVehicle here. Under strict the originator
 								-- REPLAYS its own buy, and execVBuy binds the key from
