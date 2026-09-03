@@ -1061,9 +1061,15 @@ end
 K.CONX_UI_CONTEXT = true
 function CM.conxContext()
 	if not K.CONX_UI_CONTEXT then return nil end
+	-- EXPERIMENT (cfg conx_terrain_align=0): the host's interactive builder
+	-- settles a station 0.1 m higher than this scripted proposal's terrain
+	-- re-grade (measured 2026-09-02: host z=4.5, peers z=4.4, z-only, station
+	-- edges). Turning the re-grade OFF here tests whether the peers then match
+	-- the host. Default true keeps today's behaviour.
+	local align = CM.cfgFlag("conx_terrain_align", true)
 	local ok, ctx = pcall(function()
 		local c = api.type.Context:new()
-		c.checkTerrainAlignment = true
+		c.checkTerrainAlignment = align
 		c.cleanupStreetGraph    = true
 		c.gatherBuildings       = false
 		c.gatherFields          = true
