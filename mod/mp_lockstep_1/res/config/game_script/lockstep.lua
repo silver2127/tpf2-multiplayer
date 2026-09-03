@@ -9130,6 +9130,10 @@ end
 --   2. never hold on a STALE peer time -- a silent peer is not a slow peer
 --   3. a watchdog that force-releases, so any residual deadlock self-heals
 K.MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
+-- LOAD GATE. Ticks are ~5.4 Hz (300 ticks measured over 56 s), so these are
+-- ~11 s and ~2.8 min.
+K.LOADGATE_SETTLE    = 60    -- ticks with no NEW peer before the roster counts as complete
+K.LOADGATE_MAX_TICKS = 900   -- absolute cap: a session must never hang forever
 
 -- ---------- catch-up pacing ----------
 --
@@ -9180,8 +9184,31 @@ CM.SPEED_DOWN = { [4] = 2, [2] = 1 }   -- deliberately no [1]: 1 is the floor
 -- other. Both are measured against the SLOWEST peer, because that is the
 -- quantity the barrier actually trips on -- the pacer's old "behind" reading
 -- chases the FASTEST peer, which is the wrong end for braking.
-CM.THROTTLE_AHEAD = 2.5
-CM.THROTTLE_DONE  = 1.0
+-- ONE controller, ONE signal, and a deadband wider than one correction.
+--
+-- The first attempt used two: this brake on the lead over the SLOWEST peer, and
+-- the pre-existing catch-up on the lag behind the FASTEST peer. With three
+-- instances an instance is routinely BOTH -- ahead of the slowest and behind
+-- the fastest -- so the two fought each other every dwell:
+--
+--   PACE: speed -> 2 (2.60 ahead of the slowest peer)
+--   PACE: speed -> 4 (1.00 behind the peer)
+--
+-- Both now read the lead over the SLOWEST peer, which is the quantity
+-- K.BARRIER_AHEAD fires on: positive means slow down, negative means we are the
+-- laggard and may speed up. Everyone converges on the slowest member, which is
+-- the only pace the whole session can actually sustain.
+--
+-- THE DEADBAND MUST EXCEED ONE CORRECTION'S EFFECT, or the loop cannot settle
+-- however the thresholds are placed. A notch is worth ~1.8 units/s of relative
+-- drift, so over a dwell of D ticks (~5.4 Hz) one correction moves the lead by
+-- ~1.8 * D / 5.4 units. At the old PACE_COOLDOWN of 16 ticks that is ~5.3
+-- units -- larger than any sane band, which is why every adjustment overshot
+-- and the observed cycle was a clean 0.80 <-> 2.60 limit cycle. At 8 ticks it
+-- is ~2.7, comfortably inside the 4.5-unit band below.
+CM.PACE_DWELL     = 8      -- ticks between pacing moves, both directions
+CM.THROTTLE_AHEAD = 3.0    -- above this we are too far ahead: one notch down
+CM.PACE_BEHIND    = 1.5    -- below -this we are the laggard: one notch up
 CM.catchingUp  = false
 CM.baseSpeed   = nil       -- the player's speed, sampled while in step
 CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
@@ -9273,72 +9300,68 @@ function CM.pace(ahead, lead)
 		end
 		CM.baseSpeed = s
 		CM.catchingUp = false
-		CM.throttled = false      -- their lever outranks our braking too
+		CM.paceMovedAt = nil      -- their lever outranks our pacing; react at once
 		CM.lastSetSpeed = nil
 		CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
 		return
 	end
-	-- The cooldown exists to stop us raising the speed over and over. Coming
-	-- back down is the opposite: delaying it by three seconds at double speed
-	-- overshot the peer by 3.8 units, which made the OTHER instance the one
-	-- behind, and the two took turns chasing each other.
-	if CM.catchingUp and behind <= CM.CATCHUP_DONE then
-		CM.catchingUp = false
-		CM.setSpeed(CM.baseSpeed or 1, string.format("caught up, %.2f behind", behind))
-		return
-	end
+	-- (The old "caught up -> snap back to the player's speed" branch lived here.
+	-- It fired on `behind`, the FASTEST-peer signal, and jumped straight to the
+	-- ceiling -- re-accelerating us into the next throttle and completing the
+	-- limit cycle. The controller below holds instead, in both directions, off
+	-- a single signal.)
 	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
-	-- BRAKING, against the slowest peer. Placed after the cooldown check so it
-	-- inherits the same rate limit as the catch-up and cannot chatter; placed
-	-- before the catch-up block because the two are opposites and must never
-	-- both act on one tick.
-	if lead and not CM.catchingUp then
-		if CM.throttled and lead <= CM.THROTTLE_DONE then
-			CM.throttled = false
-			CM.setSpeed(CM.baseSpeed or 1, string.format("back in step, %.2f ahead", lead))
-			return
+	if CM.paceMovedAt and (ticks - CM.paceMovedAt) < CM.PACE_DWELL then return end
+	-- No reading of the slowest peer: nothing to pace against. The catch-up used
+	-- to run off the FASTEST peer here; that is the wrong end for a controller
+	-- whose job is to stop the barrier firing.
+	if lead == nil then return end
+
+	-- The player's speed is a CEILING we never exceed, and 1 is a floor we never
+	-- go under. Only the barrier may command 0, because only the barrier sets
+	-- `paused` and is therefore covered by K.MAX_PAUSE_TICKS.
+	local ceiling = CM.baseSpeed or CM.MAX_SPEED
+	if ceiling < 1 then ceiling = 1 end
+
+	if lead > CM.THROTTLE_AHEAD then
+		local down = CM.SPEED_DOWN[s]
+		if down then
+			CM.paceMovedAt = ticks
+			CM.catchingUp = (down ~= ceiling)
+			CM.setSpeed(down, string.format("%.2f ahead of the slowest peer", lead))
+		elseif not CM.pacedFloorWarned then
+			-- At the floor and still ahead: this machine is simply faster than
+			-- the slowest peer even at speed 1. The barrier takes it from here,
+			-- which is the one case where the game is allowed to stop.
+			CM.pacedFloorWarned = true
+			log(string.format("pace: %.2f ahead at speed %s -- at the floor, the barrier has it", lead, tostring(s)))
 		end
-		if lead > CM.THROTTLE_AHEAD and CM.SPEED_DOWN[s] then
-			-- Remember the player's speed on the FIRST notch down only, so a
-			-- second notch does not record our own throttle as their choice.
-			if not CM.throttled then CM.baseSpeed = s end
-			CM.throttled = true
-			CM.setSpeed(CM.SPEED_DOWN[s], string.format("%.2f ahead of the slowest peer", lead))
-			return
+	elseif lead < -CM.PACE_BEHIND then
+		CM.pacedFloorWarned = false
+		local up = CM.SPEED_UP[s]
+		if up and up > ceiling then up = ceiling end
+		if up and up > s then
+			CM.paceMovedAt = ticks
+			CM.catchingUp = (up ~= ceiling)
+			CM.setSpeed(up, string.format("%.2f behind the slowest peer", -lead))
+		elseif not CM.pacedTopWarned then
+			CM.pacedTopWarned = true
+			log(string.format("pace: %.2f behind at speed %s -- at the player's ceiling, nothing to give",
+				-lead, tostring(s)))
 		end
-		if lead > CM.THROTTLE_AHEAD and not CM.SPEED_DOWN[s] then
-			-- At the floor and still ahead: the peer is simply slower than we
-			-- are at speed 1. The barrier takes it from here, which is correct
-			-- and is the one case where the game is allowed to stop.
-			if not CM.pacedFloorWarned then
-				CM.pacedFloorWarned = true
-				log(string.format("pace: %.2f ahead at speed %s -- at the floor, the barrier has it", lead, tostring(s)))
-			end
-		else
-			CM.pacedFloorWarned = false
-		end
-	end
-	if not CM.catchingUp then
-		if behind > CM.CATCHUP_BEHIND and s < CM.MAX_SPEED and CM.SPEED_UP[s] then
-			CM.baseSpeed = s
-			CM.catchingUp = true
-			CM.setSpeed(CM.SPEED_UP[s], string.format("%.2f behind the peer", behind))
-		elseif behind > CM.CATCHUP_BEHIND then
-			-- Already at the top speed: the peer must come down to us, which the
-			-- barrier does at K.BARRIER_AHEAD. Nothing to do but say so.
-			if not CM.pacedTopWarned then
-				CM.pacedTopWarned = true
-				log(string.format("PACE: %.2f behind at speed %s -- no notch left, "
-					.. "waiting for the barrier", behind, tostring(s)))
-			end
-		else
-			-- In step. Only adopt this as the player's speed if it is not one WE
-			-- set: recording our own catch-up 2 as "the player wants 2" is what
-			-- made the barrier release to 2, race ahead, hold at 5.2, release to
-			-- 2 again -- the loop seen live at 02:30.
-			if not CM.lastSetSpeed then CM.baseSpeed = s end
-			CM.pacedTopWarned = false
-		end
+	else
+		-- INSIDE THE DEADBAND: HOLD. Emphatically do NOT restore the ceiling
+		-- here. Snapping back to full speed the moment the lead looked healthy
+		-- is what re-accelerated us straight into the next throttle and made
+		-- the whole thing a limit cycle. If a lower notch is the speed that
+		-- keeps this instance level with the slowest peer, that is the correct
+		-- speed and it should simply be kept.
+		CM.pacedFloorWarned = false
+		CM.pacedTopWarned = false
+		-- Only adopt this as the player's speed if it is not one WE set:
+		-- recording our own throttle as "the player wants 2" would lower the
+		-- ceiling permanently.
+		if not CM.lastSetSpeed then CM.baseSpeed = s end
 	end
 end
 
@@ -9441,12 +9464,82 @@ end
 -- without taking the speed control away for the rest of the session. The
 -- barrier is unaffected: it sets speed 0 directly and is allowed to.
 local didInitialUnpause = false
+-- Numeric cfg value (CM.cfgFlag only answers yes/no). Shares its cache, so
+-- calling this first also populates it.
+function CM.cfgNum(key, default)
+	CM.cfgFlag(key, false)
+	local v = CM.cfgCache and CM.cfgCache[key]
+	return tonumber(v) or default
+end
+
+-- LOAD GATE: is everybody in?
+--
+-- Without this the first instance to finish loading starts simulating alone,
+-- because applyBarrier returns immediately while `not peerSeen` -- it will not
+-- hold against silence, which is correct once a session is running but wrong
+-- before one has started. Anything the player then does is captured, found to
+-- have no peer, and DROPPED by CM.soloDrop, while the native action still
+-- happens here. A vehicle bought in that window exists on this instance and on
+-- no other, so the setLine that follows has nothing to bind to on the peers --
+-- which is exactly the "bought while the others were still loading" breakage.
+--
+-- The gate WITHHOLDS the initial unpause rather than commanding speed 0. The
+-- game already loads paused, so this adds no new way to stop the simulation and
+-- needs no watchdog of its own: the player pressing play is a first-class
+-- override, handled by the s ~= 0 branch in ensureRunning below.
+--
+-- Two modes. With expect_players=N set, it waits for exactly N-1 peers, which is
+-- what a fixed rig wants. Otherwise it waits for at least one peer and then for
+-- the count to stop changing (K.LOADGATE_SETTLE), which handles players
+-- trickling in without needing to be told how many to expect.
+function CM.loadGateReady()
+	if not CM.cfgFlag("load_gate", true) then return true end
+	local n = 0
+	for _ in pairs(CM.peers) do n = n + 1 end
+	if n ~= CM.lgCount then
+		CM.lgCount = n
+		CM.lgChangedAt = ticks
+	end
+	if ticks > K.LOADGATE_MAX_TICKS then
+		if not CM.lgAnnounced then
+			CM.lgAnnounced = true
+			log(string.format("LOADGATE: giving up after %d ticks with %d peer(s) -- starting anyway. "
+				.. "Anything done before the others arrive will NOT reach them.",
+				K.LOADGATE_MAX_TICKS, n))
+		end
+		return true
+	end
+	local want = CM.cfgNum("expect_players", 0)
+	local ready
+	if want > 1 then
+		ready = (n >= want - 1)
+	else
+		ready = (n >= 1 and (ticks - (CM.lgChangedAt or ticks)) >= K.LOADGATE_SETTLE)
+	end
+	if not ready then
+		-- roughly every two seconds, so the player can see WHY it is paused
+		if (ticks % 12) == 0 then
+			log(string.format("LOADGATE: holding at the loaded save -- %d peer(s) in%s. Press play to start anyway.",
+				n, (want > 1) and string.format(", waiting for %d", want - 1) or ""))
+		end
+		return false
+	end
+	if not CM.lgAnnounced then
+		CM.lgAnnounced = true
+		log(string.format("LOADGATE: %d peer(s) in -- releasing", n))
+	end
+	return true
+end
+
 local function ensureRunning()
 	if didInitialUnpause or paused then return end
 	if ticks < 100 then return end            -- let the world finish loading
 	local s
 	local ok = pcall(function() s = game.interface.getGameSpeed() end)
 	if not ok or s == nil then return end
+	-- Held only while the game is still paused from the load. If the player has
+	-- already moved the lever themselves, that is their call and it wins.
+	if s == 0 and not CM.loadGateReady() then return end
 	didInitialUnpause = true
 	if s == 0 then
 		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
