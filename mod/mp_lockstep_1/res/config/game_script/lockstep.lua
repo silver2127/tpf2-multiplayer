@@ -6722,8 +6722,13 @@ function CM.sideOnEdge(eid, u, x, y, conv)
 	local tg = hermiteTangent(a, ta, b, tb, u)
 	local cross = tg[1] * (y - q[2]) - tg[2] * (x - q[1])
 	local geoL = cross > 0
+	-- plain if/else: `conv and geoL or not geoL` is WRONG when geoL is false
+	-- (Lua's and/or idiom falls through a false middle) -- it put every
+	-- right-side stop on the left and echoed it back to the host (2026-09-02)
 	local engL
-	if conv == nil then engL = not geoL else engL = conv and geoL or (not geoL) end
+	if conv == nil then engL = not geoL
+	elseif conv then engL = geoL
+	else engL = not geoL end
 	return geoL, engL
 end
 
