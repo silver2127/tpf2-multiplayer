@@ -1515,7 +1515,13 @@ local function execPolyline(c, planOnly)
 		-- = two removals of one entity = the ENGINE REJECTS THE WHOLE PROPOSAL
 		-- (trace: "vertex 3 split road 182049" then "seg 5 ... 182049 CROSSING",
 		-- then build success=false). Second hit reuses the first split's node.
-		local base = -(1000000 + CM.originIdx(c.origin) * 10000000 + c.seq * 1000)
+		-- The plan-only pre-pass passes seq="plan" (a sentinel string); it builds
+	-- nothing, so any base is fine, but c.seq * 1000 threw "arithmetic on a
+	-- string" and aborted the WHOLE plan pass -- the host then shipped no
+	-- split/crossing decisions and every peer derived its own, which diverged
+	-- on a tram-track street upgrade (2026-09-02). Coerce to a number.
+	local seqN = tonumber(c.seq) or 0
+	local base = -(1000000 + CM.originIdx(c.origin) * 10000000 + seqN * 1000)
 		local nextNew, nextEdge = 0, 0
 		local sp = api.type.SimpleProposal.new()
 		local addNodes, addEdges, removeEdges, removeNodes = {}, {}, {}, {}
