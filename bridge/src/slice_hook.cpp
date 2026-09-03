@@ -2251,8 +2251,35 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // player reporting "I can't build anything" left NO trace at all -- there
         // was no way to tell a station attempt from a bulldoze from nothing
         // happening. A build is a rare event; logging every one costs nothing.
-        Log("[slice] BuildProposal from caller_rva=%llx (not the road path) -- ignored\n",
-            (unsigned long long)caller);
+        // ...and say WHAT was ignored, not just that something was. A caller
+        // we do not handle is a player action that does not replicate, so the
+        // log has to carry enough shape to identify the tool without a
+        // debugger. The Lua range is our own replay and is expected; anything
+        // else is a real UI path going unreplicated, and the counts name it:
+        // adds and removals with NO new nodes is an in-place edit (a crossing
+        // upgraded to a double slip switch, a bridge type swapped, a level
+        // crossing changed), which is exactly the class the wiki describes as
+        // "select it with the inspector and say yes".
+        const bool luaReplay = (caller >= 0xcec000 && caller < 0xcf2000);
+        if (luaReplay) {
+            Log("[slice] BuildProposal from caller_rva=%llx (our own Lua replay) -- ignored\n",
+                (unsigned long long)caller);
+        } else {
+            int an = -1, ae = -1, rn = -1, re = -1;
+            __try {
+                uint64_t b = 0;
+                an = (int)(ReadVec(r8 + 0x00, &b, 0x20000) / 24);
+                ae = (int)(ReadVec(r8 + 0x18, &b, 0x20000) / 120);
+                rn = (int)(ReadVec(r8 + 0x30, &b, 0x20000) / 24);
+                re = (int)(ReadVec(r8 + 0x48, &b, 0x20000) / 120);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                an = ae = rn = re = -1;
+            }
+            Log("[slice] UNREPLICATED BuildProposal from caller_rva=%llx: "
+                "addNodes=%d addEdges=%d rmNodes=%d rmEdges=%d -- a UI path we do not "
+                "handle; what the player just did did NOT reach the peers\n",
+                (unsigned long long)caller, an, ae, rn, re);
+        }
         return 0;
     }
 
