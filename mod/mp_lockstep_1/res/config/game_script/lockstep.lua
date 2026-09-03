@@ -2842,6 +2842,11 @@ local function primeVehKeys()
 	log(string.format("veh: primed %d save vehicle(s) as known / s:<id>", np))
 end
 
+-- forward: CM.shipVehCap/drainVehCap (below) sell through forgetVehicle, which
+-- is defined further down; without this the name resolves to a nil global and
+-- a mass sell crashed the originator (2026-09-02, drainVehCap:forgetVehicle nil).
+local forgetVehicle
+local lineKeyFor   -- forward: shipVehCap resolves a line key; real def is below
 -- Vehicle-key-dependent captures (VLINE, VSELL) whose keys were not bound at
 -- capture time. A batch buy binds keys asynchronously, so an assign or sell
 -- issued in the same breath must WAIT for the binding rather than drop the
@@ -2994,7 +2999,7 @@ local function pollVehKeys()
 end
 
 -- A sold vehicle's key must not outlive it: entity ids get reused.
-local function forgetVehicle(vid)
+function forgetVehicle(vid)
 	local key = vehKeyOf[vid]
 	if key then vehIdOf[key] = nil end
 	vehKeyOf[vid] = nil
@@ -3095,7 +3100,7 @@ local function registerLineKey(key, lid)
 	log(string.format("line: %s <-> local line %d", key, lid))
 end
 
-local function lineKeyFor(lid)
+function lineKeyFor(lid)
 	if lineKeyOf[lid] then return lineKeyOf[lid] end
 	if primedLines[lid] then return "s:" .. tostring(lid) end
 	log(string.format("line: local line %s has no cross-peer key -- not shipped", tostring(lid)))
