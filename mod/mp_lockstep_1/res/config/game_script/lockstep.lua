@@ -211,6 +211,19 @@ local function peerFor(o)
 	if not pr then pr = { hashes = {}, details = {}, streak = 0 }; CM.peers[o] = pr end
 	return pr
 end
+-- Slowest peer by the PRECISE clock, for pacing only. Falls back to the coarse
+-- reading for a peer that has not sent a step yet (an older build).
+local function peerSlowPrecise()
+	local minT
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (ticks - pr.at) <= K.PEER_STALE_TICKS then
+			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			if t and (not minT or t < minT) then minT = t end
+		end
+	end
+	return minT
+end
+
 local function peerBounds()
 	local minT, maxT
 	for _, pr in pairs(CM.peers) do
@@ -5916,6 +5929,17 @@ local function onLine(line)
 			local o = line:match(" o=(%a)") or "?"
 			local pr = peerFor(o)
 			pr.time = t; pr.at = ticks
+			-- LSTICK has always carried the SIM STEP as well, and nothing read
+			-- it. t= is math.floor(now), so it is quantised to a whole unit --
+			-- a controller cannot hold a lead tighter than its own measurement
+			-- error. The step is K.SIM_STEP (0.2) resolution, 5x finer.
+			--
+			-- Kept in a SEPARATE field on purpose. Rewriting pr.time would move
+			-- what peerBounds returns, and that value is what K.BARRIER_AHEAD
+			-- and command stamping were tuned against -- it would silently
+			-- relax the barrier by ~0.5 and stamp every command further out.
+			local st = tonumber(line:match(" s=(%-?%d+)"))
+			if st then pr.step = st end
 			peerSeen = true
 			local hi = tonumber(line:match(" hi=(%d+)"))
 			if hi then pcall(CM.rxAdvertise, o, hi) end
@@ -9206,9 +9230,14 @@ CM.SPEED_DOWN = { [4] = 2, [2] = 1 }   -- deliberately no [1]: 1 is the floor
 -- units -- larger than any sane band, which is why every adjustment overshot
 -- and the observed cycle was a clean 0.80 <-> 2.60 limit cycle. At 8 ticks it
 -- is ~2.7, comfortably inside the 4.5-unit band below.
-CM.PACE_DWELL     = 8      -- ticks between pacing moves, both directions
-CM.THROTTLE_AHEAD = 3.0    -- above this we are too far ahead: one notch down
-CM.PACE_BEHIND    = 1.5    -- below -this we are the laggard: one notch up
+-- Ticks are ~5.4 Hz. At a dwell of 5 (~0.93 s) one notch moves the lead ~1.7
+-- units, so a 2.0-unit band still comfortably exceeds one correction and the
+-- loop settles -- while capping the steady-state skew near 1.2 instead of 3.
+-- Tightening further is measurement-bound, not gain-bound: the peer clock now
+-- reads to 0.2 units, so a band under ~1 would chatter on quantisation alone.
+CM.PACE_DWELL     = 5      -- ticks between pacing moves, both directions
+CM.THROTTLE_AHEAD = 1.2    -- above this we are too far ahead: one notch down
+CM.PACE_BEHIND    = 0.8    -- below -this we are the laggard: one notch up
 CM.catchingUp  = false
 CM.baseSpeed   = nil       -- the player's speed, sampled while in step
 CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
@@ -9225,10 +9254,20 @@ CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
 CM.PACE_COOLDOWN = 16         -- ticks between changes we make: a tick is ~0.19 s, so ~3 s
 
 function CM.setSpeed(v, why)
+	-- TWO SLOTS, not one. A single remembered value is enough only while at most
+	-- one of our commands is in flight; the moment corrections come faster than
+	-- the engine applies them, the engine reports the OLDER one, shareSpeed
+	-- fails to recognise it as ours, concludes the PLAYER moved the lever, and
+	-- broadcasts our own throttle to every peer as their choice.
+	CM.prevSetSpeed = CM.lastSetSpeed
 	CM.lastSetSpeed = v
 	CM.paceSetTick = ticks
 	CM.paceApplied = false
-	CM.paceQuietUntil = ticks + CM.PACE_COOLDOWN
+	-- The pacing dwell, NOT PACE_COOLDOWN. This is checked before the pacer's
+	-- own dwell, so leaving it at the 16-tick cooldown made that dwell inert:
+	-- corrections stayed ~3 s apart and each one moved the lead ~5 units, which
+	-- is larger than any workable deadband and is why adjustments overshot.
+	CM.paceQuietUntil = ticks + (CM.PACE_DWELL or CM.PACE_COOLDOWN)
 	pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(v)) end)
 	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
 end
@@ -9251,6 +9290,8 @@ function CM.shareSpeed()
 	CM.lastSeenSpeed = s
 	if prev == nil or s == prev then return end
 	if CM.lastSetSpeed ~= nil and s == CM.lastSetSpeed then return end   -- ours, not the player's
+	-- ...and the one before it, while our newest has not been observed yet.
+	if not CM.paceApplied and CM.prevSetSpeed ~= nil and s == CM.prevSetSpeed then return end
 	CM.baseSpeed = s
 	CM.catchingUp = false
 	broadcast(string.format("LSSPEED v=%d o=%s", s, K.INSTANCE))
@@ -9261,6 +9302,9 @@ end
 -- `lead` is the lead over the SLOWEST peer -- the quantity K.BARRIER_AHEAD
 -- fires on, and therefore the only correct signal for braking.
 function CM.pace(ahead, lead)
+	-- The load gate owns the speed until every player is in. Without this the
+	-- pacer would see one peer, floor itself at 1 and fight the gate's 0.
+	if CM.lgHolding then return end
 	if paused then return end                       -- the barrier owns the speed
 	local behind = -ahead
 	-- A gap this size is not pacing: it is two instances on different saves, or
@@ -9410,7 +9454,10 @@ local function applyBarrier(now)
 
 	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
 	CM.shareSpeed()
-	CM.pace(now - fastT, ahead)        -- chases the FASTEST, brakes on the SLOWEST
+	-- The pacer gets the PRECISE lead over the slowest peer; the barrier above
+	-- keeps the coarse peerBounds value it was tuned against.
+	local slowP = peerSlowPrecise()
+	CM.pace(now - fastT, slowP and (now - slowP) or ahead)
 	-- COMPLETENESS HOLD (cfg strict_barrier, default OFF).
 	--
 	-- The clock barrier above only keeps the instances CLOSE in time. It
@@ -9537,13 +9584,44 @@ local function ensureRunning()
 	local s
 	local ok = pcall(function() s = game.interface.getGameSpeed() end)
 	if not ok or s == nil then return end
-	-- Held only while the game is still paused from the load. If the player has
-	-- already moved the lever themselves, that is their call and it wins.
-	if s == 0 and not CM.loadGateReady() then return end
+
+	-- LOAD GATE. It has to ACTIVELY pause, not merely withhold an unpause: a
+	-- save restores its OWN speed when it loads, so the game is normally
+	-- already running by the time we get here. The first version only held when
+	-- it found speed 0 and so never fired at all -- the log said "already
+	-- running at speed 2" and the instance started simulating alone.
+	--
+	-- Safe despite commanding 0, for reasons the barrier's own speed-0 hold does
+	-- not get for free: ensureRunning is called UNCONDITIONALLY from the update
+	-- loop (right after applyBarrier), so unlike anything living inside CM.pace
+	-- it always gets a chance to release. It releases on all three of: the
+	-- roster filling up, K.LOADGATE_MAX_TICKS expiring, and the player taking
+	-- the lever back.
+	if not CM.loadGateReady() then
+		if s ~= 0 then
+			if not CM.lgHeld then
+				CM.lgResumeSpeed = s        -- remember ONCE: the save's own speed
+				CM.lgHeld, CM.lgHeldAt, CM.lgHolding = true, ticks, true
+				pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(0)) end)
+				log(string.format("LOADGATE: pausing (was speed %d) until the other players are in", s))
+			elseif (ticks - (CM.lgHeldAt or 0)) > 12 then
+				-- We asked for 0 and it is still running well past the command
+				-- latency: the player pressed play. Their lever wins.
+				didInitialUnpause = true
+				CM.lgHolding = false
+				log(string.format("LOADGATE: game started manually at speed %d -- releasing", s))
+			end
+		end
+		return
+	end
+
 	didInitialUnpause = true
-	if s == 0 then
-		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
-		log("initial unpause (speed 0 -> 1); speed is yours from here")
+	CM.lgHolding = false
+	local want = CM.lgResumeSpeed or s
+	if want == 0 then want = 1 end
+	if s ~= want then
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(want)) end)
+		log(string.format("initial unpause (speed %d -> %d); speed is yours from here", s, want))
 	else
 		log("already running at speed " .. tostring(s))
 	end
