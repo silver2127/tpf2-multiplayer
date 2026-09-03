@@ -5046,6 +5046,21 @@ end
 local function execLoan(c)
 	local v = tonumber(c.v)
 	if not v then log("LOAN: no value"); return end
+	-- The ORIGINATOR already moved its own loan -- the player did it in the
+	-- finances window; this command exists to tell the OTHER instances. Applying
+	-- it here too was meant to be a no-op via delta 0, but the loan keeps moving
+	-- between the poll that ships it and the replay a stamp later, so the delta
+	-- was not 0 and we booked it: 20,000,000 -> 18,500,000 on the originator, a
+	-- change the player never made. That fed the poll, which shipped again, and
+	-- the loan walked up to the 30,000,000 cap while the peers sat at 11,000,000
+	-- and went into the red (2026-09-03). Skip, exactly as every other channel
+	-- skips its originator.
+	if c.origin == K.INSTANCE then
+		log(string.format("LOAN seq=%s: originator already set it locally (%s), skipping",
+			tostring(c.seq), tostring(v)))
+		CM.lastLoan = v
+		return
+	end
 	CM.cmEnsure()
 	local me = api.engine.util.getPlayer()
 	local pid = me

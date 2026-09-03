@@ -2187,7 +2187,9 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // fields are somewhere in between. Capture this window for one upgrade
         // WITH a tram/bus lane and one without: the byte that differs names the
         // offset. Do NOT hardcode an offset from a single sample.
-        if (isUpgrade) {
+        // Served its purpose (it named +0x54); keep it for the next unknown
+        // street field but off by default -- 120 bytes per upgrade is noise.
+        if (isUpgrade && CfgHas("dumpprop")) {
             uint64_t pbegin = 0, pend = 0;
             if (Readable((void*)(r8 + 0x18), 16)) {
                 memcpy(&pbegin, (void*)(r8 + 0x18), 8);
