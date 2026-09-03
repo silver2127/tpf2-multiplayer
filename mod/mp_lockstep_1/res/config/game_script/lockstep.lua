@@ -8839,9 +8839,19 @@ local function pollInject()
 							-- whole point: the entity is then created on the same
 							-- sim-step everywhere.
 							if K.STRICT_OPS.VBUY and tonumber(CM.lastArmed or 0) == 1 then
+								-- NO expectVehicle here. Under strict the originator
+								-- REPLAYS its own buy, and execVBuy binds the key from
+								-- the command's own res.resultEntity -- the exact
+								-- vehicle that purchase produced. Registering a second,
+								-- HINTLESS pending key here made two entries compete for
+								-- one buy: the hintless one grabbed whichever fresh
+								-- vehicle it found first, so with several buys and line
+								-- assignments in quick succession the keys bound to the
+								-- wrong vehicles and setLine landed on the peers but not
+								-- on the originator (measured 2026-09-03, right after
+								-- strict_buy went in).
 								scheduleLocal("VBUY", bargs)
-								expectVehicle(K.INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
-								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp")
+								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp (key binds on replay)")
 							else
 								-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
 								CM.parkedBuys[#CM.parkedBuys + 1] = {
