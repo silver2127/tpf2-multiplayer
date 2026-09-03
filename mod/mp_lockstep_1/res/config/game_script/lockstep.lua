@@ -3865,6 +3865,22 @@ execConX = function(c)
 		-- an immediate rebuild would collide). Second pass (strictPhase set):
 		-- fall through and build exactly like a peer.
 		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", false) and c.strictPhase ~= "rebuilt" then
+			-- NEVER strict-replay a construction that REMOVES road edges (a depot
+			-- splits the road it sits on; its payload carries removals). Bulldozing
+			-- the native copy heals that split, so the shipped removal no longer
+			-- resolves, the rebuild goes out with rm=0 and the engine refuses it
+			-- ("Construction not possible", critical) -- and the CONFAIL rollback
+			-- then DELETES the player's depot. Measured 2026-09-02: station = 0
+			-- removals, rebuilds fine; road depot = 1 removal, rebuild fails and the
+			-- depot is lost. Those keep today's proven behaviour (originator keeps
+			-- its native copy); only removal-free constructions take the strict path.
+			local nRmShipped = 0
+			for _ in tostring(c.srm or ""):gmatch("[^;]+") do nRmShipped = nRmShipped + 1 end
+			if nRmShipped > 0 then
+				log(string.format("CONX STRICT seq=%s: payload removes %d road edge(s) -- keeping the native copy (strict would heal the split and the rebuild would be refused)", tostring(c.seq), nRmShipped))
+				conxBusy = false
+				return
+			end
 			local rec = consByKey[key]
 			if not (rec and rec.id and api.engine.entityExists(rec.id)) then
 				log(string.format("CONX STRICT seq=%s: no native construction at %s to replace -- keeping native, no strict this time", tostring(c.seq), key))
