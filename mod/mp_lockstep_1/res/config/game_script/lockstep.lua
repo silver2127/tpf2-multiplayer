@@ -184,6 +184,28 @@ local peerSeen     = false
 CM.lateCount    = 0   -- commands whose game-time stamp had already passed here
 local queue        = {}         -- pending commands
 local executed     = {}         -- key -> true, so a command runs at most once
+local executedAge  = {}         -- insertion order, so `executed` stays bounded
+local executedSeq  = 0
+-- NOTHING keyed by stamp or by command may grow for the life of the session.
+-- All of these were unbounded: one entry per 4-unit stamp per peer across five
+-- tables, one per command in `executed`, and one per sequence number per origin
+-- in the rx bookkeeping -- and CM.nackScan then walked the WHOLE sequence range
+-- every 10 ticks, so the per-tick cost of the gap scan rose with everything the
+-- players had ever done. The vpos lanes were already pruned to K.VPOS_KEEP; the
+-- rest never got the same treatment.
+K.STAMP_KEEP    = 64      -- hash/detail/compare stamps kept per side (~4 min)
+K.EXECUTED_KEEP = 2048    -- applied commands remembered, for resend de-dup
+
+-- Drop all but the newest `keep` entries of a table whose keys sort in age
+-- order (a stamp, or a "<letter>:<stamp>" string).
+function CM.pruneOldest(tbl, keep)
+	if not tbl then return end
+	local ks, n = {}, 0
+	for k in pairs(tbl) do n = n + 1; ks[n] = k end
+	if n <= keep then return end
+	table.sort(ks)
+	for i = 1, n - keep do tbl[ks[i]] = nil end
+end
 local lastHashAt   = nil
 local myHashes     = {}         -- [stamp] = our own hash
 local myDetails    = {}         -- [stamp] = our own per-component breakdown
@@ -5198,10 +5220,30 @@ function CM.rxAdvertise(o, hi)
 end
 
 -- periodic: NACK gaps that have persisted past the reorder grace
+-- Move firstSeq up past a contiguous run we already hold, and forget its
+-- bookkeeping. Without this the scan below walked an origin's entire history
+-- every 10 ticks -- cost growing with session length -- and `seen` never
+-- stopped growing. A genuine gap stops the advance, so nothing still owed is
+-- skipped; a seq that has exhausted its retries is stepped over too, because
+-- re-asking cannot help it.
+function CM.rxAdvance(r)
+	if not r then return end
+	local g = r.firstSeq + 1
+	while r.seen[g] or (r.nackN and (r.nackN[g] or 0) >= K.NACK_MAX) do
+		r.seen[g] = nil
+		if r.missSince then r.missSince[g] = nil end
+		if r.nackAt then r.nackAt[g] = nil end
+		if r.nackN then r.nackN[g] = nil end
+		r.firstSeq = g
+		g = g + 1
+	end
+end
+
 function CM.nackScan()
 	local sent = 0
 	for o, r in pairs(CM.rx) do
 		if o ~= K.INSTANCE then
+			CM.rxAdvance(r)
 			-- up to the advertised high-water (inclusive): a dropped TAIL command
 			-- sits at advMax, above maxSeq, and must be reachable here
 			for g = r.firstSeq + 1, math.max(r.maxSeq, r.advMax or 0) do
@@ -8872,6 +8914,14 @@ local function checkHash(now)
 	end
 	myHashes[stamp] = h
 	myDetails[stamp] = detail
+	CM.pruneOldest(myHashes, K.STAMP_KEEP)
+	CM.pruneOldest(myDetails, K.STAMP_KEEP)
+	CM.pruneOldest(comparedAt, K.STAMP_KEEP)
+	CM.pruneOldest(CM.vposDone, K.STAMP_KEEP * 4)   -- keyed per peer per stamp
+	for _, pr in pairs(CM.peers) do
+		CM.pruneOldest(pr.hashes, K.STAMP_KEEP)
+		CM.pruneOldest(pr.details, K.STAMP_KEEP)
+	end
 	broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
 	pcall(CM.vposShip, stamp)
 	CM.dashLastDetail = detail
@@ -8990,6 +9040,18 @@ function data()
 						local k = cmdKey(c)
 						if not executed[k] then
 							executed[k] = true
+							-- remember insertion order so this cannot grow for the life of
+							-- the session; a resend arrives inside the NACK window, far
+							-- fewer than K.EXECUTED_KEEP commands ago
+							executedSeq = executedSeq + 1
+							executedAge[executedSeq] = k
+							if executedSeq % 256 == 0 then
+								local cut = executedSeq - K.EXECUTED_KEEP
+								for i = cut - 255, cut do
+									local oldk = executedAge[i]
+									if oldk then executed[oldk] = nil; executedAge[i] = nil end
+								end
+							end
 							if c.op == "VBUY" then buysThisTick = buysThisTick + 1 end
 							-- MEASUREMENT: how far past its stamp is a command actually
 							-- issued? update() runs per frame while the clock moves in
