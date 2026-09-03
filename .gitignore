@@ -42,3 +42,6 @@ backup/
 # installer build output and PyInstaller work dir
 installer/out/
 netpunch/build/
+
+# local audit notes (not shipped)
+docs/audit.md

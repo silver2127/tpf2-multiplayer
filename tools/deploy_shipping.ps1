@@ -38,8 +38,26 @@ if (-not (Test-Path (Join-Path $Game 'alut_real.dll'))) { throw "alut_real.dll a
 Put "$Repo\bridge\out\alut.dll"           (Join-Path $Game 'alut.dll')
 Put "$Repo\bridge\out\tpf2_bridge_mp.dll" (Join-Path $Game 'tpf2_bridge_mp.dll')
 Put "$Repo\bridge\out\tpf2_menu.dll"      (Join-Path $Game 'tpf2_menu.dll')
-$slice = Get-ChildItem "$Repo\bridge\out\tpf2_slice*.dll" | Sort-Object LastWriteTime | Select-Object -Last 1
-Put $slice.FullName                       (Join-Path $Game 'tpf2_slice.dll')
+# The CANONICAL name, never "whatever is newest".
+#
+# This used to be `Get-ChildItem tpf2_slice*.dll | Sort LastWriteTime | Last 1`.
+# build_slice.bat takes an optional suffix (an injected DLL stays locked for the
+# life of the game process, so iterating means building tpf2_slice_foo.dll), and
+# every one of those lands in the same out dir -- so the last experiment anyone
+# built silently became the shipped artifact, under the shipping name, with
+# nothing in the output saying which file it actually was.
+$sliceSrc = "$Repo\bridge\out\tpf2_slice.dll"
+if (-not (Test-Path $sliceSrc)) {
+    throw "missing build output: $sliceSrc -- run bridge\build_slice.bat with NO suffix argument (a suffixed build is a dev iteration and is never shipped)"
+}
+# A suffixed build that is newer is almost always the one being worked on, and
+# shipping the stale canonical DLL instead is just as silent a failure the other
+# way round. Say so; do not guess.
+$sliceStamp = (Get-Item $sliceSrc).LastWriteTime
+Get-ChildItem "$Repo\bridge\out\tpf2_slice*.dll" -EA SilentlyContinue |
+    Where-Object { $_.Name -ne 'tpf2_slice.dll' -and $_.LastWriteTime -gt $sliceStamp } |
+    ForEach-Object { Write-Warning "[ship] $($_.Name) is NEWER than tpf2_slice.dll and will NOT be shipped -- rebuild without a suffix if that is the one you want" }
+Put $sliceSrc                             (Join-Path $Game 'tpf2_slice.dll')
 Put "$Repo\installer\cfg\tpf2_bridge_mp.cfg" (Join-Path $Game 'tpf2_bridge_mp.cfg')
 Put "$Repo\installer\cfg\tpf2_slice.cfg"     (Join-Path $Game 'tpf2_slice.cfg')
 New-Item -ItemType Directory -Force (Join-Path $Game 'netpunch') | Out-Null

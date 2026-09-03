@@ -9,8 +9,10 @@ if not exist out mkdir out
 cl /nologo /O2 /MT /W3 /EHsc /c src\hook.cpp /Fo:out\hook_probe.obj                || exit /b 1
 cl /nologo /O2 /MT /W3 /EHsc /c src\probe_apply.cpp /Fo:out\probe_apply.obj        || exit /b 1
 REM applyrelay_probe.asm, NOT applyrelay.asm: the probe variant also hands the
-REM game's return address to the handler. Kept as a separate file so the live
-REM bridge's relay (shared with capture.cpp) stays byte-identical.
+REM game's return address to the handler. It was split off so the M4a bridge's
+REM own relay stayed byte-identical; that bridge (capture.cpp / dllmain.cpp) is
+REM gone, so src\applyrelay.asm now has no consumer at all -- this file is the
+REM only live relay of the pair.
 ml64 /nologo /c /Fo out\applyrelay_probe.obj src\applyrelay_probe.asm             || exit /b 1
 REM Optional %1 suffix. Once injected, a DLL stays locked for the life of the
 REM process, so rebuilding to the same name fails with LNK1104 while the game is

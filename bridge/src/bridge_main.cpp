@@ -92,6 +92,13 @@ static void OnPeerLine(const char* line)
 // before any thread that formats paths is started.
 static std::wstring g_dataDir;
 
+// Set once, from DllMain(DLL_PROCESS_DETACH). Our worker threads were plain
+// for(;;) loops with no way out, so while shutdown ran they kept tailing a file
+// and pushing lines at a socket that was being closed underneath them. Nothing
+// waits on them (that would need the loader lock we are holding); this only
+// stops them doing more work.
+static volatile bool g_stopping = false;
+
 // Mutable runtime identity/peer, owned by the control-file poller. The
 // initial values come from the cfg (+ auto election); the control file may
 // change them later.
@@ -337,7 +344,7 @@ static DWORD WINAPI TailThread(LPVOID)
     uint64_t offset = 0;
     bool started = false;
     std::string line;
-    for (;;) {
+    while (!g_stopping) {
         Sleep(25);
         {
             std::lock_guard<std::mutex> lk(g_tailMtx);
@@ -366,7 +373,7 @@ static DWORD WINAPI TailThread(LPVOID)
             offset = 0;
         }
         _fseeki64(f, offset, SEEK_SET);
-        for (;;) {
+        while (!g_stopping) {
             int64_t lineStart = _ftelli64(f);
             // read a line of ANY length: capture lines for modular stations
             // run to several KB, and a fixed buffer here used to make the
@@ -417,6 +424,46 @@ static bool ReadSmallFile(const std::wstring& path, std::string& out)
     return ok;
 }
 
+// ---- save transfer, as a ROLE rather than a startup constant -----------------
+// Settings are latched at init; whether the server is running follows whichever
+// letter we currently hold. Save_StartServer spawns a listener thread and there
+// is no Save_StopServer, so this must be idempotent: a second call would bind
+// the same port again and fail.
+static std::mutex   g_xferMtx;
+static uint16_t     g_xferPort = 0;
+static std::string  g_saveDir;
+static std::string  g_shareSave;
+static bool         g_saveServerUp = false;
+
+// Bring the save server in line with `inst`.
+//
+// It used to run only `if (cfg.instance == "a")` at init, so a b->a promotion
+// from the lobby gave us the host's letter, the host's events file and the
+// host's tail -- and no save server at all. To a joiner that is indistinguish-
+// able from a host whose transfer port is dead.
+static void ApplySaveRole(const std::string& inst, const char* why)
+{
+    std::lock_guard<std::mutex> lk(g_xferMtx);
+    if (inst == "a") {
+        if (g_saveServerUp) return;
+        if (g_saveDir.empty()) {
+            Log("[xfer] %s: instance a, but no save dir -- server NOT started "
+                "(set save_dir= in cfg)\n", why);
+            return;
+        }
+        Save_StartServer(g_xferPort, g_saveDir, g_shareSave, Log);
+        g_saveServerUp = true;
+        Log("[xfer] %s: save server up on port %u (%s)\n", why, g_xferPort,
+            g_saveDir.c_str());
+    } else if (g_saveServerUp) {
+        // savexfer.h has no stop, and inventing one would mean tearing down a
+        // TCP transfer that may be mid-flight. A listener nobody connects to
+        // costs one socket; say so rather than leaving it a silent surprise.
+        Log("[xfer] %s: now instance %s, but the save server stays up "
+            "(no stop path; it just serves nobody)\n", why, inst.c_str());
+    }
+}
+
 // Switch letters at run time. Order matters for the Lua contract (it re-reads
 // the identity file every 60 ticks and then swaps its own capture/events
 // paths): the new events file must exist before the identity flips, and the
@@ -435,6 +482,7 @@ static void Reidentify(const std::string& inst)
     if (!g_tailFixed) SetTailPath(CapturePathFor(inst));
     else Log("[ctl] tail_file= override in effect, tail not retargeted\n");
     WriteIdentity(inst, false);
+    ApplySaveRole(inst, "re-identify");
     Log("[ctl] now instance %s (identity rewritten, events truncated, tail -> capture_%s)\n",
         inst.c_str(), inst.c_str());
 }
@@ -504,7 +552,7 @@ static DWORD WINAPI CtlThread(LPVOID)
 {
     const std::wstring path = g_dataDir + L"tpf2_bridge_ctl.txt";
     std::string last, cur;
-    for (;;) {
+    while (!g_stopping) {
         Sleep(500);
         if (!ReadSmallFile(path, cur)) cur.clear();   // missing = nothing requested
         if (cur == last) continue;
@@ -572,9 +620,13 @@ static DWORD WINAPI InitThread(LPVOID)
     // which is just as well, since getting that wrong was the single most
     // confusing failure mode this project has had. Whoever claims the host
     // port first is "a"; the other is "b".
+    // The two ports the election picks between, kept in scope: losing the bind
+    // below is itself an election result and has to be able to swap them.
+    const uint16_t hostPort  = cfg.localPort;      // base port from cfg
+    const uint16_t guestPort = cfg.peerPort;
+    bool elected = false;                          // true = the letter is ours to change
     if (cfg.instance == "auto") {
-        const uint16_t hostPort = cfg.localPort;      // base port from cfg
-        const uint16_t guestPort = cfg.peerPort;
+        elected = true;
         if (Net_PortAvailable(hostPort)) {
             cfg.instance = "a";
             cfg.localPort = hostPort;
@@ -634,13 +686,61 @@ static DWORD WINAPI InitThread(LPVOID)
         Log("[m5] relay_out: %s\n", g_fileOut ? "open" : "FAILED");
     }
 
-    if (!Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine)) {
-        cfg.localPort += 10;
-        if (!Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine)) {
-            Log("[m5] Net_Init FAILED\n");
+    bool netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
+
+    // The election is CHECK-then-BIND, and the two halves are seconds apart:
+    // Net_PortAvailable said the host port was free, this bind is where we find
+    // out whether it still is. Two games launched together both passed the
+    // check and both claimed "a" -- and the loser used to KEEP the letter,
+    // retry on localPort+10, and go on addressing the guest port. Two hosts, no
+    // guest, and nothing crossing the wire. Losing the bind is the election
+    // result: take the other letter and the other port pair.
+    // Only when the letter was ours to pick -- an explicit instance= in the cfg
+    // is a deliberate statement and must not be silently overridden.
+    if (!netUp && elected && cfg.instance == "a") {
+        Log("[m5] lost the race for port %u after the availability check said it "
+            "was free -- re-electing as instance b\n", cfg.localPort);
+        cfg.instance  = "b";
+        cfg.localPort = guestPort;
+        cfg.peerPort  = hostPort;
+        netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
+        if (netUp) {
+            // everything already derived from the old letter has to follow it
+            OpenEventsFile(cfg.instance);
+            std::lock_guard<std::mutex> lk(g_rt.mtx);
+            g_rt.instance = cfg.instance;
+            g_rt.peerIp   = cfg.peerIp;
+            g_rt.peerPort = cfg.peerPort;
+        } else {
+            // Neither port would bind, so the re-election proved nothing about
+            // who the host is. Put the letter back: a half-applied swap would
+            // leave the identity file saying "b" while the events file, the
+            // capture tail and g_rt still said "a", which is the mis-homed
+            // state WriteIdentity's mismatch warning exists to catch.
+            Log("[m5] port %u would not bind either -- reverting to instance a\n",
+                cfg.localPort);
+            cfg.instance  = "a";
+            cfg.localPort = hostPort;
+            cfg.peerPort  = guestPort;
         }
     }
-    Log("[m5] net up (local %d)\n", cfg.localPort);
+    if (!netUp) {
+        // Last resort: a private port nobody is addressing. We stay reachable
+        // only once the lobby sends peer=, so this is a degraded mode, not a
+        // recovery.
+        cfg.localPort += 10;
+        netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
+    }
+    // "net up" used to be printed unconditionally, directly under the branch
+    // that logs Net_Init FAILED -- so the one line anyone greps for said the
+    // transport was fine at the exact moment it was not.
+    if (netUp) {
+        Log("[m5] net up (local %u)\n", (unsigned)Net_LocalPort());
+    } else {
+        Log("[m5] Net_Init FAILED on every port -- NO TRANSPORT. Nothing will "
+            "replicate; the identity file gets no port= line and the lobby "
+            "cannot route to us.\n");
+    }
 
     // Identity goes out now that the bound port is known: the lobby reads
     // line 3 (port=) to learn where to hand relayed peer frames to.
@@ -657,9 +757,17 @@ static DWORD WINAPI InitThread(LPVOID)
         Log("[m5] save dir: %s\n",
             cfg.saveDir.empty() ? "(not found -- set save_dir= in cfg)" : cfg.saveDir.c_str());
 
-        if (cfg.instance == "a") {
-            Save_StartServer(cfg.xferPort, cfg.saveDir, cfg.shareSave, Log);
-        } else if (cfg.autoPull) {
+        // Latch the settings before the first role decision: from here on the
+        // server follows the LETTER, including a later instance=a from the
+        // lobby (see ApplySaveRole).
+        {
+            std::lock_guard<std::mutex> lk(g_xferMtx);
+            g_xferPort  = cfg.xferPort;
+            g_saveDir   = cfg.saveDir;
+            g_shareSave = cfg.shareSave;
+        }
+        ApplySaveRole(cfg.instance, "init");
+        if (cfg.instance != "a" && cfg.autoPull) {
             struct PullArgs { std::string ip; uint16_t port; std::string dir; };
             auto* pa = new PullArgs{ cfg.peerIp, cfg.xferPort, cfg.saveDir };
             CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
@@ -695,15 +803,17 @@ static DWORD WINAPI InitThread(LPVOID)
                         continue;
                     }
                     everRan = true;
-                    uint64_t dNoPeer = 0, dOverflow = 0; size_t pending = 0; bool alive = false;
-                    Net_Stats(&dNoPeer, &dOverflow, &pending, &alive);
+                    uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0;
+                    size_t pending = 0; bool alive = false;
+                    Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize);
                     Log("[simhook] ticks=%llu (+%llu in 10s) lastFrameTime=%llu | "
-                        "peer=%s pending=%zu dropped=%llu/%llu\n",
+                        "peer=%s pending=%zu dropped=%llu/%llu/%llu\n",
                         (unsigned long long)now,
                         (unsigned long long)(now - last),
                         (unsigned long long)SimHook_LastFrameTime(),
                         alive ? "up" : "DOWN", pending,
-                        (unsigned long long)dNoPeer, (unsigned long long)dOverflow);
+                        (unsigned long long)dNoPeer, (unsigned long long)dOverflow,
+                        (unsigned long long)dOversize);
                     last = now;
                 }
             }, nullptr, 0, nullptr);
@@ -749,7 +859,19 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hinst);
         CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
-        Net_Shutdown();
+        // NOTHING here may block. This runs under the loader lock, and
+        // Net_Shutdown's WaitForSingleObject waited on a thread whose own exit
+        // takes that same lock to run every other DLL's DLL_THREAD_DETACH: the
+        // wait cannot be satisfied until we return, and we do not return until
+        // the wait ends. That is a two-second stall on every clean exit and a
+        // deadlock whenever the net thread is inside a DLL entry point.
+        //
+        // Signal instead: the flag stops the tail and control loops, and
+        // closing the socket drops the net thread out of select(). We do not
+        // join them and we do not call WSACleanup; the process is going away
+        // and the kernel reclaims both.
+        g_stopping = true;
+        Net_SignalShutdown();
     }
     return TRUE;
 }

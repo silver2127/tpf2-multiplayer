@@ -653,6 +653,10 @@ local scheduleLocal   -- forward: called by the line registry above its definiti
 -- default) is a plain balance movement. Cost transfers used 0 until today and
 -- were quietly changing both players' loans by the transferred amount.
 K.JOURNAL_LOAN = 0
+-- How long a replayed loan may take to land before we stop waiting for it.
+-- cmBookJournal chunks at 10,000,000 and each chunk is an async command, so
+-- a 30,000,000 loan is several ticks of settling.
+K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
 K.STRICT_OPS = { VREV = true, VLINE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
@@ -1148,7 +1152,15 @@ local function execEdge(c)
 		end
 		sp.streetProposal.edgesToAdd[1] = e
 
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), false),
+		-- ignoreErrors=TRUE, as the construction and stop paths already pass.
+		-- The native road tool demolishes exactly what its footprint collides
+		-- with; false made the engine REFUSE the whole build on 'Collision'
+		-- instead, so a road upgrade that the player's own tool would have
+		-- completed failed on every instance -- and since the upgrade is
+		-- cancelled and replayed from here, it failed on the originator too
+		-- (measured 2026-09-03: five upgrades in a row, critical=false
+		-- 'Collision', in an area the player had been demolishing).
+		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), true),
 			function(res, success)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s success=%s",
 					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(success)))
@@ -2275,7 +2287,15 @@ local function execPolyline(c, planOnly)
 		-- click time. Review, 2026-08-31.)
 		if planOnly then return end
 
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), false),
+		-- ignoreErrors=TRUE, as the construction and stop paths already pass.
+		-- The native road tool demolishes exactly what its footprint collides
+		-- with; false made the engine REFUSE the whole build on 'Collision'
+		-- instead, so a road upgrade that the player's own tool would have
+		-- completed failed on every instance -- and since the upgrade is
+		-- cancelled and replayed from here, it failed on the originator too
+		-- (measured 2026-09-03: five upgrades in a row, critical=false
+		-- 'Collision', in an area the player had been demolishing).
+		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, buildContext(), true),
 			function(res, success)
 				pcall(CM.cmSettleBuild, c, res, success, "ROADP")   -- companies: owner + cost
 				-- LEVEL-CROSSING PROBE. The engine models a crossing as its own ECS
@@ -2312,6 +2332,28 @@ local function execPolyline(c, planOnly)
 					tostring(c.seq), tostring(c.origin), tostring(c.at), np, #addEdges,
 					#removeEdges, #rms, isTrack and "trackType" or "streetType",
 					isTrack and (tonumber(c.ttype) or 1) or stype, tostring(success)))
+				-- READ BACK the street properties the engine actually applied, beside
+				-- what we asked for. The wire carries two candidate bytes for the tram
+				-- variant (+0x51 and +0x54) and neither is confirmed; comparing the
+				-- request against the applied component is what settles which one is
+				-- tramTrackType, without guessing and building the wrong track.
+				if success and not isTrack then
+					pcall(function()
+						local pts2 = {}
+						for tok in tostring(c.pts or ""):gmatch("[^,]+") do pts2[#pts2 + 1] = tonumber(tok) end
+						if #pts2 >= 6 then
+							local eid = CM.findEdgeByEnds(false, pts2[1], pts2[2], pts2[4], pts2[5], 3.0)
+							if eid then
+								local sc = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
+								if sc then
+									log(string.format("STREETP applied: edge %d streetType=%s hasBus=%s tramTrackType=%s  (asked bus=%s tram=%s alt=%s)",
+										eid, tostring(sc.streetType), tostring(sc.hasBus), tostring(sc.tramTrackType),
+										tostring(c.bus), tostring(c.tram), tostring(c.tramalt)))
+								end
+							end
+						end
+					end)
+				end
 				if not success then
 					-- best-effort: surface WHY. "success=false" alone cost a
 					-- full capture-and-stare cycle to diagnose a Narrow angle.
@@ -5009,10 +5051,19 @@ local function execLoan(c)
 	if not cur then log("LOAN: cannot read loan of pid " .. tostring(pid)); return end
 	local delta = math.floor(v - cur + 0.5)
 	if pid == me then
-		-- our own loan is about to change under us: the poll must not ship it
-		-- back as a player action. Hold two polls, then re-baseline.
+		-- Our own loan is about to change under us; the poll must not ship that
+		-- back as if the player did it, or the two instances echo each other.
+		-- A fixed two-poll countdown was not enough: cmBookJournal CHUNKS at
+		-- 10,000,000 and these loans run to 30,000,000, so the move lands as
+		-- several async journal entries spread over many ticks. The poll then
+		-- caught a HALF-APPLIED loan, shipped it as a player action, the peer
+		-- applied that, and the two ping-ponged -- gaps swinging by millions
+		-- until the host pinned at the loan cap (30,000,000 vs 21,000,000
+		-- measured 2026-09-03). Wait for the value to actually arrive instead
+		-- of guessing how long it takes.
 		CM.lastLoan = v
-		CM.loanHold = 2
+		CM.loanExpect = v
+		CM.loanExpectSince = ticks
 	end
 	if delta == 0 then
 		log(string.format("EXEC LOAN seq=%s origin=%s co%s: already %d", tostring(c.seq), tostring(c.origin), tostring(c.company), v))
@@ -6519,15 +6570,30 @@ end
 -- Own loan, every 15 ticks. The first reading is the baseline (a loaded save's
 -- loan is known, not new); any later change is the player at the finances
 -- window and ships as LOAN. A change WE applied from a peer's LOAN is held out
--- by execLoan (loanHold) so it is re-baselined, not echoed.
+-- by execLoan (loanExpect) so it is re-baselined, not echoed.
 function CM.pollLoan()
 	local ok, err = pcall(function()
 		local e = game.interface.getEntity(api.engine.util.getPlayer())
 		local v = e and tonumber(e.loan)
 		if not v then return end
-		if (CM.loanHold or 0) > 0 then
-			CM.loanHold = CM.loanHold - 1
-			if CM.loanHold == 0 then CM.lastLoan = v end
+		if CM.loanExpect then
+			-- A replayed loan is still settling (possibly over several chunked
+			-- journal entries). Never ship while it is in flight.
+			if v == CM.loanExpect then
+				CM.lastLoan = v
+				CM.loanExpect = nil
+				return
+			end
+			if (ticks - (CM.loanExpectSince or ticks)) > K.LOAN_SETTLE_TICKS then
+				-- It never reached the value (the engine clamps at the loan cap,
+				-- so a peer with less headroom legitimately cannot get there).
+				-- Re-baseline to whatever we ended up with WITHOUT shipping it:
+				-- shipping here is exactly what started the echo.
+				log(string.format("loan: expected %d but settled at %d after %d ticks -- re-baselining, not shipping (DIVERGENCE)",
+					CM.loanExpect, v, K.LOAN_SETTLE_TICKS))
+				CM.lastLoan = v
+				CM.loanExpect = nil
+			end
 			return
 		end
 		if CM.lastLoan == nil then CM.lastLoan = v; return end
@@ -7733,6 +7799,9 @@ local function pollInject()
 			if o == "STREETP" then
 				CM.lastStreetBus = tonumber(w[2]) or 0
 				CM.lastStreetTram = tonumber(w[3]) or 0
+				CM.lastStreetTramAlt = tonumber(w[4]) or 0
+				log(string.format("STREETP: bus=%s tram(+0x51)=%s alt(+0x54)=%s",
+					tostring(CM.lastStreetBus), tostring(CM.lastStreetTram), tostring(CM.lastStreetTramAlt)))
 				return
 			end
 			-- A capture whose local build was CANCELLED must always be replayed,
@@ -8030,7 +8099,8 @@ local function pollInject()
 						-- originator, whose own upgrade was cancelled)
 						if CM.lastStreetBus then sargs.bus = CM.lastStreetBus end
 						if CM.lastStreetTram then sargs.tram = CM.lastStreetTram end
-						CM.lastStreetBus, CM.lastStreetTram = nil, nil
+						if CM.lastStreetTramAlt then sargs.tramalt = CM.lastStreetTramAlt end
+						CM.lastStreetBus, CM.lastStreetTram, CM.lastStreetTramAlt = nil, nil, nil
 						-- Decide HERE, once, and put the decisions on the wire.
 						-- This runs the real replay in plan-only mode: same
 						-- resolution, same splits, nothing built. Both instances

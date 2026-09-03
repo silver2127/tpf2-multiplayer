@@ -3,7 +3,58 @@
 -- Capture: new constructions (fileName+transf+params) and vehicles -> capture file.
 -- Replay: peer events from events file -> buildConstruction / buyVehicle.
 -- Loop guard: replayed entities tagged remote, never re-shipped.
-local BASE = "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/"
+-- ---------- runtime data directory ----------
+-- The SAME contract as lockstep.lua and bridge/src/datadir.h, resolved in the
+-- same order, because all three halves have to land on one directory or they
+-- read and write past each other:
+--   1. $TPF2MP_DATADIR             (the dev harness pins the old workshop out dir)
+--   2. $LOCALAPPDATA/tpf2mp/data/  (shipping layout: Program Files is read-only
+--                                   for the game process, LOCALAPPDATA is not)
+--   3. the workshop literal        (the dev rig before the data dir existed)
+-- The FIRST candidate holding tpf2_instance.txt wins: the bridge DLL writes
+-- that file at game start, so its presence proves the DLLs settled there.
+--
+-- This was candidate 3 alone, hardcoded. That workshop path is dead -- nothing
+-- has written to it since the data dir landed -- so on any shipping install
+-- IDENTITY_FILE pointed at a file that does not exist, detectInstance never
+-- returned true, and the mod ran forever with INSTANCE = nil: no capture, no
+-- replay, and a log line saying only "[mpb-?]".
+-- The game's Lua may lack 'os' entirely, hence the pcall around every getenv.
+local BASE_SOURCE = nil
+local BASE = (function()
+	local function env(name)
+		local ok, v = pcall(function() return os.getenv(name) end)
+		if ok and type(v) == "string" and #v > 0 then return v end
+		return nil
+	end
+	local function dir(p)
+		p = p:gsub("\\", "/")
+		if p:sub(-1) ~= "/" then p = p .. "/" end
+		return p
+	end
+	local cands = {}
+	local function add(source, p)
+		if p then cands[#cands + 1] = { source = source, path = dir(p) } end
+	end
+	add("TPF2MP_DATADIR", env("TPF2MP_DATADIR"))
+	local lad = env("LOCALAPPDATA")
+	add("LOCALAPPDATA", lad and (lad .. "/tpf2mp/data"))
+	add("workshop", "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/")
+	for _, c in ipairs(cands) do
+		local f = io.open(c.path .. "tpf2_instance.txt", "r")
+		if f then
+			f:close()
+			BASE_SOURCE = c.source .. " (identity file found)"
+			return c.path
+		end
+	end
+	-- no identity anywhere yet: the shipping default when the environment was
+	-- readable, otherwise the workshop literal (always last in the list)
+	local pick = cands[#cands]
+	for _, c in ipairs(cands) do if c.source == "LOCALAPPDATA" then pick = c end end
+	BASE_SOURCE = pick.source .. " (no identity file yet)"
+	return pick.path
+end)()
 local IDENTITY_FILE = BASE .. "tpf2_instance.txt"
 
 local INSTANCE = nil
@@ -67,6 +118,62 @@ end
 
 local function log(s) print("[mpb-" .. (INSTANCE or "?") .. "] " .. s) end
 
+-- ---------- channel ownership guard ----------
+-- This mod and mp_lockstep_1 compute the SAME filenames: tpf2_capture_<inst>.txt
+-- and tpf2_events_<inst>.txt. Enable both and two writers interleave lines into
+-- one capture file while two readers race each other's byte offset on the events
+-- file -- the wire then carries a shuffle of two different protocols and neither
+-- side can parse it. "Run this INSTEAD of MP Bridge" was enforced by nothing but
+-- a sentence in mod.lua's description, so a player who ticks both boxes gets
+-- silent corruption that looks like a transport bug.
+--
+-- Two detectors, because neither covers the other's case:
+--   * lockstep's global LS. It is assigned at TOP LEVEL in that chunk, so it
+--     exists the instant the mod loads, and game scripts share one Lua state
+--     (which is why that global is visible here at all).
+--   * lockstep_status_<inst>.txt CHANGING between two checks. That catches a
+--     lockstep that is not in this Lua state but IS sharing this data dir.
+--     Change, not mere existence: the file outlives the session that wrote it,
+--     and tripping on a leftover would disable this mod permanently.
+--
+-- Latching, not toggling: once the channel has been shared it may already hold
+-- interleaved lines, so there is nothing safe to resume into.
+local conflict = nil            -- reason string once tripped; nil = clear to run
+local lsStatusPrev = nil
+local conflictLogged = -10000
+local function channelConflict()
+	if conflict then return true end
+	if type(LS) == "table" and LS.findNodeNear ~= nil then
+		conflict = "mp_lockstep_1 is loaded in this Lua state (its global LS is set)"
+	elseif INSTANCE then
+		local f = io.open(BASE .. "lockstep_status_" .. INSTANCE .. ".txt", "r")
+		if f then
+			local cur = f:read("*a")
+			f:close()
+			if lsStatusPrev ~= nil and cur ~= lsStatusPrev then
+				conflict = "mp_lockstep_1 is live on this data dir (lockstep_status_"
+					.. INSTANCE .. ".txt is being rewritten)"
+			end
+			lsStatusPrev = cur
+		end
+	end
+	return conflict ~= nil
+end
+
+-- Loud, and it repeats: a one-shot line scrolls out of the log long before
+-- anyone looks, and the symptom (garbage on the wire) gives no hint of the
+-- cause.
+local function reportConflict()
+	if ticks - conflictLogged < 100 then return end
+	conflictLogged = ticks
+	log("!! DISABLED -- " .. tostring(conflict))
+	log("!! Both mods own tpf2_capture_" .. tostring(INSTANCE) .. ".txt and"
+		.. " tpf2_events_" .. tostring(INSTANCE) .. ".txt. Running them together"
+		.. " interleaves two protocols into one file and corrupts the wire.")
+	log("!! Disable ONE of them in the mod list (MP Bridge is the older one;"
+		.. " MP Lockstep supersedes it) and reload the save.")
+end
+
 local function detectInstance()
 	local f = io.open(IDENTITY_FILE, "r")
 	if not f then return false end
@@ -98,6 +205,10 @@ local function detectInstance()
 end
 
 local function appendLine(path, line)
+	-- The one place anything reaches the capture file, so the conflict guard
+	-- sits here as well as in update(): a poll that is already in flight when
+	-- the conflict is detected must not get one last line onto the shared wire.
+	if conflict then return false end
 	local f = io.open(path, "a")
 	if not f then return false end
 	f:write(line .. "\n")
@@ -2426,7 +2537,11 @@ function data()
 			log("mp bridge mod live")
 			-- must match the bridge dll's "[m5] data dir" log line, else the
 			-- two halves are reading and writing different files
-			log("base dir: " .. BASE)
+			log("base dir: " .. BASE .. "  [" .. tostring(BASE_SOURCE) .. "]")
+			-- Checked here too, not only in update(): if lockstep is in this
+			-- Lua state its global is already set, so the very first log line
+			-- of the session can say so.
+			if channelConflict() then reportConflict() end
 			-- NOTE: the entityExists probe deliberately does NOT live here.
 			-- init() only runs for a new game; continuing a save calls load(),
 			-- so anything set up here is absent in every session this project
@@ -2440,6 +2555,11 @@ function data()
 			-- pointing us at the wrong files forever
 			if ticks % 60 == 0 then detectInstance() end
 			if not INSTANCE then return end
+			-- Before ANY poll. Both capture and replay touch files lockstep
+			-- also owns, so once the two are running together neither reading
+			-- nor writing is safe -- see channelConflict.
+			if ticks % 30 == 0 then channelConflict() end
+			if conflict then reportConflict() return end
 			-- update() is 10 Hz (measured). Capture polls do full-world
 			-- getEntities scans, which are expensive on a large save, so they
 			-- stay at 2 Hz. Replay is just a file read at a byte offset, so it

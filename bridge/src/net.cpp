@@ -67,6 +67,7 @@ static uint64_t g_lastRecvMs   = 0;
 static bool     g_peerEverSeen = false;
 static uint64_t g_droppedNoPeer = 0;
 static uint64_t g_droppedOverflow = 0;
+static uint64_t g_droppedOversize = 0;
 
 static bool PeerAlive()
 {
@@ -74,13 +75,14 @@ static bool PeerAlive()
 }
 
 void Net_Stats(uint64_t* droppedNoPeer, uint64_t* droppedOverflow,
-               size_t* pending, bool* peerAlive)
+               size_t* pending, bool* peerAlive, uint64_t* droppedOversize)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
     if (droppedNoPeer)   *droppedNoPeer = g_droppedNoPeer;
     if (droppedOverflow) *droppedOverflow = g_droppedOverflow;
     if (pending)         *pending = g_pending.size();
     if (peerAlive)       *peerAlive = PeerAlive();
+    if (droppedOversize) *droppedOversize = g_droppedOversize;
 }
 
 static void SendRaw(uint32_t seq, uint32_t type, const NetEvent* ev)
@@ -128,24 +130,67 @@ static void Reassemble(const NetEvent& ev)
     }
 }
 
+// How far past the next expected seq an out-of-order packet may be stashed.
+//
+// Bounded by the ACK BITMAP, not by memory. ProcessAck treats any seq more
+// than 32 below `ack` as acked, so if `ack` were allowed to run further than
+// that ahead of the first hole, the sender would stop resending the one packet
+// the receiver is still waiting for and the ordered stream would stall for
+// good. Keeping the stash within the window makes that unrepresentable. It was
+// 64, which only worked because early packets were never acked at all.
+static const uint32_t EARLY_WINDOW = 32;
+
+// Record that `s` arrived, in a bitmap the sender can actually read.
+//
+// This used to be `g_receivedBits = (g_receivedBits << 1) | 1` on each in-order
+// delivery -- i.e. permanently all-ones -- and it was not touched at all for a
+// packet stashed in g_early. An out-of-order packet was therefore never
+// acknowledged, so it stayed in the sender's g_pending and the WHOLE stash was
+// retransmitted every RESEND_MS until the hole finally filled.
+//
+// Bit k of ackBits means "seq (ack - k - 1) was received", which is the layout
+// ProcessAck has always decoded.
+static void NoteReceived(uint32_t s)
+{
+    if (s == g_lastReceivedSeq) return;
+    if (s > g_lastReceivedSeq) {
+        uint32_t shift = s - g_lastReceivedSeq;
+        // the old high-water mark moves down to bit (shift-1); anything that
+        // falls past bit 31 leaves the window and is simply no longer reported
+        if (shift > 32)       g_receivedBits = 0;
+        else if (shift == 32) g_receivedBits = 1u << 31;   // 1u<<32 is UB
+        else                  g_receivedBits = (g_receivedBits << shift) | (1u << (shift - 1));
+        g_lastReceivedSeq = s;
+    } else {
+        uint32_t back = g_lastReceivedSeq - s;             // >= 1
+        if (back <= 32) g_receivedBits |= (1u << (back - 1));
+    }
+}
+
 static void DeliverInOrder(const Packet& p)
 {
     uint32_t s = p.h.seq;
-    if (s < g_expectedSeq) return;              // duplicate
+    if (s < g_expectedSeq) {                    // duplicate
+        NoteReceived(s);                        // our ack was lost; say so again
+        return;
+    }
     if (s > g_expectedSeq) {                    // early: stash
-        if (s - g_expectedSeq < 64) g_early[s] = p;
+        // Only note what we actually KEEP. Acking a packet we then discarded
+        // would tell the sender to stop resending something we never had.
+        if (s - g_expectedSeq < EARLY_WINDOW) {
+            g_early[s] = p;
+            NoteReceived(s);
+        }
         return;
     }
     if (p.h.type == 1) Reassemble(p.ev);
-    g_lastReceivedSeq = s;
-    g_receivedBits = (g_receivedBits << 1) | 1;
+    NoteReceived(s);
     g_expectedSeq++;
     for (;;) {
         auto it = g_early.find(g_expectedSeq);
         if (it == g_early.end()) break;
         if (it->second.h.type == 1) Reassemble(it->second.ev);
-        g_lastReceivedSeq = g_expectedSeq;
-        g_receivedBits = (g_receivedBits << 1) | 1;
+        NoteReceived(g_expectedSeq);            // already acked when stashed; idempotent
         g_early.erase(it);
         g_expectedSeq++;
     }
@@ -155,6 +200,11 @@ static DWORD WINAPI NetThread(LPVOID)
 {
     timeval tv{ 0, 20000 };  // 20ms recv slices
     while (g_running) {
+        // Net_SignalShutdown closes the socket and publishes INVALID_SOCKET to
+        // break us out of select(); re-reading it here keeps FD_SET off a
+        // handle that has already been closed.
+        SOCKET sock = g_sock;
+        if (sock == INVALID_SOCKET) break;
         // 1. flush outbound queue
         for (;;) {
             NetEvent ev;
@@ -209,12 +259,12 @@ static DWORD WINAPI NetThread(LPVOID)
             }
         }
         // 3. receive
-        fd_set fds; FD_ZERO(&fds); FD_SET(g_sock, &fds);
+        fd_set fds; FD_ZERO(&fds); FD_SET(sock, &fds);
         int n = select(0, &fds, nullptr, nullptr, &tv);
-        if (n > 0 && FD_ISSET(g_sock, &fds)) {
+        if (n > 0 && FD_ISSET(sock, &fds)) {
             Packet p{};
             sockaddr_in from{}; int fromLen = sizeof(from);
-            int got = recvfrom(g_sock, (char*)&p, sizeof(p), 0,
+            int got = recvfrom(sock, (char*)&p, sizeof(p), 0,
                                (sockaddr*)&from, &fromLen);
             if (got >= (int)sizeof(Header) && p.h.magic == MAGIC) {
                 {
@@ -312,8 +362,17 @@ void Net_QueueLine(const char* line)
 {
     size_t len = strlen(line);
     size_t chunks = (len / (NET_CHUNK_TEXT - 1)) + 1;   // >=1, even for ""
-    if (chunks > 0xFFFF) chunks = 0xFFFF;               // absurd line: clamp
     std::lock_guard<std::mutex> lk(g_mtx);
+    // REFUSE, do not clamp.
+    //
+    // This used to be `if (chunks > 0xFFFF) chunks = 0xFFFF`, which cut the
+    // line short but still shipped chunkCount = 0xFFFF -- so the receiver
+    // reassembled the truncated text, saw the last chunk arrive, and handed it
+    // to Lua as a complete line. A silently shortened command is far worse than
+    // a missing one: it parses, and it replays as something the player never
+    // did. The cap is ~67 MB of text, so hitting it means a bug upstream, not a
+    // big station.
+    if (chunks > 0xFFFF) { g_droppedOversize++; return; }
     // Nobody is listening: drop rather than queue forever. A joiner that
     // connects later starts from a transferred save, so a replay of everything
     // that happened before it existed would be wrong as well as expensive.
@@ -361,10 +420,47 @@ uint16_t Net_LocalPort()
     return g_localPort;
 }
 
-void Net_Shutdown()
+// Loader-lock-safe half of Net_Shutdown: signal and return, never block.
+//
+// The blocking version was being called straight from DllMain(PROCESS_DETACH),
+// where WaitForSingleObject waits on a thread whose own exit needs the loader
+// lock we are holding for every other DLL's DLL_THREAD_DETACH -- the classic
+// hang-on-exit. Closing the socket is what actually stops the thread: it makes
+// the 20 ms select() return immediately instead of at the end of its slice.
+void Net_SignalShutdown()
 {
     g_running = false;
-    if (g_thread) { WaitForSingleObject(g_thread, 2000); CloseHandle(g_thread); }
-    if (g_sock != INVALID_SOCKET) closesocket(g_sock);
-    WSACleanup();
+    SOCKET s = g_sock;
+    if (s != INVALID_SOCKET) {
+        // publish INVALID first so NetThread's next pass bails out rather than
+        // calling select() on a handle we are about to close
+        g_sock = INVALID_SOCKET;
+        closesocket(s);
+    }
+}
+
+void Net_Shutdown()
+{
+    Net_SignalShutdown();
+    if (g_thread) {
+        WaitForSingleObject(g_thread, 2000);
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+    }
+    // Reset BOTH, or a later Net_Init lies about succeeding: g_sock kept a
+    // stale non-INVALID value, and g_wsaUp stayed true across WSACleanup, so
+    // EnsureWsa() short-circuited and every socket call came back
+    // WSANOTINITIALISED on a transport that reported itself up.
+    g_sock = INVALID_SOCKET;
+    if (g_wsaUp) { WSACleanup(); g_wsaUp = false; }
+    g_deliver = nullptr;
+    g_localPort = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_pending.clear();
+        g_lastSent.clear();
+        g_early.clear();
+        g_rxAccum.clear();
+        g_peerEverSeen = false;
+    }
 }

@@ -155,6 +155,94 @@ def check_localvar_use_before_define(path: pathlib.Path, src: str) -> bool:
     return not bad
 
 
+_NAME = re.compile(r"[A-Za-z_]\w*")
+_WORD = re.compile(r"[A-Za-z_]\w*")
+_IN_KW = re.compile(r"\bin\b")
+
+
+def _namelist(text: str) -> set:
+    """Comma-separated Lua names, ignoring anything that is not a bare name.
+
+    `...` in a vararg parameter list and a stray `)` from a malformed slice both
+    fall out here rather than becoming fake bindings.
+    """
+    out = set()
+    for part in text.split(","):
+        part = part.strip()
+        if _NAME.fullmatch(part):
+            out.add(part)
+    return out
+
+
+def _bound_scopes(code: str):
+    """[(start, end, {names})] for every function/for body in blanked `code`.
+
+    The reason this exists: `check_use_before_define` was pure regex with no
+    idea what a parameter is, so `gtConFile(..., mutate)` calling `mutate()` in
+    its own body was reported as a call to the unrelated `local function mutate`
+    defined 50 lines below it. That one false positive made the gate
+    permanently red -- and because `check()` bailed on the first failure, it
+    also silenced every check after it.
+
+    This is not a scope analyser; it models exactly the two binders that
+    produced the false positive (function parameters and `for` loop variables)
+    by tracking Lua's block structure. Block-locals are deliberately NOT
+    modelled -- `check_localvar_use_before_define` only looks at column-0
+    declarations, and a `local x` shadow inside a function is rare enough that
+    the extra machinery would cost more than it catches.
+
+    Block structure, for the record: `function` / `if` / `do` / `repeat` open a
+    block and `end` (or `until`) closes it; `for` and `while` open one too, but
+    the `do` that terminates their header is part of the header and must not be
+    counted as a second opener.
+    """
+    scopes = []
+    stack = []
+    pending_do = 0        # for/while headers still waiting for their own `do`
+    for m in _WORD.finditer(code):
+        w = m.group(0)
+        if w == "function":
+            # the parameter list is the (...) immediately after the name
+            lp = code.find("(", m.end())
+            rp = code.find(")", lp + 1) if lp >= 0 else -1
+            names = _namelist(code[lp + 1:rp]) if (lp >= 0 and rp > lp) else set()
+            stack.append((m.start(), names))
+        elif w == "for":
+            # `for i = 1, n do` and `for k, v in pairs(t) do`: the names run
+            # from here to the `=` or the `in`, whichever comes first.
+            tail = code[m.end():m.end() + 400]
+            cut = len(tail)
+            eq = tail.find("=")
+            if eq >= 0:
+                cut = min(cut, eq)
+            kw = _IN_KW.search(tail)
+            if kw:
+                cut = min(cut, kw.start())
+            stack.append((m.start(), _namelist(tail[:cut])))
+            pending_do += 1
+        elif w == "while":
+            stack.append((m.start(), set()))
+            pending_do += 1
+        elif w == "do":
+            if pending_do:
+                pending_do -= 1     # header `do`, not a block of its own
+                continue
+            stack.append((m.start(), set()))
+        elif w in ("if", "repeat"):
+            stack.append((m.start(), set()))
+        elif w in ("end", "until"):
+            if stack:
+                start, names = stack.pop()
+                if names:
+                    scopes.append((start, m.end(), names))
+    # An unbalanced file (the parser will have already said so) still gets its
+    # open scopes closed at EOF rather than losing their bindings entirely.
+    for start, names in stack:
+        if names:
+            scopes.append((start, len(code), names))
+    return scopes
+
+
 def check_use_before_define(path: pathlib.Path, src: str) -> bool:
     """Flag calling a `local function` declared LATER in the file.
 
@@ -163,6 +251,10 @@ def check_use_before_define(path: pathlib.Path, src: str) -> bool:
     ten-minute launch-and-load cycle to discover a typo-grade mistake. It cost
     exactly that once: actCreateLine called stationGroups(), defined 180 lines
     further down, and died with "attempt to call global 'stationGroups'".
+
+    A call site sitting inside a scope that BINDS that name (a parameter, a
+    loop variable) is calling the binding, not the file-scope local, so it is
+    not reported -- see _bound_scopes.
     """
     code = _blank_noncode(src)
     defs = {}
@@ -171,6 +263,7 @@ def check_use_before_define(path: pathlib.Path, src: str) -> bool:
         defs.setdefault(m.group(1), src.count("\n", 0, m.start()) + 1)
     if not defs:
         return True
+    scopes = _bound_scopes(code)
 
     bad = []
     for m in _CALL.finditer(code):
@@ -178,9 +271,13 @@ def check_use_before_define(path: pathlib.Path, src: str) -> bool:
         if name not in defs:
             continue
         line = code.count("\n", 0, m.start()) + 1
-        if line < defs[name]:
+        if line >= defs[name]:
             # the definition line itself matches _CALL; skip it
-            bad.append((line, name, defs[name]))
+            continue
+        pos = m.start()
+        if any(a <= pos < b and name in names for a, b, names in scopes):
+            continue    # a parameter / loop variable of the enclosing scope
+        bad.append((line, name, defs[name]))
     for line, name, dline in bad:
         print(f"FAIL {path}:{line}: calls '{name}()' but it is a local function "
               f"defined at line {dline} -- resolves to a nil global at runtime")
@@ -188,30 +285,41 @@ def check_use_before_define(path: pathlib.Path, src: str) -> bool:
 
 
 def check(path: pathlib.Path) -> bool:
+    """Run EVERY sub-check and report all of them before returning.
+
+    This used to `return False` on the first failure, so one bad verdict hid
+    every check behind it: while check_use_before_define was stuck on a false
+    positive, check_localvar_use_before_define never ran once. A gate that can
+    only ever print the same first failure is not a gate.
+    """
     src = path.read_text(encoding="utf-8", errors="replace")
+    ok = True
     # A BOM makes the game's Lua parser fail on line 1; it has bitten this
     # project before via Set-Content -Encoding UTF8.
     if src.startswith("﻿"):
         print(f"FAIL {path}: file starts with a UTF-8 BOM -- strip it")
-        return False
+        ok = False
     try:
         tree = ast.parse(src)
         nloc = _toplevel_locals(tree)
         if nloc > LUA51_LOCAL_LIMIT:
             print(f"FAIL {path}: {nloc} top-level locals exceeds the Lua 5.1 limit of {LUA51_LOCAL_LIMIT} "
                   f"-- the game will crash at script load ('too many local variables'). Fold state into a table.")
-            return False
+            ok = False
     except Exception as e:  # luaparser raises several distinct types
         print(f"FAIL {path}: {type(e).__name__}: {e}")
-        return False
+        ok = False
+    # The remaining checks are pure text, so they still say something useful
+    # about a file the parser rejected -- often the very reason it did.
     if not check_unterminated_strings(path, src):
-        return False
+        ok = False
     if not check_use_before_define(path, src):
-        return False
+        ok = False
     if not check_localvar_use_before_define(path, src):
-        return False
-    print(f"ok   {path.relative_to(ROOT) if path.is_relative_to(ROOT) else path}")
-    return True
+        ok = False
+    if ok:
+        print(f"ok   {path.relative_to(ROOT) if path.is_relative_to(ROOT) else path}")
+    return ok
 
 
 def main() -> int:

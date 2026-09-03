@@ -537,11 +537,11 @@ static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
 // RAILWAY cannot be the road type. One sample would have been guesswork -- the
 // mistake that made -0.83147 look like a rotation matrix earlier today.
 struct EdgeType { int type; int streetType; int trackType; bool catenary;
-                  int hasBus; int tramTrackType; bool ok; };
+                  int hasBus; int tramTrackType; int tramAlt; bool ok; };
 
 static EdgeType DecodeEdgeType(uint64_t a2)
 {
-    EdgeType t = { 0, 16, 1, false, 0, 0, false };
+    EdgeType t = { 0, 16, 1, false, 0, 0, 0, false };
     uint64_t begin = 0, end = 0;
     if (!Readable((void*)(a2 + 0x18), 16)) return t;
     memcpy(&begin, (void*)(a2 + 0x18), 8);
@@ -562,6 +562,14 @@ static EdgeType DecodeEdgeType(uint64_t a2)
     // (0 none, and the electrified tram shows as 2).
     t.hasBus = b[0x50];
     t.tramTrackType = b[0x51];
+    // +0x54 is the OTHER candidate for the tram variant. Measured: a plain
+    // street reads 2 here, and among tram upgrades it is 1 on some and 2 on
+    // others, while +0x51 is 2 on every tram -- so +0x51 says 'a tram is
+    // present' and +0x54 is what distinguishes the variants, but the plain
+    // street reading 2 means it cannot simply be tramTrackType either. Ship
+    // both and let the applied read-back on the Lua side settle which is
+    // which, rather than guessing and building the wrong kind of track.
+    memcpy(&t.tramAlt, b + 0x54, 4);
     // Catenary is the low BYTE of +0x64; the upper three carry unrelated noise,
     // which is why reading the dword looked like chaos. Ground-truth sweep: every
     // catenary-on sample had low byte 01, every off sample 00, across 8 pairs.
@@ -654,7 +662,7 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
     // upgrade is cancelled and replayed from the wire the road came back plain
     // on every instance including the originator (2026-09-03).
     if (et.type == 0)
-        fprintf(f, "STREETP %d %d\n", et.hasBus, et.tramTrackType);
+        fprintf(f, "STREETP %d %d %d\n", et.hasBus, et.tramTrackType, et.tramAlt);
     fprintf(f, "ROADE %d %d %d %d %d %d %d %d",
             n, et.type, et.streetType, et.trackType, et.catenary ? 1 : 0, m, rn, re);
     // Node z travels too. Re-deriving it from the terrain flattened every bridge

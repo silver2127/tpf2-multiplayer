@@ -68,7 +68,21 @@ class Sealer:
 
     def seal(self, plain: bytes) -> bytes:
         with self._lock:
-            self.ctr = (self.ctr + 1) & 0xFFFFFFFF
+            self.ctr += 1
+            if self.ctr > 0xFFFFFFFF:
+                # This used to be `(self.ctr + 1) & 0xFFFFFFFF`, which wraps the
+                # counter back to 0 under an UNCHANGED salt. The nonce is
+                # salt(4)||counter(4) and the keystream is a pure function of
+                # it, so that repeats a keystream -- and two ciphertexts under
+                # one keystream XOR to give away both plaintexts. Roll a fresh
+                # salt instead: the nonce is 64 bits and this counter is the
+                # only place it can ever collide.
+                # Cheap on the receiving side too: it keys its replay window on
+                # the salt, so a new salt just opens a new window -- one extra
+                # dict entry per 2^32 frames, which at game-frame rates is
+                # never.
+                self.salt = os.urandom(4)
+                self.ctr = 1
             nonce = self.salt + struct.pack("!I", self.ctr)
         ct = _xor(plain, _keystream(self.enc_key, nonce, len(plain)))
         tag = hmac.new(self.mac_key, nonce + ct, hashlib.sha256).digest()[:TAG_LEN]
@@ -125,6 +139,16 @@ def selftest():
     frames = [a.seal(bytes([i])) for i in range(10)]
     for f in reversed(frames):
         if b.open(f) is None: ok = False; print("[seal] FAIL reorder rejected")
+    # the 2^32 counter wrap must roll the salt: same salt + repeated counter is
+    # a repeated keystream, which is the one way this construction breaks
+    w = Sealer(k)
+    w.ctr = 0xFFFFFFFF
+    salt0 = w.salt
+    wrapped = w.seal(b"wrap")
+    if w.salt == salt0 or w.ctr != 1:
+        ok = False; print("[seal] FAIL counter wrap did not re-salt")
+    if Sealer(k).open(wrapped) != b"wrap":
+        ok = False; print("[seal] FAIL frame after wrap does not open")
     import time
     t0 = time.time(); n = 0
     while time.time() - t0 < 0.5:
