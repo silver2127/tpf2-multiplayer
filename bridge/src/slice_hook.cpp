@@ -536,11 +536,12 @@ static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
 // ROADS cannot be the street/track flag, and a field that changes only on the
 // RAILWAY cannot be the road type. One sample would have been guesswork -- the
 // mistake that made -0.83147 look like a rotation matrix earlier today.
-struct EdgeType { int type; int streetType; int trackType; bool catenary; bool ok; };
+struct EdgeType { int type; int streetType; int trackType; bool catenary;
+                  int hasBus; int tramTrackType; bool ok; };
 
 static EdgeType DecodeEdgeType(uint64_t a2)
 {
-    EdgeType t = { 0, 16, 1, false, false };
+    EdgeType t = { 0, 16, 1, false, 0, 0, false };
     uint64_t begin = 0, end = 0;
     if (!Readable((void*)(a2 + 0x18), 16)) return t;
     memcpy(&begin, (void*)(a2 + 0x18), 8);
@@ -552,6 +553,15 @@ static EdgeType DecodeEdgeType(uint64_t a2)
     memcpy(&t.type, b + 0x48, 4);
     memcpy(&t.streetType, b + 0x4c, 4);
     memcpy(&t.trackType, b + 0x60, 4);
+    // A street's bus lane and tram track sit immediately after streetType
+    // (+0x4c) as two BYTES. Established differentially, not inferred: across
+    // six upgrade captures the ONLY bytes that moved were +0x50 (00 -> 01
+    // exactly when a bus lane was added) and +0x51 (00 -> 02 exactly when a
+    // tram way was added); everything else in +0x48..0x6b was identical.
+    // tramTrackType is the track TYPE, so it also carries electrification
+    // (0 none, and the electrified tram shows as 2).
+    t.hasBus = b[0x50];
+    t.tramTrackType = b[0x51];
     // Catenary is the low BYTE of +0x64; the upper three carry unrelated noise,
     // which is why reading the dword looked like chaos. Ground-truth sweep: every
     // catenary-on sample had low byte 01, every off sample 00, across 8 pairs.
@@ -636,6 +646,15 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
     // verified. If that assumption is wrong, this is where it will show up, as a
     // connecting road that lands on the wrong existing node rather than as a
     // silent failure.
+    // The bus lane and tram track ride on their OWN line just ahead of the
+    // ROADE. ROADE is positional and the Lua length-checks it, so widening it
+    // would desynchronise both parsers; a tagged line consumed by the next
+    // ROADE is the same shape ARMED already uses. Without this an upgrade that
+    // ADDS a tram way or a bus lane had nothing to carry it, and since the
+    // upgrade is cancelled and replayed from the wire the road came back plain
+    // on every instance including the originator (2026-09-03).
+    if (et.type == 0)
+        fprintf(f, "STREETP %d %d\n", et.hasBus, et.tramTrackType);
     fprintf(f, "ROADE %d %d %d %d %d %d %d %d",
             n, et.type, et.streetType, et.trackType, et.catenary ? 1 : 0, m, rn, re);
     // Node z travels too. Re-deriving it from the terrain flattened every bridge

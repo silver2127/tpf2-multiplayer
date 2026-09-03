@@ -7727,6 +7727,14 @@ local function pollInject()
 			-- never ran (review, 2026-08-31).
 			-- The slice says, per capture, whether it cancelled the local build.
 			if o == "ARMED" then CM.lastArmed = tonumber(w[2]) or 0; return end
+			-- The street's bus lane and tram track, on their own line just ahead of
+			-- the ROADE (ROADE is positional and length-checked, so it cannot be
+			-- widened). Consumed by the next ROADE exactly as ARMED is.
+			if o == "STREETP" then
+				CM.lastStreetBus = tonumber(w[2]) or 0
+				CM.lastStreetTram = tonumber(w[3]) or 0
+				return
+			end
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not peerSeen and (CM.lastArmed or 0) == 0
@@ -8017,6 +8025,12 @@ local function pollInject()
 						-- omitted entirely when there is nothing to remove: an empty
 						-- 'rm=' token would not survive decodeCmd's key=value scan
 						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
+						-- carry the bus lane / tram track the slice just decoded, so an
+						-- upgrade that ADDS either one actually reaches the peers (and the
+						-- originator, whose own upgrade was cancelled)
+						if CM.lastStreetBus then sargs.bus = CM.lastStreetBus end
+						if CM.lastStreetTram then sargs.tram = CM.lastStreetTram end
+						CM.lastStreetBus, CM.lastStreetTram = nil, nil
 						-- Decide HERE, once, and put the decisions on the wire.
 						-- This runs the real replay in plan-only mode: same
 						-- resolution, same splits, nothing built. Both instances
