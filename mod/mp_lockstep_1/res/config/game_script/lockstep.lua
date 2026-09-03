@@ -708,6 +708,10 @@ K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
 K.CMD_RING = 256          -- own commands kept for resend
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
 K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
+-- Ticks a hole must persist before the completeness barrier stops the sim.
+-- Long enough that ordinary UDP reordering never stutters the game, short
+-- enough that we cannot simulate far past a command we are owed.
+K.GAP_GRACE_TICKS = 5
 K.NACK_MAX = 10           -- give up on one seq after this many NACKs
 K.NACK_PER_SCAN = 12      -- cap NACKs sent per scan so a big gap does not flood
 K.RESEND_MIN_GAP = 5      -- ticks: do not rebroadcast the same seq more often
@@ -5239,6 +5243,32 @@ function CM.rxAdvance(r)
 	end
 end
 
+-- How many commands do we KNOW a peer has issued that we have not received?
+--
+-- This is the completeness question the whole design rests on. Every instance
+-- advertises its highest command seq in its heartbeat, so a hole below that
+-- high-water is a command that exists and is owed to us. Returns the number of
+-- such holes still worth waiting for, the age in ticks of the oldest, and which
+-- origin/seq it is (for the log). A seq that has exhausted NACK_MAX is NOT
+-- counted: re-asking cannot help it, and waiting on it would freeze the game
+-- forever.
+function CM.rxGaps()
+	local n, oldest, who, seq = 0, 0, nil, nil
+	for o, r in pairs(CM.rx) do
+		if o ~= K.INSTANCE then
+			local top = math.max(r.maxSeq or 0, r.advMax or 0)
+			for g = (r.firstSeq or 0) + 1, top do
+				if not r.seen[g] and (r.nackN[g] or 0) < K.NACK_MAX then
+					n = n + 1
+					local age = ticks - (r.missSince[g] or ticks)
+					if age >= oldest then oldest, who, seq = age, o, g end
+				end
+			end
+		end
+	end
+	return n, oldest, who, seq
+end
+
 function CM.nackScan()
 	local sent = 0
 	for o, r in pairs(CM.rx) do
@@ -8824,12 +8854,39 @@ local function applyBarrier(now)
 	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
 	CM.shareSpeed()
 	CM.pace(now - fastT)               -- the pacer chases the FASTEST
-	if ahead > K.BARRIER_AHEAD and not paused then
+	-- COMPLETENESS HOLD (cfg strict_barrier, default OFF).
+	--
+	-- The clock barrier above only keeps the instances CLOSE in time. It
+	-- does not stop us simulating past a step whose command we are still
+	-- missing: recovery then applies that command late, which is a real
+	-- divergence wearing the costume of a save. Real lockstep refuses to
+	-- advance while anything is outstanding.
+	--
+	-- Safe by construction: it holds through the SAME paused/pausedSince
+	-- state as the clock barrier, so the existing watchdog force-releases
+	-- after K.MAX_PAUSE_TICKS and a hole that can never be filled cannot
+	-- freeze the game. Pausing also HELPS, since the network thread keeps
+	-- running while the sim is stopped, so the resend arrives sooner. Off
+	-- by default: tightening this barrier has deadlocked both games before.
+	local gapN, gapAge, gapWho, gapSeq = 0, 0, nil, nil
+	if CM.cfgFlag("strict_barrier", false) then
+		gapN, gapAge, gapWho, gapSeq = CM.rxGaps()
+	end
+	-- a brief grace so ordinary UDP reordering does not stutter the game
+	local holdGap = gapN > 0 and gapAge >= K.GAP_GRACE_TICKS
+	CM.dashGaps = gapN
+	if (ahead > K.BARRIER_AHEAD or holdGap) and not paused then
 		paused = true
 		pausedSince = ticks
-		CM.setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
-		log(string.format("BARRIER hold: %.2f ahead of the slowest peer (%.2f)", ahead, slowT))
-	elseif ahead <= K.BARRIER_AHEAD / 2 and paused then
+		if holdGap then
+			CM.setSpeed(0, string.format("waiting on %d missing command(s)", gapN))
+			log(string.format("BARRIER hold: %d command(s) outstanding, oldest %s:%s for %d ticks -- not simulating past them",
+				gapN, tostring(gapWho), tostring(gapSeq), gapAge))
+		else
+			CM.setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
+			log(string.format("BARRIER hold: %.2f ahead of the slowest peer (%.2f)", ahead, slowT))
+		end
+	elseif not holdGap and ahead <= K.BARRIER_AHEAD / 2 and paused then
 		paused = false
 		pausedSince = nil
 		CM.catchingUp = false
@@ -9124,6 +9181,10 @@ function data()
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
 						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
+						-- outstanding = commands a peer says it issued that we have not
+						-- received. With strict_barrier on, a non-zero value here is the
+						-- reason the game is holding.
+						f:write(string.format("outstanding=%d\n", CM.dashGaps or 0))
 						local ps = {}
 						for o, pr in pairs(CM.peers) do
 							if pr.time and pr.at and (ticks - pr.at) <= K.PEER_STALE_TICKS then
