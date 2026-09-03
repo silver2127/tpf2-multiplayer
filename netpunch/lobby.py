@@ -205,6 +205,25 @@ HOST_DRAIN = 128            # inbound datagrams the host drains per ready cycle.
 XFER_SELECT_TIMEOUT = 0.002 # host select() timeout while a transfer is active.
 MAX_FILE_RETRIES = 3        # whole-file re-request attempts on a hash mismatch.
 INCOMING_BASENAME = "incoming_save"   # joiner writes incoming_save.sav[.lua/.jpg]
+# The ONLY names a joiner will ever write. The sender proposes names in its
+# `fbegin`; anything not on this list is refused outright rather than sanitised,
+# because there is no legitimate reason for a different name to arrive.
+ALLOWED_INCOMING = frozenset(INCOMING_BASENAME + sfx for sfx in (".sav", ".sav.lua", ".jpg"))
+
+
+def _safe_incoming_name(name):
+    """True only for one of the three exact basenames we ever write.
+
+    Rejects absolute paths, directory components, traversal, and anything else:
+    the check is a whitelist of the full name, not a filter applied to it.
+    """
+    if not isinstance(name, str) or name not in ALLOWED_INCOMING:
+        return False
+    # belt and braces: a whitelisted constant can never contain these, so this
+    # only ever fires if ALLOWED_INCOMING itself is edited carelessly later.
+    return (os.path.basename(name) == name
+            and not os.path.isabs(name)
+            and ".." not in name.split("/") and ".." not in name.split("\\"))
 XFER_BUF_BYTES = 4 * 1024 * 1024      # best-effort SO_RCVBUF/SO_SNDBUF for bursts.
 
 
@@ -1027,16 +1046,26 @@ class _ClientSaveReceiver:
         self.chunk = int(msg.get("chunk", CHUNK_DATA)) or CHUNK_DATA
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = msg.get("files", [])
+        # Validate the proposed names BEFORE allocating or acking: a rejected
+        # transfer must cost the joiner nothing.
+        bad = [m.get("name") for m in (self.files or [])
+               if not _safe_incoming_name(m.get("name"))]
+        if bad:
+            self._fail(f"refused: sender proposed unexpected filename(s) {bad}")
+            return
         self.overall_sha = msg.get("sha256")
         self.buf = None
         self.have = None
         self.complete = False
         try:
             self.buf = bytearray(self.total_bytes)
+            # inside the SAME guard: a host-declared huge total_chunks used to
+            # crash the joiner here instead of failing cleanly through _fail
+            self.have = bytearray(self.total_chunks)
         except (MemoryError, OverflowError):
-            self._fail(f"cannot allocate {self.total_bytes} bytes")
+            self._fail(f"cannot allocate {self.total_bytes} bytes "
+                       f"/ {self.total_chunks} chunks")
             return
-        self.have = bytearray(self.total_chunks)
         self.base = 0
         self.recv_count = 0
         self.complete = False
@@ -1062,6 +1091,13 @@ class _ClientSaveReceiver:
         if self.have[seq]:
             return                               # dup / reorder -- already have it
         off = seq * self.chunk
+        # bytearray slice-assignment GROWS the buffer when the slice runs past
+        # the end, so an oversized host-controlled chunk silently changed
+        # total_bytes out from under the hash check. Refuse instead.
+        if off < 0 or off + len(data) > self.total_bytes:
+            self._fail(f"refused: chunk {seq} would write "
+                       f"{off}..{off + len(data)} past {self.total_bytes}")
+            return
         self.buf[off:off + len(data)] = data
         self.have[seq] = 1
         self.recv_count += 1
@@ -1145,6 +1181,9 @@ class _ClientSaveReceiver:
         try:
             for meta in self.files:
                 name = meta.get("name")
+                if not _safe_incoming_name(name):
+                    self._fail(f"refused: unexpected filename {name!r}")
+                    return
                 with open(os.path.join(self.io.dir, name), "wb") as f:
                     f.write(parts[name])
                 written.append(name)
