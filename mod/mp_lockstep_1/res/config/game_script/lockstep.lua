@@ -1073,7 +1073,8 @@ K.CONX_UI_CONTEXT = true
 -- three grade identically. Money (native charge + bulldoze refund +
 -- recharge) is not reconciled yet -- this prototype proves the GEOMETRY
 -- converges (dump_egeo) before that is solved.
-K.CONX_STRICT = CM.cfgFlag("conx_strict", false)
+-- checked at CALL time via CM.cfgFlag("conx_strict") in execConX -- NOT here:
+-- CM.cfgFlag is defined lower in the file, so a top-level call is a nil crash.
 function CM.conxContext()
 	if not K.CONX_UI_CONTEXT then return nil end
 	-- EXPERIMENT (cfg conx_terrain_align=0): the host's interactive builder
@@ -3836,7 +3837,7 @@ local conxBusy, conxBusyAt = false, nil
 local conxQueue = {}
 local execConX
 execConX = function(c)
-	if c.origin == K.INSTANCE and not K.CONX_STRICT then
+	if c.origin == K.INSTANCE and not CM.cfgFlag("conx_strict", false) then
 		log(string.format("%s seq=%d: originator already built it locally, skipping", tostring(c.op), c.seq))
 		return
 	end
@@ -3863,7 +3864,7 @@ execConX = function(c)
 		-- proposal validates against the post-bulldoze world (bulldoze is async;
 		-- an immediate rebuild would collide). Second pass (strictPhase set):
 		-- fall through and build exactly like a peer.
-		if c.origin == K.INSTANCE and K.CONX_STRICT and c.strictPhase ~= "rebuilt" then
+		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", false) and c.strictPhase ~= "rebuilt" then
 			local rec = consByKey[key]
 			if not (rec and rec.id and api.engine.entityExists(rec.id)) then
 				log(string.format("CONX STRICT seq=%s: no native construction at %s to replace -- keeping native, no strict this time", tostring(c.seq), key))
