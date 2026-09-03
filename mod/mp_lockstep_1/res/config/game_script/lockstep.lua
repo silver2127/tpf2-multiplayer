@@ -2787,11 +2787,21 @@ local function depotVehicles(constructionId)
 	return ids
 end
 
+local function vehPurchaseTime(vid)
+	local pt = nil
+	pcall(function()
+		local tv = api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
+		local v0 = tv and tv.transportVehicleConfig and tv.transportVehicleConfig.vehicles and tv.transportVehicleConfig.vehicles[1]
+		if v0 then pt = tonumber(v0.purchaseTime) end
+	end)
+	return pt
+end
+
 local function registerVehKey(key, vid)
 	vehKeyOf[vid] = key
 	vehIdOf[key] = vid
 	knownVeh[vid] = true
-	log(string.format("veh: %s <-> local vehicle %d", key, vid))
+	log(string.format("veh: %s <-> local vehicle %d purchaseTime=%s", key, vid, tostring(vehPurchaseTime(vid))))
 end
 
 -- s:<id> is only valid for a vehicle both peers loaded from the save. A new
@@ -2921,6 +2931,54 @@ local function expectVehicle(key, depotChild, company, hint)
 	-- exact cost (balance delta) to that company.
 	local bal0 = (company and CM.cmMode == "companies") and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
 	pendingVehKeys[#pendingVehKeys + 1] = { key = key, depot = depotChild, since = gameTime() or 0, company = company, bal0 = bal0, hint = hint }
+end
+
+-- The host's own buy is shipped one tick LATE, on purpose: once the new
+-- vehicle exists here, so the wire carries its real purchaseTime. The native
+-- buy applies at the click's sim-step and cannot be cancelled (the depot
+-- window waits for it); the peers' replay applies at the stamp, ~3 steps
+-- later -- the one host-only difference left in a buy, and purchaseTime is
+-- what a vehicle keeps from its creation step. B and C (both replays) stay at
+-- 0.00 m with each other while A drifts after a batch buy (2026-09-02); giving
+-- every instance the same purchaseTime is the cheapest test of that link.
+CM.parkedBuys = {}
+function CM.shipParkedBuys()
+	if #CM.parkedBuys == 0 then return end
+	local now = gameTime() or 0
+	local claimed = {}
+	local i = 1
+	while i <= #CM.parkedBuys do
+		local pb = CM.parkedBuys[i]
+		local found, pt = nil, nil
+		pcall(function()
+			local best
+			for _, v in ipairs(depotVehicles(pb.depot)) do
+				if not knownVeh[v] and not claimed[v] then
+					local vpt = vehPurchaseTime(v) or 0
+					if not best or vpt < best.pt then best = { id = v, pt = vpt } end
+				end
+			end
+			if best then found, pt = best.id, best.pt end
+		end)
+		if found then
+			claimed[found] = true
+			pb.args.pt = pt or -1
+			scheduleLocal("VBUY", pb.args)
+			-- our own new vehicle gets the same key the peer will use; the hint
+			-- binds exactly this one even when several are fresh
+			expectVehicle(K.INSTANCE .. ":" .. tostring(seqNo), pb.depot, nil, found)
+			log(string.format("VBUY: shipped once vehicle %d existed, purchaseTime=%s (%.1f s after the click)",
+				found, tostring(pt), now - pb.since))
+			table.remove(CM.parkedBuys, i)
+		elseif now - pb.since > 1.5 then
+			scheduleLocal("VBUY", pb.args)
+			expectVehicle(K.INSTANCE .. ":" .. tostring(seqNo), pb.depot)
+			log("VBUY: no new vehicle seen in the depot within 1.5 s -- shipped without purchaseTime")
+			table.remove(CM.parkedBuys, i)
+		else
+			i = i + 1
+		end
+	end
 end
 
 -- ---------- vehicles: BuyVehicle replication ----------
@@ -3448,7 +3506,11 @@ function buildVehConfig(c)
 		-- replayed buy produced a non-fatal engine assert + an ~800 KB minidump
 		-- (the visible stall on a buy). The stamp is identical on every peer, so
 		-- it is deterministic; it is also within a second of the originator's.
-		tvp.purchaseTime = math.floor((tonumber(c.at) or 0) * 1000)
+		-- the originator's real purchaseTime when the wire has it (it ships the
+		-- buy once its vehicle exists); the stamp only as the fallback
+		local pt = tonumber(c.pt)
+		if pt and pt > 0 then tvp.purchaseTime = math.floor(pt)
+		else tvp.purchaseTime = math.floor((tonumber(c.at) or 0) * 1000) end
 		tvp.maintenanceState = 1.0
 		tvp.targetMaintenanceState = 0
 		local alc = tvp.autoLoadConfig
@@ -7930,12 +7992,13 @@ local function pollInject()
 						else
 							log(string.format("VBUY: depot %d at %.1f,%.1f (%s), %d part(s): %s",
 								depot, dx, dy, tostring(dfile), #parts, enc[1]:sub(1, 60)))
-							scheduleLocal("VBUY", { x = dx, y = dy, file = dfile or "?",
-							                        parts = table.concat(enc, ";"),
-							                        groups = table.concat(groups, "/"),
-							                        skipOrigin = 1 })
-							-- our own new vehicle gets the same key the peer will use
-							expectVehicle(K.INSTANCE .. ":" .. tostring(seqNo), dparent or depot)
+							-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
+							CM.parkedBuys[#CM.parkedBuys + 1] = {
+								args = { x = dx, y = dy, file = dfile or "?",
+								         parts = table.concat(enc, ";"),
+								         groups = table.concat(groups, "/"),
+								         skipOrigin = 1 },
+								depot = dparent or depot, since = gameTime() or 0 }
 						end
 					end
 				else
@@ -8461,6 +8524,7 @@ function data()
 			buytestPoll()
 			primeConstructions()
 			primeVehKeys()
+			CM.shipParkedBuys()
 			pollVehKeys()
 			primeLineKeys()
 			pollLineKeys()
