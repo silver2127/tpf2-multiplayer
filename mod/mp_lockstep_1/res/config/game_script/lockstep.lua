@@ -3871,8 +3871,13 @@ execConX = function(c)
 				conxBusy = false
 				return
 			end
-			local bal0 = "-"
-			pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then bal0 = tostring(e.balance) end end)
+			-- Balance right AFTER the native build and BEFORE the bulldoze: this
+			-- is exactly what the peers hold (they paid for the build once). After
+			-- the bulldoze+rebuild we restore the host to this value, so the
+			-- native charge is the only construction cost that stands -- matching
+			-- the peers. Local only (bookJournalEntry is not shipped).
+			pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then c.strictBalPre = tonumber(e.balance) end end)
+			local bal0 = tostring(c.strictBalPre or "-")
 			expectedDemolish[key] = true     -- our own bulldoze: do not ship a DEMOLISH
 			expectedCons[key] = true         -- our rebuild will re-appear: not a new build
 			local bok = pcall(game.interface.bulldoze, rec.id)
@@ -4304,6 +4309,7 @@ execConX = function(c)
 			return
 		end
 		local seq, origin, at, file, op = c.seq, c.origin, c.at, c.file, c.op
+		local strictBalPre = c.strictBalPre     -- nil unless this is our strict self-rebuild
 		api.cmd.sendCommand(cmd, function(res, success)
 			-- The engine has answered: the next queued construction may go.
 			conxBusy = false
@@ -4312,6 +4318,26 @@ execConX = function(c)
 			log(string.format("EXEC %s seq=%s origin=%s at=%s file=%s nodes=%d edges=%d rm=%d dropped=%d success=%s ent=%s",
 				tostring(op), tostring(seq), tostring(origin), tostring(at), tostring(file),
 				ni, ei, nRm, dropped, tostring(success), ent))
+			-- STRICT money reconciliation: the host paid for the native build,
+			-- refunded the bulldoze and paid again for this rebuild; the peers
+			-- paid once. Credit the net back so the host balance returns to the
+			-- pre-bulldoze value (= the peers' balance). Balance-only journal
+			-- (type 6), local, never shipped. A small window of unrelated income
+			-- between the two reads rides along -- refined later if it matters.
+			if success and strictBalPre then
+				pcall(function()
+					local e = game.interface.getEntity(api.engine.util.getPlayer())
+					local now = e and tonumber(e.balance)
+					if now then
+						local credit = strictBalPre - now
+						if credit ~= 0 then
+							CM.cmBookJournal(api.engine.util.getPlayer(), credit, K.JOURNAL_TRANSFER)
+							log(string.format("CONX STRICT seq=%s: money reconciled %+d (host %d -> %d = pre-bulldoze)",
+								tostring(seq), credit, now, strictBalPre))
+						end
+					end
+				end)
+			end
 			if success then
 				-- (companies-mode reassign happens in pollNewConstructions, which every
 				-- replay path reaches -- NOT here, where the buildConstruction fallback
