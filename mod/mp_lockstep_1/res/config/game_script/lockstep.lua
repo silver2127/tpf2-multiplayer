@@ -2351,9 +2351,9 @@ local function execPolyline(c, planOnly)
 							if eid then
 								local sc = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
 								if sc then
-									log(string.format("STREETP applied: edge %d streetType=%s hasBus=%s tramTrackType=%s  (asked bus=%s tram=%s alt=%s)",
+									log(string.format("STREETP applied: edge %d streetType=%s hasBus=%s tramTrackType=%s  (asked bus=%s tram=%s)",
 										eid, tostring(sc.streetType), tostring(sc.hasBus), tostring(sc.tramTrackType),
-										tostring(c.bus), tostring(c.tram), tostring(c.tramalt)))
+										tostring(c.bus), tostring(c.tram)))
 								end
 							end
 						end
@@ -7804,9 +7804,8 @@ local function pollInject()
 			if o == "STREETP" then
 				CM.lastStreetBus = tonumber(w[2]) or 0
 				CM.lastStreetTram = tonumber(w[3]) or 0
-				CM.lastStreetTramAlt = tonumber(w[4]) or 0
-				log(string.format("STREETP: bus=%s tram(+0x51)=%s alt(+0x54)=%s",
-					tostring(CM.lastStreetBus), tostring(CM.lastStreetTram), tostring(CM.lastStreetTramAlt)))
+				log(string.format("STREETP: hasBus=%s tramTrackType=%s",
+					tostring(CM.lastStreetBus), tostring(CM.lastStreetTram)))
 				return
 			end
 			-- A capture whose local build was CANCELLED must always be replayed,
@@ -8104,8 +8103,7 @@ local function pollInject()
 						-- originator, whose own upgrade was cancelled)
 						if CM.lastStreetBus then sargs.bus = CM.lastStreetBus end
 						if CM.lastStreetTram then sargs.tram = CM.lastStreetTram end
-						if CM.lastStreetTramAlt then sargs.tramalt = CM.lastStreetTramAlt end
-						CM.lastStreetBus, CM.lastStreetTram, CM.lastStreetTramAlt = nil, nil, nil
+						CM.lastStreetBus, CM.lastStreetTram = nil, nil
 						-- Decide HERE, once, and put the decisions on the wire.
 						-- This runs the real replay in plan-only mode: same
 						-- resolution, same splits, nothing built. Both instances
