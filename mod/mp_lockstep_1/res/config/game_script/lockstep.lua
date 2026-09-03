@@ -147,7 +147,53 @@ K.HEARTBEAT_EVERY = 5     -- ticks between LSTICK broadcasts (~0.93s)
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the barrier section.
 K.PEER_STALE_TICKS = 25
-K.HASH_EVERY_GAMETIME = 4 -- ~2 game days between desync checks
+K.HASH_EVERY_GAMETIME = 4 -- ~2 game days between desync checks, on a small map
+-- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
+-- ~400 ms, and at the base cadence that is ~10% of wall time spent inside our
+-- own bookkeeping -- which is what "it feels laggy" actually was.
+--
+-- The interval CANNOT be tuned from each instance's own measured cost: the hash
+-- stamp is floor(now / interval) * interval, so two instances with different
+-- intervals produce DISJOINT stamp sets and never compare a single one. (That
+-- exact failure is recorded at the checkHash call site: one SYNC verdict for a
+-- whole session while a real divergence sat invisible.) So it is derived from
+-- the EDGE COUNT instead, which every instance reads from the same save, and
+-- bucketed coarsely so a few edges of drift cannot change the answer.
+K.HASH_EDGES_PER_STEP = 2000   -- edges per extra interval step
+K.HASH_EVERY_MAX_MULT = 8      -- never stretch beyond this
+function CM.hashEveryFor(edges)
+	local mult = math.floor((tonumber(edges) or 0) / K.HASH_EDGES_PER_STEP) + 1
+	if mult > K.HASH_EVERY_MAX_MULT then mult = K.HASH_EVERY_MAX_MULT end
+	return K.HASH_EVERY_GAMETIME * mult
+end
+
+-- COST-AWARE POLL CADENCE. The capture-side polls scan the whole world
+-- (getEntities over every construction, every roadside stop) on a fixed tick
+-- cadence, so their cost grows with the map while their frequency does not --
+-- measured update() averaging 30-84 ms per tick with spikes over a second.
+--
+-- Unlike the hash these are LOCAL: a poll only notices what the player did HERE
+-- and ships it with a stamp fixed at capture, so slowing one delays the capture
+-- slightly and changes nothing about when peers apply it. Per-instance
+-- adaptation is therefore safe.
+CM.pollCost = {}
+function CM.pollDue(name, baseEvery)
+	local c = CM.pollCost[name]
+	local every = baseEvery
+	if c and c > 20 then
+		local mult = math.floor(c / 20) + 1
+		if mult > 8 then mult = 8 end
+		every = baseEvery * mult
+	end
+	return (ticks % every) == 0
+end
+function CM.pollTimed(name, fn)
+	local t0 = os.clock()
+	fn()
+	local ms = (os.clock() - t0) * 1000
+	-- rolling, so one slow scan does not pin the cadence open forever
+	CM.pollCost[name] = ((CM.pollCost[name] or ms) * 3 + ms) / 4
+end
 
 local ticks        = 0
 local eventsOffset = -1
@@ -1007,6 +1053,11 @@ local function worldHash(now)
 	elseif edgeStrategy and not warnedNoEdges then
 		warnedNoEdges = true
 		log("edge enumeration via " .. edgeStrategy .. ": " .. #edges .. " edges")
+		-- Same save on every instance, so every instance derives the same
+		-- cadence. Logged so it can be compared across the rig: if these
+		-- ever differ, the stamp grids are disjoint and the detector is blind.
+		CM.hashEvery = CM.hashEveryFor(#edges)
+		log(string.format("hash cadence: every %d game units (%d edges)", CM.hashEvery, #edges))
 	end
 
 	local hc = hashStr(table.concat(cons, "|"))
@@ -3678,21 +3729,43 @@ local function execVehCmd(c)
 				-- Types, because a wrong one here surfaced as an unreadable Lua
 				-- error ("execVLINE error: function: 0000018D4AC0FF60") with
 				-- nothing to say which argument was wrong.
-				local okMake, made = pcall(api.cmd.make.setLine, id, line, tonumber(c.stop) or 0)
+				-- A stop of -1 means "engine, pick one", which is what the UI sends when a
+				-- vehicle is assigned without choosing a stop -- the normal way a TRAIN is
+				-- assigned. Replaying it verbatim had the engine refuse the command every
+				-- time (EXEC VLINE ... success=false), and because the slice has already
+				-- cancelled the player's own SetLine, the assignment was simply lost --
+				-- "I can't set a line on a train" (2026-09-03). Buses were unaffected
+				-- because the UI ships a real stop index for them. Clamp to the first stop:
+				-- deterministic, since every instance clamps identically.
+				local stopIx = tonumber(c.stop) or 0
+				if stopIx < 0 then stopIx = 0 end
+				local okMake, made = pcall(api.cmd.make.setLine, id, line, stopIx)
 				if okMake and made then
 					cmds[#cmds + 1] = { made, "setLine " .. tostring(c.key) }
 				else
 					log(string.format("VLINE seq=%s: setLine(%s:%s, %s:%s, %s) refused by the maker: %s",
 						tostring(c.seq), type(id), tostring(id), type(line), tostring(line),
-						tostring(tonumber(c.stop) or 0), tostring(made)))
+						tostring(stopIx), tostring(made)))
 				end
 			end
 		end
 		for _, pair in ipairs(cmds) do
 			local what, vid = pair[2], pair[3]
 			api.cmd.sendCommand(pair[1], function(res, success)
-				log(string.format("EXEC %s seq=%s origin=%s at=%s %s success=%s",
-					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), what, tostring(success)))
+				local why = ""
+				if not success then
+					-- the engine's own reason, which this callback used to discard:
+					-- "success=false" alone cannot tell a refused command from a lost one
+					pcall(function()
+						local es = res and res.resultProposalData and res.resultProposalData.errorState
+						if es then
+							why = " critical=" .. tostring(es.critical)
+							for i = 1, #es.messages do why = why .. " '" .. tostring(es.messages[i]) .. "'" end
+						end
+					end)
+				end
+				log(string.format("EXEC %s seq=%s origin=%s at=%s %s success=%s%s",
+					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), what, tostring(success), why))
 				if success and c.op == "VSELL" and vid then forgetVehicle(vid) end
 			end)
 		end
@@ -8956,7 +9029,10 @@ function CM.vposShip(stamp)
 end
 
 local function checkHash(now)
-	local stamp = math.floor(now / K.HASH_EVERY_GAMETIME) * K.HASH_EVERY_GAMETIME
+	-- CM.hashEvery is set from the map size on the first hash and is the same
+	-- on every instance (same save); until then the base interval applies.
+	local every = CM.hashEvery or K.HASH_EVERY_GAMETIME
+	local stamp = math.floor(now / every) * every
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
 	local ph0 = os.clock()
