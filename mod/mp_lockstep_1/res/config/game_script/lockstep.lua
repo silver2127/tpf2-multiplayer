@@ -4847,7 +4847,7 @@ function CM.rxNote(o, seq)
 	if not r then
 		-- firstSeq is the earliest seq we ever hear from o: commands issued
 		-- before we joined (or before this baseline) are not ours to demand.
-		r = { seen = {}, maxSeq = seq, firstSeq = seq, missSince = {}, nackAt = {}, nackN = {} }
+		r = { seen = {}, maxSeq = seq, firstSeq = seq, advMax = seq, missSince = {}, nackAt = {}, nackN = {} }
 		CM.rx[o] = r
 	end
 	r.seen[seq] = true
@@ -4859,6 +4859,31 @@ function CM.rxNote(o, seq)
 		end
 		r.maxSeq = seq
 	end
+	if seq > (r.advMax or 0) then r.advMax = seq end
+end
+
+-- The origin advertises its highest command seq in every heartbeat. Without
+-- this, the NACK scanner only ever fills gaps BELOW the highest seq it has
+-- SEEN, so a command dropped at the END of a burst (the relay's host->joiner
+-- hop is plain UDP, no resend) leaves maxSeq short and is never asked for --
+-- one instance silently missed the last VBUY of a batch and ran a vehicle
+-- short forever (2026-09-02). Treat the advertised high-water like received
+-- seqs for gap purposes: mark every unseen seq up to it as a candidate gap.
+function CM.rxAdvertise(o, hi)
+	if o == K.INSTANCE or not hi then return end
+	local r = CM.rx[o]
+	if not r then
+		-- first contact: commands issued before we could hear them are not ours
+		-- to demand (we start from a transferred save), so set the baseline and
+		-- backfill nothing -- exactly as rxNote does on first contact.
+		CM.rx[o] = { seen = {}, maxSeq = hi, firstSeq = hi, advMax = hi, missSince = {}, nackAt = {}, nackN = {} }
+		return
+	end
+	local top = math.max(r.maxSeq, r.advMax or r.maxSeq)
+	for g = top + 1, hi do
+		if not r.seen[g] and not r.missSince[g] then r.missSince[g] = ticks end
+	end
+	if hi > (r.advMax or 0) then r.advMax = hi end
 end
 
 -- periodic: NACK gaps that have persisted past the reorder grace
@@ -4866,7 +4891,9 @@ function CM.nackScan()
 	local sent = 0
 	for o, r in pairs(CM.rx) do
 		if o ~= K.INSTANCE then
-			for g = r.firstSeq + 1, r.maxSeq - 1 do
+			-- up to the advertised high-water (inclusive): a dropped TAIL command
+			-- sits at advMax, above maxSeq, and must be reachable here
+			for g = r.firstSeq + 1, math.max(r.maxSeq, r.advMax or 0) do
 				if sent >= K.NACK_PER_SCAN then break end
 				if not r.seen[g] and r.missSince[g] then
 					local last = r.nackAt[g] or (r.missSince[g] - K.NACK_EVERY)
@@ -5128,6 +5155,8 @@ local function onLine(line)
 			local pr = peerFor(o)
 			pr.time = t; pr.at = ticks
 			peerSeen = true
+			local hi = tonumber(line:match(" hi=(%d+)"))
+			if hi then pcall(CM.rxAdvertise, o, hi) end
 		end
 	elseif op == "LSSPEED" then
 		-- The other player moved the speed lever: follow. Speed is local pacing,
@@ -8543,7 +8572,7 @@ function data()
 			if ticks % K.CON_EDIT_SCAN_EVERY == 0 then scanConstructionEdits() end
 
 			if ticks % K.HEARTBEAT_EVERY == 0 then
-				broadcast(string.format("LSTICK t=%d o=%s s=%d", math.floor(now), K.INSTANCE, CM.stepOf(now)))
+				broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d", math.floor(now), K.INSTANCE, CM.stepOf(now), seqNo))
 			end
 
 			applyBarrier(now)
