@@ -19,11 +19,17 @@ New-Item -ItemType Directory -Force $dest | Out-Null
 
 $stdoutRel = "Program Files (x86)\Steam\userdata\*\1066780\local\crash_dump\stdout.txt"
 $dataRel   = "AppData\Local\tpf2mp\data"
+# The Lua writes some side files (egeo_*.txt) to the process CWD = the GAME dir,
+# not the data dir. Collecting only the data dir silently dropped every geometry
+# dump from seven run snapshots, so a height diff could not be re-checked after
+# the fact. Each source therefore has a game dir too.
+$gameRel = "Program Files (x86)\Steam\steamapps\common\Transport Fever 2"
 $sources = @(
-    @{ name = "native";     stdout = "C:\$stdoutRel";                                        data = (Join-Path $env:LOCALAPPDATA "tpf2mp\data") },
-    @{ name = "GameAgent";  stdout = "C:\Sandbox\$env:USERNAME\GameAgent\drive\C\$stdoutRel";  data = "C:\Sandbox\$env:USERNAME\GameAgent\user\current\$dataRel" },
-    @{ name = "GameAgent2"; stdout = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$stdoutRel"; data = "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\$dataRel" }
+    @{ name = "native";     stdout = "C:\$stdoutRel";                                        data = (Join-Path $env:LOCALAPPDATA "tpf2mp\data");                    game = "C:\$gameRel" },
+    @{ name = "GameAgent";  stdout = "C:\Sandbox\$env:USERNAME\GameAgent\drive\C\$stdoutRel";  data = "C:\Sandbox\$env:USERNAME\GameAgent\user\current\$dataRel";  game = "C:\Sandbox\$env:USERNAME\GameAgent\drive\C\$gameRel" },
+    @{ name = "GameAgent2"; stdout = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$stdoutRel"; data = "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\$dataRel"; game = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$gameRel" }
 )
+$gameFiles = @("egeo_*.txt", "tpf2_slice.cfg")
 $dataFiles = @("lockstep_dash_*.txt", "lockstep_status_*.txt", "tpf2_events_*.txt", "lockstep_inject_*.txt",
                "tpf2_slice.log", "tpf2_capture_*.txt", "mp_company_*.log")
 
@@ -36,6 +42,13 @@ foreach ($s in $sources) {
     if (Test-Path $s.data) {
         foreach ($pat in $dataFiles) {
             Get-ChildItem (Join-Path $s.data $pat) -ErrorAction SilentlyContinue | ForEach-Object {
+                Copy-Item $_.FullName $out -Force; $n++
+            }
+        }
+    }
+    if ($s.game -and (Test-Path $s.game)) {
+        foreach ($pat in $gameFiles) {
+            Get-ChildItem (Join-Path $s.game $pat) -ErrorAction SilentlyContinue | ForEach-Object {
                 Copy-Item $_.FullName $out -Force; $n++
             }
         }
