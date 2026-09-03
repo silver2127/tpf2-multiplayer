@@ -1360,6 +1360,11 @@ function CM.streetProps(c, x0, y0, x1, y1)
 			if not old then return end
 			local sc = api.engine.getComponent(old, api.type.ComponentType.BASE_EDGE_STREET)
 			if not sc then return end
+			-- Log what the road being replaced ALREADY had, beside what the wire
+			-- asked for. With before / asked / applied all in the log, which byte
+			-- is tramTrackType stops being guesswork.
+			log(string.format("STREETP before: edge %d hasBus=%s tramTrackType=%s  (wire bus=%s tram=%s)",
+				old, tostring(sc.hasBus), tostring(sc.tramTrackType), tostring(wb), tostring(wt)))
 			if wb == nil then bus = sc.hasBus and true or false end
 			if wt == nil then tram = tonumber(sc.tramTrackType) or 0 end
 		end)

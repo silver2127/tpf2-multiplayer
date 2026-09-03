@@ -2192,11 +2192,18 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 if (pbegin >= 0x10000 && pend > pbegin
                     && (pend - pbegin) % 120 == 0 && Readable((void*)pbegin, 120)) {
                     const uint8_t* pb = (const uint8_t*)pbegin;
-                    char hex[128];
+                    // WHOLE record. +0x51 was NOT it: it read 239 and 246 on two
+                    // captures, which is noise rather than a 0/1/2 enum -- and
+                    // +0x54 tracks streetType (1 for type 19, 2 for type 22), so
+                    // that is a road property. Dump all 120 bytes and diff a
+                    // regular-tram upgrade against an electric one on the SAME
+                    // road type; the byte that differs is tramTrackType. Two
+                    // guesses were enough.
+                    char hex[3 * 120 + 8];
                     int o = 0;
-                    for (int i = 0x48; i < 0x6c && o + 4 < (int)sizeof(hex); i++)
+                    for (int i = 0; i < 120 && o + 4 < (int)sizeof(hex); i++)
                         o += snprintf(hex + o, sizeof(hex) - o, "%02x ", pb[i]);
-                    Log("[slice]   STREETPROBE rec+0x48..0x6b: %s\n", hex);
+                    Log("[slice]   STREETPROBE rec+0x00..0x77: %s\n", hex);
                 }
             }
         }
