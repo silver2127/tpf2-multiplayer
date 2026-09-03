@@ -2842,6 +2842,81 @@ local function primeVehKeys()
 	log(string.format("veh: primed %d save vehicle(s) as known / s:<id>", np))
 end
 
+-- Vehicle-key-dependent captures (VLINE, VSELL) whose keys were not bound at
+-- capture time. A batch buy binds keys asynchronously, so an assign or sell
+-- issued in the same breath must WAIT for the binding rather than drop the
+-- vehicle. Retried every tick until every id resolves or the window closes.
+CM.pendVehCap = {}
+K.VEHCAP_WAIT = 8.0        -- game units to keep retrying before giving up
+function CM.deferVehCap(entry)
+	-- try once now; only queue if something is unresolved
+	if CM.shipVehCap(entry) then return end
+	CM.pendVehCap[#CM.pendVehCap + 1] = entry
+end
+
+-- Returns true when the entry is fully shipped (or definitively empty), false
+-- if it still has unresolved ids and should be retried.
+function CM.shipVehCap(entry)
+	if entry.kind == "VLINE" then
+		local k = entry.id and vehKeyFor(entry.id)
+		local lk = entry.line and lineKeyFor(entry.line)
+		if k and lk then
+			log(string.format("VLINE: %s -> line %s stop %d", k, lk, entry.stop))
+			scheduleLocal("VLINE", { key = k, line = lk, stop = entry.stop, armed = entry.armed or 0 })
+			return true
+		end
+		return false
+	elseif entry.kind == "VSELL" then
+		local keys, unresolved = {}, false
+		for _, id in ipairs(entry.ids) do
+			local k = vehKeyFor(id)
+			if k then keys[#keys + 1] = k else unresolved = true end
+		end
+		-- ship only when EVERY id is resolved, so the batch stays one atomic
+		-- sale on all peers; a partial ship would split the money differently
+		if unresolved then return false end
+		if #keys > 0 then
+			log("VSELL: " .. table.concat(keys, ","))
+			scheduleLocal("VSELL", { keys = table.concat(keys, ","), skipOrigin = 1 })
+			for _, id in ipairs(entry.ids) do forgetVehicle(id) end
+		end
+		return true
+	end
+	return true
+end
+
+function CM.drainVehCap()
+	if #CM.pendVehCap == 0 then return end
+	local now = gameTime() or 0
+	local i = 1
+	while i <= #CM.pendVehCap do
+		local e = CM.pendVehCap[i]
+		if CM.shipVehCap(e) then
+			table.remove(CM.pendVehCap, i)
+		elseif now - (e.since or now) > K.VEHCAP_WAIT then
+			if e.kind == "VLINE" then
+				log(string.format("VLINE: vehicle %s never keyed within %.0fs -- assignment DROPPED (DIVERGENCE)", tostring(e.id), K.VEHCAP_WAIT))
+			else
+				local miss = {}
+				for _, id in ipairs(e.ids or {}) do if not vehKeyFor(id) then miss[#miss + 1] = tostring(id) end end
+				-- ship whatever DID resolve at the deadline rather than lose the whole sale
+				local keys = {}
+				for _, id in ipairs(e.ids or {}) do local k = vehKeyFor(id); if k then keys[#keys + 1] = k end end
+				if #keys > 0 then
+					log(string.format("VSELL: shipping %d of %d at the deadline; unkeyed [%s] stay LOCAL (DIVERGENCE)", #keys, #e.ids, table.concat(miss, ",")))
+					scheduleLocal("VSELL", { keys = table.concat(keys, ","), skipOrigin = 1 })
+					for _, id in ipairs(e.ids) do if vehKeyFor(id) then forgetVehicle(id) end end
+				else
+					log(string.format("VSELL: %d id(s), none keyed within %.0fs -- sale stays LOCAL (DIVERGENCE)", #e.ids, K.VEHCAP_WAIT))
+				end
+			end
+			table.remove(CM.pendVehCap, i)
+		else
+			i = i + 1
+		end
+	end
+end
+
 -- Resolve pending purchase keys: the depot's vehicle that is not yet known.
 local function pollVehKeys()
 	if #pendingVehKeys == 0 then return end
@@ -8036,19 +8111,14 @@ local function pollInject()
 
 			elseif o == "VSELL" and #w >= 2 then
 				local n = tonumber(w[2]) or 0
-				local keys = {}
-				for i = 1, n do
-					local id = tonumber(w[2 + i])
-					local k = id and vehKeyFor(id)
-					if k then keys[#keys + 1] = k end
-				end
-				if #keys > 0 then
-					log("VSELL: " .. table.concat(keys, ","))
-					scheduleLocal("VSELL", { keys = table.concat(keys, ","), skipOrigin = 1 })
-					for i = 1, n do local id = tonumber(w[2 + i]); if id then forgetVehicle(id) end end
-				else
-					log(string.format("VSELL: %d id(s) but none shippable -- the sale stays LOCAL (divergence)", n))
-				end
+				local ids = {}
+				for i = 1, n do local id = tonumber(w[2 + i]); if id then ids[#ids + 1] = id end end
+				-- Same key-binding race as VLINE: a sell right after a batch buy
+				-- finds the keys unbound and shipped NOTHING ("none shippable").
+				-- Defer and retry; the host sold natively already (VSELL is not
+				-- strict), and vehKeyOf survives until forgetVehicle, so the key
+				-- still resolves after the vehicle is gone locally.
+				CM.deferVehCap({ kind = "VSELL", ids = ids, since = gameTime() or 0 })
 
 			elseif (o == "VNAME" and #w >= 3) or (o == "VCOLOR" and #w >= 5) then
 				-- The slice ships a LOCAL entity id. Work out what kind of thing it
@@ -8115,12 +8185,16 @@ local function pollInject()
 
 			elseif o == "VLINE" and #w >= 4 then
 				local id, line, stop = tonumber(w[2]), tonumber(w[3]), tonumber(w[4]) or 0
-				local k = id and vehKeyFor(id)
-				local lk = line and lineKeyFor(line)
-				if k and lk then
-					log(string.format("VLINE: %s -> line %s stop %d", k, lk, stop))
-					scheduleLocal("VLINE", { key = k, line = lk, stop = stop, armed = CM.lastArmed or 0 })
-				end
+				-- A batch buy binds its vehicle keys over the next few ticks
+				-- (pollVehKeys), so a SetLine captured immediately after the buy
+				-- often finds vehKeyFor == nil. Dropping it silently un-assigned
+				-- every such vehicle: the slice had already CANCELLED the host's
+				-- SetLine (STRICT, no-callback), so the vehicle was left off the
+				-- line on EVERY instance, the host included -- "only every other
+				-- vehicle got assigned" (2026-09-02). Retry the capture instead:
+				-- hold the raw id and re-resolve for a few seconds, then ship.
+				CM.deferVehCap({ kind = "VLINE", id = id, line = line, stop = stop,
+				                 armed = CM.lastArmed or 0, since = gameTime() or 0 })
 
 			elseif o == "LCREATE" then
 				pendingLineCreates[#pendingLineCreates + 1] = { since = gameTime() or 0 }
@@ -8555,6 +8629,7 @@ function data()
 			primeVehKeys()
 			CM.shipParkedBuys()
 			pollVehKeys()
+			CM.drainVehCap()
 			primeLineKeys()
 			pollLineKeys()
 			if not conxBusy and #conxQueue > 0 then
