@@ -1560,8 +1560,14 @@ static void writeBridgeCtl(bool isHost)
         if (idx > 6) idx = 6;
         letter = (char)('b' + idx);
     }
-    snprintf(content, sizeof(content), "instance=%c\npeer=127.0.0.1:%d\npid=%lu\n",
-             letter, relayPortFor(isHost), bpid);
+    // players= is the LOBBY ROSTER SIZE, including the host. The game script
+    // needs it to know when everybody has finished loading: nothing else tells
+    // it how many instances to expect, and guessing from who has appeared so
+    // far cannot distinguish "the last player is still loading" from "that is
+    // everyone". Without it the load gate had to fall back to a settle timer
+    // and released with two of three players in.
+    snprintf(content, sizeof(content), "instance=%c\npeer=127.0.0.1:%d\npid=%lu\nplayers=%d\n",
+             letter, relayPortFor(isHost), bpid, g_playerCount);
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%stpf2_bridge_ctl.txt", g_dataDirW);

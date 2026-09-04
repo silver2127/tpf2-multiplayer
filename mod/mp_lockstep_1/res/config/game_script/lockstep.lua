@@ -9559,7 +9559,24 @@ function CM.loadGateReady()
 		end
 		return true
 	end
+	-- How many instances to expect. In order of authority:
+	--   1. expect_players in the cfg -- an explicit manual override.
+	--   2. players= in tpf2_bridge_ctl.txt -- the LOBBY ROSTER, written by the
+	--      menu DLL, which is the only thing that actually knows. Re-read while
+	--      waiting, because a player can still be joining the lobby.
+	--   3. the settle heuristic, which is a guess and can only ever be wrong in
+	--      one of the two directions.
+	-- The cfg is deliberately NOT required: it gets overwritten by an installer
+	-- run, and a wiped cfg must not change how this behaves.
 	local want = CM.cfgNum("expect_players", 0)
+	if want < 2 then
+		local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
+		if f then
+			local body = f:read("*a") or ""
+			f:close()
+			want = tonumber(body:match("players=(%d+)")) or 0
+		end
+	end
 	local ready
 	if want > 1 then
 		ready = (n >= want - 1)
@@ -9570,7 +9587,8 @@ function CM.loadGateReady()
 		-- roughly every two seconds, so the player can see WHY it is paused
 		if (ticks % 12) == 0 then
 			log(string.format("LOADGATE: holding at the loaded save -- %d peer(s) in%s. Press play to start anyway.",
-				n, (want > 1) and string.format(", waiting for %d", want - 1) or ""))
+				n, (want > 1) and string.format(", waiting for %d", want - 1)
+				   or " (roster size unknown -- holding until it settles)"))
 		end
 		return false
 	end
