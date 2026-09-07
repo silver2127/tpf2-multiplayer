@@ -5044,12 +5044,17 @@ execConX = function(c)
 						local after = CM.cmBalance(api.engine.util.getPlayer())
 						if after then
 							local delta = reconBefore - tonumber(c.cost) - after
-							-- 3000 clears the benign fractional-tick probe noise (~1200) while a
-							-- real building demolish (~200k) is far above it.
+							-- DETECT a real demolish asymmetry with the cost delta (3000 clears the
+							-- benign ~1200 probe noise; a building demolish is ~200k). BOOK an
+							-- absolute snap to the originator's post-build balance when we have it,
+							-- so the coop wallets end EXACTLY equal rather than equal-in-spend from
+							-- two differently-timed baselines (which left a ~3201 residual).
 							if math.abs(delta) > 3000 then
-								CM.cmBookJournal(api.engine.util.getPlayer(), delta, K.JOURNAL_TRANSFER)
-								log(string.format("CONX COOP seq=%s: money reconciled %+d to match originator cost %s (before=%s after=%s)",
-									tostring(seq), delta, tostring(c.cost), tostring(reconBefore), tostring(after)))
+								local book = delta
+								if c.bal then book = tonumber(c.bal) - after end
+								CM.cmBookJournal(api.engine.util.getPlayer(), book, K.JOURNAL_TRANSFER)
+								log(string.format("CONX COOP seq=%s: money reconciled %+d (costDelta=%+d) to originator bal=%s cost=%s (before=%s after=%s)",
+									tostring(seq), book, delta, tostring(c.bal), tostring(c.cost), tostring(reconBefore), tostring(after)))
 							end
 						end
 					end)
@@ -6829,8 +6834,9 @@ local function shipConxPair(cn, rc)
 		local bnow = CM.cmBalance(api.engine.util.getPlayer())
 		if bnow then conxCost = base0 - bnow end
 	end
-	log(string.format("con: CONX cost=%s (bal0=%s) for %s", tostring(conxCost), tostring(base0), tostring(cn.file)))
-	scheduleLocal("CONX", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, survivors = cn.survivors, cost = conxCost,
+	local conxBal = CM.cmBalance(api.engine.util.getPlayer())  -- absolute post-build balance (canonical coop wallet)
+	log(string.format("con: CONX cost=%s (bal0=%s bal=%s) for %s", tostring(conxCost), tostring(base0), tostring(conxBal), tostring(cn.file)))
+	scheduleLocal("CONX", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, survivors = cn.survivors, cost = conxCost, bal = conxBal,
 	                        snodes = table.concat(sn, ";"), sedges = table.concat(se, ";"),
 	                        srm = table.concat(sr, ";"), spos = table.concat(spz, ";"),
 	                        etype = rc.etype, stype = rc.stype, ttype = rc.ttype, cat = rc.cat })
