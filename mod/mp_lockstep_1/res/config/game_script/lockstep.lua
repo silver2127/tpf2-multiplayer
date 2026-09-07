@@ -6824,10 +6824,12 @@ local function shipConxPair(cn, rc)
 		spz[#spz + 1] = string.format("%d,%.4f,%.4f,%.4f", id, p[1], p[2], p[3])
 	end
 	local conxCost = nil
-	if cn.bal0 then
+	local base0 = cn.bal0 or rc.bal0   -- pre-build balance (rc covers the rescue path)
+	if base0 then
 		local bnow = CM.cmBalance(api.engine.util.getPlayer())
-		if bnow then conxCost = cn.bal0 - bnow end
+		if bnow then conxCost = base0 - bnow end
 	end
+	log(string.format("con: CONX cost=%s (bal0=%s) for %s", tostring(conxCost), tostring(base0), tostring(cn.file)))
 	scheduleLocal("CONX", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, survivors = cn.survivors, cost = conxCost,
 	                        snodes = table.concat(sn, ";"), sedges = table.concat(se, ";"),
 	                        srm = table.concat(sr, ";"), spos = table.concat(spz, ";"),
@@ -8771,7 +8773,7 @@ local function pollInject()
 					end
 					pendingRoadc[#pendingRoadc + 1] = { at = gameTime() or 0, posOf = posOf,
 						adds = adds, rms = rms, spos = spos, etype = etype, stype = stype,
-						ttype = ttype, cat = cat }
+						ttype = ttype, cat = cat, bal0 = CM.balPrevConPoll }
 					log(string.format("ROADC: parked street payload (%d nodes, %d edges, %d removals) for pairing",
 						n, #adds, #rms))
 				else
