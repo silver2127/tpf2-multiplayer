@@ -403,6 +403,17 @@ local function detectInstance()
 		end
 	end
 	log("identity " .. K.INSTANCE .. " (peer " .. K.PEER .. ")")
+	-- WALL CLOCK AT SCRIPT START. The game times a few of its own phases
+	-- (ModelRep, shader reload) and those add up to a couple of seconds, which
+	-- is nowhere near how long a 600 MB save actually takes to come up -- most
+	-- of the load is untimed and therefore invisible. This is the only anchor
+	-- the game script can give: subtract the PROCESS start time from it and the
+	-- difference is the whole load, timed phases and untimed alike.
+	--   powershell: Get-Process TransportFever2 | Select Id,StartTime
+	pcall(function()
+		log(string.format("BOOT: game script live at %s (subtract the process start time for the true load duration)",
+			os.date("%H:%M:%S")))
+	end)
 	if not CM.baseLogged then
 		-- once, and on disk: stdout is buffered until exit, cmLog is not
 		CM.baseLogged = true
