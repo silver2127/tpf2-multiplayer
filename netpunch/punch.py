@@ -166,6 +166,27 @@ class Connection:
             # An "open" side stays quiet until it hears the dialer, then aims
             # its HELLOs straight back at that source so its token gets echoed.
             return [self.peer] if self.peer else []
+        # ONCE CONNECTED, STOP DIALLING THE LOSERS.
+        #
+        # A dialer HELLOs every candidate, and self.peer tracks the most recent
+        # source -- so continuing to HELLO the other candidates after a path is
+        # established keeps handing the far end a second address to answer, and
+        # its peer flaps between the two.
+        #
+        # That is fatal for two instances behind the same NAT. Both a LAN
+        # candidate and a public one reach the host, the public one hairpinned
+        # out to the router and back; the host's peer alternates between the LAN
+        # source and the hairpinned source, and a save transfer -- tens of
+        # thousands of datagrams aimed at whichever address was seen last -- is
+        # sprayed across a path that may not carry them. Small control messages
+        # survive it because one getting through is enough; a bulk stream does
+        # not (measured: transfer pinned at 0%, control traffic fine).
+        #
+        # Keeping a single destination after connect is right in general, not
+        # just here: re-pointing an established session at another candidate can
+        # only ever move it to a worse path.
+        if self.connected.is_set() and self.peer:
+            return [self.peer]
         return self.targets
 
     def _run(self):

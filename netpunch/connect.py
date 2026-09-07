@@ -308,8 +308,17 @@ def diagnose(mine, peer, connected):
 # the race
 # --------------------------------------------------------------------------- #
 def _targets_v4(peer):
+    # LAN FIRST. When both ends sit behind the same NAT -- two instances on one
+    # machine, or two players in one house -- the LAN address is a direct path,
+    # while the public one hairpins out to the router and back. The hairpin is
+    # slower at best and, on plenty of consumer routers, silently drops the
+    # larger datagrams a save transfer is made of.
+    #
+    # Ordering is all this needs to be: both candidates are still dialled, so a
+    # genuinely remote peer (whose LAN address is unreachable private space)
+    # loses nothing -- its public candidate simply answers and wins.
     out = []
-    for key in ("public_v4", "lan_v4"):
+    for key in ("lan_v4", "public_v4"):
         hp = parse_hostport(peer["candidates"].get(key))
         if hp:
             out.append(hp)
