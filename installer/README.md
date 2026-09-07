@@ -68,6 +68,12 @@ Shipped defaults: bridge on UDP 7771 talking to a peer on 127.0.0.1:7772,
 `enabled=1 suppress=1 merge=1 cancel_vehicle=1` (full lockstep - set
 `suppress=0` for observe-only, `enabled=0` to switch the hook off entirely).
 
+Plugins loaded by the plugin host (`tpf2_pluginhost.dll`) read `tpf2mp.cfg` from
+the game folder, then `%LOCALAPPDATA%	pf2mp\data	pf2mp.cfg` as a complete
+override, and then `plugins\<name>.cfg` beside each plugin DLL, merged over
+those. That last file is how a plugin shipped by a different installer keeps
+its settings without touching `tpf2mp.cfg`.
+
 ## What it changes in the game folder
 
 The only game file the installer modifies is `alut.dll`:
@@ -80,7 +86,9 @@ The only game file the installer modifies is `alut.dll`:
 3. If the install fails after step 1, a copy of `alut_real.dll` is put back as
    `alut.dll` during rollback, so the game keeps working.
 
-Uninstalling removes the proxy and renames `alut_real.dll` back to `alut.dll`.
+Uninstalling removes the proxy and renames `alut_real.dll` back to `alut.dll`
+- unless another product that shares the proxy (TpF2 Big Maps) is still
+installed, in which case both files are left for it; see "Coexistence" below.
 A major upgrade (installing a newer MSI over an older one) leaves
 `alut_real.dll` in place and only replaces the proxy.
 
@@ -91,6 +99,81 @@ Add/Remove Programs, or reinstall, to put the proxy back.
 
 Everything else the package adds is a new file; the game does not care about
 extra DLLs, a `netpunch` folder or an extra entry under `mods`.
+
+## Coexistence with TpF2 Big Maps
+
+[TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) is a separate
+package that loads through the same plugin host. The two install in either
+order and uninstall in either order. How:
+
+- **Shared files under shared GUIDs.** `alut.dll`, `tpf2_pluginhost.dll` and the
+  Segment Heap value are declared in `installer\PluginHost.wxs`, a fragment
+  duplicated byte-for-byte in both repositories, with fixed component GUIDs.
+  Windows Installer reference-counts a component by GUID across products: the
+  second install finds the files present and registers itself as a client; the
+  first uninstall leaves them for the other; the last one out removes them and
+  restores the stock `alut.dll`.
+- **Refcount-aware custom actions.** `RestoreStockAlut` (and its rollback
+  partner) ask `MsiEnumClients` who else owns the proxy component before moving
+  the stock library back, because MSI's own refcount cannot know that a custom
+  action also touches the file. `ca	pf2ca.cpp`, `OtherProxyClients`.
+- **Separate configs.** The plugin host merges `plugins\<name>.cfg` over
+  `tpf2mp.cfg` for each plugin it loads, so a plugin from another installer
+  never has to edit a file this package owns.
+
+The Big Maps repository carries `installer	est_coexist.ps1`, which runs the
+real `msiexec` transactions for both orders against a throwaway folder, and
+`toolsendor_host.ps1`, which copies the shared binaries from this repository
+and records the source commit. If you change `PluginHost.wxs`, the proxy, the
+host or the custom actions here, re-vendor there.
+
+## Segment Heap
+
+The installer also sets **one registry value** that switches Transport Fever 2
+onto the Windows Segment Heap:
+
+```
+HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\TransportFever2.exe
+    FrontEndHeapDebugOptions  (DWORD)  0x08
+```
+
+This is the only thing the package changes about how Windows *runs* the game
+rather than adding files beside it, so it is called out here rather than buried.
+
+**Why.** On the legacy heap, allocations larger than the heap's dedicated-bucket
+threshold all share one size-ordered free list, and every allocation walks it
+from the smallest block until it finds a fit. The cost of an allocation
+therefore grows with the number of free blocks, while the number of allocations
+grows with the size of the world - so the cost grows faster than the map does.
+
+**What it is worth.** Measured on a 57 x 57 km map by sampling every thread
+through a complete load, before and after the change:
+
+| | legacy heap | segment heap |
+| --- | --- | --- |
+| time in the allocator's free-list walk | 545 CPU-s | **0** |
+| load wall clock | ~960 s | **~65 s** |
+| private bytes | ~19 GB | ~17.8 GB |
+
+The game's own work was unchanged across the pair, which is what identifies the
+allocator rather than something else. It also removes most of the in-game
+stutter on large maps, because the same code path runs on every allocation
+during play and not only while loading. Ordinary map sizes benefit far less;
+this matters most for very large worlds.
+
+**Scope and removal.** The value applies to any process named
+`TransportFever2.exe` on the machine. Uninstalling removes it. The installer
+deliberately does not delete the surrounding key, because Image File Execution
+Options entries are shared with debuggers and exploit-mitigation settings and
+removing the key could take an unrelated setting with it.
+
+To toggle it by hand - to A/B test, or to rule it out while debugging something
+else - use `tools\segment_heap.ps1` (`-Status`, `-Enable`, `-Disable`) from an
+elevated prompt. Changes apply to the next launch, not to a running game.
+
+Microsoft does not promise the Segment Heap is faster in general; it was
+introduced to reduce memory footprint and is slower for some workloads. It wins
+here because a specific legacy-heap algorithm was measured as the cost.
 
 ## After installing: enable the mod per savegame
 
@@ -126,8 +209,8 @@ adds no firewall rules of its own.
 - **Add/Remove Programs -> TpF2 Multiplayer -> Uninstall**, or
   `msiexec /x TpF2Multiplayer.msi` (same MSI file or the product from the ARP
   list). This removes every packaged file, the `netpunch` and
-  `mods\mp_lockstep_1` folders it created, the registry key, and restores the
-  stock `alut.dll` from `alut_real.dll`.
+  `mods\mp_lockstep_1` folders it created, the registry key, the Segment Heap
+  value (see above), and restores the stock `alut.dll` from `alut_real.dll`.
 - **Steam -> Verify integrity of game files** restores the stock `alut.dll`
   without uninstalling anything (see above).
 - **By hand**, if all else fails: delete `alut.dll`, rename `alut_real.dll` to

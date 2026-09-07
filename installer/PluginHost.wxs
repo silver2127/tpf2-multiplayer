@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  PluginHost.wxs - the files SHARED by every TpF2 package that loads through
+  the tpf2mp plugin host: the alut.dll proxy, tpf2_pluginhost.dll, the custom
+  actions that park and restore the game's own alut.dll, and the Segment Heap
+  switch.
+
+  THIS FILE IS DUPLICATED BYTE-FOR-BYTE in every repository that ships an MSI
+  (tpf2-multiplayer/installer and tpf2-bigmap/installer). Do not edit one copy.
+
+  WHY IT IS SHARED, AND WHY THE GUIDS ARE FIXED
+  Two products install into the same game folder and both need the proxy.
+  Windows Installer reference-counts a component by its GUID across products:
+  if both packages declare alut.dll under the SAME component GUID, the second
+  install finds it present and just registers itself as a client, and the
+  first uninstall leaves the file for the other. Under DIFFERENT GUIDs the two
+  would fight - the second install overwrites, the first uninstall deletes -
+  and whichever product remained would be broken. So every GUID below is a
+  constant, never regenerated, and identical in every copy of this file.
+
+  The custom actions are refcount-aware for the same reason (ca\tpf2ca.cpp,
+  OtherProxyClients): RestoreStockAlut must not move the stock library back
+  over the proxy while a sibling product still uses it.
+
+  The package that includes this fragment must define, on the wix command line:
+    -d ProxyDll=<path to alut.dll>
+    -d HostDll=<path to tpf2_pluginhost.dll>
+    -d CaDll=<path to tpf2ca.dll>
+  and must reference <ComponentGroupRef Id="PluginHostShared" /> from a
+  feature. Referencing the group links the whole fragment, custom actions and
+  sequencing included, so the alut handling cannot be half-included.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <?ifndef ProxyDll ?><?error PluginHost.wxs: define ProxyDll (-d ProxyDll=path\to\alut.dll) ?><?endif?>
+  <?ifndef HostDll ?><?error PluginHost.wxs: define HostDll (-d HostDll=path\to\tpf2_pluginhost.dll) ?><?endif?>
+  <?ifndef CaDll ?><?error PluginHost.wxs: define CaDll (-d CaDll=path\to\tpf2ca.dll) ?><?endif?>
+
+  <Fragment>
+    <ComponentGroup Id="PluginHostShared" Directory="INSTALLFOLDER">
+
+      <!-- The proxy. FIXED GUID: shared across products (refcounted by MSI)
+           and across versions (PreserveStockAlut/RestoreStockAlut key off this
+           component's action state). -->
+      <Component Id="ProxyAlut" Guid="F7DC2819-9B08-4477-B651-A8AAA406270D">
+        <File Id="alut.dll" Name="alut.dll" Source="$(ProxyDll)" KeyPath="yes" />
+      </Component>
+
+      <!-- The plugin host the proxy loads last. FIXED GUID, shared. -->
+      <Component Id="PluginHostDll" Guid="B82F67E2-6EDE-4EB7-A776-789B82D7F7FF">
+        <File Id="tpf2_pluginhost.dll" Name="tpf2_pluginhost.dll" Source="$(HostDll)" KeyPath="yes" />
+      </Component>
+
+      <!-- Segment Heap opt-in for TransportFever2.exe. Shared and FIXED GUID:
+           both products want it and MSI removes the value only when the last
+           client uninstalls. Owns the VALUE, never the KEY - IFEO keys are
+           shared ground (debuggers, mitigations). See the multiplayer
+           installer README, "Segment Heap", for the measurements. -->
+      <Component Id="SegmentHeapIfeo" Guid="B2E4C7A1-5D93-4F26-8C71-3A9E0D4B6F58">
+        <RegistryValue Root="HKLM"
+                       Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\TransportFever2.exe"
+                       Name="FrontEndHeapDebugOptions"
+                       Type="integer" Value="8" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- ===== custom actions (ca\tpf2ca.cpp) ===== -->
+    <Binary Id="Tpf2CustomActions" SourceFile="$(CaDll)" />
+
+    <CustomAction Id="CheckGameDir"      BinaryRef="Tpf2CustomActions" DllEntry="CheckGameDir"      Execute="immediate" Return="ignore" />
+    <CustomAction Id="RequireGameDir"    BinaryRef="Tpf2CustomActions" DllEntry="RequireGameDir"    Execute="immediate" Return="check" />
+    <CustomAction Id="PreserveStockAlut" BinaryRef="Tpf2CustomActions" DllEntry="PreserveStockAlut" Execute="deferred"  Impersonate="no" Return="check" />
+    <CustomAction Id="RollbackStockAlut" BinaryRef="Tpf2CustomActions" DllEntry="RollbackStockAlut" Execute="rollback"  Impersonate="no" Return="ignore" />
+    <CustomAction Id="RestoreStockAlut"  BinaryRef="Tpf2CustomActions" DllEntry="RestoreStockAlut"  Execute="deferred"  Impersonate="no" Return="ignore" />
+
+    <!-- Deferred actions cannot read properties; hand them the folder as CustomActionData. -->
+    <SetProperty Id="PreserveStockAlut" Value="[INSTALLFOLDER]" Sequence="execute" Before="PreserveStockAlut" />
+    <SetProperty Id="RollbackStockAlut" Value="[INSTALLFOLDER]" Sequence="execute" Before="RollbackStockAlut" />
+    <SetProperty Id="RestoreStockAlut"  Value="[INSTALLFOLDER]" Sequence="execute" Before="RestoreStockAlut" />
+
+    <InstallExecuteSequence>
+      <!-- $ProxyAlut=3: the alut.dll component is being installed (first
+           install, upgrade, repair). $ProxyAlut=2: it is being removed - which
+           is ALSO true when a sibling product keeps the file; the action itself
+           checks for that. UPGRADINGPRODUCTCODE is set only in the old
+           product's uninstall leg of a major upgrade; the stock file stays
+           parked as alut_real.dll for the new proxy in that case.
+           TPF2_SKIP_GAMEDIR_CHECK=1 on the msiexec command line bypasses the
+           exe check (test rigs only). -->
+      <Custom Action="RequireGameDir"    After="CostFinalize"        Condition="NOT Installed AND NOT TPF2_SKIP_GAMEDIR_CHECK" />
+      <Custom Action="RollbackStockAlut" Before="PreserveStockAlut"  Condition="$ProxyAlut=3" />
+      <Custom Action="PreserveStockAlut" Before="InstallFiles"       Condition="$ProxyAlut=3" />
+      <Custom Action="RestoreStockAlut"  After="RemoveFiles"         Condition="$ProxyAlut=2 AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

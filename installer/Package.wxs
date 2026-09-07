@@ -17,9 +17,11 @@
   TransportFever2.exe: the folder dialog refuses to continue without it and a
   silent install fails at RequireGameDir with the same message.
 
-  alut.dll: the game's own copy is kept as alut_real.dll before our proxy goes
-  in (PreserveStockAlut) and moved back on uninstall (RestoreStockAlut). See
-  ca\tpf2ca.cpp for the exact rules, including rollback.
+  alut.dll, tpf2_pluginhost.dll, the custom actions that park/restore the
+  game's own alut.dll, and the Segment Heap switch all live in PluginHost.wxs:
+  they are SHARED with the TpF2 Big Maps package under fixed component GUIDs so
+  the two products can be installed in either order and uninstalled in either
+  order. That file is duplicated byte-for-byte in both repositories.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
@@ -28,6 +30,7 @@
   <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
   <?ifndef BridgeOut ?><?define BridgeOut = "..\bridge\out" ?><?endif?>
   <?ifndef ProxyDll ?><?define ProxyDll = "$(BridgeOut)\alut.dll" ?><?endif?>
+  <?ifndef HostDll ?><?define HostDll = "$(BridgeOut)	pf2_pluginhost.dll" ?><?endif?>
   <?ifndef BridgeDll ?><?define BridgeDll = "$(BridgeOut)\tpf2_bridge_mp.dll" ?><?endif?>
   <?ifndef MenuDll ?><?define MenuDll = "$(BridgeOut)\tpf2_menu.dll" ?><?endif?>
   <?ifndef SliceDll ?><?define SliceDll = "$(BridgeOut)\tpf2_slice.dll" ?><?endif?>
@@ -97,36 +100,17 @@
     </StandardDirectory>
 
     <Feature Id="Main" Title="TpF2 Multiplayer" Level="1" AllowAbsent="no">
+      <!-- Proxy, plugin host, alut custom actions, Segment Heap switch: shared
+           with TpF2 Big Maps (PluginHost.wxs). The Segment Heap switch ships
+           as part of the base install rather than as a tick-box; README.md
+           ("Segment Heap") documents it because it changes how Windows runs
+           the game rather than adding files beside it. -->
+      <ComponentGroupRef Id="PluginHostShared" />
       <ComponentGroupRef Id="GameFolderFiles" />
       <ComponentGroupRef Id="ModFiles" />
     </Feature>
 
-    <!-- ===== custom actions (installer\ca\tpf2ca.cpp) ===== -->
-    <Binary Id="Tpf2CustomActions" SourceFile="$(CaDll)" />
-
-    <CustomAction Id="CheckGameDir"      BinaryRef="Tpf2CustomActions" DllEntry="CheckGameDir"      Execute="immediate" Return="ignore" />
-    <CustomAction Id="RequireGameDir"    BinaryRef="Tpf2CustomActions" DllEntry="RequireGameDir"    Execute="immediate" Return="check" />
-    <CustomAction Id="PreserveStockAlut" BinaryRef="Tpf2CustomActions" DllEntry="PreserveStockAlut" Execute="deferred"  Impersonate="no" Return="check" />
-    <CustomAction Id="RollbackStockAlut" BinaryRef="Tpf2CustomActions" DllEntry="RollbackStockAlut" Execute="rollback"  Impersonate="no" Return="ignore" />
-    <CustomAction Id="RestoreStockAlut"  BinaryRef="Tpf2CustomActions" DllEntry="RestoreStockAlut"  Execute="deferred"  Impersonate="no" Return="ignore" />
-
-    <!-- Deferred actions cannot read properties; hand them the folder as CustomActionData. -->
-    <SetProperty Id="PreserveStockAlut" Value="[INSTALLFOLDER]" Sequence="execute" Before="PreserveStockAlut" />
-    <SetProperty Id="RollbackStockAlut" Value="[INSTALLFOLDER]" Sequence="execute" Before="RollbackStockAlut" />
-    <SetProperty Id="RestoreStockAlut"  Value="[INSTALLFOLDER]" Sequence="execute" Before="RestoreStockAlut" />
-
-    <InstallExecuteSequence>
-      <!-- $ProxyAlut=3: the alut.dll component is being installed (first
-           install, upgrade, repair). $ProxyAlut=2: it is being removed.
-           UPGRADINGPRODUCTCODE is set only in the old product's uninstall leg
-           of a major upgrade; the stock file stays parked as alut_real.dll
-           for the new proxy in that case. TPF2_SKIP_GAMEDIR_CHECK=1 on the
-           msiexec command line bypasses the exe check (test rigs only). -->
-      <Custom Action="RequireGameDir"    After="CostFinalize"        Condition="NOT Installed AND NOT TPF2_SKIP_GAMEDIR_CHECK" />
-      <Custom Action="RollbackStockAlut" Before="PreserveStockAlut"  Condition="$ProxyAlut=3" />
-      <Custom Action="PreserveStockAlut" Before="InstallFiles"       Condition="$ProxyAlut=3" />
-      <Custom Action="RestoreStockAlut"  After="RemoveFiles"         Condition="$ProxyAlut=2 AND NOT UPGRADINGPRODUCTCODE" />
-    </InstallExecuteSequence>
+    <!-- Custom actions and their sequencing: PluginHost.wxs. -->
 
     <!-- ===== UI ===== -->
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
@@ -137,12 +121,7 @@
   <!-- ===== files ===== -->
   <Fragment>
     <ComponentGroup Id="GameFolderFiles" Directory="INSTALLFOLDER">
-      <!-- The proxy. Fixed GUID: PreserveStockAlut/RestoreStockAlut key off
-           this component's action state, so it must keep its identity across
-           versions. -->
-      <Component Id="ProxyAlut" Guid="F7DC2819-9B08-4477-B651-A8AAA406270D">
-        <File Id="alut.dll" Name="alut.dll" Source="$(ProxyDll)" KeyPath="yes" />
-      </Component>
+      <!-- alut.dll and tpf2_pluginhost.dll: PluginHost.wxs (shared). -->
       <Component Id="BridgeDll">
         <File Id="tpf2_bridge_mp.dll" Name="tpf2_bridge_mp.dll" Source="$(BridgeDll)" />
       </Component>
@@ -175,6 +154,9 @@
     </ComponentGroup>
 
     <!-- The Lua mod, whole tree, one component per file. -->
+    <!-- Segment Heap opt-in: PluginHost.wxs (shared component). The
+         measurements behind it are in README.md, "Segment Heap". -->
+
     <ComponentGroup Id="ModFiles" Directory="ModFolder">
       <Files Include="$(ModSource)\**" />
     </ComponentGroup>

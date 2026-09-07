@@ -117,6 +117,39 @@ extern "C" __declspec(dllexport) UINT __stdcall RequireGameDir(MSIHANDLE h)
     return ERROR_INSTALL_FAILURE;
 }
 
+
+// ---------------------------------------------------------------------------
+// Shared-proxy refcount.
+//
+// alut.dll is shipped by MORE THAN ONE product (TpF2 Multiplayer and TpF2 Big
+// Maps) under the SAME component GUID, so Windows Installer reference-counts
+// the file itself: the second product to install finds it present, the first
+// to uninstall leaves it for the other. What MSI cannot know is that our
+// deferred actions ALSO touch the file -- RestoreStockAlut moves alut_real.dll
+// back over it -- and would do so while a sibling product still needs the
+// proxy. So every action that touches alut.dll first asks the installer who
+// else owns the component. If anyone does, the file is theirs too: leave it.
+//
+// MsiEnumClients lists the product codes registered as clients of a component.
+// By the time a deferred action runs on uninstall, ProcessComponents has
+// already dropped THIS product from that list, but ProductCode is one of the
+// few properties a deferred action can read, so it is excluded explicitly in
+// case the sequence ever changes.
+static const wchar_t* PROXY_COMPONENT = L"{F7DC2819-9B08-4477-B651-A8AAA406270D}";
+
+static int OtherProxyClients(MSIHANDLE h)
+{
+    std::wstring me = GetProp(h, L"ProductCode");
+    int others = 0;
+    for (DWORD i = 0; ; ++i) {
+        wchar_t code[39] = L"";
+        UINT r = MsiEnumClientsW(PROXY_COMPONENT, i, code);
+        if (r != ERROR_SUCCESS) break;
+        if (_wcsicmp(code, me.c_str()) != 0) ++others;
+    }
+    return others;
+}
+
 extern "C" __declspec(dllexport) UINT __stdcall PreserveStockAlut(MSIHANDLE h)
 {
     std::wstring dir = WithSlash(GetProp(h, L"CustomActionData"));
@@ -146,8 +179,20 @@ extern "C" __declspec(dllexport) UINT __stdcall PreserveStockAlut(MSIHANDLE h)
         Log(h, L"PreserveStockAlut: stock alut.dll kept as alut_real.dll in " + dir);
         return ERROR_SUCCESS;
     }
-    // alut_real.dll is already there (earlier install of this package, or the
-    // developer script), so whatever alut.dll is on disk is a proxy or a copy
+    // alut_real.dll is already there (earlier install of this package, the
+    // developer script, or a SIBLING product that shares the proxy). If a
+    // sibling owns the proxy component, the alut.dll on disk is its live proxy:
+    // leave it -- InstallFiles either overwrites it with ours (same binary) or
+    // keeps it, and either way a working proxy stays in place. Deleting it here
+    // would leave a window with NO alut.dll if InstallFiles then decides the
+    // file is already current.
+    int others = OtherProxyClients(h);
+    if (others > 0) {
+        Log(h, L"PreserveStockAlut: " + std::to_wstring(others) +
+               L" other product(s) own the proxy; leaving alut.dll in " + dir);
+        return ERROR_SUCCESS;
+    }
+    // Otherwise whatever alut.dll is on disk is an old proxy of ours or a copy
     // Steam put back. Drop it; InstallFiles installs this package's proxy next.
     if (FileExists(live) && !DeleteFileW(live.c_str())) {
         Say(h, (INSTALLMESSAGE)(INSTALLMESSAGE_ERROR | MB_OK | MB_ICONERROR),
@@ -167,6 +212,14 @@ extern "C" __declspec(dllexport) UINT __stdcall RollbackStockAlut(MSIHANDLE h)
     std::wstring real = dir + L"alut_real.dll";
     if (dir.empty() || !FileExists(real)) return ERROR_SUCCESS;
     if (FileExists(live)) return ERROR_SUCCESS;   // MSI's own rollback already put something back
+    if (OtherProxyClients(h) > 0) {
+        // A sibling product still needs a PROXY here, not the stock library.
+        // MSI's rollback restores what it removed; we cannot reconstruct the
+        // sibling's file, so say so rather than break it.
+        Log(h, L"RollbackStockAlut: another product owns the proxy; NOT restoring the "
+               L"stock alut.dll -- run Repair on that product if the game fails to start");
+        return ERROR_SUCCESS;
+    }
     if (CopyFileW(real.c_str(), live.c_str(), FALSE))
         Log(h, L"RollbackStockAlut: alut.dll restored from alut_real.dll in " + dir);
     else
@@ -181,6 +234,16 @@ extern "C" __declspec(dllexport) UINT __stdcall RestoreStockAlut(MSIHANDLE h)
     std::wstring real = dir + L"alut_real.dll";
     if (dir.empty() || !FileExists(real)) {
         Log(h, L"RestoreStockAlut: no alut_real.dll in " + dir + L"; nothing to restore");
+        return ERROR_SUCCESS;
+    }
+    int others = OtherProxyClients(h);
+    if (others > 0) {
+        // The proxy file itself survives this uninstall (MSI refcounts the
+        // shared component); moving the stock library over it would silently
+        // break the product that still uses it. alut_real.dll stays too: that
+        // product's uninstall restores it when it is the last one out.
+        Log(h, L"RestoreStockAlut: " + std::to_wstring(others) +
+               L" other product(s) still own the proxy; leaving alut.dll and alut_real.dll in " + dir);
         return ERROR_SUCCESS;
     }
     if (MoveFileExW(real.c_str(), live.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))

@@ -88,10 +88,11 @@ static void Log(const char* fmt, ...)
 // built -- the exe has not even reached its entry point yet.
 static DWORD WINAPI LoadBridge(LPVOID)
 {
-    wchar_t bridgePath[MAX_PATH], menuPath[MAX_PATH], slicePath[MAX_PATH];
-    resolveShipped(L"tpf2_bridge_mp.dll", bridgePath, MAX_PATH);
-    resolveShipped(L"tpf2_menu.dll",      menuPath,   MAX_PATH);
-    resolveShipped(L"tpf2_slice.dll",     slicePath,  MAX_PATH);
+    wchar_t bridgePath[MAX_PATH], menuPath[MAX_PATH], slicePath[MAX_PATH], hostPath[MAX_PATH];
+    resolveShipped(L"tpf2_bridge_mp.dll",  bridgePath, MAX_PATH);
+    resolveShipped(L"tpf2_menu.dll",       menuPath,   MAX_PATH);
+    resolveShipped(L"tpf2_slice.dll",      slicePath,  MAX_PATH);
+    resolveShipped(L"tpf2_pluginhost.dll", hostPath,   MAX_PATH);
     HMODULE h = LoadLibraryW(bridgePath);
     Log("[proxy] pid=%lu bridge load %s (err %lu) from %ls\n",
         GetCurrentProcessId(), h ? "OK" : "FAILED", h ? 0 : GetLastError(), bridgePath);
@@ -103,6 +104,13 @@ static DWORD WINAPI LoadBridge(LPVOID)
     HMODULE hs = LoadLibraryW(slicePath);
     Log("[proxy] pid=%lu slice load %s (err %lu) from %ls\n",
         GetCurrentProcessId(), hs ? "OK" : "FAILED", hs ? 0 : GetLastError(), slicePath);
+    // The plugin host loads everything in plugins\ -- the LAST name this proxy
+    // will ever need to know. It is optional and loaded last on purpose: the
+    // three DLLs above carry the working multiplayer stack, and a plugin must
+    // not be able to stop them coming up. A missing host just means no plugins.
+    HMODULE hh = LoadLibraryW(hostPath);
+    Log("[proxy] pid=%lu pluginhost load %s (err %lu) from %ls\n",
+        GetCurrentProcessId(), hh ? "OK" : "FAILED", hh ? 0 : GetLastError(), hostPath);
     return 0;
 }
 

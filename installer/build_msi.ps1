@@ -16,7 +16,11 @@ Steps, in order (each one stops the script on failure):
   2. python -m PyInstaller --onefile --name netpunch lobby.py  (in netpunch\)
      -> netpunch\dist\netpunch.exe. -SkipFreeze reuses an existing exe.
   3. installer\ca\build_ca.bat -> installer\out\tpf2ca.dll (the custom actions).
-  4. wix build -arch x64 -ext WixToolset.UI.wixext ... installer\Package.wxs
+  4. wix build -arch x64 -ext WixToolset.UI.wixext ... installer\Package.wxs installer\PluginHost.wxs
+     PluginHost.wxs is the fragment SHARED with the TpF2 Big Maps package (same
+     file, byte-for-byte, in both repositories): proxy, plugin host, alut custom
+     actions and the Segment Heap switch under fixed component GUIDs, so the two
+     products coexist. The paths it needs are passed with -d.
 
 -Validate then runs an administrative install (msiexec /a ... /qn TARGETDIR=<temp>),
 which extracts the package without installing anything, and lists the tree.
@@ -130,10 +134,15 @@ if ($SkipBuild) {
     Say "running build_proxy.bat"
     $rc = Run-Bat (Join-Path $Bridge "build_proxy.bat")
     if ($rc -ne 0) { Fail "build_proxy.bat failed (exit $rc). If it was LNK1104, close the game (it holds alut.dll / tpf2_bridge_mp.dll) and rerun." }
+    Say "running build_host.bat"
+    $rc = Run-Bat (Join-Path $Bridge "build_host.bat")
+    if ($rc -ne 0) { Fail "build_host.bat failed (exit $rc). If it was LNK1104, close the game (it holds tpf2_pluginhost.dll) and rerun." }
     $menuDll  = Build-Suffixable "build_menu.bat"  "tpf2_menu.dll"
     $sliceDll = Build-Suffixable "build_slice.bat" "tpf2_slice.dll"
 }
-foreach ($f in @((Join-Path $BridgeOut "alut.dll"), (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll)) {
+$proxyDll = Join-Path $BridgeOut "alut.dll"
+$hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
+foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll)) {
     if (-not (Test-Path $f)) { Fail "missing: $f" }
 }
 
@@ -179,12 +188,15 @@ $wixArgs = @("build") + $eula + @(
     "-arch", "x64",
     "-ext", "WixToolset.UI.wixext",
     "-d", "ProductVersion=$Version",
+    "-d", "ProxyDll=$proxyDll",
+    "-d", "HostDll=$hostDll",
     "-d", "MenuDll=$menuDll",
     "-d", "SliceDll=$sliceDll",
     "-d", "NetpunchExe=$netExe",
     "-d", "CaDll=$caDll",
     "-o", $Msi,
-    (Join-Path $Installer "Package.wxs")
+    (Join-Path $Installer "Package.wxs"),
+    (Join-Path $Installer "PluginHost.wxs")
 )
 Say "wix $($wixArgs -join ' ')"
 Push-Location $Installer
