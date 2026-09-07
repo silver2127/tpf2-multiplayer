@@ -4840,6 +4840,13 @@ execConX = function(c)
 		local strictBalPre = c.strictBalPre     -- nil unless this is our strict self-rebuild
 		local strictBal0   = CM.conBal0[key]    -- balance before the native build
 		local strictBalMid = c.strictBalMid     -- balance after our bulldoze
+		-- COOP money reconciliation (see the post-sweep block below): on a
+		-- PEER only, snapshot the wallet before the replay so we can match the
+		-- originator's true cost once the build + obstacle-clear have settled.
+		local reconBefore = nil
+		if CM.cmMode == "coop" and origin ~= K.INSTANCE and c.cost then
+			pcall(function() reconBefore = CM.cmBalance(api.engine.util.getPlayer()) end)
+		end
 		api.cmd.sendCommand(cmd, function(res, success)
 			-- The engine has answered: the next queued construction may go.
 			conxBusy = false
@@ -5031,6 +5038,22 @@ execConX = function(c)
 					end
 					CM.cmLog(string.format("STN: %s seq=%s track-corridor clear: %d track segment(s), %d cleared within %d m", tostring(op), tostring(seq), #segs, cleared, CORRIDOR))
 				end)
+				-- COOP: match the originator's true cost now the sweep has settled.
+				if reconBefore and c.cost then
+					pcall(function()
+						local after = CM.cmBalance(api.engine.util.getPlayer())
+						if after then
+							local delta = reconBefore - tonumber(c.cost) - after
+							-- 3000 clears the benign fractional-tick probe noise (~1200) while a
+							-- real building demolish (~200k) is far above it.
+							if math.abs(delta) > 3000 then
+								CM.cmBookJournal(api.engine.util.getPlayer(), delta, K.JOURNAL_TRANSFER)
+								log(string.format("CONX COOP seq=%s: money reconciled %+d to match originator cost %s (before=%s after=%s)",
+									tostring(seq), delta, tostring(c.cost), tostring(reconBefore), tostring(after)))
+							end
+						end
+					end)
+				end
 				if false then
 					pcall(function()
 						local bid = res.resultEntities[1]
@@ -6772,6 +6795,7 @@ local function queueConCapture(fn, key, pstr, transf, id)
 	pendingCons[#pendingCons + 1] = { at = gameTime() or 0, file = fn, key = key,
 	                                  t = table.concat(t, ","), params = pstr,
 	                                  x = transf[13], y = transf[14], name = escName(name),
+	                                  bal0 = CM.balPrevConPoll,  -- balance before this build; ships as the true cost
 	                                  survivors = survivors }
 end
 
@@ -6799,7 +6823,12 @@ local function shipConxPair(cn, rc)
 	for id, p in pairs(rc.spos) do
 		spz[#spz + 1] = string.format("%d,%.4f,%.4f,%.4f", id, p[1], p[2], p[3])
 	end
-	scheduleLocal("CONX", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, survivors = cn.survivors,
+	local conxCost = nil
+	if cn.bal0 then
+		local bnow = CM.cmBalance(api.engine.util.getPlayer())
+		if bnow then conxCost = cn.bal0 - bnow end
+	end
+	scheduleLocal("CONX", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, survivors = cn.survivors, cost = conxCost,
 	                        snodes = table.concat(sn, ";"), sedges = table.concat(se, ";"),
 	                        srm = table.concat(sr, ";"), spos = table.concat(spz, ";"),
 	                        etype = rc.etype, stype = rc.stype, ttype = rc.ttype, cat = rc.cat })
