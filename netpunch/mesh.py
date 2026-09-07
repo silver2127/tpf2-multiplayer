@@ -39,6 +39,7 @@ import time
 
 from punch import (
     TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE, TYPE_DATA, TYPE_EDATA,
+    TYPE_ADATA, CHUNK_PREFIX,
     _pack, _unpack, HELLO_INTERVAL, KEEPALIVE_INTERVAL, TOKEN_LEN,
 )
 
@@ -260,8 +261,21 @@ class MeshNode:
                         plain = self.cipher.open(payload)
                         if plain is not None:
                             self.inbox.put((addr, plain))
+                elif ptype == TYPE_ADATA:
+                    # authenticated-only bulk (save chunks, if BULK_SIGN is on)
+                    if self.cipher is not None:
+                        plain = self.cipher.unsign(payload)
+                        if plain is not None:
+                            self.inbox.put((addr, plain))
                 elif ptype == TYPE_DATA:
-                    if self.cipher is None or payload.startswith(b'{"t": "reject"'):
+                    # Save chunks travel as plaintext DATA even in a sealed
+                    # session (BULK_PLAIN) -- the map is not a secret and the
+                    # per-file SHA-256 guards it. Mirror punch.py exactly: accept
+                    # a chunk by its CHUNK_PREFIX, still refuse any other
+                    # plaintext (control stays sealed).
+                    if (self.cipher is None
+                            or payload.startswith(b'{"t": "reject"')
+                            or payload.startswith(CHUNK_PREFIX)):
                         self.inbox.put((addr, payload))
 
     def close(self):

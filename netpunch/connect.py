@@ -307,7 +307,7 @@ def diagnose(mine, peer, connected):
 # --------------------------------------------------------------------------- #
 # the race
 # --------------------------------------------------------------------------- #
-def _targets_v4(peer):
+def _targets_v4(peer, mine=None):
     # LAN FIRST. When both ends sit behind the same NAT -- two instances on one
     # machine, or two players in one house -- the LAN address is a direct path,
     # while the public one hairpins out to the router and back. The hairpin is
@@ -317,15 +317,37 @@ def _targets_v4(peer):
     # Ordering is all this needs to be: both candidates are still dialled, so a
     # genuinely remote peer (whose LAN address is unreachable private space)
     # loses nothing -- its public candidate simply answers and wins.
+    #
+    # SAME NAT -> LAN ONLY. If our public address and the peer's are the same
+    # IP we are behind one router, and the public candidate is a hairpin: out
+    # to the router and back in. Dialling it is not just wasteful, it is what
+    # breaks the save transfer -- the host hears us from BOTH the LAN source and
+    # the hairpinned source, its peer address tracks whichever packet came last,
+    # and a bulk stream aimed at a flapping address never completes (measured:
+    # joiner CONNECTED to 192.168.0.140, host logged the same joiner at its
+    # public address, transfer pinned at 0%). Not creating the second path is
+    # the only fix that does not touch the most-recent-source rule the NAT
+    # re-mapping recovery depends on. Same rule ICE uses.
+    my_pub = None
+    if mine:
+        hp = parse_hostport(mine.get("candidates", {}).get("public_v4"))
+        if hp:
+            my_pub = hp[0]
+    peer_pub = parse_hostport(peer["candidates"].get("public_v4"))
+    same_nat = bool(my_pub and peer_pub and my_pub == peer_pub[0]
+                    and peer["candidates"].get("lan_v4"))
+    keys = ("lan_v4",) if same_nat else ("lan_v4", "public_v4")
+    if same_nat:
+        log("[race] peer shares our public address -> same NAT, dialling LAN only")
     out = []
-    for key in ("lan_v4", "public_v4"):
+    for key in keys:
         hp = parse_hostport(peer["candidates"].get(key))
         if hp:
             out.append(hp)
     return out
 
 
-def race(sock_v4, peer, role, local_port, timeout, my_has_v6):
+def race(sock_v4, peer, role, local_port, timeout, my_has_v6, mine=None):
     """Fire per-family Connections at the peer's candidates; first wins.
 
     Returns the winning Connection (still live) or None. Losing families are
@@ -335,7 +357,7 @@ def race(sock_v4, peer, role, local_port, timeout, my_has_v6):
     listen = role == "listen"
 
     # --- IPv4 family (always attempted; reuses the game socket) ---
-    v4_targets = [] if listen else _targets_v4(peer)
+    v4_targets = [] if listen else _targets_v4(peer, mine)
     v4 = Connection(sock_v4, v4_targets, name="v4", listen=listen,
                     log=log)
     conns.append(("v4", v4))

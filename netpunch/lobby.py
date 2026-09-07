@@ -2306,6 +2306,7 @@ def cmd_join(args):
     # Mesh: learn our OWN public mapping on this same socket first (STUN, no
     # UPnP), so the host can hand the other joiners a code that punches us.
     profile_code = None
+    prof = None
     if not getattr(args, "no_mesh", False):
         try:
             from observe import observe
@@ -2316,7 +2317,7 @@ def cmd_join(args):
         except Exception as e:                            # noqa: BLE001
             _log(f"[join] self-observe failed: {e} -- peers will reach us via relay")
     conn = race(sock, peer, "dial", args.local_port, args.timeout,
-                my_has_v6=False)
+                my_has_v6=False, mine=prof)
     if not conn:
         io.emit({"type": "status", "state": "failed",
                  "detail": "could not reach host"})
