@@ -58,8 +58,22 @@ Get-ChildItem "$Repo\bridge\out\tpf2_slice*.dll" -EA SilentlyContinue |
     Where-Object { $_.Name -ne 'tpf2_slice.dll' -and $_.LastWriteTime -gt $sliceStamp } |
     ForEach-Object { Write-Warning "[ship] $($_.Name) is NEWER than tpf2_slice.dll and will NOT be shipped -- rebuild without a suffix if that is the one you want" }
 Put $sliceSrc                             (Join-Path $Game 'tpf2_slice.dll')
+Put "$Repo\bridge\out\tpf2_pluginhost.dll"   (Join-Path $Game 'tpf2_pluginhost.dll')
 Put "$Repo\installer\cfg\tpf2_bridge_mp.cfg" (Join-Path $Game 'tpf2_bridge_mp.cfg')
 Put "$Repo\installer\cfg\tpf2_slice.cfg"     (Join-Path $Game 'tpf2_slice.cfg')
+Put "$Repo\installer\cfg\tpf2mp.cfg"         (Join-Path $Game 'tpf2mp.cfg')
+
+# Native plugins live in their OWN repositories -- they depend on nothing here
+# but the vendored ABI header, and they must be independently releasable. For
+# local testing we pick them up from sibling checkouts if they are present; a
+# missing one is not an error, it just means that feature is not under test.
+$PluginDir = Join-Path $Game 'plugins'
+New-Item -ItemType Directory -Force $PluginDir | Out-Null
+foreach ($p in @(@{repo='tpf2-bigmap'; dll='out\tpf2_bigmap.dll'})) {
+    $src = Join-Path (Split-Path -Parent $Repo) (Join-Path $p.repo $p.dll)
+    if (Test-Path $src) { Put $src (Join-Path $PluginDir (Split-Path $p.dll -Leaf)) }
+    else { Write-Host ("[ship]   plugin {0}: not built (looked in {1}) -- skipped" -f $p.repo, $src) }
+}
 New-Item -ItemType Directory -Force (Join-Path $Game 'netpunch') | Out-Null
 Put "$Repo\netpunch\dist\netpunch.exe"    (Join-Path $Game 'netpunch\netpunch.exe')
 

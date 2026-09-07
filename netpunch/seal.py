@@ -35,6 +35,12 @@ NONCE_LEN = 8
 TAG_LEN = 16
 WINDOW = 64
 
+# Domain separator for sign()/unsign(). Without it a signed (plaintext) frame
+# and a sealed (encrypted) frame share one MAC construction, so either could
+# be presented to the other's verifier. The transport already tells them apart
+# by frame type, but the crypto should not depend on that.
+SIGN_DOMAIN = b"sign"
+
 
 def derive_key(secret: bytes, password: str = "") -> bytes:
     return hashlib.sha256(b"tpf2mp-seal-v1|" + bytes(secret) + b"|"
@@ -88,6 +94,71 @@ class Sealer:
         tag = hmac.new(self.mac_key, nonce + ct, hashlib.sha256).digest()[:TAG_LEN]
         return nonce + ct + tag
 
+    # -- authenticate-only (no encryption) ---------------------------------- #
+    # For BULK SAVE CHUNKS only. Same nonce, same replay window, same tag --
+    # the only thing dropped is the keystream XOR.
+    #
+    # WHY: the keystream is one SHA-256 per 32 bytes of payload, which measures
+    # 60 MB/s, against 614 MB/s for the HMAC that protects it. Sealing a 642 MB
+    # save for two peers is ~25 s of pure CPU; signing it is ~2 s. On a save
+    # transfer that is the difference between minutes and seconds.
+    #
+    # WHAT THIS COSTS: confidentiality of the save file, and nothing else.
+    # Authenticity and integrity are unchanged (same HMAC over nonce||payload),
+    # replay is still rejected by the same window, and every file additionally
+    # carries a SHA-256 that the receiver verifies before writing. An observer
+    # on the wire could read the map you are playing. Control messages (join,
+    # chat, roster, start) keep full encryption.
+    #
+    # Enabled per-frame by the caller, never globally: see TYPE_ADATA in
+    # punch.py and _pack_data(bulk=True) in lobby.py.
+    def sign(self, plain: bytes) -> bytes:
+        with self._lock:
+            self.ctr += 1
+            if self.ctr > 0xFFFFFFFF:
+                self.salt = os.urandom(4)
+                self.ctr = 1
+            nonce = self.salt + struct.pack("!I", self.ctr)
+        tag = hmac.new(self.mac_key, SIGN_DOMAIN + nonce + plain,
+                       hashlib.sha256).digest()[:TAG_LEN]
+        return nonce + plain + tag
+
+    def unsign(self, data: bytes):
+        """-> plaintext, or None (bad tag / replay / malformed)."""
+        if len(data) < NONCE_LEN + TAG_LEN:
+            self.rejected += 1
+            return None
+        nonce, body, tag = data[:NONCE_LEN], data[NONCE_LEN:-TAG_LEN], data[-TAG_LEN:]
+        want = hmac.new(self.mac_key, SIGN_DOMAIN + nonce + body,
+                        hashlib.sha256).digest()[:TAG_LEN]
+        if not hmac.compare_digest(want, tag):
+            self.rejected += 1
+            return None
+        if not self._accept_nonce(nonce):
+            return None
+        return body
+
+    # Replay window, shared by open() and unsign() so a frame of either kind
+    # can only be accepted once per (sender salt, counter).
+    def _accept_nonce(self, nonce: bytes) -> bool:
+        salt, ctr = nonce[:4], struct.unpack("!I", nonce[4:])[0]
+        with self._lock:
+            w = self._windows.get(salt)
+            if w is None:
+                self._windows[salt] = [ctr, 1]
+                return True
+            high, bits = w
+            if ctr > high:
+                shift = ctr - high
+                w[0], w[1] = ctr, ((bits << shift) | 1) & ((1 << WINDOW) - 1)
+                return True
+            back = high - ctr
+            if back >= WINDOW or (bits >> back) & 1:
+                self.rejected += 1
+                return False                     # replayed or too old
+            w[1] = bits | (1 << back)
+            return True
+
     def open(self, data: bytes):
         """-> plaintext, or None (bad tag / replay / malformed)."""
         if len(data) < NONCE_LEN + TAG_LEN:
@@ -98,23 +169,8 @@ class Sealer:
         if not hmac.compare_digest(want, tag):
             self.rejected += 1
             return None
-        salt, ctr = nonce[:4], struct.unpack("!I", nonce[4:])[0]
-        with self._lock:
-            w = self._windows.get(salt)
-            if w is None:
-                self._windows[salt] = [ctr, 1]
-            else:
-                high, bits = w
-                if ctr > high:
-                    shift = ctr - high
-                    bits = ((bits << shift) | 1) & ((1 << WINDOW) - 1)
-                    w[0], w[1] = ctr, bits
-                else:
-                    back = high - ctr
-                    if back >= WINDOW or (bits >> back) & 1:
-                        self.rejected += 1
-                        return None                  # replayed or too old
-                    w[1] = bits | (1 << back)
+        if not self._accept_nonce(nonce):
+            return None
         return _xor(ct, _keystream(self.enc_key, nonce, len(ct)))
 
 
@@ -139,6 +195,21 @@ def selftest():
     frames = [a.seal(bytes([i])) for i in range(10)]
     for f in reversed(frames):
         if b.open(f) is None: ok = False; print("[seal] FAIL reorder rejected")
+    # sign/unsign: same guarantees minus confidentiality
+    s2 = Sealer(k); v2 = Sealer(k)
+    m = os.urandom(1200)
+    sg = s2.sign(m)
+    if m not in sg: ok = False; print("[seal] FAIL sign is supposed to be plaintext")
+    if v2.unsign(sg) != m: ok = False; print("[seal] FAIL sign roundtrip")
+    if v2.unsign(sg) is not None: ok = False; print("[seal] FAIL sign replay accepted")
+    t2 = bytearray(s2.sign(m)); t2[NONCE_LEN] ^= 1
+    if v2.unsign(bytes(t2)) is not None: ok = False; print("[seal] FAIL sign tamper accepted")
+    if Sealer(derive_key(os.urandom(SECRET_LEN), "")).unsign(s2.sign(m)) is not None:
+        ok = False; print("[seal] FAIL sign wrong key accepted")
+    # a signed frame must NOT open as sealed, and vice versa
+    if v2.open(s2.sign(m)) is not None: ok = False; print("[seal] FAIL signed frame verified as sealed")
+    if Sealer(k).unsign(Sealer(k).seal(m)) is not None:
+        ok = False; print("[seal] FAIL sealed frame verified as signed")
     # the 2^32 counter wrap must roll the salt: same salt + repeated counter is
     # a repeated keystream, which is the one way this construction breaks
     w = Sealer(k)

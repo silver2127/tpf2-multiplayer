@@ -155,7 +155,7 @@ import time
 # Reuse the transport verbatim -- do NOT reinvent the framing/handshake.
 from punch import (
     DEFAULT_PORT, TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE,
-    TYPE_DATA, TYPE_EDATA, _pack, _unpack, open_socket,
+    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, _pack, _unpack, open_socket,
 )
 from seal import Sealer, derive_key, SECRET_LEN
 # Reuse the code exchange + the connect race + observe/announce.
@@ -183,13 +183,18 @@ CHAT_BURST = 3          # copies of a chat/start packet (best-effort redundancy;
 # recovery (cumulative base + selective NACKs) while the host streams within a
 # flow-control window and retransmits on request. Correct under any loss pattern
 # and pipelined (never stop-and-wait), so a ~200 MB save moves at link speed.
+CHUNK_LOCAL = 8192          # bytes of file data per chunk when every target peer is
+                            # on 127.0.0.1. 1200 exists to fit an internet MTU; on
+                            # loopback it just multiplies the per-datagram cost.
+                            # NOT used on a LAN: 8 KB fragments at 1500 MTU and one
+                            # lost fragment loses the whole chunk.
 CHUNK_DATA = 1200           # bytes of file data per chunk. Datagram on the wire =
                             # NP1 frame(5) + chunk header(12) + 1200 = 1217 bytes,
                             # under the 1280 IPv6 min-MTU and 1500 v4 MTU (even
                             # through PPPoE/VPN overhead) -- no fragmentation.
 CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
                             # binary chunk, not a JSON lobby message ('{' != 'N').
-SEND_WINDOW = 2048          # chunks a peer may have in flight (~2.4 MB); pipelines
+SEND_WINDOW = 16384         # chunks a peer may have in flight; pipelines
                             # the link so RTT doesn't throttle a big transfer.
 SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds the
                             # time one host loop iteration spends, so pings/roster
@@ -490,8 +495,20 @@ SEAL = [None]               # the process-wide seal.Sealer, or None (plaintext)
 REJECT_PLAIN_EVERY = 2.0    # host: rate limit for the plain reject per address
 
 
-def _pack_data(payload):
+def _pack_data(payload, bulk=False):
+    """Frame an application payload.
+
+    bulk=True is for SAVE CHUNKS ONLY: authenticated but not encrypted (type A).
+    The keystream costs one SHA-256 per 32 bytes (60 MB/s measured) against
+    614 MB/s for the HMAC protecting it, so encrypting a 642 MB save for two
+    peers was ~25 s of pure CPU. Authenticity, integrity and replay protection
+    are unchanged; the save's own per-file SHA-256 is still verified before
+    anything is written. Only confidentiality of the map file is given up.
+    Every control message (join/chat/roster/start) stays fully sealed.
+    """
     if SEAL[0] is not None:
+        if bulk:
+            return _pack(TYPE_ADATA, SEAL[0].sign(payload))
         return _pack(TYPE_EDATA, SEAL[0].seal(payload))
     return _pack(TYPE_DATA, payload)
 
@@ -802,12 +819,33 @@ class _HostSaveTransfer:
     and are routed in via on_begin_ack / on_fack / on_fdone.
     """
 
+    @staticmethod
+    def _pick_chunk(targets):
+        """Big chunks when nobody is across the internet.
+
+        The chunking is decided ONCE for the whole transfer (one blob, one
+        sequence space shared by every peer), so this is all-or-nothing: a
+        single non-loopback peer puts everyone back on the MTU-safe size.
+
+        LOOPBACK ONLY, deliberately. An 8 KB datagram on a 1500-MTU LAN is IP
+        fragmented into ~6 pieces and losing any one loses the whole chunk, so
+        a bigger chunk would make a lossy wifi link WORSE. On 127.0.0.1 there
+        is no MTU to speak of and no loss, and the win is real: a 642 MB save
+        is 535k chunks at 1200 B against 78k at 8192 B, each costing a sign, a
+        pack and a sendto in single-threaded Python.
+        """
+        for addr, _name in targets:
+            host = addr[0] if isinstance(addr, tuple) else str(addr)
+            if not host.startswith("127."):
+                return CHUNK_DATA
+        return CHUNK_LOCAL
+
     def __init__(self, sock, sid, blob, files_meta, targets, io, log):
         self.sock = sock
         self.sid = sid
         self.blob = blob
         self.total_bytes = len(blob)
-        self.chunk = CHUNK_DATA
+        self.chunk = self._pick_chunk(targets)
         self.total_chunks = (self.total_bytes + self.chunk - 1) // self.chunk
         self.files_meta = files_meta
         self.overall_sha = hashlib.sha256(blob).hexdigest()
@@ -827,7 +865,9 @@ class _HostSaveTransfer:
                 "state": "active", "last_pct": -1,
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
-                 f"{self.total_chunks} chunks -> {len(self.peers)} peer(s)")
+                 f"{self.total_chunks} chunks of {self.chunk}B "
+                 f"({'local' if self.chunk == CHUNK_LOCAL else 'internet-safe'}) "
+                 f"-> {len(self.peers)} peer(s)")
 
     # -- progress ---------------------------------------------------------- #
     def _emit_pct(self, p):
@@ -847,7 +887,7 @@ class _HostSaveTransfer:
         data = self.blob[off:off + self.chunk]
         frame = CHUNK_MAGIC + struct.pack("!II", self.sid, seq) + data
         try:
-            self.sock.sendto(_pack_data(frame), addr)
+            self.sock.sendto(_pack_data(frame, bulk=True), addr)
         except OSError:
             pass                      # kernel buffer full etc.; ARQ will re-send
 
@@ -1150,20 +1190,31 @@ class _ClientSaveReceiver:
 
     # -- assemble + verify + write ----------------------------------------- #
     def _finalize(self):
+        # ZERO-COPY. This used to do bytes(self.buf[off:off+size]) per file and
+        # bytes(self.buf) for the overall hash -- three full copies of the whole
+        # save. On a 642 MB map that is ~1.9 GB of allocation and memcpy on top
+        # of the two SHA-256 passes, all of it AFTER the progress bar has
+        # reported 100%, which is exactly what "it hangs at the end" was.
+        # bytearray and memoryview both support the buffer protocol, so hashlib
+        # and file.write take them directly and none of those copies are needed.
+        t0 = time.time()
         ok = True
         off = 0
         parts = {}
+        view = memoryview(self.buf)
         for meta in self.files:
             size = int(meta.get("size", 0))
-            part = bytes(self.buf[off:off + size])
+            part = view[off:off + size]                  # a window, not a copy
             off += size
             if hashlib.sha256(part).hexdigest() != meta.get("sha256"):
                 ok = False
                 break
             parts[meta.get("name")] = part
         if ok and self.overall_sha:
-            if hashlib.sha256(bytes(self.buf)).hexdigest() != self.overall_sha:
+            if hashlib.sha256(self.buf).hexdigest() != self.overall_sha:
                 ok = False
+        self.log(f"[client] save verify: {self.total_bytes}B in "
+                 f"{time.time() - t0:.1f}s ({'ok' if ok else 'MISMATCH'})")
         if not ok:
             self.retries += 1
             if self.retries <= MAX_FILE_RETRIES:
@@ -1185,11 +1236,16 @@ class _ClientSaveReceiver:
                     self._fail(f"refused: unexpected filename {name!r}")
                     return
                 with open(os.path.join(self.io.dir, name), "wb") as f:
-                    f.write(parts[name])
+                    f.write(parts[name])                 # memoryview: no copy
                 written.append(name)
         except OSError as e:
             self._fail(f"write error: {e}")
             return
+        # Release the memoryviews before the bytearray they borrow from can be
+        # dropped; a lingering export would keep the whole save alive.
+        for v in parts.values():
+            v.release()
+        view.release()
         self.complete = True
         self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
         self.io.emit({"type": "save_ready", "name": INCOMING_BASENAME,
@@ -1614,6 +1670,21 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     elif ptype == TYPE_KEEPALIVE:
                         if addr in peers:
                             peers[addr]["last"] = now
+                    elif ptype == TYPE_ADATA:
+                        # Authenticated, not encrypted (bulk save chunks).
+                        # Only trusted in a sealed session: a plaintext session
+                        # has no key to verify with, so an unauthenticated bulk
+                        # frame is never accepted.
+                        #
+                        # The dispatch to handle_data is NOT optional. This
+                        # branch originally verified the payload and then fell
+                        # out of the if/elif chain, so a valid signed frame was
+                        # silently dropped. Harmless while only the host sends
+                        # bulk, but it would quietly swallow joiner-side bulk
+                        # traffic (e.g. peer-to-peer save fanout over the mesh).
+                        plain = SEAL[0].unsign(payload) if SEAL[0] is not None else None
+                        if plain is not None:
+                            handle_data(addr, plain)
                     elif ptype == TYPE_EDATA:
                         if SEAL[0] is None:
                             continue                        # we run plaintext

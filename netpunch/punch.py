@@ -52,6 +52,14 @@ TYPE_CONNECTED = b"C"               # payload = our token (informational)
 TYPE_KEEPALIVE = b"K"              # payload = our token
 TYPE_DATA = b"D"                     # payload = application bytes
 TYPE_EDATA = b"E"                    # payload = sealed application bytes (seal.py)
+TYPE_ADATA = b"A"                    # payload = AUTHENTICATED but NOT encrypted
+                                     # (seal.sign). Bulk save chunks only: the
+                                     # keystream is 10x slower than the HMAC that
+                                     # protects it, and a 642 MB save made that the
+                                     # transfer bottleneck. Same tag, same replay
+                                     # window, domain-separated MAC; only
+                                     # confidentiality is given up, and only for the
+                                     # save file. Control messages stay type E.
 
 DEFAULT_PORT = 29471
 HELLO_INTERVAL = 0.10                # seconds between HELLO bursts
@@ -211,6 +219,14 @@ class Connection:
             elif ptype == TYPE_EDATA:
                 if self.cipher is not None:
                     plain = self.cipher.open(payload)
+                    if plain is not None:
+                        self._inbox.put(plain)
+            elif ptype == TYPE_ADATA:
+                # Authenticated, not encrypted. Only accepted in a sealed
+                # session -- a plaintext session has no key to verify with, so
+                # an unauthenticated bulk frame is never trusted.
+                if self.cipher is not None:
+                    plain = self.cipher.unsign(payload)
                     if plain is not None:
                         self._inbox.put(plain)
             elif ptype == TYPE_DATA:
