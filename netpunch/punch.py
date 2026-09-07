@@ -33,6 +33,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
 import select
@@ -57,7 +58,10 @@ TYPE_EDATA = b"E"                    # payload = sealed application bytes (seal.
 # not the other way round -- and a one-way import must not become a cycle.
 CHUNK_PREFIX = b"NPF1"
 
-TYPE_ADATA = b"A"                    # payload = AUTHENTICATED but NOT encrypted
+TYPE_ADATA = b"S"                    # payload = AUTHENTICATED but NOT encrypted (Signed).
+                                     # MUST NOT reuse b"A" (TYPE_ACK): the dispatch tests
+                                     # ACK first, so a shared tag makes this branch dead
+                                     # code and every signed chunk is eaten as an ACK.
                                      # (seal.sign). Bulk save chunks only: the
                                      # keystream is 10x slower than the HMAC that
                                      # protects it, and a 642 MB save made that the
@@ -272,10 +276,20 @@ class Connection:
                 # "any bulk frame": every control message (join, roster, chat,
                 # start) is JSON and stays sealed, so no unauthenticated frame
                 # can ever be parsed as one.
-                if (self.cipher is None
-                        or payload.startswith(b'{"t": "reject"')
-                        or payload.startswith(CHUNK_PREFIX)):
+                if self.cipher is None or payload.startswith(CHUNK_PREFIX):
                     self._inbox.put(payload)
+                elif payload.startswith(b'{"t": "reject"'):
+                    # Re-verify it is ACTUALLY a reject before admitting it. A
+                    # loose startswith is bypassable: json is last-key-wins, so
+                    # b'{"t": "reject", "t": "start"}' passes the prefix yet
+                    # parses to t="start", smuggling a control message into a
+                    # sealed session (audit 2026-09-07). Parse and confirm.
+                    try:
+                        _obj = json.loads(payload.decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        _obj = None
+                    if isinstance(_obj, dict) and _obj.get("t") == "reject":
+                        self._inbox.put(payload)
 
     # -- public API -------------------------------------------------------- #
     def wait(self, timeout=None) -> bool:

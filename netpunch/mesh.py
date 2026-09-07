@@ -270,12 +270,13 @@ class MeshNode:
                 elif ptype == TYPE_DATA:
                     # Save chunks travel as plaintext DATA even in a sealed
                     # session (BULK_PLAIN) -- the map is not a secret and the
-                    # per-file SHA-256 guards it. Mirror punch.py exactly: accept
-                    # a chunk by its CHUNK_PREFIX, still refuse any other
-                    # plaintext (control stays sealed).
-                    if (self.cipher is None
-                            or payload.startswith(b'{"t": "reject"')
-                            or payload.startswith(CHUNK_PREFIX)):
+                    # per-file SHA-256 guards it. Accept a chunk by its
+                    # CHUNK_PREFIX and refuse ALL other plaintext. Unlike
+                    # punch.py there is NO reject carve-out here: a meshed peer
+                    # is already authenticated and never legitimately receives a
+                    # plaintext wrong-password reject, so admitting one would be
+                    # pure attack surface (audit 2026-09-07).
+                    if self.cipher is None or payload.startswith(CHUNK_PREFIX):
                         self.inbox.put((addr, payload))
 
     def close(self):
