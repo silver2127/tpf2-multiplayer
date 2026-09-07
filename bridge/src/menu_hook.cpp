@@ -848,7 +848,7 @@ static void RenderPanelLayer(int w, int h)
         mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
-        mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD  --  locks the code: without it, anyone who sees the code can read your address");
+        mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD  --  use if you post the code publicly; anyone who has it can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
           mwField(pad, cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
         mwStatus(w, h);
