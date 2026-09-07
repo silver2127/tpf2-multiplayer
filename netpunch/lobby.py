@@ -194,8 +194,25 @@ CHUNK_DATA = 1200           # bytes of file data per chunk. Datagram on the wire
                             # through PPPoE/VPN overhead) -- no fragmentation.
 CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
                             # binary chunk, not a JSON lobby message ('{' != 'N').
-SEND_WINDOW = 16384         # chunks a peer may have in flight; pipelines
-                            # the link so RTT doesn't throttle a big transfer.
+# Chunks a peer may have in flight. LOCALITY-DEPENDENT, for the same reason the
+# chunk size is, and getting this wrong is worse than getting the chunk size
+# wrong: the window is how much UNACKNOWLEDGED data we are willing to blast
+# before hearing anything back.
+#
+# 16384 chunks x 1200 B is ~19.7 MB in flight against a 4 MB socket buffer
+# (XFER_BUF_BYTES). On loopback that is harmless -- there is no loss and the
+# receiver drains faster than we can send. Across the internet it overruns the
+# receiver's buffer immediately, almost everything after the first few MB is
+# dropped, the cumulative base never advances, and the transfer sits at 0% until
+# it times out. Measured live 2026-09-07: a 114 MB save to a remote joiner made
+# no progress at all, while the loopback selftest passed at 11 MB/s -- which is
+# exactly why a loopback-only test could not catch it.
+#
+# The remote value is bounded by the receive buffer: 2048 x 1200 B = 2.4 MB sits
+# inside the 4 MB buffer with room for reordering, and is the value every
+# internet transfer before this ran on.
+SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
+SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
 SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds the
                             # time one host loop iteration spends, so pings/roster
                             # for OTHER peers keep being serviced during a send.
@@ -805,7 +822,7 @@ class _HostSaveTransfer:
     held in memory once and fanned out to every peer. Reliability is
     receiver-driven selective repeat:
 
-      * the host streams chunks within a flow-control window (SEND_WINDOW);
+      * the host streams chunks within a flow-control window (self.window);
       * each receiver periodically reports its cumulative ``base`` (every chunk
         below base is in hand) plus an explicit ``nack`` list of holes;
       * the host drops everything below base, retransmits NACKed chunks first,
@@ -840,12 +857,23 @@ class _HostSaveTransfer:
                 return CHUNK_DATA
         return CHUNK_LOCAL
 
+    @staticmethod
+    def _pick_window(chunk):
+        """The window follows the same all-or-nothing locality call as the chunk.
+
+        Tied to the chunk size rather than re-deriving locality so the two can
+        never disagree: a big window with MTU-safe chunks is precisely the
+        combination that stalled a real transfer.
+        """
+        return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
+
     def __init__(self, sock, sid, blob, files_meta, targets, io, log):
         self.sock = sock
         self.sid = sid
         self.blob = blob
         self.total_bytes = len(blob)
         self.chunk = self._pick_chunk(targets)
+        self.window = self._pick_window(self.chunk)
         self.total_chunks = (self.total_bytes + self.chunk - 1) // self.chunk
         self.files_meta = files_meta
         self.overall_sha = hashlib.sha256(blob).hexdigest()
@@ -996,7 +1024,7 @@ class _HostSaveTransfer:
                 self._send_chunk(addr, seq)
                 budget -= 1
             # 2) new in-order chunks, capped by the flow-control window
-            limit = min(self.total_chunks, p["base"] + SEND_WINDOW)
+            limit = min(self.total_chunks, p["base"] + self.window)
             while budget > 0 and p["next"] < limit:
                 self._send_chunk(addr, p["next"])
                 p["next"] += 1
@@ -1035,6 +1063,7 @@ class _ClientSaveReceiver:
         self.have = None
         self.total_bytes = 0
         self.chunk = CHUNK_DATA
+        self.window = SEND_WINDOW_REMOTE
         self.total_chunks = 0
         self.files = []
         self.overall_sha = None
@@ -1084,6 +1113,9 @@ class _ClientSaveReceiver:
         self.sid = sid
         self.total_bytes = int(msg.get("total_bytes", 0))
         self.chunk = int(msg.get("chunk", CHUNK_DATA)) or CHUNK_DATA
+        # Same rule as the host, derived from the chunk it actually chose,
+        # so the two ends agree how far ahead the NACK scan should look.
+        self.window = SEND_WINDOW_LOCAL if self.chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = msg.get("files", [])
         # Validate the proposed names BEFORE allocating or acking: a rejected
@@ -1169,7 +1201,7 @@ class _ClientSaveReceiver:
 
     def _send_fack(self):
         nack = []
-        limit = min(self.total_chunks, self.base + SEND_WINDOW)
+        limit = min(self.total_chunks, self.base + self.window)
         s = self.base
         while s < limit and len(nack) < MAX_NACK:
             if not self.have[s]:

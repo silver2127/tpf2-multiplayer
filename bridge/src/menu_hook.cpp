@@ -764,13 +764,24 @@ static void RenderPanelLayer(int w, int h)
         // ---------------- LOBBY ----------------
         mwTitle(L"LOBBY"); mwClose(w, 5);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
-            // room code beside the title, click to copy
-            wchar_t wcode[160]; MultiByteToWideChar(CP_UTF8, 0, g_code, -1, wcode, 160);
+            // ROOM CODE, DELIBERATELY NOT RENDERED.
+            //
+            // The code IS the credential: anyone who can read it can join
+            // the lobby. On a stream, a screenshot or over a shoulder it is
+            // handed to everyone watching, and unlike a password nobody ever
+            // needs to TYPE it -- the legitimate way to pass it on is the
+            // clipboard, which the click below already does. So the button
+            // shows a placeholder and the code itself only ever leaves via
+            // ClipboardSet.
+            //
+            // The placeholder is a FIXED string, not the real code masked:
+            // sizing the button from the code would leak its length.
+            const wchar_t* wcode = L"\u2022\u2022\u2022  ROOM CODE  \u2022\u2022\u2022";
             HFONT fm = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Consolas");
             int cw = textW(wcode, fm) + S(20), cx = S(25) + S(90);
             layerRect(cx, S(11), cw, S(26), RGB(0, 0, 0), 50);
             layerText(cx + S(10), S(11), cw, S(26), wcode, fm, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fm);
-            HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
+            HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy (never shown)", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
             addHit(cx, S(11), cw, S(26), 7, true);
         }
         int bottom = h - S(44);
