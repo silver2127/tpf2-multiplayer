@@ -509,6 +509,38 @@ class LobbyIO:
 # reject so a joiner learns why it is being ignored.
 # --------------------------------------------------------------------------- #
 SEAL = [None]               # the process-wide seal.Sealer, or None (plaintext)
+# Send bulk save chunks AUTHENTICATED-ONLY (type A) instead of sealed (type E).
+#
+# OFF, because it is the one behavioural difference between the build that
+# demonstrably transferred a save between these machines and the build that sits
+# at 0% forever, and a transfer that works beats one that is 10x faster in
+# theory. It is not proven guilty: the crypto round-trips correctly in isolation
+# and the send/receive plumbing is identical to the sealed path. What is proven
+# is that NOTHING tested it -- _run_transfer_once never sets SEAL[0], so every
+# self-test ran the plaintext branch and the signed branch has never once been
+# exercised end to end.
+#
+# Turning this back on needs a test that seals with a SEPARATE Sealer per peer
+# (one process-wide Sealer makes every in-process member share a salt and a
+# replay window, which breaks the join before a chunk is ever sent -- measured).
+BULK_SIGN = False
+# Send save chunks with NO crypto at all -- not sealed, not signed.
+#
+# The map file is not a secret and does not need confidentiality. Integrity is
+# already guaranteed by something stronger than the frame MAC: every file in the
+# transfer carries a SHA-256 that the receiver verifies before it writes
+# anything, plus an overall hash, and a transfer that fails either is rejected
+# and retried rather than loaded. A corrupted or injected chunk therefore costs
+# a retry, not a bad save.
+#
+# It also takes the whole per-chunk crypto cost off the transfer: the keystream
+# alone measured 60 MB/s, which on a 642 MB save is tens of seconds of CPU
+# before a byte moves.
+#
+# Control traffic is untouched. Every join, roster, chat and start message stays
+# sealed, and the receiver's plaintext carve-out is keyed on the CHUNK_MAGIC
+# prefix, so nothing that is not a save chunk can arrive unauthenticated.
+BULK_PLAIN = True
 REJECT_PLAIN_EVERY = 2.0    # host: rate limit for the plain reject per address
 
 
@@ -523,8 +555,13 @@ def _pack_data(payload, bulk=False):
     anything is written. Only confidentiality of the map file is given up.
     Every control message (join/chat/roster/start) stays fully sealed.
     """
+    if bulk and BULK_PLAIN:
+        # Save chunks go out in the clear even in a sealed session. The receiver
+        # only accepts plaintext whose first four bytes are CHUNK_MAGIC, so this
+        # cannot be used to inject a control message.
+        return _pack(TYPE_DATA, payload)
     if SEAL[0] is not None:
-        if bulk:
+        if bulk and BULK_SIGN:
             return _pack(TYPE_ADATA, SEAL[0].sign(payload))
         return _pack(TYPE_EDATA, SEAL[0].seal(payload))
     return _pack(TYPE_DATA, payload)

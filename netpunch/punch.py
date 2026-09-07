@@ -52,6 +52,11 @@ TYPE_CONNECTED = b"C"               # payload = our token (informational)
 TYPE_KEEPALIVE = b"K"              # payload = our token
 TYPE_DATA = b"D"                     # payload = application bytes
 TYPE_EDATA = b"E"                    # payload = sealed application bytes (seal.py)
+# The 4-byte tag a save chunk starts with (lobby.CHUNK_MAGIC). Duplicated here
+# rather than imported because punch.py is the lower layer -- lobby imports it,
+# not the other way round -- and a one-way import must not become a cycle.
+CHUNK_PREFIX = b"NPF1"
+
 TYPE_ADATA = b"A"                    # payload = AUTHENTICATED but NOT encrypted
                                      # (seal.sign). Bulk save chunks only: the
                                      # keystream is 10x slower than the HMAC that
@@ -230,9 +235,25 @@ class Connection:
                     if plain is not None:
                         self._inbox.put(plain)
             elif ptype == TYPE_DATA:
-                # a sealed session refuses plaintext, except the host's plain
-                # "wrong password" reject so the user learns why nothing works
-                if self.cipher is None or payload.startswith(b'{"t": "reject"'):
+                # A sealed session refuses plaintext, with exactly two carve-outs
+                # -- both narrow, both matched on a literal prefix so no other
+                # message can slip through as one of them:
+                #
+                #   * the host's plain "wrong password" reject, so the user
+                #     learns why nothing works;
+                #   * SAVE CHUNKS (b"NPF1"), which carry the map file. They are
+                #     not worth encrypting: the map is not a secret, and what
+                #     actually protects the transfer is the per-file SHA-256 the
+                #     receiver verifies before writing anything, which catches a
+                #     corrupted or injected chunk regardless of framing.
+                #
+                # The carve-out is deliberately for the CHUNK PREFIX and not for
+                # "any bulk frame": every control message (join, roster, chat,
+                # start) is JSON and stays sealed, so no unauthenticated frame
+                # can ever be parsed as one.
+                if (self.cipher is None
+                        or payload.startswith(b'{"t": "reject"')
+                        or payload.startswith(CHUNK_PREFIX)):
                     self._inbox.put(payload)
 
     # -- public API -------------------------------------------------------- #
