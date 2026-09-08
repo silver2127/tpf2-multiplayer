@@ -7,7 +7,9 @@ reverse-engineered, and written without access to the engine source. Two or more
 one world at the same time: roads, rails, stations, depots, vehicles and lines made by one
 player appear on the other's map, executed at the same in-game moment. Two modes share
 the same mod: **co-op**, where both play one shared company, and **companies**, where each
-player owns a separate company and wallet on the same map. 
+player owns a separate company and wallet on the same map. Alpha: verified between two
+machines on different networks; the lobby seats eight, the sync itself has only run
+between two.
 
 ## Installing
 
@@ -16,9 +18,11 @@ player owns a separate company and wallet on the same map.
 game, run it. It finds the game folder from Steam's registry entry, installs the
 proxy `alut.dll` (the original is kept as `alut_real.dll`), the lockstep DLLs and
 their cfgs, the `mp_lockstep_1` mod into `<game>\mods`, and the frozen lobby into
-`<game>
-etpunch`. Runtime files go to `%LOCALAPPDATA%	pf2mp\data`. Uninstall from
-*Apps* (restores `alut.dll`); Steam's *Verify integrity of game files* also undoes it.
+`<game>\netpunch`. It also sets the Segment Heap switch for `TransportFever2.exe` (a
+registry value; big saves load about 15x faster, see `installer/README.md`). Runtime
+files go to `%LOCALAPPDATA%\tpf2mp\data`. Uninstall from *Apps* (restores `alut.dll`);
+Steam's *Verify integrity of game files* also undoes it. Installs alongside
+[TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order.
 
 Never copy the mod into `userdata\<id>\1066780\local\mods`: the game treats a mod
 loaded from there as a different mod (`!mp_lockstep`), and saves made with it refuse to
@@ -52,21 +56,22 @@ MSI does, from the build outputs.
 3. Each joiner copies the code and presses **JOIN**; the panel reads it from the clipboard.
 4. The roster and chat live in the same panel.
 5. The host presses **START GAME** (with at least one joiner). The host's newest save
-   (`.sav`, `.sav.lua`, `.jpg`) is sent to every joiner, placed as `mp_shared.sav` and
-   stamped newest on all machines, and each game clicks **Continue** to load it. A joiner
-   whose transfer failed is told to have the host press START GAME again.
+   (`.sav`, `.sav.lua`, `.jpg`) is sent to every joiner and placed as `mp_shared.sav` on
+   all machines; each player opens **Load Game** and picks it. A joiner whose transfer
+   failed is told to have the host press START GAME again.
 
 ## Contributing and credits
 
-Issues and pull requests are welcome, especially reproductions with the trace files
-above attached. Please keep the project's habits: every destructive replication channel
+Issues and pull requests are welcome, especially reproductions with the logs from
+`%LOCALAPPDATA%\tpf2mp\data` attached. Please keep the project's habits: every destructive replication channel
 ships behind a flag that defaults off, and a field identification counts only when a
 differential sweep confirms it.
 
 - Companies mode is inspired by, and reuses the engine mechanisms proven in, Swiss's
   **Multiplayer Companies** Workshop mod (id 3710243057): runtime `addPlayer`,
   `setPlayer`, `bookJournalEntry` to a specific player, `setBulldozeable`.
-  
+- [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) grew out of this project:
+  maps past the New Game menu's sizes, as a plugin for the same proxy.
 - Licensed under the [MIT License](LICENSE). Third-party material is listed in
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
