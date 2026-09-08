@@ -4471,36 +4471,42 @@ execConX = function(c)
 			if c.strictHealsSplit then
 				local healed = 0
 				pcall(function()
-					local sposH = {}
-					for tok in tostring(c.spos or ""):gmatch("[^;]+") do
-						local f = {}
-						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
-						if #f == 4 then sposH[f[1]] = { f[2], f[3] } end
-					end
-					local addsH = {}
+					-- Identify the split node EXACTLY as the peer resolver does: the
+					-- added node that has an added edge to BOTH endpoints of a removed
+					-- edge. The first version derived the point from srm+spos instead,
+					-- and spos carries only ADDS' endpoints -- the removed edge's far end
+					-- is a node the native build removed, so it is on no added edge and
+					-- was missing from spos. The heal found no point, the rebuild then
+					-- collided with the untouched native split node (added node 0.000 m
+					-- from an EXISTING node) and was refused, and the depot -- already
+					-- bulldozed in phase 1 -- was lost on the originator (2026-09-08).
+					-- This test needs only snodes + sedges + srm, all of which ship.
+					local addsH, nodesH, rmsH = {}, {}, {}
 					for tok in tostring(c.snodes or ""):gmatch("[^;]+") do
 						local f = {}
 						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
-						if #f == 4 then addsH[#addsH + 1] = { f[2], f[3] } end
+						if #f == 4 then nodesH[f[1]] = { f[2], f[3] } end
+					end
+					for tok in tostring(c.sedges or ""):gmatch("[^;]+") do
+						local f = {}
+						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+						if #f >= 2 then addsH[#addsH + 1] = { f[1], f[2] } end
 					end
 					for tok in tostring(c.srm or ""):gmatch("[^;]+") do
-						local r = {}
-						for v in tok:gmatch("[^,]+") do r[#r + 1] = tonumber(v) end
-						local pa, pb = sposH[r[1]], sposH[r[2]]
-						if pa and pb then
-							local ax, ay, bx, by = pa[1], pa[2], pb[1], pb[2]
-							local vx, vy = bx - ax, by - ay
-							local L2 = vx * vx + vy * vy
-							if L2 > 1 then
-								for _, q in ipairs(addsH) do
-									local tt = ((q[1] - ax) * vx + (q[2] - ay) * vy) / L2
-									if tt > 0.02 and tt < 0.98 then
-										local px, py = ax + tt * vx, ay + tt * vy
-										if (q[1] - px) ^ 2 + (q[2] - py) ^ 2 < 2.25 then
-											if CM.healNodeAt(q[1], q[2], "strict pre-rebuild") then healed = healed + 1 end
-										end
-									end
-								end
+						local f = {}
+						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+						if #f >= 2 then rmsH[#rmsH + 1] = { f[1], f[2] } end
+					end
+					for _, r in ipairs(rmsH) do
+						for id, q in pairs(nodesH) do
+							local hitA, hitB = false, false
+							for _, e in ipairs(addsH) do
+								if (e[1] == id and e[2] == r[1]) or (e[2] == id and e[1] == r[1]) then hitA = true end
+								if (e[1] == id and e[2] == r[2]) or (e[2] == id and e[1] == r[2]) then hitB = true end
+							end
+							if hitA and hitB then
+								if CM.healNodeAt(q[1], q[2], "strict pre-rebuild") then healed = healed + 1 end
+								break
 							end
 						end
 					end
