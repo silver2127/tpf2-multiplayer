@@ -1135,9 +1135,22 @@ local function worldHash(now)
 		end)
 	end
 	CM.dashMoney, CM.dashLoan = mBal, mLoan
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t%d",
+	-- PEOPLE COUNT LANE (n:). The people sim is deterministic in lockstep, so
+	-- two instances at the same stamp must agree on how many sim persons
+	-- exist. They did not: a depot placed over town buildings left one
+	-- instance 6 people short of the other (847 vs 853) -- exactly the number
+	-- of buildings the placement demolished -- and the bus driving past those
+	-- buildings then drifted. A probe lane, not a verdict lane, until we know
+	-- whether the count ever legitimately jitters. Ids only (no includeData):
+	-- ~850 people is cheap to count and we never need their payload here.
+	local np = 0
+	pcall(function()
+		local tp = game.interface.getEntities({ radius = 999999 }, { type = "SIM_PERSON", includeData = false }) or {}
+		for _ in pairs(tp) do np = np + 1 end
+	end)
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t%d,n:%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
-		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt)
+		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt, np)
 	return verdict, detail
 end
 
@@ -5901,7 +5914,7 @@ local function compareOne(stamp, origin, theirs, dt)
 		local dm = myDetails[stamp]
 		if dm and dt then
 			CM.moneyGap = CM.moneyGap or {}
-			for lane, tag in pairs({ m = "MONEY", l = "LOAN" }) do
+			for lane, tag in pairs({ m = "MONEY", l = "LOAN", n = "PEOPLE" }) do
 				local a = dm:match(lane .. ":(%-?%d+)")
 				local b = dt:match(lane .. ":(%-?%d+)")
 				if a and b and a ~= "-" and b ~= "-" then
