@@ -2893,7 +2893,7 @@ local expectedDemolish = {}
 --
 -- Only ever touches a plain mid-road node: exactly two street edges, no track,
 -- nothing else hanging off it. Anything else is left alone and logged.
-function CM.healNodeAt(x, y, why)
+function CM.healNodeAt(x, y, why, origT)
 	local healed = false
 	pcall(function()
 		local nid = findNodeNear(false, x, y, 1.5)
@@ -2942,13 +2942,38 @@ function CM.healNodeAt(x, y, why)
 		local u = (total > 0.001) and (len[1] / total) or 0.5
 		local s1 = (u > 0.01) and (1.0 / u) or 1.0
 		local s2 = ((1 - u) > 0.01) and (1.0 / (1 - u)) or 1.0
+		local t0 = { tng[1][1] * s1, tng[1][2] * s1, tng[1][3] * s1 }
+		local t1 = { tng[2][1] * s2, tng[2][2] * s2, tng[2][3] * s2 }
+		-- EXACT GEOMETRY when the caller knows it. Reconstructing the merged edge
+		-- by rescaling the stubs' tangents assumes the split left them untouched,
+		-- but a native placement re-shapes them (terrain align + graph cleanup),
+		-- so the merged road is NOT the original road: it sits a little off, and
+		-- the rebuild's own graph cleanup then re-touches it along its length and
+		-- the buildings lining it get cleared -- collateral the peers, whose road
+		-- was never split, never see (measured: A 58 buildings vs peers 60,
+		-- 2026-09-08). The strict replay SHIPS the removed edge with its original
+		-- tangents, so the originator can put back exactly the road that was
+		-- there. origT = {t0x,t0y,t0z, t1x,t1y,t1z} oriented from the shipped
+		-- edge's node0 to node1; our merged edge runs far[1] -> far[2], so orient
+		-- by the chord: if the chord agrees with t0 the ends line up, otherwise
+		-- the shipped edge ran the other way and both tangents flip and swap.
+		if origT and #origT >= 6 then
+			local cx, cy = far[2][2][1] - far[1][2][1], far[2][2][2] - far[1][2][2]
+			if cx * origT[1] + cy * origT[2] >= 0 then
+				t0 = { origT[1], origT[2], origT[3] }
+				t1 = { origT[4], origT[5], origT[6] }
+			else
+				t0 = { -origT[4], -origT[5], -origT[6] }
+				t1 = { -origT[1], -origT[2], -origT[3] }
+			end
+		end
 		local sp = api.type.SimpleProposal.new()
 		local e = api.type.SegmentAndEntity.new()
 		e.entity = -1
 		e.comp.node0 = far[1][1]
 		e.comp.node1 = far[2][1]
-		e.comp.tangent0 = api.type.Vec3f.new(tng[1][1] * s1, tng[1][2] * s1, tng[1][3] * s1)
-		e.comp.tangent1 = api.type.Vec3f.new(tng[2][1] * s2, tng[2][2] * s2, tng[2][3] * s2)
+		e.comp.tangent0 = api.type.Vec3f.new(t0[1], t0[2], t0[3])
+		e.comp.tangent1 = api.type.Vec3f.new(t1[1], t1[2], t1[3])
 		e.comp.type = 0
 		e.comp.typeIndex = -1
 		e.type = 0
@@ -4495,7 +4520,7 @@ execConX = function(c)
 					for tok in tostring(c.srm or ""):gmatch("[^;]+") do
 						local f = {}
 						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
-						if #f >= 2 then rmsH[#rmsH + 1] = { f[1], f[2] } end
+						if #f >= 2 then rmsH[#rmsH + 1] = f end
 					end
 					for _, r in ipairs(rmsH) do
 						for id, q in pairs(nodesH) do
@@ -4505,7 +4530,8 @@ execConX = function(c)
 								if (e[1] == id and e[2] == r[2]) or (e[2] == id and e[1] == r[2]) then hitB = true end
 							end
 							if hitA and hitB then
-								if CM.healNodeAt(q[1], q[2], "strict pre-rebuild") then healed = healed + 1 end
+								local origT = (#r >= 8) and { r[3], r[4], r[5], r[6], r[7], r[8] } or nil
+								if CM.healNodeAt(q[1], q[2], "strict pre-rebuild", origT) then healed = healed + 1 end
 								break
 							end
 						end
