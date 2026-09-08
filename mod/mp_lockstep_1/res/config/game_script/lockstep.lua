@@ -131,7 +131,7 @@ K.EXEC_DELAY = 0.6
 -- keep K.EXEC_DELAY small for latency. The !! LATE warning measures the real skew
 -- -- if it starts firing, actual drift exceeds K.EXEC_DELAY and the delay must go
 -- up. That is a measurement, not a guess.
-K.BARRIER_AHEAD = 5.0
+K.BARRIER_AHEAD = 8.0   -- hard stop; above the micropause band (5.0) which paces first
 
 -- The most peer lead a command's stamp will pay for. Bigger than K.BARRIER_AHEAD
 -- on purpose: the barrier only starts acting AT that threshold, so real skew
@@ -9286,7 +9286,19 @@ CM.SPEED_DOWN = { [4] = 2, [2] = 1 }   -- deliberately no [1]: 1 is the floor
 -- loop settles -- while capping the steady-state skew near 1.2 instead of 3.
 -- Tightening further is measurement-bound, not gain-bound: the peer clock now
 -- reads to 0.2 units, so a band under ~1 would chatter on quantisation alone.
-CM.PACE_DWELL     = 5      -- ticks between pacing moves, both directions
+CM.PACE_DWELL     = 5      -- ticks between ordinary (non-micropause) speed nudges
+-- MICROPAUSE PACING. Every instance runs at the player's chosen speed. An
+-- instance that is behind or level simply STAYS at that speed and catches
+-- up -- it is never throttled (the old notch-down is what made a client that
+-- fell 1.2 units behind drop to speed 1 and never recover). Only an instance
+-- that has pulled more than PACE_MICRO_AHEAD ahead of the slowest peer
+-- micropauses: brief speed-0 pulses, each hard-capped at PACE_MICRO_MAX ticks
+-- so a pulse can never wedge the game, repeated until the lead is shaved back
+-- under PACE_MICRO_DONE. The hard barrier (K.BARRIER_AHEAD) sits above the
+-- micropause band as a rare backstop.
+CM.PACE_MICRO_AHEAD = 5.0   -- only slow down once this far ahead of the slowest
+CM.PACE_MICRO_DONE  = 2.0   -- stop pulsing once the lead is back under this
+CM.PACE_MICRO_MAX   = 3     -- max ticks per pause pulse (self-limiting)
 CM.THROTTLE_AHEAD = 1.2    -- above this we are too far ahead: one notch down
 CM.PACE_BEHIND    = 0.8    -- below -this we are the laggard: one notch up
 CM.catchingUp  = false
@@ -9364,7 +9376,9 @@ function CM.pace(ahead, lead)
 	if behind > 60 or behind < -60 then return end
 	local s
 	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
-	if s == 0 then                                   -- player paused on purpose
+	-- A speed of 0 is the PLAYER pausing -- unless it is OUR micropause pulse,
+	-- which must fall through to its own end-check below or it never ends.
+	if s == 0 and not CM.microPausing then           -- player paused on purpose
 		-- If we were mid-catch-up, the game will come back at OUR 2, not the
 		-- player's speed; remember to hand it back the moment it does.
 		if CM.catchingUp then CM.restoreAfterPause = CM.baseSpeed or 1 end
@@ -9405,58 +9419,38 @@ function CM.pace(ahead, lead)
 	-- ceiling -- re-accelerating us into the next throttle and completing the
 	-- limit cycle. The controller below holds instead, in both directions, off
 	-- a single signal.)
-	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
-	if CM.paceMovedAt and (ticks - CM.paceMovedAt) < CM.PACE_DWELL then return end
-	-- No reading of the slowest peer: nothing to pace against. The catch-up used
-	-- to run off the FASTEST peer here; that is the wrong end for a controller
-	-- whose job is to stop the barrier firing.
 	if lead == nil then return end
-
-	-- The player's speed is a CEILING we never exceed, and 1 is a floor we never
-	-- go under. Only the barrier may command 0, because only the barrier sets
-	-- `paused` and is therefore covered by K.MAX_PAUSE_TICKS.
 	local ceiling = CM.baseSpeed or CM.MAX_SPEED
 	if ceiling < 1 then ceiling = 1 end
 
-	if lead > CM.THROTTLE_AHEAD then
-		local down = CM.SPEED_DOWN[s]
-		if down then
-			CM.paceMovedAt = ticks
-			CM.catchingUp = (down ~= ceiling)
-			CM.setSpeed(down, string.format("%.2f ahead of the slowest peer", lead))
-		elseif not CM.pacedFloorWarned then
-			-- At the floor and still ahead: this machine is simply faster than
-			-- the slowest peer even at speed 1. The barrier takes it from here,
-			-- which is the one case where the game is allowed to stop.
-			CM.pacedFloorWarned = true
-			log(string.format("pace: %.2f ahead at speed %s -- at the floor, the barrier has it", lead, tostring(s)))
+	-- MICROPAUSE duty-cycle. Checked EVERY tick (exempt from the dwell) so a
+	-- pulse ends on time; the pulse is hard-capped so it cannot wedge.
+	if CM.microPausing then
+		if lead <= CM.PACE_MICRO_DONE or (ticks - (CM.microPausedAt or ticks)) >= CM.PACE_MICRO_MAX then
+			CM.microPausing = false
+			CM.setSpeed(ceiling, string.format("micropause done (%.2f ahead)", lead))
 		end
-	elseif lead < -CM.PACE_BEHIND then
-		CM.pacedFloorWarned = false
-		local up = CM.SPEED_UP[s]
-		if up and up > ceiling then up = ceiling end
-		if up and up > s then
-			CM.paceMovedAt = ticks
-			CM.catchingUp = (up ~= ceiling)
-			CM.setSpeed(up, string.format("%.2f behind the slowest peer", -lead))
-		elseif not CM.pacedTopWarned then
-			CM.pacedTopWarned = true
-			log(string.format("pace: %.2f behind at speed %s -- at the player's ceiling, nothing to give",
-				-lead, tostring(s)))
-		end
-	else
-		-- INSIDE THE DEADBAND: HOLD. Emphatically do NOT restore the ceiling
-		-- here. Snapping back to full speed the moment the lead looked healthy
-		-- is what re-accelerated us straight into the next throttle and made
-		-- the whole thing a limit cycle. If a lower notch is the speed that
-		-- keeps this instance level with the slowest peer, that is the correct
-		-- speed and it should simply be kept.
-		CM.pacedFloorWarned = false
-		CM.pacedTopWarned = false
-		-- Only adopt this as the player's speed if it is not one WE set:
-		-- recording our own throttle as "the player wants 2" would lower the
-		-- ceiling permanently.
-		if not CM.lastSetSpeed then CM.baseSpeed = s end
+		return
+	end
+	if lead > CM.PACE_MICRO_AHEAD then
+		-- too far ahead: pulse-pause to let the slowest peer close the gap
+		CM.microPausing = true
+		CM.microPausedAt = ticks
+		CM.setSpeed(0, string.format("micropause: %.2f ahead of the slowest peer", lead))
+		return
+	end
+
+	-- ordinary nudges honour the dwell so we do not spam setGameSpeed
+	if CM.paceQuietUntil and ticks < CM.paceQuietUntil then return end
+
+	-- BEHIND OR LEVEL: run at the player's chosen speed so we catch up. A
+	-- lagging client is NEVER throttled -- that was the bug (a client that fell
+	-- behind got dropped a notch and never came back). If we are below the
+	-- target, climb straight to it.
+	if s ~= ceiling then
+		CM.setSpeed(ceiling, string.format("resume to ceiling %d (%.2f ahead of slowest)", ceiling, lead))
+	elseif not CM.lastSetSpeed then
+		CM.baseSpeed = s   -- at the ceiling and it was not one we set: adopt as the player's
 	end
 end
 
