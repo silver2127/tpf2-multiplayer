@@ -2961,7 +2961,19 @@ function CM.healNodeAt(x, y, why)
 		-- with critical=true and 'Internal error (see console for details)'
 		-- (measured on the live peer, 2026-08-30).
 		sp.streetProposal.nodesToRemove[1] = nid
-		local cmd = api.cmd.make.buildProposal(sp, nil, true)
+		-- NEVER ignoreErrors here. A heal rebuilds the two stubs as ONE merged
+		-- edge, and that reconstituted Hermite is not bit-identical to the
+		-- original road -- it swings a little through whatever lines it. With
+		-- ignoreErrors=true the engine resolved that collision by BULLDOZING the
+		-- buildings: the strict pre-rebuild heal on the originator removed a
+		-- column of five town buildings directly north of the healed node that
+		-- both peers (whose road was never split, so never healed) kept -- a
+		-- construction-lane DESYNC (59 vs 65 buildings, measured 2026-09-08).
+		-- A road merge must never demolish anything. If the merge would
+		-- collide, the engine refuses it; the split node and stubs then simply
+		-- stay, which every consumer already tolerates (findEdgeContaining
+		-- position-resolves against a stub just as well as a through-road).
+		local cmd = api.cmd.make.buildProposal(sp, nil, false)
 		if not cmd then return end
 		healed = true
 		api.cmd.sendCommand(cmd, function(res, ok2)
