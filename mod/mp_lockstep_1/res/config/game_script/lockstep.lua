@@ -4906,10 +4906,22 @@ execConX = function(c)
 			end
 		end)
 		local ctx = CM.conxContext()
-		local okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, ctx, true) end)
+		-- ORIGINATOR STRICT REBUILD MUST NOT DEMOLISH. Its survivor list was
+		-- gathered right after the NATIVE build and already SHIPPED. If this
+		-- rebuild runs with ignoreErrors=true the engine does its own collision
+		-- demolish -- a DIFFERENT set from the native build's -- and the
+		-- originator ends up missing buildings that are on the list it sent:
+		-- the peers keep them, the originator loses them, construction-lane
+		-- DESYNC (measured: peer c kept four buildings at (1759,12)..(1805,23)
+		-- that were in A's own shipped survivors, 2026-09-08). The native build
+		-- already cleared what the depot collides with, so the rebuild has no
+		-- legitimate reason to remove anything: ignoreErrors=false. Peers keep
+		-- true -- their survivor-diff is what clears the footprint for them.
+		local selfRebuild = (c.origin == K.INSTANCE and c.strictPhase == "rebuilt")
+		local okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, ctx, not selfRebuild) end)
 		if (not okMake or not cmd) and ctx then
 			log(string.format("CONX seq=%s: make.buildProposal refused with the UI context (%s) -- retrying with nil", tostring(c.seq), tostring(cmd)))
-			okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, nil, true) end)
+			okMake, cmd = pcall(function() return api.cmd.make.buildProposal(sp, nil, not selfRebuild) end)
 		elseif ctx then
 			log(string.format("CONX seq=%s: built with the UI context (terrain align + graph cleanup, charged)", tostring(c.seq)))
 		end
