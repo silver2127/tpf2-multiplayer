@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Lockstep multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Unofficial,
+**Real multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Unofficial,
 reverse-engineered, and written without access to the engine source. Two or more players build in
 one world at the same time: roads, rails, stations, depots, vehicles and lines made by one
 player appear on the other's map, executed at the same in-game moment. Two modes share
@@ -20,14 +20,6 @@ their cfgs, the `mp_lockstep_1` mod into `<game>\mods`, and the frozen lobby int
 etpunch`. Runtime files go to `%LOCALAPPDATA%	pf2mp\data`. Uninstall from
 *Apps* (restores `alut.dll`); Steam's *Verify integrity of game files* also undoes it.
 
-Never copy the mod into `userdata\<id>\1066780\local\mods`: the game treats a mod
-loaded from there as a different mod (`!mp_lockstep`), and saves made with it refuse to
-load on machines that installed it normally.
-
-**Developers** -- everything below is what the scripts in `tools/` do; read each one
-before running it. They modify a file in your game folder and copy files into your
-Steam directories. `tools/deploy_shipping.ps1` lays the game folder out exactly as the
-MSI does, from the build outputs.
 
 **Prerequisites**
 
