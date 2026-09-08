@@ -28,6 +28,13 @@ Never copy the mod into `userdata\<id>\1066780\local\mods`: the game treats a mo
 loaded from there as a different mod (`!mp_lockstep`), and saves made with it refuse to
 load on machines that installed it normally.
 
+**Uninstalling:** run the same MSI again and choose **Remove**, or use *Apps* in
+Windows settings. Either removes every file it added and puts the game's own
+`alut.dll` back (unless TpF2 Big Maps is still installed, in which case the shared
+proxy stays for it). If you just want the game stock again in a hurry, Steam's
+**Verify integrity of game files** restores `alut.dll` on its own; the leftover
+files are inert and the MSI's uninstall still cleans them up later.
+
 **Developers** -- everything below is what the scripts in `tools/` do; read each one
 before running it. They modify a file in your game folder and copy files into your
 Steam directories. `tools/deploy_shipping.ps1` lays the game folder out exactly as the
