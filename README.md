@@ -20,8 +20,7 @@ proxy `alut.dll` (the original is kept as `alut_real.dll`), the lockstep DLLs an
 their cfgs, the `mp_lockstep_1` mod into `<game>\mods`, and the frozen lobby into
 `<game>\netpunch`. It also sets the Segment Heap switch for `TransportFever2.exe` (a
 registry value; big saves load about 15x faster, see `installer/README.md`). Runtime
-files go to `%LOCALAPPDATA%\tpf2mp\data`. Uninstall from *Apps* (restores `alut.dll`);
-Steam's *Verify integrity of game files* also undoes it. Installs alongside
+files go to `%LOCALAPPDATA%\tpf2mp\data`. Installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order.
 
 Never copy the mod into `userdata\<id>\1066780\local\mods`: the game treats a mod
@@ -31,9 +30,7 @@ load on machines that installed it normally.
 **Uninstalling:** run the same MSI again and choose **Remove**, or use *Apps* in
 Windows settings. Either removes every file it added and puts the game's own
 `alut.dll` back (unless TpF2 Big Maps is still installed, in which case the shared
-proxy stays for it). If you just want the game stock again in a hurry, Steam's
-**Verify integrity of game files** restores `alut.dll` on its own; the leftover
-files are inert and the MSI's uninstall still cleans them up later.
+proxy stays for it).
 
 **Developers** -- everything below is what the scripts in `tools/` do; read each one
 before running it. They modify a file in your game folder and copy files into your
