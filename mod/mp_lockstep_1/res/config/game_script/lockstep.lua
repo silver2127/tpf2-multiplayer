@@ -3012,7 +3012,29 @@ function CM.healNodeAt(x, y, why, origT)
 		-- collide, the engine refuses it; the split node and stubs then simply
 		-- stay, which every consumer already tolerates (findEdgeContaining
 		-- position-resolves against a stub just as well as a through-road).
-		local cmd = api.cmd.make.buildProposal(sp, nil, false)
+		-- gatherBuildings=FALSE is the whole point. A merge with a nil context
+		-- uses the engine default, which GATHERS (demolishes) town buildings in
+		-- the merged edge's footprint -- 7 of them on the strict originator,
+		-- buildings the peers (who never split, never heal) kept, so A ended 6
+		-- short and the town-building lane desynced (2026-09-08). The peers'
+		-- own depot build sets exactly this flag (conxContext, gatherBuildings
+		-- =false) and clears obstacles ONLY through the shared survivor-diff.
+		-- The heal must do the same: merge the road, demolish NOTHING, and let
+		-- A's survivor-diff -- the identical code and the same shipped survivor
+		-- list as the peers -- converge A to the exact same building set.
+		-- checkTerrainAlignment=false too: this is putting back a road that was
+		-- already there, not shaping a new one.
+		local hctx = nil
+		pcall(function()
+			local c = api.type.Context:new()
+			c.checkTerrainAlignment = false
+			c.cleanupStreetGraph    = true
+			c.gatherBuildings       = false
+			c.gatherFields          = true
+			c.player                = api.engine.util.getPlayer()
+			hctx = c
+		end)
+		local cmd = api.cmd.make.buildProposal(sp, hctx, false)
 		if not cmd then return end
 		healed = true
 		api.cmd.sendCommand(cmd, function(res, ok2)
