@@ -4532,52 +4532,16 @@ execConX = function(c)
 			-- removed edge's segment (same test shipConxPair uses to arm
 			-- watchSplit). healNodeAt merges the two stubs back into one edge, so
 			-- the rebuild's shipped removal finds a through-road under the split.
-			if c.strictHealsSplit then
-				local healed = 0
-				pcall(function()
-					-- Identify the split node EXACTLY as the peer resolver does: the
-					-- added node that has an added edge to BOTH endpoints of a removed
-					-- edge. The first version derived the point from srm+spos instead,
-					-- and spos carries only ADDS' endpoints -- the removed edge's far end
-					-- is a node the native build removed, so it is on no added edge and
-					-- was missing from spos. The heal found no point, the rebuild then
-					-- collided with the untouched native split node (added node 0.000 m
-					-- from an EXISTING node) and was refused, and the depot -- already
-					-- bulldozed in phase 1 -- was lost on the originator (2026-09-08).
-					-- This test needs only snodes + sedges + srm, all of which ship.
-					local addsH, nodesH, rmsH = {}, {}, {}
-					for tok in tostring(c.snodes or ""):gmatch("[^;]+") do
-						local f = {}
-						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
-						if #f == 4 then nodesH[f[1]] = { f[2], f[3] } end
-					end
-					for tok in tostring(c.sedges or ""):gmatch("[^;]+") do
-						local f = {}
-						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
-						if #f >= 2 then addsH[#addsH + 1] = { f[1], f[2] } end
-					end
-					for tok in tostring(c.srm or ""):gmatch("[^;]+") do
-						local f = {}
-						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
-						if #f >= 2 then rmsH[#rmsH + 1] = f end
-					end
-					for _, r in ipairs(rmsH) do
-						for id, q in pairs(nodesH) do
-							local hitA, hitB = false, false
-							for _, e in ipairs(addsH) do
-								if (e[1] == id and e[2] == r[1]) or (e[2] == id and e[1] == r[1]) then hitA = true end
-								if (e[1] == id and e[2] == r[2]) or (e[2] == id and e[1] == r[2]) then hitB = true end
-							end
-							if hitA and hitB then
-								local origT = (#r >= 8) and { r[3], r[4], r[5], r[6], r[7], r[8] } or nil
-								if CM.healNodeAt(q[1], q[2], "strict pre-rebuild", origT) then healed = healed + 1 end
-								break
-							end
-						end
-					end
-				end)
-				log(string.format("CONX STRICT seq=%s: healed %d split(s) before the rebuild", tostring(c.seq), healed))
-			end
+			-- NO HEAL. Merging the two native stubs back into one road demolished
+			-- the buildings lining it -- the native depot build RESHAPED the road
+			-- (it leaves an apron), so there is no clean original to restore and a
+			-- road build always clears what its edge overlaps (four attempts:
+			-- ignoreErrors, exact tangents, gatherBuildings all failed, 2026-09-08).
+			-- Instead the removal loop below SNAPS the scripted split onto the
+			-- existing native split node: the road is left exactly as the native
+			-- build made it (which is also the peers' final topology -- they split
+			-- there too), no road is rebuilt, and only the shared survivor-diff
+			-- demolishes, so A converges to the peer building set.
 			c.strictPhase = "rebuilt"
 			conxBusy = false
 			conxQueue[#conxQueue + 1] = { c = c, notBefore = (gameTime() or 0) + 0.6 }
@@ -4659,8 +4623,20 @@ execConX = function(c)
 				if hitA and hitB then X = id; break end
 			end
 			local p = X and nodes[X]
+			-- ORIGINATOR strict: the road is ALREADY split natively at this exact
+			-- point. Snap the scripted split node onto the existing native node so
+			-- downstream reuses it (nodes[X] dropped), ships NO road removal, and
+			-- attaches the depot connectors to it -- the road is never touched.
+			if p and c.strictHealsSplit and c.origin == K.INSTANCE then
+				local nid = findNodeNear(isTrack, p[1], p[2], 1.5)
+				if nid then
+					snapNode[X] = nid
+					log(string.format("CONX STRICT seq=%s: reusing native split node %d at (%.1f,%.1f) -- no heal, no road rebuild",
+						tostring(c.seq), nid, p[1], p[2]))
+				end
+			end
 			local eid
-			if p then pcall(function() eid = findEdgeContaining(isTrack, p[1], p[2]) end) end
+			if p and not snapNode[X] then pcall(function() eid = findEdgeContaining(isTrack, p[1], p[2]) end) end
 			if eid then
 				local comp, a, b, ta, tb = edgeGeomT(eid)
 				if comp then
@@ -4772,7 +4748,7 @@ execConX = function(c)
 						CM.watchSplit(p[1], p[2])
 					end
 				end
-			else
+			elseif not snapNode[X] then
 				log(string.format("CONX: removed edge %d->%d: no peer edge under its split -- removal skipped", r[1], r[2]))
 			end
 		end
