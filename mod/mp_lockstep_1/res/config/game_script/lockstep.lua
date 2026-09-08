@@ -851,6 +851,11 @@ end
 -- whether the drift GROWS (the sims are diverging) or stays flat (a constant
 -- offset, e.g. one late apply) -- that trend is the point of this metric.
 K.VPOS_PER_PART = 30
+-- Vehicle drift is now a DESYNC, not just a metric -- but thresholded, so the
+-- benign sub-tick jitter between honest instances (~1-3 m) never cries wolf.
+-- A depot-triggered native-vs-replay drift blows past this and keeps growing.
+-- cfg vpos_desync_m overrides it.
+K.VPOS_DESYNC_M = 10
 K.VPOS_KEEP = 24
 CM.vposMine = {}      -- stamp -> { s = simtime, pts = {{x,y},...} }
 CM.vposPeer = {}      -- letter -> stamp -> { s=, n=, m=, got=, pts= }
@@ -919,6 +924,18 @@ function CM.vposCompare(stamp, o)
 	CM.vposLast[o] = { mean = mean, max = mx, t = stamp, n = #a }
 	log(string.format("VPOS t=%d vs %s @%.1f: n=%d/%d mean=%.2f m max=%.2f m over1m=%d over10m=%d%s",
 		stamp, o, mine.s, #a, #b, mean, mx, over1, over10, trend))
+	-- VEHICLE DRIFT AS A DESYNC. Vehicle positions are not in the verdict
+	-- hash (they round-jitter), so this is the only place the drift is
+	-- caught. Beyond the tolerance it counts as a real desync: bump the
+	-- counter, mark the dashboard, and log it loud, exactly like a hash
+	-- mismatch. One count per stamp per peer (vposDone guards re-entry).
+	local lim = CM.cfgNum and CM.cfgNum("vpos_desync_m", K.VPOS_DESYNC_M) or K.VPOS_DESYNC_M
+	if mx > lim then
+		desyncs = desyncs + 1
+		CM.dashVerdict = string.format("DESYNC vpos %.0fm vs %s", mx, o)
+		log(string.format("!! DESYNC (vehicle drift) t=%d vs %s: max=%.2f m mean=%.2f m (> %d m) -- total %d",
+			stamp, o, mx, mean, lim, desyncs))
+	end
 end
 
 
