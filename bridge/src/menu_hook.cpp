@@ -1836,8 +1836,22 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
 {
     if (!proc) return;
     LobbySend("{\"cmd\":\"quit\"}");
-    if (WaitForSingleObject(proc, waitMs) == WAIT_OBJECT_0) Log("[menu] lobby.py exited on quit\n");
-    else { TerminateProcess(proc, 0); Log("[menu] lobby.py did not exit within %d ms -- terminated\n", waitMs); }
+    if (WaitForSingleObject(proc, waitMs) == WAIT_OBJECT_0) { Log("[menu] lobby.py exited on quit\n"); return; }
+    // netpunch.exe is a PyInstaller ONEFILE build: the process we launched is a
+    // bootstrap that unpacks and spawns the REAL python child, and it is the
+    // CHILD that owns the lobby UDP port. TerminateProcess on our handle killed
+    // only the bootstrap and ORPHANED the child, which kept udp/29471. Every
+    // later HOST click then spawned a lobby that could not bind the port, the
+    // overlay tail thread read one event line and died, and the panel looked
+    // bricked (measured: two host pairs alive, the stale child owning 29471,
+    // 2026-09-08). The Job object exists for exactly this and both processes
+    // are in it -- terminate the JOB, taking bootstrap and child together.
+    if (g_lobbyJob && TerminateJobObject(g_lobbyJob, 0)) {
+        Log("[menu] lobby.py did not exit within %d ms -- terminated the job (bootstrap + child)\n", waitMs);
+    } else {
+        TerminateProcess(proc, 0);
+        Log("[menu] lobby.py did not exit within %d ms -- terminated (no job: child may linger)\n", waitMs);
+    }
 }
 
 struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; };
