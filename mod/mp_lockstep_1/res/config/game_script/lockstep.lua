@@ -1148,7 +1148,7 @@ local function worldHash(now)
 		local tp = game.interface.getEntities({ radius = 999999 }, { type = "SIM_PERSON", includeData = false }) or {}
 		for _ in pairs(tp) do np = np + 1 end
 	end)
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t%d,n:%d",
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t:%d,n:%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
 		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt, np)
 	return verdict, detail
@@ -2893,6 +2893,20 @@ local expectedDemolish = {}
 --
 -- Only ever touches a plain mid-road node: exactly two street edges, no track,
 -- nothing else hanging off it. Anything else is left alone and logged.
+-- Unowned constructions within r of (x,y): the town-building count the strict
+-- path logs at every step so the next over-demolish names its step.
+function CM.townCountNear(x, y, r)
+	local n = 0
+	pcall(function()
+		for _, id in pairs(game.interface.getEntities({ pos = { x, y }, radius = r or 200 },
+			{ type = "CONSTRUCTION", includeData = false }) or {}) do
+			local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
+			if po == nil then n = n + 1 end
+		end
+	end)
+	return n
+end
+
 function CM.healNodeAt(x, y, why, origT)
 	local healed = false
 	pcall(function()
@@ -3012,8 +3026,8 @@ function CM.healNodeAt(x, y, why, origT)
 					end
 				end)
 			end
-			log(string.format("HEAL(%s): node %d at %.1f,%.1f rejoined: %s%s",
-				why, nid, x, y, tostring(ok2), extra))
+			log(string.format("HEAL(%s): node %d at %.1f,%.1f rejoined: %s%s | town buildings within 200 m now: %d",
+				why, nid, x, y, tostring(ok2), extra, CM.townCountNear(x, y, 200)))
 		end)
 	end)
 	return healed
@@ -4486,8 +4500,11 @@ execConX = function(c)
 			local bal0 = tostring(c.strictBalPre or "-")
 			expectedDemolish[key] = true     -- our own bulldoze: do not ship a DEMOLISH
 			expectedCons[key] = true         -- our rebuild will re-appear: not a new build
+			local townBefore = CM.townCountNear(t[13], t[14], 200)
 			local bok = pcall(game.interface.bulldoze, rec.id)
 			consByKey[key] = nil
+			log(string.format("CONX STRICT seq=%s: town buildings within 200 m: %d before bulldoze, %d after",
+				tostring(c.seq), townBefore, CM.townCountNear(t[13], t[14], 200)))
 			-- Heal the split(s) our native build made, NOW, instead of leaving it
 			-- to the sweep. The split node is the added node that lies on a
 			-- removed edge's segment (same test shipConxPair uses to arm
@@ -6045,7 +6062,7 @@ local function compareOne(stamp, origin, theirs, dt)
 		local dm = myDetails[stamp]
 		if dm and dt then
 			CM.moneyGap = CM.moneyGap or {}
-			for lane, tag in pairs({ m = "MONEY", l = "LOAN", n = "PEOPLE" }) do
+			for lane, tag in pairs({ m = "MONEY", l = "LOAN", n = "PEOPLE", t = "TOWN" }) do
 				local a = dm:match(lane .. ":(%-?%d+)")
 				local b = dt:match(lane .. ":(%-?%d+)")
 				if a and b and a ~= "-" and b ~= "-" then
@@ -6057,6 +6074,28 @@ local function compareOne(stamp, origin, theirs, dt)
 						if d ~= 0 or (was ~= nil and was ~= 0) then
 							log(string.format("$$ %s t=%d vs %s: %s vs %s (gap %+d, was %s)",
 								tag, stamp, origin, a, b, d, was ~= nil and tostring(was) or "0"))
+						end
+					end
+					-- TOWN BUILDINGS AS A DESYNC. The verdict hashes only PLAYER
+					-- constructions; town buildings are counted (t:) but never hashed, so
+					-- a placement that clears different buildings on different instances
+					-- was invisible to it (A 58 vs peers 60, verdict SYNC, 2026-09-08).
+					-- The count is deterministic across honest instances -- B and C have
+					-- matched each other on every run today -- but a building placed
+					-- exactly on a stamp boundary can differ by one for a single sample,
+					-- so it counts only once the gap has PERSISTED for two compared stamps.
+					if lane == "t" then
+						CM.townGapStreak = CM.townGapStreak or {}
+						if d ~= 0 then
+							CM.townGapStreak[origin] = (CM.townGapStreak[origin] or 0) + 1
+							if CM.townGapStreak[origin] == 2 then
+								desyncs = desyncs + 1
+								CM.dashVerdict = string.format("DESYNC town %+d vs %s", d, origin)
+								log(string.format("!! DESYNC (town buildings) t=%d vs %s: %s vs %s (gap %+d, persisted) -- total %d",
+									stamp, origin, a, b, d, desyncs))
+							end
+						else
+							CM.townGapStreak[origin] = 0
 						end
 					end
 				end
