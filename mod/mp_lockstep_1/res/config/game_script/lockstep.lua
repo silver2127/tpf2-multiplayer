@@ -4412,13 +4412,28 @@ execConX = function(c)
 			-- removals, rebuilds fine; road depot = 1 removal, rebuild fails and the
 			-- depot is lost. Those keep today's proven behaviour (originator keeps
 			-- its native copy); only removal-free constructions take the strict path.
+			-- ROAD-EDGE-REMOVING CONSTRUCTIONS (a depot splits the road it sits on)
+			-- used to be EXEMPT from strict: bulldozing the native copy leaves the
+			-- split node and its two stubs behind, the rebuild then fought them,
+			-- the engine refused it and the CONFAIL rollback deleted the player's
+			-- depot. Keeping the native copy was the safe choice -- but it made
+			-- the originator the ONE instance not running the replay path, and
+			-- that is the depot-triggered vehicle drift: the native build and the
+			-- peers' replay demolish the buildings under the depot by different
+			-- mechanisms at different sim-times, the people count diverges at the
+			-- very next stamp (872 vs 871, measured), and the bus that drives past
+			-- inherits it as different boarding times. Both replaying peers stayed
+			-- at 0.00 m from each other; only the native host drifted.
+			--
+			-- So the originator now takes the same path as the peers. The split is
+			-- HEALED DETERMINISTICALLY right after the bulldoze (below), so by the
+			-- time the rebuild runs the road is one merged edge again and the
+			-- shipped removal position-resolves against it exactly as it does on a
+			-- peer. And a refused self-rebuild no longer CONFAILs (see execConX's
+			-- fallback): it keeps whatever stands rather than deleting the depot.
 			local nRmShipped = 0
 			for _ in tostring(c.srm or ""):gmatch("[^;]+") do nRmShipped = nRmShipped + 1 end
-			if nRmShipped > 0 then
-				log(string.format("CONX STRICT seq=%s: payload removes %d road edge(s) -- keeping the native copy (strict would heal the split and the rebuild would be refused)", tostring(c.seq), nRmShipped))
-				conxBusy = false
-				return
-			end
+			c.strictHealsSplit = (nRmShipped > 0)
 			local rec = consByKey[key]
 			if not (rec and rec.id and api.engine.entityExists(rec.id)) then
 				log(string.format("CONX STRICT seq=%s: no native construction at %s to replace -- keeping native, no strict this time", tostring(c.seq), key))
@@ -4436,6 +4451,50 @@ execConX = function(c)
 			expectedCons[key] = true         -- our rebuild will re-appear: not a new build
 			local bok = pcall(game.interface.bulldoze, rec.id)
 			consByKey[key] = nil
+			-- Heal the split(s) our native build made, NOW, instead of leaving it
+			-- to the sweep. The split node is the added node that lies on a
+			-- removed edge's segment (same test shipConxPair uses to arm
+			-- watchSplit). healNodeAt merges the two stubs back into one edge, so
+			-- the rebuild's shipped removal finds a through-road under the split.
+			if c.strictHealsSplit then
+				local healed = 0
+				pcall(function()
+					local sposH = {}
+					for tok in tostring(c.spos or ""):gmatch("[^;]+") do
+						local f = {}
+						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+						if #f == 4 then sposH[f[1]] = { f[2], f[3] } end
+					end
+					local addsH = {}
+					for tok in tostring(c.snodes or ""):gmatch("[^;]+") do
+						local f = {}
+						for v in tok:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+						if #f == 4 then addsH[#addsH + 1] = { f[2], f[3] } end
+					end
+					for tok in tostring(c.srm or ""):gmatch("[^;]+") do
+						local r = {}
+						for v in tok:gmatch("[^,]+") do r[#r + 1] = tonumber(v) end
+						local pa, pb = sposH[r[1]], sposH[r[2]]
+						if pa and pb then
+							local ax, ay, bx, by = pa[1], pa[2], pb[1], pb[2]
+							local vx, vy = bx - ax, by - ay
+							local L2 = vx * vx + vy * vy
+							if L2 > 1 then
+								for _, q in ipairs(addsH) do
+									local tt = ((q[1] - ax) * vx + (q[2] - ay) * vy) / L2
+									if tt > 0.02 and tt < 0.98 then
+										local px, py = ax + tt * vx, ay + tt * vy
+										if (q[1] - px) ^ 2 + (q[2] - py) ^ 2 < 2.25 then
+											if CM.healNodeAt(q[1], q[2], "strict pre-rebuild") then healed = healed + 1 end
+										end
+									end
+								end
+							end
+						end
+					end
+				end)
+				log(string.format("CONX STRICT seq=%s: healed %d split(s) before the rebuild", tostring(c.seq), healed))
+			end
 			c.strictPhase = "rebuilt"
 			conxBusy = false
 			conxQueue[#conxQueue + 1] = { c = c, notBefore = (gameTime() or 0) + 0.6 }
@@ -4853,12 +4912,19 @@ execConX = function(c)
 				pcall(function() game.interface.setPlayer(newId, api.engine.util.getPlayer()) end)
 			else
 				expectedCons[key] = nil
-				-- Even the template fallback could not place it: this peer will never
-				-- have the building, so the originator must not keep its copy.
-				scheduleLocal("CONFAIL", { target = tostring(c.origin), x = t[13], y = t[14],
-				                           file = tostring(c.file), failedSeq = tostring(c.seq) })
-				log(string.format("CONX seq=%s: fallback failed too -- asked %s to roll its copy back",
-					tostring(c.seq), tostring(c.origin)))
+				if c.origin == K.INSTANCE then
+					-- Our OWN strict self-rebuild failed. A CONFAIL here would ask us to
+					-- delete the depot we just bulldozed for the rebuild -- deleting the
+					-- player's work. Log loudly and stop; the peers built theirs.
+					log(string.format("CONX STRICT seq=%s: self-rebuild refused and fallback failed -- NOT rolling back (worlds may differ)", tostring(c.seq)))
+				else
+					-- Even the template fallback could not place it: this peer will never
+					-- have the building, so the originator must not keep its copy.
+					scheduleLocal("CONFAIL", { target = tostring(c.origin), x = t[13], y = t[14],
+					                           file = tostring(c.file), failedSeq = tostring(c.seq) })
+					log(string.format("CONX seq=%s: fallback failed too -- asked %s to roll its copy back",
+						tostring(c.seq), tostring(c.origin)))
+				end
 			end
 			log(string.format("EXEC %s seq=%s origin=%s at=%s file=%s ok=%s id=%s (fallback)",
 				tostring(c.op), tostring(c.seq), tostring(c.origin), tostring(c.at),
@@ -5250,21 +5316,30 @@ execConX = function(c)
 								ok3 and "the STREET payload is what the engine refuses" or "the CONSTRUCTION itself is refused here"))
 							if not ok3 then
 								expectedCons[key] = nil
-								-- Nothing of this placement exists here. Tell the originator to
-								-- undo its own copy so the worlds stay identical; it is the only
-								-- side that can, and leaving it standing diverges us forever.
-								scheduleLocal("CONFAIL", { target = tostring(origin), x = t[13], y = t[14],
-								                           file = tostring(c.file), failedSeq = tostring(seq) })
-								log(string.format("%s seq=%s: asked %s to roll its copy back",
-									tostring(op), tostring(seq), tostring(origin)))
+								if origin == K.INSTANCE then
+									-- our own strict self-rebuild: never roll back the player's depot
+									log(string.format("%s STRICT seq=%s: self-rebuild refused (bare too) -- NOT rolling back", tostring(op), tostring(seq)))
+								else
+									-- Nothing of this placement exists here. Tell the originator to
+									-- undo its own copy so the worlds stay identical; it is the only
+									-- side that can, and leaving it standing diverges us forever.
+									scheduleLocal("CONFAIL", { target = tostring(origin), x = t[13], y = t[14],
+									                           file = tostring(c.file), failedSeq = tostring(seq) })
+									log(string.format("%s seq=%s: asked %s to roll its copy back",
+										tostring(op), tostring(seq), tostring(origin)))
+								end
 							else
 								-- The bare construction stands but WITHOUT its road connection,
 								-- while the originator has the connector edges: still a
 								-- divergence, just a visible one. Roll both sides back.
 								pcall(function() game.interface.bulldoze(tonumber(e3)) end)
 								expectedCons[key] = nil
-								scheduleLocal("CONFAIL", { target = tostring(origin), x = t[13], y = t[14],
-								                           file = tostring(c.file), failedSeq = tostring(seq) })
+								if origin ~= K.INSTANCE then
+									scheduleLocal("CONFAIL", { target = tostring(origin), x = t[13], y = t[14],
+									                           file = tostring(c.file), failedSeq = tostring(seq) })
+								else
+									log(string.format("%s STRICT seq=%s: unconnected self-rebuild removed -- NOT rolling back the original", tostring(op), tostring(seq)))
+								end
 								log(string.format("%s seq=%s: bare copy removed again and %s asked to roll back -- an unconnected depot on one side only is still a divergence",
 									tostring(op), tostring(seq), tostring(origin)))
 							end
