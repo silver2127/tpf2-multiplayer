@@ -1,0 +1,10 @@
+1403b1340 grade_CalcTerrainAlignment
+1403b3080 grade_CalcTerrainModFace
+1403b16f0 grade_CalcTerrainAlignmentConvexFace
+1403b2480 grade_CalcTerrainModContour
+1403b42a0 grade_CreateTerrainAlignmentInfo
+1403b3470 grade_CalculateHeightMod
+1403b69f0 grade_TerrainModHeightMap_GetHeight
+1403b46a0 grade_CreateTileBlock
+140ae0f40 grade_apply_FUN_140ae0f40
+140ade150 grade_apply_FUN_140ade150

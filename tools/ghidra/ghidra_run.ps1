@@ -26,7 +26,7 @@ $ErrorActionPreference = "Stop"
 $env:JAVA_HOME = $Jdk
 $env:GHIDRA_HEADLESS_MAXMEM = "16G"
 
-$scriptPath = Join-Path $PSScriptRoot "ghidra_scripts"
+$scriptPath = Join-Path $PSScriptRoot "scripts"
 $headless   = Join-Path $Ghidra "support\analyzeHeadless.bat"
 
 $a = @(

@@ -5,7 +5,6 @@ bridge/out/
 *.lib
 *.pdb
 *.ilk
-injector/*.exe
 
 # frozen lobby exe -- rebuild with PyInstaller, see docs/PORTABILITY.md
 netpunch/dist/

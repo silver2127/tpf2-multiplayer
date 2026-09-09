@@ -1,0 +1,13 @@
+# Roadside stop (edge object) capture/replay assessment, 2026-09-02.
+# What the street terminal tool puts in its proposal, and how apply remaps
+# old->new edge objects.
+45fc70  StreetTerminalBuilder_MakeProposal
+21ef7d0 STB_callee_21ef7d0
+21ef3f0 STB_callee_21ef3f0
+21ef550 STB_callee_21ef550
+3e3270  UIProposal_get_3e3270
+3e9510  UIProposal_set_3e9510
+21b5b30 GetAutoDetectOld2New
+21b94f0 UpdateProposalMaps
+21edd70 CalcNodeIndex_helper_21edd70
+2230b60 StreetGeometry_CreateLanes

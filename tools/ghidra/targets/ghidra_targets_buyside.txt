@@ -1,0 +1,15 @@
+# BuyVehicle apply chain + the per-step systems it could perturb (angle: buy-side-effects, 2026-09-02)
+9d6280  buy_apply_visitor
+2216d80 buy_vehicle_util_engine
+2216ac0 buy_create_entity
+2218a60 buy_callee_2218a60
+9d65f0  buy_callee_9d65f0
+b6c2d0  buy_journal_insert
+2317a0  buy_apply_callee_2317a0
+ad5b90  tvs_callee_ad5b90
+ad73a0  tvs_update2
+ad1b30  tvs_update2_lambda
+15aa00  gamesim_step
+a65620  roadveh_traffic_penalty
+217abb0 vehdef_unpark
+2164d60 vehicle_util_unpark

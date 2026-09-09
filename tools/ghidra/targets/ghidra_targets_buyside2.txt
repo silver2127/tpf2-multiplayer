@@ -1,0 +1,11 @@
+# buy-side-effects batch 2: traffic penalty core, listeners on a new vehicle, purchaseTime consumers, SetLine path
+a64770  rvms_penalty_core
+ada8c0  depotsys_entity_added
+a64be0  rvms_entity_added
+acd350  tvs_countdays_lambda
+ad11d0  tvs_charge_running_costs_lambda
+21384e0 vehicle_update_helper_dtor
+9d9b10  setline_apply_visitor
+2163b60 vehicle_util_setline
+ac5d40  tns_update2_loop
+74f5e0  ui_buy_site

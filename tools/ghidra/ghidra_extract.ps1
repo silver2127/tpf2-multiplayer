@@ -27,13 +27,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $T = $PSScriptRoot
-if (-not $Targets) { $Targets = Join-Path $T "ghidra_targets.txt" }
+if (-not $Targets) { $Targets = Join-Path $T "targets/ghidra_targets.txt" }
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 
 $env:JAVA_HOME = $Jdk
 $env:GHIDRA_HEADLESS_MAXMEM = "16G"
 
-$scriptPath = Join-Path $T "ghidra_scripts"
+$scriptPath = Join-Path $T "scripts"
 $headless   = Join-Path $Ghidra "support\analyzeHeadless.bat"
 
 function Invoke-GhidraScript($name, $scriptArgs) {
