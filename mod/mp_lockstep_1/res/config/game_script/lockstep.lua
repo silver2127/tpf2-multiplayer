@@ -592,6 +592,9 @@ function data()
 			CM.ticks = CM.ticks + 1
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
 				if not CM.detectInstance() then return end
+				-- a save's company state (load hook) is applied here, on the sim
+				-- thread with the engine API up, not inside load() itself
+				if CM.cmSaved and not CM.cmLive then CM.cmReadConfig() end
 			end
 			if not K.INSTANCE then return end
 
@@ -886,8 +889,16 @@ function data()
 			end
 		end,
 
-		save = function() return {} end,
-		load = function(s) end,
+		-- the company state rides in the save (companies.lua cmSaveState)
+		save = function()
+			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
+			local ok, st = pcall(CM.cmSaveState)
+			return { cm = ok and st or nil }
+		end,
+		load = function(s)
+			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
+		end,
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
 		guiUpdate = function()

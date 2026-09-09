@@ -1481,12 +1481,29 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     upload = [None]                         # relay-only: the leader's save coming in
     letters = {}                            # relay-only: name -> origin letter (sticky)
     letters_path = os.path.join(io.dir, "relay_letters.json")
+    chips = {}                              # relay-only: name -> company chip (sticky, like letters)
+    chips_path = os.path.join(io.dir, "relay_companies.json")
     if relay_only:
         try:
             with open(letters_path, "r", encoding="utf-8") as f:
                 letters.update({str(k): str(v) for k, v in json.load(f).items()})
             log(f"[relay] {len(letters)} letter(s) remembered from the last run")
         except (OSError, ValueError):
+            pass
+        try:
+            with open(chips_path, "r", encoding="utf-8") as f:
+                chips.update({str(k): int(v) for k, v in json.load(f).items()})
+        except (OSError, ValueError):
+            pass
+
+    def remember_chip(name, cid):
+        if not relay_only:
+            return
+        chips[name] = int(cid)
+        try:
+            with open(chips_path, "w", encoding="utf-8") as f:
+                json.dump(chips, f)
+        except OSError:
             pass
 
     def leader_addr():
@@ -1565,6 +1582,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         for p in peers.values():
             if p["name"] == name:
                 p["company"] = cid
+                remember_chip(name, cid)
                 return True
         return False
 
@@ -1652,7 +1670,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             assigned = _dedupe(name, all_names())
             peers[addr] = {"name": assigned, "last": time.time(),
                            "started": False, "profile": profile,
-                           "links": [], "mesh": bool(is_mesh), "company": 1}
+                           "links": [], "mesh": bool(is_mesh),
+                           "company": chips.get(assigned, 1)}   # a returning name gets its chip back
             late = started[0]
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))

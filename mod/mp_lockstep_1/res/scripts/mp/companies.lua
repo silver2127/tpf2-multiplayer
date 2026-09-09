@@ -55,7 +55,7 @@ function CM.cmReadConfig()
 	-- is history: the lockstep commands own the roster and the origin map.
 	if CM.cmLive then return end
 	local f = io.open(CM.CM_CFG_FILE, "r")
-	if not f then CM.cmMode = "coop"; CM.cmOriginCompany = CM.cmOriginCompany or {}; return end
+	if not f then CM.cmMode = "coop"; CM.cmOriginCompany = CM.cmOriginCompany or {}; CM.cmApplySaved(); return end
 	local mode = f:read("*l"); local mine = f:read("*l"); local roster = f:read("*l")
 	local omap = f:read("*l")
 	f:close()
@@ -75,6 +75,7 @@ function CM.cmReadConfig()
 		CM.cmRoster = {}
 		for id in roster:gmatch("%d+") do CM.cmRoster[#CM.cmRoster + 1] = tonumber(id) end
 	end
+	CM.cmApplySaved()
 end
 
 -- Lazily set up the player entities for companies mode. The local player is our
@@ -391,6 +392,81 @@ function CM.cmGoLive()
 	end
 	CM.cmLive = true
 end
+-- The hotseat swap on THIS machine: everything the human player owns goes to
+-- company cid's AI entity, cid's assets and wallet (balance + loan) come to
+-- the human, and the cid -> entity map is updated. Local representation
+-- only: what each company owns in the world does not change.
+function CM.cmLocalSwitch(cid)
+	local old = CM.cmMyCompany
+	if cid == old then return true end
+	local human, ai = CM.cmCompanyPid[old], CM.cmCompanyPid[cid]
+	if not human or not ai then log("company: switch: missing player entity (me=" .. tostring(human) .. " target=" .. tostring(ai) .. ")"); return false end
+	local mine = CM.cmOwnedEntities(human)
+	local theirs = CM.cmOwnedEntities(ai)
+	for _, eid in ipairs(mine) do pcall(function() game.interface.setPlayer(eid, ai) end) end
+	for _, eid in ipairs(theirs) do pcall(function() game.interface.setPlayer(eid, human) end) end
+	for _, eid in ipairs(mine) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, false) end end) end
+	for _, eid in ipairs(theirs) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, true) end end) end
+	local okW, bh, lh, ba, la = CM.cmSwapWallets(human, ai)
+	CM.cmCompanyPid[old] = ai; CM.cmCompanyPid[cid] = human
+	CM.cmMyCompany = cid
+	CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
+		tostring(bh), tostring(lh), tostring(ba), tostring(la), okW and "" or " -- wallet swap FAILED"))
+	if okW and (ba or 0) == 0 and (la or 0) == 0 then CM.cmNote("company " .. cid .. " starts empty: take a loan to fund it") end
+	return true
+end
+
+-- ---------- the company state travels IN THE SAVE (2026-09-09) ----------
+-- Roster, passwords, origin -> company and company -> player entity are not
+-- world state the engine saves; without this a resumed save (a relay's
+-- /resume, or anyone loading a shared save later) would come up with fresh,
+-- empty AI entities and every company's assets stranded. The game script's
+-- save() hook stores it; load() stashes it and cmReadConfig applies it over
+-- the lobby file: the entity ids are valid on every machine that loads this
+-- save (the entities are in it), and the human player of the save IS the
+-- company that saved it, so each machine then hotseat-swaps to its own
+-- company (its old one if the saved map knows its letter, else the lobby's).
+function CM.cmSaveState()
+	if CM.cmMode ~= "companies" or not CM.cmMyCompany then return { v = 1, mode = "coop" } end
+	local st = { v = 1, mode = "companies", mine = CM.cmMyCompany, roster = {}, origin = {}, pw = {}, pid = {} }
+	for i, cid in ipairs(CM.cmRoster or {}) do st.roster[i] = cid end
+	for o, cid in pairs(CM.cmOriginCompany or {}) do st.origin[o] = cid end
+	st.origin[K.INSTANCE] = CM.cmMyCompany
+	for cid, h in pairs(CM.cmPw or {}) do st.pw[tostring(cid)] = h end
+	for cid, pid in pairs(CM.cmCompanyPid or {}) do st.pid[tostring(cid)] = pid end
+	return st
+end
+function CM.cmLoadState(st)
+	if type(st) == "table" and st.mode == "companies" then CM.cmSaved = st end
+end
+function CM.cmApplySaved()
+	local sv = CM.cmSaved
+	if not sv then return end
+	CM.cmSaved = nil
+	local human = nil; pcall(function() human = api.engine.util.getPlayer() end)
+	local savedHuman = sv.pid and sv.pid[tostring(sv.mine)]
+	if not human or savedHuman ~= human then
+		log(string.format("company: saved state ignored -- this save's player entity is %s, the state was written for %s", tostring(human), tostring(savedHuman)))
+		return
+	end
+	CM.cmMode = "companies"
+	CM.cmRoster = {}
+	for i, cid in ipairs(sv.roster or {}) do CM.cmRoster[i] = tonumber(cid) end
+	CM.cmPw = {}
+	for k, h in pairs(sv.pw or {}) do CM.cmPw[tonumber(k)] = h end
+	CM.cmCompanyPid = {}
+	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid end
+	local want = CM.cmMyCompany   -- the lobby's chip for us (may be nil in coop)
+	if sv.origin and sv.origin[K.INSTANCE] then want = tonumber(sv.origin[K.INSTANCE]) end
+	if not want or not CM.cmRosterHas(want) then want = tonumber(sv.mine) end
+	for o, cid in pairs(sv.origin or {}) do if o ~= K.INSTANCE then CM.cmOriginCompany[o] = tonumber(cid) end end
+	CM.cmMyCompany = tonumber(sv.mine)     -- the human entity is the saver's company right now
+	CM.cmLive = true
+	CM.cmReady = true
+	log(string.format("company: state restored from the save: %d companies, saver was co%d, we take co%d", #CM.cmRoster, tonumber(sv.mine), want))
+	if want ~= CM.cmMyCompany then CM.cmLocalSwitch(want) end
+end
+
 function CM.execCompanyCmd(c)
 	local cid = c.cid and math.floor(tonumber(c.cid) + 0.5) or nil
 	local o = c.origin
@@ -413,25 +489,7 @@ function CM.execCompanyCmd(c)
 		local okPw, why = CM.cmPwOk(c, cid)
 		if not okPw then CM.cmNote(string.format("%s cannot join company %d: %s", tostring(o), cid, why)); return end
 		if o == K.INSTANCE then
-			local old = CM.cmMyCompany
-			if cid ~= old then
-				local human, ai = CM.cmCompanyPid[old], CM.cmCompanyPid[cid]
-				if not human or not ai then log("company: switch: missing player entity (me=" .. tostring(human) .. " target=" .. tostring(ai) .. ")"); return end
-				-- the hotseat swap, both directions, then the money
-				CM.cmMoveAssets(human, -1, "park")          -- nothing: placeholder keeps the two moves distinct below
-				local mine = CM.cmOwnedEntities(human)
-				local theirs = CM.cmOwnedEntities(ai)
-				for _, eid in ipairs(mine) do pcall(function() game.interface.setPlayer(eid, ai) end) end
-				for _, eid in ipairs(theirs) do pcall(function() game.interface.setPlayer(eid, human) end) end
-				for _, eid in ipairs(mine) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, false) end end) end
-				for _, eid in ipairs(theirs) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, true) end end) end
-				local okW, bh, lh, ba, la = CM.cmSwapWallets(human, ai)
-				CM.cmCompanyPid[old] = ai; CM.cmCompanyPid[cid] = human
-				CM.cmMyCompany = cid
-				CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
-					tostring(bh), tostring(lh), tostring(ba), tostring(la), okW and "" or " -- wallet swap FAILED"))
-				if okW and (ba or 0) == 0 and (la or 0) == 0 then CM.cmNote("company " .. cid .. " starts empty: take a loan to fund it") end
-			end
+			CM.cmLocalSwitch(cid)
 		else
 			CM.cmOriginCompany[o] = cid
 			CM.cmNote(string.format("%s now plays company %d", tostring(o), cid))
