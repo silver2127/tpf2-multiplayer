@@ -438,7 +438,7 @@ static char g_status[256] = "";
 static char g_players[8][40]; static int g_playerCount = 0;
 static int  g_companies[8] = {1,1,1,1,1,1,1,1};   // company id per roster entry (1..6)
 static const COLORREF CO_COLOR[6] = { RGB(220,80,80), RGB(80,140,230), RGB(90,190,110), RGB(230,180,60), RGB(180,100,220), RGB(80,200,200) };
-static char g_you[40] = ""; static char g_host[40] = "";
+static char g_you[40] = ""; static char g_host[40] = ""; static char g_lobbyTitle[40] = "";   // the lobby's name, from the roster
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
 static char g_chatInput[200] = ""; static int g_chatLen = 0;
 static volatile LONG g_isHost = 0;       // this instance is the lobby host
@@ -717,6 +717,34 @@ static void drawBtn(HDC dc, int x, int y, int w, int h, const wchar_t* label, in
 #define MW_YOU    RGB(150, 210, 170)
 static char g_joinCode[256] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
 static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
+static char g_username[40] = "";   // the player name (random two-word default, see ensureUsername)
+static char g_lobbyName[40] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
+static int  g_userLen = 0;
+static void ensureUsername();
+static void SaveNames();
+// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=...) so they
+// survive a relaunch; a blank file leaves the random two-word default.
+static void LoadNames()
+{
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
+    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: keep the random name from now on
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        char* e = line + strlen(line); while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+        char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
+        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, 30); }
+        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, 36); }
+    }
+    fclose(f);
+    g_userLen = (int)strlen(g_username); g_lobbyNameLen = (int)strlen(g_lobbyName);
+    Log("[menu] names: player=%s lobby=%s\n", g_username, g_lobbyName);
+}
+static void SaveNames()
+{
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
+    FILE* f = _wfopen(p, L"w"); if (!f) return;
+    fprintf(f, "player=%s\nlobby=%s\n", g_username, g_lobbyName); fclose(f);
+}
 static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itself to the master server
 
 // ---------------- the public game list (server browser) ----------------
@@ -881,7 +909,9 @@ static void RenderPanelLayer(int w, int h)
     int pad = S(25), cy = S(56);
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) {
         // ---------------- LOBBY ----------------
-        mwTitle(L"LOBBY"); mwClose(w, 5);
+        int titleW = S(90);
+        { wchar_t wt[64] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, 48); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
+          mwTitle(wt); HFONT ft = mkLato(S(18)); titleW = textW(wt, ft) + S(16); DeleteObject(ft); } mwClose(w, 5);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
             // ROOM CODE, DELIBERATELY NOT RENDERED.
             //
@@ -897,7 +927,7 @@ static void RenderPanelLayer(int w, int h)
             // sizing the button from the code would leak its length.
             const wchar_t* wcode = L"\u2022\u2022\u2022  ROOM CODE  \u2022\u2022\u2022";
             HFONT fm = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Consolas");
-            int cw = textW(wcode, fm) + S(20), cx = S(25) + S(90);
+            int cw = textW(wcode, fm) + S(20), cx = S(25) + titleW;
             layerRect(cx, S(11), cw, S(26), RGB(0, 0, 0), 50);
             layerText(cx + S(10), S(11), cw, S(26), wcode, fm, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fm);
             HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy (never shown)", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
@@ -960,18 +990,23 @@ static void RenderPanelLayer(int w, int h)
         int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
         layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
         mwHeader(lx, cy, colW, L"HOST A GAME");
-        mwBody(lx, cy + S(28), colW, S(60), L"Opens a lobby and shares your newest save with everyone who joins. You get a code to hand out.");
+        mwBody(lx, cy + S(24), colW, S(36), L"Opens a lobby and shares your newest save with everyone who joins.");
+        { ensureUsername(); char def[64]; snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
+          wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
+          mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
         { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
           if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
         mwHeader(rx, cy, colW, L"JOIN A GAME");
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
-        mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0, L"Click to paste the code", 8);
+        mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
         mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
-        mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD  --  use if you post the code publicly; anyone who has it can read your IP address");
+        mwHeader(pad, cy + S(138), S(260), L"YOUR NAME");
+        mwField(pad, cy + S(162), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Click to type a name", 13);
+        mwHeader(pad + S(290), cy + S(138), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
-          mwField(pad, cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
+          mwField(pad + S(290), cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
         // ---- PUBLIC GAMES: the server browser (OpenTTD style) ----
         if (g_flagMaster[0]) {
             int ly = cy + S(206); int lw = w - 2 * pad;
@@ -1272,6 +1307,8 @@ static void OnHit(int id)
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
+    case 13: InterlockedExchange(&g_joinFocus, 3); g_userLen = (int)strlen(g_username); InterlockedExchange(&g_panelDirty, 1); break;   // player name
+    case 14: InterlockedExchange(&g_joinFocus, 4); g_lobbyNameLen = (int)strlen(g_lobbyName); InterlockedExchange(&g_panelDirty, 1); break;   // lobby name
     case 11: {   // PUBLIC checkbox; while hosting it toggles the announcement live
         LONG on = InterlockedCompareExchange(&g_public, 0, 0) ? 0 : 1; InterlockedExchange(&g_public, on);
         if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && InterlockedCompareExchange(&g_isHost, 0, 0)) {
@@ -1632,7 +1669,6 @@ static void EnsureLobbyJob()
         CloseHandle(g_lobbyJob); g_lobbyJob = nullptr;
     }
 }
-static char   g_username[40] = "";
 // Random two-word username ("BraveOtter"), generated once per game session.
 // The Windows account name was the old default: it leaks the player's real
 // name into every lobby, and two instances on one machine got the SAME name,
@@ -1991,6 +2027,7 @@ static void applyRoster(const char* s)
     char v[40];
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
+    jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
     // Role is decided by the roster: you==host -> instance a, else b. Re-evaluated
     // on every roster (a host change re-points the bridge); writeBridgeCtl is a
     // no-op when nothing changed.
@@ -2194,7 +2231,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char game[64]; };
+struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char game[64]; char lobby[48]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -2237,9 +2274,10 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     else {
         // the public list: always tell the lobby where the master server is (the
         // PUBLIC checkbox can be flipped later, in the lobby); --public starts listed
-        wchar_t wpub[480] = L"";
+        wchar_t wpub[560] = L"";
+        { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, 48); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
         if (g_flagMaster[0]) { wchar_t wm[300], wg[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300); MultiByteToWideChar(CP_UTF8, 0, a->game, -1, wg, 64);
-                               _snwprintf_s(wpub, _TRUNCATE, L" --publish %s --game-name \"%s\"%s", wm, wg, a->pub ? L" --public" : L""); }
+                               wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s --game-name \"%s\"%s", wm, wg, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
@@ -2413,6 +2451,9 @@ static void StartLobby(int join)
     LobbyArg* a = (LobbyArg*)calloc(1, sizeof(LobbyArg)); if (!a) return;
     a->join = join; strcpy_s(a->name, g_username); strcpy_s(a->password, g_passCode);
     a->pub = InterlockedCompareExchange(&g_public, 0, 0) ? 1 : 0;
+    InterlockedExchange(&g_joinFocus, 0); SaveNames();
+    if (g_lobbyName[0]) strcpy_s(a->lobby, g_lobbyName); else snprintf(a->lobby, sizeof(a->lobby), "%s's game", g_username);
+    g_lobbyTitle[0] = 0;
     if (!join) {   // the save's name is what the public list shows as the game
         wchar_t sv[600]; if (newestSave(sv, 600)) {
             const wchar_t* b = wcsrchr(sv, L'\\'); b = b ? b + 1 : sv;
@@ -2499,10 +2540,11 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
     }
     LONG st = InterlockedCompareExchange(&g_uiState, 0, 0);
     LONG focus = InterlockedCompareExchange(&g_joinFocus, 0, 0);
-    bool codeField = st == 1 && focus != 0;
+    bool codeField = st == 1 && focus == 1;
     bool passField = st == 1 && focus == 2;
+    bool nameField = st == 1 && (focus == 3 || focus == 4);
     bool chatField = st == 2 && InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0;
-    if (code == HC_ACTION && (codeField || chatField) &&
+    if (code == HC_ACTION && (codeField || passField || nameField || chatField) &&
         InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 &&
         gameHasFocus())
     {
@@ -2516,7 +2558,18 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
             vk == VK_LWIN || vk == VK_RWIN)
             return CallNextHookEx(g_kbHook, code, wp, lp);
-        if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && passField) {
+        if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && nameField) {
+            // player name: one word (it is a bare --name argument); lobby name: words, digits, ' - _ .
+            bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = focus == 3 ? 24 : 36;
+            if (vk == VK_BACK) { if (*len > 0) { buf[--*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+            else if (vk == VK_RETURN) { if (focus == 3 && !g_username[0]) ensureUsername(); InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
+            else { char c = vkToChar((int)vk, shift);
+                   bool word = c && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.');
+                   bool okc = word || (focus == 4 && (c == ' ' || c == '\'') && *len > 0);
+                   if (okc && *len < cap) { buf[(*len)++] = c; buf[*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
+        }
+        else if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && passField) {
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             if (vk == VK_BACK) { if (g_passLen > 0) { g_passCode[--g_passLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
             else if (vk == VK_RETURN) { InterlockedExchange(&g_joinFocus, 0); InterlockedExchange(&g_panelDirty, 1); }
@@ -2732,6 +2785,7 @@ static DWORD WINAPI Init(LPVOID)
 
     // ---- A/B test: native-look overlay + real list-inserted button ----
     ReadFlags();
+    ensureUsername(); LoadNames();
     LoadLato();
     g_strAssign = (StrAssignFn)(g_base + RVA_STR_ASSIGN);
     g_actionCtx = (ActionCtxFn)(g_base + RVA_ACTION_CTX);

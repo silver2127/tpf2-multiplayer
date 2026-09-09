@@ -1421,7 +1421,7 @@ class _Publisher:
 # HOST: single socket, N peers, authority for roster + chat relay
 # --------------------------------------------------------------------------- #
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
-             log=_log, relay=None, forward_logs=(), publisher=None):
+             log=_log, relay=None, forward_logs=(), publisher=None, lobby_name=""):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``sock`` is a bound UDP socket (the observe/game socket for the real CLI, a
@@ -1503,7 +1503,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         companies = roster_companies()
         for a, p in list(peers.items()):
             _send_data(sock, a, {"t": "roster", "players": players,
-                                 "host": host_name,
+                                 "host": host_name, "lobby": lobby_name,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
                                  "profiles": profiles, "links": links,
@@ -1511,10 +1511,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     def emit_roster():
         if publisher is not None:
-            publisher.update(host_name, 1 + len(peers))
+            publisher.update(lobby_name or host_name, 1 + len(peers))
         players = roster_players()
         io.emit({"type": "roster", "players": players,
-                 "you": host_name, "host": host_name,
+                 "you": host_name, "host": host_name, "lobby": lobby_name,
                  "companies": roster_companies()})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=host_name, started=started[0])
@@ -1577,7 +1577,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 + (" (late -- game already started)" if late else ""))
         peers[addr]["last"] = time.time()
         _send_data(sock, addr, {"t": "welcome",
-                                "you": peers[addr]["name"], "host": host_name})
+                                "you": peers[addr]["name"], "host": host_name,
+                                "lobby": lobby_name})
         roster_changed()
         if late:
             # A late joiner is NOT started: it has no save (a save start) and
@@ -2177,7 +2178,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 last_roster[0] = key
                 io.emit({"type": "roster", "players": players,
                          "you": assigned[0], "host": m.get("host"),
-                         "companies": companies})
+                         "lobby": m.get("lobby", ""), "companies": companies})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
                                started=started[0])
@@ -2353,12 +2354,13 @@ def cmd_host(args):
     publisher = None
     if args.publish:
         publisher = _Publisher(args.publish, code, args.game_name, bool(args.password), _log)
-        publisher.update(args.name, 1)
+        publisher.update(args.lobby_name or args.name, 1)
         if args.public:
             publisher.set(True)
     try:
         run_host(sock, args.name, io, code=code, relay=relay,
-                 forward_logs=args.forward_log or (), publisher=publisher)
+                 forward_logs=args.forward_log or (), publisher=publisher,
+                 lobby_name=args.lobby_name)
     finally:
         if publisher is not None:
             publisher.close()
@@ -3413,6 +3415,8 @@ def main(argv=None):
                          "public (see --public and the 'publish' command)")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
+    ap.add_argument("--lobby-name", default="",
+                    help="what the lobby is called (shown to joiners and in the public list)")
     ap.add_argument("--game-name", default="",
                     help="what the public list shows as the game (the save's name)")
     ap.add_argument("--password", default="",
