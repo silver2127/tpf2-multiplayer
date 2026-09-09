@@ -506,17 +506,22 @@ end
 -- unit of the session, at which point ordinary pacing takes over. cu=1 on
 -- our heartbeat keeps the others from pacing against us meanwhile. Returns
 -- the speed to impose while active, nil otherwise.
-K.CATCHUP_MIN = 3
-K.FRAC_PACE_TICKS = 5      -- ~1 s between pacing decisions (heartbeats are 2 ticks apart)
+K.CATCHUP_MIN = 8          -- below this the PID closes the gap gradually; catch-up (hold + 4x) is for hot joins and stalls
+K.FRAC_PACE_TICKS = 8      -- ~1.5 s between pacing decisions (heartbeats are 2 ticks apart)
 
 -- The controller. Returns target speed (or nil when level) and the error.
 function CM.pidPace(now, eff)
-	local kp   = CM.cfgNum("pid_kp",   0.10)
-	local ki   = CM.cfgNum("pid_ki",   0.03)
-	local kd   = CM.cfgNum("pid_kd",   0.05)
-	local dead = CM.cfgNum("pid_dead", 0.20)
-	local lo   = CM.cfgNum("pid_min",  0.50)
-	local hi   = CM.cfgNum("pid_max",  1.30)
+	-- GENTLER (2026-09-09, second live pass: "too harsh"): half the gains, a
+	-- wider dead band, a narrower clamp, and a SLEW LIMIT -- the target may
+	-- move at most pid_slew per decision, so a 2-unit gap is closed by a
+	-- 1.1x that creeps in over a few seconds, not a 1.3x that arrives at once.
+	local kp   = CM.cfgNum("pid_kp",   0.05)
+	local ki   = CM.cfgNum("pid_ki",   0.015)
+	local kd   = CM.cfgNum("pid_kd",   0.02)
+	local dead = CM.cfgNum("pid_dead", 0.30)
+	local lo   = CM.cfgNum("pid_min",  0.70)
+	local hi   = CM.cfgNum("pid_max",  1.20)
+	local slew = CM.cfgNum("pid_slew", 0.05)
 	-- THE HOST IS THE CLOCK (2026-09-09): it runs the session speed untouched
 	-- and only its lever changes it (a host that sees a peer lagging can slow
 	-- everyone down by choice). Every joiner's reference is the host's precise
@@ -548,6 +553,10 @@ function CM.pidPace(now, eff)
 	if target > (CM.MAX_SPEED or 4) then target = CM.MAX_SPEED or 4 end
 	if target < 0.5 then target = 0.5 end
 	if math.abs(m - 1) < 0.025 then target = eff end   -- level enough: exactly the session speed
+	local prev = CM.pidHold or eff
+	local maxStep = slew * eff
+	if target > prev + maxStep then target = prev + maxStep elseif target < prev - maxStep then target = prev - maxStep end
+	target = math.floor(target / 0.05 + 0.5) * 0.05
 	if target ~= CM.pidHold then
 		log(string.format("PID: e=%+.2f vs host P=%+.3f I=%+.3f D=%+.3f -> %.2fx of %g", e, kp * eD, ki * CM.pidI, kd * d, target, eff))
 	end
