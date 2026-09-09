@@ -238,10 +238,14 @@ function CM.peerFor(o)
 end
 -- Slowest peer by the PRECISE clock, for pacing only. Falls back to the coarse
 -- reading for a peer that has not sent a step yet (an older build).
+-- A peer that is CATCHING UP (cu=1 on its heartbeat: a hot joiner running
+-- through the command history at high speed) is not a pacing reference: it
+-- would drag everyone back to its clock, or trip the barrier. It is included
+-- again the moment it drops the flag, within a unit of the session.
 function CM.peerSlowPrecise()
 	local minT
 	for _, pr in pairs(CM.peers) do
-		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
 			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
 			if t and (not minT or t < minT) then minT = t end
 		end
@@ -253,7 +257,7 @@ end
 function CM.peerFastPrecise()
 	local maxT
 	for _, pr in pairs(CM.peers) do
-		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
 			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
 			if t and (not maxT or t > maxT) then maxT = t end
 		end
@@ -264,7 +268,7 @@ end
 function CM.peerBounds()
 	local minT, maxT
 	for _, pr in pairs(CM.peers) do
-		if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+		if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
 			if not minT or pr.time < minT then minT = pr.time end
 			if not maxT or pr.time > maxT then maxT = pr.time end
 		end
@@ -621,7 +625,8 @@ function data()
 			if CM.ticks % K.CON_EDIT_SCAN_EVERY == 0 then CM.scanConstructionEdits() end
 
 			if CM.ticks % K.HEARTBEAT_EVERY == 0 then
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d ceil=%d", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo, CM.myCeiling or (CM.MAX_SPEED or 4)))
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d ceil=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo, CM.myCeiling or (CM.MAX_SPEED or 4),
+					CM.catchingUp2 and " cu=1" or ""))
 			end
 
 			CM.applyBarrier(now)

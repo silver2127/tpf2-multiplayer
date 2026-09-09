@@ -438,10 +438,17 @@ end
 -- the memory it was taken from; a DESYNC there means it does not.
 function CM.syncBegin()
 	if K.INSTANCE ~= "a" then return end
-	CM.syncState = "pausing"
+	-- NO PAUSE (2026-09-09, the Factorio shape): the save is taken while the
+	-- session runs; the newcomer loads it at its step S, asks for every
+	-- command stamped after S (LSNEED -> the history ring) and runs through
+	-- them at catch-up speed until it reaches the live clock.
+	CM.syncState = "saving"
 	CM.syncSince = CM.ticks
-	CM.syncSpeedBefore = (CM.effSpeed and CM.effSpeed > 0) and CM.effSpeed or (CM.runSpeed or 1)
-	log("SYNC: requested -- pausing the session at a common step")
+	pcall(function()
+		local f = io.open(K.BASE .. "tpf2_sync_save.txt", "w")
+		if f then f:write(string.format("step=%d\n", CM.stepOf(CM.gameTime() or 0))); f:close() end
+	end)
+	log("SYNC: requested -- asking for a save (the session keeps running; the newcomer catches up)")
 end
 function CM.syncEnd(why)
 	if not CM.syncState then return end
@@ -464,33 +471,61 @@ function CM.syncTick(now, s)
 	if not st then return end
 	if CM.ticks - (CM.syncSince or CM.ticks) > 900 * 4 then CM.syncEnd("timed out after ~11 min"); return end
 	local n, same = CM.syncPeersAtStep(now)
-	if st == "pausing" then
-		if s == 0 and #CM.queue == 0 and same == n then
-			CM.syncState = "saving"
-			pcall(function()
-				local f = io.open(K.BASE .. "tpf2_sync_save.txt", "w")
-				if f then f:write(string.format("step=%d\n", CM.stepOf(now))); f:close() end
-			end)
-			log(string.format("SYNC: everyone at step %d, queue empty -- asking for the save", CM.stepOf(now)))
-		elseif (CM.ticks % 25) == 0 then
-			log(string.format("SYNC: pausing -- speed %s, queue %d, peers at our step %d/%d", tostring(s), #CM.queue, same, n))
-		end
-	elseif st == "saving" then
+	if st == "saving" then
 		local f = io.open(K.BASE .. "tpf2_sync_sent.txt", "r")
 		if f then
 			local name = f:read("*l") or "?"; f:close()
 			os.remove(K.BASE .. "tpf2_sync_sent.txt")
-			CM.syncState = "waiting"
-			log(string.format("SYNC: save shared (%s) -- holding until the newcomer loads it", name))
-		end
-	elseif st == "waiting" then
-		local want = (CM.rosterPlayers or 0) - 1
-		if n >= want and same == n and n > 0 then
-			CM.syncEnd(string.format("everyone in (%d peer(s) at our step) -- resuming at %g", n, CM.syncSpeedBefore or 1))
-		elseif (CM.ticks % 50) == 0 then
-			log(string.format("SYNC: waiting -- %d/%d peer(s) in, %d at our step", n, want, same))
+			CM.syncEnd(string.format("save shared (%s) -- the newcomer loads it and catches up on its own", name))
 		end
 	end
+	local _ = n + same
+end
+
+-- CATCH-UP (the newcomer's side, but any instance that finds itself far
+-- behind). Behind the fastest non-catching-up peer by more than
+-- K.CATCHUP_MIN units: hold at 0, ask the host for the command history
+-- after our clock (LSNEED), wait for LSHISTEND with no gaps left (or a
+-- timeout), then run at catchup_speed (cfg, default 8) until within half a
+-- unit of the session, at which point ordinary pacing takes over. cu=1 on
+-- our heartbeat keeps the others from pacing against us meanwhile. Returns
+-- the speed to impose while active, nil otherwise.
+K.CATCHUP_MIN = 3
+function CM.catchUpTick(now, s)
+	if not CM.cfgFlag("hot_join", true) then return nil end
+	local fastP = CM.peerFastPrecise()
+	if not fastP then return nil end
+	local behind = fastP - now
+	if not CM.catchingUp2 then
+		if behind > K.CATCHUP_MIN then
+			CM.catchingUp2 = true
+			CM.cuPhase = "fetch"
+			CM.cuSince = CM.ticks
+			CM.histEndSeen = false
+			CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
+			log(string.format("CATCHUP: %.1f unit(s) behind the session -- holding, asked the host for the command history after %.1f", behind, now))
+			return 0
+		end
+		return nil
+	end
+	if CM.cuPhase == "fetch" then
+		local gaps = CM.rxGaps()
+		if CM.histEndSeen and gaps == 0 then
+			CM.cuPhase = "run"
+			log(string.format("CATCHUP: history complete -- running at %gx to close %.1f unit(s)", CM.cfgNum("catchup_speed", 8), behind))
+		elseif CM.ticks - CM.cuSince > 160 then
+			CM.cuPhase = "run"
+			log(string.format("CATCHUP: no complete history after ~30 s (end=%s, gaps=%d) -- running anyway", tostring(CM.histEndSeen), gaps))
+		else
+			return 0
+		end
+	end
+	if behind < 0.5 then
+		CM.catchingUp2 = false; CM.cuPhase = nil
+		log("CATCHUP: caught up with the session -- ordinary pacing from here")
+		return nil
+	end
+	return math.max(1, CM.cfgNum("catchup_speed", 8))
 end
 
 function CM.paceV2(now, lead)
@@ -606,7 +641,6 @@ function CM.paceV2(now, lead)
 		local why = "lowest lever"
 		if req and eff > 0 then eff = req; why = "/speed request" end
 		CM.syncTick(now, s)
-		if CM.syncState then eff = 0; why = "sync point (" .. CM.syncState .. ")" end
 		local changed = (eff ~= CM.effSpeed)
 		CM.effSpeed = eff
 		if not changed and (CM.ticks % 25) == 0 then CM.broadcast(string.format("LSEFF v=%g", eff)) end   -- a newcomer needs it at load
@@ -617,6 +651,11 @@ function CM.paceV2(now, lead)
 	end
 	-- APPLY (every instance). Joiners learn CM.effSpeed from LSEFF (net.lua),
 	-- the host computed it above.
+	local cu = CM.catchUpTick(now, s)
+	if cu ~= nil then
+		if settled and s ~= CM.leverOf(cu) then CM.setSpeed(cu, cu == 0 and "catch-up: holding for the history" or string.format("catch-up at %gx", cu)) end
+		return
+	end
 	local eff = CM.effSpeed
 	if eff == nil then return end
 	if eff > 0 then CM.runSpeed = eff end

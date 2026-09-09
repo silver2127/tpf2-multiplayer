@@ -144,8 +144,82 @@ function CM.nackScan()
 end
 
 -- someone asked us (or another origin) to resend a command
+-- COMMAND HISTORY (2026-09-09): every command that crossed this instance --
+-- ours and everyone else's -- with its stamp, K.HIST_RING deep. The Factorio
+-- shape of hot join: a newcomer loads a save taken at step S and asks for
+-- everything stamped after S (LSNEED); the host answers from this ring. Lines
+-- are re-sent with hist=1 hfor=<letter>, so nobody else pays attention.
+K.HIST_RING = 4096
+CM.hist = {}
+function CM.histPush(line, at)
+	local h = CM.hist
+	h[#h + 1] = { at = at or 0, line = line }
+	if #h > K.HIST_RING then table.remove(h, 1) end
+end
+function CM.histFind(o, seq)
+	local want = string.format("origin=%s seq=%d", tostring(o), seq)
+	for i = #CM.hist, 1, -1 do
+		local l = CM.hist[i].line
+		if l:find(want, 1, true) and l:sub(1, 6) == "LSCMD " then return l end
+	end
+	return nil
+end
+-- LSNEED t=S o=L: gather what L is missing, tell it the per-origin ranges
+-- (LSHIST), then feed the lines K.HIST_PER_TICK per tick (histPump) and close
+-- with LSHISTEND. Only the host serves: it hears everything.
+K.HIST_PER_TICK = 40
+function CM.histServe(S, L)
+	if K.INSTANCE ~= "a" then return end
+	local lines, per = {}, {}
+	for _, e in ipairs(CM.hist) do
+		if e.at > S then
+			lines[#lines + 1] = e.line
+			local o = e.line:match("origin=(%a+)")
+			local seq = tonumber(e.line:match("seq=(%d+)"))
+			if o and seq then
+				local r = per[o] or { lo = seq, hi = seq }
+				if seq < r.lo then r.lo = seq end
+				if seq > r.hi then r.hi = seq end
+				per[o] = r
+			end
+		end
+	end
+	for o, r in pairs(per) do
+		CM.broadcast(string.format("LSHIST for=%s o=%s from=%d to=%d", L, o, r.lo, r.hi))
+	end
+	CM.histSend = { fr = L, lines = lines, i = 1 }
+	log(string.format("HIST: %s needs everything after %.1f -- %d command(s) from %d origin(s) queued", L, S, #lines, (function() local n = 0; for _ in pairs(per) do n = n + 1 end; return n end)()))
+	if #lines == 0 then CM.broadcast(string.format("LSHISTEND for=%s n=0", L)); CM.histSend = nil end
+end
+function CM.histPump()
+	local hs = CM.histSend
+	if not hs then return end
+	local n = 0
+	while hs.i <= #hs.lines and n < K.HIST_PER_TICK do
+		CM.broadcast(hs.lines[hs.i] .. string.format(" hist=1 hfor=%s", hs.fr))
+		hs.i = hs.i + 1; n = n + 1
+	end
+	if hs.i > #hs.lines then
+		CM.broadcast(string.format("LSHISTEND for=%s n=%d", hs.fr, #hs.lines))
+		log(string.format("HIST: %d command(s) sent to %s", #hs.lines, hs.fr))
+		CM.histSend = nil
+	end
+end
+
 function CM.onNack(o, seq)
-	if o ~= K.INSTANCE then return end          -- only the origin answers
+	if o ~= K.INSTANCE then
+		-- the host also answers for OTHER origins from its history: a
+		-- newcomer's gaps can be older than the originator's own ring
+		if K.INSTANCE ~= "a" then return end
+		local line = CM.histFind(o, seq)
+		if not line then return end
+		local key = o .. ":" .. seq
+		if CM.resendAt[key] and CM.ticks - CM.resendAt[key] < K.RESEND_MIN_GAP then return end
+		CM.resendAt[key] = CM.ticks
+		CM.broadcast(line)
+		log(string.format("RESEND %s seq=%d from history (answering a NACK for %s)", o, seq, o))
+		return
+	end
 	local line = CM.sentRing[seq]
 	if not line then
 		log(string.format("NACK for our seq=%d but it is no longer in the ring (>%d old)", seq, K.CMD_RING))
@@ -271,6 +345,7 @@ function CM.scheduleLocal(op, args)
 	-- were never actually in step.
 	local wire = encodeCmd(c)
 	CM.recordSent(CM.seqNo, wire)
+	CM.histPush(wire, at)
 	CM.broadcast(wire)
 	log(string.format("SCHED %s seq=%d at=%.4f (now=%.4f)", op, CM.seqNo, at, now))
 end
@@ -416,6 +491,7 @@ local function onLine(line)
 			if st then pr.step = st end
 			local ce = tonumber(line:match(" ceil=(%d+)"))
 			if ce then pr.ceil = ce end
+			pr.cu = (line:find(" cu=1", 1, true) ~= nil)   -- catching up: not a pacing reference
 			CM.peerSeen = true
 			local hi = tonumber(line:match(" hi=(%d+)"))
 			if hi then pcall(CM.rxAdvertise, o, hi) end
@@ -472,14 +548,41 @@ local function onLine(line)
 		local o = line:match(" o=(%a)")
 		local seq = tonumber(line:match(" seq=(%d+)"))
 		if o and seq then pcall(CM.onNack, o, seq) end
+	elseif op == "LSNEED" then
+		local S = tonumber(line:match(" t=([%d%.]+)"))
+		local L = line:match(" o=(%a)")
+		if S and L and L ~= K.INSTANCE then pcall(CM.histServe, S, L) end
+	elseif op == "LSHIST" then
+		local fr = line:match(" for=(%a)")
+		if fr == K.INSTANCE then
+			local o = line:match(" o=(%a)")
+			local lo = tonumber(line:match(" from=(%d+)"))
+			local hi = tonumber(line:match(" to=(%d+)"))
+			if o and lo and hi and o ~= K.INSTANCE then
+				-- track this origin from the first history seq: gaps in the
+				-- burst are NACKed and the host answers them from its ring
+				CM.rx[o] = { seen = {}, maxSeq = lo - 1, firstSeq = lo - 1, advMax = lo - 1, missSince = {}, nackAt = {}, nackN = {} }
+				log(string.format("HIST: expecting %s seq %d..%d", o, lo, hi))
+			end
+		end
+	elseif op == "LSHISTEND" then
+		if line:match(" for=(%a)") == K.INSTANCE then
+			CM.histEndSeen = true
+			log(string.format("HIST: end of history (%s lines announced)", tostring(line:match(" n=(%d+)"))))
+		end
 	elseif op == "LSCMD" then
 		local c = decodeCmd(line)
+		if c and c.hist then
+			if c.hfor ~= K.INSTANCE then c = nil end   -- someone else's catch-up
+		elseif c and c.origin ~= K.INSTANCE then
+			CM.histPush(line, c.at)
+		end
 		if c then
 			-- track the origin's sequence for gap detection + resend
 			if c.origin and c.seq then pcall(CM.rxNote, c.origin, c.seq) end
 			-- a resent command may arrive after its stamp; it still executes
 			-- (LATE) so the entity exists and the world converges
-			if c.origin ~= K.INSTANCE and CM.rx[c.origin] and CM.rx[c.origin].nackN and CM.rx[c.origin].nackN[c.seq] then
+			if not c.hist and c.origin ~= K.INSTANCE and CM.rx[c.origin] and CM.rx[c.origin].nackN and CM.rx[c.origin].nackN[c.seq] then
 				CM.recovered = CM.recovered + 1
 				log(string.format("RECOVERED %s seq=%d from %s (a NACK was answered)", tostring(c.op), c.seq, c.origin))
 			end
@@ -546,6 +649,7 @@ local function onLine(line)
 end
 
 function CM.pollEvents()
+	CM.histPump()
 	if not K.EVENTS_FILE then return end
 	local data, newOff = CM.readFrom(K.EVENTS_FILE, CM.eventsOffset)
 	CM.eventsOffset = newOff
