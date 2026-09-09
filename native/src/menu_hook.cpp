@@ -1610,7 +1610,12 @@ static void SyncStart(const char* why)
         g_syncBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
         g_syncLastSize = 0; g_syncSave[0] = 0;
         Log("[sync] %s -> taking the save\n", why);
-        if (ForceAutosave()) { g_syncAskedAt = GetTickCount64(); SetStatus("Hot join: saving\xE2\x80\xA6"); }
+        if (ForceAutosave()) {
+            g_syncAskedAt = GetTickCount64(); SetStatus("Hot join: saving\xE2\x80\xA6");
+            // tell the newcomer's panel what is going on (a marked chat line;
+            // a panel still at the title menu shows it as its status, not as chat)
+            SendChat("!hotjoin A game is running. Hold on: the host is saving and will send you the world; your game loads it by itself.");
+        }
     }
     if (g_syncCsInit) LeaveCriticalSection(&g_syncCs);
 }
@@ -2105,7 +2110,14 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) { strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
                         else if (strcmp(ty, "roster") == 0) applyRoster(rem);
-                        else if (strcmp(ty, "chat") == 0) { char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx)); chatPush(fr, tx); speedFromChat(tx); }
+                        else if (strcmp(ty, "chat") == 0) {
+                            char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx));
+                            if (strncmp(tx, "!hotjoin ", 9) == 0) {
+                                // the host is saving for a newcomer: only a panel still at
+                                // the title menu needs it, as its status line
+                                if (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 && !g_gameUi) SetStatus(tx + 9);
+                            } else { chatPush(fr, tx); speedFromChat(tx); }
+                        }
                         else if (strcmp(ty, "status") == 0) { char de[200]; jsonStr(rem, "detail", de, sizeof(de)); if (de[0]) SetStatus(de); }
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));
