@@ -1596,19 +1596,30 @@ static ULONGLONG saveMtime(const wchar_t* path, ULONGLONG* size)
 }
 static ULONGLONG g_syncBaseline = 0, g_syncAskedAt = 0, g_syncLastSize = 0;
 static wchar_t   g_syncSave[600] = L"";
+static CRITICAL_SECTION g_syncCs; static bool g_syncCsInit = false;
+// Take the sync save now (host, in game). Called for a "/sync" request and,
+// the real hot join, whenever a player appears on the roster mid-game.
+static void SyncStart(const char* why)
+{
+    if (!InterlockedCompareExchange(&g_isHost, 0, 0)) { Log("[sync] %s on a joiner -- ignored (the host saves)\n", why); return; }
+    if (!g_gameUi) { Log("[sync] %s before the game is running -- ignored\n", why); return; }
+    if (g_syncCsInit) EnterCriticalSection(&g_syncCs);
+    if (g_syncAskedAt) { Log("[sync] %s while a save is pending -- one save serves everyone who joined\n", why); }
+    else {
+        wchar_t cur[600] = L""; ULONGLONG sz = 0;
+        g_syncBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
+        g_syncLastSize = 0; g_syncSave[0] = 0;
+        Log("[sync] %s -> taking the save\n", why);
+        if (ForceAutosave()) { g_syncAskedAt = GetTickCount64(); SetStatus("Hot join: saving\xE2\x80\xA6"); }
+    }
+    if (g_syncCsInit) LeaveCriticalSection(&g_syncCs);
+}
 static void SyncPoll()
 {
     wchar_t req[MAX_PATH]; _snwprintf_s(req, _TRUNCATE, L"%stpf2_sync_save.txt", g_dataDirW);
     if (GetFileAttributesW(req) != INVALID_FILE_ATTRIBUTES) {
         DeleteFileW(req);
-        if (!InterlockedCompareExchange(&g_isHost, 0, 0)) { Log("[sync] save request on a joiner -- ignored (the host saves)\n"); }
-        else if (g_syncAskedAt) { Log("[sync] save request while one is pending -- ignored\n"); }
-        else {
-            wchar_t cur[600] = L""; ULONGLONG sz = 0;
-            g_syncBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
-            g_syncLastSize = 0; g_syncSave[0] = 0;
-            if (ForceAutosave()) { g_syncAskedAt = GetTickCount64(); SetStatus("Sync: saving\xE2\x80\xA6"); }
-        }
+        SyncStart("sync request (chat or button)");
     }
     if (!g_syncAskedAt) return;
     wchar_t cur[600] = L""; ULONGLONG sz = 0;
@@ -1796,8 +1807,21 @@ static void applyRoster(const char* s)
     // no-op when nothing changed.
     bool roleKnown = g_you[0] && g_host[0];
     bool isHost = roleKnown && strcmp(g_you, g_host) == 0;
+    int count = g_playerCount;
     LeaveCriticalSection(&g_modelCs); InterlockedExchange(&g_panelDirty, 1);
     if (roleKnown) writeBridgeCtl(isHost);
+    // HOT JOIN (2026-09-09): the roster grew while the game is running and we
+    // are the host -- the newcomer is at the title menu with our code. Take a
+    // save and share it now; their game loads it by itself (the ordinary
+    // start path) and catches up on the command history. No button, no
+    // pause, no ordering to get right.
+    static int lastCount = 0;
+    bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
+    if (isHost && inGame && count > lastCount && lastCount > 0) {
+        char why[96]; snprintf(why, sizeof(why), "hot join: roster %d -> %d", lastCount, count);
+        SyncStart(why);
+    }
+    lastCount = count;
 }
 
 // ---------------- START GAME: place the shared save + load it in place ----------------
@@ -2421,6 +2445,7 @@ static DWORD WINAPI Init(LPVOID)
     InitializeCriticalSection(&g_statusCs); g_csInit = true;
     InitializeCriticalSection(&g_modelCs); g_modelCsInit = true;
     InitializeCriticalSection(&g_lobbyCs); g_lobbyCsInit = true;
+    InitializeCriticalSection(&g_syncCs); g_syncCsInit = true;
     CreateThread(nullptr, 0, KbHookThread, nullptr, 0, nullptr);  // chat keyboard capture/swallow
     Log("[menu] attached, base=%llx  save=%ls  net=%ls  data=%ls  our=%ls\n",
         (unsigned long long)g_base, g_saveDirW, g_netDirW, g_dataDirW, ourDirW());
