@@ -772,8 +772,8 @@ function data()
 					if f then
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
-						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
-							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-"))
+						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
+							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-"))
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
 							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
@@ -1131,8 +1131,10 @@ function data()
 					D.eff = eff
 					local req = mine and mine.speedreq
 					local sync = mine and mine.sync
-					D.speedText:setText(string.format("session speed: %s%s%s   ", eff and string.format("%gx", eff) or "-",
+					local pace = mine and mine.pace
+					D.speedText:setText(string.format("session speed: %s%s%s%s   ", eff and string.format("%gx", eff) or "-",
 						(req and req ~= "-") and "  (set)" or "  (lowest lever)",
+						(pace and pace ~= "-") and ("  PID " .. pace) or "",
 						(sync and sync ~= "-") and ("  SYNC: " .. sync) or ""))
 					if D.chatText and (guiTick % 30) == 0 then
 						local lines = CM.chatTail(8)

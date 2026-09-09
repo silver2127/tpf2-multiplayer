@@ -56,7 +56,10 @@ function CM.expectDrop(list, x, y) CM.expectTake(list, x, y) end
 -- Optional switches from tpf2_slice.cfg in the game folder (the game-script
 -- CWD; the same file the slice reads): key=value lines, 1/0.
 function CM.cfgFlag(key, default)
-	if CM.cfgCache == nil then
+	-- Re-read every ~5 s (2026-09-09): the PID gains and the pacing switches
+	-- are meant to be tuned while the game runs, like the DLL's own cfg.
+	if CM.cfgCache == nil or ((CM.ticks or 0) - (CM.cfgCacheAt or 0)) > 27 then
+		CM.cfgCacheAt = CM.ticks or 0
 		CM.cfgCache = {}
 		pcall(function()
 			-- game folder first (CWD), then the data dir -- the DLLs' order

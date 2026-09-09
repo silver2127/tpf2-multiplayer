@@ -492,6 +492,50 @@ end
 -- the speed to impose while active, nil otherwise.
 K.CATCHUP_MIN = 3
 K.FRAC_PACE_TICKS = 5      -- ~1 s between pacing decisions (heartbeats are 2 ticks apart)
+
+-- The controller. Returns target speed (or nil when level) and the error.
+function CM.pidPace(now, eff)
+	local kp   = CM.cfgNum("pid_kp",   0.10)
+	local ki   = CM.cfgNum("pid_ki",   0.03)
+	local kd   = CM.cfgNum("pid_kd",   0.05)
+	local dead = CM.cfgNum("pid_dead", 0.20)
+	local lo   = CM.cfgNum("pid_min",  0.50)
+	local hi   = CM.cfgNum("pid_max",  1.30)
+	-- reference: the mean of every fresh, non-catching-up clock and our own
+	local sum, n = now, 1
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
+			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			if t and math.abs(t - now) < 60 then sum = sum + t; n = n + 1 end
+		end
+	end
+	local dtTicks = CM.ticks - (CM.pidAt or CM.ticks)
+	CM.pidAt = CM.ticks
+	if n < 2 then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
+	local e = now - sum / n                       -- + = we are ahead
+	local dt = math.max(1, dtTicks) / 5.4         -- seconds between decisions
+	local eD = (math.abs(e) < dead) and 0 or e
+	CM.pidI = (CM.pidI or 0) + eD * dt
+	if ki > 0 then                                -- anti-windup: the I term alone stays inside the output range
+		local cap = math.max(hi - 1, 1 - lo) / ki
+		if CM.pidI > cap then CM.pidI = cap elseif CM.pidI < -cap then CM.pidI = -cap end
+	end
+	local d = (e - (CM.pidLastE or e)) / dt
+	CM.pidLastE = e
+	local u = kp * eD + ki * CM.pidI + kd * d
+	local m = 1 - u
+	if m < lo then m = lo elseif m > hi then m = hi end
+	local target = math.floor(eff * m / 0.05 + 0.5) * 0.05
+	if target > (CM.MAX_SPEED or 4) then target = CM.MAX_SPEED or 4 end
+	if target < 0.5 then target = 0.5 end
+	if math.abs(m - 1) < 0.025 then target = eff end   -- level enough: exactly the session speed
+	if target ~= CM.pidHold then
+		log(string.format("PID: e=%+.2f (ref mean of %d) P=%+.3f I=%+.3f D=%+.3f -> %.2fx of %g", e, n, kp * eD, ki * CM.pidI, kd * d, target, eff))
+	end
+	CM.pidHold, CM.pidErr = target, e
+	CM.paceInfo = string.format("%.2fx e=%+.2f", target, e)
+	return target, e
+end
 K.CATCHUP_SPEED_MAX = 4    -- the sim cannot keep up above the game's own 4 on real hardware; 8 felt SLOWER
 function CM.catchUpTick(now, s)
 	if not CM.cfgFlag("hot_join", true) then return nil end
@@ -688,41 +732,30 @@ function CM.paceV2(now, lead)
 	-- never asked to go faster than that, since it cannot. Quantised to 0.05 so
 	-- the dither file is rewritten on real changes only. Replaces the pulses
 	-- players felt as stutter: the leader eases off and the tail catches up.
-	-- TUNED 2026-09-09 after a live session felt like go-stop-go: the first
-	-- gain (a quarter off per unit) overshot on a heartbeat a third of a
-	-- second stale, the other side became the slow one, and the roles flipped
-	-- every few seconds. Now: dead band 0.4, 10% off per unit ahead, never
-	-- below 0.55x, and a NEW decision only every K.FRAC_PACE_TICKS -- the last
-	-- one holds in between -- so the loop settles instead of chasing.
+	-- PID PACING (2026-09-09, cfg speed_frac_pace, default on). Every instance
+	-- drives its clock to the MEAN of all fresh clocks (its own included) by
+	-- scaling the session speed with the dither: a leader eases off, a laggard
+	-- with headroom speeds up (to pid_max x, lever 4 at most), and the integral
+	-- term is what lets the group settle on the throughput of the slowest
+	-- machine instead of flipping who is slowest. One decision per
+	-- K.FRAC_PACE_TICKS from heartbeats two ticks apart; held in between.
+	-- LIVE-TUNABLE: pid_kp, pid_ki, pid_kd, pid_dead, pid_min, pid_max in
+	-- tpf2_slice.cfg are re-read every ~5 s (CM.cfgFlag), and every decision
+	-- that changes the target logs its terms.
 	local paced = nil
 	if target == eff and eff > 0 and CM.cfgFlag("speed_frac_pace", true) then
-		if CM.fracHold and (CM.ticks - (CM.fracDecidedAt or 0)) < K.FRAC_PACE_TICKS then
-			target = CM.fracHold; paced = CM.fracLead
+		if CM.pidHold and (CM.ticks - (CM.pidAt or 0)) < K.FRAC_PACE_TICKS then
+			target = CM.pidHold; paced = CM.pidErr
 		else
-			local slowP = CM.peerSlowPrecise()
-			local myLead = slowP and (now - slowP) or 0
-			if myLead > 0.4 and myLead < 60 then
-				local f = math.max(0.55, 1 - 0.10 * myLead)
-				target = math.max(0.5, math.floor(eff * f / 0.05 + 0.5) * 0.05)
-				paced = myLead
-				CM.fracHold, CM.fracLead, CM.fracDecidedAt = target, myLead, CM.ticks
-			else
-				CM.fracHold, CM.fracLead = nil, nil
-				CM.fracDecidedAt = CM.ticks
-			end
+			local t2, e = CM.pidPace(now, eff)
+			if t2 then target = t2; paced = e end
 		end
 	end
 	if settled and s == CM.leverOf(target) then CM.setDither(target) end   -- same lever, new fraction
-	if paced and CM.fracLast ~= target then
-		CM.fracLast = target
-		log(string.format("PACE: %.2fx of session %g (%.1f ahead of the slowest peer)", target, eff, paced))
-	elseif not paced and CM.fracLast then
-		CM.fracLast = nil
-		log(string.format("PACE: back in step -- session speed %g", eff))
-	end
+	if not paced and CM.paceInfo then CM.paceInfo = nil end
 	if s ~= CM.leverOf(target) and settled then
 		if paced then
-			CM.setSpeed(target, string.format("pacing %.2fx (%.1f ahead)", target, paced))
+			CM.setSpeed(target, string.format("PID %.2fx (e=%+.2f)", target, paced))
 		elseif target == eff then
 			CM.setSpeed(target, string.format("session speed %g", eff))
 		else
