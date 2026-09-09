@@ -424,6 +424,11 @@ function CM.speedRequest()
 		req = tonumber(body:match("speed=([%d%.]+)"))
 		syncN = tonumber(body:match("sync=(%d+)")) or 0
 		players = tonumber(body:match("players=(%d+)"))
+		local ld = body:match("leader=(%a+)")
+		if ld and ld ~= CM.leader then
+			CM.leader = ld
+			log("leader is now " .. ld .. (CM.isLeader() and " (that is us)" or ""))
+		end
 		local pid = body:match("pid=([^\r\n]+)")
 		if pid and pid ~= CM.pidOvText then
 			CM.pidOvText = pid
@@ -462,7 +467,7 @@ end
 -- The hash lane right after the resume is the proof that a loaded save equals
 -- the memory it was taken from; a DESYNC there means it does not.
 function CM.syncBegin()
-	if K.INSTANCE ~= "a" then return end
+	if not CM.isLeader() then return end
 	-- NO PAUSE (2026-09-09, the Factorio shape): the save is taken while the
 	-- session runs; the newcomer loads it at its step S, asks for every
 	-- command stamped after S (LSNEED -> the history ring) and runs through
@@ -539,8 +544,8 @@ function CM.pidPace(now, eff)
 	-- and only its lever changes it (a host that sees a peer lagging can slow
 	-- everyone down by choice). Every joiner's reference is the host's precise
 	-- clock; nobody steers the host.
-	if K.INSTANCE == "a" then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
-	local host = CM.peers["a"]
+	if CM.isLeader() then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
+	local host = CM.peers[CM.leader or "a"]
 	local ref
 	if host and host.at and (CM.ticks - host.at) <= K.PEER_STALE_TICKS then
 		ref = host.step and (host.step * K.SIM_STEP) or host.time
@@ -662,7 +667,7 @@ function CM.paceV2(now, lead)
 	end
 	-- The host's player pressed play (a hand-set non-zero speed after a 0, or
 	-- while the session's effective speed is 0): that unpauses the SESSION.
-	if K.INSTANCE == "a" and settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
+	if CM.isLeader() and settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
 		CM.hostUnpause(s)
 	end
 	-- A pause the player just made is being DEBOUNCED (SPD2_PAUSE_TICKS) before
@@ -693,7 +698,7 @@ function CM.paceV2(now, lead)
 			return
 		end
 	end
-	if K.INSTANCE == "a" then
+	if CM.isLeader() then
 		-- min ceiling across fresh instances (self + peers)
 		local minCeil = CM.myCeiling
 		for _, pr in pairs(CM.peers) do

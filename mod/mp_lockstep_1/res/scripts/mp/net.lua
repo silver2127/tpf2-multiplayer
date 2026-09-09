@@ -169,7 +169,7 @@ end
 -- with LSHISTEND. Only the host serves: it hears everything.
 K.HIST_PER_TICK = 40
 function CM.histServe(S, L)
-	if K.INSTANCE ~= "a" then return end
+	if not CM.isLeader() then return end
 	local lines, per = {}, {}
 	for _, e in ipairs(CM.hist) do
 		if e.at > S then
@@ -210,7 +210,7 @@ function CM.onNack(o, seq)
 	if o ~= K.INSTANCE then
 		-- the host also answers for OTHER origins from its history: a
 		-- newcomer's gaps can be older than the originator's own ring
-		if K.INSTANCE ~= "a" then return end
+		if not CM.isLeader() then return end
 		local line = CM.histFind(o, seq)
 		if not line then return end
 		local key = o .. ":" .. seq

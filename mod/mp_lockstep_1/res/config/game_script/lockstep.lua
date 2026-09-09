@@ -231,6 +231,12 @@ CM.seqNo        = 0
 -- chases the fastest, and a stamp is SYNC only when every peer that reported
 -- agrees. A peer is "fresh" while its last tick is within K.PEER_STALE_TICKS.
 CM.peers = {}   -- origin -> { time=, at=, hashes={[stamp]=h}, details={[stamp]=d}, streak=n }
+-- THE LEADER: the one instance that is the session clock (constant speed, the
+-- LSEFF sender, the history/NACK server, the sync-save taker). It used to be
+-- letter "a" by definition; a relay lobby names it in the bridge ctl
+-- (leader=<letter>, the roster's host) so the role survives "a" leaving.
+CM.leader = "a"
+function CM.isLeader() return K.INSTANCE == (CM.leader or "a") end
 function CM.peerFor(o)
 	local pr = CM.peers[o]
 	if not pr then pr = { hashes = {}, details = {}, streak = 0 }; CM.peers[o] = pr end

@@ -1480,6 +1480,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     transfer = [None]                       # the active _HostSaveTransfer, or None
     upload = [None]                         # relay-only: the leader's save coming in
     letters = {}                            # relay-only: name -> origin letter (sticky)
+    letters_path = os.path.join(io.dir, "relay_letters.json")
+    if relay_only:
+        try:
+            with open(letters_path, "r", encoding="utf-8") as f:
+                letters.update({str(k): str(v) for k, v in json.load(f).items()})
+            log(f"[relay] {len(letters)} letter(s) remembered from the last run")
+        except (OSError, ValueError):
+            pass
 
     def leader_addr():
         """relay-only: the oldest connected joiner (peers is insertion-ordered)."""
@@ -1498,7 +1506,20 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             while _origin_letter(i) in used:
                 i += 1
             letters[name] = _origin_letter(i)
+            try:
+                with open(letters_path, "w", encoding="utf-8") as f:
+                    json.dump(letters, f)
+            except OSError:
+                pass
         return letters[name]
+
+    def stored_save():
+        """relay-only: the last save uploaded here, if any (path, age seconds)."""
+        path = os.path.join(io.dir, INCOMING_BASENAME + ".sav")
+        try:
+            return path, time.time() - os.path.getmtime(path)
+        except OSError:
+            return None, None
 
     if code:
         io.emit({"type": "code", "code": code})
@@ -1641,6 +1662,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         _send_data(sock, addr, {"t": "welcome",
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "lobby": lobby_name, "relay": relay_only})
+        if relay_only and not started[0] and addr == leader_addr():
+            spath, age = stored_save()
+            if spath:
+                _send_data(sock, addr, {"t": "status", "state": "connected",
+                                        "detail": f"the relay holds a save from {int(age // 60)} min ago -- "
+                                                  f"START GAME shares yours, or say /resume to continue it"})
         roster_changed()
         if late:
             # A late joiner is NOT started: it has no save (a save start) and
@@ -1780,7 +1807,23 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     peers_log.write(p["name"], lines)
         elif t == "chat":
             if addr in peers:
-                broadcast_chat(peers[addr]["name"], str(msg.get("text", "")))
+                text = str(msg.get("text", ""))
+                if relay_only and text.strip().lower() == "/resume":
+                    spath, age = stored_save()
+                    if addr != leader_addr():
+                        _send_data(sock, addr, {"t": "status", "state": "connected",
+                                                "detail": f"only the leader ({leader_name()!r}) can resume"})
+                    elif not spath:
+                        _send_data(sock, addr, {"t": "status", "state": "connected",
+                                                "detail": "the relay holds no save to resume"})
+                    elif transfer[0] is not None or upload[0] is not None:
+                        _send_data(sock, addr, {"t": "status", "state": "connected",
+                                                "detail": "a save transfer is already running"})
+                    else:
+                        log(f"[relay] /resume by the leader: pushing the stored save ({int(age)} s old) to everyone waiting")
+                        begin_save_transfer(spath, include_leader=True)
+                    return
+                broadcast_chat(peers[addr]["name"], text)
         elif t == "ping":
             pass                                            # last-seen refreshed
         elif t == "leave":
@@ -1802,7 +1845,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 transfer[0].on_fdone(addr, msg)
 
     # ---- save transfer: read the file(s), fan out reliably, THEN start ----- #
-    def begin_save_transfer(save_path):
+    def begin_save_transfer(save_path, include_leader=False):
         """Kick off a reliable push of ``save_path`` (+ sidecars) to all peers.
 
         Runs entirely off the main loop: this only builds the transfer object;
@@ -1832,7 +1875,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         sid = int(time.time() * 1000) & 0xFFFFFFFF
         if relay_only:
             la = leader_addr()
-            targets = [(a, peers[a]["name"]) for a in peers if a != la and not peers[a].get("started")]
+            targets = [(a, peers[a]["name"]) for a in peers
+                       if (include_leader or a != la) and not peers[a].get("started")]
             if not targets:
                 # nobody is waiting: the upload was a hot-join sync for peers that
                 # have since left, or a plain re-start -- just start the leader
@@ -2509,7 +2553,28 @@ def cmd_host(args):
     # observe + print the single CODE= line (reused from connect.py). The code
     # carries a fresh session secret: whoever has the code can talk to us,
     # nobody else can read or inject; --password layers on top of it.
-    secret = os.urandom(SECRET_LEN)
+    secret = None
+    if getattr(args, "relay_only", False):
+        # a dedicated relay keeps its secret: the same code stays valid across
+        # restarts (the address and port are fixed too), so nobody re-pastes
+        spath = os.path.join(io.dir, "relay_secret.bin")
+        try:
+            with open(spath, "rb") as f:
+                secret = f.read()
+            if len(secret) != SECRET_LEN:
+                secret = None
+        except OSError:
+            secret = None
+        if secret is None:
+            secret = os.urandom(SECRET_LEN)
+            try:
+                with open(spath, "wb") as f:
+                    f.write(secret)
+                os.chmod(spath, 0o600)
+            except OSError as e:
+                _log(f"[host] could not keep the relay secret: {e}")
+    if secret is None:
+        secret = os.urandom(SECRET_LEN)
     SEAL[0] = Sealer(derive_key(secret, args.password or ""))
     sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
                                                  password=args.password or None)

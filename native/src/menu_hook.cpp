@@ -318,6 +318,7 @@ static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
 static void LeaveLobby();
 static DWORD WINAPI KbHookThread(LPVOID);
 static void LobbySend(const char* jsonLine);
+static const char* originLetterFor(const char* name);
 static void ClipboardSet(const char* utf8);
 static bool ClipboardGet(char* out, int outsz);
 static bool newestSave(wchar_t* out, int cch);
@@ -1983,6 +1984,10 @@ static void writeBridgeCtl(bool isHost)
         size_t n = strlen(content);
         snprintf(content + n, sizeof(content) - n, "pid=%s\n", g_pidReq);
     }
+    {   // the session clock: the roster's host (a relay lobby moves it when the leader leaves)
+        size_t n = strlen(content);
+        snprintf(content + n, sizeof(content) - n, "leader=%s\n", g_host[0] ? originLetterFor(g_host) : "a");
+    }
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%stpf2_bridge_ctl.txt", g_dataDirW);
@@ -2430,7 +2435,9 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 Log("[menu] start while in game -- a sync for a newcomer, ignored here\n");
                                 go = false;
                             }
-                            if (InterlockedCompareExchange(&g_isHost, 0, 0)) {
+                            if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
+                                // our own save (the one we shared / uploaded); a leader that RECEIVED a
+                                // save this session (a relay's /resume) falls through and loads that
                                 wcscpy_s(src, g_startSaveW[0] ? g_startSaveW : L""); if (!src[0]) newestSave(src, 600);
                             } else if (withSave) {
                                 if (!saveReady) {   // the transfer never completed here: loading would pick a stale/unrelated save
