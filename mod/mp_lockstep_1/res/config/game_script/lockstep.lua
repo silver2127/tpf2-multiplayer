@@ -1123,11 +1123,7 @@ function data()
 					crow:addItem(speedBtn("  >  ", function() coStep(1) end))
 					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
 					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
-					crow:addItem(speedBtn("  dissolve into mine  ", function()
-						if not D.coSel or D.coSel == D.coMine then D.coHint = "select another company first (< >)"
-						elseif (D.coPlayed or {})[D.coSel] then D.coHint = "company " .. D.coSel .. " is played by " .. D.coPlayed[D.coSel]
-						else D.coHint = "dissolving " .. D.coSel .. "..."; coRequest("CMDEL", D.coSel) end
-					end))
+					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
 					D.coNote = api.gui.comp.TextView.new("")
 					-- password: used by "new company" (locks the new one), by "switch"/"dissolve"
 					-- (the attempt), and by "set password" (your own company; empty clears)
