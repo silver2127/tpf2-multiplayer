@@ -37,9 +37,11 @@ an empty value hides the list.
 **Dedicated relay:** a lobby can live on a server with no game
 (`lobby.py host --relay-only`, deployed to the VPS by `tools/relay_deploy.sh` as
 the `tpf2mp-relay` service, always listed in PUBLIC GAMES). Everyone joins it;
-the first player in is the leader and gets the host role: START GAME uploads
-their newest save to the relay, which pushes it to everyone waiting, and hot
-joiners get the same treatment. Letters are assigned by the relay and stick to
+the first player in is the leader and gets the host role. If the relay already
+holds a world it is continued automatically; otherwise START GAME uploads the
+leader's newest save to the relay, which pushes it to everyone waiting. Hot
+joiners get the same treatment, and the leader re-uploads every 10 minutes so
+the relay's copy stays fresh. Letters are assigned by the relay and stick to
 names, so a returning leader is `a` again. Nobody needs an open port or a
 non-CGNAT connection, and the code never changes while the relay runs. The
 world only advances while players are connected: the relay carries frames, it

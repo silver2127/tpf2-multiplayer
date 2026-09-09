@@ -62,7 +62,7 @@ try:
     assert len([e for e in events(bd) if e.get("type") == "save_ready"]) == nb, "bob re-received the save"
     rc = [e for e in events(cd) if e.get("type") == "roster"][-1]
     assert rc.get("letters", {}).get("Carol") == "c", rc
-    # ---- restart the relay: same code (kept secret), letters remembered, /resume serves the stored save
+    # ---- restart the relay: same code (kept secret), letters remembered, the stored save is continued automatically
     for pr in procs: pr.kill()
     time.sleep(1.5); procs.clear()
     open(os.path.join(rd, "lobby_out.jsonl"), "w").close()
@@ -74,13 +74,11 @@ try:
     assert wait(lambda: any(e.get("type") == "roster" and "Dave" in e.get("players", []) for e in events(dd)), 40), "dave not in roster"
     rdv = [e for e in events(dd) if e.get("type") == "roster"][-1]
     assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "d", rdv     # a,b,c are remembered for Alice/Bob/Carol
-    assert wait(lambda: any(e.get("type") == "status" and "holds a save" in e.get("detail", "") for e in events(dd)), 10), "no stored-save hint"
-    with open(os.path.join(dd, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
-        f.write(json.dumps({"cmd": "chat", "text": "/resume"}) + "\n")
+    assert wait(lambda: any(e.get("type") == "status" and "continuing the relay" in e.get("detail", "") for e in events(dd)), 10), "no auto-resume status"
     assert wait(lambda: any(e.get("type") == "save_ready" for e in events(dd)), 60), "dave never got the stored save"
     assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(dd)), 30), "dave no start"
     assert open(os.path.join(dd, "incoming_save.sav"), "rb").read() == open(save, "rb").read(), "resumed save differs"
-    print("RELAY SELFTEST OK (incl. restart + /resume)")
+    print("RELAY SELFTEST OK (incl. restart + auto-resume)")
 finally:
     for p in procs:
         try: p.kill()

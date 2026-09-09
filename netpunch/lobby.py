@@ -1691,12 +1691,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         _send_data(sock, addr, {"t": "welcome",
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "lobby": lobby_name, "relay": relay_only})
-        if relay_only and not started[0] and addr == leader_addr():
+        if relay_only and not started[0] and addr == leader_addr() and transfer[0] is None and upload[0] is None:
+            # a fresh session and the relay holds the world: continue it right
+            # away -- the leader receives the save like any joiner and starts
             spath, age = stored_save()
             if spath:
                 _send_data(sock, addr, {"t": "status", "state": "connected",
-                                        "detail": f"the relay holds a save from {int(age // 60)} min ago -- "
-                                                  f"START GAME shares yours, or say /resume to continue it"})
+                                        "detail": f"continuing the relay's world (saved {int(age // 60)} min ago)…"})
+                log(f"[relay] fresh session with a stored save ({int(age)} s old): auto-resuming for {peers[addr]['name']!r}")
+                begin_save_transfer(spath, include_leader=True)
         roster_changed()
         if late:
             # A late joiner is NOT started: it has no save (a save start) and
