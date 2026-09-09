@@ -1342,10 +1342,86 @@ def _clear_stale_incoming(directory, log=_log):
 
 
 # --------------------------------------------------------------------------- #
+# PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
+# --------------------------------------------------------------------------- #
+LOBBY_VERSION = "0.4.5"
+PUBLISH_EVERY = 30.0
+
+
+class _Publisher:
+    """Announces this lobby to the master server every PUBLISH_EVERY seconds
+    while ``on``; a ``leave`` goes out when it is switched off or the host
+    exits. Runs on its own thread: an HTTP round trip must never stall the
+    relay loop. What is published is exactly what a Discord post would be --
+    the code (host address + session secret) and a name -- so it is opt-in,
+    and a password-locked code shows as locked (useless without the password)."""
+
+    def __init__(self, url, code, game, locked, log):
+        self.url = url.rstrip("/")
+        self.code = code
+        self.game = game or ""
+        self.locked = bool(locked)
+        self.log = log
+        self.id = os.urandom(8).hex()
+        self.name = "host"
+        self.players = 1
+        self.on = False
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True, name="publish")
+        self._t.start()
+
+    def set(self, on):
+        self.on = bool(on)
+        self._wake.set()
+
+    def update(self, name, players):
+        self.name, self.players = name, players
+
+    def close(self):
+        self._stop.set(); self._wake.set()
+        self._t.join(timeout=6)
+
+    def _post(self, path, body):
+        import urllib.request
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(self.url + path, data=data,
+                                     headers={"Content-Type": "application/json",
+                                              "User-Agent": "tpf2mp-lobby/" + LOBBY_VERSION})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            return r.status
+
+    def _run(self):
+        announced = False
+        while not self._stop.is_set():
+            try:
+                if self.on:
+                    self._post("/announce", {"id": self.id, "name": self.name, "code": self.code,
+                                             "players": self.players, "max": 8, "game": self.game,
+                                             "version": LOBBY_VERSION, "locked": self.locked})
+                    if not announced:
+                        self.log(f"[publish] listed publicly at {self.url} as {self.name!r}")
+                    announced = True
+                elif announced:
+                    self._post("/leave", {"id": self.id})
+                    self.log("[publish] removed from the public list")
+                    announced = False
+            except Exception as e:                            # noqa: BLE001
+                self.log(f"[publish] {self.url}: {e}")
+            self._wake.wait(PUBLISH_EVERY)
+            self._wake.clear()
+        if announced:
+            try:
+                self._post("/leave", {"id": self.id})
+            except Exception:                                 # noqa: BLE001
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # HOST: single socket, N peers, authority for roster + chat relay
 # --------------------------------------------------------------------------- #
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
-             log=_log, relay=None, forward_logs=()):
+             log=_log, relay=None, forward_logs=(), publisher=None):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``sock`` is a bound UDP socket (the observe/game socket for the real CLI, a
@@ -1434,6 +1510,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                  "companies": companies})
 
     def emit_roster():
+        if publisher is not None:
+            publisher.update(host_name, 1 + len(peers))
         players = roster_players()
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": host_name,
@@ -1681,6 +1759,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if set_company(target, cmd.get("id")):
                 log(f"[host] {target} -> company {cmd.get('id')} (set by host)")
                 roster_changed()
+        elif c == "publish":
+            if publisher is not None:
+                publisher.set(bool(cmd.get("on", True)))
+                log(f"[host] public listing {'ON' if publisher.on else 'OFF'}")
+            else:
+                log("[host] publish requested but no --publish URL was given")
         elif c == "start":
             save = cmd.get("save")
             if transfer[0] is not None:
@@ -2266,10 +2350,18 @@ def cmd_host(args):
              "-- set a password to lock it")
     _log("[host] frames are sealed (session key from the code"
          + (" + password)" if args.password else ")"))
+    publisher = None
+    if args.publish:
+        publisher = _Publisher(args.publish, code, args.game_name, bool(args.password), _log)
+        publisher.update(args.name, 1)
+        if args.public:
+            publisher.set(True)
     try:
         run_host(sock, args.name, io, code=code, relay=relay,
-                 forward_logs=args.forward_log or ())
+                 forward_logs=args.forward_log or (), publisher=publisher)
     finally:
+        if publisher is not None:
+            publisher.close()
         try:
             from observe import upnp_unmap
             if upnp_unmap(args.local_port):
@@ -3316,6 +3408,13 @@ def main(argv=None):
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
+    ap.add_argument("--publish", default="",
+                    help="master server base URL; the lobby is listed there while "
+                         "public (see --public and the 'publish' command)")
+    ap.add_argument("--public", action="store_true",
+                    help="start listed publicly (host only)")
+    ap.add_argument("--game-name", default="",
+                    help="what the public list shows as the game (the save's name)")
     ap.add_argument("--password", default="",
                     help="optional lobby password: mixed into the session key, "
                          "so everyone must enter the same one (host + joiners)")

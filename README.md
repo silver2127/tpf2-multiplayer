@@ -23,6 +23,17 @@ registry value; big saves load about 15x faster, see `installer/README.md`). Run
 files go to `%LOCALAPPDATA%\tpf2mp\data`. Installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order.
 
+**Playing:** *Multiplayer* on the title screen. **HOST GAME** opens a lobby and gives
+you a code to hand out (Discord, or tick **PUBLIC** and the game shows up in the
+**PUBLIC GAMES** list on everyone's Multiplayer page, OpenTTD style). **JOIN GAME**
+takes a pasted code, or click a row in the list to fill it in. A password locks the
+code: a public row shows as `[locked]` and needs the password typed below it. The
+list is served by a tiny stdlib HTTP service (`netpunch/masterserver.py`, deployed
+with `tools/masterserver_deploy.sh`); hosts announce every 30 s, entries expire
+after 2 minutes, and nothing is brokered: the code is the join, the list only
+repeats it. `master_url=` in `tpf2_menu_flags.txt` points the panel elsewhere;
+an empty value hides the list.
+
 **Uninstalling:** run the same MSI again and choose **Remove**, or use *Apps* in
 Windows settings. Either removes every file it added and puts the game's own
 `alut.dll` back (unless TpF2 Big Maps is still installed, in which case the shared
@@ -61,7 +72,7 @@ proxy stays for it).
 |---|---|
 | `native/` | The native side. One script, `build.bat <target>`: `proxy` (the `alut.dll` proxy and the bridge DLL: identity, relay socket, save transfer), `slice` (the command-capture hooks), `menu` (the Vulkan overlay lobby panel), `host` (the plugin host shared with TpF2 Big Maps), or `all`. Sources in `src/`, vendored Vulkan headers in `third_party/`. |
 | `mod/mp_lockstep_1/` | The game mod. `res/config/game_script/lockstep.lua` is the entry point; the replication logic is in `res/scripts/mp/*.lua`, one module per concern. |
-| `netpunch/` | The lobby: UDP hole punching, host-as-relay star, sealed frames, save transfer. `lobby.py` is what gets frozen into `netpunch.exe`. |
+| `netpunch/` | The lobby: UDP hole punching, host-as-relay star, sealed frames, save transfer. `lobby.py` is what gets frozen into `netpunch.exe`. `masterserver.py` is the public game list it announces to. |
 | `installer/` | The WiX package and its custom action; `README.md` there covers building the MSI. |
 | `tools/` | Developer scripts: deploy the mod, build and ship the DLLs, launch the multi-instance rig, run the soak test, check the Lua. `tools/ghidra/` and `tools/re/` are the reverse-engineering helpers. |
 | `docs/` | Current design and status notes; `docs/re/` the reverse-engineering findings the hooks rest on; `docs/history/` the milestone reports from the first phase. |

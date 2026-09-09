@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <string>
 #include <iphlpapi.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #include <cstdint>
 #include <cstdio>
@@ -455,9 +457,9 @@ static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSecti
 
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
 static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
-struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field; btn = hover wash
-static Hit g_hits[12]; static int g_hitCount = 0;
-static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount<12){g_hits[g_hitCount++]={x,y,w,h,id,btn};} }
+struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field 11=PUBLIC 12=REFRESH 30..37=public game rows; btn = hover wash
+static Hit g_hits[40]; static int g_hitCount = 0;
+static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount<40){g_hits[g_hitCount++]={x,y,w,h,id,btn};} }
 static const Hit* hoveredHit(){ for(int i=0;i<g_hitCount;i++) if(g_hits[i].btn && g_hits[i].id==g_hover) return &g_hits[i]; return nullptr; }
 
 // ---------------- A/B test flags (tpf2_menu_flags.txt next to this dll) ----------------
@@ -479,6 +481,7 @@ static int   g_flagNativeBtn     = 1;
 static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.60f;
 static int   g_flagFontPx = 0;
 static int   g_flagSlot = 0;
+static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
 static bool  g_latoLoaded = false;
 static void ReadFlags()
 {
@@ -494,6 +497,7 @@ static void ReadFlags()
         else if (!strcmp(line, "oy")) g_flagOy = (float)atof(v);
         else if (!strcmp(line, "fontpx")) g_flagFontPx = atoi(v);
         else if (!strcmp(line, "slot")) g_flagSlot = atoi(v);
+        else if (!strcmp(line, "master_url")) { strncpy_s(g_flagMaster, v, _TRUNCATE); char* e = g_flagMaster + strlen(g_flagMaster); while (e > g_flagMaster && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '/')) *--e = 0; }
     }
     fclose(f);
     Log("[menu] flags: native=%d slot=%d scale=%.2f\n", g_flagNativeBtn, g_flagSlot, g_flagScale);
@@ -713,6 +717,120 @@ static void drawBtn(HDC dc, int x, int y, int w, int h, const wchar_t* label, in
 #define MW_YOU    RGB(150, 210, 170)
 static char g_joinCode[256] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
 static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
+static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itself to the master server
+
+// ---------------- the public game list (server browser) ----------------
+// GET <master>/list on a background thread every PUB_EVERY ms while the
+// HOST/JOIN page is up; rows render below the password field and a click
+// drops the row's code into the join field. The list is what hosts chose to
+// publish (see _Publisher in lobby.py); nothing here talks to a host directly.
+struct PubRow { char name[48]; char code[256]; char game[64]; char version[24]; int players, max, age; bool locked; };
+static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
+static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
+static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
+static const ULONGLONG PUB_EVERY = 10000;
+
+// minimal JSON field readers for the flat objects the master server emits
+static bool pubStr(const char* obj, const char* key, char* out, int n)
+{
+    char k[64]; snprintf(k, sizeof(k), "\"%s\"", key);
+    const char* p = strstr(obj, k); if (!p) return false;
+    p = strchr(p + strlen(k), ':'); if (!p) return false; p++;
+    while (*p == ' ') p++;
+    if (*p != '"') return false;
+    p++; int j = 0;
+    while (*p && *p != '"' && j < n - 1) {
+        if (*p == '\\' && p[1]) { p++; if (*p == 'n' || *p == 't') { p++; continue; } if (*p == 'u') { p += 5; out[j++] = '?'; continue; } }
+        out[j++] = *p++;
+    }
+    out[j] = 0; return true;
+}
+static int pubInt(const char* obj, const char* key, int def)
+{
+    char k[64]; snprintf(k, sizeof(k), "\"%s\"", key);
+    const char* p = strstr(obj, k); if (!p) return def;
+    p = strchr(p + strlen(k), ':'); if (!p) return def; p++;
+    while (*p == ' ') p++;
+    if (*p == 't') return 1; if (*p == 'f') return 0;
+    return atoi(p);
+}
+static bool httpGet(const char* url, char* out, int n)
+{
+    wchar_t wurl[512]; MultiByteToWideChar(CP_UTF8, 0, url, -1, wurl, 512);
+    URL_COMPONENTS uc = { sizeof(uc) }; wchar_t host[256], path[512];
+    uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 512;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return false;
+    bool ok = false; out[0] = 0;
+    HINTERNET s = WinHttpOpen(L"tpf2mp-menu/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) return false;
+    WinHttpSetTimeouts(s, 5000, 5000, 5000, 5000);
+    HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
+        DWORD st = 0, sl = sizeof(st);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
+        int got = 0; DWORD rd = 0;
+        while (got < n - 1 && WinHttpReadData(r, out + got, (DWORD)(n - 1 - got), &rd) && rd) got += (int)rd;
+        out[got] = 0; ok = (st == 200);
+        if (!ok) snprintf(out, n, "HTTP %lu", (unsigned long)st);
+    }
+    if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+    return ok;
+}
+static DWORD WINAPI PubFetchThread(LPVOID)
+{
+    static char body[32768];
+    char url[300]; snprintf(url, sizeof(url), "%s/list", g_flagMaster);
+    bool ok = httpGet(url, body, sizeof(body));
+    PubRow rows[8]; int cnt = 0; char note[96] = "";
+    if (!ok) snprintf(note, sizeof(note), "Server browser unavailable (%s)", body[0] ? body : "no response");
+    else {
+        const char* p = strstr(body, "\"servers\"");
+        if (p) p = strchr(p, '[');
+        while (p && cnt < 8) {
+            const char* o = strchr(p, '{'); if (!o) break;
+            // find the object's closing brace, skipping quoted text
+            const char* e = o + 1; bool q = false;
+            for (; *e; e++) { if (*e == '\\' && q) { e++; continue; } if (*e == '"') q = !q; else if (*e == '}' && !q) break; }
+            if (!*e) break;
+            char obj[1024]; int L = (int)(e - o + 1); if (L > 1023) L = 1023; memcpy(obj, o, L); obj[L] = 0;
+            PubRow& r = rows[cnt]; memset(&r, 0, sizeof(r));
+            if (pubStr(obj, "code", r.code, sizeof(r.code)) && r.code[0]) {
+                pubStr(obj, "name", r.name, sizeof(r.name)); pubStr(obj, "game", r.game, sizeof(r.game)); pubStr(obj, "version", r.version, sizeof(r.version));
+                r.players = pubInt(obj, "players", 0); r.max = pubInt(obj, "max", 8); r.age = pubInt(obj, "age", 0); r.locked = pubInt(obj, "locked", 0) != 0;
+                cnt++;
+            }
+            p = e + 1;
+        }
+        if (cnt == 0) strcpy_s(note, "No public games right now.");
+    }
+    if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); memcpy(g_pub, rows, sizeof(rows)); g_pubCount = cnt; strcpy_s(g_pubNote, note); LeaveCriticalSection(&g_pubCs); }
+    static int logged = 0; if (logged++ % 30 == 0 || !ok) Log("[menu] server browser: %d game(s) %s\n", cnt, note);
+    g_pubLast = GetTickCount64(); InterlockedExchange(&g_pubBusy, 0); InterlockedExchange(&g_panelDirty, 1);
+    return 0;
+}
+static void PubPoll()   // called from the present hook while the HOST/JOIN page is shown
+{
+    if (!g_flagMaster[0]) return;
+    ULONGLONG now = GetTickCount64();
+    bool due = (g_pubLast == 0) || (now - g_pubLast > PUB_EVERY) || InterlockedCompareExchange(&g_pubForce, 0, 1) == 1;
+    if (!due || InterlockedCompareExchange(&g_pubBusy, 1, 0) != 0) return;
+    if (!g_pubCsInit) { InitializeCriticalSection(&g_pubCs); g_pubCsInit = true; }
+    HANDLE t = CreateThread(nullptr, 0, PubFetchThread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t); else InterlockedExchange(&g_pubBusy, 0);
+}
+static void mwCheck(int x, int y, const wchar_t* label, bool on, int id)
+{
+    int sz = S(16); layerRect(x, y + S(7), sz, sz, RGB(0, 0, 0), 60);
+    layerRect(x, y + S(7), sz, 1, RGB(255, 255, 255), 90); layerRect(x, y + S(7) + sz - 1, sz, 1, RGB(255, 255, 255), 90);
+    layerRect(x, y + S(7), 1, sz, RGB(255, 255, 255), 90); layerRect(x + sz - 1, y + S(7), 1, sz, RGB(255, 255, 255), 90);
+    HFONT f = mkLato(S(13));
+    if (on) layerText(x, y + S(5), sz, sz + S(4), L"✓", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    layerText(x + sz + S(8), y, S(360), S(30), label, f, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    int lw = textW(label, f); DeleteObject(f);
+    addHit(x, y, sz + S(8) + lw, S(30), id, true);
+}
 
 static void mwButton(int x, int y, int w, int h, const wchar_t* label, int id)
 {
@@ -830,7 +948,8 @@ static void RenderPanelLayer(int w, int h)
         mwField(chatX, cy + logH + S(8), chatW, inH, g_chatInput, true, L"Type a message and press Enter", 9);
         // button row: LEAVE left, START GAME right (host)
         int bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5);
-        if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6); }
+        if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
+            if (g_flagMaster[0]) mwCheck(w - pad - bw2 - S(110), bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
         // status between them
         char st[256]; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
         wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
@@ -842,7 +961,8 @@ static void RenderPanelLayer(int w, int h)
         layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
         mwHeader(lx, cy, colW, L"HOST A GAME");
         mwBody(lx, cy + S(28), colW, S(60), L"Opens a lobby and shares your newest save with everyone who joins. You get a code to hand out.");
-        mwButton(lx, cy + S(96), mwButtonW(L"HOST GAME"), S(30), L"HOST GAME", 2);
+        { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
+          if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
         mwHeader(rx, cy, colW, L"JOIN A GAME");
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) != 0, L"Click to paste the code", 8);
@@ -852,6 +972,43 @@ static void RenderPanelLayer(int w, int h)
         mwHeader(pad, cy + S(138), w - 2 * pad, L"PASSWORD  --  use if you post the code publicly; anyone who has it can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
           mwField(pad, cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
+        // ---- PUBLIC GAMES: the server browser (OpenTTD style) ----
+        if (g_flagMaster[0]) {
+            int ly = cy + S(206); int lw = w - 2 * pad;
+            mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row to fill in its code, then JOIN GAME");
+            { int rb = mwButtonW(L"REFRESH"); mwButton(w - pad - rb, ly - S(4), rb, S(30), L"REFRESH", 12); }
+            ly += S(26);
+            PubRow rows[8]; int cnt = 0; char note[96] = "";
+            if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); memcpy(rows, g_pub, sizeof(rows)); cnt = g_pubCount; strcpy_s(note, g_pubNote); LeaveCriticalSection(&g_pubCs); }
+            HFONT fr = mkLato(S(13));
+            int cName = pad + S(10), cGame = pad + S(190), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
+            layerText(cName, ly, S(180), S(20), L"HOST", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(cGame, ly, S(320), S(20), L"GAME", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(cPl, ly, S(70), S(20), L"PLAYERS", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(cVer, ly, S(60), S(20), L"VERSION", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(cAge, ly, S(80), S(20), L"SEEN", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            ly += S(22);
+            int maxRows = (h - S(40) - ly) / S(24); if (maxRows > 8) maxRows = 8;
+            for (int i = 0; i < cnt && i < maxRows; i++) {
+                const PubRow& r = rows[i]; int rh = S(24);
+                layerRect(pad, ly, lw, rh, RGB(0, 0, 0), (i & 1) ? 35 : 55);
+                wchar_t wn[64], wg[80], wv[32], wp[32], wa[32];
+                MultiByteToWideChar(CP_UTF8, 0, r.name, -1, wn, 64); MultiByteToWideChar(CP_UTF8, 0, r.game, -1, wg, 80); MultiByteToWideChar(CP_UTF8, 0, r.version, -1, wv, 32);
+                if (r.locked) { wchar_t t[64]; _snwprintf_s(t, _TRUNCATE, L"%s  [locked]", wn); wcscpy_s(wn, t); }
+                _snwprintf_s(wp, _TRUNCATE, L"%d / %d", r.players, r.max);
+                if (r.age < 60) wcscpy_s(wa, L"just now"); else _snwprintf_s(wa, _TRUNCATE, L"%d min ago", r.age / 60);
+                layerText(cName, ly, S(175), rh, wn, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                layerText(cGame, ly, S(320), rh, wg[0] ? wg : L"(unnamed save)", fr, wg[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                layerText(cPl, ly, S(70), rh, wp, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                layerText(cVer, ly, S(60), rh, wv, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                layerText(cAge, ly, S(80), rh, wa, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                addHit(pad, ly, lw, rh, 30 + i, true);
+                ly += rh + S(2);
+            }
+            if (cnt == 0) { wchar_t wnote[96]; MultiByteToWideChar(CP_UTF8, 0, note[0] ? note : "Looking for public games…", -1, wnote, 96);
+                            layerText(cName, ly, lw - S(20), S(24), wnote, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); }
+            DeleteObject(fr);
+        }
         mwStatus(w, h);
     }
 }
@@ -996,7 +1153,7 @@ static void PanelLayout()
 {
     g_s = UiScale();
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
-    else                                                     { g_copyW = S(700); g_copyH = S(300); }
+    else                                                     { g_copyW = S(780); g_copyH = g_flagMaster[0] ? S(540) : S(300); }
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
@@ -1006,6 +1163,7 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
 {
     if (imgIndex >= g_scImgCount) return;
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) { g_hitCount = 0; return; }   // collapsed: the native list entry IS the button
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 1) PubPoll();
     if (!BuildPanelImage() || !BuildBackdropImage()) return;
     PanelLayout();
     // the caret blinks and chat arrives asynchronously: re-render the layer at most 2x/s when not dirty
@@ -1114,6 +1272,21 @@ static void OnHit(int id)
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
+    case 11: {   // PUBLIC checkbox; while hosting it toggles the announcement live
+        LONG on = InterlockedCompareExchange(&g_public, 0, 0) ? 0 : 1; InterlockedExchange(&g_public, on);
+        if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && InterlockedCompareExchange(&g_isHost, 0, 0)) {
+            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) SetStatus("Lobby is starting…");
+            else { LobbySend(on ? "{\"cmd\":\"publish\",\"on\":true}" : "{\"cmd\":\"publish\",\"on\":false}");
+                   SetStatus(on ? "Listed in the public server browser." : "Removed from the public server browser."); }
+        } else SetStatus(on ? "Your game will be listed publicly when you host." : "Your game will not be listed.");
+        InterlockedExchange(&g_panelDirty, 1); } break;
+    case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game list…"); break;
+    case 30: case 31: case 32: case 33: case 34: case 35: case 36: case 37: {   // a public game row -> its code goes into the join field
+        int i = id - 30; char code[256] = ""; char name[48] = ""; bool locked = false;
+        if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
+        if (code[0]) { strcpy_s(g_joinCode, code); g_joinLen = (int)strlen(g_joinCode); InterlockedExchange(&g_joinFocus, 1);
+                       char st[200]; snprintf(st, sizeof(st), locked ? "%s's game needs its password: type it below, then JOIN GAME." : "%s's code is filled in -- press JOIN GAME.", name); SetStatus(st); }
+        InterlockedExchange(&g_panelDirty, 1); } break;
     case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27: {   // company chip
         int i = id - 20; char name[40] = ""; int cur = 1;
         if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < g_playerCount) { strcpy_s(name, g_players[i]); cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
@@ -2021,7 +2194,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; };
+struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char game[64]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -2061,8 +2234,15 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
                    _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
                                 base, wc, wname, relayPort, bridgePort, fwd, wpass); }
-    else _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s",
-                      base, wname, relayPort, bridgePort, fwd, wpass);
+    else {
+        // the public list: always tell the lobby where the master server is (the
+        // PUBLIC checkbox can be flipped later, in the lobby); --public starts listed
+        wchar_t wpub[480] = L"";
+        if (g_flagMaster[0]) { wchar_t wm[300], wg[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300); MultiByteToWideChar(CP_UTF8, 0, a->game, -1, wg, 64);
+                               _snwprintf_s(wpub, _TRUNCATE, L" --publish %s --game-name \"%s\"%s", wm, wg, a->pub ? L" --public" : L""); }
+        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
+                     base, wname, relayPort, bridgePort, fwd, wpass, wpub);
+    }
     { wchar_t shown[2048]; wcscpy_s(shown, cmd); wchar_t* pp = wcsstr(shown, L" --password "); if (pp) wcscpy_s(pp, 2048 - (pp - shown), L" --password ***");
       Log("[menu] lobby cmd: %ls\n", shown); }
 
@@ -2232,6 +2412,15 @@ static void StartLobby(int join)
     ensureUsername();
     LobbyArg* a = (LobbyArg*)calloc(1, sizeof(LobbyArg)); if (!a) return;
     a->join = join; strcpy_s(a->name, g_username); strcpy_s(a->password, g_passCode);
+    a->pub = InterlockedCompareExchange(&g_public, 0, 0) ? 1 : 0;
+    if (!join) {   // the save's name is what the public list shows as the game
+        wchar_t sv[600]; if (newestSave(sv, 600)) {
+            const wchar_t* b = wcsrchr(sv, L'\\'); b = b ? b + 1 : sv;
+            char u[200]; WideCharToMultiByte(CP_UTF8, 0, b, -1, u, sizeof(u), nullptr, nullptr);
+            char* dot = strrchr(u, '.'); if (dot && _stricmp(dot, ".sav") == 0) *dot = 0;
+            int j = 0; for (int i = 0; u[i] && j < 60; i++) { unsigned char c = (unsigned char)u[i]; if (c >= 32 && c != '"' && c != '\\') a->game[j++] = (char)c; } a->game[j] = 0;
+        }
+    }
     if (join) {
         if (g_joinLen >= 8) strcpy_s(a->code, g_joinCode);
         else if (!ClipboardGet(a->code, sizeof(a->code)) || strlen(a->code) < 8) {
