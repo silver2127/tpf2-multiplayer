@@ -188,9 +188,20 @@ CM.SPD2_PAUSE_TICKS = 8
 -- the file. A whole number clears the file and is the plain lever. The lever
 -- is what getGameSpeed() reads back, so the "ours vs the player's" test keeps
 -- comparing whole numbers.
+-- A FRACTION NEVER MOVES THE LEVER (2026-09-09): the dither alone decides the
+-- step count, so while the session speed is 2 and the PID asks for 1.7 or
+-- 2.3 the lever stays at 2. Rounding the fraction to the nearest lever made
+-- it flip between 1 and 2 as the PID crossed 1.5, and every flip plays the
+-- game's speed-button click. The lever moves only when the session speed
+-- itself changes (or for a pause / a whole-number target).
 function CM.leverOf(v)
 	v = tonumber(v) or 0
 	if v == math.floor(v) then return v end
+	local base = CM.effSpeed
+	if base and base > 0 then
+		if base ~= math.floor(base) then base = math.floor(base + 0.5) end
+		return math.max(1, math.min(CM.MAX_SPEED or 4, base))
+	end
 	return math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v + 0.5)))
 end
 -- No dither target survives a load: the bridge deletes the file at game
