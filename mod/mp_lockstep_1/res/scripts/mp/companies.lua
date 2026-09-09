@@ -223,6 +223,10 @@ function CM.cmReassignEntity(eid, cid, kind)
 	local pid = CM.cmCompanyPid[cid]
 	if not pid then CM.cmLog("CM: no player for company " .. tostring(cid)); return end
 	local before = CM.cmOwnerOf(eid)
+	if before == pid then
+		CM.cmLog(string.format("CM: %s eid=%s already owned by co%d pid=%s -- no setPlayer needed", tostring(kind), tostring(eid), cid, tostring(pid)))
+		return
+	end
 	local ok, err = pcall(function() game.interface.setPlayer(eid, pid) end)
 	local after = CM.cmOwnerOf(eid)
 	CM.cmLog(string.format("CM: reassigned %s eid=%s -> co%d pid=%s | owner before=%s after=%s | setPlayer ok=%s err=%s",

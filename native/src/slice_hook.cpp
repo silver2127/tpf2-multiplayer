@@ -1112,7 +1112,19 @@ static bool CfgHas(const char* key)
     // suppress=1 but cancel_vehicle=0 -- its Reverse runs natively AND the Lua,
     // which hard-codes VREV as strict, replays it on top: a toggle applied twice
     // (review, 2026-08-31).
-    if (!f) return strcmp(key, "cancel_vehicle") == 0 || strcmp(key, "merge") == 0;
+    // 2026-09-09: a friends' host lost its cfg files (the 0.3.1 -> 0.4.0 MSI
+    // upgrade removed them -- NeverOverwrite + RemoveExistingProducts) and ran
+    // the rest of the night with only cancel_vehicle+merge on: no strict
+    // anything, while its peers had the full set. The list below IS the shipped
+    // installer/cfg/tpf2_slice.cfg's on-switches; keep the two in step.
+    if (!f) {
+        static const char* const kShippedOn[] = {
+            "enabled", "suppress", "merge", "cancel_vehicle", "cancel_line", "conx_strict",
+            "road_demolish", "strict_buy", "strict_condemo", "strict_sell", "strict_depot",
+            "strict_replace", "strict_line_edit", "strict_module", "strict_stops", nullptr };
+        for (int i = 0; kShippedOn[i]; i++) if (strcmp(key, kShippedOn[i]) == 0) return true;
+        return false;
+    }
     char line[128], want[64]; bool on = false;
     snprintf(want, sizeof(want), "%s=1", key);
     while (fgets(line, sizeof(line), f)) {

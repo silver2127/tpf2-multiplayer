@@ -415,6 +415,7 @@ function CM.execPolyline(c, planOnly)
 		end
 
 		local splitRoads = {}   -- ANY existing edge (road or track) eid -> its split node, once per proposal
+		local splitParentEnds = {}   -- end node -> the split parent it belongs to (see crossingsFor)
 		-- ONE split for every "new edge crosses an existing edge mid-span" case.
 		-- Three separate implementations (vertex/road, vertex/track, segment/road)
 		-- drifted: one stamped halves with the NEW polyline's kind, one never
@@ -483,6 +484,8 @@ function CM.execPolyline(c, planOnly)
 			half(comp.node0, mid, ta, tm, u)
 			half(mid, comp.node1, tm, tb, 1 - u)
 			splitRoads[eid] = mid
+			splitParentEnds[comp.node0] = eid
+			splitParentEnds[comp.node1] = eid
 			log(string.format("ROADP: split %s edge %d at u=%.2f (%s)", crossedIsTrack and "track" or "road", eid, u, tostring(why)))
 			CM.cmLog(string.format("XING: split %s edge %d at u=%.2f -> node %d (%.1f,%.1f) [%s]", crossedIsTrack and "TRACK" or "road", eid, u, mid, pm[1], pm[2], tostring(why)))
 			return mid
@@ -823,7 +826,21 @@ function CM.execPolyline(c, planOnly)
 							-- anti-parallel, so a rail routed through a road
 							-- CORNER or junction crashes StreetGeometry outright.
 							local straight, deg, nEdges = CM.nodeIsStraightThrough(nid)
-							if dist > K.XING_NODE_TOUCH then
+							if splitParentEnds[nid] then
+								-- (c) NEVER an end node of an edge this proposal split
+								-- (2026-09-09). A stretched crossover leaves the track
+								-- at a shallow angle, so its diagonal runs beside the
+								-- parent's remaining half and passes inside the touch
+								-- tolerance of the parent's END node (0.64 m measured).
+								-- Routing through it duplicates the half the split
+								-- already added (mid -> end), the duplicate is dropped
+								-- and the engine refuses the proposal: every long
+								-- crossover failed, short ones passed by luck of the
+								-- distance. The rail branches OFF that edge; it cannot
+								-- also cross it at its end.
+								reason = string.format("near node %s, but that is an end of split parent %d -- the split half already reaches it, not a crossing",
+									tostring(nid), splitParentEnds[nid])
+							elseif dist > K.XING_NODE_TOUCH then
 								reason = string.format("near road node %s but the rail passes %.2f m from it -- a near-miss, not a crossing",
 									tostring(nid), dist)
 							elseif not straight then

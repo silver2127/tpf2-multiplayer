@@ -59,7 +59,8 @@ function CM.cfgFlag(key, default)
 	if CM.cfgCache == nil then
 		CM.cfgCache = {}
 		pcall(function()
-			local f = io.open("tpf2_slice.cfg", "r")
+			-- game folder first (CWD), then the data dir -- the DLLs' order
+			local f = io.open("tpf2_slice.cfg", "r") or (K.BASE and io.open(K.BASE .. "tpf2_slice.cfg", "r"))
 			if not f then return end
 			for line in f:lines() do
 				local k, v = tostring(line):match("^%s*([%w_]+)%s*=%s*(%S+)")

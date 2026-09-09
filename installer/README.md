@@ -58,10 +58,13 @@ uninstalling leaves your logs and captures in place - delete
 
 Each DLL reads its `.cfg` from its own folder first (the game folder, where the
 installer puts it), then from the data folder, then falls back to built-in
-defaults; the first file found wins. To change a setting, edit the copy in the
-game folder (needs administrator rights) or delete it there and keep your own
-copy in `%LOCALAPPDATA%\tpf2mp\data\`. `tpf2_slice.cfg` is re-read on every
-event, so its switches can be flipped while the game runs.
+defaults; the first file found wins. To change a setting, delete the copy in the
+game folder and keep your own in `%LOCALAPPDATA%\tpf2mp\data\`: an upgrade
+re-installs the game-folder copy with the shipped defaults (it no longer tries to
+preserve it; that attempt is what deleted the cfgs on the 0.3.1 to 0.4.0 upgrade),
+and never touches the data folder. `tpf2_slice.cfg` is re-read on every event, so
+its switches can be flipped while the game runs. Without any cfg the DLLs run the
+shipped defaults, so a missing file changes nothing.
 
 Shipped defaults: bridge on UDP 7771 talking to a peer on 127.0.0.1:7772,
 `instance=auto`, save transfer on TCP 7871, `sim_hook=1`, `buy_hook=1`; slice

@@ -29,6 +29,15 @@ K.MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
 K.LOADGATE_MIN_TICKS = 5
 K.LOADGATE_SETTLE    = 60    -- ticks with no NEW peer before the roster counts as complete
 K.LOADGATE_MAX_TICKS = 900   -- absolute cap: a session must never hang forever
+-- The manual override ("press play to start anyway") is honoured only after
+-- this many ticks of holding (~60 s). A friends' 4-player night (2026-09-09)
+-- started with the host pressing play at "2 of 3 in": the third player was
+-- still loading, missed a station placed at t=7, and every hash from t=16 on
+-- disagreed -- 618 desync reports, stops on roads the host did not have,
+-- vehicles 100 m apart. Nothing replays history to a player who arrives after
+-- a command's stamp, so an early start is a guaranteed fork. Before the window
+-- a play press is put back to 0 and the log says how long until it counts.
+K.LOADGATE_FORCE_TICKS = 320
 
 -- ---------- catch-up pacing ----------
 --
@@ -691,12 +700,19 @@ function CM.ensureRunning()
 			-- see the LSSPEED handler.
 			CM.setSpeed(0, "load gate: holding until the other players are in")
 			log(string.format("LOADGATE: pausing (was speed %d) until the other players are in", s))
+		elseif CM.lgSawZero and (CM.ticks - (CM.lgHeldAt or 0)) < K.LOADGATE_FORCE_TICKS then
+			-- The player pressed play while someone is still loading. Too early
+			-- to honour (see K.LOADGATE_FORCE_TICKS): put it back and say why.
+			CM.lgSawZero = false
+			CM.setSpeed(0, "load gate: still waiting for players")
+			log(string.format("LOADGATE: play pressed with players still loading -- held. Starting now would fork the session; the override unlocks in %d s",
+				math.floor((K.LOADGATE_FORCE_TICKS - (CM.ticks - (CM.lgHeldAt or 0))) * 0.19)))
 		elseif CM.lgSawZero then
 			-- We held it at 0, saw that take effect, and it is running again:
-			-- the player pressed play. Their lever wins.
+			-- the player pressed play after the window. Their lever wins.
 			didInitialUnpause = true
 			CM.lgHolding = false
-			log(string.format("LOADGATE: game started manually at speed %d -- releasing", s))
+			log(string.format("LOADGATE: game started manually at speed %d -- releasing. Anything done before the others arrive will NOT reach them.", s))
 		elseif (CM.ticks - (CM.lgHeldAt or 0)) > 12 then
 			-- Never saw it reach 0, so the command was lost rather than
 			-- overridden. Re-send rather than mistaking this for the player.

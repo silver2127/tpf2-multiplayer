@@ -146,8 +146,8 @@ struct Config {
     int         autoPull = 0;   // joiner pulls the host's save on startup
     // native sim-thread hook. Off by default: it patches game code, so it must
     // be opted into rather than surprising anyone who just wants replication.
-    int         simHook = 0;
-    int         buyHook = 0;   // probe the buyVehicle command factory
+    int         simHook = 1;   // shipped cfg says 1; no cfg must not mean a different mode (2026-09-09)
+    int         buyHook = 1;   // probe the buyVehicle command factory
 };
 
 static std::string BaseName(const wchar_t* path)

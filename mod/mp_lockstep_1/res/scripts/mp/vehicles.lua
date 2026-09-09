@@ -672,7 +672,21 @@ function CM.execVBuy(c)
 		end
 		local config, u = buildVehConfig(c)
 		local seq, origin, at = c.seq, c.origin, c.at
-		local okM, cmd = pcall(function() return api.cmd.make.buyVehicle(api.engine.util.getPlayer(), target, config) end)
+		-- COMPANIES MODE: buy AS the originating company (2026-09-09). The first
+		-- argument of buyVehicle is the player entity; passing our own and then
+		-- game.interface.setPlayer()ing the vehicle over asserts FATALLY in the
+		-- engine (interface.cpp:2340 "Assertion false", 50 of 50 purchases in a
+		-- friends' 4-company session, a minidump each). Bought under the right
+		-- player the engine owns and charges it from birth, the reassign below
+		-- sees the owner already right and skips, and the cost settle moves 0.
+		local buyer = api.engine.util.getPlayer()
+		if c.company and CM.cmMode == "companies" then
+			CM.cmEnsure()
+			local pid = CM.cmCompanyPid[tonumber(c.company)]
+			if pid then buyer = pid
+			else log(string.format("EXEC VBUY seq=%s: no player for company %s -- buying as ourselves", tostring(c.seq), tostring(c.company))) end
+		end
+		local okM, cmd = pcall(function() return api.cmd.make.buyVehicle(buyer, target, config) end)
 		if not okM or not cmd then
 			log(string.format("EXEC VBUY seq=%s: make.buyVehicle refused: %s", tostring(seq), tostring(cmd)))
 			return
