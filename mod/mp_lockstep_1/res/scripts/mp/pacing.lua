@@ -424,6 +424,15 @@ function CM.speedRequest()
 		req = tonumber(body:match("speed=([%d%.]+)"))
 		syncN = tonumber(body:match("sync=(%d+)")) or 0
 		players = tonumber(body:match("players=(%d+)"))
+		local pid = body:match("pid=([^\r\n]+)")
+		if pid and pid ~= CM.pidOvText then
+			CM.pidOvText = pid
+			CM.pidOv = CM.pidOv or {}
+			for k, v in pid:gmatch("(%a+)[=:]([%d%.]+)") do
+				if tonumber(v) then CM.pidOv[k] = tonumber(v) end
+			end
+			log("PID: gains from the tuner -> " .. pid)
+		end
 	end)
 	if req and (req <= 0 or req >= 64) then req = nil end
 	if req ~= CM.spdReq then
@@ -515,13 +524,17 @@ function CM.pidPace(now, eff)
 	-- wider dead band, a narrower clamp, and a SLEW LIMIT -- the target may
 	-- move at most pid_slew per decision, so a 2-unit gap is closed by a
 	-- 1.1x that creeps in over a few seconds, not a 1.3x that arrives at once.
-	local kp   = CM.cfgNum("pid_kp",   0.05)
-	local ki   = CM.cfgNum("pid_ki",   0.015)
-	local kd   = CM.cfgNum("pid_kd",   0.02)
-	local dead = CM.cfgNum("pid_dead", 0.30)
-	local lo   = CM.cfgNum("pid_min",  0.70)
-	local hi   = CM.cfgNum("pid_max",  1.20)
-	local slew = CM.cfgNum("pid_slew", 0.05)
+	-- "/pid kp=0.06 ..." from the in-game tuner overrides the cfg (CM.pidOv,
+	-- filled by speedRequest from the ctl file's pid= line)
+	local ov = CM.pidOv or {}
+	local kp   = ov.kp   or CM.cfgNum("pid_kp",   0.05)
+	local ki   = ov.ki   or CM.cfgNum("pid_ki",   0.015)
+	local kd   = ov.kd   or CM.cfgNum("pid_kd",   0.02)
+	local dead = ov.dead or CM.cfgNum("pid_dead", 0.30)
+	local lo   = ov.min  or CM.cfgNum("pid_min",  0.70)
+	local hi   = ov.max  or CM.cfgNum("pid_max",  1.20)
+	local slew = ov.slew or CM.cfgNum("pid_slew", 0.05)
+	CM.pidGains = string.format("kp:%g,ki:%g,kd:%g,dead:%g,min:%g,max:%g,slew:%g", kp, ki, kd, dead, lo, hi, slew)
 	-- THE HOST IS THE CLOCK (2026-09-09): it runs the session speed untouched
 	-- and only its lever changes it (a host that sees a peer lagging can slow
 	-- everyone down by choice). Every joiner's reference is the host's precise
@@ -562,6 +575,10 @@ function CM.pidPace(now, eff)
 	end
 	CM.pidHold, CM.pidErr = target, e
 	CM.paceInfo = string.format("%.2fx e=%+.2f", target, e)
+	-- the last 60 decisions, for the in-game graph
+	CM.pidHist = CM.pidHist or {}
+	CM.pidHist[#CM.pidHist + 1] = { e = e, m = target / eff }
+	while #CM.pidHist > 60 do table.remove(CM.pidHist, 1) end
 	return target, e
 end
 K.CATCHUP_SPEED_MAX = 4    -- the sim cannot keep up above the game's own 4 on real hardware; 8 felt SLOWER

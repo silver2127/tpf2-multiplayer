@@ -1662,9 +1662,16 @@ static void SyncPoll()
 // "/sync off" clears it.
 static char g_speedReq[16] = "";
 static int  g_syncReq = 0;
+static char g_pidReq[160] = "";     // "/pid kp=0.06 ki=0.01" -> pid=kp=0.06 ki=0.01 (the script merges keys)
 static void writeBridgeCtl(bool isHost);
 static void speedFromChat(const char* text)
 {
+    if (strncmp(text, "/pid ", 5) == 0) {
+        strncpy_s(g_pidReq, text + 5, _TRUNCATE);
+        Log("[menu] chat /pid -> %s\n", g_pidReq);
+        writeBridgeCtl(g_isHost != 0);
+        return;
+    }
     if (strncmp(text, "/sync", 5) == 0) {
         const char* a = text + 5; while (*a == ' ') a++;
         if (strncmp(a, "off", 3) == 0) g_syncReq = 0; else g_syncReq++;
@@ -1684,8 +1691,8 @@ static void speedFromChat(const char* text)
 
 static void writeBridgeCtl(bool isHost)
 {
-    static char last[192] = "";
-    char content[192];
+    static char last[400] = "";
+    char content[400];
     // pid= addresses the ctl to OUR bridge. Two instances sharing a data dir
     // (a sandboxed second instance reads through to the real dir until it has
     // its own copy) otherwise apply each other's role for a moment.
@@ -1721,6 +1728,10 @@ static void writeBridgeCtl(bool isHost)
     if (g_syncReq) {
         size_t n = strlen(content);
         snprintf(content + n, sizeof(content) - n, "sync=%d\n", g_syncReq);
+    }
+    if (g_pidReq[0]) {
+        size_t n = strlen(content);
+        snprintf(content + n, sizeof(content) - n, "pid=%s\n", g_pidReq);
     }
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
