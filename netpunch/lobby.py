@@ -1618,6 +1618,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     def roster_changed(broadcast=True):
         """Push the roster to peers, and emit an event only if it changed."""
+        if relay_only and not peers and (started[0] or transfer[0] is not None or upload[0] is not None):
+            # the last player left: the session is over. The next joiner is a
+            # fresh leader (not a "late" one), the stored save is offered again,
+            # and no transfer is left dangling.
+            started[0] = False
+            start_save[0] = False
+            transfer[0] = None
+            upload[0] = None
+            spath, age = stored_save()
+            log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago for /resume" if spath else ""))
         if broadcast:
             send_roster_packets()
         key = (tuple(roster_players()), tuple(sorted(roster_companies().items())))

@@ -506,6 +506,7 @@ static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.60f;
 static int   g_flagFontPx = 0;
 static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
+static int   g_flagRelayAutosaveMin = 10;   // relay lobbies: the leader uploads a fresh save this often (0 = never)
 static bool  g_latoLoaded = false;
 static void ReadFlags()
 {
@@ -520,6 +521,7 @@ static void ReadFlags()
         else if (!strcmp(line, "ox")) g_flagOx = (float)atof(v);
         else if (!strcmp(line, "oy")) g_flagOy = (float)atof(v);
         else if (!strcmp(line, "fontpx")) g_flagFontPx = atoi(v);
+        else if (!strcmp(line, "relay_autosave_min")) g_flagRelayAutosaveMin = atoi(v);
         else if (!strcmp(line, "slot")) g_flagSlot = atoi(v);
         else if (!strcmp(line, "master_url")) { strncpy_s(g_flagMaster, v, _TRUNCATE); char* e = g_flagMaster + strlen(g_flagMaster); while (e > g_flagMaster && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '/')) *--e = 0; }
     }
@@ -2471,6 +2473,15 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         }
         if (stop || WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
         SyncPoll();
+        // relay lobbies: the relay's copy of the world is whatever was last
+        // uploaded, so the leader refreshes it on a timer -- a /resume after
+        // everyone left is then at most this many minutes old
+        if (g_flagRelayAutosaveMin > 0 && InterlockedCompareExchange(&g_lobbyRelay, 0, 0) && InterlockedCompareExchange(&g_isHost, 0, 0)
+            && g_gameUi && InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) {
+            static ULONGLONG lastUp = 0; ULONGLONG nowT = GetTickCount64();
+            if (!lastUp) lastUp = nowT;
+            if (nowT - lastUp >= (ULONGLONG)g_flagRelayAutosaveMin * 60000ULL) { lastUp = nowT; SyncStart("relay: periodic save"); }
+        }
         Sleep(200);
     }
     // Say why the tail ended. A lobby that exits on its own -- rather than after
