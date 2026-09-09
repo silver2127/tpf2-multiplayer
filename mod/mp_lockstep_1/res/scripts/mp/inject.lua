@@ -1256,6 +1256,37 @@ function CM.pollInject()
 				end
 
 			-- DEMOLISH x y
+			elseif o == "STOPXDEL" and #w >= 3 then
+			-- A CANCELLED stop / signal bulldoze (slice cfg strict_stops): the
+			-- slice named the removed edge object off the bulldozer's proposal
+			-- and cancelled the native removal, ARMED 1 ahead of this line. The
+			-- object still stands here, so its position is read off it, and the
+			-- STOPDEL goes out WITHOUT skipOrigin: every instance, this one
+			-- included, removes it through nativeStopProposal at the stamp. The
+			-- poll path removed it here at click time and on the peers two steps
+			-- later; passengers walking to it re-planned on different steps and
+			-- the people count diverged from there (2026-09-08).
+			local eo, eid = tonumber(w[2]), tonumber(w[3])
+			if (CM.lastArmed or 0) ~= 1 then
+				log("STOPXDEL: not armed -- the native bulldoze ran, the stop poll ships it")
+			elseif eo and eo > 0 then
+				local x, y
+				pcall(function()
+					local mil = api.engine.getComponent(eo, api.type.ComponentType.MODEL_INSTANCE_LIST)
+					local fi = mil and mil.fatInstances and mil.fatInstances[1]
+					if fi then x, y = fi.transf[13], fi.transf[14] end
+				end)
+				if x and y then
+					CM.scheduleLocal("STOPDEL", { x = x, y = y, cancelled = 1 })
+					log(string.format("STOPXDEL: cancelled bulldoze of edge object %d at %.1f,%.1f (edge %s) -> STOPDEL (strict, every instance replays)",
+						eo, x, y, tostring(eid)))
+				else
+					log(string.format("STOPXDEL: edge object %d has no model instance here -- DROPPED, the cancelled bulldoze is lost everywhere; bulldoze it again", eo))
+				end
+			else
+				log("inject: bad STOPXDEL line: " .. line:sub(1, 70))
+			end
+
 			elseif o == "DEMOLISH" and #w >= 3 then
 				local x, y = tonumber(w[2]), tonumber(w[3])
 				if x and y then

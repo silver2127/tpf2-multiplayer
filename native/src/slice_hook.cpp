@@ -178,6 +178,11 @@ static int32_t g_stopEid = 0, g_stopSide = 0, g_stopModel = 0, g_stopPlayer = 0;
 static float   g_stopPos[3] = { 0, 0, 0 };
 static uint8_t g_stopLeft = 0, g_stopOneWay = 0;
 static char    g_stopName[256];
+// Stop/signal BULLDOZE cancel (cfg strict_stops): the removed edge object,
+// decoded off the bulldozer's edge-replace proposal (StashStopDelFromBulldoze),
+// written as STOPXDEL from the Add hook once the cancel landed.
+static volatile LONG g_pendingIsStopDel = 0;
+static int32_t g_stopDelEo = -1, g_stopDelEdge = -1;
 
 extern "C" void DeferRelay();
 
@@ -1341,6 +1346,7 @@ static void GtFactoryDumps(const Factory& f, uint64_t rdx, uint64_t r8, uint64_t
 //            addedSegments, sweep test 4 confirms)
 //   r8+0x1e0 toRemove vector<Entity>, r8+0x1f8 toAdd stride 0x8e0
 //            (r9 2, decompile only -- UNVERIFIED by any sweep)
+static bool StashStopDelFromBulldoze(uint64_t eb, int re, uint64_t adb, int aedges);   // defined with the STOPX writers below
 static bool LogBulldoze(uint64_t r8)
 {
     bool shipped = false;
@@ -1395,13 +1401,23 @@ static bool LogBulldoze(uint64_t r8)
                     "con poll ships it to the peers afterwards)\n");
         }
         else if (re >= 1 && aedges >= 1) {
-            // 2026-09-08: bulldozing a truck stop arrived here as re=1 and was
-            // shipped as an EDEMO. The replay removed the edge outright on all
-            // three instances, the engine asserted on the edge object still
-            // referenced by a line, and every instance wrote a minidump. Runs
-            // natively; the stop poll ships the removal as a STOPDEL as before.
-            Log("[slice]   edge-REPLACE shape (re=%d addEdges=%d): an edge object "
-                "removed, not a road -- runs natively, the stop poll ships it\n", re, aedges);
+            // An edge object (stop / signal) removed: the edge is re-added without
+            // it. Never an EDEMO -- shipped as one (2026-09-08) the replay removed
+            // the edge outright, the engine asserted on the object a line still
+            // referenced, and every instance wrote a minidump.
+            Log("[slice]   edge-REPLACE shape (re=%d addEdges=%d): an edge object removed, not a road\n", re, aedges);
+            // STRICT (cfg strict_stops): name the removed object off the two edge
+            // records, arm the cancel, and STOPXDEL ships from the Add hook if it
+            // lands -- every instance then removes it at the stamp. Otherwise the
+            // bulldoze runs natively here and the stop poll ships it as before.
+            if (CfgHas("strict_stops") && StashStopDelFromBulldoze(eb, re, adb, aedges)) {
+                InterlockedExchange(&g_pendingIsStopDel, 1);
+                shipped = true;
+            } else if (CfgHas("strict_stops")) {
+                Log("[slice]   (not decodable -- runs natively, the stop poll ships it)\n");
+            } else {
+                Log("[slice]   (strict_stops not set -- runs natively, the stop poll ships it)\n");
+            }
         }
         else if (re >= 1 || rn >= 1) {
             Log("[slice]   edge-demolish shape\n");
@@ -2276,6 +2292,81 @@ static void WriteInjectStop()
     g_stopEid = -1;
 }
 
+// ---------------------------------------------------------------------------
+// STOP / SIGNAL BULLDOZE OFF THE PROPOSAL (cfg strict_stops).
+//
+// The bulldozer removes an edge object by RE-ADDING its edge without it:
+// removedSegments[0] is the edge as it stands and addedSegments[0] the same
+// edge with the survivors only. Each 120-B SegmentAndEntity carries its
+// `objects` as a std::vector of 8-B {entity, type} pairs at +0x30 (read off
+// the live rmSeg hex of a truck-stop bulldoze, 2026-09-08: one pair, the
+// stop's entity). The removed object is the set difference -- exactly one
+// for a bulldoze, or this is not cancelled.
+//
+// Why strict: the host used to remove the stop natively at click time while
+// the peers rebuilt the edge two sim-steps later through a script proposal.
+// Passengers already walking to that stop re-planned on different steps,
+// the people count diverged ~50 units later, and the buses drifted from
+// the different dwell times (session 2026-09-08 t=635 -> 696 -> 2456).
+static int ReadObjList(uint64_t seg, int32_t* out, int cap)
+{
+    if (!Readable((void*)(seg + 0x30), 16)) return -1;
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (void*)(seg + 0x30), 8);
+    memcpy(&e, (void*)(seg + 0x38), 8);
+    if (e == b) return 0;                                   // an edge with no objects
+    if (e < b || (e - b) % 8 || (e - b) > 0x400 || b < 0x10000 || !Readable((void*)b, (size_t)(e - b))) return -1;
+    int n = (int)((e - b) / 8), k = 0;
+    for (int i = 0; i < n && k < cap; i++) { int32_t id = -1; memcpy(&id, (void*)(b + (uint64_t)i * 8), 4); out[k++] = id; }
+    return k;
+}
+
+static bool StashStopDelFromBulldoze(uint64_t eb, int re, uint64_t adb, int aedges)
+{
+    g_stopDelEo = -1; g_stopDelEdge = -1;
+    if (re != 1 || aedges != 1) {
+        Log("[stop] bulldoze re=%d addEdges=%d -- not a single-edge object removal, not cancelled\n", re, aedges);
+        return false;
+    }
+    int32_t before[16], after[16];
+    int nb = ReadObjList(eb, before, 16), na = ReadObjList(adb, after, 16);
+    if (nb < 0 || na < 0) {
+        Log("[stop] bulldoze: edge object list unreadable (rm=%d add=%d) -- not cancelled\n", nb, na);
+        return false;
+    }
+    int32_t gone = -1; int ngone = 0;
+    for (int i = 0; i < nb; i++) {
+        bool kept = false;
+        for (int j = 0; j < na; j++) if (after[j] == before[i]) kept = true;
+        if (!kept) { gone = before[i]; ngone++; }
+    }
+    int32_t edge = -1; memcpy(&edge, (void*)eb, 4);
+    if (ngone != 1 || gone <= 0) {
+        Log("[stop] bulldoze on edge %d: %d object(s) before, %d after, %d gone -- not exactly one, not cancelled\n", edge, nb, na, ngone);
+        return false;
+    }
+    g_stopDelEo = gone; g_stopDelEdge = edge;
+    Log("[stop] bulldoze removes edge object %d from edge %d (%d -> %d object(s))\n", gone, edge, nb, na);
+    return true;
+}
+
+// STOPXDEL <edgeObject> <edge>. ARMED 1 precedes it: the Lua ships a STOPDEL
+// without skipOrigin, so the originator removes it at the stamp like a peer.
+static void WriteInjectStopDel()
+{
+    ReadInstance();
+    if (!g_instance[0] || g_stopDelEo < 0) return;
+    WriteArmed(true);
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] cannot open %s\n", p); return; }
+    fprintf(f, "STOPXDEL %d %d\n", g_stopDelEo, g_stopDelEdge);
+    fclose(f);
+    Log("[slice] STOPXDEL shipped: object=%d edge=%d\n", g_stopDelEo, g_stopDelEdge);
+    g_stopDelEo = -1;
+}
+
 // A construction UPGRADE proposal: toRemove[0] is the entity being replaced,
 // toAdd[0] the ConstructionEntity that replaces it (same file, new params --
 // a module added or removed, a station upgraded). Reuses the placement stash
@@ -2723,7 +2814,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         if (!want || r8 != want) return 0;
         ReadCfg(&enabled, &suppress, nullptr);
         // A cancel must never outlive the switch that authorised it.
-        if (!enabled) { InterlockedExchange64(&g_pendingCmd, 0); InterlockedExchange(&g_pendingNoCb, 0); InterlockedExchange(&g_pendingIsConx, 0); InterlockedExchange(&g_pendingIsConu, 0); InterlockedExchange(&g_pendingIsStop, 0); return 0; }
+        if (!enabled) { InterlockedExchange64(&g_pendingCmd, 0); InterlockedExchange(&g_pendingNoCb, 0); InterlockedExchange(&g_pendingIsConx, 0); InterlockedExchange(&g_pendingIsConu, 0); InterlockedExchange(&g_pendingIsStop, 0); InterlockedExchange(&g_pendingIsStopDel, 0); return 0; }
         g_addSeen++;
         InterlockedExchange64(&g_pendingCmd, 0);
         {
@@ -2768,6 +2859,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 if (InterlockedExchange(&g_pendingIsConx, 0)) WriteInjectConxp();
                 if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                 if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
+                if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
                 return 1;
             }
             bool fired = false;
@@ -2829,6 +2921,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     if (InterlockedExchange(&g_pendingIsConx, 0)) WriteInjectConxp();
                     if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                     if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
+                    if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
                     return 1;
                 }
                 if (InterlockedExchange(&g_pendingHonour, 0)) {
@@ -2849,6 +2942,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     Log("[slice] upgrade cancel did not land -- CONUP dropped, the edit poll captures the native upgrade as before\n");
                 if (InterlockedExchange(&g_pendingIsStop, 0))
                     Log("[slice] stop cancel did not land -- STOPX dropped, the poll captures the native build as before\n");
+                if (InterlockedExchange(&g_pendingIsStopDel, 0))
+                    Log("[slice] stop bulldoze cancel did not land -- STOPXDEL dropped, the stop poll ships the removal as before\n");
                 Log("[slice] callback NOT fired -- letting the build run rather "
                     "than wedging the tool (caller_rva=%llx)\n",
                     (unsigned long long)caller);
@@ -2864,6 +2959,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (InterlockedExchange(&g_pendingIsConx, 0)) WriteInjectConxp();
             if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();   // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();    // the cancel LANDED
+            if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel(); // the cancel LANDED
             return 1;
         }
         Log("[slice] Add at %llx with no pending capture -- letting it run\n",
@@ -3037,6 +3133,9 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 Log("[slice] bulldoze shipped but not cancelled (enabled=%d "
                     "suppress=%d live=%d) -- it runs natively here and replays "
                     "on the peers\n", (int)bEnabled, (int)bSuppress, (int)SessionLive());
+                // a stash that was never armed must not ride the next landed cancel
+                InterlockedExchange(&g_pendingIsStopDel, 0);
+                InterlockedExchange(&g_pendingIsConu, 0);
             }
         }
         return 0;

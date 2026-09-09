@@ -898,10 +898,12 @@ function CM.execStopAdd(c)
 			if sc then stname = api.res.streetTypeRep.getName(sc.streetType) or "" end
 		end)
 		local hostSt = CM.unescName(c.stname or "")
+		local wantModel = CM.unescName(c.model)
 		for _, o in ipairs(objs) do
 			if not (rm and o[1] == rm.eo) then
 				local d = describeStop(o[1], eid)
-				if d and (d.x - c.x) ^ 2 + (d.y - c.y) ^ 2 < 1.0 then
+				local samePlace = d and (d.x - c.x) ^ 2 + (d.y - c.y) ^ 2 < 1.0
+				if samePlace and d.model == wantModel then
 					log(string.format("%s: a stop already stands at %.1f,%.1f -- nothing to do", tag, c.x, c.y))
 					return
 				end
@@ -914,7 +916,27 @@ function CM.execStopAdd(c)
 				-- 2026-09-08). Skip the guard for side 2; the co-location (<1 m)
 				-- check above still stops true duplicates, and nativeStopProposal +
 				-- the engine are the final arbiter (A already proved it accepts it).
-				if o[2] == side and side ~= 2 then
+				if (samePlace or o[2] == side) and side ~= 2 and not rm then
+					-- ONE-CLICK REPLACE (2026-09-08). The strict STOPX carries no
+					-- removal position (the old poll-based STOPREP did), and this
+					-- guard read every click on an occupied side as a pure add and
+					-- refused it -- so a bus stop over a truck stop (or the reverse)
+					-- never worked under strict. The engine allows one object per
+					-- side per edge, so natively that click can only be a replace:
+					-- remove the object that holds the side in the same proposal.
+					rm = { eo = o[1], eid = eid, x = d and d.x or c.x, y = d and d.y or c.y }
+					local lines = CM.linesUsingStation(o[1])
+					if #lines > 0 then
+						if not K.STOPS_DEL_ON_LINE then
+							log(string.format("%s: replaced stop %d is used by %d line(s) and stops_del_on_line=0 -- refused (DIVERGENCE)", tag, o[1], #lines))
+							return
+						end
+						log(string.format("%s: replacing stop %d (%s) used by %d line(s) -- the engine rewrites them, the LUPDATE behind this restores the stop",
+							tag, o[1], d and d.model or "?", #lines))
+					else
+						log(string.format("%s: replacing stop %d (%s) on side %d with %s", tag, o[1], d and d.model or "?", side, wantModel))
+					end
+				elseif o[2] == side and side ~= 2 then
 					log(string.format("%s: edge %d already carries object %d on side %d -- one per side per edge, skipped (DIVERGENCE)",
 						tag, eid, o[1], side))
 					return

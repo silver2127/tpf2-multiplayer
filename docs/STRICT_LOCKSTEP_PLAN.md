@@ -469,7 +469,7 @@ A5, A7, the people-count lane `n:` (05850df).
 
 ### 2.10 Roadside stops, signals and waypoints (poll → S, built 2026-09-08)
 
-**Status: ADD is strict (`strict_stops=1`); REPLACE and DELETE stay on the poll.**
+**Status: ADD and DELETE are strict (`strict_stops=1`); REPLACE stays on the poll.**
 
 **(a) Cancel point.** ONE caller covers all three: `CALLER_STOPTOOL = 0x460e0b`
 (`UI::StreetTerminalBuilder::commit` → `make_cmd::BuildProposal`; measured
@@ -514,12 +514,21 @@ so the tool survives.
 **(e) Not strict yet.** REPLACE (a compatible stop dropped on an occupied side):
 the DLL refuses the cancel when `edgeObjectsToRemove` is non-empty because the
 engine re-points that stop's lines (`old2newEdgeObjects`), which a script
-proposal cannot carry — the poll's `STOPREP` + `LUPDATE` re-ship stays. DELETE
-goes through the bulldozer (a different caller) — still the poll's `STOPDEL`.
+proposal cannot carry — the poll's `STOPREP` + `LUPDATE` re-ship stays.
+
+**DELETE (strict, 2026-09-08 late).** The bulldozer (`CALLER_BULLDOZE`) removes an
+edge object by re-adding its edge without it (`re=1 addEdges=1`). Each 120-B
+SegmentAndEntity carries `objects` as a vector of 8-B `{entity,type}` at `+0x30`;
+`StashStopDelFromBulldoze` takes removed−added, insists on exactly one, arms the
+cancel through the same block as a road demolish, and `STOPXDEL <eo> <edge>` ships
+from the Add hook when it lands. The Lua reads the object's position off the still-
+standing entity and ships `STOPDEL` without `skipOrigin`. Why: the poll path removed
+the stop on the host at click time and on the peers two steps later; passengers
+walking to it re-planned on different steps, the people count split ~50 units
+later, and the buses drifted (t=635 → 696 → 2456).
 
 **(f) Open.** Pin `+0xd0` with a one-way signal; make replace strict by
-shipping the line re-point (or refusing the replace under a line); the
-bulldozer caller for stop delete.
+shipping the line re-point (or refusing the replace under a line).
 ### 2.11 Constructions — true cancel (see §3)
 
 ### 2.12 Module edit / station upgrade (poll → S)
