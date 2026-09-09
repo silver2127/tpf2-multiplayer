@@ -249,6 +249,18 @@ function CM.peerSlowPrecise()
 	return minT
 end
 
+-- Fastest peer by the PRECISE clock: the pause point everyone runs to.
+function CM.peerFastPrecise()
+	local maxT
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			if t and (not maxT or t > maxT) then maxT = t end
+		end
+	end
+	return maxT
+end
+
 function CM.peerBounds()
 	local minT, maxT
 	for _, pr in pairs(CM.peers) do

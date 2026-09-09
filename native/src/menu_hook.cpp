@@ -1548,10 +1548,27 @@ static unsigned long readBridgePid()
     return 0;
 }
 
+// "/speed 2.5" typed in the lobby chat (by anyone -- the host's game script
+// applies it and broadcasts the session speed). Carried to the game script as
+// a speed= line in the bridge ctl file; "/speed off" (or 0) clears it.
+static char g_speedReq[16] = "";
+static void writeBridgeCtl(bool isHost);
+static void speedFromChat(const char* text)
+{
+    if (strncmp(text, "/speed", 6) != 0) return;
+    const char* a = text + 6;
+    while (*a == ' ') a++;
+    double v = atof(a);
+    if (v > 0.0 && v < 64.0) snprintf(g_speedReq, sizeof(g_speedReq), "%.4g", v);
+    else g_speedReq[0] = 0;
+    Log("[menu] chat /speed -> %s\n", g_speedReq[0] ? g_speedReq : "off");
+    writeBridgeCtl(g_isHost != 0);
+}
+
 static void writeBridgeCtl(bool isHost)
 {
-    static char last[128] = "";
-    char content[128];
+    static char last[192] = "";
+    char content[192];
     // pid= addresses the ctl to OUR bridge. Two instances sharing a data dir
     // (a sandboxed second instance reads through to the real dir until it has
     // its own copy) otherwise apply each other's role for a moment.
@@ -1580,6 +1597,10 @@ static void writeBridgeCtl(bool isHost)
     // and released with two of three players in.
     snprintf(content, sizeof(content), "instance=%c\npeer=127.0.0.1:%d\npid=%lu\nplayers=%d\n",
              letter, relayPortFor(isHost), bpid, g_playerCount);
+    if (g_speedReq[0]) {
+        size_t n = strlen(content);
+        snprintf(content + n, sizeof(content) - n, "speed=%s\n", g_speedReq);
+    }
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
     _snwprintf_s(path, _TRUNCATE, L"%stpf2_bridge_ctl.txt", g_dataDirW);
@@ -1955,7 +1976,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) { strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
                         else if (strcmp(ty, "roster") == 0) applyRoster(rem);
-                        else if (strcmp(ty, "chat") == 0) { char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx)); chatPush(fr, tx); }
+                        else if (strcmp(ty, "chat") == 0) { char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx)); chatPush(fr, tx); speedFromChat(tx); }
                         else if (strcmp(ty, "status") == 0) { char de[200]; jsonStr(rem, "detail", de, sizeof(de)); if (de[0]) SetStatus(de); }
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));

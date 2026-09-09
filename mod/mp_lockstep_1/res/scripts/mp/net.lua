@@ -424,8 +424,8 @@ local function onLine(line)
 		-- SPEED V2: the host broadcasts the session's effective speed; joiners
 		-- apply it. Not while the load gate holds (only the local lever releases
 		-- us, same rule as LSSPEED).
-		if CM.cfgFlag("speed_v2", false) and not CM.lgHolding then
-			local v = tonumber(line:match("v=(%d+)"))
+		if CM.cfgFlag("speed_v2", true) and not CM.lgHolding then
+			local v = tonumber(line:match("v=([%d%.]+)"))
 			if v then
 				CM.effSpeed = v; CM.baseSpeed = v
 				-- The host unpaused the session: a ceiling of 0 of our own is lifted
@@ -433,12 +433,11 @@ local function onLine(line)
 				-- is re-learned from the next persistent 0 the detector sees.
 				if v > 0 and CM.myCeiling == 0 then
 					CM.myCeiling = v
-					log(string.format("SPEED2: host unpaused the session at %d -- our ceiling of 0 lifted", v))
+					log(string.format("SPEED2: host unpaused the session at %g -- our ceiling of 0 lifted", v))
 				end
-				local s0; pcall(function() s0 = game.interface.getGameSpeed() end)
-				-- Not while the hard barrier holds us: we are AHEAD, and running now
-				-- would only widen it. The release returns to baseSpeed (= v).
-				if s0 ~= v and not CM.paused then CM.setSpeed(v, "host effective speed") end
+				-- Applied by CM.paceV2 on the next tick, which knows about the barrier
+				-- and turns a session pause into a sync point (run to the leader's
+				-- clock, then stop) instead of freezing everyone where they are.
 			end
 		end
 	elseif op == "LSSPEED" then

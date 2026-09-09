@@ -180,7 +180,33 @@ CM.SPD2_MICRO_DONE  = 0.4
 -- 2026-09-08: the host could not unpause the session from then on).
 CM.SPD2_PAUSE_TICKS = 8
 
+-- FRACTIONAL SPEEDS (2026-09-09). The engine's speed is a whole number of sim
+-- iterations per frame; the bridge DLL's speedhook dithers that count per
+-- frame to whatever number stands in DATADIR\tpf2_speed.txt (2.5 -> 2,3,2,3),
+-- and the engine's own pause still wins. So a session speed of 2.5 is: lever
+-- = round(2.5) so the UI shows something sane and the sim is not paused, plus
+-- the file. A whole number clears the file and is the plain lever. The lever
+-- is what getGameSpeed() reads back, so the "ours vs the player's" test keeps
+-- comparing whole numbers.
+function CM.leverOf(v)
+	v = tonumber(v) or 0
+	if v == math.floor(v) then return v end
+	return math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v + 0.5)))
+end
+function CM.setDither(v)
+	local want = (v and v ~= math.floor(v)) and string.format("%.4f", v) or ""
+	if CM.ditherCur == want then return end
+	CM.ditherCur = want
+	pcall(function()
+		local p = K.BASE .. "tpf2_speed.txt"
+		if want == "" then os.remove(p) else local f = io.open(p, "w"); if f then f:write(want, "\n"); f:close() end end
+	end)
+end
+
 function CM.setSpeed(v, why)
+	v = tonumber(v) or 0
+	CM.setDither(v)
+	v = CM.leverOf(v)
 	-- TWO SLOTS, not one. A single remembered value is enough only while at most
 	-- one of our commands is in flight; the moment corrections come faster than
 	-- the engine applies them, the engine reports the OLDER one, shareSpeed
@@ -350,11 +376,45 @@ function CM.hostUnpause(s)
 	log(string.format("SPEED2: host unpaused the session at %d (%d peer ceiling(s) of 0 overridden)", v, cleared))
 end
 
--- SPEED V2 controller. Runs on EVERY instance for the player-ceiling detection;
--- only the host ("a") aggregates ceilings + the sustainable cap into the
--- effective speed and broadcasts LSEFF. Joiners follow LSEFF. See the SPD2_*
--- constants for the model. This replaces CM.pace (the micropause/notch limit
--- cycle) when speed_v2 is set; the hard barrier stays as a rare backstop.
+-- SPEED V2 controller -- MANUAL model (2026-09-09). The players own the lever:
+--   * every instance reads its own speed button as its CEILING (0..4) and
+--     ships it on the heartbeat; the host takes the MINIMUM over everyone and
+--     broadcasts it as the session speed (LSEFF). Anyone can slow or pause
+--     the whole session; the host's play-click overrides a stuck 0.
+--   * a PAUSE IS A SYNC POINT: when the session speed is 0 the leader stops
+--     at once and everyone behind keeps running until they reach the
+--     leader's clock, then stops there. So "pause to let people catch up"
+--     does exactly that, and an unpause resumes everyone in step.
+--   * nothing else moves the lever. The automatic corrections that were here
+--     (leader micropause pulses, the hysteretic sustainable cap) throttled
+--     and stuttered the session in ways players felt but could not see;
+--     they are kept behind cfg speed_auto=1, default OFF.
+-- What remains automatic is the correctness floor only: the hard barrier
+-- (K.BARRIER_AHEAD) and the load gate. Commands are stamped past the fastest
+-- clock (net.lua), so a gap costs the slow player latency, never a fork.
+-- "/speed 2.5" typed in the lobby chat: the panel (menu DLL) writes speed=2.5
+-- into tpf2_bridge_ctl.txt; the HOST reads it here as the session speed
+-- request. Read every ~2 s, not per tick. "/speed off" (or 0, or 1..4 as a
+-- whole number) clears it and the lowest lever rules again.
+function CM.speedRequest()
+	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.spdReq end
+	CM.spdReqAt = CM.ticks
+	local req
+	pcall(function()
+		local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
+		if not f then return end
+		local body = f:read("*a") or ""
+		f:close()
+		req = tonumber(body:match("speed=([%d%.]+)"))
+	end)
+	if req and (req <= 0 or req >= 64) then req = nil end
+	if req ~= CM.spdReq then
+		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (lowest lever)"))
+	end
+	CM.spdReq = req
+	return req
+end
+
 function CM.paceV2(now, lead)
 	if CM.lgHolding then return end
 	local MAXS = CM.MAX_SPEED or 4
@@ -401,65 +461,109 @@ function CM.paceV2(now, lead)
 	if K.INSTANCE == "a" and settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
 		CM.hostUnpause(s)
 	end
+	-- A pause the player just made is being DEBOUNCED (SPD2_PAUSE_TICKS) before
+	-- it becomes a ceiling of 0. Pushing the session speed back onto the game
+	-- during that window undoes the player's pause before it can register --
+	-- nobody could pause at all. Leave the lever alone until the detector
+	-- has decided (a blip clears itself when the game runs again).
+	if s == 0 and CM.spd2ZeroSince and CM.myCeiling ~= 0 then return end
 	if CM.paused then return end                 -- the hard barrier owns the speed transiently
 	-- a peer 60+ units away is in a different game (loading, or a leftover
-	-- heartbeat from the last session): never pace against it. Before this a
-	-- stale 1073-unit "lead" at session start capped the whole session at 1.
+	-- heartbeat from the last session): never pace against it.
 	if lead > 60 then return end
-	local slowP = CM.peerSlowPrecise()
-	local myLead = slowP and (now - slowP) or 0
-	if CM.microPausing then
-		if myLead <= CM.SPD2_MICRO_DONE or (CM.ticks - (CM.microPausedAt or CM.ticks)) >= CM.PACE_MICRO_MAX then
-			CM.microPausing = false
-			CM.setSpeed(CM.effSpeed or CM.baseSpeed or 1, string.format("micropause done (%.2f ahead)", myLead))
+	local auto = CM.cfgFlag("speed_auto", false)
+	if auto then
+		local slowP = CM.peerSlowPrecise()
+		local myLead = slowP and (now - slowP) or 0
+		if CM.microPausing then
+			if myLead <= CM.SPD2_MICRO_DONE or (CM.ticks - (CM.microPausedAt or CM.ticks)) >= CM.PACE_MICRO_MAX then
+				CM.microPausing = false
+				CM.setSpeed(CM.effSpeed or CM.baseSpeed or 1, string.format("micropause done (%.2f ahead)", myLead))
+			end
+			return
 		end
-		return
-	end
-	if myLead > CM.SPD2_MICRO_AHEAD and myLead < 60 and s ~= 0 and CM.myCeiling ~= 0 then
-		CM.microPausing = true
-		CM.microPausedAt = CM.ticks
-		CM.setSpeed(0, string.format("micropause: %.2f ahead of the slowest peer", myLead))
-		return
-	end
-	if K.INSTANCE ~= "a" then return end       -- only the host decides; joiners follow LSEFF
-	-- min ceiling across fresh instances (self + peers)
-	local minCeil = CM.myCeiling
-	for _, pr in pairs(CM.peers) do
-		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and pr.ceil and pr.ceil < minCeil then
-			minCeil = pr.ceil
+		if myLead > CM.SPD2_MICRO_AHEAD and myLead < 60 and s ~= 0 and CM.myCeiling ~= 0 then
+			CM.microPausing = true
+			CM.microPausedAt = CM.ticks
+			CM.setSpeed(0, string.format("micropause: %.2f ahead of the slowest peer", myLead))
+			return
 		end
 	end
-	-- sustainable cap, hysteretic on the fastest-slowest lead
-	lead = lead or 0
-	if lead > CM.SPD2_LEAD_DOWN then
-		CM.spd2HiSince = CM.spd2HiSince or CM.ticks
-		CM.spd2LoSince = nil
-		if CM.ticks - CM.spd2HiSince >= CM.SPD2_DOWN_TICKS then
-			CM.susCap = math.max(1, (CM.effSpeed or minCeil) - 1)
-			CM.spd2HiSince = CM.ticks
-			log(string.format("SPEED2: lead %.1f sustained -- cap down to %d", lead, CM.susCap))
+	if K.INSTANCE == "a" then
+		-- min ceiling across fresh instances (self + peers)
+		local minCeil = CM.myCeiling
+		for _, pr in pairs(CM.peers) do
+			if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and pr.ceil and pr.ceil < minCeil then
+				minCeil = pr.ceil
+			end
 		end
-	elseif lead < CM.SPD2_LEAD_UP then
-		CM.spd2LoSince = CM.spd2LoSince or CM.ticks
-		CM.spd2HiSince = nil
-		if (CM.effSpeed or 0) < minCeil and CM.ticks - CM.spd2LoSince >= CM.SPD2_UP_TICKS then
-			CM.susCap = math.min(MAXS, (CM.effSpeed or 1) + 1)
-			CM.spd2LoSince = CM.ticks
-			log(string.format("SPEED2: in step -- cap up to %d", CM.susCap))
+		local eff = minCeil
+		if auto then
+			-- sustainable cap, hysteretic on the fastest-slowest lead
+			lead = lead or 0
+			if lead > CM.SPD2_LEAD_DOWN then
+				CM.spd2HiSince = CM.spd2HiSince or CM.ticks
+				CM.spd2LoSince = nil
+				if CM.ticks - CM.spd2HiSince >= CM.SPD2_DOWN_TICKS then
+					CM.susCap = math.max(1, (CM.effSpeed or minCeil) - 1)
+					CM.spd2HiSince = CM.ticks
+					log(string.format("SPEED2: lead %.1f sustained -- cap down to %d", lead, CM.susCap))
+				end
+			elseif lead < CM.SPD2_LEAD_UP then
+				CM.spd2LoSince = CM.spd2LoSince or CM.ticks
+				CM.spd2HiSince = nil
+				if (CM.effSpeed or 0) < minCeil and CM.ticks - CM.spd2LoSince >= CM.SPD2_UP_TICKS then
+					CM.susCap = math.min(MAXS, (CM.effSpeed or 1) + 1)
+					CM.spd2LoSince = CM.ticks
+					log(string.format("SPEED2: in step -- cap up to %d", CM.susCap))
+				end
+			else
+				CM.spd2HiSince = nil; CM.spd2LoSince = nil
+			end
+			if CM.susCap < 1 then CM.susCap = 1 end
+			eff = math.min(minCeil, CM.susCap)
+		end
+		if eff < 0 then eff = 0 end
+		local req = CM.speedRequest()
+		local why = "lowest lever"
+		if req and eff > 0 then eff = req; why = "/speed request" end
+		local changed = (eff ~= CM.effSpeed)
+		CM.effSpeed = eff
+		if changed then
+			CM.broadcast(string.format("LSEFF v=%g", eff))
+			log(string.format("SPEED2: session speed -> %g (%s%s)", eff, why, auto and ", auto cap " .. tostring(CM.susCap) or ""))
+		end
+	end
+	-- APPLY (every instance). Joiners learn CM.effSpeed from LSEFF (net.lua),
+	-- the host computed it above.
+	local eff = CM.effSpeed
+	if eff == nil then return end
+	if eff > 0 then CM.runSpeed = eff end
+	CM.baseSpeed = eff                          -- a barrier release then returns to eff
+	local target = eff
+	if eff == 0 then
+		-- PAUSE IS A SYNC POINT: run to the leader's clock, then stop there.
+		local fastP = CM.peerFastPrecise()
+		local hi = fastP and math.max(fastP, now) or now
+		if hi - now > K.SIM_STEP * 1.5 then
+			target = CM.runSpeed or 1
+			if not CM.syncingTo then
+				log(string.format("SPEED2: session paused -- running %.1f unit(s) to the leader's clock before stopping", hi - now))
+			end
+			CM.syncingTo = hi
+		elseif CM.syncingTo then
+			log("SPEED2: reached the pause point -- stopped in step with the leader")
+			CM.syncingTo = nil
 		end
 	else
-		CM.spd2HiSince = nil; CM.spd2LoSince = nil
+		CM.syncingTo = nil
 	end
-	if CM.susCap < 1 then CM.susCap = 1 end
-	local eff = math.min(minCeil, CM.susCap)   -- 0 possible if a player paused (ceiling 0)
-	if eff < 0 then eff = 0 end
-	local changed = (eff ~= CM.effSpeed)
-	CM.effSpeed = eff
-	CM.baseSpeed = eff                          -- a barrier release then returns to eff
-	if changed then CM.broadcast(string.format("LSEFF v=%d", eff)) end
-	if s ~= eff and settled then
-		CM.setSpeed(eff, string.format("v2 effective (ceil=%d cap=%d lead=%.1f)", minCeil, CM.susCap, lead))
-		if not changed then CM.broadcast(string.format("LSEFF v=%d", eff)) end
+	if s ~= CM.leverOf(target) and settled then
+		if target == eff then
+			CM.setSpeed(target, string.format("session speed %g", eff))
+		else
+			CM.setSpeed(target, string.format("catching up to the pause point (%.1f behind)", (CM.syncingTo or now) - now))
+		end
 	end
 end
 
@@ -494,7 +598,7 @@ function CM.applyBarrier(now)
 
 	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
 	-- Nothing the gate does with the speed is the player's choice; never share it.
-	if CM.cfgFlag("speed_v2", false) then
+	if CM.cfgFlag("speed_v2", true) then
 		-- V2: host-authoritative effective speed (CM.paceV2). Lead includes self
 		-- (now), so a host that is itself the leader still measures the spread.
 		local hi = math.max(now, fastT or now)
