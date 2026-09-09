@@ -3,12 +3,12 @@
 #   sh tools/relay_deploy.sh [root@76.13.109.115] [lobby name] [udp port]
 # Installs netpunch/*.py to /opt/tpf2mp/netpunch, the tpf2mp-relay service (runs
 # as user tpf2mp, io dir /var/lib/tpf2mp/relay), opens the UDP port in ufw, and
-# announces the lobby to the master server (public, always on). Re-run to
+# announces the lobby to the master server (public, always on) as "Dedicated Test Server All Welcome". Re-run to
 # update the code or the settings; the service restarts and gets a NEW code
 # (the old one stops working -- players find it again via PUBLIC GAMES).
 set -e
 HOST="${1:-root@76.13.109.115}"
-LOBBY="${2:-Public Relay}"
+LOBBY="${2:-Dedicated Test Server All Welcome}"
 PORT="${3:-29471}"
 tar -C netpunch -cf - lobby.py punch.py seal.py connect.py mesh.py observe.py swarm.py 2>/dev/null \
   | ssh "$HOST" 'mkdir -p /opt/tpf2mp/netpunch && tar -C /opt/tpf2mp/netpunch -xf -'
