@@ -5,7 +5,7 @@ depends on the following third-party material.
 
 ## Vendored
 
-- **Vulkan headers** (`bridge/third_party/vk/`) — Copyright 2015-2026 The Khronos
+- **Vulkan headers** (`native/third_party/vk/`) — Copyright 2015-2026 The Khronos
   Group Inc. Licensed under `Apache-2.0 OR MIT` (SPDX identifiers are in each
   file). Used unmodified by the in-game overlay.
 

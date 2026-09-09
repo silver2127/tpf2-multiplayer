@@ -36,7 +36,7 @@ WHAT IT ASSERTS  (each one names itself in the report)
 
 WHY THE ACTIONS ARE DRIVEN THE WAY THEY ARE  --  read this before adding one.
 The mod replicates the PLAYER's NATIVE UI commands, captured by the slice DLL on
-the CALLER'S RETURN ADDRESS (bridge/src/slice_hook.cpp: CALLER_BUILDPROPOSAL
+the CALLER'S RETURN ADDRESS (native/src/slice_hook.cpp: CALLER_BUILDPROPOSAL
 0x459e97, CALLER_UPGRADE 0x4790fc, and the Lua block 0xcec000..0xcf2000 which is
 explicitly treated as "a replay, not shipped"). A command issued from a script --
 this mod's own EVAL channel, game.interface.*, api.cmd.* -- arrives with the

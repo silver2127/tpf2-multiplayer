@@ -52,7 +52,7 @@
 
 -- ---------- runtime data directory ----------
 -- Every runtime file (identity, events, captures, injects, status, logs) lives
--- in ONE directory shared with the bridge and slice DLLs; bridge/src/datadir.h
+-- in ONE directory shared with the bridge and slice DLLs; native/src/datadir.h
 -- is the C++ half of this contract and resolves the same candidates in the same
 -- order:
 --   1. $TPF2MP_DATADIR             (the dev harness pins the old workshop out dir)

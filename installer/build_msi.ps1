@@ -5,10 +5,10 @@ Builds every shipped binary, then the TpF2 Multiplayer MSI (installer\out\TpF2Mu
 .DESCRIPTION
 Steps, in order (each one stops the script on failure):
 
-  1. bridge\build.bat proxy  -> bridge\out\alut.dll, bridge\out\tpf2_bridge_mp.dll
-     bridge\build.bat host   -> bridge\out\tpf2_pluginhost.dll
-     bridge\build.bat menu   -> bridge\out\tpf2_menu.dll
-     bridge\build.bat slice  -> bridge\out\tpf2_slice.dll
+  1. native\build.bat proxy  -> native\out\alut.dll, native\out\tpf2_bridge_mp.dll
+     native\build.bat host   -> native\out\tpf2_pluginhost.dll
+     native\build.bat menu   -> native\out\tpf2_menu.dll
+     native\build.bat slice  -> native\out\tpf2_slice.dll
      A DLL that a running game has loaded stays locked, so linking to the plain
      name fails with LNK1104. The menu and slice targets take a name suffix: on a
      failure the script retries with one, copies the result over the plain name
@@ -32,7 +32,7 @@ script never accepts it for you: pass -AcceptWixEula to add the per-invocation
 flag after reading https://wixtoolset.org/osmf/ .
 
 .PARAMETER SkipBuild
-Skip steps 1-3 (package whatever is in bridge\out, netpunch\dist and installer\out).
+Skip steps 1-3 (package whatever is in native\out, netpunch\dist and installer\out).
 
 .PARAMETER SkipFreeze
 Skip the PyInstaller step when netpunch\dist\netpunch.exe already exists (warns).
@@ -74,7 +74,7 @@ if (-not $Version) {
     if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "installer\VERSION does not contain a three-part version: '$Version'" }
 }
 $Repo      = Split-Path -Parent $Installer
-$Bridge    = Join-Path $Repo "bridge"
+$Bridge    = Join-Path $Repo "native"
 $BridgeOut = Join-Path $Bridge "out"
 $Netpunch  = Join-Path $Repo "netpunch"
 $OutDir    = Join-Path $Installer "out"
@@ -97,7 +97,7 @@ function Run-Bat([string]$bat, [string]$arg = "") {
     return $LASTEXITCODE
 }
 
-# Builds bridge\build.bat <target>, retrying with a suffix when the plain output
+# Builds native\build.bat <target>, retrying with a suffix when the plain output
 # is locked. Returns the path to hand to wix (plain name when possible).
 function Build-Suffixable([string]$target, [string]$plainName) {
     $batPath = Join-Path $Bridge "build.bat"
@@ -131,7 +131,7 @@ $caDll    = Join-Path $OutDir "tpf2ca.dll"
 
 # ---- 1. native DLLs ------------------------------------------------------
 if ($SkipBuild) {
-    Warn "-SkipBuild: packaging the existing files in bridge\out"
+    Warn "-SkipBuild: packaging the existing files in native\out"
 } else {
     $build = Join-Path $Bridge "build.bat"
     Say "running build.bat proxy"

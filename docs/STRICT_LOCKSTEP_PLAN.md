@@ -6,7 +6,7 @@
 > search by symbol or log string instead.
 
 Build 35924, ImageBase `0x140000000`; every address below is an RVA. Line
-numbers are against `bridge/src/slice_hook.cpp` (2678 lines) and
+numbers are against `native/src/slice_hook.cpp` (2678 lines) and
 `mod/mp_lockstep_1/res/config/game_script/lockstep.lua` (10464 lines) as of
 commit `302974a`. Written 2026-09-08 from the code, not the docs; where a doc
 and the code disagree the code is cited.

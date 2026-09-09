@@ -1,5 +1,5 @@
-# build output -- rebuild with bridge/build_*.bat, installer/build_msi.ps1
-bridge/out/
+# build output -- rebuild with native/build_*.bat, installer/build_msi.ps1
+native/out/
 installer/out/
 *.obj
 *.exp

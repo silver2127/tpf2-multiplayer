@@ -5,7 +5,7 @@
   Build: installer\build_msi.ps1, or from this directory
     wix build -arch x64 -ext WixToolset.UI.wixext -o out\TpF2Multiplayer.msi Package.wxs
 
-  Layout (bridge\src\datadir.h is the shared definition):
+  Layout (native\src\datadir.h is the shared definition):
     game folder  INSTALLFOLDER            binaries + cfg + mod tree      <- this package
     data folder  %LOCALAPPDATA%\tpf2mp\data\  everything written at run time  <- created by the DLLs
   The package never touches the data folder, so uninstalling leaves logs and
@@ -28,7 +28,7 @@
   <!-- Source overrides: pass -d Name=value to wix. build_msi.ps1 sets MenuDll /
        SliceDll to the newest suffixed build when the plain name is locked. -->
   <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
-  <?ifndef BridgeOut ?><?define BridgeOut = "..\bridge\out" ?><?endif?>
+  <?ifndef BridgeOut ?><?define BridgeOut = "..\native\out" ?><?endif?>
   <?ifndef ProxyDll ?><?define ProxyDll = "$(BridgeOut)\alut.dll" ?><?endif?>
   <?ifndef HostDll ?><?define HostDll = "$(BridgeOut)	pf2_pluginhost.dll" ?><?endif?>
   <?ifndef BridgeDll ?><?define BridgeDll = "$(BridgeOut)\tpf2_bridge_mp.dll" ?><?endif?>

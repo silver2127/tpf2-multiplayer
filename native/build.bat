@@ -1,5 +1,5 @@
 @echo off
-REM bridge\build.bat <target> [suffix] -- every native DLL from one script.
+REM native\build.bat <target> [suffix] -- every native DLL from one script.
 REM
 REM   slice   tpf2_slice.dll             the command-capture hooks (slice_hook.cpp +
 REM                                      deferrelay_slice.asm: its suppress path is
@@ -22,7 +22,7 @@ REM while the game runs. "build.bat slice 2" links out\tpf2_slice2.dll instead.
 REM Only the plain name ships: tools\deploy_shipping.ps1 refuses a suffixed one.
 REM
 REM Paths: Build Tools 2022 at the default location (vcvars64.bat below); edit it
-REM for another edition. Outputs go to bridge\out.
+REM for another edition. Outputs go to native\out.
 setlocal
 set "T=%~1"
 set "SFX=%~2"

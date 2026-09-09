@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 
 $Game  = "C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2"
 $Out   = "C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out"
-$Proxy = Join-Path $PSScriptRoot "..\bridge\out\alut.dll"
+$Proxy = Join-Path $PSScriptRoot "..\native\out\alut.dll"
 $Live  = Join-Path $Game "alut.dll"
 $Real  = Join-Path $Game "alut_real.dll"
 $Backup = Join-Path $PSScriptRoot "..\backup\2026-08-06\alut.dll.orig"
@@ -39,7 +39,7 @@ if ($Uninstall) {
     exit 0
 }
 
-if (-not (Test-Path $Proxy)) { Fail "proxy not built - run bridge\build.bat proxy first" }
+if (-not (Test-Path $Proxy)) { Fail "proxy not built - run native\build.bat proxy first" }
 if (-not (Test-Path (Join-Path $Out "tpf2_bridge_mp.dll"))) {
     Fail "tpf2_bridge_mp.dll missing from $Out - the proxy loads it from there"
 }

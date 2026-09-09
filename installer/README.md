@@ -257,7 +257,7 @@ action DLL from `installer\ca\`, and a `.wixpdb`). `installer\out\` is ignored
 by git.
 
 If the game is running while you build, the DLLs it has loaded are locked and
-`link` fails with LNK1104. The `menu` and `slice` targets of `bridge\build.bat`
+`link` fails with LNK1104. The `menu` and `slice` targets of `native\build.bat`
 accept a name suffix, and the script retries with one and packages the suffixed
 file under the plain name; the `proxy` target does not, so close the game for
 that step.

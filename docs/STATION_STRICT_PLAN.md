@@ -80,7 +80,7 @@ Each item names the flags, the action, the log line, and the decision. Manual UI
 
 ## 4. Strict station PLACEMENT
 
-### 4.1 Hook changes (bridge/src/slice_hook.cpp)
+### 4.1 Hook changes (native/src/slice_hook.cpp)
 
 1. Lossy hard-fail. ConxpOut gains `bool lossy`. Set it at: unknown key tag, SerLuaValue returning false for an unknown value tag, an unreadable node break, loop exit with `*nodes >= CONXP_MAX_NODES`, the depth cap (emit nothing and fail instead of "{}"), and any ReadSsoString whose source length is >= cap-1 (key 256, value 1024, fileName 512, name 512: raise the value buffer to 4096 and still flag). Tag 0 (Nil) is logged distinctly ("value tag 0 (Nil) omitted") and OMITTED without setting lossy: the poll-side ser(e.params) never yields nil values either, so it is not a fidelity loss relative to the poll; whether tag 0 ever appears is unknown (never seen in any log) and the lossy-vs-omit decision waits for the first CONXD-vs-poll comparison that contains one. StashConxpFromProposal's check becomes `!ok || o.trunc || o.lossy || nodes == 0` -> "params walk lossy -- not shipped", no arm, native build. This is a fidelity requirement, not the assert fix (section 2.2 item 8).
 2. Bool tag. SerLuaValue: `tag == 1 -> CoPut(o, *(uint8_t*)var ? "true" : "false")`. Enabled only after measurement M2 has seen a 00 payload matched against a `false` (Milestone 2); until then tag 1 is lossy.
