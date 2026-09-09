@@ -491,6 +491,8 @@ end
 -- our heartbeat keeps the others from pacing against us meanwhile. Returns
 -- the speed to impose while active, nil otherwise.
 K.CATCHUP_MIN = 3
+K.FRAC_PACE_TICKS = 5      -- ~1 s between pacing decisions (heartbeats are 2 ticks apart)
+K.CATCHUP_SPEED_MAX = 4    -- the sim cannot keep up above the game's own 4 on real hardware; 8 felt SLOWER
 function CM.catchUpTick(now, s)
 	if not CM.cfgFlag("hot_join", true) then return nil end
 	local fastP = CM.peerFastPrecise()
@@ -512,7 +514,7 @@ function CM.catchUpTick(now, s)
 		local gaps = CM.rxGaps()
 		if CM.histEndSeen and gaps == 0 then
 			CM.cuPhase = "run"
-			log(string.format("CATCHUP: history complete -- running at %gx to close %.1f unit(s)", CM.cfgNum("catchup_speed", 8), behind))
+			log(string.format("CATCHUP: history complete -- running at %gx to close %.1f unit(s)", math.min(K.CATCHUP_SPEED_MAX, CM.cfgNum("catchup_speed", 4)), behind))
 		elseif CM.ticks - CM.cuSince > 160 then
 			CM.cuPhase = "run"
 			log(string.format("CATCHUP: no complete history after ~30 s (end=%s, gaps=%d) -- running anyway", tostring(CM.histEndSeen), gaps))
@@ -525,7 +527,7 @@ function CM.catchUpTick(now, s)
 		log("CATCHUP: caught up with the session -- ordinary pacing from here")
 		return nil
 	end
-	return math.max(1, CM.cfgNum("catchup_speed", 8))
+	return math.max(1, math.min(K.CATCHUP_SPEED_MAX, CM.cfgNum("catchup_speed", 4)))
 end
 
 function CM.paceV2(now, lead)
@@ -686,14 +688,28 @@ function CM.paceV2(now, lead)
 	-- never asked to go faster than that, since it cannot. Quantised to 0.05 so
 	-- the dither file is rewritten on real changes only. Replaces the pulses
 	-- players felt as stutter: the leader eases off and the tail catches up.
+	-- TUNED 2026-09-09 after a live session felt like go-stop-go: the first
+	-- gain (a quarter off per unit) overshot on a heartbeat a third of a
+	-- second stale, the other side became the slow one, and the roles flipped
+	-- every few seconds. Now: dead band 0.4, 10% off per unit ahead, never
+	-- below 0.55x, and a NEW decision only every K.FRAC_PACE_TICKS -- the last
+	-- one holds in between -- so the loop settles instead of chasing.
 	local paced = nil
 	if target == eff and eff > 0 and CM.cfgFlag("speed_frac_pace", true) then
-		local slowP = CM.peerSlowPrecise()
-		local myLead = slowP and (now - slowP) or 0
-		if myLead > 0.3 and myLead < 60 then
-			local f = math.max(0.4, 1 - myLead / 4)
-			target = math.max(0.5, math.floor(eff * f / 0.05 + 0.5) * 0.05)
-			paced = myLead
+		if CM.fracHold and (CM.ticks - (CM.fracDecidedAt or 0)) < K.FRAC_PACE_TICKS then
+			target = CM.fracHold; paced = CM.fracLead
+		else
+			local slowP = CM.peerSlowPrecise()
+			local myLead = slowP and (now - slowP) or 0
+			if myLead > 0.4 and myLead < 60 then
+				local f = math.max(0.55, 1 - 0.10 * myLead)
+				target = math.max(0.5, math.floor(eff * f / 0.05 + 0.5) * 0.05)
+				paced = myLead
+				CM.fracHold, CM.fracLead, CM.fracDecidedAt = target, myLead, CM.ticks
+			else
+				CM.fracHold, CM.fracLead = nil, nil
+				CM.fracDecidedAt = CM.ticks
+			end
 		end
 	end
 	if settled and s == CM.leverOf(target) then CM.setDither(target) end   -- same lever, new fraction
