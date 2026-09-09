@@ -167,7 +167,7 @@ CM.MAX_LEAD = 15.0
 -- they are not free. At every 2 ticks the relay fell behind and instance A was
 -- reading peer times ~13 units stale while B saw A correctly -- both then paused
 -- against bad data. 5 ticks is a rate the relay keeps up with.
-K.HEARTBEAT_EVERY = 5     -- ticks between LSTICK broadcasts (~0.93s)
+K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- the pacer's lead reading is only as fresh as this)
 
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the barrier section.

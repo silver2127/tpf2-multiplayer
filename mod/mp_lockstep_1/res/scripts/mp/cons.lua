@@ -726,6 +726,30 @@ function CM.execEdgeDemolish(c)
 				end
 			end
 		end
+		-- SAFETY NET (2026-09-08): removing an edge that still carries an edge
+		-- object (a stop or a signal a line references) is a fatal engine
+		-- assert -- one EDEMO of that kind took all three instances down with a
+		-- minidump each. The slice no longer ships that shape (it is an edge
+		-- replace, not a demolish), but a stale or foreign command must not be
+		-- able to crash a peer: drop such edges here and say so.
+		do
+			local kept = {}
+			for _, eid in ipairs(rmList) do
+				local nobj = 0
+				pcall(function()
+					local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+					if be and be.objects then nobj = #be.objects end
+				end)
+				if nobj > 0 then
+					rmSet[eid] = nil
+					log(string.format("EDEMO seq=%s: edge %d carries %d edge object(s) -- REFUSED (fatal engine assert; DIVERGENCE if the originator removed it)",
+						tostring(c.seq), eid, nobj))
+				else
+					kept[#kept + 1] = eid
+				end
+			end
+			rmList = kept
+		end
 		if #rmList == 0 then
 			log(string.format("EDEMO seq=%s: nothing to remove (%d unmatched)", tostring(c.seq), unmatched))
 			return

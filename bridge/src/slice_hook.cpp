@@ -1350,6 +1350,11 @@ static bool LogBulldoze(uint64_t r8)
         uint64_t espan = ReadVec(r8 + 0x48, &eb, 0x20000);
         uint64_t tspan = ReadVec(r8 + 0x1e0, &tb, 0x10000);
         int rn = (int)(nspan / 24), re = (int)(espan / 120), nrem = (int)(tspan / 4);
+        // addedSegments (r8+0x18, 120-B records): a bulldoze that ADDS an edge
+        // is an edge REPLACE, not a demolish -- the bulldozer removes a stop or
+        // a signal by re-adding the same edge without the object.
+        uint64_t adb = 0;
+        int aedges = (int)(ReadVec(r8 + 0x18, &adb, 0x20000) / 120);
         int nadd = 0;
         if (Readable((void*)(r8 + 0x1f8), 16)) {
             uint64_t ab = 0, ae = 0;
@@ -1388,6 +1393,15 @@ static bool LogBulldoze(uint64_t r8)
             else
                 Log("[slice]   (strict_condemo not set -- runs natively here; the "
                     "con poll ships it to the peers afterwards)\n");
+        }
+        else if (re >= 1 && aedges >= 1) {
+            // 2026-09-08: bulldozing a truck stop arrived here as re=1 and was
+            // shipped as an EDEMO. The replay removed the edge outright on all
+            // three instances, the engine asserted on the edge object still
+            // referenced by a line, and every instance wrote a minidump. Runs
+            // natively; the stop poll ships the removal as a STOPDEL as before.
+            Log("[slice]   edge-REPLACE shape (re=%d addEdges=%d): an edge object "
+                "removed, not a road -- runs natively, the stop poll ships it\n", re, aedges);
         }
         else if (re >= 1 || rn >= 1) {
             Log("[slice]   edge-demolish shape\n");

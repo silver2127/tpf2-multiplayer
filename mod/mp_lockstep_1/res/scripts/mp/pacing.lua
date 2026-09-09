@@ -151,6 +151,25 @@ CM.SPD2_LEAD_DOWN  = 3.0   -- lead (units) above this, sustained -> cap down a n
 CM.SPD2_LEAD_UP    = 0.6   -- lead below this, long-sustained -> cap up a notch
 CM.SPD2_DOWN_TICKS = 8     -- ~1.5 s of high lead before stepping down
 CM.SPD2_UP_TICKS   = 40    -- ~7.5 s of low lead before stepping up (asymmetric)
+-- LEADER MICROPAUSE under v2 (2026-09-08). One nominal speed for everyone does
+-- not give one THROUGHPUT: the rendered host instance falls behind the sandboxed
+-- ones, and a lead of 2.6-3.2 units sat there all session -- v2 only steps the
+-- shared cap down above SPD2_LEAD_DOWN, and a lower cap does not touch the
+-- differential anyway. That lead is paid twice: every command is stamped
+-- EXEC_DELAY + lead out ("assigning a stop takes several tries" = 4 s of
+-- nothing happening), and the leader's heartbeat under-reports it, so commands
+-- land in its past (LATE applies, and the 5.6 m vehicle offset after a set-line:
+-- the leader started the vehicle 2-3 sim steps late). So whoever is more than
+-- SPD2_MICRO_AHEAD ahead of the slowest peer (step-precise reading) pulses speed
+-- 0, hard-capped at PACE_MICRO_MAX ticks, until back under SPD2_MICRO_DONE.
+-- Heartbeats every 2 ticks keep the reading within ~0.35 units of the truth.
+CM.SPD2_MICRO_AHEAD = 1.0
+CM.SPD2_MICRO_DONE  = 0.4
+-- A ceiling of 0 ("pause everyone") needs the 0 to PERSIST this long. An
+-- autosave, the menu or a focus loss reads speed 0 for a tick or two; taken
+-- at face value that made a 0 ceiling nothing could clear (b at t=261,
+-- 2026-09-08: the host could not unpause the session from then on).
+CM.SPD2_PAUSE_TICKS = 8
 
 function CM.setSpeed(v, why)
 	-- TWO SLOTS, not one. A single remembered value is enough only while at most
@@ -304,6 +323,24 @@ function CM.releaseSpeed(why)
 	CM.setSpeed(CM.baseSpeed or 1, why)
 end
 
+-- HOST-AUTHORITATIVE UNPAUSE (2026-09-08). The host's play-click beats every
+-- peer's ceiling of 0: their 0s are forgotten here (a peer re-advertises its
+-- real ceiling on its next heartbeat, and the LSEFF handler lifts a 0 of its
+-- own), and LSEFF carries the new speed at once. Before this the host could
+-- not unpause the session at all while any peer's ceiling read 0 -- and with
+-- the host behind and the peers barrier-held on it, nobody could.
+function CM.hostUnpause(s)
+	local cleared = 0
+	for _, pr in pairs(CM.peers) do
+		if pr.ceil == 0 then pr.ceil = nil; cleared = cleared + 1 end
+	end
+	local v = math.min(s, CM.susCap or s)
+	if v < 1 then v = 1 end
+	CM.effSpeed = v; CM.baseSpeed = v
+	CM.broadcast(string.format("LSEFF v=%d", v))
+	log(string.format("SPEED2: host unpaused the session at %d (%d peer ceiling(s) of 0 overridden)", v, cleared))
+end
+
 -- SPEED V2 controller. Runs on EVERY instance for the player-ceiling detection;
 -- only the host ("a") aggregates ceilings + the sustainable cap into the
 -- effective speed and broadcasts LSEFF. Joiners follow LSEFF. See the SPD2_*
@@ -311,7 +348,6 @@ end
 -- cycle) when speed_v2 is set; the hard barrier stays as a rare backstop.
 function CM.paceV2(now, lead)
 	if CM.lgHolding then return end
-	if CM.paused then return end                 -- the hard barrier owns the speed transiently
 	local MAXS = CM.MAX_SPEED or 4
 	if CM.myCeiling == nil then CM.myCeiling = MAXS end
 	if CM.susCap == nil then CM.susCap = MAXS end
@@ -322,9 +358,59 @@ function CM.paceV2(now, lead)
 	local settled = CM.paceApplied or (CM.ticks > (CM.paceSetTick or 0) + 8)
 	local ours = (CM.lastSetSpeed and s == CM.lastSetSpeed)
 		or (not CM.paceApplied and CM.prevSetSpeed and s == CM.prevSetSpeed)
+	-- PLAYER CEILING. Read even while the hard barrier holds us (2026-09-08):
+	-- the `if CM.paused then return end` used to sit above this, so a held
+	-- instance's play-click was invisible -- which closed the deadlock (b's
+	-- ceiling stuck at 0 -> host effective 0 -> host behind -> peers held on
+	-- it -> b's detector never ran). The barrier's own 0 is `ours` and skipped.
+	local prevS = CM.spd2LastS
+	CM.spd2LastS = s
 	if settled and not ours and s ~= CM.myCeiling then
-		CM.myCeiling = s                       -- the player set their ceiling (0 = pause all)
-		log(string.format("SPEED2: player ceiling -> %d", s))
+		if s == 0 then
+			CM.spd2ZeroSince = CM.spd2ZeroSince or CM.ticks
+			if CM.ticks - CM.spd2ZeroSince >= CM.SPD2_PAUSE_TICKS then
+				CM.myCeiling = 0                   -- the player paused everyone
+				log(string.format("SPEED2: player ceiling -> 0 (paused %d ticks)", CM.ticks - CM.spd2ZeroSince))
+			end
+		else
+			CM.spd2ZeroSince = nil
+			CM.myCeiling = s                       -- the player set their ceiling
+			log(string.format("SPEED2: player ceiling -> %d", s))
+		end
+	elseif s ~= 0 then
+		CM.spd2ZeroSince = nil
+		-- A game that is SIMULATING is not paused by its player, whatever the
+		-- two-slot test says: the return from a blip to the effective speed is
+		-- indistinguishable from our own set, and left the ceiling at 0 forever.
+		if CM.myCeiling == 0 and settled then
+			CM.myCeiling = s
+			log(string.format("SPEED2: running at %d -- the 0 ceiling was a blip, cleared", s))
+		end
+	end
+	-- The host's player pressed play (a hand-set non-zero speed after a 0, or
+	-- while the session's effective speed is 0): that unpauses the SESSION.
+	if K.INSTANCE == "a" and settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
+		CM.hostUnpause(s)
+	end
+	if CM.paused then return end                 -- the hard barrier owns the speed transiently
+	-- a peer 60+ units away is in a different game (loading, or a leftover
+	-- heartbeat from the last session): never pace against it. Before this a
+	-- stale 1073-unit "lead" at session start capped the whole session at 1.
+	if lead > 60 then return end
+	local slowP = CM.peerSlowPrecise()
+	local myLead = slowP and (now - slowP) or 0
+	if CM.microPausing then
+		if myLead <= CM.SPD2_MICRO_DONE or (CM.ticks - (CM.microPausedAt or CM.ticks)) >= CM.PACE_MICRO_MAX then
+			CM.microPausing = false
+			CM.setSpeed(CM.effSpeed or CM.baseSpeed or 1, string.format("micropause done (%.2f ahead)", myLead))
+		end
+		return
+	end
+	if myLead > CM.SPD2_MICRO_AHEAD and myLead < 60 and s ~= 0 and CM.myCeiling ~= 0 then
+		CM.microPausing = true
+		CM.microPausedAt = CM.ticks
+		CM.setSpeed(0, string.format("micropause: %.2f ahead of the slowest peer", myLead))
+		return
 	end
 	if K.INSTANCE ~= "a" then return end       -- only the host decides; joiners follow LSEFF
 	-- min ceiling across fresh instances (self + peers)

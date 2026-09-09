@@ -428,8 +428,17 @@ local function onLine(line)
 			local v = tonumber(line:match("v=(%d+)"))
 			if v then
 				CM.effSpeed = v; CM.baseSpeed = v
+				-- The host unpaused the session: a ceiling of 0 of our own is lifted
+				-- (host-authoritative unpause, see CM.hostUnpause). A real pause here
+				-- is re-learned from the next persistent 0 the detector sees.
+				if v > 0 and CM.myCeiling == 0 then
+					CM.myCeiling = v
+					log(string.format("SPEED2: host unpaused the session at %d -- our ceiling of 0 lifted", v))
+				end
 				local s0; pcall(function() s0 = game.interface.getGameSpeed() end)
-				if s0 ~= v then CM.setSpeed(v, "host effective speed") end
+				-- Not while the hard barrier holds us: we are AHEAD, and running now
+				-- would only widen it. The release returns to baseSpeed (= v).
+				if s0 ~= v and not CM.paused then CM.setSpeed(v, "host effective speed") end
 			end
 		end
 	elseif op == "LSSPEED" then
