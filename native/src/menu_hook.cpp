@@ -458,6 +458,8 @@ static void originName(int idx, char* out)
     idx -= 26; out[0] = (char)('a' + (idx / 26) % 26); out[1] = (char)('a' + idx % 26); out[2] = 0;
 }
 static char g_you[40] = ""; static char g_host[40] = ""; static char g_lobbyTitle[40] = "";   // the lobby's name, from the roster
+static volatile LONG g_lobbyRelay = 0;   // the host is a relay-only server: "host" in the roster is the LEADER (oldest joiner)
+static char g_letters[200][3];           // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
 static char g_chatInput[200] = ""; static int g_chatLen = 0;
 static volatile LONG g_isHost = 0;       // this instance is the lobby host
@@ -1943,7 +1945,13 @@ static void writeBridgeCtl(bool isHost)
     // order, skipping the host. Every client derives the same assignment from
     // the same roster, so nobody has to be told.
     char letter[3] = "a";
-    if (!isHost) {
+    bool fromRelay = false;
+    if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
+        if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+        for (int i = 0; i < g_playerCount; i++) if (strcmp(g_players[i], g_you) == 0 && g_letters[i][0]) { strcpy_s(letter, g_letters[i]); fromRelay = true; break; }
+        if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    }
+    if (!isHost && !fromRelay) {
         int idx = 0;
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
         for (int i = 0; i < g_playerCount; i++) {
@@ -1997,6 +2005,9 @@ static void writeBridgeCtl(bool isHost)
 static const char* originLetterFor(const char* name)
 {
     static char buf[3];
+    if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
+        for (int i = 0; i < g_playerCount; i++) if (strcmp(g_players[i], name) == 0 && g_letters[i][0]) { strcpy_s(buf, g_letters[i]); return buf; }
+    }
     if (strcmp(name, g_host) == 0) return "a";
     int idx = 0;
     for (int i = 0; i < g_playerCount; i++) {
@@ -2062,6 +2073,17 @@ static void applyRoster(const char* s)
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
     jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
+    InterlockedExchange(&g_lobbyRelay, jsonBool(s, "relay", false) ? 1 : 0);
+    // relay lobbies: the relay assigns every player a sticky origin letter
+    for (int i = 0; i < g_playerCount; i++) g_letters[i][0] = 0;
+    { const char* lm = strstr(s, "\"letters\"");
+      if (lm && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
+          for (int i = 0; i < g_playerCount; i++) {
+              char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+              const char* k = strstr(lm, keyq);
+              if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; int j = 0; while (*k && *k != '"' && j < 2) g_letters[i][j++] = *k++; g_letters[i][j] = 0; } }
+          }
+      } }
     // Role is decided by the roster: you==host -> instance a, else b. Re-evaluated
     // on every roster (a host change re-points the bridge); writeBridgeCtl is a
     // no-op when nothing changed.
@@ -2069,6 +2091,12 @@ static void applyRoster(const char* s)
     bool isHost = roleKnown && strcmp(g_you, g_host) == 0;
     int count = g_playerCount;
     LeaveCriticalSection(&g_modelCs); InterlockedExchange(&g_panelDirty, 1);
+    // a relay lobby: the leader takes the host role here (START GAME, the sync
+    // save for hot joiners); it changes when the leader leaves
+    if (roleKnown && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
+        LONG was = InterlockedExchange(&g_isHost, isHost ? 1 : 0);
+        if (was != (isHost ? 1 : 0)) { Log("[menu] relay lobby: we are %s the leader now\n", isHost ? "" : "not"); SetStatus(isHost ? "You lead this relay lobby: START GAME shares your newest save." : "Waiting for the leader to start."); }
+    }
     if (roleKnown) writeBridgeCtl(isHost);
     // HOT JOIN (2026-09-09): the roster grew while the game is running and we
     // are the host -- the newcomer is at the title menu with our code. Take a

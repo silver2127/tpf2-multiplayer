@@ -34,6 +34,17 @@ after 2 minutes, and nothing is brokered: the code is the join, the list only
 repeats it. `master_url=` in `tpf2_menu_flags.txt` points the panel elsewhere;
 an empty value hides the list.
 
+**Dedicated relay:** a lobby can live on a server with no game
+(`lobby.py host --relay-only`, deployed to the VPS by `tools/relay_deploy.sh` as
+the `tpf2mp-relay` service, always listed in PUBLIC GAMES). Everyone joins it;
+the first player in is the leader and gets the host role: START GAME uploads
+their newest save to the relay, which pushes it to everyone waiting, and hot
+joiners get the same treatment. Letters are assigned by the relay and stick to
+names, so a returning leader is `a` again. Nobody needs an open port or a
+non-CGNAT connection, and the code never changes while the relay runs. The
+world only advances while players are connected: the relay carries frames, it
+does not run the simulation.
+
 **Uninstalling:** run the same MSI again and choose **Remove**, or use *Apps* in
 Windows settings. Either removes every file it added and puts the game's own
 `alut.dll` back (unless TpF2 Big Maps is still installed, in which case the shared

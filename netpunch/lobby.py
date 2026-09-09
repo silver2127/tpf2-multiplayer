@@ -123,9 +123,24 @@ No ARQ here -- the bridge has its own. Without the flags nothing changes.
 The menu passes P=7773 for HOST / 7774 for JOIN (distinct so two instances on
 one machine can both run) and L = the port the bridge reported it bound.
 
+RELAY-ONLY HOST (a dedicated server without a game)
+----------------------------------------------------
+``host --relay-only`` runs this same host loop on a machine with no game: it
+is the star's centre (frames, chat, roster, save fan-out) and the master-server
+announcer, but NOT a player. The oldest connected joiner is the LEADER: the
+roster names it as ``host`` and carries ``relay: true`` plus a sticky
+``letters`` map (name -> origin letter, a for the first joiner ever, never
+reused while the relay lives), so the menu DLL gives the leader the host role
+(START GAME, the hot-join sync save) and every bridge keeps its letter across
+leader changes. The leader UPLOADS its save to the relay (the client-side
+``start`` command drives a _HostSaveTransfer at the relay); the relay stores it
+as its own incoming_save.* and pushes it to every peer that has not started,
+then broadcasts ``start``. The leader accepts that start because it uploaded.
+
 CLI
 ---
     python lobby.py host --name <username>          # observe, print CODE=, serve
+    python lobby.py host --relay-only --name <lobby> --publish <url> --public
     python lobby.py join <CODE> --name <username>   # dial host, participate
     python lobby.py --selftest                      # 1 host + 2 joiners, loopback
     python lobby.py --selftest-transfer             # reliable save transfer
@@ -1420,8 +1435,26 @@ class _Publisher:
 # --------------------------------------------------------------------------- #
 # HOST: single socket, N peers, authority for roster + chat relay
 # --------------------------------------------------------------------------- #
+def _origin_letter(idx):
+    """a..z, then aa, ab, ... -- the same sequence the menu DLL's originName() uses."""
+    if idx < 26:
+        return chr(97 + idx)
+    idx -= 26
+    return chr(97 + (idx // 26) % 26) + chr(97 + idx % 26)
+
+
+class _PeerConn:
+    """The receive side (_ClientSaveReceiver) talks to 'the host' through a
+    .send(bytes); on the relay the sender is one joiner, so wrap (sock, addr)."""
+    def __init__(self, sock, addr):
+        self.sock, self.addr = sock, addr
+    def send(self, payload):
+        self.sock.sendto(_pack_data(payload), self.addr)
+
+
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
-             log=_log, relay=None, forward_logs=(), publisher=None, lobby_name=""):
+             log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
+             relay_only=False):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``sock`` is a bound UDP socket (the observe/game socket for the real CLI, a
@@ -1445,6 +1478,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     start_save = [False]                    # save flag of the last broadcast start
     last_emitted_roster = [None]
     transfer = [None]                       # the active _HostSaveTransfer, or None
+    upload = [None]                         # relay-only: the leader's save coming in
+    letters = {}                            # relay-only: name -> origin letter (sticky)
+
+    def leader_addr():
+        """relay-only: the oldest connected joiner (peers is insertion-ordered)."""
+        for a in peers:
+            return a
+        return None
+
+    def leader_name():
+        a = leader_addr()
+        return peers[a]["name"] if a is not None else (host_name if not relay_only else "")
+
+    def letter_for(name):
+        if name not in letters:
+            used = set(letters.values())
+            i = 0
+            while _origin_letter(i) in used:
+                i += 1
+            letters[name] = _origin_letter(i)
+        return letters[name]
 
     if code:
         io.emit({"type": "code", "code": code})
@@ -1464,13 +1518,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return names
 
     def roster_players():
+        if relay_only:
+            return sorted(p["name"] for p in peers.values())
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
     def roster_companies():
         """name -> company id. Same id = same company (co-op); different ids =
         separate companies. Everyone starts on 1, so nothing changes until
         someone clicks a chip."""
-        m = {host_name: host_company[0]}
+        m = {} if relay_only else {host_name: host_company[0]}
         for p in peers.values():
             m[p["name"]] = int(p.get("company", 1))
         return m
@@ -1503,7 +1559,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         companies = roster_companies()
         for a, p in list(peers.items()):
             _send_data(sock, a, {"t": "roster", "players": players,
-                                 "host": host_name, "lobby": lobby_name,
+                                 "host": leader_name(), "lobby": lobby_name,
+                                 "relay": relay_only,
+                                 "letters": {p2["name"]: letter_for(p2["name"]) for p2 in peers.values()} if relay_only else None,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
                                  "profiles": profiles, "links": links,
@@ -1511,13 +1569,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     def emit_roster():
         if publisher is not None:
-            publisher.update(lobby_name or host_name, 1 + len(peers))
+            publisher.update(lobby_name or host_name, len(peers) + (0 if relay_only else 1))
         players = roster_players()
         io.emit({"type": "roster", "players": players,
-                 "you": host_name, "host": host_name, "lobby": lobby_name,
-                 "companies": roster_companies()})
+                 "you": host_name, "host": leader_name(), "lobby": lobby_name,
+                 "relay": relay_only, "companies": roster_companies()})
         io.write_state(state="connected", code=code, players=players,
-                       you=host_name, host=host_name, started=started[0])
+                       you=host_name, host=leader_name(), started=started[0])
 
     def roster_changed(broadcast=True):
         """Push the roster to peers, and emit an event only if it changed."""
@@ -1547,6 +1605,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         msg = {"t": "start", "save": start_save[0]}
         for a in list(peers):
             peers[a]["started"] = True      # heal roster carries started:true
+        if relay_only and upload[0] is not None and getattr(upload[0], "complete", False):
+            upload[0] = None                # this upload has been distributed
         for _ in range(CHAT_BURST):
             for a in list(peers):
                 _send_data(sock, a, msg)
@@ -1576,9 +1636,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))
         peers[addr]["last"] = time.time()
+        if relay_only:
+            letter_for(peers[addr]["name"])
         _send_data(sock, addr, {"t": "welcome",
-                                "you": peers[addr]["name"], "host": host_name,
-                                "lobby": lobby_name})
+                                "you": peers[addr]["name"], "host": leader_name(),
+                                "lobby": lobby_name, "relay": relay_only})
         roster_changed()
         if late:
             # A late joiner is NOT started: it has no save (a save start) and
@@ -1644,6 +1706,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             except OSError:
                                 pass
             return
+        if payload[:4] == CHUNK_MAGIC:
+            # relay-only: a save chunk from the leader's upload
+            if relay_only and upload[0] is not None and addr == leader_addr() and len(payload) >= 12:
+                peers[addr]["last"] = time.time()
+                sid, seq = struct.unpack("!II", payload[4:12])
+                upload[0].on_chunk(sid, seq, payload[12:])
+            return
         try:
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -1651,6 +1720,26 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         t = msg.get("t")
         if addr in peers:
             peers[addr]["last"] = time.time()
+        if relay_only and t in ("fbegin", "start") and addr in peers:
+            if addr != leader_addr():
+                log(f"[relay] {t} from {peers[addr]['name']!r} ignored -- only the leader "
+                    f"({leader_name()!r}) starts")
+                return
+            if t == "start":
+                broadcast_start(save=False)
+                return
+            if transfer[0] is not None:
+                log("[relay] upload refused -- still pushing the previous save")
+                return
+            u = upload[0]
+            if u is not None and u.complete and u.sid == msg.get("sid"):
+                return                                      # a late duplicate fbegin of a finished upload
+            if u is None or u.complete or u.failed or u.sid != msg.get("sid"):
+                _clear_stale_incoming(io.dir, log)
+                upload[0] = _ClientSaveReceiver(_PeerConn(sock, addr), io, log)
+                log(f"[relay] save upload from the leader {peers[addr]['name']!r} begins")
+            upload[0].on_begin(msg)
+            return
         if t == "join":
             do_join(addr, msg.get("name", "player"), msg.get("profile"),
                     msg.get("mesh", False))
@@ -1741,7 +1830,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] save read failed: {e}")
             return
         sid = int(time.time() * 1000) & 0xFFFFFFFF
-        targets = [(a, peers[a]["name"]) for a in peers]
+        if relay_only:
+            la = leader_addr()
+            targets = [(a, peers[a]["name"]) for a in peers if a != la and not peers[a].get("started")]
+            if not targets:
+                # nobody is waiting: the upload was a hot-join sync for peers that
+                # have since left, or a plain re-start -- just start the leader
+                log("[relay] save arrived but no peer is waiting for it -- starting")
+                broadcast_start(save=True)
+                return
+        else:
+            targets = [(a, peers[a]["name"]) for a in peers]
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
                                         io, log)
 
@@ -1768,7 +1867,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log("[host] publish requested but no --publish URL was given")
         elif c == "start":
             save = cmd.get("save")
-            if transfer[0] is not None:
+            if relay_only:
+                log("[relay] 'start' from the local panel ignored -- the leader starts")
+            elif transfer[0] is not None:
                 log("[host] start ignored -- a save transfer is in progress")
             elif save:
                 begin_save_transfer(save)         # start(save=True) when done
@@ -1856,6 +1957,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     elif ptype == TYPE_DATA:
                         if SEAL[0] is None:
                             handle_data(addr, payload)      # plaintext session
+                        elif relay_only and addr in peers and payload[:4] == CHUNK_MAGIC:
+                            # the leader's upload: bulk chunks ride in the clear (BULK_PLAIN),
+                            # exactly the rule a joiner applies to the host's chunks
+                            handle_data(addr, payload)
 
             # Game relay: local bridge frames -> every joiner.
             if relay is not None and relay.sock in ready:
@@ -1888,6 +1993,23 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if own_lines:
                 peers_log.write(host_name, own_lines)
 
+            # relay-only: the leader's upload
+            if relay_only and upload[0] is not None:
+                u = upload[0]
+                try:
+                    u.tick(now)
+                except Exception as e:                     # noqa: BLE001
+                    log(f"[relay] upload error: {e!r}")
+                    upload[0] = None
+                    u = None
+                if u is not None and u.failed:
+                    log("[relay] the leader's upload failed -- waiting for a new START")
+                    upload[0] = None
+                elif u is not None and u.complete and transfer[0] is None and not getattr(u, "handed", False):
+                    u.handed = True
+                    path = os.path.join(io.dir, INCOMING_BASENAME + ".sav")
+                    log(f"[relay] upload complete -> pushing {path} to the waiting peers")
+                    begin_save_transfer(path)
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
             #   any FAILED -> failed status naming them, NO start, and the
@@ -1970,6 +2092,9 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     last_links_report = [0.0]
     reported_links = [None]
     last_ignored_start = [None]     # (save, sid) of the last start we refused
+    is_relay = [False]              # the host is a relay-only server (roster/welcome say so)
+    uploader = [None]               # our save going UP to the relay (we are the leader)
+    uploaded = [False]              # an upload completed this session -> a start(save) is ours
     seen_cids = collections.deque(maxlen=512)
     seen_set = set()
 
@@ -2002,7 +2127,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         if started[0]:
             return
         save = bool(save)
-        if save and not receiver.complete:
+        if save and not receiver.complete and not uploaded[0]:
             key = (save, receiver.sid)
             if last_ignored_start[0] != key:      # log once per situation
                 last_ignored_start[0] = key
@@ -2160,14 +2285,20 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         if t == "fbegin":
             receiver.on_begin(m)
             return
+        if t in ("fbegin_ack", "fack", "fdone"):
+            if uploader[0] is not None:
+                getattr(uploader[0], "on_" + t.replace("fbegin_ack", "begin_ack"))(conn.peer, m)
+            return
         if t == "welcome":
             assigned[0] = m.get("you", desired[0])
             host_name[0] = m.get("host")
+            is_relay[0] = bool(m.get("relay"))
             io.write_state(you=assigned[0], host=m.get("host"))
             log(f"[client] host named us {assigned[0]!r}")
         elif t == "roster":
             players = m.get("players", [])
             host_name[0] = m.get("host", host_name[0])
+            is_relay[0] = bool(m.get("relay", is_relay[0]))
             participants[0] = list(players)
             roster_links[0] = m.get("links", {}) or {}
             roster_profiles[0] = m.get("profiles", {}) or {}
@@ -2178,7 +2309,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 last_roster[0] = key
                 io.emit({"type": "roster", "players": players,
                          "you": assigned[0], "host": m.get("host"),
-                         "lobby": m.get("lobby", ""), "companies": companies})
+                         "lobby": m.get("lobby", ""), "companies": companies,
+                         "relay": is_relay[0], "letters": m.get("letters") or {}})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
                                started=started[0])
@@ -2226,7 +2358,27 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 m2["profile"] = profile_code
             send(m2)
         elif c == "start":
-            log("[client] 'start' ignored -- only the host can start")
+            if not is_relay[0]:
+                log("[client] 'start' ignored -- only the host can start")
+            elif host_name[0] != assigned[0]:
+                log(f"[client] 'start' ignored -- the leader is {host_name[0]!r}")
+            elif not cmd.get("save"):
+                send({"t": "start"})                      # no-save start via the relay
+            elif uploader[0] is not None:
+                log("[client] start ignored -- an upload is in progress")
+            else:
+                try:
+                    blob, files_meta = _read_save_files(str(cmd.get("save")))
+                except (OSError, ValueError) as e:
+                    io.emit({"type": "status", "state": "failed", "detail": f"save read failed: {e}"})
+                    log(f"[client] save read failed: {e}")
+                    return
+                sid = int(time.time() * 1000) & 0xFFFFFFFF
+                uploader[0] = _HostSaveTransfer(conn.sock, sid, blob, files_meta,
+                                                [(conn.peer, "relay")], io, log)
+                io.emit({"type": "status", "state": "connected",
+                         "detail": "uploading the save to the relay…"})
+                log(f"[client] uploading {cmd.get('save')} ({len(blob)} B) to the relay")
         elif c == "quit":
             send({"t": "leave"})
             io.emit({"type": "status", "state": "failed", "detail": "left lobby"})
@@ -2281,6 +2433,23 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             now = time.time()
             mesh_housekeeping(now)
             receiver.tick(now)                              # facks / fdone cadence
+            if uploader[0] is not None:
+                try:
+                    uploader[0].pump(now)
+                    if uploader[0].all_resolved():
+                        up, uploader[0] = uploader[0], None
+                        if up.failed_names() or up.done_count() == 0:
+                            io.emit({"type": "status", "state": "failed",
+                                     "detail": "upload to the relay failed -- press START GAME to retry"})
+                            log("[client] upload to the relay FAILED")
+                        else:
+                            uploaded[0] = True
+                            io.emit({"type": "status", "state": "connected",
+                                     "detail": "save uploaded -- the relay is sharing it…"})
+                            log("[client] upload to the relay complete")
+                except Exception as e:                      # noqa: BLE001
+                    log(f"[client] upload error: {e!r}")
+                    uploader[0] = None
             if now - last_ping >= PING_INTERVAL:
                 last_ping = now
                 send({"t": "ping"})
@@ -2354,13 +2523,15 @@ def cmd_host(args):
     publisher = None
     if args.publish:
         publisher = _Publisher(args.publish, code, args.game_name, bool(args.password), _log)
-        publisher.update(args.lobby_name or args.name, 1)
+        publisher.update(args.lobby_name or args.name, 0 if args.relay_only else 1)
         if args.public:
             publisher.set(True)
     try:
-        run_host(sock, args.name, io, code=code, relay=relay,
+        if args.relay_only:
+            _log("[host] RELAY-ONLY: no game here; the oldest joiner is the leader")
+        run_host(sock, args.name, io, code=code, relay=None if args.relay_only else relay,
                  forward_logs=args.forward_log or (), publisher=publisher,
-                 lobby_name=args.lobby_name)
+                 lobby_name=args.lobby_name, relay_only=bool(args.relay_only))
     finally:
         if publisher is not None:
             publisher.close()
@@ -3410,6 +3581,8 @@ def main(argv=None):
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
+    ap.add_argument("--relay-only", action="store_true",
+                    help="host without a game (a dedicated relay): the oldest joiner leads")
     ap.add_argument("--publish", default="",
                     help="master server base URL; the lobby is listed there while "
                          "public (see --public and the 'publish' command)")
