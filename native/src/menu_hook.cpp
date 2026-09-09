@@ -13,6 +13,7 @@
 // 20-byte (0x14) steal is a safe trampoline.
 #include <share.h>
 #include <windows.h>
+#include <string>
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #include <cstdint>
@@ -2201,6 +2202,82 @@ static void MyCreatePage(uint64_t thisp, int page)
         InterlockedCompareExchange(&g_showOverlay, 0, 0)); }
 }
 
+// ---------------- auto-enable the lockstep mod ----------------
+// Transport Fever 2 activates mods per game. A fresh install had "MP Lockstep"
+// sitting in <gamedir>\mods, visible in the Mods panel and OFF, so a new game
+// hosted from a new install ran without lockstep at all (reported 2026-09-09).
+// settings.lua (<userdata>\<id>\1066780\local\) holds `activeMods`, the list a
+// NEW game starts with (a savegame carries its own list, which is how a joiner
+// inherits the host's). The game reads the file once at startup and rewrites it
+// from memory at exit, so the edit has to land BEFORE the exe's entry point --
+// that is why this runs from DllMain (the proxy loads us before main; the work
+// is one small file read/write through kernel32, nothing that touches the
+// loader lock). Idempotent: nothing is written when the entry is already there.
+// Kill switch: `automod=0` in tpf2_menu_flags.txt.
+static bool FlagsSayNoAutoMod()
+{
+    char p[MAX_PATH]; snprintf(p, sizeof(p), "%stpf2_menu_flags.txt", ourDirA());
+    FILE* f = fopen(p, "r"); if (!f) return false;
+    char line[256]; bool off = false;
+    while (fgets(line, sizeof(line), f)) if (!strncmp(line, "automod=0", 9)) off = true;
+    fclose(f);
+    return off;
+}
+
+static void AutoEnableLockstepMod(const wchar_t* saveDir)
+{
+    if (FlagsSayNoAutoMod()) { Log("[menu] automod: disabled by flags\n"); return; }
+    // <...>\1066780\local\save -> <...>\1066780\local\settings.lua
+    wchar_t local[600]; wcscpy_s(local, saveDir);
+    wchar_t* tail = wcsrchr(local, L'\\');
+    if (!tail || _wcsicmp(tail, L"\\save") != 0) { Log("[menu] automod: unexpected save dir %ls\n", saveDir); return; }
+    *tail = 0;
+    wchar_t path[600], tmp[600], bak[600];
+    _snwprintf_s(path, _TRUNCATE, L"%s\\settings.lua", local);
+    _snwprintf_s(tmp,  _TRUNCATE, L"%s\\settings.lua.mptmp", local);
+    _snwprintf_s(bak,  _TRUNCATE, L"%s\\settings.lua.mpbak", local);
+
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        // first launch ever: the game writes settings.lua at exit; next launch we patch it
+        Log("[menu] automod: no settings.lua yet (%ls) -- will add MP Lockstep on the next launch\n", path);
+        return;
+    }
+    LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(h, &sz);
+    if (sz.QuadPart <= 0 || sz.QuadPart > (4 << 20)) { CloseHandle(h); Log("[menu] automod: settings.lua size %lld, left alone\n", (long long)sz.QuadPart); return; }
+    std::string txt; txt.resize((size_t)sz.QuadPart);
+    DWORD got = 0; BOOL okR = ReadFile(h, &txt[0], (DWORD)txt.size(), &got, nullptr);
+    CloseHandle(h);
+    if (!okR || got != txt.size()) { Log("[menu] automod: read failed\n"); return; }
+
+    if (txt.find("\"mp_lockstep\"") != std::string::npos) { Log("[menu] automod: MP Lockstep already in activeMods\n"); return; }
+    const bool crlf = txt.find("\r\n") != std::string::npos;
+    const std::string nl = crlf ? "\r\n" : "\n";
+    std::string out;
+    size_t at = txt.find("activeMods = {");
+    if (at != std::string::npos) {
+        size_t brace = txt.find('{', at);
+        out = txt.substr(0, brace + 1) + nl + "\t\t{ \"mp_lockstep\", 1, }," + txt.substr(brace + 1);
+    } else {
+        size_t ret = txt.find("return {");
+        if (ret == std::string::npos) { Log("[menu] automod: settings.lua has neither activeMods nor 'return {' -- left alone\n"); return; }
+        size_t brace = ret + 7;
+        out = txt.substr(0, brace + 1) + nl + "\tactiveMods = {" + nl + "\t\t{ \"mp_lockstep\", 1, }," + nl + "\t}," + txt.substr(brace + 1);
+    }
+    if (GetFileAttributesW(bak) == INVALID_FILE_ATTRIBUTES) CopyFileW(path, bak, TRUE);
+    HANDLE w = CreateFileW(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (w == INVALID_HANDLE_VALUE) { Log("[menu] automod: cannot write %ls (err %lu)\n", tmp, GetLastError()); return; }
+    DWORD put = 0; BOOL okW = WriteFile(w, out.data(), (DWORD)out.size(), &put, nullptr);
+    CloseHandle(w);
+    if (!okW || put != out.size() || !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        Log("[menu] automod: replace failed (err %lu) -- settings.lua untouched\n", GetLastError());
+        DeleteFileW(tmp);
+        return;
+    }
+    Log("[menu] automod: MP Lockstep added to activeMods in %ls (%s; backup settings.lua.mpbak)\n",
+        path, at != std::string::npos ? "existing list" : "new list");
+}
+
 static DWORD WINAPI Init(LPVOID)
 {
     g_base = (uintptr_t)GetModuleHandleW(nullptr);
@@ -2324,6 +2401,13 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(h);
+        // Before the game's own startup reads settings.lua (see AutoEnableLockstepMod).
+        __try {
+            wchar_t sd[600]; resolveSaveDir(sd, 600);
+            AutoEnableLockstepMod(sd);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[menu] automod: exception, settings.lua left alone\n");
+        }
         CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
         // Orderly shutdown: ask the lobby to quit. Nothing may block here (the

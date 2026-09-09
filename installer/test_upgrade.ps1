@@ -51,6 +51,9 @@ New-Item -ItemType Directory -Force $game | Out-Null
 Set-Content (Join-Path $game "alut.dll") $STOCK -Encoding ascii -NoNewline
 Set-Content (Join-Path $game "TransportFever2.exe") "" -Encoding ascii
 Write-Host "sandbox: $game"
+$transcript = Join-Path $env:TEMP "tpf2mp_upgrade_test.log"
+try { Start-Transcript -Path $transcript -Force | Out-Null } catch {}
+Write-Host "transcript: $transcript"
 
 function Msi([string[]]$a, [string]$logName) {
     $log = Join-Path $sandbox $logName
@@ -73,6 +76,13 @@ try {
     $rc = Msi @('/i', $Msi, "INSTALLFOLDER=$game\", 'TPF2_SKIP_GAMEDIR_CHECK=1') "install.log"
     if ($rc -eq 0) { Ok "installed" } else { Bad "install exit $rc" }
     if (Test-Path "$game\tpf2_menu.dll") { Ok "our files are present" } else { Bad "tpf2_menu.dll missing" }
+    # The cfg files are the only installed files a player edits, and they are
+    # NeverOverwrite with RemoveExistingProducts scheduled early: the classic
+    # way for an upgrade to leave NO cfg behind (costed as "present, skip",
+    # then removed with the old product). A player-style edit is planted so
+    # the upgrade step can say which of the three outcomes happened.
+    $cfg = Join-Path $game "tpf2_slice.cfg"
+    if (Test-Path $cfg) { Ok "tpf2_slice.cfg installed"; Add-Content $cfg "`n# PLAYER-EDIT-MARKER" } else { Bad "tpf2_slice.cfg missing after install" }
     if ((AlutReal) -eq $STOCK) { Ok "alut_real.dll is the stock library" } else { Bad "alut_real.dll is NOT the stock library" }
     if ((Get-Content "$game\alut.dll" -Raw) -ne $STOCK) { Ok "alut.dll replaced by the proxy" } else { Bad "alut.dll is still the stock file -- the proxy did not install" }
     $entries = @(Arp); if ($entries.Count -eq 1) { Ok "one entry in Apps (v$($entries[0].DisplayVersion))" } else { Bad "$($entries.Count) entries in Apps" }
@@ -87,6 +97,23 @@ try {
     if ((AlutReal) -eq $STOCK) { Ok "alut_real.dll is STILL the stock library" }
     else { Bad "alut_real.dll was overwritten -- a proxy got wrapped around itself" }
     if (Test-Path "$game\tpf2_menu.dll") { Ok "our files are present after the upgrade" } else { Bad "files missing after the upgrade" }
+    $cfg = Join-Path $game "tpf2_slice.cfg"
+    if (-not (Test-Path $cfg)) {
+        Bad "tpf2_slice.cfg is GONE after the upgrade -- the DLL falls back to built-in defaults (every strict_* switch off)"
+    } else {
+        $txt = Get-Content $cfg -Raw
+        $kept = $txt -match "PLAYER-EDIT-MARKER"
+        $new  = $txt -match "(?m)^strict_stops=1"
+        if ($kept -and -not $new) { Write-Host "  NOTE  tpf2_slice.cfg KEPT from the old version (player edits survive; new switches such as strict_stops are absent = off)" -ForegroundColor Yellow }
+        elseif ($new -and -not $kept) { Write-Host "  NOTE  tpf2_slice.cfg REPLACED by the new defaults (player edits lost; new switches present)" -ForegroundColor Yellow }
+        elseif ($new -and $kept) { Ok "tpf2_slice.cfg kept AND carries the new switches" }
+        else { Bad "tpf2_slice.cfg present but has neither the marker nor strict_stops=1 -- unexpected content" }
+        Ok "tpf2_slice.cfg present after the upgrade"
+    }
+    if (Test-Path (Join-Path $game "tpf2_bridge_mp.cfg")) { Ok "tpf2_bridge_mp.cfg present after the upgrade" } else { Bad "tpf2_bridge_mp.cfg is GONE after the upgrade" }
+    foreach ($f in "mods\mp_lockstep_1\res\scripts\mp\stops.lua", "mods\mp_lockstep_1\res\config\game_script\lockstep.lua") {
+        if (Test-Path (Join-Path $game $f)) { Ok "$f present after the upgrade" } else { Bad "$f missing after the upgrade" }
+    }
 
     Step "3. uninstall"
     $code = (Arp | Select-Object -First 1).PSChildName
@@ -103,6 +130,7 @@ try {
 finally {
     if ($KeepSandbox) { Write-Host "`nsandbox kept: $sandbox" }
     else { Remove-Item $sandbox -Recurse -Force -EA SilentlyContinue }
+    try { Stop-Transcript | Out-Null } catch {}
 }
 
 Write-Host ""

@@ -256,7 +256,8 @@ builder decompile (C:\tools\ghidra_out\decomp\mainmenu_ref.c):
   while the builder runs; after it returns we build/name/connect/prep/add ours.
 
 Test build (bridge/src/menu_hook.cpp, flags in tpf2_menu_flags.txt next to the
-dll, one key=value per line, e.g. `native=1` and `slot=0`):
+dll, one key=value per line, e.g. `native=1` and `slot=0`; `automod=0` stops the
+startup edit that adds MP Lockstep to settings.lua's activeMods):
   overlay=native|classic  restyle the GDI overlay to main-menu.lua (Lato 24
                           uppercase white, padding 8/15, hover white@50, pressed
                           white@100, alpha-blended over a swapchain readback --

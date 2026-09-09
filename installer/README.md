@@ -175,14 +175,17 @@ Microsoft does not promise the Segment Heap is faster in general; it was
 introduced to reduce memory footprint and is slower for some workloads. It wins
 here because a specific legacy-heap algorithm was measured as the cost.
 
-## After installing: enable the mod per savegame
+## After installing: the mod and your saves
 
-Transport Fever 2 activates mods per savegame, not globally. For every save you
-want to play in multiplayer, open its mod list in the game (the **Mods** panel
-of the load/new-game screen) and enable **MP Lockstep**. All players need the
-same mod set on the shared save; the host's save is what gets sent to the
-joiners. Never enable **MP Bridge** (the older state-replication mod) at the
-same time - the two fight over the same world.
+Transport Fever 2 activates mods per game, not globally. On every launch the
+menu DLL adds **MP Lockstep** to `activeMods` in `settings.lua` if it is missing
+(a one-line edit, backup kept as `settings.lua.mpbak`, `automod=0` in
+`tpf2_menu_flags.txt` turns it off), so a **new game** starts with the mod on.
+An **existing save** keeps the mod list it was saved with: open its **Mods**
+panel in the load screen once and enable MP Lockstep; from then on the save
+carries it. Joiners need nothing: the host's save is what gets sent to them, and
+it brings its mod list along. Never enable **MP Bridge** (the older
+state-replication mod) at the same time - the two fight over the same world.
 
 The title menu gains a **MULTIPLAYER** entry. The host presses HOST, sends the
 code that lands on the clipboard to the others, they press JOIN; the host then
