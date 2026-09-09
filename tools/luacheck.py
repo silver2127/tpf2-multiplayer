@@ -23,7 +23,13 @@ LUA51_LOCAL_LIMIT = 200
 def _toplevel_locals(tree):
     from luaparser import astnodes as _n
     c = 0
-    for node in tree.body.body:
+    body = tree.body.body
+    # res/scripts/mp/*.lua are factories: `return function(CM, K, log) ... end`.
+    # The limit applies per FUNCTION, so count the factory's body instead.
+    if len(body) == 1 and isinstance(body[0], _n.Return) and body[0].values \
+            and isinstance(body[0].values[0], _n.AnonymousFunction):
+        body = body[0].values[0].body.body
+    for node in body:
         if isinstance(node, _n.LocalAssign): c += len(node.targets)
         elif isinstance(node, _n.LocalFunction): c += 1
     return c

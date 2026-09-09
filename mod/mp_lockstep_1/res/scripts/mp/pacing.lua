@@ -1,0 +1,646 @@
+-- mp/pacing.lua -- barrier, catch-up pacing, speed sharing, load gate
+--
+-- Split out of lockstep.lua on 2026-09-08. Loaded from the game script as
+--     require("mp.pacing")(CM, K, log)
+-- A FACTORY so each load of the game script gets fresh file-scope state.
+-- Symbols shared between modules live in CM (CM.<name>); K is the constants
+-- table, log the instance-tagged logger. Body kept at column 0 on purpose:
+-- tools/luacheck.py's use-before-define checks look at column-0 declarations.
+return function(CM, K, log)
+-- ---------- barrier ----------
+--
+-- DEADLOCK. The barrier pauses whoever is more than K.BARRIER_AHEAD in front. With
+-- heartbeats every 20 ticks, each side's view of the peer was ~3.7s stale --
+-- about 3.3 game units -- while the threshold was 0.4. Both instances read a
+-- stale peer time, both concluded they were ahead, and both paused. With both
+-- paused neither clock advances, so the gap never closes and the release
+-- condition can never fire: the game froze on 22 August and stayed there.
+--
+-- Three independent defences, because a barrier that can freeze BOTH games is a
+-- worse failure than the desync it exists to prevent:
+--   1. heartbeat far more often than the threshold (see K.HEARTBEAT_EVERY)
+--   2. never hold on a STALE peer time -- a silent peer is not a slow peer
+--   3. a watchdog that force-releases, so any residual deadlock self-heals
+K.MAX_PAUSE_TICKS  = 60     -- ~11s held = something is wrong, let it run
+-- LOAD GATE. Ticks are ~5.4 Hz (300 ticks measured over 56 s), so these are
+-- ~11 s and ~2.8 min.
+-- How soon the gate may act. Long enough for game.interface to answer, short
+-- enough that an instance is not simulating alone while the others load.
+K.LOADGATE_MIN_TICKS = 5
+K.LOADGATE_SETTLE    = 60    -- ticks with no NEW peer before the roster counts as complete
+K.LOADGATE_MAX_TICKS = 900   -- absolute cap: a session must never hang forever
+
+-- ---------- catch-up pacing ----------
+--
+-- The barrier is a wall: it does nothing until one side is K.BARRIER_AHEAD (5
+-- units) in front, then pauses it dead. Between those extremes the two clocks
+-- are free to drift, and they do -- whichever instance renders faster pulls
+-- ahead, and a live session sat at +2 to +4 units for its whole length. Skew
+-- that size is not cosmetic: it is larger than K.EXEC_DELAY, so commands from the
+-- trailing side arrive in the leader's past (see scheduleLocal).
+--
+-- So pace continuously instead of only at the wall: whoever is BEHIND runs its
+-- own clock faster until it has caught up. Speed is local pacing, not simulated
+-- state -- the same lever the barrier already pulls when it pauses a peer -- and
+-- it is the SAFE direction to be wrong in: if both sides wrongly believe they
+-- are behind (stale heartbeats), both speed up and nothing deadlocks, which is
+-- not true of both wrongly pausing.
+--
+-- The player's own speed choice is preserved: whatever speed they are running at
+-- when the clocks agree is the speed restored after a catch-up.
+CM.CATCHUP_BEHIND = 0.8    -- units behind before we run faster
+CM.CATCHUP_DONE   = 0.2    -- units behind at which we hand the speed back
+-- The engine's speeds are 0, 1, 2, 4 -- it reported 4 live (2026-08-31), so
+-- the ladder is not consecutive. Catching up means ONE notch up from whatever
+-- the player picked (1 -> 2, 2 -> 4), and there is no room at all at 4.
+CM.SPEED_UP = { [1] = 2, [2] = 4, [3] = 4 }
+CM.MAX_SPEED      = 4
+-- THE DOWN LADDER. The pacer used to have only an UP actuator: it could push a
+-- TRAILING instance one notch faster, and when it was already at the top it
+-- logged "no notch left, waiting for the barrier" and did nothing. So the only
+-- brake in the whole system was the barrier's setSpeed(0), which is why a
+-- faster instance sawtoothed between speed 4 and a dead stop:
+--
+--   BARRIER hold: 5.20 ahead -> PACE: speed -> 0
+--   PACE: speed -> 4 (peer caught up) -> BARRIER release: 1.80 ahead   (repeat)
+--
+-- This is a missing actuator, not a gain that needs tuning.
+--
+-- IT STOPS AT 1, NEVER 0. That is the single most important property here.
+-- CM.pace is reached ONLY from applyBarrier, and applyBarrier RETURNS EARLY
+-- when no peer is fresh -- before the pacer call. So a pacer that could command
+-- 0 would stop the game with paused=false, where K.MAX_PAUSE_TICKS cannot see
+-- it and nothing would ever re-command a speed: a permanent freeze one dropped
+-- peer away. Only the barrier may command 0, because only the barrier sets
+-- paused and is therefore covered by the watchdog.
+CM.SPEED_DOWN = { [4] = 2, [2] = 1 }   -- deliberately no [1]: 1 is the floor
+-- Throttle well before the barrier would fire (K.BARRIER_AHEAD = 5.0), and let
+-- go at a clearly lower lead so the two thresholds cannot chatter against each
+-- other. Both are measured against the SLOWEST peer, because that is the
+-- quantity the barrier actually trips on -- the pacer's old "behind" reading
+-- chases the FASTEST peer, which is the wrong end for braking.
+-- ONE controller, ONE signal, and a deadband wider than one correction.
+--
+-- The first attempt used two: this brake on the lead over the SLOWEST peer, and
+-- the pre-existing catch-up on the lag behind the FASTEST peer. With three
+-- instances an instance is routinely BOTH -- ahead of the slowest and behind
+-- the fastest -- so the two fought each other every dwell:
+--
+--   PACE: speed -> 2 (2.60 ahead of the slowest peer)
+--   PACE: speed -> 4 (1.00 behind the peer)
+--
+-- Both now read the lead over the SLOWEST peer, which is the quantity
+-- K.BARRIER_AHEAD fires on: positive means slow down, negative means we are the
+-- laggard and may speed up. Everyone converges on the slowest member, which is
+-- the only pace the whole session can actually sustain.
+--
+-- THE DEADBAND MUST EXCEED ONE CORRECTION'S EFFECT, or the loop cannot settle
+-- however the thresholds are placed. A notch is worth ~1.8 units/s of relative
+-- drift, so over a dwell of D ticks (~5.4 Hz) one correction moves the lead by
+-- ~1.8 * D / 5.4 units. At the old PACE_COOLDOWN of 16 ticks that is ~5.3
+-- units -- larger than any sane band, which is why every adjustment overshot
+-- and the observed cycle was a clean 0.80 <-> 2.60 limit cycle. At 8 ticks it
+-- is ~2.7, comfortably inside the 4.5-unit band below.
+-- Ticks are ~5.4 Hz. At a dwell of 5 (~0.93 s) one notch moves the lead ~1.7
+-- units, so a 2.0-unit band still comfortably exceeds one correction and the
+-- loop settles -- while capping the steady-state skew near 1.2 instead of 3.
+-- Tightening further is measurement-bound, not gain-bound: the peer clock now
+-- reads to 0.2 units, so a band under ~1 would chatter on quantisation alone.
+CM.PACE_DWELL     = 5      -- ticks between ordinary (non-micropause) speed nudges
+-- MICROPAUSE PACING. Every instance runs at the player's chosen speed. An
+-- instance that is behind or level simply STAYS at that speed and catches
+-- up -- it is never throttled (the old notch-down is what made a client that
+-- fell 1.2 units behind drop to speed 1 and never recover). Only an instance
+-- that has pulled more than PACE_MICRO_AHEAD ahead of the slowest peer
+-- micropauses: brief speed-0 pulses, each hard-capped at PACE_MICRO_MAX ticks
+-- so a pulse can never wedge the game, repeated until the lead is shaved back
+-- under PACE_MICRO_DONE. The hard barrier (K.BARRIER_AHEAD) sits above the
+-- micropause band as a rare backstop.
+CM.PACE_MICRO_AHEAD = 5.0   -- only slow down once this far ahead of the slowest
+CM.PACE_MICRO_DONE  = 2.0   -- stop pulsing once the lead is back under this
+CM.PACE_MICRO_MAX   = 3     -- max ticks per pause pulse (self-limiting)
+CM.THROTTLE_AHEAD = 1.2    -- above this we are too far ahead: one notch down
+CM.PACE_BEHIND    = 0.8    -- below -this we are the laggard: one notch up
+CM.catchingUp  = false
+CM.baseSpeed   = nil       -- the player's speed, sampled while in step
+CM.pacedTopWarned = false  -- log the "no notch left" case once, not per tick
+
+-- WHO OWNS THE SPEED CONTROL. The pacer and the player share one lever, and
+-- without an owner they fight over it: the pacer sets 2 to catch up, the player
+-- presses 1 because their game is running away, the pacer sets 2 again on the
+-- next tick, and the game stutters between them (reported from a live session).
+--
+-- Two rules settle it. First, a speed we did not set is the PLAYER's, and the
+-- player wins: the pacer adopts it as the new normal and stops chasing. Second,
+-- a change of ours starts a cooldown, so the controller can never flap faster
+-- than a person can react to what it did.
+CM.PACE_COOLDOWN = 16         -- ticks between changes we make: a tick is ~0.19 s, so ~3 s
+
+-- SPEED V2 (cfg speed_v2, default off): host-authoritative effective speed.
+-- effective = min(each player's manual ceiling, a sustainable cap). Every
+-- instance runs the SAME effective speed, so no instance out-runs another and
+-- the lead never accumulates -- which is what the v1 micropause/notch pacer
+-- fought with bang-bang corrections, producing the 4<->2 limit-cycle flicker
+-- (measured 2026-09-03). The player's speed button sets THIS instance's ceiling
+-- (min across players wins -- anyone can slow the shared clock; a pause is a
+-- ceiling of 0). The sustainable cap drops a notch when the fastest-slowest
+-- lead grows for a sustained window (a machine cannot keep up -> slow everyone)
+-- and climbs back toward the ceiling only after prolonged stability -- the
+-- hysteresis makes speed changes rare and deliberate, never a per-tick loop.
+CM.SPD2_LEAD_DOWN  = 3.0   -- lead (units) above this, sustained -> cap down a notch
+CM.SPD2_LEAD_UP    = 0.6   -- lead below this, long-sustained -> cap up a notch
+CM.SPD2_DOWN_TICKS = 8     -- ~1.5 s of high lead before stepping down
+CM.SPD2_UP_TICKS   = 40    -- ~7.5 s of low lead before stepping up (asymmetric)
+
+function CM.setSpeed(v, why)
+	-- TWO SLOTS, not one. A single remembered value is enough only while at most
+	-- one of our commands is in flight; the moment corrections come faster than
+	-- the engine applies them, the engine reports the OLDER one, shareSpeed
+	-- fails to recognise it as ours, concludes the PLAYER moved the lever, and
+	-- broadcasts our own throttle to every peer as their choice.
+	CM.prevSetSpeed = CM.lastSetSpeed
+	CM.lastSetSpeed = v
+	CM.paceSetTick = CM.ticks
+	CM.paceApplied = false
+	-- The pacing dwell, NOT PACE_COOLDOWN. This is checked before the pacer's
+	-- own dwell, so leaving it at the 16-tick cooldown made that dwell inert:
+	-- corrections stayed ~3 s apart and each one moved the lead ~5 units, which
+	-- is larger than any workable deadband and is why adjustments overshot.
+	CM.paceQuietUntil = CM.ticks + (CM.PACE_DWELL or CM.PACE_COOLDOWN)
+	pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(v)) end)
+	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
+end
+
+-- ONE SPEED FOR THE SESSION. Each instance used to run at whatever its player
+-- chose, and the barrier and pacer then fought to keep two clocks together that
+-- were being driven apart on purpose: one side at 4 racing ahead, the other at 1
+-- being paused and released in turn. A speed change the PLAYER makes is now
+-- shared, and the other side adopts it -- so both clocks run at the same rate
+-- and the pacer is left with only the small drift it was built for.
+--
+-- Only the player's changes travel. Ours (a catch-up notch, a barrier hold, a
+-- release, or a speed we adopted from the peer) are recognised because setSpeed
+-- recorded them, and are never re-broadcast -- that is what stops the two
+-- instances echoing one change back and forth forever.
+function CM.shareSpeed()
+	local s
+	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
+	local prev = CM.lastSeenSpeed
+	CM.lastSeenSpeed = s
+	if prev == nil or s == prev then return end
+	if CM.lastSetSpeed ~= nil and s == CM.lastSetSpeed then return end   -- ours, not the player's
+	-- ...and the one before it, while our newest has not been observed yet.
+	if not CM.paceApplied and CM.prevSetSpeed ~= nil and s == CM.prevSetSpeed then return end
+	CM.baseSpeed = s
+	CM.catchingUp = false
+	CM.broadcast(string.format("LSSPEED v=%d o=%s", s, K.INSTANCE))
+	log(string.format("SPEED: player set %d -- shared with the peer", s))
+end
+
+-- `ahead` is the lead over the FASTEST peer (the catch-up signal, unchanged).
+-- `lead` is the lead over the SLOWEST peer -- the quantity K.BARRIER_AHEAD
+-- fires on, and therefore the only correct signal for braking.
+function CM.pace(ahead, lead)
+	-- The load gate owns the speed until every player is in. Without this the
+	-- pacer would see one peer, floor itself at 1 and fight the gate's 0.
+	if CM.lgHolding then return end
+	if CM.paused then return end                       -- the barrier owns the speed
+	local behind = -ahead
+	-- A gap this size is not pacing: it is two instances on different saves, or
+	-- one still loading. Seen live at 55156 units. Speeding up cannot fix that
+	-- and pretending otherwise just runs somebody's game at double speed.
+	if behind > 60 or behind < -60 then return end
+	local s
+	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
+	-- A speed of 0 is the PLAYER pausing -- unless it is OUR micropause pulse,
+	-- which must fall through to its own end-check below or it never ends.
+	if s == 0 and not CM.microPausing then           -- player paused on purpose
+		-- If we were mid-catch-up, the game will come back at OUR 2, not the
+		-- player's speed; remember to hand it back the moment it does.
+		if CM.catchingUp then CM.restoreAfterPause = CM.baseSpeed or 1 end
+		CM.catchingUp = false
+		CM.lastSetSpeed = nil
+		return
+	end
+	if CM.restoreAfterPause then
+		local back = CM.restoreAfterPause
+		CM.restoreAfterPause = nil
+		CM.setSpeed(back, "player's speed restored after their pause")
+		return
+	end
+	-- setGameSpeed is a COMMAND: the engine applies it a tick or more after we
+	-- send it. On the tick in between, the speed still reads the old value --
+	-- which the check below would take for the player moving the lever, adopt
+	-- as their choice, and cancel the very catch-up we just started. So a
+	-- mismatch only counts as the player's once our own change has been seen
+	-- to land, or after a grace period in case it never does (review,
+	-- 2026-08-31).
+	if CM.lastSetSpeed and s == CM.lastSetSpeed then CM.paceApplied = true end
+	local settled = CM.paceApplied or (CM.ticks > (CM.paceSetTick or 0) + 8)   -- ~1.5 s
+	-- The player moved the lever: that is now the speed they want. Adopt it,
+	-- stop any catch-up in progress, and do not argue.
+	if CM.lastSetSpeed and settled and s ~= CM.lastSetSpeed then
+		if CM.catchingUp then
+			log(string.format("PACE: player set speed %s while catching up -- theirs wins", tostring(s)))
+		end
+		CM.baseSpeed = s
+		CM.catchingUp = false
+		CM.paceMovedAt = nil      -- their lever outranks our pacing; react at once
+		CM.lastSetSpeed = nil
+		CM.paceQuietUntil = CM.ticks + CM.PACE_COOLDOWN
+		return
+	end
+	-- (The old "caught up -> snap back to the player's speed" branch lived here.
+	-- It fired on `behind`, the FASTEST-peer signal, and jumped straight to the
+	-- ceiling -- re-accelerating us into the next throttle and completing the
+	-- limit cycle. The controller below holds instead, in both directions, off
+	-- a single signal.)
+	if lead == nil then return end
+	local ceiling = CM.baseSpeed or CM.MAX_SPEED
+	if ceiling < 1 then ceiling = 1 end
+
+	-- MICROPAUSE duty-cycle. Checked EVERY tick (exempt from the dwell) so a
+	-- pulse ends on time; the pulse is hard-capped so it cannot wedge.
+	if CM.microPausing then
+		if lead <= CM.PACE_MICRO_DONE or (CM.ticks - (CM.microPausedAt or CM.ticks)) >= CM.PACE_MICRO_MAX then
+			CM.microPausing = false
+			CM.setSpeed(ceiling, string.format("micropause done (%.2f ahead)", lead))
+		end
+		return
+	end
+	if lead > CM.PACE_MICRO_AHEAD then
+		-- too far ahead: pulse-pause to let the slowest peer close the gap
+		CM.microPausing = true
+		CM.microPausedAt = CM.ticks
+		CM.setSpeed(0, string.format("micropause: %.2f ahead of the slowest peer", lead))
+		return
+	end
+
+	-- ordinary nudges honour the dwell so we do not spam setGameSpeed
+	if CM.paceQuietUntil and CM.ticks < CM.paceQuietUntil then return end
+
+	-- BEHIND OR LEVEL: run at the player's chosen speed so we catch up. A
+	-- lagging client is NEVER throttled -- that was the bug (a client that fell
+	-- behind got dropped a notch and never came back). If we are below the
+	-- target, climb straight to it.
+	if s ~= ceiling then
+		CM.setSpeed(ceiling, string.format("resume to ceiling %d (%.2f ahead of slowest)", ceiling, lead))
+	elseif not CM.lastSetSpeed then
+		CM.baseSpeed = s   -- at the ceiling and it was not one we set: adopt as the player's
+	end
+end
+
+-- Undo a hold that WE placed. If the speed is no longer the 0 we set, the
+-- player has taken the lever back (they paused, or unpaused us) -- leave it
+-- alone rather than yanking the game back to speed under their hands.
+function CM.releaseSpeed(why)
+	local s0
+	pcall(function() s0 = game.interface.getGameSpeed() end)
+	if s0 ~= nil and s0 ~= 0 then
+		log("BARRIER release: the player already changed the speed (" .. why .. ") -- theirs kept")
+		CM.lastSetSpeed = nil
+		return
+	end
+	CM.setSpeed(CM.baseSpeed or 1, why)
+end
+
+-- SPEED V2 controller. Runs on EVERY instance for the player-ceiling detection;
+-- only the host ("a") aggregates ceilings + the sustainable cap into the
+-- effective speed and broadcasts LSEFF. Joiners follow LSEFF. See the SPD2_*
+-- constants for the model. This replaces CM.pace (the micropause/notch limit
+-- cycle) when speed_v2 is set; the hard barrier stays as a rare backstop.
+function CM.paceV2(now, lead)
+	if CM.lgHolding then return end
+	if CM.paused then return end                 -- the hard barrier owns the speed transiently
+	local MAXS = CM.MAX_SPEED or 4
+	if CM.myCeiling == nil then CM.myCeiling = MAXS end
+	if CM.susCap == nil then CM.susCap = MAXS end
+	local s
+	if not pcall(function() s = game.interface.getGameSpeed() end) or s == nil then return end
+	-- Is s a speed WE imposed, or one the player just clicked? (two-slot, as v1)
+	if CM.lastSetSpeed and s == CM.lastSetSpeed then CM.paceApplied = true end
+	local settled = CM.paceApplied or (CM.ticks > (CM.paceSetTick or 0) + 8)
+	local ours = (CM.lastSetSpeed and s == CM.lastSetSpeed)
+		or (not CM.paceApplied and CM.prevSetSpeed and s == CM.prevSetSpeed)
+	if settled and not ours and s ~= CM.myCeiling then
+		CM.myCeiling = s                       -- the player set their ceiling (0 = pause all)
+		log(string.format("SPEED2: player ceiling -> %d", s))
+	end
+	if K.INSTANCE ~= "a" then return end       -- only the host decides; joiners follow LSEFF
+	-- min ceiling across fresh instances (self + peers)
+	local minCeil = CM.myCeiling
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and pr.ceil and pr.ceil < minCeil then
+			minCeil = pr.ceil
+		end
+	end
+	-- sustainable cap, hysteretic on the fastest-slowest lead
+	lead = lead or 0
+	if lead > CM.SPD2_LEAD_DOWN then
+		CM.spd2HiSince = CM.spd2HiSince or CM.ticks
+		CM.spd2LoSince = nil
+		if CM.ticks - CM.spd2HiSince >= CM.SPD2_DOWN_TICKS then
+			CM.susCap = math.max(1, (CM.effSpeed or minCeil) - 1)
+			CM.spd2HiSince = CM.ticks
+			log(string.format("SPEED2: lead %.1f sustained -- cap down to %d", lead, CM.susCap))
+		end
+	elseif lead < CM.SPD2_LEAD_UP then
+		CM.spd2LoSince = CM.spd2LoSince or CM.ticks
+		CM.spd2HiSince = nil
+		if (CM.effSpeed or 0) < minCeil and CM.ticks - CM.spd2LoSince >= CM.SPD2_UP_TICKS then
+			CM.susCap = math.min(MAXS, (CM.effSpeed or 1) + 1)
+			CM.spd2LoSince = CM.ticks
+			log(string.format("SPEED2: in step -- cap up to %d", CM.susCap))
+		end
+	else
+		CM.spd2HiSince = nil; CM.spd2LoSince = nil
+	end
+	if CM.susCap < 1 then CM.susCap = 1 end
+	local eff = math.min(minCeil, CM.susCap)   -- 0 possible if a player paused (ceiling 0)
+	if eff < 0 then eff = 0 end
+	local changed = (eff ~= CM.effSpeed)
+	CM.effSpeed = eff
+	CM.baseSpeed = eff                          -- a barrier release then returns to eff
+	if changed then CM.broadcast(string.format("LSEFF v=%d", eff)) end
+	if s ~= eff and settled then
+		CM.setSpeed(eff, string.format("v2 effective (ceil=%d cap=%d lead=%.1f)", minCeil, CM.susCap, lead))
+		if not changed then CM.broadcast(string.format("LSEFF v=%d", eff)) end
+	end
+end
+
+function CM.applyBarrier(now)
+	local slowT, fastT = CM.peerBounds()
+	CM.slowT, CM.fastT = slowT, fastT
+	if not CM.peerSeen then return end
+
+	-- Watchdog first, so it runs even when the conditions below would hold.
+	if CM.paused and CM.pausedSince and (CM.ticks - CM.pausedSince) > K.MAX_PAUSE_TICKS then
+		CM.paused = false
+		CM.pausedSince = nil
+		CM.releaseSpeed("watchdog")
+		log(string.format("!! BARRIER WATCHDOG: held %d ticks, forcing release " ..
+			"(now=%.2f peer=%.2f). Sync is not guaranteed while this fires.",
+			K.MAX_PAUSE_TICKS, now, slowT or -1))
+		return
+	end
+
+	-- A peer that has not reported recently may itself be paused or gone.
+	-- Holding against a stale reading is exactly how both sides deadlock.
+	local stale = (slowT == nil)   -- nobody fresh: do not hold against silence
+	if stale then
+		if CM.paused then
+			CM.paused = false
+			CM.pausedSince = nil
+			CM.releaseSpeed("peer time stale")
+			log("BARRIER release: peer time is stale, not holding against it")
+		end
+		return
+	end
+
+	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
+	-- Nothing the gate does with the speed is the player's choice; never share it.
+	if CM.cfgFlag("speed_v2", false) then
+		-- V2: host-authoritative effective speed (CM.paceV2). Lead includes self
+		-- (now), so a host that is itself the leader still measures the spread.
+		local hi = math.max(now, fastT or now)
+		local lo = math.min(now, slowT or now)
+		CM.paceV2(now, hi - lo)
+	else
+		if not CM.lgHolding then CM.shareSpeed() end
+		-- The pacer gets the PRECISE lead over the slowest peer; the barrier above
+		-- keeps the coarse peerBounds value it was tuned against.
+		local slowP = CM.peerSlowPrecise()
+		CM.pace(now - fastT, slowP and (now - slowP) or ahead)
+	end
+	-- COMPLETENESS HOLD (cfg strict_barrier, default OFF).
+	--
+	-- The clock barrier above only keeps the instances CLOSE in time. It
+	-- does not stop us simulating past a step whose command we are still
+	-- missing: recovery then applies that command late, which is a real
+	-- divergence wearing the costume of a save. Real lockstep refuses to
+	-- advance while anything is outstanding.
+	--
+	-- Safe by construction: it holds through the SAME paused/pausedSince
+	-- state as the clock barrier, so the existing watchdog force-releases
+	-- after K.MAX_PAUSE_TICKS and a hole that can never be filled cannot
+	-- freeze the game. Pausing also HELPS, since the network thread keeps
+	-- running while the sim is stopped, so the resend arrives sooner. Off
+	-- by default: tightening this barrier has deadlocked both games before.
+	local gapN, gapAge, gapWho, gapSeq = 0, 0, nil, nil
+	if CM.cfgFlag("strict_barrier", false) then
+		gapN, gapAge, gapWho, gapSeq = CM.rxGaps()
+	end
+	-- a brief grace so ordinary UDP reordering does not stutter the game
+	local holdGap = gapN > 0 and gapAge >= K.GAP_GRACE_TICKS
+	CM.dashGaps = gapN
+	if (ahead > K.BARRIER_AHEAD or holdGap) and not CM.paused then
+		CM.paused = true
+		CM.pausedSince = CM.ticks
+		if holdGap then
+			CM.setSpeed(0, string.format("waiting on %d missing command(s)", gapN))
+			log(string.format("BARRIER hold: %d command(s) outstanding, oldest %s:%s for %d ticks -- not simulating past them",
+				gapN, tostring(gapWho), tostring(gapSeq), gapAge))
+		else
+			CM.setSpeed(0, string.format("barrier hold, %.2f ahead of peer", ahead))
+			log(string.format("BARRIER hold: %.2f ahead of the slowest peer (%.2f)", ahead, slowT))
+		end
+	elseif not holdGap and ahead <= K.BARRIER_AHEAD / 2 and CM.paused then
+		CM.paused = false
+		CM.pausedSince = nil
+		CM.catchingUp = false
+		CM.releaseSpeed("peer caught up")
+		log(string.format("BARRIER release: %.2f ahead", ahead))
+	end
+end
+
+-- A loaded save starts at speed 0. The barrier only ever calls setGameSpeed
+-- when RELEASING a hold, so with nothing to release the clock would sit frozen
+-- forever, and a command stamped in the future would never come due -- an
+-- experiment that looks like it ran and simply reports nothing. Both peers do
+-- this identically, and speed is local pacing rather than simulated state, so
+-- it cannot itself cause divergence.
+-- ONE SHOT, deliberately. Nudging the speed whenever it reads 0 would override
+-- a pause the player pressed on purpose, and fight them every time they stopped
+-- to look at something. Firing once after load gets an unattended test moving
+-- without taking the speed control away for the rest of the session. The
+-- barrier is unaffected: it sets speed 0 directly and is allowed to.
+local didInitialUnpause = false
+-- Numeric cfg value (CM.cfgFlag only answers yes/no). Shares its cache, so
+-- calling this first also populates it.
+function CM.cfgNum(key, default)
+	CM.cfgFlag(key, false)
+	local v = CM.cfgCache and CM.cfgCache[key]
+	return tonumber(v) or default
+end
+
+-- exec_delay (tpf2_slice.cfg): how far ahead every command is stamped, in game
+-- units, snapped UP to the 0.2 sim-step grid -- so this is the felt latency of
+-- every strict action. 0.6 (three steps, ~0.66 s at speed 1) is the shipped
+-- default and carries internet margin; on one machine or a LAN 0.4 is safe
+-- (every apply of 2026-09-08 measured late=0 at 0.6). Below that a jitter spike
+-- lands a command in a peer's PAST, which is a desync, not a delay, unless
+-- strict_barrier is on to hold the sim for it. Absent = 0.6. Read HERE, after
+-- cfgNum exists: reading it earlier in the file crashed the script at load
+-- ("attempt to call field 'cfgNum'", 2026-09-08).
+do
+	local d = CM.cfgNum("exec_delay", K.EXEC_DELAY)
+	if d and d >= 0.2 and d <= 5 then K.EXEC_DELAY = d end
+	log(string.format("EXEC_DELAY = %.1f game unit(s) = %d sim step(s)", K.EXEC_DELAY,
+		math.ceil(K.EXEC_DELAY / K.SIM_STEP - 1e-6)))
+end
+
+-- LOAD GATE: is everybody in?
+--
+-- Without this the first instance to finish loading starts simulating alone,
+-- because applyBarrier returns immediately while `not peerSeen` -- it will not
+-- hold against silence, which is correct once a session is running but wrong
+-- before one has started. Anything the player then does is captured, found to
+-- have no peer, and DROPPED by CM.soloDrop, while the native action still
+-- happens here. A vehicle bought in that window exists on this instance and on
+-- no other, so the setLine that follows has nothing to bind to on the peers --
+-- which is exactly the "bought while the others were still loading" breakage.
+--
+-- The gate WITHHOLDS the initial unpause rather than commanding speed 0. The
+-- game already loads paused, so this adds no new way to stop the simulation and
+-- needs no watchdog of its own: the player pressing play is a first-class
+-- override, handled by the s ~= 0 branch in ensureRunning below.
+--
+-- Two modes. With expect_players=N set, it waits for exactly N-1 peers, which is
+-- what a fixed rig wants. Otherwise it waits for at least one peer and then for
+-- the count to stop changing (K.LOADGATE_SETTLE), which handles players
+-- trickling in without needing to be told how many to expect.
+function CM.loadGateReady()
+	if not CM.cfgFlag("load_gate", true) then return true end
+	local n = 0
+	for _ in pairs(CM.peers) do n = n + 1 end
+	if n ~= CM.lgCount then
+		CM.lgCount = n
+		CM.lgChangedAt = CM.ticks
+	end
+	if CM.ticks > K.LOADGATE_MAX_TICKS then
+		if not CM.lgAnnounced then
+			CM.lgAnnounced = true
+			log(string.format("LOADGATE: giving up after %d ticks with %d peer(s) -- starting anyway. "
+				.. "Anything done before the others arrive will NOT reach them.",
+				K.LOADGATE_MAX_TICKS, n))
+		end
+		return true
+	end
+	-- How many instances to expect. In order of authority:
+	--   1. expect_players in the cfg -- an explicit manual override.
+	--   2. players= in tpf2_bridge_ctl.txt -- the LOBBY ROSTER, written by the
+	--      menu DLL, which is the only thing that actually knows. Re-read while
+	--      waiting, because a player can still be joining the lobby.
+	--   3. the settle heuristic, which is a guess and can only ever be wrong in
+	--      one of the two directions.
+	-- The cfg is deliberately NOT required: it gets overwritten by an installer
+	-- run, and a wiped cfg must not change how this behaves.
+	local want = CM.cfgNum("expect_players", 0)
+	if want < 2 then
+		local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
+		if f then
+			local body = f:read("*a") or ""
+			f:close()
+			want = tonumber(body:match("players=(%d+)")) or 0
+		end
+	end
+	local ready
+	if want > 1 then
+		ready = (n >= want - 1)
+	else
+		ready = (n >= 1 and (CM.ticks - (CM.lgChangedAt or CM.ticks)) >= K.LOADGATE_SETTLE)
+	end
+	if not ready then
+		-- roughly every two seconds, so the player can see WHY it is paused
+		if (CM.ticks % 12) == 0 then
+			log(string.format("LOADGATE: holding at the loaded save -- %d peer(s) in%s. Press play to start anyway.",
+				n, (want > 1) and string.format(", waiting for %d", want - 1)
+				   or " (roster size unknown -- holding until it settles)"))
+		end
+		return false
+	end
+	if not CM.lgAnnounced then
+		CM.lgAnnounced = true
+		log(string.format("LOADGATE: %d peer(s) in -- releasing", n))
+	end
+	return true
+end
+
+function CM.ensureRunning()
+	if didInitialUnpause or CM.paused then return end
+	-- The 100-tick "let the world finish loading" grace used to sit HERE, ahead
+	-- of everything. That is ~18 s during which this instance simulates at the
+	-- save's own speed with no gate at all -- and 18 s is longer than the gap
+	-- between two players loading, so by the first time the gate looked, the
+	-- others were already in and it released without ever holding
+	-- ("LOADGATE: 2 peer(s) in -- releasing", straight after load). The grace
+	-- now applies only to the ordinary unpause path, below.
+	if CM.ticks < K.LOADGATE_MIN_TICKS then return end
+	local s
+	local ok = pcall(function() s = game.interface.getGameSpeed() end)
+	if not ok or s == nil then return end
+
+	-- LOAD GATE. It has to ACTIVELY pause, not merely withhold an unpause: a
+	-- save restores its OWN speed when it loads, so the game is normally
+	-- already running by the time we get here. The first version only held when
+	-- it found speed 0 and so never fired at all -- the log said "already
+	-- running at speed 2" and the instance started simulating alone.
+	--
+	-- Safe despite commanding 0, for reasons the barrier's own speed-0 hold does
+	-- not get for free: ensureRunning is called UNCONDITIONALLY from the update
+	-- loop (right after applyBarrier), so unlike anything living inside CM.pace
+	-- it always gets a chance to release. It releases on all three of: the
+	-- roster filling up, K.LOADGATE_MAX_TICKS expiring, and the player taking
+	-- the lever back.
+	if not CM.loadGateReady() then
+		if s == 0 then
+			CM.lgSawZero = true         -- our pause landed; anything else now is the player
+		elseif not CM.lgHeld then
+			CM.lgResumeSpeed = s        -- remember ONCE: the save's own speed
+			CM.lgHeld, CM.lgHeldAt, CM.lgHolding = true, CM.ticks, true
+			-- Through setSpeed, NOT a raw sendCommand: setSpeed records the value
+			-- so shareSpeed recognises the 0 as OURS. The raw send made shareSpeed
+			-- take the gate's pause for the player's lever and broadcast
+			-- LSSPEED v=0 to every joiner -- which is how three players broke:
+			-- see the LSSPEED handler.
+			CM.setSpeed(0, "load gate: holding until the other players are in")
+			log(string.format("LOADGATE: pausing (was speed %d) until the other players are in", s))
+		elseif CM.lgSawZero then
+			-- We held it at 0, saw that take effect, and it is running again:
+			-- the player pressed play. Their lever wins.
+			didInitialUnpause = true
+			CM.lgHolding = false
+			log(string.format("LOADGATE: game started manually at speed %d -- releasing", s))
+		elseif (CM.ticks - (CM.lgHeldAt or 0)) > 12 then
+			-- Never saw it reach 0, so the command was lost rather than
+			-- overridden. Re-send rather than mistaking this for the player.
+			CM.lgHeldAt = CM.ticks
+			CM.setSpeed(0, "load gate: pause did not take, re-sending")
+			log("LOADGATE: pause did not take -- re-sending")
+		end
+		return
+	end
+
+	-- Everybody is in. If WE paused, give the speed back at once -- the world
+	-- has plainly finished loading by now, and making a held game sit out the
+	-- rest of the 100-tick grace would be a second, pointless freeze.
+	if CM.lgHeld then
+		didInitialUnpause = true
+		CM.lgHolding = false
+		local want = CM.lgResumeSpeed or 1
+		if want == 0 then want = 1 end
+		CM.setSpeed(want, "load gate: everyone is in")
+		log(string.format("LOADGATE: releasing -- speed %d restored", want))
+		return
+	end
+	if CM.ticks < 100 then return end            -- let the world finish loading
+	didInitialUnpause = true
+	CM.lgHolding = false
+	if s == 0 then
+		pcall(function() api.cmd.sendCommand(api.cmd.make.setGameSpeed(1)) end)
+		log("initial unpause (speed 0 -> 1); speed is yours from here")
+	else
+		log("already running at speed " .. tostring(s))
+	end
+end
+end
