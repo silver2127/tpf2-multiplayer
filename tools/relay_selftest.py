@@ -2,7 +2,7 @@
 The first joiner (leader) sends start(save=<file>); the relay must receive the
 upload, push it to the second joiner, and both must get start save=true."""
 import json, os, subprocess, sys, time, tempfile, shutil
-NP = r"C:\Users\<user>\tpf2-multiplayer\netpunch"
+NP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "netpunch")
 tmp = tempfile.mkdtemp(prefix="relaytest_")
 def d(n):
     p = os.path.join(tmp, n); os.makedirs(p, exist_ok=True); return p
