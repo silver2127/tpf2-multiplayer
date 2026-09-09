@@ -32,6 +32,7 @@
 #include "datadir.h"
 #include "savexfer.h"
 #include "simhook.h"
+#include "speedhook.h"
 #include "buyhook.h"
 
 static FILE* g_log = nullptr;
@@ -147,6 +148,7 @@ struct Config {
     // native sim-thread hook. Off by default: it patches game code, so it must
     // be opted into rather than surprising anyone who just wants replication.
     int         simHook = 1;   // shipped cfg says 1; no cfg must not mean a different mode (2026-09-09)
+    int         speedHook = 1; // fractional game speed via the step-count dither (speedhook.cpp)
     int         buyHook = 1;   // probe the buyVehicle command factory
 };
 
@@ -229,6 +231,7 @@ static void LoadConfig(const wchar_t* dllPath, const wchar_t* dataDir, Config& c
         else if (sscanf(line, "xfer_port=%d", &v) == 1) cfg.xferPort = (uint16_t)v;
         else if (sscanf(line, "auto_pull=%d", &v) == 1) cfg.autoPull = v;
         else if (sscanf(line, "sim_hook=%d", &v) == 1) cfg.simHook = v;
+        else if (sscanf(line, "speed_hook=%d", &v) == 1) cfg.speedHook = v;
         else if (sscanf(line, "buy_hook=%d", &v) == 1) cfg.buyHook = v;
         else if (sscanf(line, "share_save=%239[^\r\n]", pathBuf) == 1) cfg.shareSave = pathBuf;
         else if (sscanf(line, "save_dir=%239[^\r\n]", pathBuf) == 1) cfg.saveDir = pathBuf;
@@ -551,9 +554,20 @@ static void ApplyControl(const std::string& text)
 static DWORD WINAPI CtlThread(LPVOID)
 {
     const std::wstring path = g_dataDir + L"tpf2_bridge_ctl.txt";
-    std::string last, cur;
+    // DATADIR\tpf2_speed.txt: one number, the fractional speed target (2.5,
+    // 0.5, ...). Absent, empty or 0 = off (the engine's own speed). Written by
+    // the Lua / the panel; read here so the sim thread never touches a file.
+    const std::wstring speedPath = g_dataDir + L"tpf2_speed.txt";
+    std::string last, cur, lastSpeed, curSpeed;
     while (!g_stopping) {
         Sleep(500);
+        if (!ReadSmallFile(speedPath, curSpeed)) curSpeed.clear();
+        if (curSpeed != lastSpeed) {
+            lastSpeed = curSpeed;
+            double t = atof(curSpeed.c_str());
+            SpeedHook_SetTarget(t);
+            Log("[speed] target -> %.3f (%s)\n", SpeedHook_Target(), curSpeed.empty() ? "file absent/empty: engine speed" : "from tpf2_speed.txt");
+        }
         if (!ReadSmallFile(path, cur)) cur.clear();   // missing = nothing requested
         if (cur == last) continue;
         last = cur;
@@ -787,6 +801,7 @@ static DWORD WINAPI InitThread(LPVOID)
     // Prototype: prove we get a per-tick callback on the Simulation Thread and
     // that it survives. ECS reads go here next -- doing them from any other
     // thread races the sim (docs/M7_NATIVE_STATE.md).
+    if (cfg.speedHook) SpeedHook_Install(Log);
     if (cfg.simHook) {
         if (SimHook_Install(Log)) {
             // Report from OUR thread, not the sim thread. The handler itself
