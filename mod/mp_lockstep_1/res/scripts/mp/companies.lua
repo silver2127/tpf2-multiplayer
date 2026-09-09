@@ -51,6 +51,9 @@ CM.cmReady      = false
 CM.cmCfgStamp   = nil
 
 function CM.cmReadConfig()
+	-- Once a company command (CMNEW/CMSWITCH/CMDEL) has run, the lobby's file
+	-- is history: the lockstep commands own the roster and the origin map.
+	if CM.cmLive then return end
 	local f = io.open(CM.CM_CFG_FILE, "r")
 	if not f then CM.cmMode = "coop"; CM.cmOriginCompany = CM.cmOriginCompany or {}; return end
 	local mode = f:read("*l"); local mine = f:read("*l"); local roster = f:read("*l")
@@ -231,6 +234,236 @@ function CM.cmReassignEntity(eid, cid, kind)
 	local after = CM.cmOwnerOf(eid)
 	CM.cmLog(string.format("CM: reassigned %s eid=%s -> co%d pid=%s | owner before=%s after=%s | setPlayer ok=%s err=%s",
 		tostring(kind), tostring(eid), cid, tostring(pid), tostring(before), tostring(after), tostring(ok), tostring(err)))
+end
+
+-- ---------- in-game company management (2026-09-09) ----------
+-- Three lockstep commands, applied at their stamp on every peer, so every
+-- machine changes its company map on the same step:
+--   CMNEW    cid=N [sw=1]   company N joins the roster (an AI player entity on
+--                           every machine that is not playing it); sw=1 = the
+--                           origin switches to it in the same command
+--   CMSWITCH cid=N          the origin now plays as company N. On the origin's
+--                           own machine that is the hotseat swap: everything its
+--                           human player owns goes to N's AI entity and N's
+--                           assets and money come to the human player. Everyone
+--                           else only updates origin -> company.
+--   CMDEL    cid=N          company N is dissolved: its assets and money merge
+--                           into the origin's company. Refused while anyone
+--                           plays it. The AI entity stays behind, empty.
+-- The GUI cannot call these (it is a separate Lua state): it appends
+-- "CMSWITCH 3" style lines to the inject file and inject.lua schedules them.
+CM.CM_OWNED_TYPES = { "CONSTRUCTION", "VEHICLE", "LINE", "BASE_EDGE", "BASE_NODE", "STATION_GROUP", "STATION", "SIGNAL" }
+function CM.cmOwnedEntities(pid)
+	local out, seen = {}, {}
+	for _, kind in ipairs(CM.CM_OWNED_TYPES) do
+		pcall(function()
+			local t = game.interface.getEntities({ radius = 999999 }, { type = kind, includeData = false }) or {}
+			for _, eid in pairs(t) do
+				if type(eid) == "number" and not seen[eid] then
+					seen[eid] = true
+					if CM.cmOwnerOf(eid) == pid then out[#out + 1] = eid end
+				end
+			end
+		end)
+	end
+	return out
+end
+function CM.cmMoveAssets(fromPid, toPid, why)
+	if not fromPid or not toPid or fromPid == toPid then return 0 end
+	local ents = CM.cmOwnedEntities(fromPid)
+	local human = nil; pcall(function() human = api.engine.util.getPlayer() end)
+	local n = 0
+	for _, eid in ipairs(ents) do
+		local ok = pcall(function() game.interface.setPlayer(eid, toPid) end)
+		if ok then
+			n = n + 1
+			local hasCon = false
+			pcall(function() hasCon = api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) ~= nil end)
+			if hasCon then pcall(function() game.interface.setBulldozeable(eid, toPid == human) end) end
+		end
+	end
+	CM.cmLog(string.format("CM: %s: moved %d/%d entities pid %s -> %s", tostring(why), n, #ents, tostring(fromPid), tostring(toPid)))
+	return n
+end
+-- every roster company we are not playing needs its AI player entity; cmEnsure
+-- stops looking once the session is "ready", so a company created in-game
+-- goes through here
+function CM.cmEnsurePlayers()
+	for _, cid in ipairs(CM.cmRoster or {}) do
+		if cid ~= CM.cmMyCompany and not CM.cmCompanyPid[cid] then
+			local pid = nil
+			pcall(function() pid = game.interface.addPlayer() end)
+			if pid then
+				CM.cmCompanyPid[cid] = pid
+				pcall(function() game.interface.setMaximumLoan(pid, 100000000) end)
+				CM.cmLog(string.format("CM: company %d -> AI player %s (in-game)", cid, tostring(pid)))
+			end
+		end
+	end
+end
+-- A company's wallet is its balance AND its loan; both live on the player
+-- entity. Type-0 journal entries move the loan (and the balance with it),
+-- type-6 entries move balance only (measured 2026-09-01).
+function CM.cmWallet(pid)
+	local b, l = nil, nil
+	if type(pid) ~= "number" or pid < 0 then return nil end
+	pcall(function() local e = game.interface.getEntity(pid); if e then b = e.balance or 0; l = e.loan or 0 end end)
+	return b, l
+end
+-- set pid's wallet to (bal, loan) from (b0, l0)
+function CM.cmSetWallet(pid, b0, l0, bal, loan)
+	local dl = loan - l0
+	if dl ~= 0 then CM.cmBookJournal(pid, dl, K.JOURNAL_LOAN or 0) end        -- moves loan and balance by dl
+	local db = bal - (b0 + dl)
+	if db ~= 0 then CM.cmBookJournal(pid, db, K.JOURNAL_TRANSFER or 6) end   -- balance only
+end
+function CM.cmSwapWallets(p1, p2)
+	local b1, l1 = CM.cmWallet(p1); local b2, l2 = CM.cmWallet(p2)
+	if not b1 or not b2 then return false end
+	CM.cmSetWallet(p1, b1, l1, b2, l2)
+	CM.cmSetWallet(p2, b2, l2, b1, l1)
+	return true, b1, l1, b2, l2
+end
+function CM.cmNote(s) CM.cmLastNote = s; log("company: " .. s) end
+-- Company passwords. The wire and every peer only ever see a salted hash
+-- (same function everywhere, so the accept/refuse decision is identical on
+-- every machine); the clear text stays in the inject file on the typist's
+-- disk. A hash never parses as a number (the "h" prefix), so decodeCmd
+-- leaves it a string. Empty password = open company.
+CM.cmPw = {}   -- cid -> hash, or nil when open
+function CM.cmHashPw(cid, pw)
+	pw = tostring(pw or "")
+	if pw == "" or pw == "-" then return nil end
+	local sIn = "co" .. tostring(cid) .. ":" .. pw
+	local M1, A1, M2, A2 = 2147483647, 48271, 2147483629, 40692
+	local h1, h2 = 2166136261 % M1, 2166136261 % M2
+	for i = 1, #sIn do local b = sIn:byte(i); h1 = (h1 * A1 + b) % M1; h2 = (h2 * A2 + b) % M2 end
+	return string.format("h%010d%010d", h1, h2)
+end
+-- may `c` (op from origin o) act on company cid? true, or false + reason
+function CM.cmPwOk(c, cid)
+	local need = CM.cmPw[cid]
+	if not need then return true end
+	local given = c.pw
+	if given == nil or given == "" or given == "-" then return false, "company " .. cid .. " needs its password" end
+	if tostring(given) ~= need then return false, "wrong password for company " .. cid end
+	return true
+end
+function CM.cmRosterHas(cid)
+	for _, c in ipairs(CM.cmRoster or {}) do if c == cid then return true end end
+	return false
+end
+function CM.cmNextId()
+	if CM.cmOriginCompany == nil then CM.cmReadConfig() end
+	local m = 1   -- coop's single shared company is company 1
+	for _, c in ipairs(CM.cmRoster or {}) do if c > m then m = c end end
+	if CM.cmMyCompany and CM.cmMyCompany > m then m = CM.cmMyCompany end
+	return m + 1
+end
+-- who plays company cid: our own letter, or any origin the map points at it
+function CM.cmPeerLive(o)
+	local pr = CM.peers and CM.peers[o]
+	return pr and pr.at and (CM.ticks - pr.at) <= (K.PEER_STALE_TICKS or 60)
+end
+function CM.cmPlayersOf(cid)
+	local out = {}
+	if CM.cmMyCompany == cid then out[#out + 1] = K.INSTANCE end
+	-- only origins we actually hear from: the lobby file can carry letters of
+	-- players who left, and a session that shrank must not keep companies locked
+	for o, c in pairs(CM.cmOriginCompany or {}) do if c == cid and o ~= K.INSTANCE and CM.cmPeerLive(o) then out[#out + 1] = o end end
+	table.sort(out)
+	return out
+end
+-- coop has one shared company; the first company command turns the session
+-- into companies mode with everyone on company 1 (what the lobby file says)
+function CM.cmGoLive()
+	if CM.cmLive then return end
+	if CM.cmOriginCompany == nil then CM.cmReadConfig() end
+	if CM.cmMode ~= "companies" then
+		CM.cmMode = "companies"
+		CM.cmMyCompany = CM.cmMyCompany or 1
+		CM.cmRoster = { CM.cmMyCompany }
+		CM.cmOriginCompany = CM.cmOriginCompany or {}
+		for o in pairs(CM.peers or {}) do CM.cmOriginCompany[o] = CM.cmOriginCompany[o] or CM.cmMyCompany end
+		pcall(function() CM.cmCompanyPid[CM.cmMyCompany] = api.engine.util.getPlayer() end)
+		CM.cmReady = CM.cmCompanyPid[CM.cmMyCompany] ~= nil
+		CM.cmLog("CM: session moved from coop to companies mode by an in-game company command")
+	end
+	CM.cmLive = true
+end
+function CM.execCompanyCmd(c)
+	local cid = c.cid and math.floor(tonumber(c.cid) + 0.5) or nil
+	local o = c.origin
+	if not cid or cid < 1 then log("company: bad cid in " .. tostring(c.op)); return end
+	CM.cmGoLive()
+	CM.cmEnsure(); CM.cmEnsurePlayers()
+	if c.op == "CMNEW" then
+		if CM.cmRosterHas(cid) then log("company: CMNEW " .. cid .. " already exists")
+		else
+			CM.cmRoster[#CM.cmRoster + 1] = cid
+			table.sort(CM.cmRoster)
+			local h = c.pw; if h == nil or h == "" or h == "-" or h == 0 then h = nil end
+			CM.cmPw[cid] = h and tostring(h) or nil
+			CM.cmEnsurePlayers()   -- creates the AI entity for it here (we are not playing it yet)
+			CM.cmNote(string.format("%s created company %d%s (roster now %d)", tostring(o), cid, CM.cmPw[cid] and " [password]" or "", #CM.cmRoster))
+		end
+		if tonumber(c.sw or 0) == 1 then CM.execCompanyCmd({ op = "CMSWITCH", cid = cid, origin = o, pw = c.pw }) end
+	elseif c.op == "CMSWITCH" then
+		if not CM.cmRosterHas(cid) then log("company: CMSWITCH to unknown company " .. cid); return end
+		local okPw, why = CM.cmPwOk(c, cid)
+		if not okPw then CM.cmNote(string.format("%s cannot join company %d: %s", tostring(o), cid, why)); return end
+		if o == K.INSTANCE then
+			local old = CM.cmMyCompany
+			if cid ~= old then
+				local human, ai = CM.cmCompanyPid[old], CM.cmCompanyPid[cid]
+				if not human or not ai then log("company: switch: missing player entity (me=" .. tostring(human) .. " target=" .. tostring(ai) .. ")"); return end
+				-- the hotseat swap, both directions, then the money
+				CM.cmMoveAssets(human, -1, "park")          -- nothing: placeholder keeps the two moves distinct below
+				local mine = CM.cmOwnedEntities(human)
+				local theirs = CM.cmOwnedEntities(ai)
+				for _, eid in ipairs(mine) do pcall(function() game.interface.setPlayer(eid, ai) end) end
+				for _, eid in ipairs(theirs) do pcall(function() game.interface.setPlayer(eid, human) end) end
+				for _, eid in ipairs(mine) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, false) end end) end
+				for _, eid in ipairs(theirs) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, true) end end) end
+				local okW, bh, lh, ba, la = CM.cmSwapWallets(human, ai)
+				CM.cmCompanyPid[old] = ai; CM.cmCompanyPid[cid] = human
+				CM.cmMyCompany = cid
+				CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
+					tostring(bh), tostring(lh), tostring(ba), tostring(la), okW and "" or " -- wallet swap FAILED"))
+				if okW and (ba or 0) == 0 and (la or 0) == 0 then CM.cmNote("company " .. cid .. " starts empty: take a loan to fund it") end
+			end
+		else
+			CM.cmOriginCompany[o] = cid
+			CM.cmNote(string.format("%s now plays company %d", tostring(o), cid))
+		end
+	elseif c.op == "CMDEL" then
+		if not CM.cmRosterHas(cid) then CM.cmNote("cannot dissolve " .. cid .. ": no such company"); return end
+		local players = CM.cmPlayersOf(cid)
+		if #players > 0 then CM.cmNote(string.format("cannot dissolve %d: played by %s", cid, table.concat(players, ","))); return end
+		local okPw, why = CM.cmPwOk(c, cid)
+		if not okPw then CM.cmNote(string.format("%s cannot dissolve company %d: %s", tostring(o), cid, why)); return end
+		local intoCid = (o == K.INSTANCE) and CM.cmMyCompany or CM.cmOriginCompany[o]
+		local fromPid, toPid = CM.cmCompanyPid[cid], intoCid and CM.cmCompanyPid[intoCid]
+		if not fromPid or not toPid then log("company: CMDEL " .. cid .. ": missing player entity"); return end
+		local n = CM.cmMoveAssets(fromPid, toPid, "dissolve " .. cid)
+		local bf, lf = CM.cmWallet(fromPid); local bt, lt = CM.cmWallet(toPid)
+		if bf and bt then
+			CM.cmSetWallet(toPid, bt, lt, bt + bf, lt + lf)
+			CM.cmSetWallet(fromPid, bf, lf, 0, 0)
+		end
+		for i = #CM.cmRoster, 1, -1 do if CM.cmRoster[i] == cid then table.remove(CM.cmRoster, i) end end
+		CM.cmCompanyPid[cid] = nil
+		CM.cmPw[cid] = nil
+		CM.cmNote(string.format("%s dissolved company %d into %d (%d entities, balance %s, loan %s)", tostring(o), cid, intoCid, n, tostring(bf), tostring(lf)))
+	elseif c.op == "CMPW" then
+		-- set / clear a company's password: only someone playing it may
+		if not CM.cmRosterHas(cid) then CM.cmNote("cannot set a password: no company " .. cid); return end
+		local mineCid = (o == K.INSTANCE) and CM.cmMyCompany or CM.cmOriginCompany[o]
+		if mineCid ~= cid then CM.cmNote(string.format("%s cannot set company %d's password (plays %s)", tostring(o), cid, tostring(mineCid))); return end
+		local h = c.pw; if h == nil or h == "" or h == "-" or h == 0 then h = nil end
+		CM.cmPw[cid] = h and tostring(h) or nil
+		CM.cmNote(string.format("%s %s company %d's password", tostring(o), h and "set" or "cleared", cid))
+	end
 end
 
 function CM.cmReassignConstruction(eid, cid)

@@ -165,8 +165,8 @@ from mesh import MeshNode
 # --------------------------------------------------------------------------- #
 # Tunables
 # --------------------------------------------------------------------------- #
-CAP = 8                 # max players in a lobby, INCLUDING the host
-MAX_COMPANIES = 6       # company ids 1..6 (the engine-side companies mode's limit)
+CAP = 200               # max players in a lobby, INCLUDING the host (origins a..z, aa..)
+MAX_COMPANIES = 200     # company ids 1..200 (one addPlayer() entity each on every peer; measured 264 fine)
 PING_INTERVAL = 3.0     # joiner -> host lobby keepalive cadence
 DROP_AFTER = 10.0       # host drops a peer unheard-from for this long
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
@@ -1397,7 +1397,7 @@ class _Publisher:
             try:
                 if self.on:
                     self._post("/announce", {"id": self.id, "name": self.name, "code": self.code,
-                                             "players": self.players, "max": 8, "game": self.game,
+                                             "players": self.players, "max": CAP, "game": self.game,
                                              "version": LOBBY_VERSION, "locked": self.locked})
                     if not announced:
                         self.log(f"[publish] listed publicly at {self.url} as {self.name!r}")
@@ -1438,7 +1438,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                             #          "started":bool,
                                             #          "profile":code|None,
                                             #          "links":[names],
-                                            #          "company":1..6}
+                                            #          "company":1..200}
     host_company = [1]                      # the host's own company id
     cid_counter = [0]                       # host-authoritative chat id
     started = [False]

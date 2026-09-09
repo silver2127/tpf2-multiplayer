@@ -192,14 +192,25 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
 				CM.soloDrop(line)
 				return
 			end
 
 			-- ROADN n x0 y0 x1 y1 ...   (written by slice_hook from a captured
 			-- player build; carries every tessellated node)
-			if o == "HEAL" then
+			if o == "CMNEW" or o == "CMSWITCH" or o == "CMDEL" or o == "CMPW" then
+				-- the in-game company row (GUI state) asked for a company command:
+				--   CMNEW [password]   CMSWITCH cid [password]   CMDEL cid [password]   CMPW cid [password]
+				-- the clear text stays here; only its salted hash goes on the wire
+				local cid, pwAt = tonumber(w[2]), 3
+				if o == "CMNEW" then cid = CM.cmNextId(); pwAt = 2 end
+				local pw = table.concat(w, " ", pwAt)
+				if cid then
+					CM.scheduleLocal(o, { cid = cid, sw = (o == "CMNEW") and 1 or nil, pw = CM.cmHashPw(cid, pw) or "-" })
+					log("company: requested " .. o .. " " .. cid .. (pw ~= "" and " [with password]" or ""))
+				end
+			elseif o == "HEAL" then
 				-- Manual repair: rejoin a road at x,y if a scar from a replayed
 				-- split is all that is left there. Same rules as the sweep.
 				CM.healNodeAt(tonumber(w[2]) or 0, tonumber(w[3]) or 0, "manual")

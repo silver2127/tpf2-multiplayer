@@ -485,6 +485,7 @@ local function execute(c)
 			CM.execLine(c)
 		end
 	elseif c.op == "LOAN" then CM.execLoan(c)
+	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" then CM.execCompanyCmd(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
 
@@ -774,6 +775,18 @@ function data()
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
 						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
 							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-"))
+						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
+						pcall(function()
+							local ids, who = {}, {}
+							for _, cid in ipairs(CM.cmRoster or { CM.cmMyCompany or 1 }) do
+								ids[#ids + 1] = tostring(cid)
+								local p = CM.cmPlayersOf(cid); if #p > 0 then who[#who + 1] = cid .. ":" .. table.concat(p, ",") end
+							end
+							local locked = {}
+							for cid in pairs(CM.cmPw or {}) do locked[#locked + 1] = tostring(cid) end
+							table.sort(locked)
+							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ",")))
+						end)
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
 							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
@@ -1067,6 +1080,63 @@ function data()
 					local rowC = api.gui.comp.Component.new("mpSpeedRow")
 					rowC:setLayout(row)
 					box:addItem(rowC)
+					-- ---- companies (2026-09-09): switch, create, dissolve ----
+					-- The GUI state cannot reach the lockstep queue, so a button
+					-- appends "CMSWITCH 3" to the inject file; inject.lua schedules
+					-- the command and every peer applies it on the same step.
+					D.coText = api.gui.comp.TextView.new("company: -")
+					D.coSel = nil
+					local function coPw()
+						local t = ""
+						pcall(function() t = D.coPwInput and D.coPwInput:getText() or "" end)
+						return (t or ""):gsub("[%c]", "")
+					end
+					local function coRequest(op, cid)
+						local pw = coPw()
+						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						if f then f:write(op .. (cid and (" " .. cid) or "") .. (pw ~= "" and (" " .. pw) or "") .. string.char(10)); f:close() end
+					end
+					local function coStep(dir)
+						local r = D.coRoster or {}
+						if #r == 0 then return end
+						local i = 1
+						for k, v in ipairs(r) do if v == D.coSel then i = k end end
+						i = ((i - 1 + dir) % #r) + 1
+						D.coSel = r[i]
+					end
+					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					crow:addItem(D.coText)
+					crow:addItem(speedBtn("  <  ", function() coStep(-1) end))
+					crow:addItem(speedBtn("  >  ", function() coStep(1) end))
+					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
+					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
+					crow:addItem(speedBtn("  dissolve into mine  ", function()
+						if not D.coSel or D.coSel == D.coMine then D.coHint = "select another company first (< >)"
+						elseif (D.coPlayed or {})[D.coSel] then D.coHint = "company " .. D.coSel .. " is played by " .. D.coPlayed[D.coSel]
+						else D.coHint = "dissolving " .. D.coSel .. "..."; coRequest("CMDEL", D.coSel) end
+					end))
+					D.coNote = api.gui.comp.TextView.new("")
+					-- password: used by "new company" (locks the new one), by "switch"/"dissolve"
+					-- (the attempt), and by "set password" (your own company; empty clears)
+					pcall(function()
+						local mk = api.gui.comp.TextInputField
+						local ok1, inp = pcall(function() return mk.new() end)
+						if not ok1 then inp = mk.new("") end
+						D.coPwInput = inp
+						pcall(function() D.coPwInput:setMinimumSize(api.gui.util.Size.new(180, 26)) end)
+						pcall(function() D.coPwInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
+					end)
+					local prow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					prow:addItem(api.gui.comp.TextView.new("company password: "))
+					if D.coPwInput then prow:addItem(D.coPwInput) end
+					prow:addItem(speedBtn("  set on mine  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on company " .. D.coMine .. "..."; coRequest("CMPW", D.coMine) end end))
+					local prowC = api.gui.comp.Component.new("mpCompanyPwRow")
+					prowC:setLayout(prow)
+					local crowC = api.gui.comp.Component.new("mpCompanyRow")
+					crowC:setLayout(crow)
+					box:addItem(crowC)
+					box:addItem(prowC)
+					box:addItem(D.coNote)
 					local chatL = api.gui.layout.BoxLayout.new("VERTICAL")
 					D.chatText = api.gui.comp.TextView.new("chat: (no messages yet)")
 					chatL:addItem(D.chatText)
@@ -1136,6 +1206,24 @@ function data()
 						(req and req ~= "-") and "  (set)" or "  (lowest lever)",
 						(pace and pace ~= "-") and ("  PID " .. pace) or "",
 						(sync and sync ~= "-") and ("  SYNC: " .. sync) or ""))
+					if D.coText and mine then
+						local roster = {}
+						for id in tostring(mine.roster or ""):gmatch("%d+") do roster[#roster + 1] = tonumber(id) end
+						local played = {}
+						for id, who in tostring(mine.played or ""):gmatch("(%d+):([%a,]+)") do played[tonumber(id)] = who end
+						local locked = {}
+						for id in tostring(mine.colocked or ""):gmatch("%d+") do locked[tonumber(id)] = true end
+						D.coRoster, D.coPlayed, D.coMine, D.coLocked = roster, played, tonumber(mine.company), locked
+						if not D.coSel then D.coSel = D.coMine end
+						local sel = D.coSel or D.coMine
+						local selWho = sel and played[sel]
+						D.coText:setText(string.format("company: mine %s   |  %d in session   |  selected: %s%s%s   ",
+							tostring(D.coMine or "?"), #roster, tostring(sel or "-"),
+							(sel == D.coMine and " (mine)" or "") .. (sel and locked[sel] and " [password]" or ""), selWho and (" played by " .. selWho) or (sel and " (empty)" or "")))
+						local note = mine.conote or ""
+						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
+						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end
+					end
 					if D.chatText and (guiTick % 30) == 0 then
 						local lines = CM.chatTail(8)
 						if #lines > 0 then D.chatText:setText(table.concat(lines, string.char(10))) end

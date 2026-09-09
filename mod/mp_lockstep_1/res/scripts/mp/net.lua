@@ -475,7 +475,7 @@ local function onLine(line)
 	if op == "LSTICK" then
 		local t = tonumber(line:match("t=([%d%.%-]+)"))
 		if t then
-			local o = line:match(" o=(%a)") or "?"
+			local o = line:match(" o=(%a+)") or "?"
 			local pr = CM.peerFor(o)
 			pr.time = t; pr.at = CM.ticks
 			-- LSTICK has always carried the SIM STEP as well, and nothing read
@@ -545,17 +545,17 @@ local function onLine(line)
 			end
 		end
 	elseif op == "LSNACK" then
-		local o = line:match(" o=(%a)")
+		local o = line:match(" o=(%a+)")
 		local seq = tonumber(line:match(" seq=(%d+)"))
 		if o and seq then pcall(CM.onNack, o, seq) end
 	elseif op == "LSNEED" then
 		local S = tonumber(line:match(" t=([%d%.]+)"))
-		local L = line:match(" o=(%a)")
+		local L = line:match(" o=(%a+)")
 		if S and L and L ~= K.INSTANCE then pcall(CM.histServe, S, L) end
 	elseif op == "LSHIST" then
 		local fr = line:match(" for=(%a)")
 		if fr == K.INSTANCE then
-			local o = line:match(" o=(%a)")
+			local o = line:match(" o=(%a+)")
 			local lo = tonumber(line:match(" from=(%d+)"))
 			local hi = tonumber(line:match(" to=(%d+)"))
 			if o and lo and hi and o ~= K.INSTANCE then
@@ -630,7 +630,7 @@ local function onLine(line)
 		local t = tonumber(line:match("t=(%-?%d+)"))
 		local h = line:match("h=(%S+)")
 		if t and h then
-			local o = line:match(" o=(%a)") or "?"
+			local o = line:match(" o=(%a+)") or "?"
 			local pr = CM.peerFor(o)
 			pr.hashes[t] = h
 			pr.details[t] = line:match("d=(%S+)")

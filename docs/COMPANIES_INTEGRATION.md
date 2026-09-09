@@ -111,14 +111,14 @@ Networked-specific validations that still need a LIVE game:
 
 ## Lobby company assignment -- BUILT (2026-09-01)
 
-Any grouping is just a company id per player (1..6), chosen in the lobby:
+Any grouping is just a company id per player (1..16), chosen in the lobby:
 
 - **Lobby protocol:** `{t:"company", player, id}` (a joiner sets its own; the
   host's menu command `{"cmd":"company","player","id"}` sets anyone's). The
   roster carries `companies: {name: id}`. Everyone starts on 1, so a lobby
   where nobody clicks is plain co-op, byte-identical to before.
 - **Lobby page:** a coloured, numbered chip beside each name. Click your own
-  (the host: anyone's) to cycle 1..6. Same number = one company together;
+  (the host: anyone's) to cycle 1..16. Same number = one company together;
   different numbers = separate companies; 2-on-1 + 2-on-2 etc. fall out.
 - **At START every machine writes** `<data>\mp_company_cfg.txt` from the
   roster it already agrees on: mode (`companies` iff >1 distinct id), my id,

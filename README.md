@@ -8,7 +8,7 @@ one world at the same time: roads, rails, stations, depots, vehicles and lines m
 player appear on the other's map, executed at the same in-game moment. Two modes share
 the same mod: **co-op**, where both play one shared company, and **companies**, where each
 player owns a separate company and wallet on the same map. Alpha: verified between two
-machines on different networks; the lobby seats eight, the sync itself has only run
+machines on different networks; the lobby seats sixteen, the sync itself has only run
 between two.
 
 ## Installing
