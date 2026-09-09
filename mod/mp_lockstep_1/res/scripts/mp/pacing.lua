@@ -501,18 +501,21 @@ function CM.pidPace(now, eff)
 	local dead = CM.cfgNum("pid_dead", 0.20)
 	local lo   = CM.cfgNum("pid_min",  0.50)
 	local hi   = CM.cfgNum("pid_max",  1.30)
-	-- reference: the mean of every fresh, non-catching-up clock and our own
-	local sum, n = now, 1
-	for _, pr in pairs(CM.peers) do
-		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
-			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
-			if t and math.abs(t - now) < 60 then sum = sum + t; n = n + 1 end
-		end
+	-- THE HOST IS THE CLOCK (2026-09-09): it runs the session speed untouched
+	-- and only its lever changes it (a host that sees a peer lagging can slow
+	-- everyone down by choice). Every joiner's reference is the host's precise
+	-- clock; nobody steers the host.
+	if K.INSTANCE == "a" then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
+	local host = CM.peers["a"]
+	local ref
+	if host and host.at and (CM.ticks - host.at) <= K.PEER_STALE_TICKS then
+		ref = host.step and (host.step * K.SIM_STEP) or host.time
 	end
 	local dtTicks = CM.ticks - (CM.pidAt or CM.ticks)
 	CM.pidAt = CM.ticks
-	if n < 2 then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
-	local e = now - sum / n                       -- + = we are ahead
+	if not ref or math.abs(ref - now) >= 60 then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
+	local n = 1
+	local e = now - ref                           -- + = we are ahead of the host
 	local dt = math.max(1, dtTicks) / 5.4         -- seconds between decisions
 	local eD = (math.abs(e) < dead) and 0 or e
 	CM.pidI = (CM.pidI or 0) + eD * dt
@@ -530,7 +533,7 @@ function CM.pidPace(now, eff)
 	if target < 0.5 then target = 0.5 end
 	if math.abs(m - 1) < 0.025 then target = eff end   -- level enough: exactly the session speed
 	if target ~= CM.pidHold then
-		log(string.format("PID: e=%+.2f (ref mean of %d) P=%+.3f I=%+.3f D=%+.3f -> %.2fx of %g", e, n, kp * eD, ki * CM.pidI, kd * d, target, eff))
+		log(string.format("PID: e=%+.2f vs host P=%+.3f I=%+.3f D=%+.3f -> %.2fx of %g", e, kp * eD, ki * CM.pidI, kd * d, target, eff))
 	end
 	CM.pidHold, CM.pidErr = target, e
 	CM.paceInfo = string.format("%.2fx e=%+.2f", target, e)
@@ -732,12 +735,12 @@ function CM.paceV2(now, lead)
 	-- never asked to go faster than that, since it cannot. Quantised to 0.05 so
 	-- the dither file is rewritten on real changes only. Replaces the pulses
 	-- players felt as stutter: the leader eases off and the tail catches up.
-	-- PID PACING (2026-09-09, cfg speed_frac_pace, default on). Every instance
-	-- drives its clock to the MEAN of all fresh clocks (its own included) by
-	-- scaling the session speed with the dither: a leader eases off, a laggard
-	-- with headroom speeds up (to pid_max x, lever 4 at most), and the integral
-	-- term is what lets the group settle on the throughput of the slowest
-	-- machine instead of flipping who is slowest. One decision per
+	-- PID PACING (2026-09-09, cfg speed_frac_pace, default on). The host runs
+	-- the session speed as set; every JOINER drives its clock to the host's by
+	-- scaling the session speed with the dither: ahead -> eases off, behind
+	-- with headroom -> speeds up (to pid_max x, lever 4 at most). A joiner
+	-- that cannot keep up stays behind and the host's table shows it; the host
+	-- decides whether to slow the session. One decision per
 	-- K.FRAC_PACE_TICKS from heartbeats two ticks apart; held in between.
 	-- LIVE-TUNABLE: pid_kp, pid_ki, pid_kd, pid_dead, pid_min, pid_max in
 	-- tpf2_slice.cfg are re-read every ~5 s (CM.cfgFlag), and every decision
