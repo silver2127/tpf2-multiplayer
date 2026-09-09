@@ -558,8 +558,36 @@ function CM.paceV2(now, lead)
 	else
 		CM.syncingTo = nil
 	end
+	-- FRACTIONAL PACING (2026-09-09, cfg speed_frac_pace, default on). Whoever
+	-- is ahead of the slowest fresh clock runs proportionally SLOWER -- a smooth
+	-- fraction through the dither (see CM.setSpeed), never a pause pulse -- until
+	-- the gap closes: 1 unit ahead = 3/4 speed, 2 ahead = half, floor at 0.4x.
+	-- The slowest instance is the reference and runs the session speed; it is
+	-- never asked to go faster than that, since it cannot. Quantised to 0.05 so
+	-- the dither file is rewritten on real changes only. Replaces the pulses
+	-- players felt as stutter: the leader eases off and the tail catches up.
+	local paced = nil
+	if target == eff and eff > 0 and CM.cfgFlag("speed_frac_pace", true) then
+		local slowP = CM.peerSlowPrecise()
+		local myLead = slowP and (now - slowP) or 0
+		if myLead > 0.3 and myLead < 60 then
+			local f = math.max(0.4, 1 - myLead / 4)
+			target = math.max(0.5, math.floor(eff * f / 0.05 + 0.5) * 0.05)
+			paced = myLead
+		end
+	end
+	if settled and s == CM.leverOf(target) then CM.setDither(target) end   -- same lever, new fraction
+	if paced and CM.fracLast ~= target then
+		CM.fracLast = target
+		log(string.format("PACE: %.2fx of session %g (%.1f ahead of the slowest peer)", target, eff, paced))
+	elseif not paced and CM.fracLast then
+		CM.fracLast = nil
+		log(string.format("PACE: back in step -- session speed %g", eff))
+	end
 	if s ~= CM.leverOf(target) and settled then
-		if target == eff then
+		if paced then
+			CM.setSpeed(target, string.format("pacing %.2fx (%.1f ahead)", target, paced))
+		elseif target == eff then
 			CM.setSpeed(target, string.format("session speed %g", eff))
 		else
 			CM.setSpeed(target, string.format("catching up to the pause point (%.1f behind)", (CM.syncingTo or now) - now))

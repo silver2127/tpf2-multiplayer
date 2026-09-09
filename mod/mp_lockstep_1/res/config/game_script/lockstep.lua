@@ -767,6 +767,8 @@ function data()
 					if f then
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
+						f:write(string.format("eff=%s\nspeedreq=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
+							CM.spdReq and string.format("%g", CM.spdReq) or "-"))
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
 							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
@@ -875,6 +877,63 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
+				-- The lobby's folder, the same three candidates the menu DLL tries
+				-- (resolveNetDir): %LOCALAPPDATA%\tpf2mp\netpunch, <game>\netpunch
+				-- (the CWD), then the dev checkout.
+				function CM.netDir()
+					if CM.netDirCached ~= nil then return CM.netDirCached or nil end
+					local cands = {}
+					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
+					if ok and la then cands[#cands + 1] = la .. "/tpf2mp/netpunch" end
+					cands[#cands + 1] = "netpunch"
+					local ok2, up = pcall(os.getenv, "USERPROFILE")
+					if ok2 and up then cands[#cands + 1] = up .. "/tpf2-multiplayer/netpunch" end
+					for _, d in ipairs(cands) do
+						local f = io.open(d .. "/lobby_out.jsonl", "r")
+						if f then f:close(); CM.netDirCached = d; return d end
+					end
+					CM.netDirCached = false
+					return nil
+				end
+				function CM.chatSend(text)
+					local d = CM.netDir()
+					if not d then return false end
+					local f = io.open(d .. "/lobby_in.jsonl", "a")
+					if not f then return false end
+					local esc = tostring(text):gsub("\\", "\\\\"):gsub('"', '\\"')
+					f:write('{"cmd":"chat","text":"' .. esc .. '"}' .. string.char(10))
+					f:close()
+					return true
+				end
+				-- Last n chat lines from lobby_out.jsonl, read incrementally from a
+				-- remembered offset (the file also carries roster/transfer events
+				-- and grows all session; the first read starts 16 KB from the end).
+				CM.chatLines = CM.chatLines or {}
+				function CM.chatTail(n)
+					local d = CM.netDir()
+					if not d then return CM.chatLines end
+					local f = io.open(d .. "/lobby_out.jsonl", "rb")
+					if not f then return CM.chatLines end
+					local size = f:seek("end") or 0
+					if CM.chatOff == nil or CM.chatOff > size then
+						CM.chatOff = math.max(0, size - 16384)
+						CM.chatLines = {}
+					end
+					f:seek("set", CM.chatOff)
+					local chunk = f:read("*a") or ""
+					f:close()
+					CM.chatOff = size
+					for line in chunk:gmatch("[^\n]+") do
+						if line:find('"type":"chat"', 1, true) or line:find('"type": "chat"', 1, true) then
+							local from = line:match('"from":%s*"([^"]*)"') or "?"
+							local text = line:match('"text":%s*"(.-)",%s*"ts"') or line:match('"text":%s*"(.-)"}') or ""
+							text = text:gsub('\\"', '"'):gsub("\\\\", "\\")
+							CM.chatLines[#CM.chatLines + 1] = from .. ": " .. text
+							while #CM.chatLines > n do table.remove(CM.chatLines, 1) end
+						end
+					end
+					return CM.chatLines
+				end
 				local function readDash(inst)
 					local bases = { K.BASE }
 					for _, p in ipairs(CM.baseCandidates or {}) do if p ~= K.BASE then bases[#bases + 1] = p end end
@@ -954,8 +1013,86 @@ function data()
 					end
 					D.verdict = api.gui.comp.TextView.new("verdict: -")
 					local box = api.gui.layout.BoxLayout.new("VERTICAL")
-					box:addItem(D.table)
-					box:addItem(D.verdict)
+					-- Show/hide (2026-09-09): the stats table and the chat block each
+					-- have a toggle; Ctrl+Shift+D still hides the whole window.
+					local function toggleBtn(label, fn)
+						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
+						b:onClick(fn)
+						return b
+					end
+					CM.dashShowStats = (CM.dashShowStats ~= false)
+					CM.dashShowChat = (CM.dashShowChat ~= false)
+					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					tog:addItem(toggleBtn("  stats  ", function()
+						CM.dashShowStats = not CM.dashShowStats
+						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
+					end))
+					tog:addItem(toggleBtn("  chat  ", function()
+						CM.dashShowChat = not CM.dashShowChat
+						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
+					end))
+					local togC = api.gui.comp.Component.new("mpToggles")
+					togC:setLayout(tog)
+					box:addItem(togC)
+					local statsL = api.gui.layout.BoxLayout.new("VERTICAL")
+					statsL:addItem(D.table)
+					statsL:addItem(D.verdict)
+					D.statsBox = api.gui.comp.Component.new("mpStats")
+					D.statsBox:setLayout(statsL)
+					box:addItem(D.statsBox)
+					-- ---- session speed + lobby chat (2026-09-09) ----
+					-- The lobby (netpunch) keeps running behind the game; its
+					-- lobby_out.jsonl carries every chat line and lobby_in.jsonl takes
+					-- commands, so the in-game chat is those two files. The speed
+					-- buttons SEND "/speed x" as chat: every panel writes it into the
+					-- bridge ctl, the host's pacer applies it and broadcasts the
+					-- session speed (LSEFF), so anyone can set it and everyone sees it.
+					D.speedText = api.gui.comp.TextView.new("session speed: -")
+					local function speedBtn(label, fn)
+						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
+						b:onClick(fn)
+						return b
+					end
+					local row = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					row:addItem(D.speedText)
+					row:addItem(speedBtn("  -0.5  ", function() CM.chatSend(string.format("/speed %.1f", math.max(0.5, (D.eff or 1) - 0.5))) end))
+					row:addItem(speedBtn("  +0.5  ", function() CM.chatSend(string.format("/speed %.1f", math.min(8, (D.eff or 1) + 0.5))) end))
+					row:addItem(speedBtn("  levers  ", function() CM.chatSend("/speed off") end))
+					local rowC = api.gui.comp.Component.new("mpSpeedRow")
+					rowC:setLayout(row)
+					box:addItem(rowC)
+					local chatL = api.gui.layout.BoxLayout.new("VERTICAL")
+					D.chatText = api.gui.comp.TextView.new("chat: (no messages yet)")
+					chatL:addItem(D.chatText)
+					local okI, errI = pcall(function()
+						local mk = api.gui.comp.TextInputField
+						local ok1, inp = pcall(function() return mk.new() end)
+						if not ok1 then inp = mk.new("") end
+						D.input = inp
+						pcall(function() D.input:setMinimumSize(api.gui.util.Size.new(280, 26)) end)
+						pcall(function() D.input:setMaximumSize(api.gui.util.Size.new(400, 26)) end)
+						D.input:onEnter(function()
+							local t = D.input:getText()
+							if t and #t > 0 then
+								CM.chatSend(t)
+								pcall(function() D.input:setText("", false) end)
+							end
+						end)
+						local say = api.gui.layout.BoxLayout.new("HORIZONTAL")
+						say:addItem(api.gui.comp.TextView.new("say: "))
+						say:addItem(D.input)
+						local sayC = api.gui.comp.Component.new("mpSay")
+						sayC:setLayout(say)
+						chatL:addItem(sayC)
+					end)
+					if not okI then print("[ls-gui] chat input field unavailable: " .. tostring(errI)) end
+					D.chatBox = api.gui.comp.Component.new("mpChat")
+					D.chatBox:setLayout(chatL)
+					box:addItem(D.chatBox)
+					pcall(function()
+						D.statsBox:setVisible(CM.dashShowStats, false)
+						D.chatBox:setVisible(CM.dashShowChat, false)
+					end)
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
@@ -983,6 +1120,17 @@ function data()
 				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
 				table.sort(vs)
 				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-") .. (#vs > 0 and ("   [" .. table.concat(vs, ", ") .. "]") or ""))
+				pcall(function()
+					local eff = mine and tonumber(mine.eff) or nil
+					D.eff = eff
+					local req = mine and mine.speedreq
+					D.speedText:setText(string.format("session speed: %s%s   ", eff and string.format("%gx", eff) or "-",
+						(req and req ~= "-") and "  (set)" or "  (lowest lever)"))
+					if D.chatText and (guiTick % 30) == 0 then
+						local lines = CM.chatTail(8)
+						if #lines > 0 then D.chatText:setText(table.concat(lines, string.char(10))) end
+					end
+				end)
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
 				-- one-byte file; no file means shown.
 				local shown = true
