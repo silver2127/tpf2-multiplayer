@@ -61,7 +61,8 @@ exit /b 0
 :menu
 %CC% /utf-8 /c src\hook.cpp /Fo:out\hook_menu.obj                                    || exit /b 1
 %CC% /utf-8 /c src\menu_hook.cpp /Fo:out\menu_hook.obj                               || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_menu%SFX%.dll out\hook_menu.obj out\menu_hook.obj user32.lib gdi32.lib advapi32.lib || exit /b 1
+ml64 /nologo /c /Fo out\gameuirelay_menu.obj src\gameuirelay.asm                     || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_menu%SFX%.dll out\hook_menu.obj out\menu_hook.obj out\gameuirelay_menu.obj user32.lib gdi32.lib advapi32.lib || exit /b 1
 REM Deploy to where the proxy loads it from. Non-fatal: a running game holds the
 REM dll open, and the copy is simply skipped -- redeploy after the relaunch.
 set "DEST=C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out\tpf2_menu.dll"

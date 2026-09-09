@@ -399,20 +399,98 @@ end
 function CM.speedRequest()
 	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.spdReq end
 	CM.spdReqAt = CM.ticks
-	local req
+	local req, syncN, players
 	pcall(function()
 		local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
 		if not f then return end
 		local body = f:read("*a") or ""
 		f:close()
 		req = tonumber(body:match("speed=([%d%.]+)"))
+		syncN = tonumber(body:match("sync=(%d+)")) or 0
+		players = tonumber(body:match("players=(%d+)"))
 	end)
 	if req and (req <= 0 or req >= 64) then req = nil end
 	if req ~= CM.spdReq then
 		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (lowest lever)"))
 	end
 	CM.spdReq = req
+	if players then CM.rosterPlayers = players end
+	if syncN ~= nil and syncN ~= (CM.syncSeen or 0) then
+		CM.syncSeen = syncN
+		if syncN > 0 then CM.syncBegin() else CM.syncEnd("cancelled (/sync off)") end
+	end
 	return req
+end
+
+-- HOT JOIN = a SYNC POINT (2026-09-09). A player arriving mid-session needs
+-- the world at a known step and the only carrier is a save. The host runs it:
+--   pausing : session speed 0 (a pause is a sync point: everyone runs to the
+--             leader's clock and stops there); wait until we are at 0, our
+--             queue is empty and every fresh peer reports our step
+--   saving  : ask the menu DLL for a save (tpf2_sync_save.txt; it forces the
+--             game's own autosave and then shares the file with every joiner
+--             the way START GAME does, writing tpf2_sync_sent.txt)
+--   waiting : hold at 0 until the roster's players are all in AND every fresh
+--             peer sits at our step -- the newcomer loaded the save at exactly
+--             this step -- then release the levers. "/sync off" abandons it.
+-- Joiners already playing ignore the start; their lobbies latch 'started'.
+-- The hash lane right after the resume is the proof that a loaded save equals
+-- the memory it was taken from; a DESYNC there means it does not.
+function CM.syncBegin()
+	if K.INSTANCE ~= "a" then return end
+	CM.syncState = "pausing"
+	CM.syncSince = CM.ticks
+	CM.syncSpeedBefore = (CM.effSpeed and CM.effSpeed > 0) and CM.effSpeed or (CM.runSpeed or 1)
+	log("SYNC: requested -- pausing the session at a common step")
+end
+function CM.syncEnd(why)
+	if not CM.syncState then return end
+	log(string.format("SYNC: %s (was %s)", tostring(why), tostring(CM.syncState)))
+	CM.syncState = nil
+end
+function CM.syncPeersAtStep(now)
+	local myStep = CM.stepOf(now)
+	local n, same = 0, 0
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			n = n + 1
+			if pr.step and pr.step == myStep then same = same + 1 end
+		end
+	end
+	return n, same
+end
+function CM.syncTick(now, s)
+	local st = CM.syncState
+	if not st then return end
+	if CM.ticks - (CM.syncSince or CM.ticks) > 900 * 4 then CM.syncEnd("timed out after ~11 min"); return end
+	local n, same = CM.syncPeersAtStep(now)
+	if st == "pausing" then
+		if s == 0 and #CM.queue == 0 and same == n then
+			CM.syncState = "saving"
+			pcall(function()
+				local f = io.open(K.BASE .. "tpf2_sync_save.txt", "w")
+				if f then f:write(string.format("step=%d\n", CM.stepOf(now))); f:close() end
+			end)
+			log(string.format("SYNC: everyone at step %d, queue empty -- asking for the save", CM.stepOf(now)))
+		elseif (CM.ticks % 25) == 0 then
+			log(string.format("SYNC: pausing -- speed %s, queue %d, peers at our step %d/%d", tostring(s), #CM.queue, same, n))
+		end
+	elseif st == "saving" then
+		local f = io.open(K.BASE .. "tpf2_sync_sent.txt", "r")
+		if f then
+			local name = f:read("*l") or "?"; f:close()
+			os.remove(K.BASE .. "tpf2_sync_sent.txt")
+			CM.syncState = "waiting"
+			log(string.format("SYNC: save shared (%s) -- holding until the newcomer loads it", name))
+		end
+	elseif st == "waiting" then
+		local want = (CM.rosterPlayers or 0) - 1
+		if n >= want and same == n and n > 0 then
+			CM.syncEnd(string.format("everyone in (%d peer(s) at our step) -- resuming at %g", n, CM.syncSpeedBefore or 1))
+		elseif (CM.ticks % 50) == 0 then
+			log(string.format("SYNC: waiting -- %d/%d peer(s) in, %d at our step", n, want, same))
+		end
+	end
 end
 
 function CM.paceV2(now, lead)
@@ -527,8 +605,11 @@ function CM.paceV2(now, lead)
 		local req = CM.speedRequest()
 		local why = "lowest lever"
 		if req and eff > 0 then eff = req; why = "/speed request" end
+		CM.syncTick(now, s)
+		if CM.syncState then eff = 0; why = "sync point (" .. CM.syncState .. ")" end
 		local changed = (eff ~= CM.effSpeed)
 		CM.effSpeed = eff
+		if not changed and (CM.ticks % 25) == 0 then CM.broadcast(string.format("LSEFF v=%g", eff)) end   -- a newcomer needs it at load
 		if changed then
 			CM.broadcast(string.format("LSEFF v=%g", eff))
 			log(string.format("SPEED2: session speed -> %g (%s%s)", eff, why, auto and ", auto cap " .. tostring(CM.susCap) or ""))

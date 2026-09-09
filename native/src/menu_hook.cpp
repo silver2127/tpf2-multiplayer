@@ -1548,13 +1548,114 @@ static unsigned long readBridgePid()
     return 0;
 }
 
+// ---- HOT JOIN (sync point), 2026-09-09 ------------------------------------
+// A player who arrives mid-session needs the world at a known sim step, and the
+// only carrier is a save. "/sync" in chat (anyone) -> sync=<n> in the bridge
+// ctl -> the HOST's game script pauses the session (a pause is a sync point:
+// everyone stops at the leader's clock), drains its queue, confirms every peer
+// sits at the same step, then asks for a save by writing tpf2_sync_save.txt.
+// This DLL cannot build the engine's SaveGame command (GameMetadata,
+// screenshot, config...), but the game's own autosave can: CGameUI's update
+// (0x5741d0) accumulates microseconds at this+0x648 and calls
+// CGameUI::AutoSave (0x563500) once they exceed autosaveIntervalMinutes.
+// Setting the accumulator to INT64_MAX fires a full native autosave on the
+// next frame. When the new autosave_* file lands, the host lobby pushes it to
+// every joiner exactly as START GAME does; a joiner already in the game
+// ignores the start (its lobby latches 'started', and the DLL guards below),
+// the newcomer at the title menu loads it. The host's script keeps the session
+// paused until the newcomer's clock reports at the same step, then resumes.
+extern "C" {
+    void* g_gameUiTramp = nullptr;
+    void  GameUiRelay();
+    volatile uint64_t g_gameUi = 0;                 // UI::CGameUI 'this', per frame
+    void GameUiSeen(uint64_t rcx) { g_gameUi = rcx; }
+}
+static const uintptr_t RVA_GAMEUI_UPDATE = 0x5741d0;
+static const int       STEAL_GAMEUI      = 21;
+static const uint8_t   GAMEUI_EXPECTED[STEAL_GAMEUI] = {
+    0x48, 0x8B, 0xC4,                    // mov  rax, rsp
+    0x55, 0x56, 0x57,                    // push rbp ; push rsi ; push rdi
+    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,   // push r12..r15
+    0x48, 0x8D, 0xA8, 0x58, 0xFA, 0xFF, 0xFF,         // lea rbp, [rax-5A8h]
+};
+static const uintptr_t OFF_AUTOSAVE_ACC = 0x648;    // int64 microseconds since the last autosave
+static bool ForceAutosave()
+{
+    uint64_t ui = g_gameUi;
+    if (!ui) { Log("[sync] no CGameUI captured yet -- cannot force an autosave\n"); return false; }
+    InterlockedExchange64((volatile LONG64*)(ui + OFF_AUTOSAVE_ACC), 0x7fffffffffffffffLL);
+    Log("[sync] autosave forced (CGameUI %llx +%llx <- INT64_MAX)\n", (unsigned long long)ui, (unsigned long long)OFF_AUTOSAVE_ACC);
+    return true;
+}
+static ULONGLONG saveMtime(const wchar_t* path, ULONGLONG* size)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) { if (size) *size = 0; return 0; }
+    if (size) *size = ((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    return ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+}
+static ULONGLONG g_syncBaseline = 0, g_syncAskedAt = 0, g_syncLastSize = 0;
+static wchar_t   g_syncSave[600] = L"";
+static void SyncPoll()
+{
+    wchar_t req[MAX_PATH]; _snwprintf_s(req, _TRUNCATE, L"%stpf2_sync_save.txt", g_dataDirW);
+    if (GetFileAttributesW(req) != INVALID_FILE_ATTRIBUTES) {
+        DeleteFileW(req);
+        if (!InterlockedCompareExchange(&g_isHost, 0, 0)) { Log("[sync] save request on a joiner -- ignored (the host saves)\n"); }
+        else if (g_syncAskedAt) { Log("[sync] save request while one is pending -- ignored\n"); }
+        else {
+            wchar_t cur[600] = L""; ULONGLONG sz = 0;
+            g_syncBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
+            g_syncLastSize = 0; g_syncSave[0] = 0;
+            if (ForceAutosave()) { g_syncAskedAt = GetTickCount64(); SetStatus("Sync: saving\xE2\x80\xA6"); }
+        }
+    }
+    if (!g_syncAskedAt) return;
+    wchar_t cur[600] = L""; ULONGLONG sz = 0;
+    if (newestSave(cur, 600)) {
+        ULONGLONG mt = saveMtime(cur, &sz);
+        if (mt > g_syncBaseline && sz > 0) {
+            // wait until the file stops growing (the sidecars are written after the .sav)
+            if (wcscmp(cur, g_syncSave) == 0 && sz == g_syncLastSize) {
+                char u[900]; WideCharToMultiByte(CP_UTF8, 0, cur, -1, u, sizeof(u), nullptr, nullptr);
+                char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
+                char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
+                LobbySend(line);
+                Log("[sync] new save %ls (%llu B) -> sharing with every joiner\n", cur, (unsigned long long)sz);
+                SetStatus("Sync: sharing the save\xE2\x80\xA6");
+                wchar_t sent[MAX_PATH]; _snwprintf_s(sent, _TRUNCATE, L"%stpf2_sync_sent.txt", g_dataDirW);
+                HANDLE h = CreateFileW(sent, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, u, (DWORD)strlen(u), &w, nullptr); CloseHandle(h); }
+                g_syncAskedAt = 0;
+                return;
+            }
+            wcscpy_s(g_syncSave, cur); g_syncLastSize = sz;
+        }
+    }
+    if (GetTickCount64() - g_syncAskedAt > 90000) {
+        Log("[sync] no new save appeared within 90 s -- giving up (is autosave writable? see the game log)\n");
+        SetStatus("Sync: the save did not appear");
+        g_syncAskedAt = 0;
+    }
+}
+
 // "/speed 2.5" typed in the lobby chat (by anyone -- the host's game script
 // applies it and broadcasts the session speed). Carried to the game script as
 // a speed= line in the bridge ctl file; "/speed off" (or 0) clears it.
+// "/sync" the same way as sync=<n> (a counter, so a repeat is a new request);
+// "/sync off" clears it.
 static char g_speedReq[16] = "";
+static int  g_syncReq = 0;
 static void writeBridgeCtl(bool isHost);
 static void speedFromChat(const char* text)
 {
+    if (strncmp(text, "/sync", 5) == 0) {
+        const char* a = text + 5; while (*a == ' ') a++;
+        if (strncmp(a, "off", 3) == 0) g_syncReq = 0; else g_syncReq++;
+        Log("[menu] chat /sync -> %d\n", g_syncReq);
+        writeBridgeCtl(g_isHost != 0);
+        return;
+    }
     if (strncmp(text, "/speed", 6) != 0) return;
     const char* a = text + 6;
     while (*a == ' ') a++;
@@ -1600,6 +1701,10 @@ static void writeBridgeCtl(bool isHost)
     if (g_speedReq[0]) {
         size_t n = strlen(content);
         snprintf(content + n, sizeof(content) - n, "speed=%s\n", g_speedReq);
+    }
+    if (g_syncReq) {
+        size_t n = strlen(content);
+        snprintf(content + n, sizeof(content) - n, "sync=%d\n", g_syncReq);
     }
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
@@ -1992,6 +2097,12 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             bool withSave = jsonBool(rem, "save", true);
                             bool saveReady = InterlockedCompareExchange(&g_saveReady, 0, 0) != 0;
                             wchar_t src[600] = L""; bool go = true;
+                            if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi) {
+                                // HOT JOIN: we are already playing; this start is the
+                                // sync save going out to a newcomer. Nothing to load here.
+                                Log("[menu] start while in game -- a sync for a newcomer, ignored here\n");
+                                go = false;
+                            }
                             if (InterlockedCompareExchange(&g_isHost, 0, 0)) {
                                 wcscpy_s(src, g_startSaveW[0] ? g_startSaveW : L""); if (!src[0]) newestSave(src, 600);
                             } else if (withSave) {
@@ -2025,6 +2136,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
             CloseHandle(h);
         }
         if (stop || WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+        SyncPoll();
         Sleep(200);
     }
     // Say why the tail ended. A lobby that exits on its own -- rather than after
@@ -2319,6 +2431,14 @@ static DWORD WINAPI Init(LPVOID)
         Log("[menu] InstallHook FAILED on CreatePage\n");
         return 0;
     }
+    // Hot join needs CGameUI's 'this' (see ForceAutosave). Capture-only detour
+    // on its per-frame update; refused, not guessed, if the prologue moved.
+    if (memcmp((void*)(g_base + RVA_GAMEUI_UPDATE), GAMEUI_EXPECTED, STEAL_GAMEUI) != 0)
+        Log("[menu] CGameUI update prologue differs from build 35924 -- hot join's forced autosave unavailable\n");
+    else if (InstallHook(g_base + RVA_GAMEUI_UPDATE, (void*)&GameUiRelay, STEAL_GAMEUI, &g_gameUiTramp))
+        Log("[menu] hooked CGameUI update at %llx (capture 'this' for the sync autosave)\n", (unsigned long long)RVA_GAMEUI_UPDATE);
+    else
+        Log("[menu] InstallHook FAILED on CGameUI update -- hot join unavailable\n");
     // Option 2 groundwork: locate Vulkan present and dump its prologue so we can
     // choose a safe steal for an in-frame overlay (external windows cannot draw
     // over this game's borderless direct-flip present).
