@@ -1,2 +1,0 @@
-native=1
-slot=0

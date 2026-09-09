@@ -117,7 +117,7 @@ Delivery mechanism and widget construction are PROVEN and working every launch:
    place BEFORE the title menu's first build. Log: `[proxy] menu load OK`.
 2. **Detour** -- `menu_hook.cpp` detours CreatePage(0x663370), steal 20 (through
    the rsp-relative `lea`, no RIP-relative). Fires `page=2` on the first main
-   page, game unaffected. build_menu.bat -> tpf2_menu.dll.
+   page, game unaffected. build.bat menu -> tpf2_menu.dll.
 3. **std::string ABI** -- built a game std::string via `83270(dest, cstr, len)`:
    `str probe: size=14 cap=15 data='mp.multiplayer'` (textbook SSO).
 4. **Native Button widget** -- `221c930(&ctx, "mp.multiplayer")` then
@@ -256,7 +256,7 @@ builder decompile (C:\tools\ghidra_out\decomp\mainmenu_ref.c):
   while the builder runs; after it returns we build/name/connect/prep/add ours.
 
 Test build (bridge/src/menu_hook.cpp, flags in tpf2_menu_flags.txt next to the
-dll -- see bridge/tpf2_menu_flags.example.txt):
+dll, one key=value per line, e.g. `native=1` and `slot=0`):
   overlay=native|classic  restyle the GDI overlay to main-menu.lua (Lato 24
                           uppercase white, padding 8/15, hover white@50, pressed
                           white@100, alpha-blended over a swapchain readback --

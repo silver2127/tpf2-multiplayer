@@ -41,14 +41,14 @@ Put "$Repo\bridge\out\tpf2_menu.dll"      (Join-Path $Game 'tpf2_menu.dll')
 # The CANONICAL name, never "whatever is newest".
 #
 # This used to be `Get-ChildItem tpf2_slice*.dll | Sort LastWriteTime | Last 1`.
-# build_slice.bat takes an optional suffix (an injected DLL stays locked for the
+# build.bat takes an optional suffix (an injected DLL stays locked for the
 # life of the game process, so iterating means building tpf2_slice_foo.dll), and
 # every one of those lands in the same out dir -- so the last experiment anyone
 # built silently became the shipped artifact, under the shipping name, with
 # nothing in the output saying which file it actually was.
 $sliceSrc = "$Repo\bridge\out\tpf2_slice.dll"
 if (-not (Test-Path $sliceSrc)) {
-    throw "missing build output: $sliceSrc -- run bridge\build_slice.bat with NO suffix argument (a suffixed build is a dev iteration and is never shipped)"
+    throw "missing build output: $sliceSrc -- run bridge\build.bat slice with NO suffix argument (a suffixed build is a dev iteration and is never shipped)"
 }
 # A suffixed build that is newer is almost always the one being worked on, and
 # shipping the stale canonical DLL instead is just as silent a failure the other

@@ -39,7 +39,7 @@ if ($Uninstall) {
     exit 0
 }
 
-if (-not (Test-Path $Proxy)) { Fail "proxy not built - run bridge\build_proxy.bat first" }
+if (-not (Test-Path $Proxy)) { Fail "proxy not built - run bridge\build.bat proxy first" }
 if (-not (Test-Path (Join-Path $Out "tpf2_bridge_mp.dll"))) {
     Fail "tpf2_bridge_mp.dll missing from $Out - the proxy loads it from there"
 }

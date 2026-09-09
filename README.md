@@ -32,9 +32,9 @@ proxy stays for it).
 
 - Windows, Steam, Transport Fever 2 (build 35924; the hook RVAs are specific to it).
 - Visual Studio 2022 Build Tools with the MSVC x64 toolchain (`cl`, `link`, `ml64`). The
-  build `.bat` files and the scripts in `tools/` (except `install_portable.ps1`) hardcode
+  `bridge\build.bat` and the scripts in `tools/` (except `install_portable.ps1`) hardcode
   the default locations, Build Tools at `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
-  (each `.bat` calls its `vcvars64.bat`) and Steam at `C:\Program Files (x86)\Steam`; with
+  (`build.bat` calls `vcvars64.bat`) and Steam at `C:\Program Files (x86)\Steam`; with
   another VS edition or Steam library, edit the path variables at the top of each script.
 - For the lobby: a frozen `netpunch\dist\netpunch.exe` (not checked in; build it with
   `cd netpunch; python -m PyInstaller --onefile --name netpunch lobby.py`), or Python 3.12
@@ -59,7 +59,7 @@ proxy stays for it).
 
 | Path | What it is |
 |---|---|
-| `bridge/` | The native side: `build_proxy.bat` (the `alut.dll` proxy and the bridge DLL: identity, relay socket, save transfer), `build_slice.bat` (the command-capture hooks), `build_menu.bat` (the Vulkan overlay lobby panel), `build_host.bat` (the plugin host shared with TpF2 Big Maps). Sources in `src/`, vendored Vulkan headers in `third_party/`. |
+| `bridge/` | The native side. One script, `build.bat <target>`: `proxy` (the `alut.dll` proxy and the bridge DLL: identity, relay socket, save transfer), `slice` (the command-capture hooks), `menu` (the Vulkan overlay lobby panel), `host` (the plugin host shared with TpF2 Big Maps), or `all`. Sources in `src/`, vendored Vulkan headers in `third_party/`. |
 | `mod/mp_lockstep_1/` | The game mod. `res/config/game_script/lockstep.lua` is the entry point; the replication logic is in `res/scripts/mp/*.lua`, one module per concern. |
 | `netpunch/` | The lobby: UDP hole punching, host-as-relay star, sealed frames, save transfer. `lobby.py` is what gets frozen into `netpunch.exe`. |
 | `installer/` | The WiX package and its custom action; `README.md` there covers building the MSI. |
@@ -71,9 +71,9 @@ proxy stays for it).
 - Lua: edit under `mod/`, run `python tools\luacheck.py`, then `tools\deploy_mod.ps1 -Mod mp_lockstep_1`
   (the game reads mods at load, so relaunch). Anything shared between the `mp` modules is a
   field of the `CM` table, never a file-scope local.
-- DLLs: `bridge\build_slice.bat` and friends write to `bridge\out`; `tools\deploy_shipping.ps1`
+- DLLs: `bridge\build.bat <target>` writes to `bridge\out`; `tools\deploy_shipping.ps1`
   puts a full set into the game folder. A DLL loaded by a running game is locked, so the build
-  scripts accept a suffix for a side-by-side build.
+  script accepts a suffix for a side-by-side build (`build.bat slice 2`).
 - Rig: `tools\mp_menu_launch.ps1 -Players 3` brings up host and joiners on one machine (Sandboxie
   for the extra instances); `tools\snapshot_logs.ps1` first, because the game truncates its logs
   on launch. `tools\soak.ps1` is the unattended regression run.

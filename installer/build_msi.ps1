@@ -5,14 +5,15 @@ Builds every shipped binary, then the TpF2 Multiplayer MSI (installer\out\TpF2Mu
 .DESCRIPTION
 Steps, in order (each one stops the script on failure):
 
-  1. bridge\build_proxy.bat   -> bridge\out\alut.dll, bridge\out\tpf2_bridge_mp.dll
-     bridge\build_menu.bat    -> bridge\out\tpf2_menu.dll
-     bridge\build_slice.bat   -> bridge\out\tpf2_slice.dll
+  1. bridge\build.bat proxy  -> bridge\out\alut.dll, bridge\out\tpf2_bridge_mp.dll
+     bridge\build.bat host   -> bridge\out\tpf2_pluginhost.dll
+     bridge\build.bat menu   -> bridge\out\tpf2_menu.dll
+     bridge\build.bat slice  -> bridge\out\tpf2_slice.dll
      A DLL that a running game has loaded stays locked, so linking to the plain
-     name fails with LNK1104. build_menu/build_slice take a name suffix: on a
+     name fails with LNK1104. The menu and slice targets take a name suffix: on a
      failure the script retries with one, copies the result over the plain name
      if it can, and otherwise packages the suffixed file under the plain name.
-     build_proxy has no suffix support; close the game if it fails.
+     The proxy target has no suffix support; close the game if it fails.
   2. python -m PyInstaller --onefile --name netpunch lobby.py  (in netpunch\)
      -> netpunch\dist\netpunch.exe. -SkipFreeze reuses an existing exe.
   3. installer\ca\build_ca.bat -> installer\out\tpf2ca.dll (the custom actions).
@@ -96,18 +97,19 @@ function Run-Bat([string]$bat, [string]$arg = "") {
     return $LASTEXITCODE
 }
 
-# Builds bridge\<bat>, retrying with a suffix when the plain output is locked.
-# Returns the path to hand to wix (plain name when possible).
-function Build-Suffixable([string]$bat, [string]$plainName) {
-    $batPath = Join-Path $Bridge $bat
+# Builds bridge\build.bat <target>, retrying with a suffix when the plain output
+# is locked. Returns the path to hand to wix (plain name when possible).
+function Build-Suffixable([string]$target, [string]$plainName) {
+    $batPath = Join-Path $Bridge "build.bat"
+    $bat     = "build.bat $target"
     $plain   = Join-Path $BridgeOut $plainName
     Say "running $bat"
-    $rc = Run-Bat $batPath
+    $rc = Run-Bat $batPath $target
     if ($rc -eq 0) { return $plain }
 
     $suffix = "_msi" + (Get-Date -Format "HHmmss")
     Warn "$bat failed (exit $rc). If that was LNK1104 the game is holding $plainName; retrying as $suffix"
-    $rc = Run-Bat $batPath $suffix
+    $rc = Run-Bat $batPath "$target $suffix"
     if ($rc -ne 0) { Fail "$bat $suffix failed too (exit $rc) -- see the compiler output above" }
 
     $built = Join-Path $BridgeOut (($plainName -replace '\.dll$', '') + "$suffix.dll")
@@ -131,14 +133,15 @@ $caDll    = Join-Path $OutDir "tpf2ca.dll"
 if ($SkipBuild) {
     Warn "-SkipBuild: packaging the existing files in bridge\out"
 } else {
-    Say "running build_proxy.bat"
-    $rc = Run-Bat (Join-Path $Bridge "build_proxy.bat")
-    if ($rc -ne 0) { Fail "build_proxy.bat failed (exit $rc). If it was LNK1104, close the game (it holds alut.dll / tpf2_bridge_mp.dll) and rerun." }
-    Say "running build_host.bat"
-    $rc = Run-Bat (Join-Path $Bridge "build_host.bat")
-    if ($rc -ne 0) { Fail "build_host.bat failed (exit $rc). If it was LNK1104, close the game (it holds tpf2_pluginhost.dll) and rerun." }
-    $menuDll  = Build-Suffixable "build_menu.bat"  "tpf2_menu.dll"
-    $sliceDll = Build-Suffixable "build_slice.bat" "tpf2_slice.dll"
+    $build = Join-Path $Bridge "build.bat"
+    Say "running build.bat proxy"
+    $rc = Run-Bat $build "proxy"
+    if ($rc -ne 0) { Fail "build.bat proxy failed (exit $rc). If it was LNK1104, close the game (it holds alut.dll / tpf2_bridge_mp.dll) and rerun." }
+    Say "running build.bat host"
+    $rc = Run-Bat $build "host"
+    if ($rc -ne 0) { Fail "build.bat host failed (exit $rc). If it was LNK1104, close the game (it holds tpf2_pluginhost.dll) and rerun." }
+    $menuDll  = Build-Suffixable "menu"  "tpf2_menu.dll"
+    $sliceDll = Build-Suffixable "slice" "tpf2_slice.dll"
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
