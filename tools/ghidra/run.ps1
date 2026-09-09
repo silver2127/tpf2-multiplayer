@@ -3,11 +3,11 @@
 Run ONE Ghidra headless script against the already-analysed TpF2 project.
 
 .DESCRIPTION
-ghidra_extract.ps1 hardcodes ExportClassMap + DecompileTargets. This is the
+extract.ps1 hardcodes ExportClassMap + DecompileTargets. This is the
 generic form, so a new query does not need a new wrapper.
 
-  ghidra_run.ps1 DumpStringXrefs.java C:\tools\ghidra_out 4
-  ghidra_run.ps1 FindTypeUsage.java   C:\tools\ghidra_out\x Builder Toolkit
+  run.ps1 DumpStringXrefs.java C:\tools\ghidra_out 4
+  run.ps1 FindTypeUsage.java   C:\tools\ghidra_out\x Builder Toolkit
 
 A Ghidra project is locked to ONE process at a time: never run two of these
 concurrently, the second will fail on the lock file.

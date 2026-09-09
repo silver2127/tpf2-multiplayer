@@ -55,6 +55,29 @@ proxy stays for it).
    all machines; each player opens **Load Game** and picks it. A joiner whose transfer
    failed is told to have the host press START GAME again.
 
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `bridge/` | The native side: `build_proxy.bat` (the `alut.dll` proxy and the bridge DLL: identity, relay socket, save transfer), `build_slice.bat` (the command-capture hooks), `build_menu.bat` (the Vulkan overlay lobby panel), `build_host.bat` (the plugin host shared with TpF2 Big Maps). Sources in `src/`, vendored Vulkan headers in `third_party/`. |
+| `mod/mp_lockstep_1/` | The game mod. `res/config/game_script/lockstep.lua` is the entry point; the replication logic is in `res/scripts/mp/*.lua`, one module per concern. |
+| `netpunch/` | The lobby: UDP hole punching, host-as-relay star, sealed frames, save transfer. `lobby.py` is what gets frozen into `netpunch.exe`. |
+| `installer/` | The WiX package and its custom action; `README.md` there covers building the MSI. |
+| `tools/` | Developer scripts: deploy the mod, build and ship the DLLs, launch the multi-instance rig, run the soak test, check the Lua. `tools/ghidra/` and `tools/re/` are the reverse-engineering helpers. |
+| `docs/` | Current design and status notes; `docs/re/` the reverse-engineering findings the hooks rest on; `docs/history/` the milestone reports from the first phase. |
+
+## Developing
+
+- Lua: edit under `mod/`, run `python tools\luacheck.py`, then `tools\deploy_mod.ps1 -Mod mp_lockstep_1`
+  (the game reads mods at load, so relaunch). Anything shared between the `mp` modules is a
+  field of the `CM` table, never a file-scope local.
+- DLLs: `bridge\build_slice.bat` and friends write to `bridge\out`; `tools\deploy_shipping.ps1`
+  puts a full set into the game folder. A DLL loaded by a running game is locked, so the build
+  scripts accept a suffix for a side-by-side build.
+- Rig: `tools\mp_menu_launch.ps1 -Players 3` brings up host and joiners on one machine (Sandboxie
+  for the extra instances); `tools\snapshot_logs.ps1` first, because the game truncates its logs
+  on launch. `tools\soak.ps1` is the unattended regression run.
+
 ## Contributing and credits
 
 Issues and pull requests are welcome, especially reproductions with the logs from

@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #define VK_NO_PROTOTYPES
-#include "vk/vulkan_core.h"
+#include "../third_party/vk/vulkan_core.h"
 #include "hook.h"
 #include "datadir.h"
 

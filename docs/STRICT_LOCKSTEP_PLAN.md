@@ -1,5 +1,10 @@
 # STRICT lockstep for every replicated player action — engineering plan
 
+> **Note (2026-09-08, after the split):** `lockstep.lua` line numbers below refer to
+> the single-file version at commit `302974a`. The file has since been split into
+> `res/scripts/mp/*.lua` (see the layout comment at the top of `lockstep.lua`);
+> search by symbol or log string instead.
+
 Build 35924, ImageBase `0x140000000`; every address below is an RVA. Line
 numbers are against `bridge/src/slice_hook.cpp` (2678 lines) and
 `mod/mp_lockstep_1/res/config/game_script/lockstep.lua` (10464 lines) as of

@@ -1,5 +1,6 @@
-# build output (DLLs, objects, import libs) -- rebuild with bridge/build_*.bat
+# build output -- rebuild with bridge/build_*.bat, installer/build_msi.ps1
 bridge/out/
+installer/out/
 *.obj
 *.exp
 *.lib
@@ -9,13 +10,12 @@ bridge/out/
 # frozen lobby exe -- rebuild with PyInstaller, see docs/PORTABILITY.md
 netpunch/dist/
 netpunch/build/
-*.spec.bak
 
 # python
 __pycache__/
 *.pyc
 
-# runtime state written by the lobby / harness / game hooks
+# runtime state written by the lobby, the rig scripts and the game hooks
 netpunch/lobby_in.jsonl
 netpunch/lobby_out.jsonl
 netpunch/lobby_state.json
@@ -24,7 +24,6 @@ netpunch/*_out.txt
 netpunch/*_err.txt
 netpunch/netpunch_status.txt
 netpunch/incoming_save.*
-tools/.autotest_offset
 tools/shots/
 *.log
 *.lastsession
@@ -37,10 +36,4 @@ tools/shots/
 backup/
 .claude/
 *.orig
-
-# installer build output and PyInstaller work dir
-installer/out/
-netpunch/build/
-
-# local audit notes (not shipped)
 docs/audit.md

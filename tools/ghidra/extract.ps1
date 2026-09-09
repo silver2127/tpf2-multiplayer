@@ -4,7 +4,7 @@ Run the extraction scripts against the already-analysed Ghidra project.
 
 .DESCRIPTION
 Fast (seconds to minutes) because -noanalysis reuses the analysis that
-ghidra_analyze.ps1 already paid 24 minutes for. Safe to re-run.
+analyze.ps1 already paid 24 minutes for. Safe to re-run.
 
   ExportClassMap    -> classes.csv, class_methods.csv, vftables.csv
   DecompileTargets  -> <label>.c and <label>.fields.txt per target

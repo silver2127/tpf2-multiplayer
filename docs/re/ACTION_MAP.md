@@ -449,7 +449,7 @@ town growth.
 | `tools/ghidra_scripts/DumpVtables.java` | RTTI vftable contents → `vtable_dump.csv` |
 | `tools/ghidra_scripts/DumpCallEdges.java` | whole direct call graph → `call_edges.csv` |
 | `tools/ghidra_scripts/DumpPtrTable.java` | raw function-pointer table, following thunks |
-| `tools/ghidra_run.ps1` | generic single-script headless runner |
+| `tools/ghidra/run.ps1` | generic single-script headless runner |
 | `tools/funcsig.py` | `strings.csv` → `funcsig.csv` (the symbol table) |
 | `tools/func2src.py` | `strings.csv` → `func2src.csv` / `src2func.csv` |
 | `tools/src_ranges.py` | source file → address range |
@@ -458,6 +458,6 @@ town growth.
 | `tools/cmdmap.py` | regenerates the per-action table above |
 
 Outputs live in `C:\tools\ghidra_out\`. Regenerate with
-`ghidra_run.ps1 DumpStringXrefs.java C:\tools\ghidra_out 4`, then
+`toolsghidraun.ps1 DumpStringXrefs.java C:\tools\ghidra_out 4`, then
 `funcsig.py` and `func2src.py`. **Never run two Ghidra scripts concurrently** —
 the project is locked to one process.
