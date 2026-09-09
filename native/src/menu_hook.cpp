@@ -1583,8 +1583,8 @@ static bool ForceAutosave()
 {
     uint64_t ui = g_gameUi;
     if (!ui) { Log("[sync] no CGameUI captured yet -- cannot force an autosave\n"); return false; }
-    InterlockedExchange64((volatile LONG64*)(ui + OFF_AUTOSAVE_ACC), 0x7fffffffffffffffLL);
-    Log("[sync] autosave forced (CGameUI %llx +%llx <- INT64_MAX)\n", (unsigned long long)ui, (unsigned long long)OFF_AUTOSAVE_ACC);
+    InterlockedExchange64((volatile LONG64*)(ui + OFF_AUTOSAVE_ACC), 0x4000000000000000LL);   // not INT64_MAX: the frame adds dt first and would overflow negative
+    Log("[sync] autosave forced (CGameUI %llx +%llx <- 2^62 us)\n", (unsigned long long)ui, (unsigned long long)OFF_AUTOSAVE_ACC);
     return true;
 }
 static ULONGLONG saveMtime(const wchar_t* path, ULONGLONG* size)
