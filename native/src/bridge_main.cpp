@@ -558,6 +558,9 @@ static DWORD WINAPI CtlThread(LPVOID)
     // 0.5, ...). Absent, empty or 0 = off (the engine's own speed). Written by
     // the Lua / the panel; read here so the sim thread never touches a file.
     const std::wstring speedPath = g_dataDir + L"tpf2_speed.txt";
+    // A target left behind by a previous session would dither THIS game from
+    // its first frame (seen 2026-09-09: a stale 0.5 made speed 4 slower than 1).
+    if (DeleteFileW(speedPath.c_str())) Log("[speed] removed a stale tpf2_speed.txt from a previous session\n");
     std::string last, cur, lastSpeed, curSpeed;
     while (!g_stopping) {
         Sleep(500);

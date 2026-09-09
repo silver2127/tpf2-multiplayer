@@ -193,6 +193,11 @@ function CM.leverOf(v)
 	if v == math.floor(v) then return v end
 	return math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v + 0.5)))
 end
+-- No dither target survives a load: the bridge deletes the file at game
+-- start and this does it again at script load, so a leftover fraction from
+-- the last session cannot slow this one from its first frame.
+pcall(function() os.remove(K.BASE .. "tpf2_speed.txt") end)
+CM.ditherCur = ""
 function CM.setDither(v)
 	local want = (v and v ~= math.floor(v)) and string.format("%.4f", v) or ""
 	if CM.ditherCur == want then return end
