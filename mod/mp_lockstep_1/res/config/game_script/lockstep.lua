@@ -976,17 +976,25 @@ function data()
 				-- Sandboxie each box has its own copy of the data dir, so the native
 				-- instance never sees a boxed one's file, and a stale file is a dead
 				-- session (review, 2026-09-01: A showed a+b, B and C showed a+b+c).
+				-- the GUI state never runs the engine-side identity detection: read
+				-- the identity file here, or every instance's window thinks it is "a"
+				-- (B's "new company" click went into lockstep_inject_a.txt, 2026-09-09)
+				if not K.INSTANCE then pcall(CM.detectInstance) end
 				local own = K.INSTANCE or "a"
 				local ownKv = readDash(own)
 				local ownWall = ownKv and tonumber(ownKv.wall) or nil
 				local peerInfo = {}
 				if ownKv and ownKv.peers and ownKv.peers ~= "-" then
-					for o, pt, sk, vd in ownKv.peers:gmatch("(%a):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
+					for o, pt, sk, vd in ownKv.peers:gmatch("(%a+):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
 						peerInfo[o] = { t = pt, skew = sk, verdict = vd }
 					end
 				end
 				local present, fresh = {}, {}
-				for letter in ("abcdefgh"):gmatch(".") do
+				local letters, seenL = {}, {}
+				for l in ("abcdefgh"):gmatch(".") do letters[#letters + 1] = l; seenL[l] = true end
+				if not seenL[own] then letters[#letters + 1] = own; seenL[own] = true end
+				for o in pairs(peerInfo) do if not seenL[o] then letters[#letters + 1] = o; seenL[o] = true end end
+				for _, letter in ipairs(letters) do
 					local isPresent = (letter == own) or (peerInfo[letter] ~= nil)
 					local kv = (letter == own) and ownKv or readDash(letter)
 					if kv then
