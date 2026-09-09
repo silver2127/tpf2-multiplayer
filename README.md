@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Lockstep multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Unofficial,
+**Real multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Unofficial,
 reverse-engineered, and written without access to the engine source. Two or more players build in
 one world at the same time: roads, rails, stations, depots, vehicles and lines made by one
 player appear on the other's map, executed at the same in-game moment. Two modes share
@@ -23,19 +23,10 @@ registry value; big saves load about 15x faster, see `installer/README.md`). Run
 files go to `%LOCALAPPDATA%\tpf2mp\data`. Installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order.
 
-Never copy the mod into `userdata\<id>\1066780\local\mods`: the game treats a mod
-loaded from there as a different mod (`!mp_lockstep`), and saves made with it refuse to
-load on machines that installed it normally.
-
 **Uninstalling:** run the same MSI again and choose **Remove**, or use *Apps* in
 Windows settings. Either removes every file it added and puts the game's own
 `alut.dll` back (unless TpF2 Big Maps is still installed, in which case the shared
 proxy stays for it).
-
-**Developers** -- everything below is what the scripts in `tools/` do; read each one
-before running it. They modify a file in your game folder and copy files into your
-Steam directories. `tools/deploy_shipping.ps1` lays the game folder out exactly as the
-MSI does, from the build outputs.
 
 **Prerequisites**
 
