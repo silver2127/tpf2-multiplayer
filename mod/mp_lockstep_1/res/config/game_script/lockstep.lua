@@ -172,7 +172,7 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the barrier section.
 K.PEER_STALE_TICKS = 25
-K.HASH_EVERY_GAMETIME = 4 -- ~2 game days between desync checks, on a small map
+K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
 -- ~400 ms, and at the base cadence that is ~10% of wall time spent inside our
 -- own bookkeeping -- which is what "it feels laggy" actually was.

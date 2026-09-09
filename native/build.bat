@@ -79,9 +79,10 @@ exit /b 0
 %CC% /c src\speedhook.cpp /Fo:out\speedhook_mp.obj                                   || exit /b 1
 %CC% /c src\buyhook.cpp /Fo:out\buyhook_mp.obj                                       || exit /b 1
 ml64 /nologo /c /Fo out\simsteprelay_mp.obj src\simsteprelay.asm                     || exit /b 1
+ml64 /nologo /c /Fo out\cgamesteprelay_mp.obj src\cgamesteprelay.asm                 || exit /b 1
 ml64 /nologo /c /Fo out\buyrelay_mp.obj src\buyrelay.asm                             || exit /b 1
 %CC% /c src\bridge_main.cpp /Fo:out\bridge_mp.obj                                    || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\savexfer_mp.obj out\hook_mp.obj out\simhook_mp.obj out\speedhook_mp.obj out\simsteprelay_mp.obj out\buyhook_mp.obj out\buyrelay_mp.obj out\bridge_mp.obj || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\savexfer_mp.obj out\hook_mp.obj out\simhook_mp.obj out\speedhook_mp.obj out\cgamesteprelay_mp.obj out\simsteprelay_mp.obj out\buyhook_mp.obj out\buyrelay_mp.obj out\bridge_mp.obj || exit /b 1
 %CC% /LD src\proxy_alut.cpp /Fe:out\alut.dll /Fo:out\proxy_alut.obj                  || exit /b 1
 exit /b 0
 
