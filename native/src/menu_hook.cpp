@@ -506,7 +506,8 @@ static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.60f;
 static int   g_flagFontPx = 0;
 static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
-static int   g_flagRelayAutosaveMin = 10;   // relay lobbies: the leader uploads a fresh save this often (0 = never)
+static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
+static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
 static bool  g_latoLoaded = false;
 static void ReadFlags()
 {
@@ -2086,6 +2087,7 @@ static void applyRoster(const char* s)
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
     jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
     InterlockedExchange(&g_lobbyRelay, jsonBool(s, "relay", false) ? 1 : 0);
+    InterlockedExchange(&g_storedAge, jsonInt(s, "stored_age")); InterlockedExchange(&g_storedMax, jsonInt(s, "stored_max"));
     // relay lobbies: the relay assigns every player a sticky origin letter
     for (int i = 0; i < g_playerCount; i++) g_letters[i][0] = 0;
     { const char* lm = strstr(s, "\"letters\"");
@@ -2118,8 +2120,15 @@ static void applyRoster(const char* s)
     static int lastCount = 0;
     bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
     if (isHost && inGame && count > lastCount && lastCount > 0) {
-        char why[96]; snprintf(why, sizeof(why), "hot join: roster %d -> %d", lastCount, count);
-        SyncStart(why);
+        LONG age = InterlockedCompareExchange(&g_storedAge, 0, 0), mx = InterlockedCompareExchange(&g_storedMax, 0, 0);
+        if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0) && age >= 0 && mx > 0 && age <= mx) {
+            // the relay holds a copy fresh enough to serve the newcomer itself
+            // (the periodic upload keeps it that way): no autosave, no upload here
+            Log("[menu] hot join: roster %d -> %d -- the relay serves its %ld s old world, no sync taken\n", lastCount, count, age);
+        } else {
+            char why[96]; snprintf(why, sizeof(why), "hot join: roster %d -> %d", lastCount, count);
+            SyncStart(why);
+        }
     }
     lastCount = count;
 }

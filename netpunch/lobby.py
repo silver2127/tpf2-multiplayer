@@ -203,7 +203,9 @@ CHUNK_LOCAL = 8192          # bytes of file data per chunk when every target pee
                             # loopback it just multiplies the per-datagram cost.
                             # NOT used on a LAN: 8 KB fragments at 1500 MTU and one
                             # lost fragment loses the whole chunk.
-CHUNK_DATA = 1200           # bytes of file data per chunk. Datagram on the wire =
+CHUNK_DATA = 1350           # bytes of file data per chunk (1200 until 2026-09-10: +12% per
+                            # datagram; 1350+17+28 = 1395 B stays under a 1492 PPPoE MTU and
+                            # a 1400 B VPN MTU; every path measured so far is v4). Wire =
                             # NP1 frame(5) + chunk header(12) + 1200 = 1217 bytes,
                             # under the 1280 IPv6 min-MTU and 1500 v4 MTU (even
                             # through PPPoE/VPN overhead) -- no fragmentation.
@@ -1541,6 +1543,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 pass
         return letters[name]
 
+    HOTJOIN_STORED_MAX = 180.0                # a late joiner is served from the stored world when it is this fresh
+
+    def stored_age():
+        _p, age = stored_save()
+        return int(age) if age is not None else -1
+
     def stored_save():
         """relay-only: the last save uploaded here, if any (path, age seconds)."""
         path = os.path.join(io.dir, INCOMING_BASENAME + ".sav")
@@ -1611,6 +1619,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             _send_data(sock, a, {"t": "roster", "players": players,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only,
+                                 "stored_age": stored_age() if relay_only else -1,
+                                 "stored_max": int(HOTJOIN_STORED_MAX) if relay_only else -1,
                                  "letters": {p2["name"]: letter_for(p2["name"]) for p2 in peers.values()} if relay_only else None,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
@@ -1706,6 +1716,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         _send_data(sock, addr, {"t": "welcome",
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "lobby": lobby_name, "relay": relay_only})
+        if relay_only and started[0] and addr != leader_addr() and not peers[addr].get("started"):
+            age = stored_age()
+            if 0 <= age <= HOTJOIN_STORED_MAX:
+                _send_data(sock, addr, {"t": "status", "state": "connected",
+                                        "detail": f"joining the running game: the relay is sending you its world ({age} s old)\u2026"})
+                log(f"[relay] late joiner {peers[addr]['name']!r}: serving the stored world ({age} s old), no sync from the leader")
+            else:
+                _send_data(sock, addr, {"t": "status", "state": "connected",
+                                        "detail": "joining the running game: waiting for the leader's save\u2026"})
         if relay_only and not started[0] and addr == leader_addr() and transfer[0] is None and upload[0] is None:
             # a fresh session and the relay holds the world: continue it right
             # away -- the leader receives the save like any joiner and starts
@@ -1717,7 +1736,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[relay] fresh session with a stored save ({int(age)} s old): resuming for {peers[addr]['name']!r} in {int(RESUME_GRACE)} s unless /new")
                 pending_resume[0] = (addr, time.time() + RESUME_GRACE)
         roster_changed()
-        if late:
+        if late and not relay_only:   # a relay tells late joiners what it is doing itself (above)
             # A late joiner is NOT started: it has no save (a save start) and
             # nobody is in the lobby to sync with. Tell it why; the host has to
             # press START GAME again to bring it in.
@@ -2138,7 +2157,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
                 last_serve_check[0] = now
                 waiting = [a for a in peers if not peers[a].get("started")]
-                if waiting and os.path.isfile(last_shared[0]) and (not relay_only or leader_addr() not in waiting):
+                fresh = (not relay_only) or (0 <= stored_age() <= HOTJOIN_STORED_MAX)
+                if waiting and fresh and os.path.isfile(last_shared[0]) and (not relay_only or leader_addr() not in waiting):
                     log(f"[host] {len(waiting)} peer(s) waiting for the save -- pushing it again")
                     begin_save_transfer(last_shared[0])
             # relay-only: the leader's upload
@@ -2475,7 +2495,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 io.emit({"type": "roster", "players": players,
                          "you": assigned[0], "host": m.get("host"),
                          "lobby": m.get("lobby", ""), "companies": companies,
-                         "relay": is_relay[0], "letters": m.get("letters") or {}})
+                         "relay": is_relay[0], "letters": m.get("letters") or {},
+                         "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1)})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
                                started=started[0])
