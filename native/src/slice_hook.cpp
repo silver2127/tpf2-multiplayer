@@ -120,8 +120,8 @@ static const int ID_CMDADD        = 1;
 // widget's speed controls only: UI::Clock::TogglePause and the clock's two
 // other calls, identified by the factory's return address (docs/re/COMMANDS.md).
 // Every other caller (the menu switching to the game, CGameUI::GameStep, the
-// camera-path tool, a debug view) is left alone, and the Lua maker builds its
-// command without the factory, so pacing's own speed changes never come here.
+// camera-path tool, a debug view, and the Lua maker that pacing's own speed
+// changes go through, which returns to 0xc17eff) is left alone.
 static const int ID_SETGAMESPEED = 15;
 static const uintptr_t CALLER_SPEED_BUTTONS[] = { 0x4efb8f, 0x4f0097, 0x4f26ef };
 static const int BLOB_SIZE = 48;

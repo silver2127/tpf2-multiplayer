@@ -124,6 +124,8 @@ function newInst(spec)
     if not CM[nm] then CM[nm] = function() end; SIM.stubbed = (SIM.stubbed or "") .. nm .. " " end
   end
   CM.lastSetSpeed, CM.paceApplied, CM.paceSetTick = I.lever, true, -100
+  -- native=true: a game whose lever pacing never set (the save's own speed), as a live host
+  if spec.native then CM.lastSetSpeed, CM.paceApplied, CM.paceSetTick = nil, nil, nil end
   if spec.ceil then CM.myCeiling = spec.ceil end
   SIM.series[spec.letter] = {}
   return I
@@ -264,7 +266,7 @@ SCENARIOS = {
         actions = { {tick=60, who="a", kind="lever", value=0}, {tick=300, who="a", kind="lever", value=1} } }''',
     # the host's speed buttons drive the session (clicks the slice cancelled); a joiner's is ignored
     'host_buttons': '''{ ticks = 900,
-        insts = { {letter="a", T0=2000, lever=4, start=1}, {letter="b", T0=2000, lever=4, start=1},
+        insts = { {letter="a", T0=2000, lever=4, start=1, native=true}, {letter="b", T0=2000, lever=4, start=1},
                   {letter="c", T0=2000, lever=4, start=1} },
         actions = { {tick=150, who="a", kind="button", value=1}, {tick=300, who="b", kind="button", value=4},
                     {tick=450, who="a", kind="button", value=0}, {tick=600, who="a", kind="button", value=2} } }''',

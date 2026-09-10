@@ -436,7 +436,12 @@ function CM.paceV2(now)
 	local prevS = CM.spd2LastS
 	CM.spd2LastS = s
 	if CM.isLeader() then
-		if settled and not ours and s ~= CM.myCeiling then
+		-- A lever that has not moved is not the player's choice while the ceiling
+		-- came from a speed button: the button's speed reaches the lever only when
+		-- pacing applies it. A host whose lever pacing had never set read its old
+		-- speed back here and undid every click (2026-09-10).
+		local unmovedAfterButton = CM.ceilByButton and s == prevS
+		if settled and not ours and s ~= CM.myCeiling and not unmovedAfterButton then
 			if s == 0 then
 				CM.spd2ZeroSince = CM.spd2ZeroSince or CM.ticks
 				if CM.ticks - CM.spd2ZeroSince >= CM.SPD2_PAUSE_TICKS then
@@ -464,7 +469,7 @@ function CM.paceV2(now)
 		end
 		-- The host's player pressed play (a hand-set non-zero speed after a 0, or
 		-- while the session's effective speed is 0): that unpauses the SESSION.
-		if settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
+		if settled and not ours and not unmovedAfterButton and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
 			CM.hostUnpause(s)
 		end
 	end
