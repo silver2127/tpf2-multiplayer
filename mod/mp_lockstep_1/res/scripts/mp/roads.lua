@@ -739,6 +739,31 @@ function CM.execPolyline(c, planOnly)
 				CM.cmLog("XING-API: api.cmd.make *cross/street/track*: " .. table.concat(cmdn, ", "))
 			end)
 		end
+		-- Node positions are read ONCE per proposal: the per-segment scan below
+		-- used to call getComponent on every map node (10k) for every segment (a
+		-- 23-segment rail = 230k component reads, seconds of stall at the click).
+		local xingNodes = nil
+		local function xingNodeList()
+			if xingNodes then return xingNodes end
+			xingNodes = {}
+			for _, getter in ipairs({ api.engine.system.streetSystem.getNode2StreetEdgeMap, api.engine.system.streetSystem.getNode2TrackEdgeMap }) do
+				local m
+				pcall(function() m = getter() end)
+				if m then
+					for nid, edges in pairs(m) do
+						local nc = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
+						local pnode = nc and nc.position
+						if pnode then
+							local ids = {}
+							for _, eid in pairs(edges) do if eid > 0 then ids[#ids + 1] = eid end end
+							xingNodes[#xingNodes + 1] = { pnode.x or pnode[1], pnode.y or pnode[2], ids }
+						end
+					end
+				end
+			end
+			return xingNodes
+		end
+		local xingDebug = CM.cfgFlag("xing_debug", false)
 		local function crossingsFor(k, n0, n1, x0, y0, z0, x1, y1, z1, T0, T1)
 			local hits = {}
 			if not isTrack then return hits end
@@ -758,27 +783,17 @@ function CM.execPolyline(c, planOnly)
 			local cand, considered = {}, 0
 			local nMap, nIn, minD = 0, 0, 1e9
 			local mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-			for _, getter in ipairs({ api.engine.system.streetSystem.getNode2StreetEdgeMap, api.engine.system.streetSystem.getNode2TrackEdgeMap }) do
-				local m
-				pcall(function() m = getter() end)
-				if m then
-					for nid, edges in pairs(m) do
-						nMap = nMap + 1
-						local nc = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
-						local pnode = nc and nc.position
-						if pnode then
-							local px, py = pnode.x or pnode[1], pnode.y or pnode[2]
-							local d = math.sqrt((px - mx) ^ 2 + (py - my) ^ 2); if d < minD then minD = d end
-							if px >= minx and px <= maxx and py >= miny and py <= maxy then
-								nIn = nIn + 1
-								for _, eid in pairs(edges) do if eid > 0 then cand[eid] = true end end
-							end
-						end
-					end
+			for _, nd in ipairs(xingNodeList()) do
+				nMap = nMap + 1
+				local px, py = nd[1], nd[2]
+				if px >= minx and px <= maxx and py >= miny and py <= maxy then
+					nIn = nIn + 1
+					for _, eid in ipairs(nd[3]) do cand[eid] = true end
+					local d = math.sqrt((px - mx) ^ 2 + (py - my) ^ 2); if d < minD then minD = d end
 				end
 			end
-			CM.cmLog(string.format("XING: seg %d bbox x[%.0f,%.0f] y[%.0f,%.0f] mid=(%.0f,%.0f) mapNodes=%d inBox=%d nearestNode=%.1f m",
-				k, minx, maxx, miny, maxy, mx, my, nMap, nIn, minD))
+			if xingDebug then CM.cmLog(string.format("XING: seg %d bbox x[%.0f,%.0f] y[%.0f,%.0f] mid=(%.0f,%.0f) mapNodes=%d inBox=%d nearestNode=%.1f m",
+				k, minx, maxx, miny, maxy, mx, my, nMap, nIn, minD)) end
 			for eid in pairs(cand) do
 				considered = considered + 1
 				local comp, ra, rb, rta, rtb = CM.edgeGeomT(eid)
@@ -864,7 +879,7 @@ function CM.execPolyline(c, planOnly)
 							end
 						else hits[#hits + 1] = { eid = eid, ru = bestRu, u = bestU }; reason = "CROSSING (mid-edge split)" end
 					end
-					CM.cmLog(string.format("XING: seg %d vs street edge %d: closest %.2f m (road u=%.2f, rail u=%.2f) -> %s",
+					if xingDebug or reason == nil then CM.cmLog(string.format("XING: seg %d vs street edge %d: closest %.2f m (road u=%.2f, rail u=%.2f) -> %s",
 						k, eid, dist, bestRu or -1, bestU or -1, reason))
 				end
 			end
