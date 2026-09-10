@@ -93,21 +93,47 @@ end
 
 -- Prime knownVeh from every player depot once constructions are primed.
 function CM.primeVehKeys()
+	-- DEPOT-PARKED SAVE VEHICLES (2026-09-10). A vehicle parked in a depot is
+	-- not a world entity, so the getEntities pass below never listed it and it
+	-- had no s:<id> key. Every command on it stayed on the instance that issued
+	-- it: a strict line assignment was cancelled natively and then had nothing
+	-- to ship, so a parked train could not be put on a line at all (live,
+	-- vehicle 228769, twice), and a purchase into its depot could bind to it as
+	-- the "new" vehicle. transportVehicleSystem lists parked vehicles. The list
+	-- is taken on the FIRST call, before anything can be bought: a vehicle
+	-- bought in the seconds before priming binds to its purchase key instead.
+	if not CM.vehParkedAtLoad then
+		CM.vehParkedAtLoad = {}
+		pcall(function()
+			local st = api.type.enum.TransportVehicleState.IN_DEPOT
+			if st == nil then return end
+			local parked = api.engine.system.transportVehicleSystem.getVehiclesWithState(st)
+			for i = 1, #parked do CM.vehParkedAtLoad[#CM.vehParkedAtLoad + 1] = parked[i] end
+		end)
+	end
 	-- consByKey fills at K.PRIME_PER_TICK per tick after consPrimed; priming the
 	-- depot lists before that drained saw an empty table ('primed 0'), and a
 	-- purchase would then have resolved to an OLD parked vehicle. Wait for the
 	-- queue, and treat every save vehicle as known regardless.
 	if vehPrimed or not CM.consPrimed or #CM.primeQueue > 0 then return end
 	vehPrimed = true
-	local n = 0
 	pcall(function()
 		local all = game.interface.getEntities({ radius = 999999 },
 			{ type = "VEHICLE", includeData = false }) or {}
 		for _, v in pairs(all) do CM.primedVeh[v] = true; knownVeh[v] = true end
 	end)
+	local nParked = 0
+	for _, v in ipairs(CM.vehParkedAtLoad) do
+		-- still there, and not bound to a purchase key in the meantime
+		if not CM.primedVeh[v] and not CM.vehKeyOf[v] then
+			local alive = false
+			pcall(function() alive = api.engine.entityExists(v) end)
+			if alive then CM.primedVeh[v] = true; knownVeh[v] = true; nParked = nParked + 1 end
+		end
+	end
 	local np = 0
 	for _ in pairs(CM.primedVeh) do np = np + 1 end
-	log(string.format("veh: primed %d save vehicle(s) as known / s:<id>", np))
+	log(string.format("veh: primed %d save vehicle(s) as known / s:<id>, %d of them parked in depots", np, nParked))
 end
 
 -- forward: CM.shipVehCap/drainVehCap (below) sell through forgetVehicle, which
