@@ -81,8 +81,8 @@ observed in play.
 - **The second joiner on one machine loses its panel.** The overlay's present hook faults
   (`myPresent FAULT exc=c0000005`), is caught, and stops drawing; joining, the save transfer
   and loading still work.
-- **Panel messages claim the world loads by itself** (relay leader, hot join). Loading is always
-  manual: LOAD GAME → mp_shared.
+- **A player already inside a game loads the shared save by hand.** At the title menu the
+  panel starts it in-process; from inside a game it asks for LOAD GAME, then mp_shared.
 - **A code taken straight from the clipboard with trailing whitespace is rejected** *(from the
   code)*: pressing JOIN GAME without first clicking the code field validates the clipboard text before
   trimming its end. Clicking the field pastes a cleaned copy.
@@ -113,7 +113,6 @@ and remain in git history at the `v0.4.10` tag:
 | Strict mode for the remaining actions (vehicle flags, loans through the `Book` factory, terraform, line creation, in-place node edits) | `git show v0.4.10:docs/STRICT_LOCKSTEP_PLAN.md` |
 | Hardening strict station placement and module edits (lossy-walk refusal, per-file allowlist, broadcast rollback) | `git show v0.4.10:docs/STATION_STRICT_PLAN.md` |
 | Peer-to-peer distribution of the save (`netpunch/swarm.py` exists, unwired) | `git show v0.4.10:docs/SWARM_TRANSFER.md` |
-| Loading a save in-process through `CMenuUI::StartSavegame` | [re/GAME_LOOP_AND_UI.md](re/GAME_LOOP_AND_UI.md#loading-a-save) |
 | Notes toward a Transport Fever 3 port | `git show v0.4.10:docs/tf3_plan.md` |
 
 The first-phase milestone reports (M1-M10), the original recon report and the old status logs

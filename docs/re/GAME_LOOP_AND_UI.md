@@ -70,16 +70,34 @@ defined in [README.md](README.md).
 - **`CONTINUE` loads the save named in `profile.lua`** (`lastGame[2].saveGameName` under
   `userdata\<steamid>\1066780\local\`), not the newest file. Two instances with different
   profiles load different worlds. [MEASURED]
-- **The in-process load chain** (mapped, not called by the mod):
+- **The in-process load chain, called by the mod to load the shared save.**
   `UI::CMenuUI::StartSavegame(const LoadGameParams&, const SavegameInfo&)` `0x6785c0` is
   where every UI load path converges (callers in `gameui.cpp`, `ingamemenuui.cpp`,
-  `menuui.cpp`; guard `this+0x1988` = "Game initialization is already active!").
-  `platform::StandardSaveGameBackend::GetSavegameInfo(const SaveGameId&)` `0x2471830` builds
-  a SavegameInfo (SaveGameId: name string at +0x20, saveDirectory at +0x40);
-  `FindAllSaveGames(const string&)` `0x24700d0` lists saves; the loader proper is
-  `LoadGame` `0x2e5ec0` (sole caller `0x67d130`). LoadGameParams reads mods at +0x68, a bool
-  at +0x80, and campaign/mission strings at +0x108/+0x128 (both empty for a plain save).
-  Calling StartSavegame means constructing these three structs byte-exactly. [DECOMPILED]
+  `menuui.cpp`). It refuses while `this+0x1988` is set ("Game initialization is already
+  active!") and wants the campaign and mission strings of LoadGameParams (+0xF8 and +0x118;
+  their sizes sit at +0x108 and +0x128) both empty or both set. [DECOMPILED]
+  - `SaveGameId` (0x60 bytes) is `{ std::wstring path; std::string name; std::string
+    namespace }`, the three fields `profile.lua` stores for `lastGame`. A plain save is
+    `path = ""`, `namespace = "savegame"`. [DECOMPILED, profile.lua]
+  - `SavegameInfo` (0x110 bytes) comes from `0x2e6ca0(out, *(app + 200), &id)`, where `app`
+    is the global that `0xbb23c0` returns; it throws "invalid mount point" for an id it
+    cannot resolve. Destructor `0x2de250`. `GetSavegameInfo` `0x2471830` is the backend
+    call underneath. [DECOMPILED]
+  - `LoadGameParams` (0x138 bytes): default constructor `0x553b70` (name and path empty,
+    namespace "savegame"), destructor `0x5576a0`. CONTINUE's click handler `0x65e780` sets
+    only name, path and namespace before calling StartSavegame. [DECOMPILED]
+  - `UI::CMenuUI`'s per-frame update is vtable slot 33 (`0x672b10`; vftable `0x301dc38`) and
+    runs on the main thread. It starts the menu's own queued load (a future at
+    `this+0x19a0`) only while no game runs (`this+0x4e8` is 0). Nothing calls it directly.
+    [DECOMPILED]
+  - The mod swaps that slot, runs the original first, then builds the three structs for
+    `mp_shared` and calls StartSavegame: the world loads with no clicks (build 35924,
+    2026-09-10, `StartSavegame -> 1`, stdout `Loading from file mp_shared`). [MEASURED]
+  - CONTINUE fixes its target when the main page is built: `0x654350` creates the button
+    and queues the SavegameInfo lookup for the profile's `lastGame` on the thread pool.
+    [DECOMPILED]
+  - `FindAllSaveGames(const string&)` `0x24700d0` lists saves; the loader proper is
+    `LoadGame` `0x2e5ec0` (sole caller `0x67d130`).
 
 ## Title menu
 

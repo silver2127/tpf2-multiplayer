@@ -435,6 +435,10 @@ static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lo
 // stayed in lobby state and every key in the loaded game was swallowed -- the game
 // looked like it had lost the keyboard completely.
 static volatile LONG g_lobbyDone = 0;
+// auto-load (see "AUTO-LOAD" below): set when the shared save is placed, taken
+// by CMenuUI's per-frame update on the main thread, given up after 12 s
+static volatile LONG g_autoLoadPending = 0;
+static ULONGLONG     g_autoLoadSince = 0;
 static char g_status[256] = "";
 // lobby model (fed from lobby_out.jsonl)
 static char g_players[200][40]; static int g_playerCount = 0;
@@ -507,6 +511,7 @@ static int   g_flagFontPx = 0;
 static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
 static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
+static int   g_flagAutoLoad = 1;            // START loads the shared save in-process (autoload=0: the player opens LOAD GAME)
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
 static bool  g_latoLoaded = false;
 static void ReadFlags()
@@ -523,6 +528,7 @@ static void ReadFlags()
         else if (!strcmp(line, "oy")) g_flagOy = (float)atof(v);
         else if (!strcmp(line, "fontpx")) g_flagFontPx = atoi(v);
         else if (!strcmp(line, "relay_autosave_min")) g_flagRelayAutosaveMin = atoi(v);
+        else if (!strcmp(line, "autoload")) g_flagAutoLoad = atoi(v);
         else if (!strcmp(line, "slot")) g_flagSlot = atoi(v);
         else if (!strcmp(line, "master_url")) { strncpy_s(g_flagMaster, v, _TRUNCATE); char* e = g_flagMaster + strlen(g_flagMaster); while (e > g_flagMaster && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '/')) *--e = 0; }
     }
@@ -1387,6 +1393,12 @@ static void OnHit(int id)
 static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     LONG n = InterlockedIncrement(&g_presentCount);
+    if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
+        // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
+        InterlockedExchange(&g_autoLoadPending, 0);
+        Log("[menu] autoload: no menu frame picked the load up within 12 s -- the player loads mp_shared\n");
+        SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
+    }
     if (n == 1) Log("[menu] PRESENT #1 swapchains=%u dev=%p\n", pi->swapchainCount, g_dev);
     if (n % 300 == 0) Log("[menu] present state: show=%ld swc=%u rInit=%d rFail=%d dev=%p fam=%u fmt=%d\n",
         InterlockedCompareExchange(&g_showOverlay, 0, 0), pi->swapchainCount,
@@ -2225,77 +2237,123 @@ static bool placeSaveNewest(const wchar_t* srcSav)
     return true;
 }
 
-// Click the title-menu Continue button (loads the newest save) on our own window.
-// The overlay is post-present pixels (not a window), so the game's Continue stays
-// hittable at its measured position; we collapse the overlay first for clarity.
-// Returns true once the click took the game off the title menu (load started).
-// UNUSED since 2026-08-30 -- doStartLoad now asks the player to load the save.
-// Kept for reference until the menu's own load action is called directly.
-static bool clickContinueLoad()
+// ---------------- AUTO-LOAD: start the shared save in-process ----------------
+// Every menu load ends in bool UI::CMenuUI::StartSavegame(this, const
+// LoadGameParams&, const SavegameInfo&) (0x6785c0). CONTINUE feeds it from the
+// profile's lastGame, a SaveGameId { std::wstring path; std::string name;
+// std::string namespace } that profile.lua writes as path = "", saveGameName =
+// "...", saveGameNamespace = "savegame". We build that id for mp_shared, ask the
+// save manager for its SavegameInfo (0x2e6ca0, as the Missions page does),
+// default-construct LoadGameParams (0x553b70 already sets the namespace;
+// CONTINUE's click lambda 0x65e780 adds only the name) and call StartSavegame
+// from CMenuUI's own per-frame update (vtable slot 33, 0x672b10): main thread,
+// the place the game starts its own queued loads, and it checks the same
+// guards first. Decompiled with tools/ghidra, 2026-09-10.
+// This replaces the synthesised Continue click dropped on 2026-08-30 (a screen
+// position per resolution, one system cursor shared by two games, no effect on
+// any other menu page).
+static const uintptr_t RVA_MENUUI_VFTABLE  = 0x301dc38;   // UI::CMenuUI::vftable
+static const int       MENUUI_SLOT_UPDATE  = 33;          // -> 0x672b10
+static const uintptr_t RVA_MENUUI_UPDATE   = 0x672b10;
+static const uintptr_t RVA_START_SAVEGAME  = 0x6785c0;
+static const uintptr_t RVA_APP_ACCESSOR    = 0xbb23c0;    // returns the app object; +200 is the save manager
+static const uintptr_t RVA_SAVEINFO_GET    = 0x2e6ca0;    // SavegameInfo* (SavegameInfo* out, manager, const SaveGameId*); throws "invalid mount point"
+static const uintptr_t RVA_SAVEINFO_DTOR   = 0x2de250;    // SavegameInfo: 0x110 bytes
+static const uintptr_t RVA_LOADPARAMS_CTOR = 0x553b70;    // LoadGameParams: 0x138 bytes
+static const uintptr_t RVA_LOADPARAMS_DTOR = 0x5576a0;
+static const size_t    MENU_OFF_GAMEUI     = 0x4e8;       // non-zero while a game runs (loads then go through the in-game menu)
+static const size_t    MENU_OFF_INITING    = 0x1988;      // "Game initialization is already active!"
+static const size_t    MENU_OFF_QUEUED     = 0x19a0;      // the menu's own queued load (a future)
+typedef void (*MenuUpdateFn)(void*, void*, void*, void*);
+static MenuUpdateFn  g_origMenuUpdate = nullptr;
+static volatile LONG g_menuUpdates = 0;
+
+// SEH only in this frame (no C++ objects): the save manager throws on a bad id.
+static int AutoLoadCall(void* menu, const char* name)
 {
-    // Continue only exists on the title page. If the user is in Settings / Load
-    // Game (page >= 3 => overlay hidden) wait for them to come back, up to 60 s.
-    if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) {
-        SetStatus("Return to the title screen to load the shared save…");
-        Log("[menu] clickContinue: not on title screen, waiting up to 60 s\n");
-        bool visible = false;
-        for (int i = 0; i < 120; i++) {   // 60 s, 500 ms poll
-            if (InterlockedCompareExchange(&g_lobbyAbort, 0, 0)) { Log("[menu] clickContinue: aborted (lobby torn down)\n"); return false; }
-            if (InterlockedCompareExchange(&g_showOverlay, 0, 0)) { visible = true; break; }
-            Sleep(500);
-        }
-        if (!visible) { SetStatus("Timed out waiting for the title screen -- press Continue to load the shared save"); Log("[menu] clickContinue: gave up waiting for title screen\n"); return false; }
-        Sleep(400);   // let the page settle before clicking
+    unsigned char id[0x100], info[0x400], params[0x400];   // 0x60 / 0x110 / 0x138 plus slack
+    volatile int stage = 0;
+    __try {
+        memset(id, 0, sizeof(id)); memset(info, 0, sizeof(info)); memset(params, 0, sizeof(params));
+        ((GString*)(id + 0x00))->cap = 7;     // path: empty std::wstring (SSO capacity 7)
+        ((GString*)(id + 0x20))->cap = 15;    // name
+        ((GString*)(id + 0x40))->cap = 15;    // namespace
+        g_strAssign(id + 0x20, name, strlen(name));
+        g_strAssign(id + 0x40, "savegame", 8);
+        stage = 1;
+        void* app = ((void* (*)())(g_base + RVA_APP_ACCESSOR))();
+        void* mgr = app ? *(void**)((char*)app + 200) : nullptr;
+        if (!mgr) { Log("[menu] autoload: no save manager (app=%p)\n", app); return -1; }
+        ((void* (*)(void*, void*, void*))(g_base + RVA_SAVEINFO_GET))(info, mgr, id);
+        stage = 2;
+        ((void* (*)(void*))(g_base + RVA_LOADPARAMS_CTOR))(params);
+        g_strAssign(params + 0x00, name, strlen(name));
+        stage = 3;
+        char started = ((char (*)(void*, void*, void*))(g_base + RVA_START_SAVEGAME))(menu, params, info);
+        stage = 4;
+        ((void (*)(void*))(g_base + RVA_LOADPARAMS_DTOR))(params);
+        ((void (*)(void*))(g_base + RVA_SAVEINFO_DTOR))(info);
+        return started ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        Log("[menu] autoload: exception %08lx at stage %d (0 id, 1 save info, 2 load params, 3 StartSavegame, 4 cleanup)\n",
+            GetExceptionCode(), (int)stage);
+        return -10 - (int)stage;
     }
-    if (!g_gameWnd || !IsWindow(g_gameWnd)) { g_gameWnd = nullptr; EnumWindows(FindGameWnd, (LPARAM)&g_gameWnd); }
-    if (!g_gameWnd) { Log("[menu] clickContinue: no game window\n"); return false; }
-    RECT wr; GetWindowRect(g_gameWnd, &wr);
-    int W = wr.right - wr.left, H = wr.bottom - wr.top;
-    struct C { int w, h, x, y; };
-    static const C T[] = { {3856,2128,349,1110}, {3840,2161,348,1108}, {2420,1399,236,680}, {1600,900,237,682} };
-    int ox = -1, oy = -1;
-    for (const C& c : T) if (c.w == W && c.h == H) { ox = c.x; oy = c.y; break; }
-    if (ox < 0) {   // nearest measured size within 5%, scaled
-        double be = 1e9; const C* bc = nullptr;
-        for (const C& c : T) { double e = ((double)c.w / W - 1); if (e < 0) e = -e; double e2 = ((double)c.h / H - 1); if (e2 < 0) e2 = -e2; e += e2; if (e < be) { be = e; bc = &c; } }
-        if (bc && be < 0.05) { ox = (int)((double)bc->x * W / bc->w); oy = (int)((double)bc->y * H / bc->h); }
-    }
-    if (ox < 0) { Log("[menu] clickContinue: no offset for %dx%d\n", W, H); return false; }
-    int sx = wr.left + ox, sy = wr.top + oy;
-    Log("[menu] clickContinue at %d,%d (win %dx%d)\n", sx, sy, W, H);
-    POINT saved; GetCursorPos(&saved);
-    bool started = false;
-    // Click FIRST, then test: the overlay is visible at entry (checked above), so a
-    // pre-click test could never distinguish "load started" from "not yet clicked".
-    for (int i = 0; i < 14; i++) {
-        if (InterlockedCompareExchange(&g_lobbyAbort, 0, 0)) break;
-        SetForegroundWindow(g_gameWnd);
-        SetCursorPos(sx, sy); Sleep(60);
-        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0); Sleep(40);
-        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-        Sleep(700);
-        if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) { started = true; break; }  // left the menu => load started
-    }
-    SetCursorPos(saved.x, saved.y);
-    Log("[menu] clickContinue: %s\n", started ? "load started" : "menu never left");
-    return started;
 }
 
-// Place the shared save and click Continue. Returns true once a load was kicked
-// off; false (with a status) if the save could not be placed or the click failed.
+static void AutoLoadTick(void* menu)
+{
+    LONG n = InterlockedIncrement(&g_menuUpdates);
+    if (n == 1) Log("[menu] autoload: first CMenuUI update seen (this=%p)\n", menu);
+    // test trigger: <data dir>\tpf2_autoload_now.txt starts mp_shared without a lobby
+    if ((n % 30) == 0) {
+        wchar_t trig[MAX_PATH]; _snwprintf_s(trig, _TRUNCATE, L"%stpf2_autoload_now.txt", g_dataDirW);
+        if (GetFileAttributesW(trig) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileW(trig);
+            Log("[menu] autoload: test trigger file -- loading mp_shared\n");
+            g_autoLoadSince = GetTickCount64();
+            InterlockedExchange(&g_autoLoadPending, 1);
+        }
+    }
+    if (!InterlockedCompareExchange(&g_autoLoadPending, 0, 0)) return;
+    if (*(uint64_t*)((char*)menu + MENU_OFF_GAMEUI) != 0) {
+        InterlockedExchange(&g_autoLoadPending, 0);
+        Log("[menu] autoload: a game is running -- the player loads mp_shared\n");
+        SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
+        return;
+    }
+    if (*(uint8_t*)((char*)menu + MENU_OFF_INITING) != 0 || *(uint64_t*)((char*)menu + MENU_OFF_QUEUED) != 0)
+        return;   // the game is already starting something: wait (the present watchdog gives up after 12 s)
+    InterlockedExchange(&g_autoLoadPending, 0);
+    int r = AutoLoadCall(menu, "mp_shared");
+    Log("[menu] autoload: StartSavegame(mp_shared) -> %d\n", r);
+    if (r != 1) SetStatus("Couldn't start the shared save by itself -- open LOAD GAME and pick \"mp_shared\".");
+}
+
+static void MyMenuUpdate(void* menu, void* a2, void* a3, void* a4)
+{
+    g_origMenuUpdate(menu, a2, a3, a4);   // first and untouched: the frame's arguments go through as they came
+    AutoLoadTick(menu);
+}
+
+// Place the shared save and start it (in-process when the menu hook is in).
+// Returns true once the save is placed; false (with a status) if it could not be.
 static bool doStartLoad(const wchar_t* srcSav)
 {
     if (!srcSav || !srcSav[0]) { Log("[menu] doStartLoad: empty src\n"); SetStatus("No save to load."); return false; }
     if (!placeSaveNewest(srcSav)) { SetStatus("Couldn't place the shared save -- not loading"); return false; }
-    // THE PLAYER LOADS IT. Synthesising a click on the title menu's Continue button
-    // needed a table of measured button positions per window size, missed entirely on
-    // any resolution not in it (2880x1801 on the test laptop), fought the other
-    // instance for the one system cursor when two games ran on a single machine, and
-    // did nothing at all if the player happened to be on another menu page. The save
-    // is placed and stamped newest either way, so asking for one click always works.
-    // clickContinueLoad() is kept below, unused, until the proper fix lands: calling
-    // the menu's own load action (docs/re/GAME_LOOP_AND_UI.md, "Loading a save").
+    // The menu frame starts it (AUTO-LOAD above). Asking the player to open LOAD GAME
+    // stays as the fallback: autoload=0, a hook that did not install, or a save that
+    // StartSavegame refused. The old synthesised Continue click needed a screen position
+    // per resolution and fought another game on the same PC for the cursor.
     InterlockedExchange(&g_lobbyDone, 1);   // release the keyboard: the lobby's work is done
+    if (g_flagAutoLoad && g_origMenuUpdate) {
+        g_autoLoadSince = GetTickCount64();
+        InterlockedExchange(&g_autoLoadPending, 1);
+        Log("[menu] shared save placed as mp_shared -- starting it on the next menu frame\n");
+        SetStatus("Save ready -- loading it...");
+        return true;
+    }
     Log("[menu] shared save placed as mp_shared -- the player loads it from LOAD GAME\n");
     SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
     return true;
@@ -2915,6 +2973,25 @@ static DWORD WINAPI Init(LPVOID)
     g_clean     = (CleanFn)(g_base + RVA_CLEAN);
     g_setName   = (SetNameFn)(g_base + RVA_SETNAME);
     g_prep      = (PrepFn)(g_base + RVA_PREP);
+    // auto-load: CMenuUI's per-frame update runs the pending-load check on the main thread
+    {
+        void** slot = (void**)(g_base + RVA_MENUUI_VFTABLE + MENUUI_SLOT_UPDATE * sizeof(void*));
+        if ((uintptr_t)*slot != g_base + RVA_MENUUI_UPDATE) {
+            Log("[menu] autoload: CMenuUI update slot holds %p, expected %llx -- not hooked; the player loads the shared save\n",
+                *slot, (unsigned long long)(g_base + RVA_MENUUI_UPDATE));
+        } else {
+            DWORD old;
+            if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &old)) {
+                g_origMenuUpdate = (MenuUpdateFn)*slot;   // set before the slot, so the detour never calls null
+                *slot = (void*)&MyMenuUpdate;
+                VirtualProtect(slot, sizeof(void*), old, &old);
+                Log("[menu] autoload: hooked CMenuUI update (vtable slot %d)%s\n", MENUUI_SLOT_UPDATE,
+                    g_flagAutoLoad ? "" : " -- autoload=0: only the test trigger loads");
+            } else {
+                Log("[menu] autoload: VirtualProtect on the CMenuUI vtable failed (%lu)\n", GetLastError());
+            }
+        }
+    }
     if (g_flagNativeBtn) {
         // verify both prologues before patching: a game update moves everything.
         static const unsigned char kMainBuild[14] = { 0x48,0x8b,0xc4,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57 };
