@@ -16,7 +16,7 @@
 #
 #   tools\deploy_shipping.ps1            deploy everything (game must be closed)
 #   tools\deploy_shipping.ps1 -Clean     also wipe %LOCALAPPDATA%\tpf2mp\data (fresh identity/logs)
-param([switch]$Clean)
+param([switch]$Clean, [switch]$Cfg)   # -Cfg: also overwrite the three cfgs in the game dir (LIVE settings; kept by default)
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $PSScriptRoot
 $Game = $null
@@ -59,9 +59,14 @@ Get-ChildItem "$Repo\native\out\tpf2_slice*.dll" -EA SilentlyContinue |
     ForEach-Object { Write-Warning "[ship] $($_.Name) is NEWER than tpf2_slice.dll and will NOT be shipped -- rebuild without a suffix if that is the one you want" }
 Put $sliceSrc                             (Join-Path $Game 'tpf2_slice.dll')
 Put "$Repo\native\out\tpf2_pluginhost.dll"   (Join-Path $Game 'tpf2_pluginhost.dll')
-Put "$Repo\installer\cfg\tpf2_bridge_mp.cfg" (Join-Path $Game 'tpf2_bridge_mp.cfg')
-Put "$Repo\installer\cfg\tpf2_slice.cfg"     (Join-Path $Game 'tpf2_slice.cfg')
-Put "$Repo\installer\cfg\tpf2mp.cfg"         (Join-Path $Game 'tpf2mp.cfg')
+# The cfgs are LIVE settings read next to the DLL: a line that exists only in the
+# game-dir copy (cancel_construction=1 was one, 2026-09-09) is lost when the
+# shipped copy is put over it. An existing cfg is left alone unless -Cfg.
+foreach ($c in "tpf2_bridge_mp.cfg", "tpf2_slice.cfg", "tpf2mp.cfg") {
+    $dst = Join-Path $Game $c
+    if ($Cfg -or -not (Test-Path $dst)) { Put "$Repo\installer\cfg\$c" $dst }
+    else { Write-Host "[ship]   $c kept (live settings; pass -Cfg to overwrite)" }
+}
 
 # Native plugins live in their OWN repositories -- they depend on nothing here
 # but the vendored ABI header, and they must be independently releasable. For
