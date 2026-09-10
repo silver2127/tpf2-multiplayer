@@ -953,9 +953,9 @@ function data()
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
 		guiUpdate = function()
 			guiTick = guiTick + 1
-			-- other players' cursors (cursors.lua): ten times a second at 60 fps, ahead of
+			-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
 			-- the panel's own twice-a-second refresh
-			if guiTick % 6 == 0 and CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
+			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
 			if guiTick % 30 ~= 0 then return end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
