@@ -1545,9 +1545,23 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     HOTJOIN_STORED_MAX = 180.0                # a late joiner is served from the stored world when it is this fresh
 
+    session_epoch = [0.0]                     # when the current session's world left the relay (resume push)
+
     def stored_age():
-        _p, age = stored_save()
-        return int(age) if age is not None else -1
+        """Age of the stored world for the freshness rule. A copy the running
+        session was RESUMED from is the session's own starting state: it is
+        current until the leader uploads a newer one, however old its mtime
+        (an hour-old copy was refused to three joiners while the leader had
+        not even loaded yet, 2026-09-10)."""
+        p_, age = stored_save()
+        if age is None:
+            return -1
+        try:
+            if os.path.getmtime(p_) <= session_epoch[0] and session_epoch[0] > 0:
+                return 0
+        except OSError:
+            pass
+        return int(age)
 
     def stored_save():
         """relay-only: the last save uploaded here, if any (path, age seconds)."""
@@ -1647,6 +1661,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             start_save[0] = False
             transfer[0] = None
             upload[0] = None
+            session_epoch[0] = 0.0
             spath, age = stored_save()
             log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago for /resume" if spath else ""))
         if broadcast:
@@ -2150,6 +2165,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 spath, age = stored_save()
                 if la in peers and la == leader_addr() and spath and not started[0] and transfer[0] is None and upload[0] is None:
                     log(f"[relay] resuming the stored world ({int(age)} s old) for {peers[la]['name']!r}")
+                    session_epoch[0] = time.time()          # this copy IS the session from here on
                     begin_save_transfer(spath, include_leader=True)
             # Anyone who joined during a transfer is still unstarted: serve them
             # from the same save now that the pipe is free (relay: its stored
@@ -2563,7 +2579,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 uploader[0] = _HostSaveTransfer(conn.sock, sid, blob, files_meta,
                                                 [(conn.peer, "relay")], io, log)
                 io.emit({"type": "status", "state": "connected",
-                         "detail": "uploading the save to the relay…"})
+                         "detail": "uploading the save to the relay..."})
                 log(f"[client] uploading {cmd.get('save')} ({len(blob)} B) to the relay")
         elif c == "quit":
             send({"t": "leave"})
@@ -2637,7 +2653,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                         else:
                             uploaded[0] = True
                             io.emit({"type": "status", "state": "connected",
-                                     "detail": "save uploaded -- the relay is sharing it…"})
+                                     "detail": "save uploaded -- the relay is sharing it..."})
                             log("[client] upload to the relay complete")
                 except Exception as e:                      # noqa: BLE001
                     log(f"[client] upload error: {e!r}")
