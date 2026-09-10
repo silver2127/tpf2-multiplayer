@@ -1121,7 +1121,7 @@ function data()
 					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
 					CM.dashShowChat = (CM.dashShowChat ~= false)
 					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
-					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)          -- shown by default
+					CM.dashShowSpeed = (CM.dashShowSpeed == true)           -- hidden by default
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					tog:addItem(toggleBtn("  stats  ", function()
 						CM.dashShowStats = not CM.dashShowStats

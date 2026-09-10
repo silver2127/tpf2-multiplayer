@@ -80,7 +80,7 @@ buttons toggle four sections:
   while the worlds agree, `DESYNC ...` naming what differs.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
-- **speed** (shown): the **session speed**, then what your own game is doing to stay in step ("in
+- **speed** (hidden at first): the **session speed**, then what your own game is doing to stay in step ("in
   step with the leader", "catching up", "easing off", or "this game leads the clock").
 
 ### Speed and pause
