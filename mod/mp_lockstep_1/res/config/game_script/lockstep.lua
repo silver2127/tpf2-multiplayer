@@ -635,8 +635,11 @@ function data()
 			if CM.ticks % K.CON_EDIT_SCAN_EVERY == 0 then CM.scanConstructionEdits() end
 
 			if CM.ticks % K.HEARTBEAT_EVERY == 0 then
+				-- far behind the session (a fresh hot joiner, load-gated or not): say so on
+				-- every heartbeat, so nobody holds the barrier for a peer that must catch up
+				do local fp = CM.peerFastPrecise(); CM.farBehind = (fp ~= nil) and (fp - now) > K.CATCHUP_MIN end
 				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d ceil=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo, CM.myCeiling or (CM.MAX_SPEED or 4),
-					CM.catchingUp2 and " cu=1" or ""))
+					(CM.catchingUp2 or CM.farBehind) and " cu=1" or ""))
 			end
 
 			CM.applyBarrier(now)

@@ -848,6 +848,18 @@ function CM.applyBarrier(now)
 	end
 
 	local ahead = now - slowT          -- the barrier holds against the SLOWEST peer
+	-- A peer more than a catch-up distance behind is catching up whether or
+	-- not its heartbeat says so (older builds do not): holding for it cannot
+	-- close that gap, it only stalls everyone until the watchdog fires -- the
+	-- go/stop seen live 2026-09-09 while a hot joiner ran through its history.
+	if ahead > K.CATCHUP_MIN then
+		if CM.paused then
+			CM.paused = false; CM.pausedSince = nil
+			CM.releaseSpeed("peer is catching up, not holding")
+			log(string.format("BARRIER release: slowest peer is %.1f behind (catching up) -- not holding for it", ahead))
+		end
+		ahead = 0
+	end
 	-- Nothing the gate does with the speed is the player's choice; never share it.
 	if CM.cfgFlag("speed_v2", true) then
 		-- V2: host-authoritative effective speed (CM.paceV2). Lead includes self
