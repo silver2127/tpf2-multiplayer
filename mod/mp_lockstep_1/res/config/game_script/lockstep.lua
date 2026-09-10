@@ -281,6 +281,35 @@ function CM.peerBounds()
 	end
 	return minT, maxT
 end
+-- The status line's peer clock is also the slice's evidence that somebody will
+-- replay a build: SessionLive (slice_hook.cpp) cancels and replays a player's
+-- action only when peer= holds a positive time, and "?" means a solo game, so the
+-- engine builds natively. peerBounds leaves out peers that are catching up --
+-- right for pacing, wrong here. On 2026-09-10 a joiner still flagged cu=1 after
+-- its hot join made the leader's status read "peer=?" for a few seconds; a track
+-- the leader drew in that window ran natively on the leader, the joiner replayed
+-- it with different geometry (10 nodes apart) and the session desynced. Any fresh
+-- peer counts here, catching up or not; a stale one still does not.
+function CM.statusPeerT()
+	if CM.slowT then return CM.slowT end
+	local minT
+	for _, pr in pairs(CM.peers) do
+		if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			if not minT or pr.time < minT then minT = pr.time end
+		end
+	end
+	return minT
+end
+-- The line the MP panel and the slice read. A live peer shows at least 1: the
+-- slice treats peer=0 as solo, and a session's first second is at t=0.
+function CM.statusLine(now)
+	local pt = CM.statusPeerT()
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d",
+		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
+		pt and string.format("%+.1f", now - pt) or "?",
+		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
+		#CM.queue)
+end
 -- Letter -> 0..7, for anything that needs a per-origin namespace.
 function CM.originIdx(o)
 	local b = string.byte(tostring(o or "a"), 1) or 97
@@ -894,11 +923,7 @@ function data()
 				pcall(function()
 					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
 					if f then
-						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d",
-							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
-							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
-							CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-							#CM.queue))
+						f:write(CM.statusLine(now))
 						f:close()
 					end
 				end)
