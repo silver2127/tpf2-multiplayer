@@ -961,6 +961,14 @@ end
 -- trickling in without needing to be told how many to expect.
 function CM.loadGateReady()
 	if not CM.cfgFlag("load_gate", true) then return true end
+	-- THE LEADER NEVER WAITS. It is the session clock: whoever loads later is
+	-- a hot joiner and catches up to it (LSNEED + the history ring). Holding
+	-- the leader for a roster member whose game is still downloading the save
+	-- froze the leader for minutes (live 2026-09-09, twice).
+	if CM.isLeader() then
+		if not CM.lgAnnounced then CM.lgAnnounced = true; log("LOADGATE: we are the leader -- the session clock waits for nobody") end
+		return true
+	end
 	local n = 0
 	for _ in pairs(CM.peers) do n = n + 1 end
 	if n ~= CM.lgCount then
@@ -1006,7 +1014,9 @@ function CM.loadGateReady()
 	end
 	local want = CM.lgWant
 	local ready
-	if want == 1 then
+	local ld = CM.peers[CM.leader or "a"]
+	local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
+	if leaderIn or want == 1 then
 		ready = true
 	elseif want > 1 then
 		ready = (n >= want - 1)
