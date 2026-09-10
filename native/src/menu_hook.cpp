@@ -2107,7 +2107,7 @@ static void applyRoster(const char* s)
     // save for hot joiners); it changes when the leader leaves
     if (roleKnown && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
         LONG was = InterlockedExchange(&g_isHost, isHost ? 1 : 0);
-        if (was != (isHost ? 1 : 0)) { Log("[menu] relay lobby: we are %s the leader now\n", isHost ? "" : "not"); SetStatus(isHost ? "You lead this relay lobby: START GAME shares your newest save." : "Waiting for the leader to start."); }
+        if (was != (isHost ? 1 : 0)) { Log("[menu] relay lobby: we are %s the leader now\n", isHost ? "" : "not"); SetStatus(isHost ? "You lead this relay lobby. Its world loads by itself; START GAME would share yours instead." : "Waiting for the leader to start."); }
     }
     if (roleKnown) writeBridgeCtl(isHost);
     // HOT JOIN (2026-09-09): the roster grew while the game is running and we
@@ -2708,7 +2708,14 @@ static void MyCreatePage(uint64_t thisp, int page)
     // sub-layers). Full-screen replacements (Settings/Campaign/Load...) are all
     // page >= 3. So SET on 2, CLEAR only on >= 3; leave 0/1 alone -- otherwise
     // the trailing page=1 hid the overlay on the idle main menu.
-    if (page == 2)      InterlockedExchange(&g_showOverlay, 1);
+    if (page == 2) {
+        InterlockedExchange(&g_showOverlay, 1);
+        // The title menu exists only when no game runs: forget the CGameUI pointer
+        // captured in the last session. It used to survive "quit to menu", so a
+        // start arriving while the title menu sat on another page looked like
+        // "start while in game" and was ignored (relay resume, 2026-09-10).
+        g_gameUi = 0;
+    }
     else if (page >= 3) InterlockedExchange(&g_showOverlay, 0);
     static int seen = 0;
     if (seen < 30) { seen++; Log("[menu] CreatePage page=%d show=%ld\n", page,
