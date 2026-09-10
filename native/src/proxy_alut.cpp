@@ -10,9 +10,9 @@
 // Install: rename the stock alut.dll to alut_real.dll and put this beside it.
 // Every export is forwarded straight through, so the game's audio is untouched.
 //
-// This is deliberately a thin loader: it only pulls in the real bridge dll from
-// the workshop out dir, so the bridge can be rebuilt without touching any file
-// inside the game installation.
+// This is deliberately a thin loader: it only pulls in the DLLs that do the
+// work (bridge, menu, slice, plugin host), from %LOCALAPPDATA%\tpf2mp\ or from
+// its own folder.
 #include <windows.h>
 #include <cstdio>
 
@@ -37,21 +37,16 @@
 #pragma comment(linker, "/export:alutSleep=alut_real.alutSleep")
 #pragma comment(linker, "/export:alutUnloadWAV=alut_real.alutUnloadWAV")
 
-// Where our shipped files live, in order of preference. Portable first, the
-// original dev workshop path last so the existing rig keeps working untouched.
-static const wchar_t* FALLBACK_DIR =
-    L"C:\\Program Files (x86)\\Steam\\steamapps\\workshop\\content\\1066780"
-    L"\\3710243057\\recon\\m4\\out";
-
-// Resolve a shipped file by name: %LOCALAPPDATA%\tpf2mp\<name>, then next to THIS
-// proxy dll (the game dir), then the dev workshop path. Writes the first that
-// exists (or the fallback if none) into out.
 #include "datadir.h"
 
+// Resolve a shipped file by name: %LOCALAPPDATA%\tpf2mp\<name> when that file
+// exists, otherwise next to THIS proxy dll (the game dir). There is no third
+// place: a DLL in neither fails to load, and the log names the path it tried.
 static void resolveShipped(const wchar_t* name, wchar_t* out, size_t cch)
 {
     wchar_t buf[MAX_PATH];
     wchar_t la[MAX_PATH];
+    out[0] = 0;
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH)) {
         _snwprintf_s(buf, MAX_PATH, _TRUNCATE, L"%s\\tpf2mp\\%s", la, name);
         if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) { wcscpy_s(out, cch, buf); return; }
@@ -61,17 +56,14 @@ static void resolveShipped(const wchar_t* name, wchar_t* out, size_t cch)
                        (LPCWSTR)&resolveShipped, &self);
     if (self && GetModuleFileNameW(self, buf, MAX_PATH)) {
         wchar_t* s = wcsrchr(buf, L'\\');
-        if (s) { s[1] = 0; wcscat_s(buf, MAX_PATH, name);
-                 if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) { wcscpy_s(out, cch, buf); return; } }
+        if (s) { s[1] = 0; wcscat_s(buf, MAX_PATH, name); wcscpy_s(out, cch, buf); }
     }
-    _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", FALLBACK_DIR, name);
 }
 
 static void Log(const char* fmt, ...)
 {
     // The log lives in the runtime data dir (%LOCALAPPDATA%\tpf2mp\data), like
-    // every other log. Resolving it through resolveShipped sent it to the dev
-    // workshop path on a fresh machine (no such dir -> log silently dropped).
+    // every other log.
     wchar_t path[MAX_PATH];
     if (!Tpf2mpDataDirW(path, MAX_PATH, (const void*)&resolveShipped)) return;
     wcscat_s(path, MAX_PATH, L"tpf2_proxy.log");

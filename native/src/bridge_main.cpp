@@ -1,21 +1,18 @@
-// M5 bridge DLL: no hooks. Pure file<->UDP bridge.
+// M5 bridge DLL: file<->UDP bridge, plus the fractional-speed hook.
 //   - tails  tpf2_capture_<inst>.txt  (Lua writes local build events here)
 //   - sends new lines via reliable UDP to the peer
 //   - writes received lines to tpf2_events_<inst>.txt (Lua replays from here)
-// Config: tpf2_mp_<dllbasename>.cfg (falls back to tpf2_mp.cfg), looked up in
-// the DLL's own directory (CFGDIR, where the installer puts it) and then in
-// the data dir (user override).
+// No config file: everything is built in, so nothing on disk can change how
+// the bridge behaves. The letter is elected from UDP ports 7771/7772 and the
+// peer starts at 127.0.0.1; the lobby's control file retargets both.
 //
-// Two directories, deliberately:
-//   CFGDIR  = the directory this DLL lives in (game dir; may be read-only)
-//   DATADIR = Tpf2mpDataDirW (%LOCALAPPDATA%\tpf2mp\data, or TPF2MP_DATADIR)
-// Every file written at run time -- log, identity, events, captures, buy
-// probe, control file -- lives in DATADIR. Nothing is ever written to CFGDIR.
+// Every file written at run time -- log, identity, events, captures, control
+// file -- lives in DATADIR = Tpf2mpDataDirW (%LOCALAPPDATA%\tpf2mp\data, or
+// TPF2MP_DATADIR).
 //
 // Runtime control: DATADIR\tpf2_bridge_ctl.txt, polled every 500 ms, lines
 //   instance=a|b        re-identify (rewrite identity, new events file, retarget tail)
 //   peer=<ipv4>:<port>  repoint the UDP peer without restarting the socket
-// The cfg keys instance=/peer_ip=/peer_port= stay the initial values.
 // Identity: DATADIR\tpf2_instance.txt, lines '<a|b>', 'pid=<pid>',
 // 'port=<bound UDP port>' (line 3 is what the lobby routes peer frames to).
 #include <windows.h>
@@ -24,16 +21,12 @@
 #include <cstdarg>
 #include <cstring>
 #include <string>
-#include <memory>
 #include <mutex>
 #include <fcntl.h>
 #include <io.h>
 #include "net.h"
 #include "datadir.h"
-#include "savexfer.h"
-#include "simhook.h"
 #include "speedhook.h"
-#include "buyhook.h"
 
 static FILE* g_log = nullptr;
 static void Log(const char* fmt, ...)
@@ -76,7 +69,6 @@ static const char* RedactIp(const char* ip)
 
 static FILE* g_events = nullptr;   // peer events out (Lua reads)
 static std::mutex g_eventsMtx;     // OnPeerLine (net thread) vs re-identify (ctl thread)
-static FILE* g_fileOut = nullptr;  // file-relay target (tail writes here when set)
 static void OnPeerLine(const char* line)
 {
     Log("[net] peer (%zu b): %.200s\n", strlen(line), line);
@@ -101,8 +93,8 @@ static std::wstring g_dataDir;
 static volatile bool g_stopping = false;
 
 // Mutable runtime identity/peer, owned by the control-file poller. The
-// initial values come from the cfg (+ auto election); the control file may
-// change them later.
+// initial values come from the port election; the control file may change
+// them later.
 struct Runtime {
     std::mutex  mtx;
     std::string instance;   // "a" | "b"
@@ -116,7 +108,6 @@ static Runtime g_rt;
 static std::mutex   g_tailMtx;
 static std::wstring g_tailPath;
 static unsigned     g_tailGen = 0;
-static bool         g_tailFixed = false;   // cfg tail_file= override: never retarget
 
 static void SetTailPath(const std::wstring& p)
 {
@@ -131,125 +122,15 @@ static std::wstring CapturePathFor(const std::string& inst)
     return g_dataDir + L"tpf2_capture_" + std::wstring(inst.begin(), inst.end()) + L".txt";
 }
 
+// Startup identity and endpoints. Built in, never read from a file: InitThread
+// elects the letter and the port pair, and the peer stays loopback until the
+// lobby's control file names another.
 struct Config {
-    uint16_t localPort = 7771;
+    uint16_t localPort = 0;
     char peerIp[64] = "127.0.0.1";
-    uint16_t peerPort = 7772;
-    // "auto" = decide from port availability. A better default than "a": the
-    // old default silently made every configless bridge claim to be the host.
-    std::string instance = "auto";
-    std::string tailFile;   // absolute override for tail input (relay mode)
-    std::string relayOut;   // absolute path: tail writes here instead of UDP
-    // save transfer
-    uint16_t    xferPort = 7871;
-    std::string saveDir;    // blank = auto-discover Steam userdata save dir
-    std::string shareSave;  // blank = newest .sav
-    int         autoPull = 0;   // joiner pulls the host's save on startup
-    int         saveServer = 0; // host serves it over TCP (legacy; the lobby transfers saves)
-    // native sim-thread hook. Off by default: it patches game code, so it must
-    // be opted into rather than surprising anyone who just wants replication.
-    int         simHook = 1;   // shipped cfg says 1; no cfg must not mean a different mode (2026-09-09)
-    int         speedHook = 1; // fractional game speed via the step-count dither (speedhook.cpp)
-    int         buyHook = 1;   // probe the buyVehicle command factory
+    uint16_t peerPort = 0;
+    std::string instance;
 };
-
-static std::string BaseName(const wchar_t* path)
-{
-    std::wstring ws(path);
-    size_t slash = ws.find_last_of(L'\\');
-    std::wstring b = (slash == std::wstring::npos) ? ws : ws.substr(slash + 1);
-    size_t dot = b.find_last_of(L'.');
-    if (dot != std::wstring::npos) b = b.substr(0, dot);
-    return std::string(b.begin(), b.end());
-}
-
-// cfg lookup order: every candidate name in CFGDIR (the DLL's own directory,
-// where the installer drops tpf2_bridge_mp.cfg), then the same names in
-// DATADIR (a user override that survives reinstalls). `dataDir` carries a
-// trailing backslash (datadir.h contract).
-static void LoadConfig(const wchar_t* dllPath, const wchar_t* dataDir, Config& cfg)
-{
-    wchar_t dir[MAX_PATH];
-    wcscpy_s(dir, dllPath);
-    wchar_t* slash = wcsrchr(dir, L'\\');
-    if (slash) *slash = 0;
-    const std::wstring dirs[] = { std::wstring(dir) + L"\\", std::wstring(dataDir) };
-
-    // Sidecar lookup. This used to build only "tpf2_mp_<basename>.cfg", which
-    // for a dll named tpf2_bridge_a6.dll means "tpf2_mp_tpf2_bridge_a6.cfg" --
-    // a name nothing on disk ever had, so every per-dll config was silently
-    // ignored and every bridge fell through to the shared tpf2_mp.cfg (no
-    // instance=, no relay settings). Try the real conventions in order.
-    std::string base = BaseName(dllPath);
-    std::string suffix = base;                       // "a6" from tpf2_bridge_a6
-    for (const char* prefix : { "tpf2_bridge_", "tpf2_mp_" }) {
-        size_t n = strlen(prefix);
-        if (suffix.size() > n && suffix.compare(0, n, prefix) == 0) {
-            suffix = suffix.substr(n);
-            break;
-        }
-    }
-
-    const std::string candidates[] = {
-        base + ".cfg",              // tpf2_bridge_a6.cfg
-        "tpf2_mp_" + suffix + ".cfg",   // tpf2_mp_a6.cfg
-        "tpf2_mp_" + base + ".cfg",     // legacy (kept so old names still work)
-        "tpf2_mp.cfg",              // shared fallback
-    };
-
-    wchar_t path[MAX_PATH];
-    FILE* f = nullptr;
-    std::string used;
-    const wchar_t* usedDir = L"";
-    for (int d = 0; d < 2 && !f; ++d) {
-        for (const std::string& c : candidates) {
-            swprintf(path, MAX_PATH, L"%s%S", dirs[d].c_str(), c.c_str());
-            _wfopen_s(&f, path, L"rb");
-            if (f) { used = c; usedDir = d == 0 ? L"cfg dir" : L"data dir"; break; }
-        }
-    }
-    if (!f) {
-        Log("[cfg] NO CFG FOUND in cfg dir or data dir -- using built-in defaults "
-            "(inst=%s local=%d)\n", cfg.instance.c_str(), cfg.localPort);
-        return;
-    }
-    Log("[cfg] loaded %s from %S\n", used.c_str(), usedDir);
-    if (used == "tpf2_mp.cfg") {
-        Log("[cfg] WARNING: fell back to the shared cfg; per-dll settings "
-            "(instance, tail_file, relay_out) are NOT in effect\n");
-    }
-    char line[256];
-    char inst[32];
-    char pathBuf[240];
-    while (fgets(line, sizeof(line), f)) {
-        int v;
-        if (sscanf(line, "local_port=%d", &v) == 1) cfg.localPort = (uint16_t)v;
-        else if (sscanf(line, "peer_port=%d", &v) == 1) cfg.peerPort = (uint16_t)v;
-        else if (sscanf(line, "peer_ip=%63s", cfg.peerIp) == 1) {}
-        else if (sscanf(line, "instance=%31s", inst) == 1) cfg.instance = inst;
-        else if (sscanf(line, "tail_file=%239s", pathBuf) == 1) cfg.tailFile = pathBuf;
-        else if (sscanf(line, "relay_out=%239s", pathBuf) == 1) cfg.relayOut = pathBuf;
-        else if (sscanf(line, "xfer_port=%d", &v) == 1) cfg.xferPort = (uint16_t)v;
-        else if (sscanf(line, "auto_pull=%d", &v) == 1) cfg.autoPull = v;
-        else if (sscanf(line, "save_server=%d", &v) == 1) cfg.saveServer = v;
-        else if (sscanf(line, "sim_hook=%d", &v) == 1) cfg.simHook = v;
-        else if (sscanf(line, "speed_hook=%d", &v) == 1) cfg.speedHook = v;
-        else if (sscanf(line, "buy_hook=%d", &v) == 1) cfg.buyHook = v;
-        else if (sscanf(line, "share_save=%239[^\r\n]", pathBuf) == 1) cfg.shareSave = pathBuf;
-        else if (sscanf(line, "save_dir=%239[^\r\n]", pathBuf) == 1) cfg.saveDir = pathBuf;
-    }
-    fclose(f);
-}
-
-static FILE* OpenShared(const wchar_t* path, const wchar_t* mode, int osfFlags)
-{
-    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return nullptr;
-    int fd = _open_osfhandle((intptr_t)h, osfFlags);
-    return fd >= 0 ? _fdopen(fd, "r+b") : nullptr;
-}
 
 // identity file: the (single) bridge mod reads this to learn which instance
 // it is. Lives in DATADIR -- inside a sandbox this lands in the overlay,
@@ -395,14 +276,8 @@ static DWORD WINAPI TailThread(LPVOID)
             if (!sawNewline) { offset = (uint64_t)lineStart; break; }
             while (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) { offset = (uint64_t)_ftelli64(f); continue; }
-            if (g_fileOut) {
-                fprintf(g_fileOut, "%s\n", line.c_str());
-                fflush(g_fileOut);
-                Log("[relay] (%zu b) %.200s\n", line.size(), line.c_str());
-            } else {
-                Net_QueueLine(line.c_str());
-                Log("[tail] sent (%zu b): %.200s\n", line.size(), line.c_str());
-            }
+            Net_QueueLine(line.c_str());
+            Log("[tail] sent (%zu b): %.200s\n", line.size(), line.c_str());
             offset = (uint64_t)_ftelli64(f);
         }
         fclose(f);
@@ -429,55 +304,6 @@ static bool ReadSmallFile(const std::wstring& path, std::string& out)
     return ok;
 }
 
-// ---- save transfer, as a ROLE rather than a startup constant -----------------
-// Settings are latched at init; whether the server is running follows whichever
-// letter we currently hold. Save_StartServer spawns a listener thread and there
-// is no Save_StopServer, so this must be idempotent: a second call would bind
-// the same port again and fail.
-static std::mutex   g_xferMtx;
-static uint16_t     g_xferPort = 0;
-static std::string  g_saveDir;
-static std::string  g_shareSave;
-static bool         g_saveServerUp = false;
-static bool         g_saveServerOn = false;   // cfg save_server=1
-static std::string  g_xferPeerIp;             // the only address the server answers
-
-// Bring the save server in line with `inst`.
-//
-// It used to run only `if (cfg.instance == "a")` at init, so a b->a promotion
-// from the lobby gave us the host's letter, the host's events file and the
-// host's tail -- and no save server at all. To a joiner that is indistinguish-
-// able from a host whose transfer port is dead.
-//
-// Off unless the cfg asks: the lobby transfers saves, and this server used to
-// hand the newest save to anyone who connected.
-static void ApplySaveRole(const std::string& inst, const char* why)
-{
-    std::lock_guard<std::mutex> lk(g_xferMtx);
-    if (inst == "a") {
-        if (g_saveServerUp) return;
-        if (!g_saveServerOn) {
-            Log("[xfer] %s: save server off (save_server=0; the lobby transfers saves)\n", why);
-            return;
-        }
-        if (g_saveDir.empty()) {
-            Log("[xfer] %s: instance a, but no save dir -- server NOT started "
-                "(set save_dir= in cfg)\n", why);
-            return;
-        }
-        Save_StartServer(g_xferPort, g_saveDir, g_shareSave, g_xferPeerIp.c_str(), Log);
-        g_saveServerUp = true;
-        Log("[xfer] %s: save server up on port %u (%s)\n", why, g_xferPort,
-            g_saveDir.c_str());
-    } else if (g_saveServerUp) {
-        // savexfer.h has no stop, and inventing one would mean tearing down a
-        // TCP transfer that may be mid-flight. A listener nobody connects to
-        // costs one socket; say so rather than leaving it a silent surprise.
-        Log("[xfer] %s: now instance %s, but the save server stays up "
-            "(no stop path; it just serves nobody)\n", why, inst.c_str());
-    }
-}
-
 // Switch letters at run time. Order matters for the Lua contract (it re-reads
 // the identity file every 60 ticks and then swaps its own capture/events
 // paths): the new events file must exist before the identity flips, and the
@@ -493,10 +319,8 @@ static void Reidentify(const std::string& inst)
     Log("[ctl] instance %s -> %s: re-identifying (pid %lu)\n",
         old.c_str(), inst.c_str(), GetCurrentProcessId());
     OpenEventsFile(inst);
-    if (!g_tailFixed) SetTailPath(CapturePathFor(inst));
-    else Log("[ctl] tail_file= override in effect, tail not retargeted\n");
+    SetTailPath(CapturePathFor(inst));
     WriteIdentity(inst, false);
-    ApplySaveRole(inst, "re-identify");
     Log("[ctl] now instance %s (identity rewritten, events truncated, tail -> capture_%s)\n",
         inst.c_str(), inst.c_str());
 }
@@ -594,26 +418,12 @@ static DWORD WINAPI CtlThread(LPVOID)
 
 static DWORD WINAPI InitThread(LPVOID)
 {
-    wchar_t dllPath[MAX_PATH] = {0};
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&InitThread, &self);
-    GetModuleFileNameW(self, dllPath, MAX_PATH);
-
-    // CFGDIR: where this DLL (and the installer's cfg) lives. Read-only use.
-    wchar_t cfgDir[MAX_PATH];
-    wcscpy_s(cfgDir, dllPath);
-    wchar_t* slash = wcsrchr(cfgDir, L'\\');
-    if (slash) *slash = 0;
-
     // DATADIR: everything written at run time. Trailing backslash included.
+    // Without one (neither TPF2MP_DATADIR nor LOCALAPPDATA is set) the bridge
+    // does not start: the slice and the Lua mod resolve the same directory, so
+    // a bridge writing its identity anywhere else would talk to nobody.
     wchar_t dataDir[MAX_PATH] = L"";
-    if (!Tpf2mpDataDirW(dataDir, MAX_PATH, (const void*)&InitThread)) {
-        // datadir.h only fails if even the module path is unreadable; fall
-        // back to CFGDIR so the bridge at least keeps its old behaviour.
-        swprintf(dataDir, MAX_PATH, L"%s\\", cfgDir);
-    }
+    if (!Tpf2mpDataDirW(dataDir, MAX_PATH, (const void*)&InitThread)) return 1;
     g_dataDir = dataDir;
 
     // Both instances can share this directory (the alut proxy loads the same
@@ -634,16 +444,6 @@ static DWORD WINAPI InitThread(LPVOID)
     }
 
     Config cfg;
-#ifdef HARDCODE_B
-    // sandboxed instance can't read sidecar cfg (Sandboxie file isolation)
-    cfg.instance = "b";
-    cfg.localPort = 7772;
-    cfg.peerPort = 7771;
-    strcpy_s(cfg.peerIp, "127.0.0.1");
-    Log("[cfg] hardcoded B\n");
-#else
-    LoadConfig(dllPath, dataDir, cfg);
-#endif
     // Auto identity. With the alut proxy the *same* dll loads into both games,
     // so identity can no longer come from which file was injected where --
     // which is just as well, since getting that wrong was the single most
@@ -651,31 +451,27 @@ static DWORD WINAPI InitThread(LPVOID)
     // port first is "a"; the other is "b".
     // The two ports the election picks between, kept in scope: losing the bind
     // below is itself an election result and has to be able to swap them.
-    const uint16_t hostPort  = cfg.localPort;      // base port from cfg
-    const uint16_t guestPort = cfg.peerPort;
-    bool elected = false;                          // true = the letter is ours to change
-    if (cfg.instance == "auto") {
-        elected = true;
-        if (Net_PortAvailable(hostPort)) {
-            cfg.instance = "a";
-            cfg.localPort = hostPort;
-            cfg.peerPort = guestPort;
-        } else {
-            cfg.instance = "b";
-            cfg.localPort = guestPort;
-            cfg.peerPort = hostPort;
-        }
-        Log("[m5] auto identity: port %u %s -> instance %s\n", hostPort,
-            cfg.instance == "a" ? "free" : "taken", cfg.instance.c_str());
+    const uint16_t hostPort  = 7771;
+    const uint16_t guestPort = 7772;
+    if (Net_PortAvailable(hostPort)) {
+        cfg.instance = "a";
+        cfg.localPort = hostPort;
+        cfg.peerPort = guestPort;
+    } else {
+        cfg.instance = "b";
+        cfg.localPort = guestPort;
+        cfg.peerPort = hostPort;
     }
+    Log("[m5] auto identity: port %u %s -> instance %s\n", hostPort,
+        cfg.instance == "a" ? "free" : "taken", cfg.instance.c_str());
 
     Log("[m5] bridge init: inst=%s local=%d peer=%s:%d pid=%lu\n",
         cfg.instance.c_str(), cfg.localPort, RedactIp(cfg.peerIp), cfg.peerPort,
         GetCurrentProcessId());
     // The Lua and slice halves must resolve the same data dir (datadir.h /
     // TPF2MP_DATADIR / LOCALAPPDATA), otherwise the halves talk past each
-    // other. Log both dirs so a mismatch is obvious.
-    Log("[m5] cfg dir: %S data dir: %S\n", cfgDir, dataDir);
+    // other. Log it so a mismatch is obvious.
+    Log("[m5] data dir: %S\n", dataDir);
 
     {
         std::lock_guard<std::mutex> lk(g_rt.mtx);
@@ -701,20 +497,6 @@ static DWORD WINAPI InitThread(LPVOID)
     // port the socket really bound)
     OpenEventsFile(cfg.instance);
 
-    // file-relay mode: tail writes directly to a peer events file (no UDP)
-    if (!cfg.relayOut.empty()) {
-        wchar_t wpath[MAX_PATH];
-        mbstowcs(wpath, cfg.relayOut.c_str(), MAX_PATH);
-        HANDLE rh = CreateFileW(wpath, FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (rh != INVALID_HANDLE_VALUE) {
-            int fd = _open_osfhandle((intptr_t)rh, _O_WRONLY | _O_APPEND | _O_BINARY);
-            if (fd >= 0) g_fileOut = _fdopen(fd, "ab");
-        }
-        Log("[m5] relay_out: %s\n", g_fileOut ? "open" : "FAILED");
-    }
-
     bool netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
 
     // The election is CHECK-then-BIND, and the two halves are seconds apart:
@@ -724,9 +506,7 @@ static DWORD WINAPI InitThread(LPVOID)
     // retry on localPort+10, and go on addressing the guest port. Two hosts, no
     // guest, and nothing crossing the wire. Losing the bind is the election
     // result: take the other letter and the other port pair.
-    // Only when the letter was ours to pick -- an explicit instance= in the cfg
-    // is a deliberate statement and must not be silently overridden.
-    if (!netUp && elected && cfg.instance == "a") {
+    if (!netUp && cfg.instance == "a") {
         Log("[m5] lost the race for port %u after the availability check said it "
             "was free -- re-electing as instance b\n", cfg.localPort);
         cfg.instance  = "b";
@@ -783,106 +563,35 @@ static DWORD WINAPI InitThread(LPVOID)
     Log("[m5] identity written: inst=%s port=%u\n", cfg.instance.c_str(),
         (unsigned)Net_LocalPort());
 
-    // ---- save transfer -----------------------------------------------------
-    // The host serves its world so the joiner can start from the same map.
-    // Kept off the event channel on purpose: a save is ~178 MB and that
-    // channel is line-oriented reliable UDP with a 32-entry ack window.
-    {
-        if (cfg.saveDir.empty()) cfg.saveDir = Save_FindSaveDir();
-        Log("[m5] save dir: %s\n",
-            cfg.saveDir.empty() ? "(not found -- set save_dir= in cfg)" : cfg.saveDir.c_str());
+    // Fractional game speed (speedhook.cpp); CtlThread feeds it the target
+    // from tpf2_speed.txt.
+    SpeedHook_Install(Log);
 
-        // Latch the settings before the first role decision: from here on the
-        // server follows the LETTER, including a later instance=a from the
-        // lobby (see ApplySaveRole).
-        {
-            std::lock_guard<std::mutex> lk(g_xferMtx);
-            g_xferPort  = cfg.xferPort;
-            g_saveDir   = cfg.saveDir;
-            g_shareSave = cfg.shareSave;
-            g_saveServerOn = cfg.saveServer != 0;
-            g_xferPeerIp   = cfg.peerIp;
+    // Transport health, from our own thread every 10 s. A line is written only
+    // when a figure moved, so an idle bridge does not repeat itself all session.
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        char last[192] = "";
+        while (!g_stopping) {
+            Sleep(10000);
+            uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0;
+            size_t pending = 0; bool alive = false;
+            Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize);
+            char cur[192];
+            _snprintf_s(cur, sizeof(cur), _TRUNCATE,
+                "peer=%s pending=%zu dropped=%llu/%llu/%llu strangers=%llu",
+                alive ? "up" : "DOWN", pending,
+                (unsigned long long)dNoPeer, (unsigned long long)dOverflow,
+                (unsigned long long)dOversize,
+                (unsigned long long)Net_DroppedStrangers());
+            if (strcmp(cur, last) == 0) continue;
+            strcpy_s(last, cur);
+            Log("[net] %s\n", cur);
         }
-        ApplySaveRole(cfg.instance, "init");
-        if (cfg.instance != "a" && cfg.autoPull) {
-            struct PullArgs { std::string ip; uint16_t port; std::string dir; };
-            auto* pa = new PullArgs{ cfg.peerIp, cfg.xferPort, cfg.saveDir };
-            CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
-                std::unique_ptr<PullArgs> a((PullArgs*)p);
-                // the host may still be starting up; retry for a while
-                for (int i = 0; i < 60; ++i) {
-                    if (Save_Pull(a->ip.c_str(), a->port, a->dir, Log)) return 0;
-                    Sleep(1000);
-                }
-                Log("[xfer] gave up pulling save from host\n");
-                return 0;
-            }, pa, 0, nullptr);
-        }
-    }
+        return 0;
+    }, nullptr, 0, nullptr);
 
-    // ---- native sim-thread foothold ---------------------------------------
-    // Prototype: prove we get a per-tick callback on the Simulation Thread and
-    // that it survives. ECS reads go here next -- doing them from any other
-    // thread races the sim (docs/re/GAME_LOOP_AND_UI.md).
-    if (cfg.speedHook) SpeedHook_Install(Log);
-    if (cfg.simHook) {
-        if (SimHook_Install(Log)) {
-            // Report from OUR thread, not the sim thread. The handler itself
-            // only bumps counters; anything doing I/O per tick would be a
-            // repeat of M2's 56 GB logging incident.
-            CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
-                uint64_t last = 0;
-                bool everRan = false;
-                for (;;) {
-                    Sleep(10000);
-                    uint64_t now = SimHook_TickCount();
-                    if (now == last) {
-                        if (everRan) Log("[simhook] idle (no sim ticks in 10s)\n");
-                        continue;
-                    }
-                    everRan = true;
-                    uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0;
-                    size_t pending = 0; bool alive = false;
-                    Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize);
-                    Log("[simhook] ticks=%llu (+%llu in 10s) lastFrameTime=%llu | "
-                        "peer=%s pending=%zu dropped=%llu/%llu/%llu strangers=%llu\n",
-                        (unsigned long long)now,
-                        (unsigned long long)(now - last),
-                        (unsigned long long)SimHook_LastFrameTime(),
-                        alive ? "up" : "DOWN", pending,
-                        (unsigned long long)dNoPeer, (unsigned long long)dOverflow,
-                        (unsigned long long)dOversize,
-                        (unsigned long long)Net_DroppedStrangers());
-                    last = now;
-                }
-            }, nullptr, 0, nullptr);
-        }
-    } else {
-        Log("[simhook] disabled (sim_hook=0)\n");
-    }
-
-    // buyVehicle factory probe. Purchases are invisible to Lua entirely -- an
-    // in-depot vehicle is not a world entity -- so this is the only place the
-    // event can be observed.
-    if (cfg.buyHook) {
-        // Path is latched by the hook at install; a later re-identify does
-        // not move it (the probe is a dev diagnostic, not a replication path).
-        wchar_t buyPath[MAX_PATH];
-        swprintf(buyPath, MAX_PATH, L"%stpf2_buy_%S.txt", dataDir, cfg.instance.c_str());
-        BuyHook_Install(Log, buyPath);
-        Log("[buy] purchases -> %S\n", buyPath);
-    } else {
-        Log("[buy] disabled (buy_hook=0)\n");
-    }
-
-    // capture file tail (Lua -> peer). tail_file= is an absolute override
-    // (relay mode) and is never retargeted by the control file.
-    if (!cfg.tailFile.empty()) {
-        g_tailFixed = true;
-        SetTailPath(std::wstring(cfg.tailFile.begin(), cfg.tailFile.end()));
-    } else {
-        SetTailPath(CapturePathFor(cfg.instance));
-    }
+    // capture file tail (Lua -> peer); a re-identify retargets it
+    SetTailPath(CapturePathFor(cfg.instance));
     CreateThread(nullptr, 0, TailThread, nullptr, 0, nullptr);
     Log("[m5] tailing capture file\n");
 

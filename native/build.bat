@@ -6,11 +6,11 @@ REM                                      deferrelay_slice.asm: its suppress path
 REM                                      generic, so it serves every hooked function
 REM                                      whose return value the call site discards)
 REM   menu    tpf2_menu.dll              the Vulkan-overlay Multiplayer panel (menu_hook.cpp);
-REM                                      also copied to the game dir / workshop out dir
-REM                                      when nothing holds them open
+REM                                      also copied to the game dir when nothing holds
+REM                                      it open
 REM   proxy   alut.dll, tpf2_bridge_mp.dll   the export-forwarding proxy that loads us
 REM                                      before the exe entry point, and the bridge
-REM                                      (identity, relay socket, save transfer)
+REM                                      (identity, relay socket, fractional speed)
 REM   host    tpf2_pluginhost.dll        the plugin host shared with TpF2 Big Maps;
 REM                                      rebuilds alut.dll too (the host adds to what
 REM                                      the proxy loads)
@@ -65,24 +65,17 @@ ml64 /nologo /c /Fo out\gameuirelay_menu.obj src\gameuirelay.asm                
 link /nologo /DLL /OUT:out\tpf2_menu%SFX%.dll out\hook_menu.obj out\menu_hook.obj out\gameuirelay_menu.obj user32.lib gdi32.lib advapi32.lib || exit /b 1
 REM Deploy to where the proxy loads it from. Non-fatal: a running game holds the
 REM dll open, and the copy is simply skipped -- redeploy after the relaunch.
-set "DEST=C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out\tpf2_menu.dll"
-copy /y "out\tpf2_menu%SFX%.dll" "%DEST%" >nul 2>&1 && (echo deployed to the workshop out dir) || (echo workshop deploy skipped: dll locked by a running game)
 set "GAMEDEST=C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\tpf2_menu.dll"
 copy /y "out\tpf2_menu%SFX%.dll" "%GAMEDEST%" >nul 2>&1 && (echo deployed to the game dir) || (echo game-dir deploy skipped: dll locked by a running game -- close it and rerun build.bat menu)
 exit /b 0
 
 :proxy
 %CC% /c src\net.cpp /Fo:out\net_mp.obj                                               || exit /b 1
-%CC% /c src\savexfer.cpp /Fo:out\savexfer_mp.obj                                     || exit /b 1
 %CC% /c src\hook.cpp /Fo:out\hook_mp.obj                                             || exit /b 1
-%CC% /c src\simhook.cpp /Fo:out\simhook_mp.obj                                       || exit /b 1
 %CC% /c src\speedhook.cpp /Fo:out\speedhook_mp.obj                                   || exit /b 1
-%CC% /c src\buyhook.cpp /Fo:out\buyhook_mp.obj                                       || exit /b 1
-ml64 /nologo /c /Fo out\simsteprelay_mp.obj src\simsteprelay.asm                     || exit /b 1
 ml64 /nologo /c /Fo out\cgamesteprelay_mp.obj src\cgamesteprelay.asm                 || exit /b 1
-ml64 /nologo /c /Fo out\buyrelay_mp.obj src\buyrelay.asm                             || exit /b 1
 %CC% /c src\bridge_main.cpp /Fo:out\bridge_mp.obj                                    || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\savexfer_mp.obj out\hook_mp.obj out\simhook_mp.obj out\speedhook_mp.obj out\cgamesteprelay_mp.obj out\simsteprelay_mp.obj out\buyhook_mp.obj out\buyrelay_mp.obj out\bridge_mp.obj || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\hook_mp.obj out\speedhook_mp.obj out\cgamesteprelay_mp.obj out\bridge_mp.obj || exit /b 1
 %CC% /LD src\proxy_alut.cpp /Fe:out\alut.dll /Fo:out\proxy_alut.obj                  || exit /b 1
 exit /b 0
 

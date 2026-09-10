@@ -6,8 +6,7 @@
 #   <game>\tpf2_bridge_mp.dll       lockstep transport  (proxy loads it: next-to-proxy rule)
 #   <game>\tpf2_menu.dll            lobby overlay
 #   <game>\tpf2_slice.dll           capture/cancel hooks (proxy loads it at start)
-#   <game>\tpf2_bridge_mp.cfg       installer/cfg defaults
-#   <game>\tpf2_slice.cfg
+#   <game>\tpf2_slice.cfg           installer/cfg defaults
 #   <game>\netpunch\netpunch.exe    frozen lobby (menu resolves NETDIR = <dll dir>\netpunch)
 #   <game>\mods\mp_lockstep_1\**    the Lua mod (deploy_mod.ps1 also refreshes the userdata copy)
 #
@@ -16,7 +15,7 @@
 #
 #   tools\deploy_shipping.ps1            deploy everything (game must be closed)
 #   tools\deploy_shipping.ps1 -Clean     also wipe %LOCALAPPDATA%\tpf2mp\data (fresh identity/logs)
-param([switch]$Clean, [switch]$Cfg)   # -Cfg: also overwrite the three cfgs in the game dir (LIVE settings; kept by default)
+param([switch]$Clean, [switch]$Cfg)   # -Cfg: also overwrite the two cfgs in the game dir (LIVE settings; kept by default)
 $ErrorActionPreference = "Stop"
 $Repo = Split-Path -Parent $PSScriptRoot
 $Game = $null
@@ -62,7 +61,7 @@ Put "$Repo\native\out\tpf2_pluginhost.dll"   (Join-Path $Game 'tpf2_pluginhost.d
 # The cfgs are LIVE settings read next to the DLL: a line that exists only in the
 # game-dir copy (cancel_construction=1 was one, 2026-09-09) is lost when the
 # shipped copy is put over it. An existing cfg is left alone unless -Cfg.
-foreach ($c in "tpf2_bridge_mp.cfg", "tpf2_slice.cfg", "tpf2mp.cfg") {
+foreach ($c in "tpf2_slice.cfg", "tpf2mp.cfg") {
     $dst = Join-Path $Game $c
     if ($Cfg -or -not (Test-Path $dst)) { Put "$Repo\installer\cfg\$c" $dst }
     else { Write-Host "[ship]   $c kept (live settings; pass -Cfg to overwrite)" }

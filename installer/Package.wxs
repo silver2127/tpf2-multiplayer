@@ -131,19 +131,15 @@
       <Component Id="SliceDll">
         <File Id="tpf2_slice.dll" Name="tpf2_slice.dll" Source="$(SliceDll)" />
       </Component>
-      <!-- The two cfg files used to carry NeverOverwrite="yes" so a player's edits
+      <!-- The cfg files used to carry NeverOverwrite="yes" so a player's edits
            survived an upgrade. That is the documented Windows Installer trap: the
            file exists at costing, so the component is marked "do not install";
            RemoveExistingProducts then deletes the OLD product's copy, and nothing
            puts one back. A friends' host lost both cfgs on the 0.3.1 -> 0.4.0
            upgrade (2026-09-09) and played with the DLLs' built-in defaults. Now
-           the files are plain installed files: an upgrade lays down the shipped
-           defaults. A player who wants their own settings keeps a copy in
-           %LOCALAPPDATA%\tpf2mp\data\, which the DLLs read after the game folder
-           and which no installer touches. -->
-      <Component Id="BridgeCfg">
-        <File Id="tpf2_bridge_mp.cfg" Name="tpf2_bridge_mp.cfg" Source="cfg\tpf2_bridge_mp.cfg" />
-      </Component>
+           tpf2_slice.cfg is a plain installed file: an upgrade lays down the
+           shipped copy. That copy sets nothing, so an upgrade cannot take away a
+           setting multiplayer needs. -->
       <Component Id="SliceCfg">
         <File Id="tpf2_slice.cfg" Name="tpf2_slice.cfg" Source="cfg\tpf2_slice.cfg" />
       </Component>

@@ -8,15 +8,17 @@
 //
 // Shipping layout:
 //   binaries + cfg   <game dir>  (alut.dll proxy, tpf2_bridge_mp.dll, tpf2_menu.dll,
-//                                 tpf2_slice.dll, tpf2_bridge_mp.cfg, tpf2_slice.cfg)
+//                                 tpf2_slice.dll, tpf2_slice.cfg)
 //   runtime data     %LOCALAPPDATA%\tpf2mp\data   (identity, events, captures,
 //                                 injects, status, logs -- everything written at run time)
 // Program Files is not writable by the game process, LOCALAPPDATA is; the Lua
 // side finds the same directory via os.getenv("LOCALAPPDATA").
 //
-// Dev-rig compatibility: if TPF2MP_DATADIR is set in the environment it wins
-// (the harness can pin the old workshop out dir); otherwise LOCALAPPDATA; if
-// even that is missing, fall back to the directory the calling DLL lives in.
+// TPF2MP_DATADIR, if set in the environment, wins; otherwise LOCALAPPDATA.
+// There is no third candidate: the Lua side follows TPF2MP_DATADIR only once
+// that folder holds tpf2_instance.txt (the bridge writes it at start) and
+// otherwise uses LOCALAPPDATA, so any other directory would leave the halves
+// talking past each other.
 // Header-only so the bridge and slice builds stay single-file.
 #pragma once
 #include <windows.h>
@@ -24,11 +26,11 @@
 #include <string.h>
 
 // Fills `out` (MAX_PATH wide chars) with the data dir INCLUDING a trailing
-// backslash, creating it if needed. `self` = any address inside the calling
-// module (for the last-resort fallback). Returns false only if nothing could
-// be resolved at all.
+// backslash, creating it if needed. Returns false when neither TPF2MP_DATADIR
+// nor LOCALAPPDATA is set. `self` is unused; the callers still pass it.
 static inline bool Tpf2mpDataDirW(wchar_t* out, size_t cch, const void* self)
 {
+    (void)self;
     wchar_t buf[MAX_PATH] = L"";
     if (GetEnvironmentVariableW(L"TPF2MP_DATADIR", buf, MAX_PATH) && buf[0]) {
         _snwprintf_s(out, cch, _TRUNCATE, L"%s", buf);
@@ -37,11 +39,7 @@ static inline bool Tpf2mpDataDirW(wchar_t* out, size_t cch, const void* self)
         CreateDirectoryW(out, nullptr);
         _snwprintf_s(out, cch, _TRUNCATE, L"%s\\tpf2mp\\data", buf);
     } else {
-        HMODULE h = nullptr;
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                (LPCWSTR)self, &h) || !GetModuleFileNameW(h, buf, MAX_PATH)) return false;
-        wchar_t* p = wcsrchr(buf, L'\\'); if (p) *p = 0;
-        _snwprintf_s(out, cch, _TRUNCATE, L"%s", buf);
+        return false;
     }
     CreateDirectoryW(out, nullptr);
     size_t n = wcslen(out);
