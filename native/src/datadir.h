@@ -54,5 +54,10 @@ static inline bool Tpf2mpDataDirA(char* out, size_t cch, const void* self)
 {
     wchar_t w[MAX_PATH];
     if (!Tpf2mpDataDirW(w, MAX_PATH, self)) return false;
-    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cch, nullptr, nullptr) > 0;
+    // CP_ACP, not CP_UTF8: every consumer hands this to the narrow CRT
+    // (fopen/_fsopen), which takes the ANSI codepage. On an ASCII profile the
+    // two agree; on a user named "Közös pc" the UTF-8 bytes named a folder
+    // that does not exist, the slice log failed to open and the slice gave
+    // up silently -- no hooks, no replication, nothing logged (2026-09-10).
+    return WideCharToMultiByte(CP_ACP, 0, w, -1, out, (int)cch, nullptr, nullptr) > 0;
 }

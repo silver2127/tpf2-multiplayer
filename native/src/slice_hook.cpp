@@ -3588,7 +3588,7 @@ static void ResolveDllDir()
     wchar_t* slash = wcsrchr(w, L'\\');
     if (!slash) return;
     slash[1] = 0;                                   // keep the backslash
-    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, g_dllDir, (int)sizeof(g_dllDir),
+    if (WideCharToMultiByte(CP_ACP, 0, w, -1, g_dllDir, (int)sizeof(g_dllDir),   // ANSI: fopen() takes it
                             nullptr, nullptr) <= 0)
         g_dllDir[0] = 0;
 }

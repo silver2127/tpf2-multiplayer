@@ -2871,9 +2871,18 @@ static DWORD WINAPI Init(LPVOID)
                     void* gdpaReal = gdpa;
                     if (gb[0] == 0xE9) gdpaReal = (void*)((uintptr_t)gdpa + 5 + *(int32_t*)(gb + 1));
                     void* gt = nullptr;
-                    if (InstallHook((uintptr_t)gdpaReal, (void*)&myGdpa, 15, &gt)) {
+                    // The loader ships with the graphics driver, so its prologue
+                    // is whatever that build's compiler made: 15 bytes on ours,
+                    // 16 on a friend's (mov [rsp+10],rsi; push rdi; sub rsp,20;
+                    // mov rsi,rcx; mov rdi,rdx). A fixed 15 cut the last mov in
+                    // half and the game died at device creation, before its
+                    // first frame, with nothing in stdout.txt (2026-09-10).
+                    int steal = PrologueSteal((const unsigned char*)gdpaReal, 14);
+                    if (steal <= 0) {
+                        Log("[menu] vkGetDeviceProcAddr prologue not decodable -- overlay NOT hooked (the game keeps running without the in-game panel)\n");
+                    } else if (InstallHook((uintptr_t)gdpaReal, (void*)&myGdpa, steal, &gt)) {
                         g_origGdpa = (PFN_vkGetDeviceProcAddr)gt;
-                        Log("[menu] hooked vkGetDeviceProcAddr real=%p steal=15\n", gdpaReal);
+                        Log("[menu] hooked vkGetDeviceProcAddr real=%p steal=%d\n", gdpaReal, steal);
                     } else {
                         Log("[menu] InstallHook on gdpa FAILED\n");
                     }
