@@ -70,7 +70,9 @@ try:
     assert wait(lambda: any(e.get("type") == "code" for e in events(rd)), 40), "no code after restart"
     code2 = [e for e in events(rd) if e.get("type") == "code"][0]["code"]
     print("old code still used below; new code differs only by its timestamp:", code2 != code)
-    dd = d("dave"); run(["join", code, "--name", "Dave", "--local-port", "0", "--no-mesh"], dd, "dave")
+    # Dave and Erin run WITH the mesh (as real players do) and with game relay
+    # ports, so lockstep frames can be checked both ways through the relay
+    dd = d("dave"); run(["join", code, "--name", "Dave", "--local-port", "0", "--game-relay-port", "7791", "--game-local-port", "7792"], dd, "dave")
     assert wait(lambda: any(e.get("type") == "roster" and "Dave" in e.get("players", []) for e in events(dd)), 40), "dave not in roster"
     rdv = [e for e in events(dd) if e.get("type") == "roster"][-1]
     assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "d", rdv     # a,b,c are remembered for Alice/Bob/Carol
@@ -78,13 +80,37 @@ try:
     assert wait(lambda: any(e.get("type") == "save_ready" for e in events(dd)), 60), "dave never got the stored save"
     assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(dd)), 30), "dave no start"
     assert open(os.path.join(dd, "incoming_save.sav"), "rb").read() == open(save, "rb").read(), "resumed save differs"
-    print("RELAY SELFTEST OK (incl. restart + auto-resume)")
+    # ---- game frames both ways through the relay (the leader is a joiner like any other)
+    import socket
+    ed = d("erin"); run(["join", code, "--name", "Erin", "--local-port", "0", "--game-relay-port", "7793", "--game-local-port", "7794"], ed, "erin")
+    assert wait(lambda: any(e.get("type") == "roster" and "Erin" in e.get("players", []) for e in events(dd)), 40), "erin not in roster"
+    time.sleep(3)
+    dave_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); dave_bridge.bind(("127.0.0.1", 7792)); dave_bridge.settimeout(0.5)
+    erin_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); erin_bridge.bind(("127.0.0.1", 7794)); erin_bridge.settimeout(0.5)
+    def xfer(src, dst_relay_port, sink, tag):
+        got = set()
+        for i in range(20):
+            src.sendto(b"LSTICK test %s %d" % (tag, i), ("127.0.0.1", dst_relay_port))
+            time.sleep(0.05)
+        end = time.time() + 8
+        while time.time() < end and len(got) < 20:
+            try:
+                data, _ = sink.recvfrom(2048)
+                if data.startswith(b"LSTICK test " + tag): got.add(data)
+            except socket.timeout: pass
+        return len(got)
+    e2d = xfer(erin_bridge, 7793, dave_bridge, b"e2d")   # Erin's bridge -> Erin's lobby -> relay -> Dave's lobby -> Dave's bridge
+    d2e = xfer(dave_bridge, 7791, erin_bridge, b"d2e")   # and the other way
+    print(f"frames: erin->dave {e2d}/20, dave->erin {d2e}/20")
+    assert e2d >= 15, "frames to the LEADER do not arrive (the plain-to-relay bug)"
+    assert d2e >= 15, "frames from the leader do not arrive"
+    print("RELAY SELFTEST OK (incl. restart + auto-resume + frames)")
 finally:
     for p in procs:
         try: p.kill()
         except Exception: pass
     time.sleep(1)
-    for n in ("relay", "relay2", "alice", "bob", "carol", "dave"):
+    for n in ("relay", "relay2", "alice", "bob", "carol", "dave", "erin"):
         try:
             lines = open(os.path.join(tmp, n + ".log"), encoding="utf-8", errors="replace").read().splitlines()
             print("---", n, "(last 6)"); print("\n".join(lines[-6:]))

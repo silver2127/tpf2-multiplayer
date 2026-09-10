@@ -1359,7 +1359,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.6"
+LOBBY_VERSION = "0.4.7"
 PUBLISH_EVERY = 30.0
 
 
@@ -1755,6 +1755,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 peers[addr]["last"] = time.time()
                 if relay is not None:
                     relay.deliver(payload)
+                if relay_only and peers[addr].get("mesh"):
+                    # a mesh joiner sends a PLAIN frame only to "the host": in a
+                    # relay lobby that means the leader (0.4.6 clients did this)
+                    la = leader_addr()
+                    if la is not None and la != addr:
+                        try:
+                            sock.sendto(_pack_data(payload), la)
+                        except OSError:
+                            pass
+                    return
                 if not peers[addr].get("mesh"):
                     # legacy star joiner: it cannot reach the others itself
                     frame = _pack_data(payload)
@@ -2282,10 +2292,14 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         for nm in participants[0]:
             if nm == me:
                 continue
-            if nm == host_name[0]:
+            if nm == host_name[0] and not is_relay[0]:
+                # the game host: its lobby is our transport peer
                 if mesh.send(conn.peer, payload):
                     n += 1
                 continue
+            # (in a relay lobby the roster's host is the LEADER -- a joiner like
+            # us: direct link or an envelope via the relay, never a plain frame
+            # to the relay's address, which has no game to deliver it to)
             if mesh.by_name(nm):
                 if mesh.send(nm, payload):
                     n += 1
