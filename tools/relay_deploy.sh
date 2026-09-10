@@ -10,6 +10,12 @@ set -e
 HOST="${1:-root@76.13.109.115}"
 LOBBY="${2:-Dedicated Test Server All Welcome}"
 PORT="${3:-29471}"
+# Never restart the relay under a live session: the restart drops every player's
+# transport and each game carries on alone (2026-09-10, 10:12). FORCE=1 overrides.
+if [ "${FORCE:-0}" != "1" ]; then
+  N=$(ssh "$HOST" 'python3 -c "import json;d=json.load(open(\"/var/lib/tpf2mp/relay/lobby_state.json\"));print(len(d.get(\"players\",[])))" 2>/dev/null' || echo 0)
+  if [ "${N:-0}" -gt 0 ]; then echo "relay has $N player(s) connected -- not restarting (FORCE=1 to override)"; exit 3; fi
+fi
 tar -C netpunch -cf - lobby.py punch.py seal.py connect.py mesh.py observe.py swarm.py 2>/dev/null \
   | ssh "$HOST" 'mkdir -p /opt/tpf2mp/netpunch && tar -C /opt/tpf2mp/netpunch -xf -'
 ssh "$HOST" "set -e

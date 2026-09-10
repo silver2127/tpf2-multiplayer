@@ -742,10 +742,10 @@ function CM.execPolyline(c, planOnly)
 		-- Node positions are read ONCE per proposal: the per-segment scan below
 		-- used to call getComponent on every map node (10k) for every segment (a
 		-- 23-segment rail = 230k component reads, seconds of stall at the click).
-		local xingNodes = nil
+		local xingNodeCache = nil   -- NOT xingNodes: that is the crossing-node list the post-build probe walks
 		local function xingNodeList()
-			if xingNodes then return xingNodes end
-			xingNodes = {}
+			if xingNodeCache then return xingNodeCache end
+			xingNodeCache = {}
 			for _, getter in ipairs({ api.engine.system.streetSystem.getNode2StreetEdgeMap, api.engine.system.streetSystem.getNode2TrackEdgeMap }) do
 				local m
 				pcall(function() m = getter() end)
@@ -756,12 +756,12 @@ function CM.execPolyline(c, planOnly)
 						if pnode then
 							local ids = {}
 							for _, eid in pairs(edges) do if eid > 0 then ids[#ids + 1] = eid end end
-							xingNodes[#xingNodes + 1] = { pnode.x or pnode[1], pnode.y or pnode[2], ids }
+							xingNodeCache[#xingNodeCache + 1] = { pnode.x or pnode[1], pnode.y or pnode[2], ids }
 						end
 					end
 				end
 			end
-			return xingNodes
+			return xingNodeCache
 		end
 		local xingDebug = CM.cfgFlag("xing_debug", false)
 		local function crossingsFor(k, n0, n1, x0, y0, z0, x1, y1, z1, T0, T1)
