@@ -108,6 +108,7 @@ function newInst(spec)
   CM.rxGaps = function() return 0, 0, nil, nil end
   CM.gameTime = function() return I.T end
   CM.stepOf = function(t) return math.floor((t or 0) / K.SIM_STEP + 0.5) end
+  CM.clearFile = function(path) SIM.fs[path] = nil end   -- io.lua in the game empties; absent and empty read alike
   local function log(msg) SIM.logs[#SIM.logs + 1] = string.format("%5d %s: %s", SIM.tick, spec.letter, tostring(msg)) end
   HELPERS(CM, K)
   if not CM.heartbeatCu then

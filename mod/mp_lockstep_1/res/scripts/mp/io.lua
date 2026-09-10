@@ -8,6 +8,26 @@
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
 -- ---------- io ----------
+-- The game's Lua has no os.remove. Its os table is cut down, and the unguarded
+-- call in CM.syncTick raised "attempt to call field 'remove' (a nil value)" on a
+-- player's host the moment a hot-join save was shared (0.4.11, build 35924,
+-- 2026-09-10). Every pcall'd os.remove had been failing silently: stale dash and
+-- status files from days before, and a fractional speed that was never cleared.
+-- A file this mod wants gone is EMPTIED instead, and every reader treats an empty
+-- file as absent: the bridge's tpf2_speed.txt ("absent, empty or 0 = off"), the
+-- sync marker, the dash and status files. A missing file is not created.
+function CM.clearFile(path)
+	local f = io.open(path, "r")
+	if not f then return end
+	f:close()
+	if os and os.remove then
+		local ok, removed = pcall(os.remove, path)
+		if ok and removed then return end
+	end
+	local w = io.open(path, "w")
+	if w then w:close() end
+end
+
 local function appendLine(path, line)
 	local f = io.open(path, "a")
 	if not f then return false end
@@ -69,8 +89,8 @@ function CM.detectInstance()
 	-- so only one status file exists and it is always the live one.
 	for letter in ("abcdefgh"):gmatch(".") do
 		if letter ~= inst then
-			pcall(function() os.remove(K.BASE .. "lockstep_status_" .. letter .. ".txt") end)
-			pcall(function() os.remove(K.BASE .. "lockstep_dash_" .. letter .. ".txt") end)
+			pcall(CM.clearFile, K.BASE .. "lockstep_status_" .. letter .. ".txt")
+			pcall(CM.clearFile, K.BASE .. "lockstep_dash_" .. letter .. ".txt")
 		end
 	end
 	log("identity " .. K.INSTANCE .. " (peer " .. K.PEER .. ")")

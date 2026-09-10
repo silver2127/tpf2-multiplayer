@@ -63,17 +63,24 @@ function CM.leverOf(v)
 	return math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v + 0.5)))
 end
 -- No dither target survives a load: the bridge deletes the file at game
--- start and this does it again at script load, so a leftover fraction from
+-- start and this empties it again at script load (CM.clearFile: the game has no
+-- os.remove), so a leftover fraction from
 -- the last session cannot slow this one from its first frame.
-pcall(function() os.remove(K.BASE .. "tpf2_speed.txt") end)
+pcall(CM.clearFile, K.BASE .. "tpf2_speed.txt")
 CM.ditherCur = ""
+K.DITHER_REASSERT_TICKS = 25   -- ~5 s at speed 1: the file is written again even when the target is unchanged
 function CM.setDither(v)
 	local want = (v and v ~= math.floor(v)) and string.format("%.4f", v) or ""
-	if CM.ditherCur == want then return end
+	-- REWRITTEN every K.DITHER_REASSERT_TICKS even when unchanged (2026-09-10). With
+	-- the cache alone, one lost write -- and, before CM.clearFile, every clear --
+	-- left the bridge applying a stale fraction for the rest of the session:
+	-- joiners "caught up at 4x" at about 1 unit/s under a leftover 0.95.
+	if CM.ditherCur == want and (CM.ticks or 0) - (CM.ditherAt or -1e9) < K.DITHER_REASSERT_TICKS then return end
 	CM.ditherCur = want
+	CM.ditherAt = CM.ticks or 0
 	pcall(function()
 		local p = K.BASE .. "tpf2_speed.txt"
-		if want == "" then os.remove(p) else local f = io.open(p, "w"); if f then f:write(want, "\n"); f:close() end end
+		if want == "" then CM.clearFile(p) else local f = io.open(p, "w"); if f then f:write(want, "\n"); f:close() end end
 	end)
 end
 
@@ -218,6 +225,9 @@ function CM.syncBegin()
 	-- them at catch-up speed until it reaches the live clock.
 	CM.syncState = "saving"
 	CM.syncSince = CM.ticks
+	-- a marker left by an earlier sync (emptied, never deleted: see CM.clearFile)
+	-- must not end this one before its save is even taken
+	pcall(CM.clearFile, K.BASE .. "tpf2_sync_sent.txt")
 	pcall(function()
 		local f = io.open(K.BASE .. "tpf2_sync_save.txt", "w")
 		if f then f:write(string.format("step=%d\n", CM.stepOf(CM.gameTime() or 0))); f:close() end
@@ -248,9 +258,14 @@ function CM.syncTick(now, s)
 	if st == "saving" then
 		local f = io.open(K.BASE .. "tpf2_sync_sent.txt", "r")
 		if f then
-			local name = f:read("*l") or "?"; f:close()
-			os.remove(K.BASE .. "tpf2_sync_sent.txt")
-			CM.syncEnd(string.format("save shared (%s) -- the newcomer loads it and catches up on its own", name))
+			local name = f:read("*l"); f:close()
+			-- EMPTIED, not deleted, and an empty marker is no marker: the game's
+			-- Lua has no os.remove, and calling it here crashed a host the moment
+			-- a hot-join save was shared (0.4.11, 2026-09-10).
+			if name and name ~= "" then
+				pcall(CM.clearFile, K.BASE .. "tpf2_sync_sent.txt")
+				CM.syncEnd(string.format("save shared (%s) -- the newcomer loads it and catches up on its own", name))
+			end
 		end
 	end
 	local _ = n + same
