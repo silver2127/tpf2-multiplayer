@@ -63,6 +63,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | every setting |
 | [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | building, deploying, the multi-instance rig, logs, tests, releases |
 | [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | open bugs, replication gaps, plans that were not built |
+| [docs/TESTING.md](docs/TESTING.md) | the manual test plan: what to check before pushing, and before a release |
 | [docs/re/](docs/re/README.md) | the engine reference for build 35924 that the hooks rest on |
 | [installer/README.md](installer/README.md) | the MSI: what it changes, upgrades, building it |
 | [netpunch/README.md](netpunch/README.md) | the lobby's source |
