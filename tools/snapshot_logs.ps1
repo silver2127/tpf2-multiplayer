@@ -8,7 +8,7 @@ the evidence of the run being reported (lost a B-vs-C divergence, 2026-09-02).
 Run this first, then kill/relaunch. Folders are named by Sandboxie box, not by
 lockstep letter -- letters are assigned per launch and swap between boxes.
 
-  tools\snapshot_logs.ps1 [-Tag <word>]     -> %LOCALAPPDATA%\tpf2mp\runs\<stamp>[-tag]\{native,GameAgent,GameAgent2}\
+  tools\snapshot_logs.ps1 [-Tag <word>]     -> %LOCALAPPDATA%\tpf2mp\runs\<stamp>[-tag]\{native,GameAgent,GameAgent2,GameAgent3}\
 #>
 param([string]$Tag = "")
 
@@ -27,7 +27,8 @@ $gameRel = "Program Files (x86)\Steam\steamapps\common\Transport Fever 2"
 $sources = @(
     @{ name = "native";     stdout = "C:\$stdoutRel";                                        data = (Join-Path $env:LOCALAPPDATA "tpf2mp\data");                    game = "C:\$gameRel" },
     @{ name = "GameAgent";  stdout = "C:\Sandbox\$env:USERNAME\GameAgent\drive\C\$stdoutRel";  data = "C:\Sandbox\$env:USERNAME\GameAgent\user\current\$dataRel";  game = "C:\Sandbox\$env:USERNAME\GameAgent\drive\C\$gameRel" },
-    @{ name = "GameAgent2"; stdout = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$stdoutRel"; data = "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\$dataRel"; game = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$gameRel" }
+    @{ name = "GameAgent2"; stdout = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$stdoutRel"; data = "C:\Sandbox\$env:USERNAME\GameAgent2\user\current\$dataRel"; game = "C:\Sandbox\$env:USERNAME\GameAgent2\drive\C\$gameRel" },
+    @{ name = "GameAgent3"; stdout = "C:\Sandbox\$env:USERNAME\GameAgent3\drive\C\$stdoutRel"; data = "C:\Sandbox\$env:USERNAME\GameAgent3\user\current\$dataRel"; game = "C:\Sandbox\$env:USERNAME\GameAgent3\drive\C\$gameRel" }
 )
 $gameFiles = @("egeo_*.txt", "tpf2_slice.cfg")
 # tpf2_instance.txt and mp_company_cfg.txt are two lines each and they are what
