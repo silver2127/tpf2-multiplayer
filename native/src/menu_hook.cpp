@@ -49,7 +49,7 @@ static const uintptr_t RVA_BTN = 0x7c5d30;
 typedef void* (*BtnFn)(void* ctx, void* strA, void* strB);
 static BtnFn g_btn = nullptr;
 
-// --- insertion primitives (correct RVAs, see docs/re/MENU_UI.md) ---
+// --- insertion primitives (see docs/re/GAME_LOOP_AND_UI.md, "Title menu") ---
 static const uintptr_t RVA_MAINBUILD = 0x667bc0;   // main-page builder (hook here)
 static const int       STEAL_MAINBUILD = 14;       // mov rax,rsp + 7 pushes
 static const uintptr_t RVA_SEED  = 0x4c0f40;       // 4c0f40(&out, param_3)
@@ -779,7 +779,7 @@ static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itsel
 // HOST/JOIN page is up; rows render below the password field and a click
 // drops the row's code into the join field. The list is what hosts chose to
 // publish (see _Publisher in lobby.py); nothing here talks to a host directly.
-struct PubRow { char name[48]; char code[256]; char game[64]; char version[24]; int players, max, age; bool locked; };
+struct PubRow { char name[48]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
 static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
@@ -852,7 +852,7 @@ static DWORD WINAPI PubFetchThread(LPVOID)
             char obj[1024]; int L = (int)(e - o + 1); if (L > 1023) L = 1023; memcpy(obj, o, L); obj[L] = 0;
             PubRow& r = rows[cnt]; memset(&r, 0, sizeof(r));
             if (pubStr(obj, "code", r.code, sizeof(r.code)) && r.code[0]) {
-                pubStr(obj, "name", r.name, sizeof(r.name)); pubStr(obj, "game", r.game, sizeof(r.game)); pubStr(obj, "version", r.version, sizeof(r.version));
+                pubStr(obj, "name", r.name, sizeof(r.name)); pubStr(obj, "game", r.game, sizeof(r.game)); pubStr(obj, "type", r.type, sizeof(r.type)); pubStr(obj, "version", r.version, sizeof(r.version));
                 r.players = pubInt(obj, "players", 0); r.max = pubInt(obj, "max", 8); r.age = pubInt(obj, "age", 0); r.locked = pubInt(obj, "locked", 0) != 0;
                 cnt++;
             }
@@ -1048,11 +1048,11 @@ static void RenderPanelLayer(int w, int h)
             PubRow rows[8]; int cnt = 0; char note[96] = "";
             if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); memcpy(rows, g_pub, sizeof(rows)); cnt = g_pubCount; strcpy_s(note, g_pubNote); LeaveCriticalSection(&g_pubCs); }
             HFONT fr = mkLato(S(13));
-            // HOST gets 250 px (was 180): "Dedicated Test Server All Welcome" and
-            // long player names were cut off; GAME moved right to make room (2026-09-10)
-            int cName = pad + S(10), cGame = pad + S(265), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
-            layerText(cName, ly, S(250), S(20), L"HOST", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            layerText(cGame, ly, S(250), S(20), L"GAME", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            // HOST takes the room the save name had: the list shows the server TYPE,
+            // one short phrase, never the host's save file name (2026-09-10)
+            int cName = pad + S(10), cType = pad + S(395), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
+            layerText(cName, ly, S(375), S(20), L"HOST", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(cType, ly, S(120), S(20), L"TYPE", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             layerText(cPl, ly, S(70), S(20), L"PLAYERS", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             layerText(cVer, ly, S(60), S(20), L"VERSION", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             layerText(cAge, ly, S(80), S(20), L"SEEN", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1061,13 +1061,16 @@ static void RenderPanelLayer(int w, int h)
             for (int i = 0; i < cnt && i < maxRows; i++) {
                 const PubRow& r = rows[i]; int rh = S(24);
                 layerRect(pad, ly, lw, rh, RGB(0, 0, 0), (i & 1) ? 35 : 55);
-                wchar_t wn[64], wg[80], wv[32], wp[32], wa[32];
-                MultiByteToWideChar(CP_UTF8, 0, r.name, -1, wn, 64); MultiByteToWideChar(CP_UTF8, 0, r.game, -1, wg, 80); MultiByteToWideChar(CP_UTF8, 0, r.version, -1, wv, 32);
+                wchar_t wn[64], wv[32], wp[32], wa[32];
+                MultiByteToWideChar(CP_UTF8, 0, r.name, -1, wn, 64); MultiByteToWideChar(CP_UTF8, 0, r.version, -1, wv, 32);
+                // a master from before the type field: the relay is known by its game string
+                const wchar_t* wt = !strcmp(r.type, "relay") ? L"dedicated server" : !strcmp(r.type, "host") ? L"player hosted"
+                                  : !strcmp(r.game, "dedicated relay") ? L"dedicated server" : L"player hosted";
                 if (r.locked) { wchar_t t[64]; _snwprintf_s(t, _TRUNCATE, L"%s  [locked]", wn); wcscpy_s(wn, t); }
                 _snwprintf_s(wp, _TRUNCATE, L"%d / %d", r.players, r.max);
                 if (r.age < 60) wcscpy_s(wa, L"just now"); else _snwprintf_s(wa, _TRUNCATE, L"%d min ago", r.age / 60);
-                layerText(cName, ly, S(250), rh, wn, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                layerText(cGame, ly, S(250), rh, wg[0] ? wg : L"(unnamed save)", fr, wg[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                layerText(cName, ly, S(375), rh, wn, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                layerText(cType, ly, S(120), rh, wt, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 layerText(cPl, ly, S(70), rh, wp, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 layerText(cVer, ly, S(60), rh, wv, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 layerText(cAge, ly, S(80), rh, wa, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1511,7 +1514,7 @@ static void ProbeWidget()
 // hook the list's add call and remember the list pointer while the builder runs;
 // after it returns we run the same five steps for our own entry. The click slot is
 // an MSVC std::function whose in-place impl vtable is {Copy, Move, DoCall,
-// TargetType, DeleteThis} (docs/M6_MENU_UI.md) -- we supply a static one.
+// TargetType, DeleteThis} (docs/re/GAME_LOOP_AND_UI.md) -- we supply a static one.
 static const uintptr_t RVA_LIST_ADD = 0x22d99e0;  static const int STEAL_LIST_ADD = 15;   // push rdi; sub rsp,60; mov [rsp+20],-2
 static const uintptr_t RVA_SETNAME  = 0x227a1e0;
 static const uintptr_t RVA_PREP     = 0x227f880;
@@ -2288,7 +2291,7 @@ static bool doStartLoad(const wchar_t* srcSav)
     // did nothing at all if the player happened to be on another menu page. The save
     // is placed and stamped newest either way, so asking for one click always works.
     // clickContinueLoad() is kept below, unused, until the proper fix lands: calling
-    // the menu's own load action (docs/re/LOAD_SAVE.md).
+    // the menu's own load action (docs/re/GAME_LOOP_AND_UI.md, "Loading a save").
     InterlockedExchange(&g_lobbyDone, 1);   // release the keyboard: the lobby's work is done
     Log("[menu] shared save placed as mp_shared -- the player loads it from LOAD GAME\n");
     SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
@@ -2365,8 +2368,8 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         // PUBLIC checkbox can be flipped later, in the lobby); --public starts listed
         wchar_t wpub[560] = L"";
         { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, 48); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
-        if (g_flagMaster[0]) { wchar_t wm[300], wg[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300); MultiByteToWideChar(CP_UTF8, 0, a->game, -1, wg, 64);
-                               wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s --game-name \"%s\"%s", wm, wg, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
+        if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
+                               wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
@@ -2560,14 +2563,7 @@ static void StartLobby(int join)
     InterlockedExchange(&g_joinFocus, 0); SaveNames();
     if (g_lobbyName[0]) strcpy_s(a->lobby, g_lobbyName); else snprintf(a->lobby, sizeof(a->lobby), "%s's game", g_username);
     g_lobbyTitle[0] = 0;
-    if (!join) {   // the save's name is what the public list shows as the game
-        wchar_t sv[600]; if (newestSave(sv, 600)) {
-            const wchar_t* b = wcsrchr(sv, L'\\'); b = b ? b + 1 : sv;
-            char u[200]; WideCharToMultiByte(CP_UTF8, 0, b, -1, u, sizeof(u), nullptr, nullptr);
-            char* dot = strrchr(u, '.'); if (dot && _stricmp(dot, ".sav") == 0) *dot = 0;
-            int j = 0; for (int i = 0; u[i] && j < 60; i++) { unsigned char c = (unsigned char)u[i]; if (c >= 32 && c != '"' && c != '\\') a->game[j++] = (char)c; } a->game[j] = 0;
-        }
-    }
+    // (no game name: the public list shows the server type, not the host's newest save)
     if (join) {
         if (g_joinLen >= 8) strcpy_s(a->code, g_joinCode);
         else if (!ClipboardGet(a->code, sizeof(a->code)) || strlen(a->code) < 8) {

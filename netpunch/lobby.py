@@ -1376,10 +1376,10 @@ class _Publisher:
     the code (host address + session secret) and a name -- so it is opt-in,
     and a password-locked code shows as locked (useless without the password)."""
 
-    def __init__(self, url, code, game, locked, log, stable_key=None):
+    def __init__(self, url, code, kind, locked, log, stable_key=None):
         self.url = url.rstrip("/")
         self.code = code
-        self.game = game or ""
+        self.kind = kind if kind in ("relay", "host") else "host"   # listed as its type, never a save name
         self.locked = bool(locked)
         self.log = log
         # A STABLE id: derived from the lobby name + port + machine, so a
@@ -1423,7 +1423,7 @@ class _Publisher:
             try:
                 if self.on:
                     self._post("/announce", {"id": self.id, "name": self.name, "code": self.code,
-                                             "players": self.players, "max": CAP, "game": self.game,
+                                             "players": self.players, "max": CAP, "type": self.kind,
                                              "version": LOBBY_VERSION, "locked": self.locked})
                     if not announced:
                         self.log(f"[publish] listed publicly at {self.url} as {self.name!r}")
@@ -2778,7 +2778,7 @@ def cmd_host(args):
          + (" + password)" if args.password else ")"))
     publisher = None
     if args.publish:
-        publisher = _Publisher(args.publish, code, args.game_name, bool(args.password), _log,
+        publisher = _Publisher(args.publish, code, "relay" if args.relay_only else "host", bool(args.password), _log,
                                stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
         # systemd stops the relay with SIGTERM; without a handler Python just
         # dies and the finally: below (publisher.close -> /leave) never runs,
@@ -3858,7 +3858,8 @@ def main(argv=None):
     ap.add_argument("--lobby-name", default="",
                     help="what the lobby is called (shown to joiners and in the public list)")
     ap.add_argument("--game-name", default="",
-                    help="what the public list shows as the game (the save's name)")
+                    help="ignored: the public list shows the server type, never a save name "
+                         "(kept so older menu DLLs that pass it still launch)")
     ap.add_argument("--password", default="",
                     help="optional lobby password: mixed into the session key, "
                          "so everyone must enter the same one (host + joiners)")

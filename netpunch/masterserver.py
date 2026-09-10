@@ -23,7 +23,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TTL = 30.0           # seconds an entry lives without a fresh announce (lobbies announce every 10 s)
 MAX_BODY = 4096
 MAX_ENTRIES = 500
-FIELDS = ("id", "name", "code", "players", "max", "game", "version", "locked")
+FIELDS = ("id", "name", "code", "players", "max", "game", "type", "version", "locked")
+# The list shows what KIND of server a row is, never the host's save name
+# (2026-09-10): a save's file name ("multi Balage", "autosave 3") read as
+# nonsense and was not even the world START GAME ends up sharing.
+TYPE_LABELS = {"relay": "dedicated server", "host": "player hosted"}
 
 _lock = threading.Lock()
 _servers = {}        # id -> dict(fields..., "at": last announce, "ip": announcer)
@@ -88,13 +92,21 @@ class H(BaseHTTPRequestHandler):
             code = _s(d.get("code"), 400)
             if not code:
                 return self._send(400, {"error": "code required"})
+            kind = _s(d.get("type"), 16)
+            if kind not in TYPE_LABELS:
+                # lobbies before the type field send none: the relay is known by
+                # the game string its service passes, anything else is a player
+                kind = "relay" if _s(d.get("game"), 60) == "dedicated relay" else "host"
             e = {
                 "id": sid,
                 "name": _s(d.get("name"), 40) or "unnamed",
                 "code": code,
                 "players": int(d.get("players") or 0),
                 "max": int(d.get("max") or 8),
-                "game": _s(d.get("game"), 60),
+                "type": kind,
+                # "game" carries the type's label: 0.4.11-and-older panels show
+                # this field, so they list the type too instead of a save name
+                "game": TYPE_LABELS[kind],
                 "version": _s(d.get("version"), 20),
                 "locked": bool(d.get("locked")),
                 "at": now,
