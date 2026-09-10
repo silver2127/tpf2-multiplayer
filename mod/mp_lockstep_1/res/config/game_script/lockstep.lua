@@ -538,6 +538,9 @@ CM.boot("mp.inject")
 -- ---------- session speed, PID pacing, catch-up, load gate ----------
 -- Lives in res/scripts/mp/pacing.lua.
 CM.boot("mp.pacing")
+-- ---------- other players' cursors as coloured ground circles (cosmetic) ----------
+-- Lives in res/scripts/mp/cursors.lua.
+CM.boot("mp.cursors")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
 	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
@@ -690,6 +693,7 @@ function data()
 
 			CM.paceTick(now)
 			CM.ensureRunning()
+			pcall(CM.cursorTick)   -- other players' cursors (cursors.lua): cosmetic, never the sim
 
 			-- Commands that asked to be tried again (a VLINE whose line has not
 			-- arrived yet). They were executed once as far as the pump knows, so
@@ -949,6 +953,9 @@ function data()
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
 		guiUpdate = function()
 			guiTick = guiTick + 1
+			-- other players' cursors (cursors.lua): ten times a second at 60 fps, ahead of
+			-- the panel's own twice-a-second refresh
+			if guiTick % 6 == 0 and CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
 			if guiTick % 30 ~= 0 then return end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
@@ -1185,7 +1192,14 @@ function data()
 						D.coSel = r[i]
 					end
 					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					-- company colour swatches (2026-09-10): the chip colour the lobby roster shows
+					-- (style classes !mpCo1..!mpCo200 in res/config/style_sheet/mp_lockstep.lua),
+					-- for our company before the text and for the selected one after it
+					D.coSwMine = api.gui.comp.TextView.new("  ##  ")
+					D.coSwSel = api.gui.comp.TextView.new("  ##  ")
+					crow:addItem(D.coSwMine)
 					crow:addItem(D.coText)
+					crow:addItem(D.coSwSel)
 					crow:addItem(speedBtn("  <  ", function() coStep(-1) end))
 					crow:addItem(speedBtn("  >  ", function() coStep(1) end))
 					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
@@ -1318,6 +1332,11 @@ function data()
 						if not D.coSel then D.coSel = D.coMine end
 						local sel = D.coSel or D.coMine
 						local selWho = sel and played[sel]
+						-- the swatches follow the ids (see D.coSwMine)
+						local mineCls = "mpCo" .. tostring(math.max(1, math.min(200, D.coMine or 1)))
+						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, sel or D.coMine or 1)))
+						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
+						if D.coSwSel and D.coSwSelCls ~= selCls then D.coSwSelCls = selCls; pcall(function() D.coSwSel:setStyleClassList({ selCls }) end) end
 						D.coText:setText(string.format("company: mine %s   |  %d in session   |  selected: %s%s%s   ",
 							tostring(D.coMine or "?"), #roster, tostring(sel or "-"),
 							(sel == D.coMine and " (mine)" or "") .. (sel and locked[sel] and " [password]" or ""), selWho and (" played by " .. selWho) or (sel and " (empty)" or "")))

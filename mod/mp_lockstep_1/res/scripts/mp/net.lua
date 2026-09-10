@@ -539,6 +539,9 @@ local function onLine(line)
 			local hi = tonumber(line:match(" hi=(%d+)"))
 			if hi then pcall(CM.rxAdvertise, o, hi) end
 		end
+	elseif op == "LSCUR" then
+		-- another player's cursor (cursors.lua): cosmetic, straight to the GUI's file
+		pcall(CM.cursorRecv, line)
 	elseif op == "LSEFF" then
 		-- SPEED V2: the host broadcasts the session's effective speed; joiners
 		-- apply it. Not while the load gate holds (only the local lever releases
