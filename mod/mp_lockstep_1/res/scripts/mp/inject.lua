@@ -839,8 +839,12 @@ function CM.pollInject()
 				-- a construction. Anything else (a town building, an industry) is
 				-- not ours to rename.
 				local id = tonumber(w[2])
+				-- a VCOLOR that is our own replay coming back through the slice is
+				-- dropped, or it echoes between the instances forever (CM.takeColorEcho)
+				local echo = o == "VCOLOR" and id ~= nil and CM.takeColorEcho ~= nil
+					and CM.takeColorEcho(id, tonumber(w[3]) or -1, tonumber(w[4]) or -1, tonumber(w[5]) or -1)
 				local kind, key
-				if id then
+				if id and not echo then
 					key = CM.vehKeyOf[id] and CM.vehKeyFor(id) or nil
 					if key then kind = "veh" end
 					if not key then
@@ -865,7 +869,9 @@ function CM.pollInject()
 						key = CM.vehKeyFor(id); if key then kind = "veh" end
 					end
 				end
-				if key then
+				if echo then
+					log(string.format("VCOLOR: entity %s is our own replay coming back -- not shipped", tostring(w[2])))
+				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
 						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = 1 })

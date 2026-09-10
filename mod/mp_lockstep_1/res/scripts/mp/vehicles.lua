@@ -399,6 +399,41 @@ local function targetFor(kind, key)
 	return nil
 end
 
+-- OUR OWN COLOUR REPLAYS CAME BACK AS NEW PLAYER ACTIONS (2026-09-10). The slice
+-- tells a replay from a player's click by the factory's return address: the
+-- scripting wrappers sit in 0xcec000..0xcf2000. api.cmd.make.setColor is the
+-- exception -- it reaches SetColor from 0xc3848e (measured, 493,256 captures;
+-- make.setName returns inside the block, 0xceedbf, so names never echoed). So
+-- every replayed VCOLOR was captured and shipped again as a new command, every
+-- peer replayed that, and so on: with four instances one colour change grew to
+-- ~100,000 queued commands in ten minutes and froze all four games. A replay
+-- leaves an expectation here, and inject.lua drops the capture that matches it
+-- (same entity, same colour, within 600 ticks) instead of shipping it.
+CM.colorEchoes = {}
+function CM.expectColorEcho(id, r, g, b)
+	local now, keep = CM.ticks or 0, {}
+	for _, e in ipairs(CM.colorEchoes) do
+		if now - e.at <= 600 then keep[#keep + 1] = e end
+	end
+	keep[#keep + 1] = { id = id, r = r, g = g, b = b, at = now }
+	CM.colorEchoes = keep
+end
+function CM.takeColorEcho(id, r, g, b)
+	local now, keep, hit = CM.ticks or 0, {}, false
+	for _, e in ipairs(CM.colorEchoes) do
+		if now - e.at <= 600 then
+			if not hit and e.id == id and math.abs(e.r - r) < 0.0005
+					and math.abs(e.g - g) < 0.0005 and math.abs(e.b - b) < 0.0005 then
+				hit = true
+			else
+				keep[#keep + 1] = e
+			end
+		end
+	end
+	CM.colorEchoes = keep
+	return hit
+end
+
 function CM.execSetName(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
 	local ok, err = pcall(function()
@@ -427,6 +462,8 @@ function CM.execSetColor(c)
 			return
 		end
 		local r, g, b = tonumber(c.r) or 0, tonumber(c.g) or 0, tonumber(c.b) or 0
+		-- the slice captures this replay as if a player had clicked (CM.expectColorEcho)
+		CM.expectColorEcho(id, r, g, b)
 		api.cmd.sendCommand(api.cmd.make.setColor(id, api.type.Vec3f.new(r, g, b)), function(_, okc)
 			log(string.format("EXEC VCOLOR seq=%s %s %s -> %d rgb=%.2f,%.2f,%.2f success=%s",
 				tostring(c.seq), tostring(c.kind), tostring(c.key), id, r, g, b, tostring(okc)))
