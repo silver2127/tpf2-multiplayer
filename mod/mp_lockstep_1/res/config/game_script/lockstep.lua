@@ -782,8 +782,8 @@ function data()
 					if f then
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
-						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
-							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-"))
+						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
+							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1231,10 +1231,12 @@ function data()
 					local req = mine and mine.speedreq
 					local sync = mine and mine.sync
 					local pace = mine and mine.pace
-					D.speedText:setText(string.format("session speed: %s%s%s%s   ", eff and string.format("%gx", eff) or "-",
+					local xfer = mine and mine.xfer
+					D.speedText:setText(string.format("session speed: %s%s%s%s%s   ", eff and string.format("%gx", eff) or "-",
 						(req and req ~= "-") and "  (set)" or "  (lowest lever)",
 						(pace and pace ~= "-") and ("  PID " .. pace) or "",
-						(sync and sync ~= "-") and ("  SYNC: " .. sync) or ""))
+						(sync and sync ~= "-") and ("  SYNC: " .. sync) or "",
+						(xfer and xfer ~= "-") and ("  SAVE: " .. xfer) or ""))
 					if D.coText and mine then
 						local roster = {}
 						for id in tostring(mine.roster or ""):gmatch("%d+") do roster[#roster + 1] = tonumber(id) end

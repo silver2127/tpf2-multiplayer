@@ -424,6 +424,10 @@ function CM.speedRequest()
 		req = tonumber(body:match("speed=([%d%.]+)"))
 		syncN = tonumber(body:match("sync=(%d+)")) or 0
 		players = tonumber(body:match("players=(%d+)"))
+		local xf = body:match("xfer=([^\r\n]*)")
+		CM.xferInfo = (xf and xf ~= "" and xf ~= "-") and xf or nil
+		local xf = body:match("xfer=([^\r\n]*)")
+		CM.xferInfo = (xf and xf ~= "" and xf ~= "-") and xf or nil
 		local ld = body:match("leader=(%a+)")
 		if ld and ld ~= CM.leader then
 			CM.leader = ld
@@ -981,17 +985,30 @@ function CM.loadGateReady()
 	--      one of the two directions.
 	-- The cfg is deliberately NOT required: it gets overwritten by an installer
 	-- run, and a wiped cfg must not change how this behaves.
-	local want = CM.cfgNum("expect_players", 0)
-	if want < 2 then
-		local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
-		if f then
-			local body = f:read("*a") or ""
-			f:close()
-			want = tonumber(body:match("players=(%d+)")) or 0
+	-- Decided ONCE, at the first look: the roster as it was when WE loaded is
+	-- who loaded with us. A player who joins later is a hot joiner -- it
+	-- catches up to the running world -- and must never freeze anyone; and a
+	-- leader who loaded alone (a relay's auto-resume) has nobody to wait for.
+	-- Re-reading players= every tick did both (live 2026-09-09: the leader sat
+	-- at speed 0 for minutes while a joiner's save was still in transit).
+	if CM.lgWant == nil then
+		local want = CM.cfgNum("expect_players", 0)
+		if want < 2 then
+			local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
+			if f then
+				local body = f:read("*a") or ""
+				f:close()
+				want = tonumber(body:match("players=(%d+)")) or 0
+			end
 		end
+		CM.lgWant = want
+		if want == 1 then log("LOADGATE: loaded alone (roster of one) -- nothing to wait for") end
 	end
+	local want = CM.lgWant
 	local ready
-	if want > 1 then
+	if want == 1 then
+		ready = true
+	elseif want > 1 then
 		ready = (n >= want - 1)
 	else
 		ready = (n >= 1 and (CM.ticks - (CM.lgChangedAt or CM.ticks)) >= K.LOADGATE_SETTLE)

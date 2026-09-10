@@ -2088,6 +2088,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     log(f"[relay] upload error: {e!r}")
                     upload[0] = None
                     u = None
+                if u is not None and not u.failed and not u.complete and u.last_pct >= 0:
+                    # tell everyone who is waiting how the leader's upload is going
+                    if u.last_pct // 10 != getattr(u, "told_pct", -1) // 10:
+                        u.told_pct = u.last_pct
+                        for a, p2 in list(peers.items()):
+                            if not p2.get("started") and a != leader_addr():
+                                _send_data(sock, a, {"t": "status", "state": "connected",
+                                                     "detail": f"the leader is uploading the world to the relay\u2026 {u.last_pct}%"})
                 if u is not None and u.failed:
                     log("[relay] the leader's upload failed -- waiting for a new START")
                     upload[0] = None

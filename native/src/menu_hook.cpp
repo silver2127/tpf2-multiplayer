@@ -1909,7 +1909,8 @@ static void SyncPoll()
 // "/sync off" clears it.
 static char g_speedReq[16] = "";
 static int  g_syncReq = 0;
-static char g_pidReq[160] = "";     // "/pid kp=0.06 ki=0.01" -> pid=kp=0.06 ki=0.01 (the script merges keys)
+static char g_pidReq[160] = "";
+static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")     // "/pid kp=0.06 ki=0.01" -> pid=kp=0.06 ki=0.01 (the script merges keys)
 static void writeBridgeCtl(bool isHost);
 static void speedFromChat(const char* text)
 {
@@ -1985,6 +1986,10 @@ static void writeBridgeCtl(bool isHost)
     if (g_pidReq[0]) {
         size_t n = strlen(content);
         snprintf(content + n, sizeof(content) - n, "pid=%s\n", g_pidReq);
+    }
+    if (g_xfer[0]) {
+        size_t n = strlen(content);
+        snprintf(content + n, sizeof(content) - n, "xfer=%s\n", g_xfer);
     }
     {   // the session clock: the roster's host (a relay lobby moves it when the leader leaves)
         size_t n = strlen(content);
@@ -2420,9 +2425,15 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));
                             int pct = jsonInt(rem, "pct"); char msg[96];
-                            if (strcmp(role, "recv") == 0) { if (pct >= 0) { snprintf(msg, sizeof(msg), "Receiving save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); } }
-                            else if (strcmp(st, "done") == 0) SetStatus("Save sent.");
-                            else if (pct >= 0) { snprintf(msg, sizeof(msg), "Sending save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); }
+                            char peer[40]; jsonStr(rem, "peer", peer, sizeof(peer));
+                            bool toRelay = strcmp(peer, "relay") == 0;
+                            if (strcmp(role, "recv") == 0) { if (pct >= 0) { snprintf(msg, sizeof(msg), "Receiving save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); snprintf(g_xfer, sizeof(g_xfer), "receiving %d%%", pct); } }
+                            else if (strcmp(st, "done") == 0) { SetStatus(toRelay ? "Save uploaded to the relay." : "Save sent."); g_xfer[0] = 0; }
+                            else if (st[0]) { g_xfer[0] = 0; }
+                            else if (pct >= 0) { snprintf(msg, sizeof(msg), toRelay ? "Uploading save to the relay\xE2\x80\xA6 %d%%" : "Sending save\xE2\x80\xA6 %d%%", pct); SetStatus(msg);
+                                                 snprintf(g_xfer, sizeof(g_xfer), toRelay ? "uploading %d%%" : "sending %d%%", pct); }
+                            if (pct >= 100) g_xfer[0] = 0;
+                            writeBridgeCtl(g_isHost != 0);   // the in-game window reads xfer= from the ctl
                         }
                         else if (strcmp(ty, "save_ready") == 0) { InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "start") == 0) {
