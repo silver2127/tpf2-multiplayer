@@ -198,27 +198,41 @@ static void ServeOne(SOCKET c)
     LogX("[xfer] sent %u file(s) for '%s'\n", count, base.c_str());
 }
 
+// Who may fetch the save: the bridge's peer address, set by Save_StartServer.
+static in_addr g_allowed{};
+
 static DWORD WINAPI ServerThread(LPVOID)
 {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     SOCKET srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (srv == INVALID_SOCKET) { LogX("[xfer] socket failed\n"); return 0; }
+    // Exclusive, not SO_REUSEADDR: on Windows that lets another socket bind the
+    // same port and take the connections.
     BOOL yes = TRUE;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    setsockopt(srv, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&yes, sizeof(yes));
+    const bool loopback = (ntohl(g_allowed.s_addr) >> 24) == 127;
     sockaddr_in a{};
     a.sin_family = AF_INET;
-    a.sin_addr.s_addr = INADDR_ANY;
+    a.sin_addr.s_addr = htonl(loopback ? INADDR_LOOPBACK : INADDR_ANY);
     a.sin_port = htons(g_port);
     if (bind(srv, (sockaddr*)&a, sizeof(a)) != 0 || listen(srv, 4) != 0) {
         LogX("[xfer] listen on %u FAILED (%d)\n", g_port, WSAGetLastError());
         closesocket(srv);
         return 0;
     }
-    LogX("[xfer] serving saves on tcp/%u from %s\n", g_port, g_dir.c_str());
+    LogX("[xfer] serving saves on tcp/%u from %s, to %s only\n", g_port, g_dir.c_str(),
+         loopback ? "this PC" : "the peer address");
     for (;;) {
-        SOCKET c = accept(srv, nullptr, nullptr);
+        sockaddr_in from{}; int fromLen = sizeof(from);
+        SOCKET c = accept(srv, (sockaddr*)&from, &fromLen);
         if (c == INVALID_SOCKET) break;
+        if (from.sin_addr.s_addr != g_allowed.s_addr) {
+            // it used to send the newest save to anyone who connected
+            LogX("[xfer] refused a connection that did not come from the peer\n");
+            closesocket(c);
+            continue;
+        }
         LogX("[xfer] joiner connected\n");
         ServeOne(c);
         shutdown(c, SD_SEND);
@@ -229,9 +243,12 @@ static DWORD WINAPI ServerThread(LPVOID)
 }
 
 void Save_StartServer(uint16_t port, const std::string& saveDir,
-                      const std::string& shareName, XferLogFn log)
+                      const std::string& shareName, const char* peerIp,
+                      XferLogFn log)
 {
     g_log = log; g_dir = saveDir; g_share = shareName; g_port = port;
+    if (!peerIp || inet_pton(AF_INET, peerIp, &g_allowed) != 1)
+        inet_pton(AF_INET, "127.0.0.1", &g_allowed);
     if (g_dir.empty()) { LogX("[xfer] no save dir; server not started\n"); return; }
     CreateThread(nullptr, 0, ServerThread, nullptr, 0, nullptr);
 }

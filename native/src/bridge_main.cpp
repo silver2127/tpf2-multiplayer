@@ -145,6 +145,7 @@ struct Config {
     std::string saveDir;    // blank = auto-discover Steam userdata save dir
     std::string shareSave;  // blank = newest .sav
     int         autoPull = 0;   // joiner pulls the host's save on startup
+    int         saveServer = 0; // host serves it over TCP (legacy; the lobby transfers saves)
     // native sim-thread hook. Off by default: it patches game code, so it must
     // be opted into rather than surprising anyone who just wants replication.
     int         simHook = 1;   // shipped cfg says 1; no cfg must not mean a different mode (2026-09-09)
@@ -230,6 +231,7 @@ static void LoadConfig(const wchar_t* dllPath, const wchar_t* dataDir, Config& c
         else if (sscanf(line, "relay_out=%239s", pathBuf) == 1) cfg.relayOut = pathBuf;
         else if (sscanf(line, "xfer_port=%d", &v) == 1) cfg.xferPort = (uint16_t)v;
         else if (sscanf(line, "auto_pull=%d", &v) == 1) cfg.autoPull = v;
+        else if (sscanf(line, "save_server=%d", &v) == 1) cfg.saveServer = v;
         else if (sscanf(line, "sim_hook=%d", &v) == 1) cfg.simHook = v;
         else if (sscanf(line, "speed_hook=%d", &v) == 1) cfg.speedHook = v;
         else if (sscanf(line, "buy_hook=%d", &v) == 1) cfg.buyHook = v;
@@ -437,6 +439,8 @@ static uint16_t     g_xferPort = 0;
 static std::string  g_saveDir;
 static std::string  g_shareSave;
 static bool         g_saveServerUp = false;
+static bool         g_saveServerOn = false;   // cfg save_server=1
+static std::string  g_xferPeerIp;             // the only address the server answers
 
 // Bring the save server in line with `inst`.
 //
@@ -444,17 +448,24 @@ static bool         g_saveServerUp = false;
 // from the lobby gave us the host's letter, the host's events file and the
 // host's tail -- and no save server at all. To a joiner that is indistinguish-
 // able from a host whose transfer port is dead.
+//
+// Off unless the cfg asks: the lobby transfers saves, and this server used to
+// hand the newest save to anyone who connected.
 static void ApplySaveRole(const std::string& inst, const char* why)
 {
     std::lock_guard<std::mutex> lk(g_xferMtx);
     if (inst == "a") {
         if (g_saveServerUp) return;
+        if (!g_saveServerOn) {
+            Log("[xfer] %s: save server off (save_server=0; the lobby transfers saves)\n", why);
+            return;
+        }
         if (g_saveDir.empty()) {
             Log("[xfer] %s: instance a, but no save dir -- server NOT started "
                 "(set save_dir= in cfg)\n", why);
             return;
         }
-        Save_StartServer(g_xferPort, g_saveDir, g_shareSave, Log);
+        Save_StartServer(g_xferPort, g_saveDir, g_shareSave, g_xferPeerIp.c_str(), Log);
         g_saveServerUp = true;
         Log("[xfer] %s: save server up on port %u (%s)\n", why, g_xferPort,
             g_saveDir.c_str());
@@ -545,7 +556,7 @@ static void ApplyControl(const std::string& text)
                 Log("[ctl] peer %s:%d -> %s:%d\n", RedactIp(oldIp.c_str()), oldPort,
                     RedactIp(wantIp.c_str()), wantPort);
             } else {
-                Log("[ctl] peer=%s:%d REJECTED (not a dotted IPv4:port), keeping %s:%d\n",
+                Log("[ctl] peer=%s:%d REJECTED (not a dotted IPv4:port, or not this PC while the socket is loopback-only), keeping %s:%d\n",
                     RedactIp(wantIp.c_str()), wantPort, RedactIp(oldIp.c_str()), oldPort);
             }
         }
@@ -789,6 +800,8 @@ static DWORD WINAPI InitThread(LPVOID)
             g_xferPort  = cfg.xferPort;
             g_saveDir   = cfg.saveDir;
             g_shareSave = cfg.shareSave;
+            g_saveServerOn = cfg.saveServer != 0;
+            g_xferPeerIp   = cfg.peerIp;
         }
         ApplySaveRole(cfg.instance, "init");
         if (cfg.instance != "a" && cfg.autoPull) {
@@ -832,13 +845,14 @@ static DWORD WINAPI InitThread(LPVOID)
                     size_t pending = 0; bool alive = false;
                     Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize);
                     Log("[simhook] ticks=%llu (+%llu in 10s) lastFrameTime=%llu | "
-                        "peer=%s pending=%zu dropped=%llu/%llu/%llu\n",
+                        "peer=%s pending=%zu dropped=%llu/%llu/%llu strangers=%llu\n",
                         (unsigned long long)now,
                         (unsigned long long)(now - last),
                         (unsigned long long)SimHook_LastFrameTime(),
                         alive ? "up" : "DOWN", pending,
                         (unsigned long long)dNoPeer, (unsigned long long)dOverflow,
-                        (unsigned long long)dOversize);
+                        (unsigned long long)dOversize,
+                        (unsigned long long)Net_DroppedStrangers());
                     last = now;
                 }
             }, nullptr, 0, nullptr);

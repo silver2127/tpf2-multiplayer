@@ -1,6 +1,6 @@
 # Known issues and open work
 
-State of the code at version 0.4.10. Items marked *from the code* were found by reading the
+State of the code at version 0.4.11. Items marked *from the code* were found by reading the
 source while these docs were rewritten and have not been reproduced in a game; the rest were
 observed in play.
 
@@ -37,11 +37,6 @@ observed in play.
 
 ## Native side
 
-- **The bridge's UDP socket accepts packets from anyone** *(from the code)*. It binds all interfaces
-  and checks only the packet magic (`net.cpp`), so a reachable port 7771 lets an outsider inject game
-  commands that the lobby's sealing never sees. See [SECURITY.md](SECURITY.md#what-it-does-not-do).
-- **The legacy save server still listens** *(from the code)*. Instance `a` serves its newest save on
-  TCP 7871, all interfaces, without authentication (`savexfer.cpp`); the lobby's transfer replaced it.
 - **The bridge link is single-sender** *(from the code)*. With three or more players one bridge
   socket hears several senders; each change of sender resets its sequence state, so the link's
   ordering, de-duplication and chunk reassembly cannot be relied on and recovery falls to the mod's

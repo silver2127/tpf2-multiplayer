@@ -18,13 +18,20 @@ struct NetEvent {
 };
 #pragma pack(pop)
 
-// True if nothing currently holds this UDP port. Used to work out which
-// instance we are when both games load the same proxy: first one up takes the
-// host port. Inherently racy, but the two games are started seconds apart and
-// the real bind afterwards still fails loudly if we lose.
+// True if no socket holds this UDP port on any local address. Used to work out
+// which instance we are when both games load the same proxy: first one up takes
+// the host port. Inherently racy, but the two games are started seconds apart
+// and the real bind afterwards still fails loudly if we lose.
 bool Net_PortAvailable(uint16_t port);
 
 // deliverCb is called (from the net thread) once per fully reassembled line.
+//
+// The socket only listens to its peer. With a loopback peer (every lobby
+// session, and two games on one PC) it is bound to 127.0.0.1, so nothing off
+// this PC can reach it; any other peer address binds all interfaces, for a
+// direct link to that machine. Either way a datagram from any address but the
+// peer's is dropped (Net_DroppedStrangers). The bind is exclusive, and refused
+// if anything already holds the port on any address.
 bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
               void (*deliverCb)(const char* line));
 // Thread-safe; chunks as needed. A line too long to describe with a 16-bit
@@ -49,7 +56,8 @@ void Net_SignalShutdown();
 // Thread-safe. Liveness is reset and the unacked backlog dropped: those
 // packets were for the old peer and the new one starts from a transferred
 // save anyway. Returns false (and changes nothing) if `ip` is not a dotted
-// IPv4 address or the port is out of range.
+// IPv4 address, the port is out of range, or the socket is bound to 127.0.0.1
+// and `ip` is not a loopback address.
 bool Net_SetPeer(const char* ip, int port);
 
 // The UDP port the socket actually bound (queried from the socket, so it is
@@ -63,3 +71,6 @@ uint16_t Net_LocalPort();
 // upstream is generating a multi-megabyte line.
 void Net_Stats(uint64_t* droppedNoPeer, uint64_t* droppedOverflow,
                size_t* pending, bool* peerAlive, uint64_t* droppedOversize);
+
+// Datagrams dropped because their source address was not the peer's.
+uint64_t Net_DroppedStrangers();

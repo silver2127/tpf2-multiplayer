@@ -80,6 +80,8 @@ built by `installer\build_msi.ps1` ([installer/README.md](../installer/README.md
   press START GAME. With exactly two, `tools\click_continue.ps1` can click CONTINUE in both instead; that
   loads each profile's last game (`lastGame` in `profile.lua`), so both profiles must name the same save.
 - Only one un-sandboxed game per Windows session gets the slice's hooks.
+- Give every instance the same bridge build. A bridge from 0.4.11 or earlier binds all interfaces, and
+  one started after a newer bridge binds the same port beside it; the two games' local traffic then mixes.
 - Joiners on one PC take relay ports 7774, 7775, ... and never link to each other directly (their LAN
   address is advertised with port 0), so their frames go through the host.
 - A boxed instance keeps its own files: the data folder is

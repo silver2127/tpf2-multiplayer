@@ -112,10 +112,11 @@ bridge also accepts the file names `tpf2_mp_mp.cfg`, `tpf2_mp_tpf2_bridge_mp.cfg
 | key | shipped | effect |
 |---|---|---|
 | `local_port` | 7771 | The bridge's UDP port. With `instance=auto` the first game on a machine takes 7771 and the next 7772. |
-| `peer_ip`, `peer_port` | 127.0.0.1, 7772 | Where the bridge sends when there is no lobby (two games on one machine). In a lobby session the menu points it at the lobby's loopback port instead. |
+| `peer_ip`, `peer_port` | 127.0.0.1, 7772 | Where the bridge sends when there is no lobby (two games on one machine). In a lobby session the menu points it at the lobby's loopback port instead. A 127.x address binds the socket to 127.0.0.1; any other address binds all interfaces, for a direct link to that machine. Packets from any other address are dropped either way. |
 | `instance` | auto | `a`, `b`, or `auto` (decided by which port is free). The lobby assigns the real letter. |
+| `save_server` | 0 | `1` starts the legacy TCP save server on instance `a` (the pre-lobby path). It answers `peer_ip` only. |
 | `xfer_port` | 7871 | Port of the legacy TCP save server. |
-| `auto_pull` | 0 | `1` pulls the host's save over `xfer_port` at start (the pre-lobby path). |
+| `auto_pull` | 0 | `1` pulls the host's save over `xfer_port` at start; the host needs `save_server=1`. |
 | `sim_hook` | 1 | A per-step hook on `GameSim::Step` (a counter; nothing depends on it). |
 | `speed_hook` | 1 | Fractional game speed: scales the sim batch interval to the value in `tpf2_speed.txt`. |
 | `buy_hook` | 1 | A diagnostic probe on the buy-vehicle factory. Nothing reads its output, and the slice hooks the same function; `0` avoids the double hook. |
@@ -131,7 +132,7 @@ case-sensitive and must not have spaces around them. Unknown keys are ignored.
 
 | key | default | effect |
 |---|---|---|
-| `master_url` | the project's master server | Base URL of the public game list. The panel reads `<url>/list`, and a host with PUBLIC ticked announces to it. Empty hides the list and the PUBLIC checkbox. |
+| `master_url` | `https://srv1306562.hstgr.cloud/tpf2mp` (the project's master server) | Base URL of the public game list. The panel reads `<url>/list`, and a host with PUBLIC ticked announces to it. Empty hides the list and the PUBLIC checkbox. |
 | `relay_autosave_min` | 2 | How often, in minutes, a relay lobby's leader uploads a fresh save while playing; `0` never. |
 | `automod` | on | `automod=0` stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
 | `native` | 1 | Insert the Multiplayer entry into the title menu. It is the only way to open the panel: `0` leaves no way in. |

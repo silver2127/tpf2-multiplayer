@@ -4,12 +4,14 @@
 # Installs netpunch/*.py to /opt/tpf2mp/netpunch, the tpf2mp-relay service (runs
 # as user tpf2mp, io dir /var/lib/tpf2mp/relay), opens the UDP port in ufw, and
 # announces the lobby to the master server (public, always on) as "Dedicated Test Server All Welcome". Re-run to
-# update the code or the settings; the service restarts and gets a NEW code
-# (the old one stops working -- players find it again via PUBLIC GAMES).
+# update the code or the settings; the service restarts and keeps its code (the
+# relay keeps its secret in its io dir). It announces to the master server on the
+# same machine; set MASTER_URL for one elsewhere.
 set -e
 HOST="${1:-root@76.13.109.115}"
 LOBBY="${2:-Dedicated Test Server All Welcome}"
 PORT="${3:-29471}"
+MASTER="${MASTER_URL:-http://127.0.0.1:8471}"
 # Never restart the relay under a live session: the restart drops every player's
 # transport and each game carries on alone (2026-09-10, 10:12). FORCE=1 overrides.
 if [ "${FORCE:-0}" != "1" ]; then
@@ -26,7 +28,7 @@ chown -R tpf2mp:tpf2mp /var/lib/tpf2mp
 cat > /etc/tpf2mp/relay.env <<EOF
 LOBBY_NAME=$LOBBY
 RELAY_PORT=$PORT
-MASTER_URL=https://srv1306562.hstgr.cloud/tpf2mp
+MASTER_URL=$MASTER
 EOF
 cat > /etc/systemd/system/tpf2mp-relay.service <<'EOF'
 [Unit]
@@ -60,4 +62,4 @@ systemctl restart tpf2mp-relay
 sleep 6
 systemctl is-active tpf2mp-relay
 journalctl -u tpf2mp-relay -n 12 --no-pager | cut -c1-160
-curl -s https://srv1306562.hstgr.cloud/tpf2mp/list | python3 -c 'import json,sys; [print(\"listed:\", r[\"name\"], \"|\", r[\"game\"], \"|\", r[\"players\"], \"players\") for r in json.load(sys.stdin)[\"servers\"]]'"
+curl -s $MASTER/list | python3 -c 'import json,sys; [print(\"listed:\", r[\"name\"], \"|\", r[\"game\"], \"|\", r[\"players\"], \"players\") for r in json.load(sys.stdin)[\"servers\"]]'"

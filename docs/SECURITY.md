@@ -28,6 +28,12 @@ and `native/src/menu_hook.cpp`.
 - **Inputs are sanitised before they become process arguments.** The pasted code must be
   base32; player names and passwords are limited to letters, digits and `-_.`; the logged
   command line masks the password.
+- **The game's sockets answer only this PC.** The bridge DLL's UDP socket is bound to 127.0.0.1
+  whenever its peer is on this PC, which every lobby session arranges, and it drops any datagram
+  that does not come from its peer's address. The pre-lobby TCP save server is off unless
+  `save_server=1`, and then answers only the peer address.
+- **Construction settings from other players stay data.** The mod reads them with Lua's `load` in
+  an empty environment, so a crafted string cannot reach `io` or `os`.
 - **Log volume is capped.** A host accepts at most 8 forwarded-log messages per second, 64
   lines per message and 20 MiB per player into its merged log, with control characters
   stripped.
@@ -36,13 +42,9 @@ and `native/src/menu_hook.cpp`.
 
 ## What it does not do
 
-- **The game's own sockets are not sealed and listen on every interface.** The bridge DLL's UDP
-  socket (port 7771, or 7772 and fallbacks) accepts any packet that starts with its magic, from any
-  address, and delivers it as game commands; in a lobby session it only needs loopback. The instance
-  with letter `a` also runs the bridge's legacy save server on TCP 7871, which sends the newest save
-  to anyone who connects. A home router does not forward either port, and Windows Defender Firewall
-  blocks them unless `TransportFever2.exe` was allowed on that network, but on a shared LAN with the
-  firewall allowed they are open.
+- **The public game list is not vetted.** Anyone can announce a lobby under any name, including one
+  that claims to be a dedicated server. Join only lobbies you trust: the host sends the save, and a
+  save is code (below).
 - **Lobby members are trusted equally.** Anyone in the lobby holds the session key and can
   send commands under any player's instance letter. Sealing stops outsiders, not a hostile
   player.

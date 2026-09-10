@@ -36,6 +36,8 @@ static sockaddr_in g_peer{};
 static std::mutex g_peerMtx;
 static bool g_peerSet = false;
 static uint16_t g_localPort = 0;   // set once in Net_Init, after a successful bind
+static volatile bool g_loopbackOnly = true;   // bound to 127.0.0.1 (Net_Init): the peer must stay on this PC
+static uint64_t g_droppedStrangers = 0;       // datagrams not from the peer's address (under g_mtx)
 static void (*g_deliver)(const char*) = nullptr;
 static std::string g_rxAccum;   // partial line being reassembled from chunks
 
@@ -266,7 +268,18 @@ static DWORD WINAPI NetThread(LPVOID)
             sockaddr_in from{}; int fromLen = sizeof(from);
             int got = recvfrom(sock, (char*)&p, sizeof(p), 0,
                                (sockaddr*)&from, &fromLen);
-            if (got >= (int)sizeof(Header) && p.h.magic == MAGIC) {
+            in_addr peerAddr;
+            {
+                std::lock_guard<std::mutex> lk(g_peerMtx);
+                peerAddr = g_peer.sin_addr;
+            }
+            // Only the peer talks to this socket. Bound to loopback, nothing off
+            // this PC gets here at all; bound to every interface (a direct link
+            // to another machine), this is the only filter.
+            if (got >= 0 && from.sin_addr.s_addr != peerAddr.s_addr) {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_droppedStrangers++;
+            } else if (got >= (int)sizeof(Header) && p.h.magic == MAGIC) {
                 {
                     std::lock_guard<std::mutex> lk(g_mtx);
                     g_lastRecvMs = GetTickCount64();
@@ -301,29 +314,60 @@ static bool EnsureWsa()
     return true;
 }
 
-bool Net_PortAvailable(uint16_t port)
+static bool IsLoopback(const in_addr& a)
 {
-    if (!EnsureWsa()) return false;
+    return (ntohl(a.s_addr) >> 24) == 127;
+}
+
+// True if no socket holds `port` on any local address. An exclusive bind on the
+// wildcard address conflicts with every existing binding of the port, whatever
+// address and options it used. The old probe, a plain wildcard bind, succeeds
+// beside a socket bound to 127.0.0.1 alone -- and a loopback bind succeeds beside
+// an older bridge's plain wildcard socket (both measured on Windows 11).
+static bool PortFree(uint16_t port)
+{
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return false;
+    BOOL on = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&on, sizeof(on));
     sockaddr_in a{};
     a.sin_family = AF_INET;
-    a.sin_addr.s_addr = INADDR_ANY;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
     a.sin_port = htons(port);
     bool ok = bind(s, (sockaddr*)&a, sizeof(a)) == 0;
     closesocket(s);
     return ok;
 }
 
+bool Net_PortAvailable(uint16_t port)
+{
+    if (!EnsureWsa()) return false;
+    return PortFree(port);
+}
+
 bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
               void (*deliverCb)(const char*))
 {
     if (!EnsureWsa()) return false;
+    // An unreadable peer_ip used to leave the peer at 0.0.0.0, which nothing
+    // answers; this PC at least exists.
+    in_addr peerAddr{};
+    if (!peerIp || inet_pton(AF_INET, peerIp, &peerAddr) != 1)
+        inet_pton(AF_INET, "127.0.0.1", &peerAddr);
+    // The socket only listens where its peer is. Every lobby session (and two
+    // games on one PC) has a loopback peer, and then nothing off this PC can
+    // reach the socket at all. It used to take commands from any address.
+    const bool loopback = IsLoopback(peerAddr);
+    // Checked on every address first: a loopback bind succeeds beside an older
+    // bridge's all-interfaces socket and would take that game's local traffic.
+    if (!PortFree(localPort)) return false;
     g_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_sock == INVALID_SOCKET) return false;
+    BOOL on = TRUE;
+    setsockopt(g_sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&on, sizeof(on));
     sockaddr_in local{};
     local.sin_family = AF_INET;
-    local.sin_addr.s_addr = INADDR_ANY;
+    local.sin_addr.s_addr = htonl(loopback ? INADDR_LOOPBACK : INADDR_ANY);
     local.sin_port = htons(localPort);
     if (bind(g_sock, (sockaddr*)&local, sizeof(local)) != 0) {
         // leave nothing behind, so a caller can retry on another port
@@ -341,12 +385,13 @@ bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
             g_localPort = localPort;
     }
 
+    g_loopbackOnly = loopback;
     {
         std::lock_guard<std::mutex> lk(g_peerMtx);
         g_peer = sockaddr_in{};
         g_peer.sin_family = AF_INET;
         g_peer.sin_port = htons(peerPort);
-        inet_pton(AF_INET, peerIp, &g_peer.sin_addr);
+        g_peer.sin_addr = peerAddr;
         g_peerSet = true;
     }
     g_deliver = deliverCb;
@@ -398,6 +443,9 @@ bool Net_SetPeer(const char* ip, int port)
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t)port);
     if (inet_pton(AF_INET, ip, &a.sin_addr) != 1) return false;
+    // A loopback-bound socket cannot reach another machine, and rebinding to
+    // every interface on request is exactly what this module no longer does.
+    if (g_loopbackOnly && !IsLoopback(a.sin_addr)) return false;
     {
         std::lock_guard<std::mutex> lk(g_peerMtx);
         g_peer = a;
@@ -418,6 +466,12 @@ bool Net_SetPeer(const char* ip, int port)
 uint16_t Net_LocalPort()
 {
     return g_localPort;
+}
+
+uint64_t Net_DroppedStrangers()
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    return g_droppedStrangers;
 }
 
 // Loader-lock-safe half of Net_Shutdown: signal and return, never block.

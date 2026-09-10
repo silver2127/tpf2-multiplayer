@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """tpf2mp master server -- the OpenTTD-style public game list.
 
-A host that ticks PUBLIC announces its lobby here every ~30 s; the title-menu
+A host that ticks PUBLIC announces its lobby here every 10 s; the title-menu
 panel lists what is announced and pasting a row's code joins it. Nothing is
 brokered: the code IS the join mechanism (it carries the host's address and
 the session secret), this server only stores and repeats it. No accounts,
 no auth: a public lobby is public by choice, and a password-locked lobby
 shows as locked (its code alone does not get anyone in).
 
-    POST /announce   {"id","name","code","players","max","game","version","locked"}
+    POST /announce   {"id","name","code","players","max","type","version","locked"}
     POST /leave      {"id"}
     GET  /list       {"servers":[{... , "age": seconds since last announce}], "now": unix}
     GET  /health     "ok"

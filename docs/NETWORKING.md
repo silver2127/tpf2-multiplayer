@@ -21,8 +21,8 @@ own lobby process over loopback; the lobbies carry the frames between machines.
 |---|---|---|
 | lobby | UDP 29471 on the host | The one port a host must be reachable on. Joiners bind an ephemeral port and only dial out. |
 | game relay | UDP `127.0.0.1:7773` (host) / first free of 7774-7805 (joiners) | The bridge sends its frames here; the lobby delivers inbound frames to the bridge's own port. Loopback only. |
-| bridge | UDP 7771 (or 7772, or a fallback) | The `port=` line of `tpf2_instance.txt` in the data folder. The socket is bound on all interfaces although it only needs loopback; see [SECURITY.md](SECURITY.md#what-it-does-not-do). |
-| legacy save server | TCP 7871 on the instance with letter `a` | The bridge's pre-lobby save transfer, still listening on all interfaces. The lobby's transfer replaced it. |
+| bridge | UDP `127.0.0.1:7771` (or 7772, or a fallback) | The `port=` line of `tpf2_instance.txt` in the data folder. Bound to loopback, and it drops datagrams that are not from its peer ([SECURITY.md](SECURITY.md#what-is-protected)). |
+| legacy save server | TCP 7871, off | The bridge's pre-lobby save transfer, replaced by the lobby's. Runs only with `save_server=1`, on the instance with letter `a`, and answers its peer only. |
 | STUN | outbound UDP 19302 / 3478 | `stun.l.google.com`, `stun.nextcloud.com`, `stun.cloudflare.com`, `stun.services.mozilla.com`. |
 | master server | outbound HTTPS | The public game list; see [Master server](#master-server). |
 | dedicated relay | UDP 29471 on the server | Same protocol as a host. |
@@ -254,7 +254,10 @@ Operating one (all scripts take the SSH target as their first argument):
 
 `netpunch/masterserver.py` is a stdlib HTTP service that only lists games; the code in a
 row is the join, nothing is brokered. It runs as the `tpf2mp-master` systemd unit on
-`127.0.0.1:8471` behind nginx (`tools/masterserver_deploy.sh` installs both).
+`127.0.0.1:8471` behind nginx, which serves it at `https://srv1306562.hstgr.cloud/tpf2mp/` (the
+VPS's own hostname, with its own Let's Encrypt certificate); `tools/masterserver_deploy.sh`
+installs all of it. A relay deployed by `tools/relay_deploy.sh` announces to `127.0.0.1:8471`
+directly.
 
 | endpoint | behaviour |
 |---|---|

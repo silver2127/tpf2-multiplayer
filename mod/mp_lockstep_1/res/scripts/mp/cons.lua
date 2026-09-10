@@ -100,7 +100,9 @@ end
 
 function CM.deserParams(pstr)
 	if not pstr or pstr == "" then return nil end
-	local chunk = load("return " .. pstr, "params")
+	-- pstr comes from other players. An empty environment limits the chunk to
+	-- literals; with the default one a crafted string could reach io and os.
+	local chunk = load("return " .. pstr, "params", "t", {})
 	if not chunk then return nil end
 	local ok, v = pcall(chunk)
 	if ok and type(v) == "table" then return v end
