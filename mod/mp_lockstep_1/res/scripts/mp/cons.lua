@@ -1062,8 +1062,11 @@ function CM.flushConPairs()
 			shipConxPair(cn, rc)
 		elseif now - cn.at > 1.0 then
 			table.remove(CM.pendingCons, ci)
-			CM.scheduleLocal("CONP", { file = cn.file, t = cn.t, params = cn.params, name = cn.name })
-			log(string.format("con: captured %s (free-standing) -> CONP", cn.file))
+			-- cancelled=1 rides along: a free-standing placement the slice cancelled
+			-- must be built by the scripted proposal on the originator too, not
+			-- bulldozed and rebuilt (the flag used to be dropped here)
+			CM.scheduleLocal("CONP", { file = cn.file, t = cn.t, params = cn.params, name = cn.name, cancelled = cn.cancelled })
+			log(string.format("con: captured %s (free-standing%s) -> CONP", cn.file, cn.cancelled == 1 and ", cancelled" or ""))
 		end
 	end
 	for ri = #CM.pendingRoadc, 1, -1 do

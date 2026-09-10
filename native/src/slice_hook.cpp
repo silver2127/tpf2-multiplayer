@@ -3216,8 +3216,30 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     "type decode failed -- NOT shipping ROADC (peer replica will "
                     "stay unconnected)\n", m);
             } else {
+                // FREE-STANDING (no street edges: a station away from any road, a
+                // harbour, an airport). Nothing to ship as ROADC, but the placement
+                // itself is cancelled and replayed like a road-snapped one: the
+                // Lua ships the stashed params as CONP cancelled=1 when no ROADC
+                // pairs with them, and every instance builds the scripted proposal
+                // at the stamp. Until 2026-09-09 this branch built natively and the
+                // strict path then bulldozed and rebuilt the station, which is the
+                // rebuild that asserted the engine on a modular_station.
                 Log("[slice] construction placement carries no street edges "
-                    "(n=%d) -- free-standing, nothing to ship\n", n);
+                    "(n=%d) -- free-standing\n", n);
+                if (CfgHas("cancel_construction") || CfgHas("conparams_dump")) {
+                    bool stashed = StashConxpFromProposal(r8);
+                    bool kEnabled = true, kSuppress = false;
+                    ReadCfg(&kEnabled, &kSuppress, nullptr);
+                    if (stashed && CfgHas("cancel_construction") && kEnabled && kSuppress && SessionLive()) {
+                        InterlockedExchange(&g_pendingIsConx, 1);
+                        InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                        InterlockedExchange(&g_pendingNoCb, 0);
+                        Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
+                            (unsigned long long)rcx);
+                    } else if (!stashed && CfgHas("cancel_construction")) {
+                        Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
+                    }
+                }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[slice] ROADC decode fault -- placement proceeds, nothing shipped\n");
