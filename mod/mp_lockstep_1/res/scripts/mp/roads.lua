@@ -368,9 +368,9 @@ function CM.execPolyline(c, planOnly)
 			if nA and nB and nA ~= nB then
 				local mm
 				if isTrack then
-					pcall(function() mm = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+					pcall(function() mm = CM.netMap(true) end)
 				else
-					pcall(function() mm = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+					pcall(function() mm = CM.netMap(false) end)
 				end
 				for _, cand in pairs((mm and mm[nA]) or {}) do
 					local be
@@ -651,9 +651,7 @@ function CM.execPolyline(c, planOnly)
 					if Mout and Mout ~= comp.node0 and Mout ~= comp.node1 then
 						local lst
 						pcall(function()
-							local mm = isTrack
-								and api.engine.system.streetSystem.getNode2TrackEdgeMap()
-								or api.engine.system.streetSystem.getNode2StreetEdgeMap()
+							local mm = CM.netMap(isTrack)
 							lst = mm[Mout]
 						end)
 						local raw = {}
@@ -1220,5 +1218,18 @@ function CM.execPolyline(c, planOnly)
 	-- What this pass decided, for the originator to put on the wire. Empty on a
 	-- peer that just followed a plan -- it has nothing to tell anyone.
 	return CM.planEncode(planV), CM.planEncode(planH)
+end
+
+-- One geometry scope per track build: the dozen lookups inside share one read
+-- of the map (geom.lua). Nested calls share the outer scope.
+do
+	local execPolylineImpl = CM.execPolyline
+	CM.execPolyline = function(c, planOnly)
+		if CM.geomScopeBegin then CM.geomScopeBegin() end
+		local res = { pcall(execPolylineImpl, c, planOnly) }
+		if CM.geomScopeEnd then CM.geomScopeEnd() end
+		if not res[1] then error(res[2], 0) end
+		return unpack(res, 2, table.maxn(res))
+	end
 end
 end

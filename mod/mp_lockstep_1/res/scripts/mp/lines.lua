@@ -182,6 +182,98 @@ function CM.lineSnapshot(lid)
 	return snap
 end
 
+-- ---------- rapid line edits merge onto the update still waiting ----------
+-- A line update carries the WHOLE new stop list, built by the line editor from
+-- the line as the engine holds it. Cancelled and replayed, it lands only at its
+-- stamp, so a second click inside that window was built from the OLD list and
+-- replaced the stop the first click added (line 14, 2026-09-10: three quick
+-- stations applied as 1, 1 and 2 stops on every instance). At capture the click
+-- is diffed against the engine's list and that change is replayed onto the
+-- newest update still waiting for the same line.
+local function lineCount(str)
+	if not str or str == "" then return 0 end
+	local n = 0
+	for _ in (str .. ";"):gmatch("([^;]*);") do n = n + 1 end
+	return n
+end
+local function lineSplit(str, n)
+	local t = {}
+	if n == 0 then return t end
+	for part in ((str or "") .. ";"):gmatch("([^;]*);") do t[#t + 1] = part end
+	while #t < n do t[#t + 1] = "" end
+	while #t > n do t[#t] = nil end
+	return t
+end
+local function stopKey(entry)
+	local a, b, c, d = tostring(entry):match("^([^,]*),([^,]*),([^,]*),([^,]*)")
+	return table.concat({ a or "", b or "", c or "", d or "" }, ",")
+end
+CM.lineCount = lineCount
+
+-- base = the engine's list, click = what the editor built from it, pending = the
+-- list still on its way. Returns the merged stops, alts and the counts of stops
+-- added, removed and re-set. Stop identity is position + station + terminal.
+function CM.mergeLineEdit(baseS, baseA, clickS, clickA, pendS, pendA)
+	local nb, nc, np = lineCount(baseS), lineCount(clickS), lineCount(pendS)
+	local B, C, P = lineSplit(baseS, nb), lineSplit(clickS, nc), lineSplit(pendS, np)
+	local BA, CA, PA = lineSplit(baseA, nb), lineSplit(clickA, nc), lineSplit(pendA, np)
+	local L = {}
+	for i = nb + 1, 1, -1 do
+		L[i] = {}
+		for j = nc + 1, 1, -1 do
+			if i > nb or j > nc then L[i][j] = 0
+			elseif stopKey(B[i]) == stopKey(C[j]) then L[i][j] = L[i + 1][j + 1] + 1
+			else L[i][j] = math.max(L[i + 1][j], L[i][j + 1]) end
+		end
+	end
+	local function find(key)
+		for k = 1, #P do if stopKey(P[k]) == key then return k end end
+		return nil
+	end
+	local i, j, adds, dels, sets = 1, 1, 0, 0, 0
+	while i <= nb or j <= nc do
+		if i <= nb and j <= nc and stopKey(B[i]) == stopKey(C[j]) then
+			if B[i] ~= C[j] or BA[i] ~= CA[j] then
+				local k = find(stopKey(B[i]))
+				if k then P[k], PA[k] = C[j], CA[j]; sets = sets + 1 end
+			end
+			i, j = i + 1, j + 1
+		elseif j <= nc and (i > nb or L[i][j + 1] >= L[i + 1][j]) then
+			local k = (i <= nb) and find(stopKey(B[i])) or nil
+			if k then table.insert(P, k, C[j]); table.insert(PA, k, CA[j])
+			else P[#P + 1] = C[j]; PA[#PA + 1] = CA[j] end
+			adds = adds + 1
+			j = j + 1
+		else
+			local k = find(stopKey(B[i]))
+			if k then table.remove(P, k); table.remove(PA, k) end
+			dels = dels + 1
+			i = i + 1
+		end
+	end
+	return table.concat(P, ";"), table.concat(PA, ";"), adds, dels, sets
+end
+
+-- The newest update for `key` that may not show on the entity yet: one still
+-- queued (any origin), or one of ours captured in the last few game units.
+function CM.linePending(key)
+	local best
+	for _, c in ipairs(CM.queue or {}) do
+		if c.op == "LUPDATE" and c.key == key and c.stops then
+			local at, bat = tonumber(c.at) or 0, best and (tonumber(best.at) or 0) or nil
+			if not best or at > bat or (at == bat and (tonumber(c.seq) or 0) > (tonumber(best.seq) or 0)) then best = c end
+		end
+	end
+	if best then return best end
+	local sent = CM.lineSent and CM.lineSent[key]
+	if sent and ((CM.gameTime() or 0) - (sent.t or 0)) < 3 then return sent end
+	return nil
+end
+function CM.noteLineSent(key, stops, alts)
+	CM.lineSent = CM.lineSent or {}
+	CM.lineSent[key] = { stops = stops, alts = alts, t = CM.gameTime() or 0 }
+end
+
 function CM.primeLineKeys()
 	if linesPrimed then return end
 	linesPrimed = true

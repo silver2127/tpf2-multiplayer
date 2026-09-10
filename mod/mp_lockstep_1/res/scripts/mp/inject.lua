@@ -1101,11 +1101,26 @@ function CM.pollInject()
 								armed == 1 and "the edit was cancelled and is LOST; redo it, and report this line" or "not replicated"))
 						else
 							local snap = CM.lineSnapshot(lid) or {}
+							local newStops, newAlts = table.concat(stops, ";"), table.concat(alts, ";")
+							-- a second quick edit: the editor built it from the list before the
+							-- first one landed -- put this click's change onto that one instead
+							local pend = CM.linePending and CM.linePending(lk)
+							if pend and snap.stops and pend.stops ~= snap.stops then
+								local okM, mS, mA, adds, dels, sets = pcall(CM.mergeLineEdit, snap.stops, snap.alts, newStops, newAlts, pend.stops, pend.alts)
+								if okM and mS then
+									log(string.format("LUPDATE: %s edited again before %s landed -- the click's change (+%d -%d ~%d) goes onto it: %d stop(s)",
+										lk, pend.seq and ("seq " .. tostring(pend.seq)) or "the last edit", adds, dels, sets, CM.lineCount(mS)))
+									newStops, newAlts = mS, mA
+								else
+									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
+								end
+							end
 							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %d%s", lk, #stops, wait,
 								armed == 1 and " (strict)" or ""))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
-							                           wait = wait, stops = table.concat(stops, ";"),
-							                           alts = table.concat(alts, ";"), armed = armed })
+							                           wait = wait, stops = newStops,
+							                           alts = newAlts, armed = armed })
+							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts) end
 						end
 					else
 						local snap = CM.lineSnapshot(lid)

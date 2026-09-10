@@ -85,8 +85,77 @@ K.SPLIT_EPS_TRACK = 2.0
 K.SPLIT_MIN_U = 0.08   -- nearer an end than this IS the endpoint, not a split
 K.SPLIT_MIN_DIST = 0.3  -- metres from an end node: closer than this IS the node
 
+-- ---------- one map read per track build (2026-09-10) ----------
+-- findNodeNear and findEdgeContaining walked the whole node->edge map, reading
+-- every node's position and every edge's geometry, on EVERY call, and one track
+-- build calls them a dozen times: 0.4 to 2.6 s of planning at the click on a
+-- large map, on the sim thread, and the same again when the build applies.
+-- Nothing changes the world inside one execPolyline call (its commands apply
+-- later), so while a geometry scope is open each network is read once and those
+-- lists answer every lookup. Map order and the distance tests are unchanged.
+CM.geomDepth = 0
+local geomCache = nil
+function CM.geomScopeBegin()
+	CM.geomDepth = (CM.geomDepth or 0) + 1
+	if CM.geomDepth == 1 then geomCache = { maps = {}, nodes = {}, edges = {} } end
+end
+function CM.geomScopeEnd()
+	CM.geomDepth = math.max(0, (CM.geomDepth or 1) - 1)
+	if CM.geomDepth == 0 then geomCache = nil end
+end
+local function netMap(isTrack)
+	local key = isTrack and "t" or "s"
+	if geomCache and geomCache.maps[key] ~= nil then return geomCache.maps[key] or nil end
+	local m
+	if isTrack then
+		pcall(function() m = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
+	else
+		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+	end
+	if geomCache then geomCache.maps[key] = m or false end
+	return m
+end
+CM.netMap = netMap
+local function netNodes(isTrack)
+	local key = isTrack and "t" or "s"
+	if geomCache and geomCache.nodes[key] then return geomCache.nodes[key] end
+	local list = {}
+	for nid, _ in pairs(netMap(isTrack) or {}) do
+		local nc = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
+		if nc and nc.position then
+			local pp = nc.position
+			list[#list + 1] = { nid, pp.x or pp[1], pp.y or pp[2] }
+		end
+	end
+	if geomCache then geomCache.nodes[key] = list end
+	return list
+end
+local function netEdges(isTrack)
+	local key = isTrack and "t" or "s"
+	if geomCache and geomCache.edges[key] then return geomCache.edges[key] end
+	local list, seen = {}, {}
+	for _, lst in pairs(netMap(isTrack) or {}) do
+		for _, eid in pairs(lst) do
+			if not seen[eid] then
+				seen[eid] = true
+				local comp, a, b, ta, tb = edgeGeomT(eid)
+				list[#list + 1] = { eid, comp, a, b, ta, tb }
+			end
+		end
+	end
+	if geomCache then geomCache.edges[key] = list end
+	return list
+end
+CM.netEdges = netEdges
+
 local function edgeMaps()
 	local maps = {}
+	if geomCache then
+		local sm, tm = netMap(false), netMap(true)
+		if sm then maps[#maps + 1] = sm end
+		if tm then maps[#maps + 1] = tm end
+		return maps
+	end
 	pcall(function() maps[#maps + 1] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
 	pcall(function() maps[#maps + 1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
 	return maps
@@ -101,6 +170,14 @@ end
 -- are different things, even though mp_bridge searched both.
 local function findNodeNear(isTrack, x, y, eps)
 	local best, bestD
+	if geomCache then
+		for _, n in ipairs(netNodes(isTrack)) do
+			local dx, dy = n[2] - x, n[3] - y
+			local d = dx * dx + dy * dy
+			if d < eps * eps and (not bestD or d < bestD) then best, bestD = n[1], d end
+		end
+		return best
+	end
 	local m
 	if isTrack then
 		pcall(function() m = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
@@ -181,40 +258,41 @@ local function findEdgeContaining(isTrack, x, y, skipNode, eps)
 	-- exclusion is by distance (K.SPLIT_MIN_DIST), not by fraction: the UI
 	-- happily splits 1.0 m from an end node (measured: a depot snapped at
 	-- u=0.013 of a 76.9 m edge), and 8% of a long edge is many metres.
-	local best, bestD, bestU, bestGeom, seen = nil, nil, nil, nil, {}
-	local m
-	if isTrack then
-		pcall(function() m = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
-	else
-		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
-	end
-	for _, list in pairs(m or {}) do
-		for _, eid in pairs(list) do
-			if not seen[eid] then
-				seen[eid] = true
-				local comp, a, b, ta, tb = edgeGeomT(eid)
-				-- skipNode: an edge already ENDING at the node we are welding
-				-- into sits at distance ~0 but u~1.0, and would shadow the
-				-- actual street edge.
-				if comp and (not skipNode
-				             or (comp.node0 ~= skipNode and comp.node1 ~= skipNode)) then
-					local span = (b[1]-a[1])^2 + (b[2]-a[2])^2
-					local d0 = (a[1]-x)^2 + (a[2]-y)^2
-					local d1 = (b[1]-x)^2 + (b[2]-y)^2
-					if d0 < span * 4 + 400 or d1 < span * 4 + 400 then
-						local len = math.max(math.sqrt(span),
-							math.sqrt(ta[1]^2 + ta[2]^2), math.sqrt(tb[1]^2 + tb[2]^2))
-						local steps = math.min(400, math.max(19, math.ceil(len / 1.0)))
-						for i = 1, steps - 1 do
-							local u = i / steps
-							local q = hermitePos(a, ta, b, tb, u)
-							local d = (q[1]-x)^2 + (q[2]-y)^2
-							if d < tol * tol and (not bestD or d < bestD) then
-								best, bestD, bestU = eid, d, u
-								bestGeom = { a, ta, b, tb, steps }
-							end
-						end
+	local best, bestD, bestU, bestGeom = nil, nil, nil, nil
+	local function consider(eid, comp, a, b, ta, tb)
+		-- skipNode: an edge already ENDING at the node we are welding
+		-- into sits at distance ~0 but u~1.0, and would shadow the
+		-- actual street edge.
+		if comp and (not skipNode
+		             or (comp.node0 ~= skipNode and comp.node1 ~= skipNode)) then
+			local span = (b[1]-a[1])^2 + (b[2]-a[2])^2
+			local d0 = (a[1]-x)^2 + (a[2]-y)^2
+			local d1 = (b[1]-x)^2 + (b[2]-y)^2
+			if d0 < span * 4 + 400 or d1 < span * 4 + 400 then
+				local len = math.max(math.sqrt(span),
+					math.sqrt(ta[1]^2 + ta[2]^2), math.sqrt(tb[1]^2 + tb[2]^2))
+				local steps = math.min(400, math.max(19, math.ceil(len / 1.0)))
+				for i = 1, steps - 1 do
+					local u = i / steps
+					local q = hermitePos(a, ta, b, tb, u)
+					local d = (q[1]-x)^2 + (q[2]-y)^2
+					if d < tol * tol and (not bestD or d < bestD) then
+						best, bestD, bestU = eid, d, u
+						bestGeom = { a, ta, b, tb, steps }
 					end
+				end
+			end
+		end
+	end
+	if geomCache then
+		for _, e in ipairs(netEdges(isTrack)) do consider(e[1], e[2], e[3], e[4], e[5], e[6]) end
+	else
+		local seen = {}
+		for _, list in pairs(netMap(isTrack) or {}) do
+			for _, eid in pairs(list) do
+				if not seen[eid] then
+					seen[eid] = true
+					consider(eid, edgeGeomT(eid))
 				end
 			end
 		end

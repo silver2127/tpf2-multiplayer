@@ -311,6 +311,16 @@ function CM.scheduleLocal(op, args)
 	-- the clocks are together this is exactly K.EXEC_DELAY again.
 	local lead = 0
 	local _, fastT = CM.peerBounds()
+	-- PROJECTED, not the last heartbeat (2026-09-10). peerBounds hands back t=,
+	-- a whole unit rounded DOWN, as it was when the heartbeat left. At speed 2 a
+	-- joiner read the leader as 0.2 ahead while it was 1.4 ahead, stamped 0.8
+	-- out, and the leader applied four of its commands 1-3 steps late: two
+	-- vehicles bought and put on a line at different sim steps, a vehicle drift
+	-- desync for everyone. The peer's sim STEP moved forward by the wall time
+	-- since it arrived, at our own measured sim rate, plus a step of margin,
+	-- covers that. The barrier still reads peerBounds unchanged.
+	local projT = CM.projectedPeerMax and CM.projectedPeerMax() or nil
+	if projT and (not fastT or projT + K.SIM_STEP > fastT) then fastT = projT + K.SIM_STEP end
 	if fastT then
 		lead = fastT - now
 		if lead < 0 then lead = 0 end
@@ -470,6 +480,40 @@ function CM.compareOne(stamp, origin, theirs, dt)
 	end
 end
 
+-- Our own sim rate in game units per wall second, sampled from update().
+function CM.sampleSimRate()
+	local now = CM.gameTime and CM.gameTime()
+	if not now then return end
+	local clk = os.clock()
+	if not CM.rateClk then CM.rateClk, CM.rateT = clk, now; return end
+	local dc = clk - CM.rateClk
+	if dc >= 1.0 then
+		local r = (now - CM.rateT) / dc
+		if r >= 0 and r < 60 then CM.simRate = CM.simRate and (CM.simRate * 0.5 + r * 0.5) or r end
+		CM.rateClk, CM.rateT = clk, now
+	end
+end
+
+-- The furthest-ahead peer clock as it most likely stands NOW: its last sim
+-- step (0.2 resolution, not the floored t=) moved forward by the wall time
+-- since that heartbeat arrived, at our own sim rate.
+function CM.projectedPeerMax()
+	local best
+	local rate = CM.simRate or 0
+	local clk = os.clock()
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and (pr.step or pr.time) then
+			local pt = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			if pr.clk and rate > 0 then
+				local age = clk - pr.clk
+				if age > 0 and age < 5 then pt = pt + age * rate end
+			end
+			if not best or pt > best then best = pt end
+		end
+	end
+	return best
+end
+
 local function onLine(line)
 	local op = line:match("^(%u+)")
 	if op == "LSTICK" then
@@ -477,7 +521,7 @@ local function onLine(line)
 		if t then
 			local o = line:match(" o=(%a+)") or "?"
 			local pr = CM.peerFor(o)
-			pr.time = t; pr.at = CM.ticks
+			pr.time = t; pr.at = CM.ticks; pr.clk = os.clock()   -- wall clock at arrival: stamping projects the peer forward from here
 			-- LSTICK has always carried the SIM STEP as well, and nothing read
 			-- it. t= is math.floor(now), so it is quantised to a whole unit --
 			-- a controller cannot hold a lead tighter than its own measurement
