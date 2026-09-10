@@ -243,11 +243,10 @@ end
 --   CMNEW    cid=N [sw=1]   company N joins the roster (an AI player entity on
 --                           every machine that is not playing it); sw=1 = the
 --                           origin switches to it in the same command
---   CMSWITCH cid=N          the origin now plays as company N. On the origin's
---                           own machine that is the hotseat swap: everything its
---                           human player owns goes to N's AI entity and N's
---                           assets and money come to the human player. Everyone
---                           else only updates origin -> company.
+--   CMSWITCH cid=N          the origin now plays as company N. Nothing changes
+--                           hands: the origin's machine only re-labels its
+--                           human player as N (CM.cmLocalSwitch), everyone else
+--                           only updates origin -> company.
 --   CMDEL    cid=N          company N is dissolved: its assets and money merge
 --                           into the origin's company. Refused while anyone
 --                           plays it. The AI entity stays behind, empty.
@@ -419,27 +418,25 @@ function CM.cmGoLive()
 	end
 	CM.cmLive = true
 end
--- The hotseat swap on THIS machine: everything the human player owns goes to
--- company cid's AI entity, cid's assets and wallet (balance + loan) come to
--- the human, and the cid -> entity map is updated. Local representation
--- only: what each company owns in the world does not change.
+-- The player moves to company cid on THIS machine, and NOTHING is handed over
+-- (2026-09-10: "it's not supposed to swap anything, just move the player to a
+-- different company"). No entity changes owner and no money moves. Only the
+-- company -> player-entity map changes: our human player now stands for cid, so
+-- what we do from here on is cid's, and the company we left takes cid's former
+-- AI entity, which the other players' actions for it are attributed to.
+-- What this replaces was the Companies mod's hotseat swap: setPlayer on every
+-- entity the human owned, then a wallet swap. The engine asserts on setPlayer for
+-- a vehicle on a line and for track and road edges and nodes (interface.cpp:2340,
+-- a minidump apiece, pcall does not help), so one click on "new company" fired 98
+-- of them and froze the host.
 function CM.cmLocalSwitch(cid)
 	local old = CM.cmMyCompany
 	if cid == old then return true end
 	local human, ai = CM.cmCompanyPid[old], CM.cmCompanyPid[cid]
 	if not human or not ai then log("company: switch: missing player entity (me=" .. tostring(human) .. " target=" .. tostring(ai) .. ")"); return false end
-	local mine = CM.cmOwnedEntities(human)
-	local theirs = CM.cmOwnedEntities(ai)
-	for _, eid in ipairs(mine) do pcall(function() game.interface.setPlayer(eid, ai) end) end
-	for _, eid in ipairs(theirs) do pcall(function() game.interface.setPlayer(eid, human) end) end
-	for _, eid in ipairs(mine) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, false) end end) end
-	for _, eid in ipairs(theirs) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, true) end end) end
-	local okW, bh, lh, ba, la = CM.cmSwapWallets(human, ai)
 	CM.cmCompanyPid[old] = ai; CM.cmCompanyPid[cid] = human
 	CM.cmMyCompany = cid
-	CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
-		tostring(bh), tostring(lh), tostring(ba), tostring(la), okW and "" or " -- wallet swap FAILED"))
-	if okW and (ba or 0) == 0 and (la or 0) == 0 then CM.cmNote("company " .. cid .. " starts empty: take a loan to fund it") end
+	CM.cmNote(string.format("now playing company %d (was %d; nothing moved between the companies)", cid, old))
 	return true
 end
 
