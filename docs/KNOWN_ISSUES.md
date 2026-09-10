@@ -6,10 +6,6 @@ observed in play.
 
 ## Lockstep and pacing
 
-- **Hot-join catch-up does not start for a newcomer more than 60 units behind** *(from the
-  code)*. `CM.paceV2` returns early when the spread between clocks exceeds 60 units, before it
-  reaches `CM.catchUpTick`, so no history is requested. A save a few minutes old is usually
-  further behind than that.
 - **The leader role does not move** *(from the code)*. Only the current leader reads
   `tpf2_bridge_ctl.txt` (`CM.speedRequest` is called from the leader's branch), so an instance
   named leader later (a relay lobby after its first leader leaves, or one whose first leader is
@@ -23,9 +19,9 @@ observed in play.
 - **The load-time world integrity check never runs** *(from the code)*. It requires
   `CM.ticks == 30` inside a block that only runs every 60 ticks, so damaged road edges (no
   TransportNetwork component) are not reported.
-- **Company colours are skipped for strict purchases** *(from the code)*.
-  `CM.cmColorNewVehicle` is only called on the non-strict buy path, and `strict_buy=1` is the
-  default.
+- **Company colours are not applied to strict purchases** *(from the code)*.
+  `CM.cmColorNewVehicle` is only called from `CM.shipParkedBuys`, the path for a buy the slice
+  left to run natively, so in companies mode an ordinary purchase keeps its default colour.
 
 ## Native side
 
@@ -78,6 +74,7 @@ observed in play.
 - Replacing a stop on an occupied side is not strict (the poll ships it after the fact).
 - A bought or replaced vehicle's `reversed` flag is not decoded; in companies mode a
   replacement's cost is not moved to the owning company.
+- A buy, sale or replacement whose data the slice cannot read runs on the player's game only.
 - A level crossing over track on an embankment above the road fails "Too much slope"; it is
   refused on every instance rather than built on one.
 - The detector's vehicle count does not see vehicles parked in depots.
@@ -94,7 +91,7 @@ and remain in git history at the `v0.4.10` tag:
 | Steam invites and a Steam Networking relay fallback | `git show v0.4.10:docs/STEAM_TRANSPORT_PLAN.md` |
 | Strict mode for the remaining actions (vehicle flags, loans through the `Book` factory, terraform, line creation, in-place node edits) | `git show v0.4.10:docs/STRICT_LOCKSTEP_PLAN.md` |
 | Hardening strict station placement and module edits (lossy-walk refusal, per-file allowlist, broadcast rollback) | `git show v0.4.10:docs/STATION_STRICT_PLAN.md` |
-| Peer-to-peer distribution of the save (`netpunch/swarm.py` exists, unwired) | `git show v0.4.10:docs/SWARM_TRANSFER.md` |
+| Peer-to-peer distribution of the save (the unwired prototype, `netpunch/swarm.py`, is at the same tag) | `git show v0.4.10:docs/SWARM_TRANSFER.md` |
 | Notes toward a Transport Fever 3 port | `git show v0.4.10:docs/tf3_plan.md` |
 
 The first-phase milestone reports (M1-M10), the original recon report and the old status logs

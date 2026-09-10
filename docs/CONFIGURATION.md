@@ -1,145 +1,56 @@
 # Configuration
 
-Settings live in plain text files. Most players never need to touch them; they exist for
-testing, for turning off a channel that misbehaves, and for development.
-
-**Keep replication switches identical on every machine in a session.** A player whose switches
-differ runs a different protocol (for example, a peer without `road_demolish` ignores road
-demolitions and keeps the road).
+Multiplayer needs no settings. Every replication channel and the pacing are built in, so a
+missing, old or damaged settings file cannot switch part of the protocol off, or put one player on
+a different protocol from the others. The files below hold diagnostics, one latency setting, panel
+preferences and plugin settings.
 
 ## Files and where they are read from
 
 | file | read by | where | changes take effect |
 |---|---|---|---|
-| `tpf2_slice.cfg` | slice DLL, the mod | the game folder, else the data folder | slice: on the next command; mod: within about 5 s (some keys only at load, noted below) |
-| `tpf2_bridge_mp.cfg` | bridge DLL | the game folder, else the data folder | at game start |
-| `tpf2_menu_flags.txt` | menu DLL | the game folder (next to `tpf2_menu.dll`) only | at game start |
+| `tpf2_slice.cfg` | slice DLL (`dumpprop`), the mod (`dump_egeo`, `exec_delay`) | the game folder (for the slice, next to `tpf2_slice.dll`), else the data folder | `dumpprop` within 2 s, `dump_egeo` within about 5 s, `exec_delay` when a game loads |
+| `tpf2_menu_flags.txt` | menu DLL | next to `tpf2_menu.dll` (the game folder) only | at game start |
 | `tpf2mp.cfg` | plugin host | the game folder, else the data folder | at game start |
 
+- The bridge DLL has no settings file; a `tpf2_bridge_mp.cfg` left from an older version is ignored.
 - The data folder is `%LOCALAPPDATA%\tpf2mp\data\` ([Environment](#environment)).
-- **The first file found wins; files are never merged.** A copy in the data folder is ignored while the
-  game folder has one, and the installer puts the game-folder copies back on every upgrade and Repair
-  ([installer/README.md](../installer/README.md#upgrading)).
-- **`tpf2_slice.cfg` syntax:** one `key=value` per line; lines whose first non-blank character is `#`
-  or `;` are comments. The slice treats a switch as on when any line contains the text `key=1`, so
-  `key = 1` or `key=true` count as off for it, and `strict_maint=1` also switches on `maint`. The mod
-  accepts `1`, `true` or `yes`.
-- **No `tpf2_slice.cfg` at all** means real multiplayer: the slice turns on `suppress` and the switches
-  that are on in the shipped file (except `cancel_construction`). A file that exists but lacks a switch
-  means that switch is off for the slice; the mod uses the defaults listed below for the keys it reads.
+- **The first file found wins; files are never merged.** A copy in the data folder is ignored while
+  the game folder has one, and the installer puts the game-folder `tpf2_slice.cfg` back on every
+  upgrade and Repair ([installer/README.md](../installer/README.md#upgrading)).
 
 ## `tpf2_slice.cfg`
 
-### Master switches
+The installer's copy has every key commented out.
 
-| key | shipped | effect |
-|---|---|---|
-| `enabled` | 1 | `0` makes the slice inert: nothing captured, nothing cancelled; the game behaves like single player. |
-| `suppress` | 1 | Cancel captured commands so they apply only through lockstep. `0` is an observe mode: the action happens locally and is also replicated, which duplicates it (debugging only). |
-| `merge` | 1 | Weld a replayed construction's template connector onto the shipped road split ([re/PROPOSALS.md](re/PROPOSALS.md#construction-templates-and-the-connector)). |
-
-### Replication switches
-
-Each of these makes a channel strict (cancel and replay at the stamp on every instance); see
-[REPLICATION.md](REPLICATION.md). The slice cancels only while a session is live. The tool-based
-channels (roads, constructions, stops, demolitions, module edits) also need `suppress=1`; the vehicle
-and line switches do not.
-
-| key | shipped | mod default | channel |
+| key | read by | default | effect |
 |---|---|---|---|
-| `cancel_vehicle` | 1 | | reverse a vehicle |
-| `cancel_line` | 1 | | assign a vehicle to a line |
-| `strict_buy` | 1 | on (read at load) | buy a vehicle |
-| `strict_sell` | 1 | | sell vehicles |
-| `strict_depot` | 1 | | send a vehicle to a depot |
-| `strict_replace` | 1 | | replace a vehicle |
-| `strict_line_edit` | 1 | | edit a line's stops, delete a line |
-| `strict_module` | 1 | | module edits and construction upgrades |
-| `strict_stops` | 1 | | place or bulldoze a stop, signal or waypoint |
-| `strict_condemo` | 1 | | bulldoze a construction |
-| `road_demolish` | 1 | off | bulldoze roads and track. Read by both the slice (cancel) and the mod (execute): on every instance or none. |
-| `cancel_construction` | 1 | | place a construction |
-| `conx_strict` | 1 | on | when a construction was not cancelled, the originator bulldozes its native copy and rebuilds it like the peers (money reconciled) |
-| `maint` | not shipped | | ship vehicle maintenance-target changes (replay on peers) |
-| `strict_maint` | not shipped | | with `maint`, make them strict |
+| `dumpprop` | slice | 0 | `1` dumps every construction and road proposal to `tpf2_slice.log` (verbose): for a replay the engine rejects without a message. |
+| `dump_egeo` | mod | off | `1` writes every edge the desync hash sees to `egeo_<letter>.txt` in the game folder, to diff two instances after a divergence (ignore the first line, a per-instance stamp). |
+| `exec_delay` | mod | 0.6 | How far ahead every command is stamped, in game-time units, snapped up to the 0.2 step grid: the latency of every action. Accepted 0.2-5; anything else, or no value, means 0.6. 0.4 is safe on one machine or a LAN; below that a jitter spike puts a command in a peer's past. Set the same value on every machine. |
 
-### Timing and pacing (the mod)
+The two readers parse differently:
 
-| key | default | effect |
-|---|---|---|
-| `exec_delay` | 0.6 | How far ahead commands are stamped, in game-time units (snapped up to the 0.2 step grid): the latency of every action. Accepted 0.2-5; read once at load. 0.4 is safe on one machine or a LAN; below that a jitter spike puts a command in a peer's past. Same value on every instance. |
-| `load_gate` | on | Hold a joining game at speed 0 after loading until the leader is heard. |
-| `expect_players` | unset | Number of players including you; when set, the load gate waits for exactly that many. |
-| `speed_v2` | on | One session speed (the lowest player's speed button, or `/speed`). `0` selects the older pacer. |
-| `speed_auto` | off | Automatic corrections on top: the leader pulses speed 0 when ahead, and a sustained spread lowers the session speed a notch. |
-| `speed_frac_pace` | on | Followers trim their speed with the PID controller to track the leader's clock. |
-| `pid_kp`, `pid_ki`, `pid_kd` | 0.05, 0.015, 0.02 | PID gains. |
-| `pid_dead` | 0.30 | Dead band, game-time units. |
-| `pid_min`, `pid_max` | 0.70, 1.20 | Clamp on the multiplier of the session speed. |
-| `pid_slew` | 0.05 | Largest change of the multiplier per decision. |
-| `pid_far`, `pid_far_min` | 3.0, 0.25 | A joiner more than `pid_far` units ahead of the leader runs at `pid_far_min` of the session speed, rising as the gap closes, until the PID takes over. |
-| `hot_join` | on | A joiner far behind the leader asks for command history and catches up. The leader never does. |
-| `catchup_speed` | 4 | Speed used while catching up (clamped 1-4, never below the session speed). |
-| `strict_barrier` | off | Stop simulating while a command a peer announced is missing (released by a watchdog). |
-
-### Replay details (the mod)
-
-| key | default | effect |
-|---|---|---|
-| `stops_native` | on (read at load) | Replay stops with the engine's own edge-object proposal; `0` rebuilds the edge instead. |
-| `stops_del_on_line` | on (read at load) | Allow replaying the removal of a stop that a line uses. |
-| `xing_reheight` | off | Move an existing road node to the track's height at a crossing. Asserts the engine; leave off. |
-| `conx_terrain_align` | on | Replay constructions with terrain alignment, as the UI does. |
-| `company_colors` | on | In companies mode, paint a bought vehicle in its company's colour. |
-
-### Diagnostics
-
-| key | default | effect |
-|---|---|---|
-| `dumpprop` | 0 | Dump every construction and road proposal to `tpf2_slice.log` (verbose). |
-| `dump_egeo` | off | Write every edge the detector hashes to `egeo_<letter>.txt` in the game folder. |
-| `xing_debug` | off | Log every street edge the crossing scan considers. |
-| `vpos_desync_m` | 10 | Vehicle drift, in metres, that counts as a desync. |
-| `groundtruth` | off | Ground-truth sweep mode ([re/README.md](re/README.md#ground-truth-sweeps)). Do not place constructions while it is on. |
-| `conparams_dump` | off | Walk and log construction parameters without cancelling anything. |
-| `heapcheck` | off | Validate the process heap around proposal hooks (slow). |
-
-## `tpf2_bridge_mp.cfg`
-
-`key=value` starting in the first column, with no spaces around `=`; any other line is ignored. The
-bridge also accepts the file names `tpf2_mp_mp.cfg`, `tpf2_mp_tpf2_bridge_mp.cfg` and `tpf2_mp.cfg`
-(any of them in the game folder hides a copy in the data folder).
-
-| key | shipped | effect |
-|---|---|---|
-| `local_port` | 7771 | The bridge's UDP port. With `instance=auto` the first game on a machine takes 7771 and the next 7772. |
-| `peer_ip`, `peer_port` | 127.0.0.1, 7772 | Where the bridge sends when there is no lobby (two games on one machine). In a lobby session the menu points it at the lobby's loopback port instead. A 127.x address binds the socket to 127.0.0.1; any other address binds all interfaces, for a direct link to that machine. Packets from any other address are dropped either way. |
-| `instance` | auto | `a`, `b`, or `auto` (decided by which port is free). The lobby assigns the real letter. |
-| `save_server` | 0 | `1` starts the legacy TCP save server on instance `a` (the pre-lobby path). It answers `peer_ip` only. |
-| `xfer_port` | 7871 | Port of the legacy TCP save server. |
-| `auto_pull` | 0 | `1` pulls the host's save over `xfer_port` at start; the host needs `save_server=1`. |
-| `sim_hook` | 1 | A per-step hook on `GameSim::Step` (a counter; nothing depends on it). |
-| `speed_hook` | 1 | Fractional game speed: scales the sim batch interval to the value in `tpf2_speed.txt`. |
-| `buy_hook` | 1 | A diagnostic probe on the buy-vehicle factory. Nothing reads its output, and the slice hooks the same function; `0` avoids the double hook. |
-| `save_dir` | not shipped | The save folder the legacy save server serves from (default: discovered). |
-| `share_save` | not shipped | The save the legacy server shares, by base name (default: the newest). |
-| `tail_file` | not shipped | Send the lines of this file instead of `tpf2_capture_<L>.txt` (no spaces in the path). |
-| `relay_out` | not shipped | Write outgoing lines to this file instead of sending them over UDP (no spaces in the path). |
+- **Slice:** a line that is exactly `dumpprop=1` or `dumpprop=0` from its first character, optionally
+  followed by blanks. Any other line is ignored, and the last valid line wins.
+- **Mod:** `key=value`, with blanks allowed before the key and around the `=`. `dump_egeo` is on for
+  `1`, `true` or `yes`.
+- A line starting with `#` matches neither, so it works as a comment.
 
 ## `tpf2_menu_flags.txt`
 
-Not shipped; create it next to `tpf2_menu.dll` (the game folder). One `key=value` per line; keys are
-case-sensitive and must not have spaces around them. Unknown keys are ignored.
+Not shipped; create it next to `tpf2_menu.dll`. One `key=value` per line, keys case-sensitive, no
+blanks before the `=`. Unknown keys are ignored, and a value that fails its check leaves that
+setting at its default.
 
-| key | default | effect |
-|---|---|---|
-| `master_url` | `https://srv1306562.hstgr.cloud/tpf2mp` (the project's master server) | Base URL of the public game list. The panel reads `<url>/list`, and a host with PUBLIC ticked announces to it. Empty hides the list and the PUBLIC checkbox. |
-| `relay_autosave_min` | 2 | How often, in minutes, a relay lobby's leader uploads a fresh save while playing; `0` never. |
-| `automod` | on | `automod=0` stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
-| `native` | 1 | Insert the Multiplayer entry into the title menu. It is the only way to open the panel: `0` leaves no way in. |
-| `slot` | 0 | Position of the Multiplayer entry in the title menu's list (0 = top). |
-| `scale` | 0 | Panel scale; 0 = screen height / 1080. |
-| `overlay`, `ox`, `oy`, `fontpx` | | Parsed but no longer used. |
+| key | default | accepted | effect |
+|---|---|---|---|
+| `master_url` | `https://srv1306562.hstgr.cloud/tpf2mp` (the project's master server) | empty, or an `http://` or `https://` URL without blanks or quotes (a trailing `/` is dropped) | Base URL of the public game list. The panel reads `<url>/list`, and a host with PUBLIC ticked announces to it. Empty hides the list and the PUBLIC checkbox. |
+| `relay_autosave_min` | 2 | 0-60 | How often, in minutes, a relay lobby's leader uploads a fresh save while playing; `0` never. |
+| `autoload` | 1 | `0`, `1` | `1`: the shared save loads by itself after START GAME. `0`: the player loads it with LOAD GAME. |
+| `slot` | 0 | 0-7 | Position of the Multiplayer entry in the title menu's list (0 = top). |
+| `scale` | 0 | 0.5-3 | Panel scale; 0 = screen height / 1080. |
+| `automod` | on | a line starting `automod=0` | Stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
 
 ## `tpf2mp.cfg` and plugin settings
 
