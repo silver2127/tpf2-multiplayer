@@ -52,22 +52,15 @@ static BtnFn g_btn = nullptr;
 // --- insertion primitives (see docs/re/GAME_LOOP_AND_UI.md, "Title menu") ---
 static const uintptr_t RVA_MAINBUILD = 0x667bc0;   // main-page builder (hook here)
 static const int       STEAL_MAINBUILD = 14;       // mov rax,rsp + 7 pushes
-static const uintptr_t RVA_SEED  = 0x4c0f40;       // 4c0f40(&out, param_3)
-static const uintptr_t RVA_FIN   = 0x63e6e0;       // 63e6e0(&binding,&{p1}) -> writes +0x38
 static const uintptr_t RVA_ADD   = 0x22518f0;      // 2518f0(button,&{container},&binding)
 static const uintptr_t RVA_CLEAN = 0x2357910;      // 357910(&{container})
-typedef void  (*SeedFn)(void* out, void* p3);
-typedef void* (*FinFn)(void* binding, void* pP1);
 typedef void* (*AddFn)(void* button, void* pContainer, void* binding);
 typedef void  (*CleanFn)(void* pContainer);
-static SeedFn  g_seed  = nullptr;
-static FinFn   g_fin   = nullptr;
 static AddFn   g_add   = nullptr;
 static CleanFn g_clean = nullptr;
 
 typedef void (*MainBuildFn)(uint64_t p1, uint64_t p2, uint64_t p3, uint64_t p4);
 static MainBuildFn g_origMainBuild = nullptr;
-static void* g_myButton = nullptr;    // set after a successful build, for later vtable click override
 
 static uintptr_t g_base = 0;
 
@@ -292,7 +285,7 @@ static void*          g_panelPtr = nullptr;   // mapped
 static size_t         g_panelPitch = 0;       // row bytes
 static int            g_panelW = 780, g_panelH = 580;   // image alloc = max (lobby)
 static int            g_copyW = 300, g_copyH = 60;        // region actually shown/copied
-static bool           g_panelBuilt = false, g_panelInPlace = false;
+static bool           g_panelBuilt = false;
 static char           g_code[128] = "";                   // host/own code to display
 static volatile LONG  g_haveCode = 0;
 static wchar_t        g_startSaveW[600] = L"";             // host: the .sav it chose to share
@@ -329,11 +322,8 @@ static bool doStartLoad(const wchar_t* srcSav);
 //    that first event would be silently lost; START GAME / chat wait for it.
 //  g_saveReady  -- joiner: the 'save_ready' event arrived this session, i.e. the
 //    incoming_save.* files are complete and a 'start' with save=true may load them.
-//  g_lobbyAbort -- set by a teardown (LEAVE / re-HOST) so a LobbyThread parked in
-//    the wait-for-title-screen / click loop gives up instead of clicking later.
 static volatile LONG g_lobbyReady = 0;
 static volatile LONG g_saveReady  = 0;
-static volatile LONG g_lobbyAbort = 0;
 static CRITICAL_SECTION g_lobbyCs; static bool g_lobbyCsInit = false;   // guards g_lobbyProc handle use vs close
 
 template <class T> static T rget(const char* n) { return (T)g_origGdpa(g_dev, n); }
@@ -420,7 +410,6 @@ static bool InitRender(VkSwapchainKHR sc)
     return true;
 }
 
-// screen-space button rect (matches the menu column position)
 // ---- multiplayer panel state ----
 static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lobby
 // Low-level keyboard hook. While the lobby chat is open (state 2) and the game is
@@ -490,24 +479,9 @@ static Hit g_hits[64]; static int g_hitCount = 0;
 static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount<64){g_hits[g_hitCount++]={x,y,w,h,id,btn};} }
 static const Hit* hoveredHit(){ for(int i=0;i<g_hitCount;i++) if(g_hits[i].btn && g_hits[i].id==g_hover) return &g_hits[i]; return nullptr; }
 
-// ---------------- A/B test flags (tpf2_menu_flags.txt next to this dll) ----------------
-// Two candidate looks for the collapsed Multiplayer button, both live at once so
-// they can be compared in one launch:
-//   overlay=native   GDI overlay restyled to res/config/style_sheet/main-menu.lua:
-//                    transparent, Lato 24 uppercase white, padding 8/15, hover =
-//                    white @50/255, pressed = white @100/255 (alpha-blended over a
-//                    readback of the game frame -- the swapchain has TRANSFER_SRC).
-//   overlay=classic  the previous filled Settings-dialog style.
-//   native=1         ALSO insert a REAL UI::Button into the title menu's "MainMenu"
-//                    list (hook the page builder, add via the list's own add call,
-//                    connect a click slot). It appends after the game's last entry.
+// ---------------- flags (tpf2_menu_flags.txt next to this dll) ----------------
 //   scale=<f>        UI scale for the overlay (default = screen height / 1080).
-//   ox=<f> oy=<f>    overlay top-left as a fraction of the screen (default .05/.60).
-//   fontpx=<n>       override the overlay label pixel size (default 24*scale).
-static int   g_flagOverlayNative = 1;
-static int   g_flagNativeBtn     = 1;
-static float g_flagScale = 0.f, g_flagOx = 0.05f, g_flagOy = 0.60f;
-static int   g_flagFontPx = 0;
+static float g_flagScale = 0.f;
 static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
 static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
@@ -517,23 +491,18 @@ static bool  g_latoLoaded = false;
 static void ReadFlags()
 {
     char p[MAX_PATH]; snprintf(p, sizeof(p), "%stpf2_menu_flags.txt", ourDirA());
-    FILE* f = fopen(p, "r"); if (!f) { Log("[menu] flags: no %s (defaults overlay=native native=1)\n", p); return; }
+    FILE* f = fopen(p, "r"); if (!f) { Log("[menu] flags: no %s (defaults)\n", p); return; }
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
-        if (!strcmp(line, "overlay")) g_flagOverlayNative = strncmp(v, "classic", 7) != 0;
-        else if (!strcmp(line, "native")) g_flagNativeBtn = atoi(v);
-        else if (!strcmp(line, "scale")) g_flagScale = (float)atof(v);
-        else if (!strcmp(line, "ox")) g_flagOx = (float)atof(v);
-        else if (!strcmp(line, "oy")) g_flagOy = (float)atof(v);
-        else if (!strcmp(line, "fontpx")) g_flagFontPx = atoi(v);
+        if (!strcmp(line, "scale")) g_flagScale = (float)atof(v);
         else if (!strcmp(line, "relay_autosave_min")) g_flagRelayAutosaveMin = atoi(v);
         else if (!strcmp(line, "autoload")) g_flagAutoLoad = atoi(v);
         else if (!strcmp(line, "slot")) g_flagSlot = atoi(v);
         else if (!strcmp(line, "master_url")) { strncpy_s(g_flagMaster, v, _TRUNCATE); char* e = g_flagMaster + strlen(g_flagMaster); while (e > g_flagMaster && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '/')) *--e = 0; }
     }
     fclose(f);
-    Log("[menu] flags: native=%d slot=%d scale=%.2f\n", g_flagNativeBtn, g_flagSlot, g_flagScale);
+    Log("[menu] flags: slot=%d scale=%.2f\n", g_flagSlot, g_flagScale);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -548,21 +517,6 @@ static void LoadLato()
 }
 static float UiScale() { return g_flagScale > 0.f ? g_flagScale : (g_scExtent.height ? g_scExtent.height / 1080.f : 1.f); }
 
-// TF2 palette (flat, cool blue-grey; matches the Settings dialog)
-#define TF_PANEL    RGB(52, 66, 84)
-#define TF_PANEL_BD RGB(96, 112, 134)
-#define TF_FIELD    RGB(64, 80, 99)      // value boxes / buttons
-#define TF_FIELD_BD RGB(112, 132, 156)
-#define TF_INSET    RGB(38, 50, 66)      // recessed (code box)
-#define TF_TEXT     RGB(232, 238, 245)   // primary
-#define TF_TEXT_DIM RGB(176, 190, 208)   // labels
-#define TF_ACCENT   RGB(150, 200, 210)   // the teal underline TF2 uses
-
-static HFONT mkFont(int px, int weight, bool mono = false)
-{
-    return CreateFontW(-px, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
-                       CLEARTYPE_QUALITY, 0, mono ? L"Consolas" : L"Segoe UI");
-}
 // the menu face, grayscale-antialiased (coverage is read back as alpha, so no ClearType fringes)
 static HFONT mkLato(int px)
 {
@@ -717,29 +671,6 @@ static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, siz
             for (int c = 0; c < 3; c++) d[c] = (unsigned char)((d[c] * (255 - a) + l[c] * a) / 255); }
     }
     for (int y = 0; y < h; y++) memcpy((unsigned char*)dst + y * pitch, g_stage + (size_t)y * w * 4, (size_t)w * 4);
-}
-static void flatRect(HDC dc, int x, int y, int w, int h, COLORREF fill, COLORREF border)
-{
-    RECT rc = { x, y, x + w, y + h };
-    HBRUSH b = CreateSolidBrush(fill); FillRect(dc, &rc, b); DeleteObject(b);
-    if (border != CLR_INVALID) { HBRUSH bb = CreateSolidBrush(border); FrameRect(dc, &rc, bb); DeleteObject(bb); }
-}
-// uppercase, letter-spaced text (TF2's title/tab/action style)
-static void textIn(HDC dc, int x, int y, int w, int h, const wchar_t* s, HFONT f, COLORREF col, UINT fmt, int track = 0)
-{
-    HGDIOBJ of = SelectObject(dc, f); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, col);
-    int oldx = SetTextCharacterExtra(dc, track);
-    RECT rc = { x, y, x + w, y + h }; DrawTextW(dc, s, -1, &rc, fmt);
-    SetTextCharacterExtra(dc, oldx); SelectObject(dc, of);
-}
-// a flat TF2-style button: field fill, thin border, uppercase tracked label
-static void drawBtn(HDC dc, int x, int y, int w, int h, const wchar_t* label, int fontpx, bool accent)
-{
-    flatRect(dc, x, y, w, h, TF_FIELD, TF_FIELD_BD);
-    if (accent) { HBRUSH a = CreateSolidBrush(TF_ACCENT); RECT ln = { x, y, x + w, y + 2 }; FillRect(dc, &ln, a); DeleteObject(a); }
-    HFONT f = mkFont(fontpx, FW_NORMAL);
-    textIn(dc, x, y, w, h, label, f, TF_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE, 3);
-    DeleteObject(f);
 }
 
 // ---------------- the Multiplayer window (MenuWindow look) ----------------
@@ -1335,7 +1266,6 @@ static void OnHit(int id)
 {
     Log("[menu] hit id=%d\n", id);
     switch (id) {
-    case 1: InterlockedExchange(&g_uiState, 1); InterlockedExchange(&g_panelDirty, 1); break; // expand
     case 4: InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: StartLobby(1); break;   // JOIN  -> lobby (join)
@@ -1467,58 +1397,8 @@ static PFN_vkVoidFunction myGdpa(VkDevice dev, const char* name)
 // An MSVC std::string laid out for the game's helpers. Kept 32 bytes, 8-aligned.
 struct GString { char buf[16]; size_t size; size_t cap; };
 static void GStringInit(GString* s) { memset(s, 0, sizeof(*s)); s->cap = 15; }
-static const char* GStringData(const GString* s) {
-    return (s->cap > 15) ? *(const char* const*)s->buf : s->buf;
-}
 
-// Step 2a probe: prove we can build a game std::string from our detour thread
-// (the UI thread -- the correct ABI context). Runs once, on the first main page.
-static bool g_probedString = false;
-static void ProbeString()
-{
-    __try {
-        GString s; GStringInit(&s);
-        const char* key = "mp.multiplayer";
-        g_strAssign(&s, key, strlen(key));
-        // log the raw 32 bytes + the interpreted value
-        char hex[80]; int o = 0;
-        const unsigned char* b = (const unsigned char*)&s;
-        for (int i = 0; i < 32 && o < 76; i++) o += snprintf(hex + o, sizeof(hex) - o, "%02x", b[i]);
-        Log("[menu] str probe: size=%llu cap=%llu data='%s' bytes=%s\n",
-            (unsigned long long)s.size, (unsigned long long)s.cap, GStringData(&s), hex);
-        // free heap storage if it allocated (cap>15 means it went off the SSO buffer)
-        // -- "mp.multiplayer" is 14 chars so it stays inline; nothing to free.
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[menu] str probe FAULTED (exc=%lx) -- string ABI is off\n", GetExceptionCode());
-    }
-}
-
-// Step 2b: build a real Button widget from injected code. Action ctx then the
-// Button factory. Log the returned pointers; do NOT insert into the layout yet.
-static bool g_probedWidget = false;
-static void ProbeWidget()
-{
-    __try {
-        // action context for our key -- outBuf sized generously in case the
-        // built object is larger than a std::string (32 B).
-        alignas(16) unsigned char ctxBuf[128];
-        memset(ctxBuf, 0, sizeof(ctxBuf));
-        void* ctx = g_actionCtx(ctxBuf, "mp.multiplayer");
-        Log("[menu] widget probe: actionCtx ret=%p ctxBuf[0..7]=%016llx\n",
-            ctx, *(unsigned long long*)ctxBuf);
-
-        // two empty icon strings (like the "Free Game" button)
-        GString iconA, iconB; GStringInit(&iconA); GStringInit(&iconB);
-        void* btn = g_btn(ctx ? ctx : ctxBuf, &iconA, &iconB);
-        Log("[menu] widget probe: BUTTON ret=%p (vtable=%016llx)\n",
-            btn, btn ? *(unsigned long long*)btn : 0ull);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[menu] widget probe FAULTED (exc=%lx) at step -- signature/ctx off\n",
-            GetExceptionCode());
-    }
-}
-
-// ---------------- native title-menu button (A/B test, flag native=1) ----------------
+// ---------------- native title-menu button ----------------
 // What the page builder 667bc0 really does per entry (decompiled, mainmenu_ref.c):
 //   btn = 7c5d30(221c930(&s, "Load Game"), &empty, &empty)   build the Button
 //   227a1e0(btn, &"continue")                                 style class (optional)
@@ -1569,7 +1449,7 @@ static void* MyListAdd(void* list, void* widget, void* style)
     // slot=N: insert ours before the game's N-th add (0 = before the first entry,
     // which is CONTINUE when a save exists and otherwise the next one -- so we sit
     // at the top of the column either way).
-    if (inBuild && g_mainListAdds == g_flagSlot && g_flagNativeBtn) { g_mainList = list; NativeInsert(); }
+    if (inBuild && g_mainListAdds == g_flagSlot) { g_mainList = list; NativeInsert(); }
     if (!g_origListAdd) return nullptr;   // hook live before its trampoline was recorded: never call address 0
     void* r = g_origListAdd(list, widget, style);
     if (inBuild) { g_mainList = list; g_mainListAdds++; Log("[menu] list add #%d list=%p widget=%p\n", g_mainListAdds, list, widget); }
@@ -1597,10 +1477,9 @@ static void NativeInsert()
         g_prep(btn, 4, 1);
         GString li; GStringInit(&li); g_strAssign(&li, "list-item", 9);
         g_origListAdd(g_mainList, btn, &li);
-        g_myButton = btn;
         Log("[menu] native: BUTTON INSERTED into the MainMenu list during the build -- it goes at the top of the column\n");
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[menu] native: FAULTED exc=%lx (button not inserted; set native=0 in tpf2_menu_flags.txt if the menu is unstable)\n", GetExceptionCode());
+        Log("[menu] native: FAULTED exc=%lx (button not inserted)\n", GetExceptionCode());
     }
 }
 
@@ -2384,7 +2263,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char game[64]; char lobby[48]; };
+struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char lobby[48]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -2605,7 +2484,6 @@ static DWORD WINAPI LobbyThread(LPVOID param)
 static HANDLE g_lobbyThread = nullptr;
 static void TeardownLobby(int waitMs, bool joinThread)
 {
-    InterlockedExchange(&g_lobbyAbort, 1);   // unpark a thread waiting for the title screen / clicking
     if (g_lobbyCsInit) EnterCriticalSection(&g_lobbyCs);
     QuitLobbyProc(g_lobbyProc, waitMs);
     if (g_lobbyCsInit) LeaveCriticalSection(&g_lobbyCs);
@@ -2641,7 +2519,6 @@ static void StartLobby(int join)
     // A previous lobby.py still up (LEAVE not pressed, or a tail thread still
     // finishing) would fight the new one over lobby_in/out.jsonl: tear it down first.
     if (g_lobbyProc || g_lobbyThread) TeardownLobby(1500, true);
-    InterlockedExchange(&g_lobbyAbort, 0);
     InterlockedExchange(&g_lobbyReady, 0);
     InterlockedExchange(&g_saveReady, 0);
     InterlockedExchange(&g_isHost, join ? 0 : 1);
@@ -2770,12 +2647,9 @@ static DWORD WINAPI KbHookThread(LPVOID)
 
 // The detour: run the original so the page still builds, then flag the in-frame
 // button visible on the main page (page 2), hidden elsewhere.
-static volatile uint64_t g_menuThis = 0;   // the UI::CMenuUI 'this' -- needed to call StartSavegame
-
 static void MyCreatePage(uint64_t thisp, int page)
 {
     g_origCreatePage(thisp, page);
-    g_menuThis = thisp;   // captured for the future in-process save-load call (RVA 0x6785c0)
     // The main menu builds pages 0 -> 2 -> 1 (2 is the main content, 0/1 are its
     // sub-layers). Full-screen replacements (Settings/Campaign/Load...) are all
     // page >= 3. So SET on 2, CLEAR only on >= 3; leave 0/1 alone -- otherwise
@@ -2962,7 +2836,7 @@ static DWORD WINAPI Init(LPVOID)
     Log("[menu] hooked CreatePage rva=%llx steal=%d tramp=%p -- overlay thread started\n",
         (unsigned long long)RVA_CREATEPAGE, STEAL_CREATEPAGE, tramp);
 
-    // ---- A/B test: native-look overlay + real list-inserted button ----
+    // ---- native-look overlay + real list-inserted button ----
     ReadFlags();
     ensureUsername(); LoadNames();
     LoadLato();
@@ -2992,7 +2866,7 @@ static DWORD WINAPI Init(LPVOID)
             }
         }
     }
-    if (g_flagNativeBtn) {
+    {
         // verify both prologues before patching: a game update moves everything.
         static const unsigned char kMainBuild[14] = { 0x48,0x8b,0xc4,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57 };
         static const unsigned char kListAdd[15]   = { 0x40,0x57,0x48,0x83,0xec,0x60,0x48,0xc7,0x44,0x24,0x20,0xfe,0xff,0xff,0xff };
@@ -3000,7 +2874,6 @@ static DWORD WINAPI Init(LPVOID)
         bool okB = memcmp((void*)(g_base + RVA_LIST_ADD),  kListAdd, 15) == 0;
         if (!okA || !okB) {
             Log("[menu] native: prologue mismatch (mainbuild=%d listadd=%d) -- native button disabled\n", okA, okB);
-            g_flagNativeBtn = 0;
         } else {
             // ORDER MATTERS. The moment InstallHook returns, the game's list-add
             // jumps into MyListAdd -- on the UI thread, while this runs on ours.
@@ -3020,7 +2893,7 @@ static DWORD WINAPI Init(LPVOID)
                 Log("[menu] native: hooked list-add %llx (steal %d) and main builder %llx (steal %d)\n",
                     (unsigned long long)RVA_LIST_ADD, STEAL_LIST_ADD, (unsigned long long)RVA_MAINBUILD, STEAL_MAINBUILD);
             } else {
-                Log("[menu] native: InstallHook FAILED -- native button disabled\n"); g_flagNativeBtn = 0;
+                Log("[menu] native: InstallHook FAILED -- native button disabled\n");
             }
         }
     }
