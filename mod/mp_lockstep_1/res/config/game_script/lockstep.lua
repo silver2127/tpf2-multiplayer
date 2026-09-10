@@ -1,29 +1,23 @@
--- MP Lockstep -- prototype.
+-- MP Lockstep -- the game-script half of TpF2 Multiplayer (docs/ARCHITECTURE.md).
 --
 -- Replicates COMMANDS, not state. Every command carries the game time at which
 -- all peers must execute it; nobody executes early, including the originator.
--- Correctness rests on the simulation being deterministic, which M3 measured:
+-- Correctness rests on the simulation being deterministic, which was measured:
 -- two instances, same save, 79 vehicles, 59/59 state hashes identical across 58
--- in-game days (docs/M3_RESULTS.md).
+-- in-game days (docs/re/GAME_LOOP_AND_UI.md).
 --
 -- WHY GAME TIME IS THE CLOCK
 -- Wall clock is useless -- the two processes are never in step, and one may be
 -- paused. A per-instance tick counter is no better: it starts at load and
 -- counts frames, so the same tick number means different world states. Game
 -- time is part of the simulation, both instances load it from the same save,
--- and M3 showed it advances identically. So "execute at game time T" names the
--- SAME sim state on every peer, which is precisely what lockstep needs.
+-- and the determinism run showed it advances identically. So "execute at game
+-- time T" names the SAME sim state on every peer, which is precisely what
+-- lockstep needs.
 --
--- WHAT THIS PROTOTYPE DOES NOT DO
--- It cannot intercept a command the player issues through the UI: the game
--- applies those immediately and the native hook that would cancel one is not
--- built yet (blocked on applyProposal's signature, see
--- docs/re/PROPOSAL_STRUCTURE.md). Commands here are injected through a file, so
--- this proves the lockstep LOOP -- schedule, exchange, barrier, execute in
--- agreed order, verify no desync -- not yet UI capture.
---
--- MUST NOT run alongside MP Bridge: that mod replicates state and the two would
--- fight over the same world.
+-- Player commands reach this script through the slice DLL's inject file
+-- (captured, and cancelled natively while a session is live); what travels,
+-- and how each action is replayed, is in docs/REPLICATION.md.
 --
 -- LAYOUT (since 2026-09-08). This file is the entry point: constants (K), the
 -- shared state table (CM), the command dispatcher, the desync check and data().
@@ -73,7 +67,13 @@
 local K = {}
 
 local CM = {}   -- the one catch-all state table; documented at its former home below
-K.BASE = (function()
+-- Boot markers (2026-09-10): a friend's game died loading this file with
+-- "Lua exception" and an EMPTY message. Each step now prints before it runs,
+-- so stdout shows how far loading got, and a failure says what broke. Bytes
+-- above 127 are printed as "?": a Windows path with an accented user name is
+-- not valid UTF-8, and a message holding one came out as nothing at all.
+print("[ls-boot] lockstep.lua: finding the data folder")
+CM.bootOk, K.BASE = pcall(function()
 	local function env(name)
 		local ok, v = pcall(function() return os.getenv(name) end)
 		if ok and type(v) == "string" and #v > 0 then return v end
@@ -108,7 +108,13 @@ K.BASE = (function()
 	for _, c in ipairs(cands) do if c.source == "LOCALAPPDATA" then pick = c end end
 	CM.baseSource = pick.source .. " (no identity file yet)"
 	return pick.path
-end)()
+end)
+if not CM.bootOk then
+	local msg = "MP Lockstep: finding the data folder failed: " .. (tostring(K.BASE):gsub("[\128-\255]", "?"))
+	print("[ls-boot] " .. msg)
+	error(msg, 0)
+end
+print("[ls-boot] data folder " .. (K.BASE:gsub("[\128-\255]", "?")) .. " (" .. tostring(CM.baseSource) .. ")")
 K.IDENTITY_FILE = K.BASE .. "tpf2_instance.txt"
 
 K.INSTANCE  = nil
@@ -349,17 +355,48 @@ local function log(s)
 	pcall(dashNote, s)
 end
 
+-- ---------- module loading that says what broke ----------
+-- Every module loads through CM.boot: a step marker first, then on a failure
+-- a readable message naming the module (accented bytes shown as "?", see the
+-- boot markers above). A require that hands back something other than our
+-- factory is named too: another mod replacing require would look like that.
+-- CM fields, not locals: this chunk sits near Lua 5.1's 200-local limit.
+function CM.bootText(v)
+	return (tostring(v):gsub("[\128-\255]", "?"))
+end
+function CM.boot(name)
+	print("[ls-boot] loading " .. name)
+	local ok, factory = pcall(require, name)
+	if not ok then
+		local msg = "MP Lockstep: require('" .. name .. "') failed: " .. CM.bootText(factory)
+		print("[ls-boot] " .. msg)
+		error(msg, 0)
+	end
+	if type(factory) ~= "function" then
+		local msg = "MP Lockstep: require('" .. name .. "') returned a " .. type(factory) .. ", not the module factory (another mod may have replaced require)"
+		print("[ls-boot] " .. msg)
+		error(msg, 0)
+	end
+	local ok2, result = pcall(factory, CM, K, log)
+	if not ok2 then
+		local msg = "MP Lockstep: module " .. name .. " failed while loading: " .. CM.bootText(result)
+		print("[ls-boot] " .. msg)
+		error(msg, 0)
+	end
+	return result
+end
+
 -- ---------- exact hashing, game time, world hash (desync detector), vehicle drift metric ----------
 -- Lives in res/scripts/mp/hash.lua (see the header there).
-local hash = require("mp.hash")(CM, K, log)
+local hash = CM.boot("mp.hash")
 local worldHash, vposPrune
 CM.gameTime, worldHash, vposPrune = hash.gameTime, hash.worldHash, hash.vposPrune
 -- ---------- runtime files: append/read, instance detection, wire broadcast ----------
 -- Lives in res/scripts/mp/io.lua.
-require("mp.io")(CM, K, log)
+CM.boot("mp.io")
 -- ---------- multi-company mode (opt-in; co-op is the default and is untouched) ----------
 -- Lives in res/scripts/mp/companies.lua (see the header there).
-require("mp.companies")(CM, K, log)
+CM.boot("mp.companies")
 
 -- Forward declarations: worldHash uses these, and they are defined further
 -- down. A later `local function` would create a DIFFERENT variable and this
@@ -422,10 +459,10 @@ K.RESEND_MIN_GAP = 5      -- ticks: do not rebroadcast the same seq more often
 
 -- ---------- road/track replay: command order, proposal context, execEdge, execPolyline ----------
 -- Lives in res/scripts/mp/roads.lua.
-require("mp.roads")(CM, K, log)
+CM.boot("mp.roads")
 -- ---------- edge geometry: hermite, node/edge lookup, mid-span splitting (ported from mp_bridge) ----------
 -- Lives in res/scripts/mp/geom.lua (see the header there).
-local geom = require("mp.geom")(CM, K, log)
+local geom = CM.boot("mp.geom")
 CM.hermitePos, CM.hermiteTangent, CM.edgeGeomT, CM.findNodeNear, CM.findEdgeContaining, CM.copyEdgeProps = geom.hermitePos, geom.hermiteTangent, geom.edgeGeomT, geom.findNodeNear, geom.findEdgeContaining, geom.copyEdgeProps
 
 -- Diagnostic export: EVAL chunks run in the global environment and cannot
@@ -464,16 +501,16 @@ LS = { findNodeNear = CM.findNodeNear, findEdgeContaining = CM.findEdgeContainin
 -- found only garbage.
 -- ---------- constructions: hybrid replication, station edits, edge demolish, capture polls ----------
 -- Lives in res/scripts/mp/cons.lua.
-require("mp.cons")(CM, K, log)
+CM.boot("mp.cons")
 -- ---------- vehicles: cross-peer identity, names/colours, vehicle commands, buy, replace ----------
 -- Lives in res/scripts/mp/vehicles.lua.
-require("mp.vehicles")(CM, K, log)
+CM.boot("mp.vehicles")
 -- ---------- lines: cross-peer identity, create/update/delete ----------
 -- Lives in res/scripts/mp/lines.lua.
-require("mp.lines")(CM, K, log)
+CM.boot("mp.lines")
 -- ---------- constructions: native replay (CONP / CONX), CONFAIL, LOAN ----------
 -- Lives in res/scripts/mp/conx.lua.
-require("mp.conx")(CM, K, log)
+CM.boot("mp.conx")
 local function execute(c)
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
@@ -511,20 +548,20 @@ end
 
 -- ---------- command reliability (NACK + resend), encode/decode, scheduleLocal, onLine, pollEvents ----------
 -- Lives in res/scripts/mp/net.lua.
-require("mp.net")(CM, K, log)
+CM.boot("mp.net")
 -- ---------- ground-truth sweeps (constructions, vehicles, lines, demolish) ----------
 -- Lives in res/scripts/mp/gt.lua (see the header there).
-local gt = require("mp.gt")(CM, K, log)
+local gt = CM.boot("mp.gt")
 CM.gtVehPickModel, CM.gtVehConfig, CM.runGroundTruth = gt.gtVehPickModel, gt.gtVehConfig, gt.runGroundTruth
 -- ---------- roadside stops (edge objects) and native-shape stop replay ----------
 -- Lives in res/scripts/mp/stops.lua.
-require("mp.stops")(CM, K, log)
+CM.boot("mp.stops")
 -- ---------- inject reader (pollInject) and BUYTEST readback ----------
 -- Lives in res/scripts/mp/inject.lua.
-require("mp.inject")(CM, K, log)
+CM.boot("mp.inject")
 -- ---------- barrier, catch-up pacing, speed sharing, load gate ----------
 -- Lives in res/scripts/mp/pacing.lua.
-require("mp.pacing")(CM, K, log)
+CM.boot("mp.pacing")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
 	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
@@ -593,6 +630,8 @@ local function checkHash(now)
 	-- check fires whichever side's hash lands second.
 	CM.compareAt(stamp)
 end
+
+print("[ls-boot] all modules loaded")
 
 function data()
 	return {
