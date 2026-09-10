@@ -2526,8 +2526,12 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             # Drain a burst of inbound datagrams (chunks arrive fast during a
             # transfer). Block briefly on the first recv so we don't spin when
             # idle; then pull whatever else is already queued, up to DRAIN_CAP.
-            busy = receiver.active()
-            raw = conn.recv(timeout=0.02 if busy else 0.2)
+            # An UPLOAD in progress is as busy as a download: the sender's pump
+            # runs once per loop iteration, so the 0.2 s idle timeout capped a
+            # leader's upload at ~5 pumps/s x SEND_BUDGET x 1200 B = 1.5 MB/s
+            # (139 MB took minutes on a link that could do several MB/s).
+            busy = receiver.active() or uploader[0] is not None
+            raw = conn.recv(timeout=0.002 if uploader[0] is not None else (0.02 if busy else 0.2))
             drained = 0
             while raw is not None:
                 try:
