@@ -517,14 +517,15 @@ function CM.syncTick(now, s)
 end
 
 -- CATCH-UP (the newcomer's side, but any instance that finds itself far
--- behind). Behind the fastest non-catching-up peer by more than
+-- behind). Behind the LEADER's clock (never on the leader) by more than
 -- K.CATCHUP_MIN units: hold at 0, ask the host for the command history
 -- after our clock (LSNEED), wait for LSHISTEND with no gaps left (or a
--- timeout), then run at catchup_speed (cfg, default 8) until within half a
--- unit of the session, at which point ordinary pacing takes over. cu=1 on
+-- timeout), then run at catchup_speed (cfg, default 4) until half a second of closing
+-- speed short of the leader, where ordinary pacing takes over. cu=1 on
 -- our heartbeat keeps the others from pacing against us meanwhile. Returns
 -- the speed to impose while active, nil otherwise.
 K.CATCHUP_MIN = 8          -- below this the PID closes the gap gradually; catch-up (hold + 4x) is for hot joins and stalls
+K.PACE_OTHER_GAME = 1800   -- units: a leader clock this far off is another game, not one to pace against
 K.FRAC_PACE_TICKS = 8      -- ~1.5 s between pacing decisions (heartbeats are 2 ticks apart)
 
 -- The controller. Returns target speed (or nil when level) and the error.
@@ -548,17 +549,44 @@ function CM.pidPace(now, eff)
 	-- and only its lever changes it (a host that sees a peer lagging can slow
 	-- everyone down by choice). Every joiner's reference is the host's precise
 	-- clock; nobody steers the host.
-	if CM.isLeader() then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
-	local host = CM.peers[CM.leader or "a"]
-	local ref
-	if host and host.at and (CM.ticks - host.at) <= K.PEER_STALE_TICKS then
-		ref = host.step and (host.step * K.SIM_STEP) or host.time
-	end
+	if CM.isLeader() then CM.pidHold, CM.pidErr, CM.pidI, CM.pidFar = nil, nil, 0, nil; return nil end
+	local ref = CM.leaderPrecise()
 	local dtTicks = CM.ticks - (CM.pidAt or CM.ticks)
 	CM.pidAt = CM.ticks
-	if not ref or math.abs(ref - now) >= 60 then CM.pidHold, CM.pidErr, CM.pidI = nil, nil, 0; return nil end
-	local n = 1
+	-- No 60-unit cut-off (2026-09-10): a joiner 60 ahead of the leader was
+	-- left at full session speed and got 233 ahead. Only a clock THIS far
+	-- away is another game (a leftover heartbeat); far BEHIND is catch-up's.
+	if not ref or math.abs(ref - now) >= K.PACE_OTHER_GAME then CM.pidHold, CM.pidErr, CM.pidI, CM.pidFar = nil, nil, 0, nil; return nil end
 	local e = now - ref                           -- + = we are ahead of the host
+	-- FAR AHEAD of the leader (2026-09-10). The PID below is tuned for drift:
+	-- 0.70x at the least, moving 0.05 per decision, so a joiner that overshot
+	-- closed the gap at a crawl and pulled away again whenever the session
+	-- slowed. More than pid_far units ahead it runs at pid_far_min of the
+	-- session speed straight away -- a decimal speed (the dither reaches a
+	-- quarter of the lever), never a pause -- rising in proportion as the gap
+	-- closes until it meets pid_min, where the PID takes over from its floor.
+	local far = math.max(0.5, ov.far or CM.cfgNum("pid_far", 3.0))
+	local farMin = math.max(0.25, ov.farmin or CM.cfgNum("pid_far_min", 0.25))
+	local farM = 1 - (1 - farMin) * e / far
+	if e > far or (CM.pidFar and farM < lo) then
+		if farM < farMin then farM = farMin end
+		local target = math.max(0.25, math.floor(eff * farM / 0.05 + 0.5) * 0.05)
+		if not CM.pidFar or target ~= CM.pidHold then
+			log(string.format("PID: %.2f ahead of the leader -> %.2fx of %g until it reaches us", e, target, eff))
+		end
+		CM.pidFar = true
+		CM.pidI, CM.pidLastE = 0, e
+		CM.pidHold, CM.pidErr, CM.pidEff = target, e, eff
+		CM.paceInfo = string.format("%.2fx e=%+.2f far ahead", target, e)
+		CM.pidHist = CM.pidHist or {}
+		CM.pidHist[#CM.pidHist + 1] = { e = e, m = target / eff }
+		while #CM.pidHist > 60 do table.remove(CM.pidHist, 1) end
+		return target, e
+	end
+	if CM.pidFar then
+		CM.pidFar = nil
+		log(string.format("PID: %.2f ahead of the leader -- fine pacing again", e))
+	end
 	local dt = math.max(1, dtTicks) / 5.4         -- seconds between decisions
 	local eD = (math.abs(e) < dead) and 0 or e
 	CM.pidI = (CM.pidI or 0) + eD * dt
@@ -571,18 +599,21 @@ function CM.pidPace(now, eff)
 	local u = kp * eD + ki * CM.pidI + kd * d
 	local m = 1 - u
 	if m < lo then m = lo elseif m > hi then m = hi end
+	if math.abs(m - 1) < 0.025 then m = 1 end     -- level enough: exactly the session speed
+	-- SLEW ON THE MULTIPLIER, not the speed (2026-09-10). The hold was an
+	-- absolute speed, so when the session dropped from 4x to 1x a joiner held
+	-- at 2.8x crept down from 2.75x of a 1x session and ran away ("PID ...
+	-- -> 2.75x of 1", live).
+	local prevM = (CM.pidHold and CM.pidEff and CM.pidEff > 0) and (CM.pidHold / CM.pidEff) or 1
+	if m > prevM + slew then m = prevM + slew elseif m < prevM - slew then m = prevM - slew end
 	local target = math.floor(eff * m / 0.05 + 0.5) * 0.05
 	if target > (CM.MAX_SPEED or 4) then target = CM.MAX_SPEED or 4 end
-	if target < 0.5 then target = 0.5 end
-	if math.abs(m - 1) < 0.025 then target = eff end   -- level enough: exactly the session speed
-	local prev = CM.pidHold or eff
-	local maxStep = slew * eff
-	if target > prev + maxStep then target = prev + maxStep elseif target < prev - maxStep then target = prev - maxStep end
-	target = math.floor(target / 0.05 + 0.5) * 0.05
+	if target < 0.25 then target = 0.25 end       -- the dither's floor: a quarter of the lever
+	if math.abs(m - 1) < 1e-9 then target = eff end
 	if target ~= CM.pidHold then
 		log(string.format("PID: e=%+.2f vs host P=%+.3f I=%+.3f D=%+.3f -> %.2fx of %g", e, kp * eD, ki * CM.pidI, kd * d, target, eff))
 	end
-	CM.pidHold, CM.pidErr = target, e
+	CM.pidHold, CM.pidErr, CM.pidEff = target, e, eff
 	CM.paceInfo = string.format("%.2fx e=%+.2f", target, e)
 	-- the last 60 decisions, for the in-game graph
 	CM.pidHist = CM.pidHist or {}
@@ -591,11 +622,31 @@ function CM.pidPace(now, eff)
 	return target, e
 end
 K.CATCHUP_SPEED_MAX = 4    -- the sim cannot keep up above the game's own 4 on real hardware; 8 felt SLOWER
+K.CATCHUP_LOOKAHEAD = 0.5  -- s of closing speed: catch-up hands over this early (anti-overshoot)
 function CM.catchUpTick(now, s)
+	-- THE LEADER NEVER CATCHES UP (2026-09-10). It is the session clock; a
+	-- joiner ahead of it is the one that slows down (CM.pidPace). Live, joiners
+	-- that overshot sat 8 units ahead, the leader called that "behind the
+	-- session", held itself at 0 waiting ~30 s for a command history only it
+	-- could send (twice) and put the 0 back over its own player's play clicks.
+	if CM.isLeader() then
+		if CM.catchingUp2 then
+			CM.catchingUp2 = false; CM.cuPhase = nil
+			log("CATCHUP: we are the leader -- the session clock does not catch up")
+		end
+		return nil
+	end
 	if not CM.cfgFlag("hot_join", true) then return nil end
-	local fastP = CM.peerFastPrecise()
-	if not fastP then return nil end
-	local behind = fastP - now
+	-- behind the LEADER; the fastest other peer only while the leader is silent
+	local ref = CM.leaderPrecise() or CM.peerFastPrecise()
+	if not ref then
+		if CM.catchingUp2 then
+			CM.catchingUp2 = false; CM.cuPhase = nil
+			log("CATCHUP: no leader or peer heard -- nothing to catch up with, stopped")
+		end
+		return nil
+	end
+	local behind = ref - now
 	if not CM.catchingUp2 then
 		if behind > K.CATCHUP_MIN then
 			CM.catchingUp2 = true
@@ -603,7 +654,7 @@ function CM.catchUpTick(now, s)
 			CM.cuSince = CM.ticks
 			CM.histEndSeen = false
 			CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
-			log(string.format("CATCHUP: %.1f unit(s) behind the session -- holding, asked the host for the command history after %.1f", behind, now))
+			log(string.format("CATCHUP: %.1f unit(s) behind the leader -- holding, asked the host for the command history after %.1f", behind, now))
 			return 0
 		end
 		return nil
@@ -620,12 +671,21 @@ function CM.catchUpTick(now, s)
 			return 0
 		end
 	end
-	if behind < 0.5 then
+	local eff = CM.effSpeed or 1
+	local speed = math.max(1, math.min(K.CATCHUP_SPEED_MAX, CM.cfgNum("catchup_speed", 4)))
+	if eff > speed then speed = eff end            -- never catch up slower than the session runs
+	-- Hand over BEFORE the gap closes. The leader's clock we read is a
+	-- heartbeat old and our speed change lands a frame or two late, so
+	-- running on to 0.5 behind carried a 4x runner past the leader. The
+	-- margin is half a second of the closing speed; the PID does the rest.
+	local margin = math.max(0.5, (speed - eff) * K.CATCHUP_LOOKAHEAD)
+	if behind < margin then
 		CM.catchingUp2 = false; CM.cuPhase = nil
-		log("CATCHUP: caught up with the session -- ordinary pacing from here")
+		CM.pidHold, CM.pidI, CM.pidLastE, CM.pidFar = nil, 0, nil, nil
+		log(string.format("CATCHUP: %.1f unit(s) behind the leader -- ordinary pacing from here", behind))
 		return nil
 	end
-	return math.max(1, math.min(K.CATCHUP_SPEED_MAX, CM.cfgNum("catchup_speed", 4)))
+	return speed
 end
 
 function CM.paceV2(now, lead)
@@ -681,10 +741,13 @@ function CM.paceV2(now, lead)
 	-- has decided (a blip clears itself when the game runs again).
 	if s == 0 and CM.spd2ZeroSince and CM.myCeiling ~= 0 then return end
 	if CM.paused then return end                 -- the hard barrier owns the speed transiently
-	-- a peer 60+ units away is in a different game (loading, or a leftover
-	-- heartbeat from the last session): never pace against it.
-	if lead > 60 then return end
-	local auto = CM.cfgFlag("speed_auto", false)
+	-- A spread of 60+ units used to switch ALL pacing off here, on every
+	-- instance: the leader's session speed and the pacing that brings a
+	-- runaway joiner back included -- one got 233 units ahead (2026-09-10).
+	-- Joiners pace against the leader's clock alone now (CM.pidPace,
+	-- CM.catchUpTick); only the automatic lead-based corrections (speed_auto)
+	-- still stand down for a spread that wide ("a different game").
+	local auto = CM.cfgFlag("speed_auto", false) and lead <= 60
 	if auto then
 		local slowP = CM.peerSlowPrecise()
 		local myLead = slowP and (now - slowP) or 0
@@ -753,6 +816,8 @@ function CM.paceV2(now, lead)
 	-- the host computed it above.
 	local cu = CM.catchUpTick(now, s)
 	if cu ~= nil then
+		-- same lever as the catch-up speed: still clear a PID fraction left in the dither (2.8 under lever 4 is not 4x)
+		if settled and s == CM.leverOf(cu) then CM.setDither(cu) end
 		if settled and s ~= CM.leverOf(cu) then CM.setSpeed(cu, cu == 0 and "catch-up: holding for the history" or string.format("catch-up at %gx", cu)) end
 		return
 	end
@@ -798,7 +863,7 @@ function CM.paceV2(now, lead)
 	-- that changes the target logs its terms.
 	local paced = nil
 	if target == eff and eff > 0 and CM.cfgFlag("speed_frac_pace", true) then
-		if CM.pidHold and (CM.ticks - (CM.pidAt or 0)) < K.FRAC_PACE_TICKS then
+		if CM.pidHold and CM.pidEff == eff and (CM.ticks - (CM.pidAt or 0)) < K.FRAC_PACE_TICKS then
 			target = CM.pidHold; paced = CM.pidErr
 		else
 			local t2, e = CM.pidPace(now, eff)

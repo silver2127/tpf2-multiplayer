@@ -285,6 +285,29 @@ function CM.peerFastPrecise()
 	return maxT
 end
 
+-- THE LEADER's precise clock (its last sim step): nil when we ARE the leader
+-- or have not heard it within the stale window. Joiners pace against this and
+-- nothing else (2026-09-10). The fastest peer used to be the catch-up
+-- reference, so joiners chased a joiner that had overshot, and the leader --
+-- with no leader of its own -- took that joiner for "the session" and held
+-- itself at speed 0 to catch up with it. pr.cu is ignored: the leader never
+-- catches up, and an older build's flag must not hide the session clock.
+function CM.leaderPrecise()
+	if CM.isLeader() then return nil end
+	local pr = CM.peers[CM.leader or "a"]
+	if not (pr and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS) then return nil end
+	return pr.step and (pr.step * K.SIM_STEP) or pr.time
+end
+
+-- cu=1 on our heartbeat: catching up, or far behind the leader, so nobody
+-- paces against our clock. Never on the leader: it IS the clock.
+function CM.heartbeatCu(now)
+	if CM.isLeader() then CM.farBehind = false; return false end
+	local ref = CM.leaderPrecise() or CM.peerFastPrecise()
+	CM.farBehind = (ref ~= nil) and (ref - now) > K.CATCHUP_MIN
+	return (CM.catchingUp2 or CM.farBehind) and true or false
+end
+
 function CM.peerBounds()
 	local minT, maxT
 	for _, pr in pairs(CM.peers) do
@@ -708,9 +731,9 @@ function data()
 			if CM.ticks % K.HEARTBEAT_EVERY == 0 then
 				-- far behind the session (a fresh hot joiner, load-gated or not): say so on
 				-- every heartbeat, so nobody holds the barrier for a peer that must catch up
-				do local fp = CM.peerFastPrecise(); CM.farBehind = (fp ~= nil) and (fp - now) > K.CATCHUP_MIN end
+				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
 				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d ceil=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo, CM.myCeiling or (CM.MAX_SPEED or 4),
-					(CM.catchingUp2 or CM.farBehind) and " cu=1" or ""))
+					CM.heartbeatCu(now) and " cu=1" or ""))
 			end
 
 			CM.applyBarrier(now)

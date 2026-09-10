@@ -77,8 +77,9 @@ and line switches do not.
 | `pid_dead` | 0.30 | Dead band, game-time units. |
 | `pid_min`, `pid_max` | 0.70, 1.20 | Clamp on the multiplier of the session speed. |
 | `pid_slew` | 0.05 | Largest change of the multiplier per decision. |
-| `hot_join` | on | A game far behind the session asks for command history and catches up. |
-| `catchup_speed` | 4 | Speed used while catching up (clamped 1-4). |
+| `pid_far`, `pid_far_min` | 3.0, 0.25 | A joiner more than `pid_far` units ahead of the leader runs at `pid_far_min` of the session speed, rising as the gap closes, until the PID takes over. |
+| `hot_join` | on | A joiner far behind the leader asks for command history and catches up. The leader never does. |
+| `catchup_speed` | 4 | Speed used while catching up (clamped 1-4, never below the session speed). |
 | `strict_barrier` | off | Stop simulating while a command a peer announced is missing (released by a watchdog). |
 
 ### Replay details (the mod)
