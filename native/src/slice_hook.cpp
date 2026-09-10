@@ -37,9 +37,12 @@
 // command this hook just captured, and the road would vanish on both peers
 // while the logs claimed success.
 //
-// Suppression defaults OFF. With it off this is a pure observer: the player's
-// road is built locally as usual AND written to the inject file, which desyncs
-// on purpose -- that is the wiring test, not the feature.
+// ONE BEHAVIOUR, HARDCODED. While a session is live (SessionLive) a captured
+// command is cancelled locally and replayed at the stamp on every instance;
+// with no live session, or when a decode fails, it runs natively. There is no
+// observe mode and no per-channel switch: tpf2_slice.cfg carries only the
+// dumpprop diagnostic, so a missing or garbled cfg cannot put this peer on a
+// different protocol from the others.
 // ---------------------------------------------------------------------------
 #include <windows.h>
 #include <cstdint>
@@ -47,7 +50,6 @@
 #include <cstdarg>
 #include <cstring>
 #include <cmath>
-#include <malloc.h>
 #include <share.h>
 #include "hook.h"
 #include "datadir.h"
@@ -98,8 +100,8 @@ static const uintptr_t CALLER_UPGRADE       = 0x4790fc;
 // rmEdges=1 -- the edge rebuilt with the object -- plus one edgeObjectsToAdd).
 static const uintptr_t CALLER_STOPTOOL      = 0x460e0b;
 // UI::Bulldozer::Apply's BuildProposal return address (r4_recon_dem.md A1:
-// call at 0x3eb222, return addr 0x3eb227). This caller is classified and
-// LOGGED only -- never cancelled, never injected, in this commit.
+// call at 0x3eb222, return addr 0x3eb227). LogBulldoze classifies it and ships
+// what it can decode; the handler arms the cancel only when something shipped.
 static const uintptr_t CALLER_BULLDOZE      = 0x3eb227;
 // The sol2 wrapper's factory call site (Lua path: api.cmd.make.buyVehicle).
 // A BuyVehicle from HERE is our own replay on the peer: shipping it back
@@ -115,7 +117,7 @@ static const int ID_CMDADD        = 1;
 static const int BLOB_SIZE = 48;
 
 // Every other command factory, same hook shape. Steal sizes are the ones
-// args_probe ran against these functions live. ids 2..9; 0 and 1 are above.
+// args_probe ran against these functions live. ids 2..10, 13, 14; 0 and 1 are above.
 struct Factory { uintptr_t rva; int steal; int id; const char* name; const char* kind; };
 static const Factory FACTORIES[] = {
     { 0x9dca00, 15, 2, "BuyVehicle",     "vehicle" },
@@ -127,7 +129,6 @@ static const Factory FACTORIES[] = {
     { 0x9df4e0, 19, 8, "UpdateLine",     "line"    },
     { 0x9dd190, 20, 9, "DeleteLine",     "line"    },
     { 0x9ddfe0, 20, 10, "Reverse",        "vehicle" },  // steal size: docs/re/COMMANDS.md
-    { 0x9df340, 20, 12, "SetVehicleTargetMaintenanceState", "vehicle" },  // value = float in XMM3 (relay spill @ calleeRsp-0x78)
     { 0x9de8a0, 20, 13, "SetColor",       "sync"    },  // r9 -> CVec3f*, 3 floats
     { 0x9deb70, 15, 14, "SetName",        "sync"    },  // r9 -> std::string*, MSVC SSO
 };
@@ -152,13 +153,13 @@ static volatile LONG g_pendingNoCb = 0;
 // With this set the Add hook honours the cancel anyway and says so; a window
 // that needed the callback may need a refresh, which beats a double apply.
 static volatile LONG g_pendingHonour = 0;
-// Construction-placement cancel (cfg cancel_construction). The params walked off
+// Construction-placement cancel. The params walked off
 // the PROPOSAL at the factory are stashed here and written as a CONXP record from
 // the Add hook ONLY once the cancel actually landed -- if the completion callback
 // cannot be fired and the build is let run, the stash is dropped and the entity
 // poll captures the native build exactly as before. See StashConxpFromProposal.
 static volatile LONG g_pendingIsConx = 0;
-// Module edit / station upgrade (cfg strict_module): the same proposal shape
+// Module edit / station upgrade: the same proposal shape
 // carries the OLD construction in toRemove and the NEW ConstructionEntity in
 // toAdd. Stashed at BuildProposal, shipped as CONUP from the Add hook only when
 // the cancel lands -- otherwise the native upgrade runs and the entity poll
@@ -169,7 +170,7 @@ static bool StashConupFromProposal(uint64_t r8);   // defined with the CONUP wri
 static char  g_conxpFile[512];
 static float g_conxpT[16];
 static char  g_conxpParams[8192];
-// Stop/signal/waypoint cancel (cfg strict_stops). Decoded off the proposal's
+// Stop/signal/waypoint cancel. Decoded off the proposal's
 // edgeObjectsToAdd record at the factory, written as STOPX from the Add hook
 // only once the cancel landed (else dropped: the poll captures the native
 // build, no double-capture). See StashStopFromProposal for the layout.
@@ -178,7 +179,7 @@ static int32_t g_stopEid = 0, g_stopSide = 0, g_stopModel = 0, g_stopPlayer = 0;
 static float   g_stopPos[3] = { 0, 0, 0 };
 static uint8_t g_stopLeft = 0, g_stopOneWay = 0;
 static char    g_stopName[256];
-// Stop/signal BULLDOZE cancel (cfg strict_stops): the removed edge object,
+// Stop/signal BULLDOZE cancel: the removed edge object,
 // decoded off the bulldozer's edge-replace proposal (StashStopDelFromBulldoze),
 // written as STOPXDEL from the Add hook once the cancel landed.
 static volatile LONG g_pendingIsStopDel = 0;
@@ -226,20 +227,24 @@ static bool Readable(const void* p, size_t n)
     return (uintptr_t)p + n <= (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
 }
 
-// Two independent switches, re-read per event so either can be flipped while the
-// game runs. `enabled=0` makes the hook completely inert -- no capture, no
-// inject, no cancel. That case previously had no off switch: turning suppression
-// off still left the hook injecting every road, so the build happened locally AND
-// replicated, giving the player a duplicate. Getting back to normal single-player
-// behaviour meant marking the inject file read-only, which is not a control a
-// user should have to know about.
+// tpf2_slice.cfg. Every channel's behaviour is hardcoded (see the header); the
+// one key this DLL still reads is the diagnostic `dumpprop`, default off.
 //
-// Lookup order for tpf2_slice.cfg: the copy next to this DLL (where the
-// installer puts it), then the data dir, then built-in defaults if neither
-// exists. First file found wins. Lines whose first non-blank character is
-// '#' or ';' are comments and can never flip a switch -- the matching is a
-// substring test, so without this a commented-out "# suppress=1" would still
-// cancel builds.
+// The file used to carry about twenty switches, matched by substring, with a
+// separate built-in list for the no-file case -- and a lost or mangled cfg
+// silently put a peer on a different protocol from the rest: a joiner with no
+// cfg ran observe mode (2026-08-31), and a host whose MSI upgrade removed the
+// file ran a whole session without the strict channels (2026-09-09). Nothing
+// that changes what replicates may come from this file again.
+//
+// Lookup: the copy next to this DLL (where the installer puts it), then the
+// data dir. First file found wins.
+//
+// Strict parse: a key counts only as an exact `key=0` or `key=1` at the very
+// start of a line, optionally followed by blanks. Anything else -- a comment,
+// leading blanks, spaces around '=', any other value, a line too long for the
+// read buffer -- is ignored and the key keeps its default. The last valid line
+// for a key wins.
 static FILE* OpenCfg()
 {
     char p[MAX_PATH];
@@ -255,45 +260,45 @@ static FILE* OpenCfg()
     return nullptr;
 }
 
-static bool CfgLineIsComment(const char* line)
+static bool CfgFlag(const char* key, bool def)
 {
-    while (*line == ' ' || *line == '\t') line++;
-    return *line == '#' || *line == ';';
-}
-
-static void ReadCfg(bool* enabled, bool* suppress, bool* groundtruth)
-{
-    *enabled = true;      // default on; the DLL is only present if asked for
-    *suppress = false;    // see the no-cfg case below: that means lockstep
-    if (groundtruth) *groundtruth = false;
     FILE* f = OpenCfg();
-    if (!f) {
-        // NO CFG AT ALL. This fell through to suppress=0, which is observe
-        // mode: the build happens locally AND replicates, so that peer
-        // silently runs a different protocol from every other one. Measured
-        // 2026-08-31 on a joiner with no cfg installed -- it applied its own
-        // builds at click time while the host cancelled and replayed at the
-        // stamp, and the two worlds could not stay together. A missing file is
-        // not a request for a debugging mode: real multiplayer is the default,
-        // and the log says so once.
-        *suppress = true;
-        static bool warned = false;
-        if (!warned) {
-            warned = true;
-            Log("[slice] no tpf2_slice.cfg found -- defaulting to suppress=1 "
-                "(real lockstep); put a cfg next to the DLL to change it\n");
-        }
-        return;
-    }
-    char line[128];
+    if (!f) return def;
+    const size_t klen = strlen(key);
+    bool val = def;
+    bool lineStart = true;            // does the next fgets chunk begin a line?
+    char line[256];
     while (fgets(line, sizeof(line), f)) {
-        if (CfgLineIsComment(line)) continue;
-        if (strstr(line, "enabled=0"))     *enabled = false;
-        if (strstr(line, "suppress=1"))    *suppress = true;
-        if (strstr(line, "suppress=0"))    *suppress = false;   // explicit observe mode
-        if (groundtruth && strstr(line, "groundtruth=1")) *groundtruth = true;
+        const size_t len = strlen(line);
+        const bool endsLine = len > 0 && line[len - 1] == '\n';
+        const bool startsLine = lineStart;
+        lineStart = endsLine;
+        // A chunk that neither ends its line nor the file is a line too long
+        // for the buffer: its tail was not seen, so it cannot be exact.
+        if (!startsLine || !(endsLine || feof(f))) continue;
+        if (strncmp(line, key, klen) != 0 || line[klen] != '=') continue;
+        const char v = line[klen + 1];
+        if (v != '0' && v != '1') continue;
+        const char* rest = line + klen + 2;
+        while (*rest == ' ' || *rest == '\t' || *rest == '\r' || *rest == '\n') rest++;
+        if (*rest) continue;
+        val = (v == '1');
     }
     fclose(f);
+    return val;
+}
+
+// dumpprop, re-read at most every 2 s: it can still be flipped while the game
+// runs, without opening the file on every proposal.
+static bool DumpPropOn()
+{
+    static ULONGLONG lastRead = 0;
+    static bool on = false;
+    const ULONGLONG now = GetTickCount64();
+    if (lastRead && now - lastRead < 2000) return on;
+    lastRead = now;
+    on = CfgFlag("dumpprop", false);
+    return on;
 }
 
 // Instance letter, so the road lands in this peer's inject file and not the
@@ -471,69 +476,6 @@ static int DecodeEdges(uint64_t a2, Edge* out, int maxOut)
     return n;
 }
 
-// Removal lists.
-//
-// A road joining an existing one MID-SPAN splits it: the proposal inserts a new
-// node and adds both halves as new edges, which is only valid if the ORIGINAL
-// edge is also removed. Capture "ROADE 2 ... 5" showed exactly that shape --
-// two new nodes producing five edges, four of them referencing real entities --
-// and it failed on replay because edgesToRemove was never carried.
-//
-// The add-vectors sit at a2+0x00 (nodes) and a2+0x18 (edges); a2+0x30 and
-// a2+0x48 are the next two triplets and read as all-zero in every free-standing
-// capture, which is what an empty removal list looks like. That is a hypothesis,
-// so the counts are LOGGED: a build that splits two existing edges should report
-// exactly two removals. If the numbers do not match the topology, the offsets
-// are wrong and nothing downstream should trust them.
-static int DecodeIds(uint64_t vec, int32_t* out, int maxOut)
-{
-    if (!Readable((void*)vec, 16)) return 0;
-    uint64_t begin = 0, end = 0;
-    memcpy(&begin, (void*)vec, 8);
-    memcpy(&end, (void*)(vec + 8), 8);
-    if (begin < 0x10000 || end <= begin) return 0;
-    uint64_t span = end - begin;
-    if (span % 4 != 0 || span > 0x10000) return 0;
-    int n = (int)(span / 4);
-    if (n > maxOut) n = maxOut;
-    if (!Readable((void*)begin, (size_t)span)) return 0;
-    memcpy(out, (void*)begin, (size_t)n * 4);
-    return n;
-}
-
-// Find the removal vectors by SHAPE instead of guessing an offset.
-//
-// a2+0x30 and a2+0x48 were the obvious candidates -- the next two triplets after
-// nodesToAdd and edgesToAdd, all-zero in every free-standing capture. Wrong: a
-// 3-node road reported 30 entries there. An empty vector reads as zero whatever
-// it actually is, so "zero when I expect empty" was never evidence.
-//
-// Scan the whole struct for int32 vectors and log every candidate with its
-// contents. A junction that splits ONE road must remove exactly ONE edge, so the
-// right vector is identifiable by its count matching the topology -- which is a
-// test the data has to pass, not an offset I picked.
-static void DumpIdVectors(uint64_t a2)
-{
-    for (unsigned off = 0; off + 16 <= 0x120; off += 8) {
-        if (off == 0x00 || off == 0x18) continue;     // known: nodes, edges
-        if (!Readable((void*)(a2 + off), 16)) continue;
-        uint64_t begin = 0, end = 0;
-        memcpy(&begin, (void*)(a2 + off), 8);
-        memcpy(&end, (void*)(a2 + off + 8), 8);
-        if (begin < 0x10000 || end <= begin) continue;
-        uint64_t span = end - begin;
-        if (span % 4 != 0 || span > 0x400) continue;
-        int n = (int)(span / 4);
-        if (!Readable((void*)begin, (size_t)span)) continue;
-        const int32_t* v = (const int32_t*)begin;
-        char line[600];
-        int o = snprintf(line, sizeof(line), "[slice]   IDVEC +%03x n=%d:", off, n);
-        for (int i = 0; i < n && i < 24 && o < (int)sizeof(line) - 16; i++)
-            o += snprintf(line + o, sizeof(line) - o, " %d", (int)v[i]);
-        Log("%s\n", line);
-    }
-}
-
 static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
 {
     if (!Readable((void*)a2, 16)) return 0;
@@ -558,17 +500,6 @@ static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
     return n;
 }
 
-// Dump the first edge record so the street/track TYPE can be located.
-//
-// execPolyline currently hardcodes street type 16 and edge type 0, which means
-// every replicated edge comes out as one fixed road type and a railway
-// replicates as a road. The type must be somewhere in this 120-byte record --
-// the decode so far covers only id, node0, node1 and the two tangents.
-//
-// Logging the whole record on every capture turns the fix into a diff across
-// builds the player was going to make anyway: one road of type A, one of type B,
-// one railway. Whatever changes is the type field. That is the same technique
-// that decoded the node record, and it beats another dedicated probe cycle.
 // Edge type fields, decoded by diffing three builds: two roads of different
 // types and one railway.
 //
@@ -631,38 +562,6 @@ static EdgeType DecodeEdgeType(uint64_t a2)
     }
     t.ok = true;
     return t;
-}
-
-static void DumpFirstEdge(uint64_t a2)
-{
-    uint64_t begin = 0, end = 0;
-    if (!Readable((void*)(a2 + 0x18), 16)) return;
-    memcpy(&begin, (void*)(a2 + 0x18), 8);
-    memcpy(&end, (void*)(a2 + 0x20), 8);
-    if (begin < 0x10000 || end <= begin) return;
-    uint64_t span = end - begin;
-    if (span % 120 != 0 || span > 0x20000) {
-        Log("[slice]   edge vector span=%llu (not a multiple of 120) -- layout differs\n",
-            (unsigned long long)span);
-        return;
-    }
-    if (!Readable((void*)begin, 120)) return;
-    const uint8_t* b = (const uint8_t*)begin;
-    Log("[slice]   edges=%llu, first record:\n", (unsigned long long)(span / 120));
-    char line[160];
-    for (int row = 0; row < 120 / 16 + 1 && row * 16 < 120; row++) {
-        int o = snprintf(line, sizeof(line), "[slice]     +%02x: ", row * 16);
-        for (int c = 0; c < 16 && row * 16 + c < 120; c++)
-            o += snprintf(line + o, sizeof(line) - o, "%02x", b[row * 16 + c]);
-        line[o] = 0;
-        Log("%s\n", line);
-    }
-    // Every int32 that is small enough to be a resource index. The type is far
-    // more likely to be one of these than a float or a pointer.
-    for (int k = 0; k + 4 <= 120; k += 4) {
-        int32_t v; memcpy(&v, b + k, 4);
-        if (v > -4 && v < 256) Log("[slice]     I+%02x = %d\n", k, (int)v);
-    }
 }
 
 // ROADN carries every node, not just the endpoints. Collapsing a drawn road to
@@ -889,25 +788,10 @@ static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int 
 }
 
 // ---------------------------------------------------------------------------
-// GROUND TRUTH
+// DIAGNOSTIC DUMP HELPERS (dumpprop)
 //
-// Decoding by watching a player build things means one sample per five-minute
-// cycle -- rebuild, restart, ask a human to draw a road -- which is why four
-// separate field guesses this session rested on a single observation and all
-// four were wrong.
-//
-// Invert it: drive KNOWN values in and see where they land. `api.cmd.make.
-// buildProposal` from Lua reaches this exact factory (observed as
-// caller_rva=ced378), and calling the factory WITHOUT sendCommand builds the
-// Command and fires this hook while never touching the world. So a sweep of
-// hundreds of parameter values costs a second, is non-destructive, and needs no
-// restart and no human.
-//
-// Samples are self-identifying: the Lua side writes a sentinel into node 0's X
-// as 900000 + testId*1000 + sampleIndex, so a capture carries its own label and
-// nothing has to be matched up by ordering.
 // Hex-dump a memory range in 64-byte chunks under one record tag. Chunked
-// because Log() has a fixed buffer; the correlator reassembles by offset.
+// because Log() has a fixed buffer; the dump tools reassemble by offset.
 static void GtDumpRange(const char* tag, int testId, int sample, const uint8_t* b,
                         unsigned len, unsigned baseOff)
 {
@@ -938,20 +822,6 @@ static uint64_t ReadVec(uint64_t vecAddr, uint64_t* pbegin, uint64_t maxSpan)
     return span;
 }
 
-// A ground-truth sample is labelled in-band by a sentinel coordinate
-// 900000 + testId*1000 + sampleIndex. STREET sweeps put it in node 0's X;
-// CONSTRUCTION sweeps have no street nodes at all, so they put it in the
-// construction's placement X, which lives at a3+0x368 (varied with position
-// across five earlier captures -- a2 == a3+0x70 in every one of them).
-static bool GtSentinel(double x, int* testId, int* sample)
-{
-    if (x < 900000.0 || x > 999999.0) return false;
-    long s = (long)(x + 0.5);
-    *testId = (s - 900000) / 1000;
-    *sample = (s - 900000) % 1000;
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 // Pointer chase for strings. The params.modules map of a construction is a
 // native map<int, ModuleInfo> that is NOT in the raw proposal bytes -- the M8
@@ -959,8 +829,7 @@ static bool GtSentinel(double x, int* testId, int* sample)
 // three hops down. So: breadth-first over every qword that looks like a heap
 // pointer, up to three levels, reporting any printable run that contains one
 // of the needles together with the offset path that reached it. The path IS
-// the layout: two samples that reach 'GTSENT_0.lua' and 'GTSENT_1.lua' by the
-// same path have located the ModuleInfo record.
+// the layout.
 static bool IsHeapPtr(uint64_t p) { return p >= 0x10000 && p < 0x7FFFFFFFFFFFULL; }
 
 static void ChaseStrings(int testId, int sample, uint64_t root, unsigned rootLen)
@@ -983,7 +852,7 @@ static void ChaseStrings(int testId, int sample, uint64_t root, unsigned rootLen
             if (n >= 8) {
                 char tmp[160]; unsigned take = n < 159 ? n : 159;
                 memcpy(tmp, b + i, take); tmp[take] = 0;
-                if (strstr(tmp, ".module") || strstr(tmp, "station/") || strstr(tmp, "GTSENT") ||
+                if (strstr(tmp, ".module") || strstr(tmp, "station/") ||
                     strstr(tmp, ".con") || strstr(tmp, ".lua")) {
                     Log("[gt] S%d.%d %s+%03x \"%s\"\n", testId, sample, it.path, i, tmp);
                     if (++hits > 120) return;
@@ -1005,342 +874,9 @@ static void ChaseStrings(int testId, int sample, uint64_t root, unsigned rootLen
     Log("[gt] chase %d.%d: visited=%d hits=%d\n", testId, sample, visited, hits);
 }
 
-// Where did the sentinel land? A script-fed proposal was never captured
-// before, so +0x368 is an assumption for it. Scan every float in the struct.
-static bool FindSentinel(uint64_t a3, unsigned len, int* testId, int* sample, unsigned* atOff)
-{
-    if (!Readable((void*)a3, len)) return false;
-    const uint8_t* b = (const uint8_t*)a3;
-    for (unsigned off = 0; off + 4 <= len; off += 4) {
-        float f; memcpy(&f, b + off, 4);
-        if (f == f && GtSentinel(f, testId, sample)) { *atOff = off; return true; }
-    }
-    return false;
-}
-static bool GroundTruthSample(uint64_t a2, uint64_t a3)
-{
-    int testId = 0, sample = 0;
-    Node nodes[8];
-    int n = DecodeNodes(a2, nodes, 8);
-
-    if (n >= 1 && GtSentinel(nodes[0].x, &testId, &sample)) {
-        // ---- street sweep: the first edge record is the whole payload ----
-        Edge edges[8];
-        int m = DecodeEdges(a2, edges, 8);
-        Log("[gt] test=%d sample=%d nodes=%d edges=%d\n", testId, sample, n, m);
-        uint64_t begin = 0, end = 0;
-        if (Readable((void*)(a2 + 0x18), 16)) {
-            memcpy(&begin, (void*)(a2 + 0x18), 8);
-            memcpy(&end, (void*)(a2 + 0x20), 8);
-            if (begin > 0x10000 && end > begin && Readable((void*)begin, 120)) {
-                const uint8_t* b = (const uint8_t*)begin;
-                char line[400];
-                int o = snprintf(line, sizeof(line), "[gt] e%d.%d:", testId, sample);
-                for (int i = 0; i < 120; i++)
-                    o += snprintf(line + o, sizeof(line) - o, "%02x", b[i]);
-                Log("%s\n", line);
-            }
-        }
-        // Removal-vector rows for the demolish sweep (tests 4-6). Proposal base
-        // = a2 (the StreetProposal is the FIRST member of
-        // construction_builder_util::Proposal, r9_analysis_dem.md 2):
-        //   a2+0x30  removedNodes,    24-B records  (r9 1, DECOMPILED
-        //            MakeProposalRemove / CreateProposalReplace)
-        //   a2+0x48  removedSegments, 120-B records (r9 1, DECOMPILED
-        //            StreetProposal_RemoveSegment)
-        //   a2+0x1e0 toRemove vector<Entity>        (r9 2, decompile only --
-        //            UNVERIFIED; these dumps are the sweep input that settles it)
-        {
-            uint64_t rb30 = 0, rb48 = 0, rb1e0 = 0;
-            uint64_t s30  = ReadVec(a2 + 0x30, &rb30, 0x2000);
-            uint64_t s48  = ReadVec(a2 + 0x48, &rb48, 0x2000);
-            uint64_t s1e0 = ReadVec(a2 + 0x1e0, &rb1e0, 0x1000);
-            Log("[gt] spans%d.%d span30=%llu span48=%llu span1e0=%llu\n",
-                testId, sample, (unsigned long long)s30,
-                (unsigned long long)s48, (unsigned long long)s1e0);
-            if (s30)
-                GtDumpRange("r30_", testId, sample, (const uint8_t*)rb30,
-                            (unsigned)(s30 > 240 ? 240 : s30), 0);
-            if (s48)
-                GtDumpRange("r48_", testId, sample, (const uint8_t*)rb48,
-                            (unsigned)(s48 > 360 ? 360 : s48), 0);
-            if (s1e0)
-                GtDumpRange("r1e0_", testId, sample, (const uint8_t*)rb1e0,
-                            (unsigned)(s1e0 > 64 ? 64 : s1e0), 0);
-        }
-        return true;
-    }
-
-    // ---- construction sweep: find the sentinel wherever it landed ----
-    unsigned atOff = 0;
-    if (!FindSentinel(a3, 0x440, &testId, &sample, &atOff)) return false;
-    Log("[gt] test=%d sample=%d CONSTRUCTION nodes=%d sentinel at a3+%03x\n",
-        testId, sample, n, atOff);
-    ChaseStrings(testId, sample, a3, 0x440);
-
-    // The construction half of the proposal, raw. 0x1c0..0x420 covers the
-    // 23-int vector, the 24 param-key strings, the 2272-byte record, and the
-    // position, with margin either side. Nothing here is interpreted -- the
-    // correlator decides what moved.
-    const unsigned LO = 0x1c0, HI = 0x420;
-    if (Readable((void*)(a3 + LO), HI - LO))
-        GtDumpRange("c", testId, sample, (const uint8_t*)(a3 + LO), HI - LO, LO);
-
-    // Every std::vector reachable from that range, with its contents, so a
-    // value that lives behind a pointer (a param VALUE next to its KEY, say) is
-    // in the record too. Same shape test as the live probe: ascending
-    // begin/end, 4-byte multiple, bounded.
-    for (unsigned off = LO; off + 16 <= HI; off += 8) {
-        uint64_t b0 = 0, e0 = 0;
-        memcpy(&b0, (void*)(a3 + off), 8);
-        memcpy(&e0, (void*)(a3 + off + 8), 8);
-        if (b0 < 0x10000 || e0 <= b0) continue;
-        uint64_t span = e0 - b0;
-        if (span > 0x1000 || (span & 3)) continue;
-        if (!Readable((void*)b0, (size_t)span)) continue;
-        char tag[16]; snprintf(tag, sizeof(tag), "v%03x_", off);
-        GtDumpRange(tag, testId, sample, (const uint8_t*)b0, (unsigned)span, 0);
-    }
-    return true;
-}
-
-static bool CfgHas(const char* key)
-{
-    FILE* f = OpenCfg();
-    // No cfg = the shipped defaults. ReadCfg already treats a missing file as
-    // suppress=1; the switches here must agree, or a joiner with no cfg gets
-    // suppress=1 but cancel_vehicle=0 -- its Reverse runs natively AND the Lua,
-    // which hard-codes VREV as strict, replays it on top: a toggle applied twice
-    // (review, 2026-08-31).
-    // 2026-09-09: a friends' host lost its cfg files (the 0.3.1 -> 0.4.0 MSI
-    // upgrade removed them -- NeverOverwrite + RemoveExistingProducts) and ran
-    // the rest of the night with only cancel_vehicle+merge on: no strict
-    // anything, while its peers had the full set. The list below IS the shipped
-    // installer/cfg/tpf2_slice.cfg's on-switches; keep the two in step.
-    if (!f) {
-        static const char* const kShippedOn[] = {
-            "enabled", "suppress", "merge", "cancel_vehicle", "cancel_line", "conx_strict",
-            "road_demolish", "strict_buy", "strict_condemo", "strict_sell", "strict_depot",
-            "strict_replace", "strict_line_edit", "strict_module", "strict_stops", nullptr };
-        for (int i = 0; kShippedOn[i]; i++) if (strcmp(key, kShippedOn[i]) == 0) return true;
-        return false;
-    }
-    char line[128], want[64]; bool on = false;
-    snprintf(want, sizeof(want), "%s=1", key);
-    while (fgets(line, sizeof(line), f)) {
-        if (CfgLineIsComment(line)) continue;
-        if (strstr(line, want)) on = true;
-    }
-    fclose(f);
-    return on;
-}
-
-static void GtDumpArg(int fid, const char* nm, uint64_t p, int testId, int sample)
-{
-    if (!IsHeapPtr(p) || !Readable((void*)p, 0x140)) return;
-    char tag[24]; snprintf(tag, sizeof(tag), "f%d%s_", fid, nm);
-    GtDumpRange(tag, testId, sample, (const uint8_t*)p, 0x140, 0);
-    ChaseStrings(testId, sample, p, 0x140);
-}
-
-// TransportVehicleConfig ground-truth dump, for BuyVehicle (id 2, cfg = st[0]
-// = [calleeRsp+0x28] -- r6_analysis_veh.md A, DECOMPILED buyVehicle_factory.c
-// and MEASURED live by buyhook.cpp) and ReplaceVehicle (id 4, cfg = r9 --
-// INFERRED from the funcsig text only, r2_recon_veh.md; sweep t40 verifies).
-// Offsets relied on:
-//   cfg+0x00  vector<TransportVehiclePart>, stride 0x80   (r6 B/C, DECOMPILED
-//             vec_TransportVehiclePart_copy + TransportVehiclePart_copy_elem;
-//             stride independently confirmed by the VehicleManager single-unit
-//             replace colour copy, r6 F)
-//   cfg+0x18  vector<int> vehicleGroups                   (r6 B, DECOMPILED)
-//   unit+0x08 vector<int> loadConfig                      (r6 C, DECOMPILED)
-//   unit+0x60 vector<int> autoLoadConfig                  (r6 C, DECOMPILED
-//             copier; whether the STORAGE really is vector<int> is what sweep
-//             t34 settles)
-static void GtDumpVehicleConfig(int fid, uint64_t cfg, int testId, int sample)
-{
-    if (!IsHeapPtr(cfg) || !Readable((void*)cfg, 0x30)) return;
-    char tag[24];
-    snprintf(tag, sizeof(tag), "f%dcfg_", fid);
-    GtDumpRange(tag, testId, sample, (const uint8_t*)cfg, 0x30, 0);
-
-    uint64_t ub = 0;
-    uint64_t uspan = ReadVec(cfg + 0x00, &ub, 0x80 * 16);
-    Log("[gt] f%dunits%d.%d span=%llu\n", fid, testId, sample,
-        (unsigned long long)uspan);
-    if (uspan && uspan % 0x80 == 0) {
-        int units = (int)(uspan / 0x80);
-        for (int k = 0; k < units && k < 8; k++) {
-            uint64_t u = ub + (uint64_t)k * 0x80;
-            snprintf(tag, sizeof(tag), "f%du%d_", fid, k);
-            GtDumpRange(tag, testId, sample, (const uint8_t*)u, 0x80, 0);
-            uint64_t lb = 0, ab = 0;
-            uint64_t lspan = ReadVec(u + 0x08, &lb, 0x100);
-            if (lspan) {
-                snprintf(tag, sizeof(tag), "f%dlc%d_", fid, k);
-                GtDumpRange(tag, testId, sample, (const uint8_t*)lb, (unsigned)lspan, 0);
-            }
-            uint64_t aspan = ReadVec(u + 0x60, &ab, 0x100);
-            if (aspan) {
-                snprintf(tag, sizeof(tag), "f%dal%d_", fid, k);
-                GtDumpRange(tag, testId, sample, (const uint8_t*)ab, (unsigned)aspan, 0);
-            }
-        }
-    } else if (uspan) {
-        // Stride 0x80 does not divide the span: dump the whole span in one
-        // record and let the correlator find the real stride, rather than
-        // trusting a bad guess.
-        snprintf(tag, sizeof(tag), "f%duv_", fid);
-        GtDumpRange(tag, testId, sample, (const uint8_t*)ub,
-                    (unsigned)(uspan > 0x400 ? 0x400 : uspan), 0);
-    }
-    uint64_t gb = 0;
-    uint64_t gspan = ReadVec(cfg + 0x18, &gb, 0x100);
-    if (gspan) {
-        snprintf(tag, sizeof(tag), "f%dgrp_", fid);
-        GtDumpRange(tag, testId, sample, (const uint8_t*)gb, (unsigned)gspan, 0);
-    }
-}
-
-// ecs::component::Line ground-truth dump, for CreateLine (id 7, line = st[0])
-// and UpdateLine (id 8, line = r9) -- register maps DECOMPILED in
-// r8_analysis_lin.md A. Offsets relied on:
-//   line+0x00 vector<Line::Stop>, stride 0xa8  (r8 B/C, DECOMPILED: division
-//             by 0xa8 in LineSystem_EntityAdded, +=0xa8 loops in AddStop)
-//   line+0x18 float waitingTime, +0x1c LineVehicleInfo, size 0x24  (r8 B)
-//   stop+0x10 vector<StationTerminal> alternativeTerminals  (r8 C -- INFERRED
-//             by elimination; sweep T7 settles it)
-//   stop+0x38 vector<SignalId> waypoints  (r8 C, DECOMPILED)
-// The stops span is dumped WHOLE, not field-by-field: +0x04/+0x08 station vs
-// terminal order inside a Stop is exactly what sweeps T3/T4 must decide (r8
-// RISKS), so the correlator gets raw bytes rather than a pre-chewed guess.
-static void GtDumpLine(int fid, uint64_t line, int testId, int sample)
-{
-    if (!IsHeapPtr(line) || !Readable((void*)line, 0x24)) return;
-    char tag[24];
-    snprintf(tag, sizeof(tag), "f%dline_", fid);
-    GtDumpRange(tag, testId, sample, (const uint8_t*)line, 0x24, 0);
-
-    uint64_t sb = 0;
-    uint64_t sspan = ReadVec(line + 0x00, &sb, 0xa8 * 16);
-    Log("[gt] f%dstopspan%d.%d span=%llu\n", fid, testId, sample,
-        (unsigned long long)sspan);
-    if (!sspan) return;
-    snprintf(tag, sizeof(tag), "f%dstops_", fid);
-    GtDumpRange(tag, testId, sample, (const uint8_t*)sb,
-                (unsigned)(sspan > 0x540 ? 0x540 : sspan), 0);
-    if (sspan >= 0xa8) {
-        uint64_t ab = 0, wb = 0;
-        uint64_t aspan = ReadVec(sb + 0x10, &ab, 0x100);
-        if (aspan) {
-            snprintf(tag, sizeof(tag), "f%ds0alt_", fid);
-            GtDumpRange(tag, testId, sample, (const uint8_t*)ab, (unsigned)aspan, 0);
-        }
-        uint64_t wspan = ReadVec(sb + 0x38, &wb, 0x100);
-        if (wspan) {
-            snprintf(tag, sizeof(tag), "f%ds0wp_", fid);
-            GtDumpRange(tag, testId, sample, (const uint8_t*)wb, (unsigned)wspan, 0);
-        }
-    }
-}
-
-// Targeted per-factory ground-truth dumps, run after the generic GtDumpArg
-// pass once a sample has identified itself via its sentinel.
-static void GtFactoryDumps(const Factory& f, uint64_t rdx, uint64_t r8, uint64_t r9,
-                           const uint64_t* st, int testId, int sample)
-{
-    switch (f.id) {
-    case 2:
-        // BuyVehicle: r8=player, r9=depot (DECOMPILED asserts, r6 A), config =
-        // first stack qword st[0] (r6 A, DECOMPILED + MEASURED by buyhook.cpp).
-        GtDumpVehicleConfig(2, st[0], testId, sample);
-        break;
-    case 3: {
-        // SellVehicle: r8 = const vector<Entity>* (r6 E, DECOMPILED assert
-        // "!cmd.vehicleEntity.empty()"); dump the vector contents.
-        uint64_t vb = 0;
-        uint64_t vspan = IsHeapPtr(r8) ? ReadVec(r8, &vb, 0x400) : 0;
-        Log("[gt] f3vecspan%d.%d span=%llu\n", testId, sample,
-            (unsigned long long)vspan);
-        if (vspan)
-            GtDumpRange("f3vec_", testId, sample, (const uint8_t*)vb, (unsigned)vspan, 0);
-        break;
-    }
-    case 4:
-        // ReplaceVehicle: r8 = vehicleEntity; r9 = TransportVehicleConfig* is
-        // INFERRED from the funcsig text (r2_recon_veh.md) -- not decompiled
-        // for Replace; sweep t40 is what verifies it. st[0] is the bool slot.
-        Log("[gt] f4 note: cfg-at-r9 is INFERRED (r2 funcsig, unverified) "
-            "st0=%llx\n", (unsigned long long)st[0]);
-        GtDumpVehicleConfig(4, r9, testId, sample);
-        break;
-    case 5:
-        // SendToDepot: r8 = vehicleEntity, r9 = bool sellOnArrival -- INFERRED
-        // from the funcsig signature order only (r6 G); sweep t39 confirms.
-        Log("[gt] f5depot r8=%lld r9and1=%lld r9raw=%llx (register map INFERRED, "
-            "r6 G)\n", (long long)r8, (long long)(r9 & 1),
-            (unsigned long long)r9);
-        break;
-    case 6:
-        // SetLine: r8=vehicle, r9=line, st[0]=stopIndex (r8_analysis_lin.md A,
-        // from __FUNCSIG__ + the by-value Entity rule; not decompiled).
-        Log("[gt] f6setline veh=%lld line=%lld stop=%lld\n",
-            (long long)r8, (long long)r9, (long long)st[0]);
-        break;
-    case 7: {
-        // CreateLine: rdx = std::string* name (MSVC SSO: len@+0x10, cap@+0x18,
-        // chars inline iff cap<16 else heap ptr@+0x00 -- r8 A, DECOMPILED
-        // make_cmd_CreateLine.sig.c free path), r8 = CVec3f* colour, r9 =
-        // Entity player BY VALUE, st[0] = &component::Line (r8 A / r3 2b).
-        if (IsHeapPtr(rdx) && Readable((void*)rdx, 0x20)) {
-            uint64_t len = 0, cap = 0;
-            memcpy(&len, (void*)(rdx + 0x10), 8);
-            memcpy(&cap, (void*)(rdx + 0x18), 8);
-            const char* chars = nullptr;
-            if (cap < 16) chars = (const char*)rdx;
-            else {
-                uint64_t hp = 0;
-                memcpy(&hp, (void*)rdx, 8);
-                if (IsHeapPtr(hp) &&
-                    Readable((void*)hp, (size_t)(len < 256 ? len : 256)))
-                    chars = (const char*)hp;
-            }
-            char nm[64] = "";
-            if (chars) {
-                unsigned take = (unsigned)(len < 63 ? len : 63);
-                memcpy(nm, chars, take);
-                nm[take] = 0;
-            }
-            Log("[gt] f7name len=%llu cap=%llu heap=%d \"%s\"\n",
-                (unsigned long long)len, (unsigned long long)cap,
-                cap >= 16 ? 1 : 0, nm);
-        }
-        if (IsHeapPtr(r8) && Readable((void*)r8, 12)) {
-            float c[3];
-            memcpy(c, (void*)r8, 12);
-            Log("[gt] f7color %.4f %.4f %.4f\n", c[0], c[1], c[2]);
-        }
-        Log("[gt] f7player %lld\n", (long long)r9);
-        GtDumpLine(7, st[0], testId, sample);
-        break;
-    }
-    case 8:
-        // UpdateLine: r9 = &component::Line, a by-value struct passed as a
-        // pointer to the caller temp (r8 A, DECOMPILED). Read at entry ONLY:
-        // the factory moves the stops vector out and destroys the temp
-        // (r8 A NOTE) -- this steal-prologue hook runs at entry, so it is safe.
-        GtDumpLine(8, r9, testId, sample);
-        break;
-    case 9:
-        // DeleteLine: r8 = Entity line by value (r8 A, funcsig).
-        Log("[gt] f9delline line=%lld\n", (long long)r8);
-        break;
-    }
-}
-
-// Bulldozer classification. Ships EDEMO (road_demolish) and CDEMO
-// (strict_condemo); the caller arms the cancel only when something shipped,
-// and neither writer ships anything it could not decode ("never cancel on a
+// Bulldozer classification. Ships EDEMO or CDEMO, or stashes a CONUP /
+// STOPXDEL for the Add hook; the caller arms the cancel only when something
+// shipped, and nothing ships that could not be decoded ("never cancel on a
 // failed decode" applies doubly to a removal).
 // UI::Bulldozer::Apply calls BuildProposal with r8 =
 // construction_builder_util::Proposal* (0x2f8 B) whose StreetProposal is its
@@ -1381,8 +917,8 @@ static bool LogBulldoze(uint64_t r8)
             if (ae > ab) nadd = (int)((ae - ab) / 0x8e0);
         }
         Log("[slice] BULLDOZE rn=%d re=%d toRemove=%d toAdd=%d "
-            "(toRemove/toAdd offsets UNVERIFIED -- decompile only; log only, "
-            "never cancelled)\n", rn, re, nrem, nadd);
+            "(toRemove/toAdd offsets UNVERIFIED -- decompile only)\n",
+            rn, re, nrem, nadd);
         if (nspan % 24)
             Log("[slice]   removedNodes span=%llu not a multiple of 24\n",
                 (unsigned long long)nspan);
@@ -1391,26 +927,21 @@ static bool LogBulldoze(uint64_t r8)
                 (unsigned long long)espan);
         if (nrem >= 1 && nadd >= 1) {
             Log("[slice]   UPGRADE-shaped (toRemove+toAdd) -- module edit\n");
-            // STRICT (cfg strict_module): stash the new CE and arm; CONUP ships
-            // from the Add hook if the cancel lands. Otherwise the native
-            // upgrade runs and the edit poll ships it as before.
-            if (CfgHas("strict_module") && StashConupFromProposal(r8)) {
+            // STRICT: stash the new CE and arm; CONUP ships from the Add hook if
+            // the cancel lands. Undecodable -> the native upgrade runs and the
+            // edit poll ships it as before.
+            if (StashConupFromProposal(r8)) {
                 InterlockedExchange(&g_pendingIsConu, 1);
                 shipped = true;
-            } else if (CfgHas("strict_module")) {
+            } else {
                 Log("[slice]   upgrade params not readable -- NOT cancelled, left to the con poll\n");
             }
         }
         else if (nrem >= 1) {
             Log("[slice]   construction-demolish shape\n");
-            // STRICT (cfg strict_condemo): ship the ids and let the arm block
-            // below cancel the bulldoze exactly as it does for a road. Off, the
-            // removal-detection poll in the Lua still ships it after the fact.
-            if (CfgHas("strict_condemo"))
-                shipped = WriteCondemoInject(tb, nrem);
-            else
-                Log("[slice]   (strict_condemo not set -- runs natively here; the "
-                    "con poll ships it to the peers afterwards)\n");
+            // STRICT: ship the ids and let the arm block in DeferHandler cancel
+            // the bulldoze exactly as it does for a road.
+            shipped = WriteCondemoInject(tb, nrem);
         }
         else if (re >= 1 && aedges >= 1) {
             // An edge object (stop / signal) removed: the edge is re-added without
@@ -1418,31 +949,25 @@ static bool LogBulldoze(uint64_t r8)
             // the edge outright, the engine asserted on the object a line still
             // referenced, and every instance wrote a minidump.
             Log("[slice]   edge-REPLACE shape (re=%d addEdges=%d): an edge object removed, not a road\n", re, aedges);
-            // STRICT (cfg strict_stops): name the removed object off the two edge
-            // records, arm the cancel, and STOPXDEL ships from the Add hook if it
-            // lands -- every instance then removes it at the stamp. Otherwise the
-            // bulldoze runs natively here and the stop poll ships it as before.
-            if (CfgHas("strict_stops") && StashStopDelFromBulldoze(eb, re, adb, aedges)) {
+            // STRICT: name the removed object off the two edge records, arm the
+            // cancel, and STOPXDEL ships from the Add hook if it lands -- every
+            // instance then removes it at the stamp. Undecodable -> the bulldoze
+            // runs natively here and the stop poll ships it as before.
+            if (StashStopDelFromBulldoze(eb, re, adb, aedges)) {
                 InterlockedExchange(&g_pendingIsStopDel, 1);
                 shipped = true;
-            } else if (CfgHas("strict_stops")) {
-                Log("[slice]   (not decodable -- runs natively, the stop poll ships it)\n");
             } else {
-                Log("[slice]   (strict_stops not set -- runs natively, the stop poll ships it)\n");
+                Log("[slice]   (not decodable -- runs natively, the stop poll ships it)\n");
             }
         }
         else if (re >= 1 || rn >= 1) {
             Log("[slice]   edge-demolish shape\n");
-            // Gated OFF by default. A removal is not self-correcting the way an
-            // addition is: a road that fails to appear is a visible missing
-            // road, but a road removed on the wrong instance is destroyed work
-            // with nothing to rebuild it from. It ships only once the player
-            // has opted in with road_demolish=1.
-            if (CfgHas("road_demolish"))
-                shipped = WriteBulldozeInject(nb, rn, eb, re);
-            else
-                Log("[slice]   (road_demolish not set -- NOT shipped; peers keep "
-                    "this road and will diverge)\n");
+            // A removal is not self-correcting the way an addition is: a road
+            // removed on the wrong instance is destroyed work with nothing to
+            // rebuild it from. So the far end matches endpoint POSITION and edge
+            // KIND, never an entity id, and the cancel is armed only when the
+            // removal actually shipped.
+            shipped = WriteBulldozeInject(nb, rn, eb, re);
         }
         else
             Log("[slice]   empty removal shape -- nothing decoded\n");
@@ -1484,18 +1009,14 @@ static bool LogBulldoze(uint64_t r8)
     return shipped;
 }
 
-// Generic capture for the vehicle and line factories. Observe-only unless the
-// channel cancel switch is on; nothing is injected yet because nothing is
-// decoded yet -- the point of this is the ground-truth sweep that DOES the
-// decoding. An Entity argument is a plain integer, so a Lua-issued command with
-// a sentinel entity (900000 + test*1000 + i) labels its own sample.
 // VBUY: a player's BuyVehicle, shipped for replication. The config is decoded
 // from the by-value TransportVehicleConfig on the caller's stack (st[0]):
 // parts at +0x00 (0x80 stride: modelId +0x00, loadConfig +0x08, color +0x20,
 // autoLoadConfig +0x60), vehicleGroups at +0x18 -- every offset a ground-truth
 // EXACT match (docs/re/COMMANDS.md). The depot travels as its entity id; the Lua
 // side on THIS instance turns it into a position and the model ids into file
-// names before anything crosses to the peer. Never cancelled.
+// names before anything crosses to the peer. Cancelled and replayed at the
+// stamp while a session is live (see the cancel decision in DeferHandler).
 //   VBUY <depot> <nParts> { <model> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <nGroups> <group..>
 //
 // The config half is shared with VREPL (ReplaceVehicle takes the SAME
@@ -1581,16 +1102,15 @@ static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
 
 // Vehicle commands that REFERENCE vehicles ship raw local entity ids; the Lua
 // side turns them into cross-peer keys (a purchase's origin:seq, or s:<id> for
-// a save vehicle) and the peer maps them back. Never cancelled.
+// a save vehicle) and the peer maps them back. ARMED says whether the local
+// command was cancelled.
 //   VSELL  <n> <id..>            SellVehicle  (r8 = &vector<Entity>)
 //   VDEPOT <vehicle> <sell01>    SendToDepot  (r8 = Entity, r9 = bool)
 //   VLINE  <vehicle> <line> <stopIndex>   SetLine (r8, r9 = Entity, st[0] = int)
 //   VREPL  <vehicle> <config..>  ReplaceVehicle (r8 = Entity, r9 = config*)
 // VREPL's payload after the vehicle is byte-for-byte what VBUY writes after the
 // depot -- the same TransportVehicleConfig, the same encoder -- so the Lua side
-// builds the config for both lines with one function. Optimistic like the other
-// vehicle commands: the UI waits for the replacement's result entity, so this is
-// never cancelled and the originator skips its own replay.
+// builds the config for both lines with one function.
 // Written just before a capture: was the local build CANCELLED (1), so the
 // originator must replay it at the stamp, or left to run natively (0), so the
 // originator must NOT replay it. The Lua used to infer this from its own
@@ -1610,26 +1130,8 @@ static void WriteArmed(bool armed)
     fclose(f);
 }
 
-// The maintenance slider (SetVehicleTargetMaintenanceState): the value is a
-// float in XMM3, which WriteInjectVehicleCmd's (r8,r9,st0) signature cannot
-// carry, so it gets its own writer. r8 = vehicle Entity (as the other vehicle
-// commands). Shipped L-flow (no cancel): a one-time slider change has negligible
-// timing impact, so the originator applies it natively and the peers replay.
-static void WriteInjectMaint(uint64_t veh, float val)
-{
-    ReadInstance();
-    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
-    char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
-    FILE* f = _fsopen(p, "a", _SH_DENYNO);
-    if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    fprintf(f, "VMAINT %d %.6f\n", (int)(int32_t)veh, val);
-    fclose(f);
-    Log("[slice] VMAINT shipped: vehicle=%d value=%.6f\n", (int)(int32_t)veh, val);
-}
-
 // ---------------------------------------------------------------------------
-// UpdateLine's component::Line, decoded at the factory (cfg strict_line_edit).
+// UpdateLine's component::Line, decoded at the factory.
 //
 // Until now LUPDATE shipped only the line id and every peer read the NEW stop
 // list back from the entity after the command applied -- which is exactly why
@@ -1641,9 +1143,8 @@ static void WriteInjectMaint(uint64_t veh, float val)
 // sweep t10..t16 in mp/gt.lua, all EXACT unless noted):
 //   Line+0x00 vector<Stop> {begin,end,cap}   t10: span tracks 0xa8 per stop.
 //              (An older note put the vector at +0x18; waitingTime is at
-//              +0x18, and the dump that found the span reads +0x00 --
-//              GtDumpLine. +0x18 is tried as a fallback only if +0x00 fails
-//              the shape check.)
+//              +0x18, and the dump that found the span read +0x00. +0x18 is
+//              tried as a fallback only if +0x00 fails the shape check.)
 //   Line+0x18 int waitingTime               t11 EXACT
 //   Stop (0xa8): +0x04 int station (index in the group)  t13 EXACT
 //                +0x08 int terminal                       t12 EXACT
@@ -1844,8 +1345,7 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
 }
 
 static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_t r8,
-                           uint64_t r9, uint64_t calleeRsp, uint64_t caller,
-                           bool groundtruth, bool cancel)
+                           uint64_t r9, uint64_t calleeRsp, uint64_t caller, bool cancel)
 {
     uint64_t st[6] = { 0, 0, 0, 0, 0, 0 };
     for (int i = 0; i < 6; i++)
@@ -1858,19 +1358,17 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2],
         (unsigned long long)st[3], (unsigned long long)st[4], (unsigned long long)st[5]);
 
-    // Real player buy (not a sweep): ship it. r9 = depot entity (value),
-    // st[0] = pointer to the by-value config copy on the caller's stack.
     // Sell / Replace / SendToDepot / SetLine. The scripting layer's wrappers (our
     // own replays on the peer) live in one block, 0xcec000..0xcf2000 (ced378 =
     // buildProposal, cee710 = SetVehicleManualDeparture, ceefae = buyVehicle);
-    // anything else is the UI. ReplaceVehicle (4) joins the list: it was hooked
-    // for the ground-truth sweep only, so a player's "replace with this model"
-    // reached the wire nowhere and the peer kept the old vehicle.
+    // anything else is the UI. ReplaceVehicle (4) is in the list: without it a
+    // player's "replace with this model" reached the wire nowhere and the peer
+    // kept the old vehicle.
     // 13/14 (SetColor/SetName) ship through the same writer. Leaving them out
     // of this list meant the hook CAPTURED a rename -- '[cap] SetName' is in
     // the log -- and then wrote nothing, so renaming a line looked like a
     // replication failure when it never reached the wire at all.
-    if (!groundtruth && ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14)) {
+    if ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14) {
         bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
@@ -1894,72 +1392,21 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         }
     }
 
-    // Maintenance slider (id 12, cfg maint). The value is a float in XMM3, which
-    // the relay spills to calleeRsp-0x78 (deferrelay_slice.asm: xmm3 @ [rsp+0x70],
-    // calleeRsp @ [rsp+0xE8]). r8 = vehicle. NOT armed -- shipped L-flow, so a
-    // wrong decode can only mis-ship to peers (recoverable), never cancel the
-    // originator. Verify the decode from the [slice] VMAINT log before trusting.
-    if (!groundtruth && f.id == 12 && CfgHas("maint")) {
-        bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
-        if (luaPath) {
-            Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
-                f.name, (unsigned long long)caller);
-        } else {
-            float val = 1.0f;
-            if (Readable((void*)(calleeRsp - 0x78), 4)) memcpy(&val, (void*)(calleeRsp - 0x78), 4);
-            // ARMED states whether the slice cancelled the native change, so the
-            // Lua replays on the originator too (strict) only when it did.
-            WriteArmed(cancel && SessionLive());
-            __try { WriteInjectMaint(r8, val); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] VMAINT decode fault -- not shipped\n"); }
-        }
-    }
-
-    if (f.id == 2 && !groundtruth && caller == CALLER_LUA_VEHICLE) {
+    if (f.id == 2 && caller == CALLER_LUA_VEHICLE) {
         Log("[slice] VBUY from the Lua path (caller=%llx) -- a replay, not shipped\n",
             (unsigned long long)caller);
-    } else if (f.id == 2 && !groundtruth) {
-        // ARMED, exactly as the other vehicle commands do. `cancel` is false
-        // for the buy (see the decision above), so this reliably ships 0 and
-        // the originator never replays its own purchase. Note the general
-        // hazard this exposed: WriteArmed runs at CAPTURE time, before the Add
-        // hook decides whether the cancel can actually be honoured, so it
-        // states an INTENTION. That is safe only while the intention cannot be
-        // refused -- which is exactly why the buy no longer arms one.
+    } else if (f.id == 2) {
+        // A player's buy: r9 = depot entity (value), st[0] = pointer to the
+        // by-value config copy on the caller's stack. WriteArmed runs at
+        // CAPTURE time, before the Add hook decides whether the cancel can be
+        // honoured, so it states an INTENTION. For the buy that intention is
+        // not refused: its Add fires the depot window's callback and, if the
+        // fire fails, honours the armed cancel anyway (g_pendingHonour).
         WriteArmed(cancel && SessionLive());
         __try {
             WriteInjectVBuy(r9, st[0]);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[slice] VBUY decode fault -- buy proceeds locally, not shipped\n");
-        }
-    }
-
-    if (groundtruth) {
-        int testId = -1, sample = 0;
-        uint64_t cand[9] = { rdx, r8, r9, st[0], st[1], st[2], st[3], st[4], st[5] };
-        for (int i = 0; i < 9 && testId < 0; i++)
-            if (cand[i] >= 900000 && cand[i] <= 999999) GtSentinel((double)cand[i], &testId, &sample);
-        // SellVehicle (id 3): the sentinel is INSIDE the vector<Entity> -- the
-        // first int behind [r8] (vector begin), never a register value (r6 E).
-        if (testId < 0 && f.id == 3 && IsHeapPtr(r8)) {
-            uint64_t vb = 0;
-            if (ReadVec(r8, &vb, 0x400) >= 4) {
-                int32_t first = 0;
-                memcpy(&first, (void*)vb, 4);
-                if (first >= 900000 && first <= 999999)
-                    GtSentinel((double)first, &testId, &sample);
-            }
-        }
-        if (testId >= 0) {
-            Log("[gt] F%d test=%d sample=%d %s\n", f.id, testId, sample, f.name);
-            GtDumpArg(f.id, "rdx", rdx, testId, sample);
-            GtDumpArg(f.id, "r8",  r8,  testId, sample);
-            GtDumpArg(f.id, "r9",  r9,  testId, sample);
-            for (int i = 0; i < 6; i++) {
-                char nm[8]; snprintf(nm, sizeof(nm), "s%d", i);
-                GtDumpArg(f.id, nm, st[i], testId, sample);
-            }
-            GtFactoryDumps(f, rdx, r8, r9, st, testId, sample);
         }
     }
 
@@ -1991,7 +1438,7 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
 }
 
 // ---------------------------------------------------------------------------
-// CONSTRUCTION PARAMS OFF THE PROPOSAL (cfg cancel_construction / conparams_dump).
+// CONSTRUCTION PARAMS OFF THE PROPOSAL.
 //
 // The Lua captured a construction's params by reading e.params off the BUILT
 // entity (lockstep.lua ~7130), which is why the originator had to let its native
@@ -2142,8 +1589,8 @@ static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes)
     // tag 1 = boolean, value in payload byte 0 (Lua type order: nil, boolean,
     // number, string, table). A modular station carries ~20 of these in its
     // modules metadata; omitting them made the rebuilt proposal an
-    // "internal error" (2026-09-08, first modular station placed under
-    // cancel_construction).
+    // "internal error" (2026-09-08, the first modular station placed with the
+    // construction cancel).
     if (tag == 1) { uint8_t b = 0; memcpy(&b, (void*)var, 1); CoPut(o, b ? "true" : "false"); return true; }
     if (tag == 2) { double d = 0; memcpy(&d, (void*)var, 8); CoPutNum(o, d); return true; }
     if (tag == 3) { char t[1024]; if (!ReadSsoString(var, t, sizeof(t))) return false; CoPutQ(o, t); return true; }
@@ -2226,7 +1673,7 @@ static void WriteInjectConxp()
 }
 
 // ---------------------------------------------------------------------------
-// STOP / SIGNAL / WAYPOINT OFF THE PROPOSAL (cfg strict_stops).
+// STOP / SIGNAL / WAYPOINT OFF THE PROPOSAL.
 //
 // The tool's proposal is: removedSegments (r8+0x48) = the edge being rebuilt
 // (one 120-B SegmentAndEntity, entity @+0x00 -- the REAL edge id, still valid
@@ -2305,7 +1752,7 @@ static void WriteInjectStop()
 }
 
 // ---------------------------------------------------------------------------
-// STOP / SIGNAL BULLDOZE OFF THE PROPOSAL (cfg strict_stops).
+// STOP / SIGNAL BULLDOZE OFF THE PROPOSAL.
 //
 // The bulldozer removes an edge object by RE-ADDING its edge without it:
 // removedSegments[0] is the edge as it stands and addedSegments[0] the same
@@ -2758,39 +2205,6 @@ static void ZeroAddResult(uint64_t rdx)
     }
 }
 
-// ---------------------------------------------------------------------------
-// HEAP CHECKPOINTS (cfg heapcheck=1). Three instances died on the game's own
-// "Heap corruption detected!" right after a merged split proposal was REFUSED
-// (2026-09-08). The VEH only says the heap is bad, not WHEN it went bad. These
-// validate the process heap (where the UCRT's new/malloc live) and the CRT
-// heap at every proposal hook and around the in-place merge surgery, so the
-// first CORRUPT line names the step. Off unless heapcheck=1: HeapValidate
-// walks the whole heap.
-static void DbgHeap(const char* tag)
-{
-    if (!CfgHas("heapcheck")) return;
-    BOOL pv = HeapValidate(GetProcessHeap(), 0, NULL);
-    int  ck = _heapchk();
-    Log("[heap] %s: process=%s crt=%s\n", tag, pv ? "OK" : "CORRUPT",
-        ck == _HEAPOK ? "OK" : (ck == _HEAPBADNODE ? "BADNODE" : (ck == _HEAPBADBEGIN ? "BADBEGIN" : (ck == _HEAPBADPTR ? "BADPTR" : "EMPTY/other"))));
-}
-// nodes vector at r8+0x00 {begin,end,capEnd}, segments at r8+0x18. Records are
-// 24 B and 120 B. An end past capEnd, or a non-integral span, is the merge
-// surgery having moved a pointer somewhere it must not be.
-static void DbgVecState(const char* tag, uint64_t r8)
-{
-    if (!CfgHas("heapcheck")) return;
-    if (!Readable((void*)r8, 0x30)) { Log("[vec] %s: r8 unreadable\n", tag); return; }
-    uint64_t nb = 0, ne = 0, nc = 0, sb = 0, se = 0, sc = 0;
-    memcpy(&nb, (void*)(r8 + 0x00), 8); memcpy(&ne, (void*)(r8 + 0x08), 8); memcpy(&nc, (void*)(r8 + 0x10), 8);
-    memcpy(&sb, (void*)(r8 + 0x18), 8); memcpy(&se, (void*)(r8 + 0x20), 8); memcpy(&sc, (void*)(r8 + 0x28), 8);
-    Log("[vec] %s: nodes n=%lld cap=%lld%s%s | segs n=%lld cap=%lld%s%s\n", tag,
-        (long long)((ne - nb) / 24), (long long)((nc - nb) / 24),
-        (ne > nc) ? " END>CAP!" : "", ((ne - nb) % 24) ? " NONINTEGRAL!" : "",
-        (long long)((se - sb) / 120), (long long)((sc - sb) / 120),
-        (se > sc) ? " END>CAP!" : "", ((se - sb) % 120) ? " NONINTEGRAL!" : "");
-}
-
 // rax: 0 = let the original run, 1 = cancel it
 extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9,
                                  uint64_t id, uint64_t retAddr, uint64_t calleeRsp)
@@ -2806,27 +2220,17 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // the factory hook does not see 0x459eb7 as its return address (that RVA is
     // what the CommandList::Add hook observes). Dump every BuildProposal and log
     // the real caller so it can be matched by timing/coordinates instead.
-    if (id == ID_BUILDPROPOSAL && CfgHas("dumpprop")) {
+    if (id == ID_BUILDPROPOSAL && DumpPropOn()) {
         Log("[slice] DUMPPROP(any) caller_rva=%llx\n", (unsigned long long)(retAddr - g_base));
         DumpProposal(3, r8, r9);
     }
     (void)rdx;
     uint64_t caller = retAddr - g_base;
-    if (id == ID_BUILDPROPOSAL && CfgHas("heapcheck")) {
-        char tg[96];
-        snprintf(tg, sizeof(tg), "BuildProposal entry caller=%llx", (unsigned long long)caller);
-        DbgHeap(tg);
-    }
-
-    bool enabled = true, suppress = false, groundtruth = false;
 
     if (id == ID_CMDADD) {
         // Pointer match first: this runs ~100/sec and almost never matches.
         uint64_t want = (uint64_t)InterlockedCompareExchange64(&g_pendingCmd, 0, 0);
         if (!want || r8 != want) return 0;
-        ReadCfg(&enabled, &suppress, nullptr);
-        // A cancel must never outlive the switch that authorised it.
-        if (!enabled) { InterlockedExchange64(&g_pendingCmd, 0); InterlockedExchange(&g_pendingNoCb, 0); InterlockedExchange(&g_pendingIsConx, 0); InterlockedExchange(&g_pendingIsConu, 0); InterlockedExchange(&g_pendingIsStop, 0); InterlockedExchange(&g_pendingIsStopDel, 0); return 0; }
         g_addSeen++;
         InterlockedExchange64(&g_pendingCmd, 0);
         {
@@ -2967,114 +2371,53 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             ZeroAddResult(rdx);
             Log("[slice] CANCEL local build (caller_rva=%llx), completion callback "
                 "fired -- now owned by lockstep\n", (unsigned long long)caller);
-            DbgHeap("after cancel: completion callback fired");
             if (InterlockedExchange(&g_pendingIsConx, 0)) WriteInjectConxp();
             if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();   // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();    // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel(); // the cancel LANDED
             return 1;
         }
-        Log("[slice] Add at %llx with no pending capture -- letting it run\n",
-            (unsigned long long)caller);
-        return 0;
     }
 
-    if ((id >= 2 && id <= 10) || id == 12 || id == 13 || id == 14) {
-        ReadCfg(&enabled, &suppress, &groundtruth);
-        if (!enabled) return 0;
+    if ((id >= 2 && id <= 10) || id == 13 || id == 14) {
         const Factory* f = nullptr;
         for (int i = 0; i < NUM_FACTORIES; i++) if (FACTORIES[i].id == (int)id) f = &FACTORIES[i];
         if (!f) return 0;
-        // cancel_line must NEVER arm for CreateLine (7) or UpdateLine (8),
-        // regardless of cfg: cancelling CreateLine hands the UI
-        // resultEntity=-1 (only the apply writes the real id) and its next
-        // UpdateLine is a fatal assert -> game crash; cancelling UpdateLine
-        // makes the next edit ship a stale snapshot (r8_analysis_lin.md 0,
-        // DECOMPILED). Only SetLine (6) / DeleteLine (9) may consult it.
         // STRICT LOCKSTEP: cancel the UI-issued command so the originator
-        // applies it at the SAME game-time stamp as the peer, not optimistically
-        // at click time. NEVER cancel our own Lua-path replay (scripting block
-        // 0xcec000..0xcf2000) -- that would cancel the replay we just issued.
-        bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
-        bool cancel = false;
-        // STRICT is safe ONLY for a command whose UI does not WAIT for a result.
-        // Reverse (id 10) does not wait -- verified live, suppressing it cleanly
-        // is fine. BuyVehicle (id 2) DOES wait: the depot window expects the new
-        // vehicle entity back, and suppressing it without that result crashed
-        // the client (assert, 2026-08-28, caller 74fda9). So only Reverse is
-        // strict here, and (2026-09-08) sell and send-to-depot alongside it;
-        // buy stays optimistic. CreateLine(7)/UpdateLine(8) can never be cancelled.
-        if (!luaPath && id == 10)
-            cancel = CfgHas("cancel_vehicle");
-        // Maintenance slider (12): strict too. Fire-and-forget like Reverse --
-        // the slider UI does not wait on a result -- so it cancels cleanly, and
-        // cancel-and-replay lands the running-cost change on the same sim-step
-        // everywhere (no L-flow money skew). strict_maint gates the cancel; the
-        // ship itself is gated by `maint` in CaptureFactory.
-        else if (!luaPath && id == 12)
-            cancel = CfgHas("strict_maint");
-        // SetLine (6) too. Measured 2026-08-31 with the APPLY log: every command
-        // was issued on the identical sim step on both instances, yet the one
-        // train's last departure differed by 0.8 s -- because the originator
-        // assigned the line at CLICK time (optimistic) while the peer did it at
-        // the stamp. A vehicle carries that offset for the rest of the game.
-        // Strict here means both sides assign at the same step. The Lua only
-        // replays on the originator when ARMED says the cancel happened, so a
-        // cfg with this off stays consistent.
-        else if (!luaPath && id == 6)
-            cancel = CfgHas("cancel_line");
-        // SellVehicle (3) and SendToDepot (5): strict too. Neither UI waits on
-        // a result (the depot window's sell passes a callback but nothing has
-        // been shown to block on it), so they
-        // take Reverse's fire-and-forget route. The sell refund was one of the
-        // coop money-split sources: the originator's balance moved at click
-        // time, the peers' at the stamp. Now all of them move on the same step.
-        // WriteArmed runs for these ids before the inject, so the Lua knows
-        // whether the cancel happened and only replays on the originator then.
-        else if (!luaPath && id == 3)
-            cancel = CfgHas("strict_sell");
-        else if (!luaPath && id == 5)
-            cancel = CfgHas("strict_depot");
-        // ReplaceVehicle (4): its window waits on the result entity, so it
-        // takes the callback-fired route (waitsForResult in CaptureFactory).
-        else if (!luaPath && id == 4)
-            cancel = CfgHas("strict_replace");
-        // UpdateLine (8) and DeleteLine (9): strict, fire-and-forget like
-        // SetLine. The old "never cancel UpdateLine -- the next edit ships a
-        // stale snapshot" was a CAPTURE problem: LUPDATE shipped only the id.
-        // The new stop list is now decoded off the command (DecodeLine), and
-        // CaptureFactory clears `cancel` itself when that decode fails.
-        // CreateLine (7) stays un-cancellable: the editor issues UpdateLine(-1)
-        // on a cancelled create and that is a fatal assert.
-        else if (!luaPath && (id == 8 || id == 9))
-            cancel = CfgHas("strict_line_edit");
-        // BuyVehicle (2) is NOT cancellable, and this is now measured rather
-        // than assumed. The build tool's route was tried -- fire the completion
-        // callback, then cancel -- and the fire FAILS every single time:
+        // applies it at the SAME game-time stamp as every peer, not
+        // optimistically at click time. NEVER cancel our own Lua-path replay
+        // (scripting block 0xcec000..0xcf2000) -- that would cancel the replay
+        // we just issued. The Lua replays on the originator only when ARMED
+        // says the cancel happened.
         //
-        //   armed cancel: BuyVehicle (callback WILL be fired -- the window waits)
-        //   callback NOT fired -- letting the build run (caller_rva=74fda9)
-        //
-        // The Add hook then correctly lets the purchase run rather than wedge
-        // the depot window. But WriteArmed had already told the Lua the cancel
-        // happened, so the originator replayed on top of a native purchase and
-        // the player got TWO vehicles for one click, paid for twice (2026-09-03).
-        //
-        // Arming a cancel we cannot honour is worse than not arming one, so the
-        // buy stays optimistic. The vehicle drift this was meant to fix is real
-        // and still open; it needs a route that does not require suppressing a
-        // command whose UI waits for a result.
-        // BuyVehicle (2): strict again (reverses 7a29978). The fire failed at
-        // 74fda9 because the depot window's callback is a heap-allocated
-        // std::function and the Add hook read the small buffer instead of the
-        // impl slot at r9+0x38 -- fixed there. And if a fire still fails, the
-        // Add hook now honours the armed cancel rather than letting the buy run
-        // on top of the Lua's replay (g_pendingHonour), which is what produced
-        // two vehicles for one click.
-        else if (!luaPath && id == 2)
-            cancel = CfgHas("strict_buy");
+        // Cancelled, fire-and-forget (nothing in the UI waits on a result):
+        //   Reverse (10)     -- verified live, suppresses cleanly.
+        //   SetLine (6)      -- assigned at click time, a train kept a 0.8 s
+        //                       departure offset for the rest of the game
+        //                       (measured 2026-08-31).
+        //   SellVehicle (3), SendToDepot (5) -- the sell refund moved the
+        //                       originator's balance at click time and the
+        //                       peers' at the stamp, a coop money-split source.
+        //   UpdateLine (8), DeleteLine (9) -- the new stop list is decoded off
+        //                       the command (DecodeLine); CaptureFactory clears
+        //                       `cancel` when that decode fails.
+        // Cancelled, callback fired first (the window WAITS on the result
+        // entity -- waitsForResult in CaptureFactory):
+        //   BuyVehicle (2), ReplaceVehicle (4). The callback is a heap-allocated
+        //   std::function the Add hook resolves through r9+0x38; if a fire still
+        //   fails the armed cancel is honoured anyway (g_pendingHonour) rather
+        //   than run on top of the replay -- the two-vehicles-for-one-click bug
+        //   of 7a29978.
+        // Never cancelled:
+        //   CreateLine (7)   -- the editor issues UpdateLine(-1) on a cancelled
+        //                       create, which is a fatal assert.
+        //   SetColor (13), SetName (14) -- shipped only.
+        const bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
+        const bool strictId = (id == 2 || id == 3 || id == 4 || id == 5 ||
+                               id == 6 || id == 8 || id == 9 || id == 10);
+        bool cancel = !luaPath && strictId;
         __try {
-            CaptureFactory(*f, rcx, rdx, r8, r9, calleeRsp, caller, groundtruth, cancel);
+            CaptureFactory(*f, rcx, rdx, r8, r9, calleeRsp, caller, cancel);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[slice] capture fault in %s -- proceeding\n", f->name);
         }
@@ -3083,37 +2426,30 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
 
     if (id != ID_BUILDPROPOSAL) return 0;
 
-    ReadCfg(&enabled, &suppress, &groundtruth);
-    if (!enabled) return 0;
-
     // Differential proposal dump (cfg 'dumpprop'): UI placement vs Lua replay.
     // dumpprop covers construction placements (0x419f62 UI, 0xced378 Lua) and,
     // as of 2026-08-29, the STREET/TRACK tool (0x459eb7) too: a native rail-over-
     // road crossing is only ever built by that tool, and its exact proposal
     // (which segments/nodes the UI submits at the crossing node) is the ground
     // truth the Lua replay has been unable to reproduce ("Collision").
-    if ((caller == 0x419f62 || caller == 0xced378 || caller == 0x459eb7) && CfgHas("dumpprop"))
+    if ((caller == 0x419f62 || caller == 0xced378 || caller == 0x459eb7) && DumpPropOn())
         DumpProposal(caller == 0x419f62 ? 1 : (caller == 0x459eb7 ? 3 : 2), r8, r9);
 
     // A Lua-issued construction proposal (our CONX replay): merge our shipped
     // apron INTO the template's connector so the engine sees the UI's shape.
-    if (caller == 0xced378 && CfgHas("merge")) {
+    if (caller == 0xced378) {
         __try {
-            DbgVecState("pre-merge", r8);
-            DbgHeap("pre-merge");
             bool merged = MergeTemplateStreet(r8);
-            DbgHeap("post-merge");
-            DbgVecState("post-merge", r8);
-            if (merged && CfgHas("dumpprop"))
+            if (merged && DumpPropOn())
                 DumpProposal(3, r8, r9);            // post-merge, for the diff tool
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[merge] fault -- proposal left as built\n");
         }
     }
 
-    // Bulldozer path (UI::Bulldozer::Apply): classify and LOG ONLY. Checked
-    // before everything else so a bulldoze can never be mistaken for a road
-    // capture or a ground-truth sample. Never cancelled in this commit.
+    // Bulldozer path (UI::Bulldozer::Apply): classify, ship what decodes, and
+    // arm the cancel. Checked before the road path so a bulldoze can never be
+    // mistaken for a road capture.
     if (caller == CALLER_BULLDOZE) {
         bool shipped = LogBulldoze(r8);
         // STRICT LOCKSTEP, same shape as the build and upgrade tools: cancel
@@ -3134,17 +2470,14 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // whose payload never reached the wire would delete the road on nobody:
         // the player's own removal suppressed, no command to replay it.
         if (shipped) {
-            bool bEnabled = true, bSuppress = false;
-            ReadCfg(&bEnabled, &bSuppress, nullptr);
-            if (bEnabled && bSuppress && SessionLive()) {
+            if (SessionLive()) {
                 InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
                 InterlockedExchange(&g_pendingNoCb, 0);
                 Log("[slice] armed cancel: bulldoze cmd=%llx -- now owned by "
                     "lockstep, replays at the stamp\n", (unsigned long long)rcx);
             } else {
-                Log("[slice] bulldoze shipped but not cancelled (enabled=%d "
-                    "suppress=%d live=%d) -- it runs natively here and replays "
-                    "on the peers\n", (int)bEnabled, (int)bSuppress, (int)SessionLive());
+                Log("[slice] bulldoze shipped but not cancelled (no live session) "
+                    "-- it runs natively here and replays on the peers\n");
                 // a stash that was never armed must not ride the next landed cancel
                 InterlockedExchange(&g_pendingIsStopDel, 0);
                 InterlockedExchange(&g_pendingIsConu, 0);
@@ -3153,24 +2486,10 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         return 0;
     }
 
-    // Ground-truth samples come from Lua, so they arrive on a different caller
-    // than the road path and must be checked BEFORE that filter rejects them.
-    if (groundtruth && GroundTruthSample(r8, r9)) return 0;
-    if (groundtruth && caller == 0x419f62) {
-        // A real station placed by the player, chased the same way as a sweep
-        // sample so the two can be compared path-for-path.
-        Log("[gt] test=0 sample=0 PLAYER CONSTRUCTION caller=%llx\n", (unsigned long long)caller);
-        ChaseStrings(0, 0, r9, 0x440);
-        if (Readable((void*)(r9 + 0x1c0), 0x260))
-            GtDumpRange("c", 0, 0, (const uint8_t*)(r9 + 0x1c0), 0x260, 0x1c0);
-        return 0;
-    }
-
-    // Construction placement (caller 419f62): let it PROCEED untouched -- never
-    // cancelled, never armed for cancel -- but ship its street vectors as a
-    // ROADC companion so the peer can weld the replica into its road network.
-    // The Lua side schedules the replay with skipOrigin: this instance's engine
-    // has already integrated, so only the peer executes.
+    // Construction placement (caller 419f62): ship its street vectors as a
+    // ROADC companion so the peer can weld the replica into its road network,
+    // and cancel the placement itself when its params walk (CONXP, below). If
+    // the params do not walk or no session is live, the native build stands.
     if (caller == 0x419f62) {
         __try {
             Node cn[64];
@@ -3187,29 +2506,22 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     g_conroad, n, m, re, cet.type == 1 ? "TRACK" : "street",
                     cet.streetType);
                 WriteInjectConRoad(cn, n, ce, m, crm, re, cet);
-                // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF (cfg cancel_construction).
-                // Walk the params off THIS proposal and stash them; if the Add hook
-                // then cancels the native build it ships them as CONXP and the Lua
-                // builds the scripted proposal at the stamp on EVERY instance, the
-                // originator included -- no native build, no bulldoze, no window.
-                // Road-snapped placements only (this branch): a free-standing one has
-                // no ROADC to pair with and keeps today's native path. g_pendingNoCb
-                // stays 0: the placement is a TOOL and waits on its callback.
-                // conparams_dump=1 walks and logs WITHOUT arming, to validate the
-                // walker on a live placement before the cancel is switched on.
-                if (CfgHas("cancel_construction") || CfgHas("conparams_dump")) {
-                    bool stashed = StashConxpFromProposal(r8);
-                    bool kEnabled = true, kSuppress = false;
-                    ReadCfg(&kEnabled, &kSuppress, nullptr);
-                    if (stashed && CfgHas("cancel_construction") && kEnabled && kSuppress && SessionLive()) {
-                        InterlockedExchange(&g_pendingIsConx, 1);
-                        InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-                        InterlockedExchange(&g_pendingNoCb, 0);
-                        Log("[slice] armed cancel: construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                            (unsigned long long)rcx);
-                    } else if (!stashed && CfgHas("cancel_construction")) {
-                        Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
-                    }
+                // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF. Walk the params off
+                // THIS proposal and stash them; if the Add hook then cancels the
+                // native build it ships them as CONXP and the Lua builds the
+                // scripted proposal at the stamp on EVERY instance, the originator
+                // included -- no native build, no bulldoze, no window.
+                // g_pendingNoCb stays 0: the placement is a TOOL and waits on its
+                // callback.
+                bool stashed = StashConxpFromProposal(r8);
+                if (stashed && SessionLive()) {
+                    InterlockedExchange(&g_pendingIsConx, 1);
+                    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                    InterlockedExchange(&g_pendingNoCb, 0);
+                    Log("[slice] armed cancel: construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
+                        (unsigned long long)rcx);
+                } else if (!stashed) {
+                    Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
                 }
             } else if (m >= 1) {
                 Log("[slice] construction placement has %d street edge(s) but the "
@@ -3226,19 +2538,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 // rebuild that asserted the engine on a modular_station.
                 Log("[slice] construction placement carries no street edges "
                     "(n=%d) -- free-standing\n", n);
-                if (CfgHas("cancel_construction") || CfgHas("conparams_dump")) {
-                    bool stashed = StashConxpFromProposal(r8);
-                    bool kEnabled = true, kSuppress = false;
-                    ReadCfg(&kEnabled, &kSuppress, nullptr);
-                    if (stashed && CfgHas("cancel_construction") && kEnabled && kSuppress && SessionLive()) {
-                        InterlockedExchange(&g_pendingIsConx, 1);
-                        InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-                        InterlockedExchange(&g_pendingNoCb, 0);
-                        Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                            (unsigned long long)rcx);
-                    } else if (!stashed && CfgHas("cancel_construction")) {
-                        Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
-                    }
+                bool stashed = StashConxpFromProposal(r8);
+                if (stashed && SessionLive()) {
+                    InterlockedExchange(&g_pendingIsConx, 1);
+                    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                    InterlockedExchange(&g_pendingNoCb, 0);
+                    Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
+                        (unsigned long long)rcx);
+                } else if (!stashed) {
+                    Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -3251,20 +2559,17 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // on: same proposal struct, same decoders, same cancel-and-replay. Its shape
     // is the only difference (0 new nodes, N adds, N removals), and the branches
     // below say so where it matters.
-    // STOP / SIGNAL / WAYPOINT tool: strict cancel-and-replay (cfg strict_stops).
+    // STOP / SIGNAL / WAYPOINT tool: strict cancel-and-replay.
     // Decode the edge-object record and the rebuilt edge off THIS proposal,
     // arm the cancel (a UI TOOL: it waits on its callback, so g_pendingNoCb=0
     // fires it exactly as the road tool's is), and let the Add hook write STOPX
     // only when the cancel lands. Undecodable -> not cancelled, builds natively
     // and the poll replicates it as before (never cancel on a failed decode).
-    // With strict_stops off it falls through to the UNREPLICATED log (poll path).
-    if (caller == CALLER_STOPTOOL && CfgHas("strict_stops")) {
-        bool sEnabled = true, sSuppress = false;
-        ReadCfg(&sEnabled, &sSuppress, nullptr);
+    if (caller == CALLER_STOPTOOL) {
         bool stashed = false;
         __try { stashed = StashStopFromProposal(r8); }
         __except (EXCEPTION_EXECUTE_HANDLER) { stashed = false; }
-        if (stashed && sEnabled && sSuppress && SessionLive()) {
+        if (stashed && SessionLive()) {
             InterlockedExchange(&g_pendingIsStop, 1);
             InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
             InterlockedExchange(&g_pendingNoCb, 0);
@@ -3301,18 +2606,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // module builder adding/removing a module, a station upgrade):
             // detected by SHAPE, not RVA, so the caller is logged for the
             // record. Same strict route as the bulldozer's module removal.
-            bool uEnabled = true, uSuppress = false;
-            ReadCfg(&uEnabled, &uSuppress, nullptr);
-            if (CfgHas("strict_module") && StashConupFromProposal(r8)
-                && uEnabled && uSuppress && SessionLive()) {
+            if (StashConupFromProposal(r8) && SessionLive()) {
                 InterlockedExchange(&g_pendingIsConu, 1);
                 InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
                 InterlockedExchange(&g_pendingNoCb, 0);
                 Log("[slice] armed cancel: construction UPGRADE from caller_rva=%llx old=%d -- CONUP ships if the cancel lands\n",
                     (unsigned long long)caller, g_conupOldId);
             } else {
-                Log("[slice] construction UPGRADE from caller_rva=%llx -- runs natively (strict_module=%d, params %s); the edit poll ships it\n",
-                    (unsigned long long)caller, CfgHas("strict_module") ? 1 : 0,
+                Log("[slice] construction UPGRADE from caller_rva=%llx -- runs natively (params %s); the edit poll ships it\n",
+                    (unsigned long long)caller,
                     g_conxpParams[0] ? "readable" : "not readable");
             }
         } else {
@@ -3403,7 +2705,6 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         else
             Log("[slice] #%ld captured road, 0 new nodes %d edges (connects existing junctions)\n",
                 g_captured, m);
-        DumpFirstEdge(r8);
         // STREET PROPERTY PROBE (log only, upgrades are rare so it is free).
         // A street's bus lane (hasBus) and its tram track (tramTrackType,
         // which also encodes electrification) live in BaseEdgeStreet beside
@@ -3419,7 +2720,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // offset. Do NOT hardcode an offset from a single sample.
         // Served its purpose (it named +0x54); keep it for the next unknown
         // street field but off by default -- 120 bytes per upgrade is noise.
-        if (isUpgrade && CfgHas("dumpprop")) {
+        if (isUpgrade && DumpPropOn()) {
             uint64_t pbegin = 0, pend = 0;
             if (Readable((void*)(r8 + 0x18), 16)) {
                 memcpy(&pbegin, (void*)(r8 + 0x18), 8);
@@ -3461,26 +2762,19 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         Log("[slice]   type=%s streetType=%d trackType=%d%s\n",
             et.type == 1 ? "TRACK" : "street", et.streetType, et.trackType,
             et.ok ? "" : "  <- DECODE FAILED, falling back to defaults");
-        // Topology summary, then every int32 vector in the struct. The summary
-        // is what makes the vectors interpretable: a junction that splits one
-        // road must remove exactly one edge, so only a vector whose count
-        // matches can be edgesToRemove.
+        // Topology summary: a junction that splits one road must remove exactly
+        // one edge.
         Log("[slice]   removed nodes=%d segs=%d (stride-correct)\n", rn, re);
         for (int i = 0; i < m && i < 12; i++)
             Log("[slice]     edge %d: %d -> %d  btype=%d bidx=%d%s\n", i,
                 edges[i].node0, edges[i].node1, edges[i].btype, edges[i].bidx,
                 edges[i].btype == 1 ? " (BRIDGE)" : edges[i].btype == 2 ? " (TUNNEL)" : "");
-        DumpIdVectors(r8);
 
-        // Inject ONLY when we are also cancelling. These were independent, and
-        // that was a mistake: with suppression off the player's road was built
-        // locally AND queued for replay, so it appeared twice on the originating
-        // peer. Replication without cancellation is never what anyone wants, so
-        // the two are now one decision.
+        // Replicating and cancelling are ONE decision: a road built locally AND
+        // queued for replay appeared twice on the originating peer. Without a
+        // live session the capture is still written (ARMED 0) but nothing is
+        // cancelled, so the build runs natively.
         //
-        //   enabled=0             -> inert
-        //   enabled=1 suppress=0  -> observe and log only (safe to play with)
-        //   enabled=1 suppress=1  -> capture, cancel, replicate (lockstep)
         // A FAILED DECODE MUST NOT CANCEL.
         //
         // This is the bug that made it impossible to build more than one road.
@@ -3499,21 +2793,21 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // shipping them alone would lay a second edge over every upgraded one on
         // the peer, and cancelling would delete the player's upgrade locally to
         // buy that. Empty removal list -> not usable, so it stays local too.
-        if (suppress && !et.ok) {
+        if (!et.ok) {
             Log("[slice]   NOT cancelling: type decode failed, so this build "
                 "cannot be replicated faithfully -- it stays local\n");
-        } else if (suppress && isUpgrade && re < 1) {
+        } else if (isUpgrade && re < 1) {
             Log("[slice]   NOT cancelling: upgrade with %d added edge(s) decoded "
                 "0 removals -- replaying the adds alone would duplicate every "
                 "edge on the peer, so it stays local\n", m);
-        } else if (suppress && isUpgrade && re < m) {
+        } else if (isUpgrade && re < m) {
             // Fewer removals than adds means the peer would ADD edges over ones it
             // never removed (a decode cap, or a shape we have not seen). Never
             // cancel on data we cannot replay faithfully -- the same rule as a
             // failed type decode.
             Log("[slice]   NOT cancelling: upgrade has %d add(s) but only %d "
                 "removal(s) -- would duplicate edges on the peer, stays local\n", m, re);
-        } else if (suppress) {
+        } else {
             // Removed edges travel for the UPGRADE path only. The road tool's
             // splits are still shipped as re=0 and re-derived on each peer
             // (execPolyline splits its own copy); turning that on here would
@@ -3535,9 +2829,6 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // the upgrade cursor for the rest of the session).
             if (live) InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
             else Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
-        } else {
-            Log("[slice]   suppress=0: observe-only, build proceeds normally "
-                "and was NOT replicated\n");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] capture faulted -- proceeding, never cancel on an error\n");
@@ -3654,11 +2945,9 @@ static DWORD WINAPI Init(LPVOID)
     }
 
     ReadInstance();
-    bool en = true, sup = false, gt = false;
-    ReadCfg(&en, &sup, &gt);
-    Log("[slice] attached, base=%llx instance=%s suppress=%d\n",
+    Log("[slice] attached, base=%llx instance=%s dumpprop=%d\n",
         (unsigned long long)g_base, g_instance[0] ? g_instance : "?",
-        sup ? 1 : 0);
+        DumpPropOn() ? 1 : 0);
 
     uint8_t* blobs = (uint8_t*)VirtualAlloc(nullptr, 4096,
         MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
