@@ -15,23 +15,31 @@
 --                 other player's cursor, read from tpf2mp_cursors_in_<me>.txt, is
 --                 drawn as a zone circle in that player's colour
 --                 (game.interface.setZone, the call the campaign draws areas with).
---                 A circle GLIDES toward the last reported spot (K.CURSOR_SMOOTH_S):
---                 reports arrive at the script tick rate, a few per second, and
---                 moving the circle straight to each one looked jumpy.
 --   script state  CM.cursorTick, every tick: our file goes out as LSCUR on a move of
 --                 K.CURSOR_MOVE_M, or every K.CURSOR_KEEPALIVE_S while still; every
 --                 peer's last LSCUR (CM.cursorRecv, called by net.lua) is written
 --                 to tpf2mp_cursors_in_<me>.txt with its colour.
 -- The two Lua states share nothing but files, which is why a cursor passes through
 -- both of them.
+--
+-- MOTION (2026-09-10, second pass). Reports arrive at the script tick rate, about
+-- five a second. Moving a circle straight to each report was jumpy, and gliding
+-- quickly toward the newest one still went stop-and-go. A circle is now drawn
+-- K.CURSOR_DELAY_S in the past and interpolated between the two reports around
+-- that moment, the way games draw remote players: steady motion for a small,
+-- fixed delay.
+-- SIZE. The radius follows the camera distance continuously (1% steps), so a circle
+-- keeps its size on screen through a zoom instead of stepping.
 return function(CM, K, log)
 K.CURSOR_MOVE_M = 0.5        -- metres the cursor must move before it is sent again
 K.CURSOR_KEEPALIVE_S = 3     -- a cursor that stays still is re-sent this often
 K.CURSOR_STALE_S = 8         -- a peer's cursor not heard for this long is taken down
-K.CURSOR_SEGMENTS = 20       -- points per circle
-K.CURSOR_SMOOTH_S = 0.08     -- a drawn circle closes 63% of the gap to the reported spot in this long
-K.CURSOR_SNAP_M = 300        -- a report farther than this from the circle is jumped to, not glided to
+K.CURSOR_SEGMENTS = 24       -- points per circle
+K.CURSOR_DELAY_S = 0.25      -- circles are drawn this far behind the reports, interpolated between them
+K.CURSOR_GAP_S = 0.5         -- a report after a pause this long starts moving 0.2 s before it, not across the pause
+K.CURSOR_SNAP_M = 300        -- consecutive reports farther apart than this are a jump, not a glide
 K.CURSOR_IO_FRAMES = 3       -- GUI frames between file reads and writes (20 a second at 60 fps)
+K.CURSOR_SCREEN = 0.02       -- circle radius as a share of the camera distance
 
 function CM.cursorFile(me) return K.BASE .. "tpf2mp_cursor_" .. tostring(me) .. ".txt" end
 function CM.cursorsInFile(me) return K.BASE .. "tpf2mp_cursors_in_" .. tostring(me) .. ".txt" end
@@ -126,6 +134,7 @@ end
 -- and it is not documented, so the call shape is found at run time and logged:
 -- no argument first; the mouse position as the argument if that raises, or if it
 -- has returned nothing for a while. A shape that raises is not called again.
+-- (Measured 2026-09-10: the no-argument call works.)
 local function terrainPos()
 	local g = game and game.gui
 	if not g or CM.curShape == "none" then return nil end
@@ -174,8 +183,9 @@ local function terrainPos()
 	return x, y, z
 end
 
--- Circle radius in metres: about 2% of the camera distance, so a circle reads the
--- same size on screen at any zoom. Quantised, so a steady camera redraws nothing.
+-- Circle radius in metres: K.CURSOR_SCREEN of the camera distance, so a circle keeps
+-- its size on screen at any zoom. 1% steps: a zoom redraws smoothly, a still camera
+-- redraws nothing. (getCamera()[3] is the distance: 230 m logged on a default view.)
 local function cursorRadius()
 	local d
 	pcall(function()
@@ -188,15 +198,15 @@ local function cursorRadius()
 		print("[ls-gui] cursors: camera distance " .. tostring(d))
 	end
 	if not d or d <= 0 then return 12 end
-	local r = d * 0.02
-	if r < 4 then r = 4 elseif r > 200 then r = 200 end
-	if r < 20 then return math.floor(r + 0.5) end
-	return 5 * math.floor(r / 5 + 0.5)
+	local r = d * K.CURSOR_SCREEN
+	if r < 0.5 then r = 0.5 elseif r > 2000 then r = 2000 end
+	return math.exp(math.floor(math.log(r) / 0.01 + 0.5) * 0.01)
 end
 
 -- The files, every K.CURSOR_IO_FRAMES frames: ours out, theirs in. A file caught
--- mid-write (no closing "end") keeps the last complete set.
-local function cursorIo(me)
+-- mid-write (no closing "end") changes nothing. Each new reported spot becomes a
+-- sample on that player's track, stamped with the time we saw it.
+local function cursorIo(me, clk)
 	local x, y, z = terrainPos()
 	local line = x and string.format("%.1f %.1f %.1f", x, y, z) or "off"
 	if line ~= CM.curOut then
@@ -204,18 +214,60 @@ local function cursorIo(me)
 		if f then f:write(line .. "\n"); f:close(); CM.curOut = line end
 	end
 	local f = io.open(CM.cursorsInFile(me), "r")
-	if f then
-		local body = f:read("*a") or ""
-		f:close()
-		if body:find("\nend") then
-			local set = {}
-			local num = "(%-?[%d%.]+)"
-			for o, cx, cy, _, w, r, g, b in body:gmatch("(%a+) " .. num .. " " .. num .. " " .. num .. " (%d+) ([%d%.]+) ([%d%.]+) ([%d%.]+)") do
-				set[o] = { x = tonumber(cx), y = tonumber(cy), wall = tonumber(w), r = tonumber(r), g = tonumber(g), b = tonumber(b) }
+	if not f then return end
+	local body = f:read("*a") or ""
+	f:close()
+	if not body:find("\nend") then return end
+	local set = {}
+	local num = "(%-?[%d%.]+)"
+	for o, cx, cy, _, w, r, g, b in body:gmatch("(%a+) " .. num .. " " .. num .. " " .. num .. " (%d+) ([%d%.]+) ([%d%.]+) ([%d%.]+)") do
+		set[o] = { x = tonumber(cx), y = tonumber(cy), wall = tonumber(w), r = tonumber(r), g = tonumber(g), b = tonumber(b) }
+	end
+	CM.curTracks = CM.curTracks or {}
+	for o, c in pairs(set) do
+		local tr = CM.curTracks[o]
+		if not tr then
+			-- a new circle appears at once, where it was reported
+			tr = { samples = { { t = clk - K.CURSOR_DELAY_S, x = c.x, y = c.y } } }
+			CM.curTracks[o] = tr
+		else
+			local s = tr.samples
+			local last = s[#s]
+			if last.x ~= c.x or last.y ~= c.y then
+				local dx, dy = c.x - last.x, c.y - last.y
+				if dx * dx + dy * dy > K.CURSOR_SNAP_M * K.CURSOR_SNAP_M then
+					s[#s + 1] = { t = clk, x = last.x, y = last.y }
+					s[#s + 1] = { t = clk + 0.001, x = c.x, y = c.y }
+				else
+					if clk - last.t > K.CURSOR_GAP_S then
+						s[#s + 1] = { t = clk - 0.2, x = last.x, y = last.y }
+					end
+					s[#s + 1] = { t = clk, x = c.x, y = c.y }
+				end
 			end
-			CM.curPeers = set
+		end
+		tr.wall, tr.r, tr.g, tr.b = c.wall, c.r, c.g, c.b
+	end
+	-- a player no longer listed (cursor over a window, gone quiet, left) is taken down
+	for o, tr in pairs(CM.curTracks) do
+		if not set[o] then tr.gone = true end
+	end
+end
+
+-- Where a track stands at time rt: interpolated between the two samples around it.
+local function trackAt(s, rt)
+	if rt <= s[1].t then return s[1].x, s[1].y end
+	local n = #s
+	if rt >= s[n].t then return s[n].x, s[n].y end
+	for i = 2, n do
+		local b = s[i]
+		if rt <= b.t then
+			local a = s[i - 1]
+			local u = (b.t > a.t) and (rt - a.t) / (b.t - a.t) or 1
+			return a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u
 		end
 	end
+	return s[n].x, s[n].y
 end
 
 -- GUI update, every frame.
@@ -223,61 +275,42 @@ function CM.cursorGuiTick()
 	if not K.INSTANCE then pcall(CM.detectInstance) end
 	local me = K.INSTANCE
 	if not me or not K.BASE then return end
+	-- os.clock is wall time on Windows (the CRT's clock()); without it, frames at 60 fps
+	local clk
+	if os and os.clock then clk = os.clock() else CM.curFakeClk = (CM.curFakeClk or 0) + 1 / 60; clk = CM.curFakeClk end
 	CM.curFrame = (CM.curFrame or 0) + 1
-	if CM.curFrame % K.CURSOR_IO_FRAMES == 1 then cursorIo(me) end
+	if CM.curFrame % K.CURSOR_IO_FRAMES == 1 then cursorIo(me, clk) end
 	local gi = game and game.interface
-	if not gi then return end
-	-- os.clock is wall time on Windows (the CRT's clock()), which is what a glide needs;
-	-- no other GUI-state code uses it, so a missing one falls back to one 60 fps frame
-	local clk = (os and os.clock) and os.clock() or nil
-	local dt = clk and (clk - (CM.curClk or clk)) or (1 / 60)
-	CM.curClk = clk
-	if dt < 0 then dt = 0 elseif dt > 0.25 then dt = 0.25 end
-	local k = 1 - math.exp(-dt / K.CURSOR_SMOOTH_S)
+	if not gi or not CM.curTracks then return end
 	local now = os.time()
 	local radius = cursorRadius()
-	CM.curDrawn = CM.curDrawn or {}
-	for o, c in pairs(CM.curPeers or {}) do
-		if o ~= me and c.wall and now - c.wall <= K.CURSOR_STALE_S then
-			local d = CM.curDrawn[o]
-			if not d then
-				d = { x = c.x, y = c.y }
-				CM.curDrawn[o] = d
-			else
-				local ex, ey = c.x - d.x, c.y - d.y
-				local e2 = ex * ex + ey * ey
-				if e2 > K.CURSOR_SNAP_M * K.CURSOR_SNAP_M or e2 < 0.0025 then
-					d.x, d.y = c.x, c.y
-				else
-					d.x, d.y = d.x + ex * k, d.y + ey * k
-				end
-			end
-			-- centimetres: coarser, and the last few centimetres of a glide (and its
-			-- final snap onto the report) would never be drawn
-			local sig = string.format("%.2f %.2f %d %.2f %.2f %.2f", d.x, d.y, radius, c.r, c.g, c.b)
-			if d.sig ~= sig then
+	local rt = clk - K.CURSOR_DELAY_S
+	for o, tr in pairs(CM.curTracks) do
+		local s = tr.samples
+		if o == me or tr.gone or not tr.wall or now - tr.wall > K.CURSOR_STALE_S then
+			if tr.drawn then pcall(function() gi.setZone("mpcursor_" .. o, nil) end) end
+			CM.curTracks[o] = nil
+		else
+			while #s > 2 and s[2].t < rt - 1.0 do table.remove(s, 1) end
+			local px, py = trackAt(s, rt)
+			-- centimetres: coarser, and the end of a glide would never be drawn
+			local sig = string.format("%.2f %.2f %.3f %.2f %.2f %.2f", px, py, radius, tr.r, tr.g, tr.b)
+			if tr.sig ~= sig then
 				local poly = {}
 				for i = 1, K.CURSOR_SEGMENTS do
 					local a = (i - 1) * 2 * math.pi / K.CURSOR_SEGMENTS
-					poly[i] = { d.x + radius * math.cos(a), d.y + radius * math.sin(a) }
+					poly[i] = { px + radius * math.cos(a), py + radius * math.sin(a) }
 				end
 				local ok, err = pcall(function()
-					gi.setZone("mpcursor_" .. o, { polygon = poly, draw = true, drawColor = { c.r, c.g, c.b, 0.8 } })
+					gi.setZone("mpcursor_" .. o, { polygon = poly, draw = true, drawColor = { tr.r, tr.g, tr.b, 0.8 } })
 				end)
 				if ok then
-					d.sig = sig
+					tr.sig, tr.drawn = sig, true
 				elseif not CM.curZoneErr then
 					CM.curZoneErr = true
 					print("[ls-gui] cursors: game.interface.setZone raised: " .. tostring(err))
 				end
 			end
-		end
-	end
-	for o in pairs(CM.curDrawn) do
-		local c = CM.curPeers and CM.curPeers[o]
-		if not c or o == me or not c.wall or now - c.wall > K.CURSOR_STALE_S then
-			pcall(function() gi.setZone("mpcursor_" .. o, nil) end)
-			CM.curDrawn[o] = nil
 		end
 	end
 end
