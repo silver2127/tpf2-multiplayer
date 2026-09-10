@@ -175,7 +175,8 @@ Not replicated, so not tested: vehicle stop/start, manual departure, maintenance
 - [ ] **T2** The host pausing pauses both; the host pressing play resumes both.
 - [ ] **T3** `/speed 2.5` in the chat runs everyone at 2.5x; a host speed button pressed afterwards
   takes over; `/speed off` returns to the host's buttons.
-- [ ] **T4** In steady play a follower's speed row says `in step with the leader`.
+- [ ] **T4** In steady play, with the window's **speed** toggle on (the row starts hidden), a follower's
+  speed row says `in step with the leader`.
 - [ ] **T5** After a pause and unpause, the stats' skew is close to 0.
 - [ ] **T6** A much slower PC, or a heavier save on one side: that game catches up (`catching up`)
   instead of falling further behind.
