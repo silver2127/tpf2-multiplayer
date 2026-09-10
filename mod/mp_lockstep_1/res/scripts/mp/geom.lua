@@ -120,7 +120,14 @@ local function netNodes(isTrack)
 	local key = isTrack and "t" or "s"
 	if geomCache and geomCache.nodes[key] then return geomCache.nodes[key] end
 	local list = {}
-	for nid, _ in pairs(netMap(isTrack) or {}) do
+	-- HOLD THE MAP IN A LOCAL for the whole loop. The map is a C++ container
+	-- owned by its Lua userdata; iterating a bare pairs(netMap(...)) leaves
+	-- nothing referencing it, a GC step inside the loop (edgeGeomT and every
+	-- getComponent allocate) frees it, and the next step walks freed tree
+	-- nodes: a native access violation, no pcall can catch it (track build
+	-- and depot replay crashes, 2026-09-10 16:25 and 16:27).
+	local m = netMap(isTrack)
+	for nid, _ in pairs(m or {}) do
 		local nc = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
 		if nc and nc.position then
 			local pp = nc.position
@@ -134,7 +141,8 @@ local function netEdges(isTrack)
 	local key = isTrack and "t" or "s"
 	if geomCache and geomCache.edges[key] then return geomCache.edges[key] end
 	local list, seen = {}, {}
-	for _, lst in pairs(netMap(isTrack) or {}) do
+	local m = netMap(isTrack)   -- held for the loop: see netNodes
+	for _, lst in pairs(m or {}) do
 		for _, eid in pairs(lst) do
 			if not seen[eid] then
 				seen[eid] = true
@@ -288,7 +296,8 @@ local function findEdgeContaining(isTrack, x, y, skipNode, eps)
 		for _, e in ipairs(netEdges(isTrack)) do consider(e[1], e[2], e[3], e[4], e[5], e[6]) end
 	else
 		local seen = {}
-		for _, list in pairs(netMap(isTrack) or {}) do
+		local m = netMap(isTrack)   -- held for the loop: see netNodes
+		for _, list in pairs(m or {}) do
 			for _, eid in pairs(list) do
 				if not seen[eid] then
 					seen[eid] = true
