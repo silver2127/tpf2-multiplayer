@@ -41,14 +41,6 @@ observed in play.
   socket hears several senders; each change of sender resets its sequence state, so the link's
   ordering, de-duplication and chunk reassembly cannot be relied on and recovery falls to the mod's
   NACK layer.
-- **`BuyVehicle` is hooked twice.** The bridge's diagnostic buy probe and the slice both patch
-  `0x9dca00` from separate init threads; whichever comes second finds the other's jump, and the bridge
-  logs `REFUSING to patch` when it loses. The probe's output (`tpf2_buy_<L>.txt`) has no reader;
-  `buy_hook=0` in `tpf2_bridge_mp.cfg` removes it.
-- **`/pid` text starting with a digit blinds every bridge** *(from the code)*. The menu writes
-  `pid=<text>` into `tpf2_bridge_ctl.txt` after the bridge's own `pid=<process id>`, and a bridge that
-  reads a numeric `pid=` that is not its own ignores the whole file (including a later letter or peer
-  change).
 - **With no `tpf2_slice.cfg` at all, construction cancels are off** while the shipped file has
   `cancel_construction=1`: the slice's built-in list of "shipped" switches omits it.
 - **Only one instance per Windows session gets the slice hooks.** A second, un-sandboxed game in the

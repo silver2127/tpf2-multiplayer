@@ -126,6 +126,9 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 - **Lobby self-tests**: [NETWORKING.md](NETWORKING.md#self-tests); `python tools\relay_selftest.py` for
   the relay.
 - **Installer**: `installer\test_upgrade.ps1` ([installer/README.md](../installer/README.md#testing-an-upgrade)).
+- **Pacing**: `python tools\pacing_sim.py [--ref <git ref>] [--only <scenario>]` runs the mod's real
+  `pacing.lua` in a closed-loop simulation of several games (scenarios `far_ahead`, `hot_join_1x`,
+  `hot_join_2x`, `live_start`, `speed_drop`) and compares with a git ref (default `HEAD`).
 - **Soak test.** `powershell -File tools\soak.ps1` grades a live session against assertions:
   - Modes: attach to running games (default); `-Launch [-Deploy] [-Players N]` starts the rig first;
     `-AssertOnly` grades without acting; `-FromSnapshot <dir|latest>` grades saved logs; `-Manual` waits
@@ -213,8 +216,3 @@ Settings: [CONFIGURATION.md](CONFIGURATION.md#tpf2mpcfg-and-plugin-settings).
 | `tools/collect_logs.cmd` | for bug reports: double-click it; it zips the data folder, the game-folder and lobby logs, game stdout, recent crash dumps and a system summary into Downloads ([PLAYING.md](PLAYING.md#when-something-goes-wrong)) |
 | `tools/input.ps1`, `tools/screenshot.ps1` | input and screenshot helpers for driving and checking the game |
 | `tools/segment_heap.ps1` | toggles the Segment Heap setting ([installer/README.md](../installer/README.md#segment-heap)) |
-| `tools/gt_correlate.ps1` | ground-truth correlator ([re/README.md](re/README.md#ground-truth-sweeps)); pass `-Log`, its default path is from the old layout |
-| `tools/install_proxy.ps1` | stale: requires the old workshop output folder. The MSI installs the proxy; `-Uninstall` still reverts a manual install. |
-| `tools/install_portable.ps1` | superseded by the MSI. It stages `netpunch.exe` into `%LOCALAPPDATA%\tpf2mp\netpunch\`, where it then shadows the installed lobby, and its Python fallback lacks `seal.py` and `mesh.py`. |
-| `tools/mp_menu.ps1` | broken: its buttons run `tools/mp_launch.ps1`, which no longer exists |
-| `tools/make_mod_image.py` | broken: imports the logo drawing module from `tools/`, which moved to `docs/logo/` |

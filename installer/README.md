@@ -28,7 +28,7 @@ same message.
 | `tpf2_bridge_mp.dll` | Instance identity, the loopback link to the lobby, and the sim-loop and game-speed hooks. |
 | `tpf2_slice.dll` | Captures and cancels the player's commands. |
 | `tpf2_menu.dll` | The Multiplayer panel on the title menu and the lobby launcher. |
-| `tpf2_bridge_mp.cfg`, `tpf2_slice.cfg` | Settings, with comments. See [docs/CONFIGURATION.md](../docs/CONFIGURATION.md). |
+| `tpf2_slice.cfg` | Optional diagnostic settings, all commented out; multiplayer needs none. See [docs/CONFIGURATION.md](../docs/CONFIGURATION.md). |
 | `netpunch\netpunch.exe` | The lobby. |
 | `mods\mp_lockstep_1\` | The game-script mod. |
 
@@ -132,11 +132,10 @@ Install the new MSI over the old one; there is no need to uninstall first.
   also replaces the installed one. Downgrades are refused ("A newer version of TpF2 Multiplayer is already
   installed. Uninstall it first.").
 - **`alut.dll` is never wrapped twice** (see above).
-- **The cfg files are replaced** with the shipped ones on every upgrade and Repair; edits to the copies in
-  the game folder are not kept. (They used to be marked NeverOverwrite, which made an upgrade delete them
-  outright.) The DLLs read a copy in `%LOCALAPPDATA%\tpf2mp\data\` only when the game folder has none, so
-  to keep your own settings either re-apply them after upgrading, or delete the game-folder copy after each
-  upgrade and keep yours in the data folder.
+- **`tpf2_slice.cfg` is replaced** with the shipped one on every upgrade and Repair. It holds only optional
+  diagnostics, so nothing that matters is lost; to keep a diagnostic switched on across upgrades, keep your
+  copy in `%LOCALAPPDATA%\tpf2mp\data\` and delete the game-folder copy. An old `tpf2_bridge_mp.cfg`, if one
+  is left behind, is ignored: the bridge has no settings.
 - **Runtime data is untouched.**
 
 `installer\VERSION` is the version stamped into the package. Bump it for every release.
@@ -221,7 +220,7 @@ With TpF2 Big Maps installed the first check fails, because the proxy then has a
 | `ca\tpf2ca.cpp`, `ca\build_ca.bat` | the custom actions: game-folder check, preserve/rollback/restore of `alut.dll` |
 | `build_msi.ps1` | the build script |
 | `test_upgrade.ps1` | the install/upgrade/uninstall test |
-| `cfg\tpf2_bridge_mp.cfg`, `cfg\tpf2_slice.cfg` | the shipped settings files |
+| `cfg\tpf2_slice.cfg` | the shipped settings file (optional diagnostics, all commented out) |
 | `cfg\tpf2mp.cfg` | the plugin host's settings file, for reference (not packaged) |
 | `VERSION` | the version stamped into the package |
 | `License.rtf` | the MIT license shown by the wizard |

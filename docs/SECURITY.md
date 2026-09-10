@@ -28,10 +28,9 @@ and `native/src/menu_hook.cpp`.
 - **Inputs are sanitised before they become process arguments.** The pasted code must be
   base32; player names and passwords are limited to letters, digits and `-_.`; the logged
   command line masks the password.
-- **The game's sockets answer only this PC.** The bridge DLL's UDP socket is bound to 127.0.0.1
+- **The game's socket answers only this PC.** The bridge DLL's UDP socket is bound to 127.0.0.1
   whenever its peer is on this PC, which every lobby session arranges, and it drops any datagram
-  that does not come from its peer's address. The pre-lobby TCP save server is off unless
-  `save_server=1`, and then answers only the peer address.
+  that does not come from its peer's address. The DLLs open no other listening socket.
 - **Construction settings from other players stay data.** The mod reads them with Lua's `load` in
   an empty environment, so a crafted string cannot reach `io` or `os`.
 - **Log volume is capped.** A host accepts at most 8 forwarded-log messages per second, 64

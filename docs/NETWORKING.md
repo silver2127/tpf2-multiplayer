@@ -22,7 +22,6 @@ own lobby process over loopback; the lobbies carry the frames between machines.
 | lobby | UDP 29471 on the host | The one port a host must be reachable on. Joiners bind an ephemeral port and only dial out. |
 | game relay | UDP `127.0.0.1:7773` (host) / first free of 7774-7805 (joiners) | The bridge sends its frames here; the lobby delivers inbound frames to the bridge's own port. Loopback only. |
 | bridge | UDP `127.0.0.1:7771` (or 7772, or a fallback) | The `port=` line of `tpf2_instance.txt` in the data folder. Bound to loopback, and it drops datagrams that are not from its peer ([SECURITY.md](SECURITY.md#what-is-protected)). |
-| legacy save server | TCP 7871, off | The bridge's pre-lobby save transfer, replaced by the lobby's. Runs only with `save_server=1`, on the instance with letter `a`, and answers its peer only. |
 | STUN | outbound UDP 19302 / 3478 | `stun.l.google.com`, `stun.nextcloud.com`, `stun.cloudflare.com`, `stun.services.mozilla.com`. |
 | master server | outbound HTTPS | The public game list; see [Master server](#master-server). |
 | dedicated relay | UDP 29471 on the server | Same protocol as a host. |
@@ -93,8 +92,8 @@ number, acknowledgement and a 32-bit acknowledgement bitmap, type 0 keepalive or
 events, a 1,029-byte body (chunk index, chunk count, up to 1,024 bytes of text). An event packet is
 always 1,050 bytes, well under the lobby's 1,400-byte frame limit. Unacknowledged packets are resent
 every 250 ms; with more than 512 pending the backlog is dropped; a peer is considered gone after
-10 s of silence. Without a lobby (two instances on one machine, `peer_ip=127.0.0.1`) two bridges
-can also talk to each other directly on 7771/7772.
+10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
+other directly.
 
 ## Lobby protocol
 
@@ -295,4 +294,3 @@ python ..\tools\relay_selftest.py     # real processes, dedicated relay (needs i
 
 `punch.py`, `connect.py` and `observe.py` also run standalone (a two-player punch test, the
 original two-player connect CLI, and a printout of this machine's connectivity profile).
-`swarm.py` is an unused experiment (peer-to-peer piece distribution of the save).

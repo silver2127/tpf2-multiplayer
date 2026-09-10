@@ -24,6 +24,7 @@ Time: the smoke test takes about 15 minutes; everything, about three hours.
 ## Automated checks first
 
 - [ ] `python tools\luacheck.py` passes (every Lua file parses).
+- [ ] `python tools\pacing_sim.py`, if pacing changed: every scenario passes.
 - [ ] `native\build.bat all` builds.
 - [ ] `powershell -File tools\pscheck.ps1`, if a PowerShell script changed.
 - [ ] The lobby self-tests, if `netpunch/` changed ([NETWORKING.md](NETWORKING.md#self-tests)), and
@@ -203,9 +204,9 @@ Not replicated, so not tested: vehicle stop/start, manual departure, maintenance
   `port=` line of `%LOCALAPPDATA%\tpf2mp\data\tpf2_instance.txt`, then
   `Get-NetUDPEndpoint -LocalPort <port> | Select-Object LocalAddress` shows `127.0.0.1`, never `0.0.0.0`.
 - [ ] **X2** `Get-NetTCPConnection -State Listen -LocalPort 7871 -ErrorAction SilentlyContinue` shows
-  nothing, and the host's `tpf2_bridge.log` says `save server off`.
+  nothing (the old save server is gone).
 - [ ] **X3** Two, three and four games on one PC each get their own port and replicate (S3-S6).
-- [ ] **X4** The `[simhook]` lines in `tpf2_bridge.log` show `strangers=0` in a normal session.
+- [ ] **X4** In a normal session, no `[net]` line in `tpf2_bridge.log` shows `strangers=` above 0.
 - [ ] **X5** B8 passes: construction parameters from other players still load.
 
 ## D: player-facing tools

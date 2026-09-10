@@ -232,10 +232,8 @@ so a factory hook sees only the UI's use of them. The other makers are sol2 wrap
 [static; not re-verified live]
 
 The slice also hooks `CommandList::Add` itself (hook id 1, steal 18: eight pushes plus
-`lea rbp,[rsp-0x78]`, stopping short of a RIP-relative load). The bridge DLL's diagnostic buy probe
-patches `BuyVehicle` `0x9dca00` too (steal 15, prologue `48 8B C4 55 41 54 41 57 48 8D A8 28 F5 FF FF`);
-the two DLLs initialise on separate threads, and whichever patches second finds a jump where the
-prologue was (the bridge then refuses).
+`lea rbp,[rsp-0x78]`, stopping short of a RIP-relative load). `BuyVehicle` `0x9dca00` starts with
+`48 8B C4 55 41 54 41 57 48 8D A8 28 F5 FF FF` (steal 15).
 
 ### Argument ABI
 
