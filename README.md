@@ -38,7 +38,9 @@ an empty value hides the list.
 (`lobby.py host --relay-only`, deployed to the VPS by `tools/relay_deploy.sh` as
 the `tpf2mp-relay` service, always listed in PUBLIC GAMES). Everyone joins it;
 the first player in is the leader and gets the host role. If the relay already
-holds a world it is continued automatically; otherwise START GAME uploads the
+holds a world it is continued automatically after 10 s (say `/new` in chat
+within that time to discard it and share your own save with START GAME
+instead; `tools/relay_put_save.sh <save>` replaces it from a shell); otherwise START GAME uploads the
 leader's newest save to the relay, which pushes it to everyone waiting. Hot
 joiners get the same treatment, and the leader re-uploads every 10 minutes so
 the relay's copy stays fresh. Letters are assigned by the relay and stick to
