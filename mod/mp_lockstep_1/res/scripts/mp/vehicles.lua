@@ -328,11 +328,13 @@ function CM.shipParkedBuys()
 			expectVehicle(K.INSTANCE .. ":" .. tostring(CM.seqNo), pb.depot, nil, found)
 			log(string.format("VBUY: shipped once vehicle %d existed, purchaseTime=%s (%.1f s after the click)",
 				found, tostring(pt), now - pb.since))
+			pcall(CM.cmColorNewVehicle, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 			table.remove(CM.parkedBuys, i)
 		elseif now - pb.since > 1.5 then
 			CM.scheduleLocal("VBUY", pb.args)
 			expectVehicle(K.INSTANCE .. ":" .. tostring(CM.seqNo), pb.depot)
 			log("VBUY: no new vehicle seen in the depot within 1.5 s -- shipped without purchaseTime")
+			pcall(CM.cmColorNewVehicle, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 			table.remove(CM.parkedBuys, i)
 		else
 			i = i + 1

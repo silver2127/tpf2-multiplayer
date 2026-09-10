@@ -326,6 +326,34 @@ function CM.cmSwapWallets(p1, p2)
 	return true, b1, l1, b2, l2
 end
 function CM.cmNote(s) CM.cmLastNote = s; log("company: " .. s) end
+-- The company's colour, 0..1 RGB: the same six fixed colours and golden-angle
+-- hue walk the lobby chips use (menu_hook.cpp coColor), so a vehicle's paint
+-- matches the chip its owner shows in the roster.
+CM.CM_COLORS = { {220,80,80}, {80,140,230}, {90,190,110}, {230,180,60}, {180,100,220}, {80,200,200} }
+function CM.cmCompanyColor(cid)
+	cid = tonumber(cid) or 1
+	local c = CM.CM_COLORS[cid]
+	if c then return c[1] / 255, c[2] / 255, c[3] / 255 end
+	local h = ((cid - 7) * 137.508) % 360
+	local sat, val = 0.62, 0.85
+	local C = val * sat
+	local X = C * (1 - math.abs((h / 60) % 2 - 1))
+	local m = val - C
+	local r, g, b
+	if h < 60 then r, g, b = C, X, 0 elseif h < 120 then r, g, b = X, C, 0 elseif h < 180 then r, g, b = 0, C, X
+	elseif h < 240 then r, g, b = 0, X, C elseif h < 300 then r, g, b = X, 0, C else r, g, b = C, 0, X end
+	return r + m, g + m, b + m
+end
+-- A vehicle we just bought gets our company's colour on every instance: one
+-- replicated VCOLOR against the vehicle's shared key, a few units after the
+-- buy so the key has bound on every peer (it binds when the vehicle appears).
+function CM.cmColorNewVehicle(key)
+	if not CM.cfgFlag("company_colors", true) then return end
+	if CM.cmMode ~= "companies" or not CM.cmMyCompany then return end
+	local r, g, b = CM.cmCompanyColor(CM.cmMyCompany)
+	CM.scheduleLocal("VCOLOR", { kind = "veh", key = key, r = r, g = g, b = b, delay = 3 })
+	log(string.format("company: vehicle %s painted in company %d's colour (%.2f,%.2f,%.2f)", tostring(key), CM.cmMyCompany, r, g, b))
+end
 -- Company passwords. The wire and every peer only ever see a salted hash
 -- (same function everywhere, so the accept/refuse decision is identical on
 -- every machine); the clear text stays in the inject file on the typist's
