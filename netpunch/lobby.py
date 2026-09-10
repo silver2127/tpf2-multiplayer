@@ -1359,7 +1359,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.9"
+LOBBY_VERSION = "0.4.10"
 PUBLISH_EVERY = 30.0
 
 
@@ -1513,8 +1513,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return None
 
     def leader_name():
+        """The roster's ``host``: this lobby's host, unless we are a relay --
+        then the oldest joiner. (0.4.5-0.4.9 returned the oldest joiner for
+        EVERY lobby, so a plain HOST GAME told the joiner it was the host and
+        both sides derived the wrong letters; nobody could connect.)"""
+        if not relay_only:
+            return host_name
         a = leader_addr()
-        return peers[a]["name"] if a is not None else (host_name if not relay_only else "")
+        return peers[a]["name"] if a is not None else ""
 
     def letter_for(name):
         if name not in letters:
