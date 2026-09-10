@@ -419,6 +419,53 @@ function CM.cmGoLive()
 	end
 	CM.cmLive = true
 end
+-- VEHICLES IN A SWAP (2026-09-10). A vehicle on a line takes its owner from its
+-- line, and setPlayer on the vehicle itself raises an engine assert
+-- (interface.cpp:2340, a crash dump each): one "new company" on a big fleet fired
+-- 98 of them and froze the host. So a vehicle whose line is handed over in the
+-- same list is not called -- it moves with its line -- and CM.cmVehRecheck looks
+-- again a few seconds later and hands over directly any that did not arrive.
+-- Everything else, a vehicle without a line or on a line that is not moving
+-- included, is handed over directly as before.
+function CM.cmHandOver(list, to)
+	local lines = {}
+	for _, eid in ipairs(list) do
+		pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.LINE) then lines[eid] = true end end)
+	end
+	CM.cmVehPending = CM.cmVehPending or {}
+	for _, eid in ipairs(list) do
+		local lid = nil
+		pcall(function()
+			local tv = api.engine.getComponent(eid, api.type.ComponentType.TRANSPORT_VEHICLE)
+			if tv and tv.line and tv.line ~= -1 and tv.line ~= 0 then lid = tv.line end
+		end)
+		if lid and lines[lid] then
+			CM.cmVehPending[#CM.cmVehPending + 1] = { eid = eid, to = to }
+		else
+			pcall(function() game.interface.setPlayer(eid, to) end)
+		end
+	end
+	CM.cmVehPendingAt = CM.ticks or 0
+end
+-- About four seconds after a swap: every vehicle left to follow its line either
+-- has the new owner or is handed over directly now.
+function CM.cmVehRecheck()
+	local p = CM.cmVehPending
+	if not p or #p == 0 then CM.cmVehPending = nil; return end
+	if (CM.ticks or 0) - (CM.cmVehPendingAt or 0) < 20 then return end
+	CM.cmVehPending = nil
+	local direct = 0
+	for _, v in ipairs(p) do
+		local alive = false
+		pcall(function() alive = api.engine.entityExists(v.eid) end)
+		if alive and CM.cmOwnerOf(v.eid) ~= v.to then
+			pcall(function() game.interface.setPlayer(v.eid, v.to) end)
+			direct = direct + 1
+		end
+	end
+	CM.cmNote(string.format("vehicles after the switch: %d of %d moved with their lines%s", #p - direct, #p,
+		direct > 0 and string.format(", %d handed over directly", direct) or ""))
+end
 -- The hotseat swap on THIS machine: everything the human player owns goes to
 -- company cid's AI entity, cid's assets and wallet (balance + loan) come to
 -- the human, and the cid -> entity map is updated. Local representation
@@ -430,8 +477,8 @@ function CM.cmLocalSwitch(cid)
 	if not human or not ai then log("company: switch: missing player entity (me=" .. tostring(human) .. " target=" .. tostring(ai) .. ")"); return false end
 	local mine = CM.cmOwnedEntities(human)
 	local theirs = CM.cmOwnedEntities(ai)
-	for _, eid in ipairs(mine) do pcall(function() game.interface.setPlayer(eid, ai) end) end
-	for _, eid in ipairs(theirs) do pcall(function() game.interface.setPlayer(eid, human) end) end
+	CM.cmHandOver(mine, ai)
+	CM.cmHandOver(theirs, human)
 	for _, eid in ipairs(mine) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, false) end end) end
 	for _, eid in ipairs(theirs) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, true) end end) end
 	local okW, bh, lh, ba, la = CM.cmSwapWallets(human, ai)

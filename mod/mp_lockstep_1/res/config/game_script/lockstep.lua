@@ -617,6 +617,7 @@ function data()
 		update = function()
 			CM.ticks = CM.ticks + 1
 			pcall(CM.sampleSimRate)
+			if CM.cmVehPending then pcall(CM.cmVehRecheck) end   -- companies: vehicles left to follow their lines in a switch
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
 				if not CM.detectInstance() then return end
 				-- a save's company state (load hook) is applied here, on the sim
