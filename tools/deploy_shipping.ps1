@@ -57,9 +57,9 @@ Get-ChildItem "$Repo\native\out\tpf2_slice*.dll" -EA SilentlyContinue |
     ForEach-Object { Write-Warning "[ship] $($_.Name) is NEWER than tpf2_slice.dll and will NOT be shipped -- rebuild without a suffix if that is the one you want" }
 Put $sliceSrc                             (Join-Path $Game 'tpf2_slice.dll')
 Put "$Repo\native\out\tpf2_pluginhost.dll"   (Join-Path $Game 'tpf2_pluginhost.dll')
-# The cfgs are LIVE settings read next to the DLL: a line that exists only in the
-# game-dir copy (cancel_construction=1 was one, 2026-09-09) is lost when the
-# shipped copy is put over it. An existing cfg is left alone unless -Cfg.
+# The cfgs are settings read next to the DLLs (tpf2_slice.cfg's diagnostics and
+# exec_delay, tpf2mp.cfg's plugin settings): an existing copy is left alone
+# unless -Cfg, so a local setting is not lost to the shipped defaults.
 foreach ($c in "tpf2_slice.cfg", "tpf2mp.cfg") {
     $dst = Join-Path $Game $c
     if ($Cfg -or -not (Test-Path $dst)) { Put "$Repo\installer\cfg\$c" $dst }

@@ -575,7 +575,7 @@ function CM.execDemolish(c)
 		-- originator bulldozes natively at click, the peer replays here ~a few
 		-- game-units later, so the balance moves at different sim-times and any
 		-- refund difference is a lasting coop money gap (measured 2026-09-02: two
-		-- depot demolishes opened a ~175k split). A STRICT one (strict_condemo)
+		-- depot demolishes opened a ~175k split). A STRICT one (CDEMO)
 		-- lands this same bulldoze on every instance at the stamp, originator
 		-- included, so the refund is simultaneous. The measurement stays for
 		-- both, so the log shows which case this was.

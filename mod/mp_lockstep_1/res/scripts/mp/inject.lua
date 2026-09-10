@@ -395,7 +395,7 @@ function CM.pollInject()
 					log("inject: bad ROADE line: " .. line:sub(1, 70))
 				end
 			elseif o == "CONUP" and #w >= 4 then
-				-- A CANCELLED construction upgrade (slice strict_module): the old
+				-- A CANCELLED construction upgrade: the old
 				-- entity id and the new CE's file/params, walked off the proposal.
 				-- The entity still stands (the upgrade was cancelled), so resolve
 				-- it to its position here; strict=1 makes execConU run on this
@@ -443,7 +443,7 @@ function CM.pollInject()
 					log("inject: bad CONUP line: " .. line:sub(1, 70))
 				end
 			elseif o == "STOPX" and #w >= 10 then
-			-- A CANCELLED stop / signal / waypoint placement (slice cfg strict_stops):
+			-- A CANCELLED stop / signal / waypoint placement:
 			-- decoded off the tool's PROPOSAL by the slice (StashStopFromProposal) and
 			-- written only once the cancel landed, ARMED 1 ahead of it. The native
 			-- build never happened, so the edge id is still ours and the object stands
@@ -505,8 +505,8 @@ function CM.pollInject()
 			end
 
 			elseif o == "CONXP" and #w >= 3 then
-				-- The construction HALF of a CANCELLED placement (slice cfg
-				-- cancel_construction): its params walked off the PROPOSAL by the
+				-- The construction HALF of a CANCELLED placement: its params walked
+				-- off the PROPOSAL by the
 				-- slice (StashConxpFromProposal) and written only once the cancel
 				-- landed. There is no entity to poll -- the native build never
 				-- happened -- so this takes the seat the entity poll would have
@@ -706,7 +706,7 @@ function CM.pollInject()
 						local k = CM.vehKeyFor(depot)
 						if k then
 							log(string.format("VREPL: %s, %d part(s): %s", k, #parts, enc[1]:sub(1, 60)))
-							-- armed=1: the slice cancelled it (strict_replace) and the
+							-- armed=1: the slice cancelled it and the
 							-- originator replays at the stamp too; 0: it ran natively.
 							CM.scheduleLocal("VREPL", { veh = k,
 							                         parts = table.concat(enc, ";"),
@@ -806,7 +806,7 @@ function CM.pollInject()
 				for i = 1, n do local id = tonumber(w[2 + i]); if id then ids[#ids + 1] = id end end
 				-- Same key-binding race as VLINE: a sell right after a batch buy
 				-- finds the keys unbound and shipped NOTHING ("none shippable").
-				-- Defer and retry. STRICT (slice strict_sell, ARMED 1): the sale was
+				-- Defer and retry. STRICT (ARMED 1): the sale was
 				-- cancelled, the vehicles still stand here, and the originator
 				-- replays at the stamp like everyone else. ARMED 0: the host sold
 				-- natively already; vehKeyOf survives until forgetVehicle, so the
@@ -874,7 +874,7 @@ function CM.pollInject()
 				if k then
 					local armed = CM.lastArmed or 0
 					log(string.format("VDEPOT: %s sell=%d%s", k, sell, armed == 1 and " (strict)" or ""))
-					-- armed=1: the slice cancelled it (strict_depot) and the originator
+					-- armed=1: the slice cancelled it and the originator
 					-- replays at the stamp too; 0: it ran natively, peers only.
 					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
 				end
@@ -903,13 +903,13 @@ function CM.pollInject()
 				if lid and not CM.lineKeyOf[lid] and not CM.primedLines[lid] then CM.pollLineKeys() end
 				local lk = lid and CM.lineKeyFor(lid)
 				if lk then
-					-- Two shapes. DECODED (slice strict_line_edit): the NEW stop list
+					-- Two shapes. DECODED: the NEW stop list
 					-- came off the command itself -- the cancel means the entity
 					-- still holds the OLD one -- so build the stops string from it
 					-- exactly as lineSnapshot would, station groups resolved to
 					-- positions here while they still mean something. Name and
 					-- colour are not part of an UpdateLine; read them from the entity.
-					-- EVENT-ONLY (legacy, 2 words): the update ran natively; read the
+					-- EVENT-ONLY (2 words, the decode failed): the update ran natively; read the
 					-- whole line back as before and ship it to the peers only.
 					local nstops = tonumber(w[4])
 					if #w >= 4 and nstops and #w >= 4 + nstops * 7 then
@@ -1095,14 +1095,14 @@ function CM.pollInject()
 					end
 				end
 
-			-- CDEMO <n> <id>... -- a construction demolish the slice CANCELLED
-			-- (cfg strict_condemo). The ids are local; resolve each to its file
+			-- CDEMO <n> <id>... -- a construction demolish the slice CANCELLED.
+			-- The ids are local; resolve each to its file
 			-- and position NOW, while the construction is still standing (that
 			-- is what the cancel bought us), and ship that. strict=1 makes
 			-- execDemolish run here too and match exactly, not nearest-in-30m.
 			-- An id that is not a construction means the toRemove offset lied:
-			-- nothing is shipped for it and the construction stays put, visibly,
-			-- so the player can redo it after turning strict_condemo off.
+			-- nothing is shipped for it and the construction stays put on every
+			-- instance (the bulldoze was cancelled), so nothing diverges.
 			elseif o == "CDEMO" and #w >= 3 then
 				local cnt = tonumber(w[2]) or 0
 				for i = 1, cnt do
@@ -1123,14 +1123,14 @@ function CM.pollInject()
 							id, x, y, file))
 					else
 						log(string.format("CDEMO: id %s is not a standing construction -- NOT shipped; the "
-							.. "bulldoze was cancelled, so it is still there: redo it (or set strict_condemo=0)",
+							.. "bulldoze was cancelled, so it still stands on every instance (the slice read a wrong id: please report it)",
 							tostring(id)))
 					end
 				end
 
 			-- DEMOLISH x y
 			elseif o == "STOPXDEL" and #w >= 3 then
-			-- A CANCELLED stop / signal bulldoze (slice cfg strict_stops): the
+			-- A CANCELLED stop / signal bulldoze: the
 			-- slice named the removed edge object off the bulldozer's proposal
 			-- and cancelled the native removal, ARMED 1 ahead of this line. The
 			-- object still stands here, so its position is read off it, and the

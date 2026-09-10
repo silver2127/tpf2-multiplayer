@@ -287,9 +287,6 @@ function CM.pidPace(now, eff)
 		CM.pidI, CM.pidLastE = 0, e
 		CM.pidHold, CM.pidErr, CM.pidEff = target, e, eff
 		CM.paceInfo = string.format("%.2fx e=%+.2f far ahead", target, e)
-		CM.pidHist = CM.pidHist or {}
-		CM.pidHist[#CM.pidHist + 1] = { e = e, m = target / eff }
-		while #CM.pidHist > 60 do table.remove(CM.pidHist, 1) end
 		return target, e
 	end
 	if CM.pidFar then
@@ -324,10 +321,6 @@ function CM.pidPace(now, eff)
 	end
 	CM.pidHold, CM.pidErr, CM.pidEff = target, e, eff
 	CM.paceInfo = string.format("%.2fx e=%+.2f", target, e)
-	-- the last 60 decisions, for the in-game graph
-	CM.pidHist = CM.pidHist or {}
-	CM.pidHist[#CM.pidHist + 1] = { e = e, m = target / eff }
-	while #CM.pidHist > 60 do table.remove(CM.pidHist, 1) end
 	return target, e
 end
 K.CATCHUP_SPEED_MAX = 4    -- catch-up runs at this (or the session speed, if higher): the sim cannot keep up above the game's own 4 on real hardware; 8 felt SLOWER
@@ -504,14 +497,6 @@ function CM.paceV2(now)
 	else
 		CM.syncingTo = nil
 	end
-	-- FRACTIONAL PACING (2026-09-09). Whoever
-	-- is ahead of the slowest fresh clock runs proportionally SLOWER -- a smooth
-	-- fraction through the dither (see CM.setSpeed), never a pause pulse -- until
-	-- the gap closes: 1 unit ahead = 3/4 speed, 2 ahead = half, floor at 0.4x.
-	-- The slowest instance is the reference and runs the session speed; it is
-	-- never asked to go faster than that, since it cannot. Quantised to 0.05 so
-	-- the dither file is rewritten on real changes only. Replaces the pulses
-	-- players felt as stutter: the leader eases off and the tail catches up.
 	-- PID PACING (2026-09-09). The host runs
 	-- the session speed as set; every JOINER drives its clock to the host's by
 	-- scaling the session speed with the dither: ahead -> eases off, behind
@@ -542,11 +527,11 @@ function CM.paceV2(now)
 	end
 end
 
--- Once per tick: the peer bounds the status and dash files show (CM.slowT,
--- CM.fastT), then the session speed controller.
-function CM.applyBarrier(now)
-	local slowT, fastT = CM.peerBounds()
-	CM.slowT, CM.fastT = slowT, fastT
+-- Once per tick: the slowest peer's clock for the status and dash files
+-- (CM.slowT), then the session speed controller.
+function CM.paceTick(now)
+	local slowT = CM.peerBounds()
+	CM.slowT = slowT
 	if not CM.peerSeen then return end
 	-- A peer that has not reported recently may itself be paused or gone:
 	-- with nobody fresh there is nothing to pace against.
@@ -591,7 +576,7 @@ end
 -- LOAD GATE: is everybody in?
 --
 -- Without this the first instance to finish loading starts simulating alone,
--- because applyBarrier returns immediately while `not peerSeen` -- it will not
+-- because paceTick returns immediately while `not peerSeen` -- it will not
 -- hold against silence, which is correct once a session is running but wrong
 -- before one has started. Anything the player then does is captured, found to
 -- have no peer, and DROPPED by CM.soloDrop, while the native action still
@@ -702,7 +687,7 @@ function CM.ensureRunning()
 	-- running at speed 2" and the instance started simulating alone.
 	--
 	-- Safe despite commanding 0: ensureRunning is called UNCONDITIONALLY from
-	-- the update loop (right after applyBarrier), so it always gets a chance to
+	-- the update loop (right after paceTick), so it always gets a chance to
 	-- release. It releases on all three of: the roster filling up,
 	-- K.LOADGATE_MAX_TICKS expiring, and the player taking the lever back.
 	if not CM.loadGateReady() then

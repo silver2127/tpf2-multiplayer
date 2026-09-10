@@ -117,7 +117,7 @@ K.IDENTITY_FILE = K.BASE .. "tpf2_instance.txt"
 K.INSTANCE  = nil
 K.PEER      = nil
 -- (was: local K.CAPTURE_FILE, K.EVENTS_FILE, K.INJECT_FILE) -- fields of K now, nil until set
-local guiTick, statusWin, statusText = 0, nil, nil   -- gui-state only
+local guiTick = 0   -- gui-state only
 
 -- UNITS. getGameTime().time is NOT seconds: comparing a live reading (t=55234)
 -- against the M3 probe's day counter (day=27617) puts it at ~2 units per
@@ -152,7 +152,7 @@ CM.MAX_LEAD = 15.0
 K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- the pacer's lead reading is only as fresh as this)
 
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
--- because scheduleLocal consults it too, long before the barrier section.
+-- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
@@ -208,10 +208,10 @@ CM.injectOffset = -1
 CM.seqNo        = 0
 -- EVERY PEER, keyed by its letter. The lockstep core was written for exactly
 -- two players (one peer, letters a/b); this table is what makes N work. The
--- rules that used to read "the peer" now read over all of them: the barrier
--- holds against the SLOWEST, a command's stamp clears the FASTEST, the pacer
--- chases the fastest, and a stamp is SYNC only when every peer that reported
--- agrees. A peer is "fresh" while its last tick is within K.PEER_STALE_TICKS.
+-- rules that used to read "the peer" now read over all of them: a command's
+-- stamp clears the FASTEST, joiners pace against the leader, and a stamp is
+-- SYNC only when every peer that reported agrees. A peer is "fresh" while its
+-- last tick is within K.PEER_STALE_TICKS.
 CM.peers = {}   -- origin -> { time=, at=, hashes={[stamp]=h}, details={[stamp]=d}, streak=n }
 -- THE LEADER: the one instance that is the session clock (constant speed, the
 -- LSEFF sender, the history/NACK server, the sync-save taker). It used to be
@@ -232,24 +232,11 @@ function CM.peerFor(o)
 	if not pr then pr = { hashes = {}, details = {}, streak = 0 }; CM.peers[o] = pr end
 	return pr
 end
--- Slowest peer by the PRECISE clock, for pacing only. Falls back to the coarse
--- reading for a peer that has not sent a step yet (an older build).
--- A peer that is CATCHING UP (cu=1 on its heartbeat: a hot joiner running
--- through the command history at high speed) is not a pacing reference: it
--- would drag everyone back to its clock. It is included
--- again the moment it drops the flag, within a unit of the session.
-function CM.peerSlowPrecise()
-	local minT
-	for _, pr in pairs(CM.peers) do
-		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and not pr.cu then
-			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
-			if t and (not minT or t < minT) then minT = t end
-		end
-	end
-	return minT
-end
-
--- Fastest peer by the PRECISE clock: the pause point everyone runs to.
+-- Fastest peer by the PRECISE clock: the pause point everyone runs to. Falls
+-- back to the coarse reading for a peer that has not sent a step yet (an older
+-- build). A peer that is CATCHING UP (cu=1 on its heartbeat: a hot joiner
+-- running through the command history at high speed) is left out: it would
+-- drag everyone to its clock. It counts again the moment it drops the flag.
 function CM.peerFastPrecise()
 	local maxT
 	for _, pr in pairs(CM.peers) do
@@ -328,7 +315,6 @@ end
 local lastHashAt   = nil
 CM.myHashes     = {}         -- [stamp] = our own hash
 CM.myDetails    = {}         -- [stamp] = our own per-component breakdown
-CM.paused       = false
 CM.desyncs = 0
 
 -- The in-game dashboard (guiUpdate, a separate Lua state) can only read files,
@@ -702,7 +688,7 @@ function data()
 					CM.heartbeatCu(now) and " cu=1" or ""))
 			end
 
-			CM.applyBarrier(now)
+			CM.paceTick(now)
 			CM.ensureRunning()
 
 			-- Commands that asked to be tried again (a VLINE whose line has not
@@ -859,11 +845,12 @@ function data()
 							table.sort(locked)
 							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ",")))
 						end)
+						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
 							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
 							CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-							#CM.queue, CM.paused and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
+							#CM.queue, tonumber(sp) == 0 and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
 						-- vehicle drift: worst peer's latest mean/max, plus skipped count
 						local vd = "-"
 						if CM.vposLast then
@@ -884,9 +871,6 @@ function data()
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
 						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
-						-- outstanding= keeps the file's fields unchanged; nothing counts missing
-						-- commands for it any more, so it reads 0.
-						f:write(string.format("outstanding=%d\n", CM.dashGaps or 0))
 						local ps = {}
 						for o, pr in pairs(CM.peers) do
 							if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
@@ -905,11 +889,11 @@ function data()
 				pcall(function()
 					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
 					if f then
-						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d%s",
+						f:write(string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d",
 							math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
 							CM.slowT and string.format("%+.1f", now - CM.slowT) or "?",
 							CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-							#CM.queue, CM.paused and "  PAUSED" or ""))
+							#CM.queue))
 						f:close()
 					end
 				end)
@@ -945,9 +929,9 @@ function data()
 					end
 					CM.perfUpd, CM.perfHash = nil, nil
 				end)
-				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d paused=%s",
+				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d",
 					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
-					#CM.queue, CM.desyncs, tostring(CM.paused)))
+					#CM.queue, CM.desyncs))
 			end
 		end,
 
@@ -966,7 +950,7 @@ function data()
 		guiUpdate = function()
 			guiTick = guiTick + 1
 			if guiTick % 30 ~= 0 then return end
-			local ok = pcall(function()
+			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
 				-- (Window, Table, TextView, BoxLayout), so the dashboard is built
 				-- from those rather than one text blob: a metrics table with a
@@ -974,17 +958,14 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
-				-- The lobby's folder, the same three candidates the menu DLL tries
-				-- (resolveNetDir): %LOCALAPPDATA%\tpf2mp\netpunch, <game>\netpunch
-				-- (the CWD), then the dev checkout.
+				-- The lobby's folder, the same two candidates the menu DLL tries
+				-- (resolveNetDir): %LOCALAPPDATA%\tpf2mp\netpunch, then <game>\netpunch (the CWD).
 				function CM.netDir()
 					if CM.netDirCached ~= nil then return CM.netDirCached or nil end
 					local cands = {}
 					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
 					if ok and la then cands[#cands + 1] = la .. "/tpf2mp/netpunch" end
 					cands[#cands + 1] = "netpunch"
-					local ok2, up = pcall(os.getenv, "USERPROFILE")
-					if ok2 and up then cands[#cands + 1] = up .. "/tpf2-multiplayer/netpunch" end
 					for _, d in ipairs(cands) do
 						local f = io.open(d .. "/lobby_out.jsonl", "r")
 						if f then f:close(); CM.netDirCached = d; return d end
@@ -1103,7 +1084,7 @@ function data()
 					D.cols = present
 					D.colsKey = colsKey
 					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "vdrift", "money" }
-					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "held by barrier",
+					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "paused",
 					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied",
 					             vdrift = "vehicle drift mean/max", money = "balance / loan" }
 					D.cells = {}
@@ -1269,7 +1250,6 @@ function data()
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
 					D.win:setPosition(20, 120)
-					statusWin = D.win     -- keep the old handle alive for the close/rebuild path
 				end
 				-- A column with a fresh local file shows everything. A peer known only
 				-- over the wire shows what we know of it: its game time, our skew to
@@ -1359,35 +1339,7 @@ function data()
 					D.shown = shown
 					D.win:setVisible(shown, false)
 				end
-				if true then return end
-				-- Both rows come from the shared data dir. Try K.BASE first, then
-				-- every other discovery candidate, so a peer whose DLLs settled
-				-- on a different candidate (harness-pinned vs shipping default)
-				-- still shows. Same resolution as K.BASE itself -- no separate
-				-- sandbox/username-derived path lives here any more.
-				local bases = { K.BASE }
-				for _, p in ipairs(CM.baseCandidates or {}) do
-					if p ~= K.BASE then bases[#bases + 1] = p end
-				end
-				local lines = {}
-				for _, inst in ipairs({ "a", "b" }) do
-					local s
-					for _, base in ipairs(bases) do
-						local f = io.open(base .. "lockstep_status_" .. inst .. ".txt", "r")
-						if f then
-							local r = f:read("*l")
-							f:close()
-							if r and #r > 0 then s = r; break end
-						end
-					end
-					if s then lines[#lines + 1] = string.upper(inst) .. "  " .. s end
-				end
-				statusText:setText(#lines > 0 and table.concat(lines, string.char(10)) or "no status yet")
 			end)
-			if not ok then
-				-- window closed/destroyed: rebuild on the next round
-				statusWin, statusText = nil, nil
-			end
 		end,
 	}
 end

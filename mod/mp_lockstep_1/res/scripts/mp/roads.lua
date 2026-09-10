@@ -783,8 +783,7 @@ function CM.execPolyline(c, planOnly)
 						end
 					end
 					local dist = bestD and math.sqrt(bestD) or 1e9
-					local reason
-					if dist > CROSS_BAND then reason = "too far"
+					if dist > CROSS_BAND then -- too far
 					elseif splitRoads[eid] or comp.node0 == n0 or comp.node1 == n0 or comp.node0 == n1 or comp.node1 == n1 then
 						-- ADJACENCY, not a crossing. A branch never crosses the edge it
 						-- branches FROM: a track joining a bridge 6 m before the bridge's
@@ -793,14 +792,13 @@ function CM.execPolyline(c, planOnly)
 						-- 'Construction not possible' (proposal dump 2026-08-29). An edge
 						-- this proposal split (the parent) or one sharing an endpoint with
 						-- the segment only ever TOUCHES it.
-						reason = "adjacent (split parent / shares an endpoint) -- not a crossing"
 					else
 						local q = CM.hermitePos(ra, rta, rb, rtb, bestRu)
 						local dA = math.sqrt((q[1]-ra[1])^2 + (q[2]-ra[2])^2)
 						local dB = math.sqrt((q[1]-rb[1])^2 + (q[2]-rb[2])^2)
 						local r = rail[math.floor(bestU * rs + 0.5)] or rail[0]
 						local dEnd = math.min(math.sqrt((r[1]-x0)^2 + (r[2]-y0)^2), math.sqrt((r[1]-x1)^2 + (r[2]-y1)^2))
-						if dEnd < CROSS_END_MIN then reason = "at rail end (endpoint case, handled by resolve)"
+						if dEnd < CROSS_END_MIN then -- at a rail end: the endpoint case, handled by resolve
 						elseif dA < CROSS_END_MIN or dB < CROSS_END_MIN then
 							-- The rail crosses the road AT ONE OF ITS NODES (the road is
 							-- already split there, e.g. a junction or a prior crossing).
@@ -823,7 +821,7 @@ function CM.execPolyline(c, planOnly)
 							-- asserts that a crossing's opposite arms are
 							-- anti-parallel, so a rail routed through a road
 							-- CORNER or junction crashes StreetGeometry outright.
-							local straight, deg, nEdges = CM.nodeIsStraightThrough(nid)
+							local straight = CM.nodeIsStraightThrough(nid)
 							if splitParentEnds[nid] then
 								-- (c) NEVER an end node of an edge this proposal split
 								-- (2026-09-09). A stretched crossover leaves the track
@@ -836,20 +834,14 @@ function CM.execPolyline(c, planOnly)
 								-- crossover failed, short ones passed by luck of the
 								-- distance. The rail branches OFF that edge; it cannot
 								-- also cross it at its end.
-								reason = string.format("near node %s, but that is an end of split parent %d -- the split half already reaches it, not a crossing",
-									tostring(nid), splitParentEnds[nid])
 							elseif dist > K.XING_NODE_TOUCH then
-								reason = string.format("near road node %s but the rail passes %.2f m from it -- a near-miss, not a crossing",
-									tostring(nid), dist)
+								-- a near-miss beside the node, not a crossing
 							elseif not straight then
-								reason = string.format("at road node %s but that node is not a straight-through (%s edge(s), arms %s deg) -- routing a rail through it trips the engine's crossing assert",
-									tostring(nid), tostring(nEdges), deg and string.format("%.1f", deg) or "?")
+								-- a corner or junction: routing a rail through it trips the engine's crossing assert
 							else
 								hits[#hits + 1] = { node = nid, u = bestU }
-								reason = string.format("CROSSING at road node %s (arms %.1f deg, rail %.2f m)",
-									tostring(nid), deg or -1, dist)
 							end
-						else hits[#hits + 1] = { eid = eid, ru = bestRu, u = bestU }; reason = "CROSSING (mid-edge split)" end
+						else hits[#hits + 1] = { eid = eid, ru = bestRu, u = bestU } end   -- a crossing mid-edge: the road is split there
 					end
 				end
 			end

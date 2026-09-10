@@ -83,8 +83,8 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 
 Issues and pull requests are welcome, especially reproductions with logs from every player
 ([what to collect](docs/PLAYING.md#when-something-goes-wrong)). Please keep the project's conventions
-([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#conventions)): destructive replication channels ship switched off
-until validated, and a field identification counts only when a differential capture confirms it.
+([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#conventions)): destructive replication channels are validated on
+the rig before they merge, and a field identification counts only when a differential capture confirms it.
 
 - Companies mode is inspired by, and reuses engine mechanisms proven in, Swiss's **Multiplayer Companies**
   Workshop mod (item 3710243057): runtime `addPlayer`, `setPlayer`, `bookJournalEntry` to a specific player,

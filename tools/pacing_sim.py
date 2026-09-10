@@ -207,7 +207,8 @@ function SIM.run(sc)
             CM.myCeiling or 4, CM.heartbeatCu(now) and " cu=1" or ""))
         end
         CM.lgHolding = false
-        CM.applyBarrier(now)
+        local paceTick = CM.paceTick or CM.applyBarrier   -- applyBarrier in builds before remove-legacy
+        paceTick(now)
       end
     end
     local box = SIM.outbox

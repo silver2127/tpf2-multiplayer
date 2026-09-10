@@ -107,7 +107,7 @@ CM.execConX = function(c)
 		if #t ~= 16 then log("CONX: bad transf, " .. #t .. " numbers"); return end
 		local params = CM.deserParams(c.params) or {}
 		local key = CM.conKey(t[13], t[14])
-		-- CANCELLED PLACEMENT (slice cfg cancel_construction): the native build
+		-- CANCELLED PLACEMENT (c.cancelled=1): the native build
 		-- never happened, so the originator builds the scripted proposal at the
 		-- stamp exactly like a peer -- the strict bulldoze+rebuild below has
 		-- nothing to replace and is skipped, and with no native split to reuse

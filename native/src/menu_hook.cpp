@@ -194,11 +194,10 @@ static bool netDirUsable(const wchar_t* dir)
     return false;
 }
 
-// netpunch working dir, in order of preference:
-//   %LOCALAPPDATA%\tpf2mp\netpunch   portable, writable everywhere, sandbox-safe
-//   <dir of this dll>\netpunch        where the installer drops netpunch.exe
-//   %USERPROFILE%\tpf2-multiplayer\netpunch   dev checkout fallback
-// A candidate counts if it holds either lobby.py or the frozen netpunch.exe.
+// netpunch working dir:
+//   %LOCALAPPDATA%\tpf2mp\netpunch   when it holds lobby.py or the frozen netpunch.exe
+//   <dir of this dll>\netpunch        otherwise: where the installer drops netpunch.exe,
+//                                     so a lobby that cannot start names that folder
 static void resolveNetDir(wchar_t* out, int cch)
 {
     wchar_t la[MAX_PATH];
@@ -206,14 +205,7 @@ static void resolveNetDir(wchar_t* out, int cch)
         wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%s\\tpf2mp\\netpunch", la);
         if (netDirUsable(cand)) { wcscpy_s(out, cch, cand); return; }
     }
-    {
-        wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%snetpunch", ourDirW());   // ourDirW has a trailing '\'
-        if (netDirUsable(cand)) { wcscpy_s(out, cch, cand); return; }
-    }
-    // dev checkout: %USERPROFILE%\tpf2-multiplayer\netpunch
-    wchar_t up[MAX_PATH];
-    if (GetEnvironmentVariableW(L"USERPROFILE", up, MAX_PATH)) _snwprintf_s(out, cch, _TRUNCATE, L"%s\\tpf2-multiplayer\\netpunch", up);
-    else wcscpy_s(out, cch, L"C:\\tpf2-multiplayer\\netpunch");
+    _snwprintf_s(out, cch, _TRUNCATE, L"%snetpunch", ourDirW());   // ourDirW has a trailing '\'
 }
 
 static void Log(const char* fmt, ...)
@@ -1526,7 +1518,7 @@ static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp)
 }
 
 // ---------------- connect.py integration ----------------
-static const wchar_t* NETDIR = L"C:\\tpf2-multiplayer\\netpunch";   // placeholder: resolveNetDir() replaces it at init
+static const wchar_t* NETDIR = L"netpunch";   // placeholder: resolveNetDir() replaces it at init
 
 static void ClipboardSet(const char* utf8)
 {
@@ -2272,7 +2264,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
     wchar_t cmd[2048];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
-    // the target machine); fall back to `python lobby.py` for the dev checkout.
+    // the target machine); fall back to `python lobby.py` when only the scripts are there.
     wchar_t exe[600]; _snwprintf_s(exe, _TRUNCATE, L"%s\\netpunch.exe", NETDIR);
     bool haveExe = GetFileAttributesW(exe) != INVALID_FILE_ATTRIBUTES;
     wchar_t base[620];

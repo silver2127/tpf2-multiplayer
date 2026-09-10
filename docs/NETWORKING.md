@@ -150,9 +150,9 @@ join <code> --name <player> --local-port 0 --game-relay-port <7774+> --game-loca
      --forward-log <file> x4 [--password <pw>]
 ```
 
-It runs `netpunch.exe` from the first of `%LOCALAPPDATA%\tpf2mp\netpunch\`,
-`<game>\netpunch\`, or `%USERPROFILE%\tpf2-multiplayer\netpunch\` that has it, falling
-back to `python lobby.py`. That folder is the lobby's working directory and holds the
+It runs the lobby from `%LOCALAPPDATA%\tpf2mp\netpunch\` when that folder holds
+`netpunch.exe` or `lobby.py`, otherwise from `netpunch\` next to `tpf2_menu.dll` (the game
+folder), preferring `netpunch.exe` to `python lobby.py`. That folder is the lobby's working directory and holds the
 IPC files. stdout and stderr go to `lobby_proc.log` there; the process runs in a job
 object so closing the game kills it. Inputs are sanitised before they become arguments:
 the code must be base32, names are restricted to letters, digits and `-_.` (lobby names

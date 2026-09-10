@@ -158,7 +158,7 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 
   Limits: the default `-Players` is 3, so A1 fails on a two-instance rig unless you pass `-Players 2`; only
   the native instance and the `GameAgent`/`GameAgent2` boxes are known; and its capture patterns predate
-  `CONXP`, `CONUP`, `CDEMO`, `EDEMO`, `STOPX`, `STOPXDEL` and `VMAINT`, so an action that produces only
+  `CONXP`, `CONUP`, `CDEMO`, `EDEMO`, `STOPX` and `STOPXDEL`, so an action that produces only
   those reads as not performed.
 - **In a game**: watch the Multiplayer window's verdict, and after a divergence diff `egeo_<letter>.txt`
   (`dump_egeo=1`) between instances, ignoring the first line.
