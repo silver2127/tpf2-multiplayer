@@ -1862,7 +1862,11 @@ static void SyncStart(const char* why)
             g_syncAskedAt = GetTickCount64(); SetStatus("Hot join: saving\xE2\x80\xA6");
             // tell the newcomer's panel what is going on (a marked chat line;
             // a panel still at the title menu shows it as its status, not as chat)
-            SendChat("!hotjoin A game is running. Hold on: the host is saving and will send you the world; your game loads it by itself.");
+            // ...but only for a real hot join. The relay's periodic upload
+            // took the same path and every panel got "!hotjoin ..." in its
+            // chat every two minutes (2026-09-10).
+            if (strncmp(why, "relay:", 6) != 0)
+                SendChat("!hotjoin A game is running. Hold on: the host is saving and will send you the world; your game loads it by itself.");
         }
     }
     if (g_syncCsInit) LeaveCriticalSection(&g_syncCs);

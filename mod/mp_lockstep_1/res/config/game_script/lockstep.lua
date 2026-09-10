@@ -997,7 +997,12 @@ function data()
 							local from = line:match('"from":%s*"([^"]*)"') or "?"
 							local text = line:match('"text":%s*"(.-)",%s*"ts"') or line:match('"text":%s*"(.-)"}') or ""
 							text = text:gsub('\\"', '"'):gsub("\\\\", "\\")
-							CM.chatLines[#CM.chatLines + 1] = from .. ": " .. text
+							-- "!..." lines are panel-to-panel notices (the host's
+							-- "!hotjoin" while it saves for a newcomer), not chat:
+							-- the title-menu panel shows them as its status line;
+							-- in the game they were repeated on every save (2026-09-10)
+							if text:sub(1, 1) == "!" then text = nil end
+							if text then CM.chatLines[#CM.chatLines + 1] = from .. ": " .. text end
 							while #CM.chatLines > n do table.remove(CM.chatLines, 1) end
 						end
 					end
