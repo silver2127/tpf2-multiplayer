@@ -879,8 +879,8 @@ function CM.execPolyline(c, planOnly)
 							end
 						else hits[#hits + 1] = { eid = eid, ru = bestRu, u = bestU }; reason = "CROSSING (mid-edge split)" end
 					end
-					if xingDebug or reason == nil then CM.cmLog(string.format("XING: seg %d vs street edge %d: closest %.2f m (road u=%.2f, rail u=%.2f) -> %s",
-						k, eid, dist, bestRu or -1, bestU or -1, reason))
+					if xingDebug then CM.cmLog(string.format("XING: seg %d vs street edge %d: closest %.2f m (road u=%.2f, rail u=%.2f) -> %s",
+						k, eid, dist, bestRu or -1, bestU or -1, reason)) end
 				end
 			end
 			CM.cmLog(string.format("XING: seg %d: %d street edge(s) considered, %d crossing(s)", k, considered, #hits))

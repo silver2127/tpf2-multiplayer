@@ -501,6 +501,7 @@ function CM.pollInject()
 						-- resolution, same splits, nothing built. Both instances
 						-- then execute the originator's answer at the stamp instead
 						-- of each re-deriving one against its own world.
+						local planT0 = os.clock()
 						local okPlan, xv, xh = pcall(function()
 							return CM.execPolyline({ pts = sargs.pts, links = sargs.links,
 								tans = sargs.tans, bt = sargs.bt, etype = sargs.etype,
@@ -517,8 +518,8 @@ function CM.pollInject()
 								for _ in tostring(str or ""):gmatch("[^;]+") do n = n + 1 end
 								return n
 							end
-							log(string.format("ROADP plan: %d vertex decision(s), %d crossing decision(s) shipped",
-								entries(xv), entries(xh)))
+							log(string.format("ROADP plan: %d vertex decision(s), %d crossing decision(s) shipped (%d ms at the click)",
+								entries(xv), entries(xh), math.floor((os.clock() - planT0) * 1000 + 0.5)))
 						else
 							log("ROADP plan pass failed (" .. tostring(xv) .. ") -- peers will derive their own")
 						end
