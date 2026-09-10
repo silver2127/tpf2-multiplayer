@@ -136,6 +136,15 @@ CM.execConX = function(c)
 		-- proposal validates against the post-bulldoze world (bulldoze is async;
 		-- an immediate rebuild would collide). Second pass (strictPhase set):
 		-- fall through and build exactly like a peer.
+		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", true) and c.strictPhase ~= "rebuilt" and tonumber(c.cancelled or 0) ~= 1 and CM.livePeers() == 0 then
+			-- ALONE: the slice builds natively when no session is live (nothing to
+			-- replay, nothing to cancel) and strict must follow the same rule.
+			-- Bulldozing and rebuilding a station with nobody to match asserted
+			-- the engine and crashed the game (live 2026-09-09, modular_station).
+			log(string.format("CONX STRICT seq=%s: no live peer -- keeping the native build, nothing to match", tostring(c.seq)))
+			CM.conxBusy = false
+			return
+		end
 		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", true) and c.strictPhase ~= "rebuilt" and tonumber(c.cancelled or 0) ~= 1 then
 			-- NEVER strict-replay a construction that REMOVES road edges (a depot
 			-- splits the road it sits on; its payload carries removals). Bulldozing

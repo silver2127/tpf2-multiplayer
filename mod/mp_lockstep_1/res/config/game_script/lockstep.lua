@@ -237,6 +237,14 @@ CM.peers = {}   -- origin -> { time=, at=, hashes={[stamp]=h}, details={[stamp]=
 -- (leader=<letter>, the roster's host) so the role survives "a" leaving.
 CM.leader = "a"
 function CM.isLeader() return K.INSTANCE == (CM.leader or "a") end
+-- peers heard within the stale window: 0 = we are playing alone right now
+function CM.livePeers()
+	local n = 0
+	for _, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then n = n + 1 end
+	end
+	return n
+end
 function CM.peerFor(o)
 	local pr = CM.peers[o]
 	if not pr then pr = { hashes = {}, details = {}, streak = 0 }; CM.peers[o] = pr end
