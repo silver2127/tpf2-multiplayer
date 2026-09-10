@@ -1082,22 +1082,24 @@ static int WriteVehicleConfig(FILE* f, uint64_t cfg, uint64_t ub, int units)
     return ng;
 }
 
-static void WriteInjectVBuy(uint64_t depot, uint64_t cfg)
+// Returns true when the VBUY line was written.
+static bool WriteInjectVBuy(uint64_t depot, uint64_t cfg)
 {
     uint64_t ub = 0;
     int units = VCfgParts(cfg, &ub, "VBUY");
-    if (units < 0) return;
+    if (units < 0) return false;
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
-    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
+    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
-    if (!f) { Log("[slice] cannot open %s\n", p); return; }
+    if (!f) { Log("[slice] cannot open %s\n", p); return false; }
     fprintf(f, "VBUY %d", (int)(int32_t)depot);
     int ng = WriteVehicleConfig(f, cfg, ub, units);
     fprintf(f, "\n");
     fclose(f);
     Log("[slice] VBUY shipped: depot=%d parts=%d groups=%d\n", (int)(int32_t)depot, units, ng);
+    return true;
 }
 
 // Vehicle commands that REFERENCE vehicles ship raw local entity ids; the Lua
@@ -1140,7 +1142,7 @@ static void WriteArmed(bool armed)
 // the factory moves the stops vector out (r8 A NOTE).
 //
 // Layout. Ground-truth sweep (docs/re/COMMANDS.md, "Line::Stop"; the GT line
-// sweep t10..t16 in mp/gt.lua, all EXACT unless noted):
+// sweep t10..t16, all EXACT unless noted; gt.lua is in git history at v0.4.11):
 //   Line+0x00 vector<Stop> {begin,end,cap}   t10: span tracks 0xa8 per stop.
 //              (An older note put the vector at +0x18; waitingTime is at
 //              +0x18, and the dump that found the span read +0x00. +0x18 is
@@ -1234,22 +1236,29 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
     return false;
 }
 
-static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
+// Returns true when a line was written.
+static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
 {
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
-    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
+    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
-    if (!f) { Log("[slice] cannot open %s\n", p); return; }
+    if (!f) { Log("[slice] cannot open %s\n", p); return false; }
+    bool shipped = true;
     if (fid == 3) {
         uint64_t b = 0;
         uint64_t span = ReadVec(r8, &b, 0x400);
         int n = (int)(span / 4);
-        fprintf(f, "VSELL %d", n);
-        for (int i = 0; i < n; i++) { int32_t v = 0; memcpy(&v, (void*)(b + 4 * i), 4); fprintf(f, " %d", v); }
-        fprintf(f, "\n");
-        Log("[slice] VSELL shipped: %d vehicle(s)\n", n);
+        if (n > 0) {
+            fprintf(f, "VSELL %d", n);
+            for (int i = 0; i < n; i++) { int32_t v = 0; memcpy(&v, (void*)(b + 4 * i), 4); fprintf(f, " %d", v); }
+            fprintf(f, "\n");
+            Log("[slice] VSELL shipped: %d vehicle(s)\n", n);
+        } else {
+            Log("[slice] VSELL: vehicle list unreadable -- not shipped\n");
+            shipped = false;
+        }
     } else if (fid == 4) {
         // ReplaceVehicle: r8 = the vehicle being replaced, r9 = the new
         // TransportVehicleConfig (a pointer, unlike BuyVehicle's by-value copy
@@ -1262,6 +1271,8 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             WriteVehicleConfig(f, r9, ub, units);
             fprintf(f, "\n");
             Log("[slice] VREPL shipped: vehicle=%d parts=%d\n", (int)(int32_t)r8, units);
+        } else {
+            shipped = false;
         }
     } else if (fid == 5) {
         fprintf(f, "VDEPOT %d %d\n", (int)(int32_t)r8, (int)(r9 & 1));
@@ -1309,6 +1320,7 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                 (int)(int32_t)r8, col[0], col[1], col[2]);
         } else {
             Log("[slice] VCOLOR: colour at %llx unreadable -- not shipped\n", (unsigned long long)r9);
+            shipped = false;
         }
     } else if (fid == 14) {
         // SetName(entity, std::string const&). MSVC layout: a 16-byte buffer,
@@ -1339,9 +1351,25 @@ static void WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             Log("[slice] VNAME shipped: entity=%d name='%s'\n", (int)(int32_t)r8, name);
         } else {
             Log("[slice] VNAME: name at %llx unreadable or empty -- not shipped\n", (unsigned long long)r9);
+            shipped = false;
         }
     }
     fclose(f);
+    return shipped;
+}
+
+// A cancel is only honest when the command's whole payload reaches the wire:
+// BuyVehicle's and ReplaceVehicle's new config, SellVehicle's vehicle list.
+// When that does not read, nothing can ship, so the command must run natively
+// rather than be cancelled into nothing (never cancel on a failed decode). The
+// other vehicle and line commands carry plain values.
+static bool VehiclePayloadReadable(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
+{
+    uint64_t b = 0;
+    if (fid == 2) return VCfgParts(st0, &b, "VBUY") >= 0;
+    if (fid == 3) return ReadVec(r8, &b, 0x400) >= 4;
+    if (fid == 4) return VCfgParts(r9, &b, "VREPL") >= 0;
+    return true;
 }
 
 static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_t r8,
@@ -1386,9 +1414,26 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                     cancel = false;
                 }
             }
-            WriteArmed(cancel && SessionLive());
-            __try { WriteInjectVehicleCmd(f.id, r8, r9, st[0]); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] %s decode fault -- not shipped\n", f.name); }
+            bool readable = false;
+            __try { readable = VehiclePayloadReadable(f.id, r8, r9, st[0]); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { readable = false; }
+            if (!readable) {
+                Log("[slice] %s: arguments not readable -- NOT cancelled, runs natively, not shipped\n", f.name);
+                cancel = false;
+            } else {
+                const bool armed = cancel && SessionLive();
+                WriteArmed(armed);
+                bool shipped = false;
+                __try { shipped = WriteInjectVehicleCmd(f.id, r8, r9, st[0]); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] %s decode fault -- not shipped\n", f.name); }
+                if (!shipped && cancel) {
+                    // ARMED 1 is on disk with no line behind it: take it back so the
+                    // next capture cannot inherit it, and let this command run.
+                    if (armed) WriteArmed(false);
+                    Log("[slice] %s: nothing shipped -- NOT cancelled, runs natively\n", f.name);
+                    cancel = false;
+                }
+            }
         }
     }
 
@@ -1402,11 +1447,25 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         // honoured, so it states an INTENTION. For the buy that intention is
         // not refused: its Add fires the depot window's callback and, if the
         // fire fails, honours the armed cancel anyway (g_pendingHonour).
-        WriteArmed(cancel && SessionLive());
-        __try {
-            WriteInjectVBuy(r9, st[0]);
-        } __except (EXCEPTION_EXECUTE_HANDLER) {
-            Log("[slice] VBUY decode fault -- buy proceeds locally, not shipped\n");
+        // So the config must read BEFORE anything is armed: a buy cancelled
+        // with no VBUY behind it is a purchase that never happens.
+        bool readable = false;
+        __try { readable = VehiclePayloadReadable(2, r8, r9, st[0]); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { readable = false; }
+        if (!readable) {
+            Log("[slice] BuyVehicle: config not readable -- NOT cancelled, the buy runs natively, not shipped\n");
+            cancel = false;
+        } else {
+            const bool armed = cancel && SessionLive();
+            WriteArmed(armed);
+            bool shipped = false;
+            __try { shipped = WriteInjectVBuy(r9, st[0]); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { shipped = false; }
+            if (!shipped) {
+                if (armed) WriteArmed(false);   // take back the ARMED 1 that has no line behind it
+                Log("[slice] VBUY not shipped -- NOT cancelled, the buy runs natively\n");
+                cancel = false;
+            }
         }
     }
 
@@ -1997,7 +2056,6 @@ static bool MergeTemplateStreet(uint64_t r8)
     uint8_t* N = (uint8_t*)nb;
     uint8_t* S = (uint8_t*)sb;
     auto nodeId  = [&](int i) { int32_t v; memcpy(&v, N + i * 24 + 0x14, 4); return v; };
-    auto nodeFl  = [&](int i) { uint32_t v; memcpy(&v, N + i * 24 + 0x0c, 4); return v; };
 
     // Template nodes = the placeholder endpoints of construction-OWNED segments
     // (+0x74 == 1). Node FLAGS are not a discriminator: for a TRACK template the
@@ -2017,7 +2075,6 @@ static bool MergeTemplateStreet(uint64_t r8)
         Log("[merge] nodes=%d segs=%d template=%d ours=%d -- nothing to merge\n", n, m, nT, oursN);
         return false;
     }
-    (void)nodeFl;
     // Template outer = the template node nearest to any of ours. Tolerance 15 m,
     // not 2 m: the peer nudges a split point a few metres along the road when the
     // originator's position would leave a stub (execConX STUB NUDGE), and at 2 m the
@@ -2408,6 +2465,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         //   fails the armed cancel is honoured anyway (g_pendingHonour) rather
         //   than run on top of the replay -- the two-vehicles-for-one-click bug
         //   of 7a29978.
+        // CaptureFactory drops the cancel for any of these whose payload does
+        // not read or does not reach the inject file.
         // Never cancelled:
         //   CreateLine (7)   -- the editor issues UpdateLine(-1) on a cancelled
         //                       create, which is a fatal assert.
@@ -2824,11 +2883,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // Arm the cancel. The Add hook matches on the COMMAND POINTER, not
             // on a caller RVA, so the upgrade tool's own CommandList::Add call
             // site is recognised with no extra constant -- and its completion
-            // callback is fired there like the build tool's (g_pendingNoCb stays
-            // 0: this tool waits on the callback, so swallowing it would wedge
+            // callback is fired there like the build tool's (g_pendingNoCb is
+            // cleared: this tool waits on the callback, so swallowing it would wedge
             // the upgrade cursor for the rest of the session).
-            if (live) InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-            else Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
+            if (live) {
+                InterlockedExchange(&g_pendingNoCb, 0);
+                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+            } else {
+                Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] capture faulted -- proceeding, never cancel on an error\n");
