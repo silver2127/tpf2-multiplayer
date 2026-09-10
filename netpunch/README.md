@@ -15,7 +15,6 @@ model in [docs/SECURITY.md](../docs/SECURITY.md).
 | `mesh.py` | joiner-to-joiner links on one socket, and relay envelopes |
 | `seal.py` | frame sealing: encrypt-then-MAC with a replay window |
 | `masterserver.py` | the public game list service (server side only, not in the exe) |
-| `swarm.py` | an unused experiment: peer-to-peer piece distribution of the save |
 | `netpunch.spec` | PyInstaller spec (the build command regenerates it) |
 
 ## Running from source

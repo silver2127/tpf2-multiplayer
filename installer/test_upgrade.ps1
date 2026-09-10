@@ -76,11 +76,9 @@ try {
     $rc = Msi @('/i', $Msi, "INSTALLFOLDER=$game\", 'TPF2_SKIP_GAMEDIR_CHECK=1') "install.log"
     if ($rc -eq 0) { Ok "installed" } else { Bad "install exit $rc" }
     if (Test-Path "$game\tpf2_menu.dll") { Ok "our files are present" } else { Bad "tpf2_menu.dll missing" }
-    # The cfg files are the only installed files a player edits, and they are
-    # NeverOverwrite with RemoveExistingProducts scheduled early: the classic
-    # way for an upgrade to leave NO cfg behind (costed as "present, skip",
-    # then removed with the old product). A player-style edit is planted so
-    # the upgrade step can say which of the three outcomes happened.
+    # tpf2_slice.cfg is the only installed file a player might edit (optional
+    # diagnostics). A player-style edit is planted so the upgrade step can say
+    # whether the upgrade kept, replaced or removed it.
     $cfg = Join-Path $game "tpf2_slice.cfg"
     if (Test-Path $cfg) { Ok "tpf2_slice.cfg installed"; Add-Content $cfg "`n# PLAYER-EDIT-MARKER" } else { Bad "tpf2_slice.cfg missing after install" }
     if ((AlutReal) -eq $STOCK) { Ok "alut_real.dll is the stock library" } else { Bad "alut_real.dll is NOT the stock library" }
@@ -97,20 +95,14 @@ try {
     if ((AlutReal) -eq $STOCK) { Ok "alut_real.dll is STILL the stock library" }
     else { Bad "alut_real.dll was overwritten -- a proxy got wrapped around itself" }
     if (Test-Path "$game\tpf2_menu.dll") { Ok "our files are present after the upgrade" } else { Bad "files missing after the upgrade" }
+    # tpf2_slice.cfg holds only optional diagnostics now and no behaviour depends on
+    # it, so kept, replaced and missing are all acceptable: report which happened.
     $cfg = Join-Path $game "tpf2_slice.cfg"
-    if (-not (Test-Path $cfg)) {
-        Bad "tpf2_slice.cfg is GONE after the upgrade -- the DLL falls back to built-in defaults (every strict_* switch off)"
-    } else {
-        $txt = Get-Content $cfg -Raw
-        $kept = $txt -match "PLAYER-EDIT-MARKER"
-        $new  = $txt -match "(?m)^strict_stops=1"
-        if ($kept -and -not $new) { Write-Host "  NOTE  tpf2_slice.cfg KEPT from the old version (player edits survive; new switches such as strict_stops are absent = off)" -ForegroundColor Yellow }
-        elseif ($new -and -not $kept) { Write-Host "  NOTE  tpf2_slice.cfg REPLACED by the new defaults (player edits lost; new switches present)" -ForegroundColor Yellow }
-        elseif ($new -and $kept) { Ok "tpf2_slice.cfg kept AND carries the new switches" }
-        else { Bad "tpf2_slice.cfg present but has neither the marker nor strict_stops=1 -- unexpected content" }
-        Ok "tpf2_slice.cfg present after the upgrade"
-    }
-    if (Test-Path (Join-Path $game "tpf2_bridge_mp.cfg")) { Ok "tpf2_bridge_mp.cfg present after the upgrade" } else { Bad "tpf2_bridge_mp.cfg is GONE after the upgrade" }
+    if (-not (Test-Path $cfg)) { Write-Host "  NOTE  tpf2_slice.cfg absent after the upgrade (fine: nothing depends on it)" -ForegroundColor Yellow }
+    elseif ((Get-Content $cfg -Raw) -match "PLAYER-EDIT-MARKER") { Write-Host "  NOTE  tpf2_slice.cfg KEPT from the old version" -ForegroundColor Yellow }
+    else { Write-Host "  NOTE  tpf2_slice.cfg REPLACED by the new file" -ForegroundColor Yellow }
+    if (Test-Path (Join-Path $game "tpf2_bridge_mp.cfg")) { Write-Host "  NOTE  an old tpf2_bridge_mp.cfg is still in the game folder (the bridge no longer reads it)" -ForegroundColor Yellow }
+    else { Ok "no tpf2_bridge_mp.cfg left behind" }
     foreach ($f in "mods\mp_lockstep_1\res\scripts\mp\stops.lua", "mods\mp_lockstep_1\res\config\game_script\lockstep.lua") {
         if (Test-Path (Join-Path $game $f)) { Ok "$f present after the upgrade" } else { Bad "$f missing after the upgrade" }
     }

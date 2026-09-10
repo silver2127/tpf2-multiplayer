@@ -3913,9 +3913,6 @@ def main(argv=None):
                     help="start listed publicly (host only)")
     ap.add_argument("--lobby-name", default="",
                     help="what the lobby is called (shown to joiners and in the public list)")
-    ap.add_argument("--game-name", default="",
-                    help="ignored: the public list shows the server type, never a save name "
-                         "(kept so older menu DLLs that pass it still launch)")
     ap.add_argument("--password", default="",
                     help="optional lobby password: mixed into the session key, "
                          "so everyone must enter the same one (host + joiners)")
