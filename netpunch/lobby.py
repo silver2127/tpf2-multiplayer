@@ -1997,6 +1997,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 # nobody is waiting: the upload was a hot-join sync for peers that
                 # have since left, or a plain re-start -- just start the leader
+                if started[0]:
+                    # the leader's periodic upload: everyone is already playing.
+                    # Re-broadcasting START here made every game's panel flash a
+                    # join/transfer every 2 min (2026-09-10). Just keep the copy.
+                    log("[relay] save stored; nobody is waiting for it")
+                    if upload[0] is not None and getattr(upload[0], "complete", False):
+                        upload[0] = None
+                    return
                 log("[relay] save arrived but no peer is waiting for it -- starting")
                 broadcast_start(save=True)
                 return

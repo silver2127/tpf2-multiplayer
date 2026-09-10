@@ -1,4 +1,4 @@
-# mp_menu_launch.ps1 -- bring up A + sandboxed B and LEAVE THEM AT THE TITLE MENU.
+﻿# mp_menu_launch.ps1 -- bring up A + sandboxed B and LEAVE THEM AT THE TITLE MENU.
 #
 # The Multiplayer lobby lives on the title screen (the in-frame Vulkan panel that
 # menu_hook renders on main-menu page 2). autotest/mp_launch click CONTINUE and
@@ -65,12 +65,12 @@ $letters = "ABCDEFGH"
 for ($i = 1; $i -lt $Players; $i++) {
     # B, C, ...: sandboxed instances, one box each. Each box's menu DLL log
     # lands in that box's Sandboxie overlay.
-    $box = if ($i -eq 1) { $Box } else { "$Box$i" }
+    $boxName = if ($i -eq 1) { $Box } else { "$Box$i" }   # NOT $box: PowerShell variables are case-insensitive, $box clobbered $Box and box 3 became "GameAgent23"
     $tag = $letters[$i]
-    $ovl = "C:\Sandbox\$env:USERNAME\$box\drive\C" + $GameDir.Substring(2)
+    $ovl = "C:\Sandbox\$env:USERNAME\$boxName\drive\C" + $GameDir.Substring(2)
     $menuLogX = Join-Path $ovl "tpf2_menu.log"
-    Write-Host "[menu-launch] launching instance $tag (Sandboxie box '$box')"
-    Start-Process -FilePath $Sbie -ArgumentList "/box:$box", "`"$Exe`"" -WorkingDirectory (Split-Path $Exe)
+    Write-Host "[menu-launch] launching instance $tag (Sandboxie box '$boxName')"
+    Start-Process -FilePath $Sbie -ArgumentList "/box:$boxName", "`"$Exe`"" -WorkingDirectory (Split-Path $Exe)
     Wait-Menu $menuLogX "$tag" 90 | Out-Null
 }
 
@@ -78,3 +78,4 @@ $n = (Get-Process TransportFever2 -ErrorAction SilentlyContinue | Measure-Object
 Write-Host "[menu-launch] done -- $n instance(s) at the title menu."
 Write-Host "  A: click MULTIPLAYER -> HOST   (code generates + copies to clipboard)"
 for ($i = 1; $i -lt $Players; $i++) { Write-Host "  $($letters[$i]): click MULTIPLAYER -> JOIN   (reads the code from the clipboard)" }
+

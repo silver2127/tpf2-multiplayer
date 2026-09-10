@@ -745,9 +745,15 @@ static DWORD WINAPI InitThread(LPVOID)
     if (!netUp) {
         // Last resort: a private port nobody is addressing. We stay reachable
         // only once the lobby sends peer=, so this is a degraded mode, not a
-        // recovery.
-        cfg.localPort += 10;
-        netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
+        // recovery. Scan a range: with four games on one PC the letters a, b
+        // and the third box hold 7771, 7772 and 7782, and a single +10 try
+        // left the fourth box with NO TRANSPORT at all (2026-09-10).
+        const uint16_t base = cfg.localPort;
+        for (int k = 1; k <= 20 && !netUp; k++) {
+            cfg.localPort = (uint16_t)(base + 10 * k);
+            netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
+        }
+        if (!netUp) cfg.localPort = base;
     }
     // "net up" used to be printed unconditionally, directly under the branch
     // that logs Net_Init FAILED -- so the one line anyone greps for said the
