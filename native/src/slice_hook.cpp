@@ -113,6 +113,15 @@ static const uintptr_t CALLER_BULLDOZE      = 0x3eb227;
 // block is the scripting layer (cf. cee710 = SetVehicleManualDeparture's
 // wrapper, ced378 = buildProposal's).
 static const uintptr_t CALLER_LUA_VEHICLE   = 0xceefae;
+// Lua replays that reach a factory from OUTSIDE the sol2 wrapper block: two
+// makers are registration lambdas in gamescriptrep.cpp and still call their
+// factory (measured live). api.cmd.make.setColor returns to 0xc3848e -- missed,
+// every replayed VCOLOR was captured and shipped again until ~100,000 queued
+// commands froze four games -- and api.cmd.make.setGameSpeed to 0xc17eff.
+static bool IsScriptCaller(uint64_t caller)
+{
+    return (caller >= 0xcec000 && caller < 0xcf2000) || caller == 0xc3848e || caller == 0xc17eff;
+}
 
 static const int ID_BUILDPROPOSAL = 0;
 static const int ID_CMDADD        = 1;
@@ -1464,7 +1473,7 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
     // the log -- and then wrote nothing, so renaming a line looked like a
     // replication failure when it never reached the wire at all.
     if ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14) {
-        bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
+        bool luaPath = IsScriptCaller(caller);
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
                 f.name, (unsigned long long)caller);
@@ -2547,7 +2556,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         //   CreateLine (7)   -- the editor issues UpdateLine(-1) on a cancelled
         //                       create, which is a fatal assert.
         //   SetColor (13), SetName (14) -- shipped only.
-        const bool luaPath = (caller >= 0xcec000 && caller < 0xcf2000);
+        const bool luaPath = IsScriptCaller(caller);
         const bool strictId = (id == 2 || id == 3 || id == 4 || id == 5 ||
                                id == 6 || id == 8 || id == 9 || id == 10);
         bool cancel = !luaPath && strictId;
@@ -2732,7 +2741,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // upgraded to a double slip switch, a bridge type swapped, a level
         // crossing changed), which is exactly the class the wiki describes as
         // "select it with the inspector and say yes".
-        const bool luaReplay = (caller >= 0xcec000 && caller < 0xcf2000);
+        const bool luaReplay = IsScriptCaller(caller);
         if (luaReplay) {
             Log("[slice] BuildProposal from caller_rva=%llx (our own Lua replay) -- ignored\n",
                 (unsigned long long)caller);

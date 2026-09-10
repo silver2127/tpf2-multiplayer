@@ -181,6 +181,7 @@ sees Add's. They are different numbers for the same click.
 | vehicle window Reverse (`viewcreator.cpp`) | `0x8b556d` | | MEASURED |
 | `UI::Clock` speed buttons and pause toggle (SetGameSpeed) | `0x4efb8f`, `0x4f0097`, `0x4f26ef` | `0x4f00ba` (the buttons) | MEASURED (`0x4f0097`), in code |
 | Lua `api.cmd.make.setGameSpeed` | `0xc17eff` | | MEASURED |
+| Lua `api.cmd.make.setColor` | `0xc3848e` (a `gamescriptrep.cpp` lambda, outside the wrapper block) | | MEASURED |
 | Lua `api.cmd.make.*` sol2 wrappers | `0xcec000`-`0xcf2000` (buildProposal `0xced378`, buyVehicle `0xceefae`) | | MEASURED, in code |
 | Lua `api.cmd.sendCommand` | | `0x1126f1a` | MEASURED |
 
@@ -214,7 +215,7 @@ against every hooked factory.
 | `0x9de6f0` | SendToDepot | funcsig | `sendToDepot(vehicle, sellOnArrival)` | 20 | 5 |
 | `0x9de7f0` | SetAnimalState | position | `setAnimalState(...)` * | 18 | |
 | `0x9de870` | SetCalendarSpeed | position | `setCalendarSpeed(msPerDay)` * | 21 | |
-| `0x9de8a0` | SetColor | funcsig | `setColor(entity, color)` | 20 | 13 |
+| `0x9de8a0` | SetColor | funcsig | `setColor(entity, color)` (calls the factory from `0xc3848e`) | 20 | 13 |
 | `0x9de9b0` | SetDate | position | `setDate(date)` * | 21 | |
 | `0x9de9e0` | SetGameSpeed | position | `setGameSpeed(speed)` (calls this factory) | 21 | 15 |
 | `0x9dea10` | SetLine | funcsig | `setLine(vehicle, line, stopIndex)` | 18 | 6 |
