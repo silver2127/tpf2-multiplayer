@@ -1,8 +1,7 @@
 # deploy_shipping.ps1 -- lay the game folder out EXACTLY as the MSI will, from the
-# dev build outputs, so the rig test exercises the shipping paths (not the old
-# workshop out dir):
+# dev build outputs, so the rig test exercises the shipping paths:
 #
-#   <game>\alut.dll                 proxy (stock already renamed alut_real.dll by install_proxy.ps1)
+#   <game>\alut.dll                 proxy (the stock library is alut_real.dll, renamed by the MSI)
 #   <game>\tpf2_bridge_mp.dll       lockstep transport  (proxy loads it: next-to-proxy rule)
 #   <game>\tpf2_menu.dll            lobby overlay
 #   <game>\tpf2_slice.dll           capture/cancel hooks (proxy loads it at start)
@@ -33,7 +32,7 @@ function Put($src, $dst) {
     Copy-Item $src $dst -Force
     Write-Host ("[ship]   {0,-24} <- {1}  ({2:N0} B, {3:HH:mm})" -f (Split-Path $dst -Leaf), $src.Replace($Repo + '\', ''), (Get-Item $src).Length, (Get-Item $src).LastWriteTime)
 }
-if (-not (Test-Path (Join-Path $Game 'alut_real.dll'))) { throw "alut_real.dll absent: run tools\install_proxy.ps1 once first" }
+if (-not (Test-Path (Join-Path $Game 'alut_real.dll'))) { throw "alut_real.dll absent: install the MSI once first" }
 Put "$Repo\native\out\alut.dll"           (Join-Path $Game 'alut.dll')
 Put "$Repo\native\out\tpf2_bridge_mp.dll" (Join-Path $Game 'tpf2_bridge_mp.dll')
 Put "$Repo\native\out\tpf2_menu.dll"      (Join-Path $Game 'tpf2_menu.dll')

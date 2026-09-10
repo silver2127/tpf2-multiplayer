@@ -30,7 +30,7 @@ a18ca0  make_proposal_params
 9d54a0  apply_command_0
 9dc5e0  make_command_0
 
-# ---- the native vehicle-purchase factory already hooked in buyhook.cpp;
+# ---- the native vehicle-purchase factory already hooked in slice_hook.cpp;
 # included as a CONTROL. Its layout is known and working, so if the decompiler
 # renders this one sensibly the output for the unknown targets can be trusted.
 9dca00  buyVehicle_factory

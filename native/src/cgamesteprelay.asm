@@ -1,7 +1,7 @@
 ; Capture-only relay for CGame::Step (RVA 0x118e90), the main thread's
-; per-frame entry that decides when the next sim batch is due. Same shape as
-; simsteprelay.asm: save the argument registers, hand `this` (rcx) to the C
-; handler (which adjusts the batch interval), restore, run the stolen prologue.
+; per-frame entry that decides when the next sim batch is due. Save the argument
+; registers, hand `this` (rcx) to the C handler (which adjusts the batch
+; interval), restore, run the stolen prologue.
 
 EXTERN CGameStepSeen:PROC
 EXTERN g_cgameStepTramp:QWORD

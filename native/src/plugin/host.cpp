@@ -82,7 +82,7 @@ static const char* ApiDataDir(void)                                          { r
 
 // Base of TransportFever2.exe, or 0 when we are not in it. The DLLs get pulled
 // into test harnesses too, and patching a Transport Fever RVA in some other
-// process is an access violation at best -- the same check simhook.cpp makes.
+// process is an access violation at best.
 static uintptr_t ApiModuleBase(void)
 {
     HMODULE m = GetModuleHandleW(nullptr);

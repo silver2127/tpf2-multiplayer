@@ -1,6 +1,6 @@
 ; Capture-only relay for the UI::CGameUI per-frame update (RVA 0x5741d0).
 ;
-; Same shape as simsteprelay.asm: the patch is a plain `jmp [rip+0]`, so on
+; Same shape as cgamesteprelay.asm: the patch is a plain `jmp [rip+0]`, so on
 ; entry the stack is exactly as the game left it. We only want `this` (rcx),
 ; to be able to call CGameUI::AutoSave / poke its autosave timer later, so the
 ; argument registers are saved, the C handler records rcx, everything is put

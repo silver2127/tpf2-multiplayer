@@ -26,8 +26,6 @@ $ErrorActionPreference = "Stop"
 $Exe   = "C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\TransportFever2.exe"
 $Sbie  = "C:\Program Files\Sandboxie-Plus\Start.exe"
 $Box   = "GameAgent"
-$Out   = "C:\Program Files (x86)\Steam\steamapps\workshop\content\1066780\3710243057\recon\m4\out"
-$Ovl   = "C:\Sandbox\$env:USERNAME\$Box\drive\C" + $Out.Substring(2)
 
 function Wait-Menu([string]$logPath, [string]$tag, [int]$timeoutSec = 60) {
     # the menu DLL logs "present state: show=1 ..." once main-menu page 2 is drawn.
@@ -49,10 +47,8 @@ Write-Host "[menu-launch] stopping any running games"
 Get-Process TransportFever2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 600
 
-# A: real instance via Steam. Its menu DLL log is the real workshop out path.
-# The proxy loads tpf2_menu.dll from the GAME dir and the DLL logs there too
-# (the workshop out copy is stale). Boxed instances log to the same path inside
-# their Sandboxie overlay.
+# A: real instance via Steam. The menu DLL logs next to itself in the game
+# folder; a boxed instance's log is at the same path inside its Sandboxie overlay.
 $GameDir  = Split-Path $Exe
 $menuLogA = Join-Path $GameDir "tpf2_menu.log"
 $sizeA0 = if (Test-Path $menuLogA) { (Get-Item $menuLogA).Length } else { 0 }
