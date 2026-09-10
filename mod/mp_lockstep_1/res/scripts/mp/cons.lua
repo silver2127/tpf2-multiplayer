@@ -664,11 +664,6 @@ local function edemoMatchNodes(want)
 end
 
 function CM.execEdgeDemolish(c)
-	if not CM.cfgFlag("road_demolish", false) then
-		log(string.format("EDEMO seq=%s: road_demolish not enabled on this instance -- IGNORED (this peer keeps the road and will diverge)",
-			tostring(c.seq)))
-		return
-	end
 	-- NO originator skip. The slice CANCELS the player's bulldoze at
 	-- CommandList::Add and this replays it at the stamp, so all three instances
 	-- remove the road at the same game-time -- the same cancel-and-replay

@@ -464,10 +464,6 @@ function CM.execVehCmd(c)
 		elseif c.op == "VREV" then
 			local id = resolve(c.key)
 			if id then cmds[#cmds + 1] = { api.cmd.make.reverseVehicle(id), "reverse " .. tostring(c.key) } end
-		elseif c.op == "VMAINT" then
-			local id = resolve(c.key)
-			local v = tonumber(c.v) or 1.0
-			if id then cmds[#cmds + 1] = { api.cmd.make.setVehicleTargetMaintenanceState(id, v), "maint " .. tostring(c.key) .. " " .. tostring(v) } end
 		elseif c.op == "VLINE" then
 			local id = resolve(c.key)
 			local line = CM.lineIdFor(c.line)
@@ -613,12 +609,11 @@ end
 
 function CM.execVBuy(c)
 	-- The originator replays its own purchase ONLY if the buy was actually
-	-- cancelled here. Both conditions are required and neither is sufficient:
-	-- K.STRICT_OPS.VBUY is read from cfg ONCE at load, so it can outlive a
-	-- config change, and c.armed is per-command truth from the slice. Replaying
-	-- on top of a purchase that really happened buys the vehicle TWICE and
-	-- charges for both -- observed live 2026-09-03 when the slice armed a
-	-- cancel whose completion callback then could not be fired.
+	-- cancelled here: VBUY is a strict op (K.STRICT_OPS) and c.armed is the
+	-- slice's per-command truth. Replaying on top of a purchase that really
+	-- happened buys the vehicle TWICE and charges for both -- observed live
+	-- 2026-09-03 when the slice armed a cancel whose completion callback then
+	-- could not be fired.
 	if c.origin == K.INSTANCE
 			and (not K.STRICT_OPS.VBUY or tonumber(c.armed or 0) ~= 1) then
 		log(string.format("VBUY seq=%s: originator already bought locally, skipping (strict=%s armed=%s)",

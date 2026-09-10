@@ -34,28 +34,26 @@
 --   lines      line identity, create/update/delete
 --   conx       native construction replay (CONP/CONX), CONFAIL, LOAN
 --   net        command reliability (NACK+resend), encode/decode, scheduleLocal, onLine
---   gt         ground-truth sweeps
 --   stops      roadside stops and native-shape stop replay
---   inject     the inject reader (pollInject) and BUYTEST
---   pacing     barrier, catch-up pacing, speed sharing, load gate
+--   inject     the inject reader (pollInject)
+--   pacing     session speed, PID pacing, catch-up, load gate
 -- Every symbol used across module boundaries is a field of CM (CM.ticks,
 -- CM.queue, CM.execLine, ...); a file-scope local is by construction private
 -- to its module. Load-time order matters only for chunk-level statements
--- (K.* derived from CM.cfgFlag in stops, for instance); calls between modules
--- happen at runtime, after every factory has run.
+-- (pacing's exec_delay read calls CM.cfgFlag from stops, for instance); calls
+-- between modules happen at runtime, after every factory has run.
 
 -- ---------- runtime data directory ----------
 -- Every runtime file (identity, events, captures, injects, status, logs) lives
 -- in ONE directory shared with the bridge and slice DLLs; native/src/datadir.h
--- is the C++ half of this contract and resolves the same candidates in the same
--- order:
---   1. $TPF2MP_DATADIR             (the dev harness pins the old workshop out dir)
+-- is the C++ half of this contract. Two candidates:
+--   1. $TPF2MP_DATADIR             (a harness pin)
 --   2. $LOCALAPPDATA/tpf2mp/data/  (shipping layout: Program Files is read-only
 --                                   for the game process, LOCALAPPDATA is not)
---   3. the workshop literal        (the dev rig before the data dir existed)
 -- The FIRST candidate holding tpf2_instance.txt wins: the bridge writes that
 -- file at game start, so its presence proves the DLLs settled on that dir. If
--- none has it yet, prefer 2 when the environment was readable, else 3.
+-- none has it yet, 2 is used; with no readable LOCALAPPDATA either, loading
+-- stops with a readable error rather than guessing a folder.
 -- The game's Lua may lack 'os' entirely, hence the pcall around every getenv.
 -- No new top-level locals (the chunk sits at Lua 5.1's 200-local limit): the
 -- discovery is an immediately-invoked function and its bookkeeping lives in CM
@@ -91,7 +89,6 @@ CM.bootOk, K.BASE = pcall(function()
 	add("TPF2MP_DATADIR", env("TPF2MP_DATADIR"))
 	local lad = env("LOCALAPPDATA")
 	add("LOCALAPPDATA", lad and (lad .. "/tpf2mp/data"))
-	add("workshop", "C:/Program Files (x86)/Steam/steamapps/workshop/content/1066780/3710243057/recon/m4/out/")
 	CM.baseCandidates = {}
 	for _, c in ipairs(cands) do CM.baseCandidates[#CM.baseCandidates + 1] = c.path end
 	for _, c in ipairs(cands) do
@@ -102,10 +99,10 @@ CM.bootOk, K.BASE = pcall(function()
 			return c.path
 		end
 	end
-	-- no identity anywhere yet: the shipping default when the environment was
-	-- readable, otherwise the workshop literal (always last in the list)
-	local pick = cands[#cands]
+	-- no identity anywhere yet: the shipping folder
+	local pick
 	for _, c in ipairs(cands) do if c.source == "LOCALAPPDATA" then pick = c end end
+	if not pick then error("LOCALAPPDATA is not readable, and TPF2MP_DATADIR (if set) holds no tpf2_instance.txt", 0) end
 	CM.baseSource = pick.source .. " (no identity file yet)"
 	return pick.path
 end)
@@ -134,39 +131,18 @@ local guiTick, statusWin, statusText = 0, nil, nil   -- gui-state only
 -- MEASURED: 1 game-time unit is ~1.1s of wall clock at speed 1 (300 ticks took
 -- 56s and advanced 50 units), so this delay IS the felt latency of a build.
 --
--- K.EXEC_DELAY must exceed K.BARRIER_AHEAD, not trail it. A peer is allowed to run
--- up to K.BARRIER_AHEAD units ahead; if a command is stamped only K.EXEC_DELAY ahead
--- of the ORIGINATOR and the peer is further ahead than that, the stamp is
--- already in the peer's past and it executes early -- a desync, not a delay.
--- The original 4-vs-10 had that backwards.
-K.EXEC_DELAY = 0.6
-
--- Pause if we are more than this far ahead of the peer. This is the tick
--- barrier: the sim cannot be blocked from Lua, but it can be paused, which
--- achieves the same thing -- nobody runs past a peer who has not caught up, so
--- no command can arrive too late to execute at its stamp. Must be comfortably
--- larger than K.EXEC_DELAY or the barrier fights normal scheduling.
+-- What correctness needs is K.EXEC_DELAY > the peers' ACTUAL skew, and a
+-- stamp also pays the fastest peer's lead (net.lua scheduleLocal). The !! LATE
+-- warning measures the real skew -- if it starts firing, actual drift exceeds
+-- the margin and the delay must go up. That is a measurement, not a guess.
 -- MEASURED: the game clock is FRACTIONAL, advancing in steps of exactly 0.2
 -- units (~0.22s wall clock) -- so sub-second stamps are possible. A single
 -- sample at load read 55234.000000 and looked integer; it was just a round
 -- value from the save. Step size is what settles resolution, not one reading.
---
--- CORRECTION to the rule above. Latency does NOT have to clear this threshold.
--- What correctness needs is K.EXEC_DELAY > the peers' ACTUAL skew; the barrier is
--- only a backstop against one instance stalling badly. Treating it as a latency
--- budget forced the delay up, and then tightening it to buy the delay back
--- deadlocked both games.
---
--- So: keep the barrier LOOSE enough that it almost never fires (5.0 = ~5.5s of
--- drift, which two instances on one machine do not reach in normal play), and
--- keep K.EXEC_DELAY small for latency. The !! LATE warning measures the real skew
--- -- if it starts firing, actual drift exceeds K.EXEC_DELAY and the delay must go
--- up. That is a measurement, not a guess.
-K.BARRIER_AHEAD = 8.0   -- hard stop; above the micropause band (5.0) which paces first
+K.EXEC_DELAY = 0.6
 
--- The most peer lead a command's stamp will pay for. Bigger than K.BARRIER_AHEAD
--- on purpose: the barrier only starts acting AT that threshold, so real skew
--- overshoots it before coming back.
+-- The most peer lead a command's stamp will pay for: a live session was seen
+-- 9.2 units apart (net.lua scheduleLocal).
 CM.MAX_LEAD = 15.0
 
 -- Heartbeats cross between instances through a FILE RELAY (B is sandboxed), so
@@ -260,7 +236,7 @@ end
 -- reading for a peer that has not sent a step yet (an older build).
 -- A peer that is CATCHING UP (cu=1 on its heartbeat: a hot joiner running
 -- through the command history at high speed) is not a pacing reference: it
--- would drag everyone back to its clock, or trip the barrier. It is included
+-- would drag everyone back to its clock. It is included
 -- again the moment it drops the flag, within a unit of the session.
 function CM.peerSlowPrecise()
 	local minT
@@ -353,7 +329,6 @@ local lastHashAt   = nil
 CM.myHashes     = {}         -- [stamp] = our own hash
 CM.myDetails    = {}         -- [stamp] = our own per-component breakdown
 CM.paused       = false
-CM.pausedSince  = nil        -- tick the barrier engaged, for the watchdog
 CM.desyncs = 0
 
 -- The in-game dashboard (guiUpdate, a separate Lua state) can only read files,
@@ -365,7 +340,7 @@ local function dashNote(line)
 	local keep = line:find("success=false", 1, true) or line:find("DESYNC", 1, true)
 		or line:find("LATE", 1, true) or line:find("FAIL", 1, true) or line:find("DIVERGENCE", 1, true)
 		or line:find("captured", 1, true) or line:find("EXEC ", 1, true) or line:find("PACE:", 1, true)
-		or line:find("SPEED:", 1, true) or line:find("BARRIER", 1, true) or line:find("error", 1, true)
+		or line:find("error", 1, true)
 	if not keep then return end
 	if line:find("SYNC t=", 1, true) and not line:find("DESYNC", 1, true) then return end
 	local stamp = os.date("%H:%M:%S")
@@ -437,10 +412,10 @@ K.JOURNAL_LOAN = 0
 -- a 30,000,000 loan is several ticks of settling.
 K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
-K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VMAINT = true, LUPDATE = true, LDELETE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LUPDATE = true, LDELETE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
 -- read from the proposal); the originator instead deletes its native copy and
--- replays, gated by K.CONX_STRICT rather than ARMED. See execConX.
+-- replays, gated by c.cancelled rather than ARMED. See execConX.
 -- Command reliability. LSCMD ships as fire-and-forget UDP; a fully-dropped
 -- command silently desyncs the peer that missed it (measured 2026-09-01: one
 -- instance never got a VBUY and ran a truck short). Each instance keeps a ring
@@ -466,10 +441,6 @@ K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps 
 K.CMD_RING = 256          -- own commands kept for resend
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
 K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
--- Ticks a hole must persist before the completeness barrier stops the sim.
--- Long enough that ordinary UDP reordering never stutters the game, short
--- enough that we cannot simulate far past a command we are owed.
-K.GAP_GRACE_TICKS = 5
 -- How close a peer's node must be to a shipped demolish endpoint to be
 -- accepted as the same node, SQUARED. Nodes come from identically replayed
 -- proposals so they agree to well under a centimetre; a metre is generous
@@ -545,7 +516,7 @@ local function execute(c)
 	elseif c.op == "CONFAIL" then CM.execConFail(c)
 	elseif c.op == "VBUY" then CM.execVBuy(c)
 	elseif c.op == "VREPL" then CM.execVReplace(c)
-	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" or c.op == "VMAINT" then CM.execVehCmd(c)
+	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then CM.execVehCmd(c)
 	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
 	elseif c.op == "VNAME" then CM.execSetName(c)
 	elseif c.op == "VCOLOR" then CM.execSetColor(c)
@@ -572,17 +543,13 @@ end
 -- ---------- command reliability (NACK + resend), encode/decode, scheduleLocal, onLine, pollEvents ----------
 -- Lives in res/scripts/mp/net.lua.
 CM.boot("mp.net")
--- ---------- ground-truth sweeps (constructions, vehicles, lines, demolish) ----------
--- Lives in res/scripts/mp/gt.lua (see the header there).
-local gt = CM.boot("mp.gt")
-CM.gtVehPickModel, CM.gtVehConfig, CM.runGroundTruth = gt.gtVehPickModel, gt.gtVehConfig, gt.runGroundTruth
 -- ---------- roadside stops (edge objects) and native-shape stop replay ----------
 -- Lives in res/scripts/mp/stops.lua.
 CM.boot("mp.stops")
--- ---------- inject reader (pollInject) and BUYTEST readback ----------
+-- ---------- inject reader (pollInject) ----------
 -- Lives in res/scripts/mp/inject.lua.
 CM.boot("mp.inject")
--- ---------- barrier, catch-up pacing, speed sharing, load gate ----------
+-- ---------- session speed, PID pacing, catch-up, load gate ----------
 -- Lives in res/scripts/mp/pacing.lua.
 CM.boot("mp.pacing")
 -- ---------- desync check ----------
@@ -706,7 +673,6 @@ function data()
 			if CM.ticks % 15 == 7 then CM.pollLoan() end
 			if CM.ticks % 10 == 5 then CM.nackScan() end
 			CM.flushConPairs()
-			CM.buytestPoll()
 			CM.primeConstructions()
 			CM.primeVehKeys()
 			CM.shipParkedBuys()
@@ -730,7 +696,7 @@ function data()
 
 			if CM.ticks % K.HEARTBEAT_EVERY == 0 then
 				-- far behind the session (a fresh hot joiner, load-gated or not): say so on
-				-- every heartbeat, so nobody holds the barrier for a peer that must catch up
+				-- every heartbeat, so nobody paces against a peer that must catch up
 				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
 				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d ceil=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo, CM.myCeiling or (CM.MAX_SPEED or 4),
 					CM.heartbeatCu(now) and " cu=1" or ""))
@@ -918,9 +884,8 @@ function data()
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
 						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
-						-- outstanding = commands a peer says it issued that we have not
-						-- received. With strict_barrier on, a non-zero value here is the
-						-- reason the game is holding.
+						-- outstanding= keeps the file's fields unchanged; nothing counts missing
+						-- commands for it any more, so it reads 0.
 						f:write(string.format("outstanding=%d\n", CM.dashGaps or 0))
 						local ps = {}
 						for o, pr in pairs(CM.peers) do

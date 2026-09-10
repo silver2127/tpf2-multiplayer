@@ -54,10 +54,12 @@ end
 function CM.expectDrop(list, x, y) CM.expectTake(list, x, y) end
 
 -- Optional switches from tpf2_slice.cfg in the game folder (the game-script
--- CWD; the same file the slice reads): key=value lines, 1/0.
+-- CWD; the same file the slice reads): key=value lines, 1/0. The mod reads
+-- only two keys: dump_egeo (hash.lua) and exec_delay (pacing.lua, through
+-- CM.cfgNum). Everything else is fixed in code, so a missing or garbled cfg
+-- changes nothing but those two, and each then falls back to its default.
 function CM.cfgFlag(key, default)
-	-- Re-read every ~5 s (2026-09-09): the PID gains and the pacing switches
-	-- are meant to be tuned while the game runs, like the DLL's own cfg.
+	-- Re-read every ~5 s (2026-09-09), like the DLL's own cfg.
 	if CM.cfgCache == nil or ((CM.ticks or 0) - (CM.cfgCacheAt or 0)) > 27 then
 		CM.cfgCacheAt = CM.ticks or 0
 		CM.cfgCache = {}
@@ -76,23 +78,6 @@ function CM.cfgFlag(key, default)
 	if v == nil then return default end
 	return v == "1" or v == "true" or v == "yes"
 end
--- stops_native=0: the old edge rebuild (every neighbour re-created as a new
--- entity; its guards refuse anything under a line or a second object).
--- STRICT BUY (cfg strict_buy, default off). Set HERE rather than at the
--- K.STRICT_OPS literal above, because CM.cfgFlag is not defined yet at that
--- point -- calling it there is the nil-at-load crash from 2cefc5a.
---
--- execVBuy already carries both branches; this is the switch that selects the
--- strict one. The slice only actually cancels when it can fire the depot
--- window's completion callback, and it ships ARMED=0 when it could not, so a
--- buy that ran natively is still skipped rather than applied twice.
-K.STRICT_OPS.VBUY = CM.cfgFlag("strict_buy", true)   -- default ON since 2026-09-08 (the callback fire is fixed; see slice strict_buy)
--- exec_delay is read where CM.cfgNum is defined (it is not yet, here).
-K.STOPS_NATIVE = CM.cfgFlag("stops_native", true)
--- stops_del_on_line=0: refuse to remove a stop a line uses. Natively the apply
--- rewrites the lines and the station group before the entity dies, exactly as
--- when the player bulldozes it; measured on the rig before this defaulted on.
-K.STOPS_DEL_ON_LINE = CM.cfgFlag("stops_del_on_line", true)
 K.STOP_EDGE_EPS = 14.0   -- stop model to road centreline, widest town road with margin
 
 -- Everything the wire needs about one edge object, from this instance's world.
@@ -334,266 +319,6 @@ function CM.pollStops()
 	if not ok then log("stops poll error: " .. tostring(err)) end
 end
 
--- LEGACY (stops_native=0): rebuild a street edge with a given set of stops on
--- it, every one of them RE-CREATED through edgeObjectsToAdd as entity -k. That
--- is the lossy part: the native tool carries the untouched neighbours under
--- their real ids (see CM.nativeStopProposal). Kept, with its guards, as the
--- fallback. Edge objects have their own negative numbering: the k-th entry of
--- edgeObjectsToAdd is entity -k, and the edge lists it as {-k, side}. Listing
--- the object under any other id, or leaving it off the edge, asserts inside
--- CalcNodeIndex, which walks that very list looking for the object.
---
--- stops: list of { u=, left=, model=, name= } relative to node0 -> node1.
--- Every station entity some LINE stops at (via its station group), plus the
--- groups' positions for a proximity fallback. Rebuilding an edge REPLACES its
--- edge objects with new entities, so a stop a line references would be left
--- as a dead entity in that line -- an uncatchable engine assert the next time
--- the line or one of its vehicles is touched (both peers, 2026-09-02: a merged
--- station's old stop deleted from under a bus line).
-local function stationsOnLines()
-	local ents, groups = {}, {}
-	pcall(function()
-		local ls = api.engine.system.lineSystem.getLines()
-		for i = 1, #ls do
-			local lc = api.engine.getComponent(ls[i], api.type.ComponentType.LINE)
-			if lc and lc.stops then
-				for j = 1, #lc.stops do
-					local sg = lc.stops[j].stationGroup
-					if sg and sg ~= -1 and not groups[sg] then
-						groups[sg] = true
-						pcall(function()
-							local gc = api.engine.getComponent(sg, api.type.ComponentType.STATION_GROUP)
-							if gc and gc.stations then for k = 1, #gc.stations do ents[gc.stations[k]] = true end end
-						end)
-					end
-				end
-			end
-		end
-	end)
-	return ents, groups
-end
-
-local function rebuildEdgeWithStops(eid, stops, why, onDone)
-	local comp, a, b, ta, tb = CM.edgeGeomT(eid)
-	if not comp then return false, "edge gone" end
-	local isTrack = false
-	pcall(function() isTrack = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil end)
-	-- An object we cannot describe (not a stop) would be destroyed with the
-	-- edge. Refuse rather than delete something silently.
-	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
-	for eo, e2 in pairs(m) do
-		if e2 == eid and not isPlayerStop(eo) then
-			return false, string.format("edge %d carries edge object %d that is not a stop", eid, eo)
-		end
-	end
-	-- Never rebuild under a line. See stationsOnLines: the objects come back as
-	-- NEW entities and the line keeps the old id -> fatal. Refuse (DIVERGENCE):
-	-- a stop that stays or is missing shows in the c-lane; a crash shows nothing.
-	do
-		local stopsOnLine, groups = stationsOnLines()
-		for eo, e2 in pairs(m) do
-			if e2 == eid then
-				local used = stopsOnLine[eo] or false
-				if not used and next(groups) then
-					-- fallback by proximity: a group centred within 5 m of this stop
-					local d = describeStop(eo, eid)
-					if d then
-						for sg in pairs(groups) do
-							local gx, gy = CM.stationGroupPos(sg)
-							if gx and (gx - d.x) ^ 2 + (gy - d.y) ^ 2 < 25 then used = true; break end
-						end
-					end
-				end
-				if used then
-					return false, string.format("edge %d carries stop %d that a LINE uses -- rebuilding would leave the line on a dead entity (fatal engine assert), refused (DIVERGENCE)", eid, eo)
-				end
-			end
-		end
-	end
-	-- TWO OBJECTS ON ONE EDGE IS A FATAL ENGINE ASSERT. StreetGeometry::CreateLanes
-	-- requires the interleaved edgeObjects list to end in a -1 sentinel and rejects
-	-- a second object with edgeObjects[0].second == -1 -- an UNCATCHABLE C++ assert
-	-- that killed both peers on a STOPDEL rebuild (2026-09-02): the peer's road graph
-	-- differs from the originator's (town growth, wrong-side placement), so two of
-	-- the originator's stops mapped onto one peer edge, and rebuilding it with both
-	-- crashed the game. A missing/extra stop is a visible c-lane divergence; a dead
-	-- game is not. Refuse to build more than one object on an edge here too, the same
-	-- rule execStopAdd already enforces before a build.
-	if #stops > 1 then
-		return false, string.format("edge %d would carry %d objects -- a second is a fatal engine assert, refused (DIVERGENCE)", eid, #stops)
-	end
-	table.sort(stops, function(p, q) return p.u < q.u end)
-	local sp = api.type.SimpleProposal.new()
-	local e = api.type.SegmentAndEntity.new()
-	e.entity = -1
-	e.comp.node0 = comp.node0
-	e.comp.node1 = comp.node1
-	e.comp.tangent0 = api.type.Vec3f.new(ta[1], ta[2], ta[3])
-	e.comp.tangent1 = api.type.Vec3f.new(tb[1], tb[2], tb[3])
-	e.comp.type = comp.type or 0
-	e.comp.typeIndex = comp.typeIndex or -1
-	e.type = isTrack and 1 or 0
-	CM.copyEdgeProps(e, eid, isTrack, nil)
-	local objs = {}
-	for k, st in ipairs(stops) do objs[#objs + 1] = { -k, tonumber(st.kind) or 1 } end
-	e.comp.objects = objs
-	sp.streetProposal.edgesToAdd[1] = e
-	sp.streetProposal.edgesToRemove[1] = eid
-	for k, st in ipairs(stops) do
-		local eo = api.type.SimpleStreetProposal.EdgeObject.new()
-		eo.edgeEntity = -1
-		eo.param = st.u
-		eo.oneWay = st.oneWay and true or false
-		-- st.left is the GEOMETRIC side computed on THIS instance's edge (execStopAdd
-		-- projects the shipped world position onto the peer's own edge). A blanket
-		-- inversion here was wrong -- it flipped exactly the edges the projection
-		-- already had right (inconsistent side, 2026-09-02). Pass it straight; the
-		-- verify-and-flip below corrects whatever the engine's convention actually is.
-		eo.left = st.left and true or false
-		eo.model = st.model
-		eo.playerEntity = api.engine.util.getPlayer()
-		eo.name = st.name or ""
-		sp.streetProposal.edgeObjectsToAdd[k] = eo
-	end
-	-- Every stop on this edge comes back with a new entity id; the poller must
-	-- not read that as remove + add. Announce each position both ways.
-	for _, st in ipairs(stops) do
-		if st.x then
-			CM.expectAdd(CM.expectStop, st.x, st.y)
-			CM.expectAdd(CM.expectStopDel, st.x, st.y)
-		end
-	end
-	local cmd = api.cmd.make.buildProposal(sp, CM.buildContext(), true)
-	api.cmd.sendCommand(cmd, function(res, success)
-		local msg = ""
-		if not success then
-			pcall(function()
-				local es = res.resultProposalData and res.resultProposalData.errorState
-				if es then
-					msg = " critical=" .. tostring(es.critical)
-					for i = 1, #es.messages do msg = msg .. " '" .. tostring(es.messages[i]) .. "'" end
-				end
-			end)
-			for _, st in ipairs(stops) do
-				if st.x then CM.expectDrop(CM.expectStop, st.x, st.y); CM.expectDrop(CM.expectStopDel, st.x, st.y) end
-			end
-		end
-		log(string.format("EXEC %s: %s edge %d rebuilt with %d object(s) success=%s%s", why, isTrack and "track" or "street", eid, #stops, tostring(success), msg))
-		if onDone then onDone(success) end
-	end)
-	return true
-end
-
--- The stops already on an edge, described relative to that edge.
-local function stopsOnEdge(eid)
-	local list = {}
-	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
-	for eo, e2 in pairs(m) do
-		if e2 == eid and isPlayerStop(eo) then
-			local d = describeStop(eo, eid)
-			if d then list[#list + 1] = { eo = eo, u = d.u, left = d.left, model = d.model, name = d.name, x = d.x, y = d.y, kind = d.kind, oneWay = d.oneWay } end
-		end
-	end
-	return list
-end
-
-function CM.execStopAddLegacy(c)
-	local ok, err = pcall(function()
-		if c.kind == nil then
-			log(string.format("STOPADD seq=%s: no kind on the wire (older peer build) -- skipped rather than guessed", tostring(c.seq)))
-			return
-		end
-		local wantTrack = tonumber(c.track) == 1
-		local eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0)
-		if not eid then
-			log(string.format("STOPADD seq=%s: no %s edge %.1f,%.1f--%.1f,%.1f here -- skipped",
-				tostring(c.seq), wantTrack and "track" or "street", c.ax, c.ay, c.bx, c.by))
-			return
-		end
-		-- The wire's u and side are relative to the originator's node0 -> node1.
-		-- Ours may run the other way.
-		local comp, a, b, ta, tb = CM.edgeGeomT(eid)
-		-- u and left are measured along THIS instance's node0->node1, which need
-		-- not match the originator's: applying the shipped u/left (even with the
-		-- endpoint-flip heuristic) put a stop 12 m along the edge on the other
-		-- side (2026-09-02, 'Am Sportplatz' 1240 -> 1252). Project the shipped
-		-- world position onto our edge and take the side from the cross product,
-		-- exactly as describeStop does at capture. Positions in, positions out.
-		local u = CM.uOnEdge(eid, c.x, c.y)
-		local left = tonumber(c.left) == 1
-		if u then
-			local q = CM.hermitePos(a, ta, b, tb, u)
-			local tg = CM.hermiteTangent(a, ta, b, tb, u)
-			local cross = tg[1] * (c.y - q[2]) - tg[2] * (c.x - q[1])
-			left = cross > 0
-		else
-			u = tonumber(c.u) or 0.5
-			local da = (a[1] - c.ax) ^ 2 + (a[2] - c.ay) ^ 2
-			local db = (a[1] - c.bx) ^ 2 + (a[2] - c.by) ^ 2
-			if db < da then u = 1 - u; left = not left end
-			log(string.format("STOPADD seq=%s: projection failed, fell back to shipped u/left", tostring(c.seq)))
-		end
-		local stops = stopsOnEdge(eid)
-		for _, st in ipairs(stops) do
-			if (st.x - c.x) ^ 2 + (st.y - c.y) ^ 2 < 1.0 then
-				log(string.format("STOPADD seq=%s: a stop already stands at %.1f,%.1f -- nothing to do", tostring(c.seq), c.x, c.y))
-				return
-			end
-		end
-		-- TWO OBJECTS ON ONE EDGE is not yet understood. With the kinds right the
-		-- engine still asserts in StreetGeometry::CreateLanes
-		-- (edgeObjects[0].second == -1) on a second object, and one form of that
-		-- assert was fatal. Refuse loudly until the rule is read out of the
-		-- decompile: a stop the peer lacks is a visible c-lane difference, a
-		-- crashed game is not.
-		if #stops > 0 then
-			log(string.format("STOPADD seq=%s: edge %d already carries %d object(s) -- a second is NOT supported yet, skipped (DIVERGENCE)",
-				tostring(c.seq), eid, #stops))
-			return
-		end
-		stops[#stops + 1] = { u = u, left = left, model = CM.unescName(c.model), name = CM.unescName(c.name), x = c.x, y = c.y,
-			kind = tonumber(c.kind) or 1, oneWay = tonumber(c.oneWay) == 1 }
-		local ok2, why = rebuildEdgeWithStops(eid, stops, string.format("STOPADD seq=%s origin=%s '%s'",
-			tostring(c.seq), tostring(c.origin), CM.unescName(c.name)))
-		if not ok2 then log(string.format("STOPADD seq=%s: %s -- skipped", tostring(c.seq), tostring(why))) end
-	end)
-	if not ok then log("exec STOPADD error: " .. tostring(err)) end
-end
-
-function CM.execStopDelLegacy(c)
-	local ok, err = pcall(function()
-		local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
-		local best, bestD
-		for eo, eid in pairs(m) do
-			if isPlayerStop(eo) then
-				local d = describeStop(eo, eid)
-				if d then
-					local dd = (d.x - c.x) ^ 2 + (d.y - c.y) ^ 2
-					if dd < 4 and (not bestD or dd < bestD) then best, bestD = eo, dd end
-				end
-			end
-		end
-		if not best then
-			log(string.format("STOPDEL seq=%s: no roadside stop within 2 m of %.1f,%.1f -- skipped",
-				tostring(c.seq), c.x, c.y))
-			return
-		end
-		local eid = m[best]
-		local keep = {}
-		for _, st in ipairs(stopsOnEdge(eid)) do
-			if st.eo ~= best then keep[#keep + 1] = st end
-		end
-		CM.expectAdd(CM.expectStopDel, c.x, c.y)
-		local ok2, why = rebuildEdgeWithStops(eid, keep, string.format("STOPDEL seq=%s origin=%s", tostring(c.seq), tostring(c.origin)),
-			function(success) if not success then CM.expectDrop(CM.expectStopDel, c.x, c.y) end end)
-		if not ok2 then
-			CM.expectDrop(CM.expectStopDel, c.x, c.y)
-			log(string.format("STOPDEL seq=%s: %s -- skipped", tostring(c.seq), tostring(why)))
-		end
-	end)
-	if not ok then log("exec STOPDEL error: " .. tostring(err)) end
-end
-
 -- ====================== NATIVE-SHAPE STOP REPLAY ======================
 --
 -- What the street tool and the bulldozer actually submit (decompiled
@@ -819,7 +544,6 @@ end
 -- STOPADD and STOPREP (c.rx/c.ry = the stop the originator's placement
 -- replaced). Returns true when a proposal went out.
 function CM.execStopAdd(c)
-	if not K.STOPS_NATIVE then CM.execStopAddLegacy(c); return false end
 	local sent = false
 	local ok, err = pcall(function()
 		local tag = string.format("%s seq=%s", c.rx and "STOPREP" or "STOPADD", tostring(c.seq))
@@ -883,10 +607,6 @@ function CM.execStopAdd(c)
 				rm = { eo = old, eid = oldEid, x = tonumber(c.rx), y = tonumber(c.ry) }
 				local lines = CM.linesUsingStation(old)
 				if #lines > 0 then
-					if not K.STOPS_DEL_ON_LINE then
-						log(string.format("%s: replaced stop %d is used by %d line(s) and stops_del_on_line=0 -- refused (DIVERGENCE)", tag, old, #lines))
-						return
-					end
 					log(string.format("%s: replaced stop %d is used by %d line(s) -- the engine rewrites them, the LUPDATE behind this restores the stop", tag, old, #lines))
 				end
 			else
@@ -931,10 +651,6 @@ function CM.execStopAdd(c)
 					rm = { eo = o[1], eid = eid, x = d and d.x or c.x, y = d and d.y or c.y }
 					local lines = CM.linesUsingStation(o[1])
 					if #lines > 0 then
-						if not K.STOPS_DEL_ON_LINE then
-							log(string.format("%s: replaced stop %d is used by %d line(s) and stops_del_on_line=0 -- refused (DIVERGENCE)", tag, o[1], #lines))
-							return
-						end
 						log(string.format("%s: replacing stop %d (%s) used by %d line(s) -- the engine rewrites them, the LUPDATE behind this restores the stop",
 							tag, o[1], d and d.model or "?", #lines))
 					else
@@ -969,7 +685,6 @@ function CM.execStopAdd(c)
 end
 
 function CM.execStopDel(c)
-	if not K.STOPS_NATIVE then CM.execStopDelLegacy(c); return false end
 	local sent = false
 	local ok, err = pcall(function()
 		local tag = string.format("STOPDEL seq=%s", tostring(c.seq))
@@ -980,10 +695,6 @@ function CM.execStopDel(c)
 		end
 		local lines = CM.linesUsingStation(best)
 		if #lines > 0 then
-			if not K.STOPS_DEL_ON_LINE then
-				log(string.format("%s: stop %d is used by %d line(s) and stops_del_on_line=0 -- refused (DIVERGENCE)", tag, best, #lines))
-				return
-			end
 			log(string.format("%s: stop %d is used by %d line(s) -- removed natively, the engine rewrites the lines first", tag, best, #lines))
 		end
 		local okB, why = CM.nativeStopProposal(nil, { eo = best, eid = eid, x = c.x, y = c.y },

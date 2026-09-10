@@ -324,12 +324,11 @@ function CM.scheduleLocal(op, args)
 	if fastT then
 		lead = fastT - now
 		if lead < 0 then lead = 0 end
-		-- Capping this at K.BARRIER_AHEAD was wrong. The barrier is a backstop that
-		-- acts only once a peer is 5 units ahead, and it takes time to bite -- a
-		-- live session was seen 9.2 units apart. A command stamped 5.6 out then
-		-- still lands in the peer's past and is applied out of step. Cap high
-		-- enough to cover any gap the barrier tolerates in practice; the delay is
-		-- felt by the player, so it is not unbounded either.
+		-- Capping this at the barrier's threshold (5 units then) was wrong: a live
+		-- session was seen 9.2 units apart, and a command stamped 5.6 out then
+		-- still landed in the peer's past and was applied out of step. Cap high
+		-- enough to cover the gaps seen in practice; the delay is felt by the
+		-- player, so it is not unbounded either.
 		if lead > CM.MAX_LEAD then lead = CM.MAX_LEAD end
 	end
 	local delay = K.EXEC_DELAY + lead
@@ -528,9 +527,9 @@ local function onLine(line)
 			-- error. The step is K.SIM_STEP (0.2) resolution, 5x finer.
 			--
 			-- Kept in a SEPARATE field on purpose. Rewriting pr.time would move
-			-- what peerBounds returns, and that value is what K.BARRIER_AHEAD
-			-- and command stamping were tuned against -- it would silently
-			-- relax the barrier by ~0.5 and stamp every command further out.
+			-- what peerBounds returns, and that value is what command stamping
+			-- was tuned against -- it would silently stamp every command further
+			-- out.
 			local st = tonumber(line:match(" s=(%-?%d+)"))
 			if st then pr.step = st end
 			local ce = tonumber(line:match(" ceil=(%d+)"))
@@ -543,11 +542,11 @@ local function onLine(line)
 	elseif op == "LSEFF" then
 		-- SPEED V2: the host broadcasts the session's effective speed; joiners
 		-- apply it. Not while the load gate holds (only the local lever releases
-		-- us, same rule as LSSPEED).
-		if CM.cfgFlag("speed_v2", true) and not CM.lgHolding then
+		-- us).
+		if not CM.lgHolding then
 			local v = tonumber(line:match("v=([%d%.]+)"))
 			if v then
-				CM.effSpeed = v; CM.baseSpeed = v
+				CM.effSpeed = v
 				-- The host unpaused the session: a ceiling of 0 of our own is lifted
 				-- (host-authoritative unpause, see CM.hostUnpause). A real pause here
 				-- is re-learned from the next persistent 0 the detector sees.
@@ -555,37 +554,9 @@ local function onLine(line)
 					CM.myCeiling = v
 					log(string.format("SPEED2: host unpaused the session at %g -- our ceiling of 0 lifted", v))
 				end
-				-- Applied by CM.paceV2 on the next tick, which knows about the barrier
-				-- and turns a session pause into a sync point (run to the leader's
+				-- Applied by CM.paceV2 on the next tick, which turns a session pause
+				-- into a sync point (run to the leader's
 				-- clock, then stop) instead of freezing everyone where they are.
-			end
-		end
-	elseif op == "LSSPEED" then
-		-- The other player moved the speed lever: follow. Speed is local pacing,
-		-- not simulated state, so it is applied on arrival, not at a stamp.
-		--
-		-- NOT while the load gate holds. With three players this was the whole
-		-- failure: the host's gate held at 0 (and, sent raw, that 0 was shared
-		-- as if the player had chosen it), a joiner that saw everyone in hit its
-		-- tick-100 "speed 0 -> 1" unpause, THAT was shared back, the held host's
-		-- speed became 1, and its gate read a non-zero speed after its own 0 as
-		-- the player pressing play -- releasing while the third player was still
-		-- loading. Two players never showed it because the joiner is counted in
-		-- before its tick 100. While we hold, only our own lever moves us.
-		local v = tonumber(line:match("v=(%d+)"))
-		if v and CM.lgHolding then
-			if not CM.lgIgnoredSpeed then
-				CM.lgIgnoredSpeed = true
-				log(string.format("LOADGATE: ignoring peer speed %d while holding (only this player's lever releases us)", v))
-			end
-		elseif v then
-			local s0
-			pcall(function() s0 = game.interface.getGameSpeed() end)
-			if s0 ~= v then
-				CM.baseSpeed = v
-				CM.catchingUp = false
-				CM.lastSeenSpeed = v      -- so shareSpeed does not echo it back
-				CM.setSpeed(v, "the other player set it")
 			end
 		end
 	elseif op == "LSNACK" then
@@ -644,8 +615,8 @@ local function onLine(line)
 				CM.queue[#CM.queue + 1] = c
 				-- A command whose stamp has already passed here will execute at a
 				-- DIFFERENT sim time than it did on the originator, which is a
-				-- desync rather than a late delivery. It is the exact failure
-				-- K.EXEC_DELAY > K.BARRIER_AHEAD exists to prevent, so say so loudly
+				-- desync rather than a late delivery. It is the exact failure the stamp's
+				-- K.EXEC_DELAY and peer-lead margin exist to prevent, so say so loudly
 				-- if it ever happens instead of letting it look like a mystery
 				-- hash mismatch later.
 				local now = CM.gameTime()

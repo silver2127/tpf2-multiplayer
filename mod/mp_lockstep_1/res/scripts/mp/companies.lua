@@ -348,7 +348,6 @@ end
 -- replicated VCOLOR against the vehicle's shared key, a few units after the
 -- buy so the key has bound on every peer (it binds when the vehicle appears).
 function CM.cmColorNewVehicle(key)
-	if not CM.cfgFlag("company_colors", true) then return end
 	if CM.cmMode ~= "companies" or not CM.cmMyCompany then return end
 	local r, g, b = CM.cmCompanyColor(CM.cmMyCompany)
 	CM.scheduleLocal("VCOLOR", { kind = "veh", key = key, r = r, g = g, b = b, delay = 3 })

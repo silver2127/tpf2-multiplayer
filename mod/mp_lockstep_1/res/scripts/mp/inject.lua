@@ -1,4 +1,4 @@
--- mp/inject.lua -- inject reader (pollInject) and BUYTEST readback
+-- mp/inject.lua -- inject reader (pollInject)
 --
 -- Split out of lockstep.lua on 2026-09-08. Loaded from the game script as
 --     require("mp.inject")(CM, K, log)
@@ -7,138 +7,6 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
--- ---------- BUYTEST: live vehicle-identity readback (STEP 5) ----------
---
--- Three questions a factory-only sweep cannot answer, all needed before vehicle
--- replication can pick a cross-peer identity scheme:
---   1. does the sendCommand callback hand back the new vehicle's entity id?
---   2. does purchaseTime survive apply, or does the engine restamp it?
---   3. is getDepotVehicles order stable (usable as an ordinal key)?
--- This DOES touch the world (a real vehicle is bought, real money spent) -- it
--- is a one-shot diagnostic, not a sweep. Runs on whichever instance injects it.
-local buytestPending = nil    -- { depot=, want=, at= } awaiting readback
-
-local function findDepotForKind(kind)
-	-- kind: "train" -> train_depot, "road" -> road_depot. First matching depot.
-	local want = (kind == "train") and "train_depot" or "road_depot"
-	local found
-	pcall(function()
-		local list = game.interface.getEntities({ radius = 999999 },
-			{ type = "CONSTRUCTION", includeData = false }) or {}
-		for _, id in pairs(list) do
-			local alive = false
-			pcall(function() alive = api.engine.entityExists(id) end)
-			if alive and not found then
-				local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
-				if co and co.fileName and tostring(co.fileName):find(want, 1, true) then
-					found = id
-				end
-			end
-		end
-	end)
-	return found
-end
-
-local function vehiclePurchaseTime(vid)
-	local pt
-	pcall(function()
-		local tv = api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
-		-- purchaseTime lives per-part; read the first part's
-		if tv and tv.transportVehicleConfig and tv.transportVehicleConfig.vehicles then
-			local v0 = tv.transportVehicleConfig.vehicles[1]
-			if v0 then pt = v0.purchaseTime end
-		end
-	end)
-	return pt
-end
-
-local function depotVehicleOrder(depot)
-	local ids = {}
-	pcall(function()
-		local vs = game.interface.getDepotVehicles(depot)
-		if type(vs) == "table" then for _, v in ipairs(vs) do ids[#ids + 1] = v end end
-	end)
-	return ids
-end
-
-local function runBuyTest()
-	local mid, nComp, merr, kind = CM.gtVehPickModel()
-	if not mid then log("BUYTEST: " .. tostring(merr)); return end
-	-- Match the depot to the model KIND (train/road). The numeric carrier enum
-	-- must NEVER be guessed here: buying a train into a road depot is a native
-	-- assert that pcall cannot catch and wedges the sim thread (measured).
-	kind = kind or "road"
-	local depot = findDepotForKind(kind)
-	if not depot then log("BUYTEST: no " .. kind .. " depot found in save"); return end
-	-- Re-confirm the match right before buying. A native type mismatch here is an
-	-- uncatchable assert, so refuse rather than risk it.
-	local okType = false
-	pcall(function()
-		local co = api.engine.getComponent(depot, api.type.ComponentType.CONSTRUCTION)
-		local fn = co and co.fileName and tostring(co.fileName) or ""
-		okType = fn:find((kind == "train") and "train_depot" or "road_depot", 1, true) ~= nil
-	end)
-	if not okType then log("BUYTEST: depot " .. depot .. " does not match kind " .. kind .. " -- refusing"); return end
-	log(string.format("BUYTEST: model=%d comp=%d kind=%s depot=%d", mid, nComp, kind, depot))
-
-	local steps = {}
-	local function step(name, fn) local ok, e = pcall(fn); steps[#steps + 1] = name .. (ok and "" or (" FAIL:" .. tostring(e))); return ok end
-	local KNOWN_PT = 777000001         -- a sentinel purchaseTime we can recognise on readback
-	local config = CM.gtVehConfig(step, mid, nComp, 1, { purchaseTime = KNOWN_PT })
-	if not config then log("BUYTEST: config build failed: " .. table.concat(steps, " | ")); return end
-
-	local before = depotVehicleOrder(depot)
-	log("BUYTEST: depot had " .. #before .. " vehicles before")
-
-	local pid = api.engine.util.getPlayer()
-	local ok = pcall(function()
-		api.cmd.sendCommand(api.cmd.make.buyVehicle(pid, depot, config), function(res, success)
-			-- Log EVERY plausible result field; we do not know which the binding exposes.
-			local rv, re, ve, tp = "nil", "nil", "nil", "nil"
-			pcall(function() if res then rv = tostring(res.resultVehicleEntity) end end)
-			pcall(function() if res then re = tostring(res.resultEntity) end end)
-			pcall(function() if res then ve = tostring(res.vehicleEntity) end end)
-			pcall(function() if res then tp = tostring(res.type) end end)
-			log(string.format("BUYTEST CALLBACK success=%s resultVehicleEntity=%s resultEntity=%s vehicleEntity=%s type=%s",
-				tostring(success), rv, re, ve, tp))
-			-- Arm a readback a few stamps later (the vehicle needs to exist).
-			local now = CM.gameTime()
-			buytestPending = { depot = depot, before = before, want = KNOWN_PT,
-			                   at = (now and now + 3) or nil, res_rv = rv }
-		end)
-	end)
-	if not ok then log("BUYTEST: sendCommand threw"); return end
-	log("BUYTEST: buy issued (steps: " .. #steps .. " ok)")
-end
-
--- Called each tick from the main loop; fires the readback once the vehicle exists.
-function CM.buytestPoll()
-	if not buytestPending then return end
-	local now = CM.gameTime()
-	if not now or (buytestPending.at and now < buytestPending.at) then return end
-	local p = buytestPending
-	buytestPending = nil
-	local after = depotVehicleOrder(p.depot)
-	log(string.format("BUYTEST READBACK depot vehicles: before=%d after=%d", #p.before, #after))
-	-- The new vehicle is the id in `after` not in `before`.
-	local beforeSet = {}
-	for _, v in ipairs(p.before) do beforeSet[v] = true end
-	local newId
-	for _, v in ipairs(after) do if not beforeSet[v] then newId = v; break end end
-	log("BUYTEST READBACK newVehicle(by diff)=" .. tostring(newId) ..
-		"  callback_resultVehicleEntity=" .. tostring(p.res_rv))
-	if newId then
-		local pt = vehiclePurchaseTime(newId)
-		log(string.format("BUYTEST READBACK purchaseTime: set=%d read=%s -> %s",
-			p.want, tostring(pt),
-			(pt == p.want) and "SURVIVES (usable key)" or "RESTAMPED (not a key)"))
-	end
-	-- Depot order: print both so a cross-peer comparison can be eyeballed.
-	local ord = {}
-	for _, v in ipairs(after) do ord[#ord + 1] = tostring(v) end
-	log("BUYTEST READBACK depot order = [" .. table.concat(ord, ",") .. "]")
-end
-
 -- SOLO IS SOLO. The slice leaves a build alone when no peer is playing (see
 -- SessionLive in slice_hook.cpp), so the engine has already built it -- replaying
 -- it here would build it a second time. Reading the file and dropping the lines
@@ -171,7 +39,7 @@ function CM.pollInject()
 			-- Same protection pollEvents has had all along: one malformed line
 			-- (or one bug in a parser branch) must cost that line, not the tick.
 			local okLine, errLine = pcall(function()
-			-- Diagnostics (EVAL, HEAL, BUYTEST) always run; a CAPTURE is dropped
+			-- Diagnostics (EVAL, HEAL) always run; a CAPTURE is dropped
 			-- when nobody is playing with us, because the engine already built it.
 			-- Inside the per-line pcall on purpose: a `return` here skips THIS
 			-- line. Outside it, the first dropped capture abandoned every line
@@ -192,7 +60,7 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "BUYTEST" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
 				CM.soloDrop(line)
 				return
 			end
@@ -228,13 +96,6 @@ function CM.pollInject()
 				else
 					log("EVAL compile: " .. tostring(cerr))
 				end
-
-			elseif o == "BUYTEST" then
-				runBuyTest()
-
-			-- GT <track|street>  -- ground-truth sweep, non-destructive
-			elseif o == "GT" and #w >= 2 then
-				CM.runGroundTruth(w[2])
 
 			-- ROADE <N> <etype> <stype> <ttype> <cat> <M> <rn> <re>
 			--       <id x y z>*N <a1 a2 t0x t0y t0z t1x t1y t1z>*M
@@ -911,8 +772,7 @@ function CM.pollInject()
 							-- whole point: the entity is then created on the same
 							-- sim-step everywhere.
 							-- carry the slice's ARMED verdict ON the command, so the
-							-- replay guard reads per-command truth rather than a cfg
-							-- flag cached at load
+							-- replay guard reads per-command truth
 							bargs.armed = tonumber(CM.lastArmed or 0)
 							if K.STRICT_OPS.VBUY and tonumber(CM.lastArmed or 0) == 1 then
 								-- NO expectVehicle here. Under strict the originator
@@ -925,7 +785,7 @@ function CM.pollInject()
 								-- assignments in quick succession the keys bound to the
 								-- wrong vehicles and setLine landed on the peers but not
 								-- on the originator (measured 2026-09-03, right after
-								-- strict_buy went in).
+								-- strict buys went in).
 								CM.scheduleLocal("VBUY", bargs)
 								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp (key binds on replay)")
 							else
@@ -1006,20 +866,6 @@ function CM.pollInject()
 				if k then
 					log("VREV: " .. k)
 					CM.scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
-				end
-
-			elseif o == "VMAINT" and #w >= 3 then
-				-- Maintenance slider (running-cost setting) changed on a vehicle.
-				-- STRICT (cfg strict_maint): the slice cancels the native change and
-				-- ARMED=1 travels, so every instance -- originator included -- applies
-				-- the same running-cost value at the same stamp (VMAINT is in
-				-- K.STRICT_OPS). With strict_maint off it degrades to L-flow (armed=0:
-				-- originator native, peers replay).
-				local id, val = tonumber(w[2]), tonumber(w[3])
-				local k = id and CM.vehKeyFor(id)
-				if k and val then
-					log(string.format("VMAINT: %s -> %.4f", k, val))
-					CM.scheduleLocal("VMAINT", { key = k, v = val, armed = CM.lastArmed or 0 })
 				end
 
 			elseif o == "VDEPOT" and #w >= 3 then

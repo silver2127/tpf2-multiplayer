@@ -172,7 +172,6 @@ K.VPOS_PER_PART = 30
 -- Vehicle drift is now a DESYNC, not just a metric -- but thresholded, so the
 -- benign sub-tick jitter between honest instances (~1-3 m) never cries wolf.
 -- A depot-triggered native-vs-replay drift blows past this and keeps growing.
--- cfg vpos_desync_m overrides it.
 K.VPOS_DESYNC_M = 10
 K.VPOS_KEEP = 24
 CM.vposMine = {}      -- stamp -> { s = simtime, pts = {{x,y},...} }
@@ -247,7 +246,7 @@ function CM.vposCompare(stamp, o)
 	-- caught. Beyond the tolerance it counts as a real desync: bump the
 	-- counter, mark the dashboard, and log it loud, exactly like a hash
 	-- mismatch. One count per stamp per peer (vposDone guards re-entry).
-	local lim = CM.cfgNum and CM.cfgNum("vpos_desync_m", K.VPOS_DESYNC_M) or K.VPOS_DESYNC_M
+	local lim = K.VPOS_DESYNC_M
 	if mx > lim then
 		CM.desyncs = CM.desyncs + 1
 		CM.dashVerdict = string.format("DESYNC vpos %.0fm vs %s", mx, o)

@@ -56,7 +56,7 @@ end
 -- Gated, with a nil fallback if make refuses, so the worst case is today's
 -- behaviour.
 K.CONX_UI_CONTEXT = true
--- PROTOTYPE (cfg conx_strict=1, default OFF): the host keeps its native
+-- STRICT CONSTRUCTION REPLAY (execConX): the host keeps its native
 -- station placement, but its interactive builder grades the terrain 0.1 m
 -- higher than the scripted buildProposal the peers replay (measured
 -- 2026-09-02: host z=4.5, peers z=4.4, z-only). Extracting params to cancel
@@ -67,19 +67,11 @@ K.CONX_UI_CONTEXT = true
 -- three grade identically. Money (native charge + bulldoze refund +
 -- recharge) is not reconciled yet -- this prototype proves the GEOMETRY
 -- converges (dump_egeo) before that is solved.
--- checked at CALL time via CM.cfgFlag("conx_strict") in execConX -- NOT here:
--- CM.cfgFlag is defined lower in the file, so a top-level call is a nil crash.
 function CM.conxContext()
 	if not K.CONX_UI_CONTEXT then return nil end
-	-- EXPERIMENT (cfg conx_terrain_align=0): the host's interactive builder
-	-- settles a station 0.1 m higher than this scripted proposal's terrain
-	-- re-grade (measured 2026-09-02: host z=4.5, peers z=4.4, z-only, station
-	-- edges). Turning the re-grade OFF here tests whether the peers then match
-	-- the host. Default true keeps today's behaviour.
-	local align = CM.cfgFlag("conx_terrain_align", true)
 	local ok, ctx = pcall(function()
 		local c = api.type.Context:new()
-		c.checkTerrainAlignment = align
+		c.checkTerrainAlignment = true
 		c.cleanupStreetGraph    = true
 		c.gatherBuildings       = false
 		c.gatherFields          = true
@@ -549,29 +541,19 @@ function CM.execPolyline(c, planOnly)
 					-- had to climb 3.07 m over 31.6 m (9.7%) into it instead of
 					-- 1.04 m (3.3%) -- 'Too much slope', and the player's build
 					-- vanished on their own screen. The originator's engine moves the
-					-- road to meet the rail at a crossing; the shipped z IS the
-					-- height its build settled on, so ask for the same move by
-					-- carrying the existing node into the proposal at the rail's
-					-- height. Small differences are left alone: re-heighting every
-					-- crossing by a centimetre is churn the engine does not need.
+					-- road to meet the rail at a crossing, but moving an existing node
+					-- inside a replayed proposal is not safe (below); differences of
+					-- 0.25 m or less are left alone.
 					local rp = CM.nodePosXYZ(rnode)
 					if rp and math.abs(rp[3] - z) > 0.25 then
-						if CM.cfgFlag("xing_reheight", false) then
-							local mv = api.type.NodeAndEntity.new()
-							mv.entity = rnode                     -- an EXISTING id: move, not add
-							mv.comp.position = api.type.Vec3f.new(rp[1], rp[2], z)
-							addNodes[#addNodes + 1] = mv
-							CM.cmLog(string.format("XING: road node %d re-heighted %.2f -> %.2f to meet the rail", rnode, rp[3], z))
-						else
-							-- MOVING AN EXISTING NODE IN A REPLAYED PROPOSAL ASSERTS THE
-							-- ENGINE (construction_util_engine.cpp:58 AddToEngine, live
-							-- 2026-09-09, a 2.05 m move) and the game never recovers.
-							-- The rail vertex takes the road's height instead; if the
-							-- slope is then too steep the engine refuses the build the
-							-- same way on every instance, and the player re-lays it.
-							CM.cmLog(string.format("XING: road node %d is %.2f m off the rail's height -- NOT moving it (xing_reheight=0); the rail meets it at %.2f", rnode, z - rp[3], rp[3]))
-							z = rp[3]
-						end
+						-- MOVING AN EXISTING NODE IN A REPLAYED PROPOSAL ASSERTS THE
+						-- ENGINE (construction_util_engine.cpp:58 AddToEngine, live
+						-- 2026-09-09, a 2.05 m move) and the game never recovers.
+						-- The rail vertex takes the road's height instead; if the
+						-- slope is then too steep the engine refuses the build the
+						-- same way on every instance, and the player re-lays it.
+						CM.cmLog(string.format("XING: road node %d is %.2f m off the rail's height -- NOT moving it; the rail meets it at %.2f", rnode, z - rp[3], rp[3]))
+						z = rp[3]
 					end
 					planV[#planV + 1] = string.format("%d,N,%.2f,%.2f,%.2f", i, x, y, z)
 					resolved[i] = rnode; return rnode
@@ -761,7 +743,6 @@ function CM.execPolyline(c, planOnly)
 			end
 			return xingNodeCache
 		end
-		local xingDebug = CM.cfgFlag("xing_debug", false)
 		local function crossingsFor(k, n0, n1, x0, y0, z0, x1, y1, z1, T0, T1)
 			local hits = {}
 			if not isTrack then return hits end
@@ -779,19 +760,12 @@ function CM.execPolyline(c, planOnly)
 			-- crossing another rail is a plain junction -- same split, no crossing
 			-- component). Placeholder ids (<0) are never in these maps.
 			local cand, considered = {}, 0
-			local nMap, nIn, minD = 0, 0, 1e9
-			local mx, my = (x0 + x1) / 2, (y0 + y1) / 2
 			for _, nd in ipairs(xingNodeList()) do
-				nMap = nMap + 1
 				local px, py = nd[1], nd[2]
 				if px >= minx and px <= maxx and py >= miny and py <= maxy then
-					nIn = nIn + 1
 					for _, eid in ipairs(nd[3]) do cand[eid] = true end
-					local d = math.sqrt((px - mx) ^ 2 + (py - my) ^ 2); if d < minD then minD = d end
 				end
 			end
-			if xingDebug then CM.cmLog(string.format("XING: seg %d bbox x[%.0f,%.0f] y[%.0f,%.0f] mid=(%.0f,%.0f) mapNodes=%d inBox=%d nearestNode=%.1f m",
-				k, minx, maxx, miny, maxy, mx, my, nMap, nIn, minD)) end
 			for eid in pairs(cand) do
 				considered = considered + 1
 				local comp, ra, rb, rta, rtb = CM.edgeGeomT(eid)
@@ -877,8 +851,6 @@ function CM.execPolyline(c, planOnly)
 							end
 						else hits[#hits + 1] = { eid = eid, ru = bestRu, u = bestU }; reason = "CROSSING (mid-edge split)" end
 					end
-					if xingDebug then CM.cmLog(string.format("XING: seg %d vs street edge %d: closest %.2f m (road u=%.2f, rail u=%.2f) -> %s",
-						k, eid, dist, bestRu or -1, bestU or -1, reason)) end
 				end
 			end
 			CM.cmLog(string.format("XING: seg %d: %d street edge(s) considered, %d crossing(s)", k, considered, #hits))

@@ -89,10 +89,6 @@ end
 
 -- (forward declaration of execConX moved into CM)
 CM.execConX = function(c)
-	if c.origin == K.INSTANCE and not CM.cfgFlag("conx_strict", true) and tonumber(c.cancelled or 0) ~= 1 then
-		log(string.format("%s seq=%d: originator already built it locally, skipping", tostring(c.op), c.seq))
-		return
-	end
 	local nowB = CM.gameTime() or 0
 	if CM.conxBusy and CM.conxBusyAt and (nowB - CM.conxBusyAt) > 3.0 then
 		log(string.format("CONX: previous replay never reported back (%.1f units) -- releasing the queue", nowB - CM.conxBusyAt))
@@ -131,12 +127,12 @@ CM.execConX = function(c)
 				log(string.format("CONX seq=%s: cancelled placement -- originator builds the scripted proposal at the stamp like a peer", tostring(c.seq)))
 			end
 		end
-		-- STRICT delete-and-replay on the ORIGINATOR (see K.CONX_STRICT). First
+		-- STRICT delete-and-replay on the ORIGINATOR. First
 		-- pass: bulldoze our native copy and re-queue the build so the scripted
 		-- proposal validates against the post-bulldoze world (bulldoze is async;
 		-- an immediate rebuild would collide). Second pass (strictPhase set):
 		-- fall through and build exactly like a peer.
-		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", true) and c.strictPhase ~= "rebuilt" and tonumber(c.cancelled or 0) ~= 1 and CM.livePeers() == 0 then
+		if c.origin == K.INSTANCE and c.strictPhase ~= "rebuilt" and tonumber(c.cancelled or 0) ~= 1 and CM.livePeers() == 0 then
 			-- ALONE: the slice builds natively when no session is live (nothing to
 			-- replay, nothing to cancel) and strict must follow the same rule.
 			-- Bulldozing and rebuilding a station with nobody to match asserted
@@ -145,7 +141,7 @@ CM.execConX = function(c)
 			CM.conxBusy = false
 			return
 		end
-		if c.origin == K.INSTANCE and CM.cfgFlag("conx_strict", true) and c.strictPhase ~= "rebuilt" and tonumber(c.cancelled or 0) ~= 1 then
+		if c.origin == K.INSTANCE and c.strictPhase ~= "rebuilt" and tonumber(c.cancelled or 0) ~= 1 then
 			-- NEVER strict-replay a construction that REMOVES road edges (a depot
 			-- splits the road it sits on; its payload carries removals). Bulldozing
 			-- the native copy heals that split, so the shipped removal no longer
