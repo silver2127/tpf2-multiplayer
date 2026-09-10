@@ -682,6 +682,9 @@ function CM.pollInject()
 					local autos = {}
 					for j = 1, na do autos[j] = tonumber(w[i]) or 0; i = i + 1 end
 					if not (r and g and b) then ok = false; break end
+					-- the slice copies autoLoadConfig's packed vector<bool> words; the wire
+					-- carries one 0/1 per load slot (CM.autoLoadFlags, vehicles.lua)
+					if CM.autoLoadFlags then autos = CM.autoLoadFlags(autos, nl) end
 					parts[#parts + 1] = { model = model, loads = loads, color = { r, g, b }, autos = autos }
 				end
 				local ng = tonumber(w[i]) or 0

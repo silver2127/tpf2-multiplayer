@@ -573,6 +573,44 @@ function CM.execVehCmd(c)
 	if not ok then log(string.format("exec%s error: %s", tostring(c.op), tostring(err))) end
 end
 
+-- AUTO-LOAD FLAGS ARE BITS (2026-09-10). In the engine
+-- TransportVehiclePart.autoLoadConfig is a std::vector<bool>: one flag per
+-- compartment of the model, packed into 32-bit words (the word array at +0x60 of
+-- the 0x80-byte part record, the flag count at +0x78). The slice copies the word
+-- array as if it were a vector<int>, so a one-compartment vehicle shipped {1},
+-- right by luck, and the two-compartment Rigi steamer shipped {3}: one flag
+-- against two load slots. Every instance's replayed buy then failed the engine
+-- assert "ve.autoLoadConfig.size() == ve.part.loadConfig.size()"
+-- (vehicle_util_engine.cpp, UpdateConfigFromModelIds), the boat never got its
+-- key, and its line assignment was dropped: "boats can't assign a line". The
+-- Lua property takes one number per compartment, so the words become exactly
+-- nSlots 0/1 flags. A list that already has one 0/1 per slot passes through; an
+-- empty one (older wire lines) means auto-load on, the UI's default.
+function CM.autoLoadFlags(words, nSlots)
+	local out = {}
+	nSlots = tonumber(nSlots) or 0
+	if nSlots <= 0 then return out end
+	if #words == 0 then
+		for j = 1, nSlots do out[j] = 1 end
+		return out
+	end
+	local perSlot = (#words == nSlots)
+	for j = 1, (perSlot and nSlots or 0) do
+		local v = tonumber(words[j])
+		if v ~= 0 and v ~= 1 then perSlot = false; break end
+	end
+	for j = 0, nSlots - 1 do
+		if perSlot then
+			out[j + 1] = math.floor(tonumber(words[j + 1]))
+		else
+			local w = tonumber(words[math.floor(j / 32) + 1]) or 0
+			if w < 0 then w = w + 4294967296 end
+			out[j + 1] = math.floor(w / 2 ^ (j % 32)) % 2
+		end
+	end
+	return out
+end
+
 -- The TransportVehicleConfig a command carries, rebuilt on this instance.
 --
 -- VBUY and VREPL ship the SAME encoding (name~loads~colour~autoloads;... plus a
@@ -598,6 +636,8 @@ function buildVehConfig(c)
 		local lc = part.loadConfig
 		local n = 0
 		for v in loads:gmatch("[^/]+") do n = n + 1; lc[n] = tonumber(v) or 0 end
+		-- an empty loadConfig is a native assert (`!loadConfig.empty()`), not an error
+		if n == 0 then error("part without load slots: " .. spec) end
 		part.loadConfig = lc
 		part.reversed = false     -- offset not yet decoded; TODO sweep
 		local r, g, b = col:match("^([^,]+),([^,]+),([^,]+)$")
@@ -616,9 +656,12 @@ function buildVehConfig(c)
 		else tvp.purchaseTime = math.floor((tonumber(c.at) or 0) * 1000) end
 		tvp.maintenanceState = 1.0
 		tvp.targetMaintenanceState = 0
+		-- exactly one 0/1 per load slot, or the engine asserts (CM.autoLoadFlags)
+		local words = {}
+		for v in autos:gmatch("[^/]+") do words[#words + 1] = tonumber(v) or 0 end
+		local flags = CM.autoLoadFlags(words, n)
 		local alc = tvp.autoLoadConfig
-		n = 0
-		for v in autos:gmatch("[^/]+") do n = n + 1; alc[n] = tonumber(v) or 0 end
+		for j = 1, #flags do alc[j] = flags[j] end
 		tvp.autoLoadConfig = alc
 		tvp.part = part
 		u = u + 1
