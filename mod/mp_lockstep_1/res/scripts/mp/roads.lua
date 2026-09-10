@@ -556,11 +556,22 @@ function CM.execPolyline(c, planOnly)
 					-- crossing by a centimetre is churn the engine does not need.
 					local rp = CM.nodePosXYZ(rnode)
 					if rp and math.abs(rp[3] - z) > 0.25 then
-						local mv = api.type.NodeAndEntity.new()
-						mv.entity = rnode                     -- an EXISTING id: move, not add
-						mv.comp.position = api.type.Vec3f.new(rp[1], rp[2], z)
-						addNodes[#addNodes + 1] = mv
-						CM.cmLog(string.format("XING: road node %d re-heighted %.2f -> %.2f to meet the rail", rnode, rp[3], z))
+						if CM.cfgFlag("xing_reheight", false) then
+							local mv = api.type.NodeAndEntity.new()
+							mv.entity = rnode                     -- an EXISTING id: move, not add
+							mv.comp.position = api.type.Vec3f.new(rp[1], rp[2], z)
+							addNodes[#addNodes + 1] = mv
+							CM.cmLog(string.format("XING: road node %d re-heighted %.2f -> %.2f to meet the rail", rnode, rp[3], z))
+						else
+							-- MOVING AN EXISTING NODE IN A REPLAYED PROPOSAL ASSERTS THE
+							-- ENGINE (construction_util_engine.cpp:58 AddToEngine, live
+							-- 2026-09-09, a 2.05 m move) and the game never recovers.
+							-- The rail vertex takes the road's height instead; if the
+							-- slope is then too steep the engine refuses the build the
+							-- same way on every instance, and the player re-lays it.
+							CM.cmLog(string.format("XING: road node %d is %.2f m off the rail's height -- NOT moving it (xing_reheight=0); the rail meets it at %.2f", rnode, z - rp[3], rp[3]))
+							z = rp[3]
+						end
 					end
 					planV[#planV + 1] = string.format("%d,N,%.2f,%.2f,%.2f", i, x, y, z)
 					resolved[i] = rnode; return rnode
