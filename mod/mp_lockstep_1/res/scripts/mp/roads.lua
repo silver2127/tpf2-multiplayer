@@ -1190,10 +1190,14 @@ do
 	local execPolylineImpl = CM.execPolyline
 	CM.execPolyline = function(c, planOnly)
 		if CM.geomScopeBegin then CM.geomScopeBegin() end
-		local res = { pcall(execPolylineImpl, c, planOnly) }
+		-- Exactly the two values execPolylineImpl returns (the encoded vertex and
+		-- crossing plans). No table + unpack: the game's Lua has no table.maxn, and
+		-- that one call failed EVERY build and ended the game on every instance
+		-- at the stamp (2026-09-10).
+		local ok, xv, xh = pcall(execPolylineImpl, c, planOnly)
 		if CM.geomScopeEnd then CM.geomScopeEnd() end
-		if not res[1] then error(res[2], 0) end
-		return unpack(res, 2, table.maxn(res))
+		if not ok then error(xv, 0) end
+		return xv, xh
 	end
 end
 end
