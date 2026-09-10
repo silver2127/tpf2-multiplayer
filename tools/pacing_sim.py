@@ -192,6 +192,7 @@ function SIM.run(sc)
       if act.tick == tick then
         local I = SIM.byLetter[act.who]
         if act.kind == "lever" then I.lever = act.value
+        elseif act.kind == "button" then SIM.cur = I; if I.CM.speedButton then I.CM.speedButton(act.value) end
         elseif act.kind == "req" then SIM.fs["mem://" .. act.who .. "/tpf2_bridge_ctl.txt"] = "speed=" .. tostring(act.value) .. "\n" end
       end
     end
@@ -261,6 +262,12 @@ SCENARIOS = {
     'pause_during_catchup': '''{ ticks = 900,
         insts = { {letter="a", T0=1000, lever=1, ceil=1, start=1}, {letter="b", T0=900, lever=1, start=1} },
         actions = { {tick=60, who="a", kind="lever", value=0}, {tick=300, who="a", kind="lever", value=1} } }''',
+    # the host's speed buttons drive the session (clicks the slice cancelled); a joiner's is ignored
+    'host_buttons': '''{ ticks = 900,
+        insts = { {letter="a", T0=2000, lever=4, start=1}, {letter="b", T0=2000, lever=4, start=1},
+                  {letter="c", T0=2000, lever=4, start=1} },
+        actions = { {tick=150, who="a", kind="button", value=1}, {tick=300, who="b", kind="button", value=4},
+                    {tick=450, who="a", kind="button", value=0}, {tick=600, who="a", kind="button", value=2} } }''',
 }
 
 
@@ -325,7 +332,7 @@ def main():
                 print('       %s: max ahead %+.1f  max behind %.1f  end %+.2f  last tick off by 1.5+ = %d'
                       % (letter, st['max_ahead'], st['max_behind'], st['end'], st['last_out']))
         m, series, logs = res['work']
-        if name.startswith('pause'):   # the host's own pause is supposed to hold it at 0
+        if name.startswith('pause') or name == 'host_buttons':   # the host's own pause is supposed to hold it at 0
             checks = [('the leader never enters catch-up', m['aCatchup'] == 0)]
         else:
             checks = [('the leader never holds', m['leaderZero'] == 0 and m['aCatchup'] == 0)]
@@ -353,6 +360,17 @@ def main():
             checks += [('the host pause registers while the joiner catches up (20 ticks)', bool(reg) and reg[0] <= 80),
                        ('the pause holds until the player presses play', not undone and m['leaderZero'] >= 230),
                        ('the joiner stops at the pause point (max ahead < 1.0)', st['max_ahead'] < 1.0)]
+        elif name == 'host_buttons':
+            def first(txt, after):
+                ts = [int(l.split()[0]) for l in logs if txt in l and int(l.split()[0]) >= after]
+                return ts[0] if ts else None
+            st = summarize(m, series, 700)
+            checks += [("the host's 1x becomes the session speed", first(' a: SPEED2: session speed -> 1 ', 150) is not None),
+                       ("a joiner's speed button is ignored", first(' b: SPEED2: speed button 4 ignored', 300) is not None
+                        and first(' a: SPEED2: session speed -> 4 ', 300) is None),
+                       ("the host's pause pauses the session", first(' a: SPEED2: session speed -> 0 ', 450) is not None),
+                       ("the host's 2x resumes it", first(' a: SPEED2: host unpaused the session at 2', 600) is not None),
+                       ('everyone within 1.5 of the leader from tick 700', all(v['max_ahead'] < 1.5 and v['max_behind'] < 1.5 for v in st.values()))]
         elif name.startswith('hot_join'):
             st = summarize(m, series)['b']
             post = summarize(m, series, st['last_out'] + 1)['b'] if st['last_out'] < 900 else None

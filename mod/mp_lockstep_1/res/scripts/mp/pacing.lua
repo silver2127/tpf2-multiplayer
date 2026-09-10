@@ -94,29 +94,55 @@ function CM.setSpeed(v, why)
 	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
 end
 
--- HOST-AUTHORITATIVE UNPAUSE (2026-09-08). The host's play-click beats every
--- peer's ceiling of 0: their 0s are forgotten here (a peer re-advertises its
--- real ceiling on its next heartbeat, and the LSEFF handler lifts a 0 of its
--- own), and LSEFF carries the new speed at once. Before this the host could
--- not unpause the session at all while any peer's ceiling read 0 -- and with
--- the host behind and the peers barrier-held on it, nobody could.
+-- HOST UNPAUSE: the host's play press resumes the session at once, LSEFF
+-- carrying the new speed without waiting for the next controller pass.
 function CM.hostUnpause(s)
-	local cleared = 0
-	for _, pr in pairs(CM.peers) do
-		if pr.ceil == 0 then pr.ceil = nil; cleared = cleared + 1 end
-	end
 	local v = math.min(s, CM.MAX_SPEED or 4)
 	if v < 1 then v = 1 end
 	CM.effSpeed = v
 	CM.broadcast(string.format("LSEFF v=%d", v))
-	log(string.format("SPEED2: host unpaused the session at %d (%d peer ceiling(s) of 0 overridden)", v, cleared))
+	log(string.format("SPEED2: host unpaused the session at %d", v))
 end
 
--- SPEED V2 controller -- MANUAL model (2026-09-09). The players own the lever:
---   * every instance reads its own speed button as its CEILING (0..4) and
---     ships it on the heartbeat; the host takes the MINIMUM over everyone and
---     broadcasts it as the session speed (LSEFF). Anyone can slow or pause
---     the whole session; the host's play-click overrides a stuck 0.
+-- A speed button clicked on THIS game: SPEEDBTN <v> from the slice, which
+-- cancelled the click, so no lever moved. The leader's click becomes the
+-- session speed; a follower's is ignored, its lever following the session.
+-- While the load gate holds, a play press is the player's override
+-- (CM.ensureRunning reads CM.lgPress).
+function CM.speedButton(v)
+	v = tonumber(v)
+	if not v then return end
+	v = math.max(0, math.min(CM.MAX_SPEED or 4, math.floor(v)))
+	if CM.lgHolding then
+		CM.lgPress = v
+		return
+	end
+	if not CM.peerSeen then
+		-- nobody to pace with (the slice saw a session a moment ago): apply it here
+		CM.setSpeed(v, "speed button, nobody else in the session")
+		return
+	end
+	if not CM.isLeader() then
+		log(string.format("SPEED2: speed button %d ignored -- the host's speed buttons set the session speed", v))
+		return
+	end
+	local wasPaused = (CM.effSpeed == 0)
+	CM.myCeiling = v
+	CM.spd2ZeroSince = nil
+	CM.btnAt, CM.ceilByButton = CM.ticks, true
+	log(string.format("SPEED2: host speed button -> %d", v))
+	if v > 0 and wasPaused then CM.hostUnpause(v) end
+end
+
+-- SPEED V2 controller -- THE HOST'S SPEED BUTTONS (2026-09-10):
+--   * the session speed is what the leader's player picks with the game's own
+--     speed buttons. While a session is live the slice DLL cancels a click on
+--     the clock's controls (the speed buttons and the pause toggle) and writes
+--     SPEEDBTN <v> to the inject file, so a click moves no lever by itself:
+--     CM.speedButton makes the leader's click the session speed, which LSEFF
+--     carries to everyone, and ignores a follower's. A lever change the slice
+--     did not cancel (a game without hooks, the menu setting the speed as it
+--     switches to the game) still reaches the leader's detector in CM.paceV2.
 --   * a PAUSE IS A SYNC POINT: when the session speed is 0 the leader stops
 --     at once and everyone behind keeps running until they reach the
 --     leader's clock, then stops there. So "pause to let people catch up"
@@ -131,8 +157,9 @@ end
 -- never a fork.
 -- "/speed 2.5" typed in the lobby chat: the panel (menu DLL) writes speed=2.5
 -- into tpf2_bridge_ctl.txt; the HOST reads it here as the session speed
--- request. Read every ~2 s, not per tick. "/speed off" (or 0, or 1..4 as a
--- whole number) clears it and the lowest lever rules again.
+-- request. Read every ~2 s, not per tick. "/speed off" (or 0) clears it. The
+-- newer of the two wins: a speed button pressed after a /speed request
+-- overrides it until the request next changes.
 function CM.speedRequest()
 	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.spdReq end
 	CM.spdReqAt = CM.ticks
@@ -157,7 +184,8 @@ function CM.speedRequest()
 	end)
 	if req and (req <= 0 or req >= 64) then req = nil end
 	if req ~= CM.spdReq then
-		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (lowest lever)"))
+		CM.spdReqChangedAt = CM.ticks
+		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (the host's speed buttons)"))
 	end
 	CM.spdReq = req
 	if players then CM.rosterPlayers = players end
@@ -400,39 +428,45 @@ function CM.paceV2(now)
 	local settled = CM.paceApplied or (CM.ticks > (CM.paceSetTick or 0) + 8)
 	local ours = (CM.lastSetSpeed and s == CM.lastSetSpeed)
 		or (not CM.paceApplied and CM.prevSetSpeed and s == CM.prevSetSpeed)
-	-- PLAYER CEILING. Read before anything below can return (2026-09-08): a
-	-- barrier-hold check used to sit above this, so a held instance's
-	-- play-click was invisible -- which closed a deadlock (b's ceiling stuck
-	-- at 0 -> host effective 0 -> host behind -> peers held on it -> b's
-	-- detector never ran). A 0 we set ourselves is `ours` and skipped.
+	-- A LEVER MOVE THE SLICE DID NOT CANCEL (a game without the slice's hooks,
+	-- or the menu setting the speed as it switches to the game), read on the
+	-- leader only: a follower's lever follows the session speed. Read before
+	-- anything below can return (2026-09-08): a hold check used to sit above
+	-- this and hid the host's play-click. A 0 we set ourselves is `ours`.
 	local prevS = CM.spd2LastS
 	CM.spd2LastS = s
-	if settled and not ours and s ~= CM.myCeiling then
-		if s == 0 then
-			CM.spd2ZeroSince = CM.spd2ZeroSince or CM.ticks
-			if CM.ticks - CM.spd2ZeroSince >= CM.SPD2_PAUSE_TICKS then
-				CM.myCeiling = 0                   -- the player paused everyone
-				log(string.format("SPEED2: player ceiling -> 0 (paused %d ticks)", CM.ticks - CM.spd2ZeroSince))
+	if CM.isLeader() then
+		if settled and not ours and s ~= CM.myCeiling then
+			if s == 0 then
+				CM.spd2ZeroSince = CM.spd2ZeroSince or CM.ticks
+				if CM.ticks - CM.spd2ZeroSince >= CM.SPD2_PAUSE_TICKS then
+					CM.myCeiling = 0                   -- the player paused everyone
+					CM.btnAt, CM.ceilByButton = CM.ticks, false
+					log(string.format("SPEED2: player ceiling -> 0 (paused %d ticks)", CM.ticks - CM.spd2ZeroSince))
+				end
+			else
+				CM.spd2ZeroSince = nil
+				CM.myCeiling = s                       -- the player set the speed
+				CM.btnAt, CM.ceilByButton = CM.ticks, false
+				log(string.format("SPEED2: player ceiling -> %d", s))
 			end
-		else
+		elseif s ~= 0 then
 			CM.spd2ZeroSince = nil
-			CM.myCeiling = s                       -- the player set their ceiling
-			log(string.format("SPEED2: player ceiling -> %d", s))
+			-- A game that is SIMULATING is not paused by its player, whatever the
+			-- two-slot test says: the return from a blip to the effective speed is
+			-- indistinguishable from our own set, and left the ceiling at 0 forever.
+			-- Not a 0 from a speed button: that pause is explicit, and the lever still
+			-- reads the old speed until pacing applies it.
+			if CM.myCeiling == 0 and settled and not CM.ceilByButton then
+				CM.myCeiling = s
+				log(string.format("SPEED2: running at %d -- the 0 ceiling was a blip, cleared", s))
+			end
 		end
-	elseif s ~= 0 then
-		CM.spd2ZeroSince = nil
-		-- A game that is SIMULATING is not paused by its player, whatever the
-		-- two-slot test says: the return from a blip to the effective speed is
-		-- indistinguishable from our own set, and left the ceiling at 0 forever.
-		if CM.myCeiling == 0 and settled then
-			CM.myCeiling = s
-			log(string.format("SPEED2: running at %d -- the 0 ceiling was a blip, cleared", s))
+		-- The host's player pressed play (a hand-set non-zero speed after a 0, or
+		-- while the session's effective speed is 0): that unpauses the SESSION.
+		if settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
+			CM.hostUnpause(s)
 		end
-	end
-	-- The host's player pressed play (a hand-set non-zero speed after a 0, or
-	-- while the session's effective speed is 0): that unpauses the SESSION.
-	if CM.isLeader() and settled and not ours and s > 0 and (prevS == 0 or CM.effSpeed == 0) then
-		CM.hostUnpause(s)
 	end
 	-- A pause the player just made is being DEBOUNCED (SPD2_PAUSE_TICKS) before
 	-- it becomes a ceiling of 0. Pushing the session speed back onto the game
@@ -446,18 +480,13 @@ function CM.paceV2(now)
 	-- ahead. Joiners pace against the leader's clock alone (CM.pidPace,
 	-- CM.catchUpTick).
 	if CM.isLeader() then
-		-- min ceiling across fresh instances (self + peers)
-		local minCeil = CM.myCeiling
-		for _, pr in pairs(CM.peers) do
-			if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and pr.ceil and pr.ceil < minCeil then
-				minCeil = pr.ceil
-			end
-		end
-		local eff = minCeil
+		-- the host's speed buttons, or a /speed request newer than the last press
+		local eff = CM.myCeiling
 		if eff < 0 then eff = 0 end
 		local req = CM.speedRequest()
-		local why = "lowest lever"
-		if req and eff > 0 then eff = req; why = "/speed request" end
+		local why = "host's speed buttons"
+		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
+		if CM.spdReqInForce then eff = req; why = "/speed request" end
 		CM.syncTick(now, s)
 		local changed = (eff ~= CM.effSpeed)
 		CM.effSpeed = eff
@@ -698,6 +727,22 @@ function CM.ensureRunning()
 	-- release. It releases on all three of: the roster filling up,
 	-- K.LOADGATE_MAX_TICKS expiring, and the player taking the lever back.
 	if not CM.loadGateReady() then
+		-- A play press the slice cancelled (SPEEDBTN, CM.speedButton): no lever
+		-- moved, so the lever tests below cannot see it.
+		local press = CM.lgPress
+		CM.lgPress = nil
+		if press and press > 0 and CM.lgHeld then
+			if (CM.ticks - (CM.lgHeldAt or 0)) < K.LOADGATE_FORCE_TICKS then
+				log(string.format("LOADGATE: play pressed with players still loading -- held. Starting now would fork the session; the override unlocks in %d s",
+					math.floor((K.LOADGATE_FORCE_TICKS - (CM.ticks - (CM.lgHeldAt or 0))) * 0.19)))
+			else
+				didInitialUnpause = true
+				CM.lgHolding = false
+				CM.setSpeed(press, "load gate: started manually")
+				log(string.format("LOADGATE: game started manually at speed %d -- releasing. Anything done before the others arrive will NOT reach them.", press))
+				return
+			end
+		end
 		if s == 0 then
 			CM.lgSawZero = true         -- our pause landed; anything else now is the player
 		elseif not CM.lgHeld then

@@ -687,7 +687,7 @@ function data()
 				-- far behind the session (a fresh hot joiner, load-gated or not): say so on
 				-- every heartbeat, so nobody paces against a peer that must catch up
 				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d ceil=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo, CM.myCeiling or (CM.MAX_SPEED or 4),
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
 					CM.heartbeatCu(now) and " cu=1" or ""))
 			end
 
@@ -836,7 +836,7 @@ function data()
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
 						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
-							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1317,7 +1317,7 @@ function data()
 						paceTxt = "   |  this game leads the clock"
 					end
 					D.speedText:setText(string.format("session speed: %s%s%s%s%s   ", eff and string.format("%gx", eff) or "-",
-						(req and req ~= "-") and "  (set by /speed in chat; /speed off hands it back to the speed buttons)" or "  (the slowest player's speed buttons)",
+						(req and req ~= "-") and "  (set by /speed in chat; the host's speed buttons or /speed off take it back)" or "  (the host's speed buttons)",
 						paceTxt,
 						(sync and sync ~= "-") and ("  SYNC: " .. sync) or "",
 						(xfer and xfer ~= "-") and ("  SAVE: " .. xfer) or ""))

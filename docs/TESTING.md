@@ -60,7 +60,8 @@ Time: the smoke test takes about 15 minutes; everything, about three hours.
   verdict stays `SYNC`.
 - [ ] **S7** A builds five short roads quickly. The road tool keeps working and all five reach B.
 - [ ] **S8** A places a road depot and buys a bus in it. Both appear on B.
-- [ ] **S9** A at 1x, B presses 4x: both run at 1x. A pauses: both pause. Both unpause: both run.
+- [ ] **S9** A presses 1x: both run at 1x. B presses 4x: nothing changes. A pauses: both pause. A presses
+  play: both run.
 - [ ] **S10** Run the soak check above; it exits 0.
 - [ ] **S11** Both return to the title menu and leave the lobby. No crash, no minidump.
 
@@ -169,10 +170,11 @@ Not replicated, so not tested: vehicle stop/start, manual departure, maintenance
 
 ## T: time and speed
 
-- [ ] **T1** The lowest speed button wins: A 4x and B 2x run at 2x; B to 4x, both run at 4x.
-- [ ] **T2** Either player pausing pauses both; both unpausing resumes.
-- [ ] **T3** `/speed 2.5` runs everyone at 2.5x; **-0.5** and **+0.5** change it; `/speed off` or
-  **reset** returns to the speed buttons.
+- [ ] **T1** The host's speed buttons set everyone's speed: A presses 2x, both run at 2x. B presses 4x
+  or pause: nothing changes, and B's `tpf2_slice.log` shows `armed cancel: speed button`.
+- [ ] **T2** The host pausing pauses both; the host pressing play resumes both.
+- [ ] **T3** `/speed 2.5` in the chat runs everyone at 2.5x; a host speed button pressed afterwards
+  takes over; `/speed off` returns to the host's buttons.
 - [ ] **T4** In steady play a follower's speed row says `in step with the leader`.
 - [ ] **T5** After a pause and unpause, the stats' skew is close to 0.
 - [ ] **T6** A much slower PC, or a heavier save on one side: that game catches up (`catching up`)

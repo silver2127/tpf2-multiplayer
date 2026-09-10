@@ -73,35 +73,33 @@ list while it is up.
 ### The Multiplayer window
 
 A small **Multiplayer** window sits at the top left. **Ctrl+Shift+D** hides and shows it. Its
-buttons toggle three sections:
+buttons toggle four sections:
 
 - **stats** (hidden at first): a column per player with game time, skew, speed, queued and
   late commands, desyncs, apply lag, vehicle drift and balance, plus the **verdict**: `SYNC`
   while the worlds agree, `DESYNC ...` naming what differs.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
-
-Below the toggles is the speed row: **session speed**, then what your own game is doing to stay
-in step ("in step with the leader", "catching up", "easing off", or "this game leads the clock"),
-and four buttons: **-0.5** and **+0.5** set a session speed for everyone, **reset** returns to the
-normal rule, and **sync** starts a fresh shared save (as `/sync`).
+- **speed** (shown): the **session speed**, then what your own game is doing to stay in step ("in
+  step with the leader", "catching up", "easing off", or "this game leads the clock").
 
 ### Speed and pause
 
-- **Everyone plays at one speed.** Normally it is the lowest speed any player has selected with the
-  game's own speed buttons. So when anyone pauses, everyone pauses; when everyone unpauses, the
-  game resumes.
+- **Everyone plays at the host's speed.** The host's own speed buttons and pause set the speed for
+  the whole session. The other players' speed buttons do nothing while a session runs: the click is
+  cancelled, so no game can run off at its own speed.
 - A pause is also a sync point: games that are slightly behind run up to the leader's clock before
   they stop.
-- `/speed 2.5` (or the -0.5/+0.5 buttons) sets a session speed, fractions allowed; `/speed off`
-  (or **reset**) goes back to the speed buttons.
+- `/speed 2.5` in the chat sets a session speed, fractions allowed. Whichever came last counts: a
+  host speed button pressed after `/speed` takes over again, and `/speed off` hands the speed back
+  to the host's buttons.
 
 ### Chat commands
 
 | command | who | does |
 |---|---|---|
 | `/speed <x>` | anyone | set the session speed (0 < x < 64) |
-| `/speed off` | anyone | back to the lowest player's speed button |
+| `/speed off` | anyone | back to the host's speed buttons |
 | `/sync` | anyone | the host's game saves and shares the save (what a hot join does); `/sync off` cancels |
 | `/new` | relay leader, before the game starts | discard the relay's stored world |
 | `/resume` | relay leader | send the relay's stored world to everyone waiting |

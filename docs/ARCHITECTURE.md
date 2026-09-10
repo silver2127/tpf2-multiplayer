@@ -96,10 +96,12 @@ Game frames are best-effort in the lobby layer. Above it:
 ## Pacing and game speed
 
 - **The leader is the session clock.** It is the host (letter `a`), or in a relay lobby the
-  player the relay names. It computes the **session speed** as the lowest speed any player has
-  selected, or the value set with `/speed x`, and broadcasts it (`LSEFF`). A player's pause is
-  therefore a session pause. Speed 0 is a sync point: games behind the leader run until they
-  reach its clock, then stop.
+  player the relay names. Its player's speed buttons set the **session speed**, or `/speed x` when
+  that is newer, and it broadcasts the result (`LSEFF`). While a session is live the slice cancels
+  every click on a game's speed buttons and pause toggle (`UI::Clock`) and writes `SPEEDBTN <v>` to
+  the inject file; the leader's mod takes it as the session speed and a follower's ignores it, so
+  a lever only moves through pacing. Speed 0 is a sync point: games behind the leader run until
+  they reach its clock, then stop.
 - **Followers trim their own speed** around the session speed to track the leader's clock, with
   a PID controller (fixed gains, one decision every 8 ticks, 0.7-1.2x, slew limited). A follower
   more than 3 units ahead of the leader drops to a quarter of the session speed, rising as the gap
@@ -158,8 +160,8 @@ All runtime files are in the data folder, `%LOCALAPPDATA%\tpf2mp\data\` (the env
 | file | written by | read by | content |
 |---|---|---|---|
 | `tpf2_instance.txt` | bridge | slice, mod, menu | this instance's letter (line 1), process id, bridge port |
-| `tpf2_bridge_ctl.txt` | menu | bridge, mod (leader) | `instance=`, `peer=`, `pid=`, `players=`, `speed=`, `sync=`, `pid=` (gains), `xfer=`, `leader=` |
-| `lockstep_inject_<L>.txt` | slice; the mod's window (company actions) | mod | captured commands |
+| `tpf2_bridge_ctl.txt` | menu | bridge, mod (leader) | `instance=`, `peer=`, `pid=`, `players=`, `speed=`, `sync=`, `xfer=`, `leader=` |
+| `lockstep_inject_<L>.txt` | slice; the mod's window (company actions) | mod | captured commands and speed-button clicks |
 | `tpf2_capture_<L>.txt` | mod | bridge | outgoing wire lines |
 | `tpf2_events_<L>.txt` | bridge | mod | incoming wire lines |
 | `lockstep_status_<L>.txt` | mod, every 15 ticks | slice | liveness and the peer's time |

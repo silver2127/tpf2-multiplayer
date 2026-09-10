@@ -532,8 +532,6 @@ local function onLine(line)
 			-- out.
 			local st = tonumber(line:match(" s=(%-?%d+)"))
 			if st then pr.step = st end
-			local ce = tonumber(line:match(" ceil=(%d+)"))
-			if ce then pr.ceil = ce end
 			pr.cu = (line:find(" cu=1", 1, true) ~= nil)   -- catching up: not a pacing reference
 			CM.peerSeen = true
 			local hi = tonumber(line:match(" hi=(%d+)"))

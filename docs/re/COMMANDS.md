@@ -153,8 +153,11 @@ lines from `ui/components/lineeditor.cpp` (UpdateLine at `0x5fe260`, `0x607190`,
 `ui/components/line_ui_util.cpp` (terminal and waypoint lanes, DeleteLine `0x7bf590`);
 CreateLine from `linelist.cpp` `0x610380` / `linemanager.cpp` `0x618ff0` through
 `line_util` `0x215c180`; loans from `ui/components/financescomp.cpp` `0x53b660`,
-`0x53b8b0` (LIKELY); game speed from `clock.cpp`, `gameui.cpp`, `menuui.cpp`,
-`cameraaction.cpp` (LIKELY).
+`0x53b8b0` (LIKELY); game speed (SetGameSpeed, from the call graph) from `UI::Clock`
+(`TogglePause` `0x4efab0`, `0x4eff50`, `0x4f2640`: the speed buttons and pause toggle),
+`UI::CGameUI::GameStep` `0x574a70`, `menuui.cpp` `0x657710` and `CMenuUI::SwitchToGameUI`'s lambda
+`0x65eb60`, `UI::CameraAction::Play` and `Record` (the camera-path tool), a debug view `0x795900`,
+and `0xc17ed0` (unidentified).
 
 ## Call sites the hooks classify by
 
@@ -175,6 +178,7 @@ sees Add's. They are different numbers for the same click.
 | CreateLine via `line_util` | `0x215c26b` | | MEASURED |
 | line editor UpdateLine | `0x6043fd`, `0x6074b5` | | MEASURED |
 | vehicle window Reverse (`viewcreator.cpp`) | `0x8b556d` | | MEASURED |
+| `UI::Clock` speed buttons and pause toggle (SetGameSpeed) | `0x4efb8f`, `0x4f0097`, `0x4f26ef` | | call graph and call bytes, in code |
 | Lua `api.cmd.make.*` sol2 wrappers | `0xcec000`-`0xcf2000` (buildProposal `0xced378`, buyVehicle `0xceefae`) | | MEASURED, in code |
 | Lua `api.cmd.sendCommand` | | `0x1126f1a` | MEASURED |
 
@@ -210,7 +214,7 @@ against every hooked factory.
 | `0x9de870` | SetCalendarSpeed | position | `setCalendarSpeed(msPerDay)` * | 21 | |
 | `0x9de8a0` | SetColor | funcsig | `setColor(entity, color)` | 20 | 13 |
 | `0x9de9b0` | SetDate | position | `setDate(date)` * | 21 | |
-| `0x9de9e0` | SetGameSpeed | position | `setGameSpeed(speed)` * | 21 | |
+| `0x9de9e0` | SetGameSpeed | position | `setGameSpeed(speed)` * | 21 | 15 |
 | `0x9dea10` | SetLine | funcsig | `setLine(vehicle, line, stopIndex)` | 18 | 6 |
 | `0x9deb70` | SetName | funcsig | `setName(entity, name)` | 15 | 14 |
 | `0x9ded50` | SetNoCosts | position | none | 21 | |

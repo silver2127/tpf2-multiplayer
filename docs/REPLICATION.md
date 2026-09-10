@@ -96,7 +96,7 @@ Stops are resolved by the station group's position (within 20 m) and the station
 |---|---|
 | loan | Polled every 15 ticks and shipped as the new absolute loan; peers book the difference. The originator skips its own. |
 | balance | Not replicated as such: it follows from every instance applying the same actions. Construction replays reconcile the originator's balance; in co-op a gap above 3000 after a construction snaps to the originator's balance. Differences are logged as `$$` lines. |
-| game speed, pause | Not commands: the session speed is set by pacing, see [ARCHITECTURE.md](ARCHITECTURE.md#pacing-and-game-speed). |
+| game speed, pause | Not replicated as commands. The host's speed buttons set the session speed and pacing applies it on every instance; the other players' speed-button clicks are cancelled. See [ARCHITECTURE.md](ARCHITECTURE.md#pacing-and-game-speed). |
 | companies | `CMNEW`, `CMSWITCH`, `CMDEL`, `CMPW` apply at the stamp on every instance; in companies mode every command carries its company, and builds, purchases, lines and loans are attributed to that company's engine player. See [ARCHITECTURE.md](ARCHITECTURE.md#companies-mode). |
 
 ## Not replicated

@@ -39,7 +39,9 @@
 //
 // ONE BEHAVIOUR, HARDCODED. While a session is live (SessionLive) a captured
 // command is cancelled locally and replayed at the stamp on every instance;
-// with no live session, or when a decode fails, it runs natively. There is no
+// with no live session, or when a decode fails, it runs natively. A click on
+// the clock's speed buttons is cancelled the same way and handed to the mod,
+// whose leader makes it the session speed (CaptureSpeedButton). There is no
 // observe mode and no per-channel switch: tpf2_slice.cfg carries only the
 // dumpprop diagnostic, so a missing or garbled cfg cannot put this peer on a
 // different protocol from the others.
@@ -114,10 +116,18 @@ static const uintptr_t CALLER_LUA_VEHICLE   = 0xceefae;
 
 static const int ID_BUILDPROPOSAL = 0;
 static const int ID_CMDADD        = 1;
+// SetGameSpeed (make_cmd 0x9de9e0, steal 21) is acted on for the clock
+// widget's speed controls only: UI::Clock::TogglePause and the clock's two
+// other calls, identified by the factory's return address (docs/re/COMMANDS.md).
+// Every other caller (the menu switching to the game, CGameUI::GameStep, the
+// camera-path tool, a debug view) is left alone, and the Lua maker builds its
+// command without the factory, so pacing's own speed changes never come here.
+static const int ID_SETGAMESPEED = 15;
+static const uintptr_t CALLER_SPEED_BUTTONS[] = { 0x4efb8f, 0x4f0097, 0x4f26ef };
 static const int BLOB_SIZE = 48;
 
 // Every other command factory, same hook shape. Steal sizes are the ones
-// args_probe ran against these functions live. ids 2..10, 13, 14; 0 and 1 are above.
+// args_probe ran against these functions live. ids 2..10, 13, 14, 15; 0 and 1 are above.
 struct Factory { uintptr_t rva; int steal; int id; const char* name; const char* kind; };
 static const Factory FACTORIES[] = {
     { 0x9dca00, 15, 2, "BuyVehicle",     "vehicle" },
@@ -131,6 +141,7 @@ static const Factory FACTORIES[] = {
     { 0x9ddfe0, 20, 10, "Reverse",        "vehicle" },  // steal size: docs/re/COMMANDS.md
     { 0x9de8a0, 20, 13, "SetColor",       "sync"    },  // r9 -> CVec3f*, 3 floats
     { 0x9deb70, 15, 14, "SetName",        "sync"    },  // r9 -> std::string*, MSVC SSO
+    { 0x9de9e0, 21, 15, "SetGameSpeed",   "speed"   },  // clock buttons only: CaptureSpeedButton
 };
 static const int NUM_FACTORIES = (int)(sizeof(FACTORIES) / sizeof(FACTORIES[0]));
 
@@ -1372,6 +1383,62 @@ static bool VehiclePayloadReadable(int fid, uint64_t r8, uint64_t r9, uint64_t s
     return true;
 }
 
+// A click on the clock's speed controls while a session is live: cancelled
+// fire-and-forget (the clock reads the speed back every frame; nothing waits on
+// the command) and written as SPEEDBTN <speed>. The leader's mod makes it the
+// session speed and a follower's ignores it, so a lever only moves through
+// pacing. Not live, not a clock caller, or a value out of range: the click runs
+// natively, as in a stock game.
+static bool WriteInjectSpeedButton(int speed)
+{
+    ReadInstance();   // NOT cached: the lobby can rename this peer after attach
+    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] cannot open %s\n", p); return false; }
+    fprintf(f, "SPEEDBTN %d\n", speed);
+    fclose(f);
+    return true;
+}
+
+static void CaptureSpeedButton(uint64_t rcx, uint64_t rdx, uint64_t caller)
+{
+    const int speed = (int)(int32_t)(uint32_t)rdx;   // no Engine argument: the speed is the low 32 bits of rdx
+    bool button = false;
+    for (uintptr_t c : CALLER_SPEED_BUTTONS) if (caller == c) button = true;
+    if (!button) {
+        static uint64_t seen[8] = {};
+        for (int i = 0; i < 8; i++) {
+            if (seen[i] == caller) break;
+            if (!seen[i]) {
+                seen[i] = caller;
+                Log("[slice] SetGameSpeed(%d) from caller_rva=%llx -- not a speed button, left alone (logged once per caller)\n",
+                    speed, (unsigned long long)caller);
+                break;
+            }
+        }
+        return;
+    }
+    if (speed < 0 || speed > 64) {
+        Log("[slice] speed button value %d out of range -- left alone\n", speed);
+        return;
+    }
+    if (!SessionLive()) {
+        Log("[slice] speed button %d: no live session -- left alone\n", speed);
+        return;
+    }
+    if (!WriteInjectSpeedButton(speed)) {
+        Log("[slice] speed button %d: not shipped -- left alone\n", speed);
+        return;
+    }
+    InterlockedExchange(&g_pendingNoCb, 1);
+    InterlockedExchange(&g_pendingHonour, 0);
+    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+    Log("[slice] armed cancel: speed button %d (caller_rva=%llx) -- the mod applies it\n",
+        speed, (unsigned long long)caller);
+}
+
 static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_t r8,
                            uint64_t r9, uint64_t calleeRsp, uint64_t caller, bool cancel)
 {
@@ -2434,6 +2501,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel(); // the cancel LANDED
             return 1;
         }
+    }
+
+    if (id == ID_SETGAMESPEED) {
+        __try {
+            CaptureSpeedButton(rcx, rdx, caller);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[slice] speed button capture fault -- the click runs natively\n");
+        }
+        return 0;
     }
 
     if ((id >= 2 && id <= 10) || id == 13 || id == 14) {
