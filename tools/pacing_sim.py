@@ -44,7 +44,7 @@ def sources(which):
 
 def helpers(lockstep):
     out = []
-    for nm in ['isLeader', 'peerSlowPrecise', 'peerFastPrecise', 'peerBounds', 'leaderPrecise', 'heartbeatCu']:
+    for nm in ['isLeader', 'livePeers', 'peerSlowPrecise', 'peerFastPrecise', 'peerBounds', 'leaderPrecise', 'heartbeatCu']:
         i = lockstep.find('\nfunction CM.' + nm + '(')
         if i < 0:
             continue
@@ -253,6 +253,14 @@ SCENARIOS = {
     # the same at 2x
     'hot_join_2x': '''{ ticks = 900,
         insts = { {letter="a", T0=1000, lever=2, ceil=2, start=1}, {letter="b", T0=960, lever=2, start=1} } }''',
+    # the host clicks 1x while its only joiner is still catching up (every peer has cu=1)
+    'click_during_catchup': '''{ ticks = 700,
+        insts = { {letter="a", T0=1000, lever=4, start=1}, {letter="b", T0=980, lever=4, start=1} },
+        actions = { {tick=100, who="a", kind="lever", value=1} } }''',
+    # the host pauses while its only joiner is still catching up, and presses play later
+    'pause_during_catchup': '''{ ticks = 900,
+        insts = { {letter="a", T0=1000, lever=1, ceil=1, start=1}, {letter="b", T0=900, lever=1, start=1} },
+        actions = { {tick=60, who="a", kind="lever", value=0}, {tick=300, who="a", kind="lever", value=1} } }''',
 }
 
 
@@ -308,7 +316,7 @@ def main():
         res = {}
         for which in (args.ref, 'work'):
             m, series, logs, stubbed = run(which, name)
-            res[which] = (m, series)
+            res[which] = (m, series, logs)
             if stubbed:
                 print('  (stubbed: %s)' % stubbed.decode())
             print('  %-8s leader held at 0 for %d tick(s), leader catch-up lines %d, ahead-and-faster ticks %d'
@@ -316,8 +324,11 @@ def main():
             for letter, st in summarize(m, series).items():
                 print('       %s: max ahead %+.1f  max behind %.1f  end %+.2f  last tick off by 1.5+ = %d'
                       % (letter, st['max_ahead'], st['max_behind'], st['end'], st['last_out']))
-        m, series = res['work']
-        checks = [('the leader never holds', m['leaderZero'] == 0 and m['aCatchup'] == 0)]
+        m, series, logs = res['work']
+        if name.startswith('pause'):   # the host's own pause is supposed to hold it at 0
+            checks = [('the leader never enters catch-up', m['aCatchup'] == 0)]
+        else:
+            checks = [('the leader never holds', m['leaderZero'] == 0 and m['aCatchup'] == 0)]
         if name == 'live_start':
             st = summarize(m, series)
             checks += [('no joiner ever more than 3.5 ahead', all(v['max_ahead'] <= 3.5 for v in st.values())),
@@ -330,6 +341,18 @@ def main():
         elif name == 'speed_drop':
             st = summarize(m, series, 200)['b']
             checks += [('no runaway after 4x -> 1x (max ahead < 2)', st['max_ahead'] < 2.0)]
+        elif name == 'click_during_catchup':
+            reg = [int(l.split()[0]) for l in logs if ' a: SPEED2: player ceiling -> 1' in l]
+            st = summarize(m, series, 101)['b']
+            checks += [('the host takes its speed click while the joiner catches up (10 ticks)', bool(reg) and reg[0] <= 110),
+                       ('the joiner does not overshoot after it (max ahead < 1.0)', st['max_ahead'] < 1.0)]
+        elif name == 'pause_during_catchup':
+            reg = [int(l.split()[0]) for l in logs if ' a: SPEED2: player ceiling -> 0' in l]
+            undone = [l for l in logs if ' a: SPEED2: running at ' in l and 68 < int(l.split()[0]) < 300]
+            st = summarize(m, series, 61)['b']
+            checks += [('the host pause registers while the joiner catches up (20 ticks)', bool(reg) and reg[0] <= 80),
+                       ('the pause holds until the player presses play', not undone and m['leaderZero'] >= 230),
+                       ('the joiner stops at the pause point (max ahead < 1.0)', st['max_ahead'] < 1.0)]
         elif name.startswith('hot_join'):
             st = summarize(m, series)['b']
             post = summarize(m, series, st['last_out'] + 1)['b'] if st['last_out'] < 900 else None

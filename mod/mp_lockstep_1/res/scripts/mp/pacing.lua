@@ -535,7 +535,14 @@ function CM.paceTick(now)
 	if not CM.peerSeen then return end
 	-- A peer that has not reported recently may itself be paused or gone:
 	-- with nobody fresh there is nothing to pace against.
-	if slowT == nil then return end
+	-- THE LEADER runs the controller while it hears ANY fresh peer (2026-09-10).
+	-- peerBounds leaves out peers that are catching up (cu=1), so while every
+	-- joiner was catching up the leader skipped its own controller: its
+	-- player's speed click did not become the session speed, LSEFF was not
+	-- re-sent, and a pause it made was undone by the sync-point run once a
+	-- joiner arrived (tools/pacing_sim.py: click_during_catchup,
+	-- pause_during_catchup).
+	if slowT == nil and not (CM.isLeader() and CM.livePeers() > 0) then return end
 	CM.paceV2(now)
 end
 
