@@ -2856,7 +2856,7 @@ static DWORD WINAPI Init(LPVOID)
                 *slot = (void*)&MyMenuUpdate;
                 VirtualProtect(slot, sizeof(void*), old, &old);
                 Log("[menu] autoload: hooked CMenuUI update (vtable slot %d)%s\n", MENUUI_SLOT_UPDATE,
-                    g_flagAutoLoad ? "" : " -- autoload=0: only the test trigger loads");
+                    g_flagAutoLoad ? "" : " -- autoload=0: the player loads the shared save");
             } else {
                 Log("[menu] autoload: VirtualProtect on the CMenuUI vtable failed (%lu)\n", GetLastError());
             }
