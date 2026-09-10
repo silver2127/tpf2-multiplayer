@@ -1114,10 +1114,15 @@ function data()
 					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
 					CM.dashShowChat = (CM.dashShowChat ~= false)
 					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
+					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)          -- shown by default
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					tog:addItem(toggleBtn("  stats  ", function()
 						CM.dashShowStats = not CM.dashShowStats
 						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
+					end))
+					tog:addItem(toggleBtn("  speed  ", function()
+						CM.dashShowSpeed = not CM.dashShowSpeed
+						pcall(function() D.speedBox:setVisible(CM.dashShowSpeed, false) end)
 					end))
 					tog:addItem(toggleBtn("  chat  ", function()
 						CM.dashShowChat = not CM.dashShowChat
@@ -1139,10 +1144,11 @@ function data()
 					-- ---- session speed + lobby chat (2026-09-09) ----
 					-- The lobby (netpunch) keeps running behind the game; its
 					-- lobby_out.jsonl carries every chat line and lobby_in.jsonl takes
-					-- commands, so the in-game chat is those two files. The speed
-					-- buttons SEND "/speed x" as chat: every panel writes it into the
-					-- bridge ctl, the host's pacer applies it and broadcasts the
-					-- session speed (LSEFF), so anyone can set it and everyone sees it.
+					-- commands, so the in-game chat is those two files. "/speed x" typed in
+					-- the chat reaches every panel, which writes it into the bridge ctl; the
+					-- host's pacer applies it and broadcasts the session speed (LSEFF). The
+					-- -0.5 / +0.5 / reset / sync buttons are gone (2026-09-10), and the speed
+					-- line has its own show/hide toggle next to stats, chat and companies.
 					D.speedText = api.gui.comp.TextView.new("session speed: -")
 					local function speedBtn(label, fn)
 						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
@@ -1151,13 +1157,9 @@ function data()
 					end
 					local row = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					row:addItem(D.speedText)
-					row:addItem(speedBtn("  -0.5  ", function() CM.chatSend(string.format("/speed %.1f", math.max(0.5, (D.eff or 1) - 0.5))) end))
-					row:addItem(speedBtn("  +0.5  ", function() CM.chatSend(string.format("/speed %.1f", math.min(4, (D.eff or 1) + 0.5))) end))
-					row:addItem(speedBtn("  reset  ", function() CM.chatSend("/speed off") end))
-					row:addItem(speedBtn("  sync  ", function() CM.chatSend("/sync") end))
-					local rowC = api.gui.comp.Component.new("mpSpeedRow")
-					rowC:setLayout(row)
-					box:addItem(rowC)
+					D.speedBox = api.gui.comp.Component.new("mpSpeedRow")
+					D.speedBox:setLayout(row)
+					box:addItem(D.speedBox)
 					-- ---- companies (2026-09-09): switch, create, dissolve ----
 					-- The GUI state cannot reach the lockstep queue, so a button
 					-- appends "CMSWITCH 3" to the inject file; inject.lua schedules
@@ -1245,6 +1247,7 @@ function data()
 						D.statsBox:setVisible(CM.dashShowStats, false)
 						D.chatBox:setVisible(CM.dashShowChat, false)
 						D.coBox:setVisible(CM.dashShowCompanies, false)
+						D.speedBox:setVisible(CM.dashShowSpeed, false)
 					end)
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
@@ -1300,7 +1303,7 @@ function data()
 						paceTxt = "   |  this game leads the clock"
 					end
 					D.speedText:setText(string.format("session speed: %s%s%s%s%s   ", eff and string.format("%gx", eff) or "-",
-						(req and req ~= "-") and "  (set with -0.5 / +0.5; reset follows the speed buttons again)" or "  (the slowest player's speed buttons)",
+						(req and req ~= "-") and "  (set by /speed in chat; /speed off hands it back to the speed buttons)" or "  (the slowest player's speed buttons)",
 						paceTxt,
 						(sync and sync ~= "-") and ("  SYNC: " .. sync) or "",
 						(xfer and xfer ~= "-") and ("  SAVE: " .. xfer) or ""))
