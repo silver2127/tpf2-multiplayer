@@ -1032,16 +1032,19 @@ static void RenderPanelLayer(int w, int h)
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
         mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
+        // The mod has to be on in the shared save: without it nothing replicates,
+        // and START GAME refuses such a save (2026-09-10). Said up front here.
+        mwBody(pad, cy + S(136), w - 2 * pad, S(20), L"Everyone needs the Transport Fever 2 Multiplayer mod, and the shared save must have it enabled.");
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
-        mwHeader(pad, cy + S(138), S(260), L"YOUR NAME");
-        mwField(pad, cy + S(162), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Click to type a name", 13);
-        mwHeader(pad + S(290), cy + S(138), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
+        mwHeader(pad, cy + S(162), S(260), L"YOUR NAME");
+        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Click to type a name", 13);
+        mwHeader(pad + S(290), cy + S(162), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
-          mwField(pad + S(290), cy + S(162), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
+          mwField(pad + S(290), cy + S(186), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
         // ---- PUBLIC GAMES: the server browser (OpenTTD style) ----
         if (g_flagMaster[0]) {
-            int ly = cy + S(206); int lw = w - 2 * pad;
+            int ly = cy + S(230); int lw = w - 2 * pad;
             mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row to fill in its code, then JOIN GAME");
             { int rb = mwButtonW(L"REFRESH"); mwButton(w - pad - rb, ly - S(4), rb, S(30), L"REFRESH", 12); }
             ly += S(26);
@@ -2771,7 +2774,7 @@ static void AutoEnableLockstepMod(const wchar_t* saveDir)
     HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
         // first launch ever: the game writes settings.lua at exit; next launch we patch it
-        Log("[menu] automod: no settings.lua yet (%ls) -- will add MP Lockstep on the next launch\n", path);
+        Log("[menu] automod: no settings.lua yet (%ls) -- will add the Transport Fever 2 Multiplayer mod on the next launch\n", path);
         return;
     }
     LARGE_INTEGER sz; sz.QuadPart = 0; GetFileSizeEx(h, &sz);
@@ -2781,7 +2784,7 @@ static void AutoEnableLockstepMod(const wchar_t* saveDir)
     CloseHandle(h);
     if (!okR || got != txt.size()) { Log("[menu] automod: read failed\n"); return; }
 
-    if (txt.find("\"mp_lockstep\"") != std::string::npos) { Log("[menu] automod: MP Lockstep already in activeMods\n"); return; }
+    if (txt.find("\"mp_lockstep\"") != std::string::npos) { Log("[menu] automod: the Transport Fever 2 Multiplayer mod already in activeMods\n"); return; }
     const bool crlf = txt.find("\r\n") != std::string::npos;
     const std::string nl = crlf ? "\r\n" : "\n";
     std::string out;
@@ -2805,7 +2808,7 @@ static void AutoEnableLockstepMod(const wchar_t* saveDir)
         DeleteFileW(tmp);
         return;
     }
-    Log("[menu] automod: MP Lockstep added to activeMods in %ls (%s; backup settings.lua.mpbak)\n",
+    Log("[menu] automod: the Transport Fever 2 Multiplayer mod added to activeMods in %ls (%s; backup settings.lua.mpbak)\n",
         path, at != std::string::npos ? "existing list" : "new list");
 }
 

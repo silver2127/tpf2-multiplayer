@@ -58,7 +58,7 @@
 
     <!-- Repair stays available on purpose: Steam's "verify integrity" puts the
          stock alut.dll back over the proxy, and a Repair reinstalls it. -->
-    <Property Id="ARPCOMMENTS" Value="Lockstep multiplayer for Transport Fever 2. Uninstalling restores the game's own alut.dll." />
+    <Property Id="ARPCOMMENTS" Value="Multiplayer for Transport Fever 2. Uninstalling restores the game's own alut.dll." />
 
     <!-- Public properties that may arrive on the msiexec command line; Secure
          lets them cross into the elevated half of a UAC-prompted install. -->

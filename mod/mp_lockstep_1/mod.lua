@@ -4,7 +4,7 @@ function data()
 			minorVersion = 0,
 			severityAdd = "NONE",
 			severityRemove = "NONE",
-			name = "MP Lockstep",
+			name = "Transport Fever 2 Multiplayer",
 			description = [[
 Lockstep multiplayer prototype. Does NOT replicate world state: it replicates
 COMMANDS, each stamped with the game time at which every peer must execute it,

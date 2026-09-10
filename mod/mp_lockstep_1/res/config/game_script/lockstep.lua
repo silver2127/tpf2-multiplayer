@@ -110,7 +110,7 @@ CM.bootOk, K.BASE = pcall(function()
 	return pick.path
 end)
 if not CM.bootOk then
-	local msg = "MP Lockstep: finding the data folder failed: " .. (tostring(K.BASE):gsub("[\128-\255]", "?"))
+	local msg = "Transport Fever 2 Multiplayer: finding the data folder failed: " .. (tostring(K.BASE):gsub("[\128-\255]", "?"))
 	print("[ls-boot] " .. msg)
 	error(msg, 0)
 end
@@ -368,18 +368,18 @@ function CM.boot(name)
 	print("[ls-boot] loading " .. name)
 	local ok, factory = pcall(require, name)
 	if not ok then
-		local msg = "MP Lockstep: require('" .. name .. "') failed: " .. CM.bootText(factory)
+		local msg = "Transport Fever 2 Multiplayer: require('" .. name .. "') failed: " .. CM.bootText(factory)
 		print("[ls-boot] " .. msg)
 		error(msg, 0)
 	end
 	if type(factory) ~= "function" then
-		local msg = "MP Lockstep: require('" .. name .. "') returned a " .. type(factory) .. ", not the module factory (another mod may have replaced require)"
+		local msg = "Transport Fever 2 Multiplayer: require('" .. name .. "') returned a " .. type(factory) .. ", not the module factory (another mod may have replaced require)"
 		print("[ls-boot] " .. msg)
 		error(msg, 0)
 	end
 	local ok2, result = pcall(factory, CM, K, log)
 	if not ok2 then
-		local msg = "MP Lockstep: module " .. name .. " failed while loading: " .. CM.bootText(result)
+		local msg = "Transport Fever 2 Multiplayer: module " .. name .. " failed while loading: " .. CM.bootText(result)
 		print("[ls-boot] " .. msg)
 		error(msg, 0)
 	end

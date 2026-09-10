@@ -834,6 +834,53 @@ class GameRelay:
 # All files (.sav + optional .sav.lua + .jpg) are concatenated into ONE byte
 # stream with a single sequence space; the receiver splits them back out using
 # the per-file sizes in `fbegin`. Integrity is SHA-256 per file AND overall.
+MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
+_mod_refusal_notes = {}                               # save path -> when the chat was last told
+
+
+def _save_has_mp_mod(save_path):
+    """Was this save made with our mod enabled? True, False, or None when
+    there is no way to tell.
+
+    The .sav itself is Zstandard-compressed, but the game writes a plain
+    <name>.sav.lua beside it holding one entry per game script that ran,
+    keyed by the script's file name. Ours is lockstep.lua, so the entry is
+    there exactly when the mod was on: on the saves checked (2026-09-10) it
+    matched the mod list inside the compressed .sav every time."""
+    try:
+        with open(os.path.abspath(save_path) + ".lua", "rb") as f:
+            return b'["lockstep.lua"]' in f.read()
+    except OSError:
+        return None
+
+
+def _mod_check(save_path, io, log):
+    """True when ``save_path`` may be shared. A save made without the mod is
+    refused: nothing in it would replicate, and every player would load a
+    world that silently never syncs. The panel's status line is one short
+    row, so the full explanation goes to the chat log too (at most once a
+    minute per save: the relay leader's periodic upload retries every 2 min)."""
+    has = _save_has_mp_mod(save_path)
+    if has is None:
+        log(f"[host] {save_path}: no .sav.lua beside it -- cannot tell whether the mod is on; sharing anyway")
+        return True
+    if has:
+        return True
+    label = os.path.basename(save_path)
+    if label.lower().endswith(".sav"):
+        label = label[:-4]
+    log(f"[host] NOT sharing {save_path}: made without the {MOD_DISPLAY_NAME} mod (no lockstep.lua entry in its .sav.lua)")
+    io.emit({"type": "status", "state": "connected",
+             "detail": f"Not shared: '{label}' does not have the {MOD_DISPLAY_NAME} mod enabled (see chat)"})
+    now = time.time()
+    if now - _mod_refusal_notes.get(save_path, 0.0) > 60.0:
+        _mod_refusal_notes[save_path] = now
+        io.emit({"type": "chat", "from": "MULTIPLAYER",
+                 "text": f"'{label}' was saved without the {MOD_DISPLAY_NAME} mod, so nothing would sync. "
+                         "Load it, enable the mod in its Mods panel on the load screen, save, and press START GAME again."})
+    return False
+
+
 def _read_save_files(save_path):
     """Read the .sav and any sidecars; return (blob, files_meta).
 
@@ -1340,6 +1387,11 @@ class _ClientSaveReceiver:
         self.io.emit({"type": "save_ready", "name": INCOMING_BASENAME,
                       "dir": os.path.abspath(self.io.dir), "files": written})
         self.log(f"[client] save ready: {written} in {self.io.dir}")
+        if _save_has_mp_mod(os.path.join(self.io.dir, INCOMING_BASENAME + ".sav")) is False:
+            self.log(f"[client] the received save was made without the {MOD_DISPLAY_NAME} mod")
+            self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                          "text": f"The host's save does not have the {MOD_DISPLAY_NAME} mod enabled, so nothing will sync. "
+                                  "Ask the host to enable it in that save's Mods panel and share it again."})
         self._maybe_send_done(force=True)
 
 
@@ -2053,6 +2105,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log("[relay] 'start' from the local panel ignored -- the leader starts")
             elif transfer[0] is not None:
                 log("[host] start ignored -- a save transfer is in progress")
+            elif save and not _mod_check(save, io, log):
+                pass                              # refused: made without the mod (status + chat say so)
             elif save:
                 begin_save_transfer(save)         # start(save=True) when done
             else:
@@ -2589,6 +2643,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 send({"t": "start"})                      # no-save start via the relay
             elif uploader[0] is not None:
                 log("[client] start ignored -- an upload is in progress")
+            elif not _mod_check(str(cmd.get("save")), io, log):
+                pass                                      # refused: made without the mod (status + chat say so)
             else:
                 try:
                     blob, files_meta = _read_save_files(str(cmd.get("save")))
@@ -3166,7 +3222,7 @@ def _run_transfer_once(loss, size_bytes, tag):
     with open(save_path, "wb") as f:
         f.write(os.urandom(size_bytes))
     with open(save_path + ".lua", "wb") as f:            # world.sav.lua sidecar
-        f.write(b"-- meta\n" + os.urandom(2048))
+        f.write(b'["lockstep.lua"] = { }\n-- meta\n' + os.urandom(2048))   # made with the mod
     with open(os.path.join(base, "world.jpg"), "wb") as f:  # world.jpg sidecar
         f.write(os.urandom(4096))
     src_sha = {

@@ -1,13 +1,27 @@
 """Loopback test of the relay-only host (python tools/relay_selftest.py): relay + joiners on 127.0.0.1.
 The first joiner (leader) sends start(save=<file>); the relay must receive the
 upload, push it to the second joiner, and both must get start save=true."""
-import json, os, subprocess, sys, time, tempfile, shutil
+import json, os, socket, subprocess, sys, time, tempfile, shutil
+def free_udp_ports(n):
+    # Game ports are picked free on every run. Fixed 7791-7794 sat inside the
+    # bridge's fallback range, and a fourth game on this PC holding 7792 made
+    # the frames check fail with a UDP reset (2026-09-10).
+    socks = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(n)]
+    for k in socks:
+        k.bind(("127.0.0.1", 0))
+    ports = [k.getsockname()[1] for k in socks]
+    for k in socks:
+        k.close()
+    return ports
+DAVE_RELAY, DAVE_LOCAL, ERIN_RELAY, ERIN_LOCAL = free_udp_ports(4)
 NP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "netpunch")
 tmp = tempfile.mkdtemp(prefix="relaytest_")
 def d(n):
     p = os.path.join(tmp, n); os.makedirs(p, exist_ok=True); return p
 save = os.path.join(tmp, "world.sav"); open(save, "wb").write(os.urandom(3 * 1024 * 1024))
-open(save + ".lua", "w").write("return {}\n")
+open(save + ".lua", "w").write('return { ["lockstep.lua"] = { } }\n')   # made with the mod
+nomod = os.path.join(tmp, "nomod.sav"); open(nomod, "wb").write(os.urandom(64 * 1024))
+open(nomod + ".lua", "w").write('return { ["guidesystem.lua"] = { } }\n')    # made WITHOUT the mod
 procs = []
 def run(args, iodir, name):
     lg = open(os.path.join(tmp, name + ".log"), "w")
@@ -42,6 +56,13 @@ try:
     rh = [e for e in events(hd) if e.get("type") == "roster"][-1]
     assert rh.get("host") == "Hosty", rh
     print("plain host/join roster OK")
+    # a plain host refuses to share a save made without the mod
+    with open(os.path.join(hd, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"cmd": "start", "save": nomod}) + "\n")
+    assert wait(lambda: any(e.get("type") == "status" and "does not have" in e.get("detail", "") for e in events(hd)), 15), "plain host shared a save made without the mod"
+    assert wait(lambda: any(e.get("type") == "chat" and "Mods panel" in e.get("text", "") for e in events(hd)), 5), "no chat explanation on the host"
+    assert not any(e.get("type") == "save_ready" for e in events(jd)), "a save without the mod reached the joiner"
+    print("plain host refuses a save without the mod OK")
     for pr in procs: pr.kill()
     time.sleep(1); procs.clear()
     rd = d("relay"); run(["host", "--relay-only", "--name", "Relay", "--lobby-name", "Relay Test", "--local-port", "29571"], rd, "relay")
@@ -56,6 +77,13 @@ try:
     print("alice roster:", ra)
     assert ra.get("host") == "Alice" and ra.get("relay") is True, "alice should lead"
     assert ra.get("letters", {}).get("Alice") == "a" and ra.get("letters", {}).get("Bob") == "b", "letters"
+    # the relay leader refuses to upload a save made without the mod
+    with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"cmd": "start", "save": nomod}) + "\n")
+    assert wait(lambda: any(e.get("type") == "status" and "does not have" in e.get("detail", "") for e in events(ad)), 15), "relay leader uploaded a save made without the mod"
+    time.sleep(2)
+    assert not any(e.get("type") == "save_ready" for e in events(bd)), "a save without the mod reached bob"
+    print("relay leader refuses a save without the mod OK")
     # the leader starts with a save
     with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps({"cmd": "start", "save": save}) + "\n")
@@ -90,7 +118,7 @@ try:
     print("old code still used below; new code differs only by its timestamp:", code2 != code)
     # Dave and Erin run WITH the mesh (as real players do) and with game relay
     # ports, so lockstep frames can be checked both ways through the relay
-    dd = d("dave"); run(["join", code, "--name", "Dave", "--local-port", "0", "--game-relay-port", "7791", "--game-local-port", "7792"], dd, "dave")
+    dd = d("dave"); run(["join", code, "--name", "Dave", "--local-port", "0", "--game-relay-port", str(DAVE_RELAY), "--game-local-port", str(DAVE_LOCAL)], dd, "dave")
     assert wait(lambda: any(e.get("type") == "roster" and "Dave" in e.get("players", []) for e in events(dd)), 40), "dave not in roster"
     rdv = [e for e in events(dd) if e.get("type") == "roster"][-1]
     assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "e", rdv     # a,b,c,d are remembered for Alice/Bob/Carol/Zed
@@ -100,11 +128,11 @@ try:
     assert open(os.path.join(dd, "incoming_save.sav"), "rb").read() == open(save, "rb").read(), "resumed save differs"
     # ---- game frames both ways through the relay (the leader is a joiner like any other)
     import socket
-    ed = d("erin"); run(["join", code, "--name", "Erin", "--local-port", "0", "--game-relay-port", "7793", "--game-local-port", "7794"], ed, "erin")
+    ed = d("erin"); run(["join", code, "--name", "Erin", "--local-port", "0", "--game-relay-port", str(ERIN_RELAY), "--game-local-port", str(ERIN_LOCAL)], ed, "erin")
     assert wait(lambda: any(e.get("type") == "roster" and "Erin" in e.get("players", []) for e in events(dd)), 40), "erin not in roster"
     time.sleep(3)
-    dave_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); dave_bridge.bind(("127.0.0.1", 7792)); dave_bridge.settimeout(0.5)
-    erin_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); erin_bridge.bind(("127.0.0.1", 7794)); erin_bridge.settimeout(0.5)
+    dave_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); dave_bridge.bind(("127.0.0.1", DAVE_LOCAL)); dave_bridge.settimeout(0.5)
+    erin_bridge = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); erin_bridge.bind(("127.0.0.1", ERIN_LOCAL)); erin_bridge.settimeout(0.5)
     def xfer(src, dst_relay_port, sink, tag):
         got = set()
         for i in range(20):
@@ -117,8 +145,8 @@ try:
                 if data.startswith(b"LSTICK test " + tag): got.add(data)
             except socket.timeout: pass
         return len(got)
-    e2d = xfer(erin_bridge, 7793, dave_bridge, b"e2d")   # Erin's bridge -> Erin's lobby -> relay -> Dave's lobby -> Dave's bridge
-    d2e = xfer(dave_bridge, 7791, erin_bridge, b"d2e")   # and the other way
+    e2d = xfer(erin_bridge, ERIN_RELAY, dave_bridge, b"e2d")   # Erin's bridge -> Erin's lobby -> relay -> Dave's lobby -> Dave's bridge
+    d2e = xfer(dave_bridge, DAVE_RELAY, erin_bridge, b"d2e")   # and the other way
     print(f"frames: erin->dave {e2d}/20, dave->erin {d2e}/20")
     assert e2d >= 15, "frames to the LEADER do not arrive (the plain-to-relay bug)"
     assert d2e >= 15, "frames from the leader do not arrive"
