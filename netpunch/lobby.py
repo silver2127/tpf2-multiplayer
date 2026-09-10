@@ -1365,7 +1365,7 @@ def _clear_stale_incoming(directory, log=_log):
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
 LOBBY_VERSION = "0.4.11"
-PUBLISH_EVERY = 30.0
+PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
 
 
 class _Publisher:
@@ -1376,13 +1376,19 @@ class _Publisher:
     the code (host address + session secret) and a name -- so it is opt-in,
     and a password-locked code shows as locked (useless without the password)."""
 
-    def __init__(self, url, code, game, locked, log):
+    def __init__(self, url, code, game, locked, log, stable_key=None):
         self.url = url.rstrip("/")
         self.code = code
         self.game = game or ""
         self.locked = bool(locked)
         self.log = log
-        self.id = os.urandom(8).hex()
+        # A STABLE id: derived from the lobby name + port + machine, so a
+        # restarted relay REPLACES its old row instead of sitting next to a
+        # stale copy of itself until that expired (2026-09-10). A plain host
+        # gets a fresh id per run (its code changes anyway).
+        import hashlib, socket as _sk
+        seed = stable_key or ""
+        self.id = hashlib.sha256((seed + "|" + _sk.gethostname()).encode("utf-8")).hexdigest()[:16] if seed else os.urandom(8).hex()
         self.name = "host"
         self.players = 1
         self.on = False
@@ -2772,7 +2778,18 @@ def cmd_host(args):
          + (" + password)" if args.password else ")"))
     publisher = None
     if args.publish:
-        publisher = _Publisher(args.publish, code, args.game_name, bool(args.password), _log)
+        publisher = _Publisher(args.publish, code, args.game_name, bool(args.password), _log,
+                               stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
+        # systemd stops the relay with SIGTERM; without a handler Python just
+        # dies and the finally: below (publisher.close -> /leave) never runs,
+        # so the public list kept the dead row for a full TTL
+        import signal as _sig
+        def _term(_signo, _frame):
+            raise KeyboardInterrupt
+        try:
+            _sig.signal(_sig.SIGTERM, _term)
+        except (ValueError, OSError):
+            pass
         publisher.update(args.lobby_name or args.name, 0 if args.relay_only else 1)
         if args.public:
             publisher.set(True)

@@ -20,7 +20,7 @@ systemd service (see the deploy step in tools/masterserver_deploy.sh).
 import json, sys, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TTL = 120.0          # seconds an entry lives without a fresh announce
+TTL = 30.0           # seconds an entry lives without a fresh announce (lobbies announce every 10 s)
 MAX_BODY = 4096
 MAX_ENTRIES = 500
 FIELDS = ("id", "name", "code", "players", "max", "game", "version", "locked")

@@ -783,7 +783,7 @@ struct PubRow { char name[48]; char code[256]; char game[64]; char version[24]; 
 static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
-static const ULONGLONG PUB_EVERY = 10000;
+static const ULONGLONG PUB_EVERY = 10000;   // 10 s, a third of the master TTL (30 s)
 
 // minimal JSON field readers for the flat objects the master server emits
 static bool pubStr(const char* obj, const char* key, char* out, int n)
@@ -1048,9 +1048,11 @@ static void RenderPanelLayer(int w, int h)
             PubRow rows[8]; int cnt = 0; char note[96] = "";
             if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); memcpy(rows, g_pub, sizeof(rows)); cnt = g_pubCount; strcpy_s(note, g_pubNote); LeaveCriticalSection(&g_pubCs); }
             HFONT fr = mkLato(S(13));
-            int cName = pad + S(10), cGame = pad + S(190), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
-            layerText(cName, ly, S(180), S(20), L"HOST", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            layerText(cGame, ly, S(320), S(20), L"GAME", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            // HOST gets 250 px (was 180): "Dedicated Test Server All Welcome" and
+            // long player names were cut off; GAME moved right to make room (2026-09-10)
+            int cName = pad + S(10), cGame = pad + S(265), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
+            layerText(cName, ly, S(250), S(20), L"HOST", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(cGame, ly, S(250), S(20), L"GAME", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             layerText(cPl, ly, S(70), S(20), L"PLAYERS", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             layerText(cVer, ly, S(60), S(20), L"VERSION", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             layerText(cAge, ly, S(80), S(20), L"SEEN", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1064,8 +1066,8 @@ static void RenderPanelLayer(int w, int h)
                 if (r.locked) { wchar_t t[64]; _snwprintf_s(t, _TRUNCATE, L"%s  [locked]", wn); wcscpy_s(wn, t); }
                 _snwprintf_s(wp, _TRUNCATE, L"%d / %d", r.players, r.max);
                 if (r.age < 60) wcscpy_s(wa, L"just now"); else _snwprintf_s(wa, _TRUNCATE, L"%d min ago", r.age / 60);
-                layerText(cName, ly, S(175), rh, wn, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                layerText(cGame, ly, S(320), rh, wg[0] ? wg : L"(unnamed save)", fr, wg[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                layerText(cName, ly, S(250), rh, wn, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                layerText(cGame, ly, S(250), rh, wg[0] ? wg : L"(unnamed save)", fr, wg[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
                 layerText(cPl, ly, S(70), rh, wp, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 layerText(cVer, ly, S(60), rh, wv, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 layerText(cAge, ly, S(80), rh, wa, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
