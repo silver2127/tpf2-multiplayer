@@ -1051,45 +1051,6 @@ function CM.loadGateReady()
 	return true
 end
 
-K.COUNTDOWN_SEC = 3
--- start_countdown=0 in tpf2_slice.cfg turns it off. Only in a session of two or
--- more (the lobby roster's players=), once per load.
-function CM.countdownTick(s)
-	if CM.cdPhase == "done" then return false end
-	if CM.cdPhase == nil then
-		local players = CM.lgWant or 0
-		if players < 1 then
-			pcall(function()
-				local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
-				if f then
-					local body = f:read("*a") or ""
-					f:close()
-					players = tonumber(body:match("players=(%d+)")) or 0
-				end
-			end)
-		end
-		if players < 2 or not CM.cfgFlag("start_countdown", true) then CM.cdPhase = "done"; return false end
-		CM.cdPhase = "run"
-		CM.cdEnd = os.clock() + K.COUNTDOWN_SEC
-		if not CM.lgHeld then
-			CM.lgHeld, CM.lgHeldAt = true, CM.ticks
-			CM.lgResumeSpeed = (s and s > 0) and s or 1
-		end
-		CM.lgHolding = true
-		if s and s > 0 then CM.setSpeed(0, "start countdown") end
-		log(string.format("COUNTDOWN: the world is loaded -- starting in %d s", K.COUNTDOWN_SEC))
-		return true
-	end
-	if os.clock() < (CM.cdEnd or 0) then
-		if s and s > 0 and (CM.ticks % 6) == 0 then CM.setSpeed(0, "start countdown") end
-		return true
-	end
-	CM.cdPhase = "done"
-	CM.cdGoAt = os.clock()
-	log("COUNTDOWN: go")
-	return false
-end
-
 function CM.ensureRunning()
 	if didInitialUnpause or CM.paused then return end
 	-- The 100-tick "let the world finish loading" grace used to sit HERE, ahead
@@ -1151,11 +1112,6 @@ function CM.ensureRunning()
 		end
 		return
 	end
-
-	-- START COUNTDOWN (2026-09-10): the gate would let go now. In a session,
-	-- hold K.COUNTDOWN_SEC more with a 3-2-1 on screen, so every player sees the
-	-- start coming instead of the world jumping into motion under them.
-	if CM.countdownTick(s) then return end
 
 	-- Everybody is in. If WE paused, give the speed back at once -- the world
 	-- has plainly finished loading by now, and making a held game sit out the

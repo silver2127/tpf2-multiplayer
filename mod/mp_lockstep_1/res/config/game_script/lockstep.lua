@@ -631,41 +631,6 @@ local function checkHash(now)
 	CM.compareAt(stamp)
 end
 
--- The start countdown, drawn in the GUI state from the dash's cdend / cdgo
--- (both on os.clock, which the two Lua states of one process share).
-function CM.countdownGui()
-	local now = os.clock()
-	local txt
-	if CM.cdGuiEnd and now < CM.cdGuiEnd then
-		txt = string.format("Starting in %d...", math.max(1, math.ceil(CM.cdGuiEnd - now)))
-	elseif CM.cdGuiGo and now < CM.cdGuiGo + 1.5 then
-		txt = "Go!"
-	end
-	if not txt then
-		if CM.cdWin then pcall(function() CM.cdWin:setVisible(false, false) end) end
-		CM.cdWin, CM.cdText, CM.cdLast = nil, nil, nil
-		return
-	end
-	if not CM.cdWin then
-		CM.cdText = api.gui.comp.TextView.new(txt)
-		local layout = api.gui.layout.BoxLayout.new("VERTICAL")
-		layout:addItem(CM.cdText)
-		local body = api.gui.comp.Component.new("mpCountdown")
-		body:setLayout(layout)
-		CM.cdWin = api.gui.comp.Window.new("Multiplayer", body)
-		local x, y = 860, 260
-		pcall(function()
-			local r = api.gui.util.getGameUI():getContentRect()
-			if r and r.w and r.w > 0 then x = math.floor(r.w / 2 - 90); y = math.floor(r.h / 4) end
-		end)
-		CM.cdWin:setPosition(x, y)
-		CM.cdLast = txt
-	elseif CM.cdLast ~= txt then
-		CM.cdText:setText(txt)
-		CM.cdLast = txt
-	end
-end
-
 print("[ls-boot] all modules loaded")
 
 function data()
@@ -893,10 +858,6 @@ function data()
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
 						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
 							CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
-						-- the start countdown: its end and its go, on this process's os.clock
-						f:write(string.format("cdend=%s\ncdgo=%s\n",
-							(CM.cdPhase == "run" and CM.cdEnd) and string.format("%.3f", CM.cdEnd) or "-",
-							(CM.cdGoAt and os.clock() - CM.cdGoAt < 5) and string.format("%.3f", CM.cdGoAt) or "-"))
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1016,7 +977,6 @@ function data()
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
 		guiUpdate = function()
 			guiTick = guiTick + 1
-			if CM.cdGuiEnd or CM.cdGuiGo then pcall(CM.countdownGui) end   -- every frame while a countdown is on
 			if guiTick % 30 ~= 0 then return end
 			local ok = pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
@@ -1351,8 +1311,6 @@ function data()
 					local sync = mine and mine.sync
 					local pace = mine and mine.pace
 					local xfer = mine and mine.xfer
-					CM.cdGuiEnd = mine and tonumber(mine.cdend) or nil
-					CM.cdGuiGo = mine and tonumber(mine.cdgo) or nil
 					-- plain words (2026-09-10): "lowest lever" and "PID 0.95x e=-2.40"
 					-- meant nothing to players. The session speed is one number for
 					-- everyone; a joiner then runs a little faster or slower than it
