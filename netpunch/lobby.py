@@ -1871,12 +1871,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     peers[addr]["links"] = new
                     send_roster_packets()          # let everyone re-plan relays
         elif t == "company":
-            # a joiner may set ITS OWN company; only the host sets anyone's
+            # a joiner may set ITS OWN company; the host sets anyone's -- and on
+            # a relay the leader stands in for the host
             if addr in peers:
                 target = str(msg.get("player") or peers[addr]["name"])
-                if target == peers[addr]["name"] and set_company(target, msg.get("id")):
-                    log(f"[host] {target} -> company {msg.get('id')}")
+                allowed = target == peers[addr]["name"] or (relay_only and addr == leader_addr())
+                if allowed and set_company(target, msg.get("id")):
+                    log(f"[host] {target} -> company {msg.get('id')}" + ("" if target == peers[addr]["name"] else f" (set by the leader {peers[addr]['name']})"))
                     roster_changed()
+                elif not allowed:
+                    log(f"[host] {peers[addr]['name']} tried to set {target}'s company -- only the leader may")
         elif t == "mesh_hi":
             pass                                    # names are host-assigned
         elif t == "log":
@@ -2560,7 +2564,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         if c == "chat":
             send({"t": "chat", "text": str(cmd.get("text", ""))})
         elif c == "company":
-            send({"t": "company", "player": assigned[0], "id": cmd.get("id")})
+            # the panel names a player when the leader of a relay lobby clicks
+            # someone else's chip; this used to be overwritten with our own
+            # name, so the leader could only ever change its own (2026-09-10)
+            send({"t": "company", "player": str(cmd.get("player") or assigned[0]), "id": cmd.get("id")})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
             m2 = {"t": "join", "name": desired[0], "mesh": mesh is not None}
