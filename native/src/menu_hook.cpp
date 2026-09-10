@@ -480,7 +480,13 @@ static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount
 static const Hit* hoveredHit(){ for(int i=0;i<g_hitCount;i++) if(g_hits[i].btn && g_hits[i].id==g_hover) return &g_hits[i]; return nullptr; }
 
 // ---------------- flags (tpf2_menu_flags.txt next to this dll) ----------------
-//   scale=<f>        UI scale for the overlay (default = screen height / 1080).
+// Every value is checked: a garbled file, or a value out of range, leaves that
+// setting at its default instead of breaking the menu.
+//   scale=<f>               UI scale, 0.5-3 (default: screen height / 1080)
+//   slot=<n>                position of the Multiplayer entry, 0-7 (default 0 = top)
+//   master_url=<url>        public game list, a plain http(s) URL; empty hides the list
+//   relay_autosave_min=<n>  relay leader's save upload interval, 0-60 minutes (0 = never)
+//   autoload=0|1            START loads the shared save in-process (0: the player opens LOAD GAME)
 static float g_flagScale = 0.f;
 static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
@@ -494,15 +500,31 @@ static void ReadFlags()
     FILE* f = fopen(p, "r"); if (!f) { Log("[menu] flags: no %s (defaults)\n", p); return; }
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
-        if (!strcmp(line, "scale")) g_flagScale = (float)atof(v);
-        else if (!strcmp(line, "relay_autosave_min")) g_flagRelayAutosaveMin = atoi(v);
-        else if (!strcmp(line, "autoload")) g_flagAutoLoad = atoi(v);
-        else if (!strcmp(line, "slot")) g_flagSlot = atoi(v);
-        else if (!strcmp(line, "master_url")) { strncpy_s(g_flagMaster, v, _TRUNCATE); char* e = g_flagMaster + strlen(g_flagMaster); while (e > g_flagMaster && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '/')) *--e = 0; }
+        char* eq = strchr(line, '='); if (!eq) continue; *eq = 0;
+        char v[256]; strcpy_s(v, eq + 1);
+        char* e = v + strlen(v); while (e > v && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        const bool digit = v[0] >= '0' && v[0] <= '9';
+        if (!strcmp(line, "scale")) {
+            float s = (float)atof(v);
+            g_flagScale = (s >= 0.5f && s <= 3.0f) ? s : 0.f;
+        } else if (!strcmp(line, "relay_autosave_min")) {
+            int m = atoi(v);
+            if (digit && m >= 0 && m <= 60) g_flagRelayAutosaveMin = m;
+        } else if (!strcmp(line, "autoload")) {
+            if (!strcmp(v, "0")) g_flagAutoLoad = 0; else if (!strcmp(v, "1")) g_flagAutoLoad = 1;
+        } else if (!strcmp(line, "slot")) {
+            // the title menu builds 8 entries (9 with CONTINUE): a slot past them never inserts ours
+            int s = atoi(v);
+            if (digit && s >= 0 && s <= 7) g_flagSlot = s;
+        } else if (!strcmp(line, "master_url")) {
+            while (e > v && e[-1] == '/') *--e = 0;
+            // it becomes a process argument and a WinHTTP request: a space or quote breaks both
+            bool ok = !v[0] || ((!strncmp(v, "https://", 8) || !strncmp(v, "http://", 7)) && !strpbrk(v, " \t\"'"));
+            if (ok) strcpy_s(g_flagMaster, v); else Log("[menu] flags: master_url ignored (not a plain http(s) URL)\n");
+        }
     }
     fclose(f);
-    Log("[menu] flags: slot=%d scale=%.2f\n", g_flagSlot, g_flagScale);
+    Log("[menu] flags: slot=%d scale=%.2f autoload=%d relay_autosave_min=%d\n", g_flagSlot, g_flagScale, g_flagAutoLoad, g_flagRelayAutosaveMin);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -1813,17 +1835,10 @@ static void SyncPoll()
 // "/sync off" clears it.
 static char g_speedReq[16] = "";
 static int  g_syncReq = 0;
-static char g_pidReq[160] = "";
-static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")     // "/pid kp=0.06 ki=0.01" -> pid=kp=0.06 ki=0.01 (the script merges keys)
+static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")
 static void writeBridgeCtl(bool isHost);
 static void speedFromChat(const char* text)
 {
-    if (strncmp(text, "/pid ", 5) == 0) {
-        strncpy_s(g_pidReq, text + 5, _TRUNCATE);
-        Log("[menu] chat /pid -> %s\n", g_pidReq);
-        writeBridgeCtl(g_isHost != 0);
-        return;
-    }
     if (strncmp(text, "/sync", 5) == 0) {
         const char* a = text + 5; while (*a == ' ') a++;
         if (strncmp(a, "off", 3) == 0) g_syncReq = 0; else g_syncReq++;
@@ -1886,10 +1901,6 @@ static void writeBridgeCtl(bool isHost)
     if (g_syncReq) {
         size_t n = strlen(content);
         snprintf(content + n, sizeof(content) - n, "sync=%d\n", g_syncReq);
-    }
-    if (g_pidReq[0]) {
-        size_t n = strlen(content);
-        snprintf(content + n, sizeof(content) - n, "pid=%s\n", g_pidReq);
     }
     if (g_xfer[0]) {
         size_t n = strlen(content);
@@ -2184,16 +2195,6 @@ static void AutoLoadTick(void* menu)
 {
     LONG n = InterlockedIncrement(&g_menuUpdates);
     if (n == 1) Log("[menu] autoload: first CMenuUI update seen (this=%p)\n", menu);
-    // test trigger: <data dir>\tpf2_autoload_now.txt starts mp_shared without a lobby
-    if ((n % 30) == 0) {
-        wchar_t trig[MAX_PATH]; _snwprintf_s(trig, _TRUNCATE, L"%stpf2_autoload_now.txt", g_dataDirW);
-        if (GetFileAttributesW(trig) != INVALID_FILE_ATTRIBUTES) {
-            DeleteFileW(trig);
-            Log("[menu] autoload: test trigger file -- loading mp_shared\n");
-            g_autoLoadSince = GetTickCount64();
-            InterlockedExchange(&g_autoLoadPending, 1);
-        }
-    }
     if (!InterlockedCompareExchange(&g_autoLoadPending, 0, 0)) return;
     if (*(uint64_t*)((char*)menu + MENU_OFF_GAMEUI) != 0) {
         InterlockedExchange(&g_autoLoadPending, 0);
@@ -2408,17 +2409,20 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             }
                             if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
                                 // our own save (the one we shared / uploaded); a leader that RECEIVED a
-                                // save this session (a relay's /resume) falls through and loads that
-                                wcscpy_s(src, g_startSaveW[0] ? g_startSaveW : L""); if (!src[0]) newestSave(src, 600);
-                            } else if (withSave) {
-                                if (!saveReady) {   // the transfer never completed here: loading would pick a stale/unrelated save
-                                    Log("[menu] start(save=true) but no save_ready this session -- ignoring\n");
-                                    SetStatus("Start received but no save arrived -- ask the host to START again"); go = false;
-                                } else _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
+                                // save this session (a relay's /resume) falls through and loads that.
+                                // No guessing: our newest save need not be what anyone else has.
+                                wcscpy_s(src, g_startSaveW);
+                                if (!src[0]) {
+                                    Log("[menu] start: we shared no save this session -- not loading\n");
+                                    SetStatus("No save was shared -- press START GAME again"); go = false;
+                                }
+                            } else if (saveReady) {
+                                _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
                             } else {
-                                // legacy no-save start: load what this side has (a received save if any, else our newest)
-                                if (saveReady) _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
-                                else if (!newestSave(src, 600)) { SetStatus("No save to load."); go = false; }
+                                // No save arrived this session. Loading our own newest save instead
+                                // would put this player in a different world from everyone else.
+                                Log("[menu] start(save=%d) but no save_ready this session -- not loading\n", withSave ? 1 : 0);
+                                SetStatus("Start received but no save arrived -- ask the host to START again"); go = false;
                             }
                             if (go) {
                                 writeCompanyCfg();
