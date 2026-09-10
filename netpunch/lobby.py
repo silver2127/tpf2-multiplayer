@@ -1810,7 +1810,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if u is not None and u.complete and u.sid == msg.get("sid"):
                 return                                      # a late duplicate fbegin of a finished upload
             if u is None or u.complete or u.failed or u.sid != msg.get("sid"):
-                _clear_stale_incoming(io.dir, log)
+                # the stored save is NOT cleared first: the receiver holds the new
+                # one in memory and overwrites the files only once it has verified,
+                # so a failed upload leaves the previous world intact for /resume
                 upload[0] = _ClientSaveReceiver(_PeerConn(sock, addr), io, log)
                 log(f"[relay] save upload from the leader {peers[addr]['name']!r} begins")
             upload[0].on_begin(msg)
@@ -2512,6 +2514,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         join_msg["profile"] = profile_code
     send(join_msg)                                          # announce ourselves
     last_ping = 0.0
+    join_sent_at = time.time()
+    welcomed = [False]
     try:
         while not stop.is_set():
             if conn.last_seen_age() > host_gone_after:
@@ -2557,6 +2561,12 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             if now - last_ping >= PING_INTERVAL:
                 last_ping = now
                 send({"t": "ping"})
+                # No welcome yet: the join can be lost (UDP), or the host's port
+                # was briefly shared with another process. Say it again; the
+                # host treats a repeat as a rename in place, so it is harmless.
+                if host_name[0] is None and now - join_sent_at >= PING_INTERVAL:
+                    send(join_msg)
+                    log("[client] no welcome yet -- re-sending join")
             for cmd in io.poll_commands():
                 handle_command(cmd)
             if relay is not None:
