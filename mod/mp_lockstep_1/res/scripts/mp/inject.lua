@@ -211,6 +211,15 @@ function CM.pollInject()
 					-- intact in its world -- findEdgeContaining answers directly.
 					local isTrack = (etype == 1)
 					local splitNode = {}   -- new node id -> { node0, node1 } of the edge it sits on
+					-- ONE geometry scope for this split scan AND the plan pass below
+					-- (closed where this block ends; pollInject also closes any scope a
+					-- line leaves open). Unscoped, every new node walked the whole track
+					-- map and then the whole street map, reading every edge's geometry:
+					-- up to 20 full walks for a 10-node tunnel, ~1 s of freeze at the
+					-- click on top of the 268 ms plan (2026-09-10). Nothing changes the
+					-- world between here and the plan -- the build was cancelled.
+					CM.geomScopeBegin()
+					local scanT0 = os.clock()
 					for id, xyz in pairs(posOf) do
 						local hitEid
 						-- EITHER kind: a rail vertex landing on a ROAD is a split point too
@@ -228,6 +237,8 @@ function CM.pollInject()
 							splitNode[id] = ends
 						end
 					end
+
+					local scanMs = math.floor((os.clock() - scanT0) * 1000 + 0.5)
 
 					-- Resolve a real entity id to a position, on this peer, now.
 					local function realPos(id)
@@ -383,8 +394,8 @@ function CM.pollInject()
 								for _ in tostring(str or ""):gmatch("[^;]+") do n = n + 1 end
 								return n
 							end
-							log(string.format("ROADP plan: %d vertex decision(s), %d crossing decision(s) shipped (%d ms at the click)",
-								entries(xv), entries(xh), math.floor((os.clock() - planT0) * 1000 + 0.5)))
+							log(string.format("ROADP plan: %d vertex decision(s), %d crossing decision(s) shipped (%d ms at the click, split scan %d ms before it)",
+								entries(xv), entries(xh), math.floor((os.clock() - planT0) * 1000 + 0.5), scanMs))
 						else
 							log("ROADP plan pass failed (" .. tostring(xv) .. ") -- peers will derive their own")
 						end
@@ -395,6 +406,7 @@ function CM.pollInject()
 					else
 						log("inject: ROADE produced no usable edges: " .. line:sub(1, 70))
 					end
+					CM.geomScopeEnd()
 				else
 					log("inject: bad ROADE line: " .. line:sub(1, 70))
 				end
@@ -1174,6 +1186,12 @@ function CM.pollInject()
 				log("inject: unparsed line: " .. line:sub(1, 60))
 			end
 			end)
+			-- A geometry scope must never outlive the line that opened it: its map
+			-- lists would answer lookups on later ticks, after builds changed the world.
+			if (CM.geomDepth or 0) > 0 then
+				log(string.format("inject: closing %d geometry scope(s) left open by: %s", CM.geomDepth, line:sub(1, 40)))
+				while (CM.geomDepth or 0) > 0 do CM.geomScopeEnd() end
+			end
 			if not okLine then
 				log("inject dispatch error: " .. tostring(errLine) .. " -- " .. line:sub(1, 60))
 			end
