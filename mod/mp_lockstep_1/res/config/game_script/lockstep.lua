@@ -603,6 +603,29 @@ function data()
 				-- a save's company state (load hook) is applied here, on the sim
 				-- thread with the engine API up, not inside load() itself
 				if CM.cmSaved and not CM.cmLive then CM.cmReadConfig() end
+				-- WORLD INTEGRITY, once per load: a road edge without its
+				-- TransportNetwork component is a half-built leftover of a failed
+				-- proposal (the 2026-09-09 rail crossing left two); the engine
+				-- asserts and dies the moment the UI touches one. Say so loudly, so
+				-- a poisoned save is recognised before it spreads through the relay.
+				if not CM.integrityChecked and CM.ticks == 30 then
+					CM.integrityChecked = true
+					pcall(function()
+						local bad, n = {}, 0
+						local t = game.interface.getEntities({ radius = 999999 }, { type = "BASE_EDGE", includeData = false }) or {}
+						for _, eid in pairs(t) do
+							n = n + 1
+							local ok, c = pcall(function() return api.engine.getComponent(eid, api.type.ComponentType.TRANSPORT_NETWORK) end)
+							if not ok or c == nil then bad[#bad + 1] = tostring(eid) end
+						end
+						if #bad > 0 then
+							log(string.format("!! WORLD INTEGRITY: %d of %d edges have NO TransportNetwork (%s) -- clicking near them CRASHES the game; this save is damaged, repair or roll back", #bad, n, table.concat(bad, ",")))
+							pcall(dashNote, string.format("!! DAMAGED SAVE: %d broken road edge(s) %s -- clicking near them crashes; repair or roll back", #bad, table.concat(bad, ",")))
+						else
+							log(string.format("world integrity: %d edges, all complete", n))
+						end
+					end)
+				end
 			end
 			if not K.INSTANCE then return end
 
