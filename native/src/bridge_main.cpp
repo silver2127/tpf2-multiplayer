@@ -27,6 +27,7 @@
 #include "net.h"
 #include "datadir.h"
 #include "speedhook.h"
+#include "setplayer_patch.h"
 
 static FILE* g_log = nullptr;
 static void Log(const char* fmt, ...)
@@ -566,6 +567,11 @@ static DWORD WINAPI InitThread(LPVOID)
     // Fractional game speed (speedhook.cpp); CtlThread feeds it the target
     // from tpf2_speed.txt.
     SpeedHook_Install(Log);
+
+    // setPlayer on a track, road, node, signal, station or line-less vehicle
+    // re-owns it instead of asserting with a crash dump (setplayer_patch.cpp):
+    // a company switch calls it on everything the player owns.
+    SetPlayerPatch_Install(Log);
 
     // Transport health, from our own thread every 10 s. A line is written only
     // when a figure moved, so an idle bridge does not repeat itself all session.

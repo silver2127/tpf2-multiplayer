@@ -10,7 +10,8 @@ REM                                      also copied to the game dir when nothin
 REM                                      it open
 REM   proxy   alut.dll, tpf2_bridge_mp.dll   the export-forwarding proxy that loads us
 REM                                      before the exe entry point, and the bridge
-REM                                      (identity, relay socket, fractional speed)
+REM                                      (identity, relay socket, fractional speed,
+REM                                      setPlayer on any entity)
 REM   host    tpf2_pluginhost.dll        the plugin host shared with TpF2 Big Maps;
 REM                                      rebuilds alut.dll too (the host adds to what
 REM                                      the proxy loads)
@@ -73,9 +74,10 @@ exit /b 0
 %CC% /c src\net.cpp /Fo:out\net_mp.obj                                               || exit /b 1
 %CC% /c src\hook.cpp /Fo:out\hook_mp.obj                                             || exit /b 1
 %CC% /c src\speedhook.cpp /Fo:out\speedhook_mp.obj                                   || exit /b 1
+%CC% /c src\setplayer_patch.cpp /Fo:out\setplayer_patch_mp.obj                       || exit /b 1
 ml64 /nologo /c /Fo out\cgamesteprelay_mp.obj src\cgamesteprelay.asm                 || exit /b 1
 %CC% /c src\bridge_main.cpp /Fo:out\bridge_mp.obj                                    || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\hook_mp.obj out\speedhook_mp.obj out\cgamesteprelay_mp.obj out\bridge_mp.obj || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\hook_mp.obj out\speedhook_mp.obj out\setplayer_patch_mp.obj out\cgamesteprelay_mp.obj out\bridge_mp.obj || exit /b 1
 %CC% /LD src\proxy_alut.cpp /Fe:out\alut.dll /Fo:out\proxy_alut.obj                  || exit /b 1
 exit /b 0
 
