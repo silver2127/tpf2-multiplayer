@@ -70,7 +70,11 @@ try:
     nb = len([e for e in events(bd) if e.get("type") == "save_ready"])
     with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps({"cmd": "start", "save": save}) + "\n")
+    # Zed joins while Carol's transfer is in flight: must be served right after
+    zd = d("zed"); run(["join", code, "--name", "Zed", "--local-port", "0", "--no-mesh"], zd, "zed")
     assert wait(lambda: any(e.get("type") == "save_ready" for e in events(cd)), 60), "carol never got the save"
+    assert wait(lambda: any(e.get("type") == "save_ready" for e in events(zd)), 90), "zed (joined mid-transfer) never got the save"
+    assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(zd)), 30), "zed no start"
     assert wait(lambda: any(e.get("type") == "start" for e in events(cd)), 30), "carol no start"
     time.sleep(2)
     assert len([e for e in events(bd) if e.get("type") == "save_ready"]) == nb, "bob re-received the save"
@@ -89,7 +93,7 @@ try:
     dd = d("dave"); run(["join", code, "--name", "Dave", "--local-port", "0", "--game-relay-port", "7791", "--game-local-port", "7792"], dd, "dave")
     assert wait(lambda: any(e.get("type") == "roster" and "Dave" in e.get("players", []) for e in events(dd)), 40), "dave not in roster"
     rdv = [e for e in events(dd) if e.get("type") == "roster"][-1]
-    assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "d", rdv     # a,b,c are remembered for Alice/Bob/Carol
+    assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "e", rdv     # a,b,c,d are remembered for Alice/Bob/Carol/Zed
     assert wait(lambda: any(e.get("type") == "status" and "continuing the relay" in e.get("detail", "") for e in events(dd)), 10), "no auto-resume status"
     assert wait(lambda: any(e.get("type") == "save_ready" for e in events(dd)), 60), "dave never got the stored save"
     assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(dd)), 30), "dave no start"

@@ -1092,6 +1092,9 @@ class _HostSaveTransfer:
         return [p["name"] for p in self.peers.values()
                 if p["state"] == "failed"]
 
+    def done_addrs(self):
+        return [a for a, p in self.peers.items() if p["state"] == "done"]
+
     def done_count(self):
         return sum(1 for p in self.peers.values() if p["state"] == "done")
 
@@ -1653,24 +1656,28 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 _send_data(sock, a, msg)
         io.emit({"type": "chat", "from": frm, "text": text, "ts": ts})
 
-    def broadcast_start(save):
-        """Start everyone currently in the lobby. ``save`` is True when a save
-        transfer just completed for every peer (they load incoming_save.*),
-        False for a legacy no-save start."""
+    def broadcast_start(save, only=None):
+        """Start everyone currently in the lobby -- or, with ``only`` (a set of
+        addrs), just those: the peers a save transfer actually reached. A
+        peer that joined DURING the transfer has no save; starting it anyway
+        marked it started, its start(save=true) was refused for want of a
+        save, and nothing ever served it again (relay, 2026-09-10). Those stay
+        unstarted and get the next push (serve loop below)."""
         started[0] = True
         start_save[0] = bool(save)
         msg = {"t": "start", "save": start_save[0]}
-        for a in list(peers):
+        targets = [a for a in list(peers) if only is None or a in only]
+        for a in targets:
             peers[a]["started"] = True      # heal roster carries started:true
         if relay_only and upload[0] is not None and getattr(upload[0], "complete", False):
             upload[0] = None                # this upload has been distributed
         for _ in range(CHAT_BURST):
-            for a in list(peers):
+            for a in targets:
                 _send_data(sock, a, msg)
         io.emit({"type": "start", "save": start_save[0]})
         io.write_state(started=True)
         log(f"[host] START broadcast (save={start_save[0]}) to "
-            f"{len(peers)} peer(s)")
+            f"{len(targets)} of {len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
     def do_join(addr, name, profile=None, is_mesh=False):
@@ -1918,7 +1925,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 transfer[0].on_fdone(addr, msg)
 
     # ---- save transfer: read the file(s), fan out reliably, THEN start ----- #
+    last_shared = [None]                    # the save path last pushed (host: START GAME; relay: stored)
+
     def begin_save_transfer(save_path, include_leader=False):
+        last_shared[0] = save_path
         """Kick off a reliable push of ``save_path`` (+ sidecars) to all peers.
 
         Runs entirely off the main loop: this only builds the transfer object;
@@ -1957,7 +1967,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 broadcast_start(save=True)
                 return
         else:
-            targets = [(a, peers[a]["name"]) for a in peers]
+            targets = [(a, peers[a]["name"]) for a in peers if not (started[0] and peers[a].get("started"))]
+            if not targets:
+                log("[host] start(save): everyone already has this save -- nothing to push")
+                return
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
                                         io, log)
 
@@ -2002,6 +2015,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     log(f"[host] serving as {host_name!r} on udp/{sock.getsockname()[1]}")
 
     last_heal = last_drop = 0.0
+    last_serve_check = [0.0]
     reject_sent = {}                        # addr -> when we last sent a plain reject
     # The game relay's loopback socket joins the select set so a bridge frame
     # wakes the loop immediately (lockstep latency) instead of on the next tick.
@@ -2118,6 +2132,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if la in peers and la == leader_addr() and spath and not started[0] and transfer[0] is None and upload[0] is None:
                     log(f"[relay] resuming the stored world ({int(age)} s old) for {peers[la]['name']!r}")
                     begin_save_transfer(spath, include_leader=True)
+            # Anyone who joined during a transfer is still unstarted: serve them
+            # from the same save now that the pipe is free (relay: its stored
+            # world; host: the file START GAME shared). One push per batch.
+            if started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
+                last_serve_check[0] = now
+                waiting = [a for a in peers if not peers[a].get("started")]
+                if waiting and os.path.isfile(last_shared[0]) and (not relay_only or leader_addr() not in waiting):
+                    log(f"[host] {len(waiting)} peer(s) waiting for the save -- pushing it again")
+                    begin_save_transfer(last_shared[0])
             # relay-only: the leader's upload
             if relay_only and upload[0] is not None:
                 u = upload[0]
@@ -2170,9 +2193,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                                "wait for a player to join, "
                                                "then press START GAME"})
                         else:
-                            log("[host] all save transfers resolved -- "
-                                "starting")
-                            broadcast_start(save=True)
+                            got = set(xfer.done_addrs())
+                            la = leader_addr() if relay_only else None
+                            if la is not None and upload[0] is not None and getattr(upload[0], "complete", False):
+                                got.add(la)                   # the uploader has the save it sent
+                            waiting = [a for a in peers if a not in got and not peers[a].get("started")]
+                            log(f"[host] all save transfers resolved -- starting {len(got)} peer(s)"
+                                + (f"; {len(waiting)} joined during the transfer and will be served next" if waiting else ""))
+                            broadcast_start(save=True, only=got)
                 except Exception as e:                     # never crash the lobby
                     log(f"[host] save transfer error: {e!r}")
                     io.emit({"type": "status", "state": "failed",
