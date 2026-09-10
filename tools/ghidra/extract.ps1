@@ -11,7 +11,7 @@ analyze.ps1 already paid 24 minutes for. Safe to re-run.
 
 The .fields.txt files are the actual product. A decompiler renders an unknown
 struct as *(int *)(param_1 + 0xe8), and it is that offset -- cross-checked
-against the live bytes in docs/re/GROUND_TRUTH_applyProposal.md -- that turns a
+against live bytes captured in the game (docs/re/README.md) -- that turns a
 guess into a layout.
 #>
 param(

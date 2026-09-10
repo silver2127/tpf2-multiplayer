@@ -1,4 +1,4 @@
-# build output -- rebuild with native/build_*.bat, installer/build_msi.ps1
+# build output -- rebuild with native/build.bat, installer/build_msi.ps1
 native/out/
 installer/out/
 *.obj
@@ -7,7 +7,7 @@ installer/out/
 *.pdb
 *.ilk
 
-# frozen lobby exe -- rebuild with PyInstaller, see docs/PORTABILITY.md
+# frozen lobby exe -- rebuild with PyInstaller, see netpunch/README.md
 netpunch/dist/
 netpunch/build/
 

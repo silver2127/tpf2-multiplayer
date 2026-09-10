@@ -3,7 +3,7 @@
 // Why this function: it runs once per simulation step on the Simulation Thread,
 // which gives our code the same "on the sim thread at a defined point in the
 // frame" guarantee that Lua's update() has. Reading ECS memory from any other
-// thread races the sim (see docs/M7_NATIVE_STATE.md).
+// thread races the sim (see docs/re/GAME_LOOP_AND_UI.md).
 #pragma once
 #include <cstdint>
 

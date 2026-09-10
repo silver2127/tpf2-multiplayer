@@ -4,7 +4,7 @@
 // through files. On the dev rig they all pointed at a Steam workshop folder
 // (bridge: its own DLL dir; slice + Lua: compile-time literals) -- three
 // independent path sources that only agreed by construction, which is why the
-// mod could not be installed anywhere else (docs/PORTABILITY.md item 2).
+// mod could not be installed anywhere else.
 //
 // Shipping layout:
 //   binaries + cfg   <game dir>  (alut.dll proxy, tpf2_bridge_mp.dll, tpf2_menu.dll,

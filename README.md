@@ -2,126 +2,97 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Real multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Unofficial,
-reverse-engineered, and written without access to the engine source. Two or more players build in
-one world at the same time: roads, rails, stations, depots, vehicles and lines made by one
-player appear on the other's map, executed at the same in-game moment. Two modes share
-the same mod: **co-op**, where both play one shared company, and **companies**, where each
-player owns a separate company and wallet on the same map. Alpha: verified between two
-machines on different networks; the lobby seats sixteen, the sync itself has only run
-between two.
+**Multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Several players build in one
+world at the same time: the roads, track, stations, depots, vehicles and lines one player makes
+appear for everyone, applied at the same moment of the simulation on every machine. Play one shared
+company together, or separate companies with their own money on the same map.
 
-## Installing
+It is unofficial, reverse-engineered without the engine's source, and **experimental**. Sessions of up to
+four players have been run, on one PC and between PCs on different networks. Read
+[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
-**Players:** download `TpF2Multiplayer.msi` from the
-[latest release](https://github.com/silver2127/tpf2-multiplayer/releases), close the
-game, run it. It finds the game folder from Steam's registry entry, installs the
-proxy `alut.dll` (the original is kept as `alut_real.dll`), the lockstep DLLs and
-their cfgs, the `mp_lockstep_1` mod into `<game>\mods`, and the frozen lobby into
-`<game>\netpunch`. It also sets the Segment Heap switch for `TransportFever2.exe` (a
-registry value; big saves load about 15x faster, see `installer/README.md`). Runtime
-files go to `%LOCALAPPDATA%\tpf2mp\data`. Installs alongside
-[TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order.
+## How it works
 
-**Playing:** *Multiplayer* on the title screen. **HOST GAME** opens a lobby and gives
-you a code to hand out (Discord, or tick **PUBLIC** and the game shows up in the
-**PUBLIC GAMES** list on everyone's Multiplayer page, OpenTTD style). **JOIN GAME**
-takes a pasted code, or click a row in the list to fill it in. A password locks the
-code: a public row shows as `[locked]` and needs the password typed below it. The
-list is served by a tiny stdlib HTTP service (`netpunch/masterserver.py`, deployed
-with `tools/masterserver_deploy.sh`); hosts announce every 30 s, entries expire
-after 2 minutes, and nothing is brokered: the code is the join, the list only
-repeats it. `master_url=` in `tpf2_menu_flags.txt` points the panel elsewhere;
-an empty value hides the list.
+The game has no network code, so this adds lockstep multiplayer from outside. A forwarding `alut.dll`
+loads a few DLLs into the game at start-up: one captures each command a player issues and cancels it
+before it applies, one carries commands between the game and a separate lobby process, and one draws the
+Multiplayer panel on the title menu. A Lua game-script mod stamps every command with a future simulation
+step, sends it to everyone, and replays it through the game's scripting API on every machine at that step,
+including the player's own. Everyone starts from the same save, so the worlds stay identical; a detector
+compares them continuously. The lobby handles NAT traversal, encryption and sending the save.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the details.
 
-**Dedicated relay:** a lobby can live on a server with no game
-(`lobby.py host --relay-only`, deployed to the VPS by `tools/relay_deploy.sh` as
-the `tpf2mp-relay` service, always listed in PUBLIC GAMES). Everyone joins it;
-the first player in is the leader and gets the host role. If the relay already
-holds a world it is continued automatically after 10 s (say `/new` in chat
-within that time to discard it and share your own save with START GAME
-instead; `tools/relay_put_save.sh <save>` replaces it from a shell); otherwise START GAME uploads the
-leader's newest save to the relay, which pushes it to everyone waiting. Hot
-joiners get the same treatment, and the leader re-uploads every 10 minutes so
-the relay's copy stays fresh. Letters are assigned by the relay and stick to
-names, so a returning leader is `a` again. Nobody needs an open port or a
-non-CGNAT connection, and the code never changes while the relay runs. The
-world only advances while players are connected: the relay carries frames, it
-does not run the simulation.
+## Install
 
-**Uninstalling:** run the same MSI again and choose **Remove**, or use *Apps* in
-Windows settings. Either removes every file it added and puts the game's own
-`alut.dll` back (unless TpF2 Big Maps is still installed, in which case the shared
-proxy stays for it).
+**Download `TpF2Multiplayer.msi` from the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases),
+close the game, and run it.** Everyone in a session needs the same version.
 
-**Prerequisites**
+The installer finds the game folder through Steam, keeps the game's `alut.dll` as `alut_real.dll` and puts
+the proxy in its place, adds the DLLs, the lobby (`netpunch\netpunch.exe`) and the **Transport Fever 2 Multiplayer** mod, and
+switches the game to the Windows Segment Heap, which makes very large maps load far faster. Runtime files go
+to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
+[TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
+[installer/README.md](installer/README.md).
 
-- Windows, Steam, Transport Fever 2 (build 35924; the hook RVAs are specific to it).
-- Visual Studio 2022 Build Tools with the MSVC x64 toolchain (`cl`, `link`, `ml64`). The
-  `native\build.bat` and the scripts in `tools/` (except `install_portable.ps1`) hardcode
-  the default locations, Build Tools at `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`
-  (`build.bat` calls `vcvars64.bat`) and Steam at `C:\Program Files (x86)\Steam`; with
-  another VS edition or Steam library, edit the path variables at the top of each script.
-- For the lobby: a frozen `netpunch\dist\netpunch.exe` (not checked in; build it with
-  `cd netpunch; python -m PyInstaller --onefile --name netpunch lobby.py`), or Python 3.12
-  on `PATH` with `pip install -r netpunch\requirements.txt` (`pystun3`, `miniupnpc`).
-- Optional: `pip install luaparser` for `tools\luacheck.py`; Sandboxie-Plus for a second
-  instance on the same machine.
+To uninstall, use **Apps → TpF2 Multiplayer → Uninstall**, or run the MSI again and choose **Remove**; the
+game's own `alut.dll` is put back. Steam's "Verify integrity of game files" also restores it, which removes the
+Multiplayer entry until you run the MSI's **Repair**.
 
+## Play
 
-### Playing
+1. Title menu → **Multiplayer** → **HOST GAME**. The code is copied to your clipboard: send it to your friends,
+   or tick **PUBLIC** to list the game. A password locks the code.
+2. Friends open **Multiplayer**, paste the code and press **JOIN GAME**, or click your game in **PUBLIC GAMES**.
+3. Press **START GAME**. Your newest save is sent to everyone; when it is ready, everyone opens **LOAD GAME**
+   and picks **mp_shared**.
 
-1. Launch the game. A **MULTIPLAYER** bar appears over the title menu.
-2. The host presses **HOST**. A short base32 code is generated and copied to the
-   clipboard; send it to your friend however you like.
-3. Each joiner copies the code and presses **JOIN**; the panel reads it from the clipboard.
-4. The roster and chat live in the same panel.
-5. The host presses **START GAME** (with at least one joiner). The host's newest save
-   (`.sav`, `.sav.lua`, `.jpg`) is sent to every joiner and placed as `mp_shared.sav` on
-   all machines; each player opens **Load Game** and picks it. A joiner whose transfer
-   failed is told to have the host press START GAME again.
+The host needs UDP port 29471 reachable from the internet (the lobby tries UPnP). If that is not possible, use a
+dedicated relay from the PUBLIC GAMES list, where nobody needs an open port. New games have the multiplayer mod enabled
+automatically; for an existing save, enable it once in the save's Mods panel. The full guide, including the
+in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING.md).
+
+## Documentation
+
+| document | covers |
+|---|---|
+| [docs/PLAYING.md](docs/PLAYING.md) | hosting, joining, relays, the in-game window, speed, companies, troubleshooting |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | the components, a command's path, time and pacing, sessions, files |
+| [docs/REPLICATION.md](docs/REPLICATION.md) | what replicates and how, per action, and how divergence is detected |
+| [docs/NETWORKING.md](docs/NETWORKING.md) | lobby protocol, join codes, save transfer, dedicated relay, master server |
+| [docs/SECURITY.md](docs/SECURITY.md) | the threat model: what is protected and what is not |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | every setting |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | building, deploying, the multi-instance rig, logs, tests, releases |
+| [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | open bugs, replication gaps, plans that were not built |
+| [docs/re/](docs/re/README.md) | the engine reference for build 35924 that the hooks rest on |
+| [installer/README.md](installer/README.md) | the MSI: what it changes, upgrades, building it |
+| [netpunch/README.md](netpunch/README.md) | the lobby's source |
 
 ## Repository layout
 
-| Path | What it is |
+| path | contents |
 |---|---|
-| `native/` | The native side. One script, `build.bat <target>`: `proxy` (the `alut.dll` proxy and the bridge DLL: identity, relay socket, save transfer), `slice` (the command-capture hooks), `menu` (the Vulkan overlay lobby panel), `host` (the plugin host shared with TpF2 Big Maps), or `all`. Sources in `src/`, vendored Vulkan headers in `third_party/`. |
-| `mod/mp_lockstep_1/` | The game mod. `res/config/game_script/lockstep.lua` is the entry point; the replication logic is in `res/scripts/mp/*.lua`, one module per concern. |
-| `netpunch/` | The lobby: UDP hole punching, host-as-relay star, sealed frames, save transfer. `lobby.py` is what gets frozen into `netpunch.exe`. `masterserver.py` is the public game list it announces to. |
-| `installer/` | The WiX package and its custom action; `README.md` there covers building the MSI. |
-| `tools/` | Developer scripts: deploy the mod, build and ship the DLLs, launch the multi-instance rig, run the soak test, check the Lua. `tools/ghidra/` and `tools/re/` are the reverse-engineering helpers. |
-| `docs/` | Current design and status notes; `docs/re/` the reverse-engineering findings the hooks rest on; `docs/history/` the milestone reports from the first phase. |
-
-## Developing
-
-- Lua: edit under `mod/`, run `python tools\luacheck.py`, then `tools\deploy_mod.ps1 -Mod mp_lockstep_1`
-  (the game reads mods at load, so relaunch). Anything shared between the `mp` modules is a
-  field of the `CM` table, never a file-scope local.
-- DLLs: `native\build.bat <target>` writes to `native\out`; `tools\deploy_shipping.ps1`
-  puts a full set into the game folder. A DLL loaded by a running game is locked, so the build
-  script accepts a suffix for a side-by-side build (`build.bat slice 2`).
-- Rig: `tools\mp_menu_launch.ps1 -Players 3` brings up host and joiners on one machine (Sandboxie
-  for the extra instances); `tools\snapshot_logs.ps1` first, because the game truncates its logs
-  on launch. `tools\soak.ps1` is the unattended regression run.
+| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
+| `mod/mp_lockstep_1/` | the game-script mod |
+| `netpunch/` | the lobby, dedicated relay and master server (Python) |
+| `installer/` | the WiX package |
+| `tools/` | deploy, rig, soak-test and check scripts; `tools/ghidra/` and `tools/re/` for reverse engineering |
+| `docs/` | the documentation |
 
 ## Contributing and credits
 
-Issues and pull requests are welcome, especially reproductions with the logs from
-`%LOCALAPPDATA%\tpf2mp\data` attached. Please keep the project's habits: every destructive replication channel
-ships behind a flag that defaults off, and a field identification counts only when a
-differential sweep confirms it.
+Issues and pull requests are welcome, especially reproductions with logs from every player
+([what to collect](docs/PLAYING.md#when-something-goes-wrong)). Please keep the project's conventions
+([docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#conventions)): destructive replication channels ship switched off
+until validated, and a field identification counts only when a differential capture confirms it.
 
-- Companies mode is inspired by, and reuses the engine mechanisms proven in, Swiss's
-  **Multiplayer Companies** Workshop mod (id 3710243057): runtime `addPlayer`,
-  `setPlayer`, `bookJournalEntry` to a specific player, `setBulldozeable`.
-- [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) grew out of this project:
-  maps past the New Game menu's sizes, as a plugin for the same proxy.
+- Companies mode is inspired by, and reuses engine mechanisms proven in, Swiss's **Multiplayer Companies**
+  Workshop mod (item 3710243057): runtime `addPlayer`, `setPlayer`, `bookJournalEntry` to a specific player,
+  `setBulldozeable`.
+- [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) grew out of this project.
 - Licensed under the [MIT License](LICENSE). Third-party material is listed in
   [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-**Disclaimer.** This project is not affiliated with or endorsed by Urban Games. It
-modifies a file inside your Transport Fever 2 installation (`alut.dll` is renamed and
-replaced by a forwarding proxy; Steam's file verification puts the stock file back) and
-patches game code in memory while running. Use it at your own risk and keep backups.
-Multiplayer saves are ordinary `.sav` files; the mod's save hook stores nothing of its
-own (`save = function() return {} end`).
+**Disclaimer.** This project is not affiliated with or endorsed by Urban Games. It replaces a file inside your
+Transport Fever 2 installation (`alut.dll`, kept as `alut_real.dll`) and patches game code in memory while the
+game runs. Use it at your own risk and keep backups of your saves. Multiplayer saves are ordinary `.sav` files;
+the mod adds its company assignment to the save's script state.

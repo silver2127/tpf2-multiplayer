@@ -1,4 +1,4 @@
-# Targets for DecompileTargets.py. RVAs; image base is 0x140000000.
+# Targets for DecompileTargets.java. RVAs; image base is 0x140000000.
 #
 # Chosen to answer ONE question: what does a proposal contain, and can we build
 # one? Everything else in this 138k-function binary is out of scope until that
@@ -7,7 +7,7 @@
 # script is broken.
 
 # ---- the commit choke point (M2: 102 paired hits per depot build; re-confirmed
-# firing on build 35924 by bridge/src/probe_apply.cpp, incl. for SCRIPT builds).
+# firing on build 35924 by v0.4.10:docs/history/probe_apply.cpp, incl. for SCRIPT builds).
 # rdx = the proposal. The live capture found construction params reachable at
 # proposal+0xe8, so this function's field accesses are the thing to read.
 9e76e0  applyProposal
@@ -26,7 +26,7 @@ a18ca0  make_proposal_params
 83110   sol2_trampoline
 
 # ---- CommandList: script-facing per M2, not the UI path, but it is how a
-# remote command would be injected (REPORT.md 5.3 step 3).
+# remote command would be injected (v0.4.10:docs/history/REPORT.md 5.3 step 3).
 9d54a0  apply_command_0
 9dc5e0  make_command_0
 

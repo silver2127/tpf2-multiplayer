@@ -810,7 +810,7 @@ static DWORD WINAPI InitThread(LPVOID)
     // ---- native sim-thread foothold ---------------------------------------
     // Prototype: prove we get a per-tick callback on the Simulation Thread and
     // that it survives. ECS reads go here next -- doing them from any other
-    // thread races the sim (docs/M7_NATIVE_STATE.md).
+    // thread races the sim (docs/re/GAME_LOOP_AND_UI.md).
     if (cfg.speedHook) SpeedHook_Install(Log);
     if (cfg.simHook) {
         if (SimHook_Install(Log)) {

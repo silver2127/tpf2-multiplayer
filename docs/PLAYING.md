@@ -5,8 +5,8 @@
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
 - Every mod the save uses must be installed on every machine. The multiplayer mod itself
-  (**MP Lockstep**) comes with the installer.
-- **MP Lockstep has to be enabled in the save.** New games get it automatically: each time the
+  (**Transport Fever 2 Multiplayer**) comes with the installer.
+- **The multiplayer mod has to be enabled in the save.** New games get it automatically: each time the
   game starts, the Multiplayer panel adds it to the game's default mod list. For an existing save,
   open the save's **Mods** panel on the load screen once and enable it; the save remembers. The
   shared save carries its mod list to the other players.
@@ -20,8 +20,9 @@ The title menu gains a **Multiplayer** entry. It opens a panel over the menu:
 - **JOIN A GAME**: a code field (click it to paste) and **JOIN GAME**.
 - **YOUR NAME** and an optional **PASSWORD**. Your name and lobby name are remembered; the first
   time you get a random two-word name.
-- **PUBLIC GAMES**: the games currently listed, with host, save, players, version and age. Click a
-  row to fill in its code; **REFRESH** reloads the list.
+- **PUBLIC GAMES**: the games currently listed, with host, type (dedicated server or player hosted),
+  players, version and when each was last seen. Click a row to fill in its code; **REFRESH** reloads
+  the list.
 
 While the panel is open, typing goes into its fields and the game does not see it.
 
@@ -137,6 +138,7 @@ The panel shows the lobby's status line. The common ones:
 | `lobby full` | the lobby has no free seat |
 | `host unreachable` / `host closed the lobby` | the host left or lost connection |
 | `no players to share with -- wait for a player to join, then press START GAME` | START GAME was pressed with nobody in the lobby |
+| `Not shared: '<save>' does not have the Transport Fever 2 Multiplayer mod enabled (see chat)` | the save was made without the mod: load it, enable the mod in its **Mods** panel, save, and press START GAME again |
 | `save transfer failed ... -- press START GAME to retry` | a transfer did not verify; the host presses START GAME again |
 | `game already started -- ask the host to press START GAME again` | you joined after the start and the host's game is not in game |
 | `The lobby stopped before it reported anything -- see tpf2_menu.log` | `netpunch.exe` could not start or exited at once; run the installer's Repair |
@@ -149,10 +151,11 @@ themselves. Players who are already in the game ignore a new shared save (`/sync
 someone joining), so to recover: the host saves, everyone returns to the title menu and leaves
 the lobby, and the host hosts again and presses START GAME, which shares that save.
 
-For a bug report, the quickest way is to double-click `tools\collect_logs.cmd`: it gathers everything
-below (plus recent crash dumps and a system summary) into `tpf2mp-logs-<computer>-<time>.zip` in your
-Downloads folder, without uploading anything. By hand: attach the files from `%LOCALAPPDATA%\tpf2mp\data\` and the game's log
-`<Steam>\userdata\<steamid>\1066780\local\crash_dump\stdout.txt` from **every** player, collected
-**before** restarting the game (the game truncates its log on launch). `netpunch\lobby_proc.log`
-next to the game helps with connection problems but contains IP addresses; check before posting it
-publicly.
+For a bug report, collect the logs of **every** player **before** restarting the game (the game
+truncates its log on launch). The quickest way is `collect_logs.cmd` from the repository's `tools`
+folder: double-click it and it zips the data folder, the logs in the game and lobby folders, the
+game's log, recent crash dumps and a system summary into `tpf2mp-logs-<computer>-<time>.zip` in your
+Downloads folder, without uploading anything. By hand, take the files in `%LOCALAPPDATA%\tpf2mp\data\`
+and the game's log, `<Steam>\userdata\<steamid>\1066780\local\crash_dump\stdout.txt`;
+`netpunch\lobby_proc.log` next to the game helps with connection problems. The lobby logs contain IP
+addresses, so send them privately rather than posting them publicly.

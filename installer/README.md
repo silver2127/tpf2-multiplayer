@@ -1,315 +1,227 @@
-# TpF2 Multiplayer installer
+# Installer
 
-A per-machine Windows Installer package (`TpF2Multiplayer.msi`, x64) that puts
-the lockstep multiplayer mod into an existing Transport Fever 2 installation.
-It is built with the WiX Toolset from `Package.wxs` by `build_msi.ps1`.
-
-Status: first cut. The package builds, extracts cleanly and its tables have been
-checked; it has not yet been through an install/uninstall cycle on a clean
-machine. Read "What it changes in the game folder" before running it.
+`TpF2Multiplayer.msi` is a per-machine, x64 Windows Installer package that adds the multiplayer
+mod to an existing Transport Fever 2 installation. It is built with WiX Toolset v7 from
+`Package.wxs` and the shared fragment `PluginHost.wxs` by `build_msi.ps1`.
 
 ## Requirements
 
-- 64-bit Windows 10 or 11, Steam, Transport Fever 2 (build 35924 - the hook
-  addresses are specific to it).
-- Administrator rights: the package writes into the game folder under
-  `Program Files (x86)` and to `HKLM`.
-- The game must not be running while installing, upgrading or uninstalling
-  (the installer swaps `alut.dll`, which the game keeps open).
+- 64-bit Windows 10 or 11, the Steam version of Transport Fever 2 (build 35924).
+- Administrator rights: the package writes into the game folder and to `HKLM`.
+- The game closed: the installer replaces `alut.dll`, which the running game holds open.
 
-## What the MSI installs, and where
+## Where it installs
 
-Everything the package writes lands in the **game folder** (`INSTALLFOLDER`).
-The installer finds it from Steam's own registration
+The game folder is found from Steam's own uninstall entry
 (`HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780`,
-value `InstallLocation`), falls back to the folder a previous install
-remembered, then to `<Program Files (x86)>\Steam\steamapps\common\Transport Fever 2`.
-You can pick any other folder in the wizard, but it has to contain
-`TransportFever2.exe`; the folder page refuses to continue otherwise, and a
-silent install fails with the same message.
+`InstallLocation`) and from the folder a previous install remembered
+(`HKLM\SOFTWARE\silver2127\TpF2 Multiplayer`, `InstallFolder`). When both exist the remembered folder
+wins. Without either, the default is `C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2`.
+The folder page refuses a folder without `TransportFever2.exe`, and a silent install fails with the
+same message.
 
-| Path (relative to the game folder) | What it is |
+| path in the game folder | what it is |
 |---|---|
-| `alut.dll` | Our proxy. Every `alut*` export is forwarded to `alut_real.dll`; on load it pulls in the two DLLs below, before the game's own entry point runs. |
-| `alut_real.dll` | The game's original `alut.dll`, renamed by the installer (not a packaged file). |
-| `tpf2_bridge_mp.dll` | Command replication bridge (UDP peer link, save transfer, sim-step hook). |
-| `tpf2_menu.dll` | The in-game MULTIPLAYER menu and lobby panel. |
-| `tpf2_slice.dll` | Captures a player's own build/vehicle commands and hands them to lockstep. |
-| `tpf2_bridge_mp.cfg`, `tpf2_slice.cfg` | Settings for the two DLLs, commented. Sources: `installer\cfg\`. |
-| `netpunch\netpunch.exe` | The frozen lobby (PyInstaller build of `netpunch\lobby.py`): NAT traversal, roster, chat, save transfer. |
-| `mods\mp_lockstep_1\**` | The Lua game-script mod, the whole `mod\mp_lockstep_1` tree. |
+| `alut.dll` | The proxy. The game imports `alut.dll` statically, so it loads before the game's entry point. It forwards every export to `alut_real.dll` and loads the DLLs below, looking in `%LOCALAPPDATA%\tpf2mp\` before its own folder. |
+| `alut_real.dll` | The game's original `alut.dll`, moved aside by the installer (not a packaged file). |
+| `tpf2_pluginhost.dll` | The plugin host shared with [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap). |
+| `tpf2_bridge_mp.dll` | Instance identity, the loopback link to the lobby, and the sim-loop and game-speed hooks. |
+| `tpf2_slice.dll` | Captures and cancels the player's commands. |
+| `tpf2_menu.dll` | The Multiplayer panel on the title menu and the lobby launcher. |
+| `tpf2_bridge_mp.cfg`, `tpf2_slice.cfg` | Settings, with comments. See [docs/CONFIGURATION.md](../docs/CONFIGURATION.md). |
+| `netpunch\netpunch.exe` | The lobby. |
+| `mods\mp_lockstep_1\` | The game-script mod. |
 
-The package also writes `HKLM\SOFTWARE\silver2127\TpF2 Multiplayer`
-(`InstallFolder`, `Version`) so upgrades and uninstalls find the same folder,
-and the usual Add/Remove Programs entry (`TpF2 Multiplayer`, publisher
-`silver2127`).
+It also writes `HKLM\SOFTWARE\silver2127\TpF2 Multiplayer` (`InstallFolder`, `Version`), the
+[Segment Heap](#segment-heap) value, and the Apps entry **TpF2 Multiplayer** (publisher `silver2127`;
+Repair and Remove, no Modify). It adds no firewall rules, shortcuts or environment variables, and it
+does not install `tpf2mp.cfg` (the plugin host's optional settings file; the repository copy is a
+reference).
 
-### Runtime data lives elsewhere
+At run time the game side writes `tpf2_menu.log` next to `tpf2_menu.dll` (where it also reads
+`tpf2_menu_flags.txt`, if you create one), the lobby's files in `netpunch\`, and, with `dump_egeo=1`,
+`egeo_*.txt`. Everything else goes to `%LOCALAPPDATA%\tpf2mp\data\`, which the installer never touches.
 
-Nothing is written to the game folder at run time. Identity, event and capture
-files, injects, status files, company files and every `.log` go to the
-**data folder** `%LOCALAPPDATA%\tpf2mp\data\` (the DLLs create it; the
-environment variable `TPF2MP_DATADIR` overrides it, which is how the developer
-harness pins its own folder). The installer never touches the data folder, so
-uninstalling leaves your logs and captures in place - delete
-`%LOCALAPPDATA%\tpf2mp` yourself if you want them gone.
+## How `alut.dll` is swapped
 
-### Configuration lookup
+- **Install** (`PreserveStockAlut`, before the files are copied): if `alut_real.dll` does not exist,
+  the game's `alut.dll` is renamed to `alut_real.dll`; the install fails if that is impossible. If
+  `alut_real.dll` already exists (an earlier install), the `alut.dll` on disk is treated as an old
+  proxy and deleted, unless another product still owns the proxy.
+- **Rollback** (`RollbackStockAlut`): a failed install copies `alut_real.dll` back to `alut.dll` when
+  no other product owns the proxy.
+- **Uninstall** (`RestoreStockAlut`, after the files are removed): `alut_real.dll` is moved back over
+  `alut.dll`, unless another product still owns the proxy. It is skipped during an upgrade's removal
+  step, so an upgrade keeps `alut_real.dll` and only replaces the proxy.
+- **Steam's "Verify integrity of game files"** puts the stock `alut.dll` back (and leaves
+  `alut_real.dll` as an unused file). The Multiplayer entry disappears; run the MSI again and choose
+  **Repair** to restore the proxy.
 
-Each DLL reads its `.cfg` from its own folder first (the game folder, where the
-installer puts it), then from the data folder, then falls back to built-in
-defaults; the first file found wins. To change a setting, delete the copy in the
-game folder and keep your own in `%LOCALAPPDATA%\tpf2mp\data\`: an upgrade
-re-installs the game-folder copy with the shipped defaults (it no longer tries to
-preserve it; that attempt is what deleted the cfgs on the 0.3.1 to 0.4.0 upgrade),
-and never touches the data folder. `tpf2_slice.cfg` is re-read on every event, so
-its switches can be flipped while the game runs. Without any cfg the DLLs run the
-shipped defaults, so a missing file changes nothing.
-
-Shipped defaults: bridge on UDP 7771 talking to a peer on 127.0.0.1:7772,
-`instance=auto`, save transfer on TCP 7871, `sim_hook=1`, `buy_hook=1`; slice
-`enabled=1 suppress=1 merge=1 cancel_vehicle=1` (full lockstep - set
-`suppress=0` for observe-only, `enabled=0` to switch the hook off entirely).
-
-Plugins loaded by the plugin host (`tpf2_pluginhost.dll`) read `tpf2mp.cfg` from
-the game folder, then `%LOCALAPPDATA%	pf2mp\data	pf2mp.cfg` as a complete
-override, and then `plugins\<name>.cfg` beside each plugin DLL, merged over
-those. That last file is how a plugin shipped by a different installer keeps
-its settings without touching `tpf2mp.cfg`.
-
-## What it changes in the game folder
-
-The only game file the installer modifies is `alut.dll`:
-
-1. Before copying files, if `alut_real.dll` does not exist yet, the game's
-   `alut.dll` is renamed to `alut_real.dll`. (If `alut_real.dll` is already
-   there - an earlier install, or the developer script `tools\install_proxy.ps1` -
-   whatever `alut.dll` is on disk is treated as an old proxy and replaced.)
-2. Our proxy is installed as `alut.dll`.
-3. If the install fails after step 1, a copy of `alut_real.dll` is put back as
-   `alut.dll` during rollback, so the game keeps working.
-
-Uninstalling removes the proxy and renames `alut_real.dll` back to `alut.dll`
-- unless another product that shares the proxy (TpF2 Big Maps) is still
-installed, in which case both files are left for it; see "Coexistence" below.
-A major upgrade (installing a newer MSI over an older one) leaves
-`alut_real.dll` in place and only replaces the proxy.
-
-Steam's **Verify integrity of game files** also restores the stock `alut.dll`
-(it overwrites our proxy, and leaves `alut_real.dll` behind as an unused extra
-file). After a verify, the multiplayer menu is simply gone; run **Repair** from
-Add/Remove Programs, or reinstall, to put the proxy back.
-
-Everything else the package adds is a new file; the game does not care about
-extra DLLs, a `netpunch` folder or an extra entry under `mods`.
+"Another product owns the proxy" is answered by `MsiEnumClients` on the proxy's component, machine
+wide (`ca\tpf2ca.cpp`, `OtherProxyClients`).
 
 ## Coexistence with TpF2 Big Maps
 
-[TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) is a separate
-package that loads through the same plugin host. The two install in either
-order and uninstall in either order. How:
+Big Maps is a separate package that loads through the same plugin host. The two install and uninstall
+in either order:
 
-- **Shared files under shared GUIDs.** `alut.dll`, `tpf2_pluginhost.dll` and the
-  Segment Heap value are declared in `installer\PluginHost.wxs`, a fragment
-  duplicated byte-for-byte in both repositories, with fixed component GUIDs.
-  Windows Installer reference-counts a component by GUID across products: the
-  second install finds the files present and registers itself as a client; the
-  first uninstall leaves them for the other; the last one out removes them and
-  restores the stock `alut.dll`.
-- **Refcount-aware custom actions.** `RestoreStockAlut` (and its rollback
-  partner) ask `MsiEnumClients` who else owns the proxy component before moving
-  the stock library back, because MSI's own refcount cannot know that a custom
-  action also touches the file. `ca	pf2ca.cpp`, `OtherProxyClients`.
-- **Separate configs.** The plugin host merges `plugins\<name>.cfg` over
-  `tpf2mp.cfg` for each plugin it loads, so a plugin from another installer
-  never has to edit a file this package owns.
+- **Shared files under fixed component GUIDs.** `alut.dll`, `tpf2_pluginhost.dll` and the Segment Heap
+  value are declared in `PluginHost.wxs`, which is byte-identical in both repositories. Windows
+  Installer reference-counts a component by GUID across products: the second install registers as an
+  additional owner, and the last one out removes the files.
+- **Owner-aware custom actions.** Because MSI's reference count cannot know that a custom action also
+  moves `alut.dll`, all three `alut` actions ask `MsiEnumClients` first.
+- **Separate settings.** A plugin installed by another package keeps its settings in
+  `plugins\<name>.cfg` beside its DLL, so neither installer edits a file the other owns.
 
-The Big Maps repository carries `installer	est_coexist.ps1`, which runs the
-real `msiexec` transactions for both orders against a throwaway folder, and
-`toolsendor_host.ps1`, which copies the shared binaries from this repository
-and records the source commit. If you change `PluginHost.wxs`, the proxy, the
-host or the custom actions here, re-vendor there.
+The Big Maps repository has `installer\test_coexist.ps1` (real `msiexec` transactions for both orders
+against a throwaway folder) and `tools\vendor_host.ps1` (copies the shared binaries from this repository
+and records the commit). After changing `PluginHost.wxs`, the proxy, the plugin host or the custom
+actions here, re-vendor there.
 
 ## Segment Heap
 
-The installer also sets **one registry value** that switches Transport Fever 2
-onto the Windows Segment Heap:
+The installer sets one registry value that switches Transport Fever 2 to the Windows Segment Heap:
 
 ```
 HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\TransportFever2.exe
     FrontEndHeapDebugOptions  (DWORD)  0x08
 ```
 
-This is the only thing the package changes about how Windows *runs* the game
-rather than adding files beside it, so it is called out here rather than buried.
+It is the one thing the package changes about how Windows runs the game rather than adding files beside
+it.
 
-**Why.** On the legacy heap, allocations larger than the heap's dedicated-bucket
-threshold all share one size-ordered free list, and every allocation walks it
-from the smallest block until it finds a fit. The cost of an allocation
-therefore grows with the number of free blocks, while the number of allocations
-grows with the size of the world - so the cost grows faster than the map does.
+**Why.** On the legacy heap, every allocation above the dedicated-bucket threshold walks one shared,
+size-ordered free list from the smallest block until something fits. The cost of each allocation grows
+with the number of free blocks, and the number of allocations grows with the world, so large maps pay far
+more than proportionally.
 
-**What it is worth.** Measured on a 57 x 57 km map by sampling every thread
-through a complete load, before and after the change:
+**What it was worth,** measured once on a 57 x 57 km map by sampling every thread through a complete load:
 
 | | legacy heap | segment heap |
-| --- | --- | --- |
-| time in the allocator's free-list walk | 545 CPU-s | **0** |
-| load wall clock | ~960 s | **~65 s** |
+|---|---|---|
+| CPU time in the allocator's free-list walk | 545 CPU-s | 0 |
+| load time | ~960 s | ~65 s |
 | private bytes | ~19 GB | ~17.8 GB |
 
-The game's own work was unchanged across the pair, which is what identifies the
-allocator rather than something else. It also removes most of the in-game
-stutter on large maps, because the same code path runs on every allocation
-during play and not only while loading. Ordinary map sizes benefit far less;
-this matters most for very large worlds.
+The game's own work was unchanged between the two runs, which is what pins the difference on the
+allocator. The same code path runs on every allocation during play, so large maps also stutter less.
+Ordinary map sizes gain much less. Microsoft does not promise the Segment Heap is faster in general; it
+wins here because this particular legacy-heap algorithm was measured as the cost.
 
-**Scope and removal.** The value applies to any process named
-`TransportFever2.exe` on the machine. Uninstalling removes it. The installer
-deliberately does not delete the surrounding key, because Image File Execution
-Options entries are shared with debuggers and exploit-mitigation settings and
-removing the key could take an unrelated setting with it.
+**Scope and removal.** The value applies to any process named `TransportFever2.exe`. It is removed when the
+last product that owns it (this one or Big Maps) is uninstalled; the surrounding Image File Execution
+Options key is never deleted, because it is shared with debuggers and exploit-mitigation settings. To
+switch it by hand, for example to rule it out while debugging, run `tools\segment_heap.ps1 -Status`,
+`-Enable` or `-Disable` from an elevated prompt; it takes effect at the next launch.
 
-To toggle it by hand - to A/B test, or to rule it out while debugging something
-else - use `tools\segment_heap.ps1` (`-Status`, `-Enable`, `-Disable`) from an
-elevated prompt. Changes apply to the next launch, not to a running game.
+## The mod and your saves
 
-Microsoft does not promise the Segment Heap is faster in general; it was
-introduced to reduce memory footprint and is slower for some workloads. It wins
-here because a specific legacy-heap algorithm was measured as the cost.
+Transport Fever 2 enables mods per game. On every launch the menu DLL adds the **Transport Fever 2 Multiplayer** mod to
+`activeMods` in the game's `settings.lua` if it is missing (keeping a backup as `settings.lua.mpbak`;
+`automod=0` in `tpf2_menu_flags.txt` turns this off), so a new game starts with the mod enabled. An
+existing save keeps the mod list it was saved with: enable the mod once in that save's **Mods** panel
+on the load screen.
 
-## After installing: the mod and your saves
+## Upgrading
 
-Transport Fever 2 activates mods per game, not globally. On every launch the
-menu DLL adds **MP Lockstep** to `activeMods` in `settings.lua` if it is missing
-(a one-line edit, backup kept as `settings.lua.mpbak`, `automod=0` in
-`tpf2_menu_flags.txt` turns it off), so a **new game** starts with the mod on.
-An **existing save** keeps the mod list it was saved with: open its **Mods**
-panel in the load screen once and enable MP Lockstep; from then on the save
-carries it. Joiners need nothing: the host's save is what gets sent to them, and
-it brings its mod list along. Never enable **MP Bridge** (the older
-state-replication mod) at the same time - the two fight over the same world.
+Install the new MSI over the old one; there is no need to uninstall first.
 
-The title menu gains a **MULTIPLAYER** entry. The host presses HOST, sends the
-code that lands on the clipboard to the others, they press JOIN; the host then
-presses START GAME to ship the save.
+- **One entry in Apps.** Every build has a new ProductCode under one fixed UpgradeCode, and the major
+  upgrade removes the previous version in the same transaction. A rebuild with the same version number
+  also replaces the installed one. Downgrades are refused ("A newer version of TpF2 Multiplayer is already
+  installed. Uninstall it first.").
+- **`alut.dll` is never wrapped twice** (see above).
+- **The cfg files are replaced** with the shipped ones on every upgrade and Repair; edits to the copies in
+  the game folder are not kept. (They used to be marked NeverOverwrite, which made an upgrade delete them
+  outright.) The DLLs read a copy in `%LOCALAPPDATA%\tpf2mp\data\` only when the game folder has none, so
+  to keep your own settings either re-apply them after upgrading, or delete the game-folder copy after each
+  upgrade and keep yours in the data folder.
+- **Runtime data is untouched.**
 
-## Firewall and ports
+`installer\VERSION` is the version stamped into the package. Bump it for every release.
 
-- **Lobby: UDP 29471 inbound on the host** (`netpunch.exe host`). This is the
-  one port that has to be reachable from the internet. The lobby tries to open
-  it through UPnP and uses STUN to learn the public address; if neither works,
-  forward UDP 29471 to the host machine on the router. Joiners bind an
-  ephemeral port and only dial out, so they need no inbound rule.
-- **Bridge: UDP 7771/7772 and TCP 7871**, per `tpf2_bridge_mp.cfg`. With the
-  shipped `peer_ip=127.0.0.1` these never leave the machine; a remote peer
-  address has to be put in the cfg by hand for now (the bridge is not yet fed
-  the address the lobby discovered).
+## Uninstalling
 
-Windows Defender Firewall asks about `netpunch.exe` and `TransportFever2.exe`
-the first time they listen; allow them on the network profile you use. The MSI
-adds no firewall rules of its own.
+- **Apps → TpF2 Multiplayer → Uninstall**, run the MSI again and choose **Remove**, or
+  `msiexec /x TpF2Multiplayer.msi`. This removes the packaged files and the registry key; the proxy, the
+  plugin host and the Segment Heap value go too, and the stock `alut.dll` is restored, unless TpF2 Big Maps
+  is still installed and needs them. A folder that still holds runtime files (such as `netpunch\` with the
+  lobby's logs) is left behind.
+- **By hand**, if all else fails: delete `alut.dll` and rename `alut_real.dll` to `alut.dll`. The other files
+  do nothing without the proxy.
+- `%LOCALAPPDATA%\tpf2mp` is never removed; delete it yourself if you want your logs gone.
 
-## Uninstall / revert
-
-- **Add/Remove Programs -> TpF2 Multiplayer -> Uninstall**, or
-  `msiexec /x TpF2Multiplayer.msi` (same MSI file or the product from the ARP
-  list). This removes every packaged file, the `netpunch` and
-  `mods\mp_lockstep_1` folders it created, the registry key, the Segment Heap
-  value (see above), and restores the stock `alut.dll` from `alut_real.dll`.
-- **Steam -> Verify integrity of game files** restores the stock `alut.dll`
-  without uninstalling anything (see above).
-- **By hand**, if all else fails: delete `alut.dll`, rename `alut_real.dll` to
-  `alut.dll`. The other files are inert without the proxy.
-- The data folder `%LOCALAPPDATA%\tpf2mp` is never removed automatically.
-
-## Silent install and upgrades
+## Silent install
 
 ```
 msiexec /i TpF2Multiplayer.msi /qn /l*v install.log
 msiexec /i TpF2Multiplayer.msi /qn INSTALLFOLDER="D:\SteamLibrary\steamapps\common\Transport Fever 2"
 ```
 
-`INSTALLFOLDER` must contain `TransportFever2.exe`; `TPF2_SKIP_GAMEDIR_CHECK=1`
-bypasses that check for test rigs only. A newer MSI upgrades an older install in
-place (major upgrade, same `UpgradeCode`); a rebuilt package of the same version
-number also replaces the installed one. Downgrades are refused.
+`INSTALLFOLDER` must contain `TransportFever2.exe`. Setting `TPF2_SKIP_GAMEDIR_CHECK` to any value skips
+that check; it exists for test rigs.
 
 ## Building the MSI
 
-Prerequisites, all on `PATH` or in their default places:
+Prerequisites:
 
-- Visual Studio 2022 Build Tools with the MSVC x64 toolchain (the `.bat`
-  scripts call `vcvars64.bat` from the Build Tools install).
+- Visual Studio 2022 Build Tools with the MSVC x64 toolchain, in its default location (the `.bat` scripts
+  call its `vcvars64.bat`).
 - Python 3.12 with `pip install pyinstaller -r netpunch\requirements.txt`.
-- WiX Toolset v7 as a .NET global tool: `dotnet tool install --global wix`,
-  plus the UI extension: `wix extension add -g WixToolset.UI.wixext`
-  (`build_msi.ps1` adds it when missing).
-- WiX v7 requires accepting its Open Source Maintenance Fee EULA
-  (https://wixtoolset.org/osmf/) - free for individuals and open-source
-  projects, a paid fee for commercial organisations. Accept it once with
-  `wix eula accept wix7`, or per run with `-AcceptWixEula` below. The script
-  does not accept it on your behalf.
+- WiX Toolset v7 as a .NET global tool (`dotnet tool install --global wix`). `build_msi.ps1` runs it from
+  `%USERPROFILE%\.dotnet\tools\wix.exe` and adds `WixToolset.UI.wixext` if it is missing.
+- WiX v7 requires accepting its Open Source Maintenance Fee EULA (<https://wixtoolset.org/osmf/>): once with
+  `wix eula accept wix7`, or per run with `-AcceptWixEula`. The script never accepts it on your behalf.
 
 ```
-pwsh installer\build_msi.ps1                       # build DLLs, freeze netpunch, build the CA DLL, wix build
-pwsh installer\build_msi.ps1 -SkipFreeze           # reuse netpunch\dist\netpunch.exe (warns)
-pwsh installer\build_msi.ps1 -SkipBuild -Validate  # only wix build, then msiexec /a into a temp folder and list the tree
-pwsh installer\build_msi.ps1 -Version 0.2.0 -AcceptWixEula
+powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 [-AcceptWixEula] [-Validate]
 ```
 
-Output: `installer\out\TpF2Multiplayer.msi` (plus `tpf2ca.dll`, the custom
-action DLL from `installer\ca\`, and a `.wixpdb`). `installer\out\` is ignored
-by git.
-
-If the game is running while you build, the DLLs it has loaded are locked and
-`link` fails with LNK1104. The `menu` and `slice` targets of `native\build.bat`
-accept a name suffix, and the script retries with one and packages the suffixed
-file under the plain name; the `proxy` target does not, so close the game for
-that step.
-
-### Files in this directory
-
-| File | Purpose |
+| option | effect |
 |---|---|
-| `Package.wxs` | The package: folders, components, custom actions, the `WixUI_InstallDir` copy with the game-folder check. |
-| `build_msi.ps1` | The build script described above. |
-| `ca\tpf2ca.cpp`, `ca\build_ca.bat` | Custom actions: game-folder check, `alut.dll` preserve / rollback / restore. |
-| `cfg\tpf2_bridge_mp.cfg`, `cfg\tpf2_slice.cfg` | The shipped configuration files. |
-| `License.rtf` | MIT license text shown by the wizard. |
+| `-SkipBuild` | reuse the built DLLs and `netpunch.exe` (the custom-action DLL is still built if missing) |
+| `-SkipFreeze` | reuse an existing `netpunch\dist\netpunch.exe` (with a warning) instead of re-freezing |
+| `-Validate` | after building, run an administrative install into a temporary folder and list what it extracted |
+| `-Version x.y.z` | stamp this version instead of `installer\VERSION` |
+| `-AcceptWixEula` | pass `--acceptEula wix7` to `wix build` |
 
-## Updating
+What it does:
 
-The package upgrades in place: install the new MSI over the old one, no uninstall
-first. What that guarantees:
+1. Builds the native DLLs: `native\build.bat proxy` and `host`, then `menu` and `slice`. If the running game
+   holds `tpf2_menu.dll` or `tpf2_slice.dll`, those two are rebuilt under a suffixed name and packaged under
+   the plain one; `proxy` and `host` need the game closed. (The `menu` target also copies the new DLL into
+   the game folder when it can.)
+2. Freezes the lobby with PyInstaller into `netpunch\dist\netpunch.exe`.
+3. Builds the custom-action DLL with `ca\build_ca.bat` into `installer\out\tpf2ca.dll`.
+4. Runs `wix build -arch x64 -ext WixToolset.UI.wixext` on `Package.wxs` and `PluginHost.wxs` into
+   `installer\out\TpF2Multiplayer.msi` (plus a `.wixpdb`). `installer\out\` is git-ignored.
 
-- **One entry in Apps.** Every build carries a fresh ProductCode under one fixed
-  UpgradeCode, and `MajorUpgrade` removes the previous product in the same
-  transaction, so versions never stack up side by side.
-- **The version you see is the version you have.** `installer\VERSION` is the single
-  source of truth; `build_msi.ps1` reads it and stamps ProductVersion. (Every 0.1.x
-  MSI up to 2026-08-30 shipped as 0.1.0 because the build script defaulted to a
-  literal -- Windows could not tell one build from another. Bump `VERSION` when
-  cutting a release.)
-- **Your `alut.dll` is never wrapped twice.** The stock library is kept as
-  `alut_real.dll` on the first install only; later installs see it already there,
-  drop the old proxy and lay down the new one. Uninstall moves the stock file back
-  -- and is skipped during an upgrade's removal leg, so the file is not restored
-  and re-stolen mid-transaction.
-- **Edited cfg files survive.** `tpf2_bridge_mp.cfg` and `tpf2_slice.cfg` are marked
-  NeverOverwrite: a fresh install writes the defaults, an upgrade leaves your copy
-  alone.
-- **Runtime data is untouched.** Nothing under `%LOCALAPPDATA%	pf2mp` belongs to
-  the installer; logs, identity and captures are left as they are.
+## Testing an upgrade
 
-Downgrades are refused with a message rather than silently mangling the install.
+```
+powershell -ExecutionPolicy Bypass -File installer\test_upgrade.ps1 [-Msi <msi>] [-UpgradeMsi <newer msi>] [-KeepSandbox]
+```
 
-To verify all of the above against a real msiexec transaction without touching your
-game folder, run from an **elevated** PowerShell with the game closed:
+From an elevated prompt, with the game closed. It creates a throwaway game folder with a stand-in "stock"
+`alut.dll`, then installs, upgrades (with the same MSI unless `-UpgradeMsi` is given) and uninstalls,
+checking after each step that exactly one Apps entry exists, that `alut_real.dll` is still the stock file
+after the upgrade, and that uninstalling restores the stock `alut.dll` and removes the DLLs and `netpunch`.
 
-    powershell -ExecutionPolicy Bypass -File installer	est_upgrade.ps1
+Know before running it: these are real per-machine transactions that write `HKLM`. It has no guard against a
+real TpF2 Multiplayer installation, which shares the UpgradeCode and would be removed by the test's install.
+With TpF2 Big Maps installed the first check fails, because the proxy then has another owner.
 
-It installs, upgrades and uninstalls into a throwaway folder whose "stock" alut.dll
-has known content, and checks after every step -- including that `alut_real.dll` is
-still the stock library after an upgrade, which is the failure that would break
-audio and leave the game unable to start.
+## Files in this folder
+
+| file | purpose |
+|---|---|
+| `Package.wxs` | the package: folders, components, upgrade rules, and a copy of `WixUI_InstallDir` with the game-folder check |
+| `PluginHost.wxs` | shared with TpF2 Big Maps (keep it byte-identical): proxy, plugin host, Segment Heap value, custom actions and their sequencing |
+| `ca\tpf2ca.cpp`, `ca\build_ca.bat` | the custom actions: game-folder check, preserve/rollback/restore of `alut.dll` |
+| `build_msi.ps1` | the build script |
+| `test_upgrade.ps1` | the install/upgrade/uninstall test |
+| `cfg\tpf2_bridge_mp.cfg`, `cfg\tpf2_slice.cfg` | the shipped settings files |
+| `cfg\tpf2mp.cfg` | the plugin host's settings file, for reference (not packaged) |
+| `VERSION` | the version stamped into the package |
+| `License.rtf` | the MIT license shown by the wizard |

@@ -1,6 +1,6 @@
 # install_portable.ps1 -- stage the PORTABLE runtime on any machine.
 #
-# This is the shipping installer (as opposed to the dev-harness install_proxy.ps1).
+# Superseded by the MSI (installer/README.md), the shipping installer; kept for reference.
 # It discovers Steam/game paths from the registry -- nothing is hardcoded to a
 # particular user -- and stages the netpunch layer (the frozen netpunch.exe + the
 # .py fallback) into a per-user, sandbox-safe location the menu DLL already looks
@@ -11,7 +11,7 @@
 #   * deploy netpunch.exe (+ lobby/punch/connect/observe .py) to %LOCALAPPDATA%\tpf2mp\netpunch
 #   * report exactly what it found and what remains manual
 #
-# What it does NOT do yet (see PORTABILITY.md -- these need the coupled DLL/Lua
+# What it does NOT do yet (see v0.4.10:docs/PORTABILITY.md -- these need the coupled DLL/Lua
 # fix and are gated off so a half-install can't silently break replication):
 #   * relocate the bridge/menu/slice DLLs (they are coupled to the Lua mod's
 #     hardcoded BASE path -- must be fixed together)
@@ -82,4 +82,4 @@ foreach ($py in "lobby.py","punch.py","connect.py","observe.py") {
 Say "  + lobby/punch/connect/observe .py (fallback if Python is present)"
 
 Say "netpunch layer installed. The menu DLL will now resolve NETDIR here and prefer netpunch.exe." Green
-Warn "STILL MANUAL (see PORTABILITY.md): DLL/Lua BASE coupling, proxy redeploy, and the Continue-load RE."
+Warn "STILL MANUAL (see v0.4.10:docs/PORTABILITY.md): DLL/Lua BASE coupling, proxy redeploy, and the Continue-load RE."

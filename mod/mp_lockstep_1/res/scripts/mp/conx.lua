@@ -611,7 +611,7 @@ CM.execConX = function(c)
 		-- the same here, and the real-BOUNDING_VOLUME sweep after success catches
 		-- anything modular layouts leave under the floor.
 		-- The engine's octree pre-check (street_builder_util.cpp CheckGraph ->
-		-- FUN_1421e2330, see docs/re/STREET_PROPOSAL_VALIDATION.md) queries a
+		-- FUN_1421e2330, see docs/re/PROPOSALS.md) queries a
 		-- +-0.01 m box around EVERY added node and fails SILENTLY -- no message, just
 		-- critical=true -- when something is already there. Log how close each added
 		-- node sits to an existing one so a rejection can be attributed instead of
@@ -1055,7 +1055,7 @@ CM.execConX = function(c)
 				-- building silently missing on this peer), and the result localises the
 				-- fault -- if the construction alone builds, the rejection is in the
 				-- street vectors we ship, not in the construction or its template.
-				-- (docs/re/STREET_PROPOSAL_VALIDATION.md narrows it to "something we add
+				-- (docs/re/PROPOSALS.md narrows it to "something we add
 				-- already exists and we did not remove it"; this says which half.)
 				if c.retried and not c.bare then
 					pcall(function()

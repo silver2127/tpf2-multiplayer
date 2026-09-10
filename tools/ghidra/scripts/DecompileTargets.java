@@ -10,7 +10,7 @@
 //
 // The field list is the point. A decompiler renders an unknown struct as
 // *(int *)(param_1 + 0xe8), and it is that 0xe8 -- cross-checked against the
-// live proposal bytes in docs/re/GROUND_TRUTH_applyProposal.md -- that turns a
+// live proposal bytes captured in the game (docs/re/README.md) -- that turns a
 // guess into a layout. Anything the disassembly implies but the captured bytes
 // contradict is wrong, however clean the C looks. Three confident-but-wrong
 // diagnoses in one day is the reason that check is not optional.

@@ -104,7 +104,7 @@ static const uintptr_t CALLER_BULLDOZE      = 0x3eb227;
 // The sol2 wrapper's factory call site (Lua path: api.cmd.make.buyVehicle).
 // A BuyVehicle from HERE is our own replay on the peer: shipping it back
 // would ping-pong purchases between the two instances forever. NOT 0x74fd88:
-// that is the UI's buy (vehiclemanager.cpp, ACTION_MAP) -- filtering it
+// that is the UI's buy (vehiclemanager.cpp, docs/re/COMMANDS.md) -- filtering it
 // suppressed the player's real purchase (measured 2026-08-28). The cee***
 // block is the scripting layer (cf. cee710 = SetVehicleManualDeparture's
 // wrapper, ced378 = buildProposal's).
@@ -126,7 +126,7 @@ static const Factory FACTORIES[] = {
     { 0x9dcde0, 19, 7, "CreateLine",     "line"    },
     { 0x9df4e0, 19, 8, "UpdateLine",     "line"    },
     { 0x9dd190, 20, 9, "DeleteLine",     "line"    },
-    { 0x9ddfe0, 20, 10, "Reverse",        "vehicle" },  // steal from COMMAND_MAP.md
+    { 0x9ddfe0, 20, 10, "Reverse",        "vehicle" },  // steal size: docs/re/COMMANDS.md
     { 0x9df340, 20, 12, "SetVehicleTargetMaintenanceState", "vehicle" },  // value = float in XMM3 (relay spill @ calleeRsp-0x78)
     { 0x9de8a0, 20, 13, "SetColor",       "sync"    },  // r9 -> CVec3f*, 3 floats
     { 0x9deb70, 15, 14, "SetName",        "sync"    },  // r9 -> std::string*, MSVC SSO
@@ -761,7 +761,7 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
 // their positions are decoded HERE, while the proposal still describes them,
 // and travel on the same line for the Lua to substitute.
 // CDEMO <n> <id>...: a CONSTRUCTION demolish, shipped as the LOCAL entity ids
-// the bulldozer was handed (r8+0x1e0 toRemove, PROPOSAL_STRUCTURE.md). Ids do
+// the bulldozer was handed (r8+0x1e0 toRemove, docs/re/PROPOSALS.md). Ids do
 // not travel; the Lua resolves each one to fileName + position ON THIS
 // INSTANCE -- which it can, because the bulldoze was cancelled and the
 // construction is still standing -- and ships that. Every instance, this one
@@ -1493,7 +1493,7 @@ static bool LogBulldoze(uint64_t r8)
 // from the by-value TransportVehicleConfig on the caller's stack (st[0]):
 // parts at +0x00 (0x80 stride: modelId +0x00, loadConfig +0x08, color +0x20,
 // autoLoadConfig +0x60), vehicleGroups at +0x18 -- every offset a ground-truth
-// EXACT match (COMMAND_ARGS.md). The depot travels as its entity id; the Lua
+// EXACT match (docs/re/COMMANDS.md). The depot travels as its entity id; the Lua
 // side on THIS instance turns it into a position and the model ids into file
 // names before anything crosses to the peer. Never cancelled.
 //   VBUY <depot> <nParts> { <model> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <nGroups> <group..>
@@ -1637,13 +1637,13 @@ static void WriteInjectMaint(uint64_t veh, float val)
 // list. So the new list is read off the command's own Line, at entry, before
 // the factory moves the stops vector out (r8 A NOTE).
 //
-// Layout. Ground-truth sweep (COMMAND_ARGS.md "component::Line stop record",
-// lockstep.lua GT line t10..t16, all EXACT unless noted):
+// Layout. Ground-truth sweep (docs/re/COMMANDS.md, "Line::Stop"; the GT line
+// sweep t10..t16 in mp/gt.lua, all EXACT unless noted):
 //   Line+0x00 vector<Stop> {begin,end,cap}   t10: span tracks 0xa8 per stop.
-//              (COMMAND_ARGS.md has one sentence saying "+0x18", contradicting
-//              its own evidence: waitingTime is at +0x18, and the dump that
-//              found the span reads +0x00 -- GtDumpLine. +0x18 is tried as a
-//              fallback only if +0x00 fails the shape check.)
+//              (An older note put the vector at +0x18; waitingTime is at
+//              +0x18, and the dump that found the span reads +0x00 --
+//              GtDumpLine. +0x18 is tried as a fallback only if +0x00 fails
+//              the shape check.)
 //   Line+0x18 int waitingTime               t11 EXACT
 //   Stop (0xa8): +0x04 int station (index in the group)  t13 EXACT
 //                +0x08 int terminal                       t12 EXACT
@@ -1975,9 +1975,9 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         // than wedge the window. Every other vehicle/line command genuinely has
         // nothing waiting and stays fire-and-forget.
         // ReplaceVehicle (4) waits too: the vehicle window reads the
-        // replacement's result entity (SLICE_STATUS). Its callback is a
+        // replacement's result entity. Its callback is a
         // heap-allocated std::function, which the Add hook now resolves
-        // through the _Getimpl slot at r9+0x38 (STRICT_LOCKSTEP_PLAN.md 2.3).
+        // through the _Getimpl slot at r9+0x38 (docs/re/COMMANDS.md).
         const bool waitsForResult = (f.id == 2 || f.id == 4);
         InterlockedExchange(&g_pendingNoCb, waitsForResult ? 0 : 1);
         InterlockedExchange(&g_pendingHonour, 1);
@@ -3025,7 +3025,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             cancel = CfgHas("cancel_line");
         // SellVehicle (3) and SendToDepot (5): strict too. Neither UI waits on
         // a result (the depot window's sell passes a callback but nothing has
-        // been shown to block on it -- STRICT_LOCKSTEP_PLAN.md 2.1), so they
+        // been shown to block on it), so they
         // take Reverse's fire-and-forget route. The sell refund was one of the
         // coop money-split sources: the originator's balance moved at click
         // time, the peers' at the stamp. Now all of them move on the same step.
@@ -3339,7 +3339,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // without a contrived sweep whose sample index correlates with the
             // value being probed.
             //
-            // Record layout (docs/re/PROPOSAL_STRUCTURE.md): 24 bytes,
+            // Record layout (docs/re/PROPOSALS.md): 24 bytes,
             // x,y,z at +0x00, flags u32 at +0x0c, type at +0x10, id at +0x14.
             // Log only. Nothing is cancelled and nothing is shipped: with the
             // carrying bit still unknown, replaying this proposal would rebuild
