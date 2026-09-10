@@ -197,9 +197,10 @@ Settings: [CONFIGURATION.md](CONFIGURATION.md#tpf2mpcfg-and-plugin-settings).
 - **Shared state in the mod is a field of `CM`.** Each module in `res/scripts/mp/` is a factory,
   `return function(CM, K, log) ... end`. A file-scope `local` is private to its module; a reference to it
   from another module is a nil global at runtime and stops the script.
-- **Destructive channels ship off.** Anything that removes or overwrites (demolish, replace, rebuild) goes
-  behind a `tpf2_slice.cfg` switch that stays off until a multi-instance rig has validated it. A missing
-  addition is visible and harmless; a removal on the wrong instance destroys work that nothing can rebuild.
+- **Validate destructive channels on the rig before they merge.** Anything that removes or overwrites
+  (demolish, replace, rebuild) is proven on a multi-instance rig first: a missing addition is visible and
+  harmless, but a removal on the wrong instance destroys work that nothing can rebuild. There is no switch to
+  ship a channel "off"; one behaviour ships.
 - **Never cancel on a failed decode.** If a hook cannot read the whole command, let the command run.
 - **Nothing on the wire names an entity id.** Positions, file names and bound keys only.
 - **Apply by sim step.** Derive every wait from agreed stamps (`notBeforeStep`); never pace by frames and

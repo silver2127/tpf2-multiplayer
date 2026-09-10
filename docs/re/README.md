@@ -57,16 +57,13 @@ the right file. RTTI vftables give a third, independent axis (e.g. vftable slot 
 
 Driving known values through a factory is faster and more reliable than inferring from player
 actions: `api.cmd.make.*` builds the Command and fires the slice's factory hook without anything
-being sent to the engine, so a sweep changes nothing, needs no restart, and takes seconds.
+being sent to the engine, so a sweep changes nothing, needs no restart, and takes seconds. Give each
+sample a sentinel value so nothing depends on ordering, and accept an offset only when it held the
+swept value in every sample.
 
-1. Set `groundtruth=1` in `tpf2_slice.cfg`. Do not place constructions in that session: the
-   ground-truth branch returns before construction capture.
-2. Append `GT track`, `GT street`, `GT con`, `GT vehicle`, `GT line` or `GT demolish` to
-   `lockstep_inject_<letter>.txt` in the data folder (`mod/.../mp/gt.lua` runs the sweeps). Each
-   sample carries a sentinel `900000 + test * 1000 + index`, so nothing depends on ordering.
-3. `tools\gt_correlate.ps1 -Log "$env:LOCALAPPDATA\tpf2mp\data\tpf2_slice.log"` reports each offset
-   that held the swept value in every sample as `*** EXACT MATCH ***` ("varies" is not an
-   identification). Pass `-Log`; the script's default path is from the old layout.
+The sweep mode that did this (`groundtruth=1`, the mod's `gt.lua` and `tools/gt_correlate.ps1`) was
+removed with the other diagnostic switches; it is in git history, for example
+`git show v0.4.11:tools/gt_correlate.ps1`.
 
 `dumpprop=1` dumps whole proposals from the factory hook, UI and script side alike;
 `tools/re/dumpprop_diff.py` and `dumpprop_vecs.py` diff and decode them.

@@ -92,8 +92,6 @@ Game frames are best-effort in the lobby layer. Above it:
   (up to 10 times); the heartbeat's `hi=` field exposes a lost last command. The leader also
   answers for other senders from its history ring (4,096 lines).
 - **Duplicates are harmless:** a command's `at|origin|seq` is remembered (2,048 entries).
-- **`strict_barrier=1`** (off by default) pauses a game while it is missing a command, released by
-  a watchdog after 60 ticks.
 
 ## Pacing and game speed
 
@@ -103,20 +101,19 @@ Game frames are best-effort in the lobby layer. Above it:
   therefore a session pause. Speed 0 is a sync point: games behind the leader run until they
   reach its clock, then stop.
 - **Followers trim their own speed** around the session speed to track the leader's clock, with
-  a PID controller (gains in `tpf2_slice.cfg`, one decision every 8 ticks, 0.7-1.2x, slew
-  limited). Fractional speeds are written to `tpf2_speed.txt`; the bridge's speed hook scales
+  a PID controller (fixed gains, one decision every 8 ticks, 0.7-1.2x, slew limited). A follower
+  more than 3 units ahead of the leader drops to a quarter of the session speed, rising as the gap
+  closes. Fractional speeds are written to `tpf2_speed.txt`; the bridge's speed hook scales
   the engine's sim batch interval to match, so every iteration stays an ordinary sim step and
   the game's speed buttons never flip.
 - **Load gate.** After loading, a follower holds at speed 0 until it hears the leader (or the
   expected number of players), so nobody starts ahead. The leader never waits. The gate gives up
   after 900 ticks.
-- **Catch-up.** A game more than 8 units behind the others asks the leader for the command
-  history after its clock (`LSNEED`), holds until the history is complete, then runs at up to 4x
-  until it is within half a unit. Meanwhile its heartbeat carries `cu=1` so nobody paces against
-  it.
-- **Barrier.** A game too far ahead of the slowest player is meant to hold at speed 0, with a
-  60-tick watchdog. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md#lockstep-and-pacing) for why this and
-  two of the rules above do not behave as described.
+- **Catch-up.** A follower more than 8 units behind the leader asks it for the command history
+  after its clock (`LSNEED`), holds until the history is complete, then runs at up to 4x until it
+  is within half a unit. Meanwhile its heartbeat carries `cu=1` so nobody paces against it. The
+  leader never catches up: it is the clock. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md#lockstep-and-pacing)
+  for pacing rules that do not always behave as described.
 
 ## Sessions
 

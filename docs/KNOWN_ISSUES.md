@@ -6,11 +6,6 @@ observed in play.
 
 ## Lockstep and pacing
 
-- **The clock barrier never holds** *(from the code)*. In `CM.barrierTick` a gap larger than
-  `K.CATCHUP_MIN` (8 units) is treated as "that peer is catching up" and zeroed before the
-  `ahead > K.BARRIER_AHEAD` test, and `BARRIER_AHEAD` is also 8, so the test can never pass.
-  Instances are kept together only by pacing and catch-up. The command-gap hold behind
-  `strict_barrier=1` still works.
 - **Hot-join catch-up does not start for a newcomer more than 60 units behind** *(from the
   code)*. `CM.paceV2` returns early when the spread between clocks exceeds 60 units, before it
   reaches `CM.catchUpTick`, so no history is requested. A save a few minutes old is usually
@@ -19,9 +14,6 @@ observed in play.
   `tpf2_bridge_ctl.txt` (`CM.speedRequest` is called from the leader's branch), so an instance
   named leader later (a relay lobby after its first leader leaves, or one whose first leader is
   not letter `a`) never learns it, and no instance acts as the session clock.
-- **`/pid` has no effect** *(from the code)*. The leader does not run the PID controller,
-  joiners never read the ctl file, and the ctl's first `pid=` line is the bridge's process id,
-  which the parser picks up instead of the gains.
 - **History sent to a hot joiner corrupts parameterised commands** *(from the code)*.
   `CM.histPump` appends `hist=1 hfor=<letter>` after the line's greedy `params=` tail, so
   constructions, upgrades and road demolitions replayed from history arrive with broken
@@ -41,8 +33,6 @@ observed in play.
   socket hears several senders; each change of sender resets its sequence state, so the link's
   ordering, de-duplication and chunk reassembly cannot be relied on and recovery falls to the mod's
   NACK layer.
-- **With no `tpf2_slice.cfg` at all, construction cancels are off** while the shipped file has
-  `cancel_construction=1`: the slice's built-in list of "shipped" switches omits it.
 - **Only one instance per Windows session gets the slice hooks.** A second, un-sandboxed game in the
   same session skips them silently (a named mutex).
 
@@ -84,7 +74,7 @@ observed in play.
 ## Replication gaps
 
 - Not replicated: terraforming and painting, vehicle stop/start, manual departure and
-  "depart now", map-editor commands. Maintenance targets only with `maint=1`.
+  "depart now", map-editor commands, maintenance targets.
 - Replacing a stop on an occupied side is not strict (the poll ships it after the fact).
 - A bought or replaced vehicle's `reversed` flag is not decoded; in companies mode a
   replacement's cost is not moved to the owning company.
