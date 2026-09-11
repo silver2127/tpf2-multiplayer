@@ -11,7 +11,12 @@ Data dir: %LOCALAPPDATA%\tpf2mp\data\   (logs, inject files, captures)
 4. On A: raise (press, hold, release in one spot), lower, flatten, smooth, then paint a patch.
    Expect in tpf2_slice.log:  [terrain] #N ProposalAction commit ... / heights ... / material ... / mask ...
    and files terrain_a_<pid>_NNN.bin in the data dir.
-   Decode:  python scratchpad\terrain_bin.py <file>
+   Decode:  python tools\re\terrain_bin.py <file>
+4b. On A: place ONE item with the asset brush (a single tree or rock, one click), then one brush
+   stroke. Expect  [terrain] #N ... toAdd=...B v250=...B map268=...  followed by
+   [terrain] #N   toAdd[i of n] file='...' at (x,y,z)  and/or  [terrain] #N   v250 (k ints): ...
+   Those lines say whether the brush's data is ConstructionEntities (the CONXP path can replay
+   them from Lua) or lives in +0x250/+0x268 (native, like the grids).
 5. Inject on B: copy the raise capture to  <data dir>\terrain_inject_b.bin, then append this ONE line
    to <data dir>\lockstep_inject_b.txt :
 

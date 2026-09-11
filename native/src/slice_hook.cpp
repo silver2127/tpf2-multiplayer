@@ -2437,6 +2437,7 @@ static void WriteTerrainBlob(FILE* f, const TerrainGrid& g)
     if (n) fwrite((void*)g.begin, 1, (size_t)n, f);
 }
 
+static bool ReadSsoString(uint64_t sa, char* out, size_t cap);   // the CONXP walker's reader
 static void LogTerrainProposal(uint64_t r8, uint64_t r9)
 {
     if (!Readable((void*)r8, 0x2f8)) { Log("[terrain] proposal unreadable\n"); return; }
@@ -2462,6 +2463,40 @@ static void LogTerrainProposal(uint64_t r8, uint64_t r9)
         (unsigned long long)rmSB, (unsigned long long)set188, (unsigned long long)toRmB,
         (unsigned long long)toAddB, (unsigned long long)old2new, (unsigned long long)v250B,
         (unsigned long long)map268);
+
+    // THE ASSET BRUSH (2026-09-11). Its commit clears old2new and carries no
+    // grid, so its data is in the construction fields or in the unidentified
+    // +0x250 vector<int> / +0x268 map. One placement with this log says which:
+    // what toAdd holds (file, position) and the first ints of +0x250.
+    if (toAddB >= 0x8e0) {
+        uint64_t ab = 0;
+        memcpy(&ab, (void*)(r8 + 0x1f8), 8);
+        const int nadd = (int)(toAddB / 0x8e0);
+        for (int i = 0; i < nadd && i < 4; i++) {
+            const uint64_t ce = ab + (uint64_t)i * 0x8e0;
+            char fn[200] = "";
+            ReadSsoString(ce, fn, sizeof(fn));
+            float x = 0, y = 0, z = 0;
+            if (Readable((void*)(ce + 0x728), 0x40)) {
+                memcpy(&x, (void*)(ce + 0x758), 4);
+                memcpy(&y, (void*)(ce + 0x75c), 4);
+                memcpy(&z, (void*)(ce + 0x760), 4);
+            }
+            Log("[terrain] #%ld   toAdd[%d of %d] file='%s' at (%.1f,%.1f,%.1f)\n", seq, i, nadd, fn, x, y, z);
+        }
+    }
+    if (v250B >= 4) {
+        uint64_t vb = 0;
+        ReadVec(r8 + 0x250, &vb, TERRAIN_MAX_BYTES);
+        char s[200] = "";
+        int o = 0;
+        for (uint64_t i = 0; i < v250B / 4 && i < 16 && vb; i++) {
+            int32_t v;
+            memcpy(&v, (void*)(vb + i * 4), 4);
+            o += snprintf(s + o, sizeof(s) - o, " %d", v);
+        }
+        Log("[terrain] #%ld   v250 (%llu ints):%s\n", seq, (unsigned long long)(v250B / 4), s);
+    }
 
     TerrainGrid hg, mg, kg;
     const bool hok = ReadTerrainGrid(r8 + 0x278, &hg);
