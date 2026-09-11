@@ -421,6 +421,15 @@ static volatile LONG g_lobbyDone = 0;
 // auto-load (see "AUTO-LOAD" below): set when the shared save is placed, taken
 // by CMenuUI's per-frame update on the main thread, given up after 12 s
 static volatile LONG g_autoLoadPending = 0;
+// VANILLA LOAD = SHARE. Every menu load ends in CMenuUI::StartSavegame; it is
+// detoured so a host that loads a save from the game's own LOAD GAME page
+// while players are in its lobby shares that save at the same moment (the
+// lobby ships it, the joiners autoload it). g_selfLoad marks our own autoload
+// calls (pass-through); g_hostLoadedItself tells the later 'start' event not
+// to load the host a second time; g_lastPage is the page the load came from.
+typedef char (*StartSavegameFn)(void* menu, void* params, void* info);
+static StartSavegameFn g_origStartSavegame = nullptr;
+static volatile LONG g_selfLoad = 0, g_hostLoadedItself = 0, g_lastPage = -1;
 static ULONGLONG     g_autoLoadSince = 0;
 static char g_status[256] = "";
 // A pending "download the mods this save needs?" question from the lobby
@@ -2283,7 +2292,9 @@ static int AutoLoadCall(void* menu, const char* name)
         ((void* (*)(void*))(g_base + RVA_LOADPARAMS_CTOR))(params);
         g_strAssign(params + 0x00, name, strlen(name));
         stage = 3;
+        InterlockedExchange(&g_selfLoad, 1);
         char started = ((char (*)(void*, void*, void*))(g_base + RVA_START_SAVEGAME))(menu, params, info);
+        InterlockedExchange(&g_selfLoad, 0);
         stage = 4;
         ((void (*)(void*))(g_base + RVA_LOADPARAMS_DTOR))(params);
         ((void (*)(void*))(g_base + RVA_SAVEINFO_DTOR))(info);
@@ -2293,6 +2304,48 @@ static int AutoLoadCall(void* menu, const char* name)
             GetExceptionCode(), (int)stage);
         return -10 - (int)stage;
     }
+}
+
+// LoadGameParams +0x00 is the save NAME (a game std::string in the 'savegame'
+// namespace, no extension); the file is <SAVE_DIR>\<name>.sav.
+static void GStringRead(const void* gs, char* out, size_t cap)
+{
+    const GString* g = (const GString*)gs;
+    const char* src = g->cap >= 16 ? *(const char* const*)g->buf : g->buf;
+    size_t n = g->size < cap - 1 ? g->size : cap - 1;
+    if (g->size > 4096 || !src) { out[0] = 0; return; }
+    memcpy(out, src, n); out[n] = 0;
+}
+
+static char MyStartSavegame(void* menu, void* params, void* info)
+{
+    if (InterlockedCompareExchange(&g_selfLoad, 0, 0)) return g_origStartSavegame(menu, params, info);
+    char name[300] = "";
+    __try { GStringRead(params, name, sizeof(name)); } __except (EXCEPTION_EXECUTE_HANDLER) { name[0] = 0; }
+    const bool hosting = InterlockedCompareExchange(&g_isHost, 0, 0) != 0 && InterlockedCompareExchange(&g_lobbyReady, 0, 0) != 0;
+    int players = 0; if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); players = g_playerCount; LeaveCriticalSection(&g_modelCs); }
+    Log("[menu] menu load of '%s' from page %ld (hosting=%d players=%d)\n", name, InterlockedCompareExchange(&g_lastPage, 0, 0), hosting ? 1 : 0, players);
+    if (hosting && name[0] && players > 1) {
+        // the host picked a save in the game's own LOAD GAME: share it with the
+        // lobby now and let the game load it here as it would anyway
+        wchar_t wn[300]; MultiByteToWideChar(CP_UTF8, 0, name, -1, wn, 300);
+        _snwprintf_s(g_startSaveW, 600, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
+        if (GetFileAttributesW(g_startSaveW) == INVALID_FILE_ATTRIBUTES) {
+            Log("[menu] menu load: %ls not found in the save folder -- not shared\n", g_startSaveW);
+        } else {
+            writeCompanyCfg();
+            InterlockedExchange(&g_hostLoadedItself, 1);
+            char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
+            char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
+            char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
+            LobbySend(line);
+            char st[200]; snprintf(st, sizeof(st), "Sharing '%s' with %d player(s)\xE2\x80\xA6", name, players - 1); SetStatus(st);
+            Log("[menu] menu load: sharing %ls with the lobby (the game loads it here)\n", g_startSaveW);
+        }
+    } else if (hosting && name[0]) {
+        Log("[menu] menu load while hosting with nobody in the lobby -- not shared\n");
+    }
+    return g_origStartSavegame(menu, params, info);
 }
 
 static void AutoLoadTick(void* menu)
@@ -2526,7 +2579,12 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 Log("[menu] start while in game -- a sync for a newcomer, ignored here\n");
                                 go = false;
                             }
-                            if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
+                            if (InterlockedCompareExchange(&g_isHost, 0, 0) && InterlockedExchange(&g_hostLoadedItself, 0)) {
+                                // the host loaded the save from the game's own LOAD GAME: the
+                                // game is already loading it, the joiners load theirs
+                                Log("[menu] start: the host loaded its save itself -- nothing to load here\n");
+                                go = false;
+                            } else if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
                                 // our own save (the one we shared / uploaded); a leader that RECEIVED a
                                 // save this session (a relay's /resume) falls through and loads that.
                                 // No guessing: our newest save need not be what anyone else has.
@@ -2773,6 +2831,7 @@ static DWORD WINAPI KbHookThread(LPVOID)
 static void MyCreatePage(uint64_t thisp, int page)
 {
     g_origCreatePage(thisp, page);
+    InterlockedExchange(&g_lastPage, page);
     // The main menu builds pages 0 -> 2 -> 1 (2 is the main content, 0/1 are its
     // sub-layers). Full-screen replacements (Settings/Campaign/Load...) are all
     // page >= 3. So SET on 2, CLEAR only on >= 3; leave 0/1 alone -- otherwise
@@ -2887,6 +2946,13 @@ static DWORD WINAPI Init(LPVOID)
                      STEAL_CREATEPAGE, &tramp)) {
         Log("[menu] InstallHook FAILED on CreatePage\n");
         return 0;
+    }
+    {   // StartSavegame: 20-byte steal = 7 pushes + lea rbp,[rsp-0x3a0] (boundaries 2,3,4,6,8,10,12,20; none RIP-relative)
+        void* t2 = nullptr;
+        if (InstallHook(g_base + RVA_START_SAVEGAME, (void*)&MyStartSavegame, 20, &t2)) {
+            g_origStartSavegame = (StartSavegameFn)t2;
+            Log("[menu] hooked StartSavegame rva=%llx steal=20 -- a host's own LOAD GAME shares the save\n", (unsigned long long)RVA_START_SAVEGAME);
+        } else Log("[menu] InstallHook FAILED on StartSavegame -- LOAD GAME will not share; START GAME still does\n");
     }
     // Hot join needs CGameUI's 'this' (see ForceAutosave). Capture-only detour
     // on its per-frame update; refused, not guessed, if the prologue moved.
