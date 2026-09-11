@@ -2566,6 +2566,38 @@ static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
             }
             Log("[terrain] #%ld   toAdd[%d of %d] file='%s' at (%.1f,%.1f,%.1f)\n", seq, i, nadd, fn, x, y, z);
         }
+        // ASSET BRUSH LAYOUT PROBE (2026-09-11). The fields above read '' and
+        // (0,0,0) for every brush entry although toAdd is an exact multiple of
+        // 0x8e0, so dump the first two records raw: the fileName std::string's
+        // 32 bytes, the params lua::Table walked the way CONXP walks it, and the
+        // 16 floats of transf. One brush stroke then says where the data is.
+        for (int i = 0; i < nadd && i < 2; i++) {
+            const uint64_t ce = ab + (uint64_t)i * 0x8e0;
+            if (!Readable((void*)ce, 0x8e0)) { Log("[asset-probe] #%ld [%d] record unreadable\n", seq, i); continue; }
+            uint64_t q[4];
+            memcpy(q, (void*)ce, sizeof(q));
+            Log("[asset-probe] #%ld [%d] ce=%llx +00: %016llx %016llx %016llx(len) %016llx(cap)\n", seq, i,
+                (unsigned long long)ce, (unsigned long long)q[0], (unsigned long long)q[1],
+                (unsigned long long)q[2], (unsigned long long)q[3]);
+            char params[4096];
+            ConxpOut po = { params, sizeof(params), 0, false };
+            params[0] = 0;
+            int pnodes = 0;
+            const bool pok = SerLuaTable(&po, ce + 0x460, 0, &pnodes);
+            Log("[asset-probe] #%ld [%d] params(+0x460) ok=%d nodes=%d trunc=%d: %.900s\n", seq, i,
+                pok ? 1 : 0, pnodes, po.trunc ? 1 : 0, params);
+            float t[16];
+            memcpy(t, (void*)(ce + 0x728), sizeof(t));
+            Log("[asset-probe] #%ld [%d] transf(+0x728): %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
+                seq, i, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
+            // any other readable std::string in the record: scan 8-byte steps for an
+            // SSO whose len/cap look sane and whose text looks like a .con path
+            for (uint64_t off = 0x20; off + 0x20 <= 0x8e0; off += 8) {
+                char s[160];
+                if (ReadSsoString(ce + off, s, sizeof(s)) && strlen(s) >= 4 && strstr(s, ".con"))
+                    Log("[asset-probe] #%ld [%d] string at +0x%03llx: '%s'\n", seq, i, (unsigned long long)off, s);
+            }
+        }
     }
     if (v250B >= 4) {
         uint64_t vb = 0;
