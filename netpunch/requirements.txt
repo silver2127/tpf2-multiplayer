@@ -1,2 +1,3 @@
 pystun3
 miniupnpc
+zstandard

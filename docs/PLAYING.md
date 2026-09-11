@@ -4,8 +4,12 @@
 
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
-- Every mod the save uses must be installed on every machine. The multiplayer mod itself
-  (**Transport Fever 2 Multiplayer**) comes with the installer.
+- Mods the save uses are shared automatically: when the host presses START GAME, each
+  joiner receives any mod folder it lacks right after the save (a chat line lists them)
+  and the load screen's Mods panel shows them. Per-save mod settings travel inside the
+  save. The multiplayer mod itself (**Transport Fever 2 Multiplayer**) comes with the
+  installer and is never sent. Steam Workshop items are copied into the workshop folder;
+  subscribing to them yourself keeps them updated.
 - **The multiplayer mod has to be enabled in the save.** New games get it automatically: each time the
   game starts, the Multiplayer panel adds it to the game's default mod list. For an existing save,
   open the save's **Mods** panel on the load screen once and enable it; the save remembers. The
@@ -149,8 +153,17 @@ themselves. Players who are already in the game ignore a new shared save (`/sync
 someone joining), so to recover: the host saves, everyone returns to the title menu and leaves
 the lobby, and the host hosts again and presses START GAME, which shares that save.
 
-For a bug report, collect the logs of **every** player **before** restarting the game (the game
-truncates its log on launch). The quickest way is `collect_logs.cmd` from the repository's `tools`
+For a bug report, send the logs of **every** player. The mod gathers them in one folder,
+`%LOCALAPPDATA%\tpf2mp\logs\`:
+
+- Each time the game starts, the previous run's logs are saved there as `<date>-<time>-previous`: the
+  game's own log (with the mod's script lines), the logs of the mod's DLLs and the lobby, and the newest
+  crash dumps with the game log kept beside each. This happens after a crash too, so after a crash just
+  start the game again. The last 2 runs are kept.
+- **OPEN LOGS** at the top of the Multiplayer panel copies the running game's logs into a
+  `<date>-<time>-now` folder and opens the folder. The last 2 of these are kept as well.
+
+Zip the newest folders and send them. For a fuller report, including a system summary, use `collect_logs.cmd` from the repository's `tools`
 folder: double-click it and it zips the data folder, the logs in the game and lobby folders, the
 game's log, recent crash dumps and a system summary into `tpf2mp-logs-<computer>-<time>.zip` in your
 Downloads folder, without uploading anything. By hand, take the files in `%LOCALAPPDATA%\tpf2mp\data\`

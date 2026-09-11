@@ -173,6 +173,7 @@ from punch import (
     TYPE_DATA, TYPE_EDATA, TYPE_ADATA, _pack, _unpack, open_socket,
 )
 from seal import Sealer, derive_key, SECRET_LEN
+import modshare                     # share the mods a save needs (mod zips ride the save transfer)
 # Reuse the code exchange + the connect race + observe/announce.
 from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4
 from mesh import MeshNode
@@ -256,7 +257,9 @@ def _safe_incoming_name(name):
     Rejects absolute paths, directory components, traversal, and anything else:
     the check is a whitelist of the full name, not a filter applied to it.
     """
-    if not isinstance(name, str) or name not in ALLOWED_INCOMING:
+    if not isinstance(name, str):
+        return False
+    if name not in ALLOWED_INCOMING and modshare.parse_mod_zip_name(name) is None:
         return False
     # belt and braces: a whitelisted constant can never contain these, so this
     # only ever fires if ALLOWED_INCOMING itself is edited carelessly later.
@@ -834,6 +837,7 @@ class GameRelay:
 # All files (.sav + optional .sav.lua + .jpg) are concatenated into ONE byte
 # stream with a single sequence space; the receiver splits them back out using
 # the per-file sizes in `fbegin`. Integrity is SHA-256 per file AND overall.
+SHARE_MODS = [True]        # --no-share-mods turns the mods round off (host side)
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
 
@@ -968,8 +972,10 @@ class _HostSaveTransfer:
         """
         return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
 
-    def __init__(self, sock, sid, blob, files_meta, targets, io, log):
+    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save"):
         self.sock = sock
+        self.kind = kind                      # "save" or "mods" (the round after it)
+        self.mods = mods or []                # [(id, ver)] the save needs, told in fbegin
         self.sid = sid
         self.blob = blob
         self.total_bytes = len(blob)
@@ -983,7 +989,8 @@ class _HostSaveTransfer:
         self.begin_msg = {"t": "fbegin", "sid": sid,
                           "total_bytes": self.total_bytes, "chunk": self.chunk,
                           "total_chunks": self.total_chunks,
-                          "files": files_meta, "sha256": self.overall_sha}
+                          "files": files_meta, "sha256": self.overall_sha,
+                          "kind": kind, "mods": [[m, v] for m, v in self.mods]}
         now = time.time()
         self.peers = {}          # addr -> per-peer send state
         for addr, name in targets:
@@ -991,7 +998,7 @@ class _HostSaveTransfer:
                 "name": name, "ready": False, "base": 0, "next": 0,
                 "nack": [], "last_fack": now, "last_begin": 0.0,
                 "last_resend": 0.0, "last_advance": now,
-                "state": "active", "last_pct": -1,
+                "state": "active", "last_pct": -1, "need": [],
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
                  f"{self.total_chunks} chunks of {self.chunk}B "
@@ -1027,7 +1034,15 @@ class _HostSaveTransfer:
             return
         if not p["ready"]:
             p["ready"] = True
-            self.log(f"[host] {p['name']} ready for save")
+            self.log(f"[host] {p['name']} ready for {self.kind}")
+        need = msg.get("need")
+        if isinstance(need, list):
+            # the ids this joiner does not have installed, out of self.mods
+            want = {modshare.mod_folder_name(m, v): (m, v) for m, v in self.mods}
+            p["need"] = [want[n] for n in need if isinstance(n, str) and n in want]
+            if p["need"]:
+                self.log(f"[host] {p['name']} lacks {len(p['need'])} mod(s): "
+                         + ", ".join(modshare.mod_folder_name(m, v) for m, v in p['need']))
 
     def on_fack(self, addr, msg):
         p = self.peers.get(addr)
@@ -1141,6 +1156,10 @@ class _HostSaveTransfer:
         return [p["name"] for p in self.peers.values()
                 if p["state"] == "failed"]
 
+    def mod_needs(self):
+        """{addr: [(id, ver)]} for the peers that verified and still lack mods."""
+        return {a: p["need"] for a, p in self.peers.items() if p["state"] == "done" and p["need"]}
+
     def done_addrs(self):
         return [a for a, p in self.peers.items() if p["state"] == "done"]
 
@@ -1180,6 +1199,8 @@ class _ClientSaveReceiver:
         self.last_pct = -1
         self.done_sends = 0
         self.last_done = 0.0
+        self.kind = "save"
+        self.need = []
 
     def active(self):
         """True while a transfer is in progress (steer the loop to poll fast)."""
@@ -1211,7 +1232,7 @@ class _ClientSaveReceiver:
                 self._send({"t": "fdone", "sid": sid, "ok": False,
                             "final": True})
             else:
-                self._send({"t": "fbegin_ack", "sid": sid})  # duplicate -> re-ack
+                self._send({"t": "fbegin_ack", "sid": sid, "need": self.need})  # duplicate -> re-ack
             return
         # A brand-new session (first ever, or a later transfer): (re)allocate.
         self.sid = sid
@@ -1222,6 +1243,18 @@ class _ClientSaveReceiver:
         self.window = SEND_WINDOW_LOCAL if self.chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = msg.get("files", [])
+        self.kind = "mods" if msg.get("kind") == "mods" else "save"
+        # the mods this save needs that are not installed here (told back in the ack)
+        self.need = []
+        for ent in (msg.get("mods") or []):
+            try:
+                m, v = str(ent[0]), int(ent[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if modshare.installed_mod(m, v) is None:
+                self.need.append(modshare.mod_folder_name(m, v))
+        if self.need:
+            self.log(f"[client] the save needs mods we lack: {', '.join(self.need)} -- asking the host")
         # Validate the proposed names BEFORE allocating or acking: a rejected
         # transfer must cost the joiner nothing.
         bad = [m.get("name") for m in (self.files or [])
@@ -1251,7 +1284,7 @@ class _ClientSaveReceiver:
         self.done_sends = 0
         self.log(f"[client] save incoming sid={sid} {self.total_bytes}B "
                  f"{self.total_chunks} chunks")
-        self._send({"t": "fbegin_ack", "sid": sid})
+        self._send({"t": "fbegin_ack", "sid": sid, "need": self.need})
         self.io.emit({"type": "transfer", "role": "recv", "pct": 0})
         if self.total_chunks == 0:
             self._finalize()
@@ -1364,6 +1397,15 @@ class _ClientSaveReceiver:
                 return
             self._fail("hash mismatch")
             return
+        if self.kind == "mods":
+            self._install_mods(parts)
+            for v in parts.values():
+                v.release()
+            view.release()
+            self.complete = True
+            self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
+            self._maybe_send_done(force=True)
+            return
         written = []
         try:
             for meta in self.files:
@@ -1393,6 +1435,27 @@ class _ClientSaveReceiver:
                           "text": f"The host's save does not have the {MOD_DISPLAY_NAME} mod enabled, so nothing will sync. "
                                   "Ask the host to enable it in that save's Mods panel and share it again."})
         self._maybe_send_done(force=True)
+
+
+    def _install_mods(self, parts):
+        """A mods round: unpack each incoming_mod_<id>_<ver>.zip into the game's
+        mods folder (never over an existing one) and tell the player."""
+        done, kept, bad = [], [], []
+        for name, part in parts.items():
+            idv = modshare.parse_mod_zip_name(name)
+            if not idv:
+                bad.append(str(name)); continue
+            st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
+            label = modshare.mod_folder_name(*idv)
+            (done if st == "installed" else kept if st == "present" else bad).append(label)
+            self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
+        text = []
+        if done: text.append("Installed from the host: " + ", ".join(done) + " (they show in the load screen's Mods panel)")
+        if kept: text.append("already installed: " + ", ".join(kept))
+        if bad: text.append("FAILED to install: " + ", ".join(bad) + " -- install it by hand")
+        if text:
+            self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": "; ".join(text)})
+        self.io.emit({"type": "mods_ready", "installed": done, "present": kept, "failed": bad})
 
 
 def _clear_stale_incoming(directory, log=_log):
@@ -1739,6 +1802,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 _send_data(sock, a, msg)
         io.emit({"type": "chat", "from": frm, "text": text, "ts": ts})
 
+    mod_round = [None]        # the addrs to start once a mods round resolves
+
     def broadcast_start(save, only=None):
         """Start everyone currently in the lobby -- or, with ``only`` (a set of
         addrs), just those: the peers a save transfer actually reached. A
@@ -2075,8 +2140,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
+        mods = [] if (relay_only or not SHARE_MODS[0]) else (modshare.save_mod_list(save_path) or [])
+        if mods:
+            log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
+                + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
-                                        io, log)
+                                        io, log, mods=mods)
 
     # ---- local (host's own menu) commands ---------------------------------- #
     def handle_command(cmd):
@@ -2281,7 +2350,22 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if transfer[0] is not None:
                 try:
                     transfer[0].pump(now)
-                    if transfer[0].all_resolved():
+                    if transfer[0].all_resolved() and transfer[0].kind == "mods":
+                        # THE MODS ROUND is done: start everyone the save reached.
+                        # A peer whose mods did not verify is started too -- the
+                        # game tells them what is missing on load, and the chat
+                        # line names it -- rather than left behind silently.
+                        xfer, transfer[0] = transfer[0], None
+                        got = set(mod_round[0] or set())
+                        mod_round[0] = None
+                        bad = xfer.failed_names()
+                        if bad:
+                            log(f"[host] mod transfer failed for {', '.join(bad)} -- starting them anyway")
+                            broadcast_chat("MULTIPLAYER", "Mod transfer failed for " + ", ".join(bad)
+                                           + " -- they may be missing mods this save needs.")
+                        log(f"[host] mods shared -- starting {len(got)} peer(s)")
+                        broadcast_start(save=True, only=got)
+                    elif transfer[0].all_resolved():
                         xfer, transfer[0] = transfer[0], None
                         failed = xfer.failed_names()
                         if failed:
@@ -2306,9 +2390,44 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             if la is not None and upload[0] is not None and getattr(upload[0], "complete", False):
                                 got.add(la)                   # the uploader has the save it sent
                             waiting = [a for a in peers if a not in got and not peers[a].get("started")]
-                            log(f"[host] all save transfers resolved -- starting {len(got)} peer(s)"
-                                + (f"; {len(waiting)} joined during the transfer and will be served next" if waiting else ""))
-                            broadcast_start(save=True, only=got)
+                            needs = xfer.mod_needs()
+                            if needs:
+                                # MODS ROUND: zip every mod somebody lacks, send the
+                                # union to those peers, start everyone once it resolves.
+                                # A mod the host cannot find (or that is too big) is
+                                # named in chat and skipped; the rest still go.
+                                wanted = {}
+                                for lst in needs.values():
+                                    for m, v in lst:
+                                        wanted[(m, v)] = True
+                                blob2, meta2, missing = bytearray(), [], []
+                                for (m, v) in wanted:
+                                    folder = modshare.find_mod(m, v)
+                                    data = folder and modshare.zip_mod(folder)
+                                    if not data:
+                                        missing.append(modshare.mod_folder_name(m, v))
+                                        continue
+                                    meta2.append({"name": modshare.mod_zip_name(m, v), "size": len(data),
+                                                  "sha256": hashlib.sha256(data).hexdigest()})
+                                    blob2 += data
+                                if missing:
+                                    log(f"[host] cannot share {', '.join(missing)} (not installed here, or over the size cap)")
+                                    broadcast_chat("MULTIPLAYER", "Cannot share " + ", ".join(missing)
+                                                   + " -- not found on the host; install it by hand.")
+                                if meta2:
+                                    targets2 = [(a, peers[a]["name"]) for a in needs if a in peers]
+                                    names2 = ", ".join(n for _, n in targets2)
+                                    mb = len(blob2) / (1024.0 * 1024.0)
+                                    log(f"[host] sharing {len(meta2)} mod(s) ({mb:.1f} MB) with {names2}")
+                                    broadcast_chat("MULTIPLAYER", f"Sharing {len(meta2)} mod(s) ({mb:.1f} MB) with {names2}: "
+                                                   + ", ".join(m["name"][len(modshare.INCOMING_MOD_PREFIX):-4] for m in meta2))
+                                    mod_round[0] = got
+                                    transfer[0] = _HostSaveTransfer(sock, (xfer.sid + 1) & 0xFFFFFFFF, blob2, meta2,
+                                                                    targets2, io, log, kind="mods")
+                            if transfer[0] is None:          # no mods round started: start now
+                                log(f"[host] all save transfers resolved -- starting {len(got)} peer(s)"
+                                    + (f"; {len(waiting)} joined during the transfer and will be served next" if waiting else ""))
+                                broadcast_start(save=True, only=got)
                 except Exception as e:                     # never crash the lobby
                     log(f"[host] save transfer error: {e!r}")
                     io.emit({"type": "status", "state": "failed",
@@ -3518,6 +3637,151 @@ def _run_transfer_failure(tag, size_bytes=4 * 1024 * 1024):
     return ok
 
 
+def _run_transfer_mods(tag):
+    """Host + 2 joiners over loopback: the save 'needs' two mods, each joiner
+    has one of them, the host has both. Asserts that each joiner asked for the
+    one it lacked, received it after the save, unpacked it under its own mods
+    folder, told the panel (mods_ready), and was started only after that."""
+    HP, P1, P2 = 29530, 29531, 29532
+    names = {"host": "alice", "j1": "bob", "j2": "carol"}
+    base = tempfile.mkdtemp(prefix="lobby_mods_")
+    dirs = {k: os.path.join(base, k) for k in names}
+    ios = {k: LobbyIO(dirs[k]) for k in names}
+    stop = threading.Event()
+    conns = []
+    save_path = os.path.join(base, "world.sav")
+    with open(save_path, "wb") as f:
+        f.write(os.urandom(256 * 1024))
+    with open(save_path + ".lua", "wb") as f:
+        f.write(b'["lockstep.lua"] = { }\n')
+    # the host's two mod folders
+    src = {}
+    for mid in ("mod_zz", "mod_have"):
+        d = os.path.join(base, "hostmods", f"{mid}_1")
+        os.makedirs(os.path.join(d, "res", "scripts"))
+        with open(os.path.join(d, "mod.lua"), "w") as f:
+            f.write(f"-- {mid}\nfunction data() return {{}} end\n")
+        with open(os.path.join(d, "res", "scripts", "thing.lua"), "w") as f:
+            f.write("return " + repr(mid) + "\n")
+        src[mid] = d
+    dest = os.path.join(base, "joinermods")
+    real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
+    modshare.save_mod_list = lambda p: [("mod_zz", 1), ("mod_have", 1)]
+    modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
+    modshare.installed_mod = lambda m, v: src.get(m) if m == "mod_have" else None   # joiners lack mod_zz
+    modshare.install_target = lambda m, v: os.path.join(dest, threading.current_thread().name, f"{m}_{v}")
+    ok = True
+    t0 = time.time()
+    try:
+        hsock = open_socket(HP, socket.AF_INET)
+        threading.Thread(target=run_host, name="mods-host", args=(hsock, names["host"], ios["host"]),
+                         kwargs={"code": "MODSCODE", "stop": stop}, daemon=True).start()
+        time.sleep(0.4)
+        for port, key in ((P1, "j1"), (P2, "j2")):
+            peer = {"candidates": {"public_v4": f"127.0.0.1:{HP}", "lan_v4": None, "v6": None},
+                    "flags": {"open": True, "v6": False}}
+            s = open_socket(port, socket.AF_INET)
+            conn = race(s, peer, "dial", port, 12, my_has_v6=False)
+            if not conn:
+                print(f"[mods:{tag}] FAIL: joiner {names[key]} could not connect")
+                return False
+            conns.append(conn)
+            threading.Thread(target=run_client, name=key, args=(conn, names[key], ios[key]),
+                             kwargs={"stop": stop}, daemon=True).start()
+
+        def all_joined():
+            for k in names:
+                r = _latest_roster(ios[k].out_path)
+                if not r or len(r.get("players", [])) < 3:
+                    return False
+            return True
+        if not _wait_until(all_joined, timeout=15):
+            print(f"[mods:{tag}] FAIL: not all three joined")
+            return False
+        with open(ios["host"].in_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cmd": "start", "save": save_path}) + "\n")
+
+        def settled():
+            for k in ("j1", "j2"):
+                ev = _read_events(ios[k].out_path)
+                if not any(e.get("type") == "mods_ready" for e in ev):
+                    return False
+                if not _has_start(ios[k].out_path, save=True):
+                    return False
+            return any(e.get("type") == "start" for e in _read_events(ios["host"].out_path))
+        if not _wait_until(settled, timeout=60):
+            print(f"[mods:{tag}] FAIL: mods round did not settle in time")
+            ok = False
+        for k in ("j1", "j2"):
+            ev = _read_events(ios[k].out_path)
+            mr = [e for e in ev if e.get("type") == "mods_ready"]
+            if not mr or mr[-1].get("installed") != ["mod_zz_1"] or mr[-1].get("failed"):
+                print(f"[mods:{tag}] FAIL: {k} mods_ready = {mr[-1] if mr else None}")
+                ok = False
+            got = os.path.join(dest, k, "mod_zz_1")
+            if not os.path.isfile(os.path.join(got, "mod.lua")) or not os.path.isfile(os.path.join(got, "res", "scripts", "thing.lua")):
+                print(f"[mods:{tag}] FAIL: {k} did not unpack mod_zz_1 into {got}")
+                ok = False
+            if os.path.isdir(os.path.join(dest, k, "mod_have_1")):
+                print(f"[mods:{tag}] FAIL: {k} received mod_have although it had it")
+                ok = False
+            # started only after the mods landed
+            idx_ready = max(i for i, e in enumerate(ev) if e.get("type") == "mods_ready") if mr else -1
+            idx_start = [i for i, e in enumerate(ev) if e.get("type") == "start"]
+            if idx_start and idx_ready >= 0 and idx_start[-1] < idx_ready:
+                print(f"[mods:{tag}] FAIL: {k} was started before its mods arrived")
+                ok = False
+        hev = _read_events(ios["host"].out_path)
+        chat = [e.get("text", "") for e in hev if e.get("type") == "chat"]
+        if not any("Sharing 1 mod(s)" in t for t in chat):
+            print(f"[mods:{tag}] FAIL: host never announced the mods round: {chat}")
+            ok = False
+    finally:
+        stop.set()
+        time.sleep(0.5)
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target) = real
+        shutil.rmtree(base, ignore_errors=True)
+    print(f"[mods:{tag}] {'OK' if ok else 'FAIL'}  ({time.time() - t0:.1f}s)")
+    return ok
+
+
+def selftest_mods():
+    """The mods round: a joiner lacking a mod the save needs gets it from the
+    host after the save, unpacked, before it is started."""
+    print("[selftest-mods] host -> 2-joiner mod share")
+    ok = modshare_selftest_ok() and _run_transfer_mods("share-one")
+    # and the real thing: the newest save on this machine must parse (proves the
+    # zstandard decoder is bundled in a frozen build)
+    ud = modshare.userdata_mods_dir()
+    sd = ud and os.path.join(os.path.dirname(ud), "save")
+    saves = sorted((os.path.join(sd, f) for f in os.listdir(sd) if f.lower().endswith(".sav")),
+                   key=os.path.getmtime) if sd and os.path.isdir(sd) else []
+    if saves:
+        mods = modshare.save_mod_list(saves[-1])
+        print(f"[selftest-mods] {os.path.basename(saves[-1])}: mods = {mods}")
+        if mods is None:
+            print("[selftest-mods] FAIL: could not read the mod list off a real save")
+            ok = False
+    else:
+        print("[selftest-mods] (no local save to parse)")
+    print(f"[selftest-mods] {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def modshare_selftest_ok():
+    try:
+        modshare.selftest()
+        return True
+    except AssertionError as e:
+        print(f"[selftest-mods] modshare selftest FAILED: {e}")
+        return False
+
+
 def selftest_transfer():
     """Run the save-transfer self-test several times (clean + lossy) so it
     proves both correctness and non-flakiness, and exercises retransmit;
@@ -3901,6 +4165,8 @@ def main(argv=None):
                     help="directory for the lobby_*.json[l] files (default: cwd)")
     ap.add_argument("--selftest", action="store_true",
                     help="run the loopback 1-host + 2-joiner self-test and exit")
+    ap.add_argument("--selftest-mods", action="store_true",
+                    help="self-test: the mods round of the save transfer over loopback")
     ap.add_argument("--selftest-transfer", action="store_true",
                     help="run the reliable save-transfer self-test (clean + "
                          "lossy) and exit")
@@ -3921,6 +4187,8 @@ def main(argv=None):
                     help="also tail this file and ship its new lines to the "
                          "host's merged lobby_peers.log (repeatable; e.g. the "
                          "bridge log)")
+    ap.add_argument("--no-share-mods", action="store_true",
+                    help="host: do not send joiners the mods the shared save needs")
     ap.add_argument("--no-mesh", action="store_true",
                     help="joiner: do not punch other joiners directly; keep "
                          "every frame on the host relay (the pre-mesh star)")
@@ -3940,11 +4208,15 @@ def main(argv=None):
                          "delivered to (the menu reads it from "
                          "tpf2_instance.txt; default %(default)s)")
     args = ap.parse_args(argv)
+    if getattr(args, "no_share_mods", False):
+        SHARE_MODS[0] = False
 
     if args.selftest:
         return 0 if selftest() else 1
     if args.selftest_transfer:
         return 0 if selftest_transfer() else 1
+    if args.selftest_mods:
+        return 0 if selftest_mods() else 1
     if args.selftest_relay:
         return 0 if selftest_relay() else 1
     if args.selftest_mesh:

@@ -197,7 +197,20 @@ starting with `!hotjoin ` as a status message.
 4. The receiver checks the proposed filenames against a whitelist before allocating, refuses
    writes past the end, verifies every hash (retrying the whole transfer up to three
    times), writes the files and emits `save_ready`.
-5. When every receiver has verified, the host sends `start` to them. On each joiner the menu
+5. **Mods the save needs.** The host reads the save's active mod list off the `.sav`
+   (a Zstandard frame; the list sits before the game settings and is parsed from that
+   anchor) and lists it in `fbegin` as `mods`. Each receiver answers in `fbegin_ack` with
+   `need`, the ids it has no folder for (`<id>_<version>` under the game's `mods`, the
+   profile's `local/mods`, or `steamapps/workshop/content/1066780/<id>` for a `*<id>`
+   workshop item). When the save has verified everywhere and somebody needs something,
+   the host zips each such mod folder and sends the union as a second transfer
+   (`kind: "mods"`, files `incoming_mod_<id>_<version>.zip`, same chunking, hashes and
+   window); a receiver unpacks each into its game's `mods` folder (never over an existing
+   one, paths inside the zip are checked) and emits `mods_ready`. The multiplayer mod
+   itself is never sent. A mod the host cannot find, or one over 512 MB, is named in chat
+   and skipped. `lobby.py host --no-share-mods` turns the round off; a dedicated relay
+   never shares mods. Per-save mod settings need nothing: they are inside the save.
+6. When every receiver has verified (and any mods round has resolved), the host sends `start` to them. On each joiner the menu
    DLL copies the files into the game's save folder as `mp_shared.sav` (+ sidecars) and the
    player loads **mp_shared** from LOAD GAME. A failed transfer leaves the host with
    "press START GAME to retry".
