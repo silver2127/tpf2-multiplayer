@@ -808,7 +808,19 @@ function data()
 				-- command; a NACK resend recomputes the same value from the stamp.
 				do
 					local lastBuyStep = nil
-					local newLineStep = {}   -- line key created THIS batch -> its LCREATE's apply step
+					-- line key ("origin:seq" of its LCREATE) -> that LCREATE's step, kept ACROSS ticks.
+					-- It used to be rebuilt per pass from whatever sat in the queue together, so
+					-- whether an op waited for its line depended on each instance's own batching:
+					-- a slow tick on A queued B's LCREATE with its two LUPDATEs and applied them 1
+					-- and 5 steps EARLY (target below their own stamp), while B did not
+					-- (2026-09-11, line b:39). Every command passes through a pre-pass before it
+					-- executes, so the create is always recorded before its dependants.
+					CM.lineCreateStep = CM.lineCreateStep or {}
+					local newLineStep = CM.lineCreateStep
+					if CM.ticks % 300 == 0 then
+						local cut = CM.stepOf(now) - 3000
+						for k, s in pairs(newLineStep) do if s < cut then newLineStep[k] = nil end end
+					end
 					for _, c in ipairs(CM.queue) do
 						if not executed[CM.cmdKey(c)] then
 							local st = CM.stepOf(c.at)
@@ -838,8 +850,10 @@ function data()
 										or (c.op == "VLINE") and tostring(c.line) or nil
 									local cs = dep and newLineStep[dep]
 									if cs then
-										local lg = cs + K.LINE_MATERIALIZE_STEPS
-										if not c.notBeforeStep or c.notBeforeStep < lg then c.notBeforeStep = lg end
+										local lg = math.max(cs + K.LINE_MATERIALIZE_STEPS, st)   -- a hold only ever delays, never earlier than the stamp
+										-- only a real hold sets a target: a later op on an old line keeps no
+										-- notBeforeStep, so the buy guard above still applies to it
+										if lg > st and (not c.notBeforeStep or c.notBeforeStep < lg) then c.notBeforeStep = lg end
 									end
 								end
 							end
