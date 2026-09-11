@@ -231,6 +231,21 @@ static volatile LONG g_pendingIsTerrain = 0;
 static char*    g_terrainB64 = nullptr;
 static uint64_t g_terrainBlobLen = 0;
 static long     g_terrainStashSeq = 0;
+// THE STROKE WAITS FOR THE REPLAY (docs/re/PROPOSALS.md, Commit and apply).
+// The terrain modifier commits mid-stroke (30 entries / 300k cells) and applies
+// no brush while tool+0xf0 is set; its Add callback {vftable, tool, bool}
+// clears +0xf0 in _Do_call. Firing that callback for a CANCELLED commit would
+// release the stroke onto terrain that lacks the cancelled part, and the next
+// part would be computed -- and shipped, absolute -- against the old heights.
+// So after the fire the flag is set again and cleared only when this
+// instance's own replay carrier (the Lua's empty buildProposal that
+// InjectTerrainFromFile filled) reaches CommandList::Add. A safety valve
+// releases it after TERRAIN_HOLD_MAX_MS in case the replay never comes.
+static uint64_t g_terrainHeldTool = 0;
+static ULONGLONG g_terrainHeldAt = 0;
+static volatile LONG64 g_terrainCarrierCmd = 0;
+static const ULONGLONG TERRAIN_HOLD_MAX_MS = 4000;
+
 static int32_t g_stopDelEo = -1, g_stopDelEdge = -1;
 
 extern "C" void DeferRelay();
@@ -2707,6 +2722,28 @@ static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
 // cancel landed, the originator replays too. armed=false: the edit ran natively
 // here (no live session at arm time, or the callback could not be fired), the
 // mod ships it with skipOrigin so the peers still get it.
+static void HoldTerrainTool(uint64_t impl)
+{
+    uint64_t tool = 0;
+    if (Readable((void*)(impl + 8), 8)) memcpy(&tool, (void*)(impl + 8), 8);
+    if (!tool || !Readable((void*)(tool + 0xf0), 1)) {
+        Log("[terrain] cannot hold the tool (impl=%llx tool=%llx) -- the stroke resumes before the replay\n", (unsigned long long)impl, (unsigned long long)tool);
+        return;
+    }
+    *(volatile uint8_t*)(tool + 0xf0) = 1;
+    g_terrainHeldTool = tool; g_terrainHeldAt = GetTickCount64();
+    Log("[terrain] tool %llx held (+0xf0) until our replay carrier is added\n", (unsigned long long)tool);
+}
+
+static void ReleaseTerrainTool(const char* why)
+{
+    uint64_t tool = g_terrainHeldTool;
+    if (!tool) return;
+    g_terrainHeldTool = 0;
+    if (Readable((void*)(tool + 0xf0), 1)) *(volatile uint8_t*)(tool + 0xf0) = 0;
+    Log("[terrain] tool %llx released after %llu ms (%s)\n", (unsigned long long)tool, (unsigned long long)(GetTickCount64() - g_terrainHeldAt), why);
+}
+
 static void WriteInjectTerrain(bool armed)
 {
     ReadInstance();
@@ -2902,6 +2939,11 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     uint64_t caller = retAddr - g_base;
 
     if (id == ID_CMDADD) {
+        if (g_terrainHeldTool) {
+            uint64_t carrier = (uint64_t)InterlockedCompareExchange64(&g_terrainCarrierCmd, 0, 0);
+            if (carrier && r8 == carrier) { InterlockedExchange64(&g_terrainCarrierCmd, 0); ReleaseTerrainTool("our replay carrier was added"); }
+            else if (GetTickCount64() - g_terrainHeldAt > TERRAIN_HOLD_MAX_MS) ReleaseTerrainTool("timeout -- no replay carrier arrived");
+        }
         // Pointer match first: this runs ~100/sec and almost never matches.
         uint64_t want = (uint64_t)InterlockedCompareExchange64(&g_pendingCmd, 0, 0);
         if (!want || r8 != want) return 0;
@@ -2993,6 +3035,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                         } __except (EXCEPTION_EXECUTE_HANDLER) {
                             fired = false;
                         }
+                        // a cancelled terrain edit: keep the stroke waiting for our replay
+                        if (fired && InterlockedCompareExchange(&g_pendingIsTerrain, 0, 0)) HoldTerrainTool(impl);
                     }
                 }
             }
@@ -3170,7 +3214,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // apron INTO the template's connector so the engine sees the UI's shape.
     if (caller == 0xced378) {
         __try {
-            InjectTerrainFromFile(r8);              // dev test; inert without its file
+            if (InjectTerrainFromFile(r8))          // our TERRAIN replay carrier (inert without its file)
+                InterlockedExchange64(&g_terrainCarrierCmd, (LONG64)rcx);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[terrain-inject] fault -- proposal left as built\n");
         }
