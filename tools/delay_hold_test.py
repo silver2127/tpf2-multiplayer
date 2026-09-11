@@ -40,8 +40,8 @@ CLK = 100.0
 os.clock = function() return CLK end
 local logs, sent = {}, {}
 local K = {
-  INSTANCE = "a", SIM_STEP = 0.2, EXEC_DELAY = 0.4, EXEC_DELAY_MIN = 0.2, EXEC_DELAY_MAX = 3.0,
-  DELAY_SLACK_MS = 50, DELAY_DOWN_TICKS = 25, RTT_MIN_SAMPLES = 3, PEER_STALE_TICKS = 25,
+  INSTANCE = "a", SIM_STEP = 0.2, EXEC_DELAY = 0.4, EXEC_DELAY_MIN = 0.4, EXEC_DELAY_MAX = 3.0,
+  DELAY_SLACK_MS = 50, DELAY_DEV_MULT = 1, DELAY_DOWN_TICKS = 25, RTT_MIN_SAMPLES = 8, PEER_STALE_TICKS = 25,
   GAP_HOLD_GRACE_TICKS = 1, GAP_HOLD_ENGAGE_TICKS = 3, GAP_HOLD_MAX_TICKS = 55,
   NACK_MAX = 10, CMD_RING = 256, HIST_RING = 64, EVENTS_FILE = EVENTS,
 }
@@ -104,7 +104,7 @@ check("negative and absurd samples rejected", pr.rttN == n_before)
 
 
 # ---- the delay ----
-def peer(h, o, srtt, var, n=5, fresh=True):
+def peer(h, o, srtt, var, n=10, fresh=True):
     p = h.CM.peerFor(o)
     p.srtt, p.rttvar, p.rttN = srtt, var, n
     p.at = h.CM.ticks if fresh else h.CM.ticks - 100
@@ -124,26 +124,40 @@ h.CM.simRate = 0.9
 tick(h)
 check("nothing measured: the starting 0.4", abs(h.CM.execDelayCur - 0.4) < 1e-9, h.CM.execDelayCur)
 peer(h, "b", 60, 10)
+tick(h, 60)
+check("a fast peer never takes it below EXEC_DELAY_MIN (0.4)", abs(h.CM.execDelayCur - 0.4) < 1e-9, h.CM.execDelayCur)
+peer(h, "c", 1400, 100)
 tick(h)
-check("a fast peer does not lower it at once", abs(h.CM.execDelayCur - 0.4) < 1e-9, h.CM.execDelayCur)
+check("a slower peer raises it at once (1400+-100 ms -> 0.8 at 0.9 u/s)", abs(h.CM.execDelayCur - 0.8) < 1e-9, h.CM.execDelayCur)
+peer(h, "c", 500, 20)
+tick(h)
+check("it does not fall at once", abs(h.CM.execDelayCur - 0.8) < 1e-9, h.CM.execDelayCur)
 tick(h, 26)
-check("after DELAY_DOWN_TICKS it drops one step to 0.2", abs(h.CM.execDelayCur - 0.2) < 1e-9, h.CM.execDelayCur)
-peer(h, "c", 800, 100)
+check("after DELAY_DOWN_TICKS it drops one step (0.6)", abs(h.CM.execDelayCur - 0.6) < 1e-9, h.CM.execDelayCur)
+peer(h, "c", 1800, 100)
 tick(h)
-check("a slow peer raises it at once (800+-100 ms -> 0.6 at 0.9 u/s)", abs(h.CM.execDelayCur - 0.6) < 1e-9, h.CM.execDelayCur)
+check("a slow peer raises it at once (1800+-100 ms -> 1.0 at 0.9 u/s)", abs(h.CM.execDelayCur - 1.0) < 1e-9, h.CM.execDelayCur)
 check("the raise is logged with the worst peer", "worst peer c" in h.logs(), h.logs().splitlines()[-1] if h.logs() else "")
 h.CM.peers["c"].at = h.CM.ticks - 100          # c goes stale
-tick(h, 60)
-check("a stale peer stops counting (back down to 0.2 step by step)", abs(h.CM.execDelayCur - 0.2) < 1e-9, h.CM.execDelayCur)
+tick(h, 100)
+check("a stale peer stops counting (back down to 0.4 step by step)", abs(h.CM.execDelayCur - 0.4) < 1e-9, h.CM.execDelayCur)
 h.CM.simRate, h.CM.effSpeed = 3.6, 4
 peer(h, "b", 300, 40)
 tick(h)
-check("speed 4: 300+-40 ms -> 1.2 units", abs(h.CM.execDelayCur - 1.2) < 1e-9, h.CM.execDelayCur)
+# one way 300/2 + 40 + 50 = 240 ms at 3.6 u/s = 0.864 -> 1.0
+check("speed 4: 300+-40 ms -> 1.0 units", abs(h.CM.execDelayCur - 1.0) < 1e-9, h.CM.execDelayCur)
 h.CM.simRate, h.CM.effSpeed = 0.0, 1          # held or paused: rate reads 0
 peer(h, "b", 1500, 400)
 tick(h)
-# one way 1500/2 + 2*400 + 50 = 1600 ms at the session's 0.9 u/s = 1.44 -> 1.6, not 1600 ms at rate 0
-check("a paused game (rate 0) still uses the session speed (1500+-400 ms -> 1.6)", abs(h.CM.execDelayCur - 1.6) < 1e-9, h.CM.execDelayCur)
+# one way 1500/2 + 400 + 50 = 1200 ms at the session's 0.9 u/s = 1.08 -> 1.2, not 1200 ms at rate 0
+check("a paused game (rate 0) still uses the session speed (1500+-400 ms -> 1.2)", abs(h.CM.execDelayCur - 1.2) < 1e-9, h.CM.execDelayCur)
+# the first rig run's samples (A and B on one PC): all 0.4 with one deviation
+for srtt, var in ((200, 60), (273, 132), (226, 28), (319, 159), (216, 63), (304, 123)):
+    Lr, hr = runtime()
+    hr.CM.simRate = 1.0
+    peer(hr, "b", srtt, var)
+    tick(hr, 30)
+    check(f"one PC, measured {srtt}+-{var} ms -> 0.4", abs(hr.CM.execDelayCur - 0.4) < 1e-9, hr.CM.execDelayCur)
 peer(h, "b", 20000, 5000)
 tick(h)
 check("never above EXEC_DELAY_MAX", h.CM.execDelayCur <= 3.0 + 1e-9, h.CM.execDelayCur)

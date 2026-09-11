@@ -143,15 +143,27 @@ K.EXEC_DELAY = 0.4   -- two sim steps; was 0.6 until 2026-09-11 (RECV logs spare
 
 -- AUTO DELAY (2026-09-11). Unless tpf2_slice.cfg pins exec_delay, the delay
 -- follows the measured round trip to each peer (heartbeat echoes, CM.rttNote):
--- half the worst peer's smoothed round trip plus two deviations and a slack,
--- converted to game units at the current sim rate, snapped up to the step grid.
--- K.EXEC_DELAY above is only the starting value until a peer has been measured.
--- It rises at once and falls one step at a time after K.DELAY_DOWN_TICKS.
-K.EXEC_DELAY_MIN = 0.2
+-- half the worst peer's smoothed round trip plus K.DELAY_DEV_MULT deviations and
+-- a slack, converted to game units at the current sim rate, snapped up to the step
+-- grid. K.EXEC_DELAY above is only the starting value until a peer has been
+-- measured. It rises at once and falls one step at a time after K.DELAY_DOWN_TICKS.
+--
+-- ONE deviation, not two (first rig run, 2026-09-11): on one PC the round trip is
+-- 200-300 ms of which almost all is each side waiting for its next script tick,
+-- and that wait is uniformly jittery (+-60..160 ms). Two deviations sat the delay
+-- at 0.6 with spikes to 1.0 while the fixed 0.4 before it never had a command
+-- arrive late (13 saved runs, 300 RECVs: late 0 bar one catch-up, spare 0.00 in
+-- ~5%). One deviation gives 0.4 there. Eight samples before trusting a peer: the
+-- first few echoes straddle the load and read 500+-340 ms.
+-- Floor 0.4, not 0.2: a command is only read on the receiver's next script tick
+-- (about one sim step) wherever the peer is, and at 0.4 ~5% already arrived with
+-- 0.00 to spare -- a calm 226+-28 ms sample would have picked 0.2 and run late.
+K.EXEC_DELAY_MIN = 0.4
 K.EXEC_DELAY_MAX = 3.0
 K.DELAY_SLACK_MS = 50
+K.DELAY_DEV_MULT = 1
 K.DELAY_DOWN_TICKS = 25
-K.RTT_MIN_SAMPLES = 3
+K.RTT_MIN_SAMPLES = 8
 
 -- GAP HOLD (2026-09-11). A command a peer has announced (LSHI, or hi= on its
 -- heartbeat) but we have not received holds this game at speed 0 before its

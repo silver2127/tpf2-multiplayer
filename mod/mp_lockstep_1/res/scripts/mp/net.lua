@@ -563,7 +563,7 @@ local function snapStep(u) return math.floor(u / K.SIM_STEP + 0.5) * K.SIM_STEP 
 
 -- The delay a command we stamp now needs, in game units, before the peers'
 -- clocks reach it: the worst peer's one-way latency (half its round trip plus
--- two deviations plus K.DELAY_SLACK_MS) at the rate our sim runs. The stamp
+-- K.DELAY_DEV_MULT deviations plus K.DELAY_SLACK_MS) at the rate our sim runs. The stamp
 -- still adds the fastest peer's lead on top (scheduleLocal). Once per tick.
 function CM.execDelayTick()
 	local clk = os.clock()
@@ -578,7 +578,7 @@ function CM.execDelayTick()
 	local worstMs, who
 	for o, pr in pairs(CM.peers) do
 		if pr.srtt and (pr.rttN or 0) >= K.RTT_MIN_SAMPLES and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
-			local oneway = pr.srtt / 2 + 2 * (pr.rttvar or 0) + K.DELAY_SLACK_MS
+			local oneway = pr.srtt / 2 + K.DELAY_DEV_MULT * (pr.rttvar or 0) + K.DELAY_SLACK_MS
 			if not worstMs or oneway > worstMs then worstMs, who = oneway, o end
 		end
 	end
