@@ -520,6 +520,9 @@ CM.boot("mp.lines")
 -- ---------- constructions: native replay (CONP / CONX), CONFAIL, LOAN ----------
 -- Lives in res/scripts/mp/conx.lua.
 CM.boot("mp.conx")
+-- ---------- terraforming and terrain painting (TERRAINCAP -> TERRAIN) ----------
+-- Lives in res/scripts/mp/terrain.lua.
+CM.boot("mp.terrain")
 local function execute(c)
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
@@ -546,6 +549,7 @@ local function execute(c)
 		end
 	elseif c.op == "LOAN" then CM.execLoan(c)
 	elseif c.op == "SETDATE" or c.op == "CALSPEED" then CM.execCalendar(c)
+	elseif c.op == "TERRAIN" then CM.execTerrain(c)
 	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" then CM.execCompanyCmd(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end

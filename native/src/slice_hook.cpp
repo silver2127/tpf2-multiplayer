@@ -2430,11 +2430,65 @@ static uint64_t Fnv1a64(const uint8_t* p, uint64_t n)
     return h;
 }
 
-static void WriteTerrainBlob(FILE* f, const TerrainGrid& g)
+// A terrain edit crosses the wire as base64 text: the inject line, the LSCMD
+// token and the peer's inject file are all text, and base64 has no space and no
+// '=' before its padding, so it survives decodeCmd's key=value scan.
+static const char B64_ALPHABET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Returns a malloc'd, NUL-terminated string of 4*ceil(n/3) characters.
+static char* Base64Encode(const uint8_t* p, uint64_t n)
 {
-    uint64_t n = g.bytes;
-    fwrite(&n, 8, 1, f);
-    if (n) fwrite((void*)g.begin, 1, (size_t)n, f);
+    const uint64_t outLen = 4 * ((n + 2) / 3);
+    char* out = (char*)malloc((size_t)outLen + 1);
+    if (!out) return nullptr;
+    uint64_t o = 0;
+    for (uint64_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)p[i + 1] << 8;
+        if (i + 2 < n) v |= p[i + 2];
+        out[o++] = B64_ALPHABET[(v >> 18) & 63];
+        out[o++] = B64_ALPHABET[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? B64_ALPHABET[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? B64_ALPHABET[v & 63] : '=';
+    }
+    out[o] = 0;
+    return out;
+}
+
+// Decodes into a malloc'd buffer (length in *outLen). Whitespace is skipped;
+// any other character outside the alphabet fails the decode.
+static uint8_t* Base64Decode(const uint8_t* s, uint64_t n, uint64_t* outLen)
+{
+    int8_t rev[256];
+    memset(rev, -1, sizeof(rev));
+    for (int i = 0; i < 64; i++) rev[(uint8_t)B64_ALPHABET[i]] = (int8_t)i;
+    uint8_t* out = (uint8_t*)malloc((size_t)(n / 4 * 3 + 3));
+    if (!out) return nullptr;
+    uint64_t o = 0;
+    uint32_t acc = 0;
+    int bitsHeld = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t c = s[i];
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        if (c == '=') break;
+        if (rev[c] < 0) { free(out); return nullptr; }
+        acc = (acc << 6) | (uint32_t)rev[c];
+        bitsHeld += 6;
+        if (bitsHeld >= 8) {
+            bitsHeld -= 8;
+            out[o++] = (uint8_t)(acc >> bitsHeld);
+        }
+    }
+    *outLen = o;
+    return out;
+}
+
+static void AppendTerrainBlob(uint8_t* buf, uint64_t* p, const TerrainGrid& g)
+{
+    memcpy(buf + *p, &g.bytes, 8);
+    *p += 8;
+    if (g.bytes) memcpy(buf + *p, (void*)g.begin, (size_t)g.bytes);
+    *p += g.bytes;
 }
 
 static bool ReadSsoString(uint64_t sa, char* out, size_t cap);   // the CONXP walker's reader
@@ -2561,31 +2615,84 @@ static void LogTerrainProposal(uint64_t r8, uint64_t r9)
     if (Readable((void*)r9, 0x70))
         GtDumpRange("TCTX_", 0, (int)seq, (const uint8_t*)r9, 0x70, 0);
 
-    // The grids themselves, for tools\re (and the inject test below), only with
-    // dumpprop: a painting session commits on every release.
-    if (DumpPropOn() && g_dataDir[0]) {
+    // The edit as one TPTG blob: "TPTG", u32 version 1, the 0x80-byte grid tail
+    // from +0x278, the 0x70-byte context, then heights, material and mask as
+    // u64 size + data. tools\re\terrain_bin.py reads it; InjectTerrainFromFile
+    // puts it back into a proposal.
+    const bool gridsOk = hok && mok && kok &&
+        hg.bytes == (uint64_t)hg.w * (uint64_t)hg.h * 8 &&
+        mg.bytes == (uint64_t)mg.w * (uint64_t)mg.h &&
+        (uint64_t)kg.w * (uint64_t)kg.h == bits && kg.bytes == ((bits + 31) / 32) * 4;
+    const bool hasEdit = hg.bytes || mg.bytes;
+    const bool onlyTerrain = !nodesB && !segsB && !rmNB && !rmSB && !toRmB && !toAddB;
+    const bool ship = SessionLive() && hasEdit;
+    if (!ship && !DumpPropOn()) return;
+    if (!g_dataDir[0]) return;
+
+    const uint64_t blobLen = 8 + 0x80 + 0x70 + 24 + hg.bytes + mg.bytes + kg.bytes;
+    uint8_t* blob = (uint8_t*)malloc((size_t)blobLen);
+    if (!blob) { Log("[terrain] #%ld out of memory for a %lluB edit\n", seq, (unsigned long long)blobLen); return; }
+    {
+        const uint32_t ver = 1;
+        uint64_t p = 0;
+        memcpy(blob, "TPTG", 4);
+        memcpy(blob + 4, &ver, 4);
+        memcpy(blob + 8, (void*)(r8 + 0x278), 0x80);
+        memset(blob + 8 + 0x80, 0, 0x70);
+        if (Readable((void*)r9, 0x70)) memcpy(blob + 8 + 0x80, (void*)r9, 0x70);
+        p = 8 + 0x80 + 0x70;
+        AppendTerrainBlob(blob, &p, hg);
+        AppendTerrainBlob(blob, &p, mg);
+        AppendTerrainBlob(blob, &p, kg);
+    }
+
+    // The grids as a file, for tools\re, only with dumpprop: a painting session
+    // commits on every release.
+    if (DumpPropOn()) {
         char name[80], path[MAX_PATH];
         snprintf(name, sizeof(name), "terrain_%s_%lu_%03ld.bin", g_instance,
                  (unsigned long)GetCurrentProcessId(), seq);
         snprintf(path, sizeof(path), "%s%s", g_dataDir, name);
         FILE* f = _fsopen(path, "wb", _SH_DENYWR);
-        if (!f) {
+        if (f) {
+            fwrite(blob, 1, (size_t)blobLen, f);
+            fclose(f);
+            Log("[terrain] #%ld saved %s\n", seq, name);
+        } else {
             Log("[terrain] #%ld could not create %s\n", seq, name);
-            return;
         }
-        const uint32_t ver = 1;
-        uint8_t ctx[0x70] = {};
-        if (Readable((void*)r9, 0x70)) memcpy(ctx, (void*)r9, 0x70);
-        fwrite("TPTG", 1, 4, f);
-        fwrite(&ver, 4, 1, f);
-        fwrite((void*)(r8 + 0x278), 1, 0x80, f);
-        fwrite(ctx, 1, 0x70, f);
-        WriteTerrainBlob(f, hg);
-        WriteTerrainBlob(f, mg);
-        WriteTerrainBlob(f, kg);
-        fclose(f);
-        Log("[terrain] #%ld saved %s\n", seq, name);
     }
+
+    // REPLICATION, v1 (2026-09-11). The edit is NOT cancelled: it applies here
+    // natively, and TERRAINCAP hands the blob to the mod, which schedules a
+    // TERRAIN command every other instance applies at the stamp by filling an
+    // empty script proposal with these grids. Heights and material are
+    // absolute, so a replay onto an identical world lands bit-identical.
+    if (ship) {
+        if (!gridsOk) {
+            Log("[terrain] #%ld grid sizes do not match their data -- the edit runs here only, NOT replicated\n", seq);
+        } else if (!onlyTerrain) {
+            Log("[terrain] #%ld carries streets or constructions as well -- NOT replicated as terrain\n", seq);
+        } else {
+            char* b64 = Base64Encode(blob, blobLen);
+            char p[MAX_PATH];
+            snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+            FILE* f = b64 ? _fsopen(p, "a", _SH_DENYNO) : nullptr;
+            if (f) {
+                // one write for the payload: the reader re-reads a partial line
+                fprintf(f, "TERRAINCAP %llu ", (unsigned long long)blobLen);
+                fwrite(b64, 1, strlen(b64), f);
+                fputc('\n', f);
+                fclose(f);
+                Log("[terrain] #%ld shipped: %lluB edit, %lluB of base64 (runs here natively, peers replay it)\n",
+                    seq, (unsigned long long)blobLen, (unsigned long long)strlen(b64));
+            } else {
+                Log("[terrain] #%ld cannot open %s -- the edit runs here only, NOT replicated\n", seq, p);
+            }
+            free(b64);
+        }
+    }
+    free(blob);
 }
 
 // DEV TEST, inert unless terrain_inject_<inst>.bin exists in the data dir: a
@@ -2632,18 +2739,30 @@ static bool InjectTerrainFromFile(uint64_t r8)
     FILE* f = _fsopen(path, "rb", _SH_DENYNO);
     if (!f) { Log("[terrain-inject] inject file present but not readable\n"); return false; }
     fseek(f, 0, SEEK_END);
-    const long len = ftell(f);
+    long len = ftell(f);
     fseek(f, 0, SEEK_SET);
     const long minLen = 8 + 0x80 + 0x70 + 24;
     uint8_t* buf = (len >= minLen && (uint64_t)len <= TERRAIN_MAX_BYTES) ? (uint8_t*)malloc((size_t)len) : nullptr;
-    const bool got = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
+    bool got = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
     fclose(f);
     DeleteFileA(path);
+    // The mod writes the TERRAIN command's payload as the base64 it arrived in;
+    // a raw TPTG capture (the dev test) is used as it is.
+    long used = len;
+    if (got && memcmp(buf, "TPTG", 4) != 0) {
+        uint64_t rawLen = 0;
+        uint8_t* raw = Base64Decode(buf, (uint64_t)len, &rawLen);
+        free(buf);
+        buf = raw;
+        used = (long)rawLen;
+        got = raw && used >= minLen;
+    }
     if (!got) {
         free(buf);
         Log("[terrain-inject] inject file too short, too long or unreadable (%ld B) -- left alone\n", len);
         return false;
     }
+    len = used;
 
     bool done = false;
     do {
@@ -2964,9 +3083,10 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
 
     if (id != ID_BUILDPROPOSAL) return 0;
 
-    // TERRAIN TOOLS, OBSERVE ONLY. A terraform, paint or asset-brush commit is
-    // logged (and saved with dumpprop) and then runs natively: nothing is
-    // cancelled or shipped, so it still reaches no peer.
+    // TERRAIN TOOLS. A terraform, paint or asset-brush commit is logged (and
+    // saved with dumpprop) and then runs natively. In a live session a terraform
+    // or paint commit is also shipped as TERRAINCAP (see LogTerrainProposal);
+    // the asset brush reaches the peers through the construction path.
     if (caller == CALLER_PROPOSALACTION) {
         __try {
             LogTerrainProposal(r8, r9);
