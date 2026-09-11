@@ -310,11 +310,14 @@ function forgetVehicle(vid)
 	CM.vehKeyOf[vid] = nil
 end
 
-local function expectVehicle(key, depotChild, company, hint)
+local function expectVehicle(key, depotChild, company, hint, bal0)
 	-- companies mode: remember the origin company and our balance BEFORE the
 	-- purchase lands, so the bind step can hand the vehicle over and move the
 	-- exact cost (balance delta) to that company.
-	local bal0 = (company and CM.cmMode == "companies") and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+	-- (a caller that bought as our own player passes the balance from before its buy)
+	if bal0 == nil then
+		bal0 = (company and CM.cmMode == "companies") and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+	end
 	pendingVehKeys[#pendingVehKeys + 1] = { key = key, depot = depotChild, since = CM.gameTime() or 0, company = company, bal0 = bal0, hint = hint }
 end
 
@@ -789,26 +792,45 @@ function CM.execVBuy(c)
 			if pid then buyer = pid
 			else log(string.format("EXEC VBUY seq=%s: no player for company %s -- buying as ourselves", tostring(c.seq), tostring(c.company))) end
 		end
-		local okM, cmd = pcall(function() return api.cmd.make.buyVehicle(buyer, target, config) end)
-		if not okM or not cmd then
-			log(string.format("EXEC VBUY seq=%s: make.buyVehicle refused: %s", tostring(seq), tostring(cmd)))
-			return
-		end
-		api.cmd.sendCommand(cmd, function(res, success)
-			log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s",
-				tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success)))
-			if success then
-				-- buyVehicle is entity-returning (same shape VREPL reads): bind
-				-- this key to THAT entity, not to whichever new id sorts first
-				local nid = nil
-				pcall(function()
-					local r = res and res.resultEntity
-					if type(r) == "number" then nid = r elseif r ~= nil then nid = tonumber(tostring(r)) end
-				end)
-				if not (nid and nid > 0) then nid = nil end
-				expectVehicle(tostring(origin) .. ":" .. tostring(seq), depot, c.company and tonumber(c.company) or nil, nid)
+		-- The company pays on every instance, so its wallet here should cover the price.
+		-- When it does not -- a wallet out of step with the originator's (a company switch
+		-- used to mint money on the switching machine only; 2026-09-10 company 2's ships
+		-- were refused on the peer, success=false, and never existed there) -- the vehicle
+		-- is bought as our own player instead, and the bind step hands it to the company
+		-- and moves the cost, as it does for everything else a remote company builds here.
+		-- A vehicle missing on one instance is a desync; a wallet a little off is not.
+		local me = api.engine.util.getPlayer()
+		local key = tostring(origin) .. ":" .. tostring(seq)
+		local company = c.company and tonumber(c.company) or nil
+		local function buyAs(who, retry)
+			local okM, cmd = pcall(function() return api.cmd.make.buyVehicle(who, target, config) end)
+			if not okM or not cmd then
+				log(string.format("EXEC VBUY seq=%s: make.buyVehicle refused: %s", tostring(seq), tostring(cmd)))
+				return
 			end
-		end)
+			local bal0 = retry and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+			api.cmd.sendCommand(cmd, function(res, success)
+				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s",
+					tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success),
+					retry and " (as our own player)" or ""))
+				if success then
+					-- buyVehicle is entity-returning (same shape VREPL reads): bind
+					-- this key to THAT entity, not to whichever new id sorts first
+					local nid = nil
+					pcall(function()
+						local r = res and res.resultEntity
+						if type(r) == "number" then nid = r elseif r ~= nil then nid = tonumber(tostring(r)) end
+					end)
+					if not (nid and nid > 0) then nid = nil end
+					expectVehicle(key, depot, company, nid, bal0)
+				elseif not retry and who ~= me then
+					log(string.format("EXEC VBUY seq=%s: company %s could not pay for it here -- buying as our own player and handing it over",
+						tostring(seq), tostring(company)))
+					buyAs(me, true)
+				end
+			end)
+		end
+		buyAs(buyer, false)
 	end)
 	if not ok then log("execVBuy error: " .. tostring(err)) end
 end

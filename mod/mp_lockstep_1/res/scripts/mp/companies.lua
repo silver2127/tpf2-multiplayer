@@ -312,11 +312,32 @@ function CM.cmWallet(pid)
 	return b, l
 end
 -- set pid's wallet to (bal, loan) from (b0, l0)
+-- ORDER MATTERS (2026-09-10). A loan entry that REPAYS needs the cash on hand:
+-- handing company 1's 10,000,000 loan over from a 202,606 balance was refused by
+-- the engine while the balance-only entry after it went through, so the player
+-- kept the old loan AND received the balance. Every switch into a company minted
+-- about 10M on the switching machine only, that company's wallet stopped matching
+-- the other machines' copy, and a ship it bought was refused there for lack of
+-- money (success=false). Borrowing needs nothing, so it goes first; a repayment
+-- gets the cash it needs moved in before it.
 function CM.cmSetWallet(pid, b0, l0, bal, loan)
 	local dl = loan - l0
-	if dl ~= 0 then CM.cmBookJournal(pid, dl, K.JOURNAL_LOAN or 0) end        -- moves loan and balance by dl
-	local db = bal - (b0 + dl)
-	if db ~= 0 then CM.cmBookJournal(pid, db, K.JOURNAL_TRANSFER or 6) end   -- balance only
+	if dl < 0 then
+		local need = -dl - b0
+		if need > 0 then
+			need = need + 1
+			CM.cmBookJournal(pid, need, K.JOURNAL_TRANSFER or 6)              -- cash for the repayment
+		else
+			need = 0
+		end
+		CM.cmBookJournal(pid, dl, K.JOURNAL_LOAN or 0)                       -- repays: loan and balance by dl
+		local db = bal - (b0 + need + dl)
+		if db ~= 0 then CM.cmBookJournal(pid, db, K.JOURNAL_TRANSFER or 6) end
+	else
+		if dl > 0 then CM.cmBookJournal(pid, dl, K.JOURNAL_LOAN or 0) end    -- borrows: loan and balance by dl
+		local db = bal - (b0 + dl)
+		if db ~= 0 then CM.cmBookJournal(pid, db, K.JOURNAL_TRANSFER or 6) end   -- balance only
+	end
 end
 function CM.cmSwapWallets(p1, p2)
 	local b1, l1 = CM.cmWallet(p1); local b2, l2 = CM.cmWallet(p2)
@@ -482,6 +503,9 @@ function CM.cmLocalSwitch(cid)
 	for _, eid in ipairs(mine) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, false) end end) end
 	for _, eid in ipairs(theirs) do pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) then game.interface.setBulldozeable(eid, true) end end) end
 	local okW, bh, lh, ba, la = CM.cmSwapWallets(human, ai)
+	-- the human's loan now moves to the target company's: not the player at the finances
+	-- window, so the loan poll waits for it and re-baselines instead of shipping a LOAN
+	if okW then CM.loanExpect = la; CM.loanExpectSince = CM.ticks end
 	CM.cmCompanyPid[old] = ai; CM.cmCompanyPid[cid] = human
 	CM.cmMyCompany = cid
 	CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
