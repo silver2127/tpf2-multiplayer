@@ -239,8 +239,12 @@ static long     g_terrainStashSeq = 0;
 // part would be computed -- and shipped, absolute -- against the old heights.
 // So after the fire the flag is set again and cleared only when this
 // instance's own replay carrier (the Lua's empty buildProposal that
-// InjectTerrainFromFile filled) reaches CommandList::Add. A safety valve
-// releases it after TERRAIN_HOLD_MAX_MS in case the replay never comes.
+// InjectTerrainFromFile filled) has EXECUTED: Add only queues a command, it
+// applies a sim step or more later and the tool's update runs in between, so
+// the release rides a MARKER -- a second, empty Lua buildProposal that
+// terrain.lua sends from the carrier's completion callback, which the factory
+// sees only once the carrier has applied. A safety valve releases the tool
+// after TERRAIN_HOLD_MAX_MS in case no marker ever comes.
 static uint64_t g_terrainHeldTool = 0;
 static ULONGLONG g_terrainHeldAt = 0;
 static volatile LONG64 g_terrainCarrierCmd = 0;
@@ -2735,6 +2739,21 @@ static void HoldTerrainTool(uint64_t impl)
     Log("[terrain] tool %llx held (+0xf0) until our replay carrier is added\n", (unsigned long long)tool);
 }
 
+// True for a proposal with no nodes, segments, removals or constructions --
+// what terrain.lua's completion marker looks like (its carrier had grids
+// injected; the marker gets nothing, there is no file left to inject).
+static bool ProposalIsEmpty(uint64_t r8)
+{
+    uint64_t b = 0;
+    static const uint64_t offs[] = { 0x00, 0x18, 0x30, 0x48, 0x1e0 };
+    for (int i = 0; i < 5; i++) {
+        if (ReadVec(r8 + offs[i], &b, 0x20000)) return false;
+    }
+    uint64_t ab = 0, ae = 0;
+    if (Readable((void*)(r8 + 0x1f8), 16)) { memcpy(&ab, (void*)(r8 + 0x1f8), 8); memcpy(&ae, (void*)(r8 + 0x200), 8); }
+    return ae <= ab;
+}
+
 static void ReleaseTerrainTool(const char* why)
 {
     uint64_t tool = g_terrainHeldTool;
@@ -2941,8 +2960,11 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     if (id == ID_CMDADD) {
         if (g_terrainHeldTool) {
             uint64_t carrier = (uint64_t)InterlockedCompareExchange64(&g_terrainCarrierCmd, 0, 0);
-            if (carrier && r8 == carrier) { InterlockedExchange64(&g_terrainCarrierCmd, 0); ReleaseTerrainTool("our replay carrier was added"); }
-            else if (GetTickCount64() - g_terrainHeldAt > TERRAIN_HOLD_MAX_MS) ReleaseTerrainTool("timeout -- no replay carrier arrived");
+            if (carrier && r8 == carrier) {
+                InterlockedExchange64(&g_terrainCarrierCmd, 0);
+                Log("[terrain] our replay carrier was added %llu ms into the hold -- it applies a step later; waiting for its completion marker\n", (unsigned long long)(GetTickCount64() - g_terrainHeldAt));
+            }
+            else if (GetTickCount64() - g_terrainHeldAt > TERRAIN_HOLD_MAX_MS) ReleaseTerrainTool("timeout -- no completion marker arrived");
         }
         // Pointer match first: this runs ~100/sec and almost never matches.
         uint64_t want = (uint64_t)InterlockedCompareExchange64(&g_pendingCmd, 0, 0);
@@ -3216,6 +3238,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         __try {
             if (InjectTerrainFromFile(r8))          // our TERRAIN replay carrier (inert without its file)
                 InterlockedExchange64(&g_terrainCarrierCmd, (LONG64)rcx);
+            else if (g_terrainHeldTool && ProposalIsEmpty(r8))
+                ReleaseTerrainTool("the replay carrier completed (its marker proposal arrived)");
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[terrain-inject] fault -- proposal left as built\n");
         }

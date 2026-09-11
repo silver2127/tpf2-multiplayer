@@ -72,6 +72,16 @@ function CM.execTerrain(c)
 		api.cmd.sendCommand(api.cmd.make.buildProposal(api.type.SimpleProposal.new(), ctx, false), function(_, success)
 			log(string.format("EXEC TERRAIN seq=%s from %s: carrier %s", seq, origin,
 				success and "applied" or "REJECTED -- the terrain here now differs"))
+			-- STRICT, originator only: the slice holds the terrain tool (its wait
+			-- flag) from the cancelled commit until the replay has APPLIED, and
+			-- this callback is the first moment that is true. A second, empty
+			-- proposal is the marker it releases on: nothing to apply, no grid
+			-- file left to inject, and only ever sent here.
+			if origin == K.INSTANCE then
+				pcall(function()
+					api.cmd.sendCommand(api.cmd.make.buildProposal(api.type.SimpleProposal.new(), ctx, false), function() end)
+				end)
+			end
 		end)
 	end)
 	-- the slice deletes the file as it fills the carrier; still there means it
