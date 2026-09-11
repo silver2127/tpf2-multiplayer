@@ -105,6 +105,11 @@ static const uintptr_t CALLER_STOPTOOL      = 0x460e0b;
 // call at 0x3eb222, return addr 0x3eb227). LogBulldoze classifies it and ships
 // what it can decode; the handler arms the cancel only when something shipped.
 static const uintptr_t CALLER_BULLDOZE      = 0x3eb227;
+// UI::ProposalAction::commit -> make_cmd::BuildProposal return address (call at
+// 0x4311c1). Terraform, paint and the asset brush all commit through it, and
+// their edit is the proposal TAIL, not its street half (docs/re/PROPOSALS.md
+// "Terrain grids"). Observed only: logged, and saved to a file with dumpprop.
+static const uintptr_t CALLER_PROPOSALACTION = 0x4311c6;
 // The sol2 wrapper's factory call site (Lua path: api.cmd.make.buyVehicle).
 // A BuyVehicle from HERE is our own replay on the peer: shipping it back
 // would ping-pong purchases between the two instances forever. NOT 0x74fd88:
@@ -2387,6 +2392,282 @@ static bool MergeTemplateStreet(uint64_t r8)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// TERRAIN TOOLS (2026-09-10): what a terraform or paint commit carries, and a
+// dev-only test of building one from a script proposal. Layout from the
+// decompile (docs/re/PROPOSALS.md "Terrain grids"); none of it was measured
+// before this build:
+//   +0x278 Grid<CVec2f> {x0,y0,w,h}, vector of {height, base} cells at +0x288
+//   +0x2a0 Grid<uint8>  {x0,y0,w,h}, vector at +0x2b0 (0xff = unchanged)
+//   +0x2c8 Grid<bool>   {x0,y0,w,h}, vector<uint32> words at +0x2d8, bit count at +0x2f0
+// ---------------------------------------------------------------------------
+// A detection limit only: one stroke commits before its grid passes 300,000
+// cells (2.4 MB of heights), so a larger span means a bad read.
+static const uint64_t TERRAIN_MAX_BYTES = 64ull << 20;
+static long g_terrainSeq = 0;
+
+struct TerrainGrid { int32_t x0, y0, w, h; uint64_t begin; uint64_t bytes; };
+
+// Header plus data vector (at +0x10 in every grid). bytes stays 0 for an empty
+// vector; false only when a non-empty vector cannot be read.
+static bool ReadTerrainGrid(uint64_t at, TerrainGrid* g)
+{
+    memset(g, 0, sizeof(*g));
+    if (!Readable((void*)at, 0x28)) return false;
+    memcpy(&g->x0, (void*)at, 16);
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (void*)(at + 0x10), 8);
+    memcpy(&e, (void*)(at + 0x18), 8);
+    if (b == e) return true;
+    g->bytes = ReadVec(at + 0x10, &g->begin, TERRAIN_MAX_BYTES);
+    return g->bytes != 0;
+}
+
+static uint64_t Fnv1a64(const uint8_t* p, uint64_t n)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static void WriteTerrainBlob(FILE* f, const TerrainGrid& g)
+{
+    uint64_t n = g.bytes;
+    fwrite(&n, 8, 1, f);
+    if (n) fwrite((void*)g.begin, 1, (size_t)n, f);
+}
+
+static void LogTerrainProposal(uint64_t r8, uint64_t r9)
+{
+    if (!Readable((void*)r8, 0x2f8)) { Log("[terrain] proposal unreadable\n"); return; }
+    const long seq = ++g_terrainSeq;
+
+    // Everything a terrain edit should leave empty, so an unexpected shape shows.
+    uint64_t b = 0;
+    const uint64_t nodesB = ReadVec(r8 + 0x00, &b, TERRAIN_MAX_BYTES);
+    const uint64_t segsB  = ReadVec(r8 + 0x18, &b, TERRAIN_MAX_BYTES);
+    const uint64_t rmNB   = ReadVec(r8 + 0x30, &b, TERRAIN_MAX_BYTES);
+    const uint64_t rmSB   = ReadVec(r8 + 0x48, &b, TERRAIN_MAX_BYTES);
+    const uint64_t toRmB  = ReadVec(r8 + 0x1e0, &b, TERRAIN_MAX_BYTES);
+    const uint64_t toAddB = ReadVec(r8 + 0x1f8, &b, TERRAIN_MAX_BYTES);
+    const uint64_t v250B  = ReadVec(r8 + 0x250, &b, TERRAIN_MAX_BYTES);
+    uint64_t set188 = 0, old2new = 0, map268 = 0, bits = 0;
+    memcpy(&set188, (void*)(r8 + 0x198), 8);      // unordered_set size (list size at +0x10)
+    memcpy(&old2new, (void*)(r8 + 0x220), 8);     // unordered_map size
+    memcpy(&map268, (void*)(r8 + 0x270), 8);      // std::map size
+    memcpy(&bits, (void*)(r8 + 0x2f0), 8);
+    Log("[terrain] #%ld ProposalAction commit: nodes=%lluB segs=%lluB rmNodes=%lluB rmSegs=%lluB "
+        "set188=%llu toRemove=%lluB toAdd=%lluB old2new=%llu v250=%lluB map268=%llu\n",
+        seq, (unsigned long long)nodesB, (unsigned long long)segsB, (unsigned long long)rmNB,
+        (unsigned long long)rmSB, (unsigned long long)set188, (unsigned long long)toRmB,
+        (unsigned long long)toAddB, (unsigned long long)old2new, (unsigned long long)v250B,
+        (unsigned long long)map268);
+
+    TerrainGrid hg, mg, kg;
+    const bool hok = ReadTerrainGrid(r8 + 0x278, &hg);
+    const bool mok = ReadTerrainGrid(r8 + 0x2a0, &mg);
+    const bool kok = ReadTerrainGrid(r8 + 0x2c8, &kg);
+    Log("[terrain] #%ld heights%s x0=%d y0=%d w=%d h=%d data=%lluB (w*h*8=%lld)\n", seq,
+        hok ? "" : " UNREADABLE", hg.x0, hg.y0, hg.w, hg.h, (unsigned long long)hg.bytes,
+        (long long)hg.w * hg.h * 8);
+    Log("[terrain] #%ld material%s x0=%d y0=%d w=%d h=%d data=%lluB (w*h=%lld)\n", seq,
+        mok ? "" : " UNREADABLE", mg.x0, mg.y0, mg.w, mg.h, (unsigned long long)mg.bytes,
+        (long long)mg.w * mg.h);
+    Log("[terrain] #%ld mask%s x0=%d y0=%d w=%d h=%d words=%lluB bits=%llu (w*h=%lld)\n", seq,
+        kok ? "" : " UNREADABLE", kg.x0, kg.y0, kg.w, kg.h, (unsigned long long)kg.bytes,
+        (unsigned long long)bits, (long long)kg.w * kg.h);
+
+    if (hok && hg.w > 0 && hg.h > 0 && hg.bytes == (uint64_t)hg.w * (uint64_t)hg.h * 8) {
+        const float* c = (const float*)hg.begin;
+        const uint64_t n = hg.bytes / 8;
+        uint64_t changed = 0;
+        float hmin = c[0], hmax = c[0], bmin = c[1], bmax = c[1], dmin = 0, dmax = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            const float hv = c[2 * i], bv = c[2 * i + 1];
+            if (hv < hmin) hmin = hv;
+            if (hv > hmax) hmax = hv;
+            if (bv < bmin) bmin = bv;
+            if (bv > bmax) bmax = bv;
+            if (hv != bv) {
+                changed++;
+                if (hv - bv < dmin) dmin = hv - bv;
+                if (hv - bv > dmax) dmax = hv - bv;
+            }
+        }
+        const uint64_t ci = (uint64_t)(hg.h / 2) * (uint64_t)hg.w + (uint64_t)(hg.w / 2);
+        Log("[terrain] #%ld heights: %llu cells, %llu changed; height %.3f..%.3f, base %.3f..%.3f, "
+            "delta %.3f..%.3f; centre (%d,%d) = {%.4f, %.4f}; fnv=%016llx\n",
+            seq, (unsigned long long)n, (unsigned long long)changed, hmin, hmax, bmin, bmax, dmin, dmax,
+            hg.x0 + hg.w / 2, hg.y0 + hg.h / 2, c[2 * ci], c[2 * ci + 1],
+            (unsigned long long)Fnv1a64((const uint8_t*)hg.begin, hg.bytes));
+    }
+    if (mok && mg.w > 0 && mg.h > 0 && mg.bytes == (uint64_t)mg.w * (uint64_t)mg.h) {
+        const uint8_t* m = (const uint8_t*)mg.begin;
+        uint64_t hist[256] = {};
+        for (uint64_t i = 0; i < mg.bytes; i++) hist[m[i]]++;
+        char vals[200] = "";
+        int o = 0, shown = 0;
+        for (int v = 0; v < 255 && shown < 6; v++) {
+            if (!hist[v]) continue;
+            o += snprintf(vals + o, sizeof(vals) - o, " %d:%llu", v, (unsigned long long)hist[v]);
+            shown++;
+        }
+        Log("[terrain] #%ld material: %llu cells, %llu unchanged (0xff), painted:%s; fnv=%016llx\n",
+            seq, (unsigned long long)mg.bytes, (unsigned long long)hist[255], shown ? vals : " none",
+            (unsigned long long)Fnv1a64(m, mg.bytes));
+    }
+    if (kok && kg.bytes >= 4 && bits <= kg.bytes * 8) {
+        const uint32_t* w = (const uint32_t*)kg.begin;
+        uint64_t set = 0;
+        for (uint64_t i = 0; i < bits; i++) set += (w[i >> 5] >> (i & 31)) & 1;
+        Log("[terrain] #%ld mask: %llu of %llu bits set\n", seq, (unsigned long long)set,
+            (unsigned long long)bits);
+    }
+    if (Readable((void*)r9, 0x70))
+        GtDumpRange("TCTX_", 0, (int)seq, (const uint8_t*)r9, 0x70, 0);
+
+    // The grids themselves, for tools\re (and the inject test below), only with
+    // dumpprop: a painting session commits on every release.
+    if (DumpPropOn() && g_dataDir[0]) {
+        char name[80], path[MAX_PATH];
+        snprintf(name, sizeof(name), "terrain_%s_%lu_%03ld.bin", g_instance,
+                 (unsigned long)GetCurrentProcessId(), seq);
+        snprintf(path, sizeof(path), "%s%s", g_dataDir, name);
+        FILE* f = _fsopen(path, "wb", _SH_DENYWR);
+        if (!f) {
+            Log("[terrain] #%ld could not create %s\n", seq, name);
+            return;
+        }
+        const uint32_t ver = 1;
+        uint8_t ctx[0x70] = {};
+        if (Readable((void*)r9, 0x70)) memcpy(ctx, (void*)r9, 0x70);
+        fwrite("TPTG", 1, 4, f);
+        fwrite(&ver, 4, 1, f);
+        fwrite((void*)(r8 + 0x278), 1, 0x80, f);
+        fwrite(ctx, 1, 0x70, f);
+        WriteTerrainBlob(f, hg);
+        WriteTerrainBlob(f, mg);
+        WriteTerrainBlob(f, kg);
+        fclose(f);
+        Log("[terrain] #%ld saved %s\n", seq, name);
+    }
+}
+
+// DEV TEST, inert unless terrain_inject_<inst>.bin exists in the data dir: a
+// script-built proposal that carries nothing (api.cmd.make.buildProposal with
+// an empty SimpleProposal) gets the grids of that file, a capture saved above.
+// It answers what the decompile cannot: does the engine build a terrain edit
+// that arrives this way. The file is deleted once read, usable or not.
+static const uintptr_t RVA_VECCOPY_8 = 0x0cc990;   // vector<8-byte> copy ctor (game allocator)
+static const uintptr_t RVA_VECCOPY_1 = 0x1ded10;   // vector<uint8>
+static const uintptr_t RVA_VECCOPY_4 = 0x125480;   // vector<uint32>
+using GameVecCopy = uint64_t* (*)(uint64_t* dst, const uint64_t* src, uint64_t, uint64_t);
+
+static bool TerrainCarrierEmpty(uint64_t r8)
+{
+    if (!Readable((void*)r8, 0x2f8)) return false;
+    // street half, construction fields, and the three grid vectors
+    static const unsigned vecs[] = { 0x00, 0x18, 0x30, 0x48, 0xf8, 0x1c8, 0x1e0, 0x1f8, 0x250 };
+    for (unsigned off : vecs) {
+        uint64_t b = 0, e = 0;
+        memcpy(&b, (void*)(r8 + off), 8);
+        memcpy(&e, (void*)(r8 + off + 8), 8);
+        if (b != e) return false;
+    }
+    // no allocation to leak: the game's copy constructors overwrite without freeing
+    static const unsigned grids[] = { 0x278, 0x2a0, 0x2c8 };
+    for (unsigned off : grids) {
+        uint64_t b = 0;
+        memcpy(&b, (void*)(r8 + off + 0x10), 8);
+        if (b != 0) return false;
+    }
+    return true;
+}
+
+static bool InjectTerrainFromFile(uint64_t r8)
+{
+    if (!g_dataDir[0]) return false;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%sterrain_inject_%s.bin", g_dataDir, g_instance);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!TerrainCarrierEmpty(r8)) {
+        Log("[terrain-inject] inject file present, but this script proposal is not empty -- left alone\n");
+        return false;
+    }
+    FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+    if (!f) { Log("[terrain-inject] inject file present but not readable\n"); return false; }
+    fseek(f, 0, SEEK_END);
+    const long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    const long minLen = 8 + 0x80 + 0x70 + 24;
+    uint8_t* buf = (len >= minLen && (uint64_t)len <= TERRAIN_MAX_BYTES) ? (uint8_t*)malloc((size_t)len) : nullptr;
+    const bool got = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
+    fclose(f);
+    DeleteFileA(path);
+    if (!got) {
+        free(buf);
+        Log("[terrain-inject] inject file too short, too long or unreadable (%ld B) -- left alone\n", len);
+        return false;
+    }
+
+    bool done = false;
+    do {
+        if (memcmp(buf, "TPTG", 4) != 0) { Log("[terrain-inject] not a TPTG file -- left alone\n"); break; }
+        const uint8_t* tail = buf + 8;
+        uint64_t p = 8 + 0x80 + 0x70, n[3] = {};
+        const uint8_t* data[3] = {};
+        bool truncated = false;
+        for (int i = 0; i < 3; i++) {
+            if (p + 8 > (uint64_t)len) { truncated = true; break; }
+            memcpy(&n[i], buf + p, 8);
+            p += 8;
+            if (n[i] > (uint64_t)len - p) { truncated = true; break; }
+            data[i] = buf + p;
+            p += n[i];
+        }
+        if (truncated) { Log("[terrain-inject] truncated file -- left alone\n"); break; }
+        int32_t hd[4], md[4], kd[4];
+        uint64_t bits = 0;
+        memcpy(hd, tail + 0x00, 16);
+        memcpy(md, tail + 0x28, 16);
+        memcpy(kd, tail + 0x50, 16);
+        memcpy(&bits, tail + 0x78, 8);
+        if (hd[2] < 0 || hd[3] < 0 || md[2] < 0 || md[3] < 0 || kd[2] < 0 || kd[3] < 0 ||
+            (uint64_t)hd[2] * (uint64_t)hd[3] * 8 != n[0] ||
+            (uint64_t)md[2] * (uint64_t)md[3] != n[1] ||
+            (uint64_t)kd[2] * (uint64_t)kd[3] != bits || n[2] != ((bits + 31) / 32) * 4) {
+            Log("[terrain-inject] grid sizes do not match their data (heights %dx%d/%lluB, material %dx%d/%lluB, "
+                "mask %dx%d/%llu bits/%lluB) -- left alone\n", hd[2], hd[3], (unsigned long long)n[0],
+                md[2], md[3], (unsigned long long)n[1], kd[2], kd[3], (unsigned long long)bits,
+                (unsigned long long)n[2]);
+            break;
+        }
+        uint64_t src[3];
+        if (n[0]) {
+            src[0] = (uint64_t)data[0]; src[1] = src[0] + n[0]; src[2] = src[1];
+            ((GameVecCopy)(g_base + RVA_VECCOPY_8))((uint64_t*)(r8 + 0x288), src, 0, 0);
+        }
+        if (n[1]) {
+            src[0] = (uint64_t)data[1]; src[1] = src[0] + n[1]; src[2] = src[1];
+            ((GameVecCopy)(g_base + RVA_VECCOPY_1))((uint64_t*)(r8 + 0x2b0), src, 0, 0);
+        }
+        if (n[2]) {
+            src[0] = (uint64_t)data[2]; src[1] = src[0] + n[2]; src[2] = src[1];
+            ((GameVecCopy)(g_base + RVA_VECCOPY_4))((uint64_t*)(r8 + 0x2d8), src, 0, 0);
+        }
+        memcpy((void*)(r8 + 0x278), hd, 16);
+        memcpy((void*)(r8 + 0x2a0), md, 16);
+        memcpy((void*)(r8 + 0x2c8), kd, 16);
+        memcpy((void*)(r8 + 0x2f0), &bits, 8);
+        Log("[terrain-inject] filled the script proposal: heights %dx%d at (%d,%d), material %dx%d at (%d,%d), "
+            "mask %llu bits\n", hd[2], hd[3], hd[0], hd[1], md[2], md[3], md[0], md[1],
+            (unsigned long long)bits);
+        done = true;
+    } while (0);
+    free(buf);
+    return done;
+}
+
 // CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into
 // its second argument, and the caller destroys that handle as soon as Add
 // returns. Cancelling the call leaves the caller's stack slot holding whatever
@@ -2648,6 +2929,18 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
 
     if (id != ID_BUILDPROPOSAL) return 0;
 
+    // TERRAIN TOOLS, OBSERVE ONLY. A terraform, paint or asset-brush commit is
+    // logged (and saved with dumpprop) and then runs natively: nothing is
+    // cancelled or shipped, so it still reaches no peer.
+    if (caller == CALLER_PROPOSALACTION) {
+        __try {
+            LogTerrainProposal(r8, r9);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[terrain] decode fault -- the edit runs natively, nothing shipped\n");
+        }
+        return 0;
+    }
+
     // Differential proposal dump (cfg 'dumpprop'): UI placement vs Lua replay.
     // dumpprop covers construction placements (0x419f62 UI, 0xced378 Lua) and,
     // as of 2026-08-29, the STREET/TRACK tool (0x459eb7) too: a native rail-over-
@@ -2660,6 +2953,11 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // A Lua-issued construction proposal (our CONX replay): merge our shipped
     // apron INTO the template's connector so the engine sees the UI's shape.
     if (caller == 0xced378) {
+        __try {
+            InjectTerrainFromFile(r8);              // dev test; inert without its file
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[terrain-inject] fault -- proposal left as built\n");
+        }
         __try {
             bool merged = MergeTemplateStreet(r8);
             if (merged && DumpPropOn())
