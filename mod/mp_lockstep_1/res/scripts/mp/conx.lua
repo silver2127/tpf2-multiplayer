@@ -7,6 +7,19 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+-- Bulldoze one entity of a list gathered up front, only if it still exists.
+-- Bulldozing a town building also removes its own asset groups (and can take a
+-- neighbour with it), and game.interface.bulldoze on an entity that is already
+-- gone is a NATIVE crash pcall cannot catch: 2026-09-11 the survivor-diff removed
+-- town CONSTRUCTION 260032, then bulldozed its ASSET_GROUP 264852 from the same
+-- list -- the engine printed "entity 264852" and the game died.
+function CM.bulldozeAlive(id)
+	if type(id) ~= "number" or id < 0 then return false end
+	local alive = false
+	pcall(function() alive = api.engine.entityExists(id) end)
+	if not alive then return false end
+	return (pcall(game.interface.bulldoze, id))
+end
 -- ---------- constructions: NATIVE replay (CONP / CONX) ----------
 --
 -- api.cmd.make.buildProposal DOES accept a script-built ConstructionEntity --
@@ -868,7 +881,7 @@ CM.execConX = function(c)
 								CM.cmLog(string.format("STN: %s seq=%s survivor-diff wants %d removals (> %d) -> REFUSED, snapshot looks stale", tostring(op), tostring(seq), #victims, MAX_DIFF_REMOVALS))
 							else
 								for _, v in ipairs(victims) do
-									if pcall(game.interface.bulldoze, v[1]) then cleared = cleared + 1
+									if CM.bulldozeAlive(v[1]) then cleared = cleared + 1
 										CM.cmLog(string.format("STN: survivor-diff bulldozed town %s %d at (%.1f,%.1f)", v[4], v[1], v[2], v[3])) end
 								end
 							end
@@ -881,7 +894,7 @@ CM.execConX = function(c)
 							local cco = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
 							local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
 							if cco and po == nil and cco.transf and distToSegs(cco.transf[13], cco.transf[14]) <= CORRIDOR then
-								if pcall(game.interface.bulldoze, id) then cleared = cleared + 1
+								if CM.bulldozeAlive(id) then cleared = cleared + 1
 									CM.cmLog(string.format("STN: corridor-clear town CONSTRUCTION %d at (%.1f,%.1f)", id, cco.transf[13], cco.transf[14])) end
 							end
 						end
@@ -891,7 +904,7 @@ CM.execConX = function(c)
 						local px = okE and e and e.position and (e.position[1] or e.position.x)
 						local py = okE and e and e.position and (e.position[2] or e.position.y)
 						if px and py and distToSegs(px, py) <= CORRIDOR then
-							if pcall(game.interface.bulldoze, id) then cleared = cleared + 1 end
+							if CM.bulldozeAlive(id) then cleared = cleared + 1 end
 						end
 					end
 					CM.cmLog(string.format("STN: %s seq=%s track-corridor clear: %d track segment(s), %d cleared within %d m", tostring(op), tostring(seq), #segs, cleared, CORRIDOR))
@@ -937,7 +950,7 @@ CM.execConX = function(c)
 								if cco and po == nil and cco.transf
 									and cco.transf[13] >= bx0 and cco.transf[13] <= bx1
 									and cco.transf[14] >= by0 and cco.transf[14] <= by1 then
-									if pcall(game.interface.bulldoze, id) then swept = swept + 1 end
+									if CM.bulldozeAlive(id) then swept = swept + 1 end
 								end
 							end
 						end
@@ -948,7 +961,7 @@ CM.execConX = function(c)
 							local px = okE and e and e.position and (e.position[1] or e.position.x)
 							local py = okE and e and e.position and (e.position[2] or e.position.y)
 							if px and py and px >= bx0 and px <= bx1 and py >= by0 and py <= by1 then
-								if pcall(game.interface.bulldoze, id) then swept = swept + 1 end
+								if CM.bulldozeAlive(id) then swept = swept + 1 end
 							end
 						end
 						if swept > 0 then
@@ -1233,7 +1246,7 @@ CM.execConX = function(c)
 							local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
 							if cco and po == nil and cco.transf and inBox(cco.transf[13], cco.transf[14]) then
 								log(string.format("%s seq=%s DBG: bulldozing town CONSTRUCTION %d at (%.1f,%.1f)", tostring(op), tostring(seq), id, cco.transf[13], cco.transf[14]))
-								if pcall(game.interface.bulldoze, id) then cleared = cleared + 1
+								if CM.bulldozeAlive(id) then cleared = cleared + 1
 									log(string.format("%s seq=%s DBG: bulldozed %d ok", tostring(op), tostring(seq), id))
 									CM.cmLog(string.format("STN: pre-clear bulldozed town CONSTRUCTION %d at (%.1f,%.1f)", id, cco.transf[13], cco.transf[14])) end
 							end
@@ -1247,7 +1260,7 @@ CM.execConX = function(c)
 							local px = okE and e and e.position and (e.position[1] or e.position.x)
 							local py = okE and e and e.position and (e.position[2] or e.position.y)
 							if inBox(px, py) then
-								if pcall(game.interface.bulldoze, id) then cleared = cleared + 1 end
+								if CM.bulldozeAlive(id) then cleared = cleared + 1 end
 							end
 						end
 					end)
