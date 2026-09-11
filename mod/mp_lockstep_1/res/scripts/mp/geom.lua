@@ -259,6 +259,23 @@ function CM.nodeIsStraightThrough(nid)
 	return deg >= (180 - K.XING_STRAIGHT_TOL_DEG), deg, #ids
 end
 
+-- How far apart in HEIGHT a rail and a road (or another track) may be and still
+-- meet at a level crossing. Every crossing test in plan view alone treated a
+-- bridge passing over a road as a crossing: the road was split at road height,
+-- the rail was routed down through that node and climbed straight back up to
+-- the bridge. At a real crossing the shipped rail vertex and the peer's road
+-- node were measured 2.03 m apart (2026-08-31: the originator's engine lifts the
+-- road to the rail). 7 m (user's call, 2026-09-11) leaves room for a real
+-- crossing on steep ground while a bridge over a road still clears it. Not swept.
+K.XING_MAX_DZ = 7.0
+
+-- Height of an existing edge at parameter u, on its Hermite curve.
+function CM.edgeZAt(eid, u)
+	local comp, a, b, ta, tb = edgeGeomT(eid)
+	if not comp or not u then return nil end
+	return hermitePos(a, ta, b, tb, u)[3]
+end
+
 local function findEdgeContaining(isTrack, x, y, skipNode, eps)
 	local tol = eps or (isTrack and K.SPLIT_EPS_TRACK or K.SPLIT_EPS)
 	-- Sampling is by DISTANCE, not by a fixed 19 points: a 77 m town road

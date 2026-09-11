@@ -483,6 +483,24 @@ function CM.execPolyline(c, planOnly)
 			return mid
 		end
 
+		-- A vertex whose every link is a bridge or tunnel is in the air or
+		-- underground. An abutment (one ground link, one bridge link) is not: it
+		-- stands on the ground and the height test decides for it.
+		local elevatedV = nil
+		local function elevatedVertex(i)
+			if not elevatedV then
+				local ground, raised = {}, {}
+				for k = 1, ne do
+					local t = raised
+					if bridgeOf(k) == 0 then t = ground end
+					for _, v in ipairs({ links[k * 2 - 1], links[k * 2] }) do t[v] = true end
+				end
+				elevatedV = {}
+				for v in pairs(raised) do if not ground[v] then elevatedV[v] = true end end
+			end
+			return elevatedV[i] == true
+		end
+
 		-- Resolve one endpoint, splitting if it lands mid-span.
 		local function resolve(i)
 			if resolved[i] then return resolved[i] end
@@ -494,7 +512,15 @@ function CM.execPolyline(c, planOnly)
 			if told then
 				if told.kind == "N" then
 					local n = CM.findNodeNear(isTrack, told[1], told[2], 1.5)
-						or CM.findNodeNear(not isTrack, told[1], told[2], 1.5)
+					if not n then
+						-- the other kind: a rail vertex sharing a road node (a crossing)
+						n = CM.findNodeNear(not isTrack, told[1], told[2], 1.5)
+						local npz = n and CM.nodePosXYZ(n)
+						if n and isTrack and (elevatedVertex(i) or (npz and math.abs(npz[3] - told[3]) > K.XING_MAX_DZ)) then
+							CM.cmLog(string.format("PLAN: vertex %d: refusing the planned crossing at road node %d -- over/under", i, n))
+							n = nil
+						end
+					end
 					if n then
 						CM.cmLog(string.format("PLAN: vertex %d -> node %d at %.1f,%.1f (as the originator resolved it)", i, n, told[1], told[2]))
 						resolved[i] = n; return n
@@ -502,9 +528,21 @@ function CM.execPolyline(c, planOnly)
 					CM.cmLog(string.format("PLAN: vertex %d: no node at %.1f,%.1f -- deriving locally", i, told[1], told[2]))
 				elseif told.kind == "S" then
 					local eid = CM.findEdgeByEnds(false, told[4], told[5], told[6], told[7])
-						or CM.findEdgeByEnds(true, told[4], told[5], told[6], told[7])
+					local onStreet = eid ~= nil
+					eid = eid or CM.findEdgeByEnds(true, told[4], told[5], told[6], told[7])
 					if eid then
 						local u = CM.uOnEdge(eid, told[1], told[2])
+						-- A plan from an older build still asks a bridge vertex to split
+						-- the road below it, lifting the road to the bridge (road z 37.36
+						-- split at 116.62, 2026-09-11). A rail cannot meet a road it
+						-- passes over or under, whoever planned it.
+						local ez = u and CM.edgeZAt(eid, u)
+						if u and isTrack and onStreet
+						   and (elevatedVertex(i) or (ez and math.abs(ez - told[3]) > K.XING_MAX_DZ)) then
+							CM.cmLog(string.format("PLAN: vertex %d: refusing the planned split of road edge %d at z=%.2f (road z=%s) -- over/under, not a crossing",
+								i, eid, told[3], ez and string.format("%.2f", ez) or "?"))
+							u = nil
+						end
 						if u then
 							local mid = splitEdgeAt(eid, u, "vertex " .. i .. " (originator's split)", told[3])
 							if mid then
@@ -530,8 +568,18 @@ function CM.execPolyline(c, planOnly)
 			-- as a fresh node 0 m from the road node, unshared => no crossing (seen
 			-- on A and B). For a rail vertex: snap to a STREET node, else split the
 			-- street edge underfoot (road-typed halves) and route through it.
-			if isTrack then
+			-- Only when the two actually MEET: a vertex inside a bridge or tunnel,
+			-- or metres above or below the road, passes over or under it.
+			if isTrack and elevatedVertex(i) then
+				CM.cmLog(string.format("XING: vertex %d is inside a bridge or tunnel -- no level crossing with anything below or above it", i))
+			elseif isTrack then
 				local rnode = CM.findNodeNear(false, x, y, 4.0)
+				local rnp = rnode and CM.nodePosXYZ(rnode)
+				if rnp and math.abs(rnp[3] - z) > K.XING_MAX_DZ then
+					CM.cmLog(string.format("XING: vertex %d is %.2f m %s road node %d -- over/under, not a crossing",
+						i, math.abs(z - rnp[3]), z > rnp[3] and "above" or "below", rnode))
+					rnode = nil
+				end
 				if rnode then
 					log(string.format("ROADP: level crossing -- rail vertex %d shares road node %d", i, rnode))
 					CM.cmLog(string.format("XING: vertex %d snapped to road node %d (%.1f,%.1f)", i, rnode, x, y))
@@ -560,6 +608,12 @@ function CM.execPolyline(c, planOnly)
 				end
 				local reid, ru
 				pcall(function() reid, ru = CM.findEdgeContaining(false, x, y) end)
+				local rz = reid and CM.edgeZAt(reid, ru)
+				if rz and math.abs(rz - z) > K.XING_MAX_DZ then
+					CM.cmLog(string.format("XING: vertex %d is %.2f m %s road edge %d -- over/under, not split",
+						i, math.abs(z - rz), z > rz and "above" or "below", reid))
+					reid = nil
+				end
 				if reid then
 					local mid = splitEdgeAt(reid, ru, "rail vertex " .. i .. " on road", z)
 					if mid then
@@ -746,6 +800,12 @@ function CM.execPolyline(c, planOnly)
 		local function crossingsFor(k, n0, n1, x0, y0, z0, x1, y1, z1, T0, T1)
 			local hits = {}
 			if not isTrack then return hits end
+			-- A bridge or tunnel link passes over or under everything it spans.
+			local bT = bridgeOf(k)
+			if bT ~= 0 then
+				CM.cmLog(string.format("XING: seg %d is a %s -- no level crossings", k, bT == 1 and "bridge" or "tunnel"))
+				return hits
+			end
 			local a, b = { x0, y0, z0 }, { x1, y1, z1 }
 			local chord = math.sqrt((x1 - x0) ^ 2 + (y1 - y0) ^ 2)
 			if chord < 2 * CROSS_END_MIN then return hits end
@@ -783,7 +843,23 @@ function CM.execPolyline(c, planOnly)
 						end
 					end
 					local dist = bestD and math.sqrt(bestD) or 1e9
+					-- heights at the closest approach in plan view
+					local q, r, dz
+					if bestRu then
+						q = CM.hermitePos(ra, rta, rb, rtb, bestRu)
+						r = rail[math.floor(bestU * rs + 0.5)] or rail[0]
+						dz = math.abs(r[3] - q[3])
+					end
+					local crossedType = 0
+					pcall(function() crossedType = comp.type or 0 end)
 					if dist > CROSS_BAND then -- too far
+					elseif crossedType ~= 0 then
+						-- the existing edge is itself a bridge or tunnel here
+						CM.cmLog(string.format("XING: seg %d passes edge %d, a %s -- over/under, not a crossing",
+							k, eid, crossedType == 1 and "bridge" or "tunnel"))
+					elseif dz and dz > K.XING_MAX_DZ then
+						CM.cmLog(string.format("XING: seg %d passes %.2f m %s edge %d -- over/under, not a crossing",
+							k, dz, r[3] > q[3] and "above" or "below", eid))
 					elseif splitRoads[eid] or comp.node0 == n0 or comp.node1 == n0 or comp.node0 == n1 or comp.node1 == n1 then
 						-- ADJACENCY, not a crossing. A branch never crosses the edge it
 						-- branches FROM: a track joining a bridge 6 m before the bridge's
@@ -793,10 +869,8 @@ function CM.execPolyline(c, planOnly)
 						-- this proposal split (the parent) or one sharing an endpoint with
 						-- the segment only ever TOUCHES it.
 					else
-						local q = CM.hermitePos(ra, rta, rb, rtb, bestRu)
 						local dA = math.sqrt((q[1]-ra[1])^2 + (q[2]-ra[2])^2)
 						local dB = math.sqrt((q[1]-rb[1])^2 + (q[2]-rb[2])^2)
-						local r = rail[math.floor(bestU * rs + 0.5)] or rail[0]
 						local dEnd = math.min(math.sqrt((r[1]-x0)^2 + (r[2]-y0)^2), math.sqrt((r[1]-x1)^2 + (r[2]-y1)^2))
 						if dEnd < CROSS_END_MIN then -- at a rail end: the endpoint case, handled by resolve
 						elseif dA < CROSS_END_MIN or dB < CROSS_END_MIN then
@@ -905,16 +979,37 @@ function CM.execPolyline(c, planOnly)
 					-- each to a local edge/node by position; anything we cannot
 					-- place, we simply do not invent.
 					hits = {}
-					for _, told in ipairs(usePlanH[k]) do
+					-- ...except a crossing the rail cannot physically meet, which a
+					-- plan from an older build still lists.
+					local function railZ(u)
+						return CM.hermitePos({ x0, y0, z0 }, T0, { x1, y1, z1 }, T1, u or 0.5)[3]
+					end
+					local planBT = bridgeOf(k)
+					if planBT ~= 0 then
+						CM.cmLog(string.format("PLAN: link %d is a %s -- ignoring its %d planned crossing(s)",
+							k, planBT == 1 and "bridge" or "tunnel", #usePlanH[k]))
+					end
+					for _, told in ipairs(planBT == 0 and usePlanH[k] or {}) do
 						if told.kind == "N" then
 							local n = CM.findNodeNear(false, told[1], told[2], 1.5)
-							if n then hits[#hits + 1] = { node = n, u = told[4] or 0.5 }
-							else CM.cmLog(string.format("PLAN: link %d crossing node %.1f,%.1f absent here -- skipped", k, told[1], told[2])) end
+							local npz = n and CM.nodePosXYZ(n)
+							if not n then
+								CM.cmLog(string.format("PLAN: link %d crossing node %.1f,%.1f absent here -- skipped", k, told[1], told[2]))
+							elseif npz and math.abs(npz[3] - railZ(told[4])) > K.XING_MAX_DZ then
+								CM.cmLog(string.format("PLAN: link %d crossing node %d is %.2f m off the rail -- over/under, skipped", k, n, math.abs(npz[3] - railZ(told[4]))))
+							else
+								hits[#hits + 1] = { node = n, u = told[4] or 0.5 }
+							end
 						elseif told.kind == "S" then
 							local eid = CM.findEdgeByEnds(false, told[4], told[5], told[6], told[7])
 							if eid then
 								local ru = CM.uOnEdge(eid, told[1], told[2])
-								if ru then hits[#hits + 1] = { eid = eid, ru = ru, u = told[8] or 0.5, zWant = told[3] } end
+								local ez = ru and CM.edgeZAt(eid, ru)
+								if ez and math.abs(ez - railZ(told[8])) > K.XING_MAX_DZ then
+									CM.cmLog(string.format("PLAN: link %d crossing on edge %d is %.2f m off the rail -- over/under, skipped", k, eid, math.abs(ez - railZ(told[8]))))
+								elseif ru then
+									hits[#hits + 1] = { eid = eid, ru = ru, u = told[8] or 0.5, zWant = told[3] }
+								end
 							else CM.cmLog(string.format("PLAN: link %d crossing edge %.1f,%.1f--%.1f,%.1f absent here -- skipped", k, told[4], told[5], told[6], told[7])) end
 						end
 					end
