@@ -46,6 +46,178 @@ function CM.buildContext()
 	return nil
 end
 
+-- ---------- roads that are built over town buildings ----------
+--
+-- The native road tool demolishes (and RELOCATES) what its footprint collides
+-- with; since 0.4.0 every road is cancelled and replayed from here on every
+-- instance, the originator included, and the replay passed gatherBuildings=false
+-- with ignoreErrors=true. The engine records a colliding building only when
+-- gatherBuildings is set (Context+0x00/+0x01 -> CollisionInfo, decompiled), so
+-- with it off 'Collision' is raised as a NON-critical message, ignoreErrors
+-- erases it, and the road is built straight through the building: nothing is
+-- removed, on any instance. Setting the flag hands the decision back to the
+-- engine, which derives the set at apply time from the proposal and that
+-- instance's own world -- the same mechanism the strict construction replay uses
+-- (conx.lua:644). Determinism comes from every instance running this one path.
+--
+-- NOT a general claim that nothing is removed today: a road that REMOVES an edge
+-- (a split, an upgrade) already loses and relocates buildings through the engine's
+-- parcel path, which gatherBuildings does not gate. That is why the audit below
+-- logs the actual set rather than a count, and why the control run matters.
+--
+-- One-line revert; no cfg switch (2026-09-10 rule).
+K.ROAD_GATHER_BUILDINGS = true
+-- The audit disk around each corridor sample, the sampling step, and the cap on
+-- samples so a kilometre of road cannot stall the tick.
+K.ROAD_AUDIT_R, K.ROAD_AUDIT_STEP, K.ROAD_AUDIT_MAX = 60, 40, 48
+
+-- The context for replaying a player's ROAD or TRACK build. Returns (ctx, ok);
+-- a caller that gets ok=false must NOT build.
+--
+-- Never falls back to nil on this path. A nil Context builds for FREE (no player
+-- attribution, roads.lua above) *and* takes the engine's default, which GATHERS
+-- (cons.lua:422-433) -- so the fallback is simultaneously a money divergence and
+-- an unflagged demolisher, on one instance only. A road that is refused and
+-- logged is recoverable; a road that silently ran under a different context is
+-- not. The flag is read BACK off the Context: it is the native engine struct
+-- bound by sol2, and a binding that quietly dropped the write would otherwise
+-- look identical to a working one.
+function CM.roadBuildContext(c)
+	-- The originator kept its NATIVE build (the cancel did not land; inject.lua
+	-- sets skipOrigin then) and demolished at click time there. A peer that also
+	-- turned the gather on would derive a SECOND set at a different sim-time --
+	-- two mechanisms at two times, which is the depot bug of 125f8ac. Peers stay
+	-- on the plain context in that case and the pre-existing divergence stands.
+	if c and tonumber(c.skipOrigin or 0) == 1 then
+		return CM.buildContext(), true
+	end
+	if not K.ROAD_GATHER_BUILDINGS then return CM.buildContext(), true end
+	local ok, ctx = pcall(function()
+		local ct = api.type.Context:new()
+		ct.checkTerrainAlignment = false   -- a separate experiment; see docs/re/PROPOSALS.md
+		ct.cleanupStreetGraph    = true
+		ct.gatherBuildings       = true
+		ct.gatherFields          = true
+		ct.player                = api.engine.util.getPlayer()
+		return ct
+	end)
+	local readBack = false
+	if ok and ctx then pcall(function() readBack = (ctx.gatherBuildings == true) end) end
+	if ok and ctx and readBack then return ctx, true end
+	return nil, false
+end
+
+-- What the engine may remove or MOVE when this road lands, sampled along the
+-- whole corridor: a shipped edge is arbitrarily long, and losses have been
+-- measured 154 m from a build's centre, so endpoint disks are not enough.
+function CM.roadCorridorSamples(pts)
+	local out = {}
+	local function push(x, y)
+		if #out < K.ROAD_AUDIT_MAX then out[#out + 1] = { x, y } end
+	end
+	for i = 1, #pts - 1 do
+		local ax, ay, bx, by = pts[i][1], pts[i][2], pts[i + 1][1], pts[i + 1][2]
+		local d = math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2)
+		local steps = math.max(1, math.ceil(d / K.ROAD_AUDIT_STEP))
+		for s = 0, steps - 1 do push(ax + (bx - ax) * s / steps, ay + (by - ay) * s / steps) end
+	end
+	if #pts > 0 then push(pts[#pts][1], pts[#pts][2]) end
+	return out
+end
+
+-- KEYED BY ENTITY ID, never by position: the engine relocates buildings as well
+-- as removing them (a native road reported '4 buildings will be removed, 8 will
+-- be moved'), and a position-keyed diff reads a moved building as a removed one.
+function CM.roadAuditSnapshot(pts)
+	local snap, n, truncated = {}, 0, false
+	local samples = CM.roadCorridorSamples(pts)
+	truncated = #samples >= K.ROAD_AUDIT_MAX
+	pcall(function()
+		for _, p in ipairs(samples) do
+			for _, ty in ipairs({ "CONSTRUCTION", "ASSET_GROUP" }) do
+				-- held in a local: pairs() straight off the engine call lets the GC
+				-- free the C++ map mid-loop (never-iterate-engine-containers-inline)
+				local list = game.interface.getEntities({ pos = { p[1], p[2] }, radius = K.ROAD_AUDIT_R },
+					{ type = ty, includeData = false }) or {}
+				for _, id in pairs(list) do
+					if not snap[id] then
+						local px, py, owned
+						if ty == "CONSTRUCTION" then
+							local cc = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+							local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
+							if cc and cc.transf then px, py, owned = cc.transf[13], cc.transf[14], po ~= nil end
+						else
+							local okE, e = pcall(game.interface.getEntity, id)
+							if okE and e and e.position then
+								px, py, owned = e.position[1] or e.position.x, e.position[2] or e.position.y, false
+							end
+						end
+						if px and py then snap[id] = { px, py, owned, ty }; n = n + 1 end
+					end
+				end
+			end
+		end
+	end)
+	return { seen = snap, n = n, samples = #samples, truncated = truncated }
+end
+
+-- Removed vs moved, plus a hash over the sorted REMOVED positions. Counts alone
+-- are the failure mode this history already punished once (equal counts on two
+-- instances, four different buildings), so the set travels, not the number.
+function CM.roadAuditDiff(snap)
+	local removed, moved, ownedGone = {}, 0, 0
+	if not (snap and snap.seen) then return removed, 0, 0, 0 end
+	for id, rec in pairs(snap.seen) do
+		local alive = false
+		pcall(function() alive = api.engine.entityExists(id) end)
+		if not alive then
+			removed[#removed + 1] = rec
+			if rec[3] then ownedGone = ownedGone + 1 end
+		elseif rec[4] == "CONSTRUCTION" then
+			local px, py
+			pcall(function()
+				local cc = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+				if cc and cc.transf then px, py = cc.transf[13], cc.transf[14] end
+			end)
+			if px and py and ((px - rec[1]) ^ 2 + (py - rec[2]) ^ 2) > 4 then moved = moved + 1 end
+		end
+	end
+	table.sort(removed, function(p, q)
+		if p[1] ~= q[1] then return p[1] < q[1] end
+		return p[2] < q[2]
+	end)
+	local h = 5381
+	for _, r in ipairs(removed) do
+		local s = string.format("%.1f:%.1f", r[1], r[2])
+		for i = 1, #s do h = (h * 33 + s:byte(i)) % 2147483647 end
+	end
+	return removed, moved, ownedGone, h
+end
+
+-- One canonical line per road on every instance: the whole point of the test is
+-- that two instances printed the SAME sethash and the same id list.
+function CM.roadAuditLog(op, c, success, ctxKind, snap)
+	local ok, err = pcall(function()
+		local removed, moved, ownedGone, h = CM.roadAuditDiff(snap)
+		local parts = {}
+		for i, r in ipairs(removed) do
+			if i <= 12 then parts[#parts + 1] = string.format("%s@%.1f,%.1f%s", r[4] == "ASSET_GROUP" and "A" or "C", r[1], r[2], r[3] and "*" or "") end
+		end
+		local line = string.format(
+			"ROADDEM %s seq=%s origin=%s at=%s success=%s ctx=%s removed=%d moved=%d owned=%d sethash=%d watched=%d samples=%d%s [%s]",
+			tostring(op), tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(success), ctxKind,
+			#removed, moved, ownedGone, h, snap and snap.n or -1, snap and snap.samples or -1,
+			(snap and snap.truncated) and " TRUNCATED" or "", table.concat(parts, ";"))
+		log(line)
+		CM.cmLog(line)
+		if ownedGone > 0 then
+			log(string.format("ROADDEM %s seq=%s: %d PLAYER-OWNED construction(s) went with this road -- not a town building",
+				tostring(op), tostring(c.seq), ownedGone))
+		end
+	end)
+	if not ok then log("ROADDEM audit error: " .. tostring(err)) end
+end
+
 -- The Context a NATIVE construction placement runs under (measured 2026-08-28:
 -- checkTerrainAlignment=1, cleanupStreetGraph=1). The replay used nil, and the
 -- open item since then was a one-edge / heights divergence around every
@@ -142,10 +314,20 @@ function CM.execEdge(c)
 		-- cancelled and replayed from here, it failed on the originator too
 		-- (measured 2026-09-03: five upgrades in a row, critical=false
 		-- 'Collision', in an area the player had been demolishing).
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, CM.buildContext(), true),
+		local ctx, ctxOk = CM.roadBuildContext(c)
+		if not ctxOk then
+			log(string.format("ROADCTX %s seq=%s: no gather context -- REFUSING the build rather than "
+				.. "running it under a different one (a nil Context builds free AND demolishes)", c.op, tostring(c.seq)))
+			return
+		end
+		local ctxKind = (tonumber(c.skipOrigin or 0) == 1) and "plain(skipOrigin)"
+			or (K.ROAD_GATHER_BUILDINGS and "gather" or "plain")
+		local snap = CM.roadAuditSnapshot({ { c.x0, c.y0 }, { c.x1, c.y1 } })
+		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, ctx, true),
 			function(res, success)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s success=%s",
 					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(success)))
+				CM.roadAuditLog(c.op, c, success, ctxKind, snap)
 				pcall(CM.cmSettleBuild, c, res, success, c.op)   -- companies: owner + cost
 			end)
 	end)
@@ -1157,8 +1339,20 @@ function CM.execPolyline(c, planOnly)
 		-- cancelled and replayed from here, it failed on the originator too
 		-- (measured 2026-09-03: five upgrades in a row, critical=false
 		-- 'Collision', in an area the player had been demolishing).
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, CM.buildContext(), true),
+		local ctx, ctxOk = CM.roadBuildContext(c)
+		if not ctxOk then
+			log(string.format("ROADCTX ROADP seq=%s: no gather context -- REFUSING the build rather than "
+				.. "running it under a different one (a nil Context builds free AND demolishes)", tostring(c.seq)))
+			return
+		end
+		local ctxKind = (tonumber(c.skipOrigin or 0) == 1) and "plain(skipOrigin)"
+			or (K.ROAD_GATHER_BUILDINGS and "gather" or "plain")
+		local corridor = {}
+		for i = 1, np do corridor[#corridor + 1] = { pts[i * 3 - 2], pts[i * 3 - 1] } end
+		local snap = CM.roadAuditSnapshot(corridor)
+		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, ctx, true),
 			function(res, success)
+				CM.roadAuditLog("ROADP", c, success, ctxKind, snap)
 				pcall(CM.cmSettleBuild, c, res, success, "ROADP")   -- companies: owner + cost
 				-- LEVEL-CROSSING PROBE. The engine models a crossing as its own ECS
 				-- component (RAILROAD_CROSSING, added by construction_util_engine).
