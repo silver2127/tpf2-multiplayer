@@ -1002,6 +1002,14 @@ CM.execConX = function(c)
 						tostring(op), tostring(seq), tostring(eid), tostring(child),
 						tostring(cn ~= nil), tostring(cp ~= nil)))
 				end)
+				-- a reused id is already "known" and the poll would skip it for good
+				pcall(function()
+					local eid = res.resultEntities[1]
+					if eid and CM.forgetKnownCon(eid) then
+						log(string.format("%s seq=%s: entity %s reuses a known id -- the next poll adopts it",
+							tostring(op), tostring(seq), tostring(eid)))
+					end
+				end)
 			end
 			if not success then
 				CM.expectedCons[key] = nil

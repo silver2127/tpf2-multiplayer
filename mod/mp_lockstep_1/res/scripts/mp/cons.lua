@@ -110,6 +110,17 @@ function CM.deserParams(pstr)
 end
 
 local knownCons    = {}      -- construction ids already seen (or primed)
+-- Entity ids are reused. A station our replay builds can take the id of a town
+-- building it just demolished, which is still in knownCons, so the poll never adopts
+-- it: every later module edit found "no station within 10 m" and was lost on every
+-- instance (station 45198, 2026-09-11). The builder calls this with the id it got, so
+-- the next poll adopts it through the replay branch (company handover, cost settle).
+-- Returns whether the id was stale.
+function CM.forgetKnownCon(id)
+	local was = knownCons[id] == true
+	knownCons[id] = nil
+	return was
+end
 local ownershipPending = {}  -- buildable con id -> polls waited for PLAYER_OWNED
 CM.consPrimed   = false   -- first poll only records what exists
 -- Names travel percent-escaped: the wire is whitespace-tokenised and a
@@ -203,12 +214,17 @@ function CM.execConU(c)
 	local ok, err = pcall(function()
 		local x, y = tonumber(c.x), tonumber(c.y)
 		local rec = findConNear(c.file, x, y, 10)
+		local alive = false
+		if rec then pcall(function() alive = api.engine.entityExists(rec.id) end) end
+		if not (rec and alive) then
+			-- the table lost it (a reused entity id): find it in the world instead
+			local found = CM.adoptConAt(tostring(c.file), x, y, 10)
+			if found then rec, alive = found, true end
+		end
 		if not rec then
 			log(string.format("CONU: no %s within 10 m of %.1f,%.1f -- ignoring", tostring(c.file), x, y))
 			return
 		end
-		local alive = false
-		pcall(function() alive = api.engine.entityExists(rec.id) end)
 		if not alive then log("CONU: target id " .. rec.id .. " is gone -- ignoring"); return end
 		local params
 		if tonumber(c.diff or 0) == 1 then
@@ -857,6 +873,36 @@ local function noteCon(id, fn, key, pstr)
 	local prev = CM.consByKey[key]
 	CM.consByKey[key] = { id = id, file = fn, params = pstr }
 	return prev
+end
+
+-- The live player construction of `file` nearest (x, y) within maxDist, looked up in
+-- the WORLD rather than consByKey, and registered. The edit replay's fallback for a
+-- station the table lost -- a reused entity id the poll skipped, or an upgrade whose
+-- replacement took one -- so the edit lands instead of being dropped.
+function CM.adoptConAt(file, x, y, maxDist)
+	local bestId, bestD, bestCo
+	pcall(function()
+		local list = game.interface.getEntities({ pos = { x, y }, radius = maxDist },
+			{ type = "CONSTRUCTION", includeData = false }) or {}
+		for _, id in pairs(list) do
+			local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+			if co and co.transf and co.fileName and tostring(co.fileName) == file
+			   and CM.isPlayerConstruction(id, file) then
+				local d = (co.transf[13] - x) ^ 2 + (co.transf[14] - y) ^ 2
+				if d <= maxDist * maxDist and (not bestD or d < bestD) then bestId, bestD, bestCo = id, d, co end
+			end
+		end
+	end)
+	if not bestId then return nil end
+	local key = CM.conKey(bestCo.transf[13], bestCo.transf[14])
+	local pstr = "{}"
+	pcall(function() local e = game.interface.getEntity(bestId); if e and e.params then pstr = CM.ser(e.params) end end)
+	local prev = CM.consByKey[key]
+	knownCons[bestId] = true
+	noteCon(bestId, file, key, pstr)
+	log(string.format("con: adopted %s id %d at %s -- the table %s (reused entity id)", file, bestId, key,
+		prev and ("still named dead id " .. tostring(prev.id)) or "had nothing there"))
+	return CM.consByKey[key]
 end
 
 local function shipEdit(fn, key, pstr)
