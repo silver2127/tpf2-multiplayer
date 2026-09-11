@@ -42,7 +42,7 @@ Building a road, with other players connected:
    output handle and skips the call. The road is now built nowhere.
 3. **Stamp and ship.** The mod reads the inject file every tick. While this game still has the
    entities, it converts ids to positions (`ROADP`), then `CM.scheduleLocal` gives the command
-   a sequence number and a stamp: now + `EXEC_DELAY` (0.6) + how far the fastest other player's
+   a sequence number and a stamp: now + `EXEC_DELAY` (0.4) + how far the fastest other player's
    clock is ahead (at most 15), rounded up to the 0.2 sim-step grid. It queues the command
    locally and appends `LSCMD op=ROADP at=<stamp> origin=<letter> seq=<n> ... params=...` to
    `tpf2_capture_<letter>.txt`.

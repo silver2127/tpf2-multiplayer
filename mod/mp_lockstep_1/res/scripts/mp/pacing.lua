@@ -683,11 +683,13 @@ end
 
 -- exec_delay (tpf2_slice.cfg): how far ahead every command is stamped, in game
 -- units, snapped UP to the 0.2 sim-step grid -- so this is the felt latency of
--- every strict action. 0.6 (three steps, ~0.66 s at speed 1) is the shipped
--- default and carries internet margin; on one machine or a LAN 0.4 is safe
--- (every apply of 2026-09-08 measured late=0 at 0.6). Below that a jitter spike
--- lands a command in a peer's PAST, which is a desync, not a delay. Absent,
--- unparsable or outside 0.2..5 = 0.6. Read HERE, after
+-- every strict action. 0.4 (two steps, ~0.44 s at speed 1) is the shipped
+-- default since 2026-09-11; it was 0.6 (three steps, internet margin), and 0.4
+-- had measured safe on one machine (every apply of 2026-09-08 was late=0 at
+-- 0.6). Every RECV logs spare= (game time left before the stamp) so internet
+-- sessions show whether 0.4 holds; a negative spare is the !! LATE case. Below
+-- 0.4 a jitter spike lands a command in a peer's PAST, which is a desync, not a
+-- delay. Absent, unparsable or outside 0.2..5 = 0.4. Read HERE, after
 -- cfgNum exists: reading it earlier in the file crashed the script at load
 -- ("attempt to call field 'cfgNum'", 2026-09-08).
 do

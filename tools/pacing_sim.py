@@ -94,7 +94,7 @@ function newInst(spec)
   K.SIM_STEP = 0.2
   K.PEER_STALE_TICKS = 25
   K.HEARTBEAT_EVERY = 2
-  K.EXEC_DELAY = 0.6
+  K.EXEC_DELAY = 0.4
   K.BARRIER_AHEAD = 8.0
   K.GAP_GRACE_TICKS = 3
   CM.peers, CM.ticks, CM.leader, CM.seqNo, CM.cfgCache = {}, 0, "a", 0, {}

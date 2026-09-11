@@ -139,7 +139,7 @@ local guiTick = 0   -- gui-state only
 -- units (~0.22s wall clock) -- so sub-second stamps are possible. A single
 -- sample at load read 55234.000000 and looked integer; it was just a round
 -- value from the save. Step size is what settles resolution, not one reading.
-K.EXEC_DELAY = 0.6
+K.EXEC_DELAY = 0.4   -- two sim steps; was 0.6 until 2026-09-11 (RECV logs spare= to keep checking it)
 
 -- The most peer lead a command's stamp will pay for: a live session was seen
 -- 9.2 units apart (net.lua scheduleLocal).

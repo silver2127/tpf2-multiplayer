@@ -59,7 +59,7 @@ end
 --
 -- The module builder builds each proposal from the ENTITY as it stands at
 -- click time. Under strict the entity does not have the PREVIOUS click's
--- module yet (it lands at the stamp, ~0.6 s later), so the next click's full
+-- module yet (it lands at the stamp, ~0.4 s later), so the next click's full
 -- param set lacks it -- and when both replay, the second overwrites the first
 -- away: "only every other platform gets filled" (2026-09-08; the log showed
 -- every fast pair of CONUPs carrying the SAME module count). A click's true

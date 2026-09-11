@@ -635,7 +635,10 @@ local function onLine(line)
 						"-- applied out of step; the worlds agree on the build, not on when",
 						tostring(c.op), c.seq, c.at, math.floor(now), CM.lateCount))
 				end
-				log(string.format("RECV %s seq=%d at=%d from %s", tostring(c.op), c.seq, c.at, c.origin))
+				-- spare = game time left before the stamp when it arrived here: the
+				-- measured margin K.EXEC_DELAY buys (0.4 since 2026-09-11)
+				log(string.format("RECV %s seq=%d at=%d from %s spare=%s", tostring(c.op), c.seq, c.at, c.origin,
+					now and string.format("%.2f", c.at - now) or "?"))
 			end
 		else
 			log("undecodable command: " .. line:sub(1, 80))
