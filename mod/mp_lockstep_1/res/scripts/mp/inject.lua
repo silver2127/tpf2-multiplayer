@@ -111,6 +111,10 @@ function CM.pollInject()
 					log(string.format("%s %d: scheduled for every instance", o, v))
 				end
 
+			elseif o == "TERRAINCAP" then
+				-- a terraform or paint commit that applied here natively (CM.terrainCapture)
+				CM.terrainCapture(w)
+
 			-- ROADE <N> <etype> <stype> <ttype> <cat> <M> <rn> <re>
 			--       <id x y z>*N <a1 a2 t0x t0y t0z t1x t1y t1z>*M
 			--       <rmnodeid>*rn <a1 a2 t0x t0y t0z t1x t1y t1z>*re

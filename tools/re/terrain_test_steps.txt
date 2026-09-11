@@ -1,0 +1,42 @@
+Terrain capture + inject test (terrain-capture worktree build)
+================================================================
+
+DLL: <worktree>\native\out\tpf2_slice.dll
+Data dir: %LOCALAPPDATA%\tpf2mp\data\   (logs, inject files, captures)
+
+1. Close every game instance. Back up <game>\tpf2_slice.dll, then copy the worktree DLL over it.
+2. Add a line  dumpprop=1  to <game>\tpf2_slice.cfg (saves the grids; also dumps every
+   BuildProposal to the log, so remove it afterwards).
+3. Launch two instances on the same save (HOST / JOIN).
+4. On A: raise (press, hold, release in one spot), lower, flatten, smooth, then paint a patch.
+   Expect in tpf2_slice.log:  [terrain] #N ProposalAction commit ... / heights ... / material ... / mask ...
+   and files terrain_a_<pid>_NNN.bin in the data dir.
+   Decode:  python tools\re\terrain_bin.py <file>
+4b. On A: place ONE item with the asset brush (a single tree or rock, one click), then one brush
+   stroke. Expect  [terrain] #N ... toAdd=...B v250=...B map268=...  followed by
+   [terrain] #N   toAdd[i of n] file='...' at (x,y,z)  and/or  [terrain] #N   v250 (k ints): ...
+   Those lines say whether the brush's data is ConstructionEntities (the CONXP path can replay
+   them from Lua) or lives in +0x250/+0x268 (native, like the grids).
+5. Inject on B: copy the raise capture to  <data dir>\terrain_inject_b.bin, then append this ONE line
+   to <data dir>\lockstep_inject_b.txt :
+
+EVAL local c = api.type.Context:new(); c.checkTerrainAlignment = false; c.cleanupStreetGraph = false; c.gatherBuildings = false; c.gatherFields = false; c.player = api.engine.util.getPlayer(); api.cmd.sendCommand(api.cmd.make.buildProposal(api.type.SimpleProposal.new(), c, false), function(res, ok) print("[terrain-poc] carrier applied ok=" .. tostring(ok)) end); return "carrier sent"
+
+   Expect: B's slice log  [terrain-inject] filled the script proposal: heights WxH at (x,y) ...
+           B's Lua log    EVAL -> carrier sent   and   [terrain-poc] carrier applied ok=true
+           and the same hill on B's map.
+6. Restore the backed-up tpf2_slice.dll and remove dumpprop=1.
+
+Live replication test (commit "terrain: terraforming and terrain painting replicate to every peer")
+---------------------------------------------------------------------------------------------------
+Deploy the worktree's tpf2_slice.dll and its mod (tools\deploy_mod.ps1 run from the worktree).
+Start both instances from one save, so the terrain is identical.
+On A: raise, lower, flatten and paint. On B: paint something too.
+Expect, on the editing instance:
+  slice log  [terrain] #N shipped: <n>B edit, <m>B of base64 (runs here natively, peers replay it)
+  Lua log    TERRAINCAP: <n> B terrain edit ... -- applied here natively, peers apply it at the stamp
+On the other instance:
+  Lua log    RECV TERRAIN seq=.. spare=..   then   EXEC TERRAIN seq=.. from a: <n> B edit, carrier sent=true (grids filled)
+             and   EXEC TERRAIN seq=.. from a: carrier applied
+  slice log  [terrain-inject] filled the script proposal: heights WxH at (x,y), material ...
+Check heights with an EVAL on both:  EVAL return game.interface.getHeight({x*4, y*4})

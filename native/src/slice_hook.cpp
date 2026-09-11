@@ -105,6 +105,11 @@ static const uintptr_t CALLER_STOPTOOL      = 0x460e0b;
 // call at 0x3eb222, return addr 0x3eb227). LogBulldoze classifies it and ships
 // what it can decode; the handler arms the cancel only when something shipped.
 static const uintptr_t CALLER_BULLDOZE      = 0x3eb227;
+// UI::ProposalAction::commit -> make_cmd::BuildProposal return address (call at
+// 0x4311c1). Terraform, paint and the asset brush all commit through it, and
+// their edit is the proposal TAIL, not its street half (docs/re/PROPOSALS.md
+// "Terrain grids"). Observed only: logged, and saved to a file with dumpprop.
+static const uintptr_t CALLER_PROPOSALACTION = 0x4311c6;
 // The sol2 wrapper's factory call site (Lua path: api.cmd.make.buyVehicle).
 // A BuyVehicle from HERE is our own replay on the peer: shipping it back
 // would ping-pong purchases between the two instances forever. NOT 0x74fd88:
@@ -218,6 +223,33 @@ static char    g_stopName[256];
 // decoded off the bulldozer's edge-replace proposal (StashStopDelFromBulldoze),
 // written as STOPXDEL from the Add hook once the cancel landed.
 static volatile LONG g_pendingIsStopDel = 0;
+// Terraform / paint cancel (STRICT, 2026-09-11): the blob is stashed at the
+// factory and TERRAINCAP is written from the Add hook -- ARMED 1 when the
+// cancel landed (everyone, the originator included, applies it at the stamp),
+// ARMED 0 when the edit had to run natively here (the peers still get it).
+static volatile LONG g_pendingIsTerrain = 0;
+static char*    g_terrainB64 = nullptr;
+static uint64_t g_terrainBlobLen = 0;
+static long     g_terrainStashSeq = 0;
+// THE STROKE WAITS FOR THE REPLAY (docs/re/PROPOSALS.md, Commit and apply).
+// The terrain modifier commits mid-stroke (30 entries / 300k cells) and applies
+// no brush while tool+0xf0 is set; its Add callback {vftable, tool, bool}
+// clears +0xf0 in _Do_call. Firing that callback for a CANCELLED commit would
+// release the stroke onto terrain that lacks the cancelled part, and the next
+// part would be computed -- and shipped, absolute -- against the old heights.
+// So after the fire the flag is set again and cleared only when this
+// instance's own replay carrier (the Lua's empty buildProposal that
+// InjectTerrainFromFile filled) has EXECUTED: Add only queues a command, it
+// applies a sim step or more later and the tool's update runs in between, so
+// the release rides a MARKER -- a second, empty Lua buildProposal that
+// terrain.lua sends from the carrier's completion callback, which the factory
+// sees only once the carrier has applied. A safety valve releases the tool
+// after TERRAIN_HOLD_MAX_MS in case no marker ever comes.
+static uint64_t g_terrainHeldTool = 0;
+static ULONGLONG g_terrainHeldAt = 0;
+static volatile LONG64 g_terrainCarrierCmd = 0;
+static const ULONGLONG TERRAIN_HOLD_MAX_MS = 4000;
+
 static int32_t g_stopDelEo = -1, g_stopDelEdge = -1;
 
 extern "C" void DeferRelay();
@@ -2387,6 +2419,502 @@ static bool MergeTemplateStreet(uint64_t r8)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// TERRAIN TOOLS (2026-09-10): what a terraform or paint commit carries, and a
+// dev-only test of building one from a script proposal. Layout from the
+// decompile (docs/re/PROPOSALS.md "Terrain grids"); none of it was measured
+// before this build:
+//   +0x278 Grid<CVec2f> {x0,y0,w,h}, vector of {height, base} cells at +0x288
+//   +0x2a0 Grid<uint8>  {x0,y0,w,h}, vector at +0x2b0 (0xff = unchanged)
+//   +0x2c8 Grid<bool>   {x0,y0,w,h}, vector<uint32> words at +0x2d8, bit count at +0x2f0
+// ---------------------------------------------------------------------------
+// A detection limit only: one stroke commits before its grid passes 300,000
+// cells (2.4 MB of heights), so a larger span means a bad read.
+static const uint64_t TERRAIN_MAX_BYTES = 64ull << 20;
+static long g_terrainSeq = 0;
+
+struct TerrainGrid { int32_t x0, y0, w, h; uint64_t begin; uint64_t bytes; };
+
+// Header plus data vector (at +0x10 in every grid). bytes stays 0 for an empty
+// vector; false only when a non-empty vector cannot be read.
+static bool ReadTerrainGrid(uint64_t at, TerrainGrid* g)
+{
+    memset(g, 0, sizeof(*g));
+    if (!Readable((void*)at, 0x28)) return false;
+    memcpy(&g->x0, (void*)at, 16);
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (void*)(at + 0x10), 8);
+    memcpy(&e, (void*)(at + 0x18), 8);
+    if (b == e) return true;
+    g->bytes = ReadVec(at + 0x10, &g->begin, TERRAIN_MAX_BYTES);
+    return g->bytes != 0;
+}
+
+static uint64_t Fnv1a64(const uint8_t* p, uint64_t n)
+{
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// A terrain edit crosses the wire as base64 text: the inject line, the LSCMD
+// token and the peer's inject file are all text, and base64 has no space and no
+// '=' before its padding, so it survives decodeCmd's key=value scan.
+static const char B64_ALPHABET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// Returns a malloc'd, NUL-terminated string of 4*ceil(n/3) characters.
+static char* Base64Encode(const uint8_t* p, uint64_t n)
+{
+    const uint64_t outLen = 4 * ((n + 2) / 3);
+    char* out = (char*)malloc((size_t)outLen + 1);
+    if (!out) return nullptr;
+    uint64_t o = 0;
+    for (uint64_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)p[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)p[i + 1] << 8;
+        if (i + 2 < n) v |= p[i + 2];
+        out[o++] = B64_ALPHABET[(v >> 18) & 63];
+        out[o++] = B64_ALPHABET[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? B64_ALPHABET[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? B64_ALPHABET[v & 63] : '=';
+    }
+    out[o] = 0;
+    return out;
+}
+
+// Decodes into a malloc'd buffer (length in *outLen). Whitespace is skipped;
+// any other character outside the alphabet fails the decode.
+static uint8_t* Base64Decode(const uint8_t* s, uint64_t n, uint64_t* outLen)
+{
+    int8_t rev[256];
+    memset(rev, -1, sizeof(rev));
+    for (int i = 0; i < 64; i++) rev[(uint8_t)B64_ALPHABET[i]] = (int8_t)i;
+    uint8_t* out = (uint8_t*)malloc((size_t)(n / 4 * 3 + 3));
+    if (!out) return nullptr;
+    uint64_t o = 0;
+    uint32_t acc = 0;
+    int bitsHeld = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        const uint8_t c = s[i];
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        if (c == '=') break;
+        if (rev[c] < 0) { free(out); return nullptr; }
+        acc = (acc << 6) | (uint32_t)rev[c];
+        bitsHeld += 6;
+        if (bitsHeld >= 8) {
+            bitsHeld -= 8;
+            out[o++] = (uint8_t)(acc >> bitsHeld);
+        }
+    }
+    *outLen = o;
+    return out;
+}
+
+static void AppendTerrainBlob(uint8_t* buf, uint64_t* p, const TerrainGrid& g)
+{
+    memcpy(buf + *p, &g.bytes, 8);
+    *p += 8;
+    if (g.bytes) memcpy(buf + *p, (void*)g.begin, (size_t)g.bytes);
+    *p += g.bytes;
+}
+
+static bool ReadSsoString(uint64_t sa, char* out, size_t cap);   // the CONXP walker's reader
+static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
+{
+    if (!Readable((void*)r8, 0x2f8)) { Log("[terrain] proposal unreadable\n"); return false; }
+    const long seq = ++g_terrainSeq;
+
+    // Everything a terrain edit should leave empty, so an unexpected shape shows.
+    uint64_t b = 0;
+    const uint64_t nodesB = ReadVec(r8 + 0x00, &b, TERRAIN_MAX_BYTES);
+    const uint64_t segsB  = ReadVec(r8 + 0x18, &b, TERRAIN_MAX_BYTES);
+    const uint64_t rmNB   = ReadVec(r8 + 0x30, &b, TERRAIN_MAX_BYTES);
+    const uint64_t rmSB   = ReadVec(r8 + 0x48, &b, TERRAIN_MAX_BYTES);
+    const uint64_t toRmB  = ReadVec(r8 + 0x1e0, &b, TERRAIN_MAX_BYTES);
+    const uint64_t toAddB = ReadVec(r8 + 0x1f8, &b, TERRAIN_MAX_BYTES);
+    const uint64_t v250B  = ReadVec(r8 + 0x250, &b, TERRAIN_MAX_BYTES);
+    uint64_t set188 = 0, old2new = 0, map268 = 0, bits = 0;
+    memcpy(&set188, (void*)(r8 + 0x198), 8);      // unordered_set size (list size at +0x10)
+    memcpy(&old2new, (void*)(r8 + 0x220), 8);     // unordered_map size
+    memcpy(&map268, (void*)(r8 + 0x270), 8);      // std::map size
+    memcpy(&bits, (void*)(r8 + 0x2f0), 8);
+    Log("[terrain] #%ld ProposalAction commit: nodes=%lluB segs=%lluB rmNodes=%lluB rmSegs=%lluB "
+        "set188=%llu toRemove=%lluB toAdd=%lluB old2new=%llu v250=%lluB map268=%llu\n",
+        seq, (unsigned long long)nodesB, (unsigned long long)segsB, (unsigned long long)rmNB,
+        (unsigned long long)rmSB, (unsigned long long)set188, (unsigned long long)toRmB,
+        (unsigned long long)toAddB, (unsigned long long)old2new, (unsigned long long)v250B,
+        (unsigned long long)map268);
+
+    // THE ASSET BRUSH (2026-09-11). Its commit clears old2new and carries no
+    // grid, so its data is in the construction fields or in the unidentified
+    // +0x250 vector<int> / +0x268 map. One placement with this log says which:
+    // what toAdd holds (file, position) and the first ints of +0x250.
+    if (toAddB >= 0x8e0) {
+        uint64_t ab = 0;
+        memcpy(&ab, (void*)(r8 + 0x1f8), 8);
+        const int nadd = (int)(toAddB / 0x8e0);
+        for (int i = 0; i < nadd && i < 4; i++) {
+            const uint64_t ce = ab + (uint64_t)i * 0x8e0;
+            char fn[200] = "";
+            ReadSsoString(ce, fn, sizeof(fn));
+            float x = 0, y = 0, z = 0;
+            if (Readable((void*)(ce + 0x728), 0x40)) {
+                memcpy(&x, (void*)(ce + 0x758), 4);
+                memcpy(&y, (void*)(ce + 0x75c), 4);
+                memcpy(&z, (void*)(ce + 0x760), 4);
+            }
+            Log("[terrain] #%ld   toAdd[%d of %d] file='%s' at (%.1f,%.1f,%.1f)\n", seq, i, nadd, fn, x, y, z);
+        }
+    }
+    if (v250B >= 4) {
+        uint64_t vb = 0;
+        ReadVec(r8 + 0x250, &vb, TERRAIN_MAX_BYTES);
+        char s[200] = "";
+        int o = 0;
+        for (uint64_t i = 0; i < v250B / 4 && i < 16 && vb; i++) {
+            int32_t v;
+            memcpy(&v, (void*)(vb + i * 4), 4);
+            o += snprintf(s + o, sizeof(s) - o, " %d", v);
+        }
+        Log("[terrain] #%ld   v250 (%llu ints):%s\n", seq, (unsigned long long)(v250B / 4), s);
+    }
+
+    TerrainGrid hg, mg, kg;
+    const bool hok = ReadTerrainGrid(r8 + 0x278, &hg);
+    const bool mok = ReadTerrainGrid(r8 + 0x2a0, &mg);
+    const bool kok = ReadTerrainGrid(r8 + 0x2c8, &kg);
+    Log("[terrain] #%ld heights%s x0=%d y0=%d w=%d h=%d data=%lluB (w*h*8=%lld)\n", seq,
+        hok ? "" : " UNREADABLE", hg.x0, hg.y0, hg.w, hg.h, (unsigned long long)hg.bytes,
+        (long long)hg.w * hg.h * 8);
+    Log("[terrain] #%ld material%s x0=%d y0=%d w=%d h=%d data=%lluB (w*h=%lld)\n", seq,
+        mok ? "" : " UNREADABLE", mg.x0, mg.y0, mg.w, mg.h, (unsigned long long)mg.bytes,
+        (long long)mg.w * mg.h);
+    Log("[terrain] #%ld mask%s x0=%d y0=%d w=%d h=%d words=%lluB bits=%llu (w*h=%lld)\n", seq,
+        kok ? "" : " UNREADABLE", kg.x0, kg.y0, kg.w, kg.h, (unsigned long long)kg.bytes,
+        (unsigned long long)bits, (long long)kg.w * kg.h);
+
+    if (hok && hg.w > 0 && hg.h > 0 && hg.bytes == (uint64_t)hg.w * (uint64_t)hg.h * 8) {
+        const float* c = (const float*)hg.begin;
+        const uint64_t n = hg.bytes / 8;
+        uint64_t changed = 0;
+        float hmin = c[0], hmax = c[0], bmin = c[1], bmax = c[1], dmin = 0, dmax = 0;
+        for (uint64_t i = 0; i < n; i++) {
+            const float hv = c[2 * i], bv = c[2 * i + 1];
+            if (hv < hmin) hmin = hv;
+            if (hv > hmax) hmax = hv;
+            if (bv < bmin) bmin = bv;
+            if (bv > bmax) bmax = bv;
+            if (hv != bv) {
+                changed++;
+                if (hv - bv < dmin) dmin = hv - bv;
+                if (hv - bv > dmax) dmax = hv - bv;
+            }
+        }
+        const uint64_t ci = (uint64_t)(hg.h / 2) * (uint64_t)hg.w + (uint64_t)(hg.w / 2);
+        Log("[terrain] #%ld heights: %llu cells, %llu changed; height %.3f..%.3f, base %.3f..%.3f, "
+            "delta %.3f..%.3f; centre (%d,%d) = {%.4f, %.4f}; fnv=%016llx\n",
+            seq, (unsigned long long)n, (unsigned long long)changed, hmin, hmax, bmin, bmax, dmin, dmax,
+            hg.x0 + hg.w / 2, hg.y0 + hg.h / 2, c[2 * ci], c[2 * ci + 1],
+            (unsigned long long)Fnv1a64((const uint8_t*)hg.begin, hg.bytes));
+    }
+    if (mok && mg.w > 0 && mg.h > 0 && mg.bytes == (uint64_t)mg.w * (uint64_t)mg.h) {
+        const uint8_t* m = (const uint8_t*)mg.begin;
+        uint64_t hist[256] = {};
+        for (uint64_t i = 0; i < mg.bytes; i++) hist[m[i]]++;
+        char vals[200] = "";
+        int o = 0, shown = 0;
+        for (int v = 0; v < 255 && shown < 6; v++) {
+            if (!hist[v]) continue;
+            o += snprintf(vals + o, sizeof(vals) - o, " %d:%llu", v, (unsigned long long)hist[v]);
+            shown++;
+        }
+        Log("[terrain] #%ld material: %llu cells, %llu unchanged (0xff), painted:%s; fnv=%016llx\n",
+            seq, (unsigned long long)mg.bytes, (unsigned long long)hist[255], shown ? vals : " none",
+            (unsigned long long)Fnv1a64(m, mg.bytes));
+    }
+    if (kok && kg.bytes >= 4 && bits <= kg.bytes * 8) {
+        const uint32_t* w = (const uint32_t*)kg.begin;
+        uint64_t set = 0;
+        for (uint64_t i = 0; i < bits; i++) set += (w[i >> 5] >> (i & 31)) & 1;
+        Log("[terrain] #%ld mask: %llu of %llu bits set\n", seq, (unsigned long long)set,
+            (unsigned long long)bits);
+    }
+    if (Readable((void*)r9, 0x70))
+        GtDumpRange("TCTX_", 0, (int)seq, (const uint8_t*)r9, 0x70, 0);
+
+    // The edit as one TPTG blob: "TPTG", u32 version 1, the 0x80-byte grid tail
+    // from +0x278, the 0x70-byte context, then heights, material and mask as
+    // u64 size + data. tools\re\terrain_bin.py reads it; InjectTerrainFromFile
+    // puts it back into a proposal.
+    const bool gridsOk = hok && mok && kok &&
+        hg.bytes == (uint64_t)hg.w * (uint64_t)hg.h * 8 &&
+        mg.bytes == (uint64_t)mg.w * (uint64_t)mg.h &&
+        (uint64_t)kg.w * (uint64_t)kg.h == bits && kg.bytes == ((bits + 31) / 32) * 4;
+    const bool hasEdit = hg.bytes || mg.bytes;
+    const bool onlyTerrain = !nodesB && !segsB && !rmNB && !rmSB && !toRmB && !toAddB;
+    const bool ship = SessionLive() && hasEdit;
+    if (!ship && !DumpPropOn()) return false;
+    if (!g_dataDir[0]) return false;
+
+    const uint64_t blobLen = 8 + 0x80 + 0x70 + 24 + hg.bytes + mg.bytes + kg.bytes;
+    uint8_t* blob = (uint8_t*)malloc((size_t)blobLen);
+    if (!blob) { Log("[terrain] #%ld out of memory for a %lluB edit\n", seq, (unsigned long long)blobLen); return false; }
+    {
+        const uint32_t ver = 1;
+        uint64_t p = 0;
+        memcpy(blob, "TPTG", 4);
+        memcpy(blob + 4, &ver, 4);
+        memcpy(blob + 8, (void*)(r8 + 0x278), 0x80);
+        memset(blob + 8 + 0x80, 0, 0x70);
+        if (Readable((void*)r9, 0x70)) memcpy(blob + 8 + 0x80, (void*)r9, 0x70);
+        p = 8 + 0x80 + 0x70;
+        AppendTerrainBlob(blob, &p, hg);
+        AppendTerrainBlob(blob, &p, mg);
+        AppendTerrainBlob(blob, &p, kg);
+    }
+
+    // The grids as a file, for tools\re, only with dumpprop: a painting session
+    // commits on every release.
+    if (DumpPropOn()) {
+        char name[80], path[MAX_PATH];
+        snprintf(name, sizeof(name), "terrain_%s_%lu_%03ld.bin", g_instance,
+                 (unsigned long)GetCurrentProcessId(), seq);
+        snprintf(path, sizeof(path), "%s%s", g_dataDir, name);
+        FILE* f = _fsopen(path, "wb", _SH_DENYWR);
+        if (f) {
+            fwrite(blob, 1, (size_t)blobLen, f);
+            fclose(f);
+            Log("[terrain] #%ld saved %s\n", seq, name);
+        } else {
+            Log("[terrain] #%ld could not create %s\n", seq, name);
+        }
+    }
+
+    // REPLICATION, STRICT (2026-09-11). The blob is STASHED here; the factory
+    // arms the cancel and the Add hook writes TERRAINCAP once it knows whether
+    // the cancel landed (ARMED 1: every instance, this one included, applies
+    // the grids at the stamp through the empty-carrier replay) or the edit had
+    // to run natively here (ARMED 0: the peers apply it, this instance keeps
+    // its native copy -- the v1 behaviour, now the fallback). Heights and
+    // material are absolute, so a replay onto an identical world lands
+    // bit-identical; a terrain that changes EXEC_DELAY earlier on one instance
+    // is exactly the kind of window a later build reads a different height from.
+    bool stashed = false;
+    if (ship) {
+        if (!gridsOk) {
+            Log("[terrain] #%ld grid sizes do not match their data -- the edit runs here only, NOT replicated\n", seq);
+        } else if (!onlyTerrain) {
+            Log("[terrain] #%ld carries streets or constructions as well -- NOT replicated as terrain\n", seq);
+        } else {
+            char* b64 = Base64Encode(blob, blobLen);
+            if (b64) {
+                free(g_terrainB64);
+                g_terrainB64 = b64; g_terrainBlobLen = blobLen; g_terrainStashSeq = seq;
+                stashed = true;
+                Log("[terrain] #%ld stashed for the wire: %lluB edit, %lluB of base64\n",
+                    seq, (unsigned long long)blobLen, (unsigned long long)strlen(b64));
+            } else {
+                Log("[terrain] #%ld base64 encode failed -- the edit runs here only, NOT replicated\n", seq);
+            }
+        }
+    }
+    free(blob);
+    return stashed;
+}
+
+// Write the stashed edit as TERRAINCAP behind ARMED <armed>. armed=true: the
+// cancel landed, the originator replays too. armed=false: the edit ran natively
+// here (no live session at arm time, or the callback could not be fired), the
+// mod ships it with skipOrigin so the peers still get it.
+static void HoldTerrainTool(uint64_t impl)
+{
+    uint64_t tool = 0;
+    if (Readable((void*)(impl + 8), 8)) memcpy(&tool, (void*)(impl + 8), 8);
+    if (!tool || !Readable((void*)(tool + 0xf0), 1)) {
+        Log("[terrain] cannot hold the tool (impl=%llx tool=%llx) -- the stroke resumes before the replay\n", (unsigned long long)impl, (unsigned long long)tool);
+        return;
+    }
+    *(volatile uint8_t*)(tool + 0xf0) = 1;
+    g_terrainHeldTool = tool; g_terrainHeldAt = GetTickCount64();
+    Log("[terrain] tool %llx held (+0xf0) until our replay carrier is added\n", (unsigned long long)tool);
+}
+
+// True for a proposal with no nodes, segments, removals or constructions --
+// what terrain.lua's completion marker looks like (its carrier had grids
+// injected; the marker gets nothing, there is no file left to inject).
+static bool ProposalIsEmpty(uint64_t r8)
+{
+    uint64_t b = 0;
+    static const uint64_t offs[] = { 0x00, 0x18, 0x30, 0x48, 0x1e0 };
+    for (int i = 0; i < 5; i++) {
+        if (ReadVec(r8 + offs[i], &b, 0x20000)) return false;
+    }
+    uint64_t ab = 0, ae = 0;
+    if (Readable((void*)(r8 + 0x1f8), 16)) { memcpy(&ab, (void*)(r8 + 0x1f8), 8); memcpy(&ae, (void*)(r8 + 0x200), 8); }
+    return ae <= ab;
+}
+
+static void ReleaseTerrainTool(const char* why)
+{
+    uint64_t tool = g_terrainHeldTool;
+    if (!tool) return;
+    g_terrainHeldTool = 0;
+    if (Readable((void*)(tool + 0xf0), 1)) *(volatile uint8_t*)(tool + 0xf0) = 0;
+    Log("[terrain] tool %llx released after %llu ms (%s)\n", (unsigned long long)tool, (unsigned long long)(GetTickCount64() - g_terrainHeldAt), why);
+}
+
+static void WriteInjectTerrain(bool armed)
+{
+    ReadInstance();
+    char* b64 = g_terrainB64; g_terrainB64 = nullptr;
+    if (!b64) return;
+    if (!g_instance[0]) { free(b64); return; }
+    WriteArmed(armed);
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (f) {
+        // one write for the payload: the reader re-reads a partial line
+        fprintf(f, "TERRAINCAP %llu ", (unsigned long long)g_terrainBlobLen);
+        fwrite(b64, 1, strlen(b64), f);
+        fputc('\n', f);
+        fclose(f);
+        Log("[terrain] #%ld shipped: %lluB edit, %lluB of base64 (%s)\n", g_terrainStashSeq,
+            (unsigned long long)g_terrainBlobLen, (unsigned long long)strlen(b64),
+            armed ? "cancelled here, every instance applies it at the stamp" : "ran natively here, the peers apply it at the stamp");
+    } else {
+        Log("[terrain] #%ld cannot open %s -- the edit is on this instance only, NOT replicated\n", g_terrainStashSeq, p);
+    }
+    free(b64);
+}
+
+// DEV TEST, inert unless terrain_inject_<inst>.bin exists in the data dir: a
+// script-built proposal that carries nothing (api.cmd.make.buildProposal with
+// an empty SimpleProposal) gets the grids of that file, a capture saved above.
+// It answers what the decompile cannot: does the engine build a terrain edit
+// that arrives this way. The file is deleted once read, usable or not.
+static const uintptr_t RVA_VECCOPY_8 = 0x0cc990;   // vector<8-byte> copy ctor (game allocator)
+static const uintptr_t RVA_VECCOPY_1 = 0x1ded10;   // vector<uint8>
+static const uintptr_t RVA_VECCOPY_4 = 0x125480;   // vector<uint32>
+using GameVecCopy = uint64_t* (*)(uint64_t* dst, const uint64_t* src, uint64_t, uint64_t);
+
+static bool TerrainCarrierEmpty(uint64_t r8)
+{
+    if (!Readable((void*)r8, 0x2f8)) return false;
+    // street half, construction fields, and the three grid vectors
+    static const unsigned vecs[] = { 0x00, 0x18, 0x30, 0x48, 0xf8, 0x1c8, 0x1e0, 0x1f8, 0x250 };
+    for (unsigned off : vecs) {
+        uint64_t b = 0, e = 0;
+        memcpy(&b, (void*)(r8 + off), 8);
+        memcpy(&e, (void*)(r8 + off + 8), 8);
+        if (b != e) return false;
+    }
+    // no allocation to leak: the game's copy constructors overwrite without freeing
+    static const unsigned grids[] = { 0x278, 0x2a0, 0x2c8 };
+    for (unsigned off : grids) {
+        uint64_t b = 0;
+        memcpy(&b, (void*)(r8 + off + 0x10), 8);
+        if (b != 0) return false;
+    }
+    return true;
+}
+
+static bool InjectTerrainFromFile(uint64_t r8)
+{
+    if (!g_dataDir[0]) return false;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%sterrain_inject_%s.bin", g_dataDir, g_instance);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!TerrainCarrierEmpty(r8)) {
+        Log("[terrain-inject] inject file present, but this script proposal is not empty -- left alone\n");
+        return false;
+    }
+    FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+    if (!f) { Log("[terrain-inject] inject file present but not readable\n"); return false; }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    const long minLen = 8 + 0x80 + 0x70 + 24;
+    uint8_t* buf = (len >= minLen && (uint64_t)len <= TERRAIN_MAX_BYTES) ? (uint8_t*)malloc((size_t)len) : nullptr;
+    bool got = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
+    fclose(f);
+    DeleteFileA(path);
+    // The mod writes the TERRAIN command's payload as the base64 it arrived in;
+    // a raw TPTG capture (the dev test) is used as it is.
+    long used = len;
+    if (got && memcmp(buf, "TPTG", 4) != 0) {
+        uint64_t rawLen = 0;
+        uint8_t* raw = Base64Decode(buf, (uint64_t)len, &rawLen);
+        free(buf);
+        buf = raw;
+        used = (long)rawLen;
+        got = raw && used >= minLen;
+    }
+    if (!got) {
+        free(buf);
+        Log("[terrain-inject] inject file too short, too long or unreadable (%ld B) -- left alone\n", len);
+        return false;
+    }
+    len = used;
+
+    bool done = false;
+    do {
+        if (memcmp(buf, "TPTG", 4) != 0) { Log("[terrain-inject] not a TPTG file -- left alone\n"); break; }
+        const uint8_t* tail = buf + 8;
+        uint64_t p = 8 + 0x80 + 0x70, n[3] = {};
+        const uint8_t* data[3] = {};
+        bool truncated = false;
+        for (int i = 0; i < 3; i++) {
+            if (p + 8 > (uint64_t)len) { truncated = true; break; }
+            memcpy(&n[i], buf + p, 8);
+            p += 8;
+            if (n[i] > (uint64_t)len - p) { truncated = true; break; }
+            data[i] = buf + p;
+            p += n[i];
+        }
+        if (truncated) { Log("[terrain-inject] truncated file -- left alone\n"); break; }
+        int32_t hd[4], md[4], kd[4];
+        uint64_t bits = 0;
+        memcpy(hd, tail + 0x00, 16);
+        memcpy(md, tail + 0x28, 16);
+        memcpy(kd, tail + 0x50, 16);
+        memcpy(&bits, tail + 0x78, 8);
+        if (hd[2] < 0 || hd[3] < 0 || md[2] < 0 || md[3] < 0 || kd[2] < 0 || kd[3] < 0 ||
+            (uint64_t)hd[2] * (uint64_t)hd[3] * 8 != n[0] ||
+            (uint64_t)md[2] * (uint64_t)md[3] != n[1] ||
+            (uint64_t)kd[2] * (uint64_t)kd[3] != bits || n[2] != ((bits + 31) / 32) * 4) {
+            Log("[terrain-inject] grid sizes do not match their data (heights %dx%d/%lluB, material %dx%d/%lluB, "
+                "mask %dx%d/%llu bits/%lluB) -- left alone\n", hd[2], hd[3], (unsigned long long)n[0],
+                md[2], md[3], (unsigned long long)n[1], kd[2], kd[3], (unsigned long long)bits,
+                (unsigned long long)n[2]);
+            break;
+        }
+        uint64_t src[3];
+        if (n[0]) {
+            src[0] = (uint64_t)data[0]; src[1] = src[0] + n[0]; src[2] = src[1];
+            ((GameVecCopy)(g_base + RVA_VECCOPY_8))((uint64_t*)(r8 + 0x288), src, 0, 0);
+        }
+        if (n[1]) {
+            src[0] = (uint64_t)data[1]; src[1] = src[0] + n[1]; src[2] = src[1];
+            ((GameVecCopy)(g_base + RVA_VECCOPY_1))((uint64_t*)(r8 + 0x2b0), src, 0, 0);
+        }
+        if (n[2]) {
+            src[0] = (uint64_t)data[2]; src[1] = src[0] + n[2]; src[2] = src[1];
+            ((GameVecCopy)(g_base + RVA_VECCOPY_4))((uint64_t*)(r8 + 0x2d8), src, 0, 0);
+        }
+        memcpy((void*)(r8 + 0x278), hd, 16);
+        memcpy((void*)(r8 + 0x2a0), md, 16);
+        memcpy((void*)(r8 + 0x2c8), kd, 16);
+        memcpy((void*)(r8 + 0x2f0), &bits, 8);
+        Log("[terrain-inject] filled the script proposal: heights %dx%d at (%d,%d), material %dx%d at (%d,%d), "
+            "mask %llu bits\n", hd[2], hd[3], hd[0], hd[1], md[2], md[3], md[0], md[1],
+            (unsigned long long)bits);
+        done = true;
+    } while (0);
+    free(buf);
+    return done;
+}
+
 // CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into
 // its second argument, and the caller destroys that handle as soon as Add
 // returns. Cancelling the call leaves the caller's stack slot holding whatever
@@ -2430,6 +2958,14 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     uint64_t caller = retAddr - g_base;
 
     if (id == ID_CMDADD) {
+        if (g_terrainHeldTool) {
+            uint64_t carrier = (uint64_t)InterlockedCompareExchange64(&g_terrainCarrierCmd, 0, 0);
+            if (carrier && r8 == carrier) {
+                InterlockedExchange64(&g_terrainCarrierCmd, 0);
+                Log("[terrain] our replay carrier was added %llu ms into the hold -- it applies a step later; waiting for its completion marker\n", (unsigned long long)(GetTickCount64() - g_terrainHeldAt));
+            }
+            else if (GetTickCount64() - g_terrainHeldAt > TERRAIN_HOLD_MAX_MS) ReleaseTerrainTool("timeout -- no completion marker arrived");
+        }
         // Pointer match first: this runs ~100/sec and almost never matches.
         uint64_t want = (uint64_t)InterlockedCompareExchange64(&g_pendingCmd, 0, 0);
         if (!want || r8 != want) return 0;
@@ -2478,6 +3014,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                 if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
                 if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
+                if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true);
                 return 1;
             }
             bool fired = false;
@@ -2520,6 +3057,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                         } __except (EXCEPTION_EXECUTE_HANDLER) {
                             fired = false;
                         }
+                        // a cancelled terrain edit: keep the stroke waiting for our replay
+                        if (fired && InterlockedCompareExchange(&g_pendingIsTerrain, 0, 0)) HoldTerrainTool(impl);
                     }
                 }
             }
@@ -2540,6 +3079,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                     if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
                     if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
+                    if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true);
                     return 1;
                 }
                 if (InterlockedExchange(&g_pendingHonour, 0)) {
@@ -2562,6 +3102,10 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     Log("[slice] stop cancel did not land -- STOPX dropped, the poll captures the native build as before\n");
                 if (InterlockedExchange(&g_pendingIsStopDel, 0))
                     Log("[slice] stop bulldoze cancel did not land -- STOPXDEL dropped, the stop poll ships the removal as before\n");
+                if (InterlockedExchange(&g_pendingIsTerrain, 0)) {
+                    Log("[slice] terrain cancel did not land -- the edit ran natively here; shipping it for the peers behind ARMED 0\n");
+                    WriteInjectTerrain(false);
+                }
                 Log("[slice] callback NOT fired -- letting the build run rather "
                     "than wedging the tool (caller_rva=%llx)\n",
                     (unsigned long long)caller);
@@ -2577,6 +3121,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();   // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();    // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel(); // the cancel LANDED
+            if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true); // the cancel LANDED
             return 1;
         }
     }
@@ -2648,6 +3193,36 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
 
     if (id != ID_BUILDPROPOSAL) return 0;
 
+    // TERRAIN TOOLS. A terraform, paint or asset-brush commit is logged (and
+    // saved with dumpprop) and then runs natively. In a live session a terraform
+    // or paint commit is also shipped as TERRAINCAP (see LogTerrainProposal);
+    // the asset brush reaches the peers through the construction path.
+    if (caller == CALLER_PROPOSALACTION) {
+        bool stashed = false;
+        __try {
+            stashed = LogTerrainProposal(r8, r9);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[terrain] decode fault -- the edit runs natively, nothing shipped\n");
+        }
+        if (stashed) {
+            // STRICT: cancel the originator's own commit and let every instance
+            // apply the grids at the stamp. A UI tool: it waits on its completion
+            // callback, so g_pendingNoCb stays 0 and the Add hook fires it, as for
+            // the build tool. No live session -> the edit runs natively here
+            // and ships behind ARMED 0 for the peers.
+            if (SessionLive()) {
+                InterlockedExchange(&g_pendingIsTerrain, 1);
+                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                InterlockedExchange(&g_pendingNoCb, 0);
+                Log("[slice] armed cancel: terrain edit cmd=%llx -- TERRAINCAP ships from the Add hook\n", (unsigned long long)rcx);
+            } else {
+                Log("[slice] terrain edit with no live session -- runs natively here, shipped for the peers\n");
+                WriteInjectTerrain(false);
+            }
+        }
+        return 0;
+    }
+
     // Differential proposal dump (cfg 'dumpprop'): UI placement vs Lua replay.
     // dumpprop covers construction placements (0x419f62 UI, 0xced378 Lua) and,
     // as of 2026-08-29, the STREET/TRACK tool (0x459eb7) too: a native rail-over-
@@ -2660,6 +3235,14 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // A Lua-issued construction proposal (our CONX replay): merge our shipped
     // apron INTO the template's connector so the engine sees the UI's shape.
     if (caller == 0xced378) {
+        __try {
+            if (InjectTerrainFromFile(r8))          // our TERRAIN replay carrier (inert without its file)
+                InterlockedExchange64(&g_terrainCarrierCmd, (LONG64)rcx);
+            else if (g_terrainHeldTool && ProposalIsEmpty(r8))
+                ReleaseTerrainTool("the replay carrier completed (its marker proposal arrived)");
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[terrain-inject] fault -- proposal left as built\n");
+        }
         __try {
             bool merged = MergeTemplateStreet(r8);
             if (merged && DumpPropOn())

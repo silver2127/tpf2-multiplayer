@@ -49,11 +49,14 @@ function CM.readFrom(path, offset)
 	-- separate fprintfs on a shared handle; polling mid-write used to swallow
 	-- the fragment (the length guard rejected it) and the command was silently
 	-- LOST. Trim to the last newline and re-read the remainder next poll.
-	local tail = data:match("[^\n]*$")
-	if #tail > 0 then
-		if #tail == #data then return nil, offset end
-		data = data:sub(1, #data - #tail)
-	end
+	-- Found by scanning back from the end, NOT with data:match("[^\n]*$"): that
+	-- pattern restarts at every position and runs to the newline each time, so it
+	-- is quadratic in the length of the last line. A 64 KB terrain line froze
+	-- both games for 7 s (2026-09-11).
+	local last = #data
+	while last > 0 and data:byte(last) ~= 10 do last = last - 1 end
+	if last == 0 then return nil, offset end
+	if last < #data then data = data:sub(1, last) end
 	return data, offset + #data
 end
 
