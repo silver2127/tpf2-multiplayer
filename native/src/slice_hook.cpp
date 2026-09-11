@@ -53,6 +53,9 @@
 #include <cstring>
 #include <cmath>
 #include <share.h>
+#include <string>
+#include <utility>
+#include <vector>
 #include "hook.h"
 #include "datadir.h"
 
@@ -232,6 +235,16 @@ static char*    g_terrainB64 = nullptr;
 static uint64_t g_terrainBlobLen = 0;
 static long     g_terrainStashSeq = 0;
 static bool     g_terrainIsPaint = false;   // the stashed edit paints only (no height grid)
+// Asset brush cancel (STRICT, 2026-09-11): the same shape as the terrain one.
+// The stroke is stashed at the factory as base64 plus the ids of the groups it
+// removes; ASSETCAP is written from the Add hook behind ARMED 1 (cancelled, every
+// instance applies it at the stamp) or ARMED 0 (it ran natively here).
+static volatile LONG g_pendingIsAssets = 0;
+static char*    g_assetB64 = nullptr;
+static uint64_t g_assetBlobLen = 0;
+static long     g_assetStashSeq = 0;
+static char     g_assetRemoveIds[4096] = "";
+static int      g_assetRemoveCount = 0;
 // THE STROKE WAITS FOR THE REPLAY (docs/re/PROPOSALS.md, Commit and apply).
 // The terrain modifier commits mid-stroke (30 entries / 300k cells) and applies
 // no brush while tool+0xf0 is set; its Add callback {vftable, tool, bool}
@@ -2546,92 +2559,8 @@ static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
         (unsigned long long)toAddB, (unsigned long long)old2new, (unsigned long long)v250B,
         (unsigned long long)map268);
 
-    // THE ASSET BRUSH (2026-09-11). Its commit clears old2new and carries no
-    // grid, so its data is in the construction fields or in the unidentified
-    // +0x250 vector<int> / +0x268 map. One placement with this log says which:
-    // what toAdd holds (file, position) and the first ints of +0x250.
-    if (toAddB >= 0x8e0) {
-        uint64_t ab = 0;
-        memcpy(&ab, (void*)(r8 + 0x1f8), 8);
-        const int nadd = (int)(toAddB / 0x8e0);
-        for (int i = 0; i < nadd && i < 4; i++) {
-            const uint64_t ce = ab + (uint64_t)i * 0x8e0;
-            char fn[200] = "";
-            ReadSsoString(ce, fn, sizeof(fn));
-            float x = 0, y = 0, z = 0;
-            if (Readable((void*)(ce + 0x728), 0x40)) {
-                memcpy(&x, (void*)(ce + 0x758), 4);
-                memcpy(&y, (void*)(ce + 0x75c), 4);
-                memcpy(&z, (void*)(ce + 0x760), 4);
-            }
-            Log("[terrain] #%ld   toAdd[%d of %d] file='%s' at (%.1f,%.1f,%.1f)\n", seq, i, nadd, fn, x, y, z);
-        }
-        // ASSET BRUSH LAYOUT PROBE (2026-09-11). The fields above read '' and
-        // (0,0,0) for every brush entry although toAdd is an exact multiple of
-        // 0x8e0, so dump the first two records raw: the fileName std::string's
-        // 32 bytes, the params lua::Table walked the way CONXP walks it, and the
-        // 16 floats of transf. One brush stroke then says where the data is.
-        for (int i = 0; i < nadd && i < 2; i++) {
-            const uint64_t ce = ab + (uint64_t)i * 0x8e0;
-            if (!Readable((void*)ce, 0x8e0)) { Log("[asset-probe] #%ld [%d] record unreadable\n", seq, i); continue; }
-            uint64_t q[4];
-            memcpy(q, (void*)ce, sizeof(q));
-            Log("[asset-probe] #%ld [%d] ce=%llx +00: %016llx %016llx %016llx(len) %016llx(cap)\n", seq, i,
-                (unsigned long long)ce, (unsigned long long)q[0], (unsigned long long)q[1],
-                (unsigned long long)q[2], (unsigned long long)q[3]);
-            char params[4096];
-            ConxpOut po = { params, sizeof(params), 0, false };
-            params[0] = 0;
-            int pnodes = 0;
-            const bool pok = SerLuaTable(&po, ce + 0x460, 0, &pnodes);
-            Log("[asset-probe] #%ld [%d] params(+0x460) ok=%d nodes=%d trunc=%d: %.900s\n", seq, i,
-                pok ? 1 : 0, pnodes, po.trunc ? 1 : 0, params);
-            float t[16];
-            memcpy(t, (void*)(ce + 0x728), sizeof(t));
-            Log("[asset-probe] #%ld [%d] transf(+0x728): %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f\n",
-                seq, i, t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11], t[12], t[13], t[14], t[15]);
-            // any other readable std::string in the record: scan 8-byte steps for an
-            // SSO whose len/cap look sane and whose text looks like a .con path
-            for (uint64_t off = 0x20; off + 0x20 <= 0x8e0; off += 8) {
-                char s[160];
-                if (ReadSsoString(ce + off, s, sizeof(s)) && strlen(s) >= 4 && strstr(s, ".con"))
-                    Log("[asset-probe] #%ld [%d] string at +0x%03llx: '%s'\n", seq, i, (unsigned long long)off, s);
-            }
-        }
-        // Second pass (2026-09-11): fileName, params and transf are all defaults
-        // in every brush record, so the per-asset data is elsewhere. Save the first
-        // eight records whole and log every 4-byte slot where record 0 and record 1
-        // differ -- per-asset fields (position, rotation, model) differ there -- plus
-        // record 0's slots that look like world coordinates.
-        const int nsave = nadd < 8 ? nadd : 8;
-        if (nsave >= 2 && Readable((void*)ab, (size_t)nsave * 0x8e0) && g_dataDir[0]) {
-            char name[96], path[MAX_PATH];
-            snprintf(name, sizeof(name), "asset_%s_%lu_%03ld.bin", g_instance[0] ? g_instance : "x",
-                     (unsigned long)GetCurrentProcessId(), seq);
-            snprintf(path, sizeof(path), "%s%s", g_dataDir, name);
-            FILE* af = _fsopen(path, "wb", _SH_DENYWR);
-            if (af) {
-                const uint32_t stride = 0x8e0, count = (uint32_t)nsave;
-                fwrite("TPAB", 1, 4, af); fwrite(&stride, 4, 1, af); fwrite(&count, 4, 1, af);
-                fwrite((void*)ab, 1, (size_t)nsave * 0x8e0, af);
-                fclose(af);
-                Log("[asset-probe] #%ld saved %d whole record(s) to %s\n", seq, nsave, name);
-            }
-            const uint8_t* r0 = (const uint8_t*)ab;
-            const uint8_t* r1 = (const uint8_t*)(ab + 0x8e0);
-            int shown = 0;
-            for (uint32_t off = 0; off + 4 <= 0x8e0 && shown < 48; off += 4) {
-                uint32_t a0, a1;
-                memcpy(&a0, r0 + off, 4); memcpy(&a1, r1 + off, 4);
-                if (a0 == a1) continue;
-                float f0, f1;
-                memcpy(&f0, r0 + off, 4); memcpy(&f1, r1 + off, 4);
-                Log("[asset-probe] #%ld differs +0x%03x: %08x %08x  (as float %.3f %.3f)\n", seq, off, a0, a1, f0, f1);
-                shown++;
-            }
-            if (shown == 0) Log("[asset-probe] #%ld records 0 and 1 are byte-identical\n", seq);
-        }
-    }
+    // An asset-brush commit (toAdd / toRemove, no grids) is decoded by
+    // StashAssetsFromProposal, called from the factory branch.
     if (v250B >= 4) {
         uint64_t vb = 0;
         ReadVec(r8 + 0x250, &vb, TERRAIN_MAX_BYTES);
@@ -2989,6 +2918,366 @@ static bool InjectTerrainFromFile(uint64_t r8)
     return done;
 }
 
+// ---------------------------------------------------------------------------
+// ASSET BRUSH (2026-09-11). DECOMPILED: UI::AssetBrush (vftable 0x2fbdd20)
+// builds its proposal in MakeBuildAssetsProposal 0x3d1aa0 (paint) or 0x3d3280
+// (erase), the same records CreateProposalAddAsset 0xa13fc0 makes. MEASURED
+// (asset probe, A, 9 strokes): every toAdd record reads fileName '', params {}
+// and transf identity -- the known ConstructionEntity fields are defaults.
+//   toRemove +0x1e0  vector<int>   the existing groups the stroke touched
+//   toAdd    +0x1f8  vector<CE>    one 0x8e0 record per group:
+//                                  +0x020 int 0xb, +0x20d byte 1,
+//                                  +0x550 vector of one 0x48 record {.., 0.75f @+0x38, 2.5f @+0x3c},
+//                                  +0x470 vector<TransformedModel>
+//   TransformedModel 0x80           +0x00 std::string model, +0x20 std::string, +0x40 Mat4f
+// A touched group is removed and re-added with the models it keeps; an erase
+// that empties a group removes it with no record. Nothing random is left to
+// recompute: model, rotation and scale are baked into each matrix.
+//
+// Lua cannot build these records (the SimpleProposal ConstructionEntity has no
+// +0x20 or +0x470), so the replay is native, like the terrain grids: the
+// originator ships every record's models, and at the stamp every instance fills
+// an empty script proposal with them through the game's own constructors and
+// vector operations. Removed groups travel as positions (the mod resolves the
+// ids while they still stand -- the stroke is cancelled here), never as ids.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_CE_CTOR       = 0x3ceae0;  // ConstructionEntity::ConstructionEntity()
+static const uintptr_t RVA_CE_DTOR       = 0x3d0430;  // ~ConstructionEntity()
+static const uintptr_t RVA_CE_COPY_AT    = 0x3ce460;  // copy-construct a CE at (dst, const CE&)
+static const uintptr_t RVA_VEC_CE_GROW   = 0x3c8680;  // vector<CE>::_Emplace_reallocate(vec, where, const CE&)
+static const uintptr_t RVA_VEC_48_GROW   = 0x3c8b40;  // vector<0x48 record>::_Emplace_reallocate(vec, where, rec&&)
+static const uintptr_t RVA_VEC_TM_ASSIGN = 0x3c7780;  // vector<TransformedModel>::assign(vec, first, last)
+static const uintptr_t RVA_VEC_INT_GROW  = 0x0e8060;  // vector<int>::_Emplace_reallocate(vec, where, const int&)
+static const int32_t   ASSET_GROUP_TYPE  = 0xb;
+static const uint32_t  ASSET_MAX_MODELS  = 20000;     // per record
+static const uint32_t  ASSET_MAX_RECORDS = 4096;
+static const size_t    ASSET_MAX_STRING  = 511;
+
+struct AssetBlob { uint8_t* p; uint64_t n, cap; bool bad; };
+static void AbPut(AssetBlob* b, const void* d, uint64_t len)
+{
+    if (b->bad || !len) return;
+    if (b->n + len > b->cap) {
+        uint64_t nc = b->cap ? b->cap * 2 : 65536;
+        while (nc < b->n + len) nc *= 2;
+        if (nc > TERRAIN_MAX_BYTES) { b->bad = true; return; }
+        uint8_t* np = (uint8_t*)realloc(b->p, (size_t)nc);
+        if (!np) { b->bad = true; return; }
+        b->p = np; b->cap = nc;
+    }
+    memcpy(b->p + b->n, d, (size_t)len);
+    b->n += len;
+}
+
+// An asset-brush stroke off the ProposalAction commit: "TPAS", u32 version 1,
+// u32 records, u32 removals, then per record u32 models and per model
+// u16 + model path, u16 + second string, 64 bytes of Mat4f. Stashed as base64
+// with the removed group ids; false (and nothing stashed) for anything that is
+// not purely an asset stroke or does not read cleanly -- never ship bad data.
+static bool StashAssetsFromProposal(uint64_t r8, long seq)
+{
+    if (!Readable((void*)r8, 0x2f8)) return false;
+    uint64_t ab = 0, rb = 0, b = 0;
+    const uint64_t toAddB = ReadVec(r8 + 0x1f8, &ab, TERRAIN_MAX_BYTES);
+    const uint64_t toRmB  = ReadVec(r8 + 0x1e0, &rb, TERRAIN_MAX_BYTES);
+    if (!toAddB && !toRmB) return false;
+    // a stroke touches nothing else: no street half, no grids
+    if (ReadVec(r8 + 0x00, &b, TERRAIN_MAX_BYTES) || ReadVec(r8 + 0x18, &b, TERRAIN_MAX_BYTES) ||
+        ReadVec(r8 + 0x30, &b, TERRAIN_MAX_BYTES) || ReadVec(r8 + 0x48, &b, TERRAIN_MAX_BYTES) ||
+        ReadVec(r8 + 0x288, &b, TERRAIN_MAX_BYTES) || ReadVec(r8 + 0x2b0, &b, TERRAIN_MAX_BYTES) ||
+        ReadVec(r8 + 0x2d8, &b, TERRAIN_MAX_BYTES))
+        return false;
+    if (toAddB % 0x8e0 || toRmB % 4 || toAddB / 0x8e0 > ASSET_MAX_RECORDS) {
+        Log("[asset] #%ld toAdd %lluB / toRemove %lluB do not divide into records -- not an asset stroke\n",
+            seq, (unsigned long long)toAddB, (unsigned long long)toRmB);
+        return false;
+    }
+    const uint32_t nrec = (uint32_t)(toAddB / 0x8e0);
+    const uint32_t nrm  = (uint32_t)(toRmB / 4);
+
+    // the removed ids, as text for the mod (it turns them into positions)
+    char ids[sizeof(g_assetRemoveIds)] = "";
+    size_t io = 0;
+    for (uint32_t i = 0; i < nrm; i++) {
+        int32_t id = 0;
+        memcpy(&id, (void*)(rb + (uint64_t)i * 4), 4);
+        int w = snprintf(ids + io, sizeof(ids) - io, "%s%d", i ? "," : "", id);
+        if (w < 0 || (size_t)w >= sizeof(ids) - io) {
+            Log("[asset] #%ld %u removals do not fit the inject line -- not replicated\n", seq, nrm);
+            return false;
+        }
+        io += (size_t)w;
+    }
+
+    AssetBlob out = { nullptr, 0, 0, false };
+    const uint32_t ver = 1;
+    AbPut(&out, "TPAS", 4); AbPut(&out, &ver, 4); AbPut(&out, &nrec, 4); AbPut(&out, &nrm, 4);
+    uint64_t models = 0;
+    char first[ASSET_MAX_STRING + 1] = "";
+    float fx = 0, fy = 0, fz = 0;
+    const char* why = nullptr;
+    for (uint32_t i = 0; i < nrec && !why && !out.bad; i++) {
+        const uint64_t ce = ab + (uint64_t)i * 0x8e0;
+        if (!Readable((void*)ce, 0x8e0)) { why = "a record is unreadable"; break; }
+        int32_t type = 0;
+        memcpy(&type, (void*)(ce + 0x20), 4);
+        if (type != ASSET_GROUP_TYPE) { why = "a record is not an asset group (type != 0xb)"; break; }
+        uint64_t mb = 0, me = 0;
+        memcpy(&mb, (void*)(ce + 0x470), 8);
+        memcpy(&me, (void*)(ce + 0x478), 8);
+        if (me < mb || (me - mb) % 0x80 || (me - mb) / 0x80 > ASSET_MAX_MODELS || me == mb ||
+            !Readable((void*)mb, (size_t)(me - mb))) { why = "a record's model list does not read"; break; }
+        const uint32_t nm = (uint32_t)((me - mb) / 0x80);
+        AbPut(&out, &nm, 4);
+        for (uint32_t k = 0; k < nm; k++) {
+            const uint64_t tm = mb + (uint64_t)k * 0x80;
+            char s1[ASSET_MAX_STRING + 1], s2[ASSET_MAX_STRING + 1];
+            uint64_t l1 = 0, l2 = 0;
+            memcpy(&l1, (void*)(tm + 0x10), 8);
+            memcpy(&l2, (void*)(tm + 0x30), 8);
+            if (l1 == 0 || l1 > ASSET_MAX_STRING || l2 > ASSET_MAX_STRING ||
+                !ReadSsoString(tm, s1, sizeof(s1)) || !ReadSsoString(tm + 0x20, s2, sizeof(s2)) ||
+                strlen(s1) != l1 || strlen(s2) != l2) { why = "a model's strings do not read"; break; }
+            const uint16_t w1 = (uint16_t)l1, w2 = (uint16_t)l2;
+            AbPut(&out, &w1, 2); AbPut(&out, s1, l1);
+            AbPut(&out, &w2, 2); AbPut(&out, s2, l2);
+            AbPut(&out, (void*)(tm + 0x40), 0x40);
+            if (models == 0) {
+                strcpy_s(first, s1);
+                memcpy(&fx, (void*)(tm + 0x70), 4); memcpy(&fy, (void*)(tm + 0x74), 4); memcpy(&fz, (void*)(tm + 0x78), 4);
+            }
+            models++;
+        }
+    }
+    if (why || out.bad) {
+        Log("[asset] #%ld %s -- the stroke runs here only, NOT replicated\n", seq, why ? why : "the stroke is too big to ship");
+        free(out.p);
+        return false;
+    }
+    char* b64 = Base64Encode(out.p, out.n);
+    if (!b64) { free(out.p); Log("[asset] #%ld base64 encode failed -- NOT replicated\n", seq); return false; }
+    free(g_assetB64);
+    g_assetB64 = b64; g_assetBlobLen = out.n; g_assetStashSeq = seq;
+    strcpy_s(g_assetRemoveIds, ids);
+    g_assetRemoveCount = (int)nrm;
+    Log("[asset] #%ld stashed: %u group(s), %llu model(s), %u removal(s); first '%s' at (%.1f,%.1f,%.1f); %lluB\n",
+        seq, nrec, (unsigned long long)models, nrm, first, fx, fy, fz, (unsigned long long)out.n);
+    free(out.p);
+    return true;
+}
+
+// ASSETCAP <bytes> <base64> <removals> <id,id,...|->  behind ARMED <armed>.
+static void WriteInjectAssets(bool armed)
+{
+    ReadInstance();
+    char* b64 = g_assetB64; g_assetB64 = nullptr;
+    if (!b64) return;
+    if (!g_instance[0]) { free(b64); return; }
+    WriteArmed(armed);
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (f) {
+        fprintf(f, "ASSETCAP %llu ", (unsigned long long)g_assetBlobLen);
+        fwrite(b64, 1, strlen(b64), f);
+        fprintf(f, " %d %s\n", g_assetRemoveCount, g_assetRemoveCount ? g_assetRemoveIds : "-");
+        fclose(f);
+        Log("[asset] #%ld shipped: %lluB stroke, %d removal(s) (%s)\n", g_assetStashSeq,
+            (unsigned long long)g_assetBlobLen, g_assetRemoveCount,
+            armed ? "cancelled here, every instance applies it at the stamp" : "ran natively here, the peers apply it at the stamp");
+    } else {
+        Log("[asset] #%ld cannot open %s -- the stroke is on this instance only, NOT replicated\n", g_assetStashSeq, p);
+    }
+    free(b64);
+}
+
+// An MSVC std::string the game's copy constructor can read: SSO below 16 chars,
+// otherwise a pointer to our own buffer (freed by us once copied).
+static char* PutReadOnlyStdString(uint8_t* at, const std::string& s)
+{
+    memset(at, 0, 0x20);
+    const uint64_t len = s.size();
+    uint64_t cap = 15;
+    char* heap = nullptr;
+    if (len < 16) {
+        memcpy(at, s.data(), (size_t)len);
+    } else {
+        heap = (char*)malloc((size_t)len + 1);
+        if (!heap) return (char*)-1;
+        memcpy(heap, s.data(), (size_t)len);
+        heap[len] = 0;
+        memcpy(at, &heap, 8);
+        cap = len;
+    }
+    memcpy(at + 0x10, &len, 8);
+    memcpy(at + 0x18, &cap, 8);
+    return heap;
+}
+
+struct AssetModelSrc { std::string model, extra; uint8_t m[0x40]; };
+
+// The inject file's text, "rm <id,id,...|->\n<base64 TPAS stroke>", into removal
+// ids and per-group model lists. Returns why it is unusable, or nullptr. Pure (no
+// game memory), so tools\re\asset_stroke_test.py round-trips it offline.
+static const char* ParseAssetStroke(const std::string& text, std::vector<int32_t>* rm,
+                                    std::vector<std::vector<AssetModelSrc>>* recs)
+{
+    rm->clear();
+    recs->clear();
+    const size_t nl = text.find('\n');
+    if (text.compare(0, 3, "rm ") != 0 || nl == std::string::npos) return "malformed inject file";
+    std::string ids = text.substr(3, nl - 3);
+    while (!ids.empty() && (ids.back() == '\r' || ids.back() == ' ')) ids.pop_back();
+    if (ids != "-") {
+        const char* s = ids.c_str();
+        while (*s) {
+            char* e = nullptr;
+            const long v = strtol(s, &e, 10);
+            if (e == s || v <= 0 || rm->size() >= 4096) return "bad removal list";
+            rm->push_back((int32_t)v);
+            if (*e == ',') s = e + 1;
+            else if (*e == 0) s = e;
+            else return "bad removal list";
+        }
+    }
+    const std::string b64 = text.substr(nl + 1);
+    uint64_t rawLen = 0;
+    uint8_t* raw = Base64Decode((const uint8_t*)b64.data(), b64.size(), &rawLen);
+    if (!raw) return "payload is not base64";
+    const char* bad = nullptr;
+    uint64_t p = 0;
+    auto take = [&](void* d, uint64_t n) -> bool {
+        if (n > rawLen - p) return false;
+        memcpy(d, raw + p, (size_t)n);
+        p += n;
+        return true;
+    };
+    uint32_t ver = 0, nrec = 0, nrm = 0;
+    char magic[4];
+    if (!take(magic, 4) || memcmp(magic, "TPAS", 4) != 0) bad = "not a TPAS stroke";
+    else if (!take(&ver, 4) || ver != 1 || !take(&nrec, 4) || !take(&nrm, 4) || nrec > ASSET_MAX_RECORDS) bad = "bad header";
+    for (uint32_t i = 0; i < nrec && !bad; i++) {
+        uint32_t nm = 0;
+        if (!take(&nm, 4) || nm == 0 || nm > ASSET_MAX_MODELS) { bad = "bad model count"; break; }
+        std::vector<AssetModelSrc> models(nm);
+        for (uint32_t k = 0; k < nm && !bad; k++) {
+            uint16_t l1 = 0, l2 = 0;
+            if (!take(&l1, 2) || l1 == 0 || l1 > ASSET_MAX_STRING || l1 > rawLen - p) { bad = "bad model path"; break; }
+            models[k].model.assign((const char*)raw + p, l1);
+            p += l1;
+            if (!take(&l2, 2) || l2 > ASSET_MAX_STRING || l2 > rawLen - p) { bad = "bad second string"; break; }
+            models[k].extra.assign((const char*)raw + p, l2);
+            p += l2;
+            if (!take(models[k].m, 0x40)) { bad = "truncated matrix"; break; }
+        }
+        if (!bad) recs->push_back(std::move(models));
+    }
+    if (!bad && p != rawLen) bad = "trailing bytes";
+    free(raw);
+    return bad;
+}
+
+// The replay: asset_inject_<letter>.txt ("rm <id,id,...|->" then the stroke's
+// base64) fills an EMPTY script proposal with the stroke's groups and the local
+// ids the mod matched for its removals. The file is deleted once read.
+static bool InjectAssetsFromFile(uint64_t r8)
+{
+    if (!g_dataDir[0]) return false;
+    ReadInstance();
+    if (!g_instance[0]) return false;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%sasset_inject_%s.txt", g_dataDir, g_instance);
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return false;
+    if (!TerrainCarrierEmpty(r8)) {
+        Log("[asset-inject] inject file present, but this script proposal is not empty -- left alone\n");
+        return false;
+    }
+    FILE* f = _fsopen(path, "rb", _SH_DENYNO);
+    if (!f) { Log("[asset-inject] inject file present but not readable\n"); return false; }
+    fseek(f, 0, SEEK_END);
+    const long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string text;
+    if (len > 0 && (uint64_t)len <= TERRAIN_MAX_BYTES) {
+        text.resize((size_t)len);
+        if (fread(&text[0], 1, (size_t)len, f) != (size_t)len) text.clear();
+    }
+    fclose(f);
+    DeleteFileA(path);
+
+    std::vector<int32_t> rm;
+    std::vector<std::vector<AssetModelSrc>> recs;
+    if (const char* bad = ParseAssetStroke(text, &rm, &recs)) {
+        Log("[asset-inject] %s (%ld B) -- left alone\n", bad, len);
+        return false;
+    }
+
+    // removals: the local groups the mod matched by position
+    for (int32_t id : rm) {
+        uint64_t e = 0, c = 0;
+        memcpy(&e, (void*)(r8 + 0x1e8), 8);
+        memcpy(&c, (void*)(r8 + 0x1f0), 8);
+        if (e == c) {
+            ((uint64_t (*)(uint64_t*, uint64_t, const int32_t*))(g_base + RVA_VEC_INT_GROW))((uint64_t*)(r8 + 0x1e0), e, &id);
+        } else {
+            memcpy((void*)e, &id, 4);
+            e += 4;
+            memcpy((void*)(r8 + 0x1e8), &e, 8);
+        }
+    }
+    // additions: one asset-group record per shipped group, built exactly as
+    // MakeBuildAssetsProposal builds it
+    uint64_t models = 0;
+    for (auto& rec : recs) {
+        alignas(16) uint8_t ce[0x8e0];
+        ((void* (*)(uint8_t*))(g_base + RVA_CE_CTOR))(ce);
+        memcpy(ce + 0x20, &ASSET_GROUP_TYPE, 4);
+        ce[0x20d] = 1;
+        alignas(16) uint8_t r48[0x48] = {};
+        const float f75 = 0.75f, f25 = 2.5f;
+        memcpy(r48 + 0x38, &f75, 4);
+        memcpy(r48 + 0x3c, &f25, 4);
+        uint64_t e48 = 0;
+        memcpy(&e48, ce + 0x558, 8);
+        ((uint64_t (*)(uint64_t*, uint64_t, uint8_t*))(g_base + RVA_VEC_48_GROW))((uint64_t*)(ce + 0x550), e48, r48);
+
+        const size_t nm = rec.size();
+        uint8_t* src = (uint8_t*)calloc(nm, 0x80);
+        std::vector<char*> heaps;
+        bool ok = src != nullptr;
+        for (size_t k = 0; ok && k < nm; k++) {
+            uint8_t* tm = src + k * 0x80;
+            char* h1 = PutReadOnlyStdString(tm, rec[k].model);
+            char* h2 = PutReadOnlyStdString(tm + 0x20, rec[k].extra);
+            if (h1 == (char*)-1 || h2 == (char*)-1) ok = false;
+            if (h1 && h1 != (char*)-1) heaps.push_back(h1);
+            if (h2 && h2 != (char*)-1) heaps.push_back(h2);
+            memcpy(tm + 0x40, rec[k].m, 0x40);
+        }
+        if (ok) {
+            ((void (*)(uint64_t*, uint8_t*, uint8_t*))(g_base + RVA_VEC_TM_ASSIGN))((uint64_t*)(ce + 0x470), src, src + nm * 0x80);
+            uint64_t e = 0, c = 0;
+            memcpy(&e, (void*)(r8 + 0x200), 8);
+            memcpy(&c, (void*)(r8 + 0x208), 8);
+            if (e == c) {
+                ((uint64_t (*)(uint64_t*, uint64_t, uint8_t*))(g_base + RVA_VEC_CE_GROW))((uint64_t*)(r8 + 0x1f8), e, ce);
+            } else {
+                ((void* (*)(uint64_t, uint8_t*))(g_base + RVA_CE_COPY_AT))(e, ce);
+                e += 0x8e0;
+                memcpy((void*)(r8 + 0x200), &e, 8);
+            }
+            models += nm;
+        }
+        for (char* h : heaps) free(h);
+        free(src);
+        ((void (*)(uint8_t*))(g_base + RVA_CE_DTOR))(ce);
+        if (!ok) { Log("[asset-inject] out of memory building a group -- the carrier is partial\n"); break; }
+    }
+    Log("[asset-inject] filled the script proposal: %zu group(s), %llu model(s), %zu removal(s)\n",
+        recs.size(), (unsigned long long)models, rm.size());
+    return true;
+}
+
 // CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into
 // its second argument, and the caller destroys that handle as soon as Add
 // returns. Cancelling the call leaves the caller's stack slot holding whatever
@@ -3088,7 +3377,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                 if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
                 if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
-                if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true);
+                if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true); if (InterlockedExchange(&g_pendingIsAssets, 0)) WriteInjectAssets(true);
                 return 1;
             }
             bool fired = false;
@@ -3132,7 +3421,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                             fired = false;
                         }
                         // a cancelled terrain edit: keep the stroke waiting for our replay
-                        if (fired && InterlockedCompareExchange(&g_pendingIsTerrain, 0, 0)) HoldTerrainTool(impl);
+                        if (fired && (InterlockedCompareExchange(&g_pendingIsTerrain, 0, 0) || InterlockedCompareExchange(&g_pendingIsAssets, 0, 0))) HoldTerrainTool(impl);
                     }
                 }
             }
@@ -3153,7 +3442,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                     if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
                     if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
-                    if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true);
+                    if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true); if (InterlockedExchange(&g_pendingIsAssets, 0)) WriteInjectAssets(true);
                     return 1;
                 }
                 if (InterlockedExchange(&g_pendingHonour, 0)) {
@@ -3180,6 +3469,10 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     Log("[slice] terrain cancel did not land -- the edit ran natively here; shipping it for the peers behind ARMED 0\n");
                     WriteInjectTerrain(false);
                 }
+                if (InterlockedExchange(&g_pendingIsAssets, 0)) {
+                    Log("[slice] asset stroke cancel did not land -- the stroke ran natively here; shipping it for the peers behind ARMED 0\n");
+                    WriteInjectAssets(false);
+                }
                 Log("[slice] callback NOT fired -- letting the build run rather "
                     "than wedging the tool (caller_rva=%llx)\n",
                     (unsigned long long)caller);
@@ -3195,7 +3488,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();   // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();    // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel(); // the cancel LANDED
-            if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true); // the cancel LANDED
+            if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true); if (InterlockedExchange(&g_pendingIsAssets, 0)) WriteInjectAssets(true); // the cancel LANDED
             return 1;
         }
     }
@@ -3268,9 +3561,9 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     if (id != ID_BUILDPROPOSAL) return 0;
 
     // TERRAIN TOOLS. A terraform, paint or asset-brush commit is logged (and
-    // saved with dumpprop) and then runs natively. In a live session a terraform
-    // or paint commit is also shipped as TERRAINCAP (see LogTerrainProposal);
-    // the asset brush reaches the peers through the construction path.
+    // saved with dumpprop). In a live session a terraform is cancelled and
+    // shipped as TERRAINCAP, a paint stroke runs natively and is shipped, and an
+    // asset-brush stroke is cancelled and shipped as ASSETCAP.
     if (caller == CALLER_PROPOSALACTION) {
         bool stashed = false;
         __try {
@@ -3302,6 +3595,28 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 WriteInjectTerrain(false);
             }
         }
+        // THE ASSET BRUSH, STRICT like terraform: cancelled here so the groups it
+        // removes still stand while the mod turns their ids into positions, and
+        // every instance applies the stroke at the stamp.
+        bool astashed = false;
+        if (!stashed) {
+            __try {
+                astashed = StashAssetsFromProposal(r8, g_terrainSeq);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("[asset] decode fault -- the stroke runs natively, nothing shipped\n");
+            }
+        }
+        if (astashed) {
+            if (SessionLive()) {
+                InterlockedExchange(&g_pendingIsAssets, 1);
+                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                InterlockedExchange(&g_pendingNoCb, 0);
+                Log("[slice] armed cancel: asset stroke cmd=%llx -- ASSETCAP ships from the Add hook\n", (unsigned long long)rcx);
+            } else {
+                // solo: nothing to replay; drop the stash, the engine builds it
+                free(g_assetB64); g_assetB64 = nullptr;
+            }
+        }
         return 0;
     }
 
@@ -3319,6 +3634,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     if (caller == 0xced378) {
         __try {
             if (InjectTerrainFromFile(r8))          // our TERRAIN replay carrier (inert without its file)
+                InterlockedExchange64(&g_terrainCarrierCmd, (LONG64)rcx);
+            else if (InjectAssetsFromFile(r8))      // our ASSETS replay carrier (inert without its file)
                 InterlockedExchange64(&g_terrainCarrierCmd, (LONG64)rcx);
             else if (g_terrainHeldTool && ProposalIsEmpty(r8))
                 ReleaseTerrainTool("the replay carrier completed (its marker proposal arrived)");

@@ -115,6 +115,10 @@ function CM.pollInject()
 				-- a terraform or paint commit that applied here natively (CM.terrainCapture)
 				CM.terrainCapture(w)
 
+			elseif o == "ASSETCAP" then
+				-- an asset-brush stroke the slice cancelled (CM.assetCapture)
+				CM.assetCapture(w)
+
 			-- ROADE <N> <etype> <stype> <ttype> <cat> <M> <rn> <re>
 			--       <id x y z>*N <a1 a2 t0x t0y t0z t1x t1y t1z>*M
 			--       <rmnodeid>*rn <a1 a2 t0x t0y t0z t1x t1y t1z>*re
