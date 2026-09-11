@@ -256,17 +256,33 @@ end
 CM.CM_OWNED_TYPES = { "CONSTRUCTION", "VEHICLE", "LINE", "BASE_EDGE", "BASE_NODE", "STATION_GROUP", "STATION", "SIGNAL" }
 function CM.cmOwnedEntities(pid)
 	local out, seen = {}, {}
+	local function take(eid)
+		if type(eid) == "number" and eid > 0 and not seen[eid] then
+			seen[eid] = true
+			if CM.cmOwnerOf(eid) == pid then out[#out + 1] = eid end
+		end
+	end
 	for _, kind in ipairs(CM.CM_OWNED_TYPES) do
 		pcall(function()
 			local t = game.interface.getEntities({ radius = 999999 }, { type = kind, includeData = false }) or {}
-			for _, eid in pairs(t) do
-				if type(eid) == "number" and not seen[eid] then
-					seen[eid] = true
-					if CM.cmOwnerOf(eid) == pid then out[#out + 1] = eid end
-				end
-			end
+			for _, eid in pairs(t) do take(eid) end
 		end)
 	end
+	-- LINES have no position, so getEntities never returns one (probed on the
+	-- live host 2026-09-11: lineSystem 5 lines, getEntities 0). A switch
+	-- therefore left every line on the player the save had, on every
+	-- machine, and each side then listed the lines under a different
+	-- company. The line system is the enumerator for lines.
+	pcall(function()
+		local ls = api.engine.system.lineSystem.getLines()
+		for i = 1, #ls do take(ls[i]) end
+	end)
+	-- PARKED vehicles are not world entities either: only the vehicle
+	-- system sees a depot's occupants (parked-vehicles-not-world-entities).
+	pcall(function()
+		local v = api.engine.system.transportVehicleSystem.getVehiclesWithState(api.type.enum.TransportVehicleState.IN_DEPOT)
+		for i = 1, #v do take(v[i]) end
+	end)
 	return out
 end
 function CM.cmMoveAssets(fromPid, toPid, why)
@@ -468,9 +484,74 @@ function CM.cmHandOver(list, to)
 	end
 	CM.cmVehPendingAt = CM.ticks or 0
 end
+-- A LINE BELONGS WITH ITS VEHICLES. Lines were left out of every company switch
+-- until 2026-09-11 (getEntities cannot see them), so a save can carry lines on
+-- one company whose vehicles all belong to another -- and each machine had
+-- them on a different company (host: lines on co2 with co1's buses on them).
+-- Vehicle ownership IS consistent across machines (by company), so re-owning
+-- such a line to its vehicles' company gives every machine the same answer.
+-- Fires only when every vehicle on the line agrees and the line disagrees;
+-- a line without vehicles is left alone. Local representation, like every
+-- other ownership change in this file.
+function CM.cmRepairLineOwners(why)
+	if CM.cmMode ~= "companies" then return end
+	local ids = {}
+	pcall(function()
+		local ls = api.engine.system.lineSystem.getLines()
+		for i = 1, #ls do ids[#ids + 1] = ls[i] end
+	end)
+	local vehOfLine = {}
+	local function scan(list)
+		for i = 1, #list do
+			local v = list[i]
+			pcall(function()
+				local tv = api.engine.getComponent(v, api.type.ComponentType.TRANSPORT_VEHICLE)
+				if tv and tv.line and tv.line > 0 then
+					vehOfLine[tv.line] = vehOfLine[tv.line] or {}
+					table.insert(vehOfLine[tv.line], CM.cmOwnerOf(v))
+				end
+			end)
+		end
+	end
+	pcall(function()
+		local t = game.interface.getEntities({ radius = 999999 }, { type = "VEHICLE", includeData = false }) or {}
+		local list = {}
+		for _, e in pairs(t) do list[#list + 1] = e end
+		scan(list)
+	end)
+	pcall(function()
+		local v = api.engine.system.transportVehicleSystem.getVehiclesWithState(api.type.enum.TransportVehicleState.IN_DEPOT)
+		local list = {}
+		for i = 1, #v do list[#list + 1] = v[i] end
+		scan(list)
+	end)
+	local known = {}
+	for cid, pid in pairs(CM.cmCompanyPid or {}) do known[pid] = cid end
+	local fixed = 0
+	for _, lid in ipairs(ids) do
+		local owners = vehOfLine[lid]
+		if owners and #owners > 0 then
+			local want = owners[1]
+			for _, o in ipairs(owners) do if o ~= want then want = nil; break end end
+			local have = CM.cmOwnerOf(lid)
+			if want and known[want] and have ~= want then
+				local ok = pcall(function() game.interface.setPlayer(lid, want) end)
+				fixed = fixed + 1
+				CM.cmLog(string.format("CM: line %d owned by pid %s but its %d vehicle(s) belong to co%d (pid %s) -- re-owned to the vehicles' company (%s) ok=%s",
+					lid, tostring(have), #owners, known[want], tostring(want), tostring(why), tostring(ok)))
+			end
+		end
+	end
+	if fixed > 0 then CM.cmNote(string.format("%d line(s) re-owned to their vehicles' company (%s)", fixed, why)) end
+end
+
 -- About four seconds after a swap: every vehicle left to follow its line either
 -- has the new owner or is handed over directly now.
 function CM.cmVehRecheck()
+	if CM.cmRepairAt and (CM.ticks or 0) >= CM.cmRepairAt then
+		CM.cmRepairAt = nil
+		pcall(CM.cmRepairLineOwners, "after the switch")
+	end
 	local p = CM.cmVehPending
 	if not p or #p == 0 then CM.cmVehPending = nil; return end
 	if (CM.ticks or 0) - (CM.cmVehPendingAt or 0) < 20 then return end
@@ -508,6 +589,7 @@ function CM.cmLocalSwitch(cid)
 	if okW then CM.loanExpect = la; CM.loanExpectSince = CM.ticks end
 	CM.cmCompanyPid[old] = ai; CM.cmCompanyPid[cid] = human
 	CM.cmMyCompany = cid
+	CM.cmRepairAt = (CM.ticks or 0) + 25          -- lines follow their vehicles, once the swap has settled
 	CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
 		tostring(bh), tostring(lh), tostring(ba), tostring(la), okW and "" or " -- wallet swap FAILED"))
 	if okW and (ba or 0) == 0 and (la or 0) == 0 then CM.cmNote("company " .. cid .. " starts empty: take a loan to fund it") end
@@ -563,6 +645,7 @@ function CM.cmApplySaved()
 	CM.cmReady = true
 	log(string.format("company: state restored from the save: %d companies, saver was co%d, we take co%d", #CM.cmRoster, tonumber(sv.mine), want))
 	if want ~= CM.cmMyCompany then CM.cmLocalSwitch(want) end
+	CM.cmRepairAt = (CM.ticks or 0) + 25              -- the saver too: its lines may carry another company's vehicles
 end
 
 function CM.execCompanyCmd(c)
