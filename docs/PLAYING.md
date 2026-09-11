@@ -118,6 +118,11 @@ different company chips in the lobby before START GAME: click your own chip to c
 are different companies with their own money, and buildings and vehicles stay owned by the company
 that built them.
 
+Roadside bus, tram and truck stops belong to the company that placed them, on every player's game,
+and that company pays for them. Another company cannot bulldoze them, or replace one by placing its
+own stop on the same side of the road; the game tells you whose stop it is. Stops placed before this
+version keep whatever owner each game gave them.
+
 In game, the **companies** section of the Multiplayer window shows your company and how many are
 in the session. Use **<** and **>** to select one, **switch to it** to play that company instead
 of yours, **new company** to start a fresh one, and the **company password** field with **set on
