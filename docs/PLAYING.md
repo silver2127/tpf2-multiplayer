@@ -41,9 +41,7 @@ While the panel is open, typing goes into its fields and the game does not see i
    shows `[locked]`.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
-4. Press **START GAME**: the most recent save in your save folder (autosaves count) is sent to
-   everyone. Or open the game's own **LOAD GAME** and load the save you want while players
-   are in the lobby: that save is shared the same way and loads for you at once. It is sent to
+4. Press **START GAME**. The most recent save in your save folder (autosaves count) is sent to
    everyone. When the panel says the save is ready, open **LOAD GAME** and pick **mp_shared**;
    everyone else does the same.
 
