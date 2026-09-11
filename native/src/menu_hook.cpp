@@ -307,8 +307,6 @@ static const char* originLetterFor(const char* name);
 static void ClipboardSet(const char* utf8);
 static bool ClipboardGet(char* out, int outsz);
 static bool newestSave(wchar_t* out, int cch);
-static void RefreshSaves(bool force);
-static bool selectedSave(wchar_t* out, int cch);
 static bool doStartLoad(const wchar_t* srcSav);
 // Lobby lifecycle flags (all cleared in StartLobby):
 //  g_lobbyReady -- set when the FIRST event line is read from lobby_out.jsonl.
@@ -435,16 +433,6 @@ static char g_status[256] = "";
 // A pending "download the mods this save needs?" question from the lobby
 // (guarded by g_statusCs). YES / NO buttons take the status line while set.
 static char g_modsPrompt[300] = "";
-// SAVE TO SHARE: the host picks which save START GAME sends. Newest first; the
-// list is re-read every few seconds while the lobby view is up, and a pick
-// survives a re-read by name (a new autosave lands at the top without
-// stealing the selection). Guarded by g_modelCs.
-#define SAVE_ROWS 16
-static wchar_t   g_saveNames[SAVE_ROWS][300];
-static wchar_t   g_saveWhen[SAVE_ROWS][24];
-static int       g_saveCount = 0, g_saveSel = 0;
-static bool      g_saveTouched = false;
-static DWORD     g_saveScanAt = 0;
 static int  g_flagShareMods = 0;      // share_mods=ask (0, default) | always (1) | never (2)
 // lobby model (fed from lobby_out.jsonl)
 static char g_players[200][40]; static int g_playerCount = 0;
@@ -974,9 +962,6 @@ static void RenderPanelLayer(int w, int h)
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
         // chat
         int inH = S(30), logH = contentH - inH - S(8);
-        const bool hostView = InterlockedCompareExchange(&g_isHost, 0, 0) != 0;
-        const int selH = hostView ? S(30) + S(8) : 0;   // the SAVE TO SHARE row takes this off the chat log
-        logH -= selH;
         layerRect(chatX, cy, chatW, logH, RGB(0, 0, 0), 50);
         if (g_modelCsInit) {
             EnterCriticalSection(&g_modelCs);
@@ -988,23 +973,7 @@ static void RenderPanelLayer(int w, int h)
             }
             DeleteObject(fc); LeaveCriticalSection(&g_modelCs);
         }
-        if (hostView) {
-            RefreshSaves(false);
-            int sy = cy + logH + S(8), bw = S(30);
-            wchar_t label[400]; int cnt = 0;
-            if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-            cnt = g_saveCount;
-            if (cnt > 0) {
-                wchar_t nm[300]; wcscpy_s(nm, g_saveNames[g_saveSel]); size_t L = wcslen(nm); if (L > 4 && _wcsicmp(nm + L - 4, L".sav") == 0) nm[L - 4] = 0;
-                _snwprintf_s(label, _TRUNCATE, L"SHARE:  %s   (%s%s)   %d/%d", nm, g_saveWhen[g_saveSel], g_saveSel == 0 ? L", newest" : L"", g_saveSel + 1, cnt);
-            } else wcscpy_s(label, L"SHARE:  no save found in the save folder");
-            if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-            HFONT fsv = mkLato(S(12));
-            layerText(chatX, sy, chatW - 2 * bw - S(16), S(30), label, fsv, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            DeleteObject(fsv);
-            if (cnt > 1) { mwButton(chatX + chatW - 2 * bw - S(8), sy, bw, S(30), L"<", 18); mwButton(chatX + chatW - bw, sy, bw, S(30), L">", 19); }
-        }
-        mwField(chatX, cy + logH + selH + S(8), chatW, inH, g_chatInput, true, L"Type a message and press Enter", 9);
+        mwField(chatX, cy + logH + S(8), chatW, inH, g_chatInput, true, L"Type a message and press Enter", 9);
         // button row: LEAVE left, START GAME right (host)
         int bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5);
         if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
@@ -1335,14 +1304,6 @@ static void OnHit(int id)
     Log("[menu] hit id=%d\n", id);
     switch (id) {
     case 4: InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
-    case 18: case 19: {   // SAVE TO SHARE: previous / next
-        RefreshSaves(true);
-        if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-        if (g_saveCount > 0) { g_saveSel = (g_saveSel + (id == 19 ? 1 : g_saveCount - 1)) % g_saveCount; g_saveTouched = true; }
-        if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-        InterlockedExchange(&g_panelDirty, 1);
-        break;
-    }
     case 16: case 17: {   // YES / NO to the mod download
         const bool yes = (id == 16);
         if (g_csInit) { EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs); }
@@ -1358,7 +1319,7 @@ static void OnHit(int id)
         // lobby.py truncates lobby_in.jsonl when it starts: a command appended
         // before its first event line would be lost. Wait for that first line.
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
-        if (selectedSave(g_startSaveW, 600)) {
+        if (newestSave(g_startSaveW, 600)) {
             char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
             char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
             char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
@@ -2136,57 +2097,6 @@ static bool newestSave(wchar_t* out, int cch)
     if (!bestName[0] && sharedName[0]) wcscpy_s(bestName, sharedName);   // nothing else: fall back to our copy
     if (!bestName[0]) return false;
     _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", SAVE_DIR, bestName);
-    return true;
-}
-
-// Enumerate SAVE_DIR\*.sav newest-first into g_saveNames (mp_shared.sav only
-// when nothing else exists, as newestSave does). force skips the 5 s cache.
-static void RefreshSaves(bool force)
-{
-    DWORD now = GetTickCount();
-    if (!force && g_saveScanAt && now - g_saveScanAt < 5000) return;
-    g_saveScanAt = now;
-    struct Ent { wchar_t name[300]; ULONGLONG t; } ents[64]; int n = 0; Ent shared = {}; bool hasShared = false;
-    wchar_t pat[700]; _snwprintf_s(pat, _TRUNCATE, L"%s\\*.sav", SAVE_DIR);
-    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
-            if (_wcsicmp(fd.cFileName, L"mp_shared.sav") == 0) { wcscpy_s(shared.name, fd.cFileName); shared.t = t; hasShared = true; continue; }
-            if (n < 64) { wcscpy_s(ents[n].name, fd.cFileName); ents[n].t = t; n++; }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    if (n == 0 && hasShared) { ents[0] = shared; n = 1; }
-    for (int i = 1; i < n; i++) { Ent e = ents[i]; int j = i - 1; while (j >= 0 && ents[j].t < e.t) { ents[j + 1] = ents[j]; j--; } ents[j + 1] = e; }
-    wchar_t keep[300] = L"";
-    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-    if (g_saveTouched && g_saveSel < g_saveCount) wcscpy_s(keep, g_saveNames[g_saveSel]);
-    g_saveCount = n < SAVE_ROWS ? n : SAVE_ROWS;
-    int sel = 0;
-    for (int i = 0; i < g_saveCount; i++) {
-        wcscpy_s(g_saveNames[i], ents[i].name);
-        FILETIME ft; ft.dwLowDateTime = (DWORD)ents[i].t; ft.dwHighDateTime = (DWORD)(ents[i].t >> 32);
-        FILETIME lt; SYSTEMTIME st; FileTimeToLocalFileTime(&ft, &lt); FileTimeToSystemTime(&lt, &st);
-        _snwprintf_s(g_saveWhen[i], _TRUNCATE, L"%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
-        if (keep[0] && _wcsicmp(keep, ents[i].name) == 0) sel = i;
-    }
-    g_saveSel = sel;
-    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-}
-
-// The save START GAME shares: the host's pick, else the newest.
-static bool selectedSave(wchar_t* out, int cch)
-{
-    RefreshSaves(true);
-    wchar_t name[300] = L"";
-    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-    if (g_saveCount > 0 && g_saveSel < g_saveCount) wcscpy_s(name, g_saveNames[g_saveSel]);
-    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-    if (!name[0]) return newestSave(out, cch);
-    _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", SAVE_DIR, name);
-    Log("[menu] START GAME shares %ls (%s)\n", name, g_saveTouched ? "picked by the host" : "newest");
     return true;
 }
 
