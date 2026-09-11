@@ -141,6 +141,25 @@ local guiTick = 0   -- gui-state only
 -- value from the save. Step size is what settles resolution, not one reading.
 K.EXEC_DELAY = 0.4   -- two sim steps; was 0.6 until 2026-09-11 (RECV logs spare= to keep checking it)
 
+-- AUTO DELAY (2026-09-11). Unless tpf2_slice.cfg pins exec_delay, the delay
+-- follows the measured round trip to each peer (heartbeat echoes, CM.rttNote):
+-- half the worst peer's smoothed round trip plus two deviations and a slack,
+-- converted to game units at the current sim rate, snapped up to the step grid.
+-- K.EXEC_DELAY above is only the starting value until a peer has been measured.
+-- It rises at once and falls one step at a time after K.DELAY_DOWN_TICKS.
+K.EXEC_DELAY_MIN = 0.2
+K.EXEC_DELAY_MAX = 3.0
+K.DELAY_SLACK_MS = 50
+K.DELAY_DOWN_TICKS = 25
+K.RTT_MIN_SAMPLES = 3
+
+-- GAP HOLD (2026-09-11). A command a peer has announced (LSHI, or hi= on its
+-- heartbeat) but we have not received holds this game at speed 0 before its
+-- stamp comes due, until the resend fills it (CM.gapHoldTick, net.lua).
+K.GAP_HOLD_GRACE_TICKS = 1     -- ordinary reordering never stutters the game
+K.GAP_HOLD_ENGAGE_TICKS = 3    -- engage this many ticks of sim progress ahead of the stamp
+K.GAP_HOLD_MAX_TICKS = 55      -- ~10 s: then give up on that command (it applies late if it comes)
+
 -- The most peer lead a command's stamp will pay for: a live session was seen
 -- 9.2 units apart (net.lua scheduleLocal).
 CM.MAX_LEAD = 15.0
@@ -718,12 +737,18 @@ function data()
 			if CM.ticks % 60 == 0 and not CM.conxBusy then CM.sweepSplits() end
 			if CM.ticks % K.CON_EDIT_SCAN_EVERY == 0 then CM.scanConstructionEdits() end
 
+			-- the command delay follows the measured round trips (net.lua CM.execDelayTick)
+			if CM.execDelayTick then pcall(CM.execDelayTick) end
 			if CM.ticks % K.HEARTBEAT_EVERY == 0 then
 				-- far behind the session (a fresh hot joiner, load-gated or not): say so on
 				-- every heartbeat, so nobody paces against a peer that must catch up
 				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
-					CM.heartbeatCu(now) and " cu=1" or ""))
+				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
+				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
+					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
+					CM.heartbeatEcho and CM.heartbeatEcho() or ""))
 			end
 
 			CM.paceTick(now)
@@ -910,6 +935,17 @@ function data()
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
 						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
+						-- the command delay (auto or pinned), the worst peer's round trip, and a gap hold in force
+						f:write(string.format("xdelay=%.1f%s\n", CM.execDelayCur or K.EXEC_DELAY, CM.execDelayAuto and " auto" or " fixed"))
+						do
+							local rt = {}
+							for o, pr in pairs(CM.peers) do
+								if pr.srtt then rt[#rt + 1] = string.format("%s:%d+-%dms", o, math.floor(pr.srtt + 0.5), math.floor((pr.rttvar or 0) + 0.5)) end
+							end
+							table.sort(rt)
+							f:write("rtt=" .. (#rt > 0 and table.concat(rt, " ") or "-") .. "\n")
+						end
+						f:write("hold=" .. (CM.gapHold and string.format("%s seq %d", tostring(CM.gapHold.o), CM.gapHold.seq or -1) or "-") .. "\n")
 						local ps = {}
 						for o, pr in pairs(CM.peers) do
 							if pr.time and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
@@ -1122,9 +1158,10 @@ function data()
 					CM.dash = D
 					D.cols = present
 					D.colsKey = colsKey
-					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "vdrift", "money" }
+					D.rows = { "t", "peer", "skew", "speed", "paused", "queued", "desyncs", "late", "applylag", "applied", "xdelay", "rtt", "hold", "vdrift", "money" }
 					D.labels = { t = "game time", peer = "peer time", skew = "skew", speed = "speed", paused = "paused",
 					             queued = "queued", desyncs = "desyncs", late = "late arrivals", applylag = "worst apply lag", applied = "commands applied",
+					             xdelay = "command delay", rtt = "round trip", hold = "waiting for command",
 					             vdrift = "vehicle drift mean/max", money = "balance / loan" }
 					D.cells = {}
 					D.table = api.gui.comp.Table.new(1 + #D.cols, "NONE")

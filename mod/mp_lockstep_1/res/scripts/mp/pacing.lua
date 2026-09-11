@@ -671,6 +671,17 @@ function CM.paceV2(now)
 		if settled and s ~= CM.leverOf(cu) then CM.setSpeed(cu, cu == 0 and "catch-up: holding for the history" or string.format("catch-up at %gx", cu)) end
 		return
 	end
+	-- GAP HOLD (net.lua CM.gapHoldTick): a command we know a peer issued, due
+	-- before we could stop, has not arrived -- stop here until the resend fills it
+	-- (or the hold gives up), instead of simulating past it and applying it late.
+	-- Our own 0 through setSpeed, so the leader's detector never takes it for the
+	-- player's pause; the ordinary path below restores the speed after release.
+	if CM.gapHoldTick and CM.gapHoldTick(now) then
+		if s ~= 0 and (settled or CM.lastSetSpeed ~= 0) then
+			CM.setSpeed(0, string.format("holding for %s's missing command seq=%d", tostring(CM.gapHold and CM.gapHold.o), CM.gapHold and CM.gapHold.seq or -1))
+		end
+		return
+	end
 	local eff = CM.effSpeed
 	if eff == nil then return end
 	if eff > 0 then CM.runSpeed = eff end
@@ -775,11 +786,21 @@ end
 -- delay. Absent, unparsable or outside 0.2..5 = 0.4. Read HERE, after
 -- cfgNum exists: reading it earlier in the file crashed the script at load
 -- ("attempt to call field 'cfgNum'", 2026-09-08).
+-- Since 2026-09-11 a NUMBER here pins the delay; absent or anything else (e.g.
+-- exec_delay=auto) lets it follow the measured round trips (net.lua
+-- CM.execDelayTick), starting from K.EXEC_DELAY.
 do
-	local d = CM.cfgNum("exec_delay", K.EXEC_DELAY)
-	if d and d >= 0.2 and d <= 5 then K.EXEC_DELAY = d end
-	log(string.format("EXEC_DELAY = %.1f game unit(s) = %d sim step(s)", K.EXEC_DELAY,
-		math.ceil(K.EXEC_DELAY / K.SIM_STEP - 1e-6)))
+	local d = CM.cfgNum("exec_delay", nil)
+	if d and d >= 0.2 and d <= 5 then
+		K.EXEC_DELAY = d
+		CM.execDelayAuto = false
+		log(string.format("EXEC_DELAY = %.1f game unit(s) = %d sim step(s), pinned by tpf2_slice.cfg", K.EXEC_DELAY,
+			math.ceil(K.EXEC_DELAY / K.SIM_STEP - 1e-6)))
+	else
+		CM.execDelayAuto = true
+		log(string.format("EXEC_DELAY auto: starts at %.1f, then follows the measured round trip to each peer (%.1f..%.1f)",
+			K.EXEC_DELAY, K.EXEC_DELAY_MIN or 0.2, K.EXEC_DELAY_MAX or 3.0))
+	end
 end
 
 -- LOAD GATE: is everybody in?
