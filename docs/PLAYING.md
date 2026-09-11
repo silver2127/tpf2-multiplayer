@@ -79,7 +79,7 @@ list while it is up.
 ### The Multiplayer window
 
 A small **Multiplayer** window sits at the top left. **Ctrl+Shift+D** hides and shows it. Its
-buttons toggle four sections:
+buttons toggle three sections:
 
 - **stats** (hidden at first): a status line that says whether the worlds match. After a desync
   it says what differs (for example "roads and tracks" or "town buildings (5 fewer here)"), when
@@ -89,8 +89,6 @@ buttons toggle four sections:
   **numbers** shows the raw counters (game times, skew, apply lag, drift, balance) for debugging.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
-- **speed** (hidden at first): the **session speed**, then what your own game is doing to stay in step ("in
-  step with the leader", "catching up", "easing off", or "this game leads the clock").
 
 ### Speed and pause
 
