@@ -1255,6 +1255,21 @@ static bool       g_lineDecodeOk = false;
 
 static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
 {
+    // An EMPTY stop list is a real edit: removing a line's last stop. ReadVec
+    // rejects end == begin, so it used to fail the decode, stay uncancelled and
+    // run natively on the clicker two steps before the peers' replay (a:7,
+    // 2026-09-11 desync). Accepted only at +0x00 -- waitingTime at +0x18 has
+    // already read sane by then -- and only as a well-formed empty vector.
+    if (vecOff == 0x00 && Readable((void*)line, 0x18)) {
+        uint64_t vb = 0, ve = 0, vc = 0;
+        memcpy(&vb, (void*)line, 8);
+        memcpy(&ve, (void*)(line + 0x08), 8);
+        memcpy(&vc, (void*)(line + 0x10), 8);
+        if (vb == ve && vc >= ve && (vb == 0 ? vc == 0 : IsHeapPtr(vb) && IsHeapPtr(vc))) {
+            out->n = 0;
+            return true;
+        }
+    }
     uint64_t sb = 0;
     uint64_t span = ReadVec(line + vecOff, &sb, 0xa8 * 64);
     if (span == 0 || (span % 0xa8) != 0) return false;
@@ -1378,9 +1393,13 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             fprintf(f, "\n");
-            Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%d..%d)\n",
-                (int)(int32_t)r8, d.wait, d.n, d.st[0].sg, d.st[0].station, d.st[0].terminal,
-                d.st[0].loadMode, d.st[0].minWait, d.st[0].maxWait);
+            if (d.n > 0)
+                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%d..%d)\n",
+                    (int)(int32_t)r8, d.wait, d.n, d.st[0].sg, d.st[0].station, d.st[0].terminal,
+                    d.st[0].loadMode, d.st[0].minWait, d.st[0].maxWait);
+            else
+                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=0 (last stop removed)\n",
+                    (int)(int32_t)r8, d.wait);
         } else {
             fprintf(f, "LUPDATE %d\n", (int)(int32_t)r8);
             Log("[slice] LUPDATE shipped (event only): line=%d\n", (int)(int32_t)r8);
