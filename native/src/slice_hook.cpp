@@ -2598,6 +2598,39 @@ static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
                     Log("[asset-probe] #%ld [%d] string at +0x%03llx: '%s'\n", seq, i, (unsigned long long)off, s);
             }
         }
+        // Second pass (2026-09-11): fileName, params and transf are all defaults
+        // in every brush record, so the per-asset data is elsewhere. Save the first
+        // eight records whole and log every 4-byte slot where record 0 and record 1
+        // differ -- per-asset fields (position, rotation, model) differ there -- plus
+        // record 0's slots that look like world coordinates.
+        const int nsave = nadd < 8 ? nadd : 8;
+        if (nsave >= 2 && Readable((void*)ab, (size_t)nsave * 0x8e0) && g_dataDir[0]) {
+            char name[96], path[MAX_PATH];
+            snprintf(name, sizeof(name), "asset_%s_%lu_%03ld.bin", g_instance[0] ? g_instance : "x",
+                     (unsigned long)GetCurrentProcessId(), seq);
+            snprintf(path, sizeof(path), "%s%s", g_dataDir, name);
+            FILE* af = _fsopen(path, "wb", _SH_DENYWR);
+            if (af) {
+                const uint32_t stride = 0x8e0, count = (uint32_t)nsave;
+                fwrite("TPAB", 1, 4, af); fwrite(&stride, 4, 1, af); fwrite(&count, 4, 1, af);
+                fwrite((void*)ab, 1, (size_t)nsave * 0x8e0, af);
+                fclose(af);
+                Log("[asset-probe] #%ld saved %d whole record(s) to %s\n", seq, nsave, name);
+            }
+            const uint8_t* r0 = (const uint8_t*)ab;
+            const uint8_t* r1 = (const uint8_t*)(ab + 0x8e0);
+            int shown = 0;
+            for (uint32_t off = 0; off + 4 <= 0x8e0 && shown < 48; off += 4) {
+                uint32_t a0, a1;
+                memcpy(&a0, r0 + off, 4); memcpy(&a1, r1 + off, 4);
+                if (a0 == a1) continue;
+                float f0, f1;
+                memcpy(&f0, r0 + off, 4); memcpy(&f1, r1 + off, 4);
+                Log("[asset-probe] #%ld differs +0x%03x: %08x %08x  (as float %.3f %.3f)\n", seq, off, a0, a1, f0, f1);
+                shown++;
+            }
+            if (shown == 0) Log("[asset-probe] #%ld records 0 and 1 are byte-identical\n", seq);
+        }
     }
     if (v250B >= 4) {
         uint64_t vb = 0;
