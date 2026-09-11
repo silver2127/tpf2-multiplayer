@@ -231,6 +231,7 @@ static volatile LONG g_pendingIsTerrain = 0;
 static char*    g_terrainB64 = nullptr;
 static uint64_t g_terrainBlobLen = 0;
 static long     g_terrainStashSeq = 0;
+static bool     g_terrainIsPaint = false;   // the stashed edit paints only (no height grid)
 // THE STROKE WAITS FOR THE REPLAY (docs/re/PROPOSALS.md, Commit and apply).
 // The terrain modifier commits mid-stroke (30 entries / 300k cells) and applies
 // no brush while tool+0xf0 is set; its Add callback {vftable, tool, bool}
@@ -2710,6 +2711,8 @@ static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
             if (b64) {
                 free(g_terrainB64);
                 g_terrainB64 = b64; g_terrainBlobLen = blobLen; g_terrainStashSeq = seq;
+                // paint only: material and mask, no heights (see the factory branch)
+                g_terrainIsPaint = (hg.bytes == 0 && mg.bytes != 0);
                 stashed = true;
                 Log("[terrain] #%ld stashed for the wire: %lluB edit, %lluB of base64\n",
                     seq, (unsigned long long)blobLen, (unsigned long long)strlen(b64));
@@ -3210,7 +3213,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[terrain] decode fault -- the edit runs natively, nothing shipped\n");
         }
-        if (stashed) {
+        if (stashed && g_terrainIsPaint) {
+            // PAINT IS NOT CANCELLED (the user's call, 2026-09-11). It moves no
+            // heights, so nothing built later reads a different terrain while the
+            // peers catch up, and the painter commits only on release -- no
+            // mid-stroke part to wait for. It paints here at once and ships behind
+            // ARMED 0: every other instance applies it at the stamp.
+            Log("[terrain] #%ld paint: runs natively here, shipped for the peers\n", g_terrainStashSeq);
+            WriteInjectTerrain(false);
+        } else if (stashed) {
             // STRICT: cancel the originator's own commit and let every instance
             // apply the grids at the stamp. A UI tool: it waits on its completion
             // callback, so g_pendingNoCb stays 0 and the Add hook fires it, as for
