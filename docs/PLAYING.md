@@ -81,9 +81,12 @@ list while it is up.
 A small **Multiplayer** window sits at the top left. **Ctrl+Shift+D** hides and shows it. Its
 buttons toggle four sections:
 
-- **stats** (hidden at first): a column per player with game time, skew, speed, queued and
-  late commands, desyncs, apply lag, vehicle drift and balance, plus the **verdict**: `SYNC`
-  while the worlds agree, `DESYNC ...` naming what differs.
+- **stats** (hidden at first): a status line that says whether the worlds match. After a desync
+  it says what differs (for example "roads and tracks" or "town buildings (5 fewer here)"), when
+  it was first noticed, and that the fix is to reload a save the host makes. Below it, one row per
+  player: whether that player's world matches, whether their clock is in step, and for your own
+  row the speed and anything that needs attention (late or lost commands, vehicles drifting apart).
+  **numbers** shows the raw counters (game times, skew, apply lag, drift, balance) for debugging.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
 - **speed** (hidden at first): the **session speed**, then what your own game is doing to stay in step ("in

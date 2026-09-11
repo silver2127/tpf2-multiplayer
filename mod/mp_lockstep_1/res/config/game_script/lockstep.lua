@@ -571,6 +571,9 @@ CM.boot("mp.pacing")
 -- ---------- other players' cursors as coloured ground circles (cosmetic) ----------
 -- Lives in res/scripts/mp/cursors.lua.
 CM.boot("mp.cursors")
+-- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
+-- Lives in res/scripts/mp/stats.lua.
+CM.boot("mp.stats")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
 	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
@@ -1170,9 +1173,35 @@ function data()
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					box:addItem(togC)
+					-- ---- stats, in words (2026-09-11) ----
+					-- A status line (do the worlds match; if not, what differs, since when
+					-- and what to do) and one row per player (stats.lua). The raw counters
+					-- that used to be the whole section stay behind "numbers".
+					D.statusText = api.gui.comp.TextView.new("Checking...")
+					D.ptable = api.gui.comp.Table.new(4, "NONE")
+					D.ptable:addRow({ api.gui.comp.TextView.new("player   "), api.gui.comp.TextView.new("worlds   "),
+						api.gui.comp.TextView.new("clock (game time)   "), api.gui.comp.TextView.new("notes") })
+					D.pcells = {}
+					for _, letter in ipairs(D.cols) do
+						local pc = { name = api.gui.comp.TextView.new(string.upper(letter)), sync = api.gui.comp.TextView.new("-"),
+							clock = api.gui.comp.TextView.new("-"), notes = api.gui.comp.TextView.new("") }
+						D.pcells[letter] = pc
+						D.ptable:addRow({ pc.name, pc.sync, pc.clock, pc.notes })
+					end
+					CM.dashShowNumbers = (CM.dashShowNumbers == true)       -- hidden by default
+					local rawL = api.gui.layout.BoxLayout.new("VERTICAL")
+					rawL:addItem(D.table)
+					rawL:addItem(D.verdict)
+					D.rawBox = api.gui.comp.Component.new("mpStatsNumbers")
+					D.rawBox:setLayout(rawL)
 					local statsL = api.gui.layout.BoxLayout.new("VERTICAL")
-					statsL:addItem(D.table)
-					statsL:addItem(D.verdict)
+					statsL:addItem(D.statusText)
+					statsL:addItem(D.ptable)
+					statsL:addItem(toggleBtn("  numbers  ", function()
+						CM.dashShowNumbers = not CM.dashShowNumbers
+						pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					end))
+					statsL:addItem(D.rawBox)
 					D.statsBox = api.gui.comp.Component.new("mpStats")
 					D.statsBox:setLayout(statsL)
 					box:addItem(D.statsBox)
@@ -1287,6 +1316,7 @@ function data()
 					box:addItem(D.chatBox)
 					pcall(function()
 						D.statsBox:setVisible(CM.dashShowStats, false)
+						D.rawBox:setVisible(CM.dashShowNumbers, false)
 						D.chatBox:setVisible(CM.dashShowChat, false)
 						D.coBox:setVisible(CM.dashShowCompanies, false)
 						D.speedBox:setVisible(CM.dashShowSpeed, false)
@@ -1317,6 +1347,10 @@ function data()
 				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
 				table.sort(vs)
 				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-") .. (#vs > 0 and ("   [" .. table.concat(vs, ", ") .. "]") or ""))
+				if CM.statsInWords and D.statusText then
+					local okW, errW = pcall(CM.statsInWords, D.statusText, D.pcells or {}, own, D.cols, fresh, peerInfo)
+					if not okW and not D.statsErrLogged then D.statsErrLogged = true; print("[ls-gui] stats in words: " .. tostring(errW)) end
+				end
 				pcall(function()
 					local eff = mine and tonumber(mine.eff) or nil
 					D.eff = eff
