@@ -157,6 +157,7 @@ import hashlib
 import json
 import os
 import re
+import queue
 import random
 import select
 import shutil
@@ -170,12 +171,12 @@ import time
 # Reuse the transport verbatim -- do NOT reinvent the framing/handshake.
 from punch import (
     DEFAULT_PORT, TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE,
-    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, _pack, _unpack, open_socket,
+    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, TOKEN_LEN, _pack, _unpack, open_socket,
 )
 from seal import Sealer, derive_key, SECRET_LEN
 import modshare                     # share the mods a save needs (mod zips ride the save transfer)
 # Reuse the code exchange + the connect race + observe/announce.
-from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4
+from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4, parse_hostport
 from mesh import MeshNode
 
 # --------------------------------------------------------------------------- #
@@ -1709,6 +1710,155 @@ class _Publisher:
 
 
 # --------------------------------------------------------------------------- #
+# RENDEZVOUS: hole punching to the host through the master server
+# --------------------------------------------------------------------------- #
+# The host used to be reachable only when its port was OPEN: a joiner dials the
+# code's addresses and nothing ever came back the other way, so a host whose
+# UPnP mapping "succeeded" but did not take (a second router, a firewall) could
+# not be joined at all (2026-09-11: open=true in the code, no handshake).
+#
+# Now every joiner posts its own STUN-observed address to the master server while
+# it dials, sealed with a key derived from the code's secret, under a tag also
+# derived from it. The host polls its tag, opens the note and fires HELLOs at
+# that address for RV_PUNCH_FOR seconds. Its outbound packets open its own NAT
+# for the joiner's HELLOs, which then arrive and are ACKed as usual: the classic
+# simultaneous punch, over the handshake that already exists. The master can
+# neither read a note nor link a tag to a lobby. No master, no punch: joining an
+# open host still works exactly as before.
+DEFAULT_MASTER = "https://srv1306562.hstgr.cloud/tpf2mp"   # the menu's master_url default
+RV_POLL_EVERY = 1.0       # host: seconds between polls for knocks
+RV_KNOCK_EVERY = 2.0      # joiner: seconds between knocks while it dials
+RV_PUNCH_FOR = 15.0       # host: seconds to keep punching toward one knocked address
+RV_PUNCH_EVERY = 0.2      # host: seconds between punch bursts
+
+
+def _rv_tag(secret):
+    return hashlib.sha256(b"tpf2mp-rendezvous-v1|" + bytes(secret)).hexdigest()[:24]
+
+
+def _rv_sealer(secret, password):
+    # its own Sealer (own replay window) under a key separate from the session's
+    return Sealer(hashlib.sha256(derive_key(secret, password or "") + b"|rendezvous").digest())
+
+
+def _rv_url(args):
+    """The master used for knocks: --rendezvous, else --publish, else the default;
+    '--rendezvous off' disables them."""
+    v = (getattr(args, "rendezvous", "") or "").strip()
+    if v.lower() == "off":
+        return ""
+    return (v or getattr(args, "publish", "") or DEFAULT_MASTER).rstrip("/")
+
+
+def _http_json(url, body=None, timeout=6):
+    import urllib.request
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "tpf2mp-lobby/" + LOBBY_VERSION})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8") or "{}")
+
+
+class _RendezvousHost:
+    """Polls the master for joiners' sealed address notes; each valid one is put
+    on ``queue`` as a list of (ip, port) punch targets for run_host."""
+
+    def __init__(self, url, secret, password, log, poll_every=RV_POLL_EVERY):
+        self.url, self.tag, self.log = url.rstrip("/"), _rv_tag(secret), log
+        self.sealer = _rv_sealer(secret, password)
+        self.poll_every = poll_every
+        self.queue = queue.Queue()
+        self._since = 0.0
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True, name="rendezvous")
+        self._t.start()
+
+    def close(self):
+        self._stop.set()
+        self._t.join(timeout=3)
+
+    def targets_from(self, blob_b64):
+        """A knock's blob -> [(ip, port), ...], or None if it is not ours."""
+        import base64
+        try:
+            raw = base64.b64decode(blob_b64, validate=True)
+        except (ValueError, TypeError):
+            return None
+        plain = self.sealer.open(raw)
+        if plain is None:
+            return None
+        try:
+            prof = decode_code(plain.decode("ascii"))
+        except (ValueError, UnicodeDecodeError, KeyError, IndexError):
+            return None
+        out = []
+        for key in ("public_v4", "lan_v4"):
+            hp = parse_hostport(prof.get("candidates", {}).get(key))
+            if hp and hp[1] and hp not in out:
+                out.append(hp)
+        return out or None
+
+    def _run(self):
+        warned = False
+        while not self._stop.is_set():
+            try:
+                r = _http_json(f"{self.url}/knock?s={self.tag}&since={self._since:.3f}")
+                for k in r.get("knocks") or []:
+                    try:
+                        self._since = max(self._since, float(k.get("t") or 0))
+                    except (TypeError, ValueError):
+                        continue
+                    t = self.targets_from(str(k.get("blob") or ""))
+                    if t:
+                        self.log(f"[rendezvous] a joiner knocked: punching toward {t}")
+                        self.queue.put(t)
+                if warned:
+                    self.log("[rendezvous] master reachable again")
+                warned = False
+            except Exception as e:                            # noqa: BLE001
+                if not warned:
+                    self.log(f"[rendezvous] cannot poll {self.url} ({e}) -- joiners need our port open")
+                    warned = True
+            self._stop.wait(self.poll_every)
+
+
+class _RendezvousKnock:
+    """A joiner: posts its sealed profile code to the master every RV_KNOCK_EVERY
+    seconds until closed (a fresh seal each time, so the host's replay window
+    accepts every one)."""
+
+    def __init__(self, url, secret, password, profile_code, log, every=RV_KNOCK_EVERY):
+        self.url, self.tag, self.log, self.every = url.rstrip("/"), _rv_tag(secret), log, every
+        self._sealer = _rv_sealer(secret, password)
+        self._plain = profile_code.encode("ascii")
+        self.sent = 0
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True, name="knock")
+        self._t.start()
+
+    def close(self):
+        self._stop.set()
+        self._t.join(timeout=3)
+
+    def _run(self):
+        import base64
+        warned = False
+        while not self._stop.is_set():
+            try:
+                blob = base64.b64encode(self._sealer.seal(self._plain)).decode("ascii")
+                _http_json(self.url + "/knock", {"s": self.tag, "blob": blob})
+                self.sent += 1
+                if self.sent == 1:
+                    self.log("[rendezvous] knocked at the master: the host punches toward us")
+            except Exception as e:                            # noqa: BLE001
+                if not warned:
+                    self.log(f"[rendezvous] cannot knock at {self.url} ({e}) -- dialing the host directly only")
+                    warned = True
+            self._stop.wait(self.every)
+
+
+# --------------------------------------------------------------------------- #
 # HOST: single socket, N peers, authority for roster + chat relay
 # --------------------------------------------------------------------------- #
 def _origin_letter(idx):
@@ -1730,8 +1880,11 @@ class _PeerConn:
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False):
+             relay_only=False, punch_q=None):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
+
+    ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
+    each entry is punched toward with HELLOs for RV_PUNCH_FOR seconds.
 
     ``sock`` is a bound UDP socket (the observe/game socket for the real CLI, a
     plain loopback socket for the self-test). ``io`` is a :class:`LobbyIO`.
@@ -2346,6 +2499,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     last_heal = last_drop = 0.0
     last_serve_check = [0.0]
+    punching = {}                           # (ip, port) a joiner knocked from -> punch until
+    last_punch = [0.0]
+    punch_token = os.urandom(TOKEN_LEN)     # nobody echoes it back to us; any token opens the NAT
     reject_sent = {}                        # addr -> when we last sent a plain reject
     # The game relay's loopback socket joins the select set so a bridge frame
     # wakes the loop immediately (lockstep latency) instead of on the next tick.
@@ -2422,6 +2578,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             # the leader's upload: bulk chunks ride in the clear (BULK_PLAIN),
                             # exactly the rule a joiner applies to the host's chunks
                             handle_data(addr, payload)
+
+            # Hole punching: a joiner knocked through the master, so fire HELLOs
+            # at its address; they open our NAT for the joiner's own HELLOs, which
+            # the branch above ACKs. A joiner that has connected needs no more.
+            if punch_q is not None:
+                try:
+                    while True:
+                        for t in punch_q.get_nowait():
+                            punching[(str(t[0]), int(t[1]))] = now + RV_PUNCH_FOR
+                except queue.Empty:
+                    pass
+                if punching and now - last_punch[0] >= RV_PUNCH_EVERY:
+                    last_punch[0] = now
+                    for a in list(punching):
+                        if punching[a] < now or a in peers:
+                            del punching[a]
+                            continue
+                        try:
+                            sock.sendto(_pack(TYPE_HELLO, punch_token), a)
+                        except OSError:
+                            pass
 
             # Game relay: local bridge frames -> every joiner.
             if relay is not None and relay.sock in ready:
@@ -3127,13 +3304,22 @@ def cmd_host(args):
         publisher.update(args.lobby_name or args.name, 0 if args.relay_only else 1)
         if args.public:
             publisher.set(True)
+    # a dedicated relay's port is open by construction: only a player host punches
+    rendezvous = None
+    rv_url = "" if args.relay_only else _rv_url(args)
+    if rv_url:
+        rendezvous = _RendezvousHost(rv_url, secret, args.password or "", _log)
+        _log(f"[rendezvous] polling {rv_url} for joiners to punch toward")
     try:
         if args.relay_only:
             _log("[host] RELAY-ONLY: no game here; the oldest joiner is the leader")
         run_host(sock, args.name, io, code=code, relay=None if args.relay_only else relay,
                  forward_logs=args.forward_log or (), publisher=publisher,
-                 lobby_name=args.lobby_name, relay_only=bool(args.relay_only))
+                 lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
+                 punch_q=rendezvous.queue if rendezvous is not None else None)
     finally:
+        if rendezvous is not None:
+            rendezvous.close()
         if publisher is not None:
             publisher.close()
         try:
@@ -3182,8 +3368,18 @@ def cmd_join(args):
                  f"flags={prof['flags']}")
         except Exception as e:                            # noqa: BLE001
             _log(f"[join] self-observe failed: {e} -- peers will reach us via relay")
-    conn = race(sock, peer, "dial", args.local_port, args.timeout,
-                my_has_v6=False, mine=prof)
+    # Knock at the master while we dial: the host punches toward our address, so
+    # a host whose port is not really open still gets through (see RENDEZVOUS).
+    knock = None
+    rv_url = _rv_url(args)
+    if rv_url and profile_code and peer.get("secret"):
+        knock = _RendezvousKnock(rv_url, peer["secret"], args.password or "", profile_code, _log)
+    try:
+        conn = race(sock, peer, "dial", args.local_port, args.timeout,
+                    my_has_v6=False, mine=prof)
+    finally:
+        if knock is not None:
+            knock.close()
     if not conn:
         io.emit({"type": "status", "state": "failed",
                  "detail": "could not reach host"})
@@ -4444,6 +4640,9 @@ def main(argv=None):
                          "public (see --public and the 'publish' command)")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
+    ap.add_argument("--rendezvous", default="",
+                    help="master server used for hole punching to the host (default: "
+                         "--publish, else " + DEFAULT_MASTER + "; 'off' disables)")
     ap.add_argument("--lobby-name", default="",
                     help="what the lobby is called (shown to joiners and in the public list)")
     ap.add_argument("--password", default="",

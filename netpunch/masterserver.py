@@ -14,6 +14,15 @@ shows as locked (its code alone does not get anyone in).
     GET  /health     "ok"
     POST /desync     a zip of a player's scrubbed logs (netpunch/desynclogs.py), metadata
                      as JSON in the X-Tpf2mp-Meta header -> {"ok":true,"id":...}
+    POST /knock      {"s": session tag, "blob": base64} -- a joiner's sealed address note
+    GET  /knock?s=<tag>&since=<unix>   {"knocks":[{"t","blob"}], "now": unix}
+
+KNOCKS are the rendezvous for hole punching (lobby.py _Rendezvous*). A joiner
+posts its STUN-observed address, sealed with the session key, under a tag derived
+from the code's secret; the host polls its tag and fires packets back at the
+joiner, which opens the host's own NAT for the joiner's HELLOs. This server can
+neither read a note nor tell which lobby a tag belongs to; notes live KNOCK_TTL
+seconds.
 
 Entries expire TTL seconds after their last announce. Desync reports are kept in
 --desync-dir (disabled without it): at most UPLOAD_MAX bytes each, a few per
@@ -42,8 +51,18 @@ UPLOAD_DISK_CAP = 2 << 30
 UPLOAD_MAX_ENTRIES = 500       # files inside one zip
 DESYNC_DIR = None              # --desync-dir
 
+KNOCK_TTL = 60.0              # seconds a joiner's note waits for the host's poll
+KNOCK_PER_TAG = 16
+KNOCK_MAX_TAGS = 2000
+KNOCK_BLOB_MAX = 1024          # base64 characters
+KNOCK_PER_IP_MIN = 40          # posts per address per minute (a joiner posts every 2 s)
+_TAG_RE = re.compile(r"^[0-9a-f]{24}$")
+
 _lock = threading.Lock()
 _servers = {}        # id -> dict(fields..., "at": last announce, "ip": announcer)
+_knock_lock = threading.Lock()
+_knocks = {}         # tag -> [(unix, blob), ...] newest last
+_knock_by_ip = {}    # ip -> [unix times of posts in the last minute]
 _up_lock = threading.Lock()
 _up_by_ip = {}       # ip -> [unix times of accepted uploads in the last hour]
 _up_all = []         # unix times of accepted uploads in the last day
@@ -76,6 +95,33 @@ def _upload_allowed(ip, now):
         _up_by_ip.setdefault(ip, []).append(now)
         _up_all.append(now)
         return True
+
+
+def _knock_post(tag, blob, ip, now):
+    """-> None when stored, else an (http status, error) pair."""
+    with _knock_lock:
+        for k in list(_knocks):
+            _knocks[k] = [e for e in _knocks[k] if now - e[0] < KNOCK_TTL]
+            if not _knocks[k]:
+                del _knocks[k]
+        for k in list(_knock_by_ip):
+            _knock_by_ip[k] = [t for t in _knock_by_ip[k] if now - t < 60]
+            if not _knock_by_ip[k]:
+                del _knock_by_ip[k]
+        if len(_knock_by_ip.get(ip, ())) >= KNOCK_PER_IP_MIN:
+            return 429, "too many knocks"
+        if tag not in _knocks and len(_knocks) >= KNOCK_MAX_TAGS:
+            return 503, "full"
+        _knock_by_ip.setdefault(ip, []).append(now)
+        lst = _knocks.setdefault(tag, [])
+        lst.append((now, blob))
+        del lst[:-KNOCK_PER_TAG]
+    return None
+
+
+def _knock_get(tag, since, now):
+    with _knock_lock:
+        return [{"t": t, "blob": b} for t, b in _knocks.get(tag, ()) if t > since and now - t < KNOCK_TTL]
 
 
 def _prune(directory):
@@ -120,6 +166,18 @@ class H(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path.endswith("/health"):
             return self._send(200, b"ok")
+        if path.endswith("/knock"):
+            from urllib.parse import parse_qs
+            q = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            tag = (q.get("s") or [""])[0]
+            if not _TAG_RE.match(tag):
+                return self._send(400, {"error": "bad tag"})
+            try:
+                since = float((q.get("since") or ["0"])[0])
+            except ValueError:
+                since = 0.0
+            now = time.time()
+            return self._send(200, {"knocks": _knock_get(tag, since, now), "now": now})
         if path.endswith("/list") or path == "/":
             now = time.time()
             with _lock:
@@ -188,6 +246,18 @@ class H(BaseHTTPRequestHandler):
         if path.endswith("/desync"):
             return self._desync()
         d = self._body()
+        if path.endswith("/knock"):
+            if not isinstance(d, dict):
+                return self._send(400, {"error": "bad request"})
+            tag, blob = str(d.get("s") or ""), str(d.get("blob") or "")
+            if not _TAG_RE.match(tag) or not blob or len(blob) > KNOCK_BLOB_MAX \
+                    or not re.match(r"^[A-Za-z0-9+/=]+$", blob):
+                return self._send(400, {"error": "bad knock"})
+            ip = self.headers.get("X-Real-IP") or self.client_address[0]
+            err = _knock_post(tag, blob, ip, time.time())
+            if err:
+                return self._send(err[0], {"error": err[1]})
+            return self._send(200, {"ok": True, "ttl": int(KNOCK_TTL)})
         if not isinstance(d, dict) or not _s(d.get("id"), 64):
             return self._send(400, {"error": "bad request"})
         sid = _s(d.get("id"), 64)

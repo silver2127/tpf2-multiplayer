@@ -128,9 +128,11 @@ mine** to lock yours (switching into a locked company needs its password).
 
 ## Ports and firewalls
 
-- **Hosting needs UDP port 29471 reachable from the internet.** The lobby tries to open it through
-  UPnP. If friends cannot connect, forward UDP 29471 to your PC on your router, or use a dedicated
-  relay.
+- **Most hosts need no port forwarding.** When a friend joins, both lobbies punch through
+  their routers to each other with the help of the master server. The lobby also tries UPnP.
+- If friends still cannot connect, forward UDP 29471 to your PC on your router, or use a
+  dedicated relay. That is needed when the master server is unreachable, or when both
+  players are behind a strict (symmetric or carrier-grade) NAT.
 - Joiners need no open ports.
 - Windows Defender Firewall asks about `netpunch.exe` the first time; allow it.
 
@@ -140,7 +142,7 @@ The panel shows the lobby's status line. The common ones:
 
 | message | meaning |
 |---|---|
-| `could not reach host` | the host's port is not reachable (see above), or the code is from a lobby that has closed |
+| `could not reach host` | the lobbies could not punch through (see above), or the code is from a lobby that has closed. Both players need 0.4.16 or later for punching |
 | `bad code: this code is locked -- enter the lobby password` / `wrong password for this code` | type the password before pressing JOIN |
 | `lobby full` | the lobby has no free seat |
 | `host unreachable` / `host closed the lobby` | the host left or lost connection |
