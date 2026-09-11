@@ -27,7 +27,7 @@ The installer's copy has every key commented out.
 |---|---|---|---|
 | `dumpprop` | slice | 0 | `1` dumps every construction and road proposal to `tpf2_slice.log` (verbose): for a replay the engine rejects without a message. |
 | `dump_egeo` | mod | off | `1` writes every edge the desync hash sees to `egeo_<letter>.txt` in the game folder, to diff two instances after a divergence (ignore the first line, a per-instance stamp). |
-| `exec_delay` | mod | 0.4 | How far ahead every command is stamped, in game-time units, snapped up to the 0.2 step grid: the latency of every action. Accepted 0.2-5; anything else, or no value, means 0.4 (0.6 before 2026-09-11). Every received command logs `spare=`, the game time it had left before its stamp; raise this if internet sessions show spare near or below 0 (`!! LATE`). Below 0.4 a jitter spike puts a command in a peer's past. Set the same value on every machine. |
+| `exec_delay` | mod | auto | How far ahead every command is stamped, in game-time units, snapped up to the 0.2 step grid: the latency of every action. **Auto** (no value, or anything that is not a number): it starts at 0.4 and follows the measured round trip to each player (heartbeat echoes), rising at once when a connection slows and falling one step at a time when it recovers, within 0.2-3; the stats show `command delay` and `round trip`. A number from 0.2 to 5 pins it instead. Every received command logs `spare=`, the game time it had left before its stamp (`!! LATE` when negative). |
 
 The two readers parse differently:
 

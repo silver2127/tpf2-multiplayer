@@ -60,7 +60,7 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "SPEEDBTN" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
 				CM.soloDrop(line)
 				return
 			end
@@ -96,6 +96,13 @@ function CM.pollInject()
 				else
 					log("EVAL compile: " .. tostring(cerr))
 				end
+
+			elseif o == "DROPNEXT" then
+				-- TEST HOOK for the gap hold: the next command we issue is announced
+				-- (LSHI) and kept for resend, but its LSCMD is not sent -- every peer
+				-- should hold before its stamp, NACK it, get the resend and run on
+				CM.dropNextCmd = true
+				log("DROPNEXT: the next command's LSCMD will not be sent (gap hold test)")
 
 			elseif o == "SPEEDBTN" then
 				-- a speed-button click the slice cancelled: on the leader it sets the session speed (CM.speedButton)
@@ -525,6 +532,17 @@ function CM.pollInject()
 						x = x, y = y, kind = kind == 2 and 2 or 1, track = isTrack and 1 or 0,
 						oneWay = oneWay and 1 or 0, stname = CM.escName(stname),
 						model = CM.escName(model), name = CM.escName(name), cancelled = 1 }
+					-- COMPANIES: a click on a side another company's stop holds would replace
+					-- it (CM.execStopAdd's one-click replace). The placement was cancelled
+					-- natively, so refusing here changes nothing anywhere.
+					local takenBy, takenCid = nil, nil
+					if CM.cmStopSideForeign then takenBy, takenCid = CM.cmStopSideForeign(eid, wside) end
+					if takenBy then
+						log(string.format("STOPX: side %d of edge %d holds company %s's stop %d -- REFUSED, a company cannot replace another company's stop",
+							wside, eid, tostring(takenCid or "?"), takenBy))
+						pcall(CM.cmNote, string.format("That side of the road holds company %s's stop -- you cannot replace it", tostring(takenCid or "?")))
+						return
+					end
 					CM.scheduleLocal("STOPADD", fields)
 					log(string.format("STOPX: cancelled %s '%s' on edge %d u=%.3f engine-left=%s geo-left=%s side=%d%s -> STOPADD (strict, every instance replays)",
 						model, name, eid, u, tostring(engLeft), tostring(geoLeft), wside, oneWay and " one-way" or ""))
@@ -1185,6 +1203,12 @@ function CM.pollInject()
 			local eo, eid = tonumber(w[2]), tonumber(w[3])
 			if (CM.lastArmed or 0) ~= 1 then
 				log("STOPXDEL: not armed -- the native bulldoze ran, the stop poll ships it")
+			elseif eo and eo > 0 and CM.cmForeignOwner and CM.cmForeignOwner(eo) then
+				-- COMPANIES: another company's stop. The native bulldoze was cancelled,
+				-- so refusing here leaves it standing on every instance.
+				local _, fcid = CM.cmForeignOwner(eo)
+				log(string.format("STOPXDEL: edge object %d belongs to company %s -- REFUSED, a company cannot bulldoze another company's stop", eo, tostring(fcid or "?")))
+				pcall(CM.cmNote, string.format("That stop belongs to company %s -- you cannot bulldoze it", tostring(fcid or "?")))
 			elseif eo and eo > 0 then
 				local x, y
 				pcall(function()

@@ -115,6 +115,39 @@ function CM.cmOwnerOf(eid)
 	return nil
 end
 
+-- ROADSIDE STOPS BELONG TO THEIR COMPANY (2026-09-11). Companies mode only: is
+-- this player-owned entity another company's? Returns true, that company's id (nil
+-- when no company here plays that player) and the owner pid. Asked on the
+-- ORIGINATOR before a stop bulldoze or replace is shipped (inject.lua STOPXDEL,
+-- STOPX): the action was cancelled natively, so a refusal there leaves the stop
+-- standing on every instance, and nothing depends on owners agreeing elsewhere.
+function CM.cmForeignOwner(eid)
+	CM.cmEnsure()
+	if CM.cmMode ~= "companies" or not eid then return false end
+	local owner = CM.cmOwnerOf(eid)
+	if not owner then return false end
+	local mine = CM.cmCompanyPid[CM.cmMyCompany]
+	if not mine then pcall(function() mine = api.engine.util.getPlayer() end) end
+	if owner == mine then return false end
+	local cid
+	for k, pid in pairs(CM.cmCompanyPid) do if pid == owner then cid = k end end
+	return true, cid, owner
+end
+
+-- the object holding one side of an edge, if another company owns it (a click
+-- there would replace it): its id and company, else nil
+function CM.cmStopSideForeign(eid, side)
+	if side == 2 or not CM.objectsOnEdge then return nil end
+	local objs = CM.objectsOnEdge(eid)
+	for _, ob in ipairs(objs or {}) do
+		if ob[2] == side then
+			local foreign, cid = CM.cmForeignOwner(ob[1])
+			if foreign then return ob[1], cid end
+		end
+	end
+	return nil
+end
+
 -- R2: move money. A remote company's action was paid by OUR local wallet (the
 -- build/buy ran as our human player); refund us and charge the origin company's
 -- player. bookJournalEntry to a specific pid is the proven mechanism (the

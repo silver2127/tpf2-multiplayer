@@ -82,6 +82,8 @@ function CM.rxAdvance(r)
 		if r.missSince then r.missSince[g] = nil end
 		if r.nackAt then r.nackAt[g] = nil end
 		if r.nackN then r.nackN[g] = nil end
+		if r.stamp then r.stamp[g] = nil end
+		if r.holdDone then r.holdDone[g] = nil end
 		r.firstSeq = g
 		g = g + 1
 	end
@@ -331,10 +333,12 @@ function CM.scheduleLocal(op, args)
 		-- player, so it is not unbounded either.
 		if lead > CM.MAX_LEAD then lead = CM.MAX_LEAD end
 	end
-	local delay = K.EXEC_DELAY + lead
+	-- the measured delay (CM.execDelayTick), or K.EXEC_DELAY when pinned or not yet measured
+	local base = CM.execDelayCur or K.EXEC_DELAY
+	local delay = base + lead
 	if lead > 0 then
 		log(string.format("stamp: peer is %.2f ahead -- scheduling %.2f out instead of %.2f",
-			lead, delay, K.EXEC_DELAY))
+			lead, delay, base))
 	end
 	-- snap to the NEXT step boundary: a stamp between two steps names no
 	-- simulation state, and the lead term (an integer peer time) took stamps
@@ -355,7 +359,17 @@ function CM.scheduleLocal(op, args)
 	local wire = encodeCmd(c)
 	CM.recordSent(CM.seqNo, wire)
 	CM.histPush(wire, at)
-	CM.broadcast(wire)
+	if CM.dropNextCmd then
+		-- DROPNEXT test hook (inject.lua): kept for resend, announced below, not sent
+		CM.dropNextCmd = nil
+		log(string.format("DROPNEXT: %s seq=%d NOT sent -- peers should hold for it and NACK", op, CM.seqNo))
+	else
+		CM.broadcast(wire)
+	end
+	-- announce it separately too (a small line, lost independently of the command):
+	-- a peer that misses the LSCMD learns it exists and its stamp, and holds for it
+	CM.broadcast(string.format("LSHI o=%s s=%d at=%.4f", K.INSTANCE, CM.seqNo, at))
+	CM.lastSchedAt = at
 	log(string.format("SCHED %s seq=%d at=%.4f (now=%.4f)", op, CM.seqNo, at, now))
 end
 
@@ -513,6 +527,163 @@ function CM.projectedPeerMax()
 	return best
 end
 
+-- ---------- measured round trips, the command delay, the gap hold (2026-09-11) ----------
+--
+-- ROUND TRIP. Every heartbeat carries ms= (our os.clock in ms) and e=, the last
+-- ms= heard from each peer with how long we held it before this send. A peer's
+-- echo of OUR ms therefore times the whole path both ways -- file relay, lobby,
+-- network, the tick that reads it -- minus the time it sat on the other side.
+-- Smoothed like TCP's RTO (RFC 6298): srtt and rttvar per peer.
+function CM.rttNote(o, sentMs, heldMs)
+	local r = os.clock() * 1000 - sentMs - heldMs
+	if r < 0 or r > 10000 then return end
+	local pr = CM.peerFor(o)
+	if not pr.srtt then
+		pr.srtt, pr.rttvar = r, r / 2
+	else
+		pr.rttvar = 0.75 * pr.rttvar + 0.25 * math.abs(pr.srtt - r)
+		pr.srtt = 0.875 * pr.srtt + 0.125 * r
+	end
+	pr.rttN = (pr.rttN or 0) + 1
+end
+
+-- " e=b:123456:40,c:..." for our heartbeat: each fresh peer's last ms= and how long ago it arrived
+function CM.heartbeatEcho()
+	local parts, clk = {}, os.clock()
+	for o, pr in pairs(CM.peers) do
+		if pr.ms and pr.msClk and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			parts[#parts + 1] = string.format("%s:%d:%d", o, pr.ms, math.floor((clk - pr.msClk) * 1000 + 0.5))
+		end
+	end
+	table.sort(parts)
+	return #parts > 0 and (" e=" .. table.concat(parts, ",")) or ""
+end
+
+local function snapStep(u) return math.floor(u / K.SIM_STEP + 0.5) * K.SIM_STEP end
+
+-- The delay a command we stamp now needs, in game units, before the peers'
+-- clocks reach it: the worst peer's one-way latency (half its round trip plus
+-- two deviations plus K.DELAY_SLACK_MS) at the rate our sim runs. The stamp
+-- still adds the fastest peer's lead on top (scheduleLocal). Once per tick.
+function CM.execDelayTick()
+	local clk = os.clock()
+	if CM.tickClk then
+		local dt = clk - CM.tickClk
+		if dt > 0 and dt < 2 then CM.tickSec = CM.tickSec and (CM.tickSec * 0.9 + dt * 0.1) or dt end
+	end
+	CM.tickClk = clk
+	if not CM.execDelayAuto then CM.execDelayCur = K.EXEC_DELAY; return end
+	-- a held or paused game measures a sim rate near 0: never let that shrink the delay
+	local rate = math.max(CM.simRate or 0, (CM.effSpeed or 1) * 0.9, 0.9)
+	local worstMs, who
+	for o, pr in pairs(CM.peers) do
+		if pr.srtt and (pr.rttN or 0) >= K.RTT_MIN_SAMPLES and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			local oneway = pr.srtt / 2 + 2 * (pr.rttvar or 0) + K.DELAY_SLACK_MS
+			if not worstMs or oneway > worstMs then worstMs, who = oneway, o end
+		end
+	end
+	local want = K.EXEC_DELAY
+	if worstMs then
+		want = math.ceil((worstMs / 1000 * rate) / K.SIM_STEP - 1e-6) * K.SIM_STEP
+		if want < K.EXEC_DELAY_MIN then want = K.EXEC_DELAY_MIN end
+		if want > K.EXEC_DELAY_MAX then want = K.EXEC_DELAY_MAX end
+	end
+	want = snapStep(want)
+	local cur = snapStep(CM.execDelayCur or K.EXEC_DELAY)
+	local why = worstMs and string.format("worst peer %s: round trip %d+-%d ms, one way %d ms at %.2f units/s",
+		tostring(who), math.floor(CM.peers[who].srtt + 0.5), math.floor((CM.peers[who].rttvar or 0) + 0.5), math.floor(worstMs + 0.5), rate) or "nothing measured yet"
+	if want > cur + 1e-6 then
+		log(string.format("EXEC_DELAY auto: %.1f -> %.1f (%s)", cur, want, why))
+		cur, CM.execDelayLowSince = want, nil
+	elseif want < cur - 1e-6 then
+		CM.execDelayLowSince = CM.execDelayLowSince or CM.ticks
+		if CM.ticks - CM.execDelayLowSince >= K.DELAY_DOWN_TICKS then
+			local nxt = snapStep(math.max(want, cur - K.SIM_STEP))
+			log(string.format("EXEC_DELAY auto: %.1f -> %.1f (%s)", cur, nxt, why))
+			cur, CM.execDelayLowSince = nxt, CM.ticks
+		end
+	else
+		CM.execDelayLowSince = nil
+	end
+	CM.execDelayCur = cur
+end
+
+-- the stamp an origin announced for one of its commands (LSHI, or ha= for hi=)
+function CM.rxStampNote(o, seq, at)
+	local r = CM.rx[o]
+	if not r or not seq or not at then return end
+	r.stamp = r.stamp or {}
+	r.stamp[seq] = at
+end
+
+-- The most urgent command we know exists and do not have, if we must stop for it
+-- now: {o, seq, at} (at nil when its stamp is unknown), or nil. A command whose
+-- stamp is already behind us cannot be helped by stopping (it applies late); one
+-- that has used up its NACKs, or that a hold already gave up on, never holds.
+function CM.gapHoldNeed(now)
+	local rate = math.max(CM.simRate or 0, (CM.effSpeed or 1) * 0.9, 0.9)
+	local engage = K.GAP_HOLD_ENGAGE_TICKS * (CM.tickSec or 0.19) * rate + K.SIM_STEP
+	local nowStep = CM.stepOf(now)
+	local best
+	for o, r in pairs(CM.rx) do
+		if o ~= K.INSTANCE then
+			local top = math.max(r.maxSeq or 0, r.advMax or 0)
+			local topAt = r.stamp and r.stamp[top]
+			for g = (r.firstSeq or 0) + 1, top do
+				if not r.seen[g] and (r.nackN[g] or 0) < K.NACK_MAX and not (r.holdDone and r.holdDone[g])
+				   and CM.ticks - (r.missSince[g] or CM.ticks) >= K.GAP_HOLD_GRACE_TICKS then
+					local at = r.stamp and r.stamp[g]
+					if at then
+						if CM.stepOf(at) >= nowStep and at - now <= engage then
+							if not best or not best.at or at < best.at then best = { o = o, seq = g, at = at } end
+						end
+					elseif not (topAt and CM.stepOf(topAt) < nowStep) then
+						-- stamp unknown (the command and its LSHI both lost): stop now,
+						-- unless even the newest command it precedes is already due
+						if not best then best = { o = o, seq = g } end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- Once per tick from the pacing controller: true while this game must hold.
+function CM.gapHoldTick(now)
+	local need = CM.gapHoldNeed(now)
+	if not need then
+		if CM.gapHold then
+			log(string.format("HOLD: released after %d tick(s) -- %s seq=%d arrived", CM.ticks - CM.gapHold.since,
+				tostring(CM.gapHold.o), CM.gapHold.seq or -1))
+			CM.gapHold = nil
+		end
+		return false
+	end
+	if not CM.gapHold then
+		CM.gapHold = { since = CM.ticks }
+		CM.gapHolds = (CM.gapHolds or 0) + 1
+		log(string.format("HOLD: %s's command seq=%d%s has not arrived -- holding this game until it does (at most %d ticks)",
+			need.o, need.seq, need.at and string.format(" (stamp %.1f, now %.1f)", need.at, now) or " (stamp unknown)", K.GAP_HOLD_MAX_TICKS))
+	end
+	CM.gapHold.o, CM.gapHold.seq, CM.gapHold.at = need.o, need.seq, need.at
+	if CM.ticks - CM.gapHold.since > K.GAP_HOLD_MAX_TICKS then
+		-- give up on everything holding us now; those commands apply late if they arrive
+		local n = 0
+		while need and n < 256 do
+			local r = CM.rx[need.o]
+			r.holdDone = r.holdDone or {}
+			r.holdDone[need.seq] = true
+			n = n + 1
+			need = CM.gapHoldNeed(now)
+		end
+		log(string.format("HOLD: gave up after %d ticks on %d command(s) -- running on; they apply late if they arrive", CM.ticks - CM.gapHold.since, n))
+		CM.gapHold = nil
+		return false
+	end
+	return true
+end
+
 local function onLine(line)
 	local op = line:match("^(%u+)")
 	if op == "LSTICK" then
@@ -536,6 +707,27 @@ local function onLine(line)
 			CM.peerSeen = true
 			local hi = tonumber(line:match(" hi=(%d+)"))
 			if hi then pcall(CM.rxAdvertise, o, hi) end
+			local ha = tonumber(line:match(" ha=([%-%d%.]+)"))
+			if hi and ha then pcall(CM.rxStampNote, o, hi, ha) end
+			-- round trips: remember the peer's clock for our echo, and time our own echoed back
+			local ms = tonumber(line:match(" ms=(%d+)"))
+			if ms then pr.ms, pr.msClk = ms, os.clock() end
+			local e = line:match(" e=(%S+)")
+			if e then
+				for eo, sms, held in e:gmatch("(%a+):(%d+):(%d+)") do
+					if eo == K.INSTANCE then pcall(CM.rttNote, o, tonumber(sms), tonumber(held)) end
+				end
+			end
+		end
+	elseif op == "LSHI" then
+		-- a command an origin just issued: its seq and stamp, sent beside the LSCMD,
+		-- so a lost command is known -- and when it is due -- before its stamp passes
+		local o = line:match(" o=(%a+)")
+		local seq = tonumber(line:match(" s=(%d+)"))
+		local at = tonumber(line:match(" at=([%-%d%.]+)"))
+		if o and seq and o ~= K.INSTANCE then
+			pcall(CM.rxAdvertise, o, seq)
+			if at then pcall(CM.rxStampNote, o, seq, at) end
 		end
 	elseif op == "LSCUR" then
 		-- another player's cursor (cursors.lua): cosmetic, straight to the GUI's file

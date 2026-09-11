@@ -503,7 +503,10 @@ function CM.nativeStopProposal(add, remove, why, onDone)
 		eo.left = add.left and true or false
 		eo.oneWay = add.oneWay and true or false
 		eo.model = add.model
-		eo.playerEntity = api.engine.util.getPlayer()
+		-- companies: built as the ORIGIN company's player on every instance (add.player,
+		-- CM.execStopAdd), not as whoever plays here -- a replayed stop kept the local
+		-- owner and every machine showed a different company for it (2026-09-11)
+		eo.playerEntity = add.player or api.engine.util.getPlayer()
 		eo.name = add.name or ""
 		sp.streetProposal.edgeObjectsToAdd[1] = eo
 	end
@@ -536,9 +539,23 @@ function CM.nativeStopProposal(add, remove, why, onDone)
 		log(string.format("EXEC %s: %d edge(s)%s%s success=%s%s; survivors kept %d/%d%s", why, #edges,
 			add and " +add" or "", remove and (" -rm " .. tostring(remove.eo)) or "", tostring(success), msg,
 			kept, #survivors, #lost > 0 and (" LOST [" .. table.concat(lost, ",") .. "]") or ""))
-		if onDone then onDone(success) end
+		if onDone then onDone(success, res) end
 	end)
 	return true
+end
+
+-- Companies: after a replayed stop landed, check it is the origin company's (the
+-- proposal names that player; setPlayer is the fallback) and move its cost there.
+function CM.stopSettleOwner(c, res, cid, pid)
+	local stop = CM.findStopNear(c.x, c.y, 2.0)
+	local owner = stop and CM.cmOwnerOf(stop)
+	if stop and pid and owner ~= pid then
+		pcall(CM.cmReassignEntity, stop, cid, "STOP")
+		owner = CM.cmOwnerOf(stop)
+	end
+	CM.cmLog(string.format("CM: stop seq=%s origin=%s at %.1f,%.1f -> co%s pid=%s: stop %s owner %s%s", tostring(c.seq), tostring(c.origin),
+		c.x, c.y, tostring(cid), tostring(pid), tostring(stop), tostring(owner), (pid and owner ~= pid) and " MISMATCH" or ""))
+	pcall(CM.cmSettleBuild, c, res, true, "STOP")   -- the cost, when another company placed it
 end
 
 -- STOPADD and STOPREP (c.rx/c.ry = the stop the originator's placement
@@ -673,11 +690,23 @@ function CM.execStopAdd(c)
 			flipped ~= nil and string.format("engine-left=%s edge %s", tostring(tonumber(c.eleft) == 1), flipped and "REVERSED here" or "same way")
 				or ("conv=" .. tostring(conv)),
 			tostring(engL), side, #objs, rm and (", replacing " .. tostring(rm.eo)) or ""))
+		-- companies: the stop belongs to the company that placed it, on every instance
+		local ownerCid, ownerPid
+		pcall(function()
+			CM.cmEnsure()
+			if CM.cmMode == "companies" and c.company then
+				ownerCid = tonumber(c.company)
+				ownerPid = ownerCid and CM.cmCompanyPid[ownerCid]
+			end
+		end)
 		local okB, why = CM.nativeStopProposal(
 			{ eid = eid, u = u, left = engL, side = side, model = CM.unescName(c.model), name = CM.unescName(c.name),
-			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y },
+			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y, player = ownerPid },
 			rm, string.format("%s origin=%s '%s'", tag, tostring(c.origin), CM.unescName(c.name)),
-			function() CM.conxBusy = false end)
+			function(success, res)
+				CM.conxBusy = false
+				if success and ownerCid then pcall(CM.stopSettleOwner, c, res, ownerCid, ownerPid) end
+			end)
 		if okB then sent = true else log(string.format("%s: %s -- skipped", tag, tostring(why))) end
 	end)
 	if not ok then log("exec STOPADD error: " .. tostring(err)) end
