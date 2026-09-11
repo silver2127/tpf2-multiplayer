@@ -447,6 +447,12 @@ function CM.execPolyline(c, planOnly)
 	local planV, planH = {}, {}          -- what THIS pass decided, for the wire
 	local usePlanV = CM.planDecode(c.xv)    -- what the originator decided, if it said
 	local usePlanH = CM.planDecode(c.xh)
+	-- vertices the originator's engine left as plain new nodes (inject.lua, freshV)
+	local freshV = {}
+	for tok in tostring(c.fv or ""):gmatch("[^,]+") do
+		local n = tonumber(tok)
+		if n then freshV[n] = true end
+	end
 	local ok, err = pcall(function()
 		local isTrack = (tonumber(c.etype) or 0) == 1
 		local stype = tonumber(c.stype) or 16
@@ -687,6 +693,16 @@ function CM.execPolyline(c, planOnly)
 		local function resolve(i)
 			if resolved[i] then return resolved[i] end
 			local x, y, z = pts[i * 3 - 2], pts[i * 3 - 1], pts[i * 3]
+
+			-- The originator's engine made this vertex a plain new node: it split
+			-- nothing there. Never attach it to an edge it only runs beside -- a
+			-- parallel track near a road's end snapped onto that road's end node and
+			-- the whole build failed (2026-09-11).
+			if freshV[i] then
+				local id = newNodeAt(x, y, z)
+				resolved[i] = id
+				return id
+			end
 
 			-- The originator already decided this one. Follow it rather than
 			-- deriving our own answer from a world that may have drifted.

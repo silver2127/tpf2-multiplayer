@@ -307,6 +307,7 @@ function CM.pollInject()
 					end
 
 					local dropped = 0
+					local halfNode = {}   -- new node -> true: the engine split an existing edge there
 					for _, e in ipairs(raw) do
 						local a1, a2 = e[1], e[2]
 						-- A split half is an edge from an existing node to a new
@@ -326,6 +327,7 @@ function CM.pollInject()
 						                or (a2 >= 0 and a1 < 0 and isHalfOf(a2, a1))
 						if isHalf then
 							dropped = dropped + 1
+							halfNode[(a1 < 0) and a1 or a2] = true
 						else
 							local p1 = (a1 < 0) and posOf[a1] or realPos(a1)
 							local p2 = (a2 < 0) and posOf[a2] or realPos(a2)
@@ -345,6 +347,19 @@ function CM.pollInject()
 							end
 						end
 					end
+
+					-- Which new nodes did the originator's engine attach to an existing
+					-- edge? Exactly those with a dropped half. Every other new node it
+					-- left a plain node, and the replay must not split or snap it onto an
+					-- edge it merely runs beside: a parallel track's vertex 4.6 m off a
+					-- road's centreline near its end counted as "on" the road, snapped to
+					-- the road's end node, lost its rail edge in the same-pair dedup, and
+					-- the build failed critical on every instance (2026-09-11, seq 328/329).
+					local freshV = {}
+					for id in pairs(posOf) do
+						if not halfNode[id] and index[id] then freshV[#freshV + 1] = index[id] end
+					end
+					table.sort(freshV)
 
 					-- ---------- removals -> positional rm list ----------
 					--
@@ -408,6 +423,7 @@ function CM.pollInject()
 						-- omitted entirely when there is nothing to remove: an empty
 						-- 'rm=' token would not survive decodeCmd's key=value scan
 						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
+						if #freshV > 0 then sargs.fv = table.concat(freshV, ",") end
 						-- carry the bus lane / tram track the slice just decoded, so an
 						-- upgrade that ADDS either one actually reaches the peers (and the
 						-- originator, whose own upgrade was cancelled)
@@ -424,7 +440,7 @@ function CM.pollInject()
 							return CM.execPolyline({ pts = sargs.pts, links = sargs.links,
 								tans = sargs.tans, bt = sargs.bt, etype = sargs.etype,
 								stype = sargs.stype, ttype = sargs.ttype, cat = sargs.cat,
-								rm = sargs.rm, seq = "plan" }, true)
+								rm = sargs.rm, fv = sargs.fv, seq = "plan" }, true)
 						end)
 						if okPlan then
 							-- pcall folds multiple returns; re-run shape: xv is the
