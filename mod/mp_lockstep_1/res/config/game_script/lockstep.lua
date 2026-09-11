@@ -545,6 +545,7 @@ local function execute(c)
 			CM.execLine(c)
 		end
 	elseif c.op == "LOAN" then CM.execLoan(c)
+	elseif c.op == "SETDATE" or c.op == "CALSPEED" then CM.execCalendar(c)
 	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" then CM.execCompanyCmd(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end

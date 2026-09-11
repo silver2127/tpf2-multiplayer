@@ -133,10 +133,23 @@ static const int ID_CMDADD        = 1;
 // changes go through, which returns to 0xc17eff) is left alone.
 static const int ID_SETGAMESPEED = 15;
 static const uintptr_t CALLER_SPEED_BUTTONS[] = { 0x4efb8f, 0x4f0097, 0x4f26ef };
+// SetDate (make_cmd 0x9de9b0) and SetCalendarSpeed (0x9de870), steal 21 each:
+// the same shape as SetGameSpeed, no Engine, the value in the low 32 bits of rdx.
+// SetDate carries boost::gregorian's day number (the Julian Day Number: the
+// editor builds it with date(y, m, d) at 0x2855e0 just before the call);
+// SetCalendarSpeed carries milliseconds per day. Acted on for the editor's
+// controls only, by return address: the date picker (0x4efe54) and the date
+// speed slider (0x4f2af6). The Lua makers return to 0xcee8de and 0xc17e5e, and
+// the mod replays through game.interface.setDate / setMillisPerDay, which call
+// neither factory -- so a replay can never be captured again.
+static const int ID_SETDATE          = 16;
+static const int ID_SETCALENDARSPEED = 17;
+static const uintptr_t CALLER_SET_DATE       = 0x4efe54;
+static const uintptr_t CALLER_CALENDAR_SPEED = 0x4f2af6;
 static const int BLOB_SIZE = 48;
 
 // Every other command factory, same hook shape. Steal sizes are the ones
-// args_probe ran against these functions live. ids 2..10, 13, 14, 15; 0 and 1 are above.
+// args_probe ran against these functions live. ids 2..10, 13..17; 0 and 1 are above.
 struct Factory { uintptr_t rva; int steal; int id; const char* name; const char* kind; };
 static const Factory FACTORIES[] = {
     { 0x9dca00, 15, 2, "BuyVehicle",     "vehicle" },
@@ -151,6 +164,8 @@ static const Factory FACTORIES[] = {
     { 0x9de8a0, 20, 13, "SetColor",       "sync"    },  // r9 -> CVec3f*, 3 floats
     { 0x9deb70, 15, 14, "SetName",        "sync"    },  // r9 -> std::string*, MSVC SSO
     { 0x9de9e0, 21, 15, "SetGameSpeed",   "speed"   },  // clock buttons only: CaptureSpeedButton
+    { 0x9de9b0, 21, 16, "SetDate",          "calendar" },  // editor date picker only: CaptureCalendar
+    { 0x9de870, 21, 17, "SetCalendarSpeed", "calendar" },  // editor date speed slider only: CaptureCalendar
 };
 static const int NUM_FACTORIES = (int)(sizeof(FACTORIES) / sizeof(FACTORIES[0]));
 
@@ -1448,6 +1463,57 @@ static void CaptureSpeedButton(uint64_t rcx, uint64_t rdx, uint64_t caller)
         speed, (unsigned long long)caller);
 }
 
+// The editor's date picker and date speed slider while a session is live:
+// cancelled fire-and-forget (the clock reads the date and calendar speed back
+// every frame; nothing waits on the command) and written as SETDATE <julian day>
+// or CALSPEED <ms per day>. Every instance, the originator included, applies it
+// at the stamp (CM.execCalendar), so the calendar moves on the same sim step
+// everywhere. Not live, not the editor, or a value out of range: it runs
+// natively, as in a stock game.
+static void CaptureCalendar(uint64_t id, uint64_t rcx, uint64_t rdx, uint64_t caller)
+{
+    const bool isDate = (id == (uint64_t)ID_SETDATE);
+    const char* what = isDate ? "SetDate" : "SetCalendarSpeed";
+    const int value = (int)(int32_t)(uint32_t)rdx;
+    if (caller != (isDate ? CALLER_SET_DATE : CALLER_CALENDAR_SPEED)) {
+        static uint64_t seen[8] = {};
+        for (int i = 0; i < 8; i++) {
+            if (seen[i] == caller) break;
+            if (!seen[i]) {
+                seen[i] = caller;
+                Log("[slice] %s(%d) from caller_rva=%llx -- not the editor, left alone (logged once per caller)\n",
+                    what, value, (unsigned long long)caller);
+                break;
+            }
+        }
+        return;
+    }
+    // 1721426 = 0001-01-01 and 5373484 = 9999-12-31 in Julian days; a day longer
+    // than ~2.8 hours is not a calendar speed the slider offers
+    const bool inRange = isDate ? (value >= 1721426 && value <= 5373484) : (value > 0 && value <= 10000000);
+    if (!inRange) {
+        Log("[slice] %s value %d out of range -- left alone\n", what, value);
+        return;
+    }
+    if (!SessionLive()) {
+        Log("[slice] %s %d: no live session -- left alone\n", what, value);
+        return;
+    }
+    ReadInstance();   // NOT cached: the lobby can rename this peer after attach
+    if (!g_instance[0]) { Log("[slice] %s %d: no instance letter -- left alone\n", what, value); return; }
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] %s %d: cannot open %s -- left alone\n", what, value, p); return; }
+    fprintf(f, "%s %d\n", isDate ? "SETDATE" : "CALSPEED", value);
+    fclose(f);
+    InterlockedExchange(&g_pendingNoCb, 1);
+    InterlockedExchange(&g_pendingHonour, 0);
+    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+    Log("[slice] armed cancel: %s %d (caller_rva=%llx) -- every instance applies it at the stamp\n",
+        what, value, (unsigned long long)caller);
+}
+
 static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_t r8,
                            uint64_t r9, uint64_t calleeRsp, uint64_t caller, bool cancel)
 {
@@ -2517,6 +2583,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             CaptureSpeedButton(rcx, rdx, caller);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[slice] speed button capture fault -- the click runs natively\n");
+        }
+        return 0;
+    }
+
+    if (id == ID_SETDATE || id == ID_SETCALENDARSPEED) {
+        __try {
+            CaptureCalendar(id, rcx, rdx, caller);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            Log("[slice] calendar capture fault -- the change runs natively\n");
         }
         return 0;
     }

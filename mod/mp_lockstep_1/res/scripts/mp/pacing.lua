@@ -141,6 +141,73 @@ function CM.speedButton(v)
 	if v > 0 and wasPaused then CM.hostUnpause(v) end
 end
 
+-- THE EDITOR'S CALENDAR (2026-09-11). The date picker and the date speed slider
+-- only ever changed the clicking player's game. While a session is live the
+-- slice cancels them and writes SETDATE <julian day> / CALSPEED <ms per day>;
+-- inject.lua schedules that like any command, and every instance applies it
+-- here at the stamp, so the calendar moves on the same sim step everywhere.
+-- SetDate's value is boost::gregorian's day number, the Julian Day Number.
+function CM.julianToYmd(jdn)
+	local a = jdn + 32044
+	local b = math.floor((4 * a + 3) / 146097)
+	local c = a - math.floor(146097 * b / 4)
+	local d = math.floor((4 * c + 3) / 1461)
+	local e = c - math.floor(1461 * d / 4)
+	local m = math.floor((5 * e + 2) / 153)
+	local day = e - math.floor((153 * m + 2) / 5) + 1
+	local month = m + 3 - 12 * math.floor(m / 10)
+	local year = 100 * b + d - 4800 + math.floor(m / 10)
+	return year, month, day
+end
+
+function CM.execCalendar(c)
+	local t0
+	pcall(function() t0 = game.interface.getGameTime().time end)
+	if c.op == "CALSPEED" then
+		local ms = tonumber(c.ms)
+		if not ms or ms <= 0 then
+			log(string.format("EXEC CALSPEED seq=%s: bad value %s -- not applied", tostring(c.seq), tostring(c.ms)))
+			return
+		end
+		local before, after
+		pcall(function() before = game.interface.getMillisPerDay() end)
+		local ok, err = pcall(function() game.interface.setMillisPerDay(ms) end)
+		pcall(function() after = game.interface.getMillisPerDay() end)
+		log(string.format("EXEC CALSPEED seq=%s origin=%s ms/day %s -> %s (asked %d) success=%s%s",
+			tostring(c.seq), tostring(c.origin), tostring(before), tostring(after), ms, tostring(ok),
+			ok and "" or (" err=" .. tostring(err))))
+		return
+	end
+	local jdn = tonumber(c.jdn)
+	if not jdn then
+		log(string.format("EXEC SETDATE seq=%s: bad value %s -- not applied", tostring(c.seq), tostring(c.jdn)))
+		return
+	end
+	local y, m, d = CM.julianToYmd(jdn)
+	-- setDate takes the date in the order getDateFromNowPlusOffsetDays hands it
+	-- back (the old mp_bridge fed one into the other); the year is the entry
+	-- above 31, which tells day-first from year-first
+	local cur
+	pcall(function() cur = game.interface.getDateFromNowPlusOffsetDays(0) end)
+	local args
+	if type(cur) == "table" and tonumber(cur[1]) and tonumber(cur[3]) then
+		if tonumber(cur[1]) > 31 then args = { y, m, d } elseif tonumber(cur[3]) > 31 then args = { d, m, y } end
+	end
+	if not args then
+		local shape = {}
+		pcall(function() for k, v in pairs(cur or {}) do shape[#shape + 1] = tostring(k) .. "=" .. tostring(v) end end)
+		log(string.format("EXEC SETDATE seq=%s: cannot read today's date shape (%s: %s) -- %04d-%02d-%02d NOT applied",
+			tostring(c.seq), type(cur), table.concat(shape, ","), y, m, d))
+		return
+	end
+	local ok, err = pcall(function() game.interface.setDate((table.unpack or unpack)(args)) end)
+	local t1
+	pcall(function() t1 = game.interface.getGameTime().time end)
+	log(string.format("EXEC SETDATE seq=%s origin=%s -> %04d-%02d-%02d (jdn %d) success=%s%s | game time %s -> %s",
+		tostring(c.seq), tostring(c.origin), y, m, d, jdn, tostring(ok), ok and "" or (" err=" .. tostring(err)),
+		tostring(t0), tostring(t1)))
+end
+
 -- SPEED V2 controller -- THE HOST'S SPEED BUTTONS (2026-09-10):
 --   * the session speed is what the leader's player picks with the game's own
 --     speed buttons. While a session is live the slice DLL cancels a click on
