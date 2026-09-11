@@ -8,8 +8,8 @@
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 --
 -- GUI STATE ONLY. guiUpdate reads this game's dash file (written by the script
--- state) and calls CM.desyncReportTick with it. The first desync of a loaded
--- game then follows the player's choice, kept per computer in
+-- state) and calls CM.desyncReportTick with it. The first desync of a SESSION
+-- then follows the player's choice, kept per computer in
 -- <data dir>\tpf2mp_prefs.txt as desync_logs=ask|always|never:
 --   ask     a window offers Always send / Only this once / Never
 --   always  the logs go without asking (one chat line says so)
@@ -20,6 +20,13 @@
 -- Sending is the lobby's job (netpunch/desynclogs.py): this appends
 -- {"cmd":"upload_logs",...} to lobby_in.jsonl, and the lobby gathers, scrubs,
 -- zips and uploads the logs, then reports back as a chat line.
+--
+-- ONCE PER SESSION. A desync is detected again on every hash stamp after the
+-- first, and players reload the game to recover, which starts a fresh GUI
+-- state. So besides CM.desyncHandled (this loaded game) the lobby run's id --
+-- "session" in lobby_state.json, new each time the lobby starts -- is recorded
+-- in <data dir>\tpf2mp_desync_seen.txt, and a later game in the same session
+-- neither asks nor sends. The lobby also refuses a second upload per run.
 return function(CM, K, log)
 local PREF_KEY = "desync_logs"
 local NL = string.char(10)
@@ -149,6 +156,19 @@ function CM.desyncPopup(info)
 	if not ok then print("[ls-gui] desync popup could not be shown: " .. tostring(err)) end
 end
 
+local function seenPath() return (K.BASE or "") .. "tpf2mp_desync_seen.txt" end
+
+-- the running lobby's id for this session (nil without a lobby, or an older one)
+function CM.lobbySessionId()
+	local d = CM.netDir and CM.netDir()
+	if not d then return nil end
+	local f = io.open(d .. "/lobby_state.json", "r")
+	if not f then return nil end
+	local s = f:read("*a") or ""
+	f:close()
+	return s:match('"session"%s*:%s*"(%w+)"')
+end
+
 -- the GUI state's first look at this game: a dash file older than that belongs
 -- to an earlier game and says nothing about this one
 CM.desyncGuiBoot = CM.desyncGuiBoot or os.time()
@@ -159,7 +179,19 @@ function CM.desyncReportTick(kv)
 	if not n or n <= 0 then return end
 	if not boot or boot < CM.desyncGuiBoot - 60 then return end
 	CM.desyncHandled = true
-	local info = { why = kv.desyncwhy or kv.verdict or "?", t = tonumber(kv.desynct) or tonumber(kv.t) or 0, n = n }
+	local sid = CM.lobbySessionId()
+	if sid then
+		local f = io.open(seenPath(), "r")
+		local seen = f and f:read("*l")
+		if f then f:close() end
+		if seen == sid then
+			print("[ls-gui] desync detected, but this session already had its desync popup -- not asked again")
+			return
+		end
+		local w = io.open(seenPath(), "w")
+		if w then w:write(sid .. NL); w:close() end
+	end
+	local info ={ why = kv.desyncwhy or kv.verdict or "?", t = tonumber(kv.desynct) or tonumber(kv.t) or 0, n = n }
 	local pref = CM.desyncLogsPref()
 	print(string.format("[ls-gui] desync detected (%s at t=%d), desync logs set to '%s'", tostring(info.why), info.t, pref))
 	if pref == "never" then return end

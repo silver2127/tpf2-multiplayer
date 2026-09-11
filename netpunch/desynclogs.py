@@ -52,6 +52,7 @@ DELAY_DEFAULT = 20.0        # seconds to wait before gathering
 SKIP_DATA = {"tpf2_names.txt"}
 
 _busy = threading.Lock()
+_sent = []                  # ids of the reports this lobby run sent: one per session
 
 
 # --------------------------------------------------------------------------- #
@@ -253,7 +254,12 @@ def _meta(cmd, version):
 
 
 def start(io_, log, cmd, version, url=None):
-    """Gather and send in the background. False when a report is already running."""
+    """Gather and send in the background. False when a report is already running,
+    or this lobby run (the session) has already sent one: a desync keeps being
+    detected after the first, and the popup's backstop is here."""
+    if _sent:
+        log(f"[report] desync logs: already sent in this session (report {_sent[0]}) -- not sent again")
+        return False
     if not _busy.acquire(blocking=False):
         log("[report] desync logs: a report is already being sent -- this request ignored")
         return False
@@ -279,6 +285,7 @@ def _run(io_, log, cmd, version, url):
         log(f"[report] desync logs: {len(about['files'])} file(s), {len(blob)} B zipped -> {target}")
         res = post(target, blob, meta, version)
         rid = str(res.get("id") or "?")
+        _sent.append(rid)
         log(f"[report] desync logs sent: report {rid}")
         _say(io_, f"Desync logs sent to the developers (report {rid}). Thank you!")
         io_.emit({"type": "report", "ok": True, "id": rid})

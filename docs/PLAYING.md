@@ -157,12 +157,16 @@ themselves. Players who are already in the game ignore a new shared save (`/sync
 someone joining), so to recover: the host saves, everyone returns to the title menu and leaves
 the lobby, and the host hosts again and presses START GAME, which shares that save.
 
-The first desync in a game also opens a **Desync detected** window that asks whether to send that
-game's logs to the developers:
+The first desync in a session also opens a **Desync detected** window that asks whether to send
+that game's logs to the developers:
 
-- **Always send**: send them now, and after every later desync without asking.
-- **Only this once**: send them now and ask again next time.
+- **Always send**: send them now, and in later sessions without asking.
+- **Only this once**: send them now and ask again in the next session.
 - **Never**: send nothing, and never show the window again on this computer.
+
+A desync keeps being detected until the players reload, so the window appears, and logs are sent,
+at most once per session: not again for the same desync, and not after reloading the shared save in
+the same lobby.
 
 The logs go to the project's server (the one behind the public games list): the game's log with the
 mod's script lines, the mod's DLL logs and files, and the game's graphics settings. Windows user and

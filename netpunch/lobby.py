@@ -482,8 +482,12 @@ class LobbyIO:
         open(self.out_path, "w", encoding="utf-8").close()
         open(self.in_path, "w", encoding="utf-8").close()
         self._in_offset = 0
-        self._state = {}
+        # A fresh id per lobby run. The in-game desync popup reads it here
+        # (desyncreport.lua) so it asks, and sends, at most once per session,
+        # even when the players reload the game to recover from the desync.
+        self._state = {"session": os.urandom(6).hex()}
         self._lock = threading.Lock()
+        self.write_state()
 
     def emit(self, event):
         with self._lock:
