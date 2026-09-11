@@ -837,7 +837,13 @@ class GameRelay:
 # All files (.sav + optional .sav.lua + .jpg) are concatenated into ONE byte
 # stream with a single sequence space; the receiver splits them back out using
 # the per-file sizes in `fbegin`. Integrity is SHA-256 per file AND overall.
-SHARE_MODS = [True]        # --no-share-mods turns the mods round off (host side)
+# OFF since 2026-09-11 (--share-mods turns it on, host side). Live on the rig a
+# joiner whose game could not see the save's Workshop mods -- their folders were
+# there, the game still loaded without them -- was never asked, and its refused
+# autoload left it stuck on LOAD GAME. Copying a Workshop item into the workshop
+# folder is unlikely to make the game load it either. Every player installs the
+# save's mods themselves until that is solved.
+SHARE_MODS = [False]
 MODS_ANSWER_WAIT = 90.0    # s the host waits for a joiner to answer the download prompt
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
@@ -1240,17 +1246,56 @@ class _ClientSaveReceiver:
         self.kind = "save"
         self.need = []
         self.ask = False
+        # THE JOINER DECIDES WHAT IT INSTALLS (2026-09-11). A mod is Lua the game
+        # runs. The host used to be the only side that honoured a NO: a joiner
+        # installed any kind=="mods" transfer it was sent, prompt or not, so a
+        # modified host could skip the question and push code onto every joiner.
+        # Now a mods round is taken only right after a verified save round, only
+        # after THIS player said yes, and only the mods they were asked about
+        # are installed; the yes covers one round.
+        self.offered = []          # folder names the player was asked about (the last save round)
+        self.approved = set()      # of those, what the player said yes to
+        self.save_done = False     # the save round before a mods round verified here
 
     def answer_mods(self, accept):
         """The player (or the panel's share_mods flag) said yes or no."""
         if self.sid is None:
             return
         self.ask = False
+        self.approved = set(self.offered) if accept else set()
         self._send({"t": "mods_answer", "sid": self.sid, "accept": bool(accept)})
         self.log(f"[client] mod download {'accepted' if accept else 'declined'}")
         if not accept and self.need:
             self.io.emit({"type": "chat", "from": "MULTIPLAYER",
                           "text": "Mod download declined: the game will report the missing mods when the save loads."})
+
+    def _refusal(self, kind, files):
+        """Why this proposed transfer must not be taken, or None."""
+        names = [m.get("name") if isinstance(m, dict) else None for m in files]
+        if kind == "save":
+            bad = [n for n in names if n not in ALLOWED_INCOMING or not _safe_incoming_name(n)]
+            return f"refused: sender proposed unexpected filename(s) {bad}" if bad else None
+        if not self.save_done:
+            return "refused a mods transfer that did not follow a verified save transfer"
+        if not self.approved:
+            return "refused a mods transfer this player did not agree to"
+        bad = [n for n in names if not _safe_incoming_name(n) or modshare.parse_mod_zip_name(n) is None]
+        if bad:
+            return f"refused a mods transfer carrying files that are not mod zips: {bad}"
+        if len(set(names)) != len(names):
+            return "refused a mods transfer that names the same file twice"
+        return None
+
+    def _refuse_mods(self, detail):
+        """A mods round the player did not agree to: nothing is received or
+        installed, the host hears a final failure (it starts us anyway), and the
+        player is told. Not a status line: the save itself arrived fine."""
+        self.failed = True
+        self.approved = set()
+        self.log(f"[client] {detail}")
+        self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                      "text": "Blocked mod files from the host that you did not agree to download; nothing was installed."})
+        self._send({"t": "fdone", "sid": self.sid, "ok": False, "final": True})
 
     def active(self):
         """True while a transfer is in progress (steer the loop to poll fast)."""
@@ -1285,6 +1330,21 @@ class _ClientSaveReceiver:
                 self._send({"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask})  # duplicate -> re-ack
             return
         # A brand-new session (first ever, or a later transfer): (re)allocate.
+        kind = "mods" if msg.get("kind") == "mods" else "save"
+        files = msg.get("files", [])
+        if not isinstance(files, list):
+            files = []
+        # Validate BEFORE allocating, acking or asking the player anything: a
+        # rejected transfer must cost the joiner nothing.
+        refusal = self._refusal(kind, files)
+        if refusal:
+            self.sid, self.kind, self.files = sid, kind, []
+            self.buf = self.have = None
+            if kind == "mods":
+                self._refuse_mods(refusal)
+            else:
+                self._fail(refusal)
+            return
         self.sid = sid
         self.total_bytes = int(msg.get("total_bytes", 0))
         self.chunk = int(msg.get("chunk", CHUNK_DATA)) or CHUNK_DATA
@@ -1292,30 +1352,31 @@ class _ClientSaveReceiver:
         # so the two ends agree how far ahead the NACK scan should look.
         self.window = SEND_WINDOW_LOCAL if self.chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
         self.total_chunks = int(msg.get("total_chunks", 0))
-        self.files = msg.get("files", [])
-        self.kind = "mods" if msg.get("kind") == "mods" else "save"
+        self.files = files
+        self.kind = kind
         # the mods this save needs that are not installed here (told back in the ack)
         self.need = []
-        for ent in (msg.get("mods") or []):
-            try:
-                m, v = str(ent[0]), int(ent[1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            if modshare.installed_mod(m, v) is None:
-                self.need.append(modshare.mod_folder_name(m, v))
-        self.ask = bool(self.need) and self.kind == "save"
+        if kind == "save":
+            self.save_done = False
+            for ent in (msg.get("mods") or []):
+                try:
+                    m, v = str(ent[0]), int(ent[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if modshare.installed_mod(m, v) is None:
+                    self.need.append(modshare.mod_folder_name(m, v))
+            # a new save round asks afresh: an earlier yes does not carry over
+            self.offered = list(self.need)
+            self.approved = set()
+        self.ask = bool(self.need) and kind == "save"
         if self.need:
             self.log(f"[client] the save needs mods we lack: {', '.join(self.need)} -- asking the player")
             # the panel shows YES / NO (or answers from its share_mods flag)
             self.io.emit({"type": "mods_prompt", "count": len(self.need), "mods": list(self.need),
                           "text": ", ".join(self.need)})
-        # Validate the proposed names BEFORE allocating or acking: a rejected
-        # transfer must cost the joiner nothing.
-        bad = [m.get("name") for m in (self.files or [])
-               if not _safe_incoming_name(m.get("name"))]
-        if bad:
-            self._fail(f"refused: sender proposed unexpected filename(s) {bad}")
-            return
+            self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                          "text": "Mods are code that runs in your game, and these come from the host's "
+                                  "computer: only download them from a host you trust."})
         self.overall_sha = msg.get("sha256")
         self.buf = None
         self.have = None
@@ -1479,6 +1540,7 @@ class _ClientSaveReceiver:
             v.release()
         view.release()
         self.complete = True
+        self.save_done = True                    # a mods round may follow (still needs the player's yes)
         self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
         self.io.emit({"type": "save_ready", "name": INCOMING_BASENAME,
                       "dir": os.path.abspath(self.io.dir), "files": written})
@@ -1493,20 +1555,30 @@ class _ClientSaveReceiver:
 
     def _install_mods(self, parts):
         """A mods round: unpack each incoming_mod_<id>_<ver>.zip into the game's
-        mods folder (never over an existing one) and tell the player."""
-        done, kept, bad = [], [], []
+        mods folder (never over an existing one) and tell the player. Only the
+        mods this player said yes to are installed; the host sends one zip set
+        to everyone who lacked something, so the rest are left alone. The yes is
+        used up by this round."""
+        approved, self.approved = self.approved, set()
+        done, kept, bad, skipped = [], [], [], []
         for name, part in parts.items():
             idv = modshare.parse_mod_zip_name(name)
             if not idv:
                 bad.append(str(name)); continue
-            st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
             label = modshare.mod_folder_name(*idv)
+            if label not in approved:
+                if modshare.installed_mod(*idv) is None:
+                    skipped.append(label)
+                self.log(f"[client] mod {label}: not agreed to here -- not installed")
+                continue
+            st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
             (done if st == "installed" else kept if st == "present" else bad).append(label)
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
         text = []
         if done: text.append("Installed from the host: " + ", ".join(done) + " (they show in the load screen's Mods panel)")
         if kept: text.append("already installed: " + ", ".join(kept))
         if bad: text.append("FAILED to install: " + ", ".join(bad) + " -- install it by hand")
+        if skipped: text.append("not installed (you did not agree to them): " + ", ".join(skipped))
         if text:
             self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": "; ".join(text)})
         self.io.emit({"type": "mods_ready", "installed": done, "present": kept, "failed": bad})
@@ -3725,6 +3797,7 @@ def _run_transfer_mods(tag):
         src[mid] = d
     dest = os.path.join(base, "joinermods")
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
+    share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
     modshare.save_mod_list = lambda p: [("mod_zz", 1), ("mod_have", 1)]
     modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
     modshare.installed_mod = lambda m, v: src.get(m) if m == "mod_have" else None   # joiners lack mod_zz
@@ -3818,6 +3891,7 @@ def _run_transfer_mods(tag):
             except Exception:
                 pass
         (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target) = real
+        SHARE_MODS[0] = share_was
         shutil.rmtree(base, ignore_errors=True)
     print(f"[mods:{tag}] {'OK' if ok else 'FAIL'}  ({time.time() - t0:.1f}s)")
     return ok
@@ -3827,7 +3901,7 @@ def selftest_mods():
     """The mods round: a joiner lacking a mod the save needs gets it from the
     host after the save, unpacked, before it is started."""
     print("[selftest-mods] host -> 2-joiner mod share")
-    ok = modshare_selftest_ok() and _run_transfer_mods("share-one")
+    ok = modshare_selftest_ok() and _run_mods_gate("gate") and _run_transfer_mods("share-one")
     # and the real thing: the newest save on this machine must parse (proves the
     # zstandard decoder is bundled in a frozen build)
     ud = modshare.userdata_mods_dir()
@@ -3844,6 +3918,98 @@ def selftest_mods():
         print("[selftest-mods] (no local save to parse)")
     print(f"[selftest-mods] {'PASS' if ok else 'FAIL'}")
     return ok
+
+
+def _run_mods_gate(tag):
+    """The joiner-side gate: a mods round is installed only right after a
+    verified save round, only after this player said yes, and only the mods
+    they were asked about. Drives _ClientSaveReceiver directly, the way a host
+    that skips the prompt would."""
+    base = tempfile.mkdtemp(prefix="lobby_modgate_")
+    dest = os.path.join(base, "mods")
+    real = (modshare.installed_mod, modshare.install_target)
+    modshare.installed_mod = lambda m, v: None
+    modshare.install_target = lambda m, v: os.path.join(dest, f"{m}_{v}")
+    zips = {}
+    for mid in ("mod_zz", "evil"):
+        d = os.path.join(base, "src", f"{mid}_1")
+        os.makedirs(d)
+        with open(os.path.join(d, "mod.lua"), "w") as f:
+            f.write("function data() return {} end\n")
+        zips[mid] = modshare.zip_mod(d)
+
+    class Conn:
+        def __init__(self):
+            self.sent = []
+
+        def send(self, raw):
+            self.sent.append(json.loads(raw.decode("utf-8")))
+
+    def push(r, sid, kind, files, mods=None):
+        blob = b"".join(data for _, data in files)
+        meta = [{"name": n, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()} for n, data in files]
+        total = (len(blob) + CHUNK_LOCAL - 1) // CHUNK_LOCAL
+        msg = {"t": "fbegin", "sid": sid, "kind": kind, "files": meta, "total_bytes": len(blob),
+               "total_chunks": total, "chunk": CHUNK_LOCAL, "sha256": hashlib.sha256(blob).hexdigest()}
+        if mods is not None:
+            msg["mods"] = mods
+        r.on_begin(msg)
+        for seq in range(total):
+            r.on_chunk(sid, seq, blob[seq * CHUNK_LOCAL:(seq + 1) * CHUNK_LOCAL])
+
+    def installed(mid):
+        return os.path.isfile(os.path.join(dest, f"{mid}_1", "mod.lua"))
+
+    def receiver(name):
+        c = Conn()
+        return c, _ClientSaveReceiver(c, LobbyIO(os.path.join(base, name)), lambda s: None)
+
+    save = [(INCOMING_BASENAME + ".sav", os.urandom(20000))]
+    mzz = [(modshare.mod_zip_name("mod_zz", 1), zips["mod_zz"])]
+    evil = [(modshare.mod_zip_name("evil", 1), zips["evil"])]
+    results = []
+
+    def check(name, cond):
+        print(f"[mods:{tag}] {'ok  ' if cond else 'FAIL'} {name}")
+        results.append(bool(cond))
+
+    try:
+        c, r = receiver("io1")
+        push(r, 11, "mods", mzz)
+        check("a mods round with no save round and no yes is refused and installs nothing",
+              not installed("mod_zz") and not any(m.get("t") == "fbegin_ack" for m in c.sent)
+              and any(m.get("t") == "fdone" and m.get("ok") is False for m in c.sent))
+
+        c, r = receiver("io2")
+        push(r, 21, "save", save, mods=[["mod_zz", 1]])
+        check("the save round asks about the missing mod", r.save_done and r.offered == ["mod_zz_1"])
+        r.answer_mods(False)
+        push(r, 22, "mods", mzz)
+        check("after NO the mods round is refused and installs nothing", not installed("mod_zz"))
+
+        c, r = receiver("io3")
+        push(r, 31, "save", save, mods=[["mod_zz", 1]])
+        r.answer_mods(True)
+        push(r, 32, "mods", mzz + evil)
+        check("after YES the mod asked about is installed", installed("mod_zz"))
+        check("a mod the player was not asked about is not installed", not installed("evil"))
+        shutil.rmtree(os.path.join(dest, "mod_zz_1"), ignore_errors=True)
+        push(r, 33, "mods", mzz)
+        check("a second mods round on the same YES is refused", not installed("mod_zz"))
+
+        c, r = receiver("io4")
+        push(r, 41, "save", save + mzz, mods=[["mod_zz", 1]])
+        check("a save round carrying a mod zip is refused", r.failed and not r.save_done and not installed("mod_zz"))
+
+        c, r = receiver("io5")
+        push(r, 51, "save", save, mods=[["mod_zz", 1]])
+        r.answer_mods(True)
+        push(r, 52, "mods", mzz + [(INCOMING_BASENAME + ".sav", b"x" * 10)])
+        check("a mods round carrying a non-mod file is refused", not installed("mod_zz"))
+    finally:
+        modshare.installed_mod, modshare.install_target = real
+        shutil.rmtree(base, ignore_errors=True)
+    return all(results)
 
 
 def modshare_selftest_ok():
@@ -4260,8 +4426,10 @@ def main(argv=None):
                     help="also tail this file and ship its new lines to the "
                          "host's merged lobby_peers.log (repeatable; e.g. the "
                          "bridge log)")
+    ap.add_argument("--share-mods", action="store_true",
+                    help="host: send joiners the mods the shared save needs (off by default)")
     ap.add_argument("--no-share-mods", action="store_true",
-                    help="host: do not send joiners the mods the shared save needs")
+                    help="host: do not send joiners the mods the shared save needs (the default)")
     ap.add_argument("--no-mesh", action="store_true",
                     help="joiner: do not punch other joiners directly; keep "
                          "every frame on the host relay (the pre-mesh star)")
@@ -4281,8 +4449,7 @@ def main(argv=None):
                          "delivered to (the menu reads it from "
                          "tpf2_instance.txt; default %(default)s)")
     args = ap.parse_args(argv)
-    if getattr(args, "no_share_mods", False):
-        SHARE_MODS[0] = False
+    SHARE_MODS[0] = bool(getattr(args, "share_mods", False)) and not getattr(args, "no_share_mods", False)
 
     if args.selftest:
         return 0 if selftest() else 1
