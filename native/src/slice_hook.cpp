@@ -2822,6 +2822,12 @@ static bool TerrainCarrierEmpty(uint64_t r8)
 static bool InjectTerrainFromFile(uint64_t r8)
 {
     if (!g_dataDir[0]) return false;
+    // NOT the letter from attach: the lobby renames a joiner after the slice
+    // loads, and a peer that never edits calls nothing else that re-reads it.
+    // B attached as "a", looked for terrain_inject_a.bin, and left every
+    // terrain_inject_b.bin unread -- no terraform or paint reached it (2026-09-11).
+    ReadInstance();
+    if (!g_instance[0]) return false;
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%sterrain_inject_%s.bin", g_dataDir, g_instance);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) return false;
