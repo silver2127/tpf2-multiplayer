@@ -176,6 +176,8 @@ sees Add's. They are different numbers for the same click.
 | `addmodulecomp` (module list in the construction window) | `0x4b71b8` (predicted) | `0x4b71d8` (predicted) | from the call graph |
 | `UI::ProposalAction` (terraform, paint, brush) | `0x4311c6` | | MEASURED |
 | depot window buy (`vehiclemanager.cpp`) | `0x74fd88` | `0x74fda9` | MEASURED |
+| vehicle manager clone (`0x752b50` → `0x747230`, one buy per selected vehicle through `0x74f5e0`) | `0x74fd88` (same buy function) | | DECOMPILED |
+| buy completion callback, shared by buy and clone: `_Do_call` `0x753820` → `0x748250(lambda = impl+8)`; reads the result vehicle at `(*command)+0x38` after a type tag of 13 at `+0xb18`; lambda `+0x30` int line: below 0 opens the vehicle window, 0 or more SetLines the new vehicle through `0x88b840` | | | DECOMPILED |
 | CreateLine via `line_util` | `0x215c26b` | | MEASURED |
 | line editor UpdateLine | `0x6043fd`, `0x6074b5` | | MEASURED |
 | vehicle window Reverse (`viewcreator.cpp`) | `0x8b556d` | | MEASURED |

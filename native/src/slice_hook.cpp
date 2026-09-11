@@ -1332,6 +1332,28 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
     return false;
 }
 
+// The buy's completion callback. The depot window's buy and the vehicle manager's
+// CLONE share it: _Do_call 0x753820 runs 0x748250 on the lambda at impl+8, and that
+// lambda's int at +0x30 is the line a clone puts the new vehicle on (SetLine via
+// 0x88b840); below 0 it is a plain depot buy and opens the vehicle window instead.
+// Cancelled, the command has no result vehicle, so the clone's SetLine never came:
+// "the clone button does nothing" (2026-09-11). The line is shipped as VBUYLINE right
+// behind the VBUY, and the replay assigns the vehicle on every instance.
+static const uintptr_t RVA_BUY_CALLBACK_THUNK = 0x753820;
+
+static void WriteInjectBuyLine(int32_t line)
+{
+    ReadInstance();
+    if (!g_instance[0]) return;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] cannot open %s -- clone line %d not shipped\n", p, line); return; }
+    fprintf(f, "VBUYLINE %d\n", line);
+    fclose(f);
+    Log("[slice] VBUYLINE shipped: the cancelled buy was a clone onto line %d\n", line);
+}
+
 // Returns true when a line was written.
 static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st0)
 {
@@ -3432,6 +3454,25 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 if (vft && Readable((void*)vft, 8 * 5)) {
                     uint64_t doCall = 0;
                     memcpy(&doCall, (void*)(vft + 0x10), 8);
+                    if (doCall && doCall == (uint64_t)g_base + RVA_BUY_CALLBACK_THUNK) {
+                        // 0x748250 reads the result vehicle at (*command)+0x38 -- the command
+                        // IMPL, after checking its type tag at +0xb18 (13, BuyVehicle) -- not at
+                        // command+0x38 as logged above. Never applied, it must say "none" (-1),
+                        // or a clone would SetLine whatever entity the slot happens to name.
+                        int32_t cloneLine = -1, resVeh = -1;
+                        __try {
+                            uint64_t cimpl = 0;
+                            if (Readable((void*)(impl + 0x38), 4)) memcpy(&cloneLine, (void*)(impl + 0x38), 4);
+                            if (Readable((void*)r8, 8)) memcpy(&cimpl, (void*)r8, 8);
+                            if (cimpl && Readable((void*)(cimpl + 0x38), 4)) {
+                                memcpy(&resVeh, (void*)(cimpl + 0x38), 4);
+                                if (resVeh != -1) { const int32_t none = -1; memcpy((void*)(cimpl + 0x38), &none, 4); }
+                            }
+                        } __except (EXCEPTION_EXECUTE_HANDLER) { cloneLine = -1; }
+                        Log("[slice] buy callback: lambda line=%d (>= 0: a clone), impl result vehicle=%d%s\n",
+                            cloneLine, resVeh, resVeh != -1 ? " -- reset to -1 before the fire" : "");
+                        if (cloneLine >= 0) WriteInjectBuyLine(cloneLine);
+                    }
                     if (doCall) {
                         __try {
                             ((void (*)(uint64_t, uint64_t))doCall)(impl, r8);

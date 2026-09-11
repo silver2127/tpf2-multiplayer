@@ -716,6 +716,29 @@ function buildVehConfig(c)
 	return config, u
 end
 
+-- A clone joins its original's line from the buy's own callback, as the game's clone
+-- does (vehiclemanager 0x748250 -> SetLine). The buy applies on the same step on every
+-- instance, so this assignment does too. Stop 0, not the game's -1: the engine refuses
+-- -1 for trains (see VLINE), and every instance clamps the same way.
+function CM.cloneOntoLine(c, vid)
+	local line = CM.lineIdFor(tostring(c.cline))
+	if not line then
+		log(string.format("VBUY seq=%s: clone line %s is not here -- vehicle %d stays in the depot (DIVERGENCE if it moves elsewhere)",
+			tostring(c.seq), tostring(c.cline), vid))
+		return
+	end
+	local okM, cmd = pcall(api.cmd.make.setLine, vid, line, 0)
+	if not okM or not cmd then
+		log(string.format("VBUY seq=%s: clone setLine(%d, %d, 0) refused by the maker: %s",
+			tostring(c.seq), vid, line, tostring(cmd)))
+		return
+	end
+	api.cmd.sendCommand(cmd, function(_, success)
+		log(string.format("EXEC VBUY seq=%s origin=%s clone -> line %s (%d) success=%s",
+			tostring(c.seq), tostring(c.origin), tostring(c.cline), line, tostring(success)))
+	end)
+end
+
 function CM.execVBuy(c)
 	-- The originator replays its own purchase ONLY if the buy was actually
 	-- cancelled here: VBUY is a strict op (K.STRICT_OPS) and c.armed is the
@@ -823,6 +846,7 @@ function CM.execVBuy(c)
 					end)
 					if not (nid and nid > 0) then nid = nil end
 					expectVehicle(key, depot, company, nid, bal0)
+					if nid and c.cline then CM.cloneOntoLine(c, nid) end
 				elseif not retry and who ~= me then
 					log(string.format("EXEC VBUY seq=%s: company %s could not pay for it here -- buying as our own player and handing it over",
 						tostring(seq), tostring(company)))

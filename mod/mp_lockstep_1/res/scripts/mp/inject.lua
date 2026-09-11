@@ -28,9 +28,24 @@ function CM.pollInject()
 	if not K.INJECT_FILE then return end
 	local data, newOff = CM.readFrom(K.INJECT_FILE, CM.injectOffset)
 	CM.injectOffset = newOff
-	if not data then return end
+	local carry = CM.injectCarry
+	CM.injectCarry = nil
+	if not data and not carry then return end
 
-	for line in data:gmatch("[^\r\n]+") do
+	local lines = {}
+	if carry then lines[1] = carry end
+	for line in (data or ""):gmatch("[^\r\n]+") do lines[#lines + 1] = line end
+	-- A clone's buy is two records: VBUY when the slice captures the command, then
+	-- VBUYLINE <line> when it reaches CommandList::Add a moment later. A VBUY that
+	-- ENDS a read may still have its VBUYLINE on the way, so it waits for the next
+	-- poll -- once: a poll with nothing new ships it as a plain buy.
+	if data and #lines > 0 and lines[#lines]:match("^%s*VBUY%s") then
+		CM.injectCarry = table.remove(lines)
+	end
+
+	for li = 1, #lines do
+		local line = lines[li]
+		CM.injectNext = lines[li + 1]
 		line = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if line ~= "" and line:sub(1, 1) ~= "#" then
 			local w = {}
@@ -47,6 +62,8 @@ function CM.pollInject()
 			-- never ran (review, 2026-08-31).
 			-- The slice says, per capture, whether it cancelled the local build.
 			if o == "ARMED" then CM.lastArmed = tonumber(w[2]) or 0; return end
+			-- read by the VBUY just ahead of it (CM.injectNext)
+			if o == "VBUYLINE" then return end
 			-- The street's bus lane and tram track, on their own line just ahead of
 			-- the ROADE (ROADE is positional and length-checked, so it cannot be
 			-- widened). Consumed by the next ROADE exactly as ARMED is.
@@ -829,6 +846,21 @@ function CM.pollInject()
 							-- carry the slice's ARMED verdict ON the command, so the
 							-- replay guard reads per-command truth
 							bargs.armed = tonumber(CM.lastArmed or 0)
+							-- A CLONE: the cancelled buy's callback would have put the new vehicle
+							-- on the original's line. The slice names that line in the VBUYLINE
+							-- right behind; the buy carries its key so every instance assigns the
+							-- vehicle from the buy's own callback, on the same step.
+							local nx = CM.injectNext
+							local cl = nx and tonumber(nx:match("^%s*VBUYLINE%s+(%-?%d+)"))
+							if cl and cl >= 0 then
+								local lk = CM.lineKeyFor(cl)
+								if lk then
+									bargs.cline = lk
+									log(string.format("VBUY: a clone -- the new vehicle joins line %s", lk))
+								else
+									log(string.format("VBUY: a clone onto local line %d, which has no cross-peer key -- the vehicle stays in the depot", cl))
+								end
+							end
 							if K.STRICT_OPS.VBUY and tonumber(CM.lastArmed or 0) == 1 then
 								-- NO expectVehicle here. Under strict the originator
 								-- REPLAYS its own buy, and execVBuy binds the key from
