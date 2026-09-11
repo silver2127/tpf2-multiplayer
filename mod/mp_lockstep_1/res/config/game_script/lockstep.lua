@@ -376,6 +376,9 @@ local lastHashAt   = nil
 CM.myHashes     = {}         -- [stamp] = our own hash
 CM.myDetails    = {}         -- [stamp] = our own per-component breakdown
 CM.desyncs = 0
+-- when this game's script state started: the dash file carries it as boot=, so
+-- the GUI state's desync popup can tell this game's count from a leftover file
+CM.bootWall = os.time()
 
 -- The in-game dashboard (guiUpdate, a separate Lua state) can only read files,
 -- so notable events are harvested HERE, at the one point every message passes,
@@ -613,6 +616,9 @@ CM.boot("mp.cursors")
 -- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
 -- Lives in res/scripts/mp/stats.lua.
 CM.boot("mp.stats")
+-- ---------- the desync popup: send this game's logs to the developers? (GUI state) ----------
+-- Lives in res/scripts/mp/desyncreport.lua.
+CM.boot("mp.desyncreport")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
 	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
@@ -953,6 +959,12 @@ function data()
 						-- LSTICK table, with a wall clock so a leftover file can be
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
+						-- the first desync of this game, for the popup (desyncreport.lua)
+						f:write("boot=" .. tostring(CM.bootWall or 0) .. "\n")
+						if CM.firstDesync then
+							f:write("desyncwhy=" .. tostring(CM.firstDesync.why):gsub("%c", " ") .. "\n")
+							f:write("desynct=" .. tostring(math.floor(tonumber(CM.firstDesync.t) or 0)) .. "\n")
+						end
 						f:write(string.format("nack=%d/%d recovered=%d\n", CM.nackSent or 0, CM.nackAnswered or 0, CM.recovered or 0))
 						-- the command delay (auto or pinned), the worst peer's round trip, and a gap hold in force
 						f:write(string.format("xdelay=%.1f%s\n", CM.execDelayCur or K.EXEC_DELAY, CM.execDelayAuto and " auto" or " fixed"))
@@ -1142,6 +1154,10 @@ function data()
 				local own = K.INSTANCE or "a"
 				local ownKv = readDash(own)
 				local ownWall = ownKv and tonumber(ownKv.wall) or nil
+				if CM.desyncReportTick then
+					local okR, errR = pcall(CM.desyncReportTick, ownKv)
+					if not okR then print("[ls-gui] desync report: " .. tostring(errR)) end
+				end
 				local peerInfo = {}
 				if ownKv and ownKv.peers and ownKv.peers ~= "-" then
 					for o, pt, sk, vd in ownKv.peers:gmatch("(%a+):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
@@ -1346,7 +1362,8 @@ function data()
 						D.input:onEnter(function()
 							local t = D.input:getText()
 							if t and #t > 0 then
-								CM.chatSend(t)
+								-- "/desynclogs ..." sets the desync popup's choice here and never reaches the chat
+								if not (CM.desyncLogsCommand and CM.desyncLogsCommand(t)) then CM.chatSend(t) end
 								pcall(function() D.input:setText("", false) end)
 							end
 						end)

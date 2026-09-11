@@ -248,8 +248,8 @@ function CM.vposCompare(stamp, o)
 	-- mismatch. One count per stamp per peer (vposDone guards re-entry).
 	local lim = K.VPOS_DESYNC_M
 	if mx > lim then
-		CM.desyncs = CM.desyncs + 1
 		CM.dashVerdict = string.format("DESYNC vpos %.0fm vs %s", mx, o)
+		CM.noteDesync(CM.dashVerdict, stamp)
 		log(string.format("!! DESYNC (vehicle drift) t=%d vs %s: max=%.2f m mean=%.2f m (> %d m) -- total %d",
 			stamp, o, mx, mean, lim, CM.desyncs))
 	end

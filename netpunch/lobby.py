@@ -443,6 +443,26 @@ def _dedupe(name, taken):
 # --------------------------------------------------------------------------- #
 # File IPC: the flat-file surface the in-game menu reads/writes
 # --------------------------------------------------------------------------- #
+def _report_command(cmd, io, log, url_base=None):
+    """The in-game desync popup's commands (mod: res/scripts/mp/desyncreport.lua).
+
+    {"cmd":"upload_logs",...} sends this game's logs to the master server
+    (netpunch/desynclogs.py, in the background); {"cmd":"note","text":...} shows
+    a chat line from MULTIPLAYER to this player only. True when cmd was one.
+    """
+    c = cmd.get("cmd")
+    if c == "note":
+        io.emit({"type": "chat", "from": "MULTIPLAYER", "text": str(cmd.get("text", ""))[:400]})
+        return True
+    if c == "upload_logs":
+        import desynclogs
+        url = (url_base.rstrip("/") + "/desync") if url_base else None
+        if desynclogs.start(io, log, cmd, LOBBY_VERSION, url):
+            log(f"[report] desync logs requested (instance {cmd.get('instance')!r}, {cmd.get('reason')!r})")
+        return True
+    return False
+
+
 class LobbyIO:
     """Owns lobby_out.jsonl / lobby_in.jsonl / lobby_state.json in one dir.
 
@@ -462,8 +482,12 @@ class LobbyIO:
         open(self.out_path, "w", encoding="utf-8").close()
         open(self.in_path, "w", encoding="utf-8").close()
         self._in_offset = 0
-        self._state = {}
+        # A fresh id per lobby run. The in-game desync popup reads it here
+        # (desyncreport.lua) so it asks, and sends, at most once per session,
+        # even when the players reload the game to recover from the desync.
+        self._state = {"session": os.urandom(6).hex()}
         self._lock = threading.Lock()
+        self.write_state()
 
     def emit(self, event):
         with self._lock:
@@ -2311,6 +2335,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 broadcast_start(save=False)       # legacy start, no transfer
         elif c == "quit":
             stop.set()
+        elif not relay_only:
+            _report_command(cmd, io, log, publisher.url if publisher is not None else None)
 
     # ---- serve ------------------------------------------------------------- #
     io.emit({"type": "status", "state": "connected",
@@ -2912,6 +2938,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "leave"})
             io.emit({"type": "status", "state": "failed", "detail": "left lobby"})
             stop.set()
+        else:
+            _report_command(cmd, io, log)
 
     # Game relay, outbound half: the client's transport is a queue-fed
     # Connection (no select loop to join), so the loopback socket gets its own
