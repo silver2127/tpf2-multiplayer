@@ -838,6 +838,7 @@ class GameRelay:
 # stream with a single sequence space; the receiver splits them back out using
 # the per-file sizes in `fbegin`. Integrity is SHA-256 per file AND overall.
 SHARE_MODS = [True]        # --no-share-mods turns the mods round off (host side)
+MODS_ANSWER_WAIT = 90.0    # s the host waits for a joiner to answer the download prompt
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
 
@@ -998,7 +999,7 @@ class _HostSaveTransfer:
                 "name": name, "ready": False, "base": 0, "next": 0,
                 "nack": [], "last_fack": now, "last_begin": 0.0,
                 "last_resend": 0.0, "last_advance": now,
-                "state": "active", "last_pct": -1, "need": [],
+                "state": "active", "last_pct": -1, "need": [], "ask": False, "ask_since": 0.0, "ask_logged": False,
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
                  f"{self.total_chunks} chunks of {self.chunk}B "
@@ -1040,9 +1041,12 @@ class _HostSaveTransfer:
             # the ids this joiner does not have installed, out of self.mods
             want = {modshare.mod_folder_name(m, v): (m, v) for m, v in self.mods}
             p["need"] = [want[n] for n in need if isinstance(n, str) and n in want]
+            p["ask"] = bool(msg.get("ask")) and bool(p["need"])
+            p["ask_since"] = time.time()
             if p["need"]:
                 self.log(f"[host] {p['name']} lacks {len(p['need'])} mod(s): "
-                         + ", ".join(modshare.mod_folder_name(m, v) for m, v in p['need']))
+                         + ", ".join(modshare.mod_folder_name(m, v) for m, v in p['need'])
+                         + (" -- waiting for their yes/no" if p["ask"] else ""))
 
     def on_fack(self, addr, msg):
         p = self.peers.get(addr)
@@ -1156,6 +1160,40 @@ class _HostSaveTransfer:
         return [p["name"] for p in self.peers.values()
                 if p["state"] == "failed"]
 
+    def on_mods_answer(self, addr, msg):
+        """The joiner's player answered the download prompt (or its flags did)."""
+        p = self.peers.get(addr)
+        if not p or msg.get("sid") != self.sid:
+            return
+        p["ask"] = False
+        if not msg.get("accept"):
+            if p["need"]:
+                self.log(f"[host] {p['name']} declined the mod download")
+            p["need"] = []
+        elif p["need"]:
+            self.log(f"[host] {p['name']} accepted the mod download")
+
+    def awaiting_answers(self, now):
+        """True while a verified peer still has to say yes or no to the mods it
+        lacks. No answer within MODS_ANSWER_WAIT counts as no: the start must
+        not hang on a player who walked away from the prompt."""
+        waiting = False
+        for p in self.peers.values():
+            if p["state"] != "done" or not p["need"] or not p["ask"]:
+                continue
+            if now - p["ask_since"] > MODS_ANSWER_WAIT:
+                self.log(f"[host] {p['name']} did not answer the mod download prompt in {MODS_ANSWER_WAIT:.0f} s -- treating it as no")
+                p["ask"] = False
+                p["need"] = []
+                continue
+            if not p["ask_logged"]:
+                p["ask_logged"] = True
+                self.log(f"[host] waiting for {p['name']} to answer the mod download prompt (up to {MODS_ANSWER_WAIT:.0f} s)")
+                self.io.emit({"type": "status", "state": "connected",
+                              "detail": f"waiting for {p['name']} to accept the mods this save needs"})
+            waiting = True
+        return waiting
+
     def mod_needs(self):
         """{addr: [(id, ver)]} for the peers that verified and still lack mods."""
         return {a: p["need"] for a, p in self.peers.items() if p["state"] == "done" and p["need"]}
@@ -1201,6 +1239,18 @@ class _ClientSaveReceiver:
         self.last_done = 0.0
         self.kind = "save"
         self.need = []
+        self.ask = False
+
+    def answer_mods(self, accept):
+        """The player (or the panel's share_mods flag) said yes or no."""
+        if self.sid is None:
+            return
+        self.ask = False
+        self._send({"t": "mods_answer", "sid": self.sid, "accept": bool(accept)})
+        self.log(f"[client] mod download {'accepted' if accept else 'declined'}")
+        if not accept and self.need:
+            self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                          "text": "Mod download declined: the game will report the missing mods when the save loads."})
 
     def active(self):
         """True while a transfer is in progress (steer the loop to poll fast)."""
@@ -1232,7 +1282,7 @@ class _ClientSaveReceiver:
                 self._send({"t": "fdone", "sid": sid, "ok": False,
                             "final": True})
             else:
-                self._send({"t": "fbegin_ack", "sid": sid, "need": self.need})  # duplicate -> re-ack
+                self._send({"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask})  # duplicate -> re-ack
             return
         # A brand-new session (first ever, or a later transfer): (re)allocate.
         self.sid = sid
@@ -1253,8 +1303,12 @@ class _ClientSaveReceiver:
                 continue
             if modshare.installed_mod(m, v) is None:
                 self.need.append(modshare.mod_folder_name(m, v))
+        self.ask = bool(self.need) and self.kind == "save"
         if self.need:
-            self.log(f"[client] the save needs mods we lack: {', '.join(self.need)} -- asking the host")
+            self.log(f"[client] the save needs mods we lack: {', '.join(self.need)} -- asking the player")
+            # the panel shows YES / NO (or answers from its share_mods flag)
+            self.io.emit({"type": "mods_prompt", "count": len(self.need), "mods": list(self.need),
+                          "text": ", ".join(self.need)})
         # Validate the proposed names BEFORE allocating or acking: a rejected
         # transfer must cost the joiner nothing.
         bad = [m.get("name") for m in (self.files or [])
@@ -1284,7 +1338,7 @@ class _ClientSaveReceiver:
         self.done_sends = 0
         self.log(f"[client] save incoming sid={sid} {self.total_bytes}B "
                  f"{self.total_chunks} chunks")
-        self._send({"t": "fbegin_ack", "sid": sid, "need": self.need})
+        self._send({"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask})
         self.io.emit({"type": "transfer", "role": "recv", "pct": 0})
         if self.total_chunks == 0:
             self._finalize()
@@ -2084,6 +2138,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "fdone":
             if transfer[0] is not None:
                 transfer[0].on_fdone(addr, msg)
+        elif t == "mods_answer":
+            if transfer[0] is not None:
+                transfer[0].on_mods_answer(addr, msg)
 
     # ---- save transfer: read the file(s), fan out reliably, THEN start ----- #
     last_shared = [None]                    # the save path last pushed (host: START GAME; relay: stored)
@@ -2365,7 +2422,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                            + " -- they may be missing mods this save needs.")
                         log(f"[host] mods shared -- starting {len(got)} peer(s)")
                         broadcast_start(save=True, only=got)
-                    elif transfer[0].all_resolved():
+                    elif transfer[0].all_resolved() and not transfer[0].awaiting_answers(now):
                         xfer, transfer[0] = transfer[0], None
                         failed = xfer.failed_names()
                         if failed:
@@ -2742,6 +2799,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         c = cmd.get("cmd")
         if c == "chat":
             send({"t": "chat", "text": str(cmd.get("text", ""))})
+        elif c == "mods":
+            receiver.answer_mods(bool(cmd.get("accept")))
         elif c == "company":
             # the panel names a player when the leader of a relay lobby clicks
             # someone else's chip; this used to be overwritten with our own
@@ -3701,7 +3760,17 @@ def _run_transfer_mods(tag):
         with open(ios["host"].in_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({"cmd": "start", "save": save_path}) + "\n")
 
+        answered = set()
+
         def settled():
+            # the panel would show YES / NO on each joiner; press YES on every one
+            # that has asked BEFORE checking anyone's progress (the host waits for
+            # all answers, so answering one at a time would stall it)
+            for k in ("j1", "j2"):
+                if k not in answered and any(e.get("type") == "mods_prompt" for e in _read_events(ios[k].out_path)):
+                    answered.add(k)
+                    with open(ios[k].in_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"cmd": "mods", "accept": True}) + "\n")
             for k in ("j1", "j2"):
                 ev = _read_events(ios[k].out_path)
                 if not any(e.get("type") == "mods_ready" for e in ev):
@@ -3714,6 +3783,10 @@ def _run_transfer_mods(tag):
             ok = False
         for k in ("j1", "j2"):
             ev = _read_events(ios[k].out_path)
+            pr = [e for e in ev if e.get("type") == "mods_prompt"]
+            if not pr or pr[-1].get("mods") != ["mod_zz_1"]:
+                print(f"[mods:{tag}] FAIL: {k} prompt = {pr[-1] if pr else None}")
+                ok = False
             mr = [e for e in ev if e.get("type") == "mods_ready"]
             if not mr or mr[-1].get("installed") != ["mod_zz_1"] or mr[-1].get("failed"):
                 print(f"[mods:{tag}] FAIL: {k} mods_ready = {mr[-1] if mr else None}")

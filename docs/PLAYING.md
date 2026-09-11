@@ -4,9 +4,11 @@
 
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
-- Mods the save uses are shared automatically: when the host presses START GAME, each
-  joiner receives any mod folder it lacks right after the save (a chat line lists them)
-  and the load screen's Mods panel shows them. Per-save mod settings travel inside the
+- Mods the save uses are shared on request: when the host presses START GAME, a joiner
+  who lacks any of them gets a YES / NO in the panel naming them (`share_mods` in
+  `tpf2_menu_flags.txt` answers it for you: `always` or `never`); on YES the mod folders
+  arrive right after the save (a chat line lists them) and the load screen's Mods panel
+  shows them. Per-save mod settings travel inside the
   save. The multiplayer mod itself (**Transport Fever 2 Multiplayer**) comes with the
   installer and is never sent. Steam Workshop items are copied into the workshop folder;
   subscribing to them yourself keeps them updated.
@@ -39,7 +41,8 @@ While the panel is open, typing goes into its fields and the game does not see i
    shows `[locked]`.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
-4. Press **START GAME**. The most recent save in your save folder (autosaves count) is sent to
+4. Pick the save on the **SHARE:** row above the chat (newest first; `<` and `>` step through
+   the save folder, autosaves included), then press **START GAME**. That save is sent to
    everyone. When the panel says the save is ready, open **LOAD GAME** and pick **mp_shared**;
    everyone else does the same.
 

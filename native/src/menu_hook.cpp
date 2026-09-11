@@ -421,6 +421,10 @@ static volatile LONG g_lobbyDone = 0;
 static volatile LONG g_autoLoadPending = 0;
 static ULONGLONG     g_autoLoadSince = 0;
 static char g_status[256] = "";
+// A pending "download the mods this save needs?" question from the lobby
+// (guarded by g_statusCs). YES / NO buttons take the status line while set.
+static char g_modsPrompt[300] = "";
+static int  g_flagShareMods = 0;      // share_mods=ask (0, default) | always (1) | never (2)
 // lobby model (fed from lobby_out.jsonl)
 static char g_players[200][40]; static int g_playerCount = 0;
 static int  g_companies[200];   // company id per roster entry (1..200), 0 = unset -> 1
@@ -502,6 +506,8 @@ static void ReadFlags()
         } else if (!strcmp(line, "relay_autosave_min")) {
             int m = atoi(v);
             if (digit && m >= 0 && m <= 60) g_flagRelayAutosaveMin = m;
+        } else if (!strcmp(line, "share_mods")) {
+            if (!strcmp(v, "always")) g_flagShareMods = 1; else if (!strcmp(v, "never")) g_flagShareMods = 2; else g_flagShareMods = 0;
         } else if (!strcmp(line, "autoload")) {
             if (!strcmp(v, "0")) g_flagAutoLoad = 0; else if (!strcmp(v, "1")) g_flagAutoLoad = 1;
         } else if (!strcmp(line, "slot")) {
@@ -963,10 +969,18 @@ static void RenderPanelLayer(int w, int h)
         int bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5);
         if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
             if (g_flagMaster[0]) mwCheck(w - pad - bw2 - S(110), bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
-        // status between them
-        char st[256]; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
+        // status between them -- or the mod-download question with its YES / NO
+        char st[256]; char mp[300] = ""; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); strncpy_s(mp, g_modsPrompt, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
+        int rightCut = S(160);
+        if (mp[0]) {
+            strncpy_s(st, mp, _TRUNCATE);
+            int bwN = mwButtonW(L"NO"), bwY = mwButtonW(L"YES");
+            mwButton(w - pad - bwN, bottom, bwN, S(30), L"NO", 17);
+            mwButton(w - pad - bwN - S(8) - bwY, bottom, bwY, S(30), L"YES", 16);
+            rightCut = bwN + bwY + S(30);
+        }
         wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - S(160), S(30), wst, fst, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fst);
+        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), wst, fst, mp[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fst);
     } else {
         // ---------------- HOST / JOIN ----------------
         mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
@@ -1281,6 +1295,14 @@ static void OnHit(int id)
     Log("[menu] hit id=%d\n", id);
     switch (id) {
     case 4: InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
+    case 16: case 17: {   // YES / NO to the mod download
+        const bool yes = (id == 16);
+        if (g_csInit) { EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs); }
+        LobbySend(yes ? "{\"cmd\":\"mods\",\"accept\":true}" : "{\"cmd\":\"mods\",\"accept\":false}");
+        SetStatus(yes ? "Downloading the mods this save needs from the host\xE2\x80\xA6" : "Mod download declined.");
+        InterlockedExchange(&g_panelDirty, 1);
+        break;
+    }
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: StartLobby(1); break;   // JOIN  -> lobby (join)
     case 5: LeaveLobby(); break;                                    // LEAVE lobby
@@ -2303,6 +2325,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, 48); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
+        if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
@@ -2386,6 +2409,20 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             if (pct >= 100) g_xfer[0] = 0;
                             writeBridgeCtl(g_isHost != 0);   // the in-game window reads xfer= from the ctl
                         }
+                        else if (strcmp(ty, "mods_prompt") == 0) {
+                            // the host's save needs mods we lack: ask the player, unless the
+                            // share_mods flag already answers for them
+                            int n = jsonInt(rem, "count"); char tx[200]; jsonStr(rem, "text", tx, sizeof(tx));
+                            if (g_flagShareMods == 1) { LobbySend("{\"cmd\":\"mods\",\"accept\":true}"); SetStatus("Downloading the mods this save needs from the host\xE2\x80\xA6"); }
+                            else if (g_flagShareMods == 2) { LobbySend("{\"cmd\":\"mods\",\"accept\":false}"); SetStatus("Mod download is off (share_mods=never)."); }
+                            else if (g_csInit) {
+                                EnterCriticalSection(&g_statusCs);
+                                snprintf(g_modsPrompt, sizeof(g_modsPrompt), "Download %d mod(s) this save needs from the host? (%s)", n, tx);
+                                LeaveCriticalSection(&g_statusCs);
+                                InterlockedExchange(&g_panelDirty, 1);
+                            }
+                        }
+                        else if (strcmp(ty, "mods_ready") == 0) { SetStatus("Mods received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "save_ready") == 0) { InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "start") == 0) {
                             // {"type":"start","save":true|false}: save=true means a save
