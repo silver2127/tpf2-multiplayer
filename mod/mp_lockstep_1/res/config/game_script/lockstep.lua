@@ -955,8 +955,9 @@ function data()
 				pcall(function()
 					local u, h = CM.perfUpd, CM.perfHash
 					if u and u.n > 0 then
-						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps",
-							u.sum / u.n, u.max, u.n, h and h.n > 0 and h.sum / h.n or 0, h and h.max or 0, h and h.n or 0))
+						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps%s",
+							u.sum / u.n, u.max, u.n, h and h.n > 0 and h.sum / h.n or 0, h and h.max or 0, h and h.n or 0,
+							CM.hashPartsMs and (" | last hash: " .. CM.hashPartsMs) or ""))
 					end
 					CM.perfUpd, CM.perfHash = nil, nil
 				end)

@@ -377,18 +377,94 @@ function CM.pidPace(now, eff)
 	-- left at full session speed and got 233 ahead. Only a clock THIS far
 	-- away is another game (a leftover heartbeat); far BEHIND is catch-up's.
 	if not ref or math.abs(ref - now) >= K.PACE_OTHER_GAME then CM.pidHold, CM.pidErr, CM.pidI, CM.pidFar = nil, nil, 0, nil; return nil end
+	-- THE LEADER'S READING IS A HEARTBEAT OLD (2026-09-11). Compared with our
+	-- clock NOW it makes us look ahead by its age: at 2x a joiner settled ~0.7
+	-- units BEHIND the real leader while its own error read ~0 (pacing_sim
+	-- autosave_joiner_2x: PID e=-0.29, true -0.94), and at 4x it read "1.56
+	-- ahead" at the start and slowed down for good. So the reading is projected
+	-- forward by its age at our own clock rate, but by one heartbeat interval at
+	-- most. A heartbeat LATER than that means the leader froze (an autosave, the
+	-- world hash): reacting to a frozen leader throws away time a joiner at the
+	-- speed cap never wins back, so the current speed is held until it speaks.
+	local lpr = CM.peers[CM.leader or "a"]
+	local age = (lpr and lpr.at) and (CM.ticks - lpr.at) or 0
+	if CM.pidPrevTick and CM.ticks > CM.pidPrevTick then
+		local r = (now - CM.pidPrevNow) / (CM.ticks - CM.pidPrevTick)
+		if r >= 0 and r < 5 then CM.unitsPerTick = CM.unitsPerTick and (CM.unitsPerTick * 0.7 + r * 0.3) or r end
+	end
+	CM.pidPrevNow, CM.pidPrevTick = now, CM.ticks
+	-- ...but only a SHORT freeze (the hash, ~0.5 s) is held through. Past
+	-- `frozeLong` ticks it is an autosave or a hitch: the leader's last reading
+	-- is taken as its clock, unprojected, so a joiner already well ahead eases
+	-- off during the freeze instead of running 7 units ahead (autosave_leader_2x).
+	local hbEvery = K.HEARTBEAT_EVERY or 2
+	local frozeLong = 8
+	-- No rate yet (the first decision): an unprojected reading is the false
+	-- "ahead" itself, so no decision is made on it.
+	if not CM.unitsPerTick then return CM.pidHold, CM.pidErr end
+	-- Heartbeats come every hbEvery ticks: any older reading is already a late one.
+	if age > hbEvery and age <= frozeLong and CM.pidHold and CM.pidEff == eff then
+		return CM.pidHold, CM.pidErr
+	end
+	if age <= hbEvery then ref = ref + age * CM.unitsPerTick end
 	local e = now - ref                           -- + = we are ahead of the host
-	-- FAR AHEAD of the leader (2026-09-10). The PID below is tuned for drift:
-	-- 0.70x at the least, moving 0.05 per decision, so a joiner that overshot
-	-- closed the gap at a crawl and pulled away again whenever the session
-	-- slowed. More than `far` units ahead it runs at `farMin` of the
-	-- session speed straight away -- a decimal speed (the dither reaches a
-	-- quarter of the lever), never a pause -- rising in proportion as the gap
-	-- closes until it meets `lo`, where the PID takes over from its floor.
-	local far = 3.0
+	-- CLOSING A REAL GAP (2026-09-11). The PID below is tuned for DRIFT: 0.05 of
+	-- speed per ~1.5 s decision. A real gap -- an autosave that took one game
+	-- 3.7 s longer than the leader's, a load hitch -- closed at that crawl, and
+	-- the far-ahead hand-back kept its low multiplier with the slew holding it
+	-- there, so a joiner went from 0.65 AHEAD to 7.1 BEHIND and into a catch-up
+	-- hold (tools/pacing_sim.py autosave_leader_2x; live, 5-7.6 behind after
+	-- every "Saving..."). Either side of the leader, past 1.0 the speed comes
+	-- straight from the gap -- no slew, no integral, decided at every heartbeat
+	-- (paceV2) -- and hands back at 0.5, at exactly the session speed.
+	local gapIn, gapOut = 1.0, 0.5
+	local kr, hiR = 0.35, 2.0                     -- behind: 1 + 0.35 per unit, at most twice the session speed
+	-- A GAP MUST LAST before it is chased (2026-09-11). Every instance freezes
+	-- for the world hash, at slightly different moments, so a 2-unit gap can
+	-- open in 3 ticks and close again by itself when the other side freezes in
+	-- turn. Genuine drift never moves that fast. Reacting to that transient
+	-- threw time away at the 4x cap, a little more on every hash (pacing_sim
+	-- hash_stalls_4x: joiner c -1.37, -1.59, -1.73 before successive stalls). A
+	-- gap past gapIn is chased only once it has lasted `persist` ticks; until
+	-- then the current speed is held.
+	local persist = 6
+	if -e > gapIn then CM.pidBehindSince = CM.pidBehindSince or CM.ticks else CM.pidBehindSince = nil end
+	if e > gapIn then CM.pidAheadSince = CM.pidAheadSince or CM.ticks else CM.pidAheadSince = nil end
+	local behindLasting = CM.pidBehindSince and (CM.ticks - CM.pidBehindSince) >= persist
+	local aheadLasting = CM.pidAheadSince and (CM.ticks - CM.pidAheadSince) >= persist
+	if (CM.pidBehindSince and not behindLasting and not CM.pidRecover)
+	   or (CM.pidAheadSince and not aheadLasting and not CM.pidFar) then
+		if CM.pidHold and CM.pidEff == eff then return CM.pidHold, CM.pidErr end
+		return nil
+	end
+	if behindLasting or (CM.pidRecover and -e > gapOut) then
+		local mR = 1 + kr * (-e)
+		if mR > hiR then mR = hiR end
+		local target = math.floor(eff * mR / 0.05 + 0.5) * 0.05
+		if target > (CM.MAX_SPEED or 4) then target = CM.MAX_SPEED or 4 end
+		if not CM.pidRecover or target ~= CM.pidHold then
+			log(string.format("PID: %.2f behind the leader -> %.2fx of %g to close it", -e, target, eff))
+		end
+		CM.pidRecover, CM.pidFar = true, nil
+		CM.pidI, CM.pidLastE = 0, e
+		CM.pidHold, CM.pidErr, CM.pidEff = target, e, eff
+		CM.paceInfo = string.format("%.2fx e=%+.2f closing", target, e)
+		return target, e
+	end
+	if CM.pidRecover then
+		CM.pidRecover = nil
+		CM.pidI, CM.pidLastE = 0, e
+		CM.pidHold, CM.pidEff = eff, eff          -- the drift PID starts from the session speed, not the closing speed
+		log(string.format("PID: %.2f behind the leader -- closed, fine pacing again", -e))
+	end
+	-- FAR AHEAD of the leader (2026-09-10; from 1.0 instead of 3.0 since
+	-- 2026-09-11). It runs at 1 - 0.25 per unit ahead of the session speed at
+	-- once -- a decimal speed (the dither reaches a quarter of the lever), never a
+	-- pause -- rising as the gap closes, and hands back at 0.5.
+	local far = gapIn
 	local farMin = 0.25
-	local farM = 1 - (1 - farMin) * e / far
-	if e > far or (CM.pidFar and farM < lo) then
+	local farM = 1 - 0.25 * e
+	if (e > far and aheadLasting) or (CM.pidFar and e > gapOut) then
 		if farM < farMin then farM = farMin end
 		local target = math.max(0.25, math.floor(eff * farM / 0.05 + 0.5) * 0.05)
 		if not CM.pidFar or target ~= CM.pidHold then
@@ -402,6 +478,8 @@ function CM.pidPace(now, eff)
 	end
 	if CM.pidFar then
 		CM.pidFar = nil
+		CM.pidI, CM.pidLastE = 0, e
+		CM.pidHold, CM.pidEff = eff, eff          -- from the session speed: the slow multiplier held on was the overshoot
 		log(string.format("PID: %.2f ahead of the leader -- fine pacing again", e))
 	end
 	local dt = math.max(1, dtTicks) / 5.4         -- seconds between decisions
@@ -493,7 +571,7 @@ function CM.catchUpTick(now, s)
 	local margin = math.max(0.5, (speed - eff) * K.CATCHUP_LOOKAHEAD)
 	if behind < margin then
 		CM.catchingUp2 = false; CM.cuPhase = nil
-		CM.pidHold, CM.pidI, CM.pidLastE, CM.pidFar = nil, 0, nil, nil
+		CM.pidHold, CM.pidI, CM.pidLastE, CM.pidFar, CM.pidRecover = nil, 0, nil, nil, nil
 		log(string.format("CATCHUP: %.1f unit(s) behind the leader -- ordinary pacing from here", behind))
 		return nil
 	end
@@ -624,7 +702,12 @@ function CM.paceV2(now)
 	-- Every decision that changes the target logs its terms (CM.pidPace).
 	local paced = nil
 	if target == eff and eff > 0 then
-		if CM.pidHold and CM.pidEff == eff and (CM.ticks - (CM.pidAt or 0)) < K.FRAC_PACE_TICKS then
+		-- a gap being closed, or one just opened (more than 1 from the leader), is
+		-- decided at every heartbeat; drift keeps the ~1.5 s cadence
+		local refNow = CM.leaderPrecise()
+		local every = (CM.pidRecover or CM.pidFar or (refNow and math.abs(now - refNow) > 1.0))
+			and (K.HEARTBEAT_EVERY or 2) or K.FRAC_PACE_TICKS
+		if CM.pidHold and CM.pidEff == eff and (CM.ticks - (CM.pidAt or 0)) < every then
 			target = CM.pidHold; paced = CM.pidErr
 		else
 			local t2, e = CM.pidPace(now, eff)

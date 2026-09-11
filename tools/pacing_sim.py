@@ -177,6 +177,19 @@ local function deliver(msg, insts, tick)
   end
 end
 
+-- A frozen game (an autosave, the world hash): no clock advance, no update(), no
+-- heartbeats. { who, tick, ticks [, every] } -- `every` repeats the stall.
+local function isStalled(sc, letter, tick)
+  for _, st in ipairs(sc.stalls or {}) do
+    if st.who == letter and tick >= st.tick then
+      local k = tick - st.tick
+      if st.every then k = k % st.every end
+      if k < st.ticks then return true end
+    end
+  end
+  return false
+end
+
 function SIM.run(sc)
   SIM.cfg = sc.cfg or {}
   SIM.hwMax = sc.hwMax or 4
@@ -200,7 +213,8 @@ function SIM.run(sc)
       end
     end
     for _, I in ipairs(insts) do
-      if tick >= I.startTick then
+      if tick >= I.startTick and isStalled(sc, I.letter, tick) then I.rate = 0 end
+      if tick >= I.startTick and not isStalled(sc, I.letter, tick) then
         SIM.cur = I
         I.rate = advance(I, dt)
         local CM = I.CM
@@ -271,7 +285,32 @@ SCENARIOS = {
                   {letter="c", T0=2000, lever=4, start=1} },
         actions = { {tick=150, who="a", kind="button", value=1}, {tick=300, who="b", kind="button", value=4},
                     {tick=450, who="a", kind="button", value=0}, {tick=600, who="a", kind="button", value=2} } }''',
+    # AUTOSAVE (2026-09-10 live: joiners 5-7.6 behind after "Saving...: 3.4-4 s"). Everyone saves at the
+    # same game date, but not for as long: the leader 3 s, a sandboxed joiner 6.7 s, another 3.5 s. At 2x.
+    'autosave_joiner_2x': '''{ ticks = 700,
+        insts = { {letter="a", T0=5000, lever=2, ceil=2, start=1}, {letter="b", T0=5000, lever=2, start=1},
+                  {letter="c", T0=5000, lever=2, start=1} },
+        stalls = { {who="a", tick=200, ticks=16}, {who="b", tick=200, ticks=36}, {who="c", tick=200, ticks=19} } }''',
+    # the leader's save takes longest: the joiner comes out AHEAD
+    'autosave_leader_2x': '''{ ticks = 700,
+        insts = { {letter="a", T0=5000, lever=2, ceil=2, start=1}, {letter="b", T0=5000, lever=2, start=1} },
+        stalls = { {who="a", tick=200, ticks=36}, {who="b", tick=200, ticks=16} } }''',
+    # WORLD HASH: ~0.55 s on every instance every ~12 s, each at a slightly different wall moment, at 4x
+    'hash_stalls_4x': '''{ ticks = 900,
+        insts = { {letter="a", T0=5000, lever=4, ceil=4, start=1}, {letter="b", T0=5000, lever=4, start=1},
+                  {letter="c", T0=5000, lever=4, start=1} },
+        stalls = { {who="a", tick=100, ticks=3, every=65}, {who="b", tick=102, ticks=3, every=65},
+                   {who="c", tick=105, ticks=3, every=65} } }''',
 }
+
+STALL_TICK = 200   # where the autosave scenarios freeze
+
+
+def recovery(series, letter, after, limit):
+    """Ticks after `after` until |e| stays below `limit` for good (0 = never out)."""
+    s = series[letter]
+    out = [t for t, e in s.items() if t > after and abs(e) >= limit]
+    return (max(out) - after) if out else 0
 
 
 def lua_to_py(t):
@@ -374,6 +413,33 @@ def main():
                        ("the host's pause pauses the session", first(' a: SPEED2: session speed -> 0 ', 450) is not None),
                        ("the host's 2x resumes it", first(' a: SPEED2: host unpaused the session at 2', 600) is not None),
                        ('everyone within 1.5 of the leader from tick 700', all(v['max_ahead'] < 1.5 and v['max_behind'] < 1.5 for v in st.values()))]
+        elif name.startswith('autosave'):
+            # the stall ends at STALL_TICK + the longest stall; report recovery from there, in seconds
+            for which in (args.ref, 'work'):
+                mm, ss, _ = res[which]
+                for letter in sorted(ss):
+                    if not any(t > STALL_TICK for t in ss[letter]):
+                        continue   # the leader has no series of its own
+                    r15 = recovery(ss, letter, STALL_TICK, 1.5) / 5.4
+                    r10 = recovery(ss, letter, STALL_TICK, 1.0) / 5.4
+                    worst = max(abs(e) for t, e in ss[letter].items() if t > STALL_TICK)
+                    print('       %-8s %s: worst %.1f  back within 1.5 after %.1f s, within 1.0 after %.1f s'
+                          % (which, letter, worst, r15, r10))
+            st = summarize(m, series, STALL_TICK)
+            late = summarize(m, series, STALL_TICK + 36 + 60)   # once recovered: no overshoot the other way
+            checks += [('every joiner back within 1.5 within 12 s of the stall', all(recovery(series, l, STALL_TICK, 1.5) <= 65 for l in series)),
+                       ('no overshoot once recovered (|e| < 1.5 from +11 s)', all(v['max_ahead'] < 1.5 and v['max_behind'] < 1.5 for v in late.values()))]
+        elif name == 'hash_stalls_4x':
+            vals = [abs(e) for l in series for t, e in series[l].items() if t > 150]
+            vals.sort()
+            print('       work     |e| p50 %.2f p90 %.2f max %.2f over ticks 150-900' % (vals[len(vals) // 2], vals[int(len(vals) * 0.9)], vals[-1]))
+            # A joiner's OWN 0.55 s freeze puts it ~2 units behind at 4x: that transient is physics, not
+            # pacing. What pacing owns is that nothing ACCUMULATES: just before each next stall (the
+            # stalls repeat every 65 ticks from tick 100) every joiner is back near the leader.
+            before = [abs(series[l][t]) for l in series for t in range(100 + 65 * 2 - 1, 900, 65) if t in series[l]]
+            print('       work     |e| just before each stall: max %.2f over %d samples' % (max(before) if before else -1, len(before)))
+            checks += [('hash stalls do not accumulate: within 1.0 of the leader before every next stall', bool(before) and max(before) < 1.0),
+                       ('median |e| under 0.6 across the stalls', vals[len(vals) // 2] < 0.6)]
         elif name.startswith('hot_join'):
             st = summarize(m, series)['b']
             post = summarize(m, series, st['last_out'] + 1)['b'] if st['last_out'] < 900 else None

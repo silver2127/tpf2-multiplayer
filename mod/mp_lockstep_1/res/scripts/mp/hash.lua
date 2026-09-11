@@ -282,6 +282,10 @@ function CM.vposRecv(line)
 end
 
 local function worldHash(now)
+	-- Where the ~0.5 s per hash goes (2026-09-11): each lane is timed and the
+	-- split rides on the PERF line (CM.hashPartsMs), so the next session says
+	-- which part to make cheaper instead of guessing.
+	local tH0 = os.clock()
 	-- Vehicles: a count, and -- separately -- where they are.
 	--
 	-- The count alone answers "did a purchase replicate", which is not what
@@ -325,6 +329,7 @@ local function worldHash(now)
 		CM.lastVposRaw, CM.lastVposT = raw, now
 	end)
 	table.sort(vpos)
+	local tV = os.clock()
 
 	-- constructions: player-owned by content, everything else counted
 	local cons, nt = {}, 0
@@ -349,6 +354,7 @@ local function worldHash(now)
 			end
 		end
 	end)
+	local tC = os.clock()
 	-- roadside stops (edge objects with a STATION) count as player constructions
 	-- for the hash: a stop one side does not have is a c-lane difference.
 	pcall(function()
@@ -368,6 +374,7 @@ local function worldHash(now)
 			end
 		end
 	end)
+	local tO = os.clock()
 	table.sort(cons)
 
 	-- edges by geometry
@@ -392,8 +399,10 @@ local function worldHash(now)
 			egeoZ[#egeoZ + 1] = (za or "?") .. ">" .. (zb or "?")
 		end
 	end
+	local tE1 = os.clock()
 	table.sort(egeo)
 	table.sort(egeoZ)
+	local tE2 = os.clock()
 	-- Offline diff for the rail-station height desync (cfg dump_egeo=1, default
 	-- off): write the EXACT sorted strings the e-lane hashes to a per-instance
 	-- side file, rolling latest. After placing one station, egeo_a.txt vs
@@ -465,6 +474,10 @@ local function worldHash(now)
 		local tp = game.interface.getEntities({ radius = 999999 }, { type = "SIM_PERSON", includeData = false }) or {}
 		for _ in pairs(tp) do np = np + 1 end
 	end)
+	local tN = os.clock()
+	local function ms(a, b) return math.floor((b - a) * 1000 + 0.5) end
+	CM.hashPartsMs = string.format("vehicles %d, constructions %d, stops %d, edges %d + sort %d (%d edges), money+people %d, total %d ms",
+		ms(tH0, tV), ms(tV, tC), ms(tC, tO), ms(tO, tE1), ms(tE1, tE2), #egeo, ms(tE2, tN), ms(tH0, tN))
 	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t:%d,n:%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
 		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt, np)
