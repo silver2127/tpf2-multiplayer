@@ -716,27 +716,23 @@ function buildVehConfig(c)
 	return config, u
 end
 
--- A clone joins its original's line from the buy's own callback, as the game's clone
--- does (vehiclemanager 0x748250 -> SetLine). The buy applies on the same step on every
--- instance, so this assignment does too. Stop 0, not the game's -1: the engine refuses
--- -1 for trains (see VLINE), and every instance clamps the same way.
-function CM.cloneOntoLine(c, vid)
-	local line = CM.lineIdFor(tostring(c.cline))
-	if not line then
-		log(string.format("VBUY seq=%s: clone line %s is not here -- vehicle %d stays in the depot (DIVERGENCE if it moves elsewhere)",
-			tostring(c.seq), tostring(c.cline), vid))
-		return
-	end
-	local okM, cmd = pcall(api.cmd.make.setLine, vid, line, 0)
-	if not okM or not cmd then
-		log(string.format("VBUY seq=%s: clone setLine(%d, %d, 0) refused by the maker: %s",
-			tostring(c.seq), vid, line, tostring(cmd)))
-		return
-	end
-	api.cmd.sendCommand(cmd, function(_, success)
-		log(string.format("EXEC VBUY seq=%s origin=%s clone -> line %s (%d) success=%s",
-			tostring(c.seq), tostring(c.origin), tostring(c.cline), line, tostring(success)))
-	end)
+-- A clone joins its original's line, as the game's clone does from the buy's callback
+-- (vehiclemanager 0x748250 -> SetLine). NOT from our buy's callback: its result carries
+-- no vehicle entity (res.resultEntity was nil live, 2026-09-11 -- the key binds a tick
+-- later in pollVehKeys), and a poll-time setLine would land on a frame-tick-dependent
+-- step. Instead every instance queues the same VLINE at the buy's stamp, due a fixed
+-- BIND_GUARD_STEPS later; VLINE already retries an unbound key on fixed steps. Its own
+-- seq (+0.5) keeps it apart from the buy in the executed set. Stop 0, not the game's
+-- -1: the engine refuses -1 for trains (see VLINE), and every instance clamps alike.
+function CM.queueCloneAssign(c, key)
+	local vl = { op = "VLINE", at = c.at, origin = c.origin, seq = (tonumber(c.seq) or 0) + 0.5,
+	             key = key, line = tostring(c.cline), stop = 0, armed = 1,
+	             notBeforeStep = CM.stepOf(c.at) + K.BIND_GUARD_STEPS }
+	if c.company then vl.company = c.company end
+	CM.retryQueue = CM.retryQueue or {}
+	CM.retryQueue[#CM.retryQueue + 1] = vl
+	log(string.format("VBUY seq=%s: a clone -- %s joins line %s at step %d",
+		tostring(c.seq), key, tostring(c.cline), vl.notBeforeStep))
 end
 
 function CM.execVBuy(c)
@@ -846,7 +842,6 @@ function CM.execVBuy(c)
 					end)
 					if not (nid and nid > 0) then nid = nil end
 					expectVehicle(key, depot, company, nid, bal0)
-					if nid and c.cline then CM.cloneOntoLine(c, nid) end
 				elseif not retry and who ~= me then
 					log(string.format("EXEC VBUY seq=%s: company %s could not pay for it here -- buying as our own player and handing it over",
 						tostring(seq), tostring(company)))
@@ -855,6 +850,7 @@ function CM.execVBuy(c)
 			end)
 		end
 		buyAs(buyer, false)
+		if c.cline then CM.queueCloneAssign(c, key) end
 	end)
 	if not ok then log("execVBuy error: " .. tostring(err)) end
 end

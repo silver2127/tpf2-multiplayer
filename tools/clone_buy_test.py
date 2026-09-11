@@ -62,10 +62,12 @@ api.cmd = {
   sendCommand = function(cmd, cb) sent[#sent + 1] = cmd; if cb then cb({}, true) end end,
 }
 game = setmetatable({}, { __index = function() return sink() end })
-local K = setmetatable({ INSTANCE = "a", PEER = "b", INJECT_FILE = INJECT, STRICT_OPS = { VBUY = true } },
+local K = setmetatable({ INSTANCE = "a", PEER = "b", INJECT_FILE = INJECT, STRICT_OPS = { VBUY = true },
+                         BIND_GUARD_STEPS = 10 },
   { __index = function() return nil end })
 local CM = { peerSeen = true, injectOffset = 0, consByKey = { d = { id = 900 } }, seqNo = 0, ticks = 0 }
 function CM.gameTime() return 100 end
+function CM.stepOf(t) return math.floor((t or 0) / 0.2 + 0.5) end
 function CM.scheduleLocal(op, args) sched[#sched + 1] = { op = op, args = args } end
 local keys = { [170607] = "a:87" }
 function CM.lineKeyFor(lid) return keys[lid] end
@@ -98,7 +100,9 @@ function H.nsent() return #sent end
 function H.sentAt(i) local c = sent[i]; return c and string.format("%s %s %s %s", c.what, c.v, c.l, c.s) end
 function H.clearSent() sent = {} end
 function H.logs() return table.concat(logs, "\n") end
-function H.clone(cline, vid) CM.cloneOntoLine({ seq = 7, origin = "a", cline = cline }, vid) end
+function H.clone(cline, key) CM.queueCloneAssign({ seq = 7, origin = "a", at = 100, cline = cline }, key) end
+function H.nretry() return #(CM.retryQueue or {}) end
+function H.retry(i, k) local r = (CM.retryQueue or {})[i]; return r and r[k] end
 return H
 ''')
 
@@ -155,14 +159,16 @@ def main():
     check("unkeyed line: says the vehicle stays in the depot", "no cross-peer key" in H.logs())
     H.clearSched()
 
-    # 6. the replay's assignment
-    H.clone("a:87", 4242)
-    check("cloneOntoLine: setLine(vehicle, line, 0) sent", H.nsent() == 1 and H.sentAt(1) == "setLine 4242 170607 0",
-          str(H.sentAt(1)))
-    H.clearSent()
-    H.clone("b:99", 4243)
-    check("cloneOntoLine: an unknown line sends nothing", H.nsent() == 0)
-    check("cloneOntoLine: and says so", "clone line b:99 is not here" in H.logs())
+    # 6. the replay's assignment: a VLINE queued at the buy's stamp, same step everywhere
+    H.clone("a:87", "a:7")
+    check("queueCloneAssign: one VLINE queued", H.nretry() == 1 and H.retry(1, "op") == "VLINE")
+    check("queueCloneAssign: for the bought vehicle's key and the clone line",
+          H.retry(1, "key") == "a:7" and H.retry(1, "line") == "a:87", f"{H.retry(1, 'key')} {H.retry(1, 'line')}")
+    check("queueCloneAssign: stop 0, armed, its own seq",
+          H.retry(1, "stop") == 0 and H.retry(1, "armed") == 1 and H.retry(1, "seq") == 7.5, str(H.retry(1, "seq")))
+    check("queueCloneAssign: due BIND_GUARD_STEPS after the stamp (step 500 + 10)",
+          H.retry(1, "notBeforeStep") == 510, str(H.retry(1, "notBeforeStep")))
+    check("queueCloneAssign: nothing sent directly", H.nsent() == 0)
 
     print()
     if fails:
