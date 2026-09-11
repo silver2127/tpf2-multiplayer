@@ -1488,9 +1488,12 @@ static void CaptureCalendar(uint64_t id, uint64_t rcx, uint64_t rdx, uint64_t ca
         }
         return;
     }
-    // 1721426 = 0001-01-01 and 5373484 = 9999-12-31 in Julian days; a day longer
-    // than ~2.8 hours is not a calendar speed the slider offers
-    const bool inRange = isDate ? (value >= 1721426 && value <= 5373484) : (value > 0 && value <= 10000000);
+    // 1721426 = 0001-01-01 and 5373484 = 9999-12-31 in Julian days. The slider
+    // (0x4f29f0, a value-changed handler taking a stop index) sends
+    // default-ms-per-day / the stop's multiplier, and 0 for a multiplier of 0 or
+    // less -- the stopped calendar -- so 0 is a real setting and must replicate;
+    // a day longer than ~2.8 hours is not a stop the slider offers.
+    const bool inRange = isDate ? (value >= 1721426 && value <= 5373484) : (value >= 0 && value <= 10000000);
     if (!inRange) {
         Log("[slice] %s value %d out of range -- left alone\n", what, value);
         return;

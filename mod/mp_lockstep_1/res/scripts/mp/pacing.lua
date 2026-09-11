@@ -165,7 +165,8 @@ function CM.execCalendar(c)
 	pcall(function() t0 = game.interface.getGameTime().time end)
 	if c.op == "CALSPEED" then
 		local ms = tonumber(c.ms)
-		if not ms or ms <= 0 then
+		-- 0 is the slider's stopped calendar (a multiplier of 0), a real setting
+		if not ms or ms < 0 then
 			log(string.format("EXEC CALSPEED seq=%s: bad value %s -- not applied", tostring(c.seq), tostring(c.ms)))
 			return
 		end
