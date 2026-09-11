@@ -20,6 +20,29 @@ wins. Without either, the default is `C:\Program Files (x86)\Steam\steamapps\com
 The folder page refuses a folder without `TransportFever2.exe`, and a silent install fails with the
 same message.
 
+The folder page also refuses a `TransportFever2.exe` that is not Steam build 35924. It reads the exe's PE
+header and compares `TimeDateStamp` and `SizeOfImage`, the same two values the DLLs check before hooking
+anything. On any other exe the game starts normally and multiplayer never appears, so such an install would
+be useless. That covers an exe replaced or patched by another tool such as CommonAPI2, the GOG version
+(named in its own message when a `goggame-*.info` file sits beside the exe), and a game update newer than
+the DLLs. For Steam, the message points at **Verify integrity of game files**, which puts back the stock
+exe. A header the check cannot read does not block the install, since the DLLs still refuse a wrong exe at
+run time. The install log records the stamps it found (`[tpf2ca] ... TimeDateStamp 0x..., SizeOfImage
+0x...`).
+
+Two more checks on the same page look for other mods that change the game natively:
+
+- **A replaced `alut.dll`** blocks the install. With `alut_real.dll` present, that file must be the game's
+  own `alut.dll` (compared by SHA-256); without it, `alut.dll` itself must be. Anything else is another
+  mod's proxy, and two proxies of one file cannot both load, so the game would not start.
+- **Native DLLs in mods** only warn, and the player chooses. The page lists every DLL beside the exe that
+  build 35924 does not ship (`.asi` files too), and one line per mod folder that contains a DLL: in the
+  game's `mods` folder, in each Steam user's `userdata\<id>\1066780\local\mods`, and in the Workshop
+  content of the library the game is in. CommonAPI2, for example, loads `bin\CommonAPI2Native.dll` from its
+  mod folder. **No** (the default) keeps the wizard on the folder page. The scan cannot tell whether a mod
+  is enabled in a save, so a subscribed but unused mod is listed too. A silent install writes the list to
+  its log and carries on.
+
 | path in the game folder | what it is |
 |---|---|
 | `alut.dll` | The proxy. The game imports `alut.dll` statically, so it loads before the game's entry point. It forwards every export to `alut_real.dll` and loads the DLLs below, looking in `%LOCALAPPDATA%\tpf2mp\` before its own folder. |
@@ -40,7 +63,9 @@ reference).
 
 At run time the game side writes `tpf2_menu.log` next to `tpf2_menu.dll` (where it also reads
 `tpf2_menu_flags.txt`, if you create one), the lobby's files in `netpunch\`, and, with `dump_egeo=1`,
-`egeo_*.txt`. Everything else goes to `%LOCALAPPDATA%\tpf2mp\data\`, which the installer never touches.
+`egeo_*.txt`. Everything else goes to `%LOCALAPPDATA%\tpf2mp\data\`, and the logs of earlier runs to
+`%LOCALAPPDATA%\tpf2mp\logs\` (see [PLAYING.md](../docs/PLAYING.md#when-something-goes-wrong)). The
+installer touches neither.
 
 ## How `alut.dll` is swapped
 
@@ -158,8 +183,8 @@ msiexec /i TpF2Multiplayer.msi /qn /l*v install.log
 msiexec /i TpF2Multiplayer.msi /qn INSTALLFOLDER="D:\SteamLibrary\steamapps\common\Transport Fever 2"
 ```
 
-`INSTALLFOLDER` must contain `TransportFever2.exe`. Setting `TPF2_SKIP_GAMEDIR_CHECK` to any value skips
-that check; it exists for test rigs.
+`INSTALLFOLDER` must contain `TransportFever2.exe` of build 35924. Setting `TPF2_SKIP_GAMEDIR_CHECK` to any
+value skips both checks; it exists for test rigs.
 
 ## Building the MSI
 
@@ -217,7 +242,7 @@ With TpF2 Big Maps installed the first check fails, because the proxy then has a
 |---|---|
 | `Package.wxs` | the package: folders, components, upgrade rules, and a copy of `WixUI_InstallDir` with the game-folder check |
 | `PluginHost.wxs` | shared with TpF2 Big Maps (keep it byte-identical): proxy, plugin host, Segment Heap value, custom actions and their sequencing |
-| `ca\tpf2ca.cpp`, `ca\build_ca.bat` | the custom actions: game-folder check, preserve/rollback/restore of `alut.dll` |
+| `ca\tpf2ca.cpp`, `ca\build_ca.bat` | the custom actions: game-folder and game-build check, preserve/rollback/restore of `alut.dll` |
 | `build_msi.ps1` | the build script |
 | `test_upgrade.ps1` | the install/upgrade/uninstall test |
 | `cfg\tpf2_slice.cfg` | the shipped settings file (optional diagnostics, all commented out) |

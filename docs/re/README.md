@@ -10,7 +10,7 @@ does not).
 | file | covers |
 |---|---|
 | [COMMANDS.md](COMMANDS.md) | the command pipeline, `CommandList::Add`, how to cancel a command safely, UI tools and their call sites, every `make_cmd` factory with its arguments |
-| [PROPOSALS.md](PROPOSALS.md) | the proposal structure (nodes, segments, construction entities, parameters), templates, refusal rules, level crossings, stops and signals |
+| [PROPOSALS.md](PROPOSALS.md) | the proposal structure (nodes, segments, construction entities, parameters), templates, refusal rules, level crossings, stops and signals, the terraform and paint grids |
 | [GAME_LOOP_AND_UI.md](GAME_LOOP_AND_UI.md) | threads, sim pacing and game speed, forcing a save, loading a save, the title menu |
 | [SCRIPT_API.md](SCRIPT_API.md) | how the game-script Lua API actually behaves: crashes `pcall` cannot catch, vehicles, lines, constructions, GUI vs engine state |
 

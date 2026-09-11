@@ -26,6 +26,7 @@
 #include "../third_party/vk/vulkan_core.h"
 #include "hook.h"
 #include "datadir.h"
+#include "logarchive.h"
 
 static const uintptr_t RVA_CREATEPAGE = 0x663370;
 static const int       STEAL_CREATEPAGE = 20;
@@ -984,6 +985,7 @@ static void RenderPanelLayer(int w, int h)
     } else {
         // ---------------- HOST / JOIN ----------------
         mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
+        { int lb = mwButtonW(L"OPEN LOGS"); mwButton(w - S(65) - lb, S(10), lb, S(28), L"OPEN LOGS", 15); }
         int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
         layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
         mwHeader(lx, cy, colW, L"HOST A GAME");
@@ -1295,11 +1297,34 @@ static void PollClick()
     prevDown = down;
 }
 
+// OPEN LOGS: copy this run's logs beside the earlier runs the proxy saved at
+// start (logarchive.h) and show the folder. Off the render thread: copying a
+// long game log takes a moment.
+static volatile LONG g_logsBusy = 0;
+static DWORD WINAPI CollectLogsThread(LPVOID)
+{
+    Tpf2mpLogArchive a;
+    bool ok = Tpf2mpArchiveLogsSafe(false, ourDirW(), &a);
+    Log("[menu] OPEN LOGS: %d file(s) copied, %d unreadable\n", a.files, a.skipped);
+    wchar_t cmd[MAX_PATH * 2 + 40];
+    if (ok) _snwprintf_s(cmd, _TRUNCATE, L"explorer.exe /select,\"%s\"", a.folder);
+    else    _snwprintf_s(cmd, _TRUNCATE, L"explorer.exe \"%s\"", a.root);
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    SetStatus(ok ? "Logs gathered in %LOCALAPPDATA%\\tpf2mp\\logs (opened in Explorer). Send the newest folders with a bug report."
+                 : "No logs were found to gather.");
+    InterlockedExchange(&g_logsBusy, 0);
+    return 0;
+}
+
 static void OnHit(int id)
 {
     Log("[menu] hit id=%d\n", id);
     switch (id) {
-    case 4: InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
     case 16: case 17: {   // YES / NO to the mod download
         const bool yes = (id == 16);
         if (g_csInit) { EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs); }
@@ -1308,6 +1333,14 @@ static void OnHit(int id)
         InterlockedExchange(&g_panelDirty, 1);
         break;
     }
+    case 15:   // OPEN LOGS
+        if (!InterlockedExchange(&g_logsBusy, 1)) {
+            SetStatus("Gathering logs...");
+            HANDLE t = CreateThread(nullptr, 0, CollectLogsThread, nullptr, 0, nullptr);
+            if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
+        }
+        break;
+    case 4: InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: StartLobby(1); break;   // JOIN  -> lobby (join)
     case 5: LeaveLobby(); break;                                    // LEAVE lobby

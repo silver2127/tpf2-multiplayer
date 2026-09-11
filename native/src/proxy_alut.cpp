@@ -38,6 +38,7 @@
 #pragma comment(linker, "/export:alutUnloadWAV=alut_real.alutUnloadWAV")
 
 #include "datadir.h"
+#include "logarchive.h"
 
 // Resolve a shipped file by name: %LOCALAPPDATA%\tpf2mp\<name> when that file
 // exists, otherwise next to THIS proxy dll (the game dir). There is no third
@@ -110,7 +111,27 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+        // Save the previous run's logs before anything of this run truncates or
+        // appends to them (logarchive.h). Here, in DllMain and not on the loader
+        // thread below: the game's entry point, which truncates stdout.txt, may
+        // run before that thread gets the loader lock. File and registry calls
+        // only, no LoadLibrary. In the game process only.
+        Tpf2mpLogArchive arch = {};
+        bool archived = false;
+        {
+            wchar_t exe[MAX_PATH], dir[MAX_PATH];
+            const wchar_t* base = GetModuleFileNameW(nullptr, exe, MAX_PATH) ? wcsrchr(exe, L'\\') : nullptr;
+            if (base && !_wcsicmp(base + 1, L"TransportFever2.exe") && GetModuleFileNameW(hinst, dir, MAX_PATH)) {
+                wchar_t* s = wcsrchr(dir, L'\\');
+                if (s) { s[1] = 0; archived = Tpf2mpArchiveLogsSafe(true, dir, &arch); }
+            }
+        }
         Log("[proxy] attached to pid %lu\n", GetCurrentProcessId());
+        if (archived) {
+            const wchar_t* leaf = wcsrchr(arch.folder, L'\\');
+            Log("[proxy] the previous run's logs are in tpf2mp\\logs\\%ls (%d file(s), %d skipped)\n",
+                leaf ? leaf + 1 : arch.folder, arch.files, arch.skipped);
+        }
         CreateThread(nullptr, 0, LoadBridge, nullptr, 0, nullptr);
     }
     return TRUE;

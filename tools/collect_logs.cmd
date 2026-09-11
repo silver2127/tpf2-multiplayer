@@ -154,6 +154,19 @@ if (Test-Path -LiteralPath $dataDir) {
     Say "  mod data folder:  not found ($dataDir)" Yellow
 }
 
+# ---- 1b. earlier runs the mod saved (logs\<date>-<time>-previous / -now) ---
+$logsRoot = Join-Path $env:LOCALAPPDATA "tpf2mp\logs"
+if (Test-Path -LiteralPath $logsRoot) {
+    $runs = @(Get-ChildItem -LiteralPath $logsRoot -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d{8}-\d{6}-' } | Sort-Object Name -Descending | Select-Object -First 3)
+    $n = 0
+    foreach ($r in $runs) {
+        Note "== saved run: $($r.Name)"
+        $n += Copy-Matching $r.FullName @("*.log", "*.txt", "*.dmp") (Join-Path $stage "saved_runs\$($r.Name)")
+    }
+    Say "  saved earlier runs: $($runs.Count) run(s), $n file(s)"
+}
+
 # ---- 2. game folder(s) -----------------------------------------------------
 if ($gameDirs.Count -eq 0) { Say "  game folder:      NOT FOUND -- is Transport Fever 2 installed?" Yellow; Note "== game folder: not found" }
 $i = 0

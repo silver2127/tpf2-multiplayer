@@ -28,6 +28,16 @@ Vectors are MSVC `{begin, end, capacity}` triplets.
 | +0x1e0 | toRemove | `vector<Entity>` | MEASURED: a bulldoze's target, a module edit's old construction; empty for a placement |
 | +0x1f8 | toAdd | ConstructionEntity, 0x8e0 B | MEASURED |
 | +0x210 | old2new | `unordered_map` | DECOMPILED |
+| +0x250 | not identified | `vector<int>` | DECOMPILED (copy and destructor only) |
+| +0x268 | not identified | `std::map` or `std::set` | DECOMPILED (copy and destructor only) |
+| +0x278 | baseHeightMod | `Grid<CVec2f>`, cell = {height, base} | DECOMPILED (see [Terrain grids](#terrain-grids-terraform-and-paint)) |
+| +0x2a0 | terrain material indices | `Grid<unsigned char>`, 0xff = unchanged | DECOMPILED |
+| +0x2c8 | terrain material mask | `Grid<bool>` | DECOMPILED |
+
+`Grid<T>` is `{ int x0, y0, w, h; std::vector<T> data }` (0x28 bytes), row-major:
+cell (x, y) is `data[(y - y0) * w + (x - x0)]`. `Grid<bool>` holds a `vector<bool>`, a
+`vector<uint32>` of words plus a `size_t` bit count, so it is 0x30 bytes and the Proposal
+ends at +0x2f8.
 
 There is no transform matrix in the street half: rotation is baked into the node
 positions (placements at several angles compared). A construction's matrix lives in
@@ -44,7 +54,9 @@ Shapes per tool (MEASURED unless noted):
 | stop / signal / waypoint placement | the edge removed and re-added, plus one edgeObjectsToAdd record |
 | stop / signal bulldoze | the edge removed and re-added without the object |
 | construction bulldoze | `toRemove` populated, nothing added |
-| terraform, paint, asset brush | no node vector at all; where the height delta lives is unmapped |
+| terraform | no nodes or segments; the whole edit is `baseHeightMod` (+0x278) (DECOMPILED) |
+| paint | no nodes or segments; the material grids (+0x2a0, +0x2c8) (DECOMPILED) |
+| asset brush | not mapped; its commit clears old2new (+0x210) first (`0x3d1110` → `0x3500e0`) |
 
 ## Node record: NodeAndEntity (24 B)
 
@@ -261,3 +273,75 @@ bulldozer's `MakeRemoveEdgeObjectsProposal` `0x21f0c60`; consistent with
   old2newEdgeObjects) that a Lua SimpleProposal cannot set.
 - A line stop refers to a station by index within its group; the group's order is
   edge-frame ([right, left]) and can differ between instances, so resolve by position.
+
+## Terrain grids: terraform and paint
+
+All DECOMPILED. Nothing here has been checked against a live proposal yet: `dumpprop` dumps
+only the first 0x240 bytes of the proposal and never reached the grids.
+
+`UI::TerrainModifier` (vftable `0x2fcfbb8`) and `UI::TerrainPainter` (`0x2fd35c8`) are
+`UI::ProposalAction`s. While the button is held, each frame builds a candidate proposal: a copy
+of the current one (`0x3e3270`) whose grid is replaced by the union of the old grid and this
+frame's brush. `ProposalAction::Update` `0x431620` evaluates it with `CreateProposalData`
+`0xa072b0` for the preview and keeps it if the evaluation passes.
+
+- **Terraform** (update `0x46adf0`): `CalcHeightMod` `0x468770` returns the new
+  `Grid<CVec2f>`. The mode picks the modifier: `TerrainRaiser` `0x467e50` (height ± strength ×
+  mask), `TerrainSmoother` `0x467ec0`, `TerrainFlattener` `0x467dc0` (toward the height
+  captured at the press, kept at tool+0x198), anything else `TexturedTerrainModifier`
+  `0x467f70` (height ± strength × mask × (2 × texel − 1)).
+- **Paint** (update `0x46dfd0`): `Paint` `0x46d880` returns `pair<Grid<unsigned char>,
+  Grid<bool>>` over 1 m texels (tile × 256 + offset in the tile), and the merge `0x46cbf0`
+  copies every new cell that is not 0xff. Its bool argument (tool+0x15c1) sets or clears the
+  mask bits. The texel pattern comes from a noise table at a random offset drawn from the
+  tool's own generator, so a paint stroke cannot be recomputed on another machine.
+
+### Height cells
+
+A cell is `{height, base}`. `ProposalTerrain::GetHeight` (slot 1 `0x469c50`) returns the
+proposal's cell inside the grid and `{h, h}` from the terrain outside it. `CalcHeightMod` fills
+the union grid from it (`0x467020`) and its per-cell pass (`0x466da0`) writes only `height`.
+So `height` is the **absolute** target height and `base` is the terrain height before the
+proposal. The per-cell pass clamps to the terrain's height range and leaves a cell unchanged
+where:
+
+- an existing terrain alignment pins it. Alignments are rasterized into `{lo, hi}` intervals,
+  initialised to `{-FLT_MAX, FLT_MAX}`, by `0x46b7e0` (modes 0/1/2 = EQUAL, LESS, GREATER);
+- raising would pass `hi`, or lowering would pass `lo`;
+- lowering a cell near water would take it below water level + 1.
+
+### Commit and apply
+
+- Terraform commits on button release (slot 2 `0x469f40`), and also mid-stroke once the
+  evaluated ProposalData's set at +0x5c0 holds more than 30 entries or the grid exceeds
+  300,000 cells. The painter commits only on release.
+- `ProposalAction::commit` `0x4310d0` makes the Context with `0x431560(player)` (bytes +0x00,
+  +0x01, +0x08 and +0x09 zero, player at +0x14), calls `make_cmd::BuildProposal` (returns to
+  `0x4311c6`), then `CommandList::Add` `0x9d2a00` (call at `0x4311e4`) with a 24-byte functor
+  `{vftable 0x2fc8dd0, tool, bool}`. It sets tool+0xf0 and frees the proposal and its
+  ProposalData. The terraform update applies no brush while +0xf0 is set, so a stroke waits for
+  its command.
+- The callback's `_Do_call` `0x431c60` clears tool+0xf0, calls `0x817f70` on a tool member,
+  calls `0x3fec40` when command+0x30 is non-zero, and fires a one-shot `std::function` stored at
+  tool+0xf8.
+- Execution (`0x9d6e20`) recomputes the ProposalData from the proposal against the executing
+  instance's world; the ProposalData the command was made with is overwritten. With a height
+  grid, `CreateProposalData` takes the grid's box plus 16 m (`GetBaseHeightModBBox` `0xa0bfa0`),
+  LIKELY to gather what the edit touches. `applyProposal` `0x9e76e0` writes heights through an
+  `ExtendedTerrainModHeightMap` over ProposalData+0x5f0, and materials through
+  `terrain_modification_util::SetTerrainMaterialIndices` `0x3c2c10` (256-texel tiles, one
+  `TerrainTileBrush` entity per tile).
+
+### What this means for replication
+
+- `api.type.SimpleProposal` has no field for any of the three grids, so Lua cannot express a
+  terraform or a paint stroke. A replay has to put the grids into a script-built proposal at the
+  factory, the way `MergeTemplateStreet` edits construction proposals. The game's own vector
+  copy constructors allocate with its allocator: `0x0cc990` (8-byte elements), `0x1ded10`
+  (1-byte), `0x125480` (4-byte). A `Grid<bool>` also needs its bit count at +0x28.
+- Heights are absolute: the same grid applied to the same world gives the same terrain on every
+  instance, and nothing about the stroke has to be recomputed.
+- A cancelled terraform releases the tool as soon as its callback fires, and the rest of the
+  stroke is then computed against terrain that lacks the cancelled part. A stroke that commits
+  mid-way loses that part wherever the two parts overlap, unless the tool is kept waiting
+  (tool+0xf0) until the replay has run.
