@@ -16,18 +16,23 @@ set -e
 mkdir -p /opt/tpf2mp
 install -m 0644 /tmp/masterserver.py /opt/tpf2mp/masterserver.py
 id -u tpf2mp >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin tpf2mp
+# desync reports (POST /tpf2mp/desync) are kept here; the service may write nowhere else
+mkdir -p /var/lib/tpf2mp/desync
+chown tpf2mp:tpf2mp /var/lib/tpf2mp/desync
+chmod 0750 /var/lib/tpf2mp/desync
 cat > /etc/systemd/system/tpf2mp-master.service <<EOF
 [Unit]
-Description=tpf2mp master server (public game list)
+Description=tpf2mp master server (public game list, desync reports)
 After=network.target
 
 [Service]
 User=tpf2mp
-ExecStart=/usr/bin/python3 /opt/tpf2mp/masterserver.py 8471
+ExecStart=/usr/bin/python3 /opt/tpf2mp/masterserver.py 8471 --desync-dir /var/lib/tpf2mp/desync
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
 ProtectSystem=strict
+ReadWritePaths=/var/lib/tpf2mp/desync
 ProtectHome=true
 PrivateTmp=true
 
@@ -73,6 +78,14 @@ EOF
         proxy_pass http://127.0.0.1:8471/;
         proxy_set_header X-Real-IP \$remote_addr;
         client_max_body_size 8k;
+    }
+    # a desync report is a zip of scrubbed logs (netpunch/desynclogs.py); the
+    # service refuses more than 16 MB as well
+    location = /tpf2mp/desync {
+        proxy_pass http://127.0.0.1:8471/desync;
+        proxy_set_header X-Real-IP \$remote_addr;
+        client_max_body_size 16m;
+        proxy_read_timeout 120s;
     }
     location / { return 404; }
 }

@@ -363,6 +363,13 @@ end
 -- Declared ABOVE onLine because it is called from there: a local declared later
 -- resolves to a nil global at the call site, which is how an entire sweep in
 -- mpbridge silently aborted for hours (see the lastReplayTick note there).
+-- Every desync is counted here, so the first one of a game can be reported
+-- (the dash file carries it to the GUI state's popup, desyncreport.lua).
+function CM.noteDesync(why, stamp)
+	CM.desyncs = CM.desyncs + 1
+	if not CM.firstDesync then CM.firstDesync = { why = tostring(why), t = stamp } end
+end
+
 CM.comparedAt = {}
 -- One peer's hash for one stamp against ours. compareAt (below) runs this for
 -- every peer that has reported the stamp, once each.
@@ -408,8 +415,8 @@ function CM.compareOne(stamp, origin, theirs, dt)
 						if d ~= 0 then
 							CM.townGapStreak[origin] = (CM.townGapStreak[origin] or 0) + 1
 							if CM.townGapStreak[origin] == 2 then
-								CM.desyncs = CM.desyncs + 1
 								CM.dashVerdict = string.format("DESYNC town %+d vs %s", d, origin)
+								CM.noteDesync(CM.dashVerdict, stamp)
 								log(string.format("!! DESYNC (town buildings) t=%d vs %s: %s vs %s (gap %+d, persisted) -- total %d",
 									stamp, origin, a, b, d, CM.desyncs))
 							end
@@ -436,7 +443,7 @@ function CM.compareOne(stamp, origin, theirs, dt)
 				stamp, origin, pr.streak))
 			return
 		end
-		CM.desyncs = CM.desyncs + 1
+		CM.noteDesync("DESYNC vs " .. tostring(origin), stamp)
 		pr.verdict = "DESYNC"
 		CM.comparedAt[stamp].bad = true
 		log(string.format("!! DESYNC t=%d mine=%s peer %s=%s (total %d)",
@@ -458,6 +465,7 @@ function CM.compareOne(stamp, origin, theirs, dt)
 				if other and other ~= comp and name ~= "t" then diffLanes[#diffLanes + 1] = name end
 			end
 			CM.dashVerdict = "DESYNC " .. (#diffLanes > 0 and table.concat(diffLanes, "+") or "?") .. " vs " .. tostring(origin)
+			if CM.firstDesync and CM.firstDesync.t == stamp then CM.firstDesync.why = CM.dashVerdict end
 			for comp in dm:gmatch("[^,]+") do
 				local name = comp:match("^(%a+)")
 				local other = dt:match("(" .. name .. "[^,]*)")

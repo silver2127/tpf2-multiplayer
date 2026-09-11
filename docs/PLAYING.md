@@ -110,6 +110,7 @@ buttons toggle four sections:
 | `/sync` | anyone | the host's game saves and shares the save (what a hot join does); `/sync off` cancels |
 | `/new` | relay leader, before the game starts | discard the relay's stored world |
 | `/resume` | relay leader | send the relay's stored world to everyone waiting |
+| `/desynclogs always`, `ask`, `never` | anyone | what happens to your logs after a desync (see [When something goes wrong](#when-something-goes-wrong)); `/desynclogs` alone shows the current choice |
 
 ### Companies
 
@@ -155,6 +156,20 @@ If the Multiplayer window shows **DESYNC**, the worlds have drifted apart and wi
 themselves. Players who are already in the game ignore a new shared save (`/sync` only helps
 someone joining), so to recover: the host saves, everyone returns to the title menu and leaves
 the lobby, and the host hosts again and presses START GAME, which shares that save.
+
+The first desync in a game also opens a **Desync detected** window that asks whether to send that
+game's logs to the developers:
+
+- **Always send**: send them now, and after every later desync without asking.
+- **Only this once**: send them now and ask again next time.
+- **Never**: send nothing, and never show the window again on this computer.
+
+The logs go to the project's server (the one behind the public games list): the game's log with the
+mod's script lines, the mod's DLL logs and files, and the game's graphics settings. Windows user and
+computer names, the Steam account number, IP addresses and lobby codes are removed first; player
+names and chat can remain. The lobby's own logs and crash dumps are not sent. A chat line from
+MULTIPLAYER says when they arrived. Type `/desynclogs always`, `/desynclogs ask` or `/desynclogs never`
+in the in-game chat to change your choice; it is kept in `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_prefs.txt`.
 
 For a bug report, send the logs of **every** player. The mod gathers them in one folder,
 `%LOCALAPPDATA%\tpf2mp\logs\`:

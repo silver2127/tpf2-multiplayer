@@ -18,7 +18,7 @@ if [ "${FORCE:-0}" != "1" ]; then
   N=$(ssh "$HOST" 'python3 -c "import json;d=json.load(open(\"/var/lib/tpf2mp/relay/lobby_state.json\"));print(len(d.get(\"players\",[])))" 2>/dev/null' || echo 0)
   if [ "${N:-0}" -gt 0 ]; then echo "relay has $N player(s) connected -- not restarting (FORCE=1 to override)"; exit 3; fi
 fi
-tar -C netpunch -cf - lobby.py punch.py seal.py connect.py mesh.py observe.py 2>/dev/null \
+tar -C netpunch -cf - lobby.py punch.py seal.py connect.py mesh.py observe.py modshare.py desynclogs.py 2>/dev/null \
   | ssh "$HOST" 'mkdir -p /opt/tpf2mp/netpunch && tar -C /opt/tpf2mp/netpunch -xf -'
 ssh "$HOST" "set -e
 python3 -c 'import stun' 2>/dev/null || pip3 install --quiet --break-system-packages pystun3 || apt-get install -y -qq python3-pip && pip3 install --quiet --break-system-packages pystun3
