@@ -11,7 +11,10 @@
   shows them. Per-save mod settings travel inside the
   save. The multiplayer mod itself (**Transport Fever 2 Multiplayer**) comes with the
   installer and is never sent. Steam Workshop items are copied into the workshop folder;
-  subscribing to them yourself keeps them updated.
+  subscribing to them yourself keeps them updated. **Mods are code that runs in your game**, and
+  shared ones come from the host's computer: only say YES to a host you trust. Your game installs
+  only the mods it asked you about and you said YES to, and only right after the save arrived; it
+  refuses anything else the host sends.
 - **The multiplayer mod has to be enabled in the save.** New games get it automatically: each time the
   game starts, the Multiplayer panel adds it to the game's default mod list. For an existing save,
   open the save's **Mods** panel on the load screen once and enable it; the save remembers. The
