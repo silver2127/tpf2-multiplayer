@@ -197,7 +197,11 @@ starting with `!hotjoin ` as a status message.
 4. The receiver checks the proposed filenames against a whitelist before allocating, refuses
    writes past the end, verifies every hash (retrying the whole transfer up to three
    times), writes the files and emits `save_ready`.
-5. **Mods the save needs.** The host reads the save's active mod list off the `.sav`
+5. **Mods the save needs (off by default since 2026-09-11; `lobby.py host --share-mods`
+   turns it on).** A joiner whose game could not see the save's Workshop mods was never
+   asked (their folders existed) and its load was refused, and copying a Workshop item
+   into the workshop folder is unlikely to make the game load it; players install the
+   save's mods themselves until that is solved. With the flag, the host reads the save's active mod list off the `.sav`
    (a Zstandard frame; the list sits before the game settings and is parsed from that
    anchor) and lists it in `fbegin` as `mods`. Each receiver answers in `fbegin_ack` with
    `need`, the ids it has no folder for (`<id>_<version>` under the game's `mods`, the
@@ -208,8 +212,9 @@ starting with `!hotjoin ` as a status message.
    window); a receiver unpacks each into its game's `mods` folder (never over an existing
    one, paths inside the zip are checked) and emits `mods_ready`. The multiplayer mod
    itself is never sent. A mod the host cannot find, or one over 512 MB, is named in chat
-   and skipped. `lobby.py host --no-share-mods` turns the round off; a dedicated relay
-   never shares mods. Per-save mod settings need nothing: they are inside the save.
+   and skipped. A receiver takes a mods round only right after a verified save round, only
+   after its player said YES, and installs only the mods it was asked about. A dedicated
+   relay never shares mods. Per-save mod settings need nothing: they are inside the save.
 6. When every receiver has verified (and any mods round has resolved), the host sends `start` to them. On each joiner the menu
    DLL copies the files into the game's save folder as `mp_shared.sav` (+ sidecars) and the
    player loads **mp_shared** from LOAD GAME. A failed transfer leaves the host with

@@ -837,7 +837,13 @@ class GameRelay:
 # All files (.sav + optional .sav.lua + .jpg) are concatenated into ONE byte
 # stream with a single sequence space; the receiver splits them back out using
 # the per-file sizes in `fbegin`. Integrity is SHA-256 per file AND overall.
-SHARE_MODS = [True]        # --no-share-mods turns the mods round off (host side)
+# OFF since 2026-09-11 (--share-mods turns it on, host side). Live on the rig a
+# joiner whose game could not see the save's Workshop mods -- their folders were
+# there, the game still loaded without them -- was never asked, and its refused
+# autoload left it stuck on LOAD GAME. Copying a Workshop item into the workshop
+# folder is unlikely to make the game load it either. Every player installs the
+# save's mods themselves until that is solved.
+SHARE_MODS = [False]
 MODS_ANSWER_WAIT = 90.0    # s the host waits for a joiner to answer the download prompt
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
@@ -3791,6 +3797,7 @@ def _run_transfer_mods(tag):
         src[mid] = d
     dest = os.path.join(base, "joinermods")
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
+    share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
     modshare.save_mod_list = lambda p: [("mod_zz", 1), ("mod_have", 1)]
     modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
     modshare.installed_mod = lambda m, v: src.get(m) if m == "mod_have" else None   # joiners lack mod_zz
@@ -3884,6 +3891,7 @@ def _run_transfer_mods(tag):
             except Exception:
                 pass
         (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target) = real
+        SHARE_MODS[0] = share_was
         shutil.rmtree(base, ignore_errors=True)
     print(f"[mods:{tag}] {'OK' if ok else 'FAIL'}  ({time.time() - t0:.1f}s)")
     return ok
@@ -4418,8 +4426,10 @@ def main(argv=None):
                     help="also tail this file and ship its new lines to the "
                          "host's merged lobby_peers.log (repeatable; e.g. the "
                          "bridge log)")
+    ap.add_argument("--share-mods", action="store_true",
+                    help="host: send joiners the mods the shared save needs (off by default)")
     ap.add_argument("--no-share-mods", action="store_true",
-                    help="host: do not send joiners the mods the shared save needs")
+                    help="host: do not send joiners the mods the shared save needs (the default)")
     ap.add_argument("--no-mesh", action="store_true",
                     help="joiner: do not punch other joiners directly; keep "
                          "every frame on the host relay (the pre-mesh star)")
@@ -4439,8 +4449,7 @@ def main(argv=None):
                          "delivered to (the menu reads it from "
                          "tpf2_instance.txt; default %(default)s)")
     args = ap.parse_args(argv)
-    if getattr(args, "no_share_mods", False):
-        SHARE_MODS[0] = False
+    SHARE_MODS[0] = bool(getattr(args, "share_mods", False)) and not getattr(args, "no_share_mods", False)
 
     if args.selftest:
         return 0 if selftest() else 1

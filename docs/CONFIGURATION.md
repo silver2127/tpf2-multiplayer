@@ -48,7 +48,7 @@ setting at its default.
 | `master_url` | `https://srv1306562.hstgr.cloud/tpf2mp` (the project's master server) | empty, or an `http://` or `https://` URL without blanks or quotes (a trailing `/` is dropped) | Base URL of the public game list. The panel reads `<url>/list`, and a host with PUBLIC ticked announces to it. Empty hides the list and the PUBLIC checkbox. |
 | `relay_autosave_min` | 2 | 0-60 | How often, in minutes, a relay lobby's leader uploads a fresh save while playing; `0` never. |
 | `autoload` | 1 | `0`, `1` | `1`: the shared save loads by itself after START GAME. `0`: the player loads it with LOAD GAME. |
-| `share_mods` | `ask` | `ask`, `always`, `never` | Mods the shared save needs and you lack: `ask` shows a YES / NO in the panel when the host presses START GAME (no answer in 90 s counts as no), `always` downloads without asking, `never` declines and, when hosting, does not offer your mods to joiners. |
+| `share_mods` | `ask` | `ask`, `always`, `never` | Only matters when a host runs the lobby with `--share-mods` (mod sharing is off by default): mods the shared save needs and you lack. `ask` shows a YES / NO in the panel when the host presses START GAME (no answer in 90 s counts as no), `always` downloads without asking, `never` declines. |
 | `slot` | 0 | 0-7 | Position of the Multiplayer entry in the title menu's list (0 = top). |
 | `scale` | 0 | 0.5-3 | Panel scale; 0 = screen height / 1080. |
 | `automod` | on | a line starting `automod=0` | Stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
