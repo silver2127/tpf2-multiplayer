@@ -26,3 +26,17 @@ EVAL local c = api.type.Context:new(); c.checkTerrainAlignment = false; c.cleanu
            B's Lua log    EVAL -> carrier sent   and   [terrain-poc] carrier applied ok=true
            and the same hill on B's map.
 6. Restore the backed-up tpf2_slice.dll and remove dumpprop=1.
+
+Live replication test (commit "terrain: terraforming and terrain painting replicate to every peer")
+---------------------------------------------------------------------------------------------------
+Deploy the worktree's tpf2_slice.dll and its mod (tools\deploy_mod.ps1 run from the worktree).
+Start both instances from one save, so the terrain is identical.
+On A: raise, lower, flatten and paint. On B: paint something too.
+Expect, on the editing instance:
+  slice log  [terrain] #N shipped: <n>B edit, <m>B of base64 (runs here natively, peers replay it)
+  Lua log    TERRAINCAP: <n> B terrain edit ... -- applied here natively, peers apply it at the stamp
+On the other instance:
+  Lua log    RECV TERRAIN seq=.. spare=..   then   EXEC TERRAIN seq=.. from a: <n> B edit, carrier sent=true (grids filled)
+             and   EXEC TERRAIN seq=.. from a: carrier applied
+  slice log  [terrain-inject] filled the script proposal: heights WxH at (x,y), material ...
+Check heights with an EVAL on both:  EVAL return game.interface.getHeight({x*4, y*4})
