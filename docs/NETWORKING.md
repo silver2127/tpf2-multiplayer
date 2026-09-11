@@ -64,7 +64,9 @@ behind symmetric NAT or CGNAT. A dedicated relay does not poll: its port is open
 
 **Joiner.** `netpunch.exe join <code>` decodes the code, observes its own socket (no
 UPnP), and sends HELLO every 100 ms to the host's candidates, LAN first, until an ACK
-echoes its token or 40 s pass. While it dials it **knocks**: every 2 s it posts its own
+echoes its token or 40 s pass. Punching is the fallback: a host whose port is open (UPnP,
+a forward) answers within a second and nothing else happens. If there is no answer after
+4 s, the joiner **knocks**: every 2 s it posts its own
 profile code to the master server's `/knock`, sealed with a key derived from the code's
 secret (and password), under a tag also derived from the secret
 (`SHA-256("tpf2mp-rendezvous-v1|" + secret)`, 24 hex characters). The master can

@@ -307,13 +307,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="tpf2mp master server")
     ap.add_argument("port", nargs="?", type=int, default=8471)
     ap.add_argument("--desync-dir", default=None, help="accept desync reports and keep them here")
+    ap.add_argument("--bind", default="127.0.0.1",
+                    help="listen address (default 127.0.0.1, behind nginx; tools/nat_lab binds 0.0.0.0)")
     a = ap.parse_args(argv)
     if a.desync_dir:
         os.makedirs(a.desync_dir, exist_ok=True)
         DESYNC_DIR = a.desync_dir
-    srv = ThreadingHTTPServer(("127.0.0.1", a.port), H)
-    sys.stderr.write("tpf2mp master server on 127.0.0.1:%d (ttl %ds, desync reports %s)\n"
-                     % (a.port, TTL, DESYNC_DIR or "off"))
+    srv = ThreadingHTTPServer((a.bind, a.port), H)
+    sys.stderr.write("tpf2mp master server on %s:%d (ttl %ds, desync reports %s)\n"
+                     % (a.bind, a.port, TTL, DESYNC_DIR or "off"))
     srv.serve_forever()
 
 

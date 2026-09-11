@@ -1728,6 +1728,10 @@ class _Publisher:
 DEFAULT_MASTER = "https://srv1306562.hstgr.cloud/tpf2mp"   # the menu's master_url default
 RV_POLL_EVERY = 1.0       # host: seconds between polls for knocks
 RV_KNOCK_EVERY = 2.0      # joiner: seconds between knocks while it dials
+# Punching is the FALLBACK: a host that UPnP (or a forwarded port) really opened
+# answers the plain dial within a second, and then the master never hears of the
+# join. Only a dial still unanswered after RV_KNOCK_AFTER seconds knocks.
+RV_KNOCK_AFTER = 4.0
 RV_PUNCH_FOR = 15.0       # host: seconds to keep punching toward one knocked address
 RV_PUNCH_EVERY = 0.2      # host: seconds between punch bursts
 
@@ -1828,8 +1832,10 @@ class _RendezvousKnock:
     seconds until closed (a fresh seal each time, so the host's replay window
     accepts every one)."""
 
-    def __init__(self, url, secret, password, profile_code, log, every=RV_KNOCK_EVERY):
+    def __init__(self, url, secret, password, profile_code, log, every=RV_KNOCK_EVERY,
+                 delay=RV_KNOCK_AFTER):
         self.url, self.tag, self.log, self.every = url.rstrip("/"), _rv_tag(secret), log, every
+        self.delay = delay
         self._sealer = _rv_sealer(secret, password)
         self._plain = profile_code.encode("ascii")
         self.sent = 0
@@ -1844,6 +1850,10 @@ class _RendezvousKnock:
     def _run(self):
         import base64
         warned = False
+        if self._stop.wait(self.delay):
+            return                                # the direct dial connected first: no knock
+        if self.delay > 0:
+            self.log(f"[rendezvous] no answer to the direct dial after {self.delay:.0f} s -- asking the host to punch")
         while not self._stop.is_set():
             try:
                 blob = base64.b64encode(self._sealer.seal(self._plain)).decode("ascii")

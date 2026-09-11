@@ -44,7 +44,10 @@ jcode = encode_profile(joiner_profile)
 
 # ---- 1. knock -> host poller -> targets ----
 host = lobby._RendezvousHost(URL, secret, "", log, poll_every=0.1)
-knock = lobby._RendezvousKnock(URL, secret, "", jcode, log, every=0.2)
+knock = lobby._RendezvousKnock(URL, secret, "", jcode, log, every=0.2, delay=0)
+late = lobby._RendezvousKnock(URL, os.urandom(12), "", jcode, log, every=0.2, delay=30)
+late.close()
+check("a knock waiting out its delay never posts once closed (the direct dial won)", late.sent == 0)
 got = None
 deadline = time.time() + 5
 while time.time() < deadline and got is None:

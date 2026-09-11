@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import os
 import json
 import shutil
 import socket
@@ -55,6 +56,21 @@ STUN_SERVERS = [
     ("stun.cloudflare.com", 3478),
     ("stun.services.mozilla.com", 3478),
 ]
+
+
+def _stun_servers():
+    """STUN_SERVERS, or TPF2MP_STUN="host:port,host:port" when set -- the NAT lab
+    (tools/nat_lab) runs its own STUN server on a simulated internet."""
+    env = os.environ.get("TPF2MP_STUN", "").strip()
+    if not env:
+        return STUN_SERVERS
+    out = []
+    for item in env.split(","):
+        host, _, port = item.strip().rpartition(":")
+        if host and port.isdigit():
+            out.append((host, int(port)))
+    return out or STUN_SERVERS
+
 
 STUN_PER_SERVER_TIMEOUT = 1.0    # socket timeout per attempt
 STUN_TOTAL_DEADLINE = 8.0        # give up after this many seconds total
@@ -139,12 +155,13 @@ def enumerate_v6():
 # --------------------------------------------------------------------------- #
 # STUN
 # --------------------------------------------------------------------------- #
-def stun_map(sock, servers=STUN_SERVERS, want=2, deadline=STUN_TOTAL_DEADLINE):
+def stun_map(sock, servers=None, want=2, deadline=STUN_TOTAL_DEADLINE):
     """Query STUN servers on ``sock`` until we have ``want`` mapped answers.
 
     Returns (answers, log) where answers is a list of dicts
     {server, ip, port, ms} and log is a human-readable per-server list.
     """
+    servers = servers or _stun_servers()
     stun._initialize()  # populate pystun3's msg-type tables (stun_test skips this)
     prev_timeout = sock.gettimeout()
     sock.settimeout(STUN_PER_SERVER_TIMEOUT)
