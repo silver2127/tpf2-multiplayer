@@ -326,6 +326,62 @@ static void Reidentify(const std::string& inst)
         inst.c_str(), inst.c_str());
 }
 
+// ---- a second launch of the game in the same box (2026-09-11) ----
+// Launching the game inside a Sandboxie box starts TWO game processes: the one
+// launched, which hands off to the box's Steam and exits, and Steam's relaunch.
+// Both load this bridge and both write tpf2_instance.txt, so whichever writes
+// last owns it. When that is the short-lived one, the file names a dead pid,
+// the lobby addresses the control file to that pid, and ApplyControl ignored it
+// as "not us": the live game never got its letter or its peer and stayed
+// disconnected ("one instance lost connection", twice on the four-game rig).
+// So: an identity file naming a pid that has EXITED is rewritten for us, that
+// pid is remembered as a sibling, and a control file addressed to a sibling
+// that has exited is ours. A pid that is still running is never overridden.
+static bool PidAlive(unsigned long pid)
+{
+    if (pid == 0) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    // Access denied means it exists but is not ours to open (another box,
+    // another user): alive, so it is left alone.
+    if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
+    bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
+}
+
+static unsigned long g_siblingPids[16];
+static int g_nSiblings = 0;
+static volatile unsigned long g_ctlIgnoredPid = 0;   // set when a control file was left for a live pid
+
+static bool IsSibling(unsigned long pid)
+{
+    for (int i = 0; i < g_nSiblings; i++) if (g_siblingPids[i] == pid) return true;
+    return false;
+}
+
+// Returns true when it rewrote the identity file (the caller then re-reads the
+// control file, which may have been addressed to that sibling).
+static bool HealIdentity()
+{
+    std::string text;
+    if (!ReadSmallFile(g_dataDir + L"tpf2_instance.txt", text)) return false;
+    const char* p = strstr(text.c_str(), "pid=");
+    unsigned long named = 0;
+    if (!p || sscanf(p, "pid=%lu", &named) != 1) return false;
+    const unsigned long mine = GetCurrentProcessId();
+    if (named == 0 || named == mine || PidAlive(named)) return false;
+    if (!IsSibling(named) && g_nSiblings < 16) g_siblingPids[g_nSiblings++] = named;
+    std::string inst;
+    {
+        std::lock_guard<std::mutex> lk(g_rt.mtx);
+        inst = g_rt.instance;
+    }
+    Log("[m5] identity file named pid %lu, which has exited (a second launch of the game in this box) "
+        "-- rewriting it for us (pid %lu, instance %s)\n", named, mine, inst.c_str());
+    WriteIdentity(inst, false);
+    return true;
+}
+
 static void ApplyControl(const std::string& text)
 {
     std::string wantInst, wantIp;
@@ -350,8 +406,17 @@ static void ApplyControl(const std::string& text)
             // Addressed to a specific bridge: a second instance sharing this
             // data dir (sandbox read-through) must not apply our role.
             if (ctlPid != 0 && ctlPid != GetCurrentProcessId()) {
-                Log("[ctl] control file is for pid %lu, not us (%lu) -- ignored\n", ctlPid, GetCurrentProcessId());
-                return;
+                // A sibling launch in this box that has since exited was
+                // addressed from the identity file it overwrote: ours.
+                // Anything else -- a live pid, or a pid this bridge never saw
+                // in its own identity file -- stays someone else's.
+                if (!IsSibling(ctlPid) || PidAlive(ctlPid)) {
+                    Log("[ctl] control file is for pid %lu, not us (%lu) -- ignored\n", ctlPid, GetCurrentProcessId());
+                    g_ctlIgnoredPid = ctlPid;
+                    return;
+                }
+                Log("[ctl] control file is for pid %lu, a sibling launch that has exited -- applying it to us (%lu)\n",
+                    ctlPid, GetCurrentProcessId());
             }
         } else {
             Log("[ctl] ignored line: %.100s\n", ln.c_str());
@@ -407,6 +472,13 @@ static DWORD WINAPI CtlThread(LPVOID)
             double t = atof(curSpeed.c_str());
             SpeedHook_SetTarget(t);
             Log("[speed] target -> %.3f (%s)\n", SpeedHook_Target(), curSpeed.empty() ? "file absent/empty: engine speed" : "from tpf2_speed.txt");
+        }
+        // Heal first: once the identity names us, a control file that was
+        // addressed to the exited sibling is read again, not skipped as unchanged.
+        if (HealIdentity()) last.clear();
+        {
+            unsigned long ign = g_ctlIgnoredPid;
+            if (ign && IsSibling(ign) && !PidAlive(ign)) { g_ctlIgnoredPid = 0; last.clear(); }
         }
         if (!ReadSmallFile(path, cur)) cur.clear();   // missing = nothing requested
         if (cur == last) continue;
