@@ -11,17 +11,20 @@
 -- grids: absolute heights on 4 m cells, material on 1 m texels, and a mask. A
 -- script SimpleProposal cannot express them, so the grids travel as bytes.
 --
---   originator  the slice logs the commit, lets it apply natively and writes
---               TERRAINCAP <bytes> <base64> to the inject file. CM.terrainCapture
---               schedules TERRAIN with skipOrigin (this instance already has it).
+--   originator  the slice CANCELS the commit at CommandList::Add and writes
+--               TERRAINCAP <bytes> <base64> behind ARMED 1 once the cancel has
+--               landed; CM.terrainCapture schedules TERRAIN for everyone, this
+--               instance included. Behind ARMED 0 (the edit had to run natively
+--               here) it schedules with skipOrigin, the v1 fallback.
 --   every peer  CM.execTerrain at the stamp writes the base64 to
 --               terrain_inject_<me>.bin and sends an EMPTY script buildProposal;
 --               the slice sees the empty carrier, fills its grids from the file
 --               (InjectTerrainFromFile) and deletes the file.
 --
--- v1 is not strict: the originator's edit lands EXEC_DELAY earlier than the
--- peers'. Terrain moves no vehicle, and the values are absolute, so the worlds
--- still end identical.
+-- STRICT since 2026-09-11: every instance applies the grids at the same stamp.
+-- Terrain moves no vehicle, but a road built or a town grown in the window
+-- between the originator's native edit and the peers' replay reads a height
+-- the others do not have yet -- the seed of a later drift.
 return function(CM, K, log)
 -- the wire length of n bytes of base64
 local function b64Len(n) return 4 * math.ceil(n / 3) end
@@ -33,9 +36,13 @@ function CM.terrainCapture(w)
 			tostring(w[2]), tostring(d and #d)))
 		return
 	end
-	CM.scheduleLocal("TERRAIN", { d = d, n = n, skipOrigin = 1 })
-	log(string.format("TERRAINCAP: %d B terrain edit (%d B on the wire) -- applied here natively, peers apply it at the stamp",
-		n, #d))
+	local armed = (CM.lastArmed or 0) == 1
+	local args = { d = d, n = n }
+	if not armed then args.skipOrigin = 1 end
+	CM.scheduleLocal("TERRAIN", args)
+	log(string.format("TERRAINCAP: %d B terrain edit (%d B on the wire) -- %s", n, #d,
+		armed and "cancelled here, every instance applies it at the stamp"
+		      or "applied here natively, peers apply it at the stamp"))
 end
 
 function CM.execTerrain(c)

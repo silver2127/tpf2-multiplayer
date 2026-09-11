@@ -223,6 +223,14 @@ static char    g_stopName[256];
 // decoded off the bulldozer's edge-replace proposal (StashStopDelFromBulldoze),
 // written as STOPXDEL from the Add hook once the cancel landed.
 static volatile LONG g_pendingIsStopDel = 0;
+// Terraform / paint cancel (STRICT, 2026-09-11): the blob is stashed at the
+// factory and TERRAINCAP is written from the Add hook -- ARMED 1 when the
+// cancel landed (everyone, the originator included, applies it at the stamp),
+// ARMED 0 when the edit had to run natively here (the peers still get it).
+static volatile LONG g_pendingIsTerrain = 0;
+static char*    g_terrainB64 = nullptr;
+static uint64_t g_terrainBlobLen = 0;
+static long     g_terrainStashSeq = 0;
 static int32_t g_stopDelEo = -1, g_stopDelEdge = -1;
 
 extern "C" void DeferRelay();
@@ -2492,9 +2500,9 @@ static void AppendTerrainBlob(uint8_t* buf, uint64_t* p, const TerrainGrid& g)
 }
 
 static bool ReadSsoString(uint64_t sa, char* out, size_t cap);   // the CONXP walker's reader
-static void LogTerrainProposal(uint64_t r8, uint64_t r9)
+static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
 {
-    if (!Readable((void*)r8, 0x2f8)) { Log("[terrain] proposal unreadable\n"); return; }
+    if (!Readable((void*)r8, 0x2f8)) { Log("[terrain] proposal unreadable\n"); return false; }
     const long seq = ++g_terrainSeq;
 
     // Everything a terrain edit should leave empty, so an unexpected shape shows.
@@ -2626,12 +2634,12 @@ static void LogTerrainProposal(uint64_t r8, uint64_t r9)
     const bool hasEdit = hg.bytes || mg.bytes;
     const bool onlyTerrain = !nodesB && !segsB && !rmNB && !rmSB && !toRmB && !toAddB;
     const bool ship = SessionLive() && hasEdit;
-    if (!ship && !DumpPropOn()) return;
-    if (!g_dataDir[0]) return;
+    if (!ship && !DumpPropOn()) return false;
+    if (!g_dataDir[0]) return false;
 
     const uint64_t blobLen = 8 + 0x80 + 0x70 + 24 + hg.bytes + mg.bytes + kg.bytes;
     uint8_t* blob = (uint8_t*)malloc((size_t)blobLen);
-    if (!blob) { Log("[terrain] #%ld out of memory for a %lluB edit\n", seq, (unsigned long long)blobLen); return; }
+    if (!blob) { Log("[terrain] #%ld out of memory for a %lluB edit\n", seq, (unsigned long long)blobLen); return false; }
     {
         const uint32_t ver = 1;
         uint64_t p = 0;
@@ -2663,11 +2671,16 @@ static void LogTerrainProposal(uint64_t r8, uint64_t r9)
         }
     }
 
-    // REPLICATION, v1 (2026-09-11). The edit is NOT cancelled: it applies here
-    // natively, and TERRAINCAP hands the blob to the mod, which schedules a
-    // TERRAIN command every other instance applies at the stamp by filling an
-    // empty script proposal with these grids. Heights and material are
-    // absolute, so a replay onto an identical world lands bit-identical.
+    // REPLICATION, STRICT (2026-09-11). The blob is STASHED here; the factory
+    // arms the cancel and the Add hook writes TERRAINCAP once it knows whether
+    // the cancel landed (ARMED 1: every instance, this one included, applies
+    // the grids at the stamp through the empty-carrier replay) or the edit had
+    // to run natively here (ARMED 0: the peers apply it, this instance keeps
+    // its native copy -- the v1 behaviour, now the fallback). Heights and
+    // material are absolute, so a replay onto an identical world lands
+    // bit-identical; a terrain that changes EXEC_DELAY earlier on one instance
+    // is exactly the kind of window a later build reads a different height from.
+    bool stashed = false;
     if (ship) {
         if (!gridsOk) {
             Log("[terrain] #%ld grid sizes do not match their data -- the edit runs here only, NOT replicated\n", seq);
@@ -2675,24 +2688,48 @@ static void LogTerrainProposal(uint64_t r8, uint64_t r9)
             Log("[terrain] #%ld carries streets or constructions as well -- NOT replicated as terrain\n", seq);
         } else {
             char* b64 = Base64Encode(blob, blobLen);
-            char p[MAX_PATH];
-            snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
-            FILE* f = b64 ? _fsopen(p, "a", _SH_DENYNO) : nullptr;
-            if (f) {
-                // one write for the payload: the reader re-reads a partial line
-                fprintf(f, "TERRAINCAP %llu ", (unsigned long long)blobLen);
-                fwrite(b64, 1, strlen(b64), f);
-                fputc('\n', f);
-                fclose(f);
-                Log("[terrain] #%ld shipped: %lluB edit, %lluB of base64 (runs here natively, peers replay it)\n",
+            if (b64) {
+                free(g_terrainB64);
+                g_terrainB64 = b64; g_terrainBlobLen = blobLen; g_terrainStashSeq = seq;
+                stashed = true;
+                Log("[terrain] #%ld stashed for the wire: %lluB edit, %lluB of base64\n",
                     seq, (unsigned long long)blobLen, (unsigned long long)strlen(b64));
             } else {
-                Log("[terrain] #%ld cannot open %s -- the edit runs here only, NOT replicated\n", seq, p);
+                Log("[terrain] #%ld base64 encode failed -- the edit runs here only, NOT replicated\n", seq);
             }
-            free(b64);
         }
     }
     free(blob);
+    return stashed;
+}
+
+// Write the stashed edit as TERRAINCAP behind ARMED <armed>. armed=true: the
+// cancel landed, the originator replays too. armed=false: the edit ran natively
+// here (no live session at arm time, or the callback could not be fired), the
+// mod ships it with skipOrigin so the peers still get it.
+static void WriteInjectTerrain(bool armed)
+{
+    ReadInstance();
+    char* b64 = g_terrainB64; g_terrainB64 = nullptr;
+    if (!b64) return;
+    if (!g_instance[0]) { free(b64); return; }
+    WriteArmed(armed);
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (f) {
+        // one write for the payload: the reader re-reads a partial line
+        fprintf(f, "TERRAINCAP %llu ", (unsigned long long)g_terrainBlobLen);
+        fwrite(b64, 1, strlen(b64), f);
+        fputc('\n', f);
+        fclose(f);
+        Log("[terrain] #%ld shipped: %lluB edit, %lluB of base64 (%s)\n", g_terrainStashSeq,
+            (unsigned long long)g_terrainBlobLen, (unsigned long long)strlen(b64),
+            armed ? "cancelled here, every instance applies it at the stamp" : "ran natively here, the peers apply it at the stamp");
+    } else {
+        Log("[terrain] #%ld cannot open %s -- the edit is on this instance only, NOT replicated\n", g_terrainStashSeq, p);
+    }
+    free(b64);
 }
 
 // DEV TEST, inert unless terrain_inject_<inst>.bin exists in the data dir: a
@@ -2913,6 +2950,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                 if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
                 if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
+                if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true);
                 return 1;
             }
             bool fired = false;
@@ -2975,6 +3013,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();
                     if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();
                     if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel();
+                    if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true);
                     return 1;
                 }
                 if (InterlockedExchange(&g_pendingHonour, 0)) {
@@ -2997,6 +3036,10 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                     Log("[slice] stop cancel did not land -- STOPX dropped, the poll captures the native build as before\n");
                 if (InterlockedExchange(&g_pendingIsStopDel, 0))
                     Log("[slice] stop bulldoze cancel did not land -- STOPXDEL dropped, the stop poll ships the removal as before\n");
+                if (InterlockedExchange(&g_pendingIsTerrain, 0)) {
+                    Log("[slice] terrain cancel did not land -- the edit ran natively here; shipping it for the peers behind ARMED 0\n");
+                    WriteInjectTerrain(false);
+                }
                 Log("[slice] callback NOT fired -- letting the build run rather "
                     "than wedging the tool (caller_rva=%llx)\n",
                     (unsigned long long)caller);
@@ -3012,6 +3055,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (InterlockedExchange(&g_pendingIsConu, 0)) WriteInjectConup();   // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStop, 0)) WriteInjectStop();    // the cancel LANDED
             if (InterlockedExchange(&g_pendingIsStopDel, 0)) WriteInjectStopDel(); // the cancel LANDED
+            if (InterlockedExchange(&g_pendingIsTerrain, 0)) WriteInjectTerrain(true); // the cancel LANDED
             return 1;
         }
     }
@@ -3088,10 +3132,27 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // or paint commit is also shipped as TERRAINCAP (see LogTerrainProposal);
     // the asset brush reaches the peers through the construction path.
     if (caller == CALLER_PROPOSALACTION) {
+        bool stashed = false;
         __try {
-            LogTerrainProposal(r8, r9);
+            stashed = LogTerrainProposal(r8, r9);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[terrain] decode fault -- the edit runs natively, nothing shipped\n");
+        }
+        if (stashed) {
+            // STRICT: cancel the originator's own commit and let every instance
+            // apply the grids at the stamp. A UI tool: it waits on its completion
+            // callback, so g_pendingNoCb stays 0 and the Add hook fires it, as for
+            // the build tool. No live session -> the edit runs natively here
+            // and ships behind ARMED 0 for the peers.
+            if (SessionLive()) {
+                InterlockedExchange(&g_pendingIsTerrain, 1);
+                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+                InterlockedExchange(&g_pendingNoCb, 0);
+                Log("[slice] armed cancel: terrain edit cmd=%llx -- TERRAINCAP ships from the Add hook\n", (unsigned long long)rcx);
+            } else {
+                Log("[slice] terrain edit with no live session -- runs natively here, shipped for the peers\n");
+                WriteInjectTerrain(false);
+            }
         }
         return 0;
     }
