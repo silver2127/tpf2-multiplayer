@@ -1149,15 +1149,10 @@ function data()
 					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
 					CM.dashShowChat = (CM.dashShowChat ~= false)
 					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
-					CM.dashShowSpeed = (CM.dashShowSpeed == true)           -- hidden by default
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					tog:addItem(toggleBtn("  stats  ", function()
 						CM.dashShowStats = not CM.dashShowStats
 						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
-					end))
-					tog:addItem(toggleBtn("  speed  ", function()
-						CM.dashShowSpeed = not CM.dashShowSpeed
-						pcall(function() D.speedBox:setVisible(CM.dashShowSpeed, false) end)
 					end))
 					tog:addItem(toggleBtn("  chat  ", function()
 						CM.dashShowChat = not CM.dashShowChat
@@ -1176,25 +1171,20 @@ function data()
 					D.statsBox = api.gui.comp.Component.new("mpStats")
 					D.statsBox:setLayout(statsL)
 					box:addItem(D.statsBox)
-					-- ---- session speed + lobby chat (2026-09-09) ----
+					-- ---- lobby chat (2026-09-09) ----
 					-- The lobby (netpunch) keeps running behind the game; its
 					-- lobby_out.jsonl carries every chat line and lobby_in.jsonl takes
 					-- commands, so the in-game chat is those two files. "/speed x" typed in
 					-- the chat reaches every panel, which writes it into the bridge ctl; the
 					-- host's pacer applies it and broadcasts the session speed (LSEFF). The
-					-- -0.5 / +0.5 / reset / sync buttons are gone (2026-09-10), and the speed
-					-- line has its own show/hide toggle next to stats, chat and companies.
-					D.speedText = api.gui.comp.TextView.new("session speed: -")
+					-- -0.5 / +0.5 / reset / sync buttons went on 2026-09-10, and the session
+					-- speed row with its "speed" toggle on 2026-09-11: it only repeated what
+					-- the host's speed buttons already show.
 					local function speedBtn(label, fn)
 						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
 						b:onClick(fn)
 						return b
 					end
-					local row = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					row:addItem(D.speedText)
-					D.speedBox = api.gui.comp.Component.new("mpSpeedRow")
-					D.speedBox:setLayout(row)
-					box:addItem(D.speedBox)
 					-- ---- companies (2026-09-09): switch, create, dissolve ----
 					-- The GUI state cannot reach the lockstep queue, so a button
 					-- appends "CMSWITCH 3" to the inject file; inject.lua schedules
@@ -1289,7 +1279,6 @@ function data()
 						D.statsBox:setVisible(CM.dashShowStats, false)
 						D.chatBox:setVisible(CM.dashShowChat, false)
 						D.coBox:setVisible(CM.dashShowCompanies, false)
-						D.speedBox:setVisible(CM.dashShowSpeed, false)
 					end)
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
@@ -1318,37 +1307,6 @@ function data()
 				table.sort(vs)
 				D.verdict:setText("verdict: " .. (mine and mine.verdict or "-") .. (#vs > 0 and ("   [" .. table.concat(vs, ", ") .. "]") or ""))
 				pcall(function()
-					local eff = mine and tonumber(mine.eff) or nil
-					D.eff = eff
-					local req = mine and mine.speedreq
-					local sync = mine and mine.sync
-					local pace = mine and mine.pace
-					local xfer = mine and mine.xfer
-					-- plain words (2026-09-10): "lowest lever" and "PID 0.95x e=-2.40"
-					-- meant nothing to players. The session speed is one number for
-					-- everyone; a joiner then runs a little faster or slower than it
-					-- to stay in step with the leader, and that is what "this game"
-					-- reports.
-					local paceTxt = ""
-					if pace and pace ~= "-" then
-						local mult, e = pace:match("^([%d%.]+)x e=([%+%-][%d%.]+)")
-						e = tonumber(e)
-						if mult and e then
-							local how = e < -0.3 and string.format("catching up, %.1f steps behind the leader", -e)
-								or e > 0.3 and string.format("easing off, %.1f steps ahead of the leader", e)
-								or "in step with the leader"
-							paceTxt = string.format("   |  this game: %sx  %s", mult, how)
-						else
-							paceTxt = "   |  this game: " .. pace
-						end
-					elseif CM.isLeader and CM.isLeader() then
-						paceTxt = "   |  this game leads the clock"
-					end
-					D.speedText:setText(string.format("session speed: %s%s%s%s%s   ", eff and string.format("%gx", eff) or "-",
-						(req and req ~= "-") and "  (set by /speed in chat; the host's speed buttons or /speed off take it back)" or "  (the host's speed buttons)",
-						paceTxt,
-						(sync and sync ~= "-") and ("  SYNC: " .. sync) or "",
-						(xfer and xfer ~= "-") and ("  SAVE: " .. xfer) or ""))
 					if D.coText and mine then
 						local roster = {}
 						for id in tostring(mine.roster or ""):gmatch("%d+") do roster[#roster + 1] = tonumber(id) end

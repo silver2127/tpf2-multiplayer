@@ -81,15 +81,13 @@ list while it is up.
 ### The Multiplayer window
 
 A small **Multiplayer** window sits at the top left. **Ctrl+Shift+D** hides and shows it. Its
-buttons toggle four sections:
+buttons toggle three sections:
 
 - **stats** (hidden at first): a column per player with game time, skew, speed, queued and
   late commands, desyncs, apply lag, vehicle drift and balance, plus the **verdict**: `SYNC`
   while the worlds agree, `DESYNC ...` naming what differs.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
-- **speed** (hidden at first): the **session speed**, then what your own game is doing to stay in step ("in
-  step with the leader", "catching up", "easing off", or "this game leads the clock").
 
 ### Speed and pause
 
