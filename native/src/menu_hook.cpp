@@ -988,7 +988,12 @@ static void RenderPanelLayer(int w, int h)
         layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
         mwHeader(lx, cy, colW, L"HOST A GAME");
         mwBody(lx, cy + S(24), colW, S(36), L"Opens a lobby and shares your newest save with everyone who joins.");
-        { ensureUsername(); char def[64]; snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
+        // NOT ensureUsername() here: this runs every frame, so emptying the name
+        // field made the next frame roll a new random name before anything could be
+        // typed (2026-09-11). An empty name is filled only on HOST/JOIN or Enter.
+        { char def[64];
+          if (g_username[0]) snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
+          else snprintf(def, sizeof(def), "Your game  (click to name the lobby)");
           wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
           mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
         { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
