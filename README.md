@@ -1,6 +1,10 @@
-# tpf2-multiplayer
+# TpF2 Multiplayer
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+**Website: [silver2127.github.io/tpf2-multiplayer](https://silver2127.github.io/tpf2-multiplayer/)** ·
+[Download](https://github.com/silver2127/tpf2-multiplayer/releases/latest) ·
+[Privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html)
 
 **Multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Several players build in one
 world at the same time: the roads, track, stations, depots, vehicles and lines one player makes
