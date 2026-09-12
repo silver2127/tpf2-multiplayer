@@ -794,7 +794,12 @@ function CM.execEdgeDemolish(c)
 		local sp = api.type.SimpleProposal.new()
 		for i, eid in ipairs(rmList) do sp.streetProposal.edgesToRemove[i] = eid end
 		for i, nid in ipairs(orphans) do sp.streetProposal.nodesToRemove[i] = nid end
-		local cmd = api.cmd.make.buildProposal(sp, nil, true)
+		-- Removing the last rail at a road crossing also needs the engine to
+		-- clean up the surviving shared node. Orphan removal alone is not
+		-- enough: without graph cleanup both peers reject the rail stub.
+		local ctx = api.type.Context.new()
+		ctx.cleanupStreetGraph = true
+		local cmd = api.cmd.make.buildProposal(sp, ctx, true)
 		if not cmd then
 			log(string.format("EDEMO seq=%s: buildProposal returned nil", tostring(c.seq)))
 			return
