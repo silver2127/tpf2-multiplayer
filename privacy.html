@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy policy — TpF2 Multiplayer</title>
+<meta name="description" content="What TpF2 Multiplayer sends over the network, to whom, and what the project's servers keep.">
+<link rel="canonical" href="https://silver2127.github.io/tpf2-multiplayer/privacy.html">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="wrap">
+  <p class="eyebrow"><a href="./">TpF2 Multiplayer</a></p>
+  <h1>Privacy policy</h1>
+  <p class="lede">TpF2 Multiplayer has no telemetry, analytics, advertising or update checks. It sends data over the
+  network only for the multiplayer features you use. This page lists every one of them.</p>
+  <p>Last updated: 12 September 2026. Changes to this page are visible in the
+  <a href="https://github.com/silver2127/tpf2-multiplayer/commits/gh-pages">site's commit history</a>.</p>
+</header>
+
+<main class="wrap">
+  <section>
+    <h2>Who is responsible</h2>
+    <p>TpF2 Multiplayer is an open-source project run by an individual maintainer
+    (<a href="https://github.com/silver2127">silver2127</a> on GitHub). The project runs one server, which hosts the
+    public games list, the connection helper, a dedicated relay and the desync report receiver. Questions or requests
+    about your data: open an issue on <a href="https://github.com/silver2127/tpf2-multiplayer/issues">GitHub</a>.</p>
+  </section>
+
+  <section>
+    <h2>Playing with other players</h2>
+    <p>When you host or join a game, your computer exchanges data with the other players in that session (directly, or
+    through the host or a relay):</p>
+    <ul>
+      <li><strong>Your player name</strong>, the lobby name, your company choice and your chat messages.</li>
+      <li><strong>Game commands</strong>: what you build, buy and change in the game.</li>
+      <li><strong>Network addresses.</strong> Players' public and local IP addresses and ports are shared with everyone in
+      the session so the games can connect to each other.</li>
+      <li><strong>The world save.</strong> The host sends the save file to every player.</li>
+      <li><strong>Diagnostic logs.</strong> While you are in a session, your lobby and game logs are sent to the host
+      automatically, so problems can be investigated. The host's computer stores them in a log file. IPv4 addresses in the
+      lobby's own log are shortened; the game logs are not filtered.</li>
+    </ul>
+    <p>Game traffic is encrypted with a key taken from the join code (and the lobby password, if one is set). The save
+    file transfer is not encrypted; its integrity is checked with checksums sent over the encrypted channel.</p>
+    <p><strong>Join codes.</strong> A join code without a lobby password contains the host's IP address. Share it only with
+    people you want to play with, or set a lobby password: a password-locked code is encrypted.</p>
+  </section>
+
+  <section>
+    <h2>Services that help players connect</h2>
+    <div class="table-scroll">
+    <table>
+      <tr><th>Service</th><th>When</th><th>What is sent</th><th>What is kept</th></tr>
+      <tr>
+        <td>Public games list (project server)</td>
+        <td>While the Multiplayer host/join page is open, the list is fetched every 10 seconds. If you host with
+        <strong>PUBLIC</strong> ticked (off by default), your game is announced every 10 seconds.</td>
+        <td>Fetching: a normal web request. Announcing: the lobby name (by default "&lt;your player name&gt;'s game"), the join
+        code, the player count, the version and whether a password is set. A public game without a password therefore
+        publishes the host's IP address inside its code.</td>
+        <td>Listings are held in memory only and disappear 30 seconds after the last announcement, or at once when you stop
+        hosting.</td>
+      </tr>
+      <tr>
+        <td>Connection helper (project server)</td>
+        <td>When a direct connection is slow to start, a joining player leaves a note for the host, and a host checks for
+        notes during the session.</td>
+        <td>The joining player's network addresses, encrypted with a key only the players in the session have. The server
+        cannot read the note.</td>
+        <td>In memory only, for 60 seconds.</td>
+      </tr>
+      <tr>
+        <td>STUN servers (Google, Cloudflare, Nextcloud, Mozilla)</td>
+        <td>When you host or join.</td>
+        <td>A standard STUN request, which lets the game learn its public address. These servers see your IP address.</td>
+        <td>Governed by those providers' own policies.</td>
+      </tr>
+      <tr>
+        <td>Your router (UPnP)</td>
+        <td>When you host.</td>
+        <td>A request on your local network to open the game's port.</td>
+        <td>The port mapping is removed when the lobby closes.</td>
+      </tr>
+    </table>
+    </div>
+    <p>Every web request to the project server is made over HTTPS. Like any web server, it can record the IP address of
+    requests in its access logs.</p>
+  </section>
+
+  <section>
+    <h2>Dedicated relays</h2>
+    <p>If you join a dedicated relay from the public games list, all of the session's data passes through that relay:
+    player names, chat, game commands, logs and the world save. The relay's operator holds the session key and can read
+    this data. On the project's own relay:</p>
+    <ul>
+      <li>the most recent world save uploaded by the session's leader is stored until the leader starts a new world
+      (<code>/new</code>) or a newer save replaces it;</li>
+      <li>which instance letter and company each player name had is stored so returning players keep them;</li>
+      <li>the session log, including the logs forwarded by players, is kept until the relay restarts.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Desync reports</h2>
+    <p>When the game notices that the players' worlds no longer match, it can send a report so the bug can be fixed.
+    <strong>By default it asks first</strong>, offering <em>Always send</em>, <em>Only this once</em> and <em>Never</em>. You can
+    change the choice at any time by typing <code>/desynclogs ask</code>, <code>/desynclogs always</code> or
+    <code>/desynclogs never</code> in the in-game chat. At most one report is sent per session.</p>
+    <p><strong>What a report contains:</strong> the multiplayer logs and runtime files from
+    <code>%LOCALAPPDATA%\tpf2mp\data</code>, the game's log (<code>stdout.txt</code>), the game's settings file (including
+    your list of enabled mods), a few multiplayer configuration files from the game folder, and the multiplayer version,
+    your Windows version and details of the desync.</p>
+    <p><strong>What is removed first:</strong> your Windows user name, computer name and profile folder name, your Steam
+    account ID, all IP addresses, and join codes.</p>
+    <p><strong>What is not removed:</strong> player names, lobby names, chat messages and game content. In versions up to
+    0.4.18, a company password typed in the in-game Multiplayer window can also be included in plain text; do not reuse a
+    password there that you use anywhere else.</p>
+    <p><strong>What the server keeps:</strong> the report archive and its details, without your IP address. Your IP address
+    is held in memory for up to an hour for rate limiting. Reports are kept for investigating bugs; the oldest are deleted
+    automatically once they take up more than 2 GB. To have a report deleted, open an issue on GitHub with the time it was
+    sent.</p>
+  </section>
+
+  <section>
+    <h2>What stays on your computer</h2>
+    <p>The multiplayer logs, crash-log archives and settings in <code>%LOCALAPPDATA%\tpf2mp</code>, the lobby's logs in the
+    game's <code>netpunch</code> folder, and your saved player and lobby names stay on your computer. Nothing reads them
+    except the features above; you can delete them at any time.</p>
+  </section>
+
+  <section>
+    <h2>Your choices</h2>
+    <ul>
+      <li>Set <code>/desynclogs never</code> to never send desync reports.</li>
+      <li>Set a lobby password so your join code does not reveal your IP address.</li>
+      <li>Leave <strong>PUBLIC</strong> unticked to keep your game off the public list.</li>
+      <li>Play only with people you trust: players in a session see each other's IP addresses, chat and logs.</li>
+      <li>Uninstall the software to stop all of the above.</li>
+    </ul>
+  </section>
+</main>
+
+<footer class="wrap">
+  <p><a href="./">TpF2 Multiplayer</a> is an unofficial fan project, not affiliated with or endorsed by Urban Games.
+  · <a href="https://github.com/silver2127/tpf2-multiplayer">Source code</a></p>
+</footer>
+</body>
+</html>

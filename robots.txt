@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://silver2127.github.io/tpf2-multiplayer/sitemap.xml
