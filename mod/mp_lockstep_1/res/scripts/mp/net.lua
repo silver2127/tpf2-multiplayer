@@ -638,8 +638,25 @@ function CM.gapHoldNeed(now)
 			local top = math.max(r.maxSeq or 0, r.advMax or 0)
 			local topAt = r.stamp and r.stamp[top]
 			for g = (r.firstSeq or 0) + 1, top do
+				local pastGrace = CM.ticks - (r.missSince[g] or CM.ticks) >= K.GAP_HOLD_GRACE_TICKS
+				if not pastGrace and not r.seen[g] then
+					-- NO GRACE WHEN IT IS DUE NOW. The grace lets a reordered packet land
+					-- without a stop, but the sim keeps stepping meanwhile. Relay session
+					-- 2026-09-11: b's 53 and 55 arrived together on the tick a applied 53;
+					-- 54 (same stamp as 53) was missing, the hold engaged a tick later at
+					-- step 9281, and 54 applied one step late -- the calendar ran a step
+					-- longer on a, and the worlds split. The nearest command we HOLD above
+					-- the gap bounds it: due this step or the next, stop now.
+					for s = g + 1, top do
+						local sa = r.seen[s] and r.stamp and r.stamp[s]
+						if sa then
+							if CM.stepOf(sa) <= nowStep + 1 then pastGrace = true end
+							break
+						end
+					end
+				end
 				if not r.seen[g] and (r.nackN[g] or 0) < K.NACK_MAX and not (r.holdDone and r.holdDone[g])
-				   and CM.ticks - (r.missSince[g] or CM.ticks) >= K.GAP_HOLD_GRACE_TICKS then
+				   and pastGrace then
 					local at = r.stamp and r.stamp[g]
 					if at then
 						if CM.stepOf(at) >= nowStep and at - now <= engage then
@@ -796,6 +813,9 @@ local function onLine(line)
 		if c then
 			-- track the origin's sequence for gap detection + resend
 			if c.origin and c.seq then pcall(CM.rxNote, c.origin, c.seq) end
+			-- and its stamp: a gap below a command we hold is urgent when that command is
+			-- due now (CM.gapHoldNeed)
+			if c.origin and c.seq and c.at and c.origin ~= K.INSTANCE then pcall(CM.rxStampNote, c.origin, c.seq, c.at) end
 			-- a resent command may arrive after its stamp; it still executes
 			-- (LATE) so the entity exists and the world converges
 			if not c.hist and c.origin ~= K.INSTANCE and CM.rx[c.origin] and CM.rx[c.origin].nackN and CM.rx[c.origin].nackN[c.seq] then

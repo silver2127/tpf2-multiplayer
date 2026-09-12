@@ -248,6 +248,11 @@ r = rx(h, missing_age=0, stamp2=50.4)
 check("inside the grace: no hold", h.CM.gapHoldNeed(50.0) is None)
 r = rx(h, stamp2=50.4, nack=10)
 check("out of NACKs: no hold", h.CM.gapHoldNeed(50.0) is None)
+# the relay case: 53 applied, 55 held and due next step, 54 missing with no stamp, gap just seen
+r = rx(h, missing_age=0, stamp3=50.2)
+check("inside the grace but the command above it is due next step: hold now", h.CM.gapHoldNeed(50.0) is not None)
+r = rx(h, missing_age=0, stamp3=51.0)
+check("inside the grace and the command above it is not due yet: wait out the grace", h.CM.gapHoldNeed(50.0) is None)
 
 L, h = runtime()
 h_lua = L
