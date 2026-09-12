@@ -1460,6 +1460,55 @@ function CM.execPolyline(c, planOnly)
 								end
 								CM.cmLog("XING: errorState fields: " .. table.concat(ef, " | "))
 							end)
+							-- COLLISIONS live beside errorState, in collisionInfo, not in it.
+							-- A critical refusal with an empty message list (parallel track
+							-- at a level crossing, 2026-09-11: a proposal identical to the
+							-- originator's native one, node for node and tangent for tangent)
+							-- left nothing to go on. Name every colliding entity: kind,
+							-- position, and for an edge its end nodes.
+							pcall(function()
+								local ci = pd.collisionInfo
+								if not ci then CM.cmLog("XING: collisionInfo: absent"); return end
+								local function list(v)
+									local out = {}
+									if v == nil then return out end
+									pcall(function() for j = 1, 32 do local x = v[j]; if x == nil then break end; out[#out + 1] = x end end)
+									if #out == 0 then pcall(function() for _, x in pairs(v) do out[#out + 1] = x; if #out >= 32 then break end end end) end
+									return out
+								end
+								local function describe(id)
+									local d = tostring(id)
+									pcall(function()
+										local n = tonumber(id)
+										if not n then return end
+										local be = api.engine.getComponent(n, api.type.ComponentType.BASE_EDGE)
+										if be then
+											local tr = api.engine.getComponent(n, api.type.ComponentType.BASE_EDGE_TRACK) ~= nil
+											local p0, p1 = CM.nodePosXYZ(be.node0), CM.nodePosXYZ(be.node1)
+											d = string.format("%d=%s edge %d->%d (%.1f,%.1f,%.2f)-(%.1f,%.1f,%.2f)", n, tr and "TRACK" or "street",
+												be.node0, be.node1, p0 and p0[1] or 0, p0 and p0[2] or 0, p0 and p0[3] or 0,
+												p1 and p1[1] or 0, p1 and p1[2] or 0, p1 and p1[3] or 0)
+											return
+										end
+										local p = CM.nodePosXYZ(n)
+										if p then d = string.format("%d=node (%.1f,%.1f,%.2f)", n, p[1], p[2], p[3]); return end
+										local co = api.engine.getComponent(n, api.type.ComponentType.CONSTRUCTION)
+										if co then d = string.format("%d=construction %s (%.1f,%.1f)", n, tostring(co.fileName), co.transf[13], co.transf[14]) end
+									end)
+									return d
+								end
+								for _, k in ipairs({ "collisionEntities", "autoRemovalEntity2models", "fieldEntities", "buildingEntities" }) do
+									local v = nil; pcall(function() v = ci[k] end)
+									local items = list(v)
+									local parts = {}
+									for _, x in ipairs(items) do
+										local id = x
+										if type(x) == "table" or type(x) == "userdata" then pcall(function() id = x.entity or x[1] or x end) end
+										parts[#parts + 1] = describe(id)
+									end
+									CM.cmLog(string.format("XING: collisionInfo.%s (%d): %s", k, #items, table.concat(parts, " ; ")))
+								end
+							end)
 							pcall(function()
 								for i, n in ipairs(addNodes) do
 									local p = n.comp.position
