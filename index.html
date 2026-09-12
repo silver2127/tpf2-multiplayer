@@ -6,10 +6,13 @@
 <title>TpF2 Multiplayer — open-source multiplayer for Transport Fever 2</title>
 <meta name="description" content="TpF2 Multiplayer is a free, open-source mod that adds real multiplayer to Transport Fever 2: several players build roads, railways, stations and lines in one shared world at the same time.">
 <link rel="canonical" href="https://silver2127.github.io/tpf2-multiplayer/">
+<link rel="icon" href="assets/tfmp.svg" type="image/svg+xml">
 <meta property="og:title" content="TpF2 Multiplayer">
 <meta property="og:description" content="Open-source multiplayer for Transport Fever 2.">
 <meta property="og:url" content="https://silver2127.github.io/tpf2-multiplayer/">
+<meta property="og:image" content="https://silver2127.github.io/tpf2-multiplayer/assets/world-1400.jpg">
 <meta property="og:type" content="website">
+<link rel="preload" href="assets/fonts/barlow-condensed-700.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="style.css">
 <script type="application/ld+json">
 {
@@ -23,80 +26,188 @@
   "url": "https://silver2127.github.io/tpf2-multiplayer/",
   "downloadUrl": "https://github.com/silver2127/tpf2-multiplayer/releases/latest",
   "codeRepository": "https://github.com/silver2127/tpf2-multiplayer",
+  "image": "https://silver2127.github.io/tpf2-multiplayer/assets/world-1400.jpg",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" }
 }
 </script>
 </head>
 <body>
-<header class="wrap">
-  <p class="eyebrow">Open source · MIT license · Windows</p>
-  <h1>TpF2 Multiplayer</h1>
-  <p class="lede">Real multiplayer for <strong>Transport Fever 2</strong>. Several players build in one world at the
-  same time: the roads, railways, stations, depots, vehicles and lines one player makes appear for everyone,
-  applied at the same moment of the simulation on every computer.</p>
-  <p class="actions">
-    <a class="btn primary" href="https://github.com/silver2127/tpf2-multiplayer/releases/latest">Download the installer</a>
-    <a class="btn" href="https://github.com/silver2127/tpf2-multiplayer">Source code on GitHub</a>
-  </p>
+
+<header class="topbar">
+  <div class="container">
+    <a class="brand" href="./"><img src="assets/tfmp.svg" alt="" width="34" height="34"><span>TpF2 Multiplayer</span></a>
+    <nav class="topnav" aria-label="Site">
+      <a href="#how-it-works">How it works</a>
+      <a href="#download">Download</a>
+      <a href="privacy.html">Privacy</a>
+      <a href="https://github.com/silver2127/tpf2-multiplayer">GitHub</a>
+    </nav>
+  </div>
 </header>
 
-<main class="wrap">
-  <section>
-    <h2>What it does</h2>
-    <ul class="grid">
-      <li><h3>Build together</h3><p>Everything a player builds or changes is sent to everyone and applied at the same simulation step on every machine, including the player's own.</p></li>
-      <li><h3>One company or several</h3><p>Play a single shared company, or separate companies with their own money on the same map.</p></li>
-      <li><h3>Host or join from the title menu</h3><p>A Multiplayer panel on the game's title menu hosts a game, joins with a code, or lists public games. A dedicated relay works when nobody can open a port.</p></li>
-      <li><h3>Stays in sync</h3><p>Everyone starts from the same save, and a detector keeps comparing the worlds so a difference is noticed at once.</p></li>
-    </ul>
+<section class="hero">
+  <img class="hero-image" src="assets/world-1400.jpg"
+       srcset="assets/world-1400.jpg 1400w, assets/world-2400.jpg 2400w" sizes="100vw"
+       alt="A large Transport Fever 2 map with towns, roads and industries" width="1400" height="789">
+  <div class="container">
+    <img class="hero-mark" src="assets/tfmp.svg" alt="TFMP logo" width="96" height="96">
+    <h1>Build one world,<br><em>together.</em></h1>
+    <p class="lede">TpF2 Multiplayer adds real multiplayer to Transport Fever 2. Everyone in the session builds in the
+    same world at the same time, and every road, station, vehicle and line appears for all players at once.</p>
+    <div class="buttons">
+      <a class="button solid" href="https://github.com/silver2127/tpf2-multiplayer/releases/latest">Download installer</a>
+      <a class="button ghost" href="https://github.com/silver2127/tpf2-multiplayer">View source</a>
+    </div>
+    <p class="facts">Free and open source (MIT) · Windows, Steam version of the game · Experimental</p>
+  </div>
+</section>
+
+<main>
+  <section class="section">
+    <div class="container">
+      <h2>What you can do</h2>
+      <p class="intro">It is the game you already know, with friends in it. No separate client, no dedicated server to rent.</p>
+      <div class="points">
+        <div>
+          <h3>Build side by side</h3>
+          <p>Lay track, draw roads, place stations and depots, buy vehicles and set up lines. Everyone sees the result
+          the moment it happens.</p>
+        </div>
+        <div>
+          <h3>Share a company, or compete</h3>
+          <p>Run one company together with one bank balance, or give each player their own company and money on the
+          same map.</p>
+        </div>
+        <div>
+          <h3>Start from the title menu</h3>
+          <p>Host a game and send the code, join a friend's, or pick one from the public list. A relay server helps when
+          nobody can open a port.</p>
+        </div>
+      </div>
+    </div>
   </section>
 
-  <section>
-    <h2>How it works</h2>
-    <p>Transport Fever 2 has no network code, so TpF2 Multiplayer adds lockstep multiplayer from outside the game.
-    A small forwarding DLL loads the project's DLLs when the game starts: one captures each command a player issues
-    and holds it back, one carries commands between the game and a separate lobby program, and one draws the
-    Multiplayer panel. A game-script mod stamps every command with a future simulation step and replays it on every
-    machine at that step. The lobby handles connecting players, NAT traversal, encryption and sending the save.
-    The <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/docs/ARCHITECTURE.md">architecture document</a>
-    has the details.</p>
+  <section class="section" id="how-it-works">
+    <div class="container">
+      <h2>How a click reaches everyone</h2>
+      <p class="intro">Transport Fever 2 has no network code, so the mod keeps every copy of the world identical instead:
+      the same commands, applied at the same moment of the simulation, on every computer.</p>
+      <figure class="figure">
+        <div class="scroll">
+        <svg viewBox="0 0 960 300" role="img" aria-labelledby="dg-title dg-desc">
+          <title id="dg-title">A command travelling from player A to players B and C</title>
+          <desc id="dg-desc">Player A builds a road. The game holds the command back and sends it to players B and C, who
+          receive it shortly after. All three games apply it at the same simulation step.</desc>
+          <line class="dg-axis" x1="120" y1="272" x2="930" y2="272"/>
+          <text class="dg-note" x="930" y="292" text-anchor="end">simulation time →</text>
+
+          <text class="dg-label" x="24" y="77">Player A</text>
+          <text class="dg-label" x="24" y="157">Player B</text>
+          <text class="dg-label" x="24" y="237">Player C</text>
+          <line class="dg-track" x1="130" y1="70" x2="920" y2="70"/>
+          <line class="dg-track" x1="130" y1="150" x2="920" y2="150"/>
+          <line class="dg-track" x1="130" y1="230" x2="920" y2="230"/>
+
+          <line class="dg-held" x1="250" y1="70" x2="690" y2="70"/>
+          <text class="dg-note" x="480" y="56" text-anchor="middle">held back on A's own game too</text>
+
+          <path class="dg-msg" d="M 250 78 C 330 110 390 130 452 146"/>
+          <polygon class="dg-arrow" points="458,148 446,149 451,139"/>
+          <path class="dg-msg" d="M 250 78 C 340 150 440 205 522 226"/>
+          <polygon class="dg-arrow" points="528,228 516,229 521,219"/>
+
+          <circle class="dg-click" cx="250" cy="70" r="10"/>
+          <text class="dg-note" x="250" y="44" text-anchor="middle">A builds a road</text>
+          <rect class="dg-recv" x="456" y="141" width="18" height="18" rx="3"/>
+          <text class="dg-note" x="465" y="182" text-anchor="middle">received</text>
+          <rect class="dg-recv" x="526" y="221" width="18" height="18" rx="3"/>
+          <text class="dg-note" x="535" y="262" text-anchor="middle">received</text>
+
+          <line class="dg-step" x1="700" y1="28" x2="700" y2="262"/>
+          <text class="dg-steplabel" x="712" y="36">the agreed step</text>
+          <circle class="dg-apply" cx="700" cy="70" r="12"/>
+          <circle class="dg-apply" cx="700" cy="150" r="12"/>
+          <circle class="dg-apply" cx="700" cy="230" r="12"/>
+          <text class="dg-note" x="724" y="104">the road appears in all three worlds</text>
+        </svg>
+        </div>
+        <figcaption>Each action is stamped with a simulation step a moment in the future and sent to every player. Every
+        game, the player's own included, applies it at exactly that step, so the worlds never drift apart. A checker keeps
+        comparing them, and the in-game Multiplayer window shows whether they match.</figcaption>
+      </figure>
+      <p style="margin-top:28px">Under the hood, a small DLL loads alongside the game, captures each command before it
+      applies, and hands it to a game-script mod that replays it on schedule. A separate lobby program connects the
+      players, encrypts their traffic and sends the save. The
+      <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/docs/ARCHITECTURE.md">architecture notes</a>
+      go into detail.</p>
+    </div>
   </section>
 
-  <section id="download">
-    <h2>Download</h2>
-    <p>Get <code>TpF2Multiplayer.msi</code> from the
-    <a href="https://github.com/silver2127/tpf2-multiplayer/releases/latest">latest release on GitHub</a>, close the game,
-    and run it. Every player in a session needs the same version. Requirements: Transport Fever 2 on Steam for Windows.</p>
-    <p>Each release lists the installer's SHA-256 checksum in its notes. To uninstall, use
-    <em>Settings → Apps → TpF2 Multiplayer → Uninstall</em>; the game's original files are put back.</p>
-    <p>Guides: <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/docs/PLAYING.md">playing and hosting</a> ·
-    <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/docs/KNOWN_ISSUES.md">known issues</a> ·
-    <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/installer/README.md">what the installer changes</a></p>
+  <section class="section" id="download">
+    <div class="container">
+      <h2>Download and play</h2>
+      <div class="download-grid">
+        <div>
+          <ol class="steps">
+            <li><strong>Download <code>TpF2Multiplayer.msi</code></strong> from the latest GitHub release. Everyone in a
+            session needs the same version.</li>
+            <li><strong>Close the game and run the installer.</strong> It finds Transport Fever 2 through Steam and adds the
+            multiplayer files and mod.</li>
+            <li><strong>Host or join.</strong> On the title menu, open <em>Multiplayer</em>. The host shares the code; friends
+            paste it and join, then everyone loads the shared save.</li>
+          </ol>
+          <p class="notice">This is an unofficial, experimental project. Sessions of up to four players have been played, on
+          one PC and across the internet. Keep backups of your saves and read the
+          <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/docs/KNOWN_ISSUES.md">known issues</a> first.</p>
+        </div>
+        <aside class="panel" aria-label="Release details">
+          <dl>
+            <dt>Latest release</dt>
+            <dd><a href="https://github.com/silver2127/tpf2-multiplayer/releases/latest">GitHub releases</a>, with the
+            installer's SHA-256 checksum in the notes</dd>
+            <dt>Requirements</dt>
+            <dd>Transport Fever 2 on Steam, Windows 10 or 11</dd>
+            <dt>Uninstall</dt>
+            <dd>Settings → Apps → TpF2 Multiplayer. The game's original files are put back.</dd>
+            <dt>Guides</dt>
+            <dd><a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/docs/PLAYING.md">Hosting, joining and troubleshooting</a></dd>
+          </dl>
+          <a class="button solid" href="https://github.com/silver2127/tpf2-multiplayer/releases/latest">Get the installer</a>
+        </aside>
+      </div>
+    </div>
   </section>
 
-  <section id="code-signing">
-    <h2>Code signing policy</h2>
-    <p>This project has applied to the <a href="https://signpath.org/">SignPath Foundation</a> for free code signing of
-    its Windows installer and DLLs. Once approved, releases will carry: <em>Free code signing provided by
-    <a href="https://about.signpath.io/">SignPath.io</a>, certificate by <a href="https://signpath.org/">SignPath Foundation</a>.</em>
-    Until then, releases are unsigned; check the SHA-256 checksum in the release notes.</p>
-    <p>Signed files will be built only from this project's public
-    <a href="https://github.com/silver2127/tpf2-multiplayer">source repository</a>, by its automated build.
-    Committers and approvers: the project maintainer (<a href="https://github.com/silver2127">silver2127</a>).
-    Every signing request is approved by the maintainer.</p>
-  </section>
-
-  <section id="privacy">
-    <h2>Privacy</h2>
-    <p>TpF2 Multiplayer only sends data over the network for the multiplayer features a player uses. The
-    <a href="privacy.html">privacy policy</a> lists exactly what is sent, where, and what the project's servers keep.</p>
+  <section class="section" id="code-signing">
+    <div class="container narrow">
+      <h2>Code signing policy</h2>
+      <p>This project has applied to the <a href="https://signpath.org/">SignPath Foundation</a> for free code signing of
+      its Windows installer and DLLs. Once approved, releases will carry: <em>Free code signing provided by
+      <a href="https://about.signpath.io/">SignPath.io</a>, certificate by <a href="https://signpath.org/">SignPath Foundation</a>.</em>
+      Until then, releases are unsigned; check the SHA-256 checksum in the release notes before running the installer.</p>
+      <p>Signed files will be built only from this project's public
+      <a href="https://github.com/silver2127/tpf2-multiplayer">source repository</a> by its automated build. Committer and
+      approver: the project maintainer, <a href="https://github.com/silver2127">silver2127</a>, who approves every signing
+      request.</p>
+      <p>The software sends data over the network only for the multiplayer features you use; the
+      <a href="privacy.html">privacy policy</a> lists every one.</p>
+    </div>
   </section>
 </main>
 
-<footer class="wrap">
-  <p>TpF2 Multiplayer is an unofficial fan project. It is not affiliated with or endorsed by Urban Games, the makers of
-  Transport Fever 2. Licensed under the <a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/LICENSE">MIT License</a>.
-  · <a href="privacy.html">Privacy policy</a> · <a href="https://github.com/silver2127/tpf2-multiplayer/issues">Report an issue</a></p>
+<footer class="footer">
+  <div class="container">
+    <img src="assets/tfmp.svg" alt="" width="40" height="40">
+    <div>
+      <p>TpF2 Multiplayer is an unofficial fan project. It is not affiliated with or endorsed by Urban Games, the makers
+      of Transport Fever 2.</p>
+      <p><a href="https://github.com/silver2127/tpf2-multiplayer/blob/main/LICENSE">MIT License</a> ·
+      <a href="privacy.html">Privacy policy</a> ·
+      <a href="https://github.com/silver2127/tpf2-multiplayer/issues">Report an issue</a> ·
+      Headings set in Barlow Condensed (<a href="assets/fonts/OFL.txt">SIL Open Font License</a>)</p>
+    </div>
+  </div>
 </footer>
+
 </body>
 </html>
