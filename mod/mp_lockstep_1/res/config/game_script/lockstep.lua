@@ -1419,6 +1419,12 @@ function data()
 					local chatL = api.gui.layout.BoxLayout.new("VERTICAL")
 					D.chatText = api.gui.comp.TextView.new("chat: (no messages yet)")
 					chatL:addItem(D.chatText)
+					-- The input is CLOSED until the player asks for it (2026-09-12). An
+					-- always-present field kept keyboard focus after a message or a stray
+					-- click, so camera keys went into the chat ("dww", "aaaaaaaaa") and the
+					-- next Enter sent them. Now "type a message" opens it, and Enter (one
+					-- message), Esc, losing focus while empty, or 30 s untouched closes it
+					-- again. A hidden, disabled field cannot take keys.
 					local okI, errI = pcall(function()
 						local mk = api.gui.comp.TextInputField
 						local ok1, inp = pcall(function() return mk.new() end)
@@ -1426,20 +1432,50 @@ function data()
 						D.input = inp
 						pcall(function() D.input:setMinimumSize(api.gui.util.Size.new(280, 26)) end)
 						pcall(function() D.input:setMaximumSize(api.gui.util.Size.new(400, 26)) end)
+						pcall(function() D.input:setMaxLength(190) end)
+						local say = api.gui.layout.BoxLayout.new("HORIZONTAL")
+						say:addItem(api.gui.comp.TextView.new("say: "))
+						say:addItem(D.input)
+						D.sayRow = api.gui.comp.Component.new("mpSay")
+						D.sayRow:setLayout(say)
+						D.sayOpenBtn = toggleBtn("  type a message  ", function() CM.chatOpenInput() end)
+						function CM.chatCloseInput()
+							D.chatOpen = false
+							pcall(function() D.input:setText("", false) end)
+							pcall(function() D.input:setEnabled(false) end)
+							pcall(function() D.sayRow:setVisible(false, false) end)
+							pcall(function() D.sayOpenBtn:setVisible(true, false) end)
+						end
+						function CM.chatOpenInput()
+							D.chatOpen = true
+							D.chatIdleText, D.chatIdleSince = "", os.time()
+							pcall(function() D.input:setText("", false) end)
+							pcall(function() D.input:setEnabled(true) end)
+							pcall(function() D.sayOpenBtn:setVisible(false, false) end)
+							pcall(function() D.sayRow:setVisible(true, false) end)
+							pcall(function() D.input:setFocus() end)
+						end
 						D.input:onEnter(function()
 							local t = D.input:getText()
 							if t and #t > 0 then
 								-- "/desynclogs ..." sets the desync popup's choice here and never reaches the chat
 								if not (CM.desyncLogsCommand and CM.desyncLogsCommand(t)) then CM.chatSend(t) end
-								pcall(function() D.input:setText("", false) end)
 							end
+							CM.chatCloseInput()
 						end)
-						local say = api.gui.layout.BoxLayout.new("HORIZONTAL")
-						say:addItem(api.gui.comp.TextView.new("say: "))
-						say:addItem(D.input)
-						local sayC = api.gui.comp.Component.new("mpSay")
-						sayC:setLayout(say)
-						chatL:addItem(sayC)
+						pcall(function() D.input:onCancel(function() CM.chatCloseInput() end) end)
+						pcall(function()
+							D.input:onFocusChange(function(focused)
+								if focused == false and D.chatOpen then
+									local t = ""
+									pcall(function() t = D.input:getText() or "" end)
+									if t == "" then CM.chatCloseInput() end
+								end
+							end)
+						end)
+						chatL:addItem(D.sayOpenBtn)
+						chatL:addItem(D.sayRow)
+						CM.chatCloseInput()
 					end)
 					if not okI then print("[ls-gui] chat input field unavailable: " .. tostring(errI)) end
 					D.chatBox = api.gui.comp.Component.new("mpChat")
@@ -1508,6 +1544,13 @@ function data()
 					if D.chatText and (guiTick % 30) == 0 then
 						local lines = CM.chatTail(8)
 						if #lines > 0 then D.chatText:setText(table.concat(lines, string.char(10))) end
+					end
+					-- an open chat input nobody has typed into for 30 s closes itself
+					if D.chatOpen and CM.chatCloseInput and (guiTick % 30) == 0 then
+						local t = ""
+						pcall(function() t = D.input:getText() or "" end)
+						if t ~= D.chatIdleText then D.chatIdleText, D.chatIdleSince = t, os.time()
+						elseif os.time() - (D.chatIdleSince or 0) > 30 then CM.chatCloseInput() end
 					end
 				end)
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
