@@ -128,7 +128,10 @@ static const uintptr_t CALLER_LUA_VEHICLE   = 0xceefae;
 // commands froze four games -- and api.cmd.make.setGameSpeed to 0xc17eff.
 static bool IsScriptCaller(uint64_t caller)
 {
-    return (caller >= 0xcec000 && caller < 0xcf2000) || caller == 0xc3848e || caller == 0xc17eff;
+    // 0xc17c79: api.cmd.make.createLine, another gamescriptrep.cpp lambda. Missing
+    // here, every replayed LCREATE came back through the slice as a "UI" create --
+    // an inert event until 2026-09-12, a cancelled replay once CreateLine is strict.
+    return (caller >= 0xcec000 && caller < 0xcf2000) || caller == 0xc3848e || caller == 0xc17eff || caller == 0xc17c79;
 }
 
 static const int ID_BUILDPROPOSAL = 0;
@@ -1341,6 +1344,175 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// STRICT LINE CREATION (2026-09-12).
+//
+// A line the player creates used to exist on their own game one command delay
+// before anyone else's: CreateLine was never cancelled, because both UI callers'
+// completion callbacks (UI::LineList 0x610490, UI::LineManager 0x6154a0) read the
+// new line off the command and assert "resultEntity != ecs::Entity()" when it is
+// empty -- a cancel with the callback fired is a fatal assert. Created early and
+// natively, the line took a different entity id on the originator, entity ids
+// diverged from there, and the worlds split (3-game rig, 2026-09-12: people at the
+// very next sample, then town buildings).
+//
+// Now the UI's CreateLine is decoded (name, colour, component::Line), shipped as
+// LCREATEX behind ARMED 1 and cancelled WITHOUT firing its callback: the callback
+// object is MOVED into a stash instead. At the stamp the originator's Lua replays
+// the create like every peer, after writing lockstep_lclaim_<x>.txt; the factory
+// hook sees that claimed createLine, and the CommandList::Add hook puts the
+// stashed callback in place of the Lua's (the relay's pushed r9 at calleeRsp-0x38,
+// deferrelay_slice.asm). The line editor then gets its real result -- the line
+// created on the same step as everywhere else -- a fraction of a second later.
+static const uintptr_t CALLER_UI_CREATELINE = 0x215c26b;   // line_util, used by both the line list and the line manager
+struct LineCreateDecode { char nameEnc[768]; float rgb[3]; LineDecode line; };
+static LineCreateDecode g_lcDecode;
+static bool g_lcDecodeOk = false;
+struct LcStash { uint8_t* fn; ULONGLONG at; };
+static SRWLOCK g_lcLock = SRWLOCK_INIT;
+static LcStash g_lcStash[8];
+static int g_lcStashN = 0;
+static volatile LONG g_pendingStashCb = 0;        // the pending cancel is a CreateLine: stash its callback at Add
+static volatile LONG64 g_lcCarrierCmd = 0;        // our claimed Lua createLine, whose Add takes the stashed callback
+static uint8_t* g_lcCarrierFn = nullptr;          // the std::function object handed to that Add
+static uint8_t* g_lcSpentFn = nullptr;            // the previous carrier's object, emptied by Add; freed on the next swap
+static long g_lcClaimSeen = 0;
+
+static bool DecodeLineCreate(uint64_t rdx, uint64_t r8, uint64_t st0)
+{
+    g_lcDecodeOk = false;
+    // name: MSVC std::string at rdx (16-byte SSO buffer, size +0x10, capacity +0x18)
+    char name[256] = "";
+    if (!Readable((void*)rdx, 32)) return false;
+    uint64_t len = 0, cap = 0;
+    memcpy(&len, (void*)(rdx + 0x10), 8);
+    memcpy(&cap, (void*)(rdx + 0x18), 8);
+    const char* src = (const char*)rdx;
+    if (cap > 15) { uint64_t ptr = 0; memcpy(&ptr, (void*)rdx, 8); src = (const char*)ptr; }
+    if (len == 0 || len >= sizeof(name) || !src || !Readable((void*)src, (size_t)len + 1)) return false;
+    memcpy(name, src, (size_t)len);
+    name[len] = 0;
+    size_t o = 0;   // percent-encoded like VNAME: the wire splits on whitespace
+    for (size_t i = 0; name[i] && o + 4 < sizeof(g_lcDecode.nameEnc); i++) {
+        unsigned char ch = (unsigned char)name[i];
+        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') g_lcDecode.nameEnc[o++] = (char)ch;
+        else { sprintf(g_lcDecode.nameEnc + o, "%%%02X", ch); o += 3; }
+    }
+    g_lcDecode.nameEnc[o] = 0;
+    // colour: r8 -> three floats
+    if (!Readable((void*)r8, 12)) return false;
+    memcpy(g_lcDecode.rgb, (void*)r8, 12);
+    for (int i = 0; i < 3; i++) if (!(g_lcDecode.rgb[i] >= 0.0f && g_lcDecode.rgb[i] <= 1.0f)) return false;
+    // the line: st[0] -> component::Line, the same layout UpdateLine carries
+    if (!DecodeLine(st0, &g_lcDecode.line)) return false;
+    g_lcDecodeOk = true;
+    return true;
+}
+
+// Move the UI's std::function (0x40 bytes, impl pointer at +0x38) into a heap object
+// of our own, the way MSVC's own move does: a functor stored inside the object is
+// moved with its _Move (vftable +0x08) into ours; a heap impl is taken by pointer.
+static bool StashLineCreateCallback(uint64_t r9)
+{
+    if (!Readable((void*)r9, 0x40)) return false;
+    uint64_t impl = 0;
+    memcpy(&impl, (void*)(r9 + 0x38), 8);
+    if (!impl || !Readable((void*)impl, 8)) return false;
+    uint8_t* buf = (uint8_t*)calloc(1, 0x40);
+    if (!buf) return false;
+    bool ok = false;
+    __try {
+        if (impl == r9) {
+            uint64_t vft = 0, moveFn = 0;
+            memcpy(&vft, (void*)impl, 8);
+            if (vft && Readable((void*)vft, 0x28)) memcpy(&moveFn, (void*)(vft + 0x08), 8);
+            if (moveFn >= g_base && moveFn < g_base + GAME_EXE_SIZEOFIMAGE) {
+                const uint64_t moved = ((uint64_t (*)(uint64_t, uint64_t))moveFn)(impl, (uint64_t)buf);
+                memcpy(buf + 0x38, &moved, 8);
+                ok = moved != 0;
+            }
+        } else {
+            memcpy(buf + 0x38, &impl, 8);
+            const uint64_t zero = 0;
+            memcpy((void*)(r9 + 0x38), &zero, 8);
+            ok = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    if (!ok) { free(buf); return false; }
+    const ULONGLONG now = GetTickCount64();
+    AcquireSRWLockExclusive(&g_lcLock);
+    // a stash no replay claimed within a minute is dropped (leaked, never called)
+    int k = 0;
+    for (int i = 0; i < g_lcStashN; i++) if (now - g_lcStash[i].at < 60000) g_lcStash[k++] = g_lcStash[i];
+    g_lcStashN = k;
+    const bool room = g_lcStashN < (int)(sizeof(g_lcStash) / sizeof(g_lcStash[0]));
+    if (room) { g_lcStash[g_lcStashN].fn = buf; g_lcStash[g_lcStashN].at = now; g_lcStashN++; }
+    ReleaseSRWLockExclusive(&g_lcLock);
+    if (!room) { Log("[slice] CreateLine: stash full -- callback dropped\n"); return false; }
+    return true;
+}
+
+// Our Lua is about to create a line: if it wrote a fresh claim, this createLine is
+// the originator's own replay, and the oldest stashed UI callback rides on its Add.
+static void ClaimLineCreateCarrier(uint64_t rcx)
+{
+    ReadInstance();
+    if (!g_instance[0]) return;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_lclaim_%s.txt", g_dataDir, g_instance);
+    // Fresh claims only: the Lua writes it in the same call that makes this
+    // command, so a claim older than a few seconds is left over (a peer's line
+    // replayed later must not carry our editor's callback).
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const uint64_t wrote = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    const uint64_t now = ((uint64_t)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
+    if (now > wrote && now - wrote > 5ULL * 10000000ULL) return;
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return;
+    long claim = 0;
+    if (fscanf(f, "%ld", &claim) != 1) claim = 0;
+    fclose(f);
+    if (claim <= 0 || claim == g_lcClaimSeen) return;
+    g_lcClaimSeen = claim;
+    uint8_t* fn = nullptr;
+    AcquireSRWLockExclusive(&g_lcLock);
+    if (g_lcStashN > 0) {
+        fn = g_lcStash[0].fn;
+        for (int i = 1; i < g_lcStashN; i++) g_lcStash[i - 1] = g_lcStash[i];
+        g_lcStashN--;
+    }
+    ReleaseSRWLockExclusive(&g_lcLock);
+    if (!fn) { Log("[slice] CreateLine: claim %ld but no held callback -- the replay runs with the Lua's own\n", claim); return; }
+    if (g_lcCarrierFn) Log("[slice] CreateLine: a previous carrier never reached Add -- its callback is dropped\n");
+    g_lcCarrierFn = fn;
+    InterlockedExchange64(&g_lcCarrierCmd, (LONG64)rcx);
+    Log("[slice] CreateLine: claim %ld -- our replay cmd=%llx carries the line editor's callback\n", claim, (unsigned long long)rcx);
+}
+
+// At that Add: hand the engine our std::function instead of the Lua's. Checked against
+// the relay frame first: the pushed r9 must be the r9 we were called with.
+static void SwapInLineCreateCallback(uint64_t r9, uint64_t calleeRsp)
+{
+    uint8_t* fn = g_lcCarrierFn;
+    g_lcCarrierFn = nullptr;
+    if (!fn) return;
+    const uint64_t slot = calleeRsp - 0x38;   // deferrelay_slice.asm: push rcx, rdx, r8, r9 from entry rsp = calleeRsp - 0x18
+    uint64_t saved = 0;
+    if (!Readable((void*)slot, 8)) { Log("[slice] CreateLine: relay frame unreadable -- callback not swapped\n"); return; }
+    memcpy(&saved, (void*)slot, 8);
+    if (saved != r9) { Log("[slice] CreateLine: relay frame holds %llx, not r9 %llx -- callback not swapped\n", (unsigned long long)saved, (unsigned long long)r9); return; }
+    if (g_lcSpentFn) free(g_lcSpentFn);
+    const uint64_t v = (uint64_t)fn;
+    memcpy((void*)slot, &v, 8);
+    g_lcSpentFn = fn;
+    Log("[slice] CreateLine: the line editor's callback now rides on our replay\n");
+}
+
 // The buy's completion callback. The depot window's buy and the vehicle manager's
 // CLONE share it: _Do_call 0x753820 runs 0x748250 on the lambda at impl+8, and that
 // lambda's int at +0x30 is the line a clone puts the new vehicle on (SetLine via
@@ -1408,10 +1580,24 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
         fprintf(f, "VLINE %d %d %d\n", (int)(int32_t)r8, (int)(int32_t)r9, (int)(int32_t)st0);
         Log("[slice] VLINE shipped: vehicle=%d line=%d stop=%d\n", (int)(int32_t)r8, (int)(int32_t)r9, (int)(int32_t)st0);
     } else if (fid == 7) {
-        // CreateLine: the new line's content is read back from the entity by
-        // the Lua side once it exists; only the EVENT ships from here.
-        fprintf(f, "LCREATE\n");
-        Log("[slice] LCREATE shipped\n");
+        if (g_lcDecodeOk) {
+            // LCREATEX <r> <g> <b> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n name=<enc>
+            const LineDecode& d = g_lcDecode.line;
+            fprintf(f, "LCREATEX %.4f %.4f %.4f %d %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
+            for (int i = 0; i < d.n; i++) {
+                fprintf(f, " %d %d %d %d %d %d %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
+                        d.st[i].loadMode, d.st[i].minWait, d.st[i].maxWait, d.st[i].nAlt);
+                for (int a = 0; a < d.st[i].nAlt; a++)
+                    fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
+            }
+            fprintf(f, " name=%s\n", g_lcDecode.nameEnc);
+            Log("[slice] LCREATEX shipped: name=%s stops=%d\n", g_lcDecode.nameEnc, d.n);
+        } else {
+            // not decoded: the new line's content is read back from the entity by
+            // the Lua side once it exists; only the EVENT ships from here.
+            fprintf(f, "LCREATE\n");
+            Log("[slice] LCREATE shipped (event only)\n");
+        }
     } else if (fid == 8) {
         if (g_lineDecodeOk) {
             // LUPDATE <line> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n
@@ -1642,6 +1828,10 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
                 f.name, (unsigned long long)caller);
+            if (f.id == 7) {
+                __try { ClaimLineCreateCarrier(rcx); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] CreateLine: claim fault -- ignored\n"); }
+            }
         } else {
             // UpdateLine: decode the Line FIRST. A cancel is only honest when
             // the whole new stop list is on the wire; otherwise ship the event
@@ -1652,6 +1842,16 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_lineDecodeOk = false; }
                 if (!g_lineDecodeOk && cancel) {
                     Log("[slice] UpdateLine: Line decode failed -- NOT cancelled; event ships, peers read back\n");
+                    cancel = false;
+                }
+            }
+            if (f.id == 7) {
+                // CreateLine: strict only when the whole create -- name, colour, line --
+                // is on the wire (never cancel on a failed decode)
+                __try { DecodeLineCreate(rdx, r8, st[0]); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_lcDecodeOk = false; }
+                if (!g_lcDecodeOk && cancel) {
+                    Log("[slice] CreateLine: decode failed -- NOT cancelled; the event ships as before\n");
                     cancel = false;
                 }
             }
@@ -1727,6 +1927,9 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         // through the _Getimpl slot at r9+0x38 (docs/re/COMMANDS.md).
         const bool waitsForResult = (f.id == 2 || f.id == 4);
         InterlockedExchange(&g_pendingNoCb, waitsForResult ? 0 : 1);
+        // CreateLine: suppressed without firing (its callback asserts on an empty
+        // result) -- the Add hook MOVES the callback into the stash for our replay
+        InterlockedExchange(&g_pendingStashCb, f.id == 7 ? 1 : 0);
         InterlockedExchange(&g_pendingHonour, 1);
         Log("[slice] armed cancel: %s cmd=%llx (%s)\n", f.name,
             (unsigned long long)rcx,
@@ -3379,6 +3582,16 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             }
             else if (GetTickCount64() - g_terrainHeldAt > TERRAIN_HOLD_MAX_MS) ReleaseTerrainTool("timeout -- no completion marker arrived");
         }
+        // Our claimed createLine replay: give its Add the line editor's held callback.
+        {
+            const uint64_t lc = (uint64_t)InterlockedCompareExchange64(&g_lcCarrierCmd, 0, 0);
+            if (lc && r8 == lc) {
+                InterlockedExchange64(&g_lcCarrierCmd, 0);
+                __try { SwapInLineCreateCallback(r9, calleeRsp); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] CreateLine: swap fault -- the replay runs with the Lua's callback\n"); }
+                return 0;
+            }
+        }
         // Pointer match first: this runs ~100/sec and almost never matches.
         uint64_t want = (uint64_t)InterlockedCompareExchange64(&g_pendingCmd, 0, 0);
         if (!want || r8 != want) return 0;
@@ -3419,6 +3632,13 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (InterlockedCompareExchange(&g_pendingNoCb, 0, 0)) {
                 InterlockedExchange(&g_pendingNoCb, 0);
                 InterlockedExchange(&g_pendingHonour, 0);
+                if (InterlockedExchange(&g_pendingStashCb, 0)) {
+                    bool held = false;
+                    __try { held = StashLineCreateCallback(r9); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { held = false; }
+                    Log(held ? "[slice] CreateLine: the line editor's callback is held for our replay at the stamp\n"
+                             : "[slice] CreateLine: callback could not be held -- cancelled anyway (ARMED 1 promised the replay); the editor will not select the new line\n");
+                }
                 g_suppressed++;
                 ZeroAddResult(rdx);
                 Log("[slice] CANCEL fire-and-forget (caller_rva=%llx), callback "
@@ -3612,12 +3832,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         // CaptureFactory drops the cancel for any of these whose payload does
         // not read or does not reach the inject file.
         // Never cancelled:
-        //   CreateLine (7)   -- the editor issues UpdateLine(-1) on a cancelled
-        //                       create, which is a fatal assert.
         //   SetColor (13), SetName (14) -- shipped only.
+        // Cancelled, callback MOVED to our replay (STRICT LINE CREATION above):
+        //   CreateLine (7) from line_util only -- firing its callback on a cancelled
+        //                       create is a fatal assert, so it rides on the
+        //                       originator's own replay at the stamp instead.
         const bool luaPath = IsScriptCaller(caller);
         const bool strictId = (id == 2 || id == 3 || id == 4 || id == 5 ||
-                               id == 6 || id == 8 || id == 9 || id == 10);
+                               id == 6 || id == 8 || id == 9 || id == 10) ||
+                              (id == 7 && caller == CALLER_UI_CREATELINE);
         bool cancel = !luaPath && strictId;
         __try {
             CaptureFactory(*f, rcx, rdx, r8, r9, calleeRsp, caller, cancel);

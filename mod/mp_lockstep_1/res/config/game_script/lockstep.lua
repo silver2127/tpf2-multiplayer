@@ -499,7 +499,7 @@ K.JOURNAL_LOAN = 0
 -- a 30,000,000 loan is several ticks of settling.
 K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
-K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LUPDATE = true, LDELETE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
 -- read from the proposal); the originator instead deletes its native copy and
 -- replays, gated by c.cancelled rather than ARMED. See execConX.

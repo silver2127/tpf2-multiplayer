@@ -109,6 +109,30 @@ from a crash or a wedged tool.
    applies the action twice (one click bought two vehicles).
 5. Zero `*out`.
 
+### Moving the callback instead: CreateLine
+
+Neither rule fits the line editor's create. Both UI callbacks, `UI::LineList` `0x610490`
+and `UI::LineManager` `0x6154a0`, check that the command is a CreateLine (tag
+`(*cmd)+0xb18 == 3`) and read the new line off `(*cmd)+0x58`, asserting
+`resultEntity != ecs::Entity()` when it is empty. Firing `done` on a skipped create
+is a fatal assert, and not firing it leaves the create native and one command
+delay early on the clicker, where the line takes a different entity id.
+[DECOMPILED: `line_util` `0x215c180` builds an EMPTY `component::Line` on its stack:
+no stops, `waitingTime` 180.0f at +0x18]
+
+So the slice skips the Add without firing and moves the `std::function` out (the
+small functor through its `_Move` into a 0x40-byte heap copy; a heap impl by taking
+the pointer and nulling `r9+0x38`). At the stamp, the originator's Lua replays the
+create through `api.cmd.make.createLine`, which returns to `0xc17c79`. Before the
+call it writes `lockstep_lclaim_<x>.txt`, so the factory hook knows which command
+is its own. At that command's Add the hook replaces the pushed `r9` in the relay
+frame (`calleeRsp - 0x38`) with the held object. Add moves from it as from any
+`std::function` (decompiled `0x9d2a00`: `_Move` to a local then
+`_Delete_this(impl, false)` for an inline impl; pointer steal and `[7] = 0` for a
+heap one), so the editor gets the real result, created on the same step as
+everywhere else. The Lua's own callback never runs, so the Lua expects the line's
+key when it sends the command. [BUILT, not yet live-tested]
+
 The detour relay (`deferrelay_slice.asm`) preserves rcx, rdx, r8, r9, r10, r11, rax and all
 six volatile xmm registers, restores rsp to its entry value before jumping to the
 trampoline, and spills xmm3 below the callee frame (calleeRsp - 0x78) for the maintenance

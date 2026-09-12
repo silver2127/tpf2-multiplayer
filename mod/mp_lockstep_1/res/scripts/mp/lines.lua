@@ -313,8 +313,10 @@ function CM.pollLineKeys()
 		table.remove(CM.pendingLineCreates, 1)
 		local snap = CM.lineSnapshot(lid)
 		if snap then
+			-- armed=0: this line was created natively here (not decoded, or no live
+			-- session when it was made), so this instance must not create it again
 			CM.scheduleLocal("LCREATE", { name = snap.name, color = snap.color, wait = snap.wait,
-			                           stops = snap.stops, skipOrigin = 1 })
+			                           stops = snap.stops, skipOrigin = 1, armed = 0 })
 			registerLineKey(K.INSTANCE .. ":" .. tostring(CM.seqNo), lid)
 		else
 			knownLines[lid] = true
@@ -426,9 +428,9 @@ local function retryLineDep(c)
 end
 
 function CM.execLine(c)
-	-- LCREATE is never cancelled (the editor's UpdateLine(-1) on a cancelled
-	-- create is a fatal assert), so the originator always skips it. LUPDATE /
-	-- LDELETE replay here too when the slice cancelled them (armed=1).
+	-- LCREATE / LUPDATE / LDELETE replay on the originator too when the slice
+	-- cancelled them (armed=1). A cancelled LCREATE is the line editor's create,
+	-- decoded (LCREATEX); the old read-back path ships armed=0 and is skipped here.
 	if c.origin == K.INSTANCE and (not K.STRICT_OPS[c.op] or tonumber(c.armed or 1) == 0) then
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
 		return
@@ -443,11 +445,33 @@ function CM.execLine(c)
 			local color = api.type.Vec3f.new(tonumber(r) or 0.9, tonumber(g) or 0.2, tonumber(b) or 0.2)
 			local name = CM.unescName(c.name)
 			local key = tostring(c.origin) .. ":" .. tostring(c.seq)
+			local keyed = false
+			local function expectKey()
+				if keyed then return end
+				keyed = true
+				pendingLineKeys[#pendingLineKeys + 1] = { key = key, sig = c.stops, since = CM.gameTime() or 0, company = c.company and tonumber(c.company) or nil }
+			end
+			if c.origin == K.INSTANCE then
+				-- STRICT: the player's own create was cancelled. Claim this createLine so
+				-- the slice hands its Add the line editor's held callback -- which then
+				-- REPLACES ours, so the key is expected now rather than in our callback.
+				-- the slice takes a claim only when it differs from the last one and was
+				-- written seconds ago: seeded from the clock so a reloaded save's first
+				-- claim never repeats the previous session's in the same game process
+				CM.lclaimSeq = (CM.lclaimSeq or (os.time() % 100000000) * 10) + 1
+				pcall(function()
+					local f = io.open(K.BASE .. "lockstep_lclaim_" .. K.INSTANCE .. ".txt", "w")
+					if f then f:write(tostring(CM.lclaimSeq)); f:close() end
+				end)
+				expectKey()
+				log(string.format("EXEC LCREATE seq=%s origin=%s at=%s '%s' stops=%d -- created at the stamp here too (the line editor's callback takes the result)",
+					tostring(c.seq), tostring(c.origin), tostring(c.at), name, n))
+			end
 			api.cmd.sendCommand(api.cmd.make.createLine(name, color, api.engine.util.getPlayer(), lineObj),
 				function(res, success)
 					log(string.format("EXEC LCREATE seq=%s origin=%s at=%s '%s' stops=%d success=%s",
 						tostring(c.seq), tostring(c.origin), tostring(c.at), name, n, tostring(success)))
-					if success then pendingLineKeys[#pendingLineKeys + 1] = { key = key, sig = c.stops, since = CM.gameTime() or 0, company = c.company and tonumber(c.company) or nil } end
+					if success then expectKey() end
 				end)
 		elseif c.op == "LUPDATE" then
 			local lid = CM.lineIdFor(c.key)

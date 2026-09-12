@@ -1001,6 +1001,50 @@ function CM.pollInject()
 				CM.deferVehCap({ kind = "VLINE", id = id, line = line, stop = stop,
 				                 armed = CM.lastArmed or 0, since = CM.gameTime() or 0 })
 
+			elseif o == "LCREATEX" and #w >= 7 then
+				-- A DECODED line creation (slice_hook.cpp, STRICT LINE CREATION):
+				--   LCREATEX <r> <g> <b> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n name=<enc>
+				-- ARMED 1: the UI's create was cancelled, so every instance -- this one
+				-- included -- creates the line at the stamp and the entity lands on the
+				-- same step with the same id everywhere. ARMED 0: it ran natively here;
+				-- read it back once it exists, as the event-only LCREATE always did.
+				local armed = CM.lastArmed or 0
+				local r, g, b = tonumber(w[2]), tonumber(w[3]), tonumber(w[4])
+				local wait, nstops = tonumber(w[5]) or 180, tonumber(w[6]) or 0
+				local nameTok = line:match(" name=(%S+)%s*$")
+				local stops, alts, bad = {}, {}, nil
+				local pos = 7
+				for i = 1, nstops do
+					local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
+					local lm, mn, mx = tonumber(w[pos + 3]) or 0, tonumber(w[pos + 4]) or 0, tonumber(w[pos + 5]) or 180
+					local na = tonumber(w[pos + 6]) or 0
+					pos = pos + 7
+					local al = {}
+					for _ = 1, na do
+						al[#al + 1] = string.format("%d:%d", tonumber(w[pos]) or 0, tonumber(w[pos + 1]) or 0)
+						pos = pos + 2
+					end
+					local x, y
+					if sg then x, y = CM.stationGroupPos(sg) end
+					if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
+					local sx, sy = CM.stationPosInGroup(sg, st)
+					stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y, st, term, lm, mn, mx)
+						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
+					alts[#alts + 1] = table.concat(al, "/")
+				end
+				if armed ~= 1 then
+					CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
+				elseif bad or not (r and g and b) or not nameTok then
+					log(string.format("LCREATE: decoded create REJECTED (%s) -- it was cancelled and is LOST; create the line again",
+						bad or "name or colour unreadable"))
+				else
+					log(string.format("LCREATE: '%s' decoded, %d stop(s) (strict: created at the stamp here too)",
+						CM.unescName(nameTok), #stops))
+					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.4f,%.4f,%.4f", r, g, b),
+					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
+					                           armed = 1 })
+				end
+
 			elseif o == "LCREATE" then
 				CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
 
