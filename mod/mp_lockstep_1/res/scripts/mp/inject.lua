@@ -310,7 +310,42 @@ function CM.pollInject()
 						return index[key]
 					end
 
-					local dropped = 0
+					-- Building below a bridge may include the unchanged bridge span in
+					-- the native capture. ROADE has one network kind for the whole build:
+					-- treating that rail span as another STREET creates a duplicate with
+					-- the wrong kind and bridge model, rejecting the entire proposal.
+					-- Carry a proven unchanged opposite-network bridge separately so the
+					-- replay replaces it with its own type and lets the engine update its
+					-- supports. Simply omitting it leaves a bridge collision. Explicit
+					-- replacements, changed geometry and same-network upgrades stay here.
+					local function unchangedOtherBridge(e)
+						local a, b = e[1], e[2]
+						if a < 0 or b < 0 or e[4] ~= 1 then return false end
+						for _, r in ipairs(rmv) do
+							if (r[1] == a and r[2] == b) or (r[1] == b and r[2] == a) then return false end
+						end
+						local map = CM.netMap(not isTrack)
+						for _, eid in pairs((map and map[a]) or {}) do
+							local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+							if be and be.type == 1 and be.typeIndex == e[5] then
+								local forward = be.node0 == a and be.node1 == b
+								local reverse = be.node0 == b and be.node1 == a
+								if forward or reverse then
+									local t0 = forward and be.tangent0 or be.tangent1
+									local t1 = forward and be.tangent1 or be.tangent0
+									local sign = forward and 1 or -1
+									local ts = { t0.x, t0.y, t0.z, t1.x, t1.y, t1.z }
+									local same = true
+									for k = 1, 6 do
+										if math.abs(sign * ts[k] - e[3][k]) > 0.0001 then same = false; break end
+									end
+									if same then return true end
+								end
+							end
+						end
+						return false
+					end
+					local dropped, bridges = 0, {}
 					local halfNode = {}   -- new node -> true: the engine split an existing edge there
 					for _, e in ipairs(raw) do
 						local a1, a2 = e[1], e[2]
@@ -329,7 +364,12 @@ function CM.pollInject()
 						end
 						local isHalf = (a1 >= 0 and a2 < 0 and isHalfOf(a1, a2))
 						                or (a2 >= 0 and a1 < 0 and isHalfOf(a2, a1))
-						if isHalf then
+						if unchangedOtherBridge(e) then
+							local p1, p2 = realPos(a1), realPos(a2)
+							assert(p1 and p2, "bridge companion endpoints disappeared")
+							bridges[#bridges + 1] = string.format("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d",
+								p1[1], p1[2], p1[3], p2[1], p2[2], p2[3], e[5])
+						elseif isHalf then
 							dropped = dropped + 1
 							halfNode[(a1 < 0) and a1 or a2] = true
 						else
@@ -414,6 +454,9 @@ function CM.pollInject()
 							log(string.format("ROADE: dropped %d split half/halves " ..
 								"-- the peer regenerates them locally", dropped))
 						end
+						if #bridges > 0 then
+							log(string.format("ROADE: preserved %d opposite-network bridge replacement(s)", #bridges))
+						end
 						if #rmpos > 0 or rmskip > 0 then
 							log(string.format("ROADE: %d removal(s) shipped as positions, "
 								.. "%d left to the peer's own split", #rmpos, rmskip))
@@ -428,6 +471,7 @@ function CM.pollInject()
 						-- 'rm=' token would not survive decodeCmd's key=value scan
 						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
 						if #freshV > 0 then sargs.fv = table.concat(freshV, ",") end
+						if #bridges > 0 then sargs.br = table.concat(bridges, ";") end
 						-- carry the bus lane / tram track the slice just decoded, so an
 						-- upgrade that ADDS either one actually reaches the peers (and the
 						-- originator, whose own upgrade was cancelled)
@@ -444,7 +488,7 @@ function CM.pollInject()
 							return CM.execPolyline({ pts = sargs.pts, links = sargs.links,
 								tans = sargs.tans, bt = sargs.bt, etype = sargs.etype,
 								stype = sargs.stype, ttype = sargs.ttype, cat = sargs.cat,
-								rm = sargs.rm, fv = sargs.fv, seq = "plan" }, true)
+								rm = sargs.rm, fv = sargs.fv, br = sargs.br, seq = "plan" }, true)
 						end)
 						if okPlan then
 							-- pcall folds multiple returns; re-run shape: xv is the

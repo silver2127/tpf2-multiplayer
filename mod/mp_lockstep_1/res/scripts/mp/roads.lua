@@ -579,7 +579,10 @@ function CM.execPolyline(c, planOnly)
 
 		local function newNodeAt(x, y, z)
 			nextNew = nextNew + 1
-			local id = base - nextNew
+			-- Keep node placeholders dense and local to this proposal.
+			-- The engine's crossing/cleanup path rejects the same graph when these
+			-- use the large origin/sequence namespace (live parallel-track repro).
+			local id = -nextNew
 			local n = api.type.NodeAndEntity.new()
 			n.entity = id
 			n.comp.position = api.type.Vec3f.new(x, y, z)
@@ -711,11 +714,11 @@ function CM.execPolyline(c, planOnly)
 				if told.kind == "N" then
 					local n = CM.findNodeNear(isTrack, told[1], told[2], 1.5)
 					if not n then
-						-- the other kind: a rail vertex sharing a road node (a crossing)
+						-- A crossing shares a node with the other network.
 						n = CM.findNodeNear(not isTrack, told[1], told[2], 1.5)
 						local npz = n and CM.nodePosXYZ(n)
-						if n and isTrack and (elevatedVertex(i) or (npz and math.abs(npz[3] - told[3]) > K.XING_MAX_DZ)) then
-							CM.cmLog(string.format("PLAN: vertex %d: refusing the planned crossing at road node %d -- over/under", i, n))
+						if n and (elevatedVertex(i) or (npz and math.abs(npz[3] - told[3]) > K.XING_MAX_DZ)) then
+							CM.cmLog(string.format("PLAN: vertex %d: refusing the planned crossing at opposite-network node %d -- over/under", i, n))
 							n = nil
 						end
 					end
@@ -735,9 +738,9 @@ function CM.execPolyline(c, planOnly)
 						-- split at 116.62, 2026-09-11). A rail cannot meet a road it
 						-- passes over or under, whoever planned it.
 						local ez = u and CM.edgeZAt(eid, u)
-						if u and isTrack and onStreet
+						if u and (onStreet == isTrack)
 						   and (elevatedVertex(i) or (ez and math.abs(ez - told[3]) > K.XING_MAX_DZ)) then
-							CM.cmLog(string.format("PLAN: vertex %d: refusing the planned split of road edge %d at z=%.2f (road z=%s) -- over/under, not a crossing",
+							CM.cmLog(string.format("PLAN: vertex %d: refusing the planned split of opposite-network edge %d at z=%.2f (edge z=%s) -- over/under, not a crossing",
 								i, eid, told[3], ez and string.format("%.2f", ez) or "?"))
 							u = nil
 						end
@@ -759,28 +762,25 @@ function CM.execPolyline(c, planOnly)
 				resolved[i] = existing; return existing
 			end
 
-			-- LEVEL CROSSING (rail over road). The build tool splits the RAIL at
-			-- the crossing, so the crossing is always a rail VERTEX sitting on the
-			-- road -- never mid-segment (trace: every hit at rail u=0.00/1.00).
-			-- Same-kind snapping above never sees a road, so the vertex was planted
-			-- as a fresh node 0 m from the road node, unshared => no crossing (seen
-			-- on A and B). For a rail vertex: snap to a STREET node, else split the
-			-- street edge underfoot (road-typed halves) and route through it.
-			-- Only when the two actually MEET: a vertex inside a bridge or tunnel,
-			-- or metres above or below the road, passes over or under it.
-			if isTrack and elevatedVertex(i) then
+			-- LEVEL CROSSINGS work in both build directions. The captured vertex
+			-- belongs to the OTHER network when inject.lua dropped its split halves.
+			-- A road through several tracks needs a separate split for each track;
+			-- leaving these vertices fresh silently builds a disconnected crossing.
+			local crossedIsTrack = not isTrack
+			local crossedKind = crossedIsTrack and "track" or "road"
+			if elevatedVertex(i) then
 				CM.cmLog(string.format("XING: vertex %d is inside a bridge or tunnel -- no level crossing with anything below or above it", i))
-			elseif isTrack then
-				local rnode = CM.findNodeNear(false, x, y, 4.0)
+			else
+				local rnode = CM.findNodeNear(crossedIsTrack, x, y, isTrack and 4.0 or 1.5)
 				local rnp = rnode and CM.nodePosXYZ(rnode)
 				if rnp and math.abs(rnp[3] - z) > K.XING_MAX_DZ then
-					CM.cmLog(string.format("XING: vertex %d is %.2f m %s road node %d -- over/under, not a crossing",
-						i, math.abs(z - rnp[3]), z > rnp[3] and "above" or "below", rnode))
+					CM.cmLog(string.format("XING: vertex %d is %.2f m %s %s node %d -- over/under, not a crossing",
+						i, math.abs(z - rnp[3]), z > rnp[3] and "above" or "below", crossedKind, rnode))
 					rnode = nil
 				end
 				if rnode then
-					log(string.format("ROADP: level crossing -- rail vertex %d shares road node %d", i, rnode))
-					CM.cmLog(string.format("XING: vertex %d snapped to road node %d (%.1f,%.1f)", i, rnode, x, y))
+					log(string.format("ROADP: level crossing -- vertex %d shares %s node %d", i, crossedKind, rnode))
+					CM.cmLog(string.format("XING: vertex %d snapped to %s node %d (%.1f,%.1f)", i, crossedKind, rnode, x, y))
 					-- SHARING A NODE MEANS SHARING ITS HEIGHT, and the road's height
 					-- is not the rail's. Measured 2026-08-31: the shipped vertex sat
 					-- at z=27.17 and the road node 0.8 m away at z=29.20, so the rail
@@ -798,22 +798,22 @@ function CM.execPolyline(c, planOnly)
 						-- The rail vertex takes the road's height instead; if the
 						-- slope is then too steep the engine refuses the build the
 						-- same way on every instance, and the player re-lays it.
-						CM.cmLog(string.format("XING: road node %d is %.2f m off the rail's height -- NOT moving it; the rail meets it at %.2f", rnode, z - rp[3], rp[3]))
+						CM.cmLog(string.format("XING: %s node %d is %.2f m off the new vertex height -- NOT moving it; using %.2f", crossedKind, rnode, z - rp[3], rp[3]))
 						z = rp[3]
 					end
 					planV[#planV + 1] = string.format("%d,N,%.2f,%.2f,%.2f", i, x, y, z)
 					resolved[i] = rnode; return rnode
 				end
 				local reid, ru
-				pcall(function() reid, ru = CM.findEdgeContaining(false, x, y) end)
+				pcall(function() reid, ru = CM.findEdgeContaining(crossedIsTrack, x, y) end)
 				local rz = reid and CM.edgeZAt(reid, ru)
 				if rz and math.abs(rz - z) > K.XING_MAX_DZ then
-					CM.cmLog(string.format("XING: vertex %d is %.2f m %s road edge %d -- over/under, not split",
-						i, math.abs(z - rz), z > rz and "above" or "below", reid))
+					CM.cmLog(string.format("XING: vertex %d is %.2f m %s %s edge %d -- over/under, not split",
+						i, math.abs(z - rz), z > rz and "above" or "below", crossedKind, reid))
 					reid = nil
 				end
 				if reid then
-					local mid = splitEdgeAt(reid, ru, "rail vertex " .. i .. " on road", z)
+					local mid = splitEdgeAt(reid, ru, "vertex " .. i .. " on " .. crossedKind, z)
 					if mid then
 						local sh = splitShape[mid]
 						if sh then planV[#planV + 1] = string.format("%d,S,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f", i, sh[1], sh[2], sh[3], sh[4], sh[5], sh[6], sh[7]) end
@@ -1301,6 +1301,40 @@ function CM.execPolyline(c, planOnly)
 				end
 				addEdges[#addEdges + 1] = e
 				end   -- (no crossings: the original single-edge build)
+			end
+		end
+
+		-- A native build below a bridge also refreshes the existing span. It must
+		-- remain in its own network: ROADE's primary kind belongs to the new road.
+		-- br names these unchanged spans by endpoint positions and bridge model;
+		-- local ids, properties, objects and orientation come from this peer.
+		for entry in tostring(c.br or ""):gmatch("[^;]+") do
+			local f = {}
+			for token in entry:gmatch("[^,]+") do
+				local value = tonumber(token)
+				if not value then error("ROADP: malformed bridge companion") end
+				f[#f + 1] = value
+			end
+			if #f ~= 7 then error("ROADP: malformed bridge companion") end
+			local eid = CM.findEdgeByEnds(not isTrack, f[1], f[2], f[4], f[5], 0.01)
+			local be, p0, p1 = nil, nil, nil
+			if eid then be, p0, p1 = CM.edgeGeomT(eid) end
+			local function matches(p, offset)
+				return p and math.abs(p[1] - f[offset]) < 0.01
+					and math.abs(p[2] - f[offset + 1]) < 0.01 and math.abs(p[3] - f[offset + 2]) < 0.01
+			end
+			if not be or be.type ~= 1 or be.typeIndex ~= f[7]
+				or not ((matches(p0, 1) and matches(p1, 4)) or (matches(p0, 4) and matches(p1, 1))) then
+				error("ROADP: bridge companion no longer matches this world")
+			end
+			if dropEdge(eid) then
+				local e = newEdge()
+				e.comp.node0, e.comp.node1 = be.node0, be.node1
+				e.comp.tangent0, e.comp.tangent1 = be.tangent0, be.tangent1
+				e.comp.objects = be.objects
+				e.type = isTrack and 0 or 1
+				CM.copyEdgeProps(e, eid, not isTrack, nil)
+				addEdges[#addEdges + 1] = e
 			end
 		end
 
