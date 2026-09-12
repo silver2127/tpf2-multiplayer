@@ -92,9 +92,20 @@ CM.bootOk, K.BASE = pcall(function()
 	CM.baseCandidates = {}
 	for _, c in ipairs(cands) do CM.baseCandidates[#CM.baseCandidates + 1] = c.path end
 	for _, c in ipairs(cands) do
-		local f = io.open(c.path .. "tpf2_instance.txt", "r")
-		if f then
-			f:close()
+		-- Each probe in its own pcall. A player with 503 mods crashed the game here
+		-- with the error value "file (0000000000000000)": io.open or close THREW, and
+		-- threw a file handle rather than a message -- the game's script state is shared
+		-- with every mod's game scripts, so io may not be the standard library
+		-- (2026-09-12). A probe that throws just means "not proven here".
+		local okOpen, f = pcall(io.open, c.path .. "tpf2_instance.txt", "r")
+		local isFile = false
+		if okOpen and f then
+			pcall(function() isFile = (io.type == nil) or io.type(f) == "file" end)
+			pcall(function() f:close() end)
+		elseif not okOpen then
+			CM.bootIoError = f
+		end
+		if isFile then
 			CM.baseSource = c.source .. " (identity file found)"
 			return c.path
 		end
@@ -103,13 +114,27 @@ CM.bootOk, K.BASE = pcall(function()
 	local pick
 	for _, c in ipairs(cands) do if c.source == "LOCALAPPDATA" then pick = c end end
 	if not pick then error("LOCALAPPDATA is not readable, and TPF2MP_DATADIR (if set) holds no tpf2_instance.txt", 0) end
+	-- The game's io.open wants UTF-8 and os.getenv hands back ANSI bytes, so a
+	-- profile folder with non-ASCII characters cannot be opened from here. The proxy
+	-- DLL publishes an ASCII TPF2MP_DATADIR for exactly that case (datadir.h); if we
+	-- got this far without it, the DLLs are not running, and nothing would work.
+	if pick.path:find("[\128-\255]") then
+		error("the Windows user folder has non-ASCII characters and the multiplayer DLLs did not publish TPF2MP_DATADIR (reinstall with the installer, and start the game through Steam)", 0)
+	end
 	CM.baseSource = pick.source .. " (no identity file yet)"
 	return pick.path
 end)
 if not CM.bootOk then
-	local msg = "Transport Fever 2 Multiplayer: finding the data folder failed: " .. (tostring(K.BASE):gsub("[\128-\255]", "?"))
-	print("[ls-boot] " .. msg)
-	error(msg, 0)
+	-- NEVER stop the game's load. error() here aborted creating a new game outright
+	-- ("Exception during init", 2026-09-12) for a player with a plain single-player
+	-- setup. The mod switches itself off for this game instead: an empty game
+	-- script, and a line in stdout saying why.
+	local function txt(v) return type(v) .. " " .. (tostring(v):gsub("[\128-\255]", "?")) end
+	print("[ls-boot] Transport Fever 2 Multiplayer: finding the data folder failed: " .. txt(K.BASE)
+		.. " | io=" .. type(io) .. " io.open=" .. type(io and io.open) .. " last io error=" .. txt(CM.bootIoError)
+		.. " -- multiplayer is OFF for this game; everything else loads normally")
+	function data() return {} end
+	return
 end
 print("[ls-boot] data folder " .. (K.BASE:gsub("[\128-\255]", "?")) .. " (" .. tostring(CM.baseSource) .. ")")
 K.IDENTITY_FILE = K.BASE .. "tpf2_instance.txt"
@@ -416,24 +441,32 @@ end
 function CM.bootText(v)
 	return (tostring(v):gsub("[\128-\255]", "?"))
 end
+-- A module that cannot load switches the mod OFF for this game; it never stops the
+-- game's own load (error() here aborted it with "Exception during init"). Later
+-- modules are skipped and the chunk-level code between them indexes a stub that
+-- answers every field with a no-op, so the check before data() can return an
+-- empty game script.
+function CM.bootStub()
+	return setmetatable({}, { __index = function() return function() end end })
+end
+function CM.bootFail(msg)
+	print("[ls-boot] " .. msg)
+	CM.bootFailed = CM.bootFailed or msg
+	return CM.bootStub()
+end
 function CM.boot(name)
+	if CM.bootFailed then return CM.bootStub() end
 	print("[ls-boot] loading " .. name)
 	local ok, factory = pcall(require, name)
 	if not ok then
-		local msg = "Transport Fever 2 Multiplayer: require('" .. name .. "') failed: " .. CM.bootText(factory)
-		print("[ls-boot] " .. msg)
-		error(msg, 0)
+		return CM.bootFail("Transport Fever 2 Multiplayer: require('" .. name .. "') failed: " .. CM.bootText(factory))
 	end
 	if type(factory) ~= "function" then
-		local msg = "Transport Fever 2 Multiplayer: require('" .. name .. "') returned a " .. type(factory) .. ", not the module factory (another mod may have replaced require)"
-		print("[ls-boot] " .. msg)
-		error(msg, 0)
+		return CM.bootFail("Transport Fever 2 Multiplayer: require('" .. name .. "') returned a " .. type(factory) .. ", not the module factory (another mod may have replaced require)")
 	end
 	local ok2, result = pcall(factory, CM, K, log)
 	if not ok2 then
-		local msg = "Transport Fever 2 Multiplayer: module " .. name .. " failed while loading: " .. CM.bootText(result)
-		print("[ls-boot] " .. msg)
-		error(msg, 0)
+		return CM.bootFail("Transport Fever 2 Multiplayer: module " .. name .. " failed while loading: " .. CM.bootText(result))
 	end
 	return result
 end
@@ -693,6 +726,11 @@ local function checkHash(now)
 	CM.compareAt(stamp)
 end
 
+if CM.bootFailed then
+	print("[ls-boot] Transport Fever 2 Multiplayer is OFF for this game (" .. CM.bootText(CM.bootFailed) .. ") -- everything else loads normally")
+	function data() return {} end
+	return
+end
 print("[ls-boot] all modules loaded")
 
 function data()

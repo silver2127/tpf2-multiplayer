@@ -111,6 +111,10 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hinst);
+        // First: a non-ASCII profile folder gets an openable TPF2MP_DATADIR before the
+        // game's CRT and Lua read the environment, and before every half of the mod
+        // (the archive below included) resolves the data folder (datadir.h).
+        Tpf2mpPublishDataDir();
         // Save the previous run's logs before anything of this run truncates or
         // appends to them (logarchive.h). Here, in DllMain and not on the loader
         // thread below: the game's entry point, which truncates stdout.txt, may

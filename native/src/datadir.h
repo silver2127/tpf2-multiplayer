@@ -47,6 +47,48 @@ static inline bool Tpf2mpDataDirW(wchar_t* out, size_t cch, const void* self)
     return true;
 }
 
+// NON-ASCII WINDOWS USER NAMES. The game's Lua os.getenv is the CRT's narrow getenv
+// (ANSI code page bytes), and its io.open treats every path as UTF-8 and converts it
+// to wide for _wfopen (decompiled 0x7f4a0 -> 0x23a5f10). A profile folder with a
+// non-ASCII name is therefore unopenable from Lua: the conversion throws, and the
+// game reported "finding the data folder failed: file (0000000000000000)" and
+// aborted creating a game (2026-09-12). Before the game's entry point runs, the
+// proxy publishes TPF2MP_DATADIR as a path both halves can open -- the folder's 8.3
+// short name, pure ASCII, which also makes the slice's ANSI paths safe; UTF-8 when
+// the volume has no short names (only Lua is helped then). An ASCII profile, or a
+// TPF2MP_DATADIR already set by a harness, is left exactly as it was.
+static inline bool Tpf2mpIsAsciiW(const wchar_t* s)
+{
+    for (; *s; ++s) if (*s > 0x7f) return false;
+    return true;
+}
+
+static inline void Tpf2mpPublishDataDir()
+{
+    wchar_t pin[MAX_PATH] = L"";
+    if (GetEnvironmentVariableW(L"TPF2MP_DATADIR", pin, MAX_PATH) && pin[0]) return;
+    wchar_t dir[MAX_PATH];
+    if (!Tpf2mpDataDirW(dir, MAX_PATH, nullptr)) return;   // creates the folder
+    if (Tpf2mpIsAsciiW(dir)) return;
+    wchar_t shortp[MAX_PATH] = L"";
+    DWORD n = GetShortPathNameW(dir, shortp, MAX_PATH);
+    const bool ascii = n > 0 && n < MAX_PATH && Tpf2mpIsAsciiW(shortp);
+    const wchar_t* pub = ascii ? shortp : dir;
+    // The game's CRT keeps its own narrow copy of the environment once initialised;
+    // its getenv (what Lua's os.getenv calls) reads that copy, so set it there too.
+    // UTF-8 bytes for the no-short-name case, since that is what the game's io.open
+    // expects. Done BEFORE SetEnvironmentVariableW: the CRT also writes the OS block,
+    // and the wide call below must be the one that stays.
+    char narrow[MAX_PATH * 4];
+    if (WideCharToMultiByte(ascii ? CP_ACP : CP_UTF8, 0, pub, -1, narrow, (int)sizeof(narrow), nullptr, nullptr) > 0) {
+        HMODULE ucrt = GetModuleHandleW(L"ucrtbase.dll");
+        using PutEnvS = int (*)(const char*, const char*);
+        PutEnvS putenvS = ucrt ? (PutEnvS)GetProcAddress(ucrt, "_putenv_s") : nullptr;
+        if (putenvS) putenvS("TPF2MP_DATADIR", narrow);
+    }
+    SetEnvironmentVariableW(L"TPF2MP_DATADIR", pub);
+}
+
 // Narrow (UTF-8) convenience for code that formats paths with snprintf.
 static inline bool Tpf2mpDataDirA(char* out, size_t cch, const void* self)
 {
@@ -54,7 +96,7 @@ static inline bool Tpf2mpDataDirA(char* out, size_t cch, const void* self)
     if (!Tpf2mpDataDirW(w, MAX_PATH, self)) return false;
     // CP_ACP, not CP_UTF8: every consumer hands this to the narrow CRT
     // (fopen/_fsopen), which takes the ANSI codepage. On an ASCII profile the
-    // two agree; on a user named "Közös pc" the UTF-8 bytes named a folder
+    // two agree; on a user name outside ASCII the UTF-8 bytes named a folder
     // that does not exist, the slice log failed to open and the slice gave
     // up silently -- no hooks, no replication, nothing logged (2026-09-10).
     return WideCharToMultiByte(CP_ACP, 0, w, -1, out, (int)cch, nullptr, nullptr) > 0;
