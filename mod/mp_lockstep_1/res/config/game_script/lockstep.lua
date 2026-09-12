@@ -335,11 +335,16 @@ end
 -- slice treats peer=0 as solo, and a session's first second is at t=0.
 function CM.statusLine(now)
 	local pt = CM.statusPeerT()
-	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d",
+	-- mp= is the lobby's player count (tpf2_bridge_ctl.txt): a multiplayer session is
+	-- known from the first ticks, seconds before the peer's first heartbeat. The slice
+	-- reads it so a build in that window is cancelled and replayed like any other,
+	-- instead of running natively on one instance only (2026-09-11: two tracks laid
+	-- 2 s after loading existed on A and nowhere else).
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d",
 		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
 		pt and string.format("%+.1f", now - pt) or "?",
 		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-		#CM.queue)
+		#CM.queue, tonumber(CM.rosterPlayers) or 0)
 end
 -- Letter -> 0..7, for anything that needs a per-origin namespace.
 function CM.originIdx(o)
@@ -739,6 +744,16 @@ function data()
 			if CM.ticks % K.CON_POLL_EVERY == 0 then CM.pollNewConstructions() end
 			if CM.ticks % K.CON_POLL_EVERY == 3 then CM.pollStops() end
 			if CM.ticks % 15 == 7 then CM.pollLoan() end
+			-- Until the peer's first heartbeat, refresh the status file every 3 ticks rather
+			-- than every 15: the slice decides from it whether a build can be cancelled, and
+			-- the first seconds after a load are exactly when a player starts building.
+			if not CM.peerSeen and CM.ticks % 3 == 1 then
+				pcall(CM.speedRequest)   -- reads the lobby's players= (throttled inside)
+				pcall(function()
+					local f = io.open(K.BASE .. "lockstep_status_" .. K.INSTANCE .. ".txt", "w")
+					if f then f:write(CM.statusLine(CM.gameTime() or 0)); f:close() end
+				end)
+			end
 			if CM.ticks % 10 == 5 then CM.nackScan() end
 			CM.flushConPairs()
 			CM.primeConstructions()

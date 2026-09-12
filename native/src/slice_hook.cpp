@@ -490,6 +490,15 @@ static bool SessionLive()
             double pt = 0.0;
             if (sscanf(pk + 5, "%lf", &pt) == 1 && pt > 0.0) cached = true;
         }
+        // The lobby's player count. Before the peer's first heartbeat "peer=?" says
+        // nothing, yet the session is already multiplayer: two tracks laid 2 s after a
+        // load ran natively on A only, and one replay then failed on B (2026-09-11).
+        // A player count of 2 or more is live -- the replay half is running.
+        const char* mk = strstr(line, "  mp=");
+        if (!cached && mk) {
+            int players = 0;
+            if (sscanf(mk + 5, "%d", &players) == 1 && players >= 2) cached = true;
+        }
     }
     fclose(f);
     return cached;
