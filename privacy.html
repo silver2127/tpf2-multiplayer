@@ -27,8 +27,10 @@
 <div class="page-head">
   <div class="container">
     <h1>Privacy policy</h1>
-    <p>TpF2 Multiplayer has no telemetry, analytics, advertising or update checks. It sends data over the network only
-    for the multiplayer features you use, and this page lists every one of them.</p>
+    <p>TpF2 Multiplayer has no advertising, analytics or update checks, but it does use the network in ways you might not
+    expect: opening the Multiplayer page fetches the public games list from the project's server, a host checks the
+    project's connection helper throughout a session, and every player's diagnostic logs are sent to the session's host
+    automatically. This page lists everything the software sends, to whom, and what is kept.</p>
   </div>
 </div>
 
@@ -91,8 +93,8 @@
       </tr>
       <tr>
         <td>Connection helper<br><small>project server</small></td>
-        <td>When a direct connection is slow to start, a joining player leaves a note for the host, and a host checks for
-        notes during the session.</td>
+        <td>A host checks for notes every second for the whole session, whether or not the game is public. A joining
+        player leaves a note when a direct connection is slow to start.</td>
         <td>The joining player's network addresses, encrypted with a key only the players in the session have. The server
         cannot read the note.</td>
         <td>In memory only, for 60 seconds.</td>
@@ -120,8 +122,8 @@
     player names, chat, game commands, logs and the world save. The relay's operator holds the session key and can read
     this data. On the project's own relay:</p>
     <ul>
-      <li>the most recent world save uploaded by the session's leader is stored until the leader starts a new world
-      (<code>/new</code>) or a newer save replaces it;</li>
+      <li>the session's leader uploads the world save again every few minutes during the session, and the most recent
+      one is stored until the leader starts a new world (<code>/new</code>) or a newer save replaces it;</li>
       <li>which instance letter and company each player name had is stored, so returning players keep them;</li>
       <li>the session log, including the logs forwarded by players, is kept until the relay restarts.</li>
     </ul>
