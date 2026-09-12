@@ -1630,7 +1630,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.17"
+LOBBY_VERSION = "0.4.18"
 PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
 
 
