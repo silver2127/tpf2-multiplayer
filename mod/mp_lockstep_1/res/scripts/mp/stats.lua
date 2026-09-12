@@ -67,9 +67,9 @@ function CM.clockWords(sk)
 end
 
 -- Our own clock: the pacing line ("0.95x e=-2.40", e in sim steps from the
--- leader), or the leader, which is the clock.
+-- leader). The leader IS the clock, so on the host's own screen it is in step.
 function CM.paceWords(pace, isLeader)
-	if isLeader then return "sets the clock" end
+	if isLeader then return "in step" end
 	local mult, e = tostring(pace or ""):match("^([%d%.]+)x e=([%+%-][%d%.]+)")
 	e = tonumber(e)
 	if mult and e then
@@ -77,6 +77,17 @@ function CM.paceWords(pace, isLeader)
 		if e > 0.3 then return string.format("easing off (%.1f steps ahead)", e) end
 	end
 	return "in step"
+end
+
+-- The host's row on a joiner's screen: how far the host is from YOU, in sim
+-- steps, from our pacing error (e < 0: we are behind, so the host is ahead).
+-- The heartbeat skew only has whole game-time units, so it read "in step" for
+-- almost any gap; it stays the fallback while pacing has no reading yet.
+function CM.hostDiffWords(pace, skew)
+	local e = tonumber(tostring(pace or ""):match("e=([%+%-][%d%.]+)"))
+	if not e then return CM.clockWords(skew) end
+	if math.abs(e) <= 0.3 then return "in step" end
+	return string.format("%.1f steps %s", math.abs(e), e < 0 and "ahead of you" or "behind you")
 end
 
 -- the session's leader letter from the bridge ctl (a relay lobby names it)
@@ -174,7 +185,11 @@ function CM.statsInWords(status, cells, own, present, fresh, peerInfo)
 					s = (st == "sync" and "match") or (st == "desync" and "differ") or "checking"
 				end
 				c.sync:setText(s .. "   ")
-				c.clock:setText((info and CM.clockWords(info.skew) or "-") .. "   ")
+				local clock = "-"
+				if info then
+					clock = (letter == leader) and CM.hostDiffWords(kv.pace, info.skew) or CM.clockWords(info.skew)
+				end
+				c.clock:setText(clock .. "   ")
 				c.notes:setText("")
 			end
 		end
