@@ -77,7 +77,7 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
 				CM.soloDrop(line)
 				return
 			end
@@ -124,6 +124,10 @@ function CM.pollInject()
 			elseif o == "SPEEDBTN" then
 				-- a speed-button click the slice cancelled: on the leader it sets the session speed (CM.speedButton)
 				CM.speedButton(tonumber(w[2]))
+
+			elseif o == "SPEEDSET" then
+				-- the host's dashboard speed buttons (GUI state): the session speed, fractions included (CM.guiSpeedSet)
+				CM.guiSpeedSet(tonumber(w[2]))
 
 			elseif o == "SETDATE" or o == "CALSPEED" then
 				-- the editor's date picker (a Julian day) or date speed slider (ms per

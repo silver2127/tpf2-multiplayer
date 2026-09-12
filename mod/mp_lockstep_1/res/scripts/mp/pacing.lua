@@ -141,6 +141,55 @@ function CM.speedButton(v)
 	if v > 0 and wasPaused then CM.hostUnpause(v) end
 end
 
+-- THE HOST'S DASHBOARD SPEED BUTTONS (2026-09-12): 1, 1.5 ... 4.5 and -/+0.25.
+-- The GUI state appends SPEEDSET <v> to our inject file. On the leader it
+-- becomes the session speed like a /speed request, but as its own request
+-- (CM.guiReq): pressing the same value again after the game's speed buttons
+-- still takes, which a repeated /speed could not (the ctl value never changed).
+-- A newer /speed in chat replaces it (CM.speedRequest); a newer press of the
+-- game's own speed buttons wins over both, as before. A press while the session
+-- is paused also unpauses it.
+function CM.guiSpeedSet(v)
+	v = tonumber(v)
+	if not v then return end
+	v = math.max(0.25, math.min(8, math.floor(v * 4 + 0.5) / 4))
+	if CM.lgHolding then
+		log(string.format("SPEED2: dashboard speed %gx ignored -- the game is still loading", v))
+		return
+	end
+	if not CM.peerSeen then
+		CM.guiReq, CM.guiReqAt, CM.spdReqChangedAt = v, CM.ticks, CM.ticks
+		CM.effSpeed = v
+		CM.setSpeed(v, "dashboard speed button, nobody else in the session")
+		return
+	end
+	if not CM.isLeader() then
+		log(string.format("SPEED2: dashboard speed %gx ignored -- only the host sets the session speed", v))
+		return
+	end
+	CM.guiReq, CM.guiReqAt = v, CM.ticks
+	if CM.effSpeed == 0 or CM.myCeiling == 0 then
+		local lever = math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v)))
+		CM.myCeiling = lever
+		CM.spd2ZeroSince = nil
+		CM.btnAt, CM.ceilByButton = CM.ticks, true
+		CM.hostUnpause(lever)
+	end
+	CM.spdReqChangedAt = CM.ticks   -- not older than any speed-button press: in force from the next pass
+	log(string.format("SPEED2: host dashboard speed -> %gx", v))
+end
+
+-- How fast a joiner's pacing may run to keep up. Up to the engine's top lever
+-- (4) nothing changes; above it (a 4.5x session) the cap follows the session
+-- with room to close a gap, or a joiner could never reach the host's clock.
+-- The speed hook scales at most 2x over the lever, hence 8.
+function CM.paceCap(eff)
+	local maxS = CM.MAX_SPEED or 4
+	eff = tonumber(eff) or 0
+	if eff > maxS then return math.min(8, eff * 1.25) end
+	return maxS
+end
+
 -- THE EDITOR'S CALENDAR (2026-09-11). The date picker and the date speed slider
 -- only ever changed the clicking player's game. While a session is live the
 -- slice cancels them and writes SETDATE <julian day> / CALSPEED <ms per day>;
@@ -236,7 +285,7 @@ end
 -- newer of the two wins: a speed button pressed after a /speed request
 -- overrides it until the request next changes.
 function CM.speedRequest()
-	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.spdReq end
+	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.guiReq or CM.spdReq end
 	CM.spdReqAt = CM.ticks
 	local req, syncN, players
 	pcall(function()
@@ -260,6 +309,7 @@ function CM.speedRequest()
 	if req and (req <= 0 or req >= 64) then req = nil end
 	if req ~= CM.spdReq then
 		CM.spdReqChangedAt = CM.ticks
+		CM.guiReq = nil   -- a newer /speed in chat replaces the dashboard's speed
 		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (the host's speed buttons)"))
 	end
 	CM.spdReq = req
@@ -268,7 +318,7 @@ function CM.speedRequest()
 		CM.syncSeen = syncN
 		if syncN > 0 then CM.syncBegin() else CM.syncEnd("cancelled (/sync off)") end
 	end
-	return req
+	return CM.guiReq or req
 end
 
 -- HOT JOIN = a SYNC POINT (2026-09-09). A player arriving mid-session needs
@@ -441,7 +491,7 @@ function CM.pidPace(now, eff)
 		local mR = 1 + kr * (-e)
 		if mR > hiR then mR = hiR end
 		local target = math.floor(eff * mR / 0.05 + 0.5) * 0.05
-		if target > (CM.MAX_SPEED or 4) then target = CM.MAX_SPEED or 4 end
+		if target > CM.paceCap(eff) then target = CM.paceCap(eff) end
 		if not CM.pidRecover or target ~= CM.pidHold then
 			log(string.format("PID: %.2f behind the leader -> %.2fx of %g to close it", -e, target, eff))
 		end
@@ -502,7 +552,7 @@ function CM.pidPace(now, eff)
 	local prevM = (CM.pidHold and CM.pidEff and CM.pidEff > 0) and (CM.pidHold / CM.pidEff) or 1
 	if m > prevM + slew then m = prevM + slew elseif m < prevM - slew then m = prevM - slew end
 	local target = math.floor(eff * m / 0.05 + 0.5) * 0.05
-	if target > (CM.MAX_SPEED or 4) then target = CM.MAX_SPEED or 4 end
+	if target > CM.paceCap(eff) then target = CM.paceCap(eff) end
 	if target < 0.25 then target = 0.25 end       -- the dither's floor: a quarter of the lever
 	if math.abs(m - 1) < 1e-9 then target = eff end
 	if target ~= CM.pidHold then
@@ -652,7 +702,7 @@ function CM.paceV2(now)
 		local req = CM.speedRequest()
 		local why = "host's speed buttons"
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
-		if CM.spdReqInForce then eff = req; why = "/speed request" end
+		if CM.spdReqInForce then eff = req; why = CM.guiReq and "host's dashboard speed buttons" or "/speed request" end
 		CM.syncTick(now, s)
 		local changed = (eff ~= CM.effSpeed)
 		CM.effSpeed = eff

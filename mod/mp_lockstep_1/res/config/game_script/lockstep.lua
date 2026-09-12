@@ -988,7 +988,7 @@ function data()
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
 						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
-							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+							CM.spdReqInForce and (CM.guiReq or CM.spdReq) and string.format("%g", CM.guiReq or CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1308,6 +1308,36 @@ function data()
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					box:addItem(togC)
+					-- ---- host speed buttons (2026-09-12) ----
+					-- Shown on the host's window only. A press appends SPEEDSET <v> to our
+					-- inject file; the host's pacer makes it the session speed
+					-- (CM.guiSpeedSet) and every joiner follows it through LSEFF.
+					local function hostSpeed(v)
+						v = math.max(0.25, math.min(4.5, math.floor(v * 4 + 0.5) / 4))
+						D.speedAsked, D.speedAskedAt = v, os.time()
+						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						if f then f:write(string.format("SPEEDSET %g", v) .. string.char(10)); f:close() end
+						pcall(function() D.hostSpeedText:setText(string.format("session speed: %gx   ", v)) end)
+					end
+					-- -/+0.25 step from the last press for a few seconds: the session speed
+					-- read back from the dash file lags a press by a second or two
+					local function hostSpeedBase()
+						if D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5 then return D.speedAsked end
+						return (D.speedEff and D.speedEff > 0) and D.speedEff or D.speedAsked or 1
+					end
+					local hsRow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					D.hostSpeedText = api.gui.comp.TextView.new("session speed: -   ")
+					hsRow:addItem(D.hostSpeedText)
+					hsRow:addItem(toggleBtn("  -0.25  ", function() hostSpeed(hostSpeedBase() - 0.25) end))
+					for _, sv in ipairs({ 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5 }) do
+						hsRow:addItem(toggleBtn(string.format("  %g  ", sv), function() hostSpeed(sv) end))
+					end
+					hsRow:addItem(toggleBtn("  +0.25  ", function() hostSpeed(hostSpeedBase() + 0.25) end))
+					D.hostSpeedBox = api.gui.comp.Component.new("mpHostSpeed")
+					D.hostSpeedBox:setLayout(hsRow)
+					box:addItem(D.hostSpeedBox)
+					D.hostSpeedShown = false
+					pcall(function() D.hostSpeedBox:setVisible(false, false) end)
 					-- ---- stats, in words (2026-09-11) ----
 					-- A status line (do the worlds match; if not, what differs, since when
 					-- and what to do) and one row per player (stats.lua). The raw counters
@@ -1551,6 +1581,17 @@ function data()
 						pcall(function() t = D.input:getText() or "" end)
 						if t ~= D.chatIdleText then D.chatIdleText, D.chatIdleSince = t, os.time()
 						elseif os.time() - (D.chatIdleSince or 0) > 30 then CM.chatCloseInput() end
+					end
+					-- the host speed row: on the host's window only, with the session speed
+					if D.hostSpeedBox and (guiTick % 10) == 0 then
+						local isHost = (CM.guiLeader and CM.guiLeader() or "a") == own
+						if D.hostSpeedShown ~= isHost then D.hostSpeedShown = isHost; D.hostSpeedBox:setVisible(isHost, false) end
+						if isHost and mine then
+							D.speedEff = tonumber(mine.eff)
+							if not (D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5) then
+								D.hostSpeedText:setText("session speed: " .. (D.speedEff and string.format("%gx", D.speedEff) or "-") .. "   ")
+							end
+						end
 					end
 				end)
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
