@@ -42,12 +42,31 @@
 --   * a cursor that holds still is pinned where it stopped, so a circle holds through
 --     the pause and never glides across it; a jump of K.CURSOR_SNAP_M is a jump.
 -- tools/cursor_sim.py (added with this) measures the stutter offline.
+--
+-- FOURTH PASS (2026-09-12). The third pass was even on a steady sweep, but a big map
+-- steps its simulation unevenly -- one script tick in a dozen takes half a second or
+-- more -- and frames hitch. There the circle still ran out of samples, stood, then
+-- jumped ahead along the path (tools/cursor_sim.py "rough": stutter 1.15, stalls on
+-- 12% of frames). Now:
+--   * past the newest sample the playback clock holds on it, so a batch that is only
+--     late resumes the circle where it stood; a silence well past the delay it
+--     stopped at is a pause, and the delay goes back to that. The wait a late batch
+--     or a short pause added is skipped, unseen, inside the pinned pause, so a pause
+--     lasts as long as the sender's did and a wait leaves no lasting delay;
+--   * the delay rises at most K.CURSOR_LAG_RISE seconds a second, so playback never
+--     crawls or runs backwards when the jitter gets worse, and may reach
+--     K.CURSOR_DELAY_MAX_S when a slow step needs it;
+--   * a last, critically damped pass (K.CURSOR_SMOOTH_S) takes out whatever still
+--     jerks, at any frame rate; a jump snaps.
+-- LOOK. The circle is drawn in its player's colour at full brightness, lifted a
+-- little toward white, fully opaque (K.CURSOR_BRIGHT_LIFT, K.CURSOR_ALPHA), with
+-- K.CURSOR_SEGMENTS points so a large one stays round.
 -- SIZE. The radius follows the camera distance continuously (1% steps), so a circle
 -- keeps its size on screen through a zoom instead of stepping.
 return function(CM, K, log)
 K.CURSOR_KEEPALIVE_S = 3     -- a cursor that stays still is re-sent this often
 K.CURSOR_STALE_S = 8         -- a peer's cursor not heard for this long is taken down
-K.CURSOR_SEGMENTS = 24       -- points per circle
+K.CURSOR_SEGMENTS = 40       -- points per circle
 K.CURSOR_IO_FRAMES = 2       -- GUI frames between samples and file reads (30 a second at 60 fps)
 K.CURSOR_MOVE_M = 0.05       -- a new sample only when the cursor moved this far
 K.CURSOR_KEEP = 16           -- samples kept per cursor, in each file and on each track
@@ -55,10 +74,16 @@ K.CURSOR_SEND_MAX = 12       -- samples in one LSCUR at most (the newest)
 K.CURSOR_GAP_S = 0.25        -- no sample for this long = the cursor held still
 K.CURSOR_SNAP_M = 300        -- samples farther apart than this are a jump, not a glide
 K.CURSOR_DELAY_MIN_S = 0.08  -- playback trails the fastest delivery by at least this
-K.CURSOR_DELAY_MAX_S = 0.6   -- ...and by at most this, however bad the jitter
+K.CURSOR_DELAY_MAX_S = 1.0   -- ...and by at most this, however bad the jitter (a slow big-map step)
+K.CURSOR_DELAY_START_S = 0.6 -- a new circle starts this far behind the fastest delivery
 K.CURSOR_DELAY_PAD_S = 0.04  -- on top of the measured spread: one GUI read
 K.CURSOR_JITTER_S = 10       -- the delay spread is measured over this long
+K.CURSOR_LAG_RISE = 0.5      -- the delay grows at most this many seconds per second
+K.CURSOR_WAIT_S = 0.6        -- past the newest sample, wait this long beyond the wanted delay before it is a pause
+K.CURSOR_SMOOTH_S = 0.07     -- the last smoothing pass: a critically damped follow this quick
 K.CURSOR_SCREEN = 0.02       -- circle radius as a share of the camera distance
+K.CURSOR_BRIGHT_LIFT = 0.25  -- the player's colour at full brightness, lifted this far toward white
+K.CURSOR_ALPHA = 1.0         -- circle opacity
 
 function CM.cursorFile(me) return K.BASE .. "tpf2mp_cursor_" .. tostring(me) .. ".txt" end
 function CM.cursorsInFile(me) return K.BASE .. "tpf2mp_cursors_in_" .. tostring(me) .. ".txt" end
@@ -73,6 +98,17 @@ function CM.cursorColor(o)
 	local s, idx = tostring(o), 0
 	for i = 1, #s do idx = idx * 26 + (s:byte(i) - 96) end
 	return CM.cmCompanyColor(math.max(1, idx))
+end
+
+-- The colour a circle is drawn in: the player's colour at full brightness (same hue
+-- and saturation, brightest channel at 1), lifted K.CURSOR_BRIGHT_LIFT toward white.
+-- The palette's own colours sit at 85-90% brightness, dim on a sunlit map.
+function CM.cursorDrawColor(r, g, b)
+	r, g, b = tonumber(r) or 1, tonumber(g) or 1, tonumber(b) or 1
+	local m = math.max(r, g, b)
+	if m > 0 then r, g, b = r / m, g / m, b / m else r, g, b = 1, 1, 1 end
+	local w = K.CURSOR_BRIGHT_LIFT
+	return r + (1 - r) * w, g + (1 - g) * w, b + (1 - b) * w
 end
 
 -- ---------- script state ----------
@@ -398,6 +434,81 @@ local function trackAt(s, rt)
 	return s[n].x, s[n].y
 end
 
+-- The playback time for a track this frame (sender's clock), with its delay updated.
+local function playbackTime(tr, clk, dt)
+	local s = tr.samples
+	-- how far behind the sender's clock to play: up toward what the jitter asks for, so
+	-- samples do not run dry, but never faster than K.CURSOR_LAG_RISE (playback would
+	-- crawl, or run backwards); down only when clearly more than needed, and slowly, so
+	-- playback speed never wobbles with every new jitter reading
+	local want = tr.lagWant or 0
+	if not tr.lag then
+		-- a new circle starts behind and eases down to what the jitter needs: starting
+		-- low and growing ran dry (stalls) for the first seconds
+		tr.lag = math.max(want, (tr.lagLo or want) + K.CURSOR_DELAY_START_S)
+	elseif want > tr.lag then
+		local step = (want - tr.lag) * math.min(1, 3.0 * dt)
+		if step > K.CURSOR_LAG_RISE * dt then step = K.CURSOR_LAG_RISE * dt end
+		tr.lag = tr.lag + step
+	elseif want < tr.lag - 0.05 then
+		local k = 0.2 * dt
+		if k > 1 then k = 1 end
+		tr.lag = tr.lag + (want + 0.02 - tr.lag) * k
+	end
+	-- Past the newest sample there is nothing to play: hold on it (tr.lagHold keeps the
+	-- delay the circle stopped at), so a late batch resumes the circle where it stood
+	-- instead of jumping it ahead along the path. A silence K.CURSOR_WAIT_S longer than
+	-- that delay is a pause: the delay goes back to it, unseen while the circle stands.
+	-- Inside a pinned pause, playback skips the wait it added, never past the pause's
+	-- end -- so a pause lasts as long as the sender's did, and a late batch costs no
+	-- lasting delay beyond what the slow easing above takes back.
+	local newest = s[#s].t
+	local rt = clk - tr.lag
+	if rt > newest then
+		tr.lagHold = tr.lagHold or tr.lag
+		if clk - newest <= tr.lagHold + K.CURSOR_WAIT_S then
+			tr.lag, rt = clk - newest, newest
+		else
+			tr.lag, rt = tr.lagHold, clk - tr.lagHold
+		end
+	else
+		local held = false
+		for i = 2, #s do
+			local b = s[i]
+			if rt <= b.t then
+				local a = s[i - 1]
+				if rt >= a.t and a.x == b.x and a.y == b.y then
+					held = true
+					local target = math.min(clk - (tr.lagHold or tr.lag), b.t)
+					if target > rt then tr.lag, rt = clk - target, target end
+				end
+				break
+			end
+		end
+		if not held then tr.lagHold = nil end
+	end
+	return rt
+end
+
+-- The last pass: a critically damped follow of the curve position, K.CURSOR_SMOOTH_S
+-- quick, exact at any frame time (the closed form game engines call SmoothDamp). It
+-- takes out a batch that reshapes the curve just ahead of playback, the speed change
+-- of a delay adjustment and uneven frames. A jump snaps.
+local function smoothFollow(tr, px, py, dt)
+	if not tr.sx or (px - tr.sx) ^ 2 + (py - tr.sy) ^ 2 > K.CURSOR_SNAP_M * K.CURSOR_SNAP_M then
+		tr.sx, tr.sy, tr.vx, tr.vy = px, py, 0, 0
+		return px, py
+	end
+	local w = 2 / K.CURSOR_SMOOTH_S
+	local x = w * dt
+	local e = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x)
+	local cx, cy = tr.sx - px, tr.sy - py
+	local tx, ty = (tr.vx + w * cx) * dt, (tr.vy + w * cy) * dt
+	tr.vx, tr.vy = (tr.vx - w * tx) * e, (tr.vy - w * ty) * e
+	tr.sx, tr.sy = px + (cx + tx) * e, py + (cy + ty) * e
+	return tr.sx, tr.sy
+end
+
 -- GUI update, every frame.
 function CM.cursorGuiTick()
 	if not K.INSTANCE then pcall(CM.detectInstance) end
@@ -421,28 +532,13 @@ function CM.cursorGuiTick()
 			if tr.drawn then pcall(function() gi.setZone("mpcursor_" .. o, nil) end) end
 			CM.curTracks[o] = nil
 		else
-			-- how far behind the sender's clock to play: up quickly toward what the jitter asks
-			-- for, so samples do not run dry; down only when clearly more than needed, and
-			-- slowly, so playback speed never wobbles with every new jitter reading
-			local want = tr.lagWant or 0
-			if not tr.lag then
-				-- a new circle starts at the worst-case delay and eases down to what the
-				-- jitter needs: starting low and growing ran dry (stalls) for the first seconds
-				tr.lag = math.max(want, (tr.lagLo or want) + K.CURSOR_DELAY_MAX_S)
-			elseif want > tr.lag then
-				local k = 3.0 * dt
-				if k > 1 then k = 1 end
-				tr.lag = tr.lag + (want - tr.lag) * k
-			elseif want < tr.lag - 0.05 then
-				local k = 0.2 * dt
-				if k > 1 then k = 1 end
-				tr.lag = tr.lag + (want + 0.02 - tr.lag) * k
-			end
-			local rt = clk - tr.lag
+			local rt = playbackTime(tr, clk, dt)
 			while #s > 4 and s[2].t < rt - 1.0 do table.remove(s, 1) end
-			local px, py = trackAt(s, rt)
+			local cx, cy = trackAt(s, rt)
+			local px, py = smoothFollow(tr, cx, cy, dt)
+			local cr, cg, cb = CM.cursorDrawColor(tr.r, tr.g, tr.b)
 			-- centimetres: coarser, and the end of a glide would never be drawn
-			local sig = string.format("%.2f %.2f %.3f %.2f %.2f %.2f", px, py, radius, tr.r, tr.g, tr.b)
+			local sig = string.format("%.2f %.2f %.3f %.3f %.3f %.3f", px, py, radius, cr, cg, cb)
 			if tr.sig ~= sig then
 				local poly = {}
 				for i = 1, K.CURSOR_SEGMENTS do
@@ -450,7 +546,7 @@ function CM.cursorGuiTick()
 					poly[i] = { px + radius * math.cos(a), py + radius * math.sin(a) }
 				end
 				local ok, err = pcall(function()
-					gi.setZone("mpcursor_" .. o, { polygon = poly, draw = true, drawColor = { tr.r, tr.g, tr.b, 0.8 } })
+					gi.setZone("mpcursor_" .. o, { polygon = poly, draw = true, drawColor = { cr, cg, cb, K.CURSOR_ALPHA } })
 				end)
 				if ok then
 					tr.sig, tr.drawn = sig, true
