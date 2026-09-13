@@ -51,6 +51,7 @@ Two more checks on the same page look for other mods that change the game native
 | `tpf2_bridge_mp.dll` | Instance identity, the loopback link to the lobby, and the sim-loop and game-speed hooks. |
 | `tpf2_slice.dll` | Captures and cancels the player's commands. |
 | `tpf2_menu.dll` | The Multiplayer panel on the title menu and the lobby launcher. |
+| `plugins\tpf2_previews.dll` | Shared road/rail previews and experimental previews of new stations and buildings (included from 0.4.22). |
 | `tpf2_slice.cfg` | Optional diagnostic settings, all commented out; multiplayer needs none. See [docs/CONFIGURATION.md](../docs/CONFIGURATION.md). |
 | `netpunch\netpunch.exe` | The lobby. |
 | `mods\mp_lockstep_1\` | The game-script mod. |

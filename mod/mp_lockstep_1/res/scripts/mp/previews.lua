@@ -25,6 +25,7 @@ end
 -- The base game's mission/proposalutil.lua uses this event layout:
 -- param.proposal.proposal.{addedNodes,addedSegments,new2oldSegments}.
 function CM.previewExtract(id, param)
+	if id == "constructionBuilder" then return CM.previewExtractConstruction(param) end
 	local kind = id == "streetBuilder" and "road" or (id == "trackBuilder" and "rail")
 	if not kind or not param or not param.proposal then return nil end
 	local sp = param.proposal.proposal
@@ -62,6 +63,7 @@ end
 
 function CM.previewEncode(p)
 	if not p then return "off" end
+	if p.kind == "construction" then return CM.previewEncodeConstruction(p) end
 	if p.kind ~= "road" and p.kind ~= "rail" then return nil end
 	if #p.curves < 1 or #p.curves > K.PREVIEW_MAX_EDGES then return nil end
 	local rows = {}
@@ -82,6 +84,7 @@ end
 
 function CM.previewDecode(body)
 	if type(body) ~= "string" or #body > K.PREVIEW_MAX_BYTES then return nil end
+	if body:sub(1, 2) == "5|" then return CM.previewDecodeConstruction(body) end
 	if body:sub(1, 2) == "3|" or body:sub(1, 2) == "4|" then return CM.previewDecode3d(body) end
 	if body == "off" then return { off = true } end
 	local kind, data = body:match("^(%a+) ([%d%.,;%-]+)$")
@@ -226,7 +229,7 @@ function CM.previewGuiEvent(id, name, param)
 		CM.previewLocal = ok and p or nil
 		if CM.previewLocal then
 			local ok3, details = pcall(CM.previewExtract3d, id, param)
-			if ok3 and details and #details == #p.curves then p.details = details end
+			if p.kind ~= "construction" and ok3 and details and #details == #p.curves then p.details = details end
 			local okState, invalid = pcall(CM.previewExtractInvalid, param)
 			if okState then p.invalid = invalid end
 		end
@@ -414,6 +417,7 @@ local function findResource(rep, name)
 	if rep.getName(id) == name then return id end
 end
 function CM.previewNativeProposal(p)
+	if p.kind == "construction" then return CM.previewNativeConstruction(p) end
 	local sp = api.type.SimpleProposal.new()
 	local nodeMap, nextNode = {}, 0
 	-- Resources repeat across segments. Resolve once per proposal; do not keep
@@ -577,4 +581,5 @@ function CM.previewGuiTick()
 		end
 	end
 end
+require("mp/preview_constructions")(CM, K)
 end

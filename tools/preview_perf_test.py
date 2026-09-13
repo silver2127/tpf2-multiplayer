@@ -181,6 +181,8 @@ return {held=held,moving=moving,resources=resources,peers=peers}
 
 def run(path, verify=False):
     lua = LuaRuntime(unpack_returned_tuples=True)
+    lua.globals().SCRIPT_PATH = (Path(__file__).resolve().parents[1] / 'mod/mp_lockstep_1/res/scripts/?.lua').as_posix()
+    lua.execute("package.path = SCRIPT_PATH .. ';' .. package.path")
     lua.globals().SOURCE = path.read_text(encoding='utf-8')
     lua.globals().VERIFY = verify
     result = lua.execute(SCENARIO)

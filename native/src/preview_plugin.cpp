@@ -225,9 +225,25 @@ size_t count(void* p,size_t offset,size_t stride) {
 }
 bool safeProposal(void* p) {
     const size_t nodes=count(p,0,24), edges=count(p,0x18,120);
-    if(nodes>48 || edges>24 || (edges && !nodes)) return false;
-    for(size_t off:{size_t(0x30),size_t(0x48),size_t(0xe0),size_t(0xf8),size_t(0x1e0),size_t(0x1f8)})
+    const size_t constructions=count(p,0x1f8,0x8e0);
+    if(constructions>1 || nodes>(constructions?384:48) || edges>(constructions?192:24) || (edges && !nodes)) return false;
+    // Accept one independently converted construction, never a replacement or
+    // demolition. Its generated streets remain temporary, disconnected pieces.
+    for(size_t off:{size_t(0x30),size_t(0x48),size_t(0xe0),size_t(0xf8),size_t(0x1e0)})
         if(field<void*>(p,off)!=field<void*>(p,off+8)) return false;
+    if(constructions) {
+        auto c=field<unsigned char*>(p,0x1f8);
+        const auto& file=field<std::string>(c,0);
+        if(file.empty() || file.size()>180 || file.front()=='/' || file.find("..")!=std::string::npos
+            || file.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")!=std::string::npos
+            || file.size()<4 || file.substr(file.size()-4)!=".con") return false;
+        const float* t=reinterpret_cast<float*>(c+0x728);
+        for(size_t i=0;i<16;i++) if(!std::isfinite(t[i]) || fabs(t[i])>((i>=12&&i<=14)?1000000:100)) return false;
+        if(fabs(t[3])+fabs(t[7])+fabs(t[11])+fabs(t[15]-1)>0.001) return false;
+        double det=t[0]*(double(t[5])*t[10]-double(t[6])*t[9])-t[4]*(double(t[1])*t[10]-double(t[2])*t[9])
+            +t[8]*(double(t[1])*t[6]-double(t[2])*t[5]);
+        if(fabs(det)<0.000001 || fabs(det)>1000) return false;
+    }
     auto ns=field<unsigned char*>(p,0), es=field<unsigned char*>(p,0x18);
     for(size_t i=0;i<nodes;i++) {
         auto n=ns+i*24;
@@ -289,7 +305,7 @@ void* convert(void* result,void* toolkit,void* proposal) {
             if(p->seen) { p->seen=GetTickCount64(); ok=true; }
         }
     } else if((!strcmp(mode,"draw") || !strcmp(mode,"drawok") || !strcmp(mode,"drawbad"))
-        && safeProposal(output) && count(output,0x18,120)>0) {
+        && safeProposal(output) && (count(output,0x18,120)>0 || count(output,0x1f8,0x8e0)>0)) {
         if(auto p=getPeer(origin,true)) {
             alignas(16) unsigned char context[0x70]{}, data[0x790]{};
             at<void*(*)(void*,int)>(0x431560)(context,-1);
@@ -309,7 +325,7 @@ void* convert(void* result,void* toolkit,void* proposal) {
             at<DtorFn>(0x3e3d30)(context+0x18);
             p->seen=GetTickCount64(); ok=true;
             terrainChanged=true;
-            host->log("[previews] 3D origin=%s edges=%zu mode=%s",origin,count(output,0x18,120),mode);
+            host->log("[previews] 3D origin=%s edges=%zu constructions=%zu mode=%s",origin,count(output,0x18,120),count(output,0x1f8,0x8e0),mode);
         }
     }
     editingRemote=false;
@@ -323,7 +339,7 @@ extern "C" __declspec(dllexport) int Tpf2mpPluginInit(const Tpf2mpHost* h,Tpf2mp
     if(!h || h->abiMajor!=TPF2MP_ABI_MAJOR || h->size<sizeof(Tpf2mpHost)) return TPF2MP_ERR_ABI;
     if(!h->buildOk()) return TPF2MP_ERR_BUILD;
     host=h; base=h->moduleBase();
-    info->name="previews"; info->version="0.1.5-local"; info->summary="Shared 3D previews with sender error colour";
+    info->name="previews"; info->version="0.1.6-local"; info->summary="Shared road, rail and experimental construction previews";
     uploadHeight=at<HeightFn>(0x34cd90); resetHeight=at<ResetHeightFn>(0x34e5a0);
     // Complete build-35924 setter: renderer state +0x1504 controls error tint.
     const uint8_t colorBytes[]={0x48,0x8b,0x81,0xb8,0x01,0x00,0x00,0x88,0x90,0x04,0x15,0x00,0x00,0xc3};

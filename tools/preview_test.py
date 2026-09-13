@@ -9,6 +9,8 @@ import lupa.lua52 as lupa
 ROOT = Path(__file__).resolve().parents[1]
 MP = ROOT / 'mod/mp_lockstep_1/res/scripts/mp'
 lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+lua.globals().SCRIPT_PATH = (MP.parent / '?.lua').as_posix()
+lua.execute("package.path = SCRIPT_PATH .. ';' .. package.path")
 lua.globals().SOURCE = (MP / 'previews.lua').read_text(encoding='utf-8')
 lua.globals().NET = (MP / 'net.lua').read_text(encoding='utf-8')
 lua.execute(r'''
@@ -292,5 +294,60 @@ C3.previewNativeFinish({})
 api.cmd.make.buildProposal=function() makes=makes+1; return {} end
 check('stale acknowledgement cannot claim native rendering',not C3.previewNativeUpdate('a',decoded3,wire3))
 check('conversion request is always cleared',FILES['native/tpf2mp_preview_native_request.txt']=='\nend\n')
+local building={proposal={toAdd={{fileName='station/rail/modular_station/modular_station.con',
+ transf={0,1,0,0,-1,0,0,0,0,0,1,0,123,456,20,1},params={seed=17,year=1950,modules={[10]={variant=2,enabled=false}}}}},toRemove={}}}
+local bp=SG.previewExtract('constructionBuilder',building)
+check('station preview captured with rotation and placement',bp and bp.transf[13]==123 and #bp.curves==4)
+local bw=SG.previewEncode(bp)
+local bd=RG.previewDecode(bw)
+check('station options and booleans round-trip without executable Lua',bd and bd.params.modules[10].enabled==false and RG.previewEncode(bd)==bw)
+building.proposal.toAdd[1].params.modules[10].variant=99
+building.proposal.toAdd[1].transf[13]=888
+check('construction capture owns a deep copy',bp.params.modules[10].variant==2 and bp.transf[13]==123)
+building.proposal.toRemove={123}
+check('existing station replacement excluded',SG.previewExtract('constructionBuilder',building)==nil)
+for _,bad in ipairs({'5|0|../bad.con|0|m0:',bw..'garbage',bw:gsub('123','nan',1),bw:gsub('m3:','m999:',1),
+ '5|0|test.con|0,1,0,0,-1,0,0,0,0,0,1,0,123,456,20,1|m1:s2:61s2:zz'}) do
+ check('reject malformed construction payload',RG.previewDecode(bad)==nil)
+end
+local cyclic={}; cyclic.self=cyclic; bp.params=cyclic
+check('cyclic parameters are bounded',SG.previewEncode(bp)==nil)
+bp.params={huge=string.rep('x',513)}
+check('oversized parameters are bounded',SG.previewEncode(bp)==nil)
+api.res.constructionRep={find=function(f) return f==bd.file and 1 or -1 end,getName=function() return bd.file end}
+api.type.SimpleProposal.new=function() return {streetProposal={nodesToAdd={},edgesToAdd={}},constructionsToAdd={}} end
+api.type.SimpleProposal.ConstructionEntity={new=function() return {} end}
+api.type.Vec4f={new=function(...) return {...} end}
+api.type.Mat4f={new=function(...) return {...} end}
+api.engine.util={getPlayer=function() return 55 end}
+local nativeBuilding=RG.previewNativeProposal(bd)
+check('receiver creates isolated construction with local player',nativeBuilding.constructionsToAdd[1].playerEntity==55 and #nativeBuilding.streetProposal.edgesToAdd==0)
+check('receiver retains station model and options',nativeBuilding.constructionsToAdd[1].fileName==bd.file and nativeBuilding.constructionsToAdd[1].params.seed==17)
+api.res.constructionRep.find=function() return -1 end
+check('missing building resource falls back without native proposal',RG.previewNativeProposal(bd)==nil)
+SG.previewGuiEvent('constructionBuilder','builder.proposalCreate',{proposal={toAdd={{fileName=bd.file,transf=bd.transf,params=bd.params}},toRemove={}},data={errorState={messages={'collision'}}}})
+check('station sender error tint captured',SG.previewLocal and SG.previewLocal.invalid==true)
+SG.previewGuiEvent('constructionBuilder','builder.apply',{})
+check('station confirmation clears preview',SG.previewLocal==nil)
+local BG,BS,PG,PS=side('e','E/'),side('e','E/'),side('f','F/'),side('f','F/')
+BG.previewGuiTick(); PG.previewGuiTick(); BS.previewTick(); PS.previewTick()
+T=T+0.25; SENT={}
+local depot={proposal={toAdd={{fileName='depot/road/road_depot.con',transf=bd.transf,params=bd.params}},toRemove={}}}
+BG.previewGuiEvent('constructionBuilder','builder.proposalCreate',depot)
+BG.previewGuiTick(); BS.previewTick()
+check('building preview uses cosmetic transport only',#SENT==1 and #BS.queue==0 and BS.seqNo==0)
+PS.previewRecv(SENT[1]); PS.previewTick(); PG.previewGuiTick()
+check('building without native service draws oriented placement marker',ZONES.mppreview_e_1~=nil and ZONES.mppreview_e_4~=nil)
+for i=1,20 do
+ T=T+0.25; SENT={}; BG.previewGuiTick(); BS.previewTick()
+ for _,line in ipairs(SENT) do PS.previewRecv(line) end
+ PS.previewTick(); PG.previewGuiTick()
+end
+check('held building preview survives heartbeat',ZONES.mppreview_e_1~=nil)
+BG.previewControlsVisible=function() return false end
+T=T+0.5; SENT={}; BG.previewGuiTick(); BS.previewTick()
+for _,line in ipairs(SENT) do PS.previewRecv(line) end
+PS.previewTick(); PG.previewGuiTick()
+check('building cancellation without apply clears peer marker',ZONES.mppreview_e_1==nil and ZONES.mppreview_e_4==nil)
 realPrint(string.format('%d preview checks passed', count))
 ''')

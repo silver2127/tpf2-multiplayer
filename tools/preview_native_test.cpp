@@ -49,6 +49,22 @@ std::string ack() {
 }
 }
 int main() {
+    // Construction-only previews must pass without street pieces; malformed
+    // transforms, paths and any removal must fail before native evaluation.
+    alignas(16) unsigned char cp[0x2f8]{}, ce[0x8e0]{};
+    new(ce) std::string("station/rail/modular_station/modular_station.con");
+    field<void*>(cp,0x1f8)=ce; field<void*>(cp,0x200)=ce+sizeof(ce);
+    for(size_t i : {size_t(0),size_t(5),size_t(10),size_t(15)}) field<float>(ce,0x728+i*4)=1;
+    assert(safeProposal(cp));
+    field<void*>(cp,0x1e8)=ce;
+    assert(!safeProposal(cp)); field<void*>(cp,0x1e8)=nullptr;
+    field<float>(ce,0x728)=0;
+    assert(!safeProposal(cp)); field<float>(ce,0x728)=1;
+    field<float>(ce,0x728+12*4)=INFINITY;
+    assert(!safeProposal(cp)); field<float>(ce,0x728+12*4)=0;
+    field<std::string>(ce,0)="../bad.con";
+    assert(!safeProposal(cp));
+    field<std::string>(ce,0).~basic_string();
     char temp[MAX_PATH]{};
     assert(GetTempPathA(MAX_PATH,temp));
     testDir=std::string(temp)+"tpf2-preview-test-"+std::to_string(GetCurrentProcessId())+"\\";

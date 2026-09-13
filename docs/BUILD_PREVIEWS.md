@@ -7,8 +7,10 @@ the receiver uses a thin ground marking in the builder's cursor colour.
 The preview follows edits and remains visible while the builder waits to confirm.
 Confirming, cancelling or switching construction tools removes it.
 
-This covers the road and track builders. Buildings, stations, terrain tools and
-upgrades are not covered. Bridge and tunnel resource names are carried by the
+This covers the road and track builders. Experimental construction support also
+handles a single new placement from `constructionBuilder`: stations, depots and
+other `.con` buildings. Existing station module edits, replacements, terrain tools
+and upgrades are not covered. Bridge and tunnel resource names are carried by the
 3D protocol; the ground fallback only shows their horizontal route. Both players
 need the current preview Lua module. Cost labels and confirmation controls remain
 local. The receiver evaluates a temporary, disconnected route against its world;
@@ -18,6 +20,24 @@ status keeps the receiver's evaluation. The native plugin is experimental and
 supports game build 35924. Validation and remaining coverage are listed below.
 
 ## Implementation
+
+Construction extension (experimental; offline validated, live rendering pending):
+`mp/preview_constructions.lua` copies `proposal.toAdd[1]` from the builder event.
+Wire version 5 carries the `.con` resource name, 16-value transform, sender error
+status and a typed parameter tree. No entity ID or executable Lua is transmitted.
+The codec has a 4096-byte total limit, depth 8, 512 visited values and 128 entries
+per table; unsupported or oversized placements clear the previous preview.
+The receiver resolves its own construction resource and player, converts one
+temporary `ConstructionEntity`, and never submits the resulting command.
+The native guard permits at most one construction and its generated temporary
+street pieces (384 nodes/192 edges), rejects removals and invalid paths/transforms,
+and uses the same independent BuilderRenderer as road previews. Template connectors
+are evaluated disconnected, so snapping and junction details may differ locally.
+Missing resources or a rejected/absent native renderer use a small oriented
+placement marker, not an approximate footprint or full building model.
+Both peers need the new Lua files; 3D construction rendering also needs the new
+preview DLL. Construction-template evaluation can run installed mod code; this
+does not make arbitrary construction mods deterministic or sandbox their scripts.
 
 `mp/previews.lua` observes `builder.proposalCreate` in GUI Lua and copies the
 proposal's node positions and Hermite tangents. Existing node references are
@@ -54,8 +74,8 @@ replace any native handlers. A failing UI query also expires the preview.
 
 ## Native renderer
 
-Build with `native\build.bat previews [suffix]`. This optional target is separate
-from `all`, the installer and shipping deployment. For a developer test with the
+Build with `native\build.bat previews [suffix]`. This target is separate from
+`all`; from 0.4.22, the MSI build explicitly builds and packages it. For a developer test with the
 games closed, the unsuffixed DLL belongs in `<game>/plugins/tpf2_previews.dll`;
 the existing plugin host is required. Check for overriding plugin copies in the
 data directory and Sandboxie overlay. Normal player updates use the launcher.

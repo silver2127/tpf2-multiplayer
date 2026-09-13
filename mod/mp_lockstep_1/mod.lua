@@ -17,6 +17,17 @@ nothing is cancelled or replayed.
 			visible = true,
 		},
 		runFn = function(settings)
+			-- Experimental, deliberately limited to the script verified by our
+			-- compatibility tests. Resource modifiers leave Workshop files intact.
+			addModifier("loadGameScript", function(fileName, script)
+				local name = fileName:gsub("\\", "/")
+				if name ~= "natural_town_growth.lua" and not name:match("/natural_town_growth%.lua$") then
+					return script
+				end
+				return require("mp/deterministic_script").wrap(script, "natural_town_growth", {
+					naturalTownGrowth = true,
+				})
+			end)
 		end,
 	}
 end

@@ -142,10 +142,13 @@ if ($SkipBuild) {
     if ($rc -ne 0) { Fail "build.bat host failed (exit $rc). If it was LNK1104, close the game (it holds tpf2_pluginhost.dll) and rerun." }
     $menuDll  = Build-Suffixable "menu"  "tpf2_menu.dll"
     $sliceDll = Build-Suffixable "slice" "tpf2_slice.dll"
+    Say "running build.bat previews"
+    $rc = Run-Bat $build "previews"
+    if ($rc -ne 0) { Fail "build.bat previews failed (exit $rc)" }
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
-foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll)) {
+foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll, (Join-Path $BridgeOut "tpf2_previews.dll"))) {
     if (-not (Test-Path $f)) { Fail "missing: $f" }
 }
 
@@ -158,7 +161,9 @@ if ($SkipBuild) {
     Say "freezing netpunch\lobby.py with PyInstaller"
     Push-Location $Netpunch
     try {
-        python -m PyInstaller --noconfirm --onefile --name netpunch lobby.py
+        # PowerShell 5.1 otherwise treats PyInstaller's normal stderr logging
+        # as a terminating NativeCommandError under ErrorActionPreference=Stop.
+        cmd /c "python -m PyInstaller --noconfirm --onefile --name netpunch lobby.py 2>&1" | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) { Fail "PyInstaller failed (exit $LASTEXITCODE). pip install pyinstaller -r requirements.txt" }
     } finally { Pop-Location }
 }

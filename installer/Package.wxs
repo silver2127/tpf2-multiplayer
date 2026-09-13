@@ -90,6 +90,7 @@
           <Directory Name="common">
             <Directory Id="INSTALLFOLDER" Name="Transport Fever 2">
               <Directory Id="NetpunchFolder" Name="netpunch" />
+              <Directory Id="PreviewPluginsFolder" Name="plugins" />
               <Directory Id="ModsFolder" Name="mods">
                 <Directory Id="ModFolder" Name="mp_lockstep_1" />
               </Directory>
@@ -130,6 +131,9 @@
       </Component>
       <Component Id="SliceDll">
         <File Id="tpf2_slice.dll" Name="tpf2_slice.dll" Source="$(SliceDll)" />
+      </Component>
+      <Component Id="PreviewDll" Directory="PreviewPluginsFolder">
+        <File Id="tpf2_previews.dll" Name="tpf2_previews.dll" Source="$(BridgeOut)\tpf2_previews.dll" />
       </Component>
       <!-- The cfg files used to carry NeverOverwrite="yes" so a player's edits
            survived an upgrade. That is the documented Windows Installer trap: the
