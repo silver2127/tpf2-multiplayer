@@ -136,7 +136,11 @@ or native proposal/terrain timings. The native renderer is unchanged from 0.1.5.
 The same harness checks failed publication/retry, colour-only changes,
 cancellation, native session restart, rejected keepalive, stale GUI/engine/peer
 data, malformed/duplicate packets, partial snapshots and identity changes.
-In-game verification of this optimization is still pending.
+A user live test confirmed that the optimized preview works. It also showed
+differing junction geometry, as expected from reconstructing an isolated route:
+replacement segments and connections to the existing road network are not
+replicated into the cosmetic proposal. Full junction fidelity is outside this PR.
+This confirmation does not measure game FPS or cover every lifecycle case.
 
 ## Checks
 
