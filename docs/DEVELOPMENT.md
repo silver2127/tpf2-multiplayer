@@ -39,6 +39,7 @@ game through the registry; for the others, edit the path variables at the top of
 | `menu` | `tpf2_menu.dll` | also copies the new DLL into the game folder when it is not locked |
 | `slice` | `tpf2_slice.dll` | |
 | `all` | all of the above | |
+| `previews` | `tpf2_previews.dll` | optional shared 3D previews; separate from `all` and shipping deployment; see [BUILD_PREVIEWS.md](BUILD_PREVIEWS.md) |
 
 A DLL loaded by a running game is locked and relinking it fails with LNK1104. A suffix builds beside it
 (`build.bat slice 2` makes `tpf2_slice2.dll`); only unsuffixed names ship, and `deploy_shipping.ps1`

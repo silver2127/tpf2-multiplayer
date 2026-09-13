@@ -4,6 +4,10 @@ Every player action is replicated in one of three ways. This page lists each act
 way it travels, and what is known not to work. How the pieces fit together (capture, stamps,
 the clock) is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Unconfirmed road and railway routes also have [shared visual previews](BUILD_PREVIEWS.md).
+These use optional native 3D rendering with a ground-marking fallback, separate
+from the construction commands below.
+
 | mode | what happens |
 |---|---|
 | **strict** | The slice DLL cancels the player's command inside the engine before it applies. The mod ships it with a stamp, and **every** instance, the player's own included, applies it at that stamp. Nobody's world runs ahead. |
