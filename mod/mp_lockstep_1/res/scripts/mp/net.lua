@@ -291,6 +291,7 @@ local function decodeCmd(line)
 end
 
 function CM.scheduleLocal(op, args)
+	if CM.resyncHold then return end
 	local now = CM.gameTime()
 	if not now then return end
 	CM.seqNo = CM.seqNo + 1
@@ -694,11 +695,17 @@ end
 
 local function onLine(line)
 	local op = line:match("^(%u+)")
+	if op == "LSRESYNC" then
+		if CM.resyncReceive then CM.resyncReceive(line) end
+		return
+	end
+	if CM.resyncHold and op ~= "LSTICK" then return end
 	if op == "LSTICK" then
 		local t = tonumber(line:match("t=([%d%.%-]+)"))
 		if t then
 			local o = line:match(" o=(%a+)") or "?"
 			local pr = CM.peerFor(o)
+			if CM.resyncHeartbeat then CM.resyncHeartbeat(pr, line) end
 			pr.time = t; pr.at = CM.ticks; pr.clk = os.clock()   -- wall clock at arrival: stamping projects the peer forward from here
 			-- LSTICK has always carried the SIM STEP as well, and nothing read
 			-- it. t= is math.floor(now), so it is quantised to a whole unit --
@@ -870,7 +877,7 @@ local function onLine(line)
 end
 
 function CM.pollEvents()
-	CM.histPump()
+	if not CM.resyncHold then CM.histPump() end
 	if not K.EVENTS_FILE then return end
 	local data, newOff = CM.readFrom(K.EVENTS_FILE, CM.eventsOffset)
 	CM.eventsOffset = newOff

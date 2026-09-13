@@ -767,6 +767,13 @@ end
 -- to look at something. Firing once after load gets an unattended test moving
 -- without taking the speed control away for the rest of the session.
 local didInitialUnpause = false
+function CM.recoveryReleasePacing(speed)
+	didInitialUnpause = true
+	CM.lgHolding, CM.lgHeld = false, false
+	CM.myCeiling, CM.effSpeed = speed, speed
+	CM.pidHold, CM.pidI, CM.pidLastE = nil, 0, nil
+	CM.catchingUp2, CM.cuPhase = false, nil
+end
 -- Numeric cfg value (CM.cfgFlag only answers yes/no). Shares its cache, so
 -- calling this first also populates it.
 function CM.cfgNum(key, default)

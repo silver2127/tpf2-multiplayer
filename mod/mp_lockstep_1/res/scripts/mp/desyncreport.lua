@@ -26,7 +26,9 @@
 -- state. So besides CM.desyncHandled (this loaded game) the lobby run's id --
 -- "session" in lobby_state.json, new each time the lobby starts -- is recorded
 -- in <data dir>\tpf2mp_desync_seen.txt, and a later game in the same session
--- neither asks nor sends. The lobby also refuses a second upload per run.
+-- neither asks nor sends after an answer. An unanswered prompt is kept on disk
+-- for this lobby session and restored after a resync. The lobby also refuses
+-- a second upload per run.
 return function(CM, K, log)
 local PREF_KEY = "desync_logs"
 local NL = string.char(10)
@@ -108,6 +110,34 @@ function CM.desyncSendLogs(info)
 	return ok
 end
 
+local function pendingPath() return (K.BASE or "") .. "tpf2mp_desync_pending.txt" end
+
+local function readPending(sid)
+	if not sid then return nil end
+	local f = io.open(pendingPath(), "r")
+	if not f then return nil end
+	local session, why, t, n = f:read("*l"), f:read("*l"), f:read("*l"), f:read("*l")
+	f:close()
+	-- the game's Lua has no os.remove (io.lua): an emptied file reads as absent
+	if session ~= sid then CM.clearFile(pendingPath()); return nil end
+	if not why or not tonumber(t) or not tonumber(n) then return nil end
+	return {why=why, t=tonumber(t), n=tonumber(n), session=session}
+end
+
+local function keepPending(info, sid)
+	CM.desyncPending = info
+	if not sid then return end
+	local f = io.open(pendingPath(), "w")
+	if not f then print("[ls-gui] could not preserve unanswered desync log prompt"); return end
+	f:write(sid .. NL .. tostring(info.why):gsub("[\r\n]", " ") .. NL .. info.t .. NL .. info.n .. NL)
+	f:close()
+end
+
+local function clearPending()
+	CM.desyncPending = nil
+	CM.clearFile(pendingPath())
+end
+
 function CM.desyncPopup(info)
 	local ok, err = pcall(function()
 		local win
@@ -118,8 +148,10 @@ function CM.desyncPopup(info)
 		local function button(label, fn)
 			local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
 			b:onClick(function()
-				local okC, errC = pcall(fn)
-				if not okC then print("[ls-gui] desync popup: " .. tostring(errC)) end
+				local okC, result = pcall(fn)
+				if not okC then print("[ls-gui] desync popup: " .. tostring(result)); return end
+				if result == false then return end
+				clearPending()
 				close()
 			end)
 			return b
@@ -137,9 +169,9 @@ function CM.desyncPopup(info)
 		local row = api.gui.layout.BoxLayout.new("HORIZONTAL")
 		row:addItem(button("  Always send  ", function()
 			CM.prefWrite(PREF_KEY, "always")
-			CM.desyncSendLogs(info)
+			return CM.desyncSendLogs(info)
 		end))
-		row:addItem(button("  Only this once  ", function() CM.desyncSendLogs(info) end))
+		row:addItem(button("  Only this once  ", function() return CM.desyncSendLogs(info) end))
 		row:addItem(button("  Never  ", function()
 			CM.prefWrite(PREF_KEY, "never")
 			CM.desyncNote("You won't be asked about desync logs again. Type /desynclogs ask in the chat to undo that.")
@@ -150,6 +182,7 @@ function CM.desyncPopup(info)
 		local body = api.gui.comp.Component.new("mpDesyncPopup")
 		body:setLayout(box)
 		win = api.gui.comp.Window.new("Desync detected", body)
+		win:addHideOnCloseHandler()
 		pcall(function() win:setPosition(460, 260) end)
 		CM.desyncWin = win
 	end)
@@ -174,12 +207,32 @@ end
 CM.desyncGuiBoot = CM.desyncGuiBoot or os.time()
 
 function CM.desyncReportTick(kv)
-	if CM.desyncHandled or type(kv) ~= "table" then return end
+	if type(kv) ~= "table" then return end
 	local n, boot = tonumber(kv.desyncs), tonumber(kv.boot)
-	if not n or n <= 0 then return end
 	if not boot or boot < CM.desyncGuiBoot - 60 then return end
-	CM.desyncHandled = true
 	local sid = CM.lobbySessionId()
+	if not CM.desyncPendingLoaded then
+		CM.desyncPending = readPending(sid)
+		CM.desyncPendingLoaded = true
+	end
+	if kv.resync == "1" then
+		if CM.desyncWin then CM.desyncWin:setVisible(false, false) end
+		CM.desyncPromptDeferred = true
+		return
+	end
+	if CM.desyncPending then
+		CM.desyncHandled = true
+		local pref = CM.desyncLogsPref()
+		if pref == "never" then clearPending()
+		elseif pref == "always" then
+			if CM.desyncSendLogs(CM.desyncPending) then clearPending() end
+		elseif not CM.desyncWin then CM.desyncPopup(CM.desyncPending)
+		elseif CM.desyncPromptDeferred then CM.desyncWin:setVisible(true, false) end
+		CM.desyncPromptDeferred = nil
+		return
+	end
+	if CM.desyncHandled or not n or n <= 0 then return end
+	CM.desyncHandled = true
 	if sid then
 		local f = io.open(seenPath(), "r")
 		local seen = f and f:read("*l")
@@ -201,6 +254,7 @@ function CM.desyncReportTick(kv)
 		end
 		return
 	end
+	keepPending(info, sid)
 	CM.desyncPopup(info)
 end
 

@@ -25,6 +25,9 @@
 #define VK_NO_PROTOTYPES
 #include "../third_party/vk/vulkan_core.h"
 #include "hook.h"
+#include "native_io.h"
+#include "native_control.h"
+static HMODULE g_nativeModule = nullptr;
 #include "datadir.h"
 #include "logarchive.h"
 
@@ -404,7 +407,11 @@ static bool InitRender(VkSwapchainKHR sc)
 }
 
 // ---- multiplayer panel state ----
-static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lobby
+static volatile LONG g_recoveryPresent = 0;
+static volatile LONG g_recoveryWorldIo = 0;
+static char g_recoveryOperation[40] = "", g_recoveryEpoch[40] = "";
+static char g_recoveryPhase[24] = "", g_recoveryDetail[420] = "", g_recoveryFailedStep[24] = "";
+static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lobby, 3 recovery (title menu only)
 // Low-level keyboard hook. While the lobby chat is open (state 2) and the game is
 // focused, route typing into the chat box and SWALLOW the key so the game's own
 // bindings never fire -- crucially Enter, which on the title menu opens Load Game.
@@ -892,7 +899,44 @@ static void RenderPanelLayer(int w, int h)
     g_s = UiScale(); layerBegin(w, h); g_hitCount = 0;
     layerRect(0, 0, w, h, MW_BG, MW_BG_A);
     int pad = S(25), cy = S(56);
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) {
+    const LONG page=InterlockedCompareExchange(&g_uiState,0,0);
+    if(page==3) {
+        char phase[24],detail[420],failedStep[24];
+        EnterCriticalSection(&g_modelCs);
+        strcpy_s(phase,g_recoveryPhase); strcpy_s(detail,g_recoveryDetail); strcpy_s(failedStep,g_recoveryFailedStep);
+        LeaveCriticalSection(&g_modelCs);
+        // No close button and no Esc while the world is held (user test 2026-09-14:
+        // Cancel, then close, left no way back -- the Lua window cannot be clicked
+        // under the input gate). Completion hides the panel.
+        mwTitle(L"MULTIPLAYER RESYNC");
+        const wchar_t* label=L"Pausing both games";
+        if(!strcmp(phase,"waiting")) label=L"Desync detected. Both games are paused.";
+        else if(!strcmp(phase,"saving")) label=L"Saving the host world";
+        else if(!strcmp(phase,"transferring")) label=L"Transferring the save";
+        else if(!strcmp(phase,"loading")) label=L"Loading the save";
+        else if(!strcmp(phase,"checking") || !strcmp(phase,"releasing")) label=L"Checking that both worlds match";
+        else if(!strcmp(phase,"complete")) label=L"All players are in sync.";
+        else if(!strcmp(phase,"aborted")) label=L"Resync cancelled. Both games remain paused.";
+        else if(!strcmp(phase,"error")) {
+            label=L"Resync stopped";
+            if(!strcmp(failedStep,"holding")) label=L"Could not pause both games";
+            else if(!strcmp(failedStep,"saving")) label=L"Could not save the host world";
+            else if(!strcmp(failedStep,"transferring")) label=L"Save transfer failed";
+            else if(!strcmp(failedStep,"loading")) label=L"Could not load the save";
+            else if(!strcmp(failedStep,"checking") || !strcmp(failedStep,"releasing")) label=L"World comparison failed";
+        }
+        mwBody(pad,cy,w-2*pad,S(40),label);
+        if(detail[0]) { wchar_t text[420]; MultiByteToWideChar(CP_UTF8,0,detail,-1,text,420);
+            mwBody(pad,cy+S(42),w-2*pad,S(60),text,MW_DIM); }
+        mwBody(pad,h-S(130),w-2*pad,S(40),L"The host world is used. Client-only changes will be lost.",MW_DIM);
+        // aborted: the hold remains and only a new request goes on (the barrier
+        // ignores Cancel there); it used to offer nothing but Cancel (user test 2026-09-14)
+        if(!strcmp(phase,"error")) mwButton(pad,h-S(76),S(180),S(30),L"Retry",82);
+        else if(!strcmp(phase,"waiting") || !strcmp(phase,"complete") || !strcmp(phase,"aborted"))
+            mwButton(pad,h-S(76),S(210),S(30),L"Resync now",84);
+        if(strcmp(phase,"complete") && strcmp(phase,"aborted")) mwButton(w-pad-S(160),h-S(76),S(160),S(30),L"Cancel",83);
+        mwStatus(w,h);
+    } else if (page == 2) {
         // ---------------- LOBBY ----------------
         int titleW = S(90);
         { wchar_t wt[64] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, 48); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
@@ -1114,10 +1158,15 @@ static bool BuildPanelImage()
     barrierImage(cb, g_panelImg, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
     pEndCB(cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    pResetFences(g_dev, 1, &g_fence); pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence);
+    if (pResetFences(g_dev, 1, &g_fence) != VK_SUCCESS || pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence) != VK_SUCCESS) {
+        g_rFail = true; return false;
+    }
     // Wait: BuildBackdropImage runs next and resets this very command buffer and
     // fence, which is invalid while this submission is pending (review, 2026-09-01).
-    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    if (pWaitFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        g_rFail = true;
+        return false;
+    }
     g_panelBuilt = true;
     Log("[menu] vk: panel image ready %dx%d pitch=%zu\n", g_panelW, g_panelH, g_panelPitch);
     return true;
@@ -1168,15 +1217,20 @@ static bool BuildBackdropImage()
     barrierImage(cb, g_bdImg, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     pEndCB(cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    pResetFences(g_dev, 1, &g_fence); pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence);
-    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    if (pResetFences(g_dev, 1, &g_fence) != VK_SUCCESS || pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence) != VK_SUCCESS) {
+        g_rFail = true; return false;
+    }
+    if (pWaitFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        g_rFail = true;
+        return false;
+    }
     g_bdBuilt = true;
     Log("[menu] vk: backdrop image ready pitch=%zu\n", g_bdPitch);
     return true;
 }
 // Pull the region under the button out of this frame's swapchain image (usage has
 // TRANSFER_SRC) so the CPU can blend the label over it.
-static void CopyBackdrop(VkQueue q, uint32_t imgIndex)
+static bool CopyBackdrop(VkQueue q, uint32_t imgIndex)
 {
     VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1192,14 +1246,21 @@ static void CopyBackdrop(VkQueue q, uint32_t imgIndex)
     barrierImage(cb, g_bdImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     pEndCB(cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    pResetFences(g_dev, 1, &g_fence); pSubmit(q, 1, &si, g_fence);
-    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    if (pResetFences(g_dev, 1, &g_fence) != VK_SUCCESS || pSubmit(q, 1, &si, g_fence) != VK_SUCCESS) {
+        g_rFail = true; return false;
+    }
+    if (pWaitFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        g_rFail = true;
+        return false;
+    }
     if (pInvalidate) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_bdMem; r.size = VK_WHOLE_SIZE; pInvalidate(g_dev, 1, &r); }
+    return true;
 }
 static void PanelLayout()
 {
     g_s = UiScale();
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 3) { g_copyW = S(520); g_copyH = S(300); }
+    else if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
     else                                                     { g_copyW = S(780); g_copyH = g_flagMaster[0] ? S(540) : S(300); }
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
@@ -1219,7 +1280,7 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
         RenderPanelLayer(g_copyW, g_copyH); lastRender = now;
     }
     LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-    CopyBackdrop(q, imgIndex);
+    if (!CopyBackdrop(q, imgIndex)) return;
     ComposeLayer((const unsigned char*)g_bdPtr, g_bdPitch, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
     if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
     QueryPerformanceCounter(&t1);
@@ -1237,9 +1298,10 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
     barrierImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     pEndCB(cb);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    pResetFences(g_dev, 1, &g_fence);
-    pSubmit(q, 1, &si, g_fence);
-    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    if (pResetFences(g_dev, 1, &g_fence) != VK_SUCCESS || pSubmit(q, 1, &si, g_fence) != VK_SUCCESS) {
+        g_rFail = true; return;
+    }
+    if (pWaitFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) g_rFail = true;
 }
 
 // In-frame click: the button is not a window, so poll the cursor + left button
@@ -1257,11 +1319,14 @@ static bool gameHasFocus()
     return pid == GetCurrentProcessId();
 }
 
+static volatile LONG g_pendingPanelClick=0, g_mouseInstalled=0;
+static volatile LONG64 g_panelClickPoint=0;
 static void PollClick()
 {
     static bool prevDown = false;
     static ULONGLONG lastFire = 0;
     bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    const bool clicked=InterlockedExchange(&g_pendingPanelClick,0)!=0;
     // hover / pressed tracking for the native-look overlay (Button:hover / :active)
     {
         int hv = 0;
@@ -1275,8 +1340,10 @@ static void PollClick()
         }
         g_hover = hv; g_active = (hv && down) ? hv : 0;
     }
-    if (down && !prevDown && gameHasFocus()) {
+    if ((clicked || (!g_mouseInstalled && down && !prevDown)) && gameHasFocus()) {
         POINT pt; GetCursorPos(&pt);
+        if(clicked) { const auto packed=InterlockedCompareExchange64(&g_panelClickPoint,0,0);
+            pt.x=(LONG)(packed&0xffffffff); pt.y=(LONG)((unsigned long long)packed>>32); }
         if (!g_gameWnd || !IsWindow(g_gameWnd)) { g_gameWnd = nullptr; EnumWindows(FindGameWnd, (LPARAM)&g_gameWnd); }
         POINT origin = { 0, 0 };
         if (g_gameWnd) ClientToScreen(g_gameWnd, &origin);
@@ -1297,9 +1364,7 @@ static void PollClick()
     prevDown = down;
 }
 
-// OPEN LOGS: copy this run's logs beside the earlier runs the proxy saved at
-// start (logarchive.h) and show the folder. Off the render thread: copying a
-// long game log takes a moment.
+// OPEN LOGS remains a worker operation; it must not block presentation.
 static volatile LONG g_logsBusy = 0;
 static DWORD WINAPI CollectLogsThread(LPVOID)
 {
@@ -1340,6 +1405,14 @@ static void OnHit(int id)
             if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
         }
         break;
+    case 82: case 83: case 84: {
+        char operation[40]; EnterCriticalSection(&g_modelCs); strcpy_s(operation,g_recoveryOperation); LeaveCriticalSection(&g_modelCs);
+        static LONG requestNo = 0;
+        char line[256]; snprintf(line,sizeof(line),"{\"cmd\":\"%s\",\"operation\":\"%s\",\"id\":\"native-%lu-%llu-%ld\"}",
+            id==82?"sync_retry":id==83?"sync_abort":"sync_request",operation,
+            GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&requestNo));
+        LobbySend(line);
+    } break;
     case 4: InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: StartLobby(1); break;   // JOIN  -> lobby (join)
@@ -1408,11 +1481,11 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         InterlockedCompareExchange(&g_showOverlay, 0, 0), pi->swapchainCount,
         (int)g_rInit, (int)g_rFail, g_dev, g_qfam, (int)g_scFormat);
     __try {
-        if (InterlockedCompareExchange(&g_showOverlay, 0, 0) && pi->swapchainCount >= 1) {
+        if ((InterlockedCompareExchange(&g_showOverlay, 0, 0) || g_recoveryPresent) && !g_recoveryWorldIo && !NativeIo::Busy() && pi->swapchainCount >= 1) {
             VkSwapchainKHR sc = pi->pSwapchains[0];
             uint32_t idx = pi->pImageIndices[0];
             if ((!g_rInit || sc != g_theSc) && !g_rFail) InitRender(sc);
-            if (g_rInit && sc == g_theSc) { DrawButton(q, idx); PollClick(); }
+            if (g_rInit && !g_rFail && sc == g_theSc) { DrawButton(q, idx); PollClick(); }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static bool once = false;
@@ -2322,7 +2395,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
     wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
-    wchar_t cmd[2048];
+    wchar_t cmd[4096];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
     // the target machine); fall back to `python lobby.py` when only the scripts are there.
     wchar_t exe[600]; _snwprintf_s(exe, _TRUNCATE, L"%s\\netpunch.exe", NETDIR);
@@ -2367,7 +2440,16 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
-    { wchar_t shown[2048]; wcscpy_s(shown, cmd); wchar_t* pp = wcsstr(shown, L" --password "); if (pp) wcscpy_s(pp, 2048 - (pp - shown), L" --password ***");
+    { wchar_t recoveryArgs[1100];
+      // A trailing backslash escapes the closing quote in Windows argv.
+      // Forward slashes are accepted by Python/Windows for both directory paths.
+      std::wstring runtime = g_dataDirW, saves = g_saveDirW;
+      for (auto& c : runtime) if (c == L'\\') c = L'/';
+      for (auto& c : saves) if (c == L'\\') c = L'/';
+      _snwprintf_s(recoveryArgs, _TRUNCATE, L" --sync-runtime-dir \"%s\" --save-dir \"%s\" --game-pid %lu",
+          runtime.c_str(), saves.c_str(), GetCurrentProcessId());
+      wcscat_s(cmd, recoveryArgs); }
+    { wchar_t shown[4096]; wcscpy_s(shown, cmd); wchar_t* pp = wcsstr(shown, L" --password "); if (pp) wcscpy_s(pp, _countof(shown) - (pp - shown), L" --password ***");
       Log("[menu] lobby cmd: %ls\n", shown); }
 
     wchar_t outPath[512]; _snwprintf_s(outPath, _TRUNCATE, L"%s\\lobby_out.jsonl", NETDIR);
@@ -2424,6 +2506,35 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         InterlockedExchange(&g_lobbyReady, 1);   // lobby.py is up and has truncated lobby_in.jsonl
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) { strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
+                        else if(strcmp(ty,"sync_state")==0) {
+                            char operation[40],epoch[40],phase[24],detail[420];
+                            jsonStr(rem,"operation",operation,sizeof(operation)); jsonStr(rem,"epoch",epoch,sizeof(epoch));
+                            jsonStr(rem,"phase",phase,sizeof(phase)); jsonStr(rem,"detail",detail,sizeof(detail));
+                            EnterCriticalSection(&g_modelCs);
+                            bool fresh=strcmp(operation,g_recoveryOperation)!=0;
+                            strcpy_s(g_recoveryOperation,operation); strcpy_s(g_recoveryEpoch,epoch);
+                            strcpy_s(g_recoveryPhase,phase); strcpy_s(g_recoveryDetail,detail);
+                            InterlockedExchange(&g_recoveryWorldIo, !strcmp(phase,"saving") || !strcmp(phase,"loading"));
+                            jsonStr(rem,"step",g_recoveryFailedStep,sizeof(g_recoveryFailedStep));
+                            LeaveCriticalSection(&g_modelCs);
+                            SetStatus(!strcmp(phase,"complete") ? "Resync complete." : "");
+                            InterlockedExchange(&g_recoveryPresent,1);
+                            // The compact panel is the recovery view while the world is
+                            // held: the native input gate swallows clicks on game widgets,
+                            // so the Multiplayer window's Resync section (resync.lua) can
+                            // only start a resync; Retry and Cancel are here, read through
+                            // the low-level mouse hook. The panel no longer collapses to a
+                            // "Multiplayer status" button: closing it or completing hides
+                            // it; it stays open, without a close button, while the world
+                            // is held (2026-09-14).
+                            if(!strcmp(phase,"complete")) {
+                                InterlockedExchange(&g_lobbyDone,1);
+                                if(InterlockedCompareExchange(&g_uiState,0,0)==3) InterlockedExchange(&g_uiState,0);
+                            } else {
+                                InterlockedExchange(&g_uiState,3);
+                            }
+                            InterlockedExchange(&g_panelDirty,1);
+                        }
                         else if (strcmp(ty, "roster") == 0) applyRoster(rem);
                         else if (strcmp(ty, "chat") == 0) {
                             char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx));
@@ -2623,6 +2734,25 @@ static char vkToChar(int vk, bool shift)
     return 0;
 }
 static HHOOK g_kbHook = nullptr;
+static HHOOK g_mouseHook = nullptr;
+static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
+{
+    static bool captured=false;
+    if(code==HC_ACTION && wp==WM_LBUTTONUP && captured) { captured=false; return 1; }
+    if(code==HC_ACTION && wp==WM_LBUTTONDOWN && gameHasFocus() && g_uiState!=0 && (g_showOverlay || g_recoveryPresent) && !g_recoveryWorldIo && !NativeIo::Busy()) {
+        const auto data=reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
+        POINT origin{}; if(g_gameWnd) ClientToScreen(g_gameWnd,&origin);
+        const int x=data->pt.x-origin.x-g_panelX, y=data->pt.y-origin.y-g_panelY;
+        if(x>=0 && y>=0 && x<g_copyW && y<g_copyH) {
+            InterlockedExchange64(&g_panelClickPoint,(LONG64)((unsigned long long)(DWORD)data->pt.y<<32 | (DWORD)data->pt.x));
+            InterlockedExchange(&g_pendingPanelClick,1);
+            captured=true;
+            return 1; // panel clicks never reach a construction tool behind it
+        }
+    }
+    return CallNextHookEx(g_mouseHook,code,wp,lp);
+}
+
 // Ctrl+Shift+D toggles the in-game Multiplayer dashboard. The dashboard lives in
 // the game's GUI Lua state, which has no key input of its own, so the toggle is
 // a one-byte file it polls: 1 = shown, 0 = hidden. The chord is not bound by the
@@ -2710,6 +2840,8 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
 static DWORD WINAPI KbHookThread(LPVOID)
 {
     g_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, LlKeyboard, GetModuleHandleW(nullptr), 0);
+    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, LlMouse, GetModuleHandleW(nullptr), 0);
+    InterlockedExchange(&g_mouseInstalled, g_mouseHook != nullptr);
     Log("[menu] LL keyboard hook %s\n", g_kbHook ? "installed" : "FAILED");
     MSG msg;   // the LL hook needs a message pump on its installing thread
     while (GetMessage(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessage(&msg); }
@@ -2720,6 +2852,7 @@ static DWORD WINAPI KbHookThread(LPVOID)
 // button visible on the main page (page 2), hidden elsewhere.
 static void MyCreatePage(uint64_t thisp, int page)
 {
+    NativeIo::ObserveMenu(thisp);
     g_origCreatePage(thisp, page);
     // The main menu builds pages 0 -> 2 -> 1 (2 is the main content, 0/1 are its
     // sub-layers). Full-screen replacements (Settings/Campaign/Load...) are all
@@ -2732,6 +2865,14 @@ static void MyCreatePage(uint64_t thisp, int page)
         // start arriving while the title menu sat on another page looked like
         // "start while in game" and was ignored (relay resume, 2026-09-10).
         g_gameUi = 0;
+        // Back at the title menu with a recovery still open (a failed load): the
+        // game GUI's Resync section is gone, so the native panel takes over.
+        if (InterlockedCompareExchange(&g_recoveryPresent, 0, 0) && g_modelCsInit) {
+            EnterCriticalSection(&g_modelCs);
+            const bool open = g_recoveryPhase[0] != 0 && strcmp(g_recoveryPhase, "complete") != 0;
+            LeaveCriticalSection(&g_modelCs);
+            if (open) { InterlockedExchange(&g_uiState, 3); InterlockedExchange(&g_panelDirty, 1); }
+        }
     }
     else if (page >= 3) InterlockedExchange(&g_showOverlay, 0);
     static int seen = 0;
@@ -2822,6 +2963,7 @@ static DWORD WINAPI Init(LPVOID)
     resolveNetDir(g_netDirW, 600);   NETDIR   = g_netDirW;
     // the runtime data dir the bridge uses for tpf2_instance.txt / tpf2_bridge_ctl.txt
     if (!Tpf2mpDataDirW(g_dataDirW, MAX_PATH, (const void*)&Init)) wcscpy_s(g_dataDirW, ourDirW());
+    NativeControl::Start(g_dataDirW, NativeIo::Initialize(g_base, g_nativeModule, g_saveDirW));
     InitializeCriticalSection(&g_statusCs); g_csInit = true;
     InitializeCriticalSection(&g_modelCs); g_modelCsInit = true;
     InitializeCriticalSection(&g_lobbyCs); g_lobbyCsInit = true;
@@ -2974,6 +3116,7 @@ static DWORD WINAPI Init(LPVOID)
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
+        g_nativeModule = h;
         DisableThreadLibraryCalls(h);
         // Before the game's own startup reads settings.lua (see AutoEnableLockstepMod).
         __try {
@@ -2984,6 +3127,7 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID)
         }
         CreateThread(nullptr, 0, Init, nullptr, 0, nullptr);
     } else if (reason == DLL_PROCESS_DETACH) {
+        NativeControl::SignalShutdown();
         // Orderly shutdown: ask the lobby to quit. Nothing may block here (the
         // loader lock is held), so no waiting and no thread joins -- the job
         // object above is what guarantees the kill if this never runs.

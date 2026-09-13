@@ -438,6 +438,7 @@ end
 local hash = CM.boot("mp.hash")
 local worldHash, vposPrune
 CM.gameTime, worldHash, vposPrune = hash.gameTime, hash.worldHash, hash.vposPrune
+CM.recoveryWorldHash = worldHash
 -- ---------- runtime files: append/read, instance detection, wire broadcast ----------
 -- Lives in res/scripts/mp/io.lua.
 CM.boot("mp.io")
@@ -620,6 +621,7 @@ CM.boot("mp.stats")
 -- ---------- the desync popup: send this game's logs to the developers? (GUI state) ----------
 -- Lives in res/scripts/mp/desyncreport.lua.
 CM.boot("mp.desyncreport")
+CM.boot("mp.resync")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
 	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
@@ -695,6 +697,11 @@ function data()
 	return {
 		update = function()
 			CM.ticks = CM.ticks + 1
+			if not K.INSTANCE and not CM.detectInstance() then return end
+			-- Recovery is checked before every command producer, including deferred
+			-- company repairs. Recovery control uses the separate lobby connection.
+			if CM.autoSyncPump(CM.gameTime() or 0) then return end
+			CM.pollEvents()
 			pcall(CM.sampleSimRate)
 			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end   -- companies: vehicles left to follow their lines in a switch
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
@@ -735,7 +742,6 @@ function data()
 			-- Both every tick. pollInject at every 10th tick added up to 1.9s of
 			-- pure dead time before a build was even scheduled; a file stat per
 			-- tick is far cheaper than that.
-			CM.pollEvents()
 			CM.pollInject()
 			if CM.ticks % K.CON_POLL_EVERY == 0 then CM.pollNewConstructions() end
 			if CM.ticks % K.CON_POLL_EVERY == 3 then CM.pollStops() end
@@ -771,10 +777,10 @@ function data()
 				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
 				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
 				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
 					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
 					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
-					CM.heartbeatEcho and CM.heartbeatEcho() or ""))
+					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.resyncToken))
 			end
 
 			CM.paceTick(now)
@@ -977,6 +983,7 @@ function data()
 						f:write("wall=" .. tostring(os.time()) .. "\n")
 						-- the first desync of this game, for the popup (desyncreport.lua)
 						f:write("boot=" .. tostring(CM.bootWall or 0) .. "\n")
+						f:write("resynctoken=" .. CM.resyncToken .. "\n")
 						if CM.firstDesync then
 							f:write("desyncwhy=" .. tostring(CM.firstDesync.why):gsub("%c", " ") .. "\n")
 							f:write("desynct=" .. tostring(math.floor(tonumber(CM.firstDesync.t) or 0)) .. "\n")
@@ -1067,6 +1074,7 @@ function data()
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
 		guiHandleEvent = function(id, name, param)
+			if CM.recoveryGuiHeld() then return end
 			pcall(CM.previewGuiEvent, id, name, param)
 		end,
 		guiUpdate = function()
@@ -1074,7 +1082,7 @@ function data()
 			-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
 			-- the panel's own twice-a-second refresh
 			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
-			pcall(CM.previewGuiTick)
+			if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
 			if guiTick % 30 ~= 0 then return end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
@@ -1258,6 +1266,9 @@ function data()
 						CM.dashShowCompanies = not CM.dashShowCompanies
 						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
 					end))
+					-- the Resync section (resync.lua): first, so it stands out while every
+					-- other block is hidden; it is empty and hidden until a desync
+					box:addItem(CM.resyncSection())
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					box:addItem(togC)
@@ -1425,6 +1436,8 @@ function data()
 					end
 				end
 				local mine = fresh[own]
+				local okRecovery, recoveryActive = pcall(CM.resyncGuiTick, ownKv)
+				if not okRecovery then print("[ls-gui] resync: " .. tostring(recoveryActive)); recoveryActive = false end
 				-- the verdict and, per peer, our verdict against that peer
 				local vs = {}
 				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
@@ -1464,13 +1477,16 @@ function data()
 					end
 				end)
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
-				-- one-byte file; no file means shown.
+				-- one-byte file; no file means shown. A desync or a running resync
+				-- shows the window regardless: the Resync section is the only
+				-- in-game recovery view (2026-09-14).
 				local shown = true
 				local ff = io.open(K.BASE .. "tpf2mp_dash.txt", "r")
 				if ff then
 					local v = ff:read("*l"); ff:close()
 					shown = (v ~= "0")
 				end
+				if recoveryActive == true then shown = true end
 				if D.shown ~= shown then
 					D.shown = shown
 					D.win:setVisible(shown, false)
