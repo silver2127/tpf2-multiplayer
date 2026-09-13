@@ -285,6 +285,13 @@ SCENARIOS = {
                   {letter="c", T0=2000, lever=4, start=1} },
         actions = { {tick=150, who="a", kind="button", value=1}, {tick=300, who="b", kind="button", value=4},
                     {tick=450, who="a", kind="button", value=0}, {tick=600, who="a", kind="button", value=2} } }''',
+    # PAUSE AT 4x WITH THREE GAMES (2026-09-12 live: the pause never held -- every game ran to the fastest
+    # peer, each stop overshot at 4x, and a, b and c leapfrogged "running 0.4 unit(s)" dozens of times)
+    'pause_4x_three': '''{ ticks = 700,
+        -- the joiners a couple of steps AHEAD of the host, as ordinary pacing left them live (PID e=+0.40)
+        insts = { {letter="a", T0=3000, lever=4, start=1, native=true}, {letter="b", T0=3000.4, lever=4, start=1},
+                  {letter="c", T0=3000.6, lever=4, start=1} },
+        actions = { {tick=150, who="a", kind="button", value=0}, {tick=500, who="a", kind="button", value=4} } }''',
     # AUTOSAVE (2026-09-10 live: joiners 5-7.6 behind after "Saving...: 3.4-4 s"). Everyone saves at the
     # same game date, but not for as long: the leader 3 s, a sandboxed joiner 6.7 s, another 3.5 s. At 2x.
     'autosave_joiner_2x': '''{ ticks = 700,
@@ -413,6 +420,26 @@ def main():
                        ("the host's pause pauses the session", first(' a: SPEED2: session speed -> 0 ', 450) is not None),
                        ("the host's 2x resumes it", first(' a: SPEED2: host unpaused the session at 2', 600) is not None),
                        ('everyone within 1.5 of the leader from tick 700', all(v['max_ahead'] < 1.5 and v['max_behind'] < 1.5 for v in st.values()))]
+        elif name == 'pause_4x_three':
+            def runs(letter, lo, hi):
+                return len([l for l in logs if (' %s: SPEED2: session paused -- running' % letter) in l and lo <= int(l.split()[0]) < hi])
+            for which in (args.ref, 'work'):
+                _, _, lg = res[which]
+                n = {x: len([l for l in lg if (' %s: SPEED2: session paused -- running' % x) in l and 150 <= int(l.split()[0]) < 500])
+                     for x in ('a', 'b', 'c')}
+                print('       %-8s runs to a pause point while paused: a=%d b=%d c=%d' % (which, n['a'], n['b'], n['c']))
+            st = summarize(m, series, 220)
+            paused = {t: e for l in series for t, e in series[l].items() if 220 <= t < 500}
+            checks += [("the host's pause pauses the session", any(' a: SPEED2: session speed -> 0 ' in l for l in logs)),
+                       ('the host never runs to another game while paused', runs('a', 150, 500) == 0),
+                       ('each joiner runs to the pause point at most once', runs('b', 150, 500) <= 1 and runs('c', 150, 500) <= 1),
+                       ('the host stays paused (held at 0 for 300+ ticks)', m['leaderZero'] >= 300),
+                       ('the joiners stop within 1.0 of the host while paused',
+                        bool(paused) and all(abs(e) < 1.0 for e in paused.values())),
+                       # a joiner that resumed with the pause counted as one PID dt saturated its
+                       # integral, eased to 3.2x of 4x and sat 2.5 behind for good
+                       ('after play every joiner stays within 1.5 of the host (from tick 560)',
+                        all(v['max_ahead'] < 1.5 and v['max_behind'] < 1.5 for v in summarize(m, series, 560).values()))]
         elif name.startswith('autosave'):
             # the stall ends at STALL_TICK + the longest stall; report recovery from there, in seconds
             for which in (args.ref, 'work'):

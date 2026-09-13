@@ -632,7 +632,7 @@ end
 -- ---------- the company state travels IN THE SAVE (2026-09-09) ----------
 -- Roster, passwords, origin -> company and company -> player entity are not
 -- world state the engine saves; without this a resumed save (a relay's
--- /resume, or anyone loading a shared save later) would come up with fresh,
+-- a relay resume, or anyone loading a shared save later) would come up with fresh,
 -- empty AI entities and every company's assets stranded. The game script's
 -- save() hook stores it; load() stashes it and cmReadConfig applies it over
 -- the lobby file: the entity ids are valid on every machine that loads this

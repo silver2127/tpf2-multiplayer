@@ -77,6 +77,10 @@ try:
     print("alice roster:", ra)
     assert ra.get("host") == "Alice" and ra.get("relay") is True, "alice should lead"
     assert ra.get("letters", {}).get("Alice") == "a" and ra.get("letters", {}).get("Bob") == "b", "letters"
+    # a fresh relay with no stored world: the leader is asked for START GAME, the others wait for it
+    assert wait(lambda: any(e.get("type") == "status" and "press START GAME to send your most recent save" in e.get("detail", "") for e in events(ad)), 10), "leader not asked for START GAME"
+    assert wait(lambda: any(e.get("type") == "status" and "waiting for the leader" in e.get("detail", "") for e in events(bd)), 10), "bob not told to wait for the leader"
+    print("no stored world: leader asked for START GAME, others wait OK")
     # the relay leader refuses to upload a save made without the mod
     with open(os.path.join(ad, "lobby_in.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps({"cmd": "start", "save": nomod}) + "\n")
@@ -122,7 +126,7 @@ try:
     assert wait(lambda: any(e.get("type") == "roster" and "Dave" in e.get("players", []) for e in events(dd)), 40), "dave not in roster"
     rdv = [e for e in events(dd) if e.get("type") == "roster"][-1]
     assert rdv["host"] == "Dave" and rdv["letters"]["Dave"] == "e", rdv     # a,b,c,d are remembered for Alice/Bob/Carol/Zed
-    assert wait(lambda: any(e.get("type") == "status" and "continuing the relay" in e.get("detail", "") for e in events(dd)), 10), "no auto-resume status"
+    assert wait(lambda: any(e.get("type") == "status" and "loading the relay's world" in e.get("detail", "") for e in events(dd)), 10), "no auto-resume status"
     assert wait(lambda: any(e.get("type") == "save_ready" for e in events(dd)), 60), "dave never got the stored save"
     assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(dd)), 30), "dave no start"
     assert open(os.path.join(dd, "incoming_save.sav"), "rb").read() == open(save, "rb").read(), "resumed save differs"

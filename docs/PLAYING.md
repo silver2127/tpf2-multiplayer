@@ -64,8 +64,11 @@ list while it is up.
 
 - The first player to arrive is the **leader**: they have the host role and their game is the
   session's clock. If the leader leaves, the next player in line takes over.
-- If the relay already holds a world, it is continued after 10 seconds. The leader can type `/new`
-  in chat within that time to discard it and share their own save with START GAME instead.
+- If the relay already holds a world, it loads for everyone as soon as the leader arrives. To start
+  from your own save instead, the leader types `/new` in chat before it is sent (a few seconds), then
+  presses **START GAME**.
+- If it does not, the panel asks the leader to press **START GAME**, which sends the leader's most
+  recent save to the relay and on to everyone.
 - While the leader plays, their game uploads a fresh save to the relay every 2 minutes, so a
   player who joins later gets a recent world.
 - The world only advances while players are connected.
@@ -104,8 +107,7 @@ buttons toggle three sections:
 | `/speed <x>` | anyone | set the session speed (0 < x < 64) |
 | `/speed off` | anyone | back to the host's speed buttons |
 | `/sync` | anyone | the host's game saves and shares the save (what a hot join does); `/sync off` cancels |
-| `/new` | relay leader, before the game starts | discard the relay's stored world |
-| `/resume` | relay leader | send the relay's stored world to everyone waiting |
+| `/new` | relay leader, before the world is sent | discard the relay's stored world; START GAME then shares your own save |
 | `/desynclogs always`, `ask`, `never` | anyone | what happens to your logs after a desync (see [When something goes wrong](#when-something-goes-wrong)); `/desynclogs` alone shows the current choice |
 
 ### Companies
@@ -152,8 +154,8 @@ The panel shows the lobby's status line. The common ones:
 | `game already started -- ask the host to press START GAME again` | you joined after the start and the host's game is not in game |
 | `The lobby stopped before it reported anything -- see tpf2_menu.log` | `netpunch.exe` could not start or exited at once; run the installer's Repair |
 
-Some messages (on a relay, or for a hot join) say the world "loads by itself". It does not: when the
-save is ready, open **LOAD GAME** and pick **mp_shared** as usual.
+When a shared save is ready it loads by itself. If it does not (the panel says so), open
+**LOAD GAME** and pick **mp_shared**.
 
 If the Multiplayer window shows **DESYNC**, the worlds have drifted apart and will not come back by
 themselves. Players who are already in the game ignore a new shared save (`/sync` only helps

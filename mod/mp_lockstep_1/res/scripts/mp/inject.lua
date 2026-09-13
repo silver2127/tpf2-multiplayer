@@ -62,6 +62,15 @@ function CM.pollInject()
 			-- never ran (review, 2026-08-31).
 			-- The slice says, per capture, whether it cancelled the local build.
 			if o == "ARMED" then CM.lastArmed = tonumber(w[2]) or 0; return end
+			-- NATIVE <kind>: in a live session the slice had to let a player build run
+			-- natively (its record did not decode, so it could not be cancelled). No
+			-- capture line carries it and nothing scans the world on a timer any more,
+			-- so one catch-up scan runs a few ticks from now, once the build has applied.
+			if o == "NATIVE" then
+				CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks + 5)
+				log("inject: the slice built a " .. tostring(w[2] or "?") .. " natively -- catch-up scan due")
+				return
+			end
 			-- read by the VBUY just ahead of it (CM.injectNext)
 			if o == "VBUYLINE" then return end
 			-- The street's bus lane and tram track, on their own line just ahead of
@@ -267,13 +276,24 @@ function CM.pollInject()
 					CM.geomScopeBegin()
 					local scanT0 = os.clock()
 					for id, xyz in pairs(posOf) do
-						local hitEid
+						local hitEid, hitU
 						-- EITHER kind: a rail vertex landing on a ROAD is a split point too
 						-- (level crossing). Same-kind only let the road's halves through as
 						-- rail edges -> duplicated, track-typed road halves in the proposal
 						-- -> "Construction not possible" (proposal dump 2026-08-29).
-						pcall(function() hitEid = CM.findEdgeContaining(isTrack, xyz[1], xyz[2]) end)
-						if not hitEid then pcall(function() hitEid = CM.findEdgeContaining(not isTrack, xyz[1], xyz[2]) end) end
+						pcall(function() hitEid, hitU = CM.findEdgeContaining(isTrack, xyz[1], xyz[2]) end)
+						if not hitEid then pcall(function() hitEid, hitU = CM.findEdgeContaining(not isTrack, xyz[1], xyz[2]) end) end
+						-- An edge well above or below the vertex is not split by it: a road vertex
+						-- under a BRIDGE is inside the bridge's footprint in plan view only. Taken
+						-- as a split, the bridge span the engine replaced in place counted as a
+						-- split parent and its removal was not shipped (2026-09-12). A real split
+						-- point sits on the edge's surface; 2.5 m is well clear of that and well
+						-- under any bridge's clearance.
+						if hitEid and CM.edgeZAt then
+							local ez
+							pcall(function() ez = CM.edgeZAt(hitEid, hitU) end)
+							if ez and math.abs(ez - xyz[3]) > 2.5 then hitEid = nil end
+						end
 						if hitEid then
 							local ends = { -1, -1 }
 							pcall(function()
@@ -316,15 +336,34 @@ function CM.pollInject()
 					-- the wrong kind and bridge model, rejecting the entire proposal.
 					-- Carry a proven unchanged opposite-network bridge separately so the
 					-- replay replaces it with its own type and lets the engine update its
-					-- supports. Simply omitting it leaves a bridge collision. Explicit
-					-- replacements, changed geometry and same-network upgrades stay here.
-					local function unchangedOtherBridge(e)
-						local a, b = e[1], e[2]
-						if a < 0 or b < 0 or e[4] ~= 1 then return false end
-						for _, r in ipairs(rmv) do
-							if (r[1] == a and r[2] == b) or (r[1] == b and r[2] == a) then return false end
+					-- supports. Simply omitting it leaves a bridge collision. Changed geometry
+					-- and another bridge model stay here.
+					-- A span of the command's OWN network is refreshed the same way: a road built
+					-- under a road bridge (capture #36, 2026-09-12). Shipped as a link it replayed
+					-- with the NEW road's street type, so the bridge changed type on every
+					-- instance; carried like the other network's span it keeps its own. It
+					-- travels as bs, the same record as br. An upgrade replaces spans between
+					-- existing nodes on purpose, so a capture in which every edge replaces a
+					-- removal keeps its own network's spans explicit.
+					-- The slice also SHIPS a refreshed span's removal (a removal and an add
+					-- between the same two existing nodes: the road-under-bridge fix,
+					-- 2026-09-12). A companion carries that removal itself (companionPair), so
+					-- it is not shipped in rm as well -- rm is matched in the command's own
+					-- network only, and two removals of one edge reject the whole proposal.
+					local companionPair = {}
+					local function pairKey(a, b) return (a < b) and (a .. ":" .. b) or (b .. ":" .. a) end
+					local upgradeShape = #raw > 0
+					do
+						local replaced = {}
+						for _, r in ipairs(rmv) do replaced[pairKey(r[1], r[2])] = true end
+						for _, e in ipairs(raw) do
+							if e[1] < 0 or e[2] < 0 or not replaced[pairKey(e[1], e[2])] then upgradeShape = false; break end
 						end
-						local map = CM.netMap(not isTrack)
+					end
+					-- is e the existing bridge between its two nodes in network `track`, unchanged?
+					local function unchangedBridgeIn(e, track)
+						local a, b = e[1], e[2]
+						local map = CM.netMap(track)
 						for _, eid in pairs((map and map[a]) or {}) do
 							local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
 							if be and be.type == 1 and be.typeIndex == e[5] then
@@ -345,7 +384,14 @@ function CM.pollInject()
 						end
 						return false
 					end
-					local dropped, bridges = 0, {}
+					-- "br" (the other network's span), "bs" (the command's own), or nil
+					local function bridgeCompanion(e)
+						if e[1] < 0 or e[2] < 0 or e[4] ~= 1 then return nil end
+						if unchangedBridgeIn(e, not isTrack) then return "br" end
+						if not upgradeShape and unchangedBridgeIn(e, isTrack) then return "bs" end
+						return nil
+					end
+					local dropped, bridges, sameBridges = 0, {}, {}
 					local halfNode = {}   -- new node -> true: the engine split an existing edge there
 					for _, e in ipairs(raw) do
 						local a1, a2 = e[1], e[2]
@@ -364,10 +410,13 @@ function CM.pollInject()
 						end
 						local isHalf = (a1 >= 0 and a2 < 0 and isHalfOf(a1, a2))
 						                or (a2 >= 0 and a1 < 0 and isHalfOf(a2, a1))
-						if unchangedOtherBridge(e) then
+						local companion = bridgeCompanion(e)
+						if companion then
+							companionPair[pairKey(a1, a2)] = true
 							local p1, p2 = realPos(a1), realPos(a2)
 							assert(p1 and p2, "bridge companion endpoints disappeared")
-							bridges[#bridges + 1] = string.format("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d",
+							local list = (companion == "br") and bridges or sameBridges
+							list[#list + 1] = string.format("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d",
 								p1[1], p1[2], p1[3], p2[1], p2[2], p2[3], e[5])
 						elseif isHalf then
 							dropped = dropped + 1
@@ -418,7 +467,7 @@ function CM.pollInject()
 					--
 					-- The build was CANCELLED here, so every id in the capture still
 					-- resolves; positions are read now and ids never leave.
-					local rmpos, rmbad, rmskip = {}, nil, 0
+					local rmpos, rmbad, rmskip, rmcomp = {}, nil, 0, 0
 					for _, r in ipairs(rmv) do
 						local isSplitParent = false
 						for _, ends in pairs(splitNode) do
@@ -430,6 +479,8 @@ function CM.pollInject()
 						end
 						if isSplitParent then
 							rmskip = rmskip + 1
+						elseif companionPair[pairKey(r[1], r[2])] then
+							rmcomp = rmcomp + 1
 						else
 							local q1 = (r[1] < 0) and posOf[r[1]] or realPos(r[1])
 							local q2 = (r[2] < 0) and posOf[r[2]] or realPos(r[2])
@@ -457,6 +508,12 @@ function CM.pollInject()
 						if #bridges > 0 then
 							log(string.format("ROADE: preserved %d opposite-network bridge replacement(s)", #bridges))
 						end
+						if #sameBridges > 0 then
+							log(string.format("ROADE: preserved %d same-network bridge replacement(s) with their own properties", #sameBridges))
+						end
+						if rmcomp > 0 then
+							log(string.format("ROADE: %d in-place removal(s) from the slice travel with those replacements, not in rm", rmcomp))
+						end
 						if #rmpos > 0 or rmskip > 0 then
 							log(string.format("ROADE: %d removal(s) shipped as positions, "
 								.. "%d left to the peer's own split", #rmpos, rmskip))
@@ -472,6 +529,7 @@ function CM.pollInject()
 						if #rmpos > 0 then sargs.rm = table.concat(rmpos, ";") end
 						if #freshV > 0 then sargs.fv = table.concat(freshV, ",") end
 						if #bridges > 0 then sargs.br = table.concat(bridges, ";") end
+						if #sameBridges > 0 then sargs.bs = table.concat(sameBridges, ";") end
 						-- carry the bus lane / tram track the slice just decoded, so an
 						-- upgrade that ADDS either one actually reaches the peers (and the
 						-- originator, whose own upgrade was cancelled)
@@ -488,7 +546,7 @@ function CM.pollInject()
 							return CM.execPolyline({ pts = sargs.pts, links = sargs.links,
 								tans = sargs.tans, bt = sargs.bt, etype = sargs.etype,
 								stype = sargs.stype, ttype = sargs.ttype, cat = sargs.cat,
-								rm = sargs.rm, fv = sargs.fv, br = sargs.br, seq = "plan" }, true)
+								rm = sargs.rm, fv = sargs.fv, br = sargs.br, bs = sargs.bs, seq = "plan" }, true)
 						end)
 						if okPlan then
 							-- pcall folds multiple returns; re-run shape: xv is the
@@ -584,7 +642,8 @@ function CM.pollInject()
 			local engLeft, oneWay = tonumber(w[8]) == 1, tonumber(w[9]) == 1
 			local name = line:match("name=(.*)$") or ""
 			if (CM.lastArmed or 0) ~= 1 then
-				log("STOPX: not armed -- the native build stands, the poll captures it")
+				log("STOPX: not armed -- the native build stands, a catch-up scan captures it")
+				CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks + 5)
 			elseif eid and kind and mid and x and y then
 				local ok2, why = pcall(function()
 					local comp, a, b, ta, tb = CM.edgeGeomT(eid)
@@ -1009,8 +1068,14 @@ function CM.pollInject()
 						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = 1 })
 					else
 						log(string.format("VCOLOR: %s %s = %s,%s,%s", kind, key, w[3], w[4], w[5]))
+						-- rgb is the colour EXACTLY: encodeCmd rounds number fields to %.4f, and
+						-- the line editor matches line colours by exact float equality when it
+						-- picks a new line's colour (see LCREATEX below). r/g/b stay: the
+						-- company vehicle paint (companies.lua) sends only those.
 						CM.scheduleLocal("VCOLOR", { kind = kind, key = key,
-							r = tonumber(w[3]), g = tonumber(w[4]), b = tonumber(w[5]), skipOrigin = 1 })
+							r = tonumber(w[3]), g = tonumber(w[4]), b = tonumber(w[5]),
+							rgb = string.format("%.9g,%.9g,%.9g", tonumber(w[3]) or 0, tonumber(w[4]) or 0, tonumber(w[5]) or 0),
+							skipOrigin = 1 })
 					end
 				else
 					log(string.format("%s: entity %s is not a tracked vehicle, line or construction -- not shipped",
@@ -1088,7 +1153,11 @@ function CM.pollInject()
 				else
 					log(string.format("LCREATE: '%s' decoded, %d stop(s) (strict: created at the stamp here too)",
 						CM.unescName(nameTok), #stops))
-					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.4f,%.4f,%.4f", r, g, b),
+					-- the colour stays EXACT (%.9g): the line editor colours the NEXT new line by
+					-- matching the existing lines' colours exactly against its palette, so a
+					-- line created at 0.4980 instead of 127/255 left orange "unused" and every
+					-- new line came out orange (slice_hook.cpp, LCREATEX)
+					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.9g,%.9g,%.9g", r, g, b),
 					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
 					                           armed = 1 })
 				end
@@ -1151,12 +1220,20 @@ function CM.pollInject()
 							local newStops, newAlts = table.concat(stops, ";"), table.concat(alts, ";")
 							-- a second quick edit: the editor built it from the list before the
 							-- first one landed -- put this click's change onto that one instead
+							-- The click was built from the list the EDITOR saw, which can be older than
+							-- both the entity (an update applied between the click and this read) and
+							-- the update still waiting: its own base is the recent list closest to it
+							-- (CM.lineBaseFor), and its change goes onto the newest list -- the update
+							-- still waiting, else the line as it stands now.
 							local pend = CM.linePending and CM.linePending(lk)
-							if pend and snap.stops and pend.stops ~= snap.stops then
-								local okM, mS, mA, adds, dels, sets = pcall(CM.mergeLineEdit, snap.stops, snap.alts, newStops, newAlts, pend.stops, pend.alts)
+							local target = pend or (snap.stops and snap) or nil
+							local base = (CM.lineBaseFor and CM.lineBaseFor(lk, newStops, snap)) or snap
+							if target and base and base.stops and target.stops ~= base.stops then
+								local okM, mS, mA, adds, dels, sets = pcall(CM.mergeLineEdit, base.stops, base.alts, newStops, newAlts, target.stops, target.alts)
 								if okM and mS then
 									log(string.format("LUPDATE: %s edited again before %s landed -- the click's change (+%d -%d ~%d) goes onto it: %d stop(s)",
-										lk, pend.seq and ("seq " .. tostring(pend.seq)) or "the last edit", adds, dels, sets, CM.lineCount(mS)))
+										lk, (pend and pend.seq) and ("seq " .. tostring(pend.seq)) or (pend and "the last edit" or "the list it was built from"),
+										adds, dels, sets, CM.lineCount(mS)))
 									newStops, newAlts = mS, mA
 								else
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
@@ -1342,7 +1419,8 @@ function CM.pollInject()
 			-- the people count diverged from there (2026-09-08).
 			local eo, eid = tonumber(w[2]), tonumber(w[3])
 			if (CM.lastArmed or 0) ~= 1 then
-				log("STOPXDEL: not armed -- the native bulldoze ran, the stop poll ships it")
+				log("STOPXDEL: not armed -- the native bulldoze ran, a catch-up scan ships it")
+				CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks + 5)
 			elseif eo and eo > 0 and CM.cmForeignOwner and CM.cmForeignOwner(eo) then
 				-- COMPANIES: another company's stop. The native bulldoze was cancelled,
 				-- so refusing here leaves it standing on every instance.

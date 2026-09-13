@@ -32,7 +32,12 @@ CM.expectStopDel = {}    -- same, about to remove one
 -- the replay projects the shipped position onto this instance's own edge and
 -- lands a little off, and a missed match ships a phantom STOPADD back. Entries
 -- expire after 8 game units so a failed replay cannot swallow a later real one.
-function CM.expectAdd(list, x, y) list[#list + 1] = { x, y, t = CM.gameTime() or 0 } end
+function CM.expectAdd(list, x, y)
+	-- expectFind drops the expired entries. The stop scan it used to rely on now runs
+	-- only at load and on a catch-up, so an add prunes too.
+	CM.expectFind(list, x, y)
+	list[#list + 1] = { x, y, t = CM.gameTime() or 0 }
+end
 function CM.expectFind(list, x, y)
 	local now = CM.gameTime() or 0
 	for i = #list, 1, -1 do

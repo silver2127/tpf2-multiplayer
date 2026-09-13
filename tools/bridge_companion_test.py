@@ -1,7 +1,16 @@
-"""Real inject.lua: opposite-network bridges are separate replacement records.
+"""Real inject.lua: unchanged bridge spans are separate replacement records.
 
 Fixture: green road-under-rail-bridge capture, 2026-09-13, simplified only in
 the surrounding world. No game engine is mocked as accepting a build here.
+
+'removed' is the same capture as the slice ships it since the road-under-bridge
+fix: the span the engine replaced in place carries its removal. That span is still
+an unchanged companion, and its removal must not also travel in rm (the replay
+matches removals in the command's own network, where a rail span never matches).
+'removed_changed' keeps a real replacement -- changed geometry -- explicit.
+'same_kind' is a road under a ROAD bridge: the span travels as bs and keeps its own
+properties. An upgrade-shaped capture (every edge replaces a removal) keeps its own
+network's span explicit (runUpgradeShape).
 """
 from pathlib import Path
 from lupa.lua52 import LuaRuntime
@@ -16,7 +25,7 @@ function runCase(mode)
   local p0,p1={-48.4622,-474.1883,22.1595},{-38.1558,-392.8513,21.8020}
   local t={x=10.3065,y=81.3370,z=-0.3575}
   local be={node0=33254,node1=27347,type=1,typeIndex=4,tangent0=t,tangent1=t}
-  if mode=='changed' then be.tangent0={x=11,y=81.3370,z=-0.3575} end
+  if mode=='changed' or mode=='removed_changed' then be.tangent0={x=11,y=81.3370,z=-0.3575} end
   if mode=='different_model' then be.typeIndex=3 end
   local foreignMap={[33254]={123},[27347]={123}}
   if mode=='missing' then foreignMap={} end
@@ -36,7 +45,7 @@ function runCase(mode)
       if id==123 and ((kind==CT.BASE_EDGE_TRACK and not primaryTrack) or (kind==CT.BASE_EDGE_STREET and primaryTrack)) then return {} end
     end}}
   game={}
-  local removed=mode=='removed'
+  local removed=mode=='removed' or mode=='removed_changed'
   local e='33254 27347 10.3065 81.3370 -0.3575 10.3065 81.3370 -0.3575'
   if mode=='reverse' then e='27347 33254 -10.3065 -81.3370 0.3575 -10.3065 -81.3370 0.3575' end
   local wire='ARMED 1\nROADE 2 '..(primaryTrack and '1 -1 0 1' or '0 25 1 0')..' 2 0 '..(removed and '1' or '0')
@@ -57,29 +66,76 @@ function runCase(mode)
   CM.pollInject()
   assert(#scheduled==1,'expected one command: '..table.concat(logs,'\n'))
   local c=scheduled[1]
-  local drop=mode=='normal' or mode=='reverse' or mode=='inverse'
+  local drop=mode=='normal' or mode=='reverse' or mode=='inverse' or mode=='removed' or mode=='same_kind'
+  local key=(mode=='same_kind') and 'bs' or 'br'
+  local other=(key=='br') and 'bs' or 'br'
   assert(c.links==(drop and '1,2' or '1,2,3,4'),mode..': wrong edges: '..c.links)
   assert(c.bt==(drop and '0,-1' or '0,-1,1,4'),mode..': bridge type tail misaligned')
   assert(c.fv=='1,2',mode..': fresh-node hints changed')
   assert(planned[1].links==c.links and planned[1].bt==c.bt,'plan differs from wire')
-  assert(planned[1].br==c.br,'bridge companion missing from planning pass')
+  assert(planned[1].br==c.br and planned[1].bs==c.bs,'bridge companion missing from planning pass')
   if drop then
-    assert(c.br and c.br:find('22.1595',1,true) and c.br:match(',4$'),'bridge positions/model missing')
-  else assert(not c.br,'changed or explicit replacement incorrectly moved to companions') end
+    assert(c[key] and c[key]:find('22.1595',1,true) and c[key]:match(',4$'),mode..': bridge positions/model missing from '..key)
+    assert(not c[other],mode..': companion shipped under '..other)
+  else assert(not c.br and not c.bs,'changed or explicit replacement incorrectly moved to companions') end
   local n=0;for _ in c.tans:gmatch('[^,]+') do n=n+1 end
   assert(n==(drop and 6 or 12),'tangents misaligned')
-  if removed then assert(c.rm,'explicit replacement removal was lost') end
+  if mode=='removed' then
+    assert(not c.rm,'the companion span was also shipped as a removal: '..tostring(c.rm))
+    assert(table.concat(logs,'\n'):find('1 in-place removal(s) from the slice travel with those replacements',1,true),'in-place removal not reported')
+  end
+  if mode=='removed_changed' then assert(c.rm,'explicit replacement removal was lost') end
+end
+
+-- The upgrade tool: every edge replaces a removal between the same two existing nodes.
+-- Its own network's span is the upgrade itself and stays an explicit edge + removal.
+function runUpgradeShape()
+  local CT={BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_TRACK=3,BASE_EDGE_STREET=4}
+  local p0,p1={-48.4622,-474.1883,22.1595},{-38.1558,-392.8513,21.8020}
+  local t={x=10.3065,y=81.3370,z=-0.3575}
+  local be={node0=33254,node1=27347,type=1,typeIndex=4,tangent0=t,tangent1=t}
+  local streetMap={[33254]={123},[27347]={123}}
+  api={type={ComponentType=CT},engine={getComponent=function(id,kind)
+    if kind==CT.BASE_EDGE and id==123 then return be end
+    if kind==CT.BASE_NODE then
+      local p=id==33254 and p0 or (id==27347 and p1)
+      if p then return {position={x=p[1],y=p[2],z=p[3]}} end
+    end
+  end}}
+  game={}
+  local e='33254 27347 10.3065 81.3370 -0.3575 10.3065 81.3370 -0.3575'
+  local wire='ARMED 1\nROADE 0 0 25 1 0 1 0 1 '..e..' '..e..' 1 4\n'
+  local CM={peerSeen=true,injectOffset=0,seqNo=0,ticks=0}
+  local K={INSTANCE='a',INJECT_FILE='mock'}
+  local scheduled,logs={},{}
+  CM.gameTime=function() return 100 end
+  CM.readFrom=function(p,off) return off==0 and wire or nil,1 end
+  CM.scheduleLocal=function(op,args) scheduled[#scheduled+1]=args end
+  CM.geomScopeBegin=function() end;CM.geomScopeEnd=function() end
+  CM.netMap=function(track) return track and {} or streetMap end
+  CM.findEdgeContaining=function() return nil end
+  CM.execPolyline=function() end
+  assert(load(SOURCE))()(CM,K,function(s) logs[#logs+1]=s end)
+  CM.pollInject()
+  assert(#scheduled==1,'upgrade: expected one command: '..table.concat(logs,'\n'))
+  local c=scheduled[1]
+  assert(c.links=='1,2' and c.bt=='1,4','upgrade: the span must stay an explicit edge: '..tostring(c.links))
+  assert(c.rm,'upgrade: its removal must still ship')
+  assert(not c.bs and not c.br,'upgrade: moved to companions')
 end
 ''')
 
 if __name__ == '__main__':
-    for case in ('normal', 'reverse', 'inverse', 'same_kind', 'removed', 'changed', 'different_model', 'missing'):
+    for case in ('normal', 'reverse', 'inverse', 'same_kind', 'removed', 'removed_changed', 'changed', 'different_model', 'missing'):
         L.globals().runCase(case)
         print('PASS:', case)
+    L.globals().runUpgradeShape()
+    print('PASS: an upgrade-shaped capture keeps its own span explicit')
     net = (Path(__file__).resolve().parents[1] / 'mod/mp_lockstep_1/res/scripts/mp/net.lua').read_text(encoding='utf-8')
     codec = net[net.index('local function encodeCmd(c)'):net.index('function CM.scheduleLocal(op, args)')]
     encode, decode = L.execute(codec + '\nreturn encodeCmd, decodeCmd')
     bridges = '-48.4622,-474.1883,22.1595,-38.1558,-392.8513,21.8020,4;0,0,20,30,0,20,2'
-    command = L.table_from(dict(op='ROADP', at=100, origin='b', seq=27, br=bridges, links='1,2', etype=0))
-    assert decode(encode(command)).br == bridges
-    print('PASS: positional bridge records round-trip through the real wire codec')
+    command = L.table_from(dict(op='ROADP', at=100, origin='b', seq=27, br=bridges, bs=bridges, links='1,2', etype=0))
+    decoded = decode(encode(command))
+    assert decoded.br == bridges and decoded.bs == bridges
+    print('PASS: positional bridge records (br and bs) round-trip through the real wire codec')

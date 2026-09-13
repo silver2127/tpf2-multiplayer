@@ -134,8 +134,9 @@ end
 
 CM.expectedCons = {}      -- posKey -> true: our own replay is about to land here
 -- Pairing buffers for CONX: the hook's ROADC street payload arrives within a
--- tick of the placement; the construction itself is noticed by a poll up to
--- K.CON_POLL_EVERY ticks later. Whichever comes first waits for the other.
+-- tick of the placement; its construction comes from the slice's CONXP, from the
+-- position rescue (findConstructionForRoadc) or from a catch-up scan. Whichever
+-- comes first waits for the other.
 CM.pendingRoadc = {}      -- { at, posOf, adds, rms, spos, etype, stype, ttype, cat }
 CM.pendingCons  = {}      -- { at, file, t, params, x, y }
 
@@ -350,6 +351,16 @@ function CM.healNodeAt(x, y, why, origT)
 			log(string.format("HEAL(%s): node %d has %d street edge(s), not 2 -- left alone", why, nid, #ids))
 			return
 		end
+		-- A stop or signal on either half would be left on a removed edge by the
+		-- merge, which crashes the engine (roads.lua CM.carryEdgeObjects). A heal
+		-- is only a tidy-up: leave such a node alone.
+		for _, eid in ipairs(ids) do
+			local _, nobj = CM.objectsOnEdge(eid)
+			if (nobj or 0) > 0 then
+				log(string.format("HEAL(%s): node %d -- edge %d carries %d stop(s)/signal(s), left alone", why, nid, eid, nobj))
+				return
+			end
+		end
 		-- Far endpoints, and the tangent at each pointing along far1 -> far2.
 		-- Tangents in a BaseEdge always run node0 -> node1, so a half whose node0
 		-- is the split node has to be read backwards.
@@ -478,55 +489,72 @@ function CM.healNodeAt(x, y, why, origT)
 	return healed
 end
 
--- Every node a replay of ours cut into a road, with the tick it was cut at.
-CM.splitWatch = {}
-function CM.watchSplit(x, y)
-	CM.splitWatch[string.format("%.1f/%.1f", x, y)] = { x, y, CM.ticks }
+-- ORPHANED SPLITS, CHECKED ON A FIXED SIM STEP (2026-09-12).
+-- A split that is doing its job carries the construction's access as a third
+-- edge; one left with exactly two is a scar from a construction that never
+-- landed, was rolled back, or has since been demolished, and it is healed.
+--
+-- Each watched split is checked ONCE, as a HEALCHK in the step-locked queue, due
+-- CM.SPLIT_SETTLE_STEPS after the stamp of the command that cut it (a CONX) or of
+-- a demolish near it -- so the pump runs it on the same sim step on every
+-- instance. It used to be a frame-tick sweep (CM.ticks), and each game healed on
+-- its own step: the rebuilt road rerouted passengers at different moments, the
+-- people counts split at t=3024 and the buses drifted into a vehicle DESYNC at
+-- t=3156 on all three games (the world hash never differed).
+CM.splitWatch = {}            -- site key -> the step its queued check is due
+CM.SPLIT_SETTLE_STEPS = 25    -- 5 game units: past the construction's own apply and a retry behind it
+
+local function splitKey(x, y) return string.format("%.1f/%.1f", x, y) end
+
+-- c: the stamped command this watch comes from ({at, origin, seq} is enough).
+function CM.watchSplit(x, y, c)
+	if not (c and c.at and c.origin and c.seq) then
+		log(string.format("HEAL: split at %.1f,%.1f has no command stamp -- not watched", x, y))
+		return
+	end
+	local k = splitKey(x, y)
+	local due = CM.stepOf(c.at) + CM.SPLIT_SETTLE_STEPS
+	if CM.splitWatch[k] == due then return end   -- the capture and the exec of one CONX
+	CM.splitWatch[k] = due
+	-- a key of its own, the same on every instance: the parent's stamp and seq plus
+	-- a fraction from the site's position (several sites of one command sort alike)
+	local frac = ((math.floor(x * 10 + 0.5) * 31 + math.floor(y * 10 + 0.5)) % 99991) / 1e6
+	CM.retryQueue = CM.retryQueue or {}
+	CM.retryQueue[#CM.retryQueue + 1] = { op = "HEALCHK", at = c.at, origin = c.origin,
+		seq = (tonumber(c.seq) or 0) + 0.25 + frac, x = x, y = y, notBeforeStep = due }
 end
 
--- Sweep the watched splits. A split that is doing its job carries the
--- construction's access as a third edge; one left with exactly two is a scar
--- from a construction that never landed, was rolled back, or has since been
--- demolished, and the other instance does not have it. Healing is symmetric --
--- both instances watch their own splits -- so the worlds converge either way.
---
--- The delay keeps the sweep off builds that are still in flight; a construction
--- and its split always arrive in one proposal, but a retry may be queued behind.
-CM.SPLIT_SETTLE = 27       -- ticks before a scar counts as one: ~0.19 s each, so ~5 s
--- Something was demolished at x,y: every split we ever cut nearby goes back
--- under watch, so a scar it leaves is healed by the next sweep.
-function CM.rearmSplitsNear(x, y)
-	for k, site in pairs(CM.splitSites or {}) do
+-- Something was demolished at x,y (c: the DEMOLISH): every split we ever cut
+-- nearby is checked again, on a step fixed from that command's stamp.
+function CM.rearmSplitsNear(x, y, c)
+	for _, site in pairs(CM.splitSites or {}) do
 		local dx, dy = site[1] - x, site[2] - y
-		if dx * dx + dy * dy < 60 * 60 then CM.splitWatch[k] = { site[1], site[2], CM.ticks } end
+		if dx * dx + dy * dy < 60 * 60 then CM.watchSplit(site[1], site[2], c) end
 	end
 end
 
-function CM.sweepSplits()
-	for k, w in pairs(CM.splitWatch) do
-		if CM.ticks - w[3] > CM.SPLIT_SETTLE then
-			local nid = CM.findNodeNear(false, w[1], w[2], 1.5)
-			local n = 0
-			if nid then
-				local m
-				pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
-				if m and m[nid] then for _ in pairs(m[nid]) do n = n + 1 end end
-			end
-			if not nid then
-				CM.splitWatch[k] = nil                       -- already gone
-			elseif n ~= 2 then
-				-- In use today. But the construction it serves can be demolished
-				-- later, and on this instance nothing owns the split -- keep the
-				-- site, and re-arm the watch whenever something near it is
-				-- demolished (review, 2026-08-31: the sweep forgot it forever).
-				CM.splitSites = CM.splitSites or {}
-				CM.splitSites[k] = { w[1], w[2] }
-				CM.splitWatch[k] = nil
-			else
-				CM.splitWatch[k] = nil
-				CM.healNodeAt(w[1], w[2], "orphaned split")
-			end
-		end
+function CM.execHealCheck(c)
+	local x, y = tonumber(c.x), tonumber(c.y)
+	if not (x and y) then return end
+	local k = splitKey(x, y)
+	if CM.splitWatch[k] == c.notBeforeStep then CM.splitWatch[k] = nil end
+	local nid = CM.findNodeNear(false, x, y, 1.5)
+	local n = 0
+	if nid then
+		local m
+		pcall(function() m = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+		if m and m[nid] then for _ in pairs(m[nid]) do n = n + 1 end end
+	end
+	if not nid then
+		return                                       -- already gone
+	elseif n ~= 2 then
+		-- In use today. But the construction it serves can be demolished later,
+		-- and on this instance nothing owns the split -- keep the site, and check
+		-- it again whenever something near it is demolished (review, 2026-08-31).
+		CM.splitSites = CM.splitSites or {}
+		CM.splitSites[k] = { x, y }
+	else
+		CM.healNodeAt(x, y, string.format("orphaned split, step %d", CM.stepOf(CM.gameTime() or 0)))
 	end
 end
 
@@ -540,6 +568,8 @@ function CM.execDemolish(c)
 	local strict = tonumber(c.strict or 0) == 1
 	if c.origin == K.INSTANCE and not strict then
 		log(string.format("DEMOLISH seq=%s: originator already bulldozed locally, skipping", tostring(c.seq)))
+		-- the originator's scars still heal on the same step as everyone else's
+		CM.rearmSplitsNear(c.x, c.y, c)
 		return
 	end
 	local ok, err = pcall(function()
@@ -601,7 +631,7 @@ function CM.execDemolish(c)
 		if bal0 and bal1 then
 			log(string.format("DEMOLISH seq=%s: refund on this peer = %+d (%d -> %d)", tostring(c.seq), bal1 - bal0, bal0, bal1))
 		end
-		CM.rearmSplitsNear(c.x, c.y)
+		CM.rearmSplitsNear(c.x, c.y, c)
 		log(string.format("EXEC DEMOLISH seq=%s origin=%s at=%s id=%d success=%s",
 			tostring(c.seq), tostring(c.origin), tostring(c.at), best, tostring(dok)))
 		CM.cmLog(string.format("CM: DEMOLISH seq=%s id=%d owner=%s unlock=%s bulldoze ok=%s err=%s",
@@ -868,7 +898,6 @@ function CM.isPlayerConstruction(id, fileName)
 	return false
 end
 
-K.CON_POLL_EVERY = 10
 K.CON_EDIT_SCAN_EVERY = 30
 K.PRIME_PER_TICK = 100
 
@@ -1015,12 +1044,15 @@ local function shipConxPair(cn, rc)
 	                        snodes = table.concat(sn, ";"), sedges = table.concat(se, ";"),
 	                        srm = table.concat(sr, ";"), spos = table.concat(spz, ";"),
 	                        etype = rc.etype, stype = rc.stype, ttype = rc.ttype, cat = rc.cat })
-	-- Arm OUR split site too. The orphan-split heal (CM.sweepSplits) only knew
+	-- Arm OUR split site too. The orphan-split heal (CM.watchSplit) only knew
 	-- the splits a REPLAY made, so after a demolish the peer healed the split
 	-- and the originator never did: A kept the node and two halves, the peer
 	-- merged them (e1082 vs e1081, 2026-09-02), and the next depot attached to
 	-- that node on A had nothing to attach to on the peers -- fatal. The split
 	-- node is the added node that lies on a removed edge's segment.
+	-- Stamped with the CONX just scheduled (scheduleLocal sets CM.lastSchedAt and
+	-- CM.seqNo), so its check lands on the same sim step as every peer's.
+	local conxStamp = { at = CM.lastSchedAt, origin = K.INSTANCE, seq = CM.seqNo }
 	pcall(function()
 		for _, r in ipairs(rc.rms) do
 			-- a removed-edge record is { node0, node1, tangents[6] }; the endpoint
@@ -1035,7 +1067,7 @@ local function shipConxPair(cn, rc)
 					local t = ((q[1] - ax) * vx + (q[2] - ay) * vy) / L2
 					if t > 0.02 and t < 0.98 then
 						local px, py = ax + t * vx, ay + t * vy
-						if (q[1] - px) ^ 2 + (q[2] - py) ^ 2 < 2.25 then CM.watchSplit(q[1], q[2]) end
+						if (q[1] - px) ^ 2 + (q[2] - py) ^ 2 < 2.25 then CM.watchSplit(q[1], q[2], conxStamp) end
 					end
 				end
 			end
@@ -1142,6 +1174,98 @@ end
 -- 16054 more on one depot).
 CM.balPrevConPoll = nil
 CM.conBal0 = {}          -- conKey -> balance before that construction was built
+-- ---------- replays land by lookup, not by scanning the world ----------
+-- Nothing polls the whole world for new constructions on a timer any more: on a big
+-- map that scan froze the simulation ~300 ms every 10 sim steps (2026-09-12). What it
+-- used to find is already announced:
+--   * a player's own placement / upgrade / demolish: the slice's CONXP, ROADC, CONUP
+--     and CDEMO lines (a build it had to leave native says NATIVE, and a catch-up
+--     scan runs once -- see update() in lockstep.lua);
+--   * a construction our own replay builds (CONX, CONP, CONU): expectedCons or
+--     expectedEdit holds its POSITION, so a lookup at that spot finds it.
+-- landReplayed is the one place a landed replay is registered and, in companies
+-- mode, handed to the company that built it.
+K.LAND_TIMEOUT_TICKS = 600   -- ~2 min: a replay that never lands stops holding its flag
+CM.expectedSince = {}        -- key -> the tick a lookup first waited for it
+
+local function landReplayed(id, fn, key, pstr)
+	if CM.expectedCons[key] then
+		CM.expectedCons[key] = nil
+		CM.expectedSince[key] = nil
+		noteCon(id, fn, key, pstr)
+		log(string.format("con: replayed %s landed as id %d", fn, id))
+		-- companies mode: the replay landed owned by our local player; hand it to the
+		-- ORIGIN company and lock it. Done here, not in a build callback, because every
+		-- replay path -- buildProposal AND the buildConstruction fallback -- lands here.
+		local ocid = CM.cmExpectedCompany[key]
+		if ocid then
+			CM.cmExpectedCompany[key] = nil
+			pcall(function() CM.cmReassignConstruction(id, ocid) end)
+			-- R2: the build was charged to OUR wallet; the balance drop since apply is
+			-- the exact cost -> move it to co<ocid>.
+			local bal0 = CM.cmExpectedBal0[key]; CM.cmExpectedBal0[key] = nil
+			local nowBal = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
+			if bal0 and nowBal then pcall(function() CM.cmTransferCost(ocid, bal0 - nowBal, "CON " .. fn) end) end
+		end
+		return true
+	elseif expectedEdit[key] then
+		expectedEdit[key] = nil
+		CM.expectedSince[key] = nil
+		noteCon(id, fn, key, pstr)
+		log(string.format("con: replayed edit landed as id %d", id))
+		return true
+	end
+	return false
+end
+
+-- Every 3 ticks while a replay is expected (nothing to do otherwise): look at each
+-- expected position for a player construction that is not known yet -- a NEW id, so
+-- an edit's still-standing old entity is skipped until its replacement appears. A
+-- key that never lands is let go after K.LAND_TIMEOUT_TICKS: a stale flag also holds
+-- back the demolish tracker (pollConstructionRemovals).
+function CM.landReplays()
+	if CM.ticks % 3 ~= 2 then return end
+	for key in pairs(CM.expectedSince) do
+		if not CM.expectedCons[key] and not expectedEdit[key] then CM.expectedSince[key] = nil end
+	end
+	local keys = {}
+	for key in pairs(CM.expectedCons) do keys[#keys + 1] = key end
+	for key in pairs(expectedEdit) do if not CM.expectedCons[key] then keys[#keys + 1] = key end end
+	for _, key in ipairs(keys) do
+		CM.expectedSince[key] = CM.expectedSince[key] or CM.ticks
+		local kx, ky = tostring(key):match("^([-%d.]+)/([-%d.]+)$")
+		local x, y = tonumber(kx), tonumber(ky)
+		local landed = false
+		if x and y then
+			pcall(function()
+				local list = game.interface.getEntities({ pos = { x, y }, radius = 5 },
+					{ type = "CONSTRUCTION", includeData = false }) or {}
+				for _, id in pairs(list) do
+					if not knownCons[id] then
+						local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+						local fn = co and co.fileName and tostring(co.fileName)
+						if fn and co.transf and CM.conKey(co.transf[13], co.transf[14]) == key
+						   and CM.isPlayerConstruction(id, fn) then
+							local e = game.interface.getEntity(id)
+							local pstr = (e and e.params) and CM.ser(e.params) or "{}"
+							knownCons[id] = true
+							landed = landReplayed(id, fn, key, pstr)
+							if landed then return end
+						end
+					end
+				end
+			end)
+		end
+		if not landed and CM.ticks - CM.expectedSince[key] > K.LAND_TIMEOUT_TICKS then
+			CM.expectedCons[key] = nil
+			expectedEdit[key] = nil
+			CM.expectedSince[key] = nil
+			log(string.format("con: the replay expected at %s never landed within %d ticks -- flag dropped",
+				key, K.LAND_TIMEOUT_TICKS))
+		end
+	end
+end
+
 function CM.pollNewConstructions()
 	local balAtEntry = nil
 	pcall(function() local e = game.interface.getEntity(api.engine.util.getPlayer()); if e then balAtEntry = tonumber(e.balance) end end)
@@ -1195,28 +1319,8 @@ function CM.pollNewConstructions()
 						local key = CM.conKey(co.transf[13], co.transf[14])
 						local e = game.interface.getEntity(id)
 						local pstr = (e and e.params) and CM.ser(e.params) or "{}"
-						if CM.expectedCons[key] then
-							CM.expectedCons[key] = nil
-							noteCon(id, fn, key, pstr)
-							log(string.format("con: replayed %s landed as id %d", fn, id))
-							-- companies mode: the replay landed owned by our local player;
-							-- hand it to the ORIGIN company and lock it. Done here (the poll),
-							-- not in a build callback, because every replay path -- buildProposal
-							-- AND the buildConstruction fallback -- funnels through this branch.
-							local ocid = CM.cmExpectedCompany[key]
-							if ocid then
-								CM.cmExpectedCompany[key] = nil
-								pcall(function() CM.cmReassignConstruction(id, ocid) end)
-								-- R2: the build was charged to OUR wallet; the balance
-								-- drop since apply is the exact cost -> move it to co<ocid>.
-								local bal0 = CM.cmExpectedBal0[key]; CM.cmExpectedBal0[key] = nil
-								local nowBal = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
-								if bal0 and nowBal then pcall(function() CM.cmTransferCost(ocid, bal0 - nowBal, "CON " .. fn) end) end
-							end
-						elseif expectedEdit[key] then
-							expectedEdit[key] = nil
-							noteCon(id, fn, key, pstr)
-							log(string.format("con: replayed edit landed as id %d", id))
+						if landReplayed(id, fn, key, pstr) then
+							-- our own replay or replayed edit landed (registered, handed over)
 						elseif CM.consByKey[key] and CM.consByKey[key].file == fn then
 							-- Same spot, new id: the entity was REPLACED, which is
 							-- what an upgrade does. An edit, not a build.
@@ -1340,7 +1444,8 @@ function CM.pollConstructionRemovals()
 						else
 							CM.consByKey[key] = nil
 							if x and y then
-								CM.rearmSplitsNear(x, y)
+								-- no re-arm here: execDemolish re-arms on every instance at the
+								-- DEMOLISH's stamp (the originator's skip path included)
 								CM.scheduleLocal("DEMOLISH", { x = x, y = y })
 								log(string.format("con: DEMOLISH captured at %.1f,%.1f (%s)", x, y, tostring(rec.file)))
 							else

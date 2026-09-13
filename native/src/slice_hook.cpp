@@ -507,6 +507,9 @@ static bool SessionLive()
     return cached;
 }
 
+// Defined beside WriteArmed; the bulldozer's fallbacks below use it first.
+static void WriteNativeNotice(const char* kind);
+
 
 // ---------------------------------------------------------------------------
 // Node decode. Established live and cross-validated: a2 == a3 + 0x70, the node
@@ -1021,13 +1024,14 @@ static bool LogBulldoze(uint64_t r8)
         if (nrem >= 1 && nadd >= 1) {
             Log("[slice]   UPGRADE-shaped (toRemove+toAdd) -- module edit\n");
             // STRICT: stash the new CE and arm; CONUP ships from the Add hook if
-            // the cancel lands. Undecodable -> the native upgrade runs and the
-            // edit poll ships it as before.
+            // the cancel lands. Undecodable -> the native upgrade runs and a
+            // NATIVE notice asks the mod for a catch-up scan.
             if (StashConupFromProposal(r8)) {
                 InterlockedExchange(&g_pendingIsConu, 1);
                 shipped = true;
             } else {
-                Log("[slice]   upgrade params not readable -- NOT cancelled, left to the con poll\n");
+                Log("[slice]   upgrade params not readable -- NOT cancelled, the mod's catch-up scan ships it\n");
+                if (SessionLive()) WriteNativeNotice("upgrade");
             }
         }
         else if (nrem >= 1) {
@@ -1045,12 +1049,13 @@ static bool LogBulldoze(uint64_t r8)
             // STRICT: name the removed object off the two edge records, arm the
             // cancel, and STOPXDEL ships from the Add hook if it lands -- every
             // instance then removes it at the stamp. Undecodable -> the bulldoze
-            // runs natively here and the stop poll ships it as before.
+            // runs natively here and a NATIVE notice asks for a catch-up scan.
             if (StashStopDelFromBulldoze(eb, re, adb, aedges)) {
                 InterlockedExchange(&g_pendingIsStopDel, 1);
                 shipped = true;
             } else {
-                Log("[slice]   (not decodable -- runs natively, the stop poll ships it)\n");
+                Log("[slice]   (not decodable -- runs natively, the mod's catch-up scan ships it)\n");
+                if (SessionLive()) WriteNativeNotice("stop");
             }
         }
         else if (re >= 1 || rn >= 1) {
@@ -1222,6 +1227,22 @@ static void WriteArmed(bool armed)
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) return;
     fprintf(f, "ARMED %d\n", armed ? 1 : 0);
+    fclose(f);
+}
+
+// A player build left NATIVE in a LIVE session because its record did not decode,
+// so it could not be cancelled. No capture line carries it, and the mod no longer
+// scans the world on a timer, so this asks for one catch-up scan instead; without
+// it the build would stand on this instance only.
+static void WriteNativeNotice(const char* kind)
+{
+    ReadInstance();
+    if (!g_instance[0]) return;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) return;
+    fprintf(f, "NATIVE %s\n", kind);
     fclose(f);
 }
 
@@ -1582,8 +1603,13 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
     } else if (fid == 7) {
         if (g_lcDecodeOk) {
             // LCREATEX <r> <g> <b> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n name=<enc>
+            // The colour goes out EXACT: %.9g round-trips a float. The line editor gives a
+            // new line the least-used lineColors entry (bright ones first), counting the
+            // existing lines' colours by exact float equality (FUN_14215da30). Rounded to
+            // %.4f, 127/255 came back as 0.4980, matched no palette entry, and every new
+            // line was the same orange (2026-09-12).
             const LineDecode& d = g_lcDecode.line;
-            fprintf(f, "LCREATEX %.4f %.4f %.4f %d %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
+            fprintf(f, "LCREATEX %.9g %.9g %.9g %d %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
             for (int i = 0; i < d.n; i++) {
                 fprintf(f, " %d %d %d %d %d %d %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
                         d.st[i].loadMode, d.st[i].minWait, d.st[i].maxWait, d.st[i].nAlt);
@@ -1632,7 +1658,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
         float col[3] = { -1.0f, -1.0f, -1.0f };
         if (Readable((void*)r9, 12)) memcpy(col, (void*)r9, 12);
         if (col[0] >= 0.0f) {
-            fprintf(f, "VCOLOR %d %.4f %.4f %.4f\n", (int)(int32_t)r8, col[0], col[1], col[2]);
+            fprintf(f, "VCOLOR %d %.9g %.9g %.9g\n", (int)(int32_t)r8, col[0], col[1], col[2]);   // exact, like LCREATEX's colour
             Log("[slice] VCOLOR shipped: entity=%d rgb=%.3f,%.3f,%.3f\n",
                 (int)(int32_t)r8, col[0], col[1], col[2]);
         } else {
@@ -2200,7 +2226,8 @@ static void WriteInjectConxp()
 // the [stop] line logs it so a one-way placement pins or refutes it.
 // A placement that REPLACES an object (edgeObjectsToRemove non-empty) is not
 // cancelled: the engine re-points that stop's lines (old2newEdgeObjects),
-// which a script proposal cannot carry -- the poll's STOPREP path stays.
+// which a script proposal cannot carry -- it builds natively, and the stop tool's
+// NATIVE notice gets it to the mod's catch-up scan and its STOPREP path.
 static bool StashStopFromProposal(uint64_t r8)
 {
     g_stopName[0] = 0; g_stopEid = -1;
@@ -2211,7 +2238,7 @@ static bool StashStopFromProposal(uint64_t r8)
     if (eid < 0) return false;
     uint64_t xb = 0;
     if (ReadVec(r8 + 0xe0, &xb, 0x4000) >= 0x100) {
-        Log("[stop] placement replaces an object -- not cancelled, the poll's STOPREP path handles it\n");
+        Log("[stop] placement replaces an object -- not cancelled, the catch-up scan's STOPREP path handles it\n");
         return false;
     }
     uint64_t ob = 0;
@@ -3746,14 +3773,24 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                         (unsigned long long)caller);
                     return 1;
                 }
-                if (InterlockedExchange(&g_pendingIsConx, 0))
-                    Log("[slice] construction cancel did not land -- CONXP dropped, the entity poll captures the native build as before\n");
-                if (InterlockedExchange(&g_pendingIsConu, 0))
-                    Log("[slice] upgrade cancel did not land -- CONUP dropped, the edit poll captures the native upgrade as before\n");
-                if (InterlockedExchange(&g_pendingIsStop, 0))
-                    Log("[slice] stop cancel did not land -- STOPX dropped, the poll captures the native build as before\n");
-                if (InterlockedExchange(&g_pendingIsStopDel, 0))
-                    Log("[slice] stop bulldoze cancel did not land -- STOPXDEL dropped, the stop poll ships the removal as before\n");
+                // Each of these ran natively after all: a NATIVE notice gets it to the
+                // mod's catch-up scan (nothing scans the world on a timer any more).
+                if (InterlockedExchange(&g_pendingIsConx, 0)) {
+                    Log("[slice] construction cancel did not land -- CONXP dropped, the catch-up scan captures the native build\n");
+                    WriteNativeNotice("construction");
+                }
+                if (InterlockedExchange(&g_pendingIsConu, 0)) {
+                    Log("[slice] upgrade cancel did not land -- CONUP dropped, the catch-up scan captures the native upgrade\n");
+                    WriteNativeNotice("upgrade");
+                }
+                if (InterlockedExchange(&g_pendingIsStop, 0)) {
+                    Log("[slice] stop cancel did not land -- STOPX dropped, the catch-up scan captures the native build\n");
+                    WriteNativeNotice("stop");
+                }
+                if (InterlockedExchange(&g_pendingIsStopDel, 0)) {
+                    Log("[slice] stop bulldoze cancel did not land -- STOPXDEL dropped, the catch-up scan ships the removal\n");
+                    WriteNativeNotice("stop");
+                }
                 if (InterlockedExchange(&g_pendingIsTerrain, 0)) {
                     Log("[slice] terrain cancel did not land -- the edit ran natively here; shipping it for the peers behind ARMED 0\n");
                     WriteInjectTerrain(false);
@@ -4018,6 +4055,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                         (unsigned long long)rcx);
                 } else if (!stashed) {
                     Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
+                    if (SessionLive()) WriteNativeNotice("construction");
                 }
             } else if (m >= 1) {
                 Log("[slice] construction placement has %d street edge(s) but the "
@@ -4043,6 +4081,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                         (unsigned long long)rcx);
                 } else if (!stashed) {
                     Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
+                    if (SessionLive()) WriteNativeNotice("construction");
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -4072,8 +4111,11 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             Log("[slice] armed cancel: stop/signal tool cmd=%llx -- STOPX ships if the cancel lands\n",
                 (unsigned long long)rcx);
         } else {
-            Log("[slice] stop tool: %s -- NOT cancelled, builds natively (the poll replicates it)\n",
-                stashed ? "no live session" : "record not decodable");
+            const bool live = SessionLive();
+            Log("[slice] stop tool: %s -- NOT cancelled, builds natively%s\n",
+                stashed ? "no live session" : "record not decodable",
+                live ? " (the mod's catch-up scan replicates it)" : "");
+            if (live) WriteNativeNotice("stop");
         }
         return 0;
     }
@@ -4109,9 +4151,12 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 Log("[slice] armed cancel: construction UPGRADE from caller_rva=%llx old=%d -- CONUP ships if the cancel lands\n",
                     (unsigned long long)caller, g_conupOldId);
             } else {
-                Log("[slice] construction UPGRADE from caller_rva=%llx -- runs natively (params %s); the edit poll ships it\n",
+                const bool live = SessionLive();
+                Log("[slice] construction UPGRADE from caller_rva=%llx -- runs natively (params %s)%s\n",
                     (unsigned long long)caller,
-                    g_conxpParams[0] ? "readable" : "not readable");
+                    g_conxpParams[0] ? "readable" : "not readable",
+                    live ? "; the mod's edit scan or catch-up scan ships it" : "");
+                if (live) WriteNativeNotice("upgrade");
             }
         } else {
             int an = -1, ae = -1, rn = -1, re = -1;
@@ -4310,10 +4355,41 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             // change a working channel's behaviour in the same commit that adds
             // a new one, and a removal the peer cannot match now SKIPS the whole
             // command. Flip it once upgrades have proven the matcher.
+            //
+            // EXCEPT an edge REPLACED IN PLACE (2026-09-12). A road built under a
+            // bridge makes the engine remove that bridge span and add it again between
+            // the SAME two existing nodes (capture: removed segs=1, added
+            // 111672 -> 111711 btype=1). No peer can re-derive that from positions, so
+            // with re=0 every instance laid a second span over the old one and the
+            // engine refused the whole build (critical, no collision) -- the road could
+            // never be built under a bridge. Such a removal -- both ends existing nodes,
+            // and an added edge joining exactly that pair -- now travels; a split
+            // parent never has an added edge between its own two ends.
+            Edge* shipRm = rmEdges;
             int shipRe = isUpgrade ? re : 0;
+            static Edge inPlace[512];
+            if (!isUpgrade) {
+                int k = 0;
+                for (int i = 0; i < re && k < 512; i++) {
+                    const Edge& r = rmEdges[i];
+                    if (r.node0 < 0 || r.node1 < 0) continue;
+                    for (int j = 0; j < m; j++) {
+                        const Edge& a = edges[j];
+                        if ((a.node0 == r.node0 && a.node1 == r.node1) || (a.node0 == r.node1 && a.node1 == r.node0)) {
+                            inPlace[k++] = r;
+                            break;
+                        }
+                    }
+                }
+                if (k > 0) {
+                    Log("[slice]   %d removal(s) replaced in place (e.g. a bridge span over the new road) -- shipped with the build\n", k);
+                    shipRm = inPlace;
+                    shipRe = k;
+                }
+            }
             const bool live = SessionLive();
             WriteArmed(live);
-            WriteInject(nodes, n, edges, m, nullptr, 0, rmEdges, shipRe, et);
+            WriteInject(nodes, n, edges, m, nullptr, 0, shipRm, shipRe, et);
             if (isUpgrade && re > m)
                 Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
                     "more removals than adds, watch the peer\n", m, re);

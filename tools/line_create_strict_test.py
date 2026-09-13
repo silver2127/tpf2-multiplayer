@@ -4,18 +4,23 @@ The line editor's CreateLine used to run natively on the player's game one comma
 before the peers' replay, and the new line took a different entity id there. The slice now
 decodes it (name, colour, component::Line), writes ARMED 1 + LCREATEX and cancels it; the
 editor's callback is held and rides on the originator's own replay, which the Lua claims
-through lockstep_lclaim_<x>.txt. This loads the real inject.lua and lines.lua into a
-lupa.lua52 runtime with stub CM/K/api and drives:
+through lockstep_lclaim_<x>.txt. This loads the real inject.lua, lines.lua and vehicles.lua
+into a lupa.lua52 runtime with stub CM/K/api and drives:
   - ARMED 1 + LCREATEX (the editor's empty line): scheduled LCREATE, armed=1, name/colour kept
   - a decoded stop with an alternative platform: stops/alts strings as LUPDATE builds them
   - ARMED 0: nothing scheduled, the old read-back path takes it (pendingLineCreates)
   - a stop that is not a station group: rejected loudly, nothing scheduled
   - execLine on the originator, armed=1: claim written (fresh value each time), createLine sent
   - execLine on the originator, armed=0: skipped; on a peer: sent, no claim
+  - EXACT COLOURS (2026-09-12): the editor picks a new line's colour by exact float match
+    against the existing lines, so a palette colour must reach createLine / setColor as the
+    same float32 it left the editor as -- through LCREATEX, the LCREATE wire string, and
+    VCOLOR's rgb field
 
     python tools/line_create_strict_test.py
 """
 import os
+import struct
 import sys
 import tempfile
 
@@ -33,11 +38,23 @@ def check(name, cond, extra=""):
         fails.append(name)
 
 
+def f32(x):
+    """The float32 a double lands on (what api.type.Vec3f.new stores)."""
+    return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+# lineColors' first bright entry, as the game holds it: { 255/255, 127/255, 0/255 }
+ORANGE = (1.0, f32(127 / 255), 0.0)
+# what the slice writes for it: fprintf %.9g of each float
+ORANGE_TOKENS = " ".join(format(v, ".9g") for v in ORANGE)
+
+
 def runtime(inject_path, base):
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
     g = L.globals()
     g.INJECT_SRC = open(os.path.join(MP, "inject.lua"), encoding="utf-8").read()
     g.LINES_SRC = open(os.path.join(MP, "lines.lua"), encoding="utf-8").read()
+    g.VEH_SRC = open(os.path.join(MP, "vehicles.lua"), encoding="utf-8").read()
     g.INJECT = inject_path.replace("\\", "/")
     g.BASE = base.replace("\\", "/") + "/"
     return L.execute(r'''
@@ -56,7 +73,8 @@ api.engine = setmetatable({ util = { getPlayer = function() return 1 end },
   { __index = function() return sink() end })
 api.cmd = {
   make = { createLine = function(name, color, player, line)
-    return { what = "createLine", name = name, color = color, n = #line.stops } end },
+             return { what = "createLine", name = name, color = color, n = #line.stops } end,
+           setColor = function(id, color) return { what = "setColor", id = id, color = color } end },
   sendCommand = function(cmd, cb) sent[#sent + 1] = cmd end,
 }
 game = setmetatable({}, { __index = function() return sink() end })
@@ -87,9 +105,14 @@ end
 local log = function(s) logs[#logs + 1] = s end
 assert(load(INJECT_SRC, "@inject.lua"))()(CM, K, log)
 assert(load(LINES_SRC, "@lines.lua"))()(CM, K, log)
+assert(load(VEH_SRC, "@vehicles.lua"))()(CM, K, log)
 -- station group 5000 sits at 100,200; its station 1 at 101.5,202.5
 function CM.stationGroupPos(sg) if sg == 5000 then return 100, 200 end end
 function CM.stationPosInGroup(sg, st) if sg == 5000 and st == 1 then return 101.5, 202.5 end end
+-- entity 42 is a tracked line (key a:7) on this instance; that key is entity 99 on a peer
+CM.vehKeyOf, CM.lineKeyOf, CM.primedLines, CM.primedVeh = {}, { [42] = true }, {}, {}
+function CM.lineKeyFor(id) if id == 42 then return "a:7" end end
+function CM.lineIdFor(key) if key == "a:7" then return 99 end end
 local H = { CM = CM }
 function H.poll() CM.pollInject() end
 function H.nsched() return #sched end
@@ -100,11 +123,17 @@ function H.npending() return #CM.pendingLineCreates end
 function H.clearPending() CM.pendingLineCreates = {} end
 function H.nsent() return #sent end
 function H.sentName(i) local c = sent[i]; return c and c.name end
+function H.sentWhat(i) local c = sent[i]; return c and c.what end
+function H.sentColor(i, j) local c = sent[i]; return c and c.color and c.color[j] end
 function H.clearSent() sent = {} end
 function H.logs() return table.concat(logs, "\n") end
-function H.exec(origin, armed, seq)
+function H.exec(origin, armed, seq, color)
   CM.execLine({ op = "LCREATE", origin = origin, seq = seq, at = 100, armed = armed,
-                name = "Bus%20Line%201", color = "0.1,0.2,0.3", wait = 180, stops = "", alts = "" })
+                name = "Bus%20Line%201", color = color or "0.1,0.2,0.3", wait = 180, stops = "", alts = "" })
+end
+function H.execColor(r, g, b, rgb)
+  CM.execSetColor({ op = "VCOLOR", origin = "b", seq = 30, at = 100, kind = "line", key = "a:7",
+                    r = r, g = g, b = b, rgb = rgb, skipOrigin = 1 })
 end
 return H
 ''')
@@ -122,14 +151,21 @@ def main():
             for ln in lines:
                 f.write((ln + "\n").encode())
 
-    # 1. the editor's create: an empty line, a name with a space
-    write("ARMED 1", "LCREATEX 0.1000 0.2000 0.3000 180 0 name=Bus%20Line%201")
+    def exact(values):
+        return all(f32(float(v)) == o for v, o in zip(values, ORANGE))
+
+    # 0. the bug this guards against: the old %.4f text is not the palette's float
+    check("the old %.4f wire text is not 127/255 as a float32", f32(float("%.4f" % ORANGE[1])) != ORANGE[1])
+
+    # 1. the editor's create: an empty line, a name with a space, palette orange
+    write("ARMED 1", f"LCREATEX {ORANGE_TOKENS} 180 0 name=Bus%20Line%201")
     H.poll()
     check("empty create: one LCREATE scheduled", H.nsched() == 1 and H.op(1) == "LCREATE", H.logs()[-300:])
     check("empty create: armed=1", H.arg(1, "armed") == 1)
     check("empty create: name stays escaped for the wire", H.arg(1, "name") == "Bus%20Line%201", str(H.arg(1, "name")))
-    check("empty create: colour and wait", H.arg(1, "color") == "0.1000,0.2000,0.3000" and H.arg(1, "wait") == 180,
-          f"{H.arg(1, 'color')} {H.arg(1, 'wait')}")
+    check("empty create: wait", H.arg(1, "wait") == 180, str(H.arg(1, "wait")))
+    col = str(H.arg(1, "color"))
+    check("empty create: the colour string is the palette colour EXACTLY", exact(col.split(",")), col)
     check("empty create: no stops", H.arg(1, "stops") == "" and H.arg(1, "alts") == "")
     check("empty create: the read-back path is not used", H.npending() == 0)
     H.clearSched()
@@ -171,11 +207,33 @@ def main():
     H.exec("a", 0, 13)
     check("originator armed=0: skipped", H.nsent() == 0)
 
-    # 7. a peer's line: sent, no claim
-    H.exec("b", 1, 14)
+    # 7. a peer's line: sent, no claim -- created in the palette's exact colour
+    H.exec("b", 1, 14, col)
     c3 = open(claim).read().strip()
     check("peer line: createLine sent", H.nsent() == 1)
     check("peer line: claim untouched", c3 == c2, f"{c2} -> {c3}")
+    got = [H.sentColor(1, j) for j in (1, 2, 3)]
+    check("peer line: createLine gets the palette colour as the same float32", exact(got), str(got))
+    H.clearSent()
+
+    # 8. a player recolours a tracked line: VCOLOR ships the exact colour beside r/g/b
+    write(f"VCOLOR 42 {ORANGE_TOKENS}")
+    H.poll()
+    check("VCOLOR: one scheduled", H.nsched() == 1 and H.op(1) == "VCOLOR", H.logs()[-300:])
+    rgb = str(H.arg(1, "rgb"))
+    check("VCOLOR: rgb is the palette colour EXACTLY", exact(rgb.split(",")), rgb)
+    check("VCOLOR: keyed by the line's shared key", H.arg(1, "kind") == "line" and H.arg(1, "key") == "a:7")
+    H.clearSched()
+
+    # 9. the peer applies it: rgb wins over the %.4f-rounded r/g/b
+    H.execColor(1.0, 0.498, 0.0, rgb)
+    got = [H.sentColor(1, j) for j in (1, 2, 3)]
+    check("VCOLOR exec: setColor on the peer's entity", H.sentWhat(1) == "setColor")
+    check("VCOLOR exec: rgb applied as the same float32", exact(got), str(got))
+    H.clearSent()
+    H.execColor(0.25, 0.5, 0.75, None)
+    got = [H.sentColor(1, j) for j in (1, 2, 3)]
+    check("VCOLOR exec without rgb (company paint): r/g/b as sent", got == [0.25, 0.5, 0.75], str(got))
 
     print()
     if fails:

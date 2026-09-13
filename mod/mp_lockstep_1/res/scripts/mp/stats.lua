@@ -26,13 +26,15 @@ local ORDER = { "e", "z", "c", "v", "p", "t", "m", "l", "n" }
 local SIDE = { m = true, l = true, n = true }
 
 -- A dash verdict in words. The script state writes "SYNC", "-" (no comparison
--- yet), "DESYNC e+z vs a" (the hash lanes that differ), "DESYNC town +5 vs a"
--- (town buildings, ours minus theirs) or "DESYNC vpos 12m vs b" (vehicle drift),
--- and a peer's own column just "DESYNC". Returns state ("sync", "desync" or
--- "checking"), the other player's letter (or nil) and what differs (or nil).
+-- yet), "OFF" (no hash: the map is larger than vanilla allows), "DESYNC e+z vs a"
+-- (the hash lanes that differ), "DESYNC town +5 vs a" (town buildings, ours minus
+-- theirs) or "DESYNC vpos 12m vs b" (vehicle drift), and a peer's own column just
+-- "DESYNC". Returns state ("sync", "desync", "off" or "checking"), the other
+-- player's letter (or nil) and what differs (or nil).
 function CM.verdictWords(v)
 	v = tostring(v or "-")
 	if v == "SYNC" then return "sync" end
+	if v == "OFF" then return "off" end
 	if v:sub(1, 6) ~= "DESYNC" then return "checking" end
 	local d, who = v:match("^DESYNC town ([%+%-]%d+) vs (%a+)")
 	if d then
@@ -133,6 +135,9 @@ function CM.statusWords(kv, npeers)
 	if npeers == 0 then
 		return "No other player heard right now -- nothing to compare."
 	end
+	if state == "off" then
+		return "Desync check OFF: this map is larger than vanilla allows, and hashing a world this size freezes the game for seconds at a time."
+	end
 	if state == "desync" or desyncs > 0 then
 		local lines = {}
 		if state == "desync" then
@@ -173,7 +178,8 @@ function CM.statsInWords(status, cells, own, present, fresh, peerInfo)
 			if letter == own then
 				local s = "checking"
 				if ownState == "desync" then s = "differ"
-				elseif ownState == "sync" then s = desyncs > 0 and "matched last check" or "match" end
+				elseif ownState == "sync" then s = desyncs > 0 and "matched last check" or "match"
+				elseif ownState == "off" then s = "not checked" end
 				c.sync:setText(s .. "   ")
 				c.clock:setText(CM.paceWords(kv.pace, letter == leader) .. "   ")
 				c.notes:setText(CM.ownNotes(kv))
@@ -182,7 +188,8 @@ function CM.statsInWords(status, cells, own, present, fresh, peerInfo)
 				local s = "not heard"
 				if info then
 					local st = CM.verdictWords(info.verdict)
-					s = (st == "sync" and "match") or (st == "desync" and "differ") or "checking"
+					s = (st == "sync" and "match") or (st == "desync" and "differ")
+						or (ownState == "off" and "not checked") or "checking"
 				end
 				c.sync:setText(s .. "   ")
 				local clock = "-"

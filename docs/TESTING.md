@@ -194,12 +194,15 @@ Not replicated, so not tested: vehicle stop/start, manual departure, maintenance
 - [ ] **R1** The relay row joins with no port forwarded on any PC.
 - [ ] **R2** The first player is the leader: their START GAME shares a save through the relay, a
   second player loads it, `SYNC`.
-- [ ] **R3** With a world stored on the relay: the leader joins and after 10 s everyone continues it.
-- [ ] **R4** `/new` within those 10 s discards it; the leader's START GAME shares their own save.
+- [ ] **R3** With a world stored on the relay: the leader joins and the world loads for everyone
+  within a few seconds, with no button.
+- [ ] **R4** With no world stored: the leader's panel asks for START GAME; pressing it sends the
+  leader's most recent save and everyone loads it.
+- [ ] **R7** With a world stored, the leader types `/new` before it is sent: it is discarded and the
+  leader's START GAME shares their own save.
 - [ ] **R5** While the leader plays, a fresh save reaches the relay every 2 minutes; a player joining
   late gets a world less than 3 minutes old.
 - [ ] **R6** When the leader leaves, the next player becomes leader.
-- [ ] **R7** `/resume` sends the stored world to everyone waiting.
 
 ## X: security
 

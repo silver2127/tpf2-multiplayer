@@ -605,6 +605,7 @@ local function execute(c)
 	elseif c.op == "ROAD" or c.op == "RAIL" then CM.execEdge(c)
 	elseif c.op == "CON" then CM.execCon(c)
 	elseif c.op == "DEMOLISH" then CM.execDemolish(c)
+	elseif c.op == "HEALCHK" then CM.execHealCheck(c)
 	elseif c.op == "EDEMO" then CM.execEdgeDemolish(c)
 	elseif c.op == "CONFAIL" then CM.execConFail(c)
 	elseif c.op == "VBUY" then CM.execVBuy(c)
@@ -690,7 +691,37 @@ function CM.vposShip(stamp)
 	for o in pairs(CM.vposPeer) do CM.vposCompare(stamp, o) end
 end
 
+-- NO HASH ON MAPS BIGGER THAN VANILLA. The hash walks the whole world on the sim
+-- thread, and on a 224-tile map (27k edges) that measured 3.0-3.5 s per stamp: a
+-- freeze every few minutes, in solo games too. Above what the stock New Game menu
+-- builds -- Megalomaniac, at most 96 x 96 = 9,216 tiles and 192 on an axis (1:4)
+-- -- the check is off for the whole game, and desync detection with it. Decided
+-- from the terrain size, which every instance reads from the same save, so no
+-- instance hashes while another waits for stamps that never come.
+K.VANILLA_MAX_TILES      = 96 * 96
+K.VANILLA_MAX_TILES_AXIS = 192
+function CM.mapTooBigToHash()
+	if CM.hashOffBigMap ~= nil then return CM.hashOffBigMap end
+	local ok, tx, ty = pcall(function()
+		local terrain = api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.TERRAIN)
+		return terrain.size.x, terrain.size.y
+	end)
+	if not ok or type(tx) ~= "number" or type(ty) ~= "number" then
+		CM.hashOffBigMap = false
+		log("hash check: map size unreadable (" .. tostring(tx) .. ") -- hashing as usual")
+		return false
+	end
+	CM.hashOffBigMap = tx * ty > K.VANILLA_MAX_TILES or math.max(tx, ty) > K.VANILLA_MAX_TILES_AXIS
+	log(string.format("hash check: map %d x %d tiles -- %s", tx, ty, CM.hashOffBigMap
+		and "larger than vanilla allows, the desync hash is OFF for this game" or "hashing as usual"))
+	return CM.hashOffBigMap
+end
+
 local function checkHash(now)
+	if CM.mapTooBigToHash() then
+		CM.dashVerdict = "OFF"
+		return
+	end
 	-- CM.hashEvery is set from the map size on the first hash and is the same
 	-- on every instance (same save); until then the base interval applies.
 	local every = CM.hashEvery or K.HASH_EVERY_GAMETIME
@@ -779,8 +810,32 @@ function data()
 			-- tick is far cheaper than that.
 			CM.pollEvents()
 			CM.pollInject()
-			if CM.ticks % K.CON_POLL_EVERY == 0 then CM.pollNewConstructions() end
-			if CM.ticks % K.CON_POLL_EVERY == 3 then CM.pollStops() end
+			-- NO WORLD SCANS ON A TIMER. The construction and stop polls walked every
+			-- construction and every edge object on the map every 10 steps -- ~300 ms of frozen
+			-- simulation each on a big map (2026-09-12) -- to find builds the slice already
+			-- announces. They run once at load (what the save holds is known, not new) and as a
+			-- one-shot CATCH-UP: after a NATIVE line or a not-armed stop (the slice left a build
+			-- native), or after update() stalled long enough in a multiplayer session for the
+			-- status file to go stale (over 15 s, and the slice then builds natively). Replays
+			-- land by a lookup at their own position (CM.landReplays).
+			if not CM.consPrimed then CM.pollNewConstructions() end
+			if not CM.stopPrimed then CM.pollStops() end
+			CM.landReplays()
+			do
+				local wall = os.time()
+				local mp = CM.peerSeen or (tonumber(CM.rosterPlayers) or 0) >= 2
+				if mp and CM.lastUpdWall and wall - CM.lastUpdWall >= 10 then
+					CM.catchUpAt = math.min(CM.catchUpAt or math.huge, CM.ticks)
+					log(string.format("update() stalled %d s in a multiplayer session -- catch-up scan due", wall - CM.lastUpdWall))
+				end
+				CM.lastUpdWall = wall
+			end
+			if CM.catchUpAt and CM.ticks >= CM.catchUpAt then
+				CM.catchUpAt = nil
+				log("catch-up scan: constructions and stops")
+				CM.pollNewConstructions()
+				CM.pollStops()
+			end
 			if CM.ticks % 15 == 7 then CM.pollLoan() end
 			-- Until the peer's first heartbeat, refresh the status file every 3 ticks rather
 			-- than every 15: the slice decides from it whether a build can be cancelled, and
@@ -810,9 +865,9 @@ function data()
 				end
 			end
 			if CM.ticks % K.REMOVAL_POLL_EVERY == 0 then CM.pollConstructionRemovals() end
-			-- Cheap: the watch list is empty unless a replay has cut a road, and
-			-- each entry is looked at once, CM.SPLIT_SETTLE ticks after the cut.
-			if CM.ticks % 60 == 0 and not CM.conxBusy then CM.sweepSplits() end
+			-- Orphaned-split heals are NOT swept here any more: a frame-tick sweep healed
+			-- on a different sim step on every instance (desync, 2026-09-12). Each watched
+			-- split is a HEALCHK in the step-locked queue instead (cons.lua CM.watchSplit).
 			if CM.ticks % K.CON_EDIT_SCAN_EVERY == 0 then CM.scanConstructionEdits() end
 
 			-- the command delay follows the measured round trips (net.lua CM.execDelayTick)
@@ -1305,6 +1360,14 @@ function data()
 						CM.dashShowCompanies = not CM.dashShowCompanies
 						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
 					end))
+					-- the host's speed buttons: shown by default, this toggle (host only) hides them
+					CM.dashShowHostSpeed = (CM.dashShowHostSpeed ~= false)
+					D.speedTog = toggleBtn("  speed  ", function()
+						CM.dashShowHostSpeed = not CM.dashShowHostSpeed
+						D.hostSpeedShown = nil   -- the GUI tick re-applies the row's visibility
+					end)
+					tog:addItem(D.speedTog)
+					pcall(function() D.speedTog:setVisible(false, false) end)
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					box:addItem(togC)
@@ -1583,9 +1646,17 @@ function data()
 						elseif os.time() - (D.chatIdleSince or 0) > 30 then CM.chatCloseInput() end
 					end
 					-- the host speed row: on the host's window only, with the session speed
-					if D.hostSpeedBox and (guiTick % 10) == 0 then
+					if D.hostSpeedBox and (guiTick % 10) == 0 or (D.hostSpeedBox and D.hostSpeedShown == nil) then
 						local isHost = (CM.guiLeader and CM.guiLeader() or "a") == own
-						if D.hostSpeedShown ~= isHost then D.hostSpeedShown = isHost; D.hostSpeedBox:setVisible(isHost, false) end
+						local showRow = isHost and CM.dashShowHostSpeed ~= false
+						if D.hostSpeedShown ~= showRow then
+							D.hostSpeedShown = showRow
+							D.hostSpeedBox:setVisible(showRow, false)
+						end
+						if D.speedTog and D.speedTogShown ~= isHost then
+							D.speedTogShown = isHost
+							pcall(function() D.speedTog:setVisible(isHost, false) end)
+						end
 						if isHost and mine then
 							D.speedEff = tonumber(mine.eff)
 							if not (D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5) then

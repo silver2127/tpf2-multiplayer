@@ -465,6 +465,9 @@ function CM.execSetColor(c)
 			return
 		end
 		local r, g, b = tonumber(c.r) or 0, tonumber(c.g) or 0, tonumber(c.b) or 0
+		-- rgb, when the capture sent it, is the exact colour; r/g/b crossed the wire at %.4f
+		local er, eg, eb = tostring(c.rgb or ""):match("^([^,]+),([^,]+),([^,]+)$")
+		if tonumber(er) and tonumber(eg) and tonumber(eb) then r, g, b = tonumber(er), tonumber(eg), tonumber(eb) end
 		-- the slice captures this replay as if a player had clicked (CM.expectColorEcho)
 		CM.expectColorEcho(id, r, g, b)
 		api.cmd.sendCommand(api.cmd.make.setColor(id, api.type.Vec3f.new(r, g, b)), function(_, okc)

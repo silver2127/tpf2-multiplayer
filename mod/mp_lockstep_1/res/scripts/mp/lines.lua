@@ -175,7 +175,9 @@ function CM.lineSnapshot(lid)
 			local cc = api.engine.getComponent(lid, api.type.ComponentType.COLOR)
 			if cc and cc.color then r, g, b = cc.color.x or cc.color[1], cc.color.y or cc.color[2], cc.color.z or cc.color[3] end
 		end)
-		snap = { name = CM.escName(name), color = string.format("%.3f,%.3f,%.3f", r, g, b),
+		-- the colour EXACTLY (%.9g round-trips a float): a peer's next new line is
+		-- coloured by an exact match against the existing lines' colours (LCREATEX)
+		snap = { name = CM.escName(name), color = string.format("%.9g,%.9g,%.9g", r, g, b),
 		         wait = tonumber(lc.waitingTime) or 180, stops = table.concat(stops, ";"),
 		         alts = table.concat(alts, ";") }
 	end)
@@ -252,6 +254,58 @@ function CM.mergeLineEdit(baseS, baseA, clickS, clickA, pendS, pendA)
 		end
 	end
 	return table.concat(P, ";"), table.concat(PA, ";"), adds, dels, sets
+end
+
+-- How many single-stop changes turn one list into the other (stop identity as in
+-- mergeLineEdit: position + station + terminal): additions plus removals.
+local function lineDistance(aS, bS)
+	local na, nb = lineCount(aS), lineCount(bS)
+	local A, B = lineSplit(aS, na), lineSplit(bS, nb)
+	local L = {}
+	for i = na + 1, 1, -1 do
+		L[i] = {}
+		for j = nb + 1, 1, -1 do
+			if i > na or j > nb then L[i][j] = 0
+			elseif stopKey(A[i]) == stopKey(B[j]) then L[i][j] = L[i + 1][j + 1] + 1
+			else L[i][j] = math.max(L[i + 1][j], L[i][j + 1]) end
+		end
+	end
+	return na + nb - 2 * L[1][1]
+end
+CM.lineDistance = lineDistance
+
+-- THE LIST A CLICK WAS BUILT FROM (2026-09-12). The line editor builds each click
+-- from the list IT last saw, and an update can land between the click and the
+-- moment the Lua reads it. Diffing the click against the entity's list then read
+-- "stop 1 removed, stop 3 added" for a click that only added stop 3, and the merge
+-- deleted stop 1 (b:6: three quick stations applied as 1, 2, 2 stops). So every
+-- applied update records the list before and after it, and a click's base is the
+-- NEWEST recent list it is at most one change away from (one click is one change:
+-- an add, a removal or a re-set); failing that, the closest, newest first.
+-- Newest first keeps "remove the stop just added" a removal, not a no-op.
+function CM.lineHistNote(key, stops, alts)
+	if not key then return end
+	CM.lineHist = CM.lineHist or {}
+	local h = CM.lineHist[key] or {}
+	h[#h + 1] = { stops = stops or "", alts = alts or "", t = CM.gameTime() or 0 }
+	while #h > 12 do table.remove(h, 1) end
+	CM.lineHist[key] = h
+end
+function CM.lineBaseFor(key, clickS, snap)
+	local cands = {}
+	if snap and snap.stops then cands[#cands + 1] = snap end
+	local now = CM.gameTime() or 0
+	local h = (CM.lineHist or {})[key] or {}
+	for k = #h, 1, -1 do
+		if now - (h[k].t or 0) <= 8 then cands[#cands + 1] = h[k] end
+	end
+	local best, bestD
+	for _, cand in ipairs(cands) do
+		local d = lineDistance(cand.stops, clickS)
+		if d <= 1 then return cand end
+		if not bestD or d < bestD then best, bestD = cand, d end
+	end
+	return best or snap
 end
 
 -- The newest update for `key` that may not show on the entity yet: one still
@@ -477,6 +531,12 @@ function CM.execLine(c)
 			local lid = CM.lineIdFor(c.key)
 			if not lid then retryLineDep(c); return end
 			local lineObj, n = buildLineObject(c)
+			-- the lists the line editor may still be showing (CM.lineBaseFor)
+			pcall(function()
+				local pre = CM.lineSnapshot(lid)
+				if pre and pre.stops then CM.lineHistNote(c.key, pre.stops, pre.alts) end
+				CM.lineHistNote(c.key, c.stops or "", c.alts or "")
+			end)
 			api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
 				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s",
 					tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.key), n, tostring(success)))

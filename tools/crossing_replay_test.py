@@ -48,6 +48,13 @@ local function reset()
   for k,v in pairs(geom) do CM[k]=v end
   assert(load(ROADS))()(CM,K,log)
   CM.roadAuditSnapshot=function() return {} end
+  -- stops.lua's reader (not loaded here): roads.lua carries a removed edge's
+  -- stops and signals onto its replacement through it
+  CM.objectsOnEdge=function(eid)
+    local e=edges[eid];local objs=(e and e.comp.objects) or {}
+    local list={};for i,o in ipairs(objs) do list[i]={o[1],o[2] or 1} end
+    return list,#objs
+  end
 end
 local function node(id,x,y,z) nodes[id]={position=vec(x,y,z)} end
 local function edge(id,n0,n1,kind)
@@ -160,6 +167,24 @@ function test_invalid_companion(mode)
   CM.execPolyline({origin='b',seq=8,etype=0,pts='-20,0,0,20,0,0',links='1,2',fv='1,2',br=br},false)
   assert(#proposals==0,'mismatched bridge produced a partial build')
 end
+-- A road under a ROAD bridge (or a track under a track bridge): the refreshed span is
+-- the command's own network, carried as bs. It keeps its OWN properties -- as a link
+-- it took the new road's type (street 24 would have become 15 here).
+function test_same_network_companion(isTrack)
+  reset()
+  node(101,40,-20,20);node(102,40,20,20)
+  edge(201,101,102,isTrack and 1 or 0)
+  edges[201].comp.type=1;edges[201].comp.typeIndex=4;edges[201].comp.objects={{778,1}}
+  edges[201].streetEdge.streetType=24;edges[201].trackEdge.trackType=1;edges[201].trackEdge.catenary=false
+  local sp=execute({etype=isTrack and 1 or 0,pts='-20,0,0,20,0,0',links='1,2',fv='1,2',bs='40,-20,20,40,20,20,4'})
+  assert(#sp.edgesToAdd==2 and #sp.nodesToAdd==2 and #sp.edgesToRemove==1,'same-network companion shape')
+  assert(sp.edgesToRemove[1]==201)
+  local e=sp.edgesToAdd[2]
+  assert(e.type==(isTrack and 1 or 0) and e.comp.type==1 and e.comp.typeIndex==4,'same-network bridge kind/model lost')
+  assert(e.comp.node0==101 and e.comp.node1==102 and e.comp.objects[1][1]==778,'same-network bridge orientation/object lost')
+  if isTrack then assert(e.trackEdge.trackType==1 and e.trackEdge.catenary==false,'track bridge took the new track props')
+  else assert(e.streetEdge.streetType==24,'road bridge took the new road type: '..tostring(e.streetEdge.streetType)) end
+end
 ''')
 
 if __name__ == "__main__":
@@ -187,4 +212,6 @@ if __name__ == "__main__":
                 lua.globals().test_bridge_companion(reverse, is_track)
         for mode in ('height', 'model', 'missing', 'malformed'):
             lua.globals().test_invalid_companion(mode)
-        print("PASS: bridge replacement kinds, properties, objects, orientation and mismatch rejection")
+        for is_track in (False, True):
+            lua.globals().test_same_network_companion(is_track)
+        print("PASS: bridge replacement kinds (both networks), properties, objects, orientation and mismatch rejection")

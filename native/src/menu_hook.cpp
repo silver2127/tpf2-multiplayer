@@ -2075,7 +2075,14 @@ static void applyRoster(const char* s)
     // save for hot joiners); it changes when the leader leaves
     if (roleKnown && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
         LONG was = InterlockedExchange(&g_isHost, isHost ? 1 : 0);
-        if (was != (isHost ? 1 : 0)) { Log("[menu] relay lobby: we are %s the leader now\n", isHost ? "" : "not"); SetStatus(isHost ? "You lead this relay lobby. Its world loads by itself; START GAME would share yours instead." : "Waiting for the leader to start."); }
+        if (was != (isHost ? 1 : 0)) {
+            // stored_age < 0: the relay holds no world, so the leader has to send one
+            const bool relayHasWorld = InterlockedCompareExchange(&g_storedAge, 0, 0) >= 0;
+            Log("[menu] relay lobby: we are %s the leader now (relay %s a saved world)\n", isHost ? "" : "not", relayHasWorld ? "holds" : "has no");
+            SetStatus(relayHasWorld ? "Loading the relay's world\xE2\x80\xA6"
+                      : isHost ? "This relay has no saved world yet -- press START GAME to send your most recent save."
+                               : "Waiting for the leader to press START GAME.");
+        }
     }
     if (roleKnown) writeBridgeCtl(isHost);
     // HOT JOIN (2026-09-09): the roster grew while the game is running and we
@@ -2476,7 +2483,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             }
                             if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
                                 // our own save (the one we shared / uploaded); a leader that RECEIVED a
-                                // save this session (a relay's /resume) falls through and loads that.
+                                // save this session (a relay loading its stored world) falls through and loads that.
                                 // No guessing: our newest save need not be what anyone else has.
                                 wcscpy_s(src, g_startSaveW);
                                 if (!src[0]) {
@@ -2514,7 +2521,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         if (stop || WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
         SyncPoll();
         // relay lobbies: the relay's copy of the world is whatever was last
-        // uploaded, so the leader refreshes it on a timer -- a /resume after
+        // uploaded, so the leader refreshes it on a timer -- a resume after
         // everyone left is then at most this many minutes old
         if (g_flagRelayAutosaveMin > 0 && InterlockedCompareExchange(&g_lobbyRelay, 0, 0) && InterlockedCompareExchange(&g_isHost, 0, 0)
             && g_gameUi && InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0) {

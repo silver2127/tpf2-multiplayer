@@ -188,9 +188,9 @@ Commands (`lobby_in.jsonl`): `chat` (`text`); `company` (`player`, `id`);
 `publish` (`on`); `start` (optional `save` = path of the save to share); `quit`; `name`
 (accepted, never sent).
 
-Chat lines starting with `/` are conventions of the game side, not the lobby, except
-`/new` and `/resume`, which a relay interprets (below). The panel treats a chat line
-starting with `!hotjoin ` as a status message.
+Chat lines starting with `/` are conventions of the game side, not the lobby, except `/new`,
+which a relay interprets (below). The panel treats a chat line starting with `!hotjoin ` as a
+status message.
 
 ## Save transfer
 
@@ -254,10 +254,11 @@ accept inbound connections, and for an always-on public server.
 - **Stored world.** The relay keeps the last save a leader uploaded
   (`incoming_save.*` in its data folder), replaced only when a new upload verifies.
 - **Resuming.** When a leader joins a relay that holds a world and no session is running,
-  everyone is told the world will continue in 10 s. The leader can say `/new` in chat within
-  that time to discard it and share their own save with START GAME instead. After the grace
-  the relay pushes the stored world to everyone and starts them. `/resume` (leader) pushes
-  it on demand.
+  the relay pushes the stored world to everyone and starts them, after 3 s so that players
+  arriving together share one transfer. With no stored world, the leader is told to press
+  START GAME, which uploads the leader's most recent save (below). Until the stored world is
+  sent, the leader can say `/new` in chat to discard it and share their own save with START
+  GAME instead. To replace the stored world from outside the game, see `tools/relay_put_save.sh`.
 - **Uploads.** The leader's START GAME uploads its save to the relay, which then shares it
   with everyone waiting. While a leader plays, its menu DLL re-uploads a fresh autosave every
   2 minutes (`relay_autosave_min` in `tpf2_menu_flags.txt`; 0 turns it off); when nobody is

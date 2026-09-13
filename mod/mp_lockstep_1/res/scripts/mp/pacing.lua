@@ -630,6 +630,9 @@ end
 
 function CM.paceV2(now)
 	if CM.lgHolding then return end
+	-- noted before any early return below (catch-up, gap hold): the unpause reset
+	-- of the PID (see BACK FROM A PAUSE) must see every pause
+	if CM.effSpeed == 0 then CM.pacePaused = true end
 	local MAXS = CM.MAX_SPEED or 4
 	if CM.myCeiling == nil then CM.myCeiling = MAXS end
 	local s
@@ -734,14 +737,39 @@ function CM.paceV2(now)
 	end
 	local eff = CM.effSpeed
 	if eff == nil then return end
-	if eff > 0 then CM.runSpeed = eff end
+	if eff > 0 then
+		-- BACK FROM A PAUSE: the PID's integral, hold and gap timers were built before
+		-- it. A joiner that paused a step ahead resumed with a saturated integral, eased
+		-- to 3.2x of a 4x session and fell 2.4 behind with no headroom left to close it
+		-- (tools/pacing_sim.py pause_4x_three). It starts from the session speed again.
+		if CM.pacePaused then
+			CM.pidI, CM.pidLastE, CM.pidHold, CM.pidEff = 0, nil, nil, nil
+			CM.pidRecover, CM.pidFar, CM.pidBehindSince, CM.pidAheadSince = nil, nil, nil, nil
+			-- the decision clock and the rate sample too: the first decision after a
+			-- pause otherwise counts the whole pause as dt (65 s here) and saturates
+			-- the fresh integral in one step, and reads the stopped clock as a rate
+			CM.pidAt, CM.pidPrevTick, CM.pidPrevNow = nil, nil, nil
+			CM.pacePaused = nil
+		end
+		CM.runSpeed = eff
+	else
+		CM.pacePaused = true
+	end
 	local target = eff
 	if eff == 0 then
-		-- PAUSE IS A SYNC POINT: run to the leader's clock, then stop there.
-		local fastP = CM.peerFastPrecise()
-		local hi = fastP and math.max(fastP, now) or now
+		-- PAUSE IS A SYNC POINT: a joiner runs to the LEADER's clock, then stops there.
+		-- The leader is the clock and never chases anyone, and a joiner never chases
+		-- another joiner (2026-09-12). Every game used to run to the FASTEST peer's
+		-- step; at speed 4 each stop landed a couple of steps past it, so the others
+		-- then saw a peer 0.4 ahead and ran again -- the games leapfrogged each other
+		-- forever and the pause never held ("session paused -- running 0.4 unit(s)"
+		-- dozens of times on a, b and c).
+		local ref = (not CM.isLeader()) and CM.leaderPrecise() or nil
+		local hi = ref and math.max(ref, now) or now
 		if hi - now > K.SIM_STEP * 1.5 then
-			target = CM.runSpeed or 1
+			-- the last 2 units at speed 1: the lever change lands a tick late, and at
+			-- the session's speed that is several steps past the pause point
+			target = (hi - now > 2) and (CM.runSpeed or 1) or 1
 			if not CM.syncingTo then
 				log(string.format("SPEED2: session paused -- running %.1f unit(s) to the leader's clock before stopping", hi - now))
 			end

@@ -433,7 +433,7 @@ CM.execConX = function(c)
 						-- Watch the node this cut creates. Nothing owns a replayed split,
 						-- so if the construction it was cut for never lands (or is later
 						-- removed) the node stays behind for good -- see healNodeAt.
-						CM.watchSplit(p[1], p[2])
+						CM.watchSplit(p[1], p[2], c)
 					end
 				end
 			elseif not snapNode[X] then

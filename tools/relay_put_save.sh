@@ -3,8 +3,9 @@
 #   sh tools/relay_put_save.sh "<path to save>.sav" [root@76.13.109.115]
 # Copies the .sav and its .sav.lua / .jpg sidecars to the relay's io dir as
 # incoming_save.*; no restart needed (the relay reads the file when it resumes).
-# In-game alternative: the leader says /new in chat within 10 s of joining an
-# idle relay, then presses START GAME with the save to share.
+# A relay with no stored world asks its leader to press START GAME, which uploads
+# the leader's most recent save; with one stored, it loads for everyone on arrival
+# unless the leader says /new in chat before it is sent.
 set -e
 SAV="$1"; HOST="${2:-root@76.13.109.115}"
 [ -f "$SAV" ] || { echo "no such save: $SAV" >&2; exit 2; }

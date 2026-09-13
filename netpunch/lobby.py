@@ -1919,7 +1919,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     transfer = [None]                       # the active _HostSaveTransfer, or None
     upload = [None]                         # relay-only: the leader's save coming in
     pending_resume = [None]                 # relay-only: (leader addr, when) -- the stored world goes out then
-    RESUME_GRACE = 10.0                     # seconds a fresh leader has to say /new instead
+    # A relay that holds a world loads it as soon as a leader arrives (2026-09-12: the
+    # 10 s grace and /resume are gone -- simpler; /new stays, until the world is sent).
+    # The few seconds let players who arrive together share one transfer instead of two.
+    RESUME_GRACE = 3.0
     letters = {}                            # relay-only: name -> origin letter (sticky)
     letters_path = os.path.join(io.dir, "relay_letters.json")
     chips = {}                              # relay-only: name -> company chip (sticky, like letters)
@@ -2097,7 +2100,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             upload[0] = None
             session_epoch[0] = 0.0
             spath, age = stored_save()
-            log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago for /resume" if spath else ""))
+            log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago -- the next player continues it" if spath else ""))
         if broadcast:
             send_roster_packets()
         key = (tuple(roster_players()), tuple(sorted(roster_companies().items())))
@@ -2176,16 +2179,25 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             else:
                 _send_data(sock, addr, {"t": "status", "state": "connected",
                                         "detail": "joining the running game: waiting for the leader's save\u2026"})
-        if relay_only and not started[0] and addr == leader_addr() and transfer[0] is None and upload[0] is None:
-            # a fresh session and the relay holds the world: continue it right
-            # away -- the leader receives the save like any joiner and starts
+        if relay_only and not started[0] and transfer[0] is None and upload[0] is None:
+            # A session that has not started. With a stored world the relay loads it
+            # for everyone (the leader receives the save like any joiner and starts);
+            # without one the leader sends theirs with START GAME.
             spath, age = stored_save()
-            if spath:
+            if addr == leader_addr():
+                if spath:
+                    _send_data(sock, addr, {"t": "status", "state": "connected",
+                                            "detail": f"loading the relay's world (saved {int(age // 60)} min ago)…"})
+                    log(f"[relay] fresh session with a stored save ({int(age)} s old): loading it for {peers[addr]['name']!r}")
+                    pending_resume[0] = (addr, time.time() + RESUME_GRACE)
+                else:
+                    _send_data(sock, addr, {"t": "status", "state": "connected",
+                                            "detail": "this relay has no saved world yet -- press START GAME to send your most recent save"})
+                    log(f"[relay] fresh session, no stored save: waiting for {peers[addr]['name']!r} to press START GAME")
+            else:
                 _send_data(sock, addr, {"t": "status", "state": "connected",
-                                        "detail": f"continuing the relay's world (saved {int(age // 60)} min ago) in "
-                                                  f"{int(RESUME_GRACE)} s -- say /new to start from your own save instead"})
-                log(f"[relay] fresh session with a stored save ({int(age)} s old): resuming for {peers[addr]['name']!r} in {int(RESUME_GRACE)} s unless /new")
-                pending_resume[0] = (addr, time.time() + RESUME_GRACE)
+                                        "detail": "loading the relay's world…" if spath
+                                                  else f"waiting for the leader ({leader_name()!r}) to press START GAME"})
         roster_changed()
         if late and not relay_only:   # a relay tells late joiners what it is doing itself (above)
             # A late joiner is NOT started: it has no save (a save start) and
@@ -2292,7 +2304,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if u is None or u.complete or u.failed or u.sid != msg.get("sid"):
                 # the stored save is NOT cleared first: the receiver holds the new
                 # one in memory and overwrites the files only once it has verified,
-                # so a failed upload leaves the previous world intact for /resume
+                # so a failed upload leaves the previous world intact for the next session
                 upload[0] = _ClientSaveReceiver(_PeerConn(sock, addr), io, log)
                 log(f"[relay] save upload from the leader {peers[addr]['name']!r} begins")
             upload[0].on_begin(msg)
@@ -2343,12 +2355,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if addr in peers:
                 text = str(msg.get("text", ""))
                 if relay_only and text.strip().lower() == "/new":
+                    # the leader discards the stored world before the session starts,
+                    # and shares their own save with START GAME instead
                     if addr != leader_addr():
                         _send_data(sock, addr, {"t": "status", "state": "connected",
                                                 "detail": f"only the leader ({leader_name()!r}) can start a new world"})
                     elif started[0]:
                         _send_data(sock, addr, {"t": "status", "state": "connected",
                                                 "detail": "the session is running -- /new only works before it starts"})
+                    elif transfer[0] is not None:
+                        _send_data(sock, addr, {"t": "status", "state": "connected",
+                                                "detail": "the relay's world is already on its way -- /new only works before it is sent"})
                     else:
                         pending_resume[0] = None
                         removed = 0
@@ -2360,22 +2377,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                         log(f"[relay] /new by the leader: stored world forgotten ({removed} file(s)); waiting for START GAME")
                         for a in list(peers):
                             _send_data(sock, a, {"t": "status", "state": "connected",
-                                                 "detail": "the relay's old world was discarded -- the leader's START GAME shares a fresh one"})
-                    return
-                if relay_only and text.strip().lower() == "/resume":
-                    spath, age = stored_save()
-                    if addr != leader_addr():
-                        _send_data(sock, addr, {"t": "status", "state": "connected",
-                                                "detail": f"only the leader ({leader_name()!r}) can resume"})
-                    elif not spath:
-                        _send_data(sock, addr, {"t": "status", "state": "connected",
-                                                "detail": "the relay holds no save to resume"})
-                    elif transfer[0] is not None or upload[0] is not None:
-                        _send_data(sock, addr, {"t": "status", "state": "connected",
-                                                "detail": "a save transfer is already running"})
-                    else:
-                        log(f"[relay] /resume by the leader: pushing the stored save ({int(age)} s old) to everyone waiting")
-                        begin_save_transfer(spath, include_leader=True)
+                                                 "detail": "the relay's old world was discarded -- the leader's START GAME sends a fresh one"
+                                                           if a == addr else
+                                                           f"the relay's old world was discarded -- waiting for the leader ({leader_name()!r}) to press START GAME"})
                     return
                 broadcast_chat(peers[addr]["name"], text)
         elif t == "ping":
@@ -2641,7 +2645,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if own_lines:
                 peers_log.write(host_name, own_lines)
 
-            # relay-only: the grace before the stored world goes out
+            # relay-only: the stored world goes out (after RESUME_GRACE, so players arriving together share one transfer)
             if relay_only and pending_resume[0] is not None and now >= pending_resume[0][1]:
                 la, _ = pending_resume[0]
                 pending_resume[0] = None
