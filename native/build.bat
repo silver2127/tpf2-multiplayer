@@ -16,6 +16,7 @@ REM   host    tpf2_pluginhost.dll        the plugin host shared with TpF2 Big Ma
 REM                                      rebuilds alut.dll too (the host adds to what
 REM                                      the proxy loads)
 REM   all     proxy, host, menu, slice -- in that order
+REM   previews  optional tpf2_previews.dll plugin; not included in all/deployment
 REM
 REM Optional suffix (slice / menu / host): a DLL an instance has loaded stays locked
 REM for the life of that process, so relinking to the same name fails with LNK1104
@@ -31,8 +32,9 @@ if /i "%T%"=="slice" goto run
 if /i "%T%"=="menu"  goto run
 if /i "%T%"=="proxy" goto run
 if /i "%T%"=="host"  goto run
+if /i "%T%"=="previews" goto run
 if /i "%T%"=="all"   goto run
-echo usage: build.bat slice^|menu^|proxy^|host^|all [suffix]
+echo usage: build.bat slice^|menu^|proxy^|host^|previews^|all [suffix]
 exit /b 2
 
 :run
@@ -57,6 +59,10 @@ exit /b 0
 %CC% /c src\slice_hook.cpp /Fo:out\slice_hook.obj                                    || exit /b 1
 ml64 /nologo /c /Fo out\deferrelay_slice.obj src\deferrelay_slice.asm                || exit /b 1
 link /nologo /DLL /OUT:out\tpf2_slice%SFX%.dll out\hook_slice.obj out\slice_hook.obj out\deferrelay_slice.obj || exit /b 1
+exit /b 0
+
+:previews
+%CC% /std:c++17 /LD src\preview_plugin.cpp /Fe:out\tpf2_previews%SFX%.dll /Fo:out\preview_plugin.obj || exit /b 1
 exit /b 0
 
 :menu
