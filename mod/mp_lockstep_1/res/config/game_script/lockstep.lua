@@ -613,6 +613,7 @@ CM.boot("mp.pacing")
 -- ---------- other players' cursors as coloured ground circles (cosmetic) ----------
 -- Lives in res/scripts/mp/cursors.lua.
 CM.boot("mp.cursors")
+CM.boot("mp.previews")
 -- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
 -- Lives in res/scripts/mp/stats.lua.
 CM.boot("mp.stats")
@@ -779,6 +780,7 @@ function data()
 			CM.paceTick(now)
 			CM.ensureRunning()
 			pcall(CM.cursorTick)   -- other players' cursors (cursors.lua): cosmetic, never the sim
+			pcall(CM.previewTick)
 
 			-- Commands that asked to be tried again (a VLINE whose line has not
 			-- arrived yet). They were executed once as far as the pump knows, so
@@ -1064,11 +1066,15 @@ function data()
 		end,
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
+		guiHandleEvent = function(id, name, param)
+			pcall(CM.previewGuiEvent, id, name, param)
+		end,
 		guiUpdate = function()
 			guiTick = guiTick + 1
 			-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
 			-- the panel's own twice-a-second refresh
 			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
+			pcall(CM.previewGuiTick)
 			if guiTick % 30 ~= 0 then return end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set

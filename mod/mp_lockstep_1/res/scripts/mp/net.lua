@@ -740,6 +740,8 @@ local function onLine(line)
 	elseif op == "LSCUR" then
 		-- another player's cursor (cursors.lua): cosmetic, straight to the GUI's file
 		pcall(CM.cursorRecv, line)
+	elseif op == "LSPREVIEW" then
+		pcall(CM.previewRecv, line)
 	elseif op == "LSEFF" then
 		-- SPEED V2: the host broadcasts the session's effective speed; joiners
 		-- apply it. Not while the load gate holds (only the local lever releases
