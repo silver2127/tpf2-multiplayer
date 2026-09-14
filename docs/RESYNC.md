@@ -38,6 +38,12 @@ recovery stays open until completion. To abandon recovery entirely, exit all
 games normally and start a new lobby. Neither an error nor a timeout unpauses a
 diverged world. Log upload preferences remain independent of recovery.
 
+Log reporting is deduplicated per loaded world within the lobby. After a resync,
+a new desync asks again when the preference is `ask`; a previous **Only this once**
+answer is not consent for that new report. **Always send** and **Never** remain
+preferences. An unanswered earlier prompt keeps its original world identity
+when restored, without suppressing a later incident in the recovered world.
+
 ## Supported session
 
 The current implementation allows **two or more players in a player-hosted lobby**, all running

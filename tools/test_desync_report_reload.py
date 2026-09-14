@@ -11,9 +11,10 @@ SOURCE = (MOD / 'desyncreport.lua').read_text(encoding='utf-8')
 IO_SOURCE = (MOD / 'io.lua').read_text(encoding='utf-8')   # CM.clearFile: the game's os has no remove
 
 
-def world(directory, *, desyncs=0, held=False):
+def world(directory, *, desyncs=0, held=False, token='world1'):
     lua = LuaRuntime(unpack_returned_tuples=True)
     lua.globals().base = directory.as_posix() + '/'
+    lua.globals().world_token = token
     lua.execute('''
         CM={netDir=function() return base end}; K={BASE=base,INSTANCE='b'}
         buttons={}; windows=0
@@ -28,7 +29,7 @@ def world(directory, *, desyncs=0, held=False):
             Window={new=function(t) windows=windows+1; return widget(t) end}},
             layout={BoxLayout={new=widget}}}}
         function tick(n,held)
-            CM.desyncReportTick({boot=os.time(),wall=os.time(),t=432,
+            CM.desyncReportTick({boot=os.time(),wall=os.time(),t=432,resynctoken=world_token,
                 desyncs=n,verdict='DESYNC vs a',resync=held and '1' or nil})
         end
     ''')
@@ -66,6 +67,16 @@ with TemporaryDirectory() as temporary:
     again.execute('assert(windows==0)')
     assert len(inbox.read_text(encoding='utf-8').splitlines()) == 1
 
+    # Same lobby, new recovered world: a second incident asks again. The first
+    # world's Only this once response is not consent for the second upload.
+    recovered = world(directory, token='world2')
+    recovered.execute('assert(windows==0); tick(1,false); tick(2,false); assert(windows==1)')
+    assert len(inbox.read_text(encoding='utf-8').splitlines()) == 1
+    recovered.execute("buttons['  Only this once  '].click(); tick(3,false); assert(windows==1)")
+    commands = [json.loads(line) for line in inbox.read_text(encoding='utf-8').splitlines()]
+    assert [c['world'] for c in commands] == ['world1', 'world2']
+    world(directory, token='world2', desyncs=2).execute('assert(windows==0)')
+
     # An explicit Never answer is retained, including across a new GUI state.
     state.write_text('{"session":"def456"}', encoding='utf-8')
     declined = world(directory, desyncs=1)
@@ -99,5 +110,52 @@ with TemporaryDirectory() as temporary:
     assert not kept(pending)
     after = inbox.read_text(encoding='utf-8')
     assert len(after.splitlines()) == len(before.splitlines()) + 1
+    auto_next = world(directory, desyncs=1, token='anotherWorld')
+    auto_next.execute('tick(2,false); assert(windows==0)')
+    # upload_logs plus the informational note; only one upload for this world
+    sent = [json.loads(line) for line in inbox.read_text().splitlines()]
+    assert sum(c.get('cmd') == 'upload_logs' and c.get('world') == 'anotherWorld' for c in sent) == 1
 
-print('PASS: unanswered log consent survives resync; no implicit upload, duplicate, stale-session prompt or lost failed send')
+with TemporaryDirectory() as temporary:
+    directory = Path(temporary)
+    (directory / 'lobby_state.json').write_text('{"session":"sameLobby"}')
+    world(directory, desyncs=1, token='oldWorld')
+    restored = world(directory, desyncs=1, token='newWorld')
+    restored.execute("buttons['  Only this once  '].click(); tick(1,false); assert(windows==2 and CM.desyncWin.visible)")
+    cmds = [json.loads(s) for s in (directory/'lobby_in.jsonl').read_text().splitlines()]
+    assert len(cmds) == 1 and cmds[0]['world'] == 'oldWorld'
+    restored.execute("buttons['  Never  '].click()")
+    world(directory, desyncs=1, token='thirdWorld').execute('assert(windows==0)')
+
+# Exercise the real background-worker gate, replacing collection/network only.
+# No log content is gathered and no HTTP request is made by this regression.
+import sys
+from unittest.mock import Mock, patch
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'netpunch'))
+import desynclogs
+
+class ImmediateThread:
+    def __init__(self, target, args, **kwargs):
+        self.target, self.args = target, args
+    def start(self):
+        self.target(*self.args)
+
+desynclogs._sent.clear()
+with patch.object(desynclogs.threading, 'Thread', ImmediateThread), \
+     patch.object(desynclogs.time, 'sleep'), \
+     patch.object(desynclogs, 'build_capped', return_value=(b'test', {'files': []})), \
+     patch.object(desynclogs, 'post', return_value={'id':'mock-report'}) as post:
+    sink, log = Mock(), Mock()
+    assert desynclogs.start(sink, log, {'world':'world1'}, 'test')
+    assert not desynclogs.start(sink, log, {'world':'world1'}, 'test')
+    assert desynclogs.start(sink, log, {'world':'world2'}, 'test')
+    assert post.call_count == 2
+    post.side_effect = RuntimeError('simulated failure')
+    assert desynclogs.start(sink, log, {'world':'world3'}, 'test')
+    assert 'world3' not in desynclogs._sent
+    post.side_effect = None
+    assert desynclogs.start(sink, log, {'world':'world3'}, 'test')
+    assert desynclogs.start(sink, log, {}, 'test')
+    assert not desynclogs.start(sink, log, {'world':'invalid token'}, 'test')
+
+print('PASS: per-world consent and upload deduplication, second desync after resync, pending old consent, never, failed-send retry; no real uploads')
