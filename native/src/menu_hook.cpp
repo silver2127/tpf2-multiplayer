@@ -202,6 +202,10 @@ static bool netDirUsable(const wchar_t* dir)
 static void resolveNetDir(wchar_t* out, int cch)
 {
     wchar_t la[MAX_PATH];
+    if (GetEnvironmentVariableW(L"TPF2MP_RELEASE_ROOT", la, MAX_PATH)) {
+        _snwprintf_s(out, cch, _TRUNCATE, L"%s\\netpunch", la);
+        return;
+    }
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH)) {
         wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%s\\tpf2mp\\netpunch", la);
         if (netDirUsable(cand)) { wcscpy_s(out, cch, cand); return; }
@@ -283,6 +287,8 @@ static char           g_code[128] = "";                   // host/own code to di
 static volatile LONG  g_haveCode = 0;
 static wchar_t        g_startSaveW[600] = L"";             // host: the .sav it chose to share
 static volatile LONG  g_panelDirty = 1;       // re-render the GDI content
+static volatile LONG g_updateAvailable = 0, g_updateBusy = 0;
+static void StartUpdateCheck();
 static int            g_panelX = 0, g_panelY = 0;   // top-left on the swapchain
 
 // render resources
@@ -985,7 +991,9 @@ static void RenderPanelLayer(int w, int h)
     } else {
         // ---------------- HOST / JOIN ----------------
         mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
-        { int lb = mwButtonW(L"OPEN LOGS"); mwButton(w - S(65) - lb, S(10), lb, S(28), L"OPEN LOGS", 15); }
+        { int lb = mwButtonW(L"OPEN LOGS"); mwButton(w - S(65) - lb, S(10), lb, S(28), L"OPEN LOGS", 15);
+          const wchar_t* label = InterlockedCompareExchange(&g_updateAvailable, 0, 0) ? L"DOWNLOAD UPDATE" : L"CHECK UPDATES";
+          int ub = mwButtonW(label); mwButton(w - S(75) - lb - ub, S(10), ub, S(28), label, 18); }
         int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
         layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
         mwHeader(lx, cy, colW, L"HOST A GAME");
@@ -1301,6 +1309,39 @@ static void PollClick()
 // start (logarchive.h) and show the folder. Off the render thread: copying a
 // long game log takes a moment.
 static volatile LONG g_logsBusy = 0;
+static DWORD WINAPI UpdateThread(LPVOID)
+{
+    wchar_t net[600], data[MAX_PATH], result[600], exe[650], cmd[1600];
+    resolveNetDir(net, 600);
+    if (!Tpf2mpDataDirW(data, MAX_PATH, nullptr)) { InterlockedExchange(&g_updateBusy, 0); return 1; }
+    _snwprintf_s(result, _TRUNCATE, L"%supdate-%lu-%llu.txt", data, GetCurrentProcessId(), GetTickCount64());
+    _snwprintf_s(exe, _TRUNCATE, L"%s\\netpunch.exe", net);
+    bool download = InterlockedCompareExchange(&g_updateAvailable, 0, 0) != 0;
+    _snwprintf_s(cmd, _TRUNCATE, L"\"%s\" --update %s --result \"%s\"", exe, download ? L"download" : L"check", result);
+    DeleteFileW(result);
+    STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
+    SetStatus(download ? "Downloading multiplayer update..." : "Checking for multiplayer updates...");
+    if (CreateProcessW(exe, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, net, &si, &pi)) {
+        DWORD waited = WaitForSingleObject(pi.hProcess, 180000);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        FILE* f = nullptr;
+        if (waited == WAIT_OBJECT_0 && !_wfopen_s(&f, result, L"rb") && f) {
+            char state[32] = {}, message[512] = {};
+            fgets(state, sizeof(state), f); fread(message, 1, sizeof(message) - 1, f); fclose(f);
+            InterlockedExchange(&g_updateAvailable, strncmp(state, "Available", 9) == 0);
+            SetStatus(message[0] ? message : "Update check returned no result.");
+            DeleteFileW(result);
+        } else SetStatus("Update check did not finish. Try again later.");
+    } else SetStatus("Cannot start the updater. Install the latest multiplayer MSI once to enable updates.");
+    InterlockedExchange(&g_updateBusy, 0);
+    return 0;
+}
+static void StartUpdateCheck()
+{
+    if (InterlockedExchange(&g_updateBusy, 1)) return;
+    HANDLE thread = CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread); else InterlockedExchange(&g_updateBusy, 0);
+}
 static DWORD WINAPI CollectLogsThread(LPVOID)
 {
     Tpf2mpLogArchive a;
@@ -1325,6 +1366,7 @@ static void OnHit(int id)
 {
     Log("[menu] hit id=%d\n", id);
     switch (id) {
+    case 18: StartUpdateCheck(); break;
     case 16: case 17: {   // YES / NO to the mod download
         const bool yes = (id == 16);
         if (g_csInit) { EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs); }
@@ -2833,6 +2875,7 @@ static DWORD WINAPI Init(LPVOID)
     InitializeCriticalSection(&g_modelCs); g_modelCsInit = true;
     InitializeCriticalSection(&g_lobbyCs); g_lobbyCsInit = true;
     InitializeCriticalSection(&g_syncCs); g_syncCsInit = true;
+    StartUpdateCheck();
     CreateThread(nullptr, 0, KbHookThread, nullptr, 0, nullptr);  // chat keyboard capture/swallow
     Log("[menu] attached, base=%llx  save=%ls  net=%ls  data=%ls  our=%ls\n",
         (unsigned long long)g_base, g_saveDirW, g_netDirW, g_dataDirW, ourDirW());

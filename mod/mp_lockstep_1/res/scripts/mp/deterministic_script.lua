@@ -1,7 +1,13 @@
 -- Scoped compatibility for simulation callbacks. No persistent global patches:
 -- networking, GUI callbacks and other mods retain their original clocks/RNG.
 local M = {}
-local unpack = table.unpack or unpack
+-- The game's init.lua replaces table.unpack with a one-argument wrapper.
+-- Passing (results, 2, n) to it returns pcall's success flag as the payload.
+-- Explicit bounds also preserve nil and trailing nil callback return values.
+local function unpackRange(values, first, last)
+	if first > last then return end
+	return values[first], unpackRange(values, first + 1, last)
+end
 local floor = math.floor
 local KEY = "__tpf2mp_deterministic_v1"
 local MOD = 2147483647
@@ -106,7 +112,7 @@ function M.wrap(script, id, options)
 		game.interface.getTowns = oldTowns
 		if collections then collections.keys = oldKeys end
 		if not result[1] then error(result[2], 0) end
-		return unpack(result, 2, result.n)
+		return unpackRange(result, 2, result.n)
 	end
 	for _, name in ipairs({"init", "handleEvent"}) do
 		local fn = script[name]
@@ -119,7 +125,7 @@ function M.wrap(script, id, options)
 			if lastUpdate == now then return end
 			local result = pack(invoke(script.update, ...))
 			lastUpdate = now
-			return unpack(result, 1, result.n)
+			return unpackRange(result, 1, result.n)
 		end
 	end
 	out.save = function(...)

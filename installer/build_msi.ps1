@@ -218,6 +218,10 @@ if ($rc -ne 0) { Fail "wix build failed (exit $rc)" }
 if (-not (Test-Path $Msi)) { Fail "wix reported success but $Msi is missing" }
 Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $Version)" Green
 
+# Ship this alongside the MSI in the GitHub release for user-local updates.
+& python (Join-Path $Repo "tools\build_update.py")
+if ($LASTEXITCODE -ne 0) { Fail "automatic update bundle build failed" }
+
 # ---- 5. optional validation ----------------------------------------------
 if ($Validate) {
     $tmp = Join-Path $env:TEMP ("tpf2mp_msi_validate_" + (Get-Date -Format "yyyyMMdd_HHmmss"))

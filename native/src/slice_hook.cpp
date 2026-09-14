@@ -99,6 +99,12 @@ static const uintptr_t CALLER_CMDADD        = 0x459eb7;
 // SECOND edge on top of the old one on the peer) and that there is nothing to
 // log about new nodes, because there are none.
 static const uintptr_t CALLER_UPGRADE       = 0x4790fc;
+// Clicking a bridge and confirming its replacement model uses a separate UI
+// path. Live capture 2026-09-14: 0 new nodes, 10 added/10 removed bridge edges.
+// Build 35924: 0x898680 calls BuildProposal, followed by CommandList::Add at
+// 0x89869e. Use the same strict replacement path (including the callback) as
+// the road/track upgrade brush; otherwise this applies only on the clicking peer.
+static const uintptr_t CALLER_BRIDGE_UPGRADE = 0x898685;
 // UI::StreetTerminalBuilder::commit -> make_cmd::BuildProposal return address.
 // ONE tool covers roadside stops, rail signals and waypoints (measured
 // 2026-09-08: all three placements arrived on this caller, shape addEdges=1
@@ -4119,7 +4125,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         }
         return 0;
     }
-    const bool isUpgrade = (caller == CALLER_UPGRADE);
+    const bool isUpgrade = (caller == CALLER_UPGRADE || caller == CALLER_BRIDGE_UPGRADE);
 
     if (caller != CALLER_BUILDPROPOSAL && !isUpgrade) {
         // Log and move on. The previous version returned here in silence, so a

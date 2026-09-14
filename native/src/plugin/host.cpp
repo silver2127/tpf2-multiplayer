@@ -222,6 +222,9 @@ static const char* ResultName(int rc)
 static void LoadPlugins(const std::wstring& dataDirW, const std::wstring& selfDirW)
 {
     std::vector<Found> found;
+    wchar_t release[MAX_PATH];
+    if (GetEnvironmentVariableW(L"TPF2MP_RELEASE_ROOT", release, MAX_PATH))
+        ScanDir(std::wstring(release) + L"\\plugins\\", found);
     ScanDir(dataDirW + L"plugins\\", found);
     ScanDir(selfDirW + L"plugins\\", found);
 

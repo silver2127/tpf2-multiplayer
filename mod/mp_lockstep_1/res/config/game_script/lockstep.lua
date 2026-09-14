@@ -1,3 +1,9 @@
+if os.getenv("TPF2MP_RELEASE_ROOT") then
+    require("mp/update_bootstrap").setup()
+    local path = os.getenv("TPF2MP_RELEASE_ROOT") .. "/mod/res/scripts/mp/entry.lua"
+    assert(loadfile(path, "t", _ENV))()
+    return
+end
 -- MP Lockstep -- the game-script half of TpF2 Multiplayer (docs/ARCHITECTURE.md).
 --
 -- Replicates COMMANDS, not state. Every command carries the game time at which

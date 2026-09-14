@@ -39,6 +39,7 @@
 
 #include "datadir.h"
 #include "logarchive.h"
+#include "update_bootstrap.h"
 
 // Resolve a shipped file by name: %LOCALAPPDATA%\tpf2mp\<name> when that file
 // exists, otherwise next to THIS proxy dll (the game dir). There is no third
@@ -48,6 +49,11 @@ static void resolveShipped(const wchar_t* name, wchar_t* out, size_t cch)
     wchar_t buf[MAX_PATH];
     wchar_t la[MAX_PATH];
     out[0] = 0;
+    if (wcscmp(name, L"tpf2_pluginhost.dll") != 0 &&
+        GetEnvironmentVariableW(L"TPF2MP_RELEASE_ROOT", la, MAX_PATH)) {
+        _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", la, name);
+        return;
+    }
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH)) {
         _snwprintf_s(buf, MAX_PATH, _TRUNCATE, L"%s\\tpf2mp\\%s", la, name);
         if (GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) { wcscpy_s(out, cch, buf); return; }
@@ -115,6 +121,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID)
         // game's CRT and Lua read the environment, and before every half of the mod
         // (the archive below included) resolves the data folder (datadir.h).
         Tpf2mpPublishDataDir();
+        Tpf2mpPinRelease();
         // Save the previous run's logs before anything of this run truncates or
         // appends to them (logarchive.h). Here, in DllMain and not on the loader
         // thread below: the game's entry point, which truncates stdout.txt, may

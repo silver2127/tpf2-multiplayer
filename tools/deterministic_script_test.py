@@ -4,10 +4,14 @@ from natural_town_growth_probe import runtime
 
 REPO = Path(__file__).resolve().parents[1]
 SOURCE = (REPO / 'mod/mp_lockstep_1/res/scripts/mp/deterministic_script.lua').read_text()
+GAME_INIT = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\res\scripts\init.lua').read_text()
+# Use the shipped override, which discards unpack's start/end arguments.
+GAME_UNPACK = GAME_INIT[GAME_INIT.index('local unpackhelper'):GAME_INIT.index('api = {}')]
 
 
 def peer(wall):
     lua = runtime(wall)
+    lua.execute(GAME_UNPACK)
     lua.globals().compat_source = SOURCE
     lua.execute('''
         compat = assert(load(compat_source))()
@@ -92,6 +96,12 @@ a.execute('''
         assert(os.time({year=2000,month=13,day=1,hour=0}) == 978307200)
     end}, 'clock')
     clock.update()
+    local returns = compat.wrap({handleEvent=function() return false,nil,42,nil end}, 'returns')
+    local function capture(...) return {n=select('#',...),...} end
+    local r=capture(returns.handleEvent())
+    assert(r.n==4 and r[1]==false and r[2]==nil and r[3]==42 and r[4]==nil)
+    local empty=compat.wrap({save=function() return nil end},'empty')
+    assert(empty.save().__tpf2mp_deterministic_v1.empty)
 ''')
 print('PASS: RNG save/reload, stream isolation, GUI exclusion, exception cleanup, UTC calendar')
 

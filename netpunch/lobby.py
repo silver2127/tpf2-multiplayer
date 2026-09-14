@@ -27,8 +27,8 @@ Two layers ride the same ``NP1:`` wire:
     both handle it unchanged.
 
 Lobby message types (the ``"t"`` field):
-    join    {t:join, name}                       joiner -> host
-    welcome {t:welcome, you, host}               host -> one joiner (your final,
+    join    {t:join, name, version}              joiner -> host (exact release match)
+    welcome {t:welcome, you, host, version}      host -> one joiner (your final,
                                                   de-duplicated, username)
     roster  {t:roster, players[sorted], host,
              started, start_save}                 host -> all (also the ~2 s heal).
@@ -1630,7 +1630,18 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.22"
+LOBBY_VERSION = "0.4.24"
+
+
+def version_rejection(remote):
+    """Exact release match; legacy peers without a version fail closed."""
+    if isinstance(remote, str) and remote == LOBBY_VERSION:
+        return None
+    label = remote[:64] if isinstance(remote, str) and remote else "unknown (older build)"
+    return (f"Multiplayer version mismatch: you have {LOBBY_VERSION}; "
+            f"the other side has {label}. Install the same multiplayer version on both sides.")
+
+
 PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
 
 
@@ -2067,7 +2078,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         links = {p["name"]: p.get("links", []) for p in peers.values()}
         companies = roster_companies()
         for a, p in list(peers.items()):
-            _send_data(sock, a, {"t": "roster", "players": players,
+            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "players": players,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only,
                                  "stored_age": stored_age() if relay_only else -1,
@@ -2144,7 +2155,21 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             f"{len(targets)} of {len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
-    def do_join(addr, name, profile=None, is_mesh=False):
+    def do_join(addr, name, profile=None, is_mesh=False, version=None):
+        reason = version_rejection(version)
+        if reason:
+            # Phrase the error from the joining player's perspective.
+            remote = version[:64] if isinstance(version, str) and version else "unknown (older build)"
+            reason = (f"Multiplayer version mismatch: you have {remote}; the host has "
+                      f"{LOBBY_VERSION}. Install the same multiplayer version on both sides.")
+            _send_data(sock, addr, {"t": "reject", "reason": reason})
+            if addr in peers:
+                del peers[addr]
+                if transfer[0] is not None:
+                    transfer[0].on_peer_dropped(addr)
+                roster_changed()
+            log(f"[host] rejected incompatible multiplayer version: {remote!r}")
+            return
         late = False
         if addr in peers:                                   # rename in place
             peers[addr]["name"] = _dedupe(name, all_names(exclude_addr=addr))
@@ -2167,7 +2192,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         peers[addr]["last"] = time.time()
         if relay_only:
             letter_for(peers[addr]["name"])
-        _send_data(sock, addr, {"t": "welcome",
+        _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION,
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "lobby": lobby_name, "relay": relay_only})
         if relay_only and started[0] and addr != leader_addr() and not peers[addr].get("started"):
@@ -2284,7 +2309,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return
+        if not isinstance(msg, dict):
+            return
         t = msg.get("t")
+        if t != "join" and addr not in peers:
+            return
         if addr in peers:
             peers[addr]["last"] = time.time()
         if relay_only and t in ("fbegin", "start") and addr in peers:
@@ -2311,7 +2340,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return
         if t == "join":
             do_join(addr, msg.get("name", "player"), msg.get("profile"),
-                    msg.get("mesh", False))
+                    msg.get("mesh", False), msg.get("version"))
         elif t == "links":
             if addr in peers:
                 new = [str(x) for x in msg.get("direct", [])][:CAP]
@@ -2819,6 +2848,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     started = [False]
     last_roster = [None]
     host_name = [None]
+    version_checked = [False]
     participants = [[]]     # every player name, from the roster
     roster_links = [{}]     # name -> [names it has direct links to]
     roster_profiles = [{}]  # name -> profile code (how to punch it)
@@ -2841,11 +2871,11 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     fwd = LogForwarder(forward_logs)        # our log lines -> the host's merged log
     _log_sinks.append(fwd.add)
 
-    io.emit({"type": "status", "state": "connected",
+    io.emit({"type": "status", "state": "connecting",
              # no address in the panel: a joiner's screen (or a stream of it)
              # must not show the host's IP. The redacted log still has it.
-             "detail": "joined the host"})
-    io.write_state(state="connected", you=desired[0], started=False)
+             "detail": "checking multiplayer version..."})
+    io.write_state(state="connecting", you=desired[0], started=False)
 
     def send(msg):
         try:
@@ -2960,6 +2990,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     def handle_peer(addr, payload):
         """Traffic from a NON-host address: a direct peer's bridge frame, a
         relay envelope (for us, or to forward), or a mesh_hi."""
+        if not version_checked[0] or stop.is_set():
+            return
         if payload[:1] == MESH_RELAY_MAGIC:
             env = _relay_unwrap(payload)
             if env is None:
@@ -2995,6 +3027,29 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         conn.on_peer = handle_peer
 
     def handle_msg(raw):
+        if stop.is_set():
+            return
+        if not version_checked[0]:
+            try:
+                greeting = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(greeting, dict):
+                return
+            if greeting.get("t") in ("welcome", "roster"):
+                reason = version_rejection(greeting.get("version"))
+                if reason:
+                    send({"t": "leave"})
+                    io.emit({"type": "status", "state": "failed", "detail": reason})
+                    io.write_state(state="failed", detail=reason, started=False)
+                    log(f"[client] {reason}")
+                    stop.set()
+                    return
+                version_checked[0] = True
+                io.emit({"type": "status", "state": "connected", "detail": "joined the host"})
+                io.write_state(state="connected")
+            elif greeting.get("t") not in ("reject", "bye"):
+                return
         # Two binary payload kinds are NOT JSON: a relayed bridge frame (first
         # byte GAME_RELAY_MAGIC) and a save chunk (CHUNK_MAGIC); everything
         # else is a JSON lobby message.
@@ -3078,6 +3133,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         elif t == "reject":
             io.emit({"type": "status", "state": "failed",
                      "detail": m.get("reason", "rejected")})
+            io.write_state(state="failed", detail=m.get("reason", "rejected"), started=False)
             stop.set()
         elif t == "bye":
             io.emit({"type": "status", "state": "failed",
@@ -3086,6 +3142,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
 
     def handle_command(cmd):
         c = cmd.get("cmd")
+        if not version_checked[0] and c not in ("quit", "name"):
+            return
         if c == "chat":
             send({"t": "chat", "text": str(cmd.get("text", ""))})
         elif c == "mods":
@@ -3097,7 +3155,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "company", "player": str(cmd.get("player") or assigned[0]), "id": cmd.get("id")})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
-            m2 = {"t": "join", "name": desired[0], "mesh": mesh is not None}
+            m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None}
             if profile_code:
                 m2["profile"] = profile_code
             send(m2)
@@ -3140,6 +3198,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     relay_thread = None
     if relay is not None:
         def relay_forward(payload):
+            if not version_checked[0] or stop.is_set():
+                return 0
             if mesh is not None:
                 return mesh_forward(payload)
             conn.send(payload)          # RuntimeError (no peer yet) -> pump
@@ -3151,7 +3211,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                                         daemon=True)
         relay_thread.start()
 
-    join_msg = {"t": "join", "name": desired[0], "mesh": mesh is not None}
+    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None}
     if profile_code:
         join_msg["profile"] = profile_code
     send(join_msg)                                          # announce ourselves
@@ -3160,6 +3220,12 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     welcomed = [False]
     try:
         while not stop.is_set():
+            if not version_checked[0] and time.time() - join_sent_at > 15.0:
+                reason = "Host did not confirm a compatible multiplayer version. Install the same version on both sides."
+                send({"t": "leave"})
+                io.emit({"type": "status", "state": "failed", "detail": reason})
+                io.write_state(state="failed", detail=reason, started=False)
+                break
             if conn.last_seen_age() > host_gone_after:
                 io.emit({"type": "status", "state": "failed",
                          "detail": "host unreachable"})
@@ -3184,6 +3250,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 if drained >= DRAIN_CAP:
                     break
                 raw = conn.recv(timeout=0.0)
+            if stop.is_set():
+                break
             now = time.time()
             mesh_housekeeping(now)
             receiver.tick(now)                              # facks / fdone cadence
@@ -4630,6 +4698,10 @@ def selftest_mesh():
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if "--update" in argv:
+        import updater
+        return updater.main(argv, LOBBY_VERSION)
     ap = argparse.ArgumentParser(description="netpunch N-player lobby")
     ap.add_argument("mode", nargs="?", choices=["host", "join"],
                     help="host a lobby or join one with a CODE")

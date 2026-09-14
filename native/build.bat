@@ -73,6 +73,7 @@ link /nologo /DLL /OUT:out\tpf2_menu%SFX%.dll out\hook_menu.obj out\menu_hook.ob
 REM Deploy to where the proxy loads it from. Non-fatal: a running game holds the
 REM dll open, and the copy is simply skipped -- redeploy after the relaunch.
 set "GAMEDEST=C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\tpf2_menu.dll"
+if defined TPF2MP_NO_DEPLOY exit /b 0
 copy /y "out\tpf2_menu%SFX%.dll" "%GAMEDEST%" >nul 2>&1 && (echo deployed to the game dir) || (echo game-dir deploy skipped: dll locked by a running game -- close it and rerun build.bat menu)
 exit /b 0
 
