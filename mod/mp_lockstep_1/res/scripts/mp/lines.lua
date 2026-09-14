@@ -7,6 +7,7 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+require("mp.waypoints")(CM)
 -- ---------- lines: cross-peer identity + Create / Update / Delete ----------
 --
 -- Same shape as vehicles: a created line gets the key origin:seq, each peer
@@ -167,6 +168,7 @@ function CM.lineSnapshot(lid)
 				if at then for a = 1, #at do al[#al + 1] = string.format("%d:%d", tonumber(at[a].station) or 0, tonumber(at[a].terminal) or 0) end end
 			end)
 			alts[#alts + 1] = table.concat(al, "/")
+			stops[#stops] = stops[#stops] .. CM.lineWaypointSuffix(s.waypoints)
 		end
 		local name = ""
 		pcall(function() name = game.interface.getName(lid) or "" end)
@@ -405,7 +407,7 @@ local function buildLineObject(c)
 	end
 	for rec in tostring(c.stops or ""):gmatch("[^;]+") do
 		local f = {}
-		for v in rec:gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+		for v in (rec:match("^[^~]+") or rec):gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
 		if #f < 7 then error("bad stop record " .. rec) end
 		local sg = findStationGroupNear(f[1], f[2])
 		if not sg then error(string.format("no station group within 20 m of %.1f,%.1f", f[1], f[2])) end
@@ -435,6 +437,12 @@ local function buildLineObject(c)
 		s.loadMode = f[5]
 		s.minWaitingTime = f[6]
 		s.maxWaitingTime = f[7]
+		local wp = CM.lineReadWaypoints(rec)
+		if #wp > 0 then
+			local target = s.waypoints
+			for wi, w in ipairs(wp) do target[wi] = w end
+			s.waypoints = target
+		end
 		n = n + 1
 		-- alternative platforms, aligned by stop index in c.alts ("st:term/st:term;;...")
 		local altRec = altList and altList[n]

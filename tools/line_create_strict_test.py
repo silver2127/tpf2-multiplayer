@@ -51,6 +51,7 @@ ORANGE_TOKENS = " ".join(format(v, ".9g") for v in ORANGE)
 
 def runtime(inject_path, base):
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.globals().package.path = os.path.join(REPO, "mod/mp_lockstep_1/res/scripts/?.lua").replace("\\", "/") + ";" + L.globals().package.path
     g = L.globals()
     g.INJECT_SRC = open(os.path.join(MP, "inject.lua"), encoding="utf-8").read()
     g.LINES_SRC = open(os.path.join(MP, "lines.lua"), encoding="utf-8").read()

@@ -1287,10 +1287,20 @@ static void WriteNativeNotice(const char* kind)
 // and the peers read back as before). The first stop's raw fields are logged
 // on every decode so one real edit pins the predicted offsets.
 struct LineAlt  { int32_t station, terminal; };                   // StationTerminal, 8 B (t16: span 8*i at stop+0x10)
-struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[8]; };
+struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[8]; int nWp; int32_t wp[64][2]; };
 struct LineDecode { int32_t wait; int n; LineStop st[64]; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
+
+static void WriteLineWaypoints(FILE* f, const LineDecode& d)
+{
+    bool first = true;
+    for (int i = 0; i < d.n; i++) for (int w = 0; w < d.st[i].nWp; w++) {
+        fprintf(f, "%s%d:%d:%d", first ? " wp=" : ",", i + 1,
+                d.st[i].wp[w][0], d.st[i].wp[w][1]);
+        first = false;
+    }
+}
 
 static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
 {
@@ -1349,6 +1359,16 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
                 return false;
         }
         t.nAlt = na;
+        // vector<transport::SignalId> {entity,index}, after this station stop.
+        uint64_t wb = 0, we = 0;
+        memcpy(&wb, b + 0x38, 8); memcpy(&we, b + 0x40, 8);
+        if (we < wb || (we - wb) % 8 || (we - wb) > sizeof(t.wp)) return false;
+        t.nWp = (int)((we - wb) / 8);
+        if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) return false;
+        for (int w = 0; w < t.nWp; w++) {
+            memcpy(t.wp[w], (void*)(wb + w * 8), 8);
+            if (t.wp[w][0] <= 0 || t.wp[w][1] < 0 || t.wp[w][1] > 64) return false;
+        }
     }
     return true;
 }
@@ -1622,6 +1642,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
+            WriteLineWaypoints(f, d);
             fprintf(f, " name=%s\n", g_lcDecode.nameEnc);
             Log("[slice] LCREATEX shipped: name=%s stops=%d\n", g_lcDecode.nameEnc, d.n);
         } else {
@@ -1641,6 +1662,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
+            WriteLineWaypoints(f, d);
             fprintf(f, "\n");
             if (d.n > 0)
                 Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%d..%d)\n",
@@ -2253,7 +2275,7 @@ static bool StashStopFromProposal(uint64_t r8)
     memcpy(&kind, (void*)(ob + 0x04), 4);
     memcpy(&model, (void*)(ob + 0x10), 4);
     memcpy(&player, (void*)(ob + 0xf8), 4);
-    if ((kind != 0 && kind != 2) || model <= 0) return false;
+    if ((kind < 0 || kind > 2) || model <= 0) return false;
     float pos[3];
     memcpy(pos, (void*)(ob + 0x44), 12);
     uint8_t b0 = *(const uint8_t*)(ob + 0xd0), left = *(const uint8_t*)(ob + 0xd1);
@@ -2504,9 +2526,11 @@ static void DumpProposal(int c, uint64_t r8, uint64_t r9)
 // Segment record (120 B): placeholder id @0, node0 @0x08, node1 @0x0c,
 // t0 @0x10, t1 @0x1c, ... construction @0x68, player @0x70, owned @0x74.
 static const uint32_t NODE_FLAGS_TEMPLATE = 0x7f00;
+#include "station_weld.h"
 
 static bool MergeTemplateStreet(uint64_t r8)
 {
+    if (MergeStationEndpoint(r8)) return true;
     // v3 (2026-08-28). Ghidra (research-construction-linkage): the construction
     // is tied to its street pieces by INDICES -- ConstructionEntity+0x768
     // frozenNodes = indices into addedNodes, +0x780 segmentsBefore = segment

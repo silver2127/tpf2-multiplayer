@@ -10,11 +10,11 @@ from lupa.lua52 import LuaRuntime
 
 ROOT = Path(__file__).resolve().parents[1]
 lua = LuaRuntime(unpack_returned_tuples=True)
-for name in ("geom", "roads"):
+for name in ("geom", "roads", "shared_infra"):
     lua.globals()[name.upper()] = (ROOT / "mod/mp_lockstep_1/res/scripts/mp" / f"{name}.lua").read_text(encoding="utf-8")
 lua.execute(r'''
-local nodes, edges, streetMap, trackMap, proposals, logs
-local CT = {BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_STREET=3,BASE_EDGE_TRACK=4}
+local nodes, edges, streetMap, trackMap, proposals, logs, models
+local CT = {BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_STREET=3,BASE_EDGE_TRACK=4,MODEL_INSTANCE_LIST=5}
 local function vec(x,y,z) return {x=x,y=y,z=z} end
 local function edgeNew() return {comp={objects={}}} end
 api={type={ComponentType=CT,Vec3f={new=vec},
@@ -28,6 +28,7 @@ api={type={ComponentType=CT,Vec3f={new=vec},
     getNode2StreetEdgeMap=function() return streetMap end,
     getNode2TrackEdgeMap=function() return trackMap end}},
     getComponent=function(id,kind)
+      if kind==CT.MODEL_INSTANCE_LIST then return models[id] end
       if kind==CT.BASE_NODE then return nodes[id] end
       local e=edges[id]
       if not e then return nil end
@@ -36,11 +37,12 @@ api={type={ComponentType=CT,Vec3f={new=vec},
       if kind==CT.BASE_EDGE_STREET and e.type==0 then return e.streetEdge end
     end},
   cmd={make={buildProposal=function(sp,ctx) return {sp=sp,ctx=ctx} end},
-    sendCommand=function(c) proposals[#proposals+1]=c end}}
+    sendCommand=function(c,cb) c.callback=cb; proposals[#proposals+1]=c end}}
 game={}
 local CM,K
 local function reset()
   nodes,edges,streetMap,trackMap,proposals,logs={},{},{},{},{},{}
+  models={}
   local function log(s) logs[#logs+1]=s end
   CM={cmLog=log,originIdx=function(o) return string.byte(o)-string.byte('a') end,xingApiProbed=true}
   K={INSTANCE='a',ROAD_GATHER_BUILDINGS=true}
@@ -87,6 +89,40 @@ local function execute(c,keepPlan)
     assert(not seen[key],'duplicate endpoint pair');seen[key]=true
   end
   return sp,xv
+end
+function test_company_build()
+  for _, companyPid in ipairs({2002,3003}) do
+    reset()
+    CM.cmMode='companies'; CM.cmCompanyPid={[2]=companyPid}
+    CM.cmEnsure=function() end
+    assert(load(SHARED_INFRA))()(CM,K)
+    local settlements=0
+    CM.cmSettleBuild=function() settlements=settlements+1 end
+    CM.roadAuditLog=function() end
+    execute({company=2,etype=1,pts='0,0,0,10,0,0,20,0,0',links='1,2,2,3',fv='1,2,3'})
+    assert(proposals[1].ctx.player==companyPid,'road context must use origin company on each peer')
+    proposals[1].callback({resultEntities={},resultProposalData={costs=1234}},true)
+    assert(settlements==0,'native company charge must not be charged twice')
+  end
+end
+function test_signal_split(reverse)
+  reset()
+  node(101,0,-20,0);node(102,0,20,0)
+  edge(201,reverse and 102 or 101,reverse and 101 or 102,1)
+  edges[201].comp.objects={{301,2},{302,2}}
+  models[301]={fatInstances={{transf={[13]=1,[14]=-10,[15]=0}}}}
+  models[302]={fatInstances={{transf={[13]=1,[14]=10,[15]=0}}}}
+  local sp=execute({etype=1,pts='0,0,0,20,0,0',links='1,2',fv='2'})
+  local seen={}
+  for _,e in ipairs(sp.edgesToAdd) do
+    for _,o in ipairs(e.comp.objects or {}) do
+      assert(not seen[o[1]],'signal duplicated');seen[o[1]]=true
+      local endNode=o[1]==301 and 101 or 102
+      assert(e.comp.node0==endNode or e.comp.node1==endNode,'signal assigned to wrong half')
+      assert(o[2]==2,'signal kind changed')
+    end
+  end
+  assert(seen[301] and seen[302],'signals dropped during switch build')
 end
 function test_rail(origin)
   reset()
@@ -215,3 +251,8 @@ if __name__ == "__main__":
         for is_track in (False, True):
             lua.globals().test_same_network_companion(is_track)
         print("PASS: bridge replacement kinds (both networks), properties, objects, orientation and mismatch rejection")
+    lua.globals().test_company_build()
+    print('PASS: company road contexts use per-peer player IDs; no duplicate settlement with empty resultEntities')
+    lua.globals().test_signal_split(False)
+    lua.globals().test_signal_split(True)
+    print('PASS: rail switch split retains signals on both halves, including reversed edge orientation')

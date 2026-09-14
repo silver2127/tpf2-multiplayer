@@ -138,6 +138,7 @@ struct Config {
 // which is exactly the view the mod shares. `warnMismatch` = complain if the
 // file already names a different instance (only meaningful at startup; a
 // control-file re-identify differs by definition).
+static bool g_entityOwnerReady = false;
 static void WriteIdentity(const std::string& inst, bool warnMismatch)
 {
     std::wstring idPath = g_dataDir + L"tpf2_instance.txt";
@@ -183,6 +184,10 @@ static void WriteIdentity(const std::string& inst, bool warnMismatch)
         uint16_t port = Net_LocalPort();
         if (port) {
             int m = _snprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, "port=%u\n", port);
+            if (m > 0) n += m;
+        }
+        if (g_entityOwnerReady) {
+            int m = _snprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, "entity_owner_v1=1\n");
             if (m > 0) n += m;
         }
         DWORD written;
@@ -643,7 +648,8 @@ static DWORD WINAPI InitThread(LPVOID)
     // setPlayer on a track, road, node, signal, station or line-less vehicle
     // re-owns it instead of asserting with a crash dump (setplayer_patch.cpp):
     // a company switch calls it on everything the player owns.
-    SetPlayerPatch_Install(Log);
+    g_entityOwnerReady = SetPlayerPatch_Install(Log);
+    WriteIdentity(cfg.instance, false);
 
     // Transport health, from our own thread every 10 s. A line is written only
     // when a figure moved, so an idle bridge does not repeat itself all session.

@@ -1630,7 +1630,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.24"
+LOBBY_VERSION = "0.4.25"
 
 
 def version_rejection(remote):

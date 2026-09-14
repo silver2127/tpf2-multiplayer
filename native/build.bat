@@ -83,8 +83,9 @@ exit /b 0
 %CC% /c src\speedhook.cpp /Fo:out\speedhook_mp.obj                                   || exit /b 1
 %CC% /c src\setplayer_patch.cpp /Fo:out\setplayer_patch_mp.obj                       || exit /b 1
 ml64 /nologo /c /Fo out\cgamesteprelay_mp.obj src\cgamesteprelay.asm                 || exit /b 1
+ml64 /nologo /c /Fo out\setplayerrelay_mp.obj src\setplayerrelay.asm                 || exit /b 1
 %CC% /c src\bridge_main.cpp /Fo:out\bridge_mp.obj                                    || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\hook_mp.obj out\speedhook_mp.obj out\setplayer_patch_mp.obj out\cgamesteprelay_mp.obj out\bridge_mp.obj || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\hook_mp.obj out\speedhook_mp.obj out\setplayer_patch_mp.obj out\setplayerrelay_mp.obj out\cgamesteprelay_mp.obj out\bridge_mp.obj || exit /b 1
 %CC% /LD src\proxy_alut.cpp /Fe:out\alut.dll /Fo:out\proxy_alut.obj                  || exit /b 1
 exit /b 0
 

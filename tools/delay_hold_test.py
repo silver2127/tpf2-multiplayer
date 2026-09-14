@@ -33,6 +33,7 @@ def check(name, cond, extra=""):
 
 def runtime():
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.globals().package.path = os.path.join(REPO, "mod/mp_lockstep_1/res/scripts/?.lua").replace("\\", "/") + ";" + L.globals().package.path
     L.globals().NET_SRC = open(NET, encoding="utf-8").read()
     L.globals().EVENTS = os.path.join(tempfile.mkdtemp(), "events.txt").replace("\\", "/")
     h = L.execute(r'''

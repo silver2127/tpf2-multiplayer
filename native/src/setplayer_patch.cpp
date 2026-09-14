@@ -65,6 +65,45 @@ static const uint8_t EXPECTED[] = {
 };
 static const uint8_t NOP2[2] = { 0x66, 0x90 };     // xchg ax, ax
 
+extern "C" {
+    void SetPlayerRelay();
+    uintptr_t g_setPlayerGeneric = 0;
+    uintptr_t g_setPlayerConstruction = 0;
+    uintptr_t g_setPlayerLine = 0;
+}
+
+static bool InstallEntityOnly(SetPlayerLogFn log, uintptr_t base)
+{
+    // Never expose the Lua capability until both guarded patches are installed.
+    // Unlike InstallHook, this relay explicitly relocates the stolen JE.
+    static const uint8_t expected[] = {
+        0x90, 0x48, 0x85, 0xf6, 0x74, 0x26,
+        0x48, 0x8d, 0x85, 0x80, 0, 0, 0,
+        0x48, 0x89, 0x44, 0x24, 0x20
+    };
+    auto at = reinterpret_cast<uint8_t*>(base + 0x11673da);
+    if (memcmp(at, expected, sizeof(expected))) {
+        log("[setplayer] entity-only dispatch mismatch; sharing capability unavailable\n");
+        return false;
+    }
+    g_setPlayerGeneric = base + 0x11677a3;
+    g_setPlayerConstruction = base + 0x11673ec;
+    g_setPlayerLine = base + 0x1167406;
+    uint8_t patch[sizeof(expected)];
+    memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xff; patch[1] = 0x25;
+    memset(patch + 2, 0, 4);
+    uintptr_t relay = reinterpret_cast<uintptr_t>(&SetPlayerRelay);
+    memcpy(patch + 6, &relay, sizeof(relay));
+    DWORD old;
+    if (!VirtualProtect(at, sizeof(patch), PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(at, patch, sizeof(patch));
+    VirtualProtect(at, sizeof(patch), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, sizeof(patch));
+    log("[setplayer] entity-only ownership enabled; lines can retain shared infrastructure owners\n");
+    return true;
+}
+
 bool SetPlayerPatch_Install(SetPlayerLogFn log)
 {
     const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
@@ -76,7 +115,7 @@ bool SetPlayerPatch_Install(SetPlayerLogFn log)
     memcpy(done + jeAt, NOP2, sizeof(NOP2));
     if (memcmp(at, done, sizeof(done)) == 0) {
         log("[setplayer] already patched\n");
-        return true;
+        return InstallEntityOnly(log, base);
     }
     if (memcmp(at, EXPECTED, sizeof(EXPECTED)) != 0) {
         log("[setplayer] the interface.cpp:2340 branch differs from build 35924 -- not patched: "
@@ -96,5 +135,5 @@ bool SetPlayerPatch_Install(SetPlayerLogFn log)
     FlushInstructionCache(GetCurrentProcess(), je, sizeof(NOP2));
     log("[setplayer] patched %llx: setPlayer re-owns any entity through the engine's owner setter "
         "(no interface.cpp:2340 assert, no crash dump)\n", (unsigned long long)RVA_JE);
-    return true;
+    return InstallEntityOnly(log, base);
 }

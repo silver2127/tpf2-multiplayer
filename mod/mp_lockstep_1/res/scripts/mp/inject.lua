@@ -238,6 +238,10 @@ function CM.pollInject()
 						rmv[#rmv + 1] = { a1, a2 }
 					end
 				end
+				if ok and CM.cmMayReplaceEdges and not CM.cmMayReplaceEdges(rmv, etype == 1) then
+					ok = false
+					log("ROADE: refused change to foreign or unresolved infrastructure")
+				end
 				-- Bridge/tunnel tail: <type idx> per added edge, appended AFTER the
 				-- legacy payload (old captures simply lack it -> ground).
 				if ok then
@@ -594,7 +598,9 @@ function CM.pollInject()
 					end
 				end)
 				if not x and #ct == 16 then x, y = ct[13], ct[14] end
-				if cfile and x and y then
+				if CM.cmMayModify and not CM.cmMayModify(oldId) then
+					log("CONUP: refused change to foreign or unresolved construction")
+				elseif cfile and x and y then
 					-- Ship the DIFF against the entity as it stands NOW (see CM.conDiff):
 					-- the proposal was built from this same entity, so the difference
 					-- is exactly this click. Falls back to the full set if the entity
@@ -1145,6 +1151,7 @@ function CM.pollInject()
 						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 					alts[#alts + 1] = table.concat(al, "/")
 				end
+				if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
 				if armed ~= 1 then
 					CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
 				elseif bad or not (r and g and b) or not nameTok then
@@ -1208,6 +1215,7 @@ function CM.pollInject()
 								.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 							alts[#alts + 1] = table.concat(al, "/")
 						end
+						if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
 						local armed = CM.lastArmed or 0
 						if bad then
 							-- The DLL's +0x00 stationGroup slot is INFERRED; this is
@@ -1393,7 +1401,9 @@ function CM.pollInject()
 							end
 						end)
 					end
-					if co and co.transf then
+					if co and CM.cmMayModify and not CM.cmMayModify(id) then
+						log("CDEMO: refused demolition of foreign construction")
+					elseif co and co.transf then
 						local x, y = co.transf[13], co.transf[14]
 						local file = tostring(co.fileName or "")
 						CM.scheduleLocal("DEMOLISH", { x = x, y = y, z = CM.groundAt(x, y), file = file, strict = 1 })

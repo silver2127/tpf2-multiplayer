@@ -12,6 +12,7 @@
 -- The body stays at column 0 on purpose: tools/luacheck.py's use-before-define
 -- checks look at column-0 declarations.
 return function(CM, K, log)
+require("mp.shared_infra")(CM, K)
 -- ---------- multi-company mode (opt-in; co-op is the default and is untouched) ----------
 --
 -- Two multiplayer models share this mod:
@@ -264,7 +265,7 @@ function CM.cmReassignEntity(eid, cid, kind)
 		CM.cmLog(string.format("CM: %s eid=%s already owned by co%d pid=%s -- no setPlayer needed", tostring(kind), tostring(eid), cid, tostring(pid)))
 		return
 	end
-	local ok, err = pcall(function() game.interface.setPlayer(eid, pid) end)
+	local ok, err = pcall(function() CM.cmSetPlayer(eid, pid) end)
 	local after = CM.cmOwnerOf(eid)
 	CM.cmLog(string.format("CM: reassigned %s eid=%s -> co%d pid=%s | owner before=%s after=%s | setPlayer ok=%s err=%s",
 		tostring(kind), tostring(eid), cid, tostring(pid), tostring(before), tostring(after), tostring(ok), tostring(err)))
@@ -324,7 +325,7 @@ function CM.cmMoveAssets(fromPid, toPid, why)
 	local human = nil; pcall(function() human = api.engine.util.getPlayer() end)
 	local n = 0
 	for _, eid in ipairs(ents) do
-		local ok = pcall(function() game.interface.setPlayer(eid, toPid) end)
+		local ok = pcall(function() CM.cmSetPlayer(eid, toPid) end)
 		if ok then
 			n = n + 1
 			local hasCon = false
@@ -489,33 +490,13 @@ function CM.cmGoLive()
 	end
 	CM.cmLive = true
 end
--- VEHICLES IN A SWAP (2026-09-10). A vehicle on a line takes its owner from its
--- line, and setPlayer on the vehicle itself raises an engine assert
--- (interface.cpp:2340, a crash dump each): one "new company" on a big fleet fired
--- 98 of them and froze the host. So a vehicle whose line is handed over in the
--- same list is not called -- it moves with its line -- and CM.cmVehRecheck looks
--- again a few seconds later and hands over directly any that did not arrive.
--- Everything else, a vehicle without a line or on a line that is not moving
--- included, is handed over directly as before.
+-- Lines move with their fleet, constructions with their infrastructure children.
+-- The scoped setters preserve foreign stations and visiting depot vehicles.
 function CM.cmHandOver(list, to)
-	local lines = {}
 	for _, eid in ipairs(list) do
-		pcall(function() if api.engine.getComponent(eid, api.type.ComponentType.LINE) then lines[eid] = true end end)
+		local ok, err = pcall(CM.cmSetPlayer, eid, to)
+		if not ok then CM.cmLog("CM: asset handover failed: " .. tostring(err)) end
 	end
-	CM.cmVehPending = CM.cmVehPending or {}
-	for _, eid in ipairs(list) do
-		local lid = nil
-		pcall(function()
-			local tv = api.engine.getComponent(eid, api.type.ComponentType.TRANSPORT_VEHICLE)
-			if tv and tv.line and tv.line ~= -1 and tv.line ~= 0 then lid = tv.line end
-		end)
-		if lid and lines[lid] then
-			CM.cmVehPending[#CM.cmVehPending + 1] = { eid = eid, to = to }
-		else
-			pcall(function() game.interface.setPlayer(eid, to) end)
-		end
-	end
-	CM.cmVehPendingAt = CM.ticks or 0
 end
 -- A LINE BELONGS WITH ITS VEHICLES. Lines were left out of every company switch
 -- until 2026-09-11 (getEntities cannot see them), so a save can carry lines on
@@ -568,7 +549,7 @@ function CM.cmRepairLineOwners(why)
 			for _, o in ipairs(owners) do if o ~= want then want = nil; break end end
 			local have = CM.cmOwnerOf(lid)
 			if want and known[want] and have ~= want then
-				local ok = pcall(function() game.interface.setPlayer(lid, want) end)
+				local ok = pcall(function() CM.cmSetPlayer(lid, want) end)
 				fixed = fixed + 1
 				CM.cmLog(string.format("CM: line %d owned by pid %s but its %d vehicle(s) belong to co%d (pid %s) -- re-owned to the vehicles' company (%s) ok=%s",
 					lid, tostring(have), #owners, known[want], tostring(want), tostring(why), tostring(ok)))
@@ -682,6 +663,10 @@ function CM.cmApplySaved()
 end
 
 function CM.execCompanyCmd(c)
+	if not CM.cmOwnerCapability() then
+		CM.cmNote("Company changes require the matching shared-infrastructure DLL")
+		return
+	end
 	local cid = c.cid and math.floor(tonumber(c.cid) + 0.5) or nil
 	local o = c.origin
 	if not cid or cid < 1 then log("company: bad cid in " .. tostring(c.op)); return end
@@ -760,7 +745,7 @@ function CM.cmReassignConstruction(eid, cid)
 	pcall(function() hasCon = api.engine.getComponent(eid, api.type.ComponentType.CONSTRUCTION) ~= nil end)
 	-- Do NOT swallow errors silently: the whole point of this probe is to learn
 	-- whether setPlayer works on a replicated construction. Record each result.
-	local okSP, errSP = pcall(function() game.interface.setPlayer(eid, pid) end)
+	local okSP, errSP = pcall(function() CM.cmSetConstructionPlayer(eid, pid) end)
 	local okBZ, errBZ = true, "skipped (no CONSTRUCTION component)"
 	if hasCon then okBZ, errBZ = pcall(function() game.interface.setBulldozeable(eid, false) end) end
 	-- (sendScriptEvent is a GUI-side API and is nil on the engine side -- the
