@@ -119,114 +119,19 @@ local function validDash(kv)
 		and tonumber(kv.boot) and tonumber(kv.boot) >= guiBoot - 60 and fresh(tonumber(kv.wall))
 end
 
--- ---- the Resync section of the Multiplayer window (GUI Lua state) ----
--- One section inside the existing window instead of a separate Lua popup
--- (2026-09-14). It appears when a desync is counted or a recovery is active
--- and follows the phase written by the lobby into tpf2_sync_lua.txt (the same
--- control file the engine state reads, so it survives the world reload). Its
--- only action is Resync now: while the world is held, the native input gate
--- swallows every click on game widgets (native_io.cpp), so Retry and Cancel
--- live in the native overlay's panel, which reads the mouse through its own
--- low-level hook (user test 2026-09-14: the Lua buttons could not be pressed).
-local PHASE_TEXT = {
-	holding = "Pausing both games", waiting = "Desync detected. Both games are paused.",
-	saving = "Saving the host world", transferring = "Transferring the save", loading = "Loading the save",
-	checking = "Checking that both worlds match", releasing = "Checking that both worlds match",
-	complete = "All players are in sync.", aborted = "Resync cancelled. Both games remain paused.",
-}
-local FAILED_TEXT = {
-	holding = "Could not pause both games", saving = "Could not save the host world",
-	transferring = "Save transfer failed", loading = "Could not load the save",
-	checking = "World comparison failed", releasing = "World comparison failed",
-}
-local NL = string.char(10)
-
-local function sectionText(kv, state)
-	if kv.resync ~= "1" then
-		return "The game worlds are out of sync." .. NL
-			.. "Resync now pauses both games, saves the host world, transfers the save and reloads it for both players." .. NL
-			.. "Play resumes automatically once both worlds match. The host world is used; client-only changes will be lost."
-	end
-	local phase = state and state.phase or kv.resyncstatus or "holding"
-	local line = PHASE_TEXT[phase] or ("Resync: " .. tostring(phase))
-	if phase == "error" then line = FAILED_TEXT[state and state.step or ""] or "Resync stopped" end
-	local detail = state and state.detail or ""
-	return "Resync: " .. line .. (detail ~= "" and (NL .. detail) or "") .. NL
-		.. "The host world is used. Client-only changes will be lost." .. NL
-		.. "Retry and Cancel are in the Multiplayer Resync panel; this window cannot be clicked while the game is held."
-end
-
-local function button(label, fn)
-	local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
-	b:onClick(fn)
-	return b
-end
-
-local function act()
-	local kv = CM.resyncGuiDash
-	if not validDash(kv) or kv.resync == "1" then return end
-	if not CM.syncRequest("sync_request") then
-		if CM.resyncText then
-			CM.resyncText:setText("Automatic resync is unavailable. Both players must use the same version in a player-hosted lobby.")
-		end
-		return
-	end
-	CM.resyncRequested = { token = kv.resynctoken, at = os.time() }
-	if CM.resyncText then CM.resyncText:setText("Resync requested. Waiting for confirmation; do not build anything.") end
-	CM.resyncSetButtons(false)
-end
-
--- nil hides the button, false shows it disabled, true shows it enabled
-function CM.resyncSetButtons(request)
-	pcall(function()
-		CM.resyncButton:setVisible(request ~= nil, false); CM.resyncButton:setEnabled(request == true)
-	end)
-end
-
--- Builds the section; the dashboard adds the returned component to its layout.
-function CM.resyncSection()
-	local box = api.gui.layout.BoxLayout.new("VERTICAL")
-	CM.resyncText = api.gui.comp.TextView.new("")
-	box:addItem(CM.resyncText)
-	CM.resyncButton = button("  Resync now  ", act)
-	box:addItem(CM.resyncButton)
-	CM.resyncBox = api.gui.comp.Component.new("mpResync")
-	CM.resyncBox:setLayout(box)
-	CM.resyncBox:setVisible(false, false)
-	CM.resyncActive = false
-	return CM.resyncBox
-end
-
--- Called twice a second with the own dash file. Returns true while the section
--- is showing, so the dashboard shows the window even when Ctrl+Shift+D hid it.
+-- Publish fresh GUI observations for the native panel. This is only a notice:
+-- displaying a desync never starts a recovery or acquires an input hold.
 function CM.resyncGuiTick(kv)
-	CM.resyncGuiDash = kv
-	pcall(CM.recoveryGuiHeld)
-	local state = CM.recoveryGuiLatest
-	if not validDash(kv) then
-		if CM.resyncBox and CM.resyncActive then
-			CM.resyncText:setText("Waiting for current game status. Do not build anything.")
-			CM.resyncSetButtons(false)
-		end
-		return CM.resyncActive == true
+	if not validDash(kv) then return end
+	if not K.PROCESS_ID then pcall(CM.detectInstance) end
+	if not K.PROCESS_ID then return end
+	local count = math.max(0, math.floor(tonumber(kv.desyncs) or 0))
+	local f = io.open(K.BASE .. "tpf2_sync_notice.txt", "wb")
+	if f then
+		f:write("pid=" .. K.PROCESS_ID .. "\nworld=" .. kv.resynctoken ..
+			"\nwall=" .. os.time() .. "\ndesyncs=" .. count ..
+			"\nheld=" .. (kv.resync == "1" and "1" or "0") .. "\n")
+		f:close()
 	end
-	if CM.resyncGuiToken ~= kv.resynctoken then
-		CM.resyncGuiToken, CM.resyncRequested = kv.resynctoken, nil
-	end
-	local held = kv.resync == "1"
-	local active = held or (tonumber(kv.desyncs) or 0) > 0
-	local req = CM.resyncRequested
-	if req and (held or req.token ~= kv.resynctoken or os.time() - req.at > 5) then
-		CM.resyncRequested, req = nil, nil
-	end
-	if CM.resyncBox then
-		if active then
-			CM.resyncText:setText(sectionText(kv, held and state or nil))
-			if held then CM.resyncSetButtons(nil) else CM.resyncSetButtons(req == nil) end
-		end
-		if CM.resyncActive ~= active then pcall(function() CM.resyncBox:setVisible(active, false) end) end
-	end
-	CM.resyncActive = active
-	return active
 end
 end

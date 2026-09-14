@@ -1266,9 +1266,6 @@ function data()
 						CM.dashShowCompanies = not CM.dashShowCompanies
 						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
 					end))
-					-- the Resync section (resync.lua): first, so it stands out while every
-					-- other block is hidden; it is empty and hidden until a desync
-					box:addItem(CM.resyncSection())
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					box:addItem(togC)
@@ -1436,8 +1433,8 @@ function data()
 					end
 				end
 				local mine = fresh[own]
-				local okRecovery, recoveryActive = pcall(CM.resyncGuiTick, ownKv)
-				if not okRecovery then print("[ls-gui] resync: " .. tostring(recoveryActive)); recoveryActive = false end
+				local okRecovery, recoveryError = pcall(CM.resyncGuiTick, ownKv)
+				if not okRecovery then print("[ls-gui] resync: " .. tostring(recoveryError)) end
 				-- the verdict and, per peer, our verdict against that peer
 				local vs = {}
 				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
@@ -1477,16 +1474,14 @@ function data()
 					end
 				end)
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
-				-- one-byte file; no file means shown. A desync or a running resync
-				-- shows the window regardless: the Resync section is the only
-				-- in-game recovery view (2026-09-14).
+				-- one-byte file; no file means shown. Recovery uses its own native
+				-- panel and does not override the dashboard visibility preference.
 				local shown = true
 				local ff = io.open(K.BASE .. "tpf2mp_dash.txt", "r")
 				if ff then
 					local v = ff:read("*l"); ff:close()
 					shown = (v ~= "0")
 				end
-				if recoveryActive == true then shown = true end
 				if D.shown ~= shown then
 					D.shown = shown
 					D.win:setVisible(shown, false)

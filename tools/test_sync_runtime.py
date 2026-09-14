@@ -7,9 +7,38 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'netpunch'))
 from sync_runtime import SyncParticipant, read_fields, write_fields
 from sync_snapshot import PreparedSnapshot
+from sync_lobby import publish_prompt
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_native_prompt_is_local_fresh_and_does_not_reopen_after_recovery(self):
+        from unittest.mock import Mock
+        io = Mock()
+        def notice(world='old', count=1, held=0, wall=100, pid=123):
+            write_fields(self.root/'tpf2_sync_notice.txt',
+                         dict(pid=pid, world=world, desyncs=count, held=held, wall=wall))
+            publish_prompt(self.runtime, io, True, 100)
+        notice(pid=999)
+        notice(wall=94)
+        notice(world='invalid token')
+        io.emit.assert_not_called()
+        notice()
+        io.emit.assert_called_once_with(dict(type='sync_prompt', phase='detected'))
+        self.assertIsNone(self.runtime.state)  # a notice does not pause or save
+        notice()
+        self.assertEqual(io.emit.call_count, 1)
+        self.phase('holding')
+        notice(count=2)
+        self.phase('complete')
+        notice(count=2)
+        self.assertEqual(io.emit.call_count, 1)  # old world's desync stays consumed
+        notice(world='new', count=0)
+        io.emit.assert_called_with(dict(type='sync_prompt', phase='clear'))
+        notice(world='new', count=1)
+        io.emit.assert_called_with(dict(type='sync_prompt', phase='detected'))
+        publish_prompt(self.runtime, io, False, 100)
+        io.emit.assert_called_with(dict(type='sync_prompt', phase='unavailable'))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

@@ -1866,7 +1866,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
     def recovery_supported():
-        return (sync_runtime is not None and not relay_only and len(peers) == 1
+        return (sync_runtime is not None and not relay_only and len(peers) >= 1
                 and all(p.get("recovery") == 4 for p in peers.values())
                 and started[0] and transfer[0] is None)
 

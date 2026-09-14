@@ -409,9 +409,13 @@ static bool InitRender(VkSwapchainKHR sc)
 // ---- multiplayer panel state ----
 static volatile LONG g_recoveryPresent = 0;
 static volatile LONG g_recoveryWorldIo = 0;
+static ULONGLONG g_recoveryRequestedAt = 0; // guarded by g_modelCs
 static char g_recoveryOperation[40] = "", g_recoveryEpoch[40] = "";
 static char g_recoveryPhase[24] = "", g_recoveryDetail[420] = "", g_recoveryFailedStep[24] = "";
-static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lobby, 3 recovery (title menu only)
+static char g_readyToken[40] = "";
+static int g_readyCount = 0, g_readyTotal = 0;
+static bool g_readyMine = false;
+static volatile LONG g_uiState = 0;     // 0 collapsed, 1 host/join choice, 2 lobby, 3 recovery (only on desync or during recovery)
 // Low-level keyboard hook. While the lobby chat is open (state 2) and the game is
 // focused, route typing into the chat box and SWALLOW the key so the game's own
 // bindings never fire -- crucially Enter, which on the title menu opens Load Game.
@@ -901,40 +905,62 @@ static void RenderPanelLayer(int w, int h)
     int pad = S(25), cy = S(56);
     const LONG page=InterlockedCompareExchange(&g_uiState,0,0);
     if(page==3) {
-        char phase[24],detail[420],failedStep[24];
+        char phase[24],detail[420],failedStep[24]; bool requested, readyMine; int readyCount, readyTotal;
         EnterCriticalSection(&g_modelCs);
         strcpy_s(phase,g_recoveryPhase); strcpy_s(detail,g_recoveryDetail); strcpy_s(failedStep,g_recoveryFailedStep);
+        requested = g_recoveryRequestedAt != 0;
+        readyMine=g_readyMine; readyCount=g_readyCount; readyTotal=g_readyTotal;
         LeaveCriticalSection(&g_modelCs);
-        // No close button and no Esc while the world is held (user test 2026-09-14:
-        // Cancel, then close, left no way back -- the Lua window cannot be clicked
-        // under the input gate). Completion hides the panel.
         mwTitle(L"MULTIPLAYER RESYNC");
-        const wchar_t* label=L"Pausing both games";
-        if(!strcmp(phase,"waiting")) label=L"Desync detected. Both games are paused.";
-        else if(!strcmp(phase,"saving")) label=L"Saving the host world";
-        else if(!strcmp(phase,"transferring")) label=L"Transferring the save";
-        else if(!strcmp(phase,"loading")) label=L"Loading the save";
-        else if(!strcmp(phase,"checking") || !strcmp(phase,"releasing")) label=L"Checking that both worlds match";
+        const bool detected = !strcmp(phase,"detected");
+        const bool unavailable = !strcmp(phase,"unavailable");
+        const bool readiness = !strcmp(phase,"readiness");
+        const bool host = InterlockedCompareExchange(&g_isHost,0,0)!=0;
+        if(unavailable) mwClose(w,85); // No hold has been acquired.
+        const wchar_t* label=L"1 / 5  Pausing all games";
+        if(detected) label=L"The game worlds are out of sync.";
+        else if(readiness) label=L"The host has requested a resync.";
+        else if(unavailable) label=L"Automatic resync is unavailable.";
+        else if(!strcmp(phase,"waiting")) label=L"All games are paused. Ready to resync.";
+        else if(!strcmp(phase,"saving")) label=L"2 / 5  Saving the host world";
+        else if(!strcmp(phase,"transferring")) label=L"3 / 5  Transferring the save";
+        else if(!strcmp(phase,"loading")) label=L"4 / 5  Loading the save";
+        else if(!strcmp(phase,"checking") || !strcmp(phase,"releasing")) label=L"5 / 5  Checking that all worlds match";
         else if(!strcmp(phase,"complete")) label=L"All players are in sync.";
-        else if(!strcmp(phase,"aborted")) label=L"Resync cancelled. Both games remain paused.";
+        else if(!strcmp(phase,"aborted")) label=L"All games are paused. Ready to resync.";
         else if(!strcmp(phase,"error")) {
-            label=L"Resync stopped";
-            if(!strcmp(failedStep,"holding")) label=L"Could not pause both games";
-            else if(!strcmp(failedStep,"saving")) label=L"Could not save the host world";
-            else if(!strcmp(failedStep,"transferring")) label=L"Save transfer failed";
-            else if(!strcmp(failedStep,"loading")) label=L"Could not load the save";
-            else if(!strcmp(failedStep,"checking") || !strcmp(failedStep,"releasing")) label=L"World comparison failed";
+            label=L"Resync could not finish. All games remain paused.";
+            if(!strcmp(failedStep,"holding")) label=L"Could not pause all games.";
+            else if(!strcmp(failedStep,"saving")) label=L"Could not save the host world.";
+            else if(!strcmp(failedStep,"transferring")) label=L"Could not transfer the save.";
+            else if(!strcmp(failedStep,"loading")) label=L"Could not load the save.";
+            else if(!strcmp(failedStep,"checking") || !strcmp(failedStep,"releasing")) label=L"Could not verify that all worlds match.";
+        }
+        if(requested) label=L"Request sent. Waiting for the host...";
+        wchar_t readyLabel[100];
+        if(readiness && !requested) {
+            swprintf_s(readyLabel,L"%d / %d players ready",readyCount,readyTotal);
+            label=readyLabel;
         }
         mwBody(pad,cy,w-2*pad,S(40),label);
         if(detail[0]) { wchar_t text[420]; MultiByteToWideChar(CP_UTF8,0,detail,-1,text,420);
             mwBody(pad,cy+S(42),w-2*pad,S(60),text,MW_DIM); }
         mwBody(pad,h-S(130),w-2*pad,S(40),L"The host world is used. Client-only changes will be lost.",MW_DIM);
-        // aborted: the hold remains and only a new request goes on (the barrier
-        // ignores Cancel there); it used to offer nothing but Cancel (user test 2026-09-14)
-        if(!strcmp(phase,"error")) mwButton(pad,h-S(76),S(180),S(30),L"Retry",82);
-        else if(!strcmp(phase,"waiting") || !strcmp(phase,"complete") || !strcmp(phase,"aborted"))
-            mwButton(pad,h-S(76),S(210),S(30),L"Resync now",84);
-        if(strcmp(phase,"complete") && strcmp(phase,"aborted")) mwButton(w-pad-S(160),h-S(76),S(160),S(30),L"Cancel",83);
+        if(detected && !detail[0]) mwBody(pad,cy+S(42),w-2*pad,S(60),
+            L"Reload all games from the host's save. Play resumes automatically when all worlds match.",MW_DIM);
+        if(unavailable) mwBody(pad,cy+S(42),w-2*pad,S(60),
+            L"Resync requires all players on the same version in a player-hosted lobby.",MW_DIM);
+        if(readiness) mwBody(pad,cy+S(42),w-2*pad,S(60),
+            readyMine ? L"You are ready. Resync starts when everyone has confirmed." :
+            L"The host wants to reload all games. Confirm when you are ready.",MW_DIM);
+        if(!requested) {
+            if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
+            else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
+            else if(host && (detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted")))
+                mwButton(pad,h-S(76),S(210),S(30),g_playerCount>2 ? L"Request readiness" : L"Resync now",84);
+            else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
+                mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
+        }
         mwStatus(w,h);
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
@@ -1405,11 +1431,28 @@ static void OnHit(int id)
             if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
         }
         break;
-    case 82: case 83: case 84: {
-        char operation[40]; EnterCriticalSection(&g_modelCs); strcpy_s(operation,g_recoveryOperation); LeaveCriticalSection(&g_modelCs);
+    case 85: // Dismiss an unavailable notice; never hide a held operation.
+        EnterCriticalSection(&g_modelCs);
+        if(!strcmp(g_recoveryPhase,"unavailable")) {
+            InterlockedExchange(&g_uiState,0); InterlockedExchange(&g_recoveryPresent,0);
+            InterlockedExchange(&g_panelDirty,1);
+        }
+        LeaveCriticalSection(&g_modelCs);
+        break;
+    case 82: case 84: case 86: {
+        char operation[40],token[40];
+        EnterCriticalSection(&g_modelCs);
+        bool allowed = id==86 ? (!strcmp(g_recoveryPhase,"readiness") && !g_readyMine) : id==82 ? !strcmp(g_recoveryPhase,"error") :
+            (!strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"waiting") || !strcmp(g_recoveryPhase,"aborted"));
+        if(!allowed || g_recoveryRequestedAt || (id!=86 && !g_isHost)) { LeaveCriticalSection(&g_modelCs); break; }
+        g_recoveryRequestedAt=GetTickCount64();
+        strcpy_s(operation,g_recoveryOperation);
+        strcpy_s(token,g_readyToken);
+        LeaveCriticalSection(&g_modelCs);
+        InterlockedExchange(&g_panelDirty,1);
         static LONG requestNo = 0;
-        char line[256]; snprintf(line,sizeof(line),"{\"cmd\":\"%s\",\"operation\":\"%s\",\"id\":\"native-%lu-%llu-%ld\"}",
-            id==82?"sync_retry":id==83?"sync_abort":"sync_request",operation,
+        char line[320]; snprintf(line,sizeof(line),"{\"cmd\":\"%s\",\"operation\":\"%s\",\"token\":\"%s\",\"id\":\"native-%lu-%llu-%ld\"}",
+            id==86?"sync_ready":id==82?"sync_retry":"sync_request",operation,token,
             GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&requestNo));
         LobbySend(line);
     } break;
@@ -2506,12 +2549,53 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         InterlockedExchange(&g_lobbyReady, 1);   // lobby.py is up and has truncated lobby_in.jsonl
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) { strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
+                        else if(strcmp(ty,"sync_prompt")==0) {
+                            char phase[24]; jsonStr(rem,"phase",phase,sizeof(phase));
+                            EnterCriticalSection(&g_modelCs);
+                            const bool idle = !g_recoveryPhase[0] || !strcmp(g_recoveryPhase,"complete") ||
+                                !strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"unavailable");
+                            if(idle && (!strcmp(phase,"detected") || !strcmp(phase,"unavailable"))) {
+                                strcpy_s(g_recoveryPhase,phase);
+                                g_recoveryDetail[0]=g_recoveryFailedStep[0]=0;
+                                g_recoveryRequestedAt=0;
+                                InterlockedExchange(&g_recoveryPresent,1);
+                                InterlockedExchange(&g_uiState,3);
+                                InterlockedExchange(&g_panelDirty,1);
+                            } else if(idle && !strcmp(phase,"clear")) {
+                                g_recoveryPhase[0]=0;
+                                InterlockedExchange(&g_recoveryPresent,0);
+                                if(g_uiState==3) InterlockedExchange(&g_uiState,0);
+                                InterlockedExchange(&g_panelDirty,1);
+                            }
+                            LeaveCriticalSection(&g_modelCs);
+                        }
+                        else if(strcmp(ty,"sync_ready_state")==0) {
+                            char phase[24],kind[24]; jsonStr(rem,"phase",phase,sizeof(phase));
+                            jsonStr(rem,"kind",kind,sizeof(kind));
+                            EnterCriticalSection(&g_modelCs);
+                            g_recoveryRequestedAt=0;
+                            if(!strcmp(phase,"waiting")) {
+                                strcpy_s(g_recoveryPhase,"readiness");
+                                jsonStr(rem,"token",g_readyToken,sizeof(g_readyToken));
+                                g_readyCount=pubInt(rem,"ready_count",0); g_readyTotal=pubInt(rem,"total",0);
+                                g_readyMine=pubInt(rem,"is_ready",0)!=0;
+                                g_recoveryDetail[0]=0;
+                                InterlockedExchange(&g_recoveryPresent,1); InterlockedExchange(&g_uiState,3);
+                            } else if(!strcmp(g_recoveryPhase,"readiness")) {
+                                if(!strcmp(phase,"cancelled")) {
+                                    strcpy_s(g_recoveryPhase,!strcmp(kind,"sync_retry") ? "error" : "detected");
+                                    strcpy_s(g_recoveryDetail,"The player list changed. The host must request readiness again.");
+                                } else strcpy_s(g_recoveryPhase,"holding");
+                            }
+                            LeaveCriticalSection(&g_modelCs);
+                            InterlockedExchange(&g_panelDirty,1);
+                        }
                         else if(strcmp(ty,"sync_state")==0) {
                             char operation[40],epoch[40],phase[24],detail[420];
                             jsonStr(rem,"operation",operation,sizeof(operation)); jsonStr(rem,"epoch",epoch,sizeof(epoch));
                             jsonStr(rem,"phase",phase,sizeof(phase)); jsonStr(rem,"detail",detail,sizeof(detail));
                             EnterCriticalSection(&g_modelCs);
-                            bool fresh=strcmp(operation,g_recoveryOperation)!=0;
+                            g_recoveryRequestedAt=0;
                             strcpy_s(g_recoveryOperation,operation); strcpy_s(g_recoveryEpoch,epoch);
                             strcpy_s(g_recoveryPhase,phase); strcpy_s(g_recoveryDetail,detail);
                             InterlockedExchange(&g_recoveryWorldIo, !strcmp(phase,"saving") || !strcmp(phase,"loading"));
@@ -2519,15 +2603,10 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             LeaveCriticalSection(&g_modelCs);
                             SetStatus(!strcmp(phase,"complete") ? "Resync complete." : "");
                             InterlockedExchange(&g_recoveryPresent,1);
-                            // The compact panel is the recovery view while the world is
-                            // held: the native input gate swallows clicks on game widgets,
-                            // so the Multiplayer window's Resync section (resync.lua) can
-                            // only start a resync; Retry and Cancel are here, read through
-                            // the low-level mouse hook. The panel no longer collapses to a
-                            // "Multiplayer status" button: closing it or completing hides
-                            // it; it stays open, without a close button, while the world
-                            // is held (2026-09-14).
+                            // Keep the same panel from the desync notice through recovery.
+                            // Native input remains usable while game widgets are held.
                             if(!strcmp(phase,"complete")) {
+                                InterlockedExchange(&g_recoveryPresent,0);
                                 InterlockedExchange(&g_lobbyDone,1);
                                 if(InterlockedCompareExchange(&g_uiState,0,0)==3) InterlockedExchange(&g_uiState,0);
                             } else {
@@ -2623,6 +2702,13 @@ static DWORD WINAPI LobbyThread(LPVOID param)
             CloseHandle(h);
         }
         if (stop || WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) break;
+        EnterCriticalSection(&g_modelCs);
+        if(g_recoveryRequestedAt && GetTickCount64()-g_recoveryRequestedAt > 5000) {
+            g_recoveryRequestedAt=0;
+            strcpy_s(g_recoveryDetail,"No confirmation yet. Check that the other player is connected, then try again.");
+            InterlockedExchange(&g_panelDirty,1);
+        }
+        LeaveCriticalSection(&g_modelCs);
         SyncPoll();
         // relay lobbies: the relay's copy of the world is whatever was last
         // uploaded, so the leader refreshes it on a timer -- a /resume after
@@ -2865,8 +2951,7 @@ static void MyCreatePage(uint64_t thisp, int page)
         // start arriving while the title menu sat on another page looked like
         // "start while in game" and was ignored (relay resume, 2026-09-10).
         g_gameUi = 0;
-        // Back at the title menu with a recovery still open (a failed load): the
-        // game GUI's Resync section is gone, so the native panel takes over.
+        // Keep recovery reachable at the title menu after a failed load.
         if (InterlockedCompareExchange(&g_recoveryPresent, 0, 0) && g_modelCsInit) {
             EnterCriticalSection(&g_modelCs);
             const bool open = g_recoveryPhase[0] != 0 && strcmp(g_recoveryPhase, "complete") != 0;
