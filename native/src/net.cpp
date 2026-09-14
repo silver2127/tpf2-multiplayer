@@ -111,8 +111,8 @@ static void ProcessAck(uint32_t ack, uint32_t bits)
     std::lock_guard<std::mutex> lk(g_mtx);
     for (auto it = g_pending.begin(); it != g_pending.end();) {
         uint32_t s = it->first;
-        bool acked = (s == ack) || (s < ack && ((ack - s) > 32)) ||
-                     (s < ack && (bits & (1u << (ack - s - 1))));
+        bool acked = (s == ack) ||
+                     (s < ack && ack - s <= 32 && (bits & (1u << (ack - s - 1))));
         if (acked) { g_lastSent.erase(s); it = g_pending.erase(it); }
         else { ++it; }
     }
@@ -213,18 +213,18 @@ static DWORD WINAPI NetThread(LPVOID)
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 if (g_outQueue.empty()) break;
+                // Selective acknowledgements cover only 32 earlier packets.
+                // Never advance beyond an unacknowledged gap's visibility.
+                if (!g_pending.empty() && g_nextSeq - g_pending.begin()->first > 32) break;
                 ev = g_outQueue.front();
                 g_outQueue.pop();
-            }
             uint32_t seq = g_nextSeq++;
             Packet p{};
             p.h.magic = MAGIC; p.h.seq = seq; p.h.type = 1; p.ev = ev;
-            {
-                std::lock_guard<std::mutex> lk(g_mtx);
                 g_pending[seq] = p;
                 g_lastSent[seq] = GetTickCount64();
-            }
             SendRaw(seq, 1, &ev);
+            }
         }
         // 2. resend unacked (sent-time tracked alongside)
         {
@@ -237,6 +237,8 @@ static DWORD WINAPI NetThread(LPVOID)
                 g_droppedOverflow += g_pending.size();
                 g_pending.clear();
                 g_lastSent.clear();
+                g_outQueue = std::queue<NetEvent>();
+                ++g_session;
                 g_peerEverSeen = false;   // force rediscovery via keepalives
             }
             for (auto& kv : g_pending) {
@@ -257,7 +259,7 @@ static DWORD WINAPI NetThread(LPVOID)
             if (now - lastKeepalive >= KEEPALIVE_MS) {
                 lastKeepalive = now;
                 std::lock_guard<std::mutex> lk(g_mtx);
-                SendRaw(g_nextSeq, 0, nullptr);
+                SendRaw(g_pending.empty() ? g_nextSeq : g_pending.begin()->first, 0, nullptr);
             }
         }
         // 3. receive
@@ -447,17 +449,22 @@ bool Net_SetPeer(const char* ip, int port)
     // every interface on request is exactly what this module no longer does.
     if (g_loopbackOnly && !IsLoopback(a.sin_addr)) return false;
     {
-        std::lock_guard<std::mutex> lk(g_peerMtx);
-        g_peer = a;
-        g_peerSet = true;
-    }
-    {
         // Same reasoning as the overflow path in NetThread: the backlog was
         // addressed to the old peer, and a hole is not allowed in the ordered
         // stream, so the whole thing goes. Keepalives rediscover the new peer.
         std::lock_guard<std::mutex> lk(g_mtx);
+        {
+            std::lock_guard<std::mutex> peerLock(g_peerMtx);
+            if (g_peerSet && g_peer.sin_addr.s_addr == a.sin_addr.s_addr && g_peer.sin_port == a.sin_port) return true;
+            g_peer = a;
+            g_peerSet = true;
+        }
         g_pending.clear();
         g_lastSent.clear();
+        g_outQueue = std::queue<NetEvent>();
+        // A discarded sequence range requires a new stream identity; otherwise
+        // a receiver that already met us directly waits forever for that gap.
+        ++g_session;
         g_peerEverSeen = false;
     }
     return true;

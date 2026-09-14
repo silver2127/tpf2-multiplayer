@@ -1420,10 +1420,12 @@ static void OnHit(int id)
     case 3: if (WorldLoaded()) SetStatus("Return to the main menu to join another world."); else StartLobby(1); break;
     case 5: if (!WorldLoaded()) LeaveLobby(); break;                // title-menu LEAVE only
     case 6: if (InterlockedCompareExchange(&g_isHost,0,0)) {   // START GAME (host): share newest save, then start
+        // Hosting from a running map already starts its snapshot/hot-join flow.
+        // Dismiss the panel without resending the world or waiting for loaders.
+        if (WorldLoaded()) { OnHit(4); break; }
         // lobby.py truncates lobby_in.jsonl when it starts: a command appended
         // before its first event line would be lost. Wait for that first line.
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
-        if (WorldLoaded()) { SyncStart("host: share current world"); break; }
         if (newestSave(g_startSaveW, 600)) {
             char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
             char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
@@ -1908,7 +1910,9 @@ static void PollLobbyOpen()
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
     if (!DeleteFileW(path) || !WorldLoaded()) return;
     InterlockedExchange(&g_ingameOverlay, 1);
-    InterlockedExchange(&g_uiState, LobbyRunning() ? 2 : 1);
+    bool running = LobbyRunning();
+    InterlockedExchange(&g_uiState, running ? 2 : 1);
+    if (running) SetStatus("Game running. New players can join this lobby.");
     InterlockedExchange(&g_lobbyDone, 0);
     InterlockedExchange(&g_panelDirty, 1);
 }
@@ -2568,9 +2572,9 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             int pct = jsonInt(rem, "pct"); char msg[96];
                             char peer[40]; jsonStr(rem, "peer", peer, sizeof(peer));
                             bool toRelay = strcmp(peer, "relay") == 0;
-                            if (strcmp(role, "recv") == 0) { if (pct >= 0) { snprintf(msg, sizeof(msg), "Receiving save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); snprintf(g_xfer, sizeof(g_xfer), "receiving %d%%", pct); } }
-                            else if (strcmp(st, "done") == 0) { SetStatus(toRelay ? "Save uploaded to the relay." : "Save sent."); g_xfer[0] = 0; }
+                            if (strcmp(st, "done") == 0) { SetStatus(WorldLoaded() ? "Game running. New players can join this lobby." : "Save transfer complete."); g_xfer[0] = 0; }
                             else if (st[0]) { g_xfer[0] = 0; }
+                            else if (strcmp(role, "recv") == 0) { if (pct >= 0) { snprintf(msg, sizeof(msg), "Receiving save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); snprintf(g_xfer, sizeof(g_xfer), "receiving %d%%", pct); } }
                             else if (pct >= 0) { snprintf(msg, sizeof(msg), toRelay ? "Uploading save to the relay\xE2\x80\xA6 %d%%" : "Sending save\xE2\x80\xA6 %d%%", pct); SetStatus(msg);
                                                  snprintf(g_xfer, sizeof(g_xfer), toRelay ? "uploading %d%%" : "sending %d%%", pct); }
                             if (pct >= 100) g_xfer[0] = 0;

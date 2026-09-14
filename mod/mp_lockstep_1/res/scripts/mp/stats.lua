@@ -19,7 +19,7 @@ local NL = string.char(10)
 function CM.lobbyPanelPage(body, requested)
 	local lines = {}
 	for line in tostring(body or ""):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
-	if #lines < 3 then return "Lobby information unavailable.", 1, 1 end
+	if #lines < 3 then return "", 1, 1 end
 	local count = #lines - 3
 	local pages = math.max(1, math.ceil(count / 8))
 	local page = math.max(1, math.min(pages, tonumber(requested) or 1))

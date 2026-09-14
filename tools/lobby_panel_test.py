@@ -59,7 +59,7 @@ class LobbyPanel(unittest.TestCase):
             text, _, _ = cm.lobbyPanelPage((Path(folder) / "lobby_panel.txt").read_text(), 1)
             self.assertIn("Disconnected", text)
             self.assertIn("0 player(s)", text)
-            self.assertIn("unavailable", cm.lobbyPanelPage("", 1)[0])
+            self.assertEqual("", cm.lobbyPanelPage("", 1)[0])
 
 
 if __name__ == "__main__":
