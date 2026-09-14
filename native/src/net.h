@@ -6,6 +6,7 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include <string>
 
 #define NET_CHUNK_TEXT 1024
 
@@ -37,7 +38,9 @@ bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
 // Thread-safe; chunks as needed. A line too long to describe with a 16-bit
 // chunk count is REFUSED (counted in Net_Stats' droppedOversize), never
 // truncated -- a shortened command still parses on the far side.
-void Net_QueueLine(const char* line);
+void Net_QueueLine(const char* line, const char* expectedWorld = nullptr);
+std::string Net_WorldEpoch();
+bool Net_SetWorldEpoch(const char* epoch, void (*resetLocal)(const char*) = nullptr);
 
 // Orderly shutdown: stops the net thread, WAITS for it, closes the socket and
 // releases Winsock, leaving the module reinitialisable by Net_Init.
@@ -53,9 +56,8 @@ void Net_SignalShutdown();
 
 // Repoint the peer address without touching the socket or the net thread
 // (the lobby decides who we talk to after the game is already running).
-// Thread-safe. Liveness is reset and the unacked backlog dropped: those
-// packets were for the old peer and the new one starts from a transferred
-// save anyway. Returns false (and changes nothing) if `ip` is not a dotted
+// Thread-safe. Route changes preserve the reliable stream; a coordinated
+// world reset clears it. Returns false (and changes nothing) if `ip` is not a dotted
 // IPv4 address, the port is out of range, or the socket is bound to 127.0.0.1
 // and `ip` is not a loopback address.
 bool Net_SetPeer(const char* ip, int port);

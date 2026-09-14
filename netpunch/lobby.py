@@ -152,6 +152,7 @@ Optional: --local-port 29471, --timeout 40, --io-dir <dir>,
 from __future__ import annotations
 
 import argparse
+from sync_lobby import HostRecovery, ClientRecovery, make_runtime
 import collections
 import hashlib
 import json
@@ -1790,7 +1791,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.0"
+LOBBY_VERSION = "0.5.1"
 
 
 def version_rejection(remote):
@@ -2061,7 +2062,7 @@ class _PeerConn:
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False, punch_q=None):
+             relay_only=False, punch_q=None, sync_runtime=None):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
@@ -2201,6 +2202,21 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return sorted(p["name"] for p in peers.values())
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
+    def recovery_supported():
+        return (sync_runtime is not None and not relay_only and len(peers) >= 1
+                and all(p.get("recovery") == 4 for p in peers.values())
+                and started[0] and transfer[0] is None)
+
+    def recovery_send(name, message):
+        for address, peer in peers.items():
+            if peer["name"] == name:
+                _send_data(sock, address, message)
+
+    recovery = HostRecovery(sync_runtime, host_name, io, recovery_send,
+        roster_players, lambda: [(a, p["name"]) for a, p in peers.items()],
+        lambda sid, blob, files, targets: _HostSaveTransfer(sock, sid, blob, files, targets, io, log),
+        available=recovery_supported) if sync_runtime is not None and not relay_only else None
+
     def roster_companies():
         """name -> company id. Same id = same company (co-op); different ids =
         separate companies. Everyone starts on 1, so nothing changes until
@@ -2238,7 +2254,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         links = {p["name"]: p.get("links", []) for p in peers.values()}
         companies = roster_companies()
         for a, p in list(peers.items()):
-            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "players": players,
+            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "players": players, "recovery": 4 if recovery_supported() else 0,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only, "mods": advertised[1],
                                  "stored_age": stored_age() if relay_only else -1,
@@ -2331,7 +2347,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             f"{len(targets)} of {len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
-    def do_join(addr, name, profile=None, is_mesh=False, version=None):
+    def do_join(addr, name, profile=None, is_mesh=False, version=None, recovery_protocol=0):
         reason = version_rejection(version)
         if reason:
             # Phrase the error from the joining player's perspective.
@@ -2345,6 +2361,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     transfer[0].on_peer_dropped(addr)
                 roster_changed()
             log(f"[host] rejected incompatible multiplayer version: {remote!r}")
+            return
+        if recovery and recovery.barrier.operation and addr not in peers:
+            _send_data(sock, addr, {"t": "reject", "reason": "This recovery session has a fixed player roster. Restart both games and the lobby to join."})
             return
         late = False
         if addr in peers:                                   # rename in place
@@ -2366,10 +2385,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))
         peers[addr]["last"] = time.time()
+        peers[addr]["recovery"] = recovery_protocol
         if relay_only:
             letter_for(peers[addr]["name"])
         _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION,
                                 "you": peers[addr]["name"], "host": leader_name(),
+                                "recovery": 4 if recovery_supported() else 0,
                                 "lobby": lobby_name, "relay": relay_only, "mods": advertised[1]})
         if relay_only and started[0] and addr != leader_addr() and not peers[addr].get("started"):
             age = stored_age()
@@ -2388,7 +2409,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if addr == leader_addr():
                 if spath:
                     _send_data(sock, addr, {"t": "status", "state": "connected",
-                                            "detail": f"loading the relay's world (saved {int(age // 60)} min ago)…"})
+                                            "detail": f"loading the relay's world (saved {int(age // 60)} min ago)â€¦"})
                     log(f"[relay] fresh session with a stored save ({int(age)} s old): loading it for {peers[addr]['name']!r}")
                     pending_resume[0] = (addr, time.time() + RESUME_GRACE)
                 else:
@@ -2397,7 +2418,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     log(f"[relay] fresh session, no stored save: waiting for {peers[addr]['name']!r} to press START GAME")
             else:
                 _send_data(sock, addr, {"t": "status", "state": "connected",
-                                        "detail": "loading the relay's world…" if spath
+                                        "detail": "loading the relay's worldâ€¦" if spath
                                                   else f"waiting for the leader ({leader_name()!r}) to press START GAME"})
         roster_changed()
         if late and not relay_only:   # a relay tells late joiners what it is doing itself (above)
@@ -2492,6 +2513,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return
         if addr in peers:
             peers[addr]["last"] = time.time()
+        if recovery and addr in peers:
+            if recovery.command(peers[addr]["name"], msg) or recovery.feedback(addr, msg):
+                return
         if relay_only and t in ("fbegin", "start") and addr in peers:
             if addr != leader_addr():
                 log(f"[relay] {t} from {peers[addr]['name']!r} ignored -- only the leader "
@@ -2516,7 +2540,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return
         if t == "join":
             do_join(addr, msg.get("name", "player"), msg.get("profile"),
-                    msg.get("mesh", False), msg.get("version"))
+                    msg.get("mesh", False), msg.get("version"), msg.get("recovery", 0))
         elif t == "links":
             if addr in peers:
                 new = [str(x) for x in msg.get("direct", [])][:CAP]
@@ -2683,6 +2707,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     # ---- local (host's own menu) commands ---------------------------------- #
     def handle_command(cmd):
         nonlocal host_name
+        if recovery and recovery.command(host_name, cmd):
+            return
+        if recovery and recovery.held and cmd.get("cmd") in ("start", "name", "company"):
+            return
         c = cmd.get("cmd")
         if c == "advertise_mods":
             path=str(cmd.get("save", ""))
@@ -2698,6 +2726,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif c == "name":
             host_name = _dedupe(str(cmd.get("name", "player")),
                                 {p["name"] for p in peers.values()})
+            if recovery:
+                recovery.barrier.host = host_name
+                recovery.runtime.player = host_name
             roster_changed()
         elif c == "company":
             target = str(cmd.get("player") or host_name)
@@ -2751,7 +2782,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         while not stop.is_set():
             # While a transfer runs, poll fast so we pump chunks + absorb ACKs
             # promptly; otherwise idle at 0.2 s to keep the loop cheap.
-            timeout = XFER_SELECT_TIMEOUT if transfer[0] is not None else 0.2
+            timeout = (XFER_SELECT_TIMEOUT if transfer[0] is not None or (recovery and recovery.transfer is not None)
+                       else 0.05 if recovery and recovery.held else 0.2)
             try:
                 ready, _, _ = select.select(rlist, [], [], timeout)
             except (OSError, ValueError):
@@ -2863,6 +2895,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             for cmd in io.poll_commands():
                 handle_command(cmd)
+            if recovery:
+                recovery.tick(now)
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
@@ -2884,7 +2918,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # Anyone who joined during a transfer is still unstarted: serve them
             # from the same save now that the pipe is free (relay: its stored
             # world; host: the file START GAME shared). One push per batch.
-            if started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
+            if not (recovery and recovery.held) and started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
                 last_serve_check[0] = now
                 waiting = [a for a in peers if not peers[a].get("started")]
                 fresh = (not relay_only) or (0 <= stored_age() <= HOTJOIN_STORED_MAX)
@@ -3059,7 +3093,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 # --------------------------------------------------------------------------- #
 def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                log=_log, receiver_cls=_ClientSaveReceiver, relay=None,
-               mesh=None, profile_code=None, forward_logs=()):
+               mesh=None, profile_code=None, forward_logs=(), sync_runtime=None):
     """Participate in the lobby over a connected ``punch.Connection`` (blocks).
 
     ``receiver_cls`` is the save-receive implementation (the self-test swaps in
@@ -3109,12 +3143,14 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         except (RuntimeError, OSError):
             pass
 
+    recovery = ClientRecovery(sync_runtime, io, send, receiver) if sync_runtime is not None else None
+
     def apply_start(save, via):
         """The save-flag rule: emit start only if save==false, or save==true
         AND our receiver completed this session (it emitted save_ready). An
         unsatisfiable start is ignored WITHOUT latching started, so a retried
         START GAME (after the host re-sends the save) still works."""
-        if started[0] or receiver.cancelled or receiver.failed or receiver.ask or receiver.catalogue_token or not receiver.mods_satisfied:
+        if started[0] or (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask or receiver.catalogue_token or not receiver.mods_satisfied:
             return
         if receiver.need and not receiver.complete:
             return
@@ -3306,7 +3342,13 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         if t == "mods_manifest":
             receiver.on_manifest(m.get("mods"))
             return
+        if recovery and recovery.message(m):
+            return
         if t == "fbegin":
+            if recovery and recovery.begin(m):
+                return
+            if recovery and recovery.held:
+                return
             receiver.on_begin(m)
             return
         if t in ("fbegin_ack", "fack", "fdone"):
@@ -3318,6 +3360,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             assigned[0] = m.get("you", desired[0])
             host_name[0] = m.get("host")
             is_relay[0] = bool(m.get("relay"))
+            if recovery:
+                recovery.identify(assigned[0], host_name[0], m.get("recovery") == 4 and not is_relay[0])
             io.write_state(you=assigned[0], host=m.get("host"))
             log(f"[client] host named us {assigned[0]!r}")
         elif t == "roster":
@@ -3325,6 +3369,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             players = m.get("players", [])
             host_name[0] = m.get("host", host_name[0])
             is_relay[0] = bool(m.get("relay", is_relay[0]))
+            if recovery:
+                recovery.identify(assigned[0], host_name[0], m.get("recovery") == 4 and not is_relay[0])
             participants[0] = list(players)
             roster_links[0] = m.get("links", {}) or {}
             roster_profiles[0] = m.get("profiles", {}) or {}
@@ -3374,6 +3420,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             stop.set()
 
     def handle_command(cmd):
+        if recovery and recovery.command(cmd):
+            return
+        if recovery and recovery.held and cmd.get("cmd") in ("start", "name", "company"):
+            return
         c = cmd.get("cmd")
         if not version_checked[0] and c not in ("quit", "name"):
             return
@@ -3388,7 +3438,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "company", "player": str(cmd.get("player") or assigned[0]), "id": cmd.get("id")})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
-            m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None}
+            m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
             if profile_code:
                 m2["profile"] = profile_code
             send(m2)
@@ -3444,7 +3494,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                                         daemon=True)
         relay_thread.start()
 
-    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None}
+    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
     if profile_code:
         join_msg["profile"] = profile_code
     send(join_msg)                                          # announce ourselves
@@ -3494,6 +3544,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 io.write_state(state="disconnected",started=False)
                 stop.set()
                 continue
+            if recovery:
+                recovery.tick(now)
             if uploader[0] is not None:
                 try:
                     uploader[0].pump(now)
@@ -3647,7 +3699,8 @@ def cmd_host(args):
         run_host(sock, args.name, io, code=code, relay=None if args.relay_only else relay,
                  forward_logs=args.forward_log or (), publisher=publisher,
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
-                 punch_q=rendezvous.queue if rendezvous is not None else None)
+                 punch_q=rendezvous.queue if rendezvous is not None else None,
+                 sync_runtime=make_runtime(args) if not args.relay_only else None)
     finally:
         if rendezvous is not None:
             rendezvous.close()
@@ -3726,7 +3779,7 @@ def cmd_join(args):
         mesh, conn = _mesh_from_conn(conn)
         _log("[join] mesh: direct links to other joiners enabled")
     run_client(conn, args.name, io, relay=relay, mesh=mesh,
-               profile_code=profile_code, forward_logs=args.forward_log or ())
+               profile_code=profile_code, forward_logs=args.forward_log or (), sync_runtime=make_runtime(args))
     return 0
 
 
@@ -4983,6 +5036,9 @@ def main(argv=None):
     ap.add_argument("mode", nargs="?", choices=["host", "join"],
                     help="host a lobby or join one with a CODE")
     ap.add_argument("code", nargs="?", help="peer CODE (join mode)")
+    ap.add_argument("--sync-runtime-dir")
+    ap.add_argument("--save-dir")
+    ap.add_argument("--game-pid", type=int)
     ap.add_argument("--name", default="player", help="your username")
     ap.add_argument("--local-port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--timeout", type=int, default=40,

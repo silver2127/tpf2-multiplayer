@@ -39,7 +39,7 @@ echo usage: build.bat slice^|menu^|proxy^|host^|workshop^|previews^|all [suffix]
 exit /b 2
 
 :run
-call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
+call "%~dp0..\tools\msvc_env.bat" || exit /b 1
 cd /d "%~dp0"
 if not exist out mkdir out
 set "CC=cl /nologo /O2 /MT /W3 /EHsc"
@@ -73,11 +73,14 @@ exit /b 0
 
 :menu
 %CC% /utf-8 /c src\hook.cpp /Fo:out\hook_menu.obj                                    || exit /b 1
+%CC% /utf-8 /c src\native_io.cpp /Fo:out\native_io.obj || exit /b 1
+%CC% /utf-8 /c src\native_control.cpp /Fo:out\native_control.obj || exit /b 1
 %CC% /utf-8 /c src\menu_hook.cpp /Fo:out\menu_hook.obj                               || exit /b 1
 ml64 /nologo /c /Fo out\gameuirelay_menu.obj src\gameuirelay.asm                     || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_menu%SFX%.dll out\hook_menu.obj out\menu_hook.obj out\gameuirelay_menu.obj user32.lib gdi32.lib advapi32.lib || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_menu%SFX%.dll out\hook_menu.obj out\menu_hook.obj out\native_io.obj out\native_control.obj out\gameuirelay_menu.obj user32.lib gdi32.lib advapi32.lib || exit /b 1
 REM Deploy to where the proxy loads it from. Non-fatal: a running game holds the
 REM dll open, and the copy is simply skipped -- redeploy after the relaunch.
+if "%TPF2_BUILD_NO_DEPLOY%"=="1" exit /b 0
 set "GAMEDEST=C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\tpf2_menu.dll"
 if defined TPF2MP_NO_DEPLOY exit /b 0
 copy /y "out\tpf2_menu%SFX%.dll" "%GAMEDEST%" >nul 2>&1 && (echo deployed to the game dir) || (echo game-dir deploy skipped: dll locked by a running game -- close it and rerun build.bat menu)

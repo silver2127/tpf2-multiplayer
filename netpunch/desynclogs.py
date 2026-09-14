@@ -52,7 +52,7 @@ DELAY_DEFAULT = 20.0        # seconds to wait before gathering
 SKIP_DATA = {"tpf2_names.txt"}
 
 _busy = threading.Lock()
-_sent = []                  # ids of the reports this lobby run sent: one per session
+_sent = {}                  # world token -> report id, scoped to this lobby run
 
 
 # --------------------------------------------------------------------------- #
@@ -253,15 +253,19 @@ def _meta(cmd, version):
     }
 
 
+def _world(cmd):
+    token = cmd.get('world')
+    return token if isinstance(token, str) and re.fullmatch(r'[A-Za-z0-9_]{1,128}', token) else 'legacy'
+
+
 def start(io_, log, cmd, version, url=None):
-    """Gather and send in the background. False when a report is already running,
-    or this lobby run (the session) has already sent one: a desync keeps being
-    detected after the first, and the popup's backstop is here."""
-    if _sent:
-        log(f"[report] desync logs: already sent in this session (report {_sent[0]}) -- not sent again")
-        return False
+    """One report per loaded world; a completed resync permits a new report."""
     if not _busy.acquire(blocking=False):
         log("[report] desync logs: a report is already being sent -- this request ignored")
+        return False
+    if _world(cmd) in _sent:
+        log("[report] desync logs: already sent for this world -- not sent again")
+        _busy.release()
         return False
     threading.Thread(target=_run, args=(io_, log, dict(cmd), version, url),
                      name="desync-report", daemon=True).start()
@@ -285,7 +289,7 @@ def _run(io_, log, cmd, version, url):
         log(f"[report] desync logs: {len(about['files'])} file(s), {len(blob)} B zipped -> {target}")
         res = post(target, blob, meta, version)
         rid = str(res.get("id") or "?")
-        _sent.append(rid)
+        _sent[_world(cmd)] = rid
         log(f"[report] desync logs sent: report {rid}")
         _say(io_, f"Desync logs sent to the developers (report {rid}). Thank you!")
         io_.emit({"type": "report", "ok": True, "id": rid})

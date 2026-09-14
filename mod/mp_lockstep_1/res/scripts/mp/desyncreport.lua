@@ -8,7 +8,7 @@
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 --
 -- GUI STATE ONLY. guiUpdate reads this game's dash file (written by the script
--- state) and calls CM.desyncReportTick with it. The first desync of a SESSION
+-- state) and calls CM.desyncReportTick with it. The first desync of a WORLD
 -- then follows the player's choice, kept per computer in
 -- <data dir>\tpf2mp_prefs.txt as desync_logs=ask|always|never:
 --   ask     a window offers Always send / Only this once / Never
@@ -21,12 +21,14 @@
 -- {"cmd":"upload_logs",...} to lobby_in.jsonl, and the lobby gathers, scrubs,
 -- zips and uploads the logs, then reports back as a chat line.
 --
--- ONCE PER SESSION. A desync is detected again on every hash stamp after the
+-- ONCE PER WORLD. A desync is detected again on every hash stamp after the
 -- first, and players reload the game to recover, which starts a fresh GUI
--- state. So besides CM.desyncHandled (this loaded game) the lobby run's id --
+-- state. So besides CM.desyncHandledWorld the lobby run's id --
 -- "session" in lobby_state.json, new each time the lobby starts -- is recorded
 -- in <data dir>\tpf2mp_desync_seen.txt, and a later game in the same session
--- neither asks nor sends. The lobby also refuses a second upload per run.
+-- does not ask again for that world after an answer. A new world after resync
+-- may ask again. Unanswered prompts retain their original world and consent;
+-- restoring them must not consume the next world's first desync.
 return function(CM, K, log)
 local PREF_KEY = "desync_logs"
 local NL = string.char(10)
@@ -103,9 +105,39 @@ end
 
 function CM.desyncSendLogs(info)
 	local ok = CM.lobbyCommand({ { "cmd", "upload_logs" }, { "instance", K.INSTANCE or "?" },
-		{ "reason", info.why or "?" }, { "t", info.t or 0 }, { "desyncs", info.n or 0 } })
+		{ "reason", info.why or "?" }, { "t", info.t or 0 }, { "desyncs", info.n or 0 },
+		{ "world", info.world or "legacy" } })
 	print("[ls-gui] desync logs: " .. (ok and "asked the lobby to send them" or "no lobby is running -- not sent"))
 	return ok
+end
+
+local function pendingPath() return (K.BASE or "") .. "tpf2mp_desync_pending.txt" end
+
+local function readPending(sid)
+	if not sid then return nil end
+	local f = io.open(pendingPath(), "r")
+	if not f then return nil end
+	local session, why, t, n = f:read("*l"), f:read("*l"), f:read("*l"), f:read("*l")
+	local world = f:read("*l")
+	f:close()
+	-- the game's Lua has no os.remove (io.lua): an emptied file reads as absent
+	if session ~= sid then CM.clearFile(pendingPath()); return nil end
+	if not why or not tonumber(t) or not tonumber(n) then return nil end
+	return {why=why, t=tonumber(t), n=tonumber(n), session=session, world=world or "legacy"}
+end
+
+local function keepPending(info, sid)
+	CM.desyncPending = info
+	if not sid then return end
+	local f = io.open(pendingPath(), "w")
+	if not f then print("[ls-gui] could not preserve unanswered desync log prompt"); return end
+	f:write(sid .. NL .. tostring(info.why):gsub("[\r\n]", " ") .. NL .. info.t .. NL .. info.n .. NL .. info.world .. NL)
+	f:close()
+end
+
+local function clearPending()
+	CM.desyncPending = nil
+	CM.clearFile(pendingPath())
 end
 
 function CM.desyncPopup(info)
@@ -118,8 +150,10 @@ function CM.desyncPopup(info)
 		local function button(label, fn)
 			local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
 			b:onClick(function()
-				local okC, errC = pcall(fn)
-				if not okC then print("[ls-gui] desync popup: " .. tostring(errC)) end
+				local okC, result = pcall(fn)
+				if not okC then print("[ls-gui] desync popup: " .. tostring(result)); return end
+				if result == false then return end
+				clearPending()
 				close()
 			end)
 			return b
@@ -137,9 +171,9 @@ function CM.desyncPopup(info)
 		local row = api.gui.layout.BoxLayout.new("HORIZONTAL")
 		row:addItem(button("  Always send  ", function()
 			CM.prefWrite(PREF_KEY, "always")
-			CM.desyncSendLogs(info)
+			return CM.desyncSendLogs(info)
 		end))
-		row:addItem(button("  Only this once  ", function() CM.desyncSendLogs(info) end))
+		row:addItem(button("  Only this once  ", function() return CM.desyncSendLogs(info) end))
 		row:addItem(button("  Never  ", function()
 			CM.prefWrite(PREF_KEY, "never")
 			CM.desyncNote("You won't be asked about desync logs again. Type /desynclogs ask in the chat to undo that.")
@@ -150,6 +184,7 @@ function CM.desyncPopup(info)
 		local body = api.gui.comp.Component.new("mpDesyncPopup")
 		body:setLayout(box)
 		win = api.gui.comp.Window.new("Desync detected", body)
+		win:addHideOnCloseHandler()
 		pcall(function() win:setPosition(460, 260) end)
 		CM.desyncWin = win
 	end)
@@ -174,24 +209,46 @@ end
 CM.desyncGuiBoot = CM.desyncGuiBoot or os.time()
 
 function CM.desyncReportTick(kv)
-	if CM.desyncHandled or type(kv) ~= "table" then return end
+	if type(kv) ~= "table" then return end
 	local n, boot = tonumber(kv.desyncs), tonumber(kv.boot)
-	if not n or n <= 0 then return end
 	if not boot or boot < CM.desyncGuiBoot - 60 then return end
-	CM.desyncHandled = true
 	local sid = CM.lobbySessionId()
+	local world = tostring(kv.resynctoken or boot)
+	if not CM.desyncPendingLoaded then
+		CM.desyncPending = readPending(sid)
+		CM.desyncPendingLoaded = true
+	end
+	if kv.resync == "1" then
+		if CM.desyncWin then CM.desyncWin:setVisible(false, false) end
+		CM.desyncPromptDeferred = true
+		return
+	end
+	if CM.desyncPending then
+		CM.desyncHandledWorld = CM.desyncPending.world
+		local pref = CM.desyncLogsPref()
+		if pref == "never" then clearPending()
+		elseif pref == "always" then
+			if CM.desyncSendLogs(CM.desyncPending) then clearPending() end
+		elseif not CM.desyncWin then CM.desyncPopup(CM.desyncPending)
+		elseif CM.desyncPromptDeferred then CM.desyncWin:setVisible(true, false) end
+		CM.desyncPromptDeferred = nil
+		return
+	end
+	if CM.desyncHandledWorld == world or not n or n <= 0 then return end
+	CM.desyncHandledWorld = world
 	if sid then
 		local f = io.open(seenPath(), "r")
 		local seen = f and f:read("*l")
+		local seenWorld = f and f:read("*l")
 		if f then f:close() end
-		if seen == sid then
-			print("[ls-gui] desync detected, but this session already had its desync popup -- not asked again")
+		if seen == sid and seenWorld == world then
+			print("[ls-gui] desync detected, but this world already had its desync popup -- not asked again")
 			return
 		end
 		local w = io.open(seenPath(), "w")
-		if w then w:write(sid .. NL); w:close() end
+		if w then w:write(sid .. NL .. world .. NL); w:close() end
 	end
-	local info ={ why = kv.desyncwhy or kv.verdict or "?", t = tonumber(kv.desynct) or tonumber(kv.t) or 0, n = n }
+	local info ={ why = kv.desyncwhy or kv.verdict or "?", t = tonumber(kv.desynct) or tonumber(kv.t) or 0, n = n, world = world }
 	local pref = CM.desyncLogsPref()
 	print(string.format("[ls-gui] desync detected (%s at t=%d), desync logs set to '%s'", tostring(info.why), info.t, pref))
 	if pref == "never" then return end
@@ -201,6 +258,7 @@ function CM.desyncReportTick(kv)
 		end
 		return
 	end
+	keepPending(info, sid)
 	CM.desyncPopup(info)
 end
 

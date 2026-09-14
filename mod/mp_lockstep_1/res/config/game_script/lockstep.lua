@@ -482,6 +482,7 @@ end
 local hash = CM.boot("mp.hash")
 local worldHash, vposPrune
 CM.gameTime, worldHash, vposPrune = hash.gameTime, hash.worldHash, hash.vposPrune
+CM.recoveryWorldHash = worldHash
 -- ---------- runtime files: append/read, instance detection, wire broadcast ----------
 -- Lives in res/scripts/mp/io.lua.
 CM.boot("mp.io")
@@ -665,6 +666,7 @@ CM.boot("mp.stats")
 -- ---------- the desync popup: send this game's logs to the developers? (GUI state) ----------
 -- Lives in res/scripts/mp/desyncreport.lua.
 CM.boot("mp.desyncreport")
+CM.boot("mp.resync")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
 	CM.comparedAt[stamp] = CM.comparedAt[stamp] or {}
@@ -775,6 +777,11 @@ function data()
 	return {
 		update = function()
 			CM.ticks = CM.ticks + 1
+			if not K.INSTANCE and not CM.detectInstance() then return end
+			-- Recovery is checked before every command producer, including deferred
+			-- company repairs. Recovery control uses the separate lobby connection.
+			if CM.autoSyncPump(CM.gameTime() or 0) then return end
+			CM.pollEvents()
 			pcall(CM.sampleSimRate)
 			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end   -- companies: vehicles left to follow their lines in a switch
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
@@ -815,7 +822,6 @@ function data()
 			-- Both every tick. pollInject at every 10th tick added up to 1.9s of
 			-- pure dead time before a build was even scheduled; a file stat per
 			-- tick is far cheaper than that.
-			CM.pollEvents()
 			CM.pollInject()
 			-- NO WORLD SCANS ON A TIMER. The construction and stop polls walked every
 			-- construction and every edge object on the map every 10 steps -- ~300 ms of frozen
@@ -885,10 +891,10 @@ function data()
 				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
 				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
 				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
 					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
 					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
-					CM.heartbeatEcho and CM.heartbeatEcho() or ""))
+					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.resyncToken))
 			end
 
 			CM.paceTick(now)
@@ -1091,6 +1097,7 @@ function data()
 						f:write("wall=" .. tostring(os.time()) .. "\n")
 						-- the first desync of this game, for the popup (desyncreport.lua)
 						f:write("boot=" .. tostring(CM.bootWall or 0) .. "\n")
+						f:write("resynctoken=" .. CM.resyncToken .. "\n")
 						if CM.firstDesync then
 							f:write("desyncwhy=" .. tostring(CM.firstDesync.why):gsub("%c", " ") .. "\n")
 							f:write("desynct=" .. tostring(math.floor(tonumber(CM.firstDesync.t) or 0)) .. "\n")
@@ -1181,6 +1188,7 @@ function data()
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
 		guiHandleEvent = function(id, name, param)
+			if CM.recoveryGuiHeld() then return end
 			pcall(CM.previewGuiEvent, id, name, param)
 		end,
 		guiUpdate = function()
@@ -1188,7 +1196,7 @@ function data()
 			-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
 			-- the panel's own twice-a-second refresh
 			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
-			pcall(CM.previewGuiTick)
+			if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
 			if guiTick % 30 ~= 0 then return end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
@@ -1657,6 +1665,8 @@ function data()
 					D.lobbyText:setText(text)
 					D.lobbyNav:setVisible(pages > 1, false)
 				end
+				local okRecovery, recoveryError = pcall(CM.resyncGuiTick, ownKv)
+				if not okRecovery then print("[ls-gui] resync: " .. tostring(recoveryError)) end
 				-- the verdict and, per peer, our verdict against that peer
 				local vs = {}
 				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
@@ -1722,7 +1732,8 @@ function data()
 					end
 				end)
 				-- Ctrl+Shift+D (caught by the menu DLL's keyboard hook) flips a
-				-- one-byte file; no file means shown.
+				-- one-byte file; no file means shown. Recovery uses its own native
+				-- panel and does not override the dashboard visibility preference.
 				local shown = true
 				local ff = io.open(K.BASE .. "tpf2mp_dash.txt", "r")
 				if ff then
