@@ -291,12 +291,14 @@ function CM.pollInject()
 						-- under a BRIDGE is inside the bridge's footprint in plan view only. Taken
 						-- as a split, the bridge span the engine replaced in place counted as a
 						-- split parent and its removal was not shipped (2026-09-12). A real split
-						-- point sits on the edge's surface; 2.5 m is well clear of that and well
-						-- under any bridge's clearance.
+						-- point normally sits on the edge's surface. Keep the 2.5 m guard
+						-- except for an explicitly captured pair of ground-road split halves:
+						-- the native crossing tool can move that road to the rail's height.
 						if hitEid and CM.edgeZAt then
 							local ez
 							pcall(function() ez = CM.edgeZAt(hitEid, hitU) end)
-							if ez and math.abs(ez - xyz[3]) > 2.5 then hitEid = nil end
+							local maxDz = CM.captureSplitHeightLimit and CM.captureSplitHeightLimit(isTrack, hitEid, id, raw) or 2.5
+							if ez and math.abs(ez - xyz[3]) > maxDz then hitEid = nil end
 						end
 						if hitEid then
 							local ends = { -1, -1 }

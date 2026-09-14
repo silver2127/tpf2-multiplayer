@@ -7,6 +7,23 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+-- Native rail crossings can lower/raise a ground road to the new rail height.
+-- Only widen capture's height allowance when BOTH replacement halves prove
+-- that this road is actually being split; proximity alone also finds bridges.
+function CM.captureSplitHeightLimit(isTrack, eid, nodeId, raw)
+	if not isTrack then return 2.5 end
+	local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+	local street = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
+	if not be or not street or be.type ~= 0 then return 2.5 end
+	local first, second = false, false
+	for _, e in ipairs(raw) do
+		local other
+		if e[1] == nodeId then other = e[2] elseif e[2] == nodeId then other = e[1] end
+		if other == be.node0 then first = true end
+		if other == be.node1 then second = true end
+	end
+	return first and second and (K.XING_MAX_DZ or 7.0) or 2.5
+end
 -- ---------- command execution ----------
 -- Deterministic order is mandatory. Two commands due at the same stamp must be
 -- applied in the same sequence on every peer, or the worlds diverge even though
