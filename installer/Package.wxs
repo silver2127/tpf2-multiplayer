@@ -135,6 +135,9 @@
       <Component Id="SliceDll">
         <File Id="tpf2_slice.dll" Name="tpf2_slice.dll" Source="$(SliceDll)" />
       </Component>
+      <Component Id="WorkshopRegisterDll" Directory="PreviewPluginsFolder">
+        <File Id="tpf2_workshop_register.dll" Name="tpf2_workshop_register.dll" Source="$(BridgeOut)\tpf2_workshop_register.dll" />
+      </Component>
       <Component Id="PreviewDll" Directory="PreviewPluginsFolder">
         <File Id="tpf2_previews.dll" Name="tpf2_previews.dll" Source="$(BridgeOut)\tpf2_previews.dll" />
       </Component>

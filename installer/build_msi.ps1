@@ -148,7 +148,7 @@ if ($SkipBuild) {
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
-foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll, (Join-Path $BridgeOut "tpf2_previews.dll"))) {
+foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll, (Join-Path $BridgeOut "tpf2_previews.dll"), (Join-Path $BridgeOut "tpf2_workshop_register.dll"))) {
     if (-not (Test-Path $f)) { Fail "missing: $f" }
 }
 

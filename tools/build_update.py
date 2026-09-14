@@ -17,6 +17,7 @@ def build():
     files = {}
     for name in ("tpf2_bridge_mp.dll", "tpf2_menu.dll", "tpf2_slice.dll"):
         files[name] = (REPO / "native/out" / name).read_bytes()
+    files["plugins/tpf2_workshop_register.dll"] = (REPO / "native/out/tpf2_workshop_register.dll").read_bytes()
     files["plugins/tpf2_previews.dll"] = (REPO / "native/out/tpf2_previews.dll").read_bytes()
     files["netpunch/netpunch.exe"] = (REPO / "netpunch/dist/netpunch.exe").read_bytes()
     for path in (REPO / "mod/mp_lockstep_1/res/scripts/mp").glob("*.lua"):

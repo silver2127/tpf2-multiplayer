@@ -32,9 +32,10 @@ if /i "%T%"=="slice" goto run
 if /i "%T%"=="menu"  goto run
 if /i "%T%"=="proxy" goto run
 if /i "%T%"=="host"  goto run
+if /i "%T%"=="workshop" goto run
 if /i "%T%"=="previews" goto run
 if /i "%T%"=="all"   goto run
-echo usage: build.bat slice^|menu^|proxy^|host^|previews^|all [suffix]
+echo usage: build.bat slice^|menu^|proxy^|host^|workshop^|previews^|all [suffix]
 exit /b 2
 
 :run
@@ -47,6 +48,7 @@ if /i "%T%"=="all" (
     call :host  || exit /b 1
     call :menu  || exit /b 1
     call :slice || exit /b 1
+    call :workshop || exit /b 1
     echo BUILD ALL OK
     exit /b 0
 )
@@ -59,6 +61,10 @@ exit /b 0
 %CC% /c src\slice_hook.cpp /Fo:out\slice_hook.obj                                    || exit /b 1
 ml64 /nologo /c /Fo out\deferrelay_slice.obj src\deferrelay_slice.asm                || exit /b 1
 link /nologo /DLL /OUT:out\tpf2_slice%SFX%.dll out\hook_slice.obj out\slice_hook.obj out\deferrelay_slice.obj || exit /b 1
+exit /b 0
+
+:workshop
+%CC% /std:c++17 /LD src\workshop_register.cpp /Fe:out\tpf2_workshop_register.dll /Fo:out\workshop_register.obj || exit /b 1
 exit /b 0
 
 :previews
