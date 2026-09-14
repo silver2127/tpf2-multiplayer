@@ -1790,7 +1790,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.25"
+LOBBY_VERSION = "0.4.29"
 
 
 def version_rejection(remote):
@@ -3540,7 +3540,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     except KeyboardInterrupt:
         send({"t": "leave"})
     finally:
-        io.write_state(state="disconnected", started=False)
+        io.write_state(state="failed" if io._state.get("state") == "failed" else "disconnected", started=False)
         lines = fwd.drain(time.time() + LOG_FLUSH_INTERVAL)   # last words
         if lines:
             send({"t": "log", "lines": lines})

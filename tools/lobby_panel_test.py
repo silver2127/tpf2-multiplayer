@@ -12,6 +12,28 @@ from lobby import LobbyIO
 
 
 class LobbyPanel(unittest.TestCase):
+    def test_open_controls_without_existing_lobby(self):
+        lua = LuaRuntime(unpack_returned_tuples=True)
+        source = (ROOT / "mod/mp_lockstep_1/res/config/game_script/lockstep.lua").read_text()
+        # Compile the entire script, then exercise its actual button callback.
+        lua.execute("assert(load(...))", source)
+        start = source.index('lobbyL:addItem(toggleBtn("  host / manage lobby  "')
+        end = source.index("end))", start) + len("end))")
+        lua.execute('''
+            lobbyL = {addItem = function(_, button) openLobby = button end}
+            function toggleBtn(_, callback) return callback end
+            D = {lobbyText = {setText = function(_, text) failure = text end}}
+        ''')
+        with tempfile.TemporaryDirectory() as folder:
+            lua.globals().K = lua.table(BASE=folder.replace("\\", "/") + "/")
+            lua.execute(source[start:end])
+            lua.globals().openLobby()
+            self.assertEqual((Path(folder) / "tpf2_lobby_open.txt").read_text(), "open\n")
+            self.assertIsNone(lua.globals().failure)
+            lua.globals().K.BASE = folder.replace("\\", "/") + "/missing/"
+            lua.globals().openLobby()
+            self.assertIn("Could not open lobby controls", lua.globals().failure)
+
     def test_roster_pagination_and_disconnect(self):
         lua = LuaRuntime(unpack_returned_tuples=True)
         cm = lua.table()

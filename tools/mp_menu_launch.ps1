@@ -27,11 +27,23 @@ $Exe   = "C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\Transp
 $Sbie  = "C:\Program Files\Sandboxie-Plus\Start.exe"
 $Box   = "GameAgent"
 
-function Wait-Menu([string]$logPath, [string]$tag, [int]$timeoutSec = 60) {
+function Get-MenuLog([string]$gameDir, [string]$localDir) {
+    $updates = Join-Path $localDir 'tpf2mp\updates'
+    $active = Join-Path $updates 'active.txt'
+    if (Test-Path $active) {
+        $version = (Get-Content $active -Raw).Trim()
+        if ($version -match '^\d{1,5}\.\d{1,5}\.\d{1,5}$') {
+            return Join-Path $updates "releases\$version\tpf2_menu.log"
+        }
+    }
+    return Join-Path $gameDir 'tpf2_menu.log'
+}
+
+function Wait-Menu([string]$logPath, [string]$tag, [int]$timeoutSec = 60, [datetime]$since = (Get-Date)) {
     # the menu DLL logs "present state: show=1 ..." once main-menu page 2 is drawn.
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path $logPath) {
+        if ((Test-Path $logPath) -and (Get-Item $logPath).LastWriteTime -ge $since) {
             try {
                 $tail = Get-Content $logPath -Tail 3 -ErrorAction SilentlyContinue
                 if ($tail -match "show=1") { Write-Host "[$tag] title menu is up (Multiplayer button visible)"; return $true }
@@ -50,11 +62,12 @@ Start-Sleep -Milliseconds 600
 # A: real instance via Steam. The menu DLL logs next to itself in the game
 # folder; a boxed instance's log is at the same path inside its Sandboxie overlay.
 $GameDir  = Split-Path $Exe
-$menuLogA = Join-Path $GameDir "tpf2_menu.log"
+$menuLogA = Get-MenuLog $GameDir $env:LOCALAPPDATA
 $sizeA0 = if (Test-Path $menuLogA) { (Get-Item $menuLogA).Length } else { 0 }
 Write-Host "[menu-launch] launching instance A (Steam)"
+$launchSince = Get-Date
 Start-Process "steam://rungameid/1066780"
-Wait-Menu $menuLogA "A" 90 | Out-Null
+Wait-Menu $menuLogA "A" 90 $launchSince | Out-Null
 
 if ($Solo) { $Players = 1 }
 $letters = "ABCDEFGH"
@@ -64,14 +77,14 @@ for ($i = 1; $i -lt $Players; $i++) {
     $boxName = if ($i -eq 1) { $Box } else { "$Box$i" }   # NOT $box: PowerShell variables are case-insensitive, $box clobbered $Box and box 3 became "GameAgent23"
     $tag = $letters[$i]
     $ovl = "C:\Sandbox\$env:USERNAME\$boxName\drive\C" + $GameDir.Substring(2)
-    $menuLogX = Join-Path $ovl "tpf2_menu.log"
+    $menuLogX = Get-MenuLog $ovl "C:\Sandbox\$env:USERNAME\$boxName\user\current\AppData\Local"
     Write-Host "[menu-launch] launching instance $tag (Sandboxie box '$boxName')"
-    Start-Process -FilePath $Sbie -ArgumentList "/box:$boxName", "`"$Exe`"" -WorkingDirectory (Split-Path $Exe)
-    Wait-Menu $menuLogX "$tag" 90 | Out-Null
+    $launchSince = Get-Date
+    Start-Process -FilePath $Sbie -ArgumentList "/box:$boxName", "`"$Exe`"" -WorkingDirectory (Split-Path $Exe) -WindowStyle Hidden
+    Wait-Menu $menuLogX "$tag" 90 $launchSince | Out-Null
 }
 
 $n = (Get-Process TransportFever2 -ErrorAction SilentlyContinue | Measure-Object).Count
 Write-Host "[menu-launch] done -- $n instance(s) at the title menu."
 Write-Host "  A: click MULTIPLAYER -> HOST   (code generates + copies to clipboard)"
 for ($i = 1; $i -lt $Players; $i++) { Write-Host "  $($letters[$i]): click MULTIPLAYER -> JOIN   (reads the code from the clipboard)" }
-

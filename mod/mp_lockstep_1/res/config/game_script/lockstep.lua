@@ -1360,6 +1360,14 @@ function data()
 					CM.dashShowChat = (CM.dashShowChat ~= false)
 					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", function()
+						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
+						if f then
+							f:write("0\n"); f:close()
+							D.shown = false
+							D.win:setVisible(false, false)
+						end
+					end))
 					tog:addItem(toggleBtn("  lobby  ", function()
 						CM.dashShowLobby = not CM.dashShowLobby
 						D.lobbyBox:setVisible(CM.dashShowLobby, false)
@@ -1390,6 +1398,11 @@ function data()
 					local lobbyL = api.gui.layout.BoxLayout.new("VERTICAL")
 					D.lobbyText = api.gui.comp.TextView.new("Lobby information unavailable.")
 					lobbyL:addItem(D.lobbyText)
+					lobbyL:addItem(toggleBtn("  host / manage lobby  ", function()
+						local f, err = io.open(K.BASE .. "tpf2_lobby_open.txt", "w")
+						if f then f:write("open\n"); f:close()
+						else D.lobbyText:setText("Could not open lobby controls: " .. tostring(err)) end
+					end))
 					local lobbyNav = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					lobbyNav:addItem(toggleBtn("  previous players  ", function()
 						CM.lobbyPage = math.max(1, (CM.lobbyPage or 1) - 1)
