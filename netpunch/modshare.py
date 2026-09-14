@@ -3,16 +3,15 @@ modshare.py -- share the mods a save needs with the players who lack them.
 
 A shared save carries its own mod list and every mod's per-save settings (the
 values from the Mods panel live inside the .sav, right after the list), so the
-only thing a joiner can be missing is the mod folder itself. The host reads
-the list off the save it is about to share, tells each joiner in the transfer's
-``fbegin``, each joiner answers with the ids it does not have installed, and
-after the save has verified the host sends those mod folders as zip files in a
-second transfer round. The joiner unpacks each into its game's mods folder and
-the game's load screen lists them (the engine re-reads mod descriptions when
-that screen opens: "Loaded 1 of 39 mod descriptions from disk" mid-session).
+joiner needs both the files and recognition in the game's mod catalogue.
+The host advertises the save's list on join and again with the save transfer.
+Missing mods are downloaded only after consent. Workshop downloads live in
+the multiplayer data folder; the native registrar adds them to the game's
+catalogue. Loading waits for a matching catalogue receipt after installation.
 
 The multiplayer mod itself is never shared (the installer ships it) and a mod
-that is already present is never overwritten.
+that is already present is never overwritten. Game DLC, including Deluxe and
+Early Supporter content, is never packaged or installed by this module.
 
 Save header format (measured on a 0.4.x autosave, 2026-09-11): the .sav is one
 Zstandard frame; a few hundred KB into the decompressed stream the active mod
@@ -22,8 +21,8 @@ immediately by the game settings pairs (``u32 n``, then ``u32 len "climate"``
 
 Mod ids: a folder ``<id>_<version>`` under the game's ``mods`` or the profile's
 ``local/mods``; a Steam Workshop item is ``*<workshopid>`` and lives under
-``steamapps/workshop/content/1066780/<workshopid>`` (assumed from the game's
-naming; no local save with a workshop mod was available to measure).
+``steamapps/workshop/content/1066780/<workshopid>`` or our managed workshop
+folder after a multiplayer download.
 """
 from __future__ import annotations
 import io
@@ -32,6 +31,8 @@ import re
 import struct
 import sys
 import zipfile
+import hashlib
+import uuid
 
 TF2_APPID = "1066780"
 MP_MOD_ID = "mp_lockstep"                 # ours: shipped by the installer, never sent
@@ -108,6 +109,71 @@ def userdata_mods_dir():
     return best
 
 
+def data_dir():
+    return os.environ.get("TPF2MP_DATADIR") or os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "tpf2mp", "data")
+
+
+def managed_workshop():
+    return os.path.join(data_dir(), "workshop")
+
+
+def cache_name(m,v):
+    return hashlib.sha256(mod_folder_name(m,v).encode("utf-8")).hexdigest()+".zip"
+
+
+def is_dlc(m):
+    return m.startswith("_") or m in ("urbangames_deluxe_pack", "urbangames_preorder_pack")
+
+
+def package_mod(m, v):
+    if is_dlc(m) or not valid_mod(m,v):
+        return None
+    folder=find_mod(m,v)
+    return zip_mod(folder) if folder else None
+
+
+def valid_mod(m, v):
+    return (isinstance(m, str) and bool(_ID_RE.fullmatch(m)) and m not in (".", "..")
+            and (not m.startswith("*") or (m[1:].isdigit() and len(m) <= 21 and v == 1))
+            and isinstance(v, int) and 0 <= v <= 100000)
+
+
+def catalogue():
+    try:
+        with open(os.path.join(data_dir(), "mods_catalogue.txt"), encoding="utf-8") as f:
+            lines = f.read(1024 * 1024).splitlines()
+        return lines[0], {tuple(line.rsplit("\t", 1)) for line in lines[1:] if "\t" in line}
+    except (OSError, IndexError):
+        return "", set()
+
+
+def installed_mod(m, v):
+    if not valid_mod(m, v) or find_mod(m, v) is None:
+        return None
+    _, entries = catalogue()
+    return find_mod(m, v) if (m, str(v)) in entries else None
+
+
+def request_catalogue():
+    """Atomically publish all consented Workshop installs and a fresh receipt token."""
+    root = data_dir()
+    os.makedirs(root, exist_ok=True)
+    token = uuid.uuid4().hex
+    lines = [token]
+    if os.path.isdir(managed_workshop()):
+        for item in sorted(os.listdir(managed_workshop())):
+            path = os.path.abspath(os.path.join(managed_workshop(), item))
+            if item.isdigit() and len(item) <= 20 and os.path.isfile(os.path.join(path, "mod.lua")):
+                lines.append(item + "\t" + path)
+    if len(lines) > 129:
+        raise ValueError("too many registered Workshop mods")
+    target = os.path.join(root, "mods_registry.txt")
+    with open(target + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(target + ".tmp", target)
+    return token
+
+
 def workshop_dir():
     root = steam_root()
     return os.path.join(root, "steamapps", "workshop", "content", TF2_APPID) if root else None
@@ -119,12 +185,18 @@ def mod_folder_name(mod_id, version):
 
 def find_mod(mod_id, version):
     """The installed folder for a mod id, or None."""
-    if not isinstance(mod_id, str) or not _ID_RE.match(mod_id):
+    if not valid_mod(mod_id, version):
         return None
     if mod_id.startswith("*"):
-        w = workshop_dir()
-        p = w and os.path.join(w, mod_id[1:])
-        return p if p and os.path.isfile(os.path.join(p, "mod.lua")) else None
+        for w in (workshop_dir(), managed_workshop()):
+            p = w and os.path.join(w, mod_id[1:])
+            if p and os.path.isfile(os.path.join(p, "mod.lua")):
+                return p
+        return None
+    if mod_id.startswith("_"):
+        g=game_dir()
+        p=g and os.path.join(g,"dlcs",mod_folder_name(mod_id[1:],version))
+        return p if p and os.path.isfile(os.path.join(p,"mod.lua")) else None
     name = mod_folder_name(mod_id, version)
     for base in (game_dir() and os.path.join(game_dir(), "mods"), userdata_mods_dir()):
         if base:
@@ -136,7 +208,7 @@ def find_mod(mod_id, version):
 
 # The joiner asks this (the host asks find_mod): one process can then play both
 # ends in a test with different answers. In the game they are the same lookup.
-installed_mod = find_mod
+# installed_mod checks the engine catalogue, not just files.
 
 
 def install_target(mod_id, version):
@@ -144,8 +216,7 @@ def install_target(mod_id, version):
     uses), the profile's local/mods if that is not writable, the workshop
     content folder for a workshop item."""
     if mod_id.startswith("*"):
-        w = workshop_dir()
-        return w and os.path.join(w, mod_id[1:])
+        return os.path.join(managed_workshop(), mod_id[1:])
     name = mod_folder_name(mod_id, version)
     g = game_dir()
     if g and os.access(os.path.join(g, "mods"), os.W_OK):
@@ -274,12 +345,14 @@ def install_mod_zip(data, mod_id, version, log=None):
     """Unpack one received mod. Returns (status, path): status is
     'installed', 'present' (left alone), or 'failed'."""
     log = log or (lambda s: None)
+    if not valid_mod(mod_id, version) or is_dlc(mod_id):
+        return "failed", None
     target = install_target(mod_id, version)
     if not target:
         log(f"[mods] no mods folder to install {mod_id} into")
         return "failed", None
     if os.path.isdir(target):
-        return "present", target
+        return ("present", target) if os.path.isfile(os.path.join(target, "mod.lua")) else ("failed", None)
     tmp = target + ".mp_incoming"
     try:
         if os.path.isdir(tmp):
@@ -287,6 +360,8 @@ def install_mod_zip(data, mod_id, version, log=None):
             shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp, exist_ok=True)
         with zipfile.ZipFile(io.BytesIO(data)) as z:
+            if len(z.infolist()) > 50000 or sum(i.file_size for i in z.infolist()) > MAX_MOD_ZIP:
+                raise ValueError("mod archive exceeds extraction limit")
             base = os.path.realpath(tmp)
             for info in z.infolist():
                 n = info.filename.replace("\\", "/")

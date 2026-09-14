@@ -16,7 +16,7 @@ ASSET = "TpF2Multiplayer-update.zip"
 BOOTSTRAP_ABI = 1
 MAX_BYTES = 256 * 1024 * 1024
 REQUIRED = {"tpf2_bridge_mp.dll", "tpf2_menu.dll", "tpf2_slice.dll",
-            "plugins/tpf2_previews.dll", "netpunch/netpunch.exe",
+            "plugins/tpf2_previews.dll", "plugins/tpf2_workshop_register.dll", "netpunch/netpunch.exe",
             "mod/res/scripts/mp/entry.lua", "mod/res/scripts/mp/mod_data.lua"}
 
 

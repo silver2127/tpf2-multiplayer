@@ -72,6 +72,7 @@ foreach ($c in "tpf2_slice.cfg", "tpf2mp.cfg") {
 # missing one is not an error, it just means that feature is not under test.
 $PluginDir = Join-Path $Game 'plugins'
 New-Item -ItemType Directory -Force $PluginDir | Out-Null
+Put "$Repo\native\out\tpf2_workshop_register.dll" (Join-Path $PluginDir 'tpf2_workshop_register.dll')
 foreach ($p in @(@{repo='tpf2-bigmap'; dll='out\tpf2_bigmap.dll'})) {
     $src = Join-Path (Split-Path -Parent $Repo) (Join-Path $p.repo $p.dll)
     if (Test-Path $src) { Put $src (Join-Path $PluginDir (Split-Path $p.dll -Leaf)) }

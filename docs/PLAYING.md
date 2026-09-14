@@ -4,8 +4,8 @@
 
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
-- Every mod the save uses must be installed on every machine: local mods copied into each game's
-  `mods` folder, Steam Workshop mods subscribed by each player. Mods are not sent with the save.
+- The host advertises the save's required mods. Missing mods are offered in a **Download Mods / Cancel** dialog; Cancel leaves the lobby. **Auto-accept mod downloads** in the multiplayer menu saves your choice for future joins and hotjoins. Downloads must be recognised by the game before it loads the save.
+- Deluxe and Early Supporter content are DLC, never transferred. Each player must have the required DLC installed.
   Per-save mod settings need nothing: they travel inside the save. The multiplayer mod itself
   (**Transport Fever 2 Multiplayer**) comes with the installer.
 - **The multiplayer mod has to be enabled in the save.** New games get it automatically: each time the
@@ -80,6 +80,7 @@ list while it is up.
 A small **Multiplayer** window sits at the top left. **Ctrl+Shift+D** hides and shows it. Its
 buttons toggle three sections:
 
+- **lobby** (hidden at first): show or hide the session name, host, connected players and their companies. Available to hosts and joiners during play; larger rosters have previous/next page buttons. Your visibility choice stays in place when the roster changes.
 - **stats** (hidden at first): a status line that says whether the worlds match. After a desync
   it says what differs (for example "roads and tracks" or "town buildings (5 fewer here)"), when
   it was first noticed, and that the fix is to reload a save the host makes. Below it, one row per

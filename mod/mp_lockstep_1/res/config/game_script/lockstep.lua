@@ -1360,6 +1360,10 @@ function data()
 					CM.dashShowChat = (CM.dashShowChat ~= false)
 					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					tog:addItem(toggleBtn("  lobby  ", function()
+						CM.dashShowLobby = not CM.dashShowLobby
+						D.lobbyBox:setVisible(CM.dashShowLobby, false)
+					end))
 					tog:addItem(toggleBtn("  stats  ", function()
 						CM.dashShowStats = not CM.dashShowStats
 						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
@@ -1383,6 +1387,23 @@ function data()
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					box:addItem(togC)
+					local lobbyL = api.gui.layout.BoxLayout.new("VERTICAL")
+					D.lobbyText = api.gui.comp.TextView.new("Lobby information unavailable.")
+					lobbyL:addItem(D.lobbyText)
+					local lobbyNav = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					lobbyNav:addItem(toggleBtn("  previous players  ", function()
+						CM.lobbyPage = math.max(1, (CM.lobbyPage or 1) - 1)
+					end))
+					lobbyNav:addItem(toggleBtn("  next players  ", function()
+						CM.lobbyPage = math.min(D.lobbyPages or 1, (CM.lobbyPage or 1) + 1)
+					end))
+					D.lobbyNav = api.gui.comp.Component.new("mpLobbyPages")
+					D.lobbyNav:setLayout(lobbyNav)
+					lobbyL:addItem(D.lobbyNav)
+					D.lobbyBox = api.gui.comp.Component.new("mpLobby")
+					D.lobbyBox:setLayout(lobbyL)
+					D.lobbyBox:setVisible(CM.dashShowLobby == true, false)
+					box:addItem(D.lobbyBox)
 					-- ---- host speed buttons (2026-09-12) ----
 					-- Shown on the host's window only. A press appends SPEEDSET <v> to our
 					-- inject file; the host's pacer makes it the session speed
@@ -1613,6 +1634,16 @@ function data()
 					end
 				end
 				local mine = fresh[own]
+				if CM.dashShowLobby and D.lobbyText and CM.lobbyPanelPage then
+					local dir = CM.netDir()
+					local f = dir and io.open(dir .. "/lobby_panel.txt", "r")
+					local body = ""
+					if f then body = f:read(65536) or ""; f:close() end
+					local text, page, pages = CM.lobbyPanelPage(body, CM.lobbyPage)
+					CM.lobbyPage, D.lobbyPages = page, pages
+					D.lobbyText:setText(text)
+					D.lobbyNav:setVisible(pages > 1, false)
+				end
 				-- the verdict and, per peer, our verdict against that peer
 				local vs = {}
 				for o, info in pairs(peerInfo) do vs[#vs + 1] = o .. " " .. tostring(info.verdict) end
