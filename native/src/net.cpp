@@ -54,12 +54,15 @@ static std::queue<NetEvent> g_outQueue;
 static std::mutex g_mtx;
 static std::mutex g_epochMtx; // outer lock: net iteration vs coordinated reset
 static std::string g_worldEpoch(32, '0');
+static std::string g_lobbyEpoch;
 // Zero is a real data sequence, not "nothing received". An initial keepalive
 // must not acknowledge and discard packet 0 while it is still in flight.
 static const uint32_t NO_ACK = UINT32_MAX;
 // Relay frames retain the original process session. Each sender has an
 // independent sequence space, ACK bitmap and partially assembled line.
 struct PeerStream {
+    bool sequenceReady = false; // initial join waits for a sender-advertised floor
+    bool assembling = false;
     uint32_t expectedSeq = 0;
     uint32_t lastReceivedSeq = NO_ACK;
     uint32_t receivedBits = 0;
@@ -148,11 +151,14 @@ static void Reassemble(PeerStream& stream, const NetEvent& ev)
 {
     if (!g_deliver) return;
     size_t n = strnlen(ev.text, NET_CHUNK_TEXT);
-    if (ev.chunkIdx == 0) stream.rxAccum.clear();
+    if (ev.chunkIdx == 0) { stream.rxAccum.clear(); stream.assembling = true; }
+    // Joining may start inside an old fragmented line; never deliver its suffix.
+    if (!stream.assembling) return;
     stream.rxAccum.append(ev.text, n);
     if (ev.chunkIdx + 1 >= ev.chunkCount) {
         g_deliver(stream.rxAccum.c_str());
         stream.rxAccum.clear();
+        stream.assembling = false;
     }
 }
 
@@ -322,9 +328,19 @@ static DWORD WINAPI NetThread(LPVOID)
                     g_peerEverSeen = true;
                 }
                 if (p.h.ackSession == g_session) ProcessAck(p.h.session, p.h.ack, p.h.ackBits);
+                // Only an ACK/keepalive advertises the oldest retained packet.
+                // A reordered data packet is not a safe initial sequence floor.
+                // Do not ACK data before discovery: the sender must retry it.
+                if (!found->second.sequenceReady) {
+                    if (p.h.type != 0) continue;
+                    found->second.expectedSeq = p.h.seq;
+                    found->second.sequenceReady = true;
+                }
                 if (p.h.type == 1) {
                     DeliverInOrder(found->second, p);
-                    SendRaw(g_nextSeq, 0, nullptr, found->first, &found->second);
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    SendRaw(g_pending.empty() ? g_nextSeq : g_pending.begin()->first,
+                            0, nullptr, found->first, &found->second);
                 }
             }
         }
@@ -425,6 +441,7 @@ bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
     g_loopbackOnly = loopback;
     g_deliver = deliverCb;
     g_worldEpoch.assign(32, '0');
+    g_lobbyEpoch.clear();
     g_nextSeq = 0;
     g_streams.clear();
     g_awaiting.clear();
@@ -488,12 +505,42 @@ bool Net_SetWorldEpoch(const char* epoch,void (*resetLocal)(const char*)) {
         g_worldEpoch=epoch;
         g_nextSeq=0;
         g_rosterFrozen=true;
-        for (auto& peer : g_streams) peer.second = PeerStream{};
+        for (auto& peer : g_streams) {
+            peer.second = PeerStream{};
+            // Coordinated resets really do start at zero, even if the first
+            // keepalive arrives ahead of a missing/reordered packet zero.
+            peer.second.sequenceReady = true;
+        }
         g_pending.clear(); g_lastSent.clear(); g_awaiting.clear();
         while(!g_outQueue.empty()) g_outQueue.pop();
         g_lastRecvMs=0; g_peerEverSeen=false;
         // Keep process identities: changing worlds does not admit a restarted
         // peer process that has lost its lobby/world state.
+    }
+    if(resetLocal) resetLocal(epoch);
+    return true;
+}
+
+// A new lobby is a new recipient cohort, unlike a route change or resync.
+// Its shared nonce also rejects delayed packets and ACKs from the old lobby.
+bool Net_BeginLobby(const char* epoch, const char* ip, int port,
+                    void (*resetLocal)(const char*)) {
+    if(!epoch || strlen(epoch)!=32 || strspn(epoch,"0123456789abcdef")!=32 ||
+       strspn(epoch,"0")==32) return false;
+    std::lock_guard<std::mutex> epochLock(g_epochMtx);
+    if(!Net_SetPeer(ip,port)) return false;
+    if(g_lobbyEpoch==epoch) return true;
+    {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        g_lobbyEpoch=epoch;
+        g_worldEpoch=epoch;
+        if(++g_session==0) ++g_session;
+        g_nextSeq=0;
+        g_streams.clear(); g_awaiting.clear();
+        g_pending.clear(); g_lastSent.clear();
+        while(!g_outQueue.empty()) g_outQueue.pop();
+        g_rosterFrozen=false;
+        g_lastRecvMs=0; g_peerEverSeen=false;
     }
     if(resetLocal) resetLocal(epoch);
     return true;

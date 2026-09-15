@@ -317,7 +317,7 @@ static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
 static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
 static void LeaveLobby();
 static DWORD WINAPI KbHookThread(LPVOID);
-static void LobbySend(const char* jsonLine);
+static bool LobbySend(const char* jsonLine);
 static const char* originLetterFor(const char* name);
 static void ClipboardSet(const char* utf8);
 static bool ClipboardGet(char* out, int outsz);
@@ -934,13 +934,15 @@ static void RenderPanelLayer(int w, int h)
         readyMine=g_readyMine; readyCount=g_readyCount; readyTotal=g_readyTotal;
         LeaveCriticalSection(&g_modelCs);
         mwTitle(L"MULTIPLAYER RESYNC");
+        const bool manual = !strcmp(phase,"manual");
         const bool detected = !strcmp(phase,"detected");
         const bool unavailable = !strcmp(phase,"unavailable");
         const bool readiness = !strcmp(phase,"readiness");
         const bool host = InterlockedCompareExchange(&g_isHost,0,0)!=0;
-        if(unavailable) mwClose(w,85); // No hold has been acquired.
+        if(unavailable || manual || detected) mwClose(w,85); // No hold has been acquired.
         const wchar_t* label=L"1 / 5  Pausing all games";
-        if(detected) label=L"The game worlds are out of sync.";
+        if(manual) label=L"Reload all players from the host world.";
+        else if(detected) label=L"The game worlds are out of sync.";
         else if(readiness) label=L"The host has requested a resync.";
         else if(unavailable) label=L"Automatic resync is unavailable.";
         else if(!strcmp(phase,"waiting")) label=L"All games are paused. Ready to resync.";
@@ -958,7 +960,7 @@ static void RenderPanelLayer(int w, int h)
             else if(!strcmp(failedStep,"loading")) label=L"Could not load the save.";
             else if(!strcmp(failedStep,"checking") || !strcmp(failedStep,"releasing")) label=L"Could not verify that all worlds match.";
         }
-        if(requested) label=L"Request sent. Waiting for the host...";
+        if(requested) label=host ? L"Starting resync. Waiting for confirmation..." : L"Sending your ready confirmation...";
         wchar_t readyLabel[100];
         if(readiness && !requested) {
             swprintf_s(readyLabel,L"%d / %d players ready",readyCount,readyTotal);
@@ -968,7 +970,7 @@ static void RenderPanelLayer(int w, int h)
         if(detail[0]) { wchar_t text[420]; MultiByteToWideChar(CP_UTF8,0,detail,-1,text,420);
             mwBody(pad,cy+S(42),w-2*pad,S(60),text,MW_DIM); }
         mwBody(pad,h-S(130),w-2*pad,S(40),L"The host world is used. Client-only changes will be lost.",MW_DIM);
-        if(detected && !detail[0]) mwBody(pad,cy+S(42),w-2*pad,S(60),
+        if((detected || manual) && !detail[0]) mwBody(pad,cy+S(42),w-2*pad,S(60),
             L"Reload all games from the host's save. Play resumes automatically when all worlds match.",MW_DIM);
         if(unavailable) mwBody(pad,cy+S(42),w-2*pad,S(60),
             L"Resync requires all players on the same version in a player-hosted lobby.",MW_DIM);
@@ -978,7 +980,7 @@ static void RenderPanelLayer(int w, int h)
         if(!requested) {
             if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
             else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
-            else if(host && (detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted")))
+            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted")))
                 mwButton(pad,h-S(76),S(210),S(30),g_playerCount>2 ? L"Request readiness" : L"Resync now",84);
             else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
                 mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
@@ -1063,6 +1065,10 @@ static void RenderPanelLayer(int w, int h)
         if (!WorldLoaded()) { bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5); }
         if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
             if (g_flagMaster[0]) mwCheck(w - pad - bw2 - S(110), bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
+        if(WorldLoaded() && g_isHost) {
+            bw1=mwButtonW(L"RESYNC...");
+            mwButton(pad,bottom,bw1,S(30),L"RESYNC...",87);
+        }
         // status between them -- or the mod-download question with its YES / NO
         char st[256]; char mp[300] = ""; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); strncpy_s(mp, g_modsPrompt, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
         int rightCut = S(160);
@@ -1506,19 +1512,32 @@ static void OnHit(int id)
             if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
         }
         break;
-    case 85: // Dismiss an unavailable notice; never hide a held operation.
+    case 85: // Dismiss a preflight notice; never hide a held operation.
         EnterCriticalSection(&g_modelCs);
-        if(!strcmp(g_recoveryPhase,"unavailable")) {
+        if(!strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual") || !strcmp(g_recoveryPhase,"detected")) {
             InterlockedExchange(&g_uiState,0); InterlockedExchange(&g_recoveryPresent,0);
             InterlockedExchange(&g_panelDirty,1);
         }
+        LeaveCriticalSection(&g_modelCs);
+        break;
+    case 87: // Always reachable from the host lobby, even if only a client detected drift.
+        if(!g_isHost || !WorldLoaded()) break;
+        EnterCriticalSection(&g_modelCs);
+        if(!g_recoveryPhase[0] || !strcmp(g_recoveryPhase,"complete") ||
+           !strcmp(g_recoveryPhase,"unavailable")) {
+            strcpy_s(g_recoveryPhase,"manual");
+            g_recoveryDetail[0]=0;
+        }
+        InterlockedExchange(&g_recoveryPresent,1);
+        InterlockedExchange(&g_uiState,3);
+        InterlockedExchange(&g_panelDirty,1);
         LeaveCriticalSection(&g_modelCs);
         break;
     case 82: case 84: case 86: {
         char operation[40],token[40];
         EnterCriticalSection(&g_modelCs);
         bool allowed = id==86 ? (!strcmp(g_recoveryPhase,"readiness") && !g_readyMine) : id==82 ? !strcmp(g_recoveryPhase,"error") :
-            (!strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"waiting") || !strcmp(g_recoveryPhase,"aborted"));
+            (!strcmp(g_recoveryPhase,"manual") || !strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"waiting") || !strcmp(g_recoveryPhase,"aborted"));
         if(!allowed || g_recoveryRequestedAt || (id!=86 && !g_isHost)) { LeaveCriticalSection(&g_modelCs); break; }
         g_recoveryRequestedAt=GetTickCount64();
         strcpy_s(operation,g_recoveryOperation);
@@ -1529,7 +1548,13 @@ static void OnHit(int id)
         char line[320]; snprintf(line,sizeof(line),"{\"cmd\":\"%s\",\"operation\":\"%s\",\"token\":\"%s\",\"id\":\"native-%lu-%llu-%ld\"}",
             id==86?"sync_ready":id==82?"sync_retry":"sync_request",operation,token,
             GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&requestNo));
-        LobbySend(line);
+        if(!LobbySend(line)) {
+            EnterCriticalSection(&g_modelCs);
+            g_recoveryRequestedAt=0;
+            strcpy_s(g_recoveryDetail,"Could not send the request to the lobby. Reopen Manage Lobby and try again.");
+            InterlockedExchange(&g_panelDirty,1);
+            LeaveCriticalSection(&g_modelCs);
+        }
     } break;
     case 4: InterlockedExchange(&g_ingameOverlay, 0); InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
@@ -1905,14 +1930,16 @@ static void ensureUsername()
     Log("[menu] username: %s\n", g_username);
 }
 
-static void LobbySend(const char* jsonLine)   // append a command to lobby_in.jsonl
+static bool LobbySend(const char* jsonLine)   // append a command to lobby_in.jsonl
 {
     wchar_t p[512]; _snwprintf_s(p, _TRUNCATE, L"%s\\lobby_in.jsonl", NETDIR);
     HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return false;
     SetFilePointer(h, 0, nullptr, FILE_END);
     DWORD w; char line[1600]; int L = snprintf(line, sizeof(line), "%s\n", jsonLine);   // start lines carry a full save path
-    WriteFile(h, line, L, &w, nullptr); CloseHandle(h);
+    const bool ok = WriteFile(h, line, L, &w, nullptr) && w == (DWORD)L;
+    CloseHandle(h);
+    return ok;
 }
 static void SendChat(const char* text)
 {
@@ -2113,6 +2140,7 @@ static void SyncPoll()
 static char g_speedReq[16] = "";
 static int  g_syncReq = 0;
 static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")
+static char g_transportLobby[33] = ""; // owned by LobbyThread
 static void writeBridgeCtl(bool isHost);
 static void speedFromChat(const char* text)
 {
@@ -2171,6 +2199,10 @@ static void writeBridgeCtl(bool isHost)
     // and released with two of three players in.
     snprintf(content, sizeof(content), "instance=%s\npeer=127.0.0.1:%d\npid=%lu\nplayers=%d\n",
              letter, relayPortFor(isHost), bpid, g_playerCount);
+    if (g_transportLobby[0]) {
+        size_t n = strlen(content);
+        snprintf(content+n,sizeof(content)-n,"lobby=%s\n",g_transportLobby);
+    }
     if (g_speedReq[0]) {
         size_t n = strlen(content);
         snprintf(content + n, sizeof(content) - n, "speed=%s\n", g_speedReq);
@@ -2560,6 +2592,7 @@ struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; in
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
+    g_transportLobby[0]=0;
     wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
     wchar_t cmd[4096];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
@@ -2682,6 +2715,14 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 }
                             }
                             strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
+                        else if(strcmp(ty,"transport_lobby")==0) {
+                            char epoch[40]; jsonStr(rem,"epoch",epoch,sizeof(epoch));
+                            if(strlen(epoch)==32 && strspn(epoch,"0123456789abcdef")==32 &&
+                               strcmp(epoch,g_transportLobby)) {
+                                strcpy_s(g_transportLobby,epoch);
+                                writeBridgeCtl(g_isHost != 0);
+                            }
+                        }
                         else if(strcmp(ty,"sync_prompt")==0) {
                             char phase[24]; jsonStr(rem,"phase",phase,sizeof(phase));
                             EnterCriticalSection(&g_modelCs);
@@ -2700,6 +2741,13 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 if(g_uiState==3) InterlockedExchange(&g_uiState,0);
                                 InterlockedExchange(&g_panelDirty,1);
                             }
+                            LeaveCriticalSection(&g_modelCs);
+                        }
+                        else if(strcmp(ty,"sync_feedback")==0) {
+                            EnterCriticalSection(&g_modelCs);
+                            g_recoveryRequestedAt=0;
+                            jsonStr(rem,"detail",g_recoveryDetail,sizeof(g_recoveryDetail));
+                            InterlockedExchange(&g_panelDirty,1);
                             LeaveCriticalSection(&g_modelCs);
                         }
                         else if(strcmp(ty,"sync_ready_state")==0) {
@@ -2842,7 +2890,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         EnterCriticalSection(&g_modelCs);
         if(g_recoveryRequestedAt && GetTickCount64()-g_recoveryRequestedAt > 5000) {
             g_recoveryRequestedAt=0;
-            strcpy_s(g_recoveryDetail,"No confirmation yet. Check that the other player is connected, then try again.");
+            strcpy_s(g_recoveryDetail,"The lobby did not confirm this request within 5 seconds. Reopen Manage Lobby, check the connection, and try again.");
             InterlockedExchange(&g_panelDirty,1);
         }
         LeaveCriticalSection(&g_modelCs);

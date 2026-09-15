@@ -48,6 +48,19 @@ int main(int argc, char** argv) {
     };
     for(int i=0;i<peers;i++) send(i,zero,0,nullptr);
     waitFor([&]{std::lock_guard<std::mutex> l(g_epochMtx); return g_streams.size()==(size_t)peers;});
+    // Existing hosts may already be hundreds of packets into their stream.
+    // Use a separate process identity, with data arriving before discovery.
+    send(peers,zero,502,"must-retry");
+    Sleep(100); assert(count()==0);
+    send(peers,zero,500,nullptr);
+    send(peers,zero,502,"joined");
+    send(peers,zero,501,"old-tail",NO_ACK,1,2);
+    Sleep(100); assert(count()==0);
+    send(peers,zero,500,"old-middle",NO_ACK,1,3);
+    waitFor([]{return count()==1;});
+    { std::lock_guard<std::mutex> l(receivedMutex); assert(received[0]=="joined"); }
+    // Remove the synthetic joiner before the established-cohort tests.
+    { std::lock_guard<std::mutex> l(g_epochMtx); g_streams.erase(1000+peers); }
     for(int round=0;round<3;round++) {
         const std::string epoch(32,char('1'+round));
         const size_t before=count();

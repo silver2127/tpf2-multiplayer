@@ -424,7 +424,7 @@ static void ResetWorldFiles(const char* epoch)
 
 static void ApplyControl(const std::string& text)
 {
-    std::string wantInst, wantIp, wantEpoch;
+    std::string wantInst, wantIp, wantEpoch, wantLobby;
     int wantPort = 0;
     bool havePeer = false;
     size_t pos = 0;
@@ -440,6 +440,8 @@ static void ApplyControl(const std::string& text)
         if ((ln.size() == 10 || ln.size() == 11) && ln.rfind("instance=", 0) == 0 && ln[9] >= 'a' && ln[9] <= 'z'
             && (ln.size() == 10 || (ln[10] >= 'a' && ln[10] <= 'z'))) {   // a..z, then aa..: up to 702 players
             wantInst = ln.substr(9);
+        } else if (ln.rfind("lobby=", 0) == 0) {
+            wantLobby = ln.substr(6);
         } else if (ln.rfind("epoch=", 0) == 0) {
             wantEpoch = ln.substr(6);
         } else if (sscanf(ln.c_str(), "peer=%63[0-9.]:%d", ip, &port) == 2) {
@@ -472,6 +474,12 @@ static void ApplyControl(const std::string& text)
             differs = wantInst != g_rt.instance;
         }
         if (differs) Reidentify(wantInst);
+    }
+    if (!wantLobby.empty()) {
+        if(!havePeer || !Net_BeginLobby(wantLobby.c_str(),wantIp.c_str(),wantPort,ResetWorldFiles)) {
+            Log("[ctl] invalid lobby boundary rejected\n");
+            return;
+        }
     }
     if (!wantEpoch.empty() && !Net_SetWorldEpoch(wantEpoch.c_str(), ResetWorldFiles))
         Log("[ctl] invalid world epoch rejected\n");

@@ -61,6 +61,10 @@ void Net_SignalShutdown();
 // IPv4 address, the port is out of range, or the socket is bound to 127.0.0.1
 // and `ip` is not a loopback address.
 bool Net_SetPeer(const char* ip, int port);
+// Explicit new-lobby boundary: discard the old cohort, queues and world.
+// Repeating the same nonce is idempotent, including after a resync.
+bool Net_BeginLobby(const char* epoch, const char* ip, int port,
+                    void (*resetLocal)(const char*) = nullptr);
 
 // The UDP port the socket actually bound (queried from the socket, so it is
 // right even after a retry on another port). 0 until Net_Init has succeeded.

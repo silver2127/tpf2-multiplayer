@@ -37,6 +37,13 @@ def publish_prompt(runtime, io, available, now):
     io.emit(dict(type='sync_prompt', phase=('detected' if available else 'unavailable') if count else 'clear'))
 
 
+def ui_state(state):
+    # Native UI consumes flat fields; the wire state keeps the structured error.
+    error = state.get('error') or {}
+    return dict(state, type='sync_state', step=error.get('step', ''),
+                detail=error.get('detail', ''))
+
+
 def make_runtime(args):
     if not getattr(args, 'sync_runtime_dir', None):
         return None
@@ -46,10 +53,13 @@ def make_runtime(args):
 
 
 class HostRecovery:
-    def __init__(self, runtime, host, io, send, members, targets, transfer_factory, available=lambda: True):
+    def __init__(self, runtime, host, io, send, members, targets, transfer_factory,
+                 available=lambda: True,
+                 unavailable_reason=lambda: "Resync is not ready. Wait for all players to finish joining."):
         self.runtime, self.io, self.send = runtime, io, send
         self.members, self.targets, self.transfer_factory = members, targets, transfer_factory
         self.is_available = available
+        self.unavailable_reason = unavailable_reason
         self.barrier = SyncOperation(host)
         self.barrier.revision = int(time.time() * 1000)
         self.transfer = None
@@ -116,15 +126,22 @@ class HostRecovery:
         if sender != self.barrier.host:
             return True
         if self.readiness and self.readiness['phase'] == 'waiting':
+            self.ready_state()
+            return True
+        if kind in ('sync_request', 'sync_retry') and not self.is_available() and not self.held:
+            self.io.emit(dict(type='sync_feedback', detail=self.unavailable_reason()))
             return True
         if kind in ('sync_request', 'sync_retry') and len(self.members()) > 2:
             if not self.is_available():
+                self.io.emit(dict(type='sync_feedback', detail=self.unavailable_reason()))
                 return True
             if kind == 'sync_request' and self.barrier.operation and self.barrier.phase not in ('complete', 'aborted'):
+                self.io.emit(ui_state(self.barrier.view()))
                 return True
             if kind == 'sync_retry' and (self.barrier.phase != 'error' or
                     message.get('operation') != self.barrier.operation or
                     set(self.members()) != set(self.barrier.members)):
+                self.io.emit(dict(type='sync_feedback', detail='Cannot retry with this player list or operation. Restore the original players and reopen resync.'))
                 return True
             self.readiness = dict(token=secrets.token_hex(16), phase='waiting',
                 host=self.barrier.host, members=list(self.members()), ready=[sender],
@@ -133,9 +150,13 @@ class HostRecovery:
             return True
         if kind == 'sync_request':
             if self.is_available() or self.held:
-                self.barrier.request(sender, self.members(), 'resync')
+                if self.barrier.request(sender, self.members(), 'resync'):
+                    self.io.emit(ui_state(self.barrier.view()))
+                else:
+                    self.io.emit(dict(type='sync_feedback', detail='Resync needs at least two connected players.'))
         elif kind == 'sync_retry':
-            self.barrier.retry(sender, message.get('operation'), self.members())
+            if not self.barrier.retry(sender, message.get('operation'), self.members()):
+                self.io.emit(dict(type='sync_feedback', detail='Cannot retry with this player list or operation. Restore the original players and reopen resync.'))
         else:
             self.barrier.abort(sender, message.get('operation'))
         return True
@@ -176,7 +197,7 @@ class HostRecovery:
             return
         state = self.barrier.view()
         if self.runtime.accept(state):
-            self.io.emit(dict(state, type='sync_state'))
+            self.io.emit(ui_state(state))
         ack = self.runtime.tick()
         if ack:
             self.barrier.acknowledge(self.barrier.host, ack)
@@ -255,7 +276,7 @@ class ClientRecovery:
             return False
         if self.replica and (self.supported or self.held) and self.replica.receive(self.replica.host, message):
             if self.runtime.accept(message):
-                self.io.emit(dict(message, type='sync_state'))
+                self.io.emit(ui_state(message))
         return True
 
     def begin(self, message):

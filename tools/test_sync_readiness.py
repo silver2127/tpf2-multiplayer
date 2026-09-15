@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'netpunch'))
-from sync_lobby import HostRecovery, ClientRecovery
+from sync_lobby import HostRecovery, ClientRecovery, ui_state
 
 
 class ReadinessTests(unittest.TestCase):
@@ -16,6 +16,34 @@ class ReadinessTests(unittest.TestCase):
         self.host = HostRecovery(self.runtime, 'host', self.io, Mock(),
             lambda: self.members, lambda: [], Mock())
         return self.host
+
+    def test_unavailable_request_explains_why_without_starting(self):
+        for count in (2, 3):
+            h = self.make_host(count)
+            h.is_available = lambda: False
+            h.unavailable_reason = lambda: 'A player is receiving the save.'
+            h.command('host', dict(cmd='sync_request', id='blocked'))
+            self.assertIsNone(h.barrier.operation)
+            self.io.emit.assert_called_with(dict(type='sync_feedback',
+                detail='A player is receiving the save.'))
+
+    def test_repeated_request_shows_current_readiness(self):
+        h = self.make_host(3)
+        h.command('host', dict(cmd='sync_request', id='first'))
+        token = h.readiness['token']
+        self.io.reset_mock()
+        h.command('host', dict(cmd='sync_request', id='second'))
+        self.assertEqual(h.readiness['token'], token)
+        self.assertEqual(self.io.emit.call_args.args[0]['ready_count'], 1)
+        self.assertIsNone(h.barrier.operation)
+
+    def test_ui_preserves_failure_step_and_reason(self):
+        state = dict(phase='error', error=dict(step='loading', detail='Player p1 timed out'))
+        message = ui_state(state)
+        self.assertEqual(message['step'], 'loading')
+        self.assertEqual(message['detail'], 'Player p1 timed out')
+        self.assertNotIn('detail', state)
+        self.assertEqual(ui_state(dict(phase='holding', error=None))['detail'], '')
 
     def test_host_only_two_player_start(self):
         h = self.make_host(2)

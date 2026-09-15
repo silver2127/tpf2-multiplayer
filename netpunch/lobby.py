@@ -1791,7 +1791,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.1"
+LOBBY_VERSION = "0.5.2"
 
 
 def version_rejection(remote):
@@ -2077,6 +2077,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     sock.setblocking(False)
     _boost_socket_buffers(sock)             # help bursty save-transfer traffic
 
+    transport_lobby = os.urandom(16).hex()
+    io.emit(dict(type='transport_lobby', epoch=transport_lobby))
     host_name = _dedupe(my_name, set())     # reassigned by the 'name' command
     peers = collections.OrderedDict()       # addr -> {"name":str, "last":float,
                                             #          "started":bool,
@@ -2207,6 +2209,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 and all(p.get("recovery") == 4 for p in peers.values())
                 and started[0] and transfer[0] is None)
 
+    def recovery_unavailable_reason():
+        if not peers:
+            return "Resync needs at least one connected player."
+        if not all(p.get("recovery") == 4 for p in peers.values()):
+            return "Every player needs a version that supports resync."
+        if not started[0]:
+            return "Start the multiplayer game before requesting resync."
+        if transfer[0] is not None:
+            return "A player is receiving the save. Wait for that transfer to finish, then try again."
+        return "Resync is not ready yet."
+
     def recovery_send(name, message):
         for address, peer in peers.items():
             if peer["name"] == name:
@@ -2215,7 +2228,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     recovery = HostRecovery(sync_runtime, host_name, io, recovery_send,
         roster_players, lambda: [(a, p["name"]) for a, p in peers.items()],
         lambda sid, blob, files, targets: _HostSaveTransfer(sock, sid, blob, files, targets, io, log),
-        available=recovery_supported) if sync_runtime is not None and not relay_only else None
+        available=recovery_supported, unavailable_reason=recovery_unavailable_reason) if sync_runtime is not None and not relay_only else None
 
     def roster_companies():
         """name -> company id. Same id = same company (co-op); different ids =
@@ -2254,7 +2267,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         links = {p["name"]: p.get("links", []) for p in peers.values()}
         companies = roster_companies()
         for a, p in list(peers.items()):
-            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "players": players, "recovery": 4 if recovery_supported() else 0,
+            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "transport_lobby": transport_lobby, "players": players, "recovery": 4 if recovery_supported() else 0,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only, "mods": advertised[1],
                                  "stored_age": stored_age() if relay_only else -1,
@@ -2388,7 +2401,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         peers[addr]["recovery"] = recovery_protocol
         if relay_only:
             letter_for(peers[addr]["name"])
-        _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION,
+        _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "recovery": 4 if recovery_supported() else 0,
                                 "lobby": lobby_name, "relay": relay_only, "mods": advertised[1]})
@@ -3355,6 +3368,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             if uploader[0] is not None:
                 getattr(uploader[0], "on_" + t.replace("fbegin_ack", "begin_ack"))(conn.peer, m)
             return
+        if t in ("welcome", "roster"):
+            lobby_epoch = m.get("transport_lobby", "")
+            if isinstance(lobby_epoch, str) and re.fullmatch(r"[0-9a-f]{32}", lobby_epoch):
+                io.emit(dict(type='transport_lobby', epoch=lobby_epoch))
         if t == "welcome":
             receiver.on_manifest(m.get("mods", []))
             assigned[0] = m.get("you", desired[0])

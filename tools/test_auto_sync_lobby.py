@@ -91,6 +91,14 @@ with tempfile.TemporaryDirectory() as temporary:
             workers[-1].start()
         assert lobby._wait_until(lambda: all(len((lobby._latest_roster(io.out_path) or {}).get('players', [])) == players
                                             for io in ios.values()), timeout=5)
+        # Every participant's native menu receives the same new-lobby boundary.
+        epochs = []
+        for io in ios.values():
+            events = [json.loads(line) for line in Path(io.out_path).read_text(encoding='utf-8').splitlines()]
+            ids = {e['epoch'] for e in events if e.get('type') == 'transport_lobby'}
+            assert len(ids) == 1
+            epochs.append(next(iter(ids)))
+        assert len(set(epochs)) == 1 and len(epochs[0]) == 32
         def command(who, **fields):
             with open(ios[who].in_path, 'a', encoding='utf-8') as stream:
                 stream.write(json.dumps(fields) + '\n')

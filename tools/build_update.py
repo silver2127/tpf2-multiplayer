@@ -12,7 +12,7 @@ import updater
 
 
 def build():
-    version = (REPO / "installer/VERSION").read_text().strip()
+    version = (REPO / "installer/VERSION").read_text(encoding="utf-8").strip()
     assert version == lobby.LOBBY_VERSION, "Installer/lobby version mismatch"
     files = {}
     for name in ("tpf2_bridge_mp.dll", "tpf2_menu.dll", "tpf2_slice.dll"):
@@ -24,9 +24,9 @@ def build():
         files["mod/res/scripts/mp/" + path.name] = path.read_bytes()
     # Derive these from the canonical installed sources, so future edits cannot
     # accidentally update the MSI while leaving the automatic payload behind.
-    source = (REPO / "mod/mp_lockstep_1/res/config/game_script/lockstep.lua").read_text()
+    source = (REPO / "mod/mp_lockstep_1/res/config/game_script/lockstep.lua").read_text(encoding="utf-8")
     files["mod/res/scripts/mp/entry.lua"] = ("-- MP Lockstep" + source.split("-- MP Lockstep", 1)[1]).encode()
-    source = (REPO / "mod/mp_lockstep_1/mod.lua").read_text()
+    source = (REPO / "mod/mp_lockstep_1/mod.lua").read_text(encoding="utf-8")
     start = source.index("\n\treturn {")
     files["mod/res/scripts/mp/mod_data.lua"] = ("return function()" + source[start:]).encode()
     manifest = {"version": version, "bootstrap_abi": updater.BOOTSTRAP_ABI,
