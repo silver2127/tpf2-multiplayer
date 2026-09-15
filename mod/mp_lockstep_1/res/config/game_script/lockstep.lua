@@ -1206,10 +1206,14 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
-				-- The lobby's folder, the same two candidates the menu DLL tries
-				-- (resolveNetDir): %LOCALAPPDATA%\tpf2mp\netpunch, then <game>\netpunch (the CWD).
+				-- Match the native lobby's process-pinned release directory. Never fall
+				-- back to an older inbox while a release lobby is still starting.
 				function CM.netDir()
-					if CM.netDirCached ~= nil then return CM.netDirCached or nil end
+					local okRelease, release = pcall(os.getenv, "TPF2MP_RELEASE_ROOT")
+					if okRelease and release and release ~= "" then
+						return release .. "/netpunch"
+					end
+					if CM.netDirCached then return CM.netDirCached end
 					local cands = {}
 					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
 					if ok and la then cands[#cands + 1] = la .. "/tpf2mp/netpunch" end
@@ -1218,7 +1222,7 @@ function data()
 						local f = io.open(d .. "/lobby_out.jsonl", "r")
 						if f then f:close(); CM.netDirCached = d; return d end
 					end
-					CM.netDirCached = false
+					-- A map can load before the host creates its first lobby.
 					return nil
 				end
 				function CM.chatSend(text)

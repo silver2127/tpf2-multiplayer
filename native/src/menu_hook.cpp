@@ -872,7 +872,7 @@ static void mwCheck(int x, int y, const wchar_t* label, bool on, int id)
     layerRect(x, y + S(7), sz, 1, RGB(255, 255, 255), 90); layerRect(x, y + S(7) + sz - 1, sz, 1, RGB(255, 255, 255), 90);
     layerRect(x, y + S(7), 1, sz, RGB(255, 255, 255), 90); layerRect(x + sz - 1, y + S(7), 1, sz, RGB(255, 255, 255), 90);
     HFONT f = mkLato(S(13));
-    if (on) layerText(x, y + S(5), sz, sz + S(4), L"âœ“", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (on) layerText(x, y + S(5), sz, sz + S(4), L"\u2713", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     layerText(x + sz + S(8), y, S(360), S(30), label, f, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     int lw = textW(label, f); DeleteObject(f);
     addHit(x, y, sz + S(8) + lw, S(30), id, true);
@@ -908,7 +908,7 @@ static void mwField(int x, int y, int w, int h, const char* utf8, bool focused, 
 static void mwClose(int w, int id)
 {
     int sz = S(32), x = w - S(25) - sz + S(8), y = S(8);
-    HFONT f = mkLato(S(20)); layerText(x, y, sz, sz, L"Ã—", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
+    HFONT f = mkLato(S(20)); layerText(x, y, sz, sz, L"\u00D7", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
     addHit(x, y, sz, sz, id, true);
 }
 static void mwTitle(const wchar_t* t) { HFONT f = mkLato(S(18)); layerText(S(25), S(8), S(400), S(32), t, f, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f); }
@@ -1157,7 +1157,7 @@ static void RenderPanelLayer(int w, int h)
                 addHit(pad, ly, lw, rh, 40 + i, true);
                 ly += rh + S(2);
             }
-            if (cnt == 0) { wchar_t wnote[96]; MultiByteToWideChar(CP_UTF8, 0, note[0] ? note : "Looking for public gamesâ€¦", -1, wnote, 96);
+            if (cnt == 0) { wchar_t wnote[96]; MultiByteToWideChar(CP_UTF8, 0, note[0] ? note : "Looking for public games…", -1, wnote, 96);
                             layerText(cName, ly, lw - S(20), S(24), wnote, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); }
             DeleteObject(fr);
         }
@@ -1541,27 +1541,27 @@ static void OnHit(int id)
         if (WorldLoaded()) { OnHit(4); break; }
         // lobby.py truncates lobby_in.jsonl when it starts: a command appended
         // before its first event line would be lost. Wait for that first line.
-        if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is startingâ€¦"); break; }
+        if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
         if (newestSave(g_startSaveW, 600)) {
             char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
             char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
             char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
-            LobbySend(line); SetStatus("Sharing save & starting gameâ€¦");
+            LobbySend(line); SetStatus("Sharing save & starting game…");
         } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
     } break;
-    case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard â€” share it in Discord."); } break;
+    case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
     case 13: InterlockedExchange(&g_joinFocus, 3); g_userLen = (int)strlen(g_username); InterlockedExchange(&g_panelDirty, 1); break;   // player name
     case 14: InterlockedExchange(&g_joinFocus, 4); g_lobbyNameLen = (int)strlen(g_lobbyName); InterlockedExchange(&g_panelDirty, 1); break;   // lobby name
     case 11: {   // PUBLIC checkbox; while hosting it toggles the announcement live
         LONG on = InterlockedCompareExchange(&g_public, 0, 0) ? 0 : 1; InterlockedExchange(&g_public, on);
         if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && InterlockedCompareExchange(&g_isHost, 0, 0)) {
-            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) SetStatus("Lobby is startingâ€¦");
+            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) SetStatus("Lobby is starting…");
             else { LobbySend(on ? "{\"cmd\":\"publish\",\"on\":true}" : "{\"cmd\":\"publish\",\"on\":false}");
                    SetStatus(on ? "Listed in the public server browser." : "Removed from the public server browser."); }
         } else SetStatus(on ? "Your game will be listed publicly when you host." : "Your game will not be listed.");
         InterlockedExchange(&g_panelDirty, 1); } break;
-    case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game listâ€¦"); break;
+    case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game list…"); break;
     case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
         int i = id - 40; char code[256] = ""; char name[48] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
@@ -1916,7 +1916,7 @@ static void LobbySend(const char* jsonLine)   // append a command to lobby_in.js
 }
 static void SendChat(const char* text)
 {
-    if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is startingâ€¦"); return; }   // see g_lobbyReady
+    if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); return; }   // see g_lobbyReady
     // escape quotes/backslashes minimally
     char esc[400]; int j = 0; for (int i = 0; text[i] && j < 390; i++) { char c = text[i]; if (c == '"' || c == '\\') esc[j++] = '\\'; esc[j++] = c; } esc[j] = 0;
     char line[512]; snprintf(line, sizeof(line), "{\"cmd\":\"chat\",\"text\":\"%s\"}", esc);
@@ -2645,10 +2645,10 @@ static DWORD WINAPI LobbyThread(LPVOID param)
             logPath, GetLastError());
     }
     PROCESS_INFORMATION pi = {};
-    SetStatus(a->join ? "Joining lobbyâ€¦" : "Starting lobbyâ€¦");
+    SetStatus(a->join ? "Joining lobby…" : "Starting lobby…");
     BOOL ok = CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, NETDIR, &si, &pi);
     if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
-    if (!ok) { SetStatus("Couldn't start Python â€” is it on PATH?"); free(a); return 0; }
+    if (!ok) { SetStatus("Couldn't start Python — is it on PATH?"); free(a); return 0; }
     EnsureLobbyJob();
     if (g_lobbyJob && !AssignProcessToJobObject(g_lobbyJob, pi.hProcess))
         Log("[menu] AssignProcessToJobObject failed (err %lu) -- the lobby may outlive a crash\n", GetLastError());
@@ -2681,7 +2681,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                     std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+escaped+"\"}"; LobbySend(line.c_str());
                                 }
                             }
-                            strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied â€” share it in Discord."); } }
+                            strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
                         else if(strcmp(ty,"sync_prompt")==0) {
                             char phase[24]; jsonStr(rem,"phase",phase,sizeof(phase));
                             EnterCriticalSection(&g_modelCs);
@@ -2820,7 +2820,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             }
                             if (go) {
                                 writeCompanyCfg();
-                                SetStatus("Loading shared saveâ€¦"); Sleep(400);
+                                SetStatus("Loading shared save…"); Sleep(400);
                                 if (doStartLoad(src)) {
                                     // The game is loading. The lobby process STAYS ALIVE: since the
                                     // game-frame relay (--game-relay-port) the lobby IS the lockstep

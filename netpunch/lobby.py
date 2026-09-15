@@ -2409,7 +2409,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if addr == leader_addr():
                 if spath:
                     _send_data(sock, addr, {"t": "status", "state": "connected",
-                                            "detail": f"loading the relay's world (saved {int(age // 60)} min ago)â€¦"})
+                                            "detail": f"loading the relay's world (saved {int(age // 60)} min ago)…"})
                     log(f"[relay] fresh session with a stored save ({int(age)} s old): loading it for {peers[addr]['name']!r}")
                     pending_resume[0] = (addr, time.time() + RESUME_GRACE)
                 else:
@@ -2418,7 +2418,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     log(f"[relay] fresh session, no stored save: waiting for {peers[addr]['name']!r} to press START GAME")
             else:
                 _send_data(sock, addr, {"t": "status", "state": "connected",
-                                        "detail": "loading the relay's worldâ€¦" if spath
+                                        "detail": "loading the relay's world…" if spath
                                                   else f"waiting for the leader ({leader_name()!r}) to press START GAME"})
         roster_changed()
         if late and not relay_only:   # a relay tells late joiners what it is doing itself (above)
