@@ -73,6 +73,23 @@ int main()
     assert(SlicePublishReady(dir.c_str(),false));
     assert(!lobby::StartGame().empty() && lobby::S().q.empty());
     lobby::ShareAndStart(); // Worker recheck must return without reading a save.
+    // Every roster refresh exports the same stable origins used by bridge/company state.
+    auto& model = lobby::S().m;
+    model.players = {"Joiner with spaces", std::string(100, 'H')};
+    model.host = model.players[1]; model.relay = false;
+    lobby::WritePlayerNames();
+    auto readNames = [&] {
+        FILE* f = fopen((dir + "mp_players.txt").c_str(), "r"); assert(f);
+        char buf[1024]{}; const size_t n = fread(buf, 1, sizeof(buf), f); fclose(f);
+        return std::string(buf, n);
+    };
+    assert(readNames() == "b=Joiner with spaces\na=" + model.host + "\n");
+    model.relay = true; model.letters = {"ac", "z"};
+    lobby::WritePlayerNames();
+    assert(readNames() == "ac=Joiner with spaces\nz=" + model.host + "\n");
+    model.players.resize(1); lobby::WritePlayerNames();
+    assert(readNames() == "ac=Joiner with spaces\n");
+    assert(unlink((dir + "mp_players.txt").c_str()) == 0);
     assert(unlink(path.c_str())==0 && rmdir(temporary)==0);
     puts("lobby readiness: current-process hooks required for host, join and start; no external effects");
 }

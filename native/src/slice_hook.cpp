@@ -1297,8 +1297,24 @@ static void WriteNativeNotice(const char* kind)
 // and the peers read back as before). The first stop's raw fields are logged
 // on every decode so one real edit pins the predicted offsets.
 struct LineAlt  { int32_t station, terminal; };                   // StationTerminal, 8 B (t16: span 8*i at stop+0x10)
-struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[8]; int nWp; int32_t wp[64][2]; };
-struct LineDecode { int32_t wait; int n; LineStop st[64]; };
+// No limits of our own on a line: stops, a stop's platform choice (every
+// platform of a modular station it may use) and its signal waypoints are
+// whatever the game holds. The fixed arrays this had (8 platforms, a waypoint
+// index under 64) failed the decode SILENTLY; the edit then ran natively on
+// the host alone and the peers applied a read-back that carries neither, so
+// the host's trains and the peers' took different routes (vehicle drift
+// desync 2026-09-16). No bounds at all: a vector is read at the length the
+// game holds (ReadVec still requires the memory to be readable), an index
+// only has to be non-negative, and every refusal names its check in
+// g_lineDecodeWhy.
+struct LineWp   { int32_t entity, index; };                        // transport::SignalId
+// waits are the engine's floats, any value it holds (the cargo-wait slider goes
+// past the 36000 s this once refused, natively on the host only -- 2026-09-16)
+struct LineStop { int32_t sg, station, terminal, loadMode; float minWait, maxWait; int nAlt; std::vector<LineAlt> alt; int nWp; std::vector<LineWp> wp; };
+static const uint64_t LINE_ANY_SPAN = ~0ull;   // ReadVec's cap, not used as one
+static char g_lineDecodeWhy[200] = "";
+#define LINE_REFUSE(...) do { _snprintf_s(g_lineDecodeWhy, sizeof(g_lineDecodeWhy), _TRUNCATE, __VA_ARGS__); return false; } while (0)
+struct LineDecode { float wait; int n; std::vector<LineStop> st; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
 
@@ -1307,7 +1323,7 @@ static void WriteLineWaypoints(FILE* f, const LineDecode& d)
     bool first = true;
     for (int i = 0; i < d.n; i++) for (int w = 0; w < d.st[i].nWp; w++) {
         fprintf(f, "%s%d:%d:%d", first ? " wp=" : ",", i + 1,
-                d.st[i].wp[w][0], d.st[i].wp[w][1]);
+                d.st[i].wp[w].entity, d.st[i].wp[w].index);
         first = false;
     }
 }
@@ -1326,15 +1342,18 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         memcpy(&vc, (void*)(line + 0x10), 8);
         if (vb == ve && vc >= ve && (vb == 0 ? vc == 0 : IsHeapPtr(vb) && IsHeapPtr(vc))) {
             out->n = 0;
+            out->st.clear();
             return true;
         }
     }
     uint64_t sb = 0;
-    uint64_t span = ReadVec(line + vecOff, &sb, 0xa8 * 64);
-    if (span == 0 || (span % 0xa8) != 0) return false;
+    uint64_t span = ReadVec(line + vecOff, &sb, LINE_ANY_SPAN);
+    if (span == 0 || (span % 0xa8) != 0) LINE_REFUSE("stops vector at +0x%llx: span %llu (0 or not a multiple of 0xa8)", (unsigned long long)vecOff, (unsigned long long)span);
     int n = (int)(span / 0xa8);
-    if (n < 1 || n > 64) return false;
+    if (n < 1) LINE_REFUSE("%d stops", n);
     out->n = n;
+    out->st.clear();
+    out->st.resize((size_t)n);
     for (int i = 0; i < n; i++) {
         const uint8_t* b = (const uint8_t*)sb + (size_t)i * 0xa8;
         LineStop& t = out->st[i];
@@ -1345,39 +1364,45 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         memcpy(&t.loadMode, b + 0x28, 4);
         memcpy(&f2c,        b + 0x2c, 4);
         memcpy(&f30,        b + 0x30, 4);
-        // floats (see the layout note); NaN fails every comparison below
-        if (!(f2c >= 0.f && f2c <= 36000.f) || !(f30 >= 0.f && f30 <= 36000.f)) return false;
-        int32_t w2c = (int32_t)(f2c + 0.5f), w30 = (int32_t)(f30 + 0.5f);
-        // which of +0x2c/+0x30 is min is unpinned; min <= max always holds
-        if (w2c <= w30) { t.minWait = w2c; t.maxWait = w30; } else { t.minWait = w30; t.maxWait = w2c; }
-        if (t.sg <= 0 || t.station < 0 || t.station > 64 || t.terminal < 0 || t.terminal > 64
+        // floats (see the layout note); only NaN is refused -- a huge, infinite
+        // or negative wait is the slider's own encoding, shipped as %.9g
+        if (f2c != f2c || f30 != f30) LINE_REFUSE("stop %d waits %g/%g", i + 1, f2c, f30);
+        // +0x2c is minWaitingTime and +0x30 maxWaitingTime: the API's field
+        // order (stationGroup, station, terminal, alternativeTerminals,
+        // loadMode, minWaitingTime, maxWaitingTime, waypoints) laid out in
+        // memory. This used to SORT the two ("min <= max always holds"), and
+        // a max below the min -- the cargo slider's unlimited wait -- came out
+        // swapped on every peer (2026-09-16: "min and max confused").
+        t.minWait = f2c; t.maxWait = f30;
+        if (t.sg <= 0 || t.station < 0 || t.terminal < 0
             || t.loadMode < 0 || t.loadMode > 3)
-            return false;
+            LINE_REFUSE("stop %d sg=%d station=%d terminal=%d loadMode=%d", i + 1, t.sg, t.station, t.terminal, t.loadMode);
         // alternativeTerminals: vector<StationTerminal> at stop+0x10, 8 B each
         // (t16). Platform choice in the line editor lives here; a stop may
         // list several. Capped at 8; more than that fails the decode.
         t.nAlt = 0;
         uint64_t ab = 0;
-        uint64_t aspan = ReadVec((uint64_t)b + 0x10, &ab, 8 * 9);
-        if (aspan % 8) return false;
+        uint64_t aspan = ReadVec((uint64_t)b + 0x10, &ab, LINE_ANY_SPAN);
+        if (aspan % 8) LINE_REFUSE("stop %d alternative terminals span %llu", i + 1, (unsigned long long)aspan);
         int na = (int)(aspan / 8);
-        if (na > 8) return false;
+        t.alt.assign((size_t)na, LineAlt{});
         for (int a = 0; a < na; a++) {
             memcpy(&t.alt[a].station,  (const uint8_t*)ab + a * 8 + 0, 4);
             memcpy(&t.alt[a].terminal, (const uint8_t*)ab + a * 8 + 4, 4);
-            if (t.alt[a].station < 0 || t.alt[a].station > 64 || t.alt[a].terminal < 0 || t.alt[a].terminal > 64)
-                return false;
+            if (t.alt[a].station < 0 || t.alt[a].terminal < 0)
+                LINE_REFUSE("stop %d alternative %d: station=%d terminal=%d", i + 1, a + 1, t.alt[a].station, t.alt[a].terminal);
         }
         t.nAlt = na;
         // vector<transport::SignalId> {entity,index}, after this station stop.
         uint64_t wb = 0, we = 0;
         memcpy(&wb, b + 0x38, 8); memcpy(&we, b + 0x40, 8);
-        if (we < wb || (we - wb) % 8 || (we - wb) > sizeof(t.wp)) return false;
+        if (we < wb || (we - wb) % 8) LINE_REFUSE("stop %d waypoint vector %llx..%llx", i + 1, (unsigned long long)wb, (unsigned long long)we);
         t.nWp = (int)((we - wb) / 8);
-        if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) return false;
+        if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) LINE_REFUSE("stop %d waypoints unreadable", i + 1);
+        t.wp.assign((size_t)t.nWp, LineWp{});
         for (int w = 0; w < t.nWp; w++) {
-            memcpy(t.wp[w], (void*)(wb + w * 8), 8);
-            if (t.wp[w][0] <= 0 || t.wp[w][1] < 0 || t.wp[w][1] > 64) return false;
+            memcpy(&t.wp[w], (void*)(wb + w * 8), 8);
+            if (t.wp[w].entity <= 0 || t.wp[w].index < 0) LINE_REFUSE("stop %d waypoint %d: entity=%d index=%d", i + 1, w + 1, t.wp[w].entity, t.wp[w].index);
         }
     }
     return true;
@@ -1385,16 +1410,15 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
 
 static bool DecodeLine(uint64_t line, LineDecode* out)
 {
-    if (!IsHeapPtr(line) || !Readable((void*)line, 0x24)) return false;
-    // waitingTime's type was never recorded (t11 matched the value, not the
-    // width). Take whichever interpretation is a sane number of seconds.
+    g_lineDecodeWhy[0] = 0;
+    if (!IsHeapPtr(line) || !Readable((void*)line, 0x24)) LINE_REFUSE("line struct unreadable");
+    // waitingTime is a FLOAT at +0x18 (every live capture said so); any value
+    // but NaN is the game's own
     {
-        int32_t wi = 0; float wf = 0.f;
-        memcpy(&wi, (void*)(line + 0x18), 4);
+        float wf = 0.f;
         memcpy(&wf, (void*)(line + 0x18), 4);
-        if (wi >= 0 && wi <= 36000) out->wait = wi;
-        else if (wf >= 0.f && wf <= 36000.f) { out->wait = (int32_t)(wf + 0.5f); Log("[slice] LUPDATE: waitingTime is a FLOAT at +0x18 (%.1f) -- note it\n", wf); }
-        else return false;
+        if (wf != wf) LINE_REFUSE("waitingTime NaN");
+        out->wait = wf;
     }
     if (DecodeLineAt(line, 0x00, out)) return true;
     if (DecodeLineAt(line, 0x18, out)) { Log("[slice] LUPDATE: stops vector found at +0x18, not +0x00 -- update the layout note\n"); return true; }
@@ -1645,9 +1669,9 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             // %.4f, 127/255 came back as 0.4980, matched no palette entry, and every new
             // line was the same orange (2026-09-12).
             const LineDecode& d = g_lcDecode.line;
-            fprintf(f, "LCREATEX %.9g %.9g %.9g %d %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
+            fprintf(f, "LCREATEX %.9g %.9g %.9g %.9g %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
             for (int i = 0; i < d.n; i++) {
-                fprintf(f, " %d %d %d %d %d %d %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
+                fprintf(f, " %d %d %d %d %.9g %.9g %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
                         d.st[i].loadMode, d.st[i].minWait, d.st[i].maxWait, d.st[i].nAlt);
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
@@ -1665,9 +1689,9 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
         if (g_lineDecodeOk) {
             // LUPDATE <line> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n
             const LineDecode& d = g_lineDecode;
-            fprintf(f, "LUPDATE %d %d %d", (int)(int32_t)r8, d.wait, d.n);
+            fprintf(f, "LUPDATE %d %.9g %d", (int)(int32_t)r8, d.wait, d.n);
             for (int i = 0; i < d.n; i++) {
-                fprintf(f, " %d %d %d %d %d %d %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
+                fprintf(f, " %d %d %d %d %.9g %.9g %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
                         d.st[i].loadMode, d.st[i].minWait, d.st[i].maxWait, d.st[i].nAlt);
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
@@ -1675,11 +1699,11 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             WriteLineWaypoints(f, d);
             fprintf(f, "\n");
             if (d.n > 0)
-                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%d..%d)\n",
+                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%g stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%g..%g)\n",
                     (int)(int32_t)r8, d.wait, d.n, d.st[0].sg, d.st[0].station, d.st[0].terminal,
                     d.st[0].loadMode, d.st[0].minWait, d.st[0].maxWait);
             else
-                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=0 (last stop removed)\n",
+                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%g stops=0 (last stop removed)\n",
                     (int)(int32_t)r8, d.wait);
         } else {
             fprintf(f, "LUPDATE %d\n", (int)(int32_t)r8);
@@ -1908,7 +1932,8 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                 __try { g_lineDecodeOk = DecodeLine(r9, &g_lineDecode); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_lineDecodeOk = false; }
                 if (!g_lineDecodeOk && cancel) {
-                    Log("[slice] UpdateLine: Line decode failed -- NOT cancelled; event ships, peers read back\n");
+                    Log("[slice] UpdateLine: Line decode failed (%s) -- NOT cancelled; event ships, peers read back. "
+                        "LOCKSTEP AT RISK: this edit runs on this game first and the read-back may not carry it\n", g_lineDecodeWhy);
                     cancel = false;
                 }
             }
@@ -4540,8 +4565,16 @@ static DWORD WINAPI Init(LPVOID)
 
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%stpf2_slice.log", g_dataDir);
-    g_log = _fsopen(path, "w", _SH_DENYWR);
+    // KEEP LOGS: while <data dir>\tpf2mp_keep_logs.txt exists, every log that
+    // would start afresh is appended to instead (the bridge and menu logs always
+    // append); a session banner marks the start. The game's own stdout.txt is
+    // the game's -- snapshot it (tools\snapshot_logs.ps1) before a restart.
+    char keep[MAX_PATH]; snprintf(keep, sizeof(keep), "%stpf2mp_keep_logs.txt", g_dataDir);
+    const bool keepLogs = GetFileAttributesA(keep) != INVALID_FILE_ATTRIBUTES;
+    g_log = _fsopen(path, keepLogs ? "a" : "w", _SH_DENYWR);
     if (!g_log) return 0;
+    if (keepLogs) { SYSTEMTIME st; GetLocalTime(&st); fprintf(g_log, "\n==== session %04u-%02u-%02u %02u:%02u:%02u pid %lu (tpf2mp_keep_logs.txt present: appending) ====\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId()); }
     g_base = (uintptr_t)GetModuleHandleW(nullptr);
     Log("[slice] data dir=%s\n", g_dataDir);
     Log("[slice] dll dir=%s\n", g_dllDir[0] ? g_dllDir : "?");

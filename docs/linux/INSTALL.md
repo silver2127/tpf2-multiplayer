@@ -21,12 +21,12 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree follows **0.5.6 plus Windows dev `b406a913`** (dashboard
-tabs). All 28 shared Lua files match that commit byte for byte. This integration
-does not assign a new release version or establish cross-platform gameplay
-compatibility. See [UPSTREAM_dev_b406a913.md](UPSTREAM_dev_b406a913.md) for
-its scope and validation, and [UPSTREAM_0.5.6.md](UPSTREAM_0.5.6.md) for the
-previous integration.
+This development tree follows **0.5.6 plus Windows dev `55e97a48`**. Of 28
+shared Lua files, 27 match that commit byte for byte; lockstep.lua retains the
+previously integrated dashboard tabs alongside the new close-button behavior.
+The exact merge is hash-pinned. See [UPSTREAM_dev_55e97a48.md](UPSTREAM_dev_55e97a48.md)
+for native changes, tests and the remaining recovery-panel gap. This is not a
+new release or a claim of live cross-platform gameplay compatibility.
 
 **Known limits:** automatic resync, the new separate-company/shared-ownership
 operations, and automatic Workshop registration still need native Linux support.
@@ -152,6 +152,8 @@ the script fallback. Logs are in `<data home>/tpf2mp/data/tpf2mp_host.log`.
 
   This also works after a crash: just start the game again. The last 2 are kept. `about.txt` in each
   folder lists what is there, with sizes.
+  Create `tpf2mp_keep_logs.txt` in the runtime data folder to keep every archive
+  and append mod/lobby logs across starts. Remove it to restore normal retention.
 - **`./collect_logs.sh`** packs everything a bug report needs into
   `tpf2mp-logs-<computer>-<time>.zip` in your Downloads folder, without uploading anything:
   - the data folder and the saved runs;

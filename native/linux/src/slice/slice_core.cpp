@@ -157,7 +157,11 @@ SliceOpenResult SliceCoreOpen(const SliceCoreEnv& env)
     }
     g_lockFd = fd;
 
-    g_logFd = open(logPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND | O_CLOEXEC | O_NOCTTY, 0644);
+    char keepPath[4096 + 64];
+    snprintf(keepPath, sizeof(keepPath), "%stpf2mp_keep_logs.txt", g_dataDir);
+    const bool keepLogs = access(keepPath, F_OK) == 0;
+    g_logFd = open(logPath, O_WRONLY | O_CREAT | (keepLogs ? 0 : O_TRUNC) | O_APPEND | O_CLOEXEC | O_NOCTTY, 0644);
+    if (keepLogs && g_logFd >= 0) SliceLog("\n==== slice session %ld pid %d (keeping logs) ====\n", (long)time(nullptr), (int)g_pid);
     if (g_logFd < 0) return SliceOpenResult::NoLog;   // nowhere to log: stay inert, as Windows does
     if (g_lockFd < 0) {
         SliceLog("[slice] no instance lock (%s): hooks stay disabled\n", strerror(lockErr));
@@ -402,11 +406,11 @@ bool SliceSessionLive()
 static bool RecordReserve(SliceRecord* r, size_t extra)
 {
     if (r->failed) return false;
-    if (extra > ((size_t)1 << 30) || r->len > ((size_t)1 << 30)) { r->failed = true; return false; }
+    if (r->len == SIZE_MAX || extra > SIZE_MAX - r->len - 1) { r->failed = true; return false; }
     const size_t need = r->len + extra + 1;
     if (need <= r->cap) return true;
     size_t cap = r->cap ? r->cap : 256;
-    while (cap < need) cap *= 2;
+    while (cap < need) { if (cap > SIZE_MAX / 2) { cap = need; break; } cap *= 2; }
     char* d = (char*)realloc(r->data, cap);
     if (!d) { r->failed = true; return false; }
     r->data = d;

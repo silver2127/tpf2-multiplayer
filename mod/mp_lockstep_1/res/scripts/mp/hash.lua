@@ -239,22 +239,53 @@ function CM.vposCompare(stamp, o)
 		log(string.format("VPOS t=%d vs %s: n=%d/%d -- nothing to pair", stamp, o, #a, #b))
 		return
 	end
+	-- Pair by the vehicle's cross-peer key when both sides carry it: THE SAME
+	-- vehicle, not whichever of theirs happens to be closest. Only a vehicle one
+	-- side has not bound yet falls back to the nearest point.
+	local byKey = {}
+	for j = 1, #b do if b[j][3] then byKey[b[j][3]] = b[j] end end
 	local sum, mx, over1, over10 = 0, 0, 0, 0
+	local worst = {}
 	for i = 1, #a do
-		local ax, ay = a[i][1], a[i][2]
-		local best = nil
-		for j = 1, #b do
-			local dx, dy = b[j][1] - ax, b[j][2] - ay
-			local d = dx * dx + dy * dy
-			if not best or d < best then best = d end
+		local ax, ay, ak = a[i][1], a[i][2], a[i][3]
+		local best, pair = nil, ak and byKey[ak] or nil
+		if pair then
+			local dx, dy = pair[1] - ax, pair[2] - ay
+			best = dx * dx + dy * dy
+		else
+			for j = 1, #b do
+				local dx, dy = b[j][1] - ax, b[j][2] - ay
+				local d = dx * dx + dy * dy
+				if not best or d < best then best = d; pair = b[j] end
+			end
 		end
 		local d = math.sqrt(best)
 		sum = sum + d
 		if d > mx then mx = d end
-		if d > 1 then over1 = over1 + 1 end
+		if d > 1 then
+			over1 = over1 + 1
+			worst[#worst + 1] = { d = d, key = ak, x = ax, y = ay, px = pair and pair[1], py = pair and pair[2], byKey = ak and byKey[ak] ~= nil }
+		end
 		if d > 10 then over10 = over10 + 1 end
 	end
 	local mean = sum / #a
+	-- the offenders, worst first: which vehicle, on which line, where each side has it
+	table.sort(worst, function(p, q) return p.d > q.d end)
+	for i = 1, math.min(3, #worst) do
+		local w = worst[i]
+		local line = "?"
+		pcall(function()
+			local vid = w.key and CM.vehIdForKey and CM.vehIdForKey(w.key)
+			local tv = vid and api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
+			if tv and tv.line and tv.line > 0 then
+				local nm = api.engine.getComponent(tv.line, api.type.ComponentType.NAME)
+				line = tostring(tv.line) .. (nm and nm.name and (" '" .. tostring(nm.name) .. "'") or "")
+			end
+		end)
+		log(string.format("VPOS t=%d vs %s: drift #%d %s (%s) line %s: mine %.1f,%.1f  %s's %s,%s  off by %.1f m",
+			stamp, o, i, tostring(w.key or "unbound"), w.byKey and "same key" or "nearest", line, w.x, w.y, o,
+			w.px and string.format("%.1f", w.px) or "?", w.py and string.format("%.1f", w.py) or "?", w.d))
+	end
 	local h = CM.vposHist[o] or {}
 	CM.vposHist[o] = h
 	h[#h + 1] = { t = stamp, mean = mean, max = mx }
@@ -310,8 +341,8 @@ function CM.vposRecv(line)
 	rec.seen[i] = true
 	rec.got = rec.got + 1
 	if d and d ~= "-" then
-		for x, y in d:gmatch("([%-%d%.]+),([%-%d%.]+)") do
-			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0 }
+		for x, y, k in d:gmatch("([%-%d%.]+),([%-%d%.]+),?([^;]*)") do
+			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0, (k ~= "" and k ~= "-") and k or nil }
 		end
 	end
 	CM.vposCompare(stamp, o)
@@ -495,7 +526,12 @@ local function worldHash(now)
 				-- quantised exactly as it ships (0.1 m), so a peer's copy of an
 				-- identical world compares at 0.00 and not at the rounding floor
 				-- (measured 0.04-0.05 m before this)
-				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10 } end
+				-- with the vehicle's cross-peer key, so the drift check pairs the SAME
+				-- vehicle on both sides and can name the one that drifts (a nearest-
+				-- neighbour pairing read 10 m on the host while the joiner's copy of one
+				-- train was 1,150 m away, 2026-09-16). Silent for a vehicle not bound yet.
+				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10,
+					CM.vehKeyOf and CM.vehKeyOf[vid] or (CM.primedVeh and CM.primedVeh[vid] and ("s:" .. tostring(vid))) or nil } end
 			end
 		end
 		-- the raw positions feed the drift METRIC (CM.vposShip / CM.vposCompare):

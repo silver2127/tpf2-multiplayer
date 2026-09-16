@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that Linux ships the exact Lua sources from Windows dev dashboard-tabs snapshot."""
+"""Verify that Linux ships the pinned Windows dev Lua plus the retained dashboard-tabs merge."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,8 +7,12 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "b406a9139676d63d67f61b4e7b77699c2070f0f8"
+REFERENCE = "55e97a48b7dfdf46743fab5a78a8aefdd14f2ed9"
 PREFIX = "mod/mp_lockstep_1/"
+# The earlier b406a913 tabs were integrated before this batch. The exact,
+# reviewed merge retains them alongside upstream's title-bar close handler.
+# docs/linux/UPSTREAM_dev_55e97a48_tabs.patch records the complete difference.
+MERGED_SHA256 = {"res/config/game_script/lockstep.lua": "62953bf38cda8121b6c54da61980967de5231554bd9571dbbbbc503336f85cb6"}
 
 
 def main():
@@ -26,14 +30,15 @@ def main():
                   for p in args.mod_dir.rglob("*.lua")}
         missing = sorted(expected.keys() - actual.keys())
         extra = sorted(actual.keys() - expected.keys())
-        different = sorted(p for p in expected.keys() & actual.keys() if expected[p] != actual[p])
+        different = sorted(p for p in expected.keys() & actual.keys() if (hashlib.sha256(actual[p]).hexdigest() != MERGED_SHA256[p]
+                            if p in MERGED_SHA256 else expected[p] != actual[p]))
         for title, names in (("missing", missing), ("extra", extra), ("changed", different)):
             for name in names:
                 print(f"FAIL: {title} Lua file: {name}", file=sys.stderr)
         if missing or extra or different:
             return 1
-        manifest = "".join(f"{hashlib.sha256(expected[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files match Windows dev b406a913 ({commit}) byte for byte")
+        manifest = "".join(f"{hashlib.sha256(actual[p]).hexdigest()}  {p}\n" for p in sorted(expected))
+        print(f"PASS: {len(expected)} Lua files verified against Windows dev 55e97a48 ({commit}); 27 byte-identical, 1 pinned dashboard-tabs merge")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
         return 0
     except (OSError, subprocess.CalledProcessError) as error:

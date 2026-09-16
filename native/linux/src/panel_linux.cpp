@@ -60,6 +60,9 @@ struct PanelState {
     std::string dataDir;
     std::string joinCode, passCode, username, lobbyName, chatInput;
     std::string status;
+    bool userAuto = true;
+    std::string steamName;
+    uint64_t steamNext = 0;
     std::string flagMaster = "https://srv1306562.hstgr.cloud/tpf2mp";   // menu_hook.cpp g_flagMaster
     lobby::View view;
     std::vector<lobby::PubRow> pubRows;
@@ -152,15 +155,16 @@ static void SaveNamesLocked()
 {
     FILE* f = fopen((P().dataDir + "tpf2_names.txt").c_str(), "w");
     if (!f) return;
-    fprintf(f, "player=%s\nlobby=%s\n", P().username.c_str(), P().lobbyName.c_str());
+    fprintf(f, "player=%s\nlobby=%s\nauto=%d\n", P().username.c_str(), P().lobbyName.c_str(), P().userAuto ? 1 : 0);
     fclose(f);
 }
 
 static void LoadNamesLocked()
 {
     FILE* f = fopen((P().dataDir + "tpf2_names.txt").c_str(), "r");
+    bool sawAuto = false, sawPlayer = false;
     if (f) {
-        char line[128];
+        char line[512];
         while (fgets(line, sizeof(line), f)) {
             char* e = line + strlen(line);
             while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
@@ -168,13 +172,57 @@ static void LoadNamesLocked()
             if (!eq) continue;
             *eq = 0;
             const char* v = eq + 1;
-            if (!strcmp(line, "player") && v[0]) P().username.assign(v, strnlen(v, 30));
-            else if (!strcmp(line, "lobby")) P().lobbyName.assign(v, strnlen(v, 36));
+            if (!strcmp(line, "player") && v[0]) { P().username.assign(v, strnlen(v, 127)); sawPlayer = true; }
+            else if (!strcmp(line, "lobby")) P().lobbyName.assign(v, strnlen(v, 127));
+            else if (!strcmp(line, "auto")) { sawAuto = true; P().userAuto = v[0] == '1'; }
         }
         fclose(f);
     }
+    if (!sawAuto) P().userAuto = !sawPlayer;
     EnsureUsernameLocked();
     if (!f) SaveNamesLocked();   // first run: keep the random name from now on
+}
+
+// Use only the game's already loaded Steam API. SysV C exports verified in
+// the shipped libsteam_api.so; no Steam initialization or interface vtable guesses.
+static void SteamNameTickLocked()
+{
+    const uint64_t now = NowMs();
+    if (now < P().steamNext) return;
+    P().steamNext = now + (P().steamName.empty() ? 2000 : 30000);
+    void* h = dlopen("libsteam_api.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!h) return;
+    auto user = reinterpret_cast<int (*)()>(dlsym(h, "SteamAPI_GetHSteamUser"));
+    auto friends = reinterpret_cast<void* (*)()>(dlsym(h, "SteamAPI_SteamFriends_v017"));
+    auto persona = reinterpret_cast<const char* (*)(void*)>(dlsym(h, "SteamAPI_ISteamFriends_GetPersonaName"));
+    std::string name;
+    if (user && friends && persona && user()) {
+        void* f = friends();
+        const char* n = f ? persona(f) : nullptr;
+        bool space = false;
+        for (size_t i = 0; n && n[i] && name.size() < 127; ++i) {
+            unsigned char c = n[i];
+            if (c < 32 || c == '"' || c == '\\' || c == '#') continue;
+            if (c == ' ') { space = !name.empty(); continue; }
+            if (space) { name += ' '; space = false; }
+            if (name.size() < 127) name += char(c);
+        }
+        // Do not retain a partial UTF-8 codepoint at the byte limit.
+        if (n && n[0] && name.size() == 127) {
+            size_t start = name.size() - 1;
+            while (start && (static_cast<unsigned char>(name[start]) & 0xc0) == 0x80) --start;
+            unsigned char c = name[start];
+            size_t width = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+            if (name.size() - start < width) name.resize(start);
+        }
+    }
+    dlclose(h);
+    if (name.empty()) return;
+    P().steamName = name;
+    if (!P().userAuto || g_focus == 3 || g_uiState >= 2 || P().username == name) return;
+    P().username = name;
+    SaveNamesLocked();
+    g_dirty = true;
 }
 
 static void WriteDashFlagLocked()
@@ -439,7 +487,7 @@ static void RenderHostJoinLocked(int w, int h)
     MwBody(pad, cy + S(136), w - 2 * pad, S(20),
            "Everyone needs the Transport Fever 2 Multiplayer mod, and the shared save must have it enabled.");
     MwHeader(pad, cy + S(162), S(260), "YOUR NAME");
-    MwField(pad, cy + S(186), S(260), S(30), P().username, g_focus == 3, "Click to type a name", 13);
+    MwField(pad, cy + S(186), S(260), S(30), P().username, g_focus == 3, "Steam name (click to type your own)", 13);
     MwHeader(pad + S(290), cy + S(162), w - 2 * pad - S(290),
              "PASSWORD  --  optional; anyone who has the code can read your IP address");
     MwField(pad + S(290), cy + S(186), S(260), S(30), std::string(P().passCode.size(), '*'), g_focus == 2,
@@ -663,8 +711,8 @@ static void TypeLocked(const char* text)
         switch (g_focus) {
             case 1: if (c > 32 && P().joinCode.size() < 200) P().joinCode.push_back((char)c); break;
             case 2: if (WordChar(c) && P().passCode.size() < 32) P().passCode.push_back((char)c); break;
-            case 3: if (WordChar(c) && P().username.size() < 24) P().username.push_back((char)c); break;
-            case 4: if ((WordChar(c) || ((c == ' ' || c == '\'') && !P().lobbyName.empty())) && P().lobbyName.size() < 36)
+            case 3: if ((WordChar(c) || (c == ' ' && !P().username.empty())) && P().username.size() < 64) P().username.push_back((char)c); break;
+            case 4: if ((WordChar(c) || ((c == ' ' || c == '\'') && !P().lobbyName.empty())) && P().lobbyName.size() < 64)
                         P().lobbyName.push_back((char)c);
                     break;
             default: break;
@@ -690,8 +738,9 @@ static void TypeChatLocked(const char* text)
 static void PopCharLocked(std::string* s)
 {
     if (s->empty()) return;
-    s->pop_back();
-    while (!s->empty() && ((unsigned char)s->back() & 0xC0) == 0x80) s->pop_back();   // a whole UTF-8 character
+    size_t start = s->size() - 1;
+    while (start && ((unsigned char)(*s)[start] & 0xC0) == 0x80) --start;
+    s->resize(start);   // a whole UTF-8 character
     g_dirty = true;
 }
 
@@ -802,7 +851,10 @@ static bool HandleEventLocked(SDL_Event* e, Post* post)
                 else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
                     const int f = g_focus;
                     g_focus = 0;
-                    if (f == 3 && P().username.empty()) EnsureUsernameLocked();
+                    if (f == 3) {
+                        P().userAuto = P().username.empty() || P().username == P().steamName;
+                        if (P().username.empty()) { P().username = P().steamName; EnsureUsernameLocked(); }
+                    }
                     if (f == 3 || f == 4) SaveNamesLocked();
                     if (f == 1) OnHitLocked(3, post);
                     g_dirty = true;
@@ -987,6 +1039,7 @@ void MaxSize(int screenW, int screenH, int* w, int* h)
 bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* changed)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
+    SteamNameTickLocked();
     if (!VisibleLocked()) return false;
     int pw, ph;
     LayoutLocked(screenW, screenH, &pw, &ph);

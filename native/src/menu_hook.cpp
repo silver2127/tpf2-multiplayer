@@ -483,7 +483,11 @@ static void ModDownloadPreference(bool save) {
 }
 
 // lobby model (fed from lobby_out.jsonl)
-static char g_players[200][40]; static int g_playerCount = 0;
+// Player and lobby names (2026-09-16: longer names). A Steam persona is up to 32
+// characters, in UTF-8 up to 96 bytes; the panel takes 64 typed characters.
+#define NAME_MAX 128
+#define NAME_TYPED_MAX 64
+static char g_players[200][NAME_MAX]; static int g_playerCount = 0;
 static int  g_companies[200];   // company id per roster entry (1..200), 0 = unset -> 1
 // Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
 static COLORREF coColor(int cid)
@@ -504,7 +508,7 @@ static void originName(int idx, char* out)
     if (idx < 26) { out[0] = (char)('a' + idx); out[1] = 0; return; }
     idx -= 26; out[0] = (char)('a' + (idx / 26) % 26); out[1] = (char)('a' + idx % 26); out[2] = 0;
 }
-static char g_you[40] = ""; static char g_host[40] = ""; static char g_lobbyTitle[40] = "";   // the lobby's name, from the roster
+static char g_you[NAME_MAX] = ""; static char g_host[NAME_MAX] = ""; static char g_lobbyTitle[NAME_MAX] = "";   // the lobby's name, from the roster
 static volatile LONG g_lobbyRelay = 0;   // the host is a relay-only server: "host" in the roster is the LEADER (oldest joiner)
 static char g_letters[200][3];           // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
@@ -769,33 +773,87 @@ static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, siz
 #define MW_YOU    RGB(150, 210, 170)
 static char g_joinCode[256] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
 static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
-static char g_username[40] = "";   // the player name (random two-word default, see ensureUsername)
-static char g_lobbyName[40] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
+static char g_username[NAME_MAX] = "";   // the player name (random two-word default, see ensureUsername)
+static char g_lobbyName[NAME_MAX] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
 static int  g_userLen = 0;
 static void ensureUsername();
 static void SaveNames();
-// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=...) so they
-// survive a relaunch; a blank file leaves the random two-word default.
+// The player name follows the STEAM persona name (2026-09-16) unless the
+// player typed one. g_userAuto says which: auto names are re-read from Steam
+// every launch (the persona can change), a typed one is kept as typed. Clearing
+// the field and pressing Enter goes back to Steam.
+static bool g_userAuto = true;
+static char g_steamName[NAME_MAX] = "";
+static bool SteamPersonaName(char* out, size_t cap)
+{
+    HMODULE h = GetModuleHandleW(L"steam_api64.dll"); if (!h) return false;
+    typedef int (*HUserFn)(); typedef void* (*FriendsFn)(); typedef const char* (*PersonaFn)(void*);
+    HUserFn huser = (HUserFn)GetProcAddress(h, "SteamAPI_GetHSteamUser");
+    FriendsFn friends = (FriendsFn)GetProcAddress(h, "SteamAPI_SteamFriends_v017");
+    PersonaFn persona = (PersonaFn)GetProcAddress(h, "SteamAPI_ISteamFriends_GetPersonaName");
+    if (!huser || !friends || !persona || huser() == 0) return false;   // the game has not initialised Steam yet
+    void* fr = friends(); if (!fr) return false;
+    const char* n = persona(fr); if (!n || !n[0]) return false;
+    // The name is a command-line argument, a JSON string and a roster key:
+    // printable only, no quotes or backslashes, no '#' (the lobby's own
+    // de-dup suffix, "name#2"), spaces collapsed and trimmed.
+    size_t o = 0; bool sp = false;
+    for (size_t i = 0; n[i] && o + 1 < cap; i++) {
+        unsigned char c = (unsigned char)n[i];
+        if (c < 32 || c == '"' || c == '\\' || c == '#') continue;
+        if (c == ' ') { sp = o > 0; continue; }
+        if (sp) { out[o++] = ' '; sp = false; if (o + 1 >= cap) break; }
+        out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return o > 0;
+}
+// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=..., auto=1)
+// so they survive a relaunch. No file, or auto=1: the name follows Steam
+// (the random two-word default stands in until Steam answers).
 static void LoadNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
-    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: keep the random name from now on
-    char line[128];
+    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: follow Steam from now on
+    char line[512]; bool sawAuto = false, sawPlayer = false;
     while (fgets(line, sizeof(line), f)) {
         char* e = line + strlen(line); while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
         char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
-        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, 30); }
-        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, 36); }
+        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, NAME_MAX - 1); sawPlayer = true; }
+        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, NAME_MAX - 1); }
+        else if (!strcmp(line, "auto")) { sawAuto = true; g_userAuto = v[0] == '1'; }
     }
     fclose(f);
+    // a file from before auto= existed holds a name the player kept: treat it as typed
+    if (!sawAuto) g_userAuto = !sawPlayer;
     g_userLen = (int)strlen(g_username); g_lobbyNameLen = (int)strlen(g_lobbyName);
-    Log("[menu] names: player=%s lobby=%s\n", g_username, g_lobbyName);
+    Log("[menu] names: player=%s (%s) lobby=%s\n", g_username, g_userAuto ? "follows Steam" : "typed", g_lobbyName);
 }
 static void SaveNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
     FILE* f = _wfopen(p, L"w"); if (!f) return;
-    fprintf(f, "player=%s\nlobby=%s\n", g_username, g_lobbyName); fclose(f);
+    fprintf(f, "player=%s\nlobby=%s\nauto=%d\n", g_username, g_lobbyName, g_userAuto ? 1 : 0); fclose(f);
+}
+// Called from the present hook: Steam is initialised by the game some time
+// after our DLL loads, so the persona is asked for until it answers, then
+// re-checked now and then (the player can rename themselves in Steam).
+static void SteamNameTick()
+{
+    static ULONGLONG next = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + (g_steamName[0] ? 30000 : 2000);
+    char n[NAME_MAX];
+    if (!SteamPersonaName(n, sizeof(n))) return;
+    if (strcmp(n, g_steamName) != 0) { strcpy_s(g_steamName, n); Log("[menu] steam persona: %s\n", n); }
+    if (!g_userAuto || InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3) return;   // typed, or being typed right now
+    if (strcmp(g_username, n) == 0) return;
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) >= 2) return;   // in a lobby already: the roster has the old name; next time
+    strcpy_s(g_username, n); g_userLen = (int)strlen(g_username);
+    SaveNames();
+    InterlockedExchange(&g_panelDirty, 1);
+    Log("[menu] username follows Steam: %s\n", g_username);
 }
 static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itself to the master server
 
@@ -804,7 +862,7 @@ static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itsel
 // HOST/JOIN page is up; rows render below the password field and a click
 // drops the row's code into the join field. The list is what hosts chose to
 // publish (see _Publisher in lobby.py); nothing here talks to a host directly.
-struct PubRow { char name[48]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
+struct PubRow { char name[NAME_MAX]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
 static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
@@ -1014,8 +1072,12 @@ static void RenderPanelLayer(int w, int h)
         if(!requested) {
             if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
             else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
-            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted")))
+            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted"))) {
                 mwButton(pad,h-S(76),S(210),S(30),g_playerCount>2 ? L"Request readiness" : L"Resync now",84);
+                // The host declines: the panel closes on every game and stays
+                // closed for this world (a later resync, or a new lobby, lifts it).
+                if(detected) mwButton(pad+S(222),h-S(76),S(150),S(30),L"Keep playing",88);
+            }
             else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
                 mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
         }
@@ -1023,7 +1085,7 @@ static void RenderPanelLayer(int w, int h)
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
         int titleW = S(90);
-        { wchar_t wt[64] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, 48); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
+        { wchar_t wt[NAME_MAX + 16] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, NAME_MAX); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
           mwTitle(wt); HFONT ft = mkLato(S(18)); titleW = textW(wt, ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
             // ROOM CODE, DELIBERATELY NOT RENDERED.
@@ -1057,7 +1119,7 @@ static void RenderPanelLayer(int w, int h)
         mwHeader(pad, cy, listW, whdr);
         HFONT fr = mkLato(S(14)), fs = mkLato(S(11));
         for (int i = 0; i < n && i < ROSTER_ROWS; i++) {
-            wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, 64);
+            wchar_t wn[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, NAME_MAX);
             bool isYou = strcmp(g_players[i], g_you) == 0, isHost = strcmp(g_players[i], g_host) == 0;
             int ry = cy + S(30) + i * S(26);
             // company chip: colour + number; click your own (the host: anyone's) to cycle 1..16
@@ -1137,7 +1199,7 @@ static void RenderPanelLayer(int w, int h)
         // NOT ensureUsername() here: this runs every frame, so emptying the name
         // field made the next frame roll a new random name before anything could be
         // typed (2026-09-11). An empty name is filled only on HOST/JOIN or Enter.
-        { char def[64];
+        { char def[NAME_MAX + 48];
           if (g_username[0]) snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
           else snprintf(def, sizeof(def), "Your game  (click to name the lobby)");
           wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
@@ -1155,7 +1217,7 @@ static void RenderPanelLayer(int w, int h)
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
         mwHeader(pad, cy + S(162), S(260), L"YOUR NAME");
-        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Click to type a name", 13);
+        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Steam name (click to type your own)", 13);
         mwHeader(pad + S(290), cy + S(162), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
           mwField(pad + S(290), cy + S(186), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
@@ -1568,6 +1630,20 @@ static void OnHit(int id)
             if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
         }
         break;
+    case 88: { // The host keeps playing: every game's panel closes and stays closed for this world.
+        if(!InterlockedCompareExchange(&g_isHost,0,0)) break;
+        static LONG declineNo = 0;
+        char line[160]; snprintf(line,sizeof(line),"{\"cmd\":\"sync_decline\",\"id\":\"decline-%lu-%llu-%ld\"}",
+            GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&declineNo));
+        LobbySend(line);
+        EnterCriticalSection(&g_modelCs);
+        if(!strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual")) {
+            g_recoveryPhase[0]=0;
+            InterlockedExchange(&g_uiState,0); InterlockedExchange(&g_recoveryPresent,0);
+            InterlockedExchange(&g_panelDirty,1);
+        }
+        LeaveCriticalSection(&g_modelCs);
+    } break;
     case 85: // Dismiss a preflight notice; never hide a held operation.
         EnterCriticalSection(&g_modelCs);
         if(!strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual") || !strcmp(g_recoveryPhase,"detected")) {
@@ -1644,14 +1720,14 @@ static void OnHit(int id)
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game list…"); break;
     case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
-        int i = id - 40; char code[256] = ""; char name[48] = ""; bool locked = false;
+        int i = id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
         if (code[0]) { strcpy_s(g_joinCode, code); g_joinLen = (int)strlen(g_joinCode); InterlockedExchange(&g_joinFocus, 1);
                        char st[200]; snprintf(st, sizeof(st), locked ? "%s's game needs its password: type it below, then JOIN GAME." : "%s's code is filled in -- press JOIN GAME.", name); SetStatus(st); }
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
     case 28: case 29: case 30: case 31: case 32: case 33: case 34: case 35: {   // company chip
-        int i = id - 20; char name[40] = ""; int cur = 1;
+        int i = id - 20; char name[NAME_MAX] = ""; int cur = 1;
         if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < g_playerCount) { strcpy_s(name, g_players[i]); cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
         // cycle: the next company id somebody already uses, then one brand-new id, then back to 1
         bool used[MAX_COMPANIES + 2] = {}; int maxUsed = 0;
@@ -1672,6 +1748,7 @@ static void OnHit(int id)
 static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     PollLobbyOpen();
+    SteamNameTick();
     LONG n = InterlockedIncrement(&g_presentCount);
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
@@ -2341,6 +2418,24 @@ static void writeCompanyCfg()
     Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3, l4);
 }
 
+// mp_players.txt: "letter=name" per roster entry, with the same letters the
+// bridge ctl and the company cfg use. The in-game dashboard's company picker
+// shows player names instead of origin letters from it (2026-09-16). Written on
+// every roster change so a hot joiner appears by name too.
+static void writePlayerNames()
+{
+    std::string content;
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    for (int i = 0; i < g_playerCount; i++) {
+        content += originLetterFor(g_players[i]); content += '='; content += g_players[i]; content += '\n';
+    }
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_players.txt", g_dataDirW);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0; WriteFile(h, content.c_str(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
+}
+
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
 static void applyRoster(const char* s)
 {
@@ -2352,7 +2447,7 @@ static void applyRoster(const char* s)
         if (pa && end) { const char* q = pa;
             while (g_playerCount < MAX_PLAYERS) {
                 q = strchr(q, '"'); if (!q || q > end) break; q++;
-                int k = 0; while (*q && *q != '"' && k < 38) g_players[g_playerCount][k++] = *q++;
+                int k = 0; while (*q && *q != '"' && k < NAME_MAX - 1) g_players[g_playerCount][k++] = *q++;
                 g_players[g_playerCount][k] = 0; g_playerCount++;
                 if (*q == '"') q++;
             } } }
@@ -2361,11 +2456,11 @@ static void applyRoster(const char* s)
     for (int i = 0; i < g_playerCount; i++) {
         g_companies[i] = 1;
         if (!co) continue;
-        char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+        char keyq[NAME_MAX + 8]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
         const char* k = strstr(co, keyq);
         if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
     }
-    char v[40];
+    char v[NAME_MAX];
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
     jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
@@ -2376,7 +2471,7 @@ static void applyRoster(const char* s)
     { const char* lm = strstr(s, "\"letters\"");
       if (lm && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
           for (int i = 0; i < g_playerCount; i++) {
-              char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+              char keyq[NAME_MAX + 8]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
               const char* k = strstr(lm, keyq);
               if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; int j = 0; while (*k && *k != '"' && j < 2) g_letters[i][j++] = *k++; g_letters[i][j] = 0; } }
           }
@@ -2408,6 +2503,7 @@ static void applyRoster(const char* s)
     // start path) and catches up on the command history. No button, no
     // pause, no ordering to get right.
     static int lastCount = 0;
+    writePlayerNames();
     bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
     if (isHost && inGame && count > lastCount && lastCount > 0) {
         LONG age = InterlockedCompareExchange(&g_storedAge, 0, 0), mx = InterlockedCompareExchange(&g_storedMax, 0, 0);
@@ -2659,13 +2755,13 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char lobby[48]; };
+struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; char lobby[NAME_MAX]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
     g_transportLobby[0]=0;
-    wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
+    wchar_t wname[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, NAME_MAX);
     wchar_t cmd[4096];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
     // the target machine); fall back to `python lobby.py` when only the scripts are there.
@@ -2698,17 +2794,17 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     wchar_t wpass[96] = L"";
     if (a->password[0]) { wchar_t wp[40]; MultiByteToWideChar(CP_UTF8, 0, a->password, -1, wp, 40); _snwprintf_s(wpass, _TRUNCATE, L" --password %s", wp); }
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
-                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
+                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name \"%s\" --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
                                 base, wc, wname, relayPort, bridgePort, fwd, wpass); }
     else {
         // the public list: always tell the lobby where the master server is (the
         // PUBLIC checkbox can be flipped later, in the lobby); --public starts listed
-        wchar_t wpub[560] = L"";
-        { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, 48); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
+        wchar_t wpub[560 + NAME_MAX] = L"";
+        { wchar_t wl[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, NAME_MAX); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
-        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
+        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name \"%s\" --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
     { wchar_t recoveryArgs[1100];
@@ -2733,7 +2829,18 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // KEEP LOGS: with <data dir>\tpf2mp_keep_logs.txt present the previous run's
+    // lobby_proc.log is kept and this run appends after a banner.
+    wchar_t keepFlag[MAX_PATH]; _snwprintf_s(keepFlag, _TRUNCATE, L"%stpf2mp_keep_logs.txt", g_dataDirW);
+    const bool keepLogs = g_dataDirW[0] && GetFileAttributesW(keepFlag) != INVALID_FILE_ATTRIBUTES;
+    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, keepLogs ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (keepLogs && hLog != INVALID_HANDLE_VALUE) {
+        SetFilePointer(hLog, 0, nullptr, FILE_END);
+        SYSTEMTIME st; GetLocalTime(&st);
+        char banner[160]; int n = snprintf(banner, sizeof(banner), "\n==== lobby session %04u-%02u-%02u %02u:%02u:%02u (tpf2mp_keep_logs.txt present: appending) ====\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        DWORD w; WriteFile(hLog, banner, (DWORD)n, &w, nullptr);
+    }
     STARTUPINFOW si = { sizeof(si) };
     // Redirect the lobby's output ONLY if the log actually opened. Handing
     // CreateProcess an INVALID_HANDLE_VALUE as stdout/stderr gives the child a
@@ -3171,12 +3278,20 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
         if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && nameField) {
             // player name: one word (it is a bare --name argument); lobby name: words, digits, ' - _ .
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = focus == 3 ? 24 : 36;
+            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = NAME_TYPED_MAX;
             if (vk == VK_BACK) { if (*len > 0) { buf[--*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
-            else if (vk == VK_RETURN) { if (focus == 3 && !g_username[0]) ensureUsername(); InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
+            else if (vk == VK_RETURN) {
+                if (focus == 3) {
+                    if (!g_username[0]) {   // cleared: back to the Steam name (or the random default until Steam answers)
+                        g_userAuto = true;
+                        if (g_steamName[0]) { strcpy_s(g_username, g_steamName); g_userLen = (int)strlen(g_username); } else ensureUsername();
+                        Log("[menu] username cleared -> follows Steam (%s)\n", g_username);
+                    } else g_userAuto = strcmp(g_username, g_steamName) == 0;   // typed back exactly the Steam name: still follows it
+                }
+                InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
             else { char c = vkToChar((int)vk, shift);
                    bool word = c && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.');
-                   bool okc = word || (focus == 4 && (c == ' ' || c == '\'') && *len > 0);
+                   bool okc = word || ((focus == 4 || focus == 3) && c == ' ' && *len > 0) || (focus == 4 && c == '\'' && *len > 0);
                    if (okc && *len < cap) { buf[(*len)++] = c; buf[*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
         }
         else if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && passField) {

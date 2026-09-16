@@ -90,6 +90,7 @@ local function vehIdFor(key)
 	if id and CM.primedVeh[id] then return id end
 	return nil
 end
+function CM.vehIdForKey(key) return vehIdFor(key) end   -- the drift check names the vehicle that drifts
 
 -- Prime knownVeh from every player depot once constructions are primed.
 function CM.primeVehKeys()
@@ -228,6 +229,107 @@ function CM.drainVehCap()
 end
 
 -- Resolve pending purchase keys: the depot's vehicle that is not yet known.
+-- Which STEP each keyed vehicle leaves its depot on, logged on every instance:
+-- two clones bought 0.8 s apart onto one line left the same depot in opposite
+-- order on the two games (a:58/a:59, 2026-09-16) with every command of ours on
+-- the same step on both, so the order was decided inside the engine. This
+-- names the step so the next pair says whether the departures themselves
+-- differ. One transportVehicleSystem query per tick.
+function CM.watchDepartures()
+	local parked = {}
+	local ok = pcall(function()
+		local st = api.type.enum.TransportVehicleState.IN_DEPOT
+		if st == nil then return end
+		local list = api.engine.system.transportVehicleSystem.getVehiclesWithState(st)
+		for i = 1, #list do parked[list[i]] = true end
+	end)
+	if not ok then return end
+	local step = CM.stepOf(CM.gameTime() or 0)
+	CM.depotSince = CM.depotSince or {}
+	for vid, since in pairs(CM.depotSince) do
+		if not parked[vid] then
+			local key = CM.vehKeyOf[vid] or (CM.primedVeh[vid] and ("s:" .. tostring(vid))) or ("id " .. tostring(vid))
+			log(string.format("veh: %s left its depot at step %d (parked since step %d)", key, step, since))
+			CM.depotSince[vid] = nil
+		end
+	end
+	for vid in pairs(parked) do
+		if not CM.depotSince[vid] then CM.depotSince[vid] = step end
+	end
+end
+
+-- TRAIN PATHS AND HALTS, STEP-STAMPED (2026-09-16). A desync at t=19008 had no
+-- command in 1,450 game units, identical positions 288 units earlier, identical
+-- edge/node ids at the junction, and the world hash still equal -- yet on one
+-- game two trains queued on one track while the other track's train went
+-- through, and on the other game the opposite. That is something the engine
+-- decides on its own: which train gets a junction, when a path result lands.
+-- Every train's path signature (edge count, first and last edge) and its
+-- stop/go transitions are logged with the SIM STEP, so two games' logs can be
+-- diffed to the step: a path that changes on step N here and N+2 there is the
+-- finding. Rail only, refreshed every 300 ticks, one MOVE_PATH read per train
+-- per update; off past 200 trains.
+CM.trainWatch = { list = {}, last = {}, at = -1e9, off = false }
+function CM.watchTrains()
+	local W = CM.trainWatch
+	if W.off then return end
+	local step = CM.stepOf(CM.gameTime() or 0)
+	if CM.ticks - W.at >= 300 then
+		W.at = CM.ticks
+		local list, ok = {}, pcall(function()
+			local rail = api.type.enum.Carrier.RAIL
+			local t = game.interface.getEntities({ radius = 999999 }, { type = "VEHICLE" }) or {}
+			for _, vid in pairs(t) do
+				local tv = api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
+				if tv and tv.carrier == rail then list[#list + 1] = vid end
+			end
+		end)
+		if not ok then W.off = true; log("TRAIN watch: cannot list rail vehicles -- off"); return end
+		if #list > 200 then W.off = true; log(string.format("TRAIN watch: %d trains -- off", #list)); return end
+		table.sort(list)
+		W.list = list
+		local keep = {}
+		for _, vid in ipairs(list) do keep[vid] = W.last[vid] end
+		W.last = keep
+	end
+	for _, vid in ipairs(W.list) do
+		local okR, err = pcall(function()
+			local mp = api.engine.getComponent(vid, api.type.ComponentType.MOVE_PATH)
+			if not mp then return end
+			local edges = mp.path.edges
+			local n = #edges
+			local sig = n .. ":" .. (n > 0 and tostring(edges[1].edgeId.entity) or "-") .. ":" .. (n > 0 and tostring(edges[n].edgeId.entity) or "-")
+			local speed = mp.dyn.speed or 0
+			local idx = mp.dyn.pathPos and mp.dyn.pathPos.edgeIndex or -1
+			local key = CM.vehKeyOf[vid] or (CM.primedVeh[vid] and ("s:" .. tostring(vid))) or ("id " .. tostring(vid))
+			local L = W.last[vid]
+			if not L then W.last[vid] = { sig = sig, speed = speed, since = step }; return end
+			if sig ~= L.sig then
+				log(string.format("TRAIN %s path -> %s at step %d (was %s; idx %d)", key, sig, step, L.sig, idx))
+				L.sig = sig
+			end
+			local wasMoving, moving = (L.speed or 0) > 0.01, speed > 0.01
+			if wasMoving ~= moving then
+				local state = "?"
+				pcall(function() state = tostring(api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE).state) end)
+				local edge = (idx >= 0 and idx < n) and tostring(edges[idx + 1].edgeId.entity) or "?"
+				if moving then
+					log(string.format("TRAIN %s moving at step %d after %d steps halted (edge %s idx %d/%d state %s)", key, step, step - (L.since or step), edge, idx, n, state))
+				else
+					log(string.format("TRAIN %s halted at step %d (edge %s idx %d/%d state %s)", key, step, edge, idx, n, state))
+				end
+				L.since = step
+			end
+			L.speed = speed
+		end)
+		if not okR then
+			W.off = true
+			log("TRAIN watch: MOVE_PATH unreadable (" .. tostring(err) .. ") -- off")
+			return
+		end
+	end
+end
+
 function CM.pollVehKeys()
 	if #pendingVehKeys == 0 then return end
 	local now = CM.gameTime()
@@ -494,7 +596,12 @@ function CM.execVehCmd(c)
 	-- left the vehicle unassigned on the peer while the host assigned it, and a
 	-- setLine on the unresolved id crashed both peers on GetComponentDataIndex
 	-- (2026-09-01). Same retry the "line not here yet" path uses.
-	if c.op == "VLINE" and c.origin ~= K.INSTANCE then
+	-- EVERY instance, the originator included (2026-09-16): its strict buy
+	-- replays like everyone's, so its key binds a tick after the stamp too. The
+	-- originator used to fall through to "unknown vehicle key" and DROP the
+	-- assignment while the peers retried and assigned: seven cloned trucks
+	-- stayed parked on the host and ran on the joiner (a:40..a:46, v64 vs v65).
+	if c.op == "VLINE" then
 		local haveAll = true
 		if c.key and not vehIdFor(c.key) then haveAll = false end
 		if not haveAll then
@@ -594,15 +701,16 @@ function CM.execVehCmd(c)
 		end
 		for _, pair in ipairs(cmds) do
 			local what, vid = pair[2], pair[3]
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(pair[1], function(res, success)
-				local why = ""
+				local why = string.format(" step=%d +%d ticks", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick)
 				if not success then
 					-- the engine's own reason, which this callback used to discard:
 					-- "success=false" alone cannot tell a refused command from a lost one
 					pcall(function()
 						local es = res and res.resultProposalData and res.resultProposalData.errorState
 						if es then
-							why = " critical=" .. tostring(es.critical)
+							why = why .. " critical=" .. tostring(es.critical)
 							for i = 1, #es.messages do why = why .. " '" .. tostring(es.messages[i]) .. "'" end
 						end
 					end)
@@ -831,10 +939,11 @@ function CM.execVBuy(c)
 				return
 			end
 			local bal0 = retry and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(cmd, function(res, success)
-				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s",
+				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s step=%d +%d ticks",
 					tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success),
-					retry and " (as our own player)" or ""))
+					retry and " (as our own player)" or "", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
 				if success then
 					-- buyVehicle is entity-returning (same shape VREPL reads): bind
 					-- this key to THAT entity, not to whichever new id sorts first

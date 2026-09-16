@@ -100,6 +100,7 @@ function CM.cmEnsure()
 	if CM.cmCompanyPid[CM.cmMyCompany] then
 		CM.cmReady = true
 		CM.cmLog(string.format("CM: companies mode ready, me=co%d players=%d", CM.cmMyCompany, #CM.cmRoster))
+		CM.cmApplyNames()
 	end
 end
 
@@ -351,6 +352,7 @@ function CM.cmEnsurePlayers()
 			end
 		end
 	end
+	CM.cmApplyNames()
 end
 -- A company's wallet is its balance AND its loan; both live on the player
 -- entity. Type-0 journal entries move the loan (and the balance with it),
@@ -430,6 +432,43 @@ end
 -- disk. A hash never parses as a number (the "h" prefix), so decodeCmd
 -- leaves it a string. Empty password = open company.
 CM.cmPw = {}   -- cid -> hash, or nil when open
+-- Company names (2026-09-16): a name is company state, not player-entity
+-- state -- a switch swaps the entities between the human and the AI player,
+-- so a NAME component would follow the wrong company. CMNAME carries it,
+-- every instance stores it here, the save keeps it. Unnamed: "Company N".
+CM.cmName = {}   -- cid -> name
+function CM.cmNameOf(cid)
+	local n = CM.cmName[cid]
+	if n and n ~= "" then return n end
+	return "Company " .. tostring(cid)
+end
+-- The game's finances / company windows show the player ENTITY's NAME. Keep
+-- every company's entity named after the company, here on every instance
+-- (the entity ids differ per instance, the companies do not), and again after
+-- a switch: the entities swap between the human and the AI player, the names
+-- must stay with the companies. make.setName from Lua reaches the slice from
+-- the scripting block, which it takes for a replay, so nothing is shipped.
+function CM.cmApplyNames()
+	if CM.cmMode ~= "companies" then return end
+	for _, cid in ipairs(CM.cmRoster or {}) do
+		local pid = CM.cmCompanyPid[cid]
+		if pid then
+			local want = CM.cmNameOf(cid)
+			local have = nil
+			pcall(function()
+				local nc = api.engine.getComponent(pid, api.type.ComponentType.NAME)
+				if nc and type(nc.name) == "string" then have = nc.name end
+			end)
+			if have ~= want then
+				pcall(function()
+					api.cmd.sendCommand(api.cmd.make.setName(pid, want), function(_, okc)
+						log(string.format("company: entity %s of company %d named %q success=%s", tostring(pid), cid, want, tostring(okc)))
+					end)
+				end)
+			end
+		end
+	end
+end
 function CM.cmHashPw(cid, pw)
 	pw = tostring(pw or "")
 	if pw == "" or pw == "-" then return nil end
@@ -607,6 +646,7 @@ function CM.cmLocalSwitch(cid)
 	CM.cmNote(string.format("switched %d -> %d (%d + %d entities; wallet %s/%s <-> %s/%s%s)", old, cid, #mine, #theirs,
 		tostring(bh), tostring(lh), tostring(ba), tostring(la), okW and "" or " -- wallet swap FAILED"))
 	if okW and (ba or 0) == 0 and (la or 0) == 0 then CM.cmNote("company " .. cid .. " starts empty: take a loan to fund it") end
+	CM.cmApplyNames()
 	return true
 end
 
@@ -628,6 +668,8 @@ function CM.cmSaveState()
 	st.origin[K.INSTANCE] = CM.cmMyCompany
 	for cid, h in pairs(CM.cmPw or {}) do st.pw[tostring(cid)] = h end
 	for cid, pid in pairs(CM.cmCompanyPid or {}) do st.pid[tostring(cid)] = pid end
+	st.names = {}
+	for cid, n in pairs(CM.cmName or {}) do st.names[tostring(cid)] = n end
 	return st
 end
 function CM.cmLoadState(st)
@@ -650,6 +692,8 @@ function CM.cmApplySaved()
 	for k, h in pairs(sv.pw or {}) do CM.cmPw[tonumber(k)] = h end
 	CM.cmCompanyPid = {}
 	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid end
+	CM.cmName = {}
+	for k, n in pairs(sv.names or {}) do if type(n) == "string" and n ~= "" then CM.cmName[tonumber(k)] = n end end
 	local want = CM.cmMyCompany   -- the lobby's chip for us (may be nil in coop)
 	if sv.origin and sv.origin[K.INSTANCE] then want = tonumber(sv.origin[K.INSTANCE]) end
 	if not want or not CM.cmRosterHas(want) then want = tonumber(sv.mine) end
@@ -659,6 +703,7 @@ function CM.cmApplySaved()
 	CM.cmReady = true
 	log(string.format("company: state restored from the save: %d companies, saver was co%d, we take co%d", #CM.cmRoster, tonumber(sv.mine), want))
 	if want ~= CM.cmMyCompany then CM.cmLocalSwitch(want) end
+	CM.cmApplyNames()
 	CM.cmRepairAt = (CM.ticks or 0) + 25              -- the saver too: its lines may carry another company's vehicles
 end
 
@@ -711,7 +756,17 @@ function CM.execCompanyCmd(c)
 		for i = #CM.cmRoster, 1, -1 do if CM.cmRoster[i] == cid then table.remove(CM.cmRoster, i) end end
 		CM.cmCompanyPid[cid] = nil
 		CM.cmPw[cid] = nil
+		CM.cmName[cid] = nil
 		CM.cmNote(string.format("%s dissolved company %d into %d (%d entities, balance %s, loan %s)", tostring(o), cid, intoCid, n, tostring(bf), tostring(lf)))
+	elseif c.op == "CMNAME" then
+		-- name / unname a company: only someone playing it may (like CMPW)
+		if not CM.cmRosterHas(cid) then CM.cmNote("cannot name a company: no company " .. cid); return end
+		local mineCid = (o == K.INSTANCE) and CM.cmMyCompany or CM.cmOriginCompany[o]
+		if mineCid ~= cid then CM.cmNote(string.format("%s cannot name company %d (plays %s)", tostring(o), cid, tostring(mineCid))); return end
+		local name = CM.unescName(c.name or ""):gsub("[%c]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+		CM.cmName[cid] = (name ~= "") and name or nil
+		CM.cmNote(string.format("%s named company %d %s", tostring(o), cid, name ~= "" and ('"' .. name .. '"') or "(unnamed)"))
+		CM.cmApplyNames()
 	elseif c.op == "CMPW" then
 		-- set / clear a company's password: only someone playing it may
 		if not CM.cmRosterHas(cid) then CM.cmNote("cannot set a password: no company " .. cid); return end

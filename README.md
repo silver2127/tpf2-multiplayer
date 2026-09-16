@@ -16,9 +16,8 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration is Windows **0.5.6 plus dev `b406a913`**, which makes the in-game
-dashboard sections mutually exclusive tabs. See [Linux installation](docs/linux/INSTALL.md),
-[the integration record](docs/linux/UPSTREAM_dev_b406a913.md), and
+integration is Windows **0.5.6 plus dev `55e97a48`**, retaining the earlier dashboard tabs. See [Linux installation](docs/linux/INSTALL.md),
+[the integration record](docs/linux/UPSTREAM_dev_55e97a48.md), and
 [existing port coverage and gaps](docs/linux/RESUME_STATUS.md).
 Historical native/Proton tests in those records do not establish live gameplay
 compatibility for this development snapshot.

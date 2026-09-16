@@ -1009,6 +1009,20 @@ static void WriteCompanyCfg()
         S().cfg.dataDir.c_str(), mode.c_str(), mine, l3.c_str(), l4.c_str());
 }
 
+static void WritePlayerNames()
+{
+    std::string content;
+    {
+        std::lock_guard<std::mutex> lk(S().mtx);
+        const Model& m = S().m;
+        for (const auto& name : m.players)
+            content += OriginLetterFor(m, name) + "=" + OneLine(name) + "\n";
+    }
+    std::string err;
+    if (!WriteFileAtomic(S().cfg.dataDir + "mp_players.txt", content, &err))
+        Log("[lobby] player names: %s\n", err.c_str());
+}
+
 // ---- commands to the lobby ----------------------------------------------------------------------
 // One write() with O_APPEND: whole lines, even with the game script appending
 // its own chat to the same file.
@@ -1164,7 +1178,7 @@ static void ApplyRoster(const Json& ev)
         if (!v.empty()) m.you = Cap(v, 256);
         v = JStr(ev, "host");
         if (!v.empty()) m.host = Cap(v, 256);
-        m.title = Cap(JStr(ev, "lobby"), 96);
+        m.title = Cap(JStr(ev, "lobby"), 127);
         m.relay = JBool(ev, "relay", false);
         m.storedAge = JInt(ev, "stored_age", -1);
         m.storedMax = JInt(ev, "stored_max", -1);
@@ -1198,6 +1212,7 @@ static void ApplyRoster(const Json& ev)
                : isHost ? "This relay has no saved world yet -- press START GAME to send your most recent save."
                         : "Waiting for the leader to press START GAME.");
     }
+    WritePlayerNames();
     if (roleKnown) WriteBridgeCtl(isHost);
     // HOT JOIN: the roster grew while we host a running game -- take a save and
     // share it; the newcomer's game loads it by itself.
@@ -1625,7 +1640,9 @@ static void Launch(const Request& r)
         for (const char* f : { "incoming_save.sav", "incoming_save.sav.lua", "incoming_save.jpg" }) unlink((dir + f).c_str());
 
     const std::string logPath = dir + "lobby_proc.log";
-    const int logFd = HighFd(open(logPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+    const bool keepLogs = access((S().cfg.dataDir + "tpf2mp_keep_logs.txt").c_str(), F_OK) == 0;
+    const int logFd = HighFd(open(logPath.c_str(), O_WRONLY | O_CREAT | (keepLogs ? O_APPEND : O_TRUNC) | O_CLOEXEC, 0644));
+    if (keepLogs && logFd >= 0) dprintf(logFd, "\n==== lobby session %ld pid %ld (keeping logs) ====\n", (long)time(nullptr), (long)getpid());
     if (logFd < 0) Log("[lobby] cannot open %s (%s) -- the lobby runs without its output captured\n", logPath.c_str(), strerror(errno));
     Status(a.join ? "Joining lobby\xE2\x80\xA6" : "Starting lobby\xE2\x80\xA6");
 
@@ -1815,7 +1832,7 @@ static bool FetchPublic(std::vector<PubRow>* rows, std::string* note)
             PubRow row;
             row.code = JStr(o, "code");
             if (row.code.empty() || row.code.size() > 255) continue;
-            row.name = Cap(OneLine(JStr(o, "name")), 47);
+            row.name = Cap(OneLine(JStr(o, "name")), 127);
             row.game = Cap(OneLine(JStr(o, "game")), 63);
             row.type = Cap(OneLine(JStr(o, "type")), 15);
             row.version = Cap(OneLine(JStr(o, "version")), 23);

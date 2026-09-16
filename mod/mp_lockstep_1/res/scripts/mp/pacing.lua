@@ -559,6 +559,67 @@ end
 -- pacing takes over. cu=1 on
 -- our heartbeat keeps the others from pacing against us meanwhile. Returns
 -- the speed to impose while active, nil otherwise.
+-- THE GOVERNOR (2026-09-16). A joiner that cannot run the session speed stays
+-- behind for good: its PID is already at its ceiling. The LEADER now lowers the
+-- session speed, gradually, while the slowest peer falls behind, and raises it
+-- again, more gradually, while everyone keeps up -- so the session settles at
+-- the fastest speed the slowest machine sustains, on its own. One decision
+-- per K.FRAC_PACE_TICKS; the votes remain the ceiling it works under.
+K.GOV_LAG_START = 3      -- units behind before the governor acts (while the gap grows)...
+K.GOV_LAG_HARD = 8       -- ...or at once, growing or not
+K.GOV_LAG_OK = 1.0       -- everyone within this: the speed may climb again
+K.GOV_DOWN = 0.94        -- per decision while a peer falls behind (~4%/s at 1.5 s decisions)
+K.GOV_UP = 1.02          -- per decision while everyone keeps up
+K.GOV_MIN = 0.25         -- never below this fraction of the voted speed: below the slow
+                         -- machine's own ceiling, or it can never make up what it lost
+K.GOV_UP_HOLD = 4        -- decisions everyone must keep up before a raise
+function CM.governSpeed(now, eff)
+	if not eff or eff <= 0 then CM.govPrevNow, CM.govPrevTick = nil, nil; return eff end
+	-- our own clock rate, to project a heartbeat forward by its age
+	if CM.govPrevTick and CM.ticks > CM.govPrevTick then
+		local r = (now - CM.govPrevNow) / (CM.ticks - CM.govPrevTick)
+		if r >= 0 and r < 5 then CM.govRate = CM.govRate and (CM.govRate * 0.7 + r * 0.3) or r end
+	end
+	CM.govPrevNow, CM.govPrevTick = now, CM.ticks
+	local f = CM.govFactor or 1
+	local function apply(v)
+		if f >= 1 then return v end
+		return math.max(0.25, math.floor(v * f / 0.05 + 0.5) * 0.05)
+	end
+	if CM.govAt and (CM.ticks - CM.govAt) < K.FRAC_PACE_TICKS then return apply(eff) end
+	CM.govAt = CM.ticks
+	local worst, who = 0, nil
+	local hb = K.HEARTBEAT_EVERY or 2
+	for letter, pr in pairs(CM.peers) do
+		-- only a peer heard THIS heartbeat interval: one gone quiet (an autosave, a
+		-- drop) is absent, not behind, and its stale clock must not slow the rest
+		if pr.at and (CM.ticks - pr.at) <= hb + 1 and (pr.step or pr.time) then
+			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			local lag = now - (t + (CM.ticks - pr.at) * (CM.govRate or 0))
+			if lag > worst then worst, who = lag, letter end
+		end
+	end
+	local prev = CM.govPrevWorst
+	CM.govPrevWorst = worst
+	local growing = prev ~= nil and worst > prev + 0.2
+	local was = f
+	if worst >= K.GOV_LAG_HARD or (worst >= K.GOV_LAG_START and growing) then
+		f = math.max(K.GOV_MIN, f * K.GOV_DOWN)
+		CM.govOkRuns = 0
+	elseif worst <= K.GOV_LAG_OK then
+		CM.govOkRuns = (CM.govOkRuns or 0) + 1
+		if f < 1 and CM.govOkRuns >= K.GOV_UP_HOLD then f = math.min(1, f * K.GOV_UP) end
+	else
+		CM.govOkRuns = 0
+	end
+	CM.govFactor, CM.govWorst, CM.govWho = f, worst, who
+	if math.abs(f - was) > 1e-9 then
+		log(string.format("GOV: %s is %.1f behind%s -> session x%.2f of %g = %.2f", tostring(who or "?"), worst,
+			growing and " and falling further" or (worst <= K.GOV_LAG_OK and ", everyone keeps up" or ""), f, eff, apply(eff)))
+	end
+	return apply(eff)
+end
+
 K.CATCHUP_MIN = 8          -- below this the PID closes the gap gradually; catch-up (hold + 4x) is for hot joins and stalls
 K.PACE_OTHER_GAME = 1800   -- units: a leader clock this far off is another game, not one to pace against
 K.FRAC_PACE_TICKS = 8      -- ~1.5 s between pacing decisions (heartbeats are 2 ticks apart)
@@ -876,6 +937,9 @@ function CM.paceV2(now)
 		local req = CM.speedRequest()
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
 		if CM.spdReqInForce then eff = req; why = "/speed request" end
+		-- the governor works under the votes (or the request): the slowest peer sets the pace
+		local governed = CM.governSpeed(now, eff)
+		if governed ~= eff then eff = governed; why = string.format("governed: %s is %.1f behind", tostring(CM.govWho or "?"), CM.govWorst or 0) end
 		CM.syncTick(now, s)
 		local changed = (eff ~= CM.effSpeed)
 		local recounted = (vt ~= CM.voteCounted)
@@ -1002,7 +1066,9 @@ function CM.paceTick(now)
 	-- re-sent, and a pause it made was undone by the sync-point run once a
 	-- joiner arrived (tools/pacing_sim.py: click_during_catchup,
 	-- pause_during_catchup).
-	if slowT == nil and not (CM.isLeader() and CM.livePeers() > 0) then return end
+	-- ...and while the governor still holds the speed down after the last peer
+	-- left, so it can climb back to the votes (the controller is what raises it).
+	if slowT == nil and not (CM.isLeader() and (CM.livePeers() > 0 or (CM.govFactor or 1) < 1)) then return end
 	CM.paceV2(now)
 end
 

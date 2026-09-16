@@ -219,10 +219,10 @@ static void TestLines()
 {
     Line line{};line.wait=180.4f;
     auto c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
-    assert(armed && writes[0]=="ARMED 1\nLUPDATE 42 180 0\n");Add();
+    assert(armed && writes[0]=="ARMED 1\nLUPDATE 42 180.399994 0\n");Add();
     line.stops.reserve(2);line.stops.resize(1);auto& s=line.stops[0];s.group=98;s.station=1;s.terminal=2;s.loadMode=3;s.min=20.4f;s.max=10.7f;
     s.alternatives={{2,3},{4,5}};c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
-    assert(writes[0]=="ARMED 1\nLUPDATE 42 180 1 98 1 2 3 20 11 2 2 3 4 5\n");Add();
+    assert(writes[0]=="ARMED 1\nLUPDATE 42 180.399994 1 98 1 2 3 20.3999996 10.6999998 2 2 3 4 5\n");Add();
     // Preserve waypoint order and 1-based stop positions in both wire records.
     s.waypoints={uint64_t(123) | (uint64_t(2)<<32),uint64_t(456)};
     SliceRecord rec{};
@@ -238,15 +238,28 @@ static void TestLines()
     assert(std::string(rec.data).find(",2:123:2,2:456:0")!=std::string::npos);
     SliceRecordFree(&rec);
     line.stops.pop_back();
-    for (uint64_t invalid : {uint64_t(0),uint64_t(123)|(uint64_t(65)<<32)}) {
+    for (uint64_t invalid : {uint64_t(0),uint64_t(123)|(uint64_t(0xffffffff)<<32)}) {
         line.stops[0].waypoints={invalid};
         assert(!slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
     }
     line.stops[0].waypoints.assign(65,123);
-    assert(!slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
+    assert(slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
     line.stops[0].waypoints.clear();
-    s.min=-1;c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
+    s.min=NAN;c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(!armed && writes.empty());s.min=0;
+    // More than all former caps, large indices, negative/infinite/fractional waits.
+    Line large = line;
+    large.wait = INFINITY;
+    large.stops[0].min = -1.25f; large.stops[0].max = -INFINITY;
+    large.stops[0].station = 100; large.stops[0].terminal = 200;
+    large.stops[0].alternatives.assign(40, {100, 200});
+    large.stops[0].waypoints.assign(80, uint64_t(123) | (uint64_t(9999)<<32));
+    large.stops.resize(70, large.stops[0]);
+    assert(slice_lines::Decode(&rec,42,uintptr_t(&large)));
+    assert(std::string(rec.data).find("inf 70 98 100 200 3 -1.25 -inf 40") != std::string::npos);
+    assert(std::string(rec.data).find("70:123:9999") != std::string::npos);
+    SliceRecordFree(&rec);
+
     c=Call(slice_lines::kUpdate,0x132c513);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(armed && arm.done==SliceDone::Required && writes.empty());
     int counter=1;uintptr_t lambda=uintptr_t(&counter);

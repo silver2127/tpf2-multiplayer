@@ -535,6 +535,7 @@ K.SIM_STEP = 0.2
 -- which is what drifted departures -- review, 2026-09-01).
 K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
 K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
+K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
 K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
 K.CMD_RING = 256          -- own commands kept for resend
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
@@ -617,6 +618,7 @@ local function execute(c)
 	elseif c.op == "CON" then CM.execCon(c)
 	elseif c.op == "DEMOLISH" then CM.execDemolish(c)
 	elseif c.op == "HEALCHK" then CM.execHealCheck(c)
+	elseif c.op == "LREADBACK" then CM.execLineReadback(c)
 	elseif c.op == "EDEMO" then CM.execEdgeDemolish(c)
 	elseif c.op == "CONFAIL" then CM.execConFail(c)
 	elseif c.op == "VBUY" then CM.execVBuy(c)
@@ -640,7 +642,7 @@ local function execute(c)
 	elseif c.op == "SPEEDVOTE" then CM.execSpeedVote(c)
 	elseif c.op == "TERRAIN" then CM.execTerrain(c)
 	elseif c.op == "ASSETS" then CM.execAssets(c)
-	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" then CM.execCompanyCmd(c)
+	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" or c.op == "CMNAME" then CM.execCompanyCmd(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
 
@@ -706,7 +708,7 @@ function CM.vposShip(stamp)
 	for i = 1, m do
 		local seg = {}
 		for j = (i - 1) * K.VPOS_PER_PART + 1, math.min(i * K.VPOS_PER_PART, #pts) do
-			seg[#seg + 1] = string.format("%.1f,%.1f", pts[j][1], pts[j][2])
+			seg[#seg + 1] = string.format("%.1f,%.1f,%s", pts[j][1], pts[j][2], pts[j][3] or "-")
 		end
 		CM.broadcast(string.format("LSVPOS t=%d s=%.1f o=%s i=%d m=%d n=%d d=%s",
 			stamp, st, K.INSTANCE, i, m, #pts, #seg > 0 and table.concat(seg, ";") or "-"))
@@ -872,6 +874,8 @@ function data()
 			CM.primeVehKeys()
 			CM.shipParkedBuys()
 			CM.pollVehKeys()
+			CM.watchDepartures()
+			CM.watchTrains()
 			CM.drainVehCap()
 			CM.primeLineKeys()
 			CM.pollLineKeys()
@@ -985,6 +989,19 @@ function data()
 										if lg > st and (not c.notBeforeStep or c.notBeforeStep < lg) then c.notBeforeStep = lg end
 									end
 								end
+								-- Line assignments land on a step GRID. Depot departures are dispatched
+								-- with frame granularity: two assignments a few steps apart fell into one
+								-- engine batch on the slower-rendering game and into two on the other,
+								-- and two long trains left the same depot in opposite order (a:58/a:59,
+								-- 2026-09-16), while ten trucks assigned on one step never drifted -- on
+								-- one step the engine orders them the same everywhere. So assignments
+								-- due within a grid cell are issued together, on its last step, on
+								-- every instance; a hold above only ever moves this later.
+								if c.op == "VLINE" then
+									local due = c.notBeforeStep or st
+									if due % K.VLINE_GRID_STEPS ~= 0 then due = due + (K.VLINE_GRID_STEPS - due % K.VLINE_GRID_STEPS) end
+									c.notBeforeStep = due
+								end
 							end
 						end
 					end
@@ -1068,6 +1085,7 @@ function data()
 						f:write(string.format("eff=%s\nspeedreq=%s\nvotes=%s\nmyvote=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
 							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.voteWords(CM.voteCounted),
 							myVote and string.format("%g", myVote.v) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+						f:write("gov=" .. ((CM.govFactor and CM.govFactor < 1) and string.format("x%.2f (%s %.1f behind)", CM.govFactor, tostring(CM.govWho or "?"), CM.govWorst or 0) or "-") .. "\n")
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1078,7 +1096,13 @@ function data()
 							local locked = {}
 							for cid in pairs(CM.cmPw or {}) do locked[#locked + 1] = tostring(cid) end
 							table.sort(locked)
-							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ",")))
+							-- names, percent-escaped ("3:Acme%20Co 4:...")
+							local names = {}
+							for _, cid in ipairs(CM.cmRoster or {}) do
+								local n = CM.cmName and CM.cmName[cid]
+								if n and n ~= "" then names[#names + 1] = cid .. ":" .. CM.escName(n) end
+							end
+							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " ")))
 						end)
 						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
@@ -1436,14 +1460,17 @@ function data()
 					end
 					for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", function()
+					-- Hiding is one thing done from two places: this button and the
+					-- window's own title-bar "x" (below). Both write the flag the
+					-- menu DLL's Ctrl+Shift+D reads, so the next chord SHOWS it.
+					local function hideDash()
 						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
-						if f then
-							f:write("0\n"); f:close()
-							D.shown = false
-							D.win:setVisible(false, false)
-						end
-					end))
+						if f then f:write("0\n"); f:close() end
+						D.shown = false
+						if D.win then D.win:setVisible(false, false) end
+					end
+					D.hideDash = hideDash
+					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", hideDash))
 					D.tabLabels = {}
 					for _, t in ipairs(TABS) do
 						local name = t[1]
@@ -1578,13 +1605,22 @@ function data()
 						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
 						if f then f:write(op .. (cid and (" " .. cid) or "") .. (pw ~= "" and (" " .. pw) or "") .. string.char(10)); f:close() end
 					end
-					local function coStep(dir)
-						local r = D.coRoster or {}
-						if #r == 0 then return end
-						local i = 1
-						for k, v in ipairs(r) do if v == D.coSel then i = k end end
-						i = ((i - 1 + dir) % #r) + 1
-						D.coSel = r[i]
+					-- Player names for the dropdown: the menu DLL writes mp_players.txt
+					-- ("a=alice" per line) from the roster it assigns letters from.
+					CM.playerNames = CM.playerNames or {}
+					function CM.readPlayerNames()
+						local f = io.open(K.BASE .. "mp_players.txt", "r")
+						if not f then return end
+						local t = {}
+						for line in f:lines() do
+							local l, n = line:match("^(%a+)=(.+)$")
+							if l and n then t[l] = n:gsub("[%c]", "") end
+						end
+						f:close()
+						CM.playerNames = t
+					end
+					function CM.playerNameOf(letter)
+						return CM.playerNames[letter] or letter
 					end
 					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					-- company colour swatches (2026-09-10): the chip colour the lobby roster shows
@@ -1595,8 +1631,15 @@ function data()
 					crow:addItem(D.coSwMine)
 					crow:addItem(D.coText)
 					crow:addItem(D.coSwSel)
-					crow:addItem(speedBtn("  <  ", function() coStep(-1) end))
-					crow:addItem(speedBtn("  >  ", function() coStep(1) end))
+					-- The picker (2026-09-16): a dropdown of every company, "player -- company
+					-- name", alphabetical, in place of the < > stepper. Rebuilt only when
+					-- its labels change (see D.coItemsSig below), so a click is never lost
+					-- to a refresh; the box sits in its own component so a rebuild
+					-- swaps it in place.
+					D.coPickL = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					D.coPick = api.gui.comp.Component.new("mpCompanyPick")
+					D.coPick:setLayout(D.coPickL)
+					crow:addItem(D.coPick)
 					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
 					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
 					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
@@ -1615,6 +1658,26 @@ function data()
 					prow:addItem(api.gui.comp.TextView.new("company password: "))
 					if D.coPwInput then prow:addItem(D.coPwInput) end
 					prow:addItem(speedBtn("  set on mine  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on company " .. D.coMine .. "..."; coRequest("CMPW", D.coMine) end end))
+					-- the name of our own company (empty = back to "Company N")
+					pcall(function()
+						local mk = api.gui.comp.TextInputField
+						local ok1, inp = pcall(function() return mk.new() end)
+						if not ok1 then inp = mk.new("") end
+						D.coNameInput = inp
+						pcall(function() D.coNameInput:setMinimumSize(api.gui.util.Size.new(180, 26)) end)
+						pcall(function() D.coNameInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
+					end)
+					prow:addItem(api.gui.comp.TextView.new("   company name: "))
+					if D.coNameInput then prow:addItem(D.coNameInput) end
+					prow:addItem(speedBtn("  name mine  ", function()
+						if not D.coMine then return end
+						local t = ""
+						pcall(function() t = D.coNameInput and D.coNameInput:getText() or "" end)
+						t = (t or ""):gsub("[%c]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+						D.coHint = (t ~= "" and ("naming company " .. D.coMine .. ' "' .. t .. '"...') or ("unnaming company " .. D.coMine .. "..."))
+						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						if f then f:write("CMNAME " .. D.coMine .. (t ~= "" and (" " .. t) or "") .. string.char(10)); f:close() end
+					end))
 					local prowC = api.gui.comp.Component.new("mpCompanyPwRow")
 					prowC:setLayout(prow)
 					local crowC = api.gui.comp.Component.new("mpCompanyRow")
@@ -1695,6 +1758,13 @@ function data()
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
 					D.win:setPosition(20, 120)
+					-- The title-bar "x" (2026-09-16): a Window has no close behaviour
+					-- of its own, so the button did nothing. Closing is hiding (the
+					-- window is rebuilt from D on every refresh and must survive),
+					-- and it goes through the same flag as the hide button, or the
+					-- poll below would put it straight back.
+					pcall(function() D.win:addHideOnCloseHandler() end)
+					pcall(function() D.win:onClose(function() D.hideDash() end) end)
 				end
 				-- A column with a fresh local file shows everything. A peer known only
 				-- over the wire shows what we know of it: its game time, our skew to
@@ -1749,8 +1819,52 @@ function data()
 						for id, who in tostring(mine.played or ""):gmatch("(%d+):([%a,]+)") do played[tonumber(id)] = who end
 						local locked = {}
 						for id in tostring(mine.colocked or ""):gmatch("%d+") do locked[tonumber(id)] = true end
-						D.coRoster, D.coPlayed, D.coMine, D.coLocked = roster, played, tonumber(mine.company), locked
+						local names = {}
+						for id, n in tostring(mine.conames or ""):gmatch("(%d+):(%S+)") do names[tonumber(id)] = CM.unescName(n) end
+						D.coRoster, D.coPlayed, D.coMine, D.coLocked, D.coNames = roster, played, tonumber(mine.company), locked, names
+						local function coName(cid) return (names[cid] and names[cid] ~= "") and names[cid] or ("Company " .. tostring(cid)) end
+						local function whoNames(cid)
+							local out = {}
+							for l in tostring(played[cid] or ""):gmatch("%a+") do out[#out + 1] = CM.playerNameOf(l) end
+							return out
+						end
+						if (guiTick % 30) == 0 or not D.coNamesRead then D.coNamesRead = true; pcall(CM.readPlayerNames) end
 						if not D.coSel then D.coSel = D.coMine end
+						-- the dropdown: "player, player -- company name", alphabetical
+						local items = {}
+						for _, cid in ipairs(roster) do
+							local who = whoNames(cid)
+							local label = (#who > 0 and table.concat(who, ", ") or "(empty)") .. " -- " .. coName(cid)
+								.. (cid == D.coMine and "  (mine)" or "") .. (locked[cid] and "  [password]" or "")
+							items[#items + 1] = { cid = cid, label = label }
+						end
+						table.sort(items, function(p, q) if p.label:lower() == q.label:lower() then return p.cid < q.cid end return p.label:lower() < q.label:lower() end)
+						local sig = {}
+						for _, it in ipairs(items) do sig[#sig + 1] = it.cid .. "=" .. it.label end
+						sig = table.concat(sig, "|")
+						if sig ~= D.coItemsSig and D.coPickL then
+							D.coItemsSig, D.coItems = sig, items
+							local old = D.coCombo
+							local cb = api.gui.comp.ComboBox.new()
+							for _, it in ipairs(items) do cb:addItem(it.label) end
+							D.coRebuilding = true
+							cb:onIndexChanged(function(i)
+								if D.coRebuilding then return end
+								local it = D.coItems and D.coItems[(tonumber(i) or -1) + 1]
+								if it then D.coSel = it.cid end
+							end)
+							if old then
+								local okR = pcall(function() D.coPickL:removeItem(old) end)
+								if not okR then pcall(function() old:setVisible(false, false) end) end
+							end
+							D.coPickL:addItem(cb)
+							D.coCombo = cb
+							local at = nil
+							for i, it in ipairs(items) do if it.cid == D.coSel then at = i - 1 end end
+							if not at and #items > 0 then at = 0; D.coSel = items[1].cid end
+							if at then pcall(function() cb:setSelected(at, false) end) end
+							D.coRebuilding = false
+						end
 						local sel = D.coSel or D.coMine
 						local selWho = sel and played[sel]
 						-- the swatches follow the ids (see D.coSwMine)
@@ -1758,9 +1872,10 @@ function data()
 						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, sel or D.coMine or 1)))
 						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
 						if D.coSwSel and D.coSwSelCls ~= selCls then D.coSwSelCls = selCls; pcall(function() D.coSwSel:setStyleClassList({ selCls }) end) end
-						D.coText:setText(string.format("company: mine %s   |  %d in session   |  selected: %s%s%s   ",
-							tostring(D.coMine or "?"), #roster, tostring(sel or "-"),
-							(sel == D.coMine and " (mine)" or "") .. (sel and locked[sel] and " [password]" or ""), selWho and (" played by " .. selWho) or (sel and " (empty)" or "")))
+						D.coText:setText(string.format("company: mine %s (%s)   |  %d in session   |  selected: %s%s%s   ",
+							D.coMine and coName(D.coMine) or "?", tostring(D.coMine or "?"), #roster, sel and (coName(sel) .. " (" .. sel .. ")") or "-",
+							(sel == D.coMine and " (mine)" or "") .. (sel and locked[sel] and " [password]" or ""),
+							selWho and (" played by " .. table.concat(whoNames(sel), ", ")) or (sel and " (empty)" or "")))
 						local note = mine.conote or ""
 						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
 						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end
