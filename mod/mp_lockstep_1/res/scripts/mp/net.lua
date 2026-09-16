@@ -333,7 +333,7 @@ end
 -- feed. The tick's line budget is shared between the feeds in flight, and
 -- every feed moves at least a line a tick, so no requester reads a stall.
 K.HIST_PER_TICK = 40
-function CM.histServe(S, L)
+function CM.histServe(S, L, live)
 	if not CM.isLeader() then return end
 	local cur = CM.histFeeds[L]
 	if cur and cur.S == S and cur.i <= #cur.lines then
@@ -344,7 +344,11 @@ function CM.histServe(S, L)
 	end
 	local lines, per = {}, {}
 	for _, e in ipairs(CM.hist) do
-		if e.at > S then
+		-- after the save's stamp for a save (the file holds S itself); FROM the
+		-- stamp for a live clock (2026-09-16: a command stamped exactly at the
+		-- requester's clock was never served, and never NACKed either -- it was
+		-- the one it was holding for). A duplicate is deduplicated on arrival.
+		if (live and e.at >= S) or (not live and e.at > S) then
 			lines[#lines + 1] = e.line
 			local o, seq = e.o, e.seq
 			if o and seq then
@@ -965,15 +969,34 @@ function CM.rxHistRange(o, lo, hi)
 	for g = lo, hi do
 		if r.notOwed[g] then r.notOwed[g] = nil; r.nackN[g] = nil end
 	end
-	-- what lies between two runs is in none: not in the history, not owed
-	for i = 2, #r.runs do
-		local a, b = r.runs[i - 1], r.runs[i]
-		if b.lo > a.hi + 1 then
-			local n = 0
-			for g = a.hi + 1, b.lo - 1 do
-				if not r.seen[g] and not r.notOwed[g] then r.notOwed[g] = true; r.nackN[g] = K.NACK_MAX; n = n + 1 end
+	-- What lies between two runs is in none: not in the history, not owed --
+	-- when this game caught up FROM A SAVE (the seqs below the feed are in the
+	-- file, or belong to an origin's earlier life). NOT during a live catch-up
+	-- (2026-09-16): a live peer that fell behind knows from the origin's own
+	-- heartbeat which seqs exist; a gap below the feed is a lost line that the
+	-- NACK scan recovers. The feed for seq 65.. arrived within the NACK grace
+	-- and this wrote seq 64 off, no NACK ever went out, the hold "released",
+	-- and one aircraft was never bought on the joiner (24 vs 25 planes).
+	if CM.histLive then
+		for i = 2, #r.runs do
+			local a, b = r.runs[i - 1], r.runs[i]
+			if b.lo > a.hi + 1 then
+				log(string.format("HIST: %s seq %d..%d are below the history feed -- still owed (live catch-up), the NACK scan recovers them", o, a.hi + 1, b.lo - 1))
+				for g = a.hi + 1, b.lo - 1 do
+					if not r.seen[g] and not r.missSince[g] then r.missSince[g] = CM.ticks end
+				end
 			end
-			if n > 0 then log(string.format("HIST: %s seq %d..%d are not in the history (its sequence restarted) -- not owed", o, a.hi + 1, b.lo - 1)) end
+		end
+	else
+		for i = 2, #r.runs do
+			local a, b = r.runs[i - 1], r.runs[i]
+			if b.lo > a.hi + 1 then
+				local n = 0
+				for g = a.hi + 1, b.lo - 1 do
+					if not r.seen[g] and not r.notOwed[g] then r.notOwed[g] = true; r.nackN[g] = K.NACK_MAX; n = n + 1 end
+				end
+				if n > 0 then log(string.format("HIST: %s seq %d..%d are not in the history (its sequence restarted) -- not owed", o, a.hi + 1, b.lo - 1)) end
+			end
 		end
 	end
 	if lo - 1 < r.firstSeq then r.firstSeq = lo - 1 end
@@ -1053,8 +1076,11 @@ function CM.gapHoldTick(now)
 	local need = CM.gapHoldNeed(now)
 	if not need then
 		if CM.gapHold then
-			log(string.format("HOLD: released after %d tick(s) -- %s seq=%d arrived", CM.ticks - CM.gapHold.since,
-				tostring(CM.gapHold.o), CM.gapHold.seq or -1))
+			local r = CM.gapHold.o and CM.rx[CM.gapHold.o]
+			local got = r and r.seen and CM.gapHold.seq and r.seen[CM.gapHold.seq]
+			log(string.format("HOLD: released after %d tick(s) -- %s seq=%d %s", CM.ticks - CM.gapHold.since,
+				tostring(CM.gapHold.o), CM.gapHold.seq or -1,
+				got and "arrived" or "WRITTEN OFF (retries exhausted or not owed) -- if it existed, this game is missing it"))
 			CM.gapHold = nil
 		end
 		return false
@@ -1183,8 +1209,9 @@ local function onLine(line)
 		if S and L and L ~= K.INSTANCE then
 			-- save=1: L loaded a save taken at S (the load gate's request). A plain
 			-- catch-up request names a live clock, not a save, and moves no floor.
-			if line:find(" save=1", 1, true) then CM.histFloorNote(S, L) end
-			pcall(CM.histServe, S, L)
+			local fromSave = line:find(" save=1", 1, true) ~= nil
+			if fromSave then CM.histFloorNote(S, L) end
+			pcall(CM.histServe, S, L, not fromSave)
 		end
 	elseif op == "LSHIST" then
 		local fr = line:match(" for=(%a)")
