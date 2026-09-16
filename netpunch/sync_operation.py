@@ -150,7 +150,10 @@ class SyncOperation:
             if message.get('paused') is not True or message.get('drained') is not True:
                 return False
             speed = message.get('speed')
-            if type(speed) not in (int, float) or speed not in (0, 1, 2, 4):
+            # the engine's speed index, 0 (paused) to 4 -- 3 exists: a session ran
+            # at it, every holding ack carried speed=3, and the barrier silently
+            # rejected them all, so the resync never left 'holding' (2026-09-16)
+            if type(speed) not in (int, float) or speed not in (0, 1, 2, 3, 4):
                 return False
             if sender == self.host and self.resume_speed is None:
                 self.resume_speed = speed

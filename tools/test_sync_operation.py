@@ -62,6 +62,22 @@ class OperationTests(unittest.TestCase):
         self.assertEqual(self.op.phase, 'complete')
         self.assertEqual(self.op.resume_speed, 0)
 
+    def test_every_engine_speed_is_a_valid_resume_speed(self):
+        # The engine's speed index runs 0..4 and a session really does sit at 3
+        # (a speed vote lands there). Every holding ack carried speed=3 and the
+        # barrier rejected them all, so the resync never left 'holding'
+        # (2026-09-16). A junk speed is still refused.
+        for speed in (0, 1, 2, 3, 4):
+            self.setUp()
+            self.ack('client', speed=speed)
+            self.ack('host', speed=speed)
+            self.assertEqual(self.op.phase, 'saving', speed)
+            self.assertEqual(self.op.resume_speed, speed)
+        self.setUp()
+        self.ack('client', speed=7)
+        self.ack('host', speed='fast')
+        self.assertEqual(self.op.phase, 'holding')
+
     def test_duplicate_and_stale_messages_cannot_advance(self):
         first = self.ack('host')
         for _ in range(10):
