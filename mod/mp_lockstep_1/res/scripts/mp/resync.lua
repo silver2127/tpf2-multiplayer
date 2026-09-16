@@ -71,7 +71,7 @@ function CM.autoSyncPump(now)
 	if state.phase == "complete" then
 		if not CM.autoReleased or CM.autoReleased ~= state.epoch then
 			local speed = tonumber(state.resume_speed)
-			if speed ~= 0 and speed ~= 1 and speed ~= 2 and speed ~= 4 then return true end
+			if speed ~= 0 and speed ~= 1 and speed ~= 2 and speed ~= 3 and speed ~= 4 then return true end
 			CM.autoReleased = state.epoch
 			CM.recoveryReleasePacing(speed)
 			CM.lgHolding, CM.resyncHold = false, false

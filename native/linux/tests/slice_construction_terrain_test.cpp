@@ -70,6 +70,21 @@ void Construction()
     CHECK(nodes == 5);
     CHECK(std::string(out.data) == "{[\"enabled\"]=false,[\"modules\"]={[1]=true,[2]=\"a\\010\\\"\\\\\\000z\"},[\"seed\"]=123}");
     SliceRecordFree(&out);
+    // 0.5.6 regression: modular station params must not truncate at 8 KB.
+    // Linux's dynamic record already supports up to 256 KB.
+    Table large;
+    const std::string payload(1024, 'x');
+    std::string expected = "{";
+    for (int i = 1; i <= 64; ++i) {
+        large.emplace(Number(i), String(payload));
+        if (i > 1) expected += ",";
+        expected += "[" + std::to_string(i) + "]=\"" + payload + "\"";
+    }
+    expected += "}";
+    CHECK(expected.size() > 65536);
+    CHECK(SliceConstructionParams(uintptr_t(&large), &out, &nodes));
+    CHECK(nodes == 64 && std::string(out.data, out.len) == expected);
+    SliceRecordFree(&out);
     Table bad; bad.emplace(Number(1), Number(INFINITY));
     CHECK(!SliceConstructionParams(uintptr_t(&bad), &out, nullptr)); SliceRecordFree(&out);
     CHECK(!SliceConstructionParams(1, &out, nullptr)); SliceRecordFree(&out);

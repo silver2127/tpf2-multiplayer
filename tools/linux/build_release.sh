@@ -167,7 +167,7 @@ for s in install.sh uninstall.sh collect_logs.sh; do install -m 0755 "$REPO/tool
 install -m 0755 "$REPO/tools/linux/tpf2mp-launch" "$STAGE/tpf2mp-launch"
 install -m 0644 "$REPO/tools/linux/tpf2mp_paths.sh" "$STAGE/tpf2mp_paths.sh"
 install -m 0644 "$REPO/docs/linux/INSTALL.md" "$STAGE/INSTALL.md"
-install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.5.md" "$STAGE/UPSTREAM_0.5.5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.6.md" "$STAGE/UPSTREAM_0.5.6.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
@@ -183,7 +183,7 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows release 0.5.5 (ecbaf1d), verified byte-identical"
+  echo "Lua: Windows release 0.5.6 (e470266), verified byte-identical"
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"
   if [ "$HOST_BUILD" = 1 ]; then echo "native runtime: host build (development only)"

@@ -227,7 +227,11 @@ static int32_t       g_conupOldId    = 0;
 static bool StashConupFromProposal(uint64_t r8);   // defined with the CONUP writer below
 static char  g_conxpFile[512];
 static float g_conxpT[16];
-static char  g_conxpParams[8192];
+// 64 KB: a modular station with a dozen modules is ~9 KB of params, and at
+// 8 KB the walk truncated, the upgrade ran natively on the host only, and the
+// peer rebuilt the station from a coalesced full-params edit -- 4 edges, the
+// track heights and the price differed (desync 2026-09-16).
+static char  g_conxpParams[65536];
 // Stop/signal/waypoint cancel. Decoded off the proposal's
 // edgeObjectsToAdd record at the factory, written as STOPX from the Add hook
 // only once the cancel landed (else dropped: the poll captures the native
