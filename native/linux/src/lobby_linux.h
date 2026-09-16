@@ -78,7 +78,7 @@ bool TakeAutoCopy(std::string* code);
 bool CapturesTyping();                           // lock-free: false once the shared save is placed
 
 struct Player {
-    std::string name;
+    std::string name, stage;
     int company = 1;
     bool you = false, host = false;
 };

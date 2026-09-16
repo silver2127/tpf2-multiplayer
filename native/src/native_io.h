@@ -18,6 +18,13 @@ bool PauseAndDrain(const std::string& operation);
 bool Poll(Event& event);
 bool HasWorld();
 bool Busy();
+// The threads that do the engine's work, so the lobby can read whether a
+// save or load is ALIVE (native_control.cpp reports their CPU time next to
+// busy): the observed UI thread, and the world's command thread -- the one
+// that executed the last pause/save completion, 0 until a completion has run
+// on it and 0 again once that world is destroyed (a later world may run its
+// commands on another thread).
+void WorkThreads(DWORD& ui, DWORD& command);
 // Suppress new game input before it can create a command/callback. Native MP
 // progress controls use their separate input path. Escape remains available.
 bool SetActionsHeld(bool held);

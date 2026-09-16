@@ -25,6 +25,39 @@ def read_fields(path):
 
 _temporary_counter = itertools.count()
 
+# Engine liveness while the engine runs our command (native busy=1). The work
+# is invisible from outside the process except as CPU burnt by the thread doing
+# it (native_control.cpp reports cpu_ui / cpu_command from GetThreadTimes, in
+# ms) and as bytes the process moved through the disk (its IO counters, writes
+# net of the mailbox's own). The mailbox's own 100 ms heartbeat is NOT progress:
+# it ticked whether or not the engine advanced, so a game thread hung mid-save
+# kept the barrier's silence timeout from ever firing (2026-09-16). Quantised so
+# that a thread idling in a modal dialog or a deadlock -- microseconds of CPU,
+# no bytes -- never reads as progress, while the slowest real save or load (a
+# big world, an HDD) crosses a step many times per SILENCE window: a compressing
+# save burns a CPU second in about a second, an HDD writes 16 MB in well under
+# one. Which thread and which direction depends on the phase: the engine saves
+# on the world's command thread and writes; a load runs on the UI thread and
+# reads.
+ENGINE_CPU_STEP_MS = 1000
+ENGINE_IO_STEP = 16 << 20
+ENGINE_WORK = {'saving': ('cpu_command', 'io_write'), 'loading': ('cpu_ui', 'io_read')}
+
+
+def engine_work(phase, status):
+    """The quantised engine-work reading for ``phase`` out of a native status
+    file's fields: 'cpu_command=12,io_write=3' (CPU seconds, 16 MB steps).
+    A field the status lacks is left out; an old status yields ''."""
+    parts = []
+    for key in ENGINE_WORK.get(phase, ('cpu_ui', 'cpu_command', 'io_read', 'io_write')):
+        try:
+            value = int(status.get(key, ''))
+        except ValueError:
+            continue
+        step = ENGINE_CPU_STEP_MS if key.startswith('cpu') else ENGINE_IO_STEP
+        parts.append('%s=%d' % (key, value // step))
+    return ','.join(parts)
+
 
 def write_fields(path, fields):
     path = Path(path)
@@ -131,6 +164,31 @@ class SyncParticipant:
         self.ack = {k: self.state[k] for k in ('operation', 'epoch', 'revision', 'phase')}
         self.ack.update(success=True, **fields)
         return self.ack
+
+    def progress(self):
+        """A token that changes while this member's part of the current phase
+        advances, for the host barrier's silence timeout (sync_operation.SILENCE):
+        the control stage (which native/epoch commands were issued and answered),
+        the engine's work while it runs our command (engine_work: CPU time of
+        the thread doing it and bytes through the disk, quantised), the save
+        file's size while the host's engine writes it, and the Lua ack's
+        world/held/paused. A dead or hung engine stops changing it; a slow one
+        never does. Never the mailbox's own heartbeat: that ticks regardless."""
+        if not self.state:
+            return None
+        phase = self.state['phase']
+        parts = [phase, ','.join(f'{k}={int(bool(v))}' for k, v in sorted(self.commands.items()))]
+        status = self._read('tpf2_native_status.txt')
+        if status.get('busy') == '1':
+            parts.append('engine:' + engine_work(phase, status))
+        if phase == 'saving' and self.player == self.state.get('host'):
+            try:
+                parts.append('save=%d' % (self.save_directory / ('mp_' + self.state['epoch'][:12] + '.sav')).stat().st_size)
+            except OSError:
+                pass
+        lua = self._lua()
+        parts.append('lua=%s/%s/%s' % (lua.get('world', ''), lua.get('held', ''), lua.get('paused', '')))
+        return ':'.join(parts)
 
     def receive_snapshot(self, blob):
         if not self.state or self.state['phase'] != 'transferring':

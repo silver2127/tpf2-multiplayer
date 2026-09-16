@@ -32,6 +32,30 @@ class AutoInstall(unittest.TestCase):
                 self.assertEqual(len(calls), 3)
                 self.assertTrue(all('--force' not in c for c in calls))
 
+    def test_bigmap_worktree_is_an_input_and_shipped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bigmap = root / 'selected-worktree'
+            (root / 'installer').mkdir()
+            (root / 'installer/VERSION').write_text('0.5.6')
+            installer = root / 'dist/linux-auto/tpf2mp-linux-0.5.6/install.sh'
+            calls = []
+            def run(args, check):
+                calls.append(args)
+                if args[0].endswith('build_release.sh'):
+                    installer.parent.mkdir(parents=True, exist_ok=True)
+                    installer.touch()
+            revision = ['one']
+            def digest(path):
+                return revision[0] if path == bigmap else 'multiplayer'
+            state = {}
+            with patch.object(auto, 'source_digest', side_effect=digest):
+                auto.pass_once(root, ['A'], state, run, lambda: False, bigmap)
+                self.assertEqual(calls[0][-2:], ['--bigmap-repo', str(bigmap)])
+                revision[0] = 'two'
+                auto.pass_once(root, ['A'], state, run, lambda: False, bigmap)
+                self.assertEqual(len(calls), 4)  # plugin-only edit rebuilds and reinstalls
+
 
 if __name__ == '__main__':
     unittest.main()

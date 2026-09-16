@@ -33,11 +33,20 @@ $Targets = @(
     @{ name = 'slice'; out = 'native\out\tpf2_slice.dll';     src = @('native\src\slice_hook.cpp', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\deferrelay_slice.asm', 'native\src\station_weld.h', 'native\src\datadir.h') },
     @{ name = 'host';  out = 'native\out\tpf2_pluginhost.dll'; src = @('native\src\plugin\*', 'native\src\hook.cpp', 'native\src\hook.h') }
 )
+# native plugins built in their own sibling checkouts; deploy_shipping.ps1 ships them into
+# <game>\plugins. From a worktree (<main>\.claude\worktrees\<name>) the siblings sit next
+# to the main checkout. A plugin rebuilt on its own must trigger an install too.
+$SiblingRoot = Split-Path $Repo -Parent
+if ($Repo -match '^(.*)\\\.claude\\worktrees\\[^\\]+$') { $SiblingRoot = Split-Path $Matches[1] -Parent }
+$Plugins = @(
+    @{ name = 'bigmap'; repo = (Join-Path $SiblingRoot 'tpf2-bigmap'); out = 'out\tpf2_bigmap.dll'; ok = 'BUILD BIGMAP OK'
+       src = @('src\*', 'mod\minimap\*', 'tools\embed_lua.ps1', 'build.bat') }
+)
 
 function Say($m, $c = 'Gray') { Write-Host ("[auto-install {0:HH:mm:ss}] {1}" -f (Get-Date), $m) -ForegroundColor $c }
-function Newest($paths) {
+function Newest($paths, $root = $Repo) {
     $t = [datetime]0
-    foreach ($p in $paths) { foreach ($f in (Get-ChildItem (Join-Path $Repo $p) -Recurse -File -EA SilentlyContinue)) { if ($f.LastWriteTime -gt $t) { $t = $f.LastWriteTime } } }
+    foreach ($p in $paths) { foreach ($f in (Get-ChildItem (Join-Path $root $p) -Recurse -File -EA SilentlyContinue)) { if ($f.LastWriteTime -gt $t) { $t = $f.LastWriteTime } } }
     return $t
 }
 function GamesRunning { return @(Get-Process TransportFever2 -EA SilentlyContinue).Count }
@@ -55,12 +64,23 @@ function BuildStale {
             Say "built $($t.name)" Green
         }
     }
+    foreach ($p in $Plugins) {
+        if (-not (Test-Path (Join-Path $p.repo 'build.bat'))) { continue }
+        $out = Join-Path $p.repo $p.out
+        $outT = if (Test-Path $out) { (Get-Item $out).LastWriteTime } else { [datetime]0 }
+        if ((Newest $p.src $p.repo) -gt $outT) {
+            Say "building $($p.name) (sources newer than $out)" Cyan
+            $log = cmd /c "`"$($p.repo)\build.bat`"" 2>&1
+            if ($LASTEXITCODE -ne 0 -or -not ($log -match $p.ok)) { Say ("build $($p.name) FAILED:`n" + ($log | Select-String 'error' | Out-String)) Red; continue }
+            Say "built $($p.name)" Green
+        }
+    }
     $exe = Join-Path $Repo 'netpunch\dist\netpunch.exe'
     $exeT = if (Test-Path $exe) { (Get-Item $exe).LastWriteTime } else { [datetime]0 }
     if ((Newest @('netpunch\*.py')) -gt $exeT) {
         Say 'freezing netpunch (lobby sources newer than dist\netpunch.exe)' Cyan
         Push-Location (Join-Path $Repo 'netpunch')
-        try { $log = python -m PyInstaller --onefile --name netpunch lobby.py --noconfirm --log-level WARN 2>&1 } finally { Pop-Location }
+        try { $log = cmd /c "python -m PyInstaller --onefile --name netpunch lobby.py --noconfirm --log-level WARN 2>&1" } finally { Pop-Location }   # via cmd: PS 5.1 turns PyInstaller's stderr INFO lines into terminating errors
         if ((Test-Path $exe) -and ((Get-Item $exe).LastWriteTime -gt $exeT)) { Say 'froze netpunch' Green } else { Say ("freeze FAILED:`n" + ($log | Select-Object -Last 5 | Out-String)) Red }
     }
 }
@@ -73,8 +93,22 @@ function InstallStale {
         $p = Join-Path $Game $f; if (Test-Path $p) { $t = (Get-Item $p).LastWriteTime; if ($t -gt $deployed) { $deployed = $t } }
     }
     foreach ($f in (Get-ChildItem (Join-Path $Game 'mods\mp_lockstep_1') -Recurse -File -EA SilentlyContinue)) { if ($f.LastWriteTime -gt $deployed) { $deployed = $f.LastWriteTime } }
-    if ($built -le $deployed) { return $false }
-    if ((GamesRunning) -gt 0) { Say "install pending (outputs from $built) -- waiting for the games to close" DarkYellow; return $false }
+    $why = @()
+    if ($built -gt $deployed) { $why += "multiplayer outputs from $built" }
+    foreach ($p in $Plugins) {
+        $out = Join-Path $p.repo $p.out
+        $dst = Join-Path $Game ('plugins\' + (Split-Path $p.out -Leaf))
+        if ((Test-Path $out) -and (-not (Test-Path $dst) -or (Get-Item $out).LastWriteTime -gt (Get-Item $dst).LastWriteTime)) {
+            $why += "$($p.name) from $((Get-Item $out).LastWriteTime)"
+        }
+    }
+    if ($why.Count -eq 0) { return $false }
+    if ((GamesRunning) -gt 0) {
+        $pending = $why -join ', '
+        if ($pending -ne $script:LastPending) { Say "install pending ($pending) -- waiting for the games to close" DarkYellow; $script:LastPending = $pending }
+        return $false
+    }
+    $script:LastPending = $null
     Say 'games are closed and the build is newer than the game folder: installing' Cyan
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'tools\snapshot_logs.ps1') 2>&1 | Select-Object -Last 1 | ForEach-Object { Say $_ }
     $log = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'tools\deploy_shipping.ps1') 2>&1

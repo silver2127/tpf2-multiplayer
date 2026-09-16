@@ -38,15 +38,18 @@ def games_running():
     return False
 
 
-def pass_once(root, games, state, run=subprocess.run, running=games_running):
-    current = source_digest(root)
+def pass_once(root, games, state, run=subprocess.run, running=games_running, bigmap_repo=None):
+    def inputs():
+        return source_digest(root) + (source_digest(bigmap_repo) if bigmap_repo else "")
+    current = inputs()
     out = root / "dist/linux-auto"
     version = (root / "installer/VERSION").read_text().strip()
     installer = out / ("tpf2mp-linux-" + version) / "install.sh"
     if state.get("built") != current or not installer.is_file():
-        run([str(root / "tools/linux/build_release.sh"), "--out", str(out)], check=True)
+        run([str(root / "tools/linux/build_release.sh"), "--out", str(out)] +
+            (["--bigmap-repo", str(bigmap_repo)] if bigmap_repo else []), check=True)
         # Never install a package built while its inputs changed.
-        if source_digest(root) != current:
+        if inputs() != current:
             state.pop("built", None)
             return
         state["built"] = current
@@ -67,6 +70,7 @@ def pass_once(root, games, state, run=subprocess.run, running=games_running):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--game", type=Path, action="append", default=[])
+    parser.add_argument("--bigmap-repo", type=Path, help="native Big Maps checkout or worktree to build and ship")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--poll-seconds", type=float, default=5)
     args = parser.parse_args()
@@ -75,7 +79,7 @@ def main():
     state = {}
     while True:
         try:
-            pass_once(ROOT, args.game, state)
+            pass_once(ROOT, args.game, state, bigmap_repo=args.bigmap_repo)
         except (OSError, subprocess.CalledProcessError) as error:
             print(f"auto-install: {error}", flush=True)
             if args.once:

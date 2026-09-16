@@ -133,7 +133,7 @@ struct Model {
     std::string speedReq;      // speed= from "/speed"
     int syncReq = 0;           // sync= from "/sync"
     std::string startSave;     // host: the save START GAME shared
-    std::vector<std::string> players;
+    std::vector<std::string> players, stages;
     std::vector<int> companies;
     std::vector<std::string> letters;   // relay lobbies: the relay's origin letter per player
     std::deque<std::string> chat;
@@ -175,6 +175,9 @@ struct State {
     std::string lobbyDir;      // the running lobby's folder, trailing slash
     std::string ctlLast;
     uint64_t syncBaseline = 0, syncAskedAt = 0, syncLastSize = 0;
+    uint64_t unpausedMs = 0, unpausedLast = 0, sharedUnpaused = 0;
+    std::string sharedSave, stageSent;
+    bool stageWatch = false;
     std::string syncSave;
     uint64_t relayLastUp = 0;
     bool loggedNoGameUi = false;
@@ -916,7 +919,6 @@ static std::string OriginLetterFor(const Model& m, const std::string& name)
         if (p == name) break;
         idx++;
     }
-    if (idx > MAX_PLAYERS - 2) idx = MAX_PLAYERS - 2;
     return OriginName(idx + 1);
 }
 
@@ -951,8 +953,7 @@ static void WriteBridgeCtl(bool isHost)
                 if (p == m.you) break;
                 idx++;
             }
-            if (idx > MAX_PLAYERS - 2) idx = MAX_PLAYERS - 2;
-            letter = OriginName(idx + 1);
+                    letter = OriginName(idx + 1);
         }
         count = (int)m.players.size();
         port = m.relayPort ? m.relayPort : (isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN);
@@ -1071,6 +1072,55 @@ static void SendChatNow(const std::string& text)
 static bool InGame() { return !g_titleMenu.load() && g_gameUiSeen.load(); }
 
 // ---- HOT JOIN (menu_hook.cpp SyncStart / SyncPoll) --------------------------------------------------
+// Owned by the lobby thread. Unknown pause state ages the snapshot normally.
+static std::string OwnLetter()
+{
+    std::lock_guard<std::mutex> lk(S().mtx);
+    return S().m.you.empty() ? "a" : OriginLetterFor(S().m, S().m.you);
+}
+static void UnpausedTick()
+{
+    const uint64_t now = NowMs();
+    std::string dash;
+    ReadSmallFile(S().cfg.dataDir + "lockstep_dash_" + OwnLetter() + ".txt", &dash);
+    if (S().unpausedLast && dash.find("paused=yes") == std::string::npos)
+        S().unpausedMs += now - S().unpausedLast;
+    S().unpausedLast = now;
+}
+static void MarkSaveShared(const std::string& path)
+{
+    S().sharedSave = path;
+    S().sharedUnpaused = S().unpausedMs;
+}
+static void ReportStage(const std::string& text)
+{
+    if (text == S().stageSent) return;
+    AppendIn("{\"cmd\":\"stage\",\"text\":\"" + JsonEscape(text) + "\"}");
+    S().stageSent = text;
+}
+static void StageTick()
+{
+    if (!S().stageWatch || !InGame()) return;
+    std::string status;
+    ReadSmallFile(S().cfg.dataDir + "lockstep_status_" + OwnLetter() + ".txt", &status);
+    auto start = status.find("stage=");
+    if (start == std::string::npos) { ReportStage("world loaded"); return; }
+    start += 6;
+    std::string stage = status.substr(start, status.find_first_of(" \r\n\t", start) - start);
+    if (stage == "live") { ReportStage(""); S().stageWatch = false; }
+    else if (stage == "starting") ReportStage("world loaded, waiting for the session");
+    else if (stage.compare(0, 8, "catchup:") == 0) {
+        auto colon = stage.find(':', 8);
+        double behind = colon == std::string::npos ? 0 : std::atof(stage.c_str() + colon + 1);
+        char text[128];
+        std::snprintf(text, sizeof(text), stage.compare(8, 5, "fetch") == 0 ?
+            "catching up: fetching history (%.0f s behind)" : "catching up (%.0f s behind)", behind);
+        ReportStage(text);
+    } else if (stage.compare(0, 7, "behind:") == 0) {
+        char text[80]; std::snprintf(text, sizeof(text), "%.0f s behind", std::atof(stage.c_str()+7)); ReportStage(text);
+    }
+}
+
 static void SyncStart(const std::string& why)
 {
     bool isHost;
@@ -1081,6 +1131,13 @@ static void SyncStart(const std::string& why)
     if (!isHost) { Log("[sync] %s on a joiner -- ignored (the host saves)\n", why.c_str()); return; }
     if (!g_gameUiSeen.load()) { Log("[sync] %s before the game is running -- ignored\n", why.c_str()); return; }
     if (S().syncAskedAt) { Log("[sync] %s while a save is pending -- one save serves everyone who joined\n", why.c_str()); return; }
+    UnpausedTick();
+    if (why.compare(0, 8, "hot join") == 0 && !S().sharedSave.empty() &&
+        Exists(S().sharedSave) && S().unpausedMs - S().sharedUnpaused < 15000) {
+        Status("Hot join: sending the recent save");
+        SendChatNow("!hotjoin A game is running. Hold on: the host is sending you the world; your game loads it by itself.");
+        return; // lobby.py serves its retained snapshot to unstarted joiners
+    }
     std::string cur;
     uint64_t size = 0;
     S().syncBaseline = MenuGame_NewestSave(&cur) ? MtimeNs(cur, &size) : 0;
@@ -1099,6 +1156,8 @@ static void SyncStart(const std::string& why)
 
 static void SyncPoll()
 {
+    UnpausedTick();
+    StageTick();
     const std::string req = S().cfg.dataDir + "tpf2_sync_save.txt";
     if (Exists(req)) {
         unlink(req.c_str());
@@ -1113,6 +1172,8 @@ static void SyncPoll()
             // wait until the file stops growing (the sidecars are written after the .sav)
             if (cur == S().syncSave && sz == S().syncLastSize) {
                 AppendIn("{\"cmd\":\"start\",\"save\":\"" + JsonEscape(cur) + "\"}");
+                MarkSaveShared(cur);
+                { std::lock_guard<std::mutex> lk(S().mtx); S().m.startSave = cur; }
                 Log("[sync] new save %s (%llu B) -> sharing with every joiner\n", cur.c_str(), (unsigned long long)sz);
                 Status("Sync: sharing the save\xE2\x80\xA6");
                 std::string err;
@@ -1165,9 +1226,11 @@ static void ApplyRoster(const Json& ev)
         if (const Json* pa = ev.Get("players"))
             if (pa->type == Json::Arr)
                 for (const Json& it : pa->items) {
-                    if ((int)m.players.size() >= MAX_PLAYERS) break;
-                    m.players.push_back(it.type == Json::Str ? Cap(it.s, 256) : std::string());
+                    m.players.push_back(it.type == Json::Str ? it.s : std::string());
                 }
+        m.stages.assign(m.players.size(), std::string());
+        if (const Json* stages = ev.Get("stages"))
+            for (size_t i = 0; i < m.players.size(); ++i) m.stages[i] = JStr(*stages, m.players[i].c_str());
         m.companies.assign(m.players.size(), 1);
         if (const Json* co = ev.Get("companies"))
             for (size_t i = 0; i < m.players.size(); i++) {
@@ -1175,10 +1238,10 @@ static void ApplyRoster(const Json& ev)
                 if (v && v->type == Json::Num && v->n >= 1 && v->n <= MAX_COMPANIES) m.companies[i] = (int)v->n;
             }
         std::string v = JStr(ev, "you");
-        if (!v.empty()) m.you = Cap(v, 256);
+        if (!v.empty()) m.you = v;
         v = JStr(ev, "host");
-        if (!v.empty()) m.host = Cap(v, 256);
-        m.title = Cap(JStr(ev, "lobby"), 127);
+        if (!v.empty()) m.host = v;
+        m.title = JStr(ev, "lobby");
         m.relay = JBool(ev, "relay", false);
         m.storedAge = JInt(ev, "stored_age", -1);
         m.storedMax = JInt(ev, "stored_max", -1);
@@ -1345,7 +1408,10 @@ static void HandleStart(const Json& ev)
     Status("Loading shared save\xE2\x80\xA6");
     SleepMs(400);
     // The lobby stays: since the game-frame relay it IS the lockstep transport.
-    if (DoStartLoad(src)) Log("[lobby] game loading -- lobby kept alive as the game transport\n");
+    if (DoStartLoad(src)) {
+        ReportStage("loading world"); S().stageWatch = true;
+        Log("[lobby] game loading -- lobby kept alive as the game transport\n");
+    }
 }
 
 static void Dispatch(const std::string& line)
@@ -1469,7 +1535,7 @@ static void TailOut()
         c.offset += (uint64_t)got;
         for (ssize_t i = 0; i < got; i++) {
             if (buf[i] != '\n') {
-                if (c.partial.size() < (1u << 20)) c.partial.push_back(buf[i]);
+                c.partial.push_back(buf[i]);
                 continue;
             }
             std::string line;
@@ -1486,6 +1552,8 @@ static void ForgetChild()
 {
     g_childPid = 0;
     S().child = Child();
+    S().sharedSave.clear(); S().unpausedLast = 0; S().stageWatch = false; S().stageSent.clear();
+    S().syncAskedAt = 0;
 }
 
 // Quit, then SIGTERM, then SIGKILL, always to the whole group (menu_hook.cpp
@@ -1686,6 +1754,7 @@ static void ShareAndStart()
             S().m.startSave = save;
         }
         AppendIn("{\"cmd\":\"start\",\"save\":\"" + JsonEscape(save) + "\"}");
+        MarkSaveShared(save);
         Log("[lobby] START GAME: sharing %s\n", save.c_str());
         Status("Sharing save & starting game\xE2\x80\xA6");
     } else {
@@ -2076,6 +2145,7 @@ void Snapshot(View* v)
     for (size_t i = 0; i < m.players.size(); i++) {
         Player& p = v->players[i];
         p.name = OneLine(m.players[i]);
+        p.stage = i < m.stages.size() ? OneLine(m.stages[i]) : std::string();
         p.company = m.companies[i] < 1 ? 1 : m.companies[i] > MAX_COMPANIES ? MAX_COMPANIES : m.companies[i];
         p.you = m.players[i] == m.you;
         p.host = m.players[i] == m.host;

@@ -10,7 +10,7 @@
 #include <vector>
 
 namespace {
-constexpr size_t MaxRecords = 64, MaxOwnedBytes = 64u << 20;
+constexpr size_t MaxRecords = SIZE_MAX, MaxOwnedBytes = SliceSanityBytes;
 using Node = std::array<uint8_t, 24>;
 using Edge = std::array<uint8_t, 120>;
 using String = std::array<uint8_t, 32>;
@@ -95,8 +95,8 @@ bool ReadIndices(Transaction& tx, uintptr_t at, size_t nodes, SliceVec* span, st
 }
 bool StringOwnership(Transaction& tx, uintptr_t at, String* value)
 {
-    char text[4097]; size_t len;
-    if (!SliceReadStdString(at, text, sizeof(text), &len, 4096) || !SliceRead(at, value->data(), 32)) return false;
+    std::string text;
+    if (!SliceReadStdString(at, &text) || !SliceRead(at, value->data(), 32)) return false;
     const uintptr_t ptr = Get<uintptr_t>(value->data(), 0);
     if (ptr == at + 16) return true;
     const size_t capacity = Get<size_t>(value->data(), 16);
@@ -124,18 +124,18 @@ static bool MergeTemplateStreet(uintptr_t proposal, const slice_terrain_assets::
         !SliceRead(rv.begin, removed.data(), removed.size() * 120)) return false;
     std::vector<SliceVec> objects(sv.count), removedObjects(rv.count);
     for (size_t i = 0; i < sv.count; ++i) {
-        if (edges[i][0x74] > 1 || !tx.Vector(sv.begin + i * 120 + 0x30, 8, 16384, &objects[i])) return false;
+        if (edges[i][0x74] > 1 || !tx.Vector(sv.begin + i * 120 + 0x30, 8, SIZE_MAX, &objects[i])) return false;
         for (size_t j = 0x10; j < 0x28; j += 4) if (!std::isfinite(Get<float>(edges[i].data(), j))) return false;
     }
     for (size_t i = 0; i < rv.count; ++i)
-        if (!tx.Vector(rv.begin + i * 120 + 0x30, 8, 16384, &removedObjects[i])) return false;
+        if (!tx.Vector(rv.begin + i * 120 + 0x30, 8, SIZE_MAX, &removedObjects[i])) return false;
     auto nodeId = [&](size_t i) { return Get<int32_t>(nodes[i].data(), 0x14); };
     for (size_t i = 0; i < nv.count; ++i) {
         for (size_t axis = 0; axis < 12; axis += 4) if (!std::isfinite(Get<float>(nodes[i].data(), axis))) return false;
         if (nodes[i][0xc] > 1) return false;
         for (size_t j = 0; j < i; ++j) if (nodeId(i) == nodeId(j)) return false;
     }
-    bool isTemplate[MaxRecords]{}; size_t countTemplate = 0;
+    std::vector<bool> isTemplate(nv.count); size_t countTemplate = 0;
     for (const Edge& edge : edges) {
         if (!edge[0x74]) continue;
         const int32_t a = Get<int32_t>(edge.data(), 8), b = Get<int32_t>(edge.data(), 12);

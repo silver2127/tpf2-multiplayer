@@ -1,6 +1,7 @@
 // Off-game integration harness: real libstdc++ objects + guarded process reads,
 // with the slice-core registration, Add, session and inject services modelled.
 // Run: tools/linux/test_slice_commands.sh
+#include <algorithm>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -198,6 +199,15 @@ static void TestVehicles()
     p.automatic.assign(65,true); p.loads.assign(65,0);
     SliceRecord rec{}; assert(slice_vehicles::AutoLoad(&rec,uintptr_t(&p.automatic)));
     assert(std::string(rec.data)==" 3 -1 -1 1"); SliceRecordFree(&rec);
+    p.automatic.assign(1025, true);
+    assert(slice_vehicles::AutoLoad(&rec, uintptr_t(&p.automatic)));
+    assert(std::string(rec.data).find(" 33 -1 -1") == 0 && std::string(rec.data).substr(rec.len-2) == " 1");
+    SliceRecordFree(&rec);
+    Config huge; huge.parts.assign(100, p); huge.groups.assign(300, 0);
+    assert(slice_vehicles::Config(&rec, uintptr_t(&huge))); SliceRecordFree(&rec);
+    std::vector<int> sale(1000, 17);
+    assert(slice_vehicles::IntVector(&rec, uintptr_t(&sale), true));
+    assert(std::string(rec.data).find(" 1000 17 17") == 0); SliceRecordFree(&rec);
     // An iterator with a nonzero start offset is normalized before serialization.
     uint64_t source[2]={0x8000000000000000ULL,1};
     uintptr_t bits[5]={uintptr_t(source),63,uintptr_t(source+1),1,uintptr_t(source+2)};
@@ -341,6 +351,17 @@ static void TestStrictCreates()
     assert(original[2]==SliceAddr(0x10d44b0));assert(!slice_lines::g_creates[0]);
     // A mismatched callback emits no replay or legacy read-back event.
     create(false);assert(!Add(luaFn));assert(writes.empty());
+    // A burst beyond the former eight slots retains every callback and expires safely.
+    p.name.assign(10000, 'n');
+    for (int i=0; i<20; ++i) {
+        original[2]=SliceAddr(0x10d44b0); create(false); assert(Add(original));
+        assert(writes[0].find(p.name) != std::string::npos);
+    }
+    assert(std::count_if(slice_lines::g_creates.begin(), slice_lines::g_creates.end(), [](auto* h){return h != nullptr;}) == 20);
+    // Mock managers are addresses, so clear them before the expiry destructor.
+    for (auto* h : slice_lines::g_creates) if (h) h->fn[2]=0;
+    nowMs += 60001; slice_lines::ExpireCreates();
+    for (auto* h : slice_lines::g_creates) assert(!h);
     // Actual libstdc++ function move/destruction: no clone and no double release.
     auto state=std::make_shared<int>(0);
     std::function<void(int)> fn=[state](int v){*state=v;};assert(state.use_count()==2);

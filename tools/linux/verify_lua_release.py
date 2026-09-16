@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the cumulative Linux Lua integration: dev 55e97a48 plus 3edfbccd."""
+"""Verify the cumulative Linux Lua integration: dev cae5d370 plus retained dashboard/diagnostics."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,18 +7,12 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "55e97a48b7dfdf46743fab5a78a8aefdd14f2ed9"
-INCOMING = "3edfbccd52c0498124a55db57c0714796f3600a1"
-# Incoming is based on 0.5.6, not the previously integrated dev history.
-# Preserve that history; net.lua is exact incoming, hash.lua combines both.
-INCOMING_FILES = {"res/scripts/mp/net.lua"}
+REFERENCE = "cae5d370798ee7d724dfc739fa9d0546fbc505d2"
+INCOMING = REFERENCE
+INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"
-# The earlier b406a913 tabs were integrated before this batch. The exact,
-# reviewed merge retains them alongside upstream's title-bar close handler.
-# docs/linux/UPSTREAM_dev_55e97a48_tabs.patch records the tabs difference.
-# UPSTREAM_dev_3edfbccd_hash.patch records retained hash.lua changes.
-MERGED_SHA256 = {"res/scripts/mp/hash.lua": "1ce99738028429fa5c8d387361e1db30ca12e0a969cbc06e0f4d383a3c4bd886",
-                 "res/config/game_script/lockstep.lua": "62953bf38cda8121b6c54da61980967de5231554bd9571dbbbbc503336f85cb6"}
+# Reviewed cumulative differences are recorded in UPSTREAM_dev_cae5d370_lua.patch.
+MERGED_SHA256 = {'res/config/game_script/lockstep.lua': '911f1c4bd6d861717a7290a5b7610ffe173c8e55381395d6befed349809a0fcd'}
 
 
 def main():
@@ -46,7 +40,7 @@ def main():
         if missing or extra or different:
             return 1
         manifest = "".join(f"{hashlib.sha256(actual[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files: 25 exact dev 55e97a48, net.lua exact {INCOMING}, 2 pinned cumulative merges (hash.lua and dashboard tabs)")
+        print(f"PASS: {len(expected)} Lua files: exact dev cae5d370 except {len(MERGED_SHA256)} pinned cumulative merges")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
         return 0
     except (OSError, subprocess.CalledProcessError) as error:

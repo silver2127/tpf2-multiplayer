@@ -1,6 +1,12 @@
 // Included by slice_hook.cpp after Readable/IsHeapPtr/Log. Build 35924.
 // A modular station has many frozen nodes/segments, unlike the old depot weld.
 // Adopt ONLY the snapped boundary segment, and remap indices after compaction.
+// No count cap (2026-09-16): a station of any size welds. The old 64-node /
+// 64-segment cap answered "not ours" to a bigger one on every instance, and
+// the raw apron was built beside ours. STATION_WELD_SANITY_BYTES is the
+// misread-pointer guard on a vector span, not a limit on a station.
+#include <vector>
+static const uint64_t STATION_WELD_SANITY_BYTES = 1ull << 30;
 static bool MergeStationEndpoint(uint64_t p)
 {
     if (!Readable((void*)p, 0x210)) return false;
@@ -9,13 +15,18 @@ static bool MergeStationEndpoint(uint64_t p)
     uint64_t cb=q(p+0x1f8), ce=q(p+0x200);
     if (ce-cb!=0x8e0 || !Readable((void*)cb,0x8e0) || ne<nb || se<sb ||
         (ne-nb)%24 || (se-sb)%120) return false;
+    if (ne-nb>STATION_WELD_SANITY_BYTES || se-sb>STATION_WELD_SANITY_BYTES) {
+        Log("[station-weld] node/segment vectors span %llu/%llu B -- past the misread-pointer bound, not ours\n",
+            (unsigned long long)(ne-nb), (unsigned long long)(se-sb));
+        return false;
+    }
     int n=(int)((ne-nb)/24), m=(int)((se-sb)/120);
-    if(n<4 || n>64 || m<3 || m>64 || !Readable((void*)nb,n*24) || !Readable((void*)sb,m*120)) return false;
+    if(n<4 || m<3 || !Readable((void*)nb,(size_t)(ne-nb)) || !Readable((void*)sb,(size_t)(se-sb))) return false;
     auto ni = [&](int i) { int v; memcpy(&v,(void*)(nb+i*24+20),4); return v; };
     auto si = [&](int i,int off) { int v; memcpy(&v,(void*)(sb+i*120+off),4); return v; };
     auto node = [&](int id) { for(int i=0;i<n;i++) if(ni(i)==id) return i; return -1; };
     auto xyz = [&](int i,float* v) { memcpy(v,(void*)(nb+i*24),12); };
-    int degree[64]={}; bool owned[64]={};
+    std::vector<int> degree(n,0); std::vector<uint8_t> owned(n,0);
     for(int s=0;s<m;s++) if(si(s,0x74)==1) {
         for(int off=8;off<=12;off+=4) { int i=node(si(s,off)); if(i>=0) {degree[i]++;owned[i]=true;} }
     }
@@ -52,7 +63,9 @@ static bool MergeStationEndpoint(uint64_t p)
     if(q(p+0x198)!=0) return false;
     uint64_t fb[2]={q(p+0x170),q(cb+0x768)}, fe[2]={q(p+0x178),q(cb+0x770)};
     for(int k=0;k<2;k++) {
-        if(fe[k]<fb[k] || (fe[k]-fb[k])%4 || fe[k]-fb[k]>256 ||
+        // any number of frozen indices (the old 256-byte cap allowed 64); the
+        // span bound is the misread guard, every index is checked against n below
+        if(fe[k]<fb[k] || (fe[k]-fb[k])%4 || fe[k]-fb[k]>STATION_WELD_SANITY_BYTES ||
             (fe[k]>fb[k] && !Readable((void*)fb[k],(size_t)(fe[k]-fb[k])))) return false;
         for(uint64_t v=fb[k];v<fe[k];v+=4) {int i;memcpy(&i,(void*)v,4);if(i<0||i>=n||i==u)return false;}
     }
@@ -61,7 +74,7 @@ static bool MergeStationEndpoint(uint64_t p)
     if(te<tb || (te!=tb && (te-tb!=(uint64_t)m*32 || !Readable((void*)tb,m*32))))return false;
     // A removed script connector must own no heap-backed object vector.
     if(q(sb+o*120+0x30)!=q(sb+o*120+0x38))return false;
-    int remap[64],count=0;
+    std::vector<int> remap(n); int count=0;
     for(int i=0;i<n;i++) remap[i]=(i==x||i==u)?-1:count++;
     remap[x]=remap[t];
     // All validation is above this point: rejected proposals are untouched.

@@ -71,11 +71,11 @@ void Construction()
     CHECK(std::string(out.data) == "{[\"enabled\"]=false,[\"modules\"]={[1]=true,[2]=\"a\\010\\\"\\\\\\000z\"},[\"seed\"]=123}");
     SliceRecordFree(&out);
     // 0.5.6 regression: modular station params must not truncate at 8 KB.
-    // Linux's dynamic record already supports up to 256 KB.
+    // Exceed both the old node and text limits.
     Table large;
     const std::string payload(1024, 'x');
     std::string expected = "{";
-    for (int i = 1; i <= 64; ++i) {
+    for (int i = 1; i <= 2050; ++i) {
         large.emplace(Number(i), String(payload));
         if (i > 1) expected += ",";
         expected += "[" + std::to_string(i) + "]=\"" + payload + "\"";
@@ -83,14 +83,28 @@ void Construction()
     expected += "}";
     CHECK(expected.size() > 65536);
     CHECK(SliceConstructionParams(uintptr_t(&large), &out, &nodes));
-    CHECK(nodes == 64 && std::string(out.data, out.len) == expected);
+    CHECK(nodes == 2050 && std::string(out.data, out.len) == expected);
     SliceRecordFree(&out);
+    // 100 nested maps use a heap traversal stack, with valid parent headers.
+    Table deep;
+    std::vector<Table*> nestedTables;
+    Table* at = &deep;
+    for (int i=0; i<100; ++i) {
+        auto entry = at->emplace(Number(i), Value{}).first;
+        entry->second.tag = 4;
+        at = new (entry->second.payload.data()) Table;
+        nestedTables.push_back(at);
+    }
+    at->emplace(Number(100), Boolean(true));
+    CHECK(SliceConstructionParams(uintptr_t(&deep), &out, &nodes) && nodes == 101);
+    SliceRecordFree(&out);
+    for (auto i=nestedTables.rbegin(); i!=nestedTables.rend(); ++i) (*i)->~Table();
     Table bad; bad.emplace(Number(1), Number(INFINITY));
     CHECK(!SliceConstructionParams(uintptr_t(&bad), &out, nullptr)); SliceRecordFree(&out);
     CHECK(!SliceConstructionParams(1, &out, nullptr)); SliceRecordFree(&out);
     Table empty;
-    CHECK(!SliceConstructionParams(uintptr_t(&empty), &out, nullptr)); SliceRecordFree(&out);
-    // Cycle nested payload back into itself: must hit a depth limit, never hang.
+    CHECK(SliceConstructionParams(uintptr_t(&empty), &out, nullptr)); SliceRecordFree(&out);
+    // Cycle nested payload back into itself: must reject the ancestor alias, never hang.
     Table cycle; cycle.emplace(Number(1), Value{});
     cycle.begin()->second = Nested(cycle);
     CHECK(!SliceConstructionParams(uintptr_t(&cycle), &out, nullptr)); SliceRecordFree(&out);
@@ -160,7 +174,7 @@ void Codecs()
     Assets a; a.groups.resize(1); a.originalRemovals = 2; a.removals = {12};
     Model model; model.model = "tree.mdl"; model.extra = "tag"; for (int i = 0; i < 16; i += 5) model.matrix[i] = 1;
     a.groups[0].push_back(model);
-    CHECK(EncodeAssets(a, &bytes)); CHECK(std::memcmp(bytes.data(), "TPAS\1\0\0\0\1\0\0\0\2\0\0\0", 16) == 0);
+    CHECK(EncodeAssets(a, &bytes)); CHECK(std::memcmp(bytes.data(), "TPAS\2\0\0\0\1\0\0\0\2\0\0\0", 16) == 0);
     Assets decoded; CHECK(DecodeAssets(bytes, &decoded));
     CHECK(decoded.groups[0][0].model == "tree.mdl" && decoded.originalRemovals == 2);
     CHECK(ParseAssetsFile("rm 12\n" + Base64(bytes), &decoded) && decoded.removals == std::vector<int32_t>{12});
@@ -168,6 +182,15 @@ void Codecs()
     for (const char* prefix : {"rm \n", "rm 1,\n", "rm 0\n", "rm -1\n", "rm 2147483648\n", "rm 1,2,3\n"})
         CHECK(!ParseAssetsFile(std::string(prefix) + Base64(bytes), &decoded));
     bytes.push_back(0); CHECK(!DecodeAssets(bytes, &decoded));
+    a.groups[0][0].model.assign(70000, 'm');
+    a.originalRemovals = 5000;
+    CHECK(EncodeAssets(a, &bytes) && DecodeAssets(bytes, &decoded));
+    CHECK(decoded.groups[0][0].model.size() == 70000 && decoded.originalRemovals == 5000);
+    auto old = bytes; old[4] = 1; CHECK(!DecodeAssets(old, &decoded));
+    for (size_t n : {size_t(16), size_t(20), size_t(24), bytes.size()-1}) {
+        std::vector<uint8_t> truncated(bytes.begin(), bytes.begin()+n);
+        CHECK(!DecodeAssets(truncated, &decoded));
+    }
     a.groups[0][0].model = "a\0b"s; CHECK(!EncodeAssets(a, &bytes));
 }
 

@@ -118,7 +118,18 @@ CM.execConX = function(c)
 		local t = {}
 		for tok in tostring(c.t or ""):gmatch("[^,]+") do t[#t + 1] = tonumber(tok) end
 		if #t ~= 16 then log("CONX: bad transf, " .. #t .. " numbers"); return end
-		local params = CM.deserParams(c.params) or {}
+		local params = CM.deserParams(c.params)
+		if not params then
+			if c.params and c.params ~= "" then
+				-- deserParams said why. Building with EMPTY params would put a
+				-- default-layout construction where the originator has its real one.
+				log(string.format("%s seq=%s: shipped params could not be read -- build SKIPPED (DIVERGENCE: no %s at %s on this instance)",
+					tostring(c.op), tostring(c.seq), tostring(c.file), CM.conKey(t[13], t[14])))
+				CM.conxBusy = false
+				return
+			end
+			params = {}
+		end
 		local key = CM.conKey(t[13], t[14])
 		-- CANCELLED PLACEMENT (c.cancelled=1): the native build
 		-- never happened, so the originator builds the scripted proposal at the
@@ -827,66 +838,101 @@ CM.execConX = function(c)
 					local r = math.sqrt((bb.max.x - bb.min.x) ^ 2 + (bb.max.y - bb.min.y) ^ 2) / 2 + 10
 					local cleared = 0
 					-- EXACT path: the originator shipped the town buildings its world still
-					-- has. Anything inside this station's bbox that is NOT on that list is a
-					-- building the originator lost to the placement -> remove it here too.
-					if c.survivors then
+					-- has, and the radius it gathered them in (srad). Anything inside that
+					-- disk that is NOT on the list is a building the originator lost to the
+					-- placement -> remove it here too.
+					local srad = tonumber(c.srad)
+					if c.survivors and not srad then
+						CM.cmLog(string.format("STN: %s seq=%s survivors shipped without their gather radius (srad) -- the diff cannot tell what was judged; falling back to the %d m track corridor (report this line)",
+							tostring(op), tostring(seq), CORRIDOR))
+					end
+					if srad then
 						local survPts = {}
-						for sx, sy in tostring(c.survivors):gmatch("([%-%d%.]+):([%-%d%.]+)") do survPts[#survPts + 1] = { tonumber(sx), tonumber(sy) } end
+						for sx, sy in tostring(c.survivors or ""):gmatch("([%-%d%.]+):([%-%d%.]+)") do survPts[#survPts + 1] = { tonumber(sx), tonumber(sy) } end
 						local function isSurvivor(px, py)
 							for _, sp in ipairs(survPts) do if (px - sp[1]) ^ 2 + (py - sp[2]) ^ 2 <= 9 then return true end end
 							return false
 						end
-							-- diff region: the WHOLE gather disk, no bbox term. The bbox gate was
-							-- the wrong knob once the diff became survivor-keyed: a depot's native
-							-- placement demolished two buildings 45-58 m from its centre (outside
-							-- bbox+10) and the peer kept them (2026-08-29). Since the peer only
-							-- removes what the originator's snapshot LACKS, the region is bounded by
-							-- the snapshot's coverage, not by the footprint. Anchor on the built
-							-- construction's own position (what gatherSurvivors used on the
-							-- originator), 190 m inside the 200 m gather so nothing unlisted is judged.
-							local gx, gy = cx, cy
-							pcall(function()
-								local bc = api.engine.getComponent(bid, api.type.ComponentType.CONSTRUCTION)
-								if bc and bc.transf then gx, gy = bc.transf[13], bc.transf[14] end
-							end)
-							local DIFF_R = 190
-							local inb = function(px, py)
-								return (px - gx) ^ 2 + (py - gy) ^ 2 <= DIFF_R * DIFF_R
-							end
-							-- Sanity cap: a placement clears a handful of buildings. A diff wanting
-							-- far more means the snapshot is stale/foreign -> log and refuse rather
-							-- than level a town.
-							local MAX_DIFF_REMOVALS = 40
-							local victims = {}
-							local kept = 0
-							for _, id in pairs(game.interface.getEntities({ pos = { gx, gy }, radius = DIFF_R }, { type = "CONSTRUCTION", includeData = false }) or {}) do
-								if id ~= bid then
-									local cco = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
-									local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
-									if cco and po == nil and cco.transf and inb(cco.transf[13], cco.transf[14]) then
-										if isSurvivor(cco.transf[13], cco.transf[14]) then kept = kept + 1
-										else victims[#victims + 1] = { id, cco.transf[13], cco.transf[14], "CONSTRUCTION" } end
+						-- diff region: the originator's gather disk, K.SURV_INNER m inside its
+						-- shipped radius so nothing it never listed is judged. The radius comes
+						-- from the construction's EXTENT on the originator (CM.survivorRadius:
+						-- bounding box + street payload + margin), so a station, airport or
+						-- harbour of any size is judged in full. Until 2026-09-16 this was a
+						-- fixed 190 m inside a fixed 200 m gather, and a big placement left
+						-- every building beyond it standing on the peers with no log line. The
+						-- bbox was never the right knob once the diff became survivor-keyed: a
+						-- depot's native placement demolished two buildings 45-58 m from its
+						-- centre (outside bbox+10) and the peer kept them (2026-08-29). Anchor on
+						-- the built construction's own position (what gatherSurvivors used).
+						local gx, gy = cx, cy
+						pcall(function()
+							local bc = api.engine.getComponent(bid, api.type.ComponentType.CONSTRUCTION)
+							if bc and bc.transf then gx, gy = bc.transf[13], bc.transf[14] end
+						end)
+						local DIFF_R = srad - K.SURV_INNER
+						local inb = function(px, py)
+							return (px - gx) ^ 2 + (py - gy) ^ 2 <= DIFF_R * DIFF_R
+						end
+						-- STALENESS is judged by what the list CLAIMS, never by how much work it
+						-- asks for. A listed survivor with no town construction or asset group
+						-- within 3 m of it here (the diff's own slack) is a building this world
+						-- never had where the originator's has one: the towns already differed
+						-- there. When MOST of the list is like that the snapshot describes a
+						-- different world state and the diff is refused, loudly. The number of
+						-- removals is not a reason: a big station legitimately levels dozens of
+						-- buildings, and until 2026-09-16 a diff wanting more than 40 was refused
+						-- as 'stale' -- exactly the largest placements were the ones whose peers
+						-- kept every building (town-building desync). A cancelled placement
+						-- ships its PRE-build list and every instance runs the same engine
+						-- demolish, so its demolished buildings are unmatched here without any
+						-- divergence: the test only matters when there is something to remove.
+						local here = {}   -- every town construction / asset group in the gather disk, this world
+						local victims, kept = {}, 0
+						for _, id in pairs(game.interface.getEntities({ pos = { gx, gy }, radius = srad }, { type = "CONSTRUCTION", includeData = false }) or {}) do
+							if id ~= bid then
+								local cco = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+								local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
+								if cco and po == nil and cco.transf then
+									local px, py = cco.transf[13], cco.transf[14]
+									here[#here + 1] = { px, py }
+									if inb(px, py) then
+										if isSurvivor(px, py) then kept = kept + 1
+										else victims[#victims + 1] = { id, px, py, "CONSTRUCTION" } end
 									end
 								end
 							end
-							for _, id in pairs(game.interface.getEntities({ pos = { gx, gy }, radius = DIFF_R }, { type = "ASSET_GROUP", includeData = false }) or {}) do
-								local okE, e = pcall(game.interface.getEntity, id)
-								local px = okE and e and e.position and (e.position[1] or e.position.x)
-								local py = okE and e and e.position and (e.position[2] or e.position.y)
-								if px and py and inb(px, py) and not isSurvivor(px, py) then
+						end
+						for _, id in pairs(game.interface.getEntities({ pos = { gx, gy }, radius = srad }, { type = "ASSET_GROUP", includeData = false }) or {}) do
+							local okE, e = pcall(game.interface.getEntity, id)
+							local px = okE and e and e.position and (e.position[1] or e.position.x)
+							local py = okE and e and e.position and (e.position[2] or e.position.y)
+							if px and py then
+								here[#here + 1] = { px, py }
+								if inb(px, py) and not isSurvivor(px, py) then
 									victims[#victims + 1] = { id, px, py, "ASSET_GROUP" }
 								end
 							end
-							if #victims > MAX_DIFF_REMOVALS then
-								CM.cmLog(string.format("STN: %s seq=%s survivor-diff wants %d removals (> %d) -> REFUSED, snapshot looks stale", tostring(op), tostring(seq), #victims, MAX_DIFF_REMOVALS))
-							else
-								for _, v in ipairs(victims) do
-									if CM.bulldozeAlive(v[1]) then cleared = cleared + 1
-										CM.cmLog(string.format("STN: survivor-diff bulldozed town %s %d at (%.1f,%.1f)", v[4], v[1], v[2], v[3])) end
-								end
+						end
+						local unmatched = 0
+						for _, sp in ipairs(survPts) do
+							local found = false
+							for _, h in ipairs(here) do
+								if (h[1] - sp[1]) ^ 2 + (h[2] - sp[2]) ^ 2 <= 9 then found = true; break end
 							end
-							CM.cmLog(string.format("STN: %s seq=%s survivor-diff: %d survivor(s) shipped, %d kept in %d m disk, %d removed", tostring(op), tostring(seq), #survPts, kept, DIFF_R, cleared))
-							return
+							if not found then unmatched = unmatched + 1 end
+						end
+						if #victims > 0 and unmatched * 2 > #survPts then
+							CM.cmLog(string.format("STN: %s seq=%s survivor-diff REFUSED (DIVERGENCE): %d of the %d listed survivor(s) do not exist on this instance -- the list describes a different world state (the towns already differed here, or the list is foreign); the %d building(s) it would have removed are KEPT; report this line",
+								tostring(op), tostring(seq), unmatched, #survPts, #victims))
+						else
+							for _, v in ipairs(victims) do
+								if CM.bulldozeAlive(v[1]) then cleared = cleared + 1
+									CM.cmLog(string.format("STN: survivor-diff bulldozed town %s %d at (%.1f,%.1f)", v[4], v[1], v[2], v[3])) end
+							end
+						end
+						CM.cmLog(string.format("STN: %s seq=%s survivor-diff: %d survivor(s) shipped (%d not found here), %d kept in the %.0f m disk (gathered %.0f m), %d removed",
+							tostring(op), tostring(seq), #survPts, unmatched, kept, DIFF_R, srad, cleared))
+						return
 					end
 					CM.cmLog(string.format("STN: %s seq=%s NO survivors shipped -> falling back to the %d m track corridor", tostring(op), tostring(seq), CORRIDOR))
 					for _, id in pairs(game.interface.getEntities({ pos = { cx, cy }, radius = r }, { type = "CONSTRUCTION", includeData = false }) or {}) do

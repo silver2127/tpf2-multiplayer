@@ -6,6 +6,9 @@
 std::string MenuGame_SaveDir() { assert(false && "unexpected save lookup"); return {}; }
 bool MenuGame_NewestSave(std::string*) { assert(false && "unexpected save lookup"); return false; }
 
+bool MenuGame_PlaceSharedSave(const std::string&, std::string*) { assert(false && "unexpected load"); return false; }
+void MenuGame_RequestAutoload(const std::string&) { assert(false && "unexpected load"); }
+
 static void Write(const std::string& path, const std::string& body)
 {
     FILE* f = fopen(path.c_str(), "w");
@@ -89,6 +92,37 @@ int main()
     assert(readNames() == "ac=Joiner with spaces\nz=" + model.host + "\n");
     model.players.resize(1); lobby::WritePlayerNames();
     assert(readNames() == "ac=Joiner with spaces\n");
+    // A complete roster over 1 MiB survives the mailbox tail and parser.
+    lobby::S().lobbyDir=dir; lobby::S().child.gen=model.gen;
+    std::string event="{\"type\":\"roster\",\"players\":[";
+    const std::string longName(5000, 'n');
+    for (int i=0;i<220;++i) event += (i ? "," : "") + std::string("\"") + longName + std::to_string(i) + "\"";
+    event += "],\"stages\":{\"" + longName + "219\":\"loading world\"}}\n";
+    Write(dir+"lobby_out.jsonl",event.substr(0,event.size()/2));
+    lobby::TailOut(); assert(lobby::S().child.lines==0);
+    Write(dir+"lobby_out.jsonl",event);
+    lobby::TailOut(); assert(model.players.size()==220 && model.players.back()==longName+"219");
+    lobby::View view; lobby::Snapshot(&view);
+    assert(view.players.back().stage=="loading world");
+    // Pause time does not age a reusable snapshot; unknown/running time does.
+    const std::string letter=lobby::OwnLetter();
+    Write(dir+"lockstep_dash_"+letter+".txt", "paused=yes\n");
+    lobby::S().unpausedLast=lobby::NowMs()-1000; lobby::S().unpausedMs=10;
+    lobby::UnpausedTick(); assert(lobby::S().unpausedMs==10);
+    Write(dir+"lockstep_dash_"+letter+".txt", "paused=no\n");
+    lobby::S().unpausedLast=lobby::NowMs()-1000; lobby::UnpausedTick();
+    assert(lobby::S().unpausedMs>=1010);
+    lobby::MarkSaveShared(dir+"snapshot.sav");
+    assert(lobby::S().sharedUnpaused==lobby::S().unpausedMs);
+    // Stage updates are sent once and cleared when the script reports live.
+    lobby::g_gameUiSeen=true; lobby::g_titleMenu=false; lobby::S().stageWatch=true;
+    Write(dir+"lockstep_status_"+letter+".txt", "stage=catchup:fetch:25\n");
+    lobby::StageTick(); assert(lobby::S().stageSent=="catching up: fetching history (25 s behind)");
+    Write(dir+"lockstep_status_"+letter+".txt", "stage=live\n");
+    lobby::StageTick(); assert(!lobby::S().stageWatch && lobby::S().stageSent.empty());
+    for (const auto& name : {"lobby_out.jsonl", "lobby_in.jsonl", "tpf2_bridge_ctl.txt"}) unlink((dir+name).c_str());
+    unlink((dir+"lockstep_dash_"+letter+".txt").c_str());
+    unlink((dir+"lockstep_status_"+letter+".txt").c_str());
     assert(unlink((dir + "mp_players.txt").c_str()) == 0);
     assert(unlink(path.c_str())==0 && rmdir(temporary)==0);
     puts("lobby readiness: current-process hooks required for host, join and start; no external effects");

@@ -21,11 +21,10 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **0.5.6 plus Windows dev `55e97a48` and
-`3edfbccd`**. It preserves the earlier dashboard tabs and vehicle diagnostics,
+This development tree combines **0.5.6 plus Windows dev through `cae5d370`**. It preserves the earlier dashboard tabs and vehicle diagnostics,
 and adds native train reservation ordering by name with seeded jitter.
 The cumulative Lua result is hash-pinned. See
-[UPSTREAM_dev_3edfbccd.md](UPSTREAM_dev_3edfbccd.md) for provenance, native
+[UPSTREAM_dev_cae5d370.md](UPSTREAM_dev_cae5d370.md) for provenance, native
 changes and tests. This is not a new release or a claim of live cross-platform
 compatibility. `trainorder=0` in the root/data `tpf2_menu_flags.txt` disables
 the new ordering hook at startup; peers need matching ordering settings.
@@ -226,3 +225,14 @@ The script:
 The lobby builder uses pinned Python and manylinux wheels, checks every bundled ELF dependency against glibc 2.31, and supports `--test` for its five local network/transfer tests. Native build provenance, source commit, included libraries and lobby checksum are recorded in `BUILDINFO`.
 
 The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the source tree for implementation coverage and remaining runtime validation; packaging success alone does not establish multiplayer parity.
+
+### Optional Big Maps worktree in development packages
+
+Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`
+or `tools/linux/auto_install.py` to build and ship that checkout's native
+plugin and configuration. Source is mounted read-only; outputs go in the
+multiplayer build directory. Plugin-only source changes trigger a rebuild
+and installation after all games close. The selected checkout must contain
+`linux/CMakeLists.txt` and `linux/tpf2_bigmap.cfg`. This option never launches
+the game. Automatic recovery and Workshop registration remain unsupported as
+recorded in the integration notes.

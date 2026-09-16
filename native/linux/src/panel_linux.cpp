@@ -404,7 +404,7 @@ static void RenderLobbyLocked(int w, int h)
         snprintf(num, sizeof(num), "%d", p.company);
         layer::Text(pad, ry + S(4), S(22), S(16), num, S(11), rgb(0, 0, 0), layer::kCenter | layer::kVCenter);
         if (p.you || v.youAreHost) AddHit(pad, ry + S(2), S(24), S(20), 20 + i, true);
-        layer::Text(pad + S(30), ry, listW - S(80), S(24), p.name.c_str(), S(14), p.you ? MW_YOU : MW_TEXT,
+        layer::Text(pad + S(30), ry, listW - S(80), S(24), (p.stage.empty() ? p.name : p.name + "  (" + p.stage + ")").c_str(), S(14), p.you ? MW_YOU : MW_TEXT,
                     layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
         if (p.host) layer::Text(pad + listW - S(50), ry, S(50), S(24), "HOST", S(11), MW_DIM, layer::kRight | layer::kVCenter, 180);
     }
@@ -632,7 +632,7 @@ static void OnHitLocked(int id, Post* post)
             if (lobby::CopyCode(&code)) { post->copy = code; post->copied = "Code copied to clipboard \xE2\x80\x94 share it in Discord."; }
             break;
         }
-        case 8:  g_focus = 1; if (P().joinCode.empty()) post->pasteCode = true; break;
+        case 8:  g_focus = 1; if (P().joinCode.empty()) post->pasteCode = true; else P().joinCode.clear(); break;
         case 9:  break;   // the chat field is always focused in the lobby
         case 10: g_focus = 2; break;
         case 13: g_focus = 3; break;

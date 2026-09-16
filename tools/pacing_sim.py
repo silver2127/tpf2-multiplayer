@@ -139,6 +139,9 @@ function newInst(spec)
   end
   SIM.cur = I
   FACTORY(CM, K, log)
+  -- the load gate is not modelled: every game starts with the history since its save in hand
+  -- (CM.lgFetch, pacing.lua; tools/late_loader_test.py drives the gate itself)
+  CM.lgFetch = "done"
   for _, nm in ipairs({ "hostUnpause", "syncBegin", "syncEnd" }) do
     if not CM[nm] then CM[nm] = function() end; SIM.stubbed = (SIM.stubbed or "") .. nm .. " " end
   end

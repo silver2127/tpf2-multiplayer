@@ -708,6 +708,10 @@ bool SliceReadStdVector(uintptr_t obj, size_t stride, size_t maxCount, SliceVec*
     if (b > e || e > c) return false;
     if ((e - b) % stride || (c - b) % stride) return false;
     const size_t count = (e - b) / stride;
+    if (e - b > SliceSanityBytes) {
+        SliceLog("[slice] vector at %lx spans %zu bytes: corrupt-span guard\n", (unsigned long)obj, size_t(e-b));
+        return false;
+    }
     if (count > maxCount) return false;
     if (count && !SliceReadable(b, e - b)) return false;
     out->begin = b;

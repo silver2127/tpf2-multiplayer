@@ -1,5 +1,6 @@
 // Linux build 35924: layouts/callback policies from docs/re/linux/SLICE_LINES.md.
 #include "slice_core.h"
+#include <vector>
 #include <cmath>
 #include <cerrno>
 #include <initializer_list>
@@ -80,11 +81,12 @@ static bool Decode(SliceRecord* rec, int32_t entity, uintptr_t line)
 
 static bool EncodeName(SliceRecord* rec, uintptr_t address)
 {
-    char name[256]; size_t len;
-    if (!SliceReadStdString(address, name, sizeof(name), &len, 255) || !len) return false;
+    std::string name;
+    if (!SliceReadStdString(address, &name) || name.empty()) return false;
+    const size_t len = name.size();
     for (size_t i = 0; i < len; ++i) {
         const unsigned char ch = name[i];
-        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') SliceRecordAppend(rec, name + i, 1);
+        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') SliceRecordAppend(rec, name.data() + i, 1);
         else SliceRecordPrintf(rec, "%%%02X", unsigned(ch));
     }
     return !rec->failed;
@@ -110,7 +112,7 @@ struct HeldCreate {
     SliceRecord identity;
     bool inflight;
 };
-static HeldCreate* g_creates[8]{};
+static std::vector<HeldCreate*> g_creates;
 static pthread_mutex_t g_createMutex = PTHREAD_MUTEX_INITIALIZER;
 static std::atomic<uint32_t> g_createSequence{0};
 static uint64_t g_claimSeen = 0;
@@ -142,14 +144,15 @@ static void ReleaseCreate(void*, void* context)
 
 static void ExpireCreates()
 {
-    HeldCreate* expired[8]{}; size_t count=0;
+    std::vector<HeldCreate*> expired;
     const uint64_t now=SliceNowMs();
     pthread_mutex_lock(&g_createMutex);
+    try { expired.reserve(g_creates.size()); } catch (...) { pthread_mutex_unlock(&g_createMutex); throw; }
     for (auto& slot:g_creates) if (slot && !slot->inflight && now-slot->at>60000) {
-        expired[count++]=slot;slot=nullptr;
+        expired.push_back(slot);slot=nullptr;
     }
     pthread_mutex_unlock(&g_createMutex);
-    for (size_t i=0;i<count;++i) ReleaseCreate(nullptr,expired[i]);
+    for (auto* h : expired) ReleaseCreate(nullptr,h);
 }
 
 static bool FreshClaim(uint64_t* nonce, char* letter)
@@ -281,13 +284,15 @@ static bool PrepareCreate(const SliceAddCall& add, void*)
     std::memcpy(h->fn,fn,sizeof(fn)); h->id=t_create.id; h->at=SliceNowMs(); std::strcpy(h->instance,instance);
     char claimInstance[8]; uint64_t priorClaim;
     if (FreshClaim(&priorClaim,claimInstance) && !std::strcmp(claimInstance,instance)) h->claimBefore=priorClaim;
-    int slot=-1;
+    size_t slot=0;
     // A simulation-thread replay can observe the append immediately. Publish
     // the moved callback and its identity in the same critical section as the
     // append, so that replay cannot claim a half-committed holder.
     pthread_mutex_lock(&g_createMutex);
-    for (int i=0;i<8;++i) if (!g_creates[i]) { g_creates[i]=h; slot=i; break; }
-    if (slot<0) {pthread_mutex_unlock(&g_createMutex);std::free(h);return false;}
+    for (;slot<g_creates.size();++slot) if (!g_creates[slot]) break;
+    try { if (slot == g_creates.size()) g_creates.push_back(nullptr); }
+    catch (...) { pthread_mutex_unlock(&g_createMutex); std::free(h); throw; }
+    g_creates[slot]=h;
     const uintptr_t zero=0;
     if (!WriteMemory(uintptr_t(add.done)+0x10,&zero,sizeof(zero))) {
         g_creates[slot]=nullptr;pthread_mutex_unlock(&g_createMutex);
