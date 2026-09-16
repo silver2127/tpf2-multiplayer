@@ -994,6 +994,8 @@ function data()
 			if CM.retryQueue and #CM.retryQueue > 0 then
 				for _, rc in ipairs(CM.retryQueue) do
 					executed[CM.cmdKey(rc)] = nil
+					CM.queuedKeys = CM.queuedKeys or {}
+					CM.queuedKeys[CM.cmdKey(rc)] = true   -- a copy arriving during the retry is not queued beside it
 					CM.queue[#CM.queue + 1] = rc
 				end
 				CM.retryQueue = {}
@@ -1094,6 +1096,7 @@ function data()
 							keep[#keep + 1] = c
 						else
 						local k = CM.cmdKey(c)
+						if CM.queuedKeys then CM.queuedKeys[k] = nil end   -- the queue's copy is done with (net.lua: one copy queued per key)
 						if not executed[k] then
 							executed[k] = true
 							-- remember insertion order so this cannot grow for the life of

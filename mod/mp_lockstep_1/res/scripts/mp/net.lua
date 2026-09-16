@@ -1358,7 +1358,26 @@ local function onLine(line)
 					end
 					c.company = lc
 				end
-				CM.queue[#CM.queue + 1] = c
+				-- ONE COPY IN THE QUEUE (2026-09-16). A command now arrives up to three
+				-- times (scheduleLocal's copies, a NACK resend, the history feed). The
+				-- apply loop deduplicates at EXECUTION, but its pre-pass hands every
+				-- queued VBUY its own step target, chained one step after the previous
+				-- queued buy -- copies included. b held three copies of each of a's
+				-- eight buses and chained 803, 804, 805, 806, ... across them, so its
+				-- buses were created on steps 806, 808, 811, ... while a, which never
+				-- receives its own copies, used 804, 805, 806, ...: eight buses created
+				-- on different steps, the towns split within a minute (19:30). So a
+				-- key that is queued (or being retried) is not queued again.
+				local qk = c.at .. "|" .. tostring(c.origin) .. "|" .. tostring(c.seq)
+				local dup = false
+				CM.queuedKeys = CM.queuedKeys or {}
+				if CM.queuedKeys[qk] then
+					CM.dupDropped = (CM.dupDropped or 0) + 1
+					dup = true
+				else
+					CM.queuedKeys[qk] = true
+					CM.queue[#CM.queue + 1] = c
+				end
 				-- A command whose stamp has already passed here will execute at a
 				-- DIFFERENT sim time than it did on the originator, which is a
 				-- desync rather than a late delivery. It is the exact failure the stamp's
@@ -1366,7 +1385,7 @@ local function onLine(line)
 				-- if it ever happens instead of letting it look like a mystery
 				-- hash mismatch later.
 				local now = CM.gameTime()
-				if now and c.at < math.floor(now) then
+				if not dup and now and c.at < math.floor(now) then
 					-- A command is meant to be applied at a GAME TIME both sides
 					-- agree on. This one's moment has already passed here, so it
 					-- will be applied on arrival instead: the build still appears
