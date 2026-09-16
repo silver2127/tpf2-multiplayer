@@ -420,8 +420,12 @@ class PeersLog:
     def __init__(self, directory):
         self.path = os.path.join(directory, PEERS_LOG_NAME)
         self._lock = threading.Lock()
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("# merged lobby log, started " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        # KEEP LOGS: with <io dir>/tpf2mp_keep_logs.txt present the previous run's
+        # merged log is kept and this run appends after its banner.
+        keep = os.path.isfile(os.path.join(directory, "tpf2mp_keep_logs.txt"))
+        with open(self.path, "a" if keep else "w", encoding="utf-8") as f:
+            f.write(("\n" if keep else "") + "# merged lobby log, started " + time.strftime("%Y-%m-%d %H:%M:%S")
+                    + (" (tpf2mp_keep_logs.txt present: appending)" if keep else "") + "\n")
 
     def write(self, who, lines):
         stamp = time.strftime("%H:%M:%S")

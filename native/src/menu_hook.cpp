@@ -2751,7 +2751,18 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // KEEP LOGS: with <data dir>\tpf2mp_keep_logs.txt present the previous run's
+    // lobby_proc.log is kept and this run appends after a banner.
+    wchar_t keepFlag[MAX_PATH]; _snwprintf_s(keepFlag, _TRUNCATE, L"%stpf2mp_keep_logs.txt", g_dataDirW);
+    const bool keepLogs = g_dataDirW[0] && GetFileAttributesW(keepFlag) != INVALID_FILE_ATTRIBUTES;
+    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, keepLogs ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (keepLogs && hLog != INVALID_HANDLE_VALUE) {
+        SetFilePointer(hLog, 0, nullptr, FILE_END);
+        SYSTEMTIME st; GetLocalTime(&st);
+        char banner[160]; int n = snprintf(banner, sizeof(banner), "\n==== lobby session %04u-%02u-%02u %02u:%02u:%02u (tpf2mp_keep_logs.txt present: appending) ====\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        DWORD w; WriteFile(hLog, banner, (DWORD)n, &w, nullptr);
+    }
     STARTUPINFOW si = { sizeof(si) };
     // Redirect the lobby's output ONLY if the log actually opened. Handing
     // CreateProcess an INVALID_HANDLE_VALUE as stdout/stderr gives the child a

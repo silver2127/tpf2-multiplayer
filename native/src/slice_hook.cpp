@@ -4560,8 +4560,16 @@ static DWORD WINAPI Init(LPVOID)
 
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%stpf2_slice.log", g_dataDir);
-    g_log = _fsopen(path, "w", _SH_DENYWR);
+    // KEEP LOGS: while <data dir>\tpf2mp_keep_logs.txt exists, every log that
+    // would start afresh is appended to instead (the bridge and menu logs always
+    // append); a session banner marks the start. The game's own stdout.txt is
+    // the game's -- snapshot it (tools\snapshot_logs.ps1) before a restart.
+    char keep[MAX_PATH]; snprintf(keep, sizeof(keep), "%stpf2mp_keep_logs.txt", g_dataDir);
+    const bool keepLogs = GetFileAttributesA(keep) != INVALID_FILE_ATTRIBUTES;
+    g_log = _fsopen(path, keepLogs ? "a" : "w", _SH_DENYWR);
     if (!g_log) return 0;
+    if (keepLogs) { SYSTEMTIME st; GetLocalTime(&st); fprintf(g_log, "\n==== session %04u-%02u-%02u %02u:%02u:%02u pid %lu (tpf2mp_keep_logs.txt present: appending) ====\n",
+        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, GetCurrentProcessId()); }
     g_base = (uintptr_t)GetModuleHandleW(nullptr);
     Log("[slice] data dir=%s\n", g_dataDir);
     Log("[slice] dll dir=%s\n", g_dllDir[0] ? g_dllDir : "?");
