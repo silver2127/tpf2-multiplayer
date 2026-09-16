@@ -1297,7 +1297,16 @@ static void WriteNativeNotice(const char* kind)
 // and the peers read back as before). The first stop's raw fields are logged
 // on every decode so one real edit pins the predicted offsets.
 struct LineAlt  { int32_t station, terminal; };                   // StationTerminal, 8 B (t16: span 8*i at stop+0x10)
-struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[8]; int nWp; int32_t wp[64][2]; };
+// alt[32]: a stop's platform choice lists every platform it may use, and a
+// modular station has more than the 8 this held. wp index bound 1<<20: a
+// signal's index is an entity-scoped number, not a small ordinal. Either
+// used to fail the decode SILENTLY; the edit then ran natively on the host
+// alone and the peers applied a read-back that carries neither, so the
+// host's trains and the peers' took different routes (vehicle drift desync
+// 2026-09-16). g_lineDecodeWhy names the check that refused.
+struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[32]; int nWp; int32_t wp[64][2]; };
+static char g_lineDecodeWhy[200] = "";
+#define LINE_REFUSE(...) do { _snprintf_s(g_lineDecodeWhy, sizeof(g_lineDecodeWhy), _TRUNCATE, __VA_ARGS__); return false; } while (0)
 struct LineDecode { int32_t wait; int n; LineStop st[64]; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
@@ -1331,9 +1340,9 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
     }
     uint64_t sb = 0;
     uint64_t span = ReadVec(line + vecOff, &sb, 0xa8 * 64);
-    if (span == 0 || (span % 0xa8) != 0) return false;
+    if (span == 0 || (span % 0xa8) != 0) LINE_REFUSE("stops vector at +0x%llx: span %llu (0 or not a multiple of 0xa8)", (unsigned long long)vecOff, (unsigned long long)span);
     int n = (int)(span / 0xa8);
-    if (n < 1 || n > 64) return false;
+    if (n < 1 || n > 64) LINE_REFUSE("%d stops (1..64)", n);
     out->n = n;
     for (int i = 0; i < n; i++) {
         const uint8_t* b = (const uint8_t*)sb + (size_t)i * 0xa8;
@@ -1346,38 +1355,38 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         memcpy(&f2c,        b + 0x2c, 4);
         memcpy(&f30,        b + 0x30, 4);
         // floats (see the layout note); NaN fails every comparison below
-        if (!(f2c >= 0.f && f2c <= 36000.f) || !(f30 >= 0.f && f30 <= 36000.f)) return false;
+        if (!(f2c >= 0.f && f2c <= 36000.f) || !(f30 >= 0.f && f30 <= 36000.f)) LINE_REFUSE("stop %d waits %.1f/%.1f", i + 1, f2c, f30);
         int32_t w2c = (int32_t)(f2c + 0.5f), w30 = (int32_t)(f30 + 0.5f);
         // which of +0x2c/+0x30 is min is unpinned; min <= max always holds
         if (w2c <= w30) { t.minWait = w2c; t.maxWait = w30; } else { t.minWait = w30; t.maxWait = w2c; }
         if (t.sg <= 0 || t.station < 0 || t.station > 64 || t.terminal < 0 || t.terminal > 64
             || t.loadMode < 0 || t.loadMode > 3)
-            return false;
+            LINE_REFUSE("stop %d sg=%d station=%d terminal=%d loadMode=%d", i + 1, t.sg, t.station, t.terminal, t.loadMode);
         // alternativeTerminals: vector<StationTerminal> at stop+0x10, 8 B each
         // (t16). Platform choice in the line editor lives here; a stop may
         // list several. Capped at 8; more than that fails the decode.
         t.nAlt = 0;
         uint64_t ab = 0;
-        uint64_t aspan = ReadVec((uint64_t)b + 0x10, &ab, 8 * 9);
-        if (aspan % 8) return false;
+        uint64_t aspan = ReadVec((uint64_t)b + 0x10, &ab, 8 * 33);
+        if (aspan % 8) LINE_REFUSE("stop %d alternative terminals span %llu", i + 1, (unsigned long long)aspan);
         int na = (int)(aspan / 8);
-        if (na > 8) return false;
+        if (na > 32) LINE_REFUSE("stop %d has %d alternative terminals (max 32)", i + 1, na);
         for (int a = 0; a < na; a++) {
             memcpy(&t.alt[a].station,  (const uint8_t*)ab + a * 8 + 0, 4);
             memcpy(&t.alt[a].terminal, (const uint8_t*)ab + a * 8 + 4, 4);
             if (t.alt[a].station < 0 || t.alt[a].station > 64 || t.alt[a].terminal < 0 || t.alt[a].terminal > 64)
-                return false;
+                LINE_REFUSE("stop %d alternative %d: station=%d terminal=%d", i + 1, a + 1, t.alt[a].station, t.alt[a].terminal);
         }
         t.nAlt = na;
         // vector<transport::SignalId> {entity,index}, after this station stop.
         uint64_t wb = 0, we = 0;
         memcpy(&wb, b + 0x38, 8); memcpy(&we, b + 0x40, 8);
-        if (we < wb || (we - wb) % 8 || (we - wb) > sizeof(t.wp)) return false;
+        if (we < wb || (we - wb) % 8 || (we - wb) > sizeof(t.wp)) LINE_REFUSE("stop %d waypoint vector %llx..%llx", i + 1, (unsigned long long)wb, (unsigned long long)we);
         t.nWp = (int)((we - wb) / 8);
-        if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) return false;
+        if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) LINE_REFUSE("stop %d waypoints unreadable", i + 1);
         for (int w = 0; w < t.nWp; w++) {
             memcpy(t.wp[w], (void*)(wb + w * 8), 8);
-            if (t.wp[w][0] <= 0 || t.wp[w][1] < 0 || t.wp[w][1] > 64) return false;
+            if (t.wp[w][0] <= 0 || t.wp[w][1] < 0 || t.wp[w][1] > (1 << 20)) LINE_REFUSE("stop %d waypoint %d: entity=%d index=%d", i + 1, w + 1, t.wp[w][0], t.wp[w][1]);
         }
     }
     return true;
@@ -1385,7 +1394,8 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
 
 static bool DecodeLine(uint64_t line, LineDecode* out)
 {
-    if (!IsHeapPtr(line) || !Readable((void*)line, 0x24)) return false;
+    g_lineDecodeWhy[0] = 0;
+    if (!IsHeapPtr(line) || !Readable((void*)line, 0x24)) LINE_REFUSE("line struct unreadable");
     // waitingTime's type was never recorded (t11 matched the value, not the
     // width). Take whichever interpretation is a sane number of seconds.
     {
@@ -1394,7 +1404,7 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
         memcpy(&wf, (void*)(line + 0x18), 4);
         if (wi >= 0 && wi <= 36000) out->wait = wi;
         else if (wf >= 0.f && wf <= 36000.f) { out->wait = (int32_t)(wf + 0.5f); Log("[slice] LUPDATE: waitingTime is a FLOAT at +0x18 (%.1f) -- note it\n", wf); }
-        else return false;
+        else LINE_REFUSE("waitingTime %d / %.1f", wi, wf);
     }
     if (DecodeLineAt(line, 0x00, out)) return true;
     if (DecodeLineAt(line, 0x18, out)) { Log("[slice] LUPDATE: stops vector found at +0x18, not +0x00 -- update the layout note\n"); return true; }
@@ -1908,7 +1918,8 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                 __try { g_lineDecodeOk = DecodeLine(r9, &g_lineDecode); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { g_lineDecodeOk = false; }
                 if (!g_lineDecodeOk && cancel) {
-                    Log("[slice] UpdateLine: Line decode failed -- NOT cancelled; event ships, peers read back\n");
+                    Log("[slice] UpdateLine: Line decode failed (%s) -- NOT cancelled; event ships, peers read back. "
+                        "LOCKSTEP AT RISK: this edit runs on this game first and the read-back may not carry it\n", g_lineDecodeWhy);
                     cancel = false;
                 }
             }
