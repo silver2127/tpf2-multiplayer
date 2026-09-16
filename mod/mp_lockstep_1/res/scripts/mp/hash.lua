@@ -111,6 +111,9 @@ local function collectEdges()
 	return out
 end
 local warnedNoEdges = false
+-- said once if this build's vehicle records carry no `carrier` field (see the
+-- train-name lane in worldHash)
+local warnedNoCarrier = false
 -- node id -> "x,y", valid for ONE hash pass only. Ids are recycled: a node that
 -- is bulldozed hands its id to whatever is built next, so a cache kept across
 -- passes reports the dead node's position for the live one -- a phantom desync
@@ -476,6 +479,25 @@ local function worldHash(now)
 	-- to read, not a verdict, until the evidence says otherwise.
 	local nv = 0
 	local vpos = {}
+	-- TRAIN NAMES (the r lane). The native reservation-order patch
+	-- (native/src/slice_hook.cpp, "TRAIN RESERVATION ORDER") ranks trains by
+	-- their NAME to decide which one reserves track first at a junction. That
+	-- makes a name a piece of simulation input, not decoration: two peers whose
+	-- trains are named differently send them through a junction in different
+	-- orders, and every geometry lane in this hash stays identical while it
+	-- happens. So the names get a lane of their own, gathered in the same pass
+	-- (and therefore at the same cadence) as the vehicle positions.
+	--
+	-- TWO hashes in one lane, because the ranking depends on two things:
+	--   by-id    the names in entity-id order -- the patch's tie-break is the id,
+	--            so this also catches ids that RANK differently between peers
+	--   sorted   the names alone, sorted, so a pure name difference is
+	--            distinguishable from an id-order one. Ids legitimately differ in
+	--            value between peers (hash-world-by-geometry-not-ids), so a lane
+	--            that could only say "something differs" would be the kind of
+	--            detector that fires constantly and proves nothing.
+	-- net.lua's compareOne tells the two apart and says which it is.
+	local tnById, tnSorted, tnCarrier = {}, {}, false
 	pcall(function()
 		-- includeData=true hands back every vehicle's record in ONE call. The
 		-- first version did a getEntity per vehicle inside its own closure --
@@ -484,8 +506,25 @@ local function worldHash(now)
 		local t = game.interface.getEntities({ radius = 999999 },
 			{ type = "VEHICLE", includeData = true }) or {}
 		local raw = (not CM.vposOff) and {} or nil
+		local rail = {}
 		for vid, e in pairs(t) do
 			nv = nv + 1
+			-- Rail only: the patch orders trains, and a bus cannot contest a
+			-- track reservation. `carrier` is read by CALLING, not by testing
+			-- for it -- and if this build never hands one back, the lane falls
+			-- back to every vehicle rather than to nothing (a lane that silently
+			-- covers no vehicles is worse than a noisy one).
+			local id = (type(e) == "table" and tonumber(e.id)) or tonumber(vid)
+			local carrier = type(e) == "table" and e.carrier or nil
+			if carrier ~= nil then tnCarrier = true end
+			if id and (carrier == nil or tostring(carrier):upper() == "RAIL") then
+				local nm = ""
+				pcall(function()
+					local nc = api.engine.getComponent(id, api.type.ComponentType.NAME)
+					if nc and nc.name then nm = tostring(nc.name) end
+				end)
+				rail[#rail + 1] = { id = id, name = nm }
+			end
 			local p = type(e) == "table" and e.position or nil
 			if p then
 				-- sorted below, so this says nothing about WHICH vehicle is
@@ -502,6 +541,12 @@ local function worldHash(now)
 		-- the hash says equal-or-not, the metric says by how many metres. Never
 		-- past K.VPOS_MAX_VEHICLES, and never again once past it (CM.vposCapReached).
 		if raw and not CM.vposCapReached(nv, "in this game") then CM.lastVposRaw, CM.lastVposT = raw, now end
+		-- pairs() order is undefined and differs run to run, so BOTH orders are
+		-- imposed here and neither depends on how the engine enumerated them.
+		table.sort(rail, function(a, b) return a.id < b.id end)
+		for i = 1, #rail do tnById[i] = rail[i].name end
+		for i = 1, #rail do tnSorted[i] = rail[i].name end
+		table.sort(tnSorted)
 	end)
 	table.sort(vpos)
 	local tV = os.clock()
@@ -653,9 +698,19 @@ local function worldHash(now)
 	local function ms(a, b) return math.floor((b - a) * 1000 + 0.5) end
 	CM.hashPartsMs = string.format("vehicles %d, constructions %d, stops %d, edges %d + sort %d (%d edges), money+people %d, total %d ms",
 		ms(tH0, tV), ms(tV, tC), ms(tC, tO), ms(tO, tE1), ms(tE1, tE2), #egeo, ms(tE2, tN), ms(tH0, tN))
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t:%d,n:%d",
+	-- r: the train-name lane. "|" separates the names so "ab","c" cannot hash
+	-- the same as "a","bc"; the lane letter is a single character on purpose --
+	-- net.lua matches a lane by its leading letters, and a two-letter name would
+	-- be found inside itself by the single-letter lanes it contains.
+	local rLane = string.format("r%d:%s/%s", #tnById,
+		hashStr(table.concat(tnById, "|")), hashStr(table.concat(tnSorted, "|")))
+	if not tnCarrier and #tnById > 0 and not warnedNoCarrier then
+		warnedNoCarrier = true
+		log("train-name lane: no vehicle reported a carrier -- the r lane covers EVERY vehicle, not just trains")
+	end
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,%s,m:%s,l:%s,t:%d,n:%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
-		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt, np)
+		#vpos, now or -1, hashStr(table.concat(vpos, "|")), rLane, mBal, mLoan, nt, np)
 	return verdict, detail
 end
 
