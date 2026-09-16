@@ -1791,7 +1791,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.2"
+LOBBY_VERSION = "0.5.3"
 
 
 def version_rejection(remote):
@@ -2375,8 +2375,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 roster_changed()
             log(f"[host] rejected incompatible multiplayer version: {remote!r}")
             return
-        if recovery and recovery.barrier.operation and addr not in peers:
-            _send_data(sock, addr, {"t": "reject", "reason": "This recovery session has a fixed player roster. Restart both games and the lobby to join."})
+        # Only while a recovery is actually in flight (HostRecovery.roster_locked).
+        # Testing the bare operation token here kept rejecting every new joiner
+        # after the first resync, for as long as this lobby process lived --
+        # including in the next NEW game, since the lobby outlives the world.
+        if recovery and recovery.roster_locked and addr not in peers:
+            _send_data(sock, addr, {"t": "reject", "reason": "A world recovery is in progress and the player list is fixed until it finishes. Try again in a moment."})
             return
         late = False
         if addr in peers:                                   # rename in place
@@ -2644,7 +2648,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if transfer[0] is not None:
                 transfer[0].on_fdone(addr, msg)
         elif t == "mods_request":
-            if transfer[0] is not None and addr in transfer[0].peers: return
+            if transfer[0] is not None and addr in transfer[0].peers:
+                # A joiner prompted BEFORE the save is in "preflight" mode, and
+                # answers yes with mods_request -- never the mods_answer this
+                # host is waiting for (see _ClientMods.answer_mods). Dropping it
+                # outright meant the player pressed yes, the host waited the full
+                # MODS_ANSWER_WAIT for a message that mode never sends, called it
+                # a no and failed the save transfer (seen 2026-09-15). Count it as
+                # the consent it is; the queued preflight request is still skipped
+                # while a transfer to this peer is open.
+                pr = transfer[0].peers.get(addr)
+                if pr and pr.get("ask"):
+                    transfer[0].on_mods_answer(addr, {"sid": transfer[0].sid, "accept": True})
+                return
             allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in advertised[1]}
             requested=msg.get("need",[])
             if isinstance(requested,list) and len(requested)<=128:

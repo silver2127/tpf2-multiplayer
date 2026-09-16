@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 
-from sync_operation import SyncOperation, SyncReplica
+from sync_operation import SyncOperation, SyncReplica, ACTIVE
 from sync_runtime import SyncParticipant
 
 
@@ -94,6 +94,17 @@ class HostRecovery:
     @property
     def held(self):
         return self.barrier.operation is not None and self.barrier.phase != 'complete'
+
+    @property
+    def roster_locked(self):
+        """A recovery is in flight, so the member set must not change under it.
+
+        Only while the barrier is ACTIVE. A finished or aborted operation keeps
+        its token (nothing ever sets it back to None), and the join gate used
+        to read the token alone -- so after one resync the lobby rejected every
+        new joiner for the rest of its life, including in a NEW game, because
+        the lobby process outlives the world (2026-09-15)."""
+        return self.barrier.operation is not None and self.barrier.phase in ACTIVE
 
     def command(self, sender, message):
         kind = message.get('cmd', message.get('t'))

@@ -116,6 +116,27 @@ class ReadinessTests(unittest.TestCase):
         client.command(dict(cmd='sync_retry', id='blocked2'))
         self.assertFalse(client.pending)
 
+    def test_join_gate_releases_once_the_recovery_is_over(self):
+        # A finished or aborted recovery keeps its operation token (nothing ever
+        # sets it back to None). The join gate must read the PHASE: reading the
+        # token alone rejected every new joiner for the rest of the lobby's life,
+        # seen in a brand-new game after one resync (2026-09-15).
+        h = self.make_host(2)
+        self.assertFalse(h.roster_locked)
+        h.command('host', dict(cmd='sync_request', id='start'))
+        self.assertEqual(h.barrier.phase, 'holding')
+        self.assertTrue(h.roster_locked)
+        operation = h.barrier.operation
+        h.barrier._enter('complete')
+        self.assertEqual(h.barrier.operation, operation)   # the token lingers: that was the trap
+        self.assertFalse(h.roster_locked)
+        h = self.make_host(2)
+        h.command('host', dict(cmd='sync_request', id='again'))
+        self.assertTrue(h.roster_locked)
+        h.barrier.abort('host', h.barrier.operation)
+        self.assertEqual(h.barrier.phase, 'aborted')
+        self.assertFalse(h.roster_locked)
+
 
 if __name__ == '__main__':
     unittest.main()
