@@ -1303,12 +1303,13 @@ struct LineAlt  { int32_t station, terminal; };                   // StationTerm
 // index under 64) failed the decode SILENTLY; the edit then ran natively on
 // the host alone and the peers applied a read-back that carries neither, so
 // the host's trains and the peers' took different routes (vehicle drift
-// desync 2026-09-16). The only bounds left are sanity against a misread
-// pointer (LINE_MAX_* below), far above anything a line can hold, and every
-// refusal names its check in g_lineDecodeWhy.
+// desync 2026-09-16). No bounds at all: a vector is read at the length the
+// game holds (ReadVec still requires the memory to be readable), an index
+// only has to be non-negative, and every refusal names its check in
+// g_lineDecodeWhy.
 struct LineWp   { int32_t entity, index; };                        // transport::SignalId
 struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; std::vector<LineAlt> alt; int nWp; std::vector<LineWp> wp; };
-static const int LINE_MAX_STOPS = 4096, LINE_MAX_ALTS = 4096, LINE_MAX_WPS = 4096;
+static const uint64_t LINE_ANY_SPAN = ~0ull;   // ReadVec's cap, not used as one
 static char g_lineDecodeWhy[200] = "";
 #define LINE_REFUSE(...) do { _snprintf_s(g_lineDecodeWhy, sizeof(g_lineDecodeWhy), _TRUNCATE, __VA_ARGS__); return false; } while (0)
 struct LineDecode { int32_t wait; int n; std::vector<LineStop> st; };
@@ -1344,10 +1345,10 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         }
     }
     uint64_t sb = 0;
-    uint64_t span = ReadVec(line + vecOff, &sb, 0xa8 * (uint64_t)LINE_MAX_STOPS);
+    uint64_t span = ReadVec(line + vecOff, &sb, LINE_ANY_SPAN);
     if (span == 0 || (span % 0xa8) != 0) LINE_REFUSE("stops vector at +0x%llx: span %llu (0 or not a multiple of 0xa8)", (unsigned long long)vecOff, (unsigned long long)span);
     int n = (int)(span / 0xa8);
-    if (n < 1 || n > LINE_MAX_STOPS) LINE_REFUSE("%d stops", n);
+    if (n < 1) LINE_REFUSE("%d stops", n);
     out->n = n;
     out->st.clear();
     out->st.resize((size_t)n);
@@ -1366,7 +1367,7 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         int32_t w2c = (int32_t)(f2c + 0.5f), w30 = (int32_t)(f30 + 0.5f);
         // which of +0x2c/+0x30 is min is unpinned; min <= max always holds
         if (w2c <= w30) { t.minWait = w2c; t.maxWait = w30; } else { t.minWait = w30; t.maxWait = w2c; }
-        if (t.sg <= 0 || t.station < 0 || t.station > LINE_MAX_ALTS || t.terminal < 0 || t.terminal > LINE_MAX_ALTS
+        if (t.sg <= 0 || t.station < 0 || t.terminal < 0
             || t.loadMode < 0 || t.loadMode > 3)
             LINE_REFUSE("stop %d sg=%d station=%d terminal=%d loadMode=%d", i + 1, t.sg, t.station, t.terminal, t.loadMode);
         // alternativeTerminals: vector<StationTerminal> at stop+0x10, 8 B each
@@ -1374,21 +1375,21 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         // list several. Capped at 8; more than that fails the decode.
         t.nAlt = 0;
         uint64_t ab = 0;
-        uint64_t aspan = ReadVec((uint64_t)b + 0x10, &ab, 8 * (uint64_t)LINE_MAX_ALTS);
+        uint64_t aspan = ReadVec((uint64_t)b + 0x10, &ab, LINE_ANY_SPAN);
         if (aspan % 8) LINE_REFUSE("stop %d alternative terminals span %llu", i + 1, (unsigned long long)aspan);
         int na = (int)(aspan / 8);
         t.alt.assign((size_t)na, LineAlt{});
         for (int a = 0; a < na; a++) {
             memcpy(&t.alt[a].station,  (const uint8_t*)ab + a * 8 + 0, 4);
             memcpy(&t.alt[a].terminal, (const uint8_t*)ab + a * 8 + 4, 4);
-            if (t.alt[a].station < 0 || t.alt[a].station > LINE_MAX_ALTS || t.alt[a].terminal < 0 || t.alt[a].terminal > LINE_MAX_ALTS)
+            if (t.alt[a].station < 0 || t.alt[a].terminal < 0)
                 LINE_REFUSE("stop %d alternative %d: station=%d terminal=%d", i + 1, a + 1, t.alt[a].station, t.alt[a].terminal);
         }
         t.nAlt = na;
         // vector<transport::SignalId> {entity,index}, after this station stop.
         uint64_t wb = 0, we = 0;
         memcpy(&wb, b + 0x38, 8); memcpy(&we, b + 0x40, 8);
-        if (we < wb || (we - wb) % 8 || (we - wb) > 8 * (uint64_t)LINE_MAX_WPS) LINE_REFUSE("stop %d waypoint vector %llx..%llx", i + 1, (unsigned long long)wb, (unsigned long long)we);
+        if (we < wb || (we - wb) % 8) LINE_REFUSE("stop %d waypoint vector %llx..%llx", i + 1, (unsigned long long)wb, (unsigned long long)we);
         t.nWp = (int)((we - wb) / 8);
         if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) LINE_REFUSE("stop %d waypoints unreadable", i + 1);
         t.wp.assign((size_t)t.nWp, LineWp{});
