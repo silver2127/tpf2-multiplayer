@@ -26,9 +26,12 @@ static bool Hook(void* rep, const Result* source) {
         std::string line;
         if (std::getline(in, line) && line.size()==32 && line.find_first_not_of("0123456789abcdef")==std::string::npos) {
             token=line;
-            unsigned count=0;
+            // No cap on the row count or the row length: every consented Workshop
+            // mod in the registry is shadow-registered, however many there are and
+            // however long its folder path. A cap here rejected the WHOLE registry,
+            // so no Workshop mod was registered and the game loaded a different mod
+            // set from its peers. A malformed row still rejects the file (below).
             while (std::getline(in,line)) {
-                if (++count>128 || line.size()>4096) throw std::runtime_error("registry limit");
                 auto tab=line.find('\t');
                 if (tab==std::string::npos) throw std::runtime_error("registry row");
                 auto id=line.substr(0,tab);

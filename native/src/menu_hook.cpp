@@ -14,6 +14,7 @@
 #include <share.h>
 #include <windows.h>
 #include <string>
+#include <vector>
 #include <iphlpapi.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
@@ -341,7 +342,7 @@ static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
 static void LeaveLobby();
 static DWORD WINAPI KbHookThread(LPVOID);
 static bool LobbySend(const char* jsonLine);
-static const char* originLetterFor(const char* name);
+static std::string originLetterFor(const std::string& name);
 static void ClipboardSet(const char* utf8);
 static bool ClipboardGet(char* out, int outsz);
 static bool newestSave(wchar_t* out, int cch);
@@ -482,9 +483,49 @@ static void ModDownloadPreference(bool save) {
     else { _wfopen_s(&f,path,L"rb"); if (f) { int v=0; if (fscanf_s(f,"%d",&v)==1) g_flagShareMods=v==1 ? 1:0; fclose(f); } }
 }
 
-// lobby model (fed from lobby_out.jsonl)
-static char g_players[200][40]; static int g_playerCount = 0;
-static int  g_companies[200];   // company id per roster entry (1..200), 0 = unset -> 1
+// lobby model (fed from lobby_out.jsonl). One entry per roster row in roster
+// order. No cap of ours on the count or on a name's length: the roster is
+// whatever lobby.py sends (its CAP is the admission rule, not this parser), and
+// the origin letter, the company map and the panel all work from the full name.
+// A name cut short here would make two players look alike, give a joiner the
+// wrong letter and leave the load gate waiting for the wrong player count.
+static std::vector<std::string> g_players;
+static std::vector<int>         g_companies;   // company id per roster entry (1..200), 0 = unset -> 1
+static int playerCount() { return (int)g_players.size(); }
+
+// ---- small string helpers (no fixed buffers) ----
+// JSON-escape the two characters json.dumps escapes in our payloads.
+static std::string jsonEscape(const char* text)
+{
+    std::string out; for (const char* p = text; *p; ++p) { if (*p == '\\' || *p == '"') out += '\\'; out += *p; }
+    return out;
+}
+// Read a JSON string body: r points just past the opening quote and is left on
+// the closing (unescaped) quote or the NUL. Decodes the escapes json.dumps
+// emits for our payloads: \\ -> \, \" -> ", \/ -> /. Anything else (\uXXXX,
+// \n ...) is left verbatim -- the backslash is copied and the next character
+// follows on the next iteration.
+static std::string jsonUnquote(const char*& r)
+{
+    std::string out;
+    while (*r && *r != '"') {
+        if (*r == '\\' && (r[1] == '\\' || r[1] == '"' || r[1] == '/')) { out += r[1]; r += 2; }
+        else out += *r++;
+    }
+    return out;
+}
+static std::wstring wideOf(const char* utf8)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    std::wstring w; if (n > 1) { w.resize(n - 1); MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &w[0], n); }
+    return w;
+}
+static std::string utf8Of(const wchar_t* wide)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    std::string u; if (n > 1) { u.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, wide, -1, &u[0], n, nullptr, nullptr); }
+    return u;
+}
 // Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
 static COLORREF coColor(int cid)
 {
@@ -504,9 +545,9 @@ static void originName(int idx, char* out)
     if (idx < 26) { out[0] = (char)('a' + idx); out[1] = 0; return; }
     idx -= 26; out[0] = (char)('a' + (idx / 26) % 26); out[1] = (char)('a' + idx % 26); out[2] = 0;
 }
-static char g_you[40] = ""; static char g_host[40] = ""; static char g_lobbyTitle[40] = "";   // the lobby's name, from the roster
+static std::string g_you, g_host, g_lobbyTitle;   // the lobby's name, from the roster; all three are whatever the roster says, any length
 static volatile LONG g_lobbyRelay = 0;   // the host is a relay-only server: "host" in the roster is the LEADER (oldest joiner)
-static char g_letters[200][3];           // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
+static std::vector<std::string> g_letters;   // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
 static char g_chatInput[200] = ""; static int g_chatLen = 0;
 static volatile LONG g_isHost = 0;       // this instance is the lobby host
@@ -526,7 +567,7 @@ static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSecti
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
 static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
 struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field 11=PUBLIC 12=REFRESH 30..37=public game rows; btn = hover wash
-static const int MAX_PLAYERS = 200, MAX_COMPANIES = 200;   // lobby.py CAP / MAX_COMPANIES; origins a..z then aa, ab, ...
+static const int MAX_COMPANIES = 200;   // lobby.py MAX_COMPANIES (one addPlayer() entity each on every peer); the roster itself has no cap here -- origins a..z then aa, ab, ...
 static const int ROSTER_ROWS = 16;                        // rows the lobby page can show; the rest is a "+N more" line
 static Hit g_hits[64]; static int g_hitCount = 0;
 static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount<64){g_hits[g_hitCount++]={x,y,w,h,id,btn};} }
@@ -1015,7 +1056,7 @@ static void RenderPanelLayer(int w, int h)
             if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
             else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
             else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted"))) {
-                mwButton(pad,h-S(76),S(210),S(30),g_playerCount>2 ? L"Request readiness" : L"Resync now",84);
+                mwButton(pad,h-S(76),S(210),S(30),playerCount()>2 ? L"Request readiness" : L"Resync now",84);
                 // The host declines: the panel closes on every game and stays
                 // closed for this world (a later resync, or a new lobby, lifts it).
                 if(detected) mwButton(pad+S(222),h-S(76),S(150),S(30),L"Keep playing",88);
@@ -1027,8 +1068,9 @@ static void RenderPanelLayer(int w, int h)
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
         int titleW = S(90);
-        { wchar_t wt[64] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, 48); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
-          mwTitle(wt); HFONT ft = mkLato(S(18)); titleW = textW(wt, ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
+        { std::wstring wt = L"LOBBY";
+          if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_lobbyTitle.empty()) wt = L"LOBBY  --  " + wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
+          mwTitle(wt.c_str()); HFONT ft = mkLato(S(18)); titleW = textW(wt.c_str(), ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
             // ROOM CODE, DELIBERATELY NOT RENDERED.
             //
@@ -1055,23 +1097,23 @@ static void RenderPanelLayer(int w, int h)
         int contentH = bottom - cy - S(12);
         // players
         char hdr[48]; int n = 0;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); n = g_playerCount; }
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); n = playerCount(); }
         snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", n);
         wchar_t whdr[48]; MultiByteToWideChar(CP_UTF8, 0, hdr, -1, whdr, 48);
         mwHeader(pad, cy, listW, whdr);
         HFONT fr = mkLato(S(14)), fs = mkLato(S(11));
         for (int i = 0; i < n && i < ROSTER_ROWS; i++) {
-            wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, 64);
-            bool isYou = strcmp(g_players[i], g_you) == 0, isHost = strcmp(g_players[i], g_host) == 0;
+            std::wstring wn = wideOf(g_players[i].c_str());
+            bool isYou = g_players[i] == g_you, isHost = g_players[i] == g_host;
             int ry = cy + S(30) + i * S(26);
             // company chip: colour + number; click your own (the host: anyone's) to cycle 1..16
             int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
             layerRect(pad, ry + S(4), S(22), S(16), coColor(cid), 220);
             wchar_t wc[4]; _snwprintf_s(wc, _TRUNCATE, L"%d", cid);
             layerText(pad, ry + S(4), S(22), S(16), wc, fs, RGB(0, 0, 0), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            bool amHost = strcmp(g_you, g_host) == 0;
+            bool amHost = g_you == g_host;
             if (isYou || amHost) addHit(pad, ry + S(2), S(24), S(20), 20 + i, true);   // chip ids 20..35
-            layerText(pad + S(30), ry, listW - S(80), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            layerText(pad + S(30), ry, listW - S(80), S(24), wn.c_str(), fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
         }
         { HFONT fl = mkLato(S(11));
@@ -1642,10 +1684,8 @@ static void OnHit(int id)
         // before its first event line would be lost. Wait for that first line.
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
         if (newestSave(g_startSaveW, 600)) {
-            char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
-            char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
-            char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
-            LobbySend(line); SetStatus("Sharing save & starting game…");
+            std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(g_startSaveW).c_str()) + "\"}";
+            LobbySend(line.c_str()); SetStatus("Sharing save & starting game…");
         } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
@@ -1669,15 +1709,15 @@ static void OnHit(int id)
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
     case 28: case 29: case 30: case 31: case 32: case 33: case 34: case 35: {   // company chip
-        int i = id - 20; char name[40] = ""; int cur = 1;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < g_playerCount) { strcpy_s(name, g_players[i]); cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
+        int i = id - 20; std::string name; int cur = 1;
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < playerCount()) { name = g_players[i]; cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
         // cycle: the next company id somebody already uses, then one brand-new id, then back to 1
         bool used[MAX_COMPANIES + 2] = {}; int maxUsed = 0;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); for (int k = 0; k < g_playerCount; k++) { int c2 = g_companies[k]; if (c2 >= 1 && c2 <= MAX_COMPANIES) { used[c2] = true; if (c2 > maxUsed) maxUsed = c2; } } LeaveCriticalSection(&g_modelCs); }
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); for (int k = 0; k < playerCount(); k++) { int c2 = g_companies[k]; if (c2 >= 1 && c2 <= MAX_COMPANIES) { used[c2] = true; if (c2 > maxUsed) maxUsed = c2; } } LeaveCriticalSection(&g_modelCs); }
         int next = 0;
         for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[c2]) { next = c2; break; }
         if (!next) next = (cur <= maxUsed && maxUsed < MAX_COMPANIES) ? maxUsed + 1 : 1;
-        if (name[0]) { char line[160]; snprintf(line, sizeof(line), "{\"cmd\":\"company\",\"player\":\"%s\",\"id\":%d}", name, next); LobbySend(line); }
+        if (!name.empty()) { std::string line = "{\"cmd\":\"company\",\"player\":\"" + jsonEscape(name.c_str()) + "\",\"id\":" + std::to_string(next) + "}"; LobbySend(line.c_str()); }
     } break;
     case 8: {   // code field: focus; if empty, paste the clipboard
         InterlockedExchange(&g_joinFocus, 1);
@@ -1916,16 +1956,27 @@ static void jsonStr(const char* s, const char* key, char* dst, int dsz)
         p += plen;
     }
     if (!last) return;
-    // Copy up to the closing (unescaped) quote, decoding the escapes json.dumps
-    // emits for our payloads: \\ -> \, \" -> ", \/ -> /. Anything else (\uXXXX,
-    // \n ...) is left verbatim -- the backslash is copied and the next character
-    // follows on the next iteration.
-    int i = 0; const char* r = last;
-    while (*r && *r != '"' && i < dsz - 1) {
-        if (*r == '\\' && (r[1] == '\\' || r[1] == '"' || r[1] == '/')) { dst[i++] = r[1]; r += 2; }
-        else dst[i++] = *r++;
+    // dst holds a protocol-bounded field (a type, a phase, a token); a value the
+    // roster feeds (names, the lobby title, a save path) goes through jsonStrS.
+    std::string v = jsonUnquote(last);
+    if ((int)v.size() > dsz - 1) { Log("[menu] jsonStr: \"%s\" is %zu bytes, the field holds %d -- cut\n", key, v.size(), dsz - 1); v.resize(dsz - 1); }
+    memcpy(dst, v.c_str(), v.size() + 1);
+}
+// The same, any length: the string value for `key` (last occurrence), "" if absent.
+static std::string jsonStrS(const char* s, const char* key)
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+    const char* last = nullptr; const char* p = s;
+    while ((p = strstr(p, pat)) != nullptr) {
+        const char* q = p + plen;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == ':') { q++; while (*q == ' ' || *q == '\t') q++;
+                         if (*q == '"') last = q + 1; }
+        p += plen;
     }
-    dst[i] = 0;
+    if (!last) return std::string();
+    return jsonUnquote(last);
 }
 
 // Extract a boolean for `key` (e.g. start "save"). Absent/unparseable -> dflt.
@@ -2010,8 +2061,8 @@ static bool LobbySend(const char* jsonLine)   // append a command to lobby_in.js
     HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     SetFilePointer(h, 0, nullptr, FILE_END);
-    DWORD w; char line[1600]; int L = snprintf(line, sizeof(line), "%s\n", jsonLine);   // start lines carry a full save path
-    const bool ok = WriteFile(h, line, L, &w, nullptr) && w == (DWORD)L;
+    DWORD w; std::string line(jsonLine); line += '\n';   // start lines carry a full save path: no fixed buffer here
+    const bool ok = WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr) && w == (DWORD)line.size();
     CloseHandle(h);
     return ok;
 }
@@ -2187,16 +2238,15 @@ static void SyncPoll()
         if (mt > g_syncBaseline && sz > 0) {
             // wait until the file stops growing (the sidecars are written after the .sav)
             if (wcscmp(cur, g_syncSave) == 0 && sz == g_syncLastSize) {
-                char u[900]; WideCharToMultiByte(CP_UTF8, 0, cur, -1, u, sizeof(u), nullptr, nullptr);
-                char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
-                char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
+                std::string u = utf8Of(cur);
+                std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(u.c_str()) + "\"}";
                 wcscpy_s(g_startSaveW, cur);
-                LobbySend(line);
+                LobbySend(line.c_str());
                 Log("[sync] new save %ls (%llu B) -> sharing with every joiner\n", cur, (unsigned long long)sz);
                 SetStatus("Sync: sharing the save\xE2\x80\xA6");
                 wchar_t sent[MAX_PATH]; _snwprintf_s(sent, _TRUNCATE, L"%stpf2_sync_sent.txt", g_dataDirW);
                 HANDLE h = CreateFileW(sent, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, u, (DWORD)strlen(u), &w, nullptr); CloseHandle(h); }
+                if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, u.data(), (DWORD)u.size(), &w, nullptr); CloseHandle(h); }
                 g_syncAskedAt = 0;
                 return;
             }
@@ -2250,24 +2300,23 @@ static void writeBridgeCtl(bool isHost)
     // Letters for N players: the host is 'a'; joiners take b, c, d... in roster
     // order, skipping the host. Every client derives the same assignment from
     // the same roster, so nobody has to be told.
-    char letter[3] = "a";
+    std::string letter = "a";
     bool fromRelay = false;
     if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-        for (int i = 0; i < g_playerCount; i++) if (strcmp(g_players[i], g_you) == 0 && g_letters[i][0]) { strcpy_s(letter, g_letters[i]); fromRelay = true; break; }
+        for (int i = 0; i < playerCount(); i++) if (g_players[i] == g_you && !g_letters[i].empty()) { letter = g_letters[i]; fromRelay = true; break; }
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
     }
     if (!isHost && !fromRelay) {
         int idx = 0;
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-        for (int i = 0; i < g_playerCount; i++) {
-            if (strcmp(g_players[i], g_host) == 0) continue;
-            if (strcmp(g_players[i], g_you) == 0) break;
+        for (int i = 0; i < playerCount(); i++) {
+            if (g_players[i] == g_host) continue;
+            if (g_players[i] == g_you) break;
             idx++;
         }
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-        if (idx > MAX_PLAYERS - 2) idx = MAX_PLAYERS - 2;
-        originName(idx + 1, letter);
+        char nm[3]; originName(idx + 1, nm); letter = nm;
     }
     // players= is the LOBBY ROSTER SIZE, including the host. The game script
     // needs it to know when everybody has finished loading: nothing else tells
@@ -2276,7 +2325,7 @@ static void writeBridgeCtl(bool isHost)
     // everyone". Without it the load gate had to fall back to a settle timer
     // and released with two of three players in.
     snprintf(content, sizeof(content), "instance=%s\npeer=127.0.0.1:%d\npid=%lu\nplayers=%d\n",
-             letter, relayPortFor(isHost), bpid, g_playerCount);
+             letter.c_str(), relayPortFor(isHost), bpid, playerCount());
     if (g_transportLobby[0]) {
         size_t n = strlen(content);
         snprintf(content+n,sizeof(content)-n,"lobby=%s\n",g_transportLobby);
@@ -2295,7 +2344,7 @@ static void writeBridgeCtl(bool isHost)
     }
     {   // the session clock: the roster's host (a relay lobby moves it when the leader leaves)
         size_t n = strlen(content);
-        snprintf(content + n, sizeof(content) - n, "leader=%s\n", g_host[0] ? originLetterFor(g_host) : "a");
+        snprintf(content + n, sizeof(content) - n, "leader=%s\n", !g_host.empty() ? originLetterFor(g_host).c_str() : "a");
     }
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
@@ -2311,26 +2360,33 @@ static void writeBridgeCtl(bool isHost)
     }
     strcpy_s(last, content);
     Log("[menu] bridge ctl -> %ls: instance=%s peer=127.0.0.1:%d\n",
-        path, letter, relayPortFor(isHost));
+        path, letter.c_str(), relayPortFor(isHost));
 }
 
 // The origin letter each machine's bridge uses: the host is 'a', joiners take
 // b, c, ... in roster order skipping the host (same rule as writeBridgeCtl).
-static const char* originLetterFor(const char* name)
+static std::string originLetterFor(const std::string& name)
 {
-    static char buf[3];
+    // the critical section is recursive: writeCompanyCfg calls this with it held
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    std::string out;
     if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
-        for (int i = 0; i < g_playerCount; i++) if (strcmp(g_players[i], name) == 0 && g_letters[i][0]) { strcpy_s(buf, g_letters[i]); return buf; }
+        for (int i = 0; i < playerCount(); i++) if (g_players[i] == name && !g_letters[i].empty()) { out = g_letters[i]; break; }
     }
-    if (strcmp(name, g_host) == 0) return "a";
-    int idx = 0;
-    for (int i = 0; i < g_playerCount; i++) {
-        if (strcmp(g_players[i], g_host) == 0) continue;
-        if (strcmp(g_players[i], name) == 0) break;
-        idx++;
+    if (out.empty()) {
+        if (name == g_host) out = "a";
+        else {
+            int idx = 0;
+            for (int i = 0; i < playerCount(); i++) {
+                if (g_players[i] == g_host) continue;
+                if (g_players[i] == name) break;
+                idx++;
+            }
+            char nm[3]; originName(idx + 1, nm); out = nm;
+        }
     }
-    if (idx > MAX_PLAYERS - 2) idx = MAX_PLAYERS - 2;
-    originName(idx + 1, buf); return buf;
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    return out;
 }
 
 // mp_company_cfg.txt for the game script (lockstep.lua companies mode):
@@ -2341,70 +2397,71 @@ static const char* originLetterFor(const char* name)
 // Written at START from the roster every machine already agrees on.
 static void writeCompanyCfg()
 {
-    static char l3[1024], l4[2048]; l3[0] = 0; l4[0] = 0; int mine = 1, distinct = 0; bool seen[MAX_COMPANIES + 1] = {};
+    std::string l3, l4; int mine = 1, distinct = 0; bool seen[MAX_COMPANIES + 1] = {};
     if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-    for (int i = 0; i < g_playerCount; i++) {
+    for (int i = 0; i < playerCount(); i++) {
         int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
-        if (strcmp(g_players[i], g_you) == 0) mine = cid;
+        if (g_players[i] == g_you) mine = cid;
         if (!seen[cid]) { seen[cid] = true; distinct++; }
-        char e[24]; snprintf(e, sizeof(e), "%s%s=%d", l4[0] ? "," : "", originLetterFor(g_players[i]), cid); strcat_s(l4, 2048, e);
+        if (!l4.empty()) l4 += ','; l4 += originLetterFor(g_players[i]) + "=" + std::to_string(cid);
     }
     if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-    for (int c = 1; c <= MAX_COMPANIES; c++) if (seen[c]) { char e[8]; snprintf(e, sizeof(e), "%s%d", l3[0] ? "," : "", c); strcat_s(l3, 1024, e); }
-    static char content[4096]; snprintf(content, sizeof(content), "%s\n%d\n%s\n%s\n", distinct > 1 ? "companies" : "coop", mine, l3, l4);
+    for (int c = 1; c <= MAX_COMPANIES; c++) if (seen[c]) { if (!l3.empty()) l3 += ','; l3 += std::to_string(c); }
+    std::string content = std::string(distinct > 1 ? "companies" : "coop") + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
     wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW);
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { Log("[menu] company cfg: cannot write %ls\n", path); return; }
-    DWORD w = 0; WriteFile(h, content, (DWORD)strlen(content), &w, nullptr); CloseHandle(h);
-    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3, l4);
+    DWORD w = 0; WriteFile(h, content.data(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
+    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3.c_str(), l4.c_str());
 }
 
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
 static void applyRoster(const char* s)
 {
     if (!g_modelCsInit) return; EnterCriticalSection(&g_modelCs);
-    g_playerCount = 0;
-    // whitespace-tolerant: find "players", then its '[' .. ']', pull each "quoted" name.
+    g_players.clear(); g_companies.clear(); g_letters.clear();
+    // whitespace-tolerant: find "players", then its '[' and pull each "quoted"
+    // name until the list ends. Every name, in full, however many: the roster
+    // is the load gate's player count and the origin-letter order on every peer.
     const char* pa = strstr(s, "\"players\"");
-    if (pa) { pa = strchr(pa, '['); const char* end = pa ? strchr(pa, ']') : nullptr;
-        if (pa && end) { const char* q = pa;
-            while (g_playerCount < MAX_PLAYERS) {
-                q = strchr(q, '"'); if (!q || q > end) break; q++;
-                int k = 0; while (*q && *q != '"' && k < 38) g_players[g_playerCount][k++] = *q++;
-                g_players[g_playerCount][k] = 0; g_playerCount++;
+    if (pa) { pa = strchr(pa, '[');
+        if (pa) { const char* q = pa + 1;
+            for (;;) {
+                while (*q == ' ' || *q == '\t' || *q == ',') q++;
+                if (*q != '"') break;   // ']' (or anything that is not a name): end of the list
+                q++;
+                g_players.push_back(jsonUnquote(q));
                 if (*q == '"') q++;
             } } }
+    g_companies.assign(g_players.size(), 1); g_letters.assign(g_players.size(), std::string());
     // "companies":{"name":id,...} -> g_companies[i] for each roster entry (default 1)
     const char* co = strstr(s, "\"companies\"");
-    for (int i = 0; i < g_playerCount; i++) {
-        g_companies[i] = 1;
-        if (!co) continue;
-        char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
-        const char* k = strstr(co, keyq);
-        if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
+    for (int i = 0; co && i < playerCount(); i++) {
+        std::string keyq = "\"" + jsonEscape(g_players[i].c_str()) + "\"";
+        const char* k = strstr(co, keyq.c_str());
+        if (k) { k += keyq.size(); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
     }
-    char v[40];
-    jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
-    jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
-    jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
+    std::string v;
+    v = jsonStrS(s, "you");  if (!v.empty()) g_you = v;
+    v = jsonStrS(s, "host"); if (!v.empty()) g_host = v;
+    g_lobbyTitle = jsonStrS(s, "lobby");
     InterlockedExchange(&g_lobbyRelay, jsonBool(s, "relay", false) ? 1 : 0);
     InterlockedExchange(&g_storedAge, jsonInt(s, "stored_age")); InterlockedExchange(&g_storedMax, jsonInt(s, "stored_max"));
     // relay lobbies: the relay assigns every player a sticky origin letter
-    for (int i = 0; i < g_playerCount; i++) g_letters[i][0] = 0;
     { const char* lm = strstr(s, "\"letters\"");
       if (lm && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
-          for (int i = 0; i < g_playerCount; i++) {
-              char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
-              const char* k = strstr(lm, keyq);
-              if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; int j = 0; while (*k && *k != '"' && j < 2) g_letters[i][j++] = *k++; g_letters[i][j] = 0; } }
+          for (int i = 0; i < playerCount(); i++) {
+              std::string keyq = "\"" + jsonEscape(g_players[i].c_str()) + "\"";
+              const char* k = strstr(lm, keyq.c_str());
+              if (k) { k += keyq.size(); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; g_letters[i] = jsonUnquote(k); } }
           }
       } }
     // Role is decided by the roster: you==host -> instance a, else b. Re-evaluated
     // on every roster (a host change re-points the bridge); writeBridgeCtl is a
     // no-op when nothing changed.
-    bool roleKnown = g_you[0] && g_host[0];
-    bool isHost = roleKnown && strcmp(g_you, g_host) == 0;
-    int count = g_playerCount;
+    bool roleKnown = !g_you.empty() && !g_host.empty();
+    bool isHost = roleKnown && g_you == g_host;
+    int count = playerCount();
     LeaveCriticalSection(&g_modelCs); InterlockedExchange(&g_panelDirty, 1);
     // a relay lobby: the leader takes the host role here (START GAME, the sync
     // save for hot joiners); it changes when the leader leaves
@@ -2789,7 +2846,11 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     g_lobbyProc = pi.hProcess;
 
     // tail lobby_out.jsonl line by line
-    LARGE_INTEGER off = { 0 }; char rem[2048]; int remLen = 0; char buf[8192];
+    // rem accumulates one event line up to its newline, whatever its length: a
+    // roster of a few dozen players is well past any fixed line buffer, and a
+    // line cut short would parse as a smaller roster (wrong letters, a load
+    // gate waiting for the wrong count).
+    LARGE_INTEGER off = { 0 }; std::string remS; char buf[8192];
     bool stop = false;   // set once the game load is under way: lobby.py is done, end the tail
     for (;;) {
         HANDLE h = CreateFileW(outPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -2801,7 +2862,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                 for (DWORD i = 0; i < got && !stop; i++) {
                     char c = buf[i];
                     if (c == '\n') {
-                        rem[remLen] = 0;
+                        const char* rem = remS.c_str();
                         // dispatch one event line
                         InterlockedExchange(&g_lobbyReady, 1);   // lobby.py is up and has truncated lobby_in.jsonl
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
@@ -2810,9 +2871,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 wchar_t save[600];
                                 if (WorldLoaded()) SyncStart("host: initial world snapshot");
                                 else if (newestSave(save,600)) {
-                                    char u[1800]; WideCharToMultiByte(CP_UTF8,0,save,-1,u,sizeof(u),nullptr,nullptr);
-                                    std::string escaped; for (const char* p=u;*p;++p) { if (*p=='\\' || *p=='"') escaped+='\\'; escaped+=*p; }
-                                    std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+escaped+"\"}"; LobbySend(line.c_str());
+                                    std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+jsonEscape(utf8Of(save).c_str())+"\"}"; LobbySend(line.c_str());
                                 }
                             }
                             strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
@@ -2898,12 +2957,12 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         }
                         else if (strcmp(ty, "roster") == 0) applyRoster(rem);
                         else if (strcmp(ty, "chat") == 0) {
-                            char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx));
+                            std::string fr = jsonStrS(rem, "from"); char tx[256]; jsonStr(rem, "text", tx, sizeof(tx));
                             if (strncmp(tx, "!hotjoin ", 9) == 0) {
                                 // the host is saving for a newcomer: only a panel still at
                                 // the title menu needs it, as its status line
                                 if (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 && !g_gameUi) SetStatus(tx + 9);
-                            } else { chatPush(fr, tx); speedFromChat(tx); }
+                            } else { chatPush(fr.c_str(), tx); speedFromChat(tx); }
                         }
                         else if (strcmp(ty, "status") == 0) { char de[200]; jsonStr(rem, "detail", de, sizeof(de)); if (de[0]) SetStatus(de); }
                         else if (strcmp(ty, "transfer") == 0) {
@@ -2981,8 +3040,8 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 }
                             }
                         }
-                        remLen = 0;
-                    } else if (remLen < (int)sizeof(rem) - 1) rem[remLen++] = c;
+                        remS.clear();
+                    } else remS.push_back(c);
                 }
             }
             CloseHandle(h);
@@ -3059,7 +3118,7 @@ static void StartLobby(int join)
     a->pub = InterlockedCompareExchange(&g_public, 0, 0) ? 1 : 0;
     InterlockedExchange(&g_joinFocus, 0); SaveNames();
     if (g_lobbyName[0]) strcpy_s(a->lobby, g_lobbyName); else snprintf(a->lobby, sizeof(a->lobby), "%s's game", g_username);
-    g_lobbyTitle[0] = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); g_lobbyTitle.clear(); LeaveCriticalSection(&g_modelCs); }
     // (no game name: the public list shows the server type, not the host's newest save)
     if (join) {
         if (g_joinLen >= 8) strcpy_s(a->code, g_joinCode);
@@ -3082,7 +3141,8 @@ static void StartLobby(int join)
     InterlockedExchange(&g_isHost, join ? 0 : 1);
     InterlockedExchange(&g_lobbyDone, 0);   // a new lobby captures typing again
     InterlockedExchange(&g_uiState, 2); InterlockedExchange(&g_panelDirty, 1);
-    g_chatCount = 0; g_chatHead = 0; g_playerCount = 0;
+    g_chatCount = 0; g_chatHead = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); g_players.clear(); g_companies.clear(); g_letters.clear(); LeaveCriticalSection(&g_modelCs); }
     g_lobbyThread = CreateThread(nullptr, 0, LobbyThread, a, 0, nullptr);
     if (!g_lobbyThread) { free(a); SetStatus("Couldn't start the lobby thread."); }
 }
