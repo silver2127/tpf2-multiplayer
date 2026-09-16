@@ -1735,11 +1735,12 @@ static void OnHit(int id)
         int next = 0;
         for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[c2]) { next = c2; break; }
         if (!next) next = (cur <= maxUsed && maxUsed < MAX_COMPANIES) ? maxUsed + 1 : 1;
-        if (name[0]) { char line[160]; snprintf(line, sizeof(line), "{\"cmd\":\"company\",\"player\":\"%s\",\"id\":%d}", name, next); LobbySend(line); }
+        if (name[0]) { char line[NAME_MAX + 64]; snprintf(line, sizeof(line), "{\"cmd\":\"company\",\"player\":\"%s\",\"id\":%d}", name, next); LobbySend(line); }
     } break;
-    case 8: {   // code field: focus; if empty, paste the clipboard
+    case 8: {   // code field: a click on a code CLEARS it (2026-09-16), a click on the empty field pastes the clipboard
         InterlockedExchange(&g_joinFocus, 1);
-        if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
+        if (g_joinLen > 0) { g_joinCode[0] = 0; g_joinLen = 0; InterlockedExchange(&g_panelDirty, 1); break; }
+        if (g_joinLen == 0) { char buf[256]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 9: break;   // chat field is always focused in the lobby
     }
