@@ -240,7 +240,7 @@ static volatile LONG g_pendingIsStop = 0;
 static int32_t g_stopEid = 0, g_stopSide = 0, g_stopModel = 0, g_stopPlayer = 0;
 static float   g_stopPos[3] = { 0, 0, 0 };
 static uint8_t g_stopLeft = 0, g_stopOneWay = 0;
-static char    g_stopName[256];
+static std::string g_stopName;   // the stop's name at any length (the 255 this held cut a longer one)
 // Stop/signal BULLDOZE cancel: the removed edge object,
 // decoded off the bulldozer's edge-replace proposal (StashStopDelFromBulldoze),
 // written as STOPXDEL from the Add hook once the cancel landed.
@@ -526,6 +526,79 @@ static bool SessionLive()
 // Defined beside WriteArmed; the bulldozer's fallbacks below use it first.
 static void WriteNativeNotice(const char* kind);
 
+// ---------------------------------------------------------------------------
+// VECTORS AT THE GAME'S OWN LENGTH.
+//
+// This DLL imposes no content limit of its own: a proposal, a vehicle config or
+// an id list is read at whatever length the game holds. The fixed spans these
+// readers used to carry (0x20000 B of road records, 64 vehicle parts, 256 sold
+// vehicles, 16 demolished constructions, 16 edge objects) were not sanity checks
+// but silent truncations: the command then ran natively on one instance and
+// nowhere else, or shipped short and rebuilt short on every peer.
+//
+// The one bound left is a MISREAD-POINTER guard: a {begin,end} pair that spans
+// more than VEC_SANE_SPAN is garbage read off the wrong offset, not a command
+// (the largest real proposal, a whole-map terrain edit, is tens of MB). It logs
+// the offending size and is treated as unreadable, which every caller handles
+// as "cannot ship -- runs natively, NATIVE notice".
+static const uint64_t VEC_SANE_SPAN = 512ull << 20;
+
+enum VecRead { VEC_UNREADABLE, VEC_EMPTY, VEC_OK };
+
+// The {begin,end} pair at vecAddr, empty told apart from unreadable: VEC_EMPTY
+// for a well-formed empty vector (begin == end), VEC_OK with the readable span
+// in bytes, VEC_UNREADABLE (logged under `tag` when the guard trips) otherwise.
+static VecRead ReadVecAnyEx(uint64_t vecAddr, uint64_t* pbegin, uint64_t* pspan, const char* tag)
+{
+    *pbegin = 0; *pspan = 0;
+    if (!Readable((void*)vecAddr, 16)) return VEC_UNREADABLE;
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (void*)vecAddr, 8);
+    memcpy(&e, (void*)(vecAddr + 8), 8);
+    if (e == b) return VEC_EMPTY;
+    if (b < 0x10000 || e < b) return VEC_UNREADABLE;
+    const uint64_t span = e - b;
+    if (span > VEC_SANE_SPAN) {
+        Log("[slice] %s: vector at %llx spans %llu bytes (begin=%llx end=%llx) -- past the "
+            "%llu MB misread guard, a garbage pointer, treated as unreadable\n",
+            tag, (unsigned long long)vecAddr, (unsigned long long)span,
+            (unsigned long long)b, (unsigned long long)e,
+            (unsigned long long)(VEC_SANE_SPAN >> 20));
+        return VEC_UNREADABLE;
+    }
+    if (!Readable((void*)b, (size_t)span)) return VEC_UNREADABLE;
+    *pbegin = b; *pspan = span;
+    return VEC_OK;
+}
+
+// The span in bytes (0 when empty or unreadable), the shape ReadVec returns.
+static uint64_t ReadVecAny(uint64_t vecAddr, uint64_t* pbegin, const char* tag)
+{
+    uint64_t b = 0, span = 0;
+    if (ReadVecAnyEx(vecAddr, &b, &span, tag) != VEC_OK) return 0;
+    *pbegin = b;
+    return span;
+}
+
+// A vector of int32 (entity ids, load configs) into `out`, any length.
+// false when unreadable or not a whole number of ints; an empty vector is true.
+static bool ReadIntVec(uint64_t vecAddr, std::vector<int32_t>* out, const char* tag)
+{
+    out->clear();
+    uint64_t b = 0, span = 0;
+    const VecRead r = ReadVecAnyEx(vecAddr, &b, &span, tag);
+    if (r == VEC_EMPTY) return true;
+    if (r != VEC_OK) return false;
+    if (span % 4) {
+        Log("[slice] %s: int vector span %llu is not a multiple of 4 -- not a vector<int>\n",
+            tag, (unsigned long long)span);
+        return false;
+    }
+    out->resize((size_t)(span / 4));
+    memcpy(out->data(), (const void*)b, (size_t)span);
+    return true;
+}
+
 
 // ---------------------------------------------------------------------------
 // Node decode. Established live and cross-validated: a2 == a3 + 0x70, the node
@@ -564,51 +637,89 @@ struct Node { float x, y, z; int32_t id; };
 // embankment ("game infers landscape instead of a bridge", 2026-08-29).
 struct Edge { int32_t node0, node1; float t0[3], t1[3]; int32_t btype, bidx; };
 
-static int DecodeEdges(uint64_t a2, Edge* out, int maxOut)
+// Every edge record the vector holds, however many: a long road drag or a
+// station upgrade re-adding all its internal track is one proposal, and the
+// 0x20000-byte span (1,092 edges) plus the callers' fixed arrays this once had
+// cut it short SILENTLY -- the tail never shipped. Returns the count, 0 for an
+// empty vector, -1 (logged) when the pair is unreadable or not whole records.
+static int DecodeEdgesVec(uint64_t a2, std::vector<Edge>* out, const char* tag)
 {
-    if (!Readable((void*)(a2 + 0x18), 16)) return 0;
-    uint64_t begin = 0, end = 0;
-    memcpy(&begin, (void*)(a2 + 0x18), 8);
-    memcpy(&end, (void*)(a2 + 0x20), 8);
-    if (begin < 0x10000 || end <= begin) return 0;
-    uint64_t span = end - begin;
-    if (span % 120 != 0 || span > 0x20000) return 0;
-    int n = (int)(span / 120);
-    if (n > maxOut) n = maxOut;
-    if (!Readable((void*)begin, (size_t)span)) return 0;
+    out->clear();
+    uint64_t begin = 0, span = 0;
+    const VecRead r = ReadVecAnyEx(a2 + 0x18, &begin, &span, tag);
+    if (r == VEC_EMPTY) return 0;
+    if (r != VEC_OK) return -1;
+    if (span % 120 != 0) {
+        Log("[slice] %s: edge vector span %llu is not whole 120-byte records\n", tag, (unsigned long long)span);
+        return -1;
+    }
+    const int n = (int)(span / 120);
+    out->resize((size_t)n);
     const uint8_t* b = (const uint8_t*)begin;
     for (int i = 0; i < n; i++) {
-        memcpy(&out[i].node0, b + i * 120 + 0x08, 4);
-        memcpy(&out[i].node1, b + i * 120 + 0x0c, 4);
-        memcpy(out[i].t0,     b + i * 120 + 0x10, 12);
-        memcpy(out[i].t1,     b + i * 120 + 0x1c, 12);
-        memcpy(&out[i].btype, b + i * 120 + 0x28, 4);
-        memcpy(&out[i].bidx,  b + i * 120 + 0x2c, 4);
+        Edge& e = (*out)[(size_t)i];
+        memcpy(&e.node0, b + (size_t)i * 120 + 0x08, 4);
+        memcpy(&e.node1, b + (size_t)i * 120 + 0x0c, 4);
+        memcpy(e.t0,     b + (size_t)i * 120 + 0x10, 12);
+        memcpy(e.t1,     b + (size_t)i * 120 + 0x1c, 12);
+        memcpy(&e.btype, b + (size_t)i * 120 + 0x28, 4);
+        memcpy(&e.bidx,  b + (size_t)i * 120 + 0x2c, 4);
     }
+    return n;
+}
+
+static int DecodeNodesVec(uint64_t a2, std::vector<Node>* out, const char* tag)
+{
+    out->clear();
+    uint64_t begin = 0, span = 0;
+    const VecRead r = ReadVecAnyEx(a2, &begin, &span, tag);
+    if (r == VEC_EMPTY) return 0;
+    if (r != VEC_OK) return -1;
+    if (span % 24 != 0) {
+        Log("[slice] %s: node vector span %llu is not whole 24-byte records\n", tag, (unsigned long long)span);
+        return -1;
+    }
+    const int n = (int)(span / 24);
+    out->resize((size_t)n);
+    const uint8_t* b = (const uint8_t*)begin;
+    for (int i = 0; i < n; i++) {
+        Node& nd = (*out)[(size_t)i];
+        memcpy(&nd.x,  b + (size_t)i * 24 + 0x00, 4);
+        memcpy(&nd.y,  b + (size_t)i * 24 + 0x04, 4);
+        memcpy(&nd.z,  b + (size_t)i * 24 + 0x08, 4);
+        // The placeholder id (-1, -2, ...). Edges address nodes by THIS, not by
+        // position in the vector, so it has to travel with the geometry.
+        memcpy(&nd.id, b + (size_t)i * 24 + 0x14, 4);
+    }
+    return n;
+}
+
+// Fixed-buffer readers, kept for the construction placement's ROADC companion
+// (its buffers are that caller's own). They no longer cap the DECODE: a vector
+// longer than the buffer is logged as truncated so it can never pass silently.
+static int DecodeEdges(uint64_t a2, Edge* out, int maxOut)
+{
+    std::vector<Edge> v;
+    int n = DecodeEdgesVec(a2, &v, "edges");
+    if (n <= 0) return 0;
+    if (n > maxOut) {
+        Log("[slice] edges: %d records but this caller's buffer holds %d -- TRUNCATED, the tail does not ship\n", n, maxOut);
+        n = maxOut;
+    }
+    memcpy(out, v.data(), (size_t)n * sizeof(Edge));
     return n;
 }
 
 static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
 {
-    if (!Readable((void*)a2, 16)) return 0;
-    uint64_t begin = 0, end = 0;
-    memcpy(&begin, (void*)a2, 8);
-    memcpy(&end, (void*)(a2 + 8), 8);
-    if (begin < 0x10000 || end <= begin) return 0;
-    uint64_t span = end - begin;
-    if (span % 24 != 0 || span > 0x20000) return 0;
-    int n = (int)(span / 24);
-    if (n > maxOut) n = maxOut;
-    if (!Readable((void*)begin, (size_t)span)) return 0;
-    const uint8_t* b = (const uint8_t*)begin;
-    for (int i = 0; i < n; i++) {
-        memcpy(&out[i].x,  b + i * 24 + 0x00, 4);
-        memcpy(&out[i].y,  b + i * 24 + 0x04, 4);
-        memcpy(&out[i].z,  b + i * 24 + 0x08, 4);
-        // The placeholder id (-1, -2, ...). Edges address nodes by THIS, not by
-        // position in the vector, so it has to travel with the geometry.
-        memcpy(&out[i].id, b + i * 24 + 0x14, 4);
+    std::vector<Node> v;
+    int n = DecodeNodesVec(a2, &v, "nodes");
+    if (n <= 0) return 0;
+    if (n > maxOut) {
+        Log("[slice] nodes: %d records but this caller's buffer holds %d -- TRUNCATED, the tail does not ship\n", n, maxOut);
+        n = maxOut;
     }
+    memcpy(out, v.data(), (size_t)n * sizeof(Node));
     return n;
 }
 
@@ -666,11 +777,18 @@ static EdgeType DecodeEdgeType(uint64_t a2)
     // catenary-on sample had low byte 01, every off sample 00, across 8 pairs.
     t.catenary = (b[0x64] & 1) != 0;
     if (t.type != 0 && t.type != 1) return t;          // not the layout we know
+    // The type is an index into the loaded street/track type list, so only a
+    // NEGATIVE one is impossible. There is no upper bound: the list is as long
+    // as the installed mods make it, and the 512 this once refused (as "not the
+    // layout") left a modded road type unreplicated -- the build ran natively
+    // on one instance. The index travels as is and the peer applies it to its
+    // own repository (roads.lua); the session's shared mod list is what keeps
+    // the two lists equal, not a bound here.
     if (t.type == 0) {
         t.trackType = 1;                               // not applicable on a street
-        if (t.streetType < 0 || t.streetType > 512) return t;
+        if (t.streetType < 0) return t;
     } else {
-        if (t.trackType < 0 || t.trackType > 512) return t;
+        if (t.trackType < 0) return t;
     }
     t.ok = true;
     return t;
@@ -785,17 +903,20 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
 // The Lua adds the real check (each id must carry a CONSTRUCTION component);
 // if that fails nothing is replayed and the construction simply stays, which
 // the player can see and redo.
-static bool WriteCondemoInject(uint64_t tb, int nrem)
+// Every id the bulldozer was handed: a drag over a whole district is one
+// command with as many constructions as it covered. The 16 this once refused
+// (as "not a construction demolish") let the bulldoze run natively on the
+// originator alone, with no notice to the peers.
+static bool WriteCondemoInject(const std::vector<int32_t>& ids)
 {
-    if (nrem < 1 || nrem > 16) {
+    const int nrem = (int)ids.size();
+    if (nrem < 1) {
         Log("[slice] CDEMO: %d ids is not a construction demolish -- NOT shipped, not cancelled\n", nrem);
         return false;
     }
-    int32_t ids[16];
     for (int i = 0; i < nrem; i++) {
-        memcpy(&ids[i], (const uint8_t*)tb + (size_t)i * 4, 4);
-        if (ids[i] <= 0) {
-            Log("[slice] CDEMO: id[%d]=%d is not an entity -- NOT shipped, not cancelled\n", i, ids[i]);
+        if (ids[(size_t)i] <= 0) {
+            Log("[slice] CDEMO: id[%d]=%d is not an entity -- NOT shipped, not cancelled\n", i, ids[(size_t)i]);
             return false;
         }
     }
@@ -806,7 +927,7 @@ static bool WriteCondemoInject(uint64_t tb, int nrem)
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return false; }
     fprintf(f, "CDEMO %d", nrem);
-    for (int i = 0; i < nrem; i++) fprintf(f, " %d", ids[i]);
+    for (int i = 0; i < nrem; i++) fprintf(f, " %d", ids[(size_t)i]);
     fprintf(f, "\n");
     fclose(f);
     Log("[slice] CDEMO shipped: %d construction(s), first id=%d\n", nrem, ids[0]);
@@ -944,6 +1065,52 @@ static uint64_t ReadVec(uint64_t vecAddr, uint64_t* pbegin, uint64_t maxSpan)
 // the layout.
 static bool IsHeapPtr(uint64_t p) { return p >= 0x10000 && p < 0x7FFFFFFFFFFFULL; }
 
+// An MSVC std::string at sa, at ANY length: 16-byte SSO buffer, size at +0x10,
+// capacity at +0x18; the text sits inline while the capacity is 15 or less and
+// past that +0x00 points at it. A name is whatever the player typed -- the 255
+// characters the line and vehicle renames once stopped at refused the rename
+// ("unreadable or empty -- not shipped") and it applied on one instance only.
+// False when the struct or the text does not read; the only bound is the
+// misread guard on the length.
+static bool ReadStdString(uint64_t sa, std::string* out, const char* tag)
+{
+    out->clear();
+    if (!Readable((void*)sa, 32)) return false;
+    uint64_t len = 0, cap = 0;
+    memcpy(&len, (void*)(sa + 0x10), 8);
+    memcpy(&cap, (void*)(sa + 0x18), 8);
+    if (len > cap) return false;
+    if (len > VEC_SANE_SPAN) {
+        Log("[slice] %s: string at %llx claims %llu bytes -- past the misread guard, not a string\n",
+            tag, (unsigned long long)sa, (unsigned long long)len);
+        return false;
+    }
+    const char* src = (const char*)sa;
+    if (cap > 15) {
+        uint64_t ptr = 0; memcpy(&ptr, (void*)sa, 8);
+        if (!IsHeapPtr(ptr)) return false;
+        src = (const char*)ptr;
+    }
+    if (!Readable((void*)src, (size_t)len + 1)) return false;
+    out->assign(src, (size_t)len);
+    return true;
+}
+
+// Percent-encoded for the inject file, which the Lua splits on whitespace:
+// printable ASCII other than '%' and '=' travels as is, everything else
+// (spaces, UTF-8, the two escape characters) as %XX. CM.unescName undoes it.
+static std::string PercentEncode(const std::string& s)
+{
+    std::string enc;
+    enc.reserve(s.size() * 3);
+    for (size_t i = 0; i < s.size(); i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') enc.push_back((char)ch);
+        else { char h[4]; snprintf(h, sizeof(h), "%%%02X", ch); enc.append(h, 3); }
+    }
+    return enc;
+}
+
 static void ChaseStrings(int testId, int sample, uint64_t root, unsigned rootLen)
 {
     struct Item { uint64_t base; unsigned len; int depth; char path[64]; };
@@ -1007,120 +1174,147 @@ static void ChaseStrings(int testId, int sample, uint64_t root, unsigned rootLen
 //   r8+0x1e0 toRemove vector<Entity>, r8+0x1f8 toAdd stride 0x8e0
 //            (r9 2, decompile only -- UNVERIFIED by any sweep)
 static bool StashStopDelFromBulldoze(uint64_t eb, int re, uint64_t adb, int aedges);   // defined with the STOPX writers below
-static bool LogBulldoze(uint64_t r8)
+static bool ClassifyBulldoze(uint64_t r8)
 {
     bool shipped = false;
+    // Every vector at the length the bulldozer holds (a drag over a whole
+    // district removes hundreds of records in ONE command); only the
+    // misread guard applies. toRemove is the construction id list.
+    uint64_t nb = 0, eb = 0;
+    uint64_t nspan = ReadVecAny(r8 + 0x30, &nb, "BULLDOZE removedNodes");
+    uint64_t espan = ReadVecAny(r8 + 0x48, &eb, "BULLDOZE removedSegments");
+    std::vector<int32_t> toRemove;
+    const bool tok = ReadIntVec(r8 + 0x1e0, &toRemove, "BULLDOZE toRemove");
+    int rn = (int)(nspan / 24), re = (int)(espan / 120), nrem = (int)toRemove.size();
+    // addedSegments (r8+0x18, 120-B records): a bulldoze that ADDS an edge
+    // is an edge REPLACE, not a demolish -- the bulldozer removes a stop or
+    // a signal by re-adding the same edge without the object.
+    uint64_t adb = 0;
+    int aedges = (int)(ReadVecAny(r8 + 0x18, &adb, "BULLDOZE addedSegments") / 120);
+    int nadd = 0;
+    if (Readable((void*)(r8 + 0x1f8), 16)) {
+        uint64_t ab = 0, ae = 0;
+        memcpy(&ab, (void*)(r8 + 0x1f8), 8);
+        memcpy(&ae, (void*)(r8 + 0x200), 8);
+        if (ae > ab) nadd = (int)((ae - ab) / 0x8e0);
+    }
+    Log("[slice] BULLDOZE rn=%d re=%d toRemove=%d toAdd=%d "
+        "(toRemove/toAdd offsets UNVERIFIED -- decompile only)\n",
+        rn, re, nrem, nadd);
+    if (nspan % 24)
+        Log("[slice]   removedNodes span=%llu not a multiple of 24\n",
+            (unsigned long long)nspan);
+    if (espan % 120)
+        Log("[slice]   removedSegments span=%llu not a multiple of 120\n",
+            (unsigned long long)espan);
+    if (!tok)
+        Log("[slice]   toRemove vector unreadable or malformed -- classified without it\n");
+    if (nrem >= 1 && nadd >= 1) {
+        Log("[slice]   UPGRADE-shaped (toRemove+toAdd) -- module edit\n");
+        // STRICT: stash the new CE and arm; CONUP ships from the Add hook if
+        // the cancel lands. Undecodable -> the native upgrade runs and a
+        // NATIVE notice asks the mod for a catch-up scan.
+        if (StashConupFromProposal(r8)) {
+            InterlockedExchange(&g_pendingIsConu, 1);
+            shipped = true;
+        } else {
+            Log("[slice]   upgrade params not readable -- NOT cancelled, the mod's catch-up scan ships it\n");
+            if (SessionLive()) WriteNativeNotice("upgrade");
+        }
+    }
+    else if (nrem >= 1) {
+        Log("[slice]   construction-demolish shape\n");
+        // STRICT: ship the ids and let the arm block in DeferHandler cancel
+        // the bulldoze exactly as it does for a road. Not shipped (an id
+        // that is no entity, no instance letter, the inject file) -> the
+        // bulldoze runs natively HERE, so the peers get a NATIVE notice and
+        // the catch-up scan sees the constructions gone; without it nothing
+        // said the demolish happened at all.
+        shipped = WriteCondemoInject(toRemove);
+        if (!shipped && SessionLive()) {
+            Log("[slice]   CDEMO not shipped -- the bulldoze runs natively, NATIVE notice written\n");
+            WriteNativeNotice("construction");
+        }
+    }
+    else if (re >= 1 && aedges >= 1) {
+        // An edge object (stop / signal) removed: the edge is re-added without
+        // it. Never an EDEMO -- shipped as one (2026-09-08) the replay removed
+        // the edge outright, the engine asserted on the object a line still
+        // referenced, and every instance wrote a minidump.
+        Log("[slice]   edge-REPLACE shape (re=%d addEdges=%d): an edge object removed, not a road\n", re, aedges);
+        // STRICT: name the removed object off the two edge records, arm the
+        // cancel, and STOPXDEL ships from the Add hook if it lands -- every
+        // instance then removes it at the stamp. Undecodable -> the bulldoze
+        // runs natively here and a NATIVE notice asks for a catch-up scan.
+        if (StashStopDelFromBulldoze(eb, re, adb, aedges)) {
+            InterlockedExchange(&g_pendingIsStopDel, 1);
+            shipped = true;
+        } else {
+            Log("[slice]   (not decodable -- runs natively, the mod's catch-up scan ships it)\n");
+            if (SessionLive()) WriteNativeNotice("stop");
+        }
+    }
+    else if (re >= 1 || rn >= 1) {
+        Log("[slice]   edge-demolish shape\n");
+        // A removal is not self-correcting the way an addition is: a road
+        // removed on the wrong instance is destroyed work with nothing to
+        // rebuild it from. So the far end matches endpoint POSITION and edge
+        // KIND, never an entity id, and the cancel is armed only when the
+        // removal actually shipped.
+        shipped = WriteBulldozeInject(nb, rn, eb, re);
+        // Not shipped (no edge record, no instance letter, the inject file):
+        // the demolish runs natively here and only here. Say so to the mod;
+        // the catch-up scan does not rebuild roads, but the notice puts the
+        // native demolish in every log instead of nowhere.
+        if (!shipped && SessionLive()) {
+            Log("[slice]   EDEMO not shipped -- the bulldoze runs natively, NATIVE notice written\n");
+            WriteNativeNotice("road");
+        }
+    }
+    else
+        Log("[slice]   empty removal shape -- nothing decoded\n");
+    char line[560];
+    if (nspan >= 24) {
+        float x, y, z; int32_t nid;
+        const uint8_t* b = (const uint8_t*)nb;
+        memcpy(&x, b + 0x00, 4); memcpy(&y, b + 0x04, 4);
+        memcpy(&z, b + 0x08, 4); memcpy(&nid, b + 0x14, 4);
+        int o = snprintf(line, sizeof(line),
+                         "[slice]   rmNode[0] pos=(%.2f,%.2f,%.2f) id=%d hex=",
+                         x, y, z, nid);
+        for (int i = 0; i < 24 && o < (int)sizeof(line) - 4; i++)
+            o += snprintf(line + o, sizeof(line) - o, "%02x", b[i]);
+        Log("%s\n", line);
+    }
+    if (espan >= 120) {
+        int32_t ent, n0, n1;
+        const uint8_t* b = (const uint8_t*)eb;
+        memcpy(&ent, b + 0x00, 4);
+        memcpy(&n0, b + 0x08, 4);
+        memcpy(&n1, b + 0x0c, 4);
+        int o = snprintf(line, sizeof(line),
+                         "[slice]   rmSeg[0] entity=%d node0=%d node1=%d hex=",
+                         ent, n0, n1);
+        for (int i = 0; i < 120 && o < (int)sizeof(line) - 4; i++)
+            o += snprintf(line + o, sizeof(line) - o, "%02x", b[i]);
+        Log("%s\n", line);
+    }
+    if (nrem >= 1)
+        Log("[slice]   toRemove[0]=%d (offset +0x1e0 UNVERIFIED)\n", toRemove[0]);
+    return shipped;
+}
+
+// The SEH guard around the classifier, which owns vectors of its own (a function
+// with a __try may not, C2712). A fault anywhere in the decode: nothing shipped,
+// nothing cancelled.
+static bool LogBulldoze(uint64_t r8)
+{
     __try {
-        uint64_t nb = 0, eb = 0, tb = 0;
-        uint64_t nspan = ReadVec(r8 + 0x30, &nb, 0x20000);
-        uint64_t espan = ReadVec(r8 + 0x48, &eb, 0x20000);
-        uint64_t tspan = ReadVec(r8 + 0x1e0, &tb, 0x10000);
-        int rn = (int)(nspan / 24), re = (int)(espan / 120), nrem = (int)(tspan / 4);
-        // addedSegments (r8+0x18, 120-B records): a bulldoze that ADDS an edge
-        // is an edge REPLACE, not a demolish -- the bulldozer removes a stop or
-        // a signal by re-adding the same edge without the object.
-        uint64_t adb = 0;
-        int aedges = (int)(ReadVec(r8 + 0x18, &adb, 0x20000) / 120);
-        int nadd = 0;
-        if (Readable((void*)(r8 + 0x1f8), 16)) {
-            uint64_t ab = 0, ae = 0;
-            memcpy(&ab, (void*)(r8 + 0x1f8), 8);
-            memcpy(&ae, (void*)(r8 + 0x200), 8);
-            if (ae > ab) nadd = (int)((ae - ab) / 0x8e0);
-        }
-        Log("[slice] BULLDOZE rn=%d re=%d toRemove=%d toAdd=%d "
-            "(toRemove/toAdd offsets UNVERIFIED -- decompile only)\n",
-            rn, re, nrem, nadd);
-        if (nspan % 24)
-            Log("[slice]   removedNodes span=%llu not a multiple of 24\n",
-                (unsigned long long)nspan);
-        if (espan % 120)
-            Log("[slice]   removedSegments span=%llu not a multiple of 120\n",
-                (unsigned long long)espan);
-        if (nrem >= 1 && nadd >= 1) {
-            Log("[slice]   UPGRADE-shaped (toRemove+toAdd) -- module edit\n");
-            // STRICT: stash the new CE and arm; CONUP ships from the Add hook if
-            // the cancel lands. Undecodable -> the native upgrade runs and a
-            // NATIVE notice asks the mod for a catch-up scan.
-            if (StashConupFromProposal(r8)) {
-                InterlockedExchange(&g_pendingIsConu, 1);
-                shipped = true;
-            } else {
-                Log("[slice]   upgrade params not readable -- NOT cancelled, the mod's catch-up scan ships it\n");
-                if (SessionLive()) WriteNativeNotice("upgrade");
-            }
-        }
-        else if (nrem >= 1) {
-            Log("[slice]   construction-demolish shape\n");
-            // STRICT: ship the ids and let the arm block in DeferHandler cancel
-            // the bulldoze exactly as it does for a road.
-            shipped = WriteCondemoInject(tb, nrem);
-        }
-        else if (re >= 1 && aedges >= 1) {
-            // An edge object (stop / signal) removed: the edge is re-added without
-            // it. Never an EDEMO -- shipped as one (2026-09-08) the replay removed
-            // the edge outright, the engine asserted on the object a line still
-            // referenced, and every instance wrote a minidump.
-            Log("[slice]   edge-REPLACE shape (re=%d addEdges=%d): an edge object removed, not a road\n", re, aedges);
-            // STRICT: name the removed object off the two edge records, arm the
-            // cancel, and STOPXDEL ships from the Add hook if it lands -- every
-            // instance then removes it at the stamp. Undecodable -> the bulldoze
-            // runs natively here and a NATIVE notice asks for a catch-up scan.
-            if (StashStopDelFromBulldoze(eb, re, adb, aedges)) {
-                InterlockedExchange(&g_pendingIsStopDel, 1);
-                shipped = true;
-            } else {
-                Log("[slice]   (not decodable -- runs natively, the mod's catch-up scan ships it)\n");
-                if (SessionLive()) WriteNativeNotice("stop");
-            }
-        }
-        else if (re >= 1 || rn >= 1) {
-            Log("[slice]   edge-demolish shape\n");
-            // A removal is not self-correcting the way an addition is: a road
-            // removed on the wrong instance is destroyed work with nothing to
-            // rebuild it from. So the far end matches endpoint POSITION and edge
-            // KIND, never an entity id, and the cancel is armed only when the
-            // removal actually shipped.
-            shipped = WriteBulldozeInject(nb, rn, eb, re);
-        }
-        else
-            Log("[slice]   empty removal shape -- nothing decoded\n");
-        char line[560];
-        if (nspan >= 24) {
-            float x, y, z; int32_t nid;
-            const uint8_t* b = (const uint8_t*)nb;
-            memcpy(&x, b + 0x00, 4); memcpy(&y, b + 0x04, 4);
-            memcpy(&z, b + 0x08, 4); memcpy(&nid, b + 0x14, 4);
-            int o = snprintf(line, sizeof(line),
-                             "[slice]   rmNode[0] pos=(%.2f,%.2f,%.2f) id=%d hex=",
-                             x, y, z, nid);
-            for (int i = 0; i < 24 && o < (int)sizeof(line) - 4; i++)
-                o += snprintf(line + o, sizeof(line) - o, "%02x", b[i]);
-            Log("%s\n", line);
-        }
-        if (espan >= 120) {
-            int32_t ent, n0, n1;
-            const uint8_t* b = (const uint8_t*)eb;
-            memcpy(&ent, b + 0x00, 4);
-            memcpy(&n0, b + 0x08, 4);
-            memcpy(&n1, b + 0x0c, 4);
-            int o = snprintf(line, sizeof(line),
-                             "[slice]   rmSeg[0] entity=%d node0=%d node1=%d hex=",
-                             ent, n0, n1);
-            for (int i = 0; i < 120 && o < (int)sizeof(line) - 4; i++)
-                o += snprintf(line + o, sizeof(line) - o, "%02x", b[i]);
-            Log("%s\n", line);
-        }
-        if (tspan >= 4) {
-            int32_t c0;
-            memcpy(&c0, (void*)tb, 4);
-            Log("[slice]   toRemove[0]=%d (offset +0x1e0 UNVERIFIED)\n", c0);
-        }
+        return ClassifyBulldoze(r8);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] BULLDOZE classification faulted -- ignored, build proceeds\n");
         return false;   // never cancel on a failed decode
     }
-    return shipped;
 }
 
 // VBUY: a player's BuyVehicle, shipped for replication. The config is decoded
@@ -1141,6 +1335,13 @@ static bool LogBulldoze(uint64_t r8)
 // VCfgParts validates the config and hands back the parts vector; it returns -1
 // when the struct cannot be trusted, and NOTHING may be written in that case --
 // a half-written line would corrupt every command after it in the inject file.
+// The config is read WHOLE, at whatever size the game holds: a train of any
+// length, a part's load config and autoload words of any count, any number of
+// vehicle groups. It used to stop at 64 parts and 256 ints per vector, and a
+// 65-wagon train came back "config not readable -- runs natively, not shipped":
+// bought on one instance, on no other, a hard desync. Each vector is checked
+// here, before anything is written, so a config that does not read refuses
+// as a whole (nothing half-written) and names the vector and its size.
 static int VCfgParts(uint64_t cfg, uint64_t* partsBase, const char* tag)
 {
     if (!IsHeapPtr(cfg) || !Readable((void*)cfg, 0x30)) {
@@ -1148,51 +1349,59 @@ static int VCfgParts(uint64_t cfg, uint64_t* partsBase, const char* tag)
         return -1;
     }
     uint64_t ub = 0;
-    uint64_t uspan = ReadVec(cfg + 0x00, &ub, 0x80 * 64);
+    uint64_t uspan = ReadVecAny(cfg + 0x00, &ub, tag);
     if (!uspan || uspan % 0x80 != 0) {
         Log("[slice] %s: parts span %llu not a multiple of 0x80 -- not shipped\n",
             tag, (unsigned long long)uspan);
         return -1;
     }
+    const int units = (int)(uspan / 0x80);
+    std::vector<int32_t> v;
+    for (int k = 0; k < units; k++) {
+        const uint64_t u = ub + (uint64_t)k * 0x80;
+        if (!ReadIntVec(u + 0x08, &v, tag)) {
+            Log("[slice] %s: part %d of %d: loadConfig vector unreadable -- not shipped\n", tag, k + 1, units);
+            return -1;
+        }
+        if (!ReadIntVec(u + 0x60, &v, tag)) {
+            Log("[slice] %s: part %d of %d: autoLoadConfig vector unreadable -- not shipped\n", tag, k + 1, units);
+            return -1;
+        }
+    }
+    if (!ReadIntVec(cfg + 0x18, &v, tag)) {
+        Log("[slice] %s: vehicleGroups vector unreadable -- not shipped\n", tag);
+        return -1;
+    }
     *partsBase = ub;
-    return (int)(uspan / 0x80);
+    return units;
 }
 
 // Everything after the leading entity field: the part count, one record per
 // part, then the vehicle groups. Returns the group count (for the log line).
+// Every vector was validated by VCfgParts; it is re-read here at full length.
 static int WriteVehicleConfig(FILE* f, uint64_t cfg, uint64_t ub, int units)
 {
     fprintf(f, " %d", units);
+    std::vector<int32_t> v;
     for (int k = 0; k < units; k++) {
         uint64_t u = ub + (uint64_t)k * 0x80;
         int32_t model = 0;
         memcpy(&model, (void*)(u + 0x00), 4);
         fprintf(f, " %d", model);
-        uint64_t lb = 0;
-        uint64_t lspan = ReadVec(u + 0x08, &lb, 0x400);
-        int nl = (int)(lspan / 4);
-        fprintf(f, " %d", nl);
-        for (int j = 0; j < nl; j++) {
-            int32_t v = 0; memcpy(&v, (void*)(lb + 4 * j), 4); fprintf(f, " %d", v);
-        }
+        ReadIntVec(u + 0x08, &v, "loadConfig");
+        fprintf(f, " %d", (int)v.size());
+        for (size_t j = 0; j < v.size(); j++) fprintf(f, " %d", v[j]);
         float c[3] = { -1, -1, -1 };
         memcpy(c, (void*)(u + 0x20), 12);
         fprintf(f, " %.4f %.4f %.4f", c[0], c[1], c[2]);
-        uint64_t ab = 0;
-        uint64_t aspan = ReadVec(u + 0x60, &ab, 0x400);
-        int na = (int)(aspan / 4);
-        fprintf(f, " %d", na);
-        for (int j = 0; j < na; j++) {
-            int32_t v = 0; memcpy(&v, (void*)(ab + 4 * j), 4); fprintf(f, " %d", v);
-        }
+        ReadIntVec(u + 0x60, &v, "autoLoadConfig");
+        fprintf(f, " %d", (int)v.size());
+        for (size_t j = 0; j < v.size(); j++) fprintf(f, " %d", v[j]);
     }
-    uint64_t gb = 0;
-    uint64_t gspan = ReadVec(cfg + 0x18, &gb, 0x400);
-    int ng = (int)(gspan / 4);
+    ReadIntVec(cfg + 0x18, &v, "vehicleGroups");
+    const int ng = (int)v.size();
     fprintf(f, " %d", ng);
-    for (int j = 0; j < ng; j++) {
-        int32_t v = 0; memcpy(&v, (void*)(gb + 4 * j), 4); fprintf(f, " %d", v);
-    }
+    for (size_t j = 0; j < v.size(); j++) fprintf(f, " %d", v[j]);
     return ng;
 }
 
@@ -1446,13 +1655,15 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
 // deferrelay_slice.asm). The line editor then gets its real result -- the line
 // created on the same step as everywhere else -- a fraction of a second later.
 static const uintptr_t CALLER_UI_CREATELINE = 0x215c26b;   // line_util, used by both the line list and the line manager
-struct LineCreateDecode { char nameEnc[768]; float rgb[3]; LineDecode line; };
+struct LineCreateDecode { std::string nameEnc; float rgb[3]; LineDecode line; };   // the name at any length, percent-encoded
 static LineCreateDecode g_lcDecode;
 static bool g_lcDecodeOk = false;
 struct LcStash { uint8_t* fn; ULONGLONG at; };
 static SRWLOCK g_lcLock = SRWLOCK_INIT;
-static LcStash g_lcStash[8];
-static int g_lcStashN = 0;
+// Held UI callbacks, oldest first, as many as the player creates lines: the
+// eight this once held dropped the ninth callback of a burst of creates ("stash
+// full"), and that line's editor never got its result.
+static std::vector<LcStash> g_lcStash;
 static volatile LONG g_pendingStashCb = 0;        // the pending cancel is a CreateLine: stash its callback at Add
 static volatile LONG64 g_lcCarrierCmd = 0;        // our claimed Lua createLine, whose Add takes the stashed callback
 static uint8_t* g_lcCarrierFn = nullptr;          // the std::function object handed to that Add
@@ -1462,24 +1673,12 @@ static long g_lcClaimSeen = 0;
 static bool DecodeLineCreate(uint64_t rdx, uint64_t r8, uint64_t st0)
 {
     g_lcDecodeOk = false;
-    // name: MSVC std::string at rdx (16-byte SSO buffer, size +0x10, capacity +0x18)
-    char name[256] = "";
-    if (!Readable((void*)rdx, 32)) return false;
-    uint64_t len = 0, cap = 0;
-    memcpy(&len, (void*)(rdx + 0x10), 8);
-    memcpy(&cap, (void*)(rdx + 0x18), 8);
-    const char* src = (const char*)rdx;
-    if (cap > 15) { uint64_t ptr = 0; memcpy(&ptr, (void*)rdx, 8); src = (const char*)ptr; }
-    if (len == 0 || len >= sizeof(name) || !src || !Readable((void*)src, (size_t)len + 1)) return false;
-    memcpy(name, src, (size_t)len);
-    name[len] = 0;
-    size_t o = 0;   // percent-encoded like VNAME: the wire splits on whitespace
-    for (size_t i = 0; name[i] && o + 4 < sizeof(g_lcDecode.nameEnc); i++) {
-        unsigned char ch = (unsigned char)name[i];
-        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') g_lcDecode.nameEnc[o++] = (char)ch;
-        else { sprintf(g_lcDecode.nameEnc + o, "%%%02X", ch); o += 3; }
-    }
-    g_lcDecode.nameEnc[o] = 0;
+    // name: the UI's std::string at rdx, any length (ReadStdString). Empty is
+    // refused: the Lua's LCREATEX parser needs a name token (name=%S+).
+    std::string name;
+    if (!ReadStdString(rdx, &name, "CreateLine name")) { Log("[slice] CreateLine: name at %llx unreadable\n", (unsigned long long)rdx); return false; }
+    if (name.empty()) { Log("[slice] CreateLine: empty name -- not decodable for the wire\n"); return false; }
+    g_lcDecode.nameEnc = PercentEncode(name);   // like VNAME: the wire splits on whitespace
     // colour: r8 -> three floats
     if (!Readable((void*)r8, 12)) return false;
     memcpy(g_lcDecode.rgb, (void*)r8, 12);
@@ -1525,13 +1724,11 @@ static bool StashLineCreateCallback(uint64_t r9)
     const ULONGLONG now = GetTickCount64();
     AcquireSRWLockExclusive(&g_lcLock);
     // a stash no replay claimed within a minute is dropped (leaked, never called)
-    int k = 0;
-    for (int i = 0; i < g_lcStashN; i++) if (now - g_lcStash[i].at < 60000) g_lcStash[k++] = g_lcStash[i];
-    g_lcStashN = k;
-    const bool room = g_lcStashN < (int)(sizeof(g_lcStash) / sizeof(g_lcStash[0]));
-    if (room) { g_lcStash[g_lcStashN].fn = buf; g_lcStash[g_lcStashN].at = now; g_lcStashN++; }
+    size_t k = 0;
+    for (size_t i = 0; i < g_lcStash.size(); i++) if (now - g_lcStash[i].at < 60000) g_lcStash[k++] = g_lcStash[i];
+    g_lcStash.resize(k);
+    g_lcStash.push_back(LcStash{ buf, now });
     ReleaseSRWLockExclusive(&g_lcLock);
-    if (!room) { Log("[slice] CreateLine: stash full -- callback dropped\n"); return false; }
     return true;
 }
 
@@ -1562,10 +1759,9 @@ static void ClaimLineCreateCarrier(uint64_t rcx)
     g_lcClaimSeen = claim;
     uint8_t* fn = nullptr;
     AcquireSRWLockExclusive(&g_lcLock);
-    if (g_lcStashN > 0) {
-        fn = g_lcStash[0].fn;
-        for (int i = 1; i < g_lcStashN; i++) g_lcStash[i - 1] = g_lcStash[i];
-        g_lcStashN--;
+    if (!g_lcStash.empty()) {
+        fn = g_lcStash.front().fn;
+        g_lcStash.erase(g_lcStash.begin());
     }
     ReleaseSRWLockExclusive(&g_lcLock);
     if (!fn) { Log("[slice] CreateLine: claim %ld but no held callback -- the replay runs with the Lua's own\n", claim); return; }
@@ -1627,16 +1823,16 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
     if (!f) { Log("[slice] cannot open %s\n", p); return false; }
     bool shipped = true;
     if (fid == 3) {
-        uint64_t b = 0;
-        uint64_t span = ReadVec(r8, &b, 0x400);
-        int n = (int)(span / 4);
-        if (n > 0) {
-            fprintf(f, "VSELL %d", n);
-            for (int i = 0; i < n; i++) { int32_t v = 0; memcpy(&v, (void*)(b + 4 * i), 4); fprintf(f, " %d", v); }
+        // the whole list: a bulk sell of a big fleet is ONE command with every
+        // vehicle in it (256 was the old cut, and the rest stayed unsold on the peers)
+        std::vector<int32_t> ids;
+        if (ReadIntVec(r8, &ids, "VSELL") && !ids.empty()) {
+            fprintf(f, "VSELL %d", (int)ids.size());
+            for (size_t i = 0; i < ids.size(); i++) fprintf(f, " %d", ids[i]);
             fprintf(f, "\n");
-            Log("[slice] VSELL shipped: %d vehicle(s)\n", n);
+            Log("[slice] VSELL shipped: %d vehicle(s)\n", (int)ids.size());
         } else {
-            Log("[slice] VSELL: vehicle list unreadable -- not shipped\n");
+            Log("[slice] VSELL: vehicle list unreadable or empty -- not shipped\n");
             shipped = false;
         }
     } else if (fid == 4) {
@@ -1677,8 +1873,8 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
-            fprintf(f, " name=%s\n", g_lcDecode.nameEnc);
-            Log("[slice] LCREATEX shipped: name=%s stops=%d\n", g_lcDecode.nameEnc, d.n);
+            fprintf(f, " name=%s\n", g_lcDecode.nameEnc.c_str());
+            Log("[slice] LCREATEX shipped: name=%.200s stops=%d\n", g_lcDecode.nameEnc.c_str(), d.n);
         } else {
             // not decoded: the new line's content is read back from the entity by
             // the Lua side once it exists; only the EVENT ships from here.
@@ -1728,32 +1924,17 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             shipped = false;
         }
     } else if (fid == 14) {
-        // SetName(entity, std::string const&). MSVC layout: a 16-byte buffer,
-        // size at +0x10, capacity at +0x18. The text sits inline while capacity
-        // is 15 or less; past that, +0x00 is a pointer to it.
-        char name[256]; name[0] = 0;
-        if (Readable((void*)r9, 32)) {
-            uint64_t len = 0, cap = 0;
-            memcpy(&len, (void*)(r9 + 0x10), 8);
-            memcpy(&cap, (void*)(r9 + 0x18), 8);
-            const char* src = (const char*)r9;
-            if (cap > 15) { uint64_t ptr = 0; memcpy(&ptr, (void*)r9, 8); src = (const char*)ptr; }
-            if (len < sizeof(name) && src && Readable((void*)src, (size_t)len + 1)) {
-                memcpy(name, src, (size_t)len); name[len] = 0;
-            }
-        }
-        if (name[0]) {
-            // Percent-encode: the wire is split on whitespace, and a player
-            // names things "Coal Line 2".
-            char enc[768]; size_t o = 0;
-            for (size_t i = 0; name[i] && o + 4 < sizeof(enc); i++) {
-                unsigned char ch = (unsigned char)name[i];
-                if (ch > 32 && ch < 127 && ch != '%' && ch != '=') enc[o++] = (char)ch;
-                else { sprintf(enc + o, "%%%02X", ch); o += 3; }
-            }
-            enc[o] = 0;
-            fprintf(f, "VNAME %d %s\n", (int)(int32_t)r8, enc);
-            Log("[slice] VNAME shipped: entity=%d name='%s'\n", (int)(int32_t)r8, name);
+        // SetName(entity, std::string const&): the name at any length
+        // (ReadStdString), percent-encoded because the wire is split on
+        // whitespace and a player names things "Coal Line 2". An EMPTY name
+        // cannot travel: the Lua's VNAME parser needs a third token.
+        std::string name;
+        if (!ReadStdString(r9, &name, "VNAME")) name.clear();
+        if (!name.empty()) {
+            const std::string enc = PercentEncode(name);
+            fprintf(f, "VNAME %d %s\n", (int)(int32_t)r8, enc.c_str());
+            Log("[slice] VNAME shipped: entity=%d name='%.200s'%s\n", (int)(int32_t)r8, name.c_str(),
+                name.size() > 200 ? "..." : "");
         } else {
             Log("[slice] VNAME: name at %llx unreadable or empty -- not shipped\n", (unsigned long long)r9);
             shipped = false;
@@ -1772,7 +1953,7 @@ static bool VehiclePayloadReadable(int fid, uint64_t r8, uint64_t r9, uint64_t s
 {
     uint64_t b = 0;
     if (fid == 2) return VCfgParts(st0, &b, "VBUY") >= 0;
-    if (fid == 3) return ReadVec(r8, &b, 0x400) >= 4;
+    if (fid == 3) { std::vector<int32_t> ids; return ReadIntVec(r8, &ids, "VSELL") && !ids.empty(); }
     if (fid == 4) return VCfgParts(r9, &b, "VREPL") >= 0;
     return true;
 }
@@ -2296,19 +2477,22 @@ static void WriteInjectConxp()
 // NATIVE notice gets it to the mod's catch-up scan and its STOPREP path.
 static bool StashStopFromProposal(uint64_t r8)
 {
-    g_stopName[0] = 0; g_stopEid = -1;
+    g_stopName.clear(); g_stopEid = -1;
     uint64_t rb = 0;
-    if (ReadVec(r8 + 0x48, &rb, 0x20000) < 120 || !Readable((void*)rb, 120)) return false;
+    if (ReadVecAny(r8 + 0x48, &rb, "STOP removedSegments") < 120 || !Readable((void*)rb, 120)) return false;
     int32_t eid = -1;
     memcpy(&eid, (void*)rb, 4);
     if (eid < 0) return false;
+    // edgeObjectsToRemove at any length: the 0x4000-byte span this once read
+    // through would have read a LONGER list as empty and cancelled a
+    // replacement as a plain placement.
     uint64_t xb = 0;
-    if (ReadVec(r8 + 0xe0, &xb, 0x4000) >= 0x100) {
+    if (ReadVecAny(r8 + 0xe0, &xb, "STOP edgeObjectsToRemove") >= 0x100) {
         Log("[stop] placement replaces an object -- not cancelled, the catch-up scan's STOPREP path handles it\n");
         return false;
     }
     uint64_t ob = 0;
-    if (ReadVec(r8 + 0xf8, &ob, 0x4000) < 0x100 || !Readable((void*)ob, 0x100)) return false;
+    if (ReadVecAny(r8 + 0xf8, &ob, "STOP edgeObjectsToAdd") < 0x100 || !Readable((void*)ob, 0x100)) return false;
     int32_t kind = -1, model = 0, player = 0;
     memcpy(&kind, (void*)(ob + 0x04), 4);
     memcpy(&model, (void*)(ob + 0x10), 4);
@@ -2317,11 +2501,11 @@ static bool StashStopFromProposal(uint64_t r8)
     float pos[3];
     memcpy(pos, (void*)(ob + 0x44), 12);
     uint8_t b0 = *(const uint8_t*)(ob + 0xd0), left = *(const uint8_t*)(ob + 0xd1);
-    if (!ReadSsoString(ob + 0xd8, g_stopName, sizeof(g_stopName))) g_stopName[0] = 0;
+    if (!ReadStdString(ob + 0xd8, &g_stopName, "STOP name")) g_stopName.clear();
     g_stopEid = eid; g_stopSide = kind; g_stopModel = model; g_stopPlayer = player;
     memcpy(g_stopPos, pos, 12); g_stopLeft = left ? 1 : 0; g_stopOneWay = b0 ? 1 : 0;
     Log("[stop] edge=%d kind=%d model=%d pos=(%.1f,%.1f,%.1f) left=%u b0(oneWay?)=%u player=%d name='%s' diag +08=%08x +d0..d3=%02x%02x%02x%02x\n",
-        eid, kind, model, pos[0], pos[1], pos[2], (unsigned)left, (unsigned)b0, player, g_stopName,
+        eid, kind, model, pos[0], pos[1], pos[2], (unsigned)left, (unsigned)b0, player, g_stopName.c_str(),
         *(const uint32_t*)(ob + 0x08), (unsigned)b0, (unsigned)left,
         (unsigned)*(const uint8_t*)(ob + 0xd2), (unsigned)*(const uint8_t*)(ob + 0xd3));
     return true;
@@ -2341,7 +2525,7 @@ static void WriteInjectStop()
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
     fprintf(f, "STOPX %d %d %d %.4f %.4f %.4f %u %u %d name=%s\n",
             g_stopEid, g_stopSide, g_stopModel, g_stopPos[0], g_stopPos[1], g_stopPos[2],
-            (unsigned)g_stopLeft, (unsigned)g_stopOneWay, g_stopPlayer, g_stopName);
+            (unsigned)g_stopLeft, (unsigned)g_stopOneWay, g_stopPlayer, g_stopName.c_str());
     fclose(f);
     Log("[slice] STOPX shipped: edge=%d kind=%d model=%d left=%u\n", g_stopEid, g_stopSide, g_stopModel, (unsigned)g_stopLeft);
     g_stopEid = -1;
@@ -2363,17 +2547,21 @@ static void WriteInjectStop()
 // Passengers already walking to that stop re-planned on different steps,
 // the people count diverged ~50 units later, and the buses drifted from
 // the different dwell times (session 2026-09-08 t=635 -> 696 -> 2456).
-static int ReadObjList(uint64_t seg, int32_t* out, int cap)
+// The edge's whole object list, however long: a busy street edge carries
+// every stop, signal and waypoint on it, and the 128 records / first-16 cut
+// this once made called an object past the sixteenth "not ours" -- its
+// removal then ran natively on the originator alone. -1 when unreadable.
+static int ReadObjList(uint64_t seg, std::vector<int32_t>* out)
 {
-    if (!Readable((void*)(seg + 0x30), 16)) return -1;
-    uint64_t b = 0, e = 0;
-    memcpy(&b, (void*)(seg + 0x30), 8);
-    memcpy(&e, (void*)(seg + 0x38), 8);
-    if (e == b) return 0;                                   // an edge with no objects
-    if (e < b || (e - b) % 8 || (e - b) > 0x400 || b < 0x10000 || !Readable((void*)b, (size_t)(e - b))) return -1;
-    int n = (int)((e - b) / 8), k = 0;
-    for (int i = 0; i < n && k < cap; i++) { int32_t id = -1; memcpy(&id, (void*)(b + (uint64_t)i * 8), 4); out[k++] = id; }
-    return k;
+    out->clear();
+    uint64_t b = 0, span = 0;
+    const VecRead r = ReadVecAnyEx(seg + 0x30, &b, &span, "STOPXDEL edge objects");
+    if (r == VEC_EMPTY) return 0;                           // an edge with no objects
+    if (r != VEC_OK || span % 8) return -1;
+    const int n = (int)(span / 8);
+    out->resize((size_t)n);
+    for (int i = 0; i < n; i++) memcpy(&(*out)[(size_t)i], (void*)(b + (uint64_t)i * 8), 4);
+    return n;
 }
 
 static bool StashStopDelFromBulldoze(uint64_t eb, int re, uint64_t adb, int aedges)
@@ -2383,8 +2571,8 @@ static bool StashStopDelFromBulldoze(uint64_t eb, int re, uint64_t adb, int aedg
         Log("[stop] bulldoze re=%d addEdges=%d -- not a single-edge object removal, not cancelled\n", re, aedges);
         return false;
     }
-    int32_t before[16], after[16];
-    int nb = ReadObjList(eb, before, 16), na = ReadObjList(adb, after, 16);
+    std::vector<int32_t> before, after;
+    int nb = ReadObjList(eb, &before), na = ReadObjList(adb, &after);
     if (nb < 0 || na < 0) {
         Log("[stop] bulldoze: edge object list unreadable (rm=%d add=%d) -- not cancelled\n", nb, na);
         return false;
@@ -2392,8 +2580,8 @@ static bool StashStopDelFromBulldoze(uint64_t eb, int re, uint64_t adb, int aedg
     int32_t gone = -1; int ngone = 0;
     for (int i = 0; i < nb; i++) {
         bool kept = false;
-        for (int j = 0; j < na; j++) if (after[j] == before[i]) kept = true;
-        if (!kept) { gone = before[i]; ngone++; }
+        for (int j = 0; j < na; j++) if (after[(size_t)j] == before[(size_t)i]) kept = true;
+        if (!kept) { gone = before[(size_t)i]; ngone++; }
     }
     int32_t edge = -1; memcpy(&edge, (void*)eb, 4);
     if (ngone != 1 || gone <= 0) {
@@ -2469,7 +2657,7 @@ static bool IsUpgradeShape(uint64_t r8)
     __try {
         uint64_t b = 0;
         int nadd = 0, nrem = 0;
-        uint64_t tspan = ReadVec(r8 + 0x1e0, &b, 0x10000);
+        uint64_t tspan = ReadVecAny(r8 + 0x1e0, &b, "upgrade-shape toRemove");
         nrem = (int)(tspan / 4);
         if (Readable((void*)(r8 + 0x1f8), 16)) {
             uint64_t ab = 0, ae = 0;
@@ -3647,6 +3835,219 @@ static void ZeroAddResult(uint64_t rdx)
 }
 
 // rax: 0 = let the original run, 1 = cancel it
+// A road/rail build or upgrade proposal (the build tool, the upgrade tool):
+// decode it whole, ship it as ROADE and arm the cancel. Its own frame because
+// the records live in vectors, which a function holding a __try may not own
+// (C2712); DeferHandler wraps the call in the SEH guard as before.
+static void CaptureRoadProposal(uint64_t rcx, uint64_t r8, bool isUpgrade)
+{
+    // Every node and edge the proposal holds. These were arrays of 256 nodes
+    // and 512 edges, and DecodeNodes/DecodeEdges CAPPED at them without a word:
+    // a long drag shipped its first 512 edges and rebuilt short on every peer.
+    std::vector<Node> nodes;
+    std::vector<Edge> edges;
+    int n = DecodeNodesVec(r8, &nodes, "ROADE addNodes");
+    int m = DecodeEdgesVec(r8, &edges, "ROADE addEdges");
+    // Gate on EDGES, not new nodes. A road connecting two EXISTING junctions
+    // adds ZERO new nodes (both endpoints already exist) and one edge whose
+    // node0/node1 are positive existing ids. The old n<2 guard (correct for
+    // the all-new-nodes ROADN format, wrong since ROADE) rejected exactly
+    // that case: the build was not cancelled, so it happened LOCALLY and
+    // never replicated -- observed as a one-edge desync in the two-way test.
+    // The ROADE->ROADP converter already resolves positive endpoints to
+    // positions via realPos(), so a 0-new-node road rebuilds on the peer.
+    if (n < 0 || m < 0) {
+        // A vector that does not read (the misread guard, or not whole
+        // records): nothing can ship, the build runs natively here, and the
+        // peers are told so.
+        const bool live = SessionLive();
+        Log("[slice] %s capture: proposal vectors unreadable (n=%d m=%d) -- NOT cancelled, "
+            "runs natively%s\n", isUpgrade ? "upgrade" : "road", n, m,
+            live ? "; NATIVE notice written" : "");
+        if (live) WriteNativeNotice(isUpgrade ? "upgrade" : "road");
+        return;
+    }
+    if (m < 1) {
+        Log("[slice] %s capture: no edges (n=%d m=%d) -- not a build, "
+            "letting it proceed\n", isUpgrade ? "upgrade" : "road", n, m);
+        return;
+    }
+    g_captured++;
+    if (isUpgrade)
+        Log("[slice] #%ld captured UPGRADE, %d edges replaced\n", g_captured, m);
+    else if (n >= 1)
+        Log("[slice] #%ld captured road, %d nodes %d edges, first=(%.2f,%.2f) last=(%.2f,%.2f)\n",
+            g_captured, n, m, nodes[0].x, nodes[0].y, nodes[n - 1].x, nodes[n - 1].y);
+    else
+        Log("[slice] #%ld captured road, 0 new nodes %d edges (connects existing junctions)\n",
+            g_captured, m);
+    // STREET PROPERTY PROBE (log only, upgrades are rare so it is free).
+    // A street's bus lane (hasBus) and its tram track (tramTrackType,
+    // which also encodes electrification) live in BaseEdgeStreet beside
+    // streetType, but DecodeEdgeType never reads them for a street -- it
+    // forces trackType and returns. So adding a tram way or a bus lane
+    // cannot travel on the wire, and since the upgrade is cancelled and
+    // replayed from what IS on the wire, the road came back plain on every
+    // instance including the originator (2026-09-03).
+    //
+    // streetType sits at record +0x4c and trackType at +0x60, so both
+    // fields are somewhere in between. Capture this window for one upgrade
+    // WITH a tram/bus lane and one without: the byte that differs names the
+    // offset. Do NOT hardcode an offset from a single sample.
+    // Served its purpose (it named +0x54); keep it for the next unknown
+    // street field but off by default -- 120 bytes per upgrade is noise.
+    if (isUpgrade && DumpPropOn()) {
+        uint64_t pbegin = 0, pend = 0;
+        if (Readable((void*)(r8 + 0x18), 16)) {
+            memcpy(&pbegin, (void*)(r8 + 0x18), 8);
+            memcpy(&pend, (void*)(r8 + 0x20), 8);
+            if (pbegin >= 0x10000 && pend > pbegin
+                && (pend - pbegin) % 120 == 0 && Readable((void*)pbegin, 120)) {
+                const uint8_t* pb = (const uint8_t*)pbegin;
+                // WHOLE record. +0x51 was NOT it: it read 239 and 246 on two
+                // captures, which is noise rather than a 0/1/2 enum -- and
+                // +0x54 tracks streetType (1 for type 19, 2 for type 22), so
+                // that is a road property. Dump all 120 bytes and diff a
+                // regular-tram upgrade against an electric one on the SAME
+                // road type; the byte that differs is tramTrackType. Two
+                // guesses were enough.
+                char hex[3 * 120 + 8];
+                int o = 0;
+                for (int i = 0; i < 120 && o + 4 < (int)sizeof(hex); i++)
+                    o += snprintf(hex + o, sizeof(hex) - o, "%02x ", pb[i]);
+                Log("[slice]   STREETPROBE rec+0x00..0x77: %s\n", hex);
+            }
+        }
+    }
+    // Stride-correct removal counts, for the LOG only. removedNodes at
+    // r8+0x30 are 24-byte node records and removedSegments at r8+0x48 are
+    // 120-byte SegmentAndEntity records (r9_analysis_dem.md 1, DECOMPILED;
+    // the old DecodeIds read them at a 4-byte stride, which is how one
+    // 120-byte record became "30 removals"). DecodeNodes/DecodeEdges take a
+    // base whose vector triplets sit at +0x00/+0x18, so passing r8+0x30
+    // addresses exactly the two removal vectors.
+    // Read whole, like the adds: a removal list cut short (the 64/512-slot
+    // arrays this had) would ship every add against a truncated removal list
+    // and the peer would add edges on top of the ones it never removed. An
+    // unreadable one reads as -1 and the checks below keep the build local.
+    std::vector<Node> rmNodes;
+    std::vector<Edge> rmEdges;
+    int rn = DecodeNodesVec(r8 + 0x30, &rmNodes, "ROADE rmNodes");
+    int re = DecodeEdgesVec(r8 + 0x30, &rmEdges, "ROADE rmEdges");
+    EdgeType et = DecodeEdgeType(r8);
+    Log("[slice]   type=%s streetType=%d trackType=%d%s\n",
+        et.type == 1 ? "TRACK" : "street", et.streetType, et.trackType,
+        et.ok ? "" : "  <- DECODE FAILED, falling back to defaults");
+    // Topology summary: a junction that splits one road must remove exactly
+    // one edge.
+    Log("[slice]   removed nodes=%d segs=%d (stride-correct)\n", rn, re);
+    for (int i = 0; i < m && i < 12; i++)
+        Log("[slice]     edge %d: %d -> %d  btype=%d bidx=%d%s\n", i,
+            edges[i].node0, edges[i].node1, edges[i].btype, edges[i].bidx,
+            edges[i].btype == 1 ? " (BRIDGE)" : edges[i].btype == 2 ? " (TUNNEL)" : "");
+
+    // Replicating and cancelling are ONE decision: a road built locally AND
+    // queued for replay appeared twice on the originating peer. Without a
+    // live session the capture is still written (ARMED 0) but nothing is
+    // cancelled, so the build runs natively.
+    //
+    // A FAILED DECODE MUST NOT CANCEL.
+    //
+    // This is the bug that made it impossible to build more than one road.
+    // The validation correctly rejected a bad type decode and printed
+    // "DECODE FAILED" -- and then the cancel ran anyway, because et.ok was
+    // logged but never tested. The player's build was killed locally and a
+    // garbage trackType was queued for replay, so the road vanished and
+    // nothing replaced it.
+    //
+    // "Never cancel on an error" was already the rule in the fault handler
+    // below. It just was not applied to the case where the code works fine
+    // and the DATA is unusable, which is the more likely failure by far.
+    //
+    // An UPGRADE with no decodable removals is the same class of failure.
+    // It replaces edges in place, so the adds are only half the command:
+    // shipping them alone would lay a second edge over every upgraded one on
+    // the peer, and cancelling would delete the player's upgrade locally to
+    // buy that. Empty removal list -> not usable, so it stays local too.
+    // Each stays-local branch also writes the NATIVE notice in a live session:
+    // the build happens here and nowhere else, and the peers' logs must say so
+    // rather than nothing.
+    if (!et.ok) {
+        Log("[slice]   NOT cancelling: type decode failed, so this build "
+            "cannot be replicated faithfully -- it stays local\n");
+        if (SessionLive()) WriteNativeNotice(isUpgrade ? "upgrade" : "road");
+    } else if (isUpgrade && re < 1) {
+        Log("[slice]   NOT cancelling: upgrade with %d added edge(s) decoded "
+            "%d removals -- replaying the adds alone would duplicate every "
+            "edge on the peer, so it stays local\n", m, re);
+        if (SessionLive()) WriteNativeNotice("upgrade");
+    } else if (isUpgrade && re < m) {
+        // Fewer removals than adds means the peer would ADD edges over ones it
+        // never removed (a shape we have not seen; the decode no longer caps).
+        // Never cancel on data we cannot replay faithfully -- the same rule as
+        // a failed type decode.
+        Log("[slice]   NOT cancelling: upgrade has %d add(s) but only %d "
+            "removal(s) -- would duplicate edges on the peer, stays local\n", m, re);
+        if (SessionLive()) WriteNativeNotice("upgrade");
+    } else {
+        // Removed edges travel for the UPGRADE path only. The road tool's
+        // splits are still shipped as re=0 and re-derived on each peer
+        // (execPolyline splits its own copy); turning that on here would
+        // change a working channel's behaviour in the same commit that adds
+        // a new one, and a removal the peer cannot match now SKIPS the whole
+        // command. Flip it once upgrades have proven the matcher.
+        //
+        // EXCEPT an edge REPLACED IN PLACE (2026-09-12). A road built under a
+        // bridge makes the engine remove that bridge span and add it again between
+        // the SAME two existing nodes (capture: removed segs=1, added
+        // 111672 -> 111711 btype=1). No peer can re-derive that from positions, so
+        // with re=0 every instance laid a second span over the old one and the
+        // engine refused the whole build (critical, no collision) -- the road could
+        // never be built under a bridge. Such a removal -- both ends existing nodes,
+        // and an added edge joining exactly that pair -- now travels; a split
+        // parent never has an added edge between its own two ends.
+        const Edge* shipRm = rmEdges.data();
+        int shipRe = isUpgrade ? re : 0;
+        std::vector<Edge> inPlace;   // every in-place replacement, not the first 512
+        if (!isUpgrade) {
+            for (int i = 0; i < re; i++) {
+                const Edge& r = rmEdges[(size_t)i];
+                if (r.node0 < 0 || r.node1 < 0) continue;
+                for (int j = 0; j < m; j++) {
+                    const Edge& a = edges[(size_t)j];
+                    if ((a.node0 == r.node0 && a.node1 == r.node1) || (a.node0 == r.node1 && a.node1 == r.node0)) {
+                        inPlace.push_back(r);
+                        break;
+                    }
+                }
+            }
+            if (!inPlace.empty()) {
+                Log("[slice]   %d removal(s) replaced in place (e.g. a bridge span over the new road) -- shipped with the build\n", (int)inPlace.size());
+                shipRm = inPlace.data();
+                shipRe = (int)inPlace.size();
+            }
+        }
+        const bool live = SessionLive();
+        WriteArmed(live);
+        WriteInject(nodes.data(), n, edges.data(), m, nullptr, 0, shipRm, shipRe, et);
+        if (isUpgrade && re > m)
+            Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
+                "more removals than adds, watch the peer\n", m, re);
+        // Arm the cancel. The Add hook matches on the COMMAND POINTER, not
+        // on a caller RVA, so the upgrade tool's own CommandList::Add call
+        // site is recognised with no extra constant -- and its completion
+        // callback is fired there like the build tool's (g_pendingNoCb is
+        // cleared: this tool waits on the callback, so swallowing it would wedge
+        // the upgrade cursor for the rest of the session).
+        if (live) {
+            InterlockedExchange(&g_pendingNoCb, 0);
+            InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+        } else {
+            Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
+        }
+    }
+}
+
 extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9,
                                  uint64_t id, uint64_t retAddr, uint64_t calleeRsp)
 {
@@ -4230,10 +4631,10 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             int an = -1, ae = -1, rn = -1, re = -1;
             __try {
                 uint64_t b = 0;
-                an = (int)(ReadVec(r8 + 0x00, &b, 0x20000) / 24);
-                ae = (int)(ReadVec(r8 + 0x18, &b, 0x20000) / 120);
-                rn = (int)(ReadVec(r8 + 0x30, &b, 0x20000) / 24);
-                re = (int)(ReadVec(r8 + 0x48, &b, 0x20000) / 120);
+                an = (int)(ReadVecAny(r8 + 0x00, &b, "unreplicated addNodes") / 24);
+                ae = (int)(ReadVecAny(r8 + 0x18, &b, "unreplicated addEdges") / 120);
+                rn = (int)(ReadVecAny(r8 + 0x30, &b, "unreplicated rmNodes") / 24);
+                re = (int)(ReadVecAny(r8 + 0x48, &b, "unreplicated rmEdges") / 120);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 an = ae = rn = re = -1;
             }
@@ -4259,8 +4660,8 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             if (an >= 1 || rn >= 1) {
                 __try {
                     uint64_t ab = 0, rb = 0;
-                    ReadVec(r8 + 0x00, &ab, 0x20000);
-                    ReadVec(r8 + 0x30, &rb, 0x20000);
+                    ReadVecAny(r8 + 0x00, &ab, "unreplicated addNodes");
+                    ReadVecAny(r8 + 0x30, &rb, "unreplicated rmNodes");
                     for (int k = 0; k < 2; k++) {
                         uint64_t base = k ? rb : ab;
                         int cnt = k ? rn : an;
@@ -4288,192 +4689,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     }
 
     __try {
-        Node nodes[256];
-        Edge edges[512];
-        int n = DecodeNodes(r8, nodes, 256);
-        int m = DecodeEdges(r8, edges, 512);
-        // Gate on EDGES, not new nodes. A road connecting two EXISTING junctions
-        // adds ZERO new nodes (both endpoints already exist) and one edge whose
-        // node0/node1 are positive existing ids. The old n<2 guard (correct for
-        // the all-new-nodes ROADN format, wrong since ROADE) rejected exactly
-        // that case: the build was not cancelled, so it happened LOCALLY and
-        // never replicated -- observed as a one-edge desync in the two-way test.
-        // The ROADE->ROADP converter already resolves positive endpoints to
-        // positions via realPos(), so a 0-new-node road rebuilds on the peer.
-        if (m < 1) {
-            Log("[slice] %s capture: no edges (n=%d m=%d) -- not a build, "
-                "letting it proceed\n", isUpgrade ? "upgrade" : "road", n, m);
-            return 0;
-        }
-        g_captured++;
-        if (isUpgrade)
-            Log("[slice] #%ld captured UPGRADE, %d edges replaced\n", g_captured, m);
-        else if (n >= 1)
-            Log("[slice] #%ld captured road, %d nodes %d edges, first=(%.2f,%.2f) last=(%.2f,%.2f)\n",
-                g_captured, n, m, nodes[0].x, nodes[0].y, nodes[n - 1].x, nodes[n - 1].y);
-        else
-            Log("[slice] #%ld captured road, 0 new nodes %d edges (connects existing junctions)\n",
-                g_captured, m);
-        // STREET PROPERTY PROBE (log only, upgrades are rare so it is free).
-        // A street's bus lane (hasBus) and its tram track (tramTrackType,
-        // which also encodes electrification) live in BaseEdgeStreet beside
-        // streetType, but DecodeEdgeType never reads them for a street -- it
-        // forces trackType and returns. So adding a tram way or a bus lane
-        // cannot travel on the wire, and since the upgrade is cancelled and
-        // replayed from what IS on the wire, the road came back plain on every
-        // instance including the originator (2026-09-03).
-        //
-        // streetType sits at record +0x4c and trackType at +0x60, so both
-        // fields are somewhere in between. Capture this window for one upgrade
-        // WITH a tram/bus lane and one without: the byte that differs names the
-        // offset. Do NOT hardcode an offset from a single sample.
-        // Served its purpose (it named +0x54); keep it for the next unknown
-        // street field but off by default -- 120 bytes per upgrade is noise.
-        if (isUpgrade && DumpPropOn()) {
-            uint64_t pbegin = 0, pend = 0;
-            if (Readable((void*)(r8 + 0x18), 16)) {
-                memcpy(&pbegin, (void*)(r8 + 0x18), 8);
-                memcpy(&pend, (void*)(r8 + 0x20), 8);
-                if (pbegin >= 0x10000 && pend > pbegin
-                    && (pend - pbegin) % 120 == 0 && Readable((void*)pbegin, 120)) {
-                    const uint8_t* pb = (const uint8_t*)pbegin;
-                    // WHOLE record. +0x51 was NOT it: it read 239 and 246 on two
-                    // captures, which is noise rather than a 0/1/2 enum -- and
-                    // +0x54 tracks streetType (1 for type 19, 2 for type 22), so
-                    // that is a road property. Dump all 120 bytes and diff a
-                    // regular-tram upgrade against an electric one on the SAME
-                    // road type; the byte that differs is tramTrackType. Two
-                    // guesses were enough.
-                    char hex[3 * 120 + 8];
-                    int o = 0;
-                    for (int i = 0; i < 120 && o + 4 < (int)sizeof(hex); i++)
-                        o += snprintf(hex + o, sizeof(hex) - o, "%02x ", pb[i]);
-                    Log("[slice]   STREETPROBE rec+0x00..0x77: %s\n", hex);
-                }
-            }
-        }
-        // Stride-correct removal counts, for the LOG only. removedNodes at
-        // r8+0x30 are 24-byte node records and removedSegments at r8+0x48 are
-        // 120-byte SegmentAndEntity records (r9_analysis_dem.md 1, DECOMPILED;
-        // the old DecodeIds read them at a 4-byte stride, which is how one
-        // 120-byte record became "30 removals"). DecodeNodes/DecodeEdges take a
-        // base whose vector triplets sit at +0x00/+0x18, so passing r8+0x30
-        // addresses exactly the two removal vectors.
-        // rmEdges is 512 like the add vector: DecodeEdges silently CAPS at maxOut,
-        // so a 64-slot buffer on an upgrade drag covering more than 64 segments
-        // would ship every add against a truncated removal list -- the peer would
-        // add edges on top of the ones it never removed.
-        Node rmNodes[64];
-        Edge rmEdges[512];
-        int rn = DecodeNodes(r8 + 0x30, rmNodes, 64);
-        int re = DecodeEdges(r8 + 0x30, rmEdges, 512);
-        EdgeType et = DecodeEdgeType(r8);
-        Log("[slice]   type=%s streetType=%d trackType=%d%s\n",
-            et.type == 1 ? "TRACK" : "street", et.streetType, et.trackType,
-            et.ok ? "" : "  <- DECODE FAILED, falling back to defaults");
-        // Topology summary: a junction that splits one road must remove exactly
-        // one edge.
-        Log("[slice]   removed nodes=%d segs=%d (stride-correct)\n", rn, re);
-        for (int i = 0; i < m && i < 12; i++)
-            Log("[slice]     edge %d: %d -> %d  btype=%d bidx=%d%s\n", i,
-                edges[i].node0, edges[i].node1, edges[i].btype, edges[i].bidx,
-                edges[i].btype == 1 ? " (BRIDGE)" : edges[i].btype == 2 ? " (TUNNEL)" : "");
-
-        // Replicating and cancelling are ONE decision: a road built locally AND
-        // queued for replay appeared twice on the originating peer. Without a
-        // live session the capture is still written (ARMED 0) but nothing is
-        // cancelled, so the build runs natively.
-        //
-        // A FAILED DECODE MUST NOT CANCEL.
-        //
-        // This is the bug that made it impossible to build more than one road.
-        // The validation correctly rejected a bad type decode and printed
-        // "DECODE FAILED" -- and then the cancel ran anyway, because et.ok was
-        // logged but never tested. The player's build was killed locally and a
-        // garbage trackType was queued for replay, so the road vanished and
-        // nothing replaced it.
-        //
-        // "Never cancel on an error" was already the rule in the fault handler
-        // below. It just was not applied to the case where the code works fine
-        // and the DATA is unusable, which is the more likely failure by far.
-        //
-        // An UPGRADE with no decodable removals is the same class of failure.
-        // It replaces edges in place, so the adds are only half the command:
-        // shipping them alone would lay a second edge over every upgraded one on
-        // the peer, and cancelling would delete the player's upgrade locally to
-        // buy that. Empty removal list -> not usable, so it stays local too.
-        if (!et.ok) {
-            Log("[slice]   NOT cancelling: type decode failed, so this build "
-                "cannot be replicated faithfully -- it stays local\n");
-        } else if (isUpgrade && re < 1) {
-            Log("[slice]   NOT cancelling: upgrade with %d added edge(s) decoded "
-                "0 removals -- replaying the adds alone would duplicate every "
-                "edge on the peer, so it stays local\n", m);
-        } else if (isUpgrade && re < m) {
-            // Fewer removals than adds means the peer would ADD edges over ones it
-            // never removed (a decode cap, or a shape we have not seen). Never
-            // cancel on data we cannot replay faithfully -- the same rule as a
-            // failed type decode.
-            Log("[slice]   NOT cancelling: upgrade has %d add(s) but only %d "
-                "removal(s) -- would duplicate edges on the peer, stays local\n", m, re);
-        } else {
-            // Removed edges travel for the UPGRADE path only. The road tool's
-            // splits are still shipped as re=0 and re-derived on each peer
-            // (execPolyline splits its own copy); turning that on here would
-            // change a working channel's behaviour in the same commit that adds
-            // a new one, and a removal the peer cannot match now SKIPS the whole
-            // command. Flip it once upgrades have proven the matcher.
-            //
-            // EXCEPT an edge REPLACED IN PLACE (2026-09-12). A road built under a
-            // bridge makes the engine remove that bridge span and add it again between
-            // the SAME two existing nodes (capture: removed segs=1, added
-            // 111672 -> 111711 btype=1). No peer can re-derive that from positions, so
-            // with re=0 every instance laid a second span over the old one and the
-            // engine refused the whole build (critical, no collision) -- the road could
-            // never be built under a bridge. Such a removal -- both ends existing nodes,
-            // and an added edge joining exactly that pair -- now travels; a split
-            // parent never has an added edge between its own two ends.
-            Edge* shipRm = rmEdges;
-            int shipRe = isUpgrade ? re : 0;
-            static Edge inPlace[512];
-            if (!isUpgrade) {
-                int k = 0;
-                for (int i = 0; i < re && k < 512; i++) {
-                    const Edge& r = rmEdges[i];
-                    if (r.node0 < 0 || r.node1 < 0) continue;
-                    for (int j = 0; j < m; j++) {
-                        const Edge& a = edges[j];
-                        if ((a.node0 == r.node0 && a.node1 == r.node1) || (a.node0 == r.node1 && a.node1 == r.node0)) {
-                            inPlace[k++] = r;
-                            break;
-                        }
-                    }
-                }
-                if (k > 0) {
-                    Log("[slice]   %d removal(s) replaced in place (e.g. a bridge span over the new road) -- shipped with the build\n", k);
-                    shipRm = inPlace;
-                    shipRe = k;
-                }
-            }
-            const bool live = SessionLive();
-            WriteArmed(live);
-            WriteInject(nodes, n, edges, m, nullptr, 0, shipRm, shipRe, et);
-            if (isUpgrade && re > m)
-                Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
-                    "more removals than adds, watch the peer\n", m, re);
-            // Arm the cancel. The Add hook matches on the COMMAND POINTER, not
-            // on a caller RVA, so the upgrade tool's own CommandList::Add call
-            // site is recognised with no extra constant -- and its completion
-            // callback is fired there like the build tool's (g_pendingNoCb is
-            // cleared: this tool waits on the callback, so swallowing it would wedge
-            // the upgrade cursor for the rest of the session).
-            if (live) {
-                InterlockedExchange(&g_pendingNoCb, 0);
-                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-            } else {
-                Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
-            }
-        }
+        CaptureRoadProposal(rcx, r8, isUpgrade);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] capture faulted -- proceeding, never cancel on an error\n");
         InterlockedExchange64(&g_pendingCmd, 0);
