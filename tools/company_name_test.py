@@ -58,8 +58,24 @@ CM.cmMode, CM.cmMyCompany, CM.cmRoster = "companies", 1, { 1, 2, 3 }
 CM.cmOriginCompany = { b = 2, c = 3 }
 CM.cmCompanyPid = { [1] = 7, [2] = 8, [3] = 9 }
 CM.cmPw = {}
+-- the engine side: NAME components per entity and the setName commands issued
+local ename, sets = {}, {}
+api = { engine = { getComponent = function(id, t) return ename[id] and { name = ename[id] } or nil end },
+        type = { ComponentType = { NAME = 9 } },
+        cmd = { make = { setName = function(id, n) return { id = id, n = n } end },
+                sendCommand = function(c, cb) ename[c.id] = c.n; sets[#sets + 1] = c.id .. "=" .. c.n; if cb then cb(nil, true) end end } }
+local realSwitch = CM.cmLocalSwitch
 local T = {}
 function T.nameOf(cid) return CM.cmNameOf(cid) end
+function T.entityNames() local out = {} for _, id in ipairs({ 7, 8, 9 }) do out[#out + 1] = tostring(ename[id]) end return table.concat(out, "|") end
+function T.sets() local n = #sets; sets = {}; return n end
+function T.swapSwitch()
+  -- a local switch 1 -> 2 in the real code swaps the ENTITIES (7 <-> 8 own each other's assets);
+  -- the names must stay with the companies: stub the swap, keep the real re-naming
+  CM.cmOwnedEntities = function() return {} end; CM.cmHandOver = function() end; CM.cmSwapWallets = function() return true, 0, 0, 0, 0 end
+  realSwitch(2)
+  return T.entityNames() .. " mine=" .. tostring(CM.cmMyCompany) .. " pid1=" .. tostring(CM.cmCompanyPid[1]) .. " pid2=" .. tostring(CM.cmCompanyPid[2])
+end
 function T.name(origin, cid, name) CM.execCompanyCmd({ op = "CMNAME", cid = cid, origin = origin, name = CM.escName(name) }) return notes[#notes] end
 function T.raw(cid) return CM.cmName[cid] end
 function T.dissolve(cid) CM.peers = {}; CM.cmPlayersOf = function() return {} end; CM.cmMoveAssets = function() return 0 end; CM.cmWallet = function() return 0, 0 end; CM.cmSetWallet = function() end; CM.cmPwOk = function() return true end
@@ -74,7 +90,7 @@ function T.roundTrip()
   CM.cmMyCompany = 1
   CM.cmApplySaved = CM.cmApplySaved   -- the real one
   -- api.engine.util.getPlayer() must equal the saved human pid for the state to apply
-  api = { engine = { util = { getPlayer = function() return 7 end } } }
+  api.engine.util = { getPlayer = function() return 7 end }
   CM.cmLocalSwitch = function() return true end
   CM.cmApplySaved()
   return table.concat(names, ","), CM.cmNameOf(1), CM.cmNameOf(2), CM.cmNameOf(3)
@@ -90,6 +106,10 @@ n = T.name("c", 2, "Hijack")
 check("an origin playing another company may not", T.raw(2) == "Acme & Sons" and "cannot name" in n, n)
 T.name("a", 1, "Host Rail")
 check("the host names its own", T.nameOf(1) == "Host Rail", T.nameOf(1))
+check("every company's entity carries its name (finances window)", T.entityNames() == "Host Rail|Acme & Sons|Company 3", T.entityNames())
+T.sets()
+T.name("a", 1, "Host Rail")
+check("an unchanged name issues no setName", T.sets() == 0)
 saved, n1, n2, n3 = T.roundTrip()
 check("names ride in the save state", saved == "1=Host Rail,2=Acme & Sons", saved)
 check("and come back from it", (n1, n2, n3) == ("Host Rail", "Acme & Sons", "Company 3"), f"{n1}|{n2}|{n3}")
@@ -97,6 +117,8 @@ n = T.name("b", 2, "")
 check("an empty name clears it", T.nameOf(2) == "Company 2" and "unnamed" in n, n)
 T.name("c", 3, "Gone Soon")
 T.dissolve(3)
+CM_names_after_switch = T.swapSwitch()
+check("after a switch the entities swap but the names stay with the companies", CM_names_after_switch == "Company 2|Host Rail|Gone Soon mine=2 pid1=8 pid2=7", CM_names_after_switch)
 check("a dissolved company loses its name", T.raw(3) is None, repr(T.raw(3)))
 
 inject = open(INJECT, encoding="utf-8", errors="replace").read()
