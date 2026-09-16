@@ -774,28 +774,82 @@ static char g_lobbyName[40] = ""; static int g_lobbyNameLen = 0;   // what the h
 static int  g_userLen = 0;
 static void ensureUsername();
 static void SaveNames();
-// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=...) so they
-// survive a relaunch; a blank file leaves the random two-word default.
+// The player name follows the STEAM persona name (2026-09-16) unless the
+// player typed one. g_userAuto says which: auto names are re-read from Steam
+// every launch (the persona can change), a typed one is kept as typed. Clearing
+// the field and pressing Enter goes back to Steam.
+static bool g_userAuto = true;
+static char g_steamName[40] = "";
+static bool SteamPersonaName(char* out, size_t cap)
+{
+    HMODULE h = GetModuleHandleW(L"steam_api64.dll"); if (!h) return false;
+    typedef int (*HUserFn)(); typedef void* (*FriendsFn)(); typedef const char* (*PersonaFn)(void*);
+    HUserFn huser = (HUserFn)GetProcAddress(h, "SteamAPI_GetHSteamUser");
+    FriendsFn friends = (FriendsFn)GetProcAddress(h, "SteamAPI_SteamFriends_v017");
+    PersonaFn persona = (PersonaFn)GetProcAddress(h, "SteamAPI_ISteamFriends_GetPersonaName");
+    if (!huser || !friends || !persona || huser() == 0) return false;   // the game has not initialised Steam yet
+    void* fr = friends(); if (!fr) return false;
+    const char* n = persona(fr); if (!n || !n[0]) return false;
+    // The name is a command-line argument, a JSON string and a roster key:
+    // printable only, no quotes or backslashes, no '#' (the lobby's own
+    // de-dup suffix, "name#2"), spaces collapsed and trimmed.
+    size_t o = 0; bool sp = false;
+    for (size_t i = 0; n[i] && o + 1 < cap; i++) {
+        unsigned char c = (unsigned char)n[i];
+        if (c < 32 || c == '"' || c == '\\' || c == '#') continue;
+        if (c == ' ') { sp = o > 0; continue; }
+        if (sp) { out[o++] = ' '; sp = false; if (o + 1 >= cap) break; }
+        out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return o > 0;
+}
+// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=..., auto=1)
+// so they survive a relaunch. No file, or auto=1: the name follows Steam
+// (the random two-word default stands in until Steam answers).
 static void LoadNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
-    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: keep the random name from now on
-    char line[128];
+    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: follow Steam from now on
+    char line[128]; bool sawAuto = false, sawPlayer = false;
     while (fgets(line, sizeof(line), f)) {
         char* e = line + strlen(line); while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
         char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
-        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, 30); }
+        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, 30); sawPlayer = true; }
         else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, 36); }
+        else if (!strcmp(line, "auto")) { sawAuto = true; g_userAuto = v[0] == '1'; }
     }
     fclose(f);
+    // a file from before auto= existed holds a name the player kept: treat it as typed
+    if (!sawAuto) g_userAuto = !sawPlayer;
     g_userLen = (int)strlen(g_username); g_lobbyNameLen = (int)strlen(g_lobbyName);
-    Log("[menu] names: player=%s lobby=%s\n", g_username, g_lobbyName);
+    Log("[menu] names: player=%s (%s) lobby=%s\n", g_username, g_userAuto ? "follows Steam" : "typed", g_lobbyName);
 }
 static void SaveNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
     FILE* f = _wfopen(p, L"w"); if (!f) return;
-    fprintf(f, "player=%s\nlobby=%s\n", g_username, g_lobbyName); fclose(f);
+    fprintf(f, "player=%s\nlobby=%s\nauto=%d\n", g_username, g_lobbyName, g_userAuto ? 1 : 0); fclose(f);
+}
+// Called from the present hook: Steam is initialised by the game some time
+// after our DLL loads, so the persona is asked for until it answers, then
+// re-checked now and then (the player can rename themselves in Steam).
+static void SteamNameTick()
+{
+    static ULONGLONG next = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + (g_steamName[0] ? 30000 : 2000);
+    char n[40];
+    if (!SteamPersonaName(n, sizeof(n))) return;
+    if (strcmp(n, g_steamName) != 0) { strcpy_s(g_steamName, n); Log("[menu] steam persona: %s\n", n); }
+    if (!g_userAuto || InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3) return;   // typed, or being typed right now
+    if (strcmp(g_username, n) == 0) return;
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) >= 2) return;   // in a lobby already: the roster has the old name; next time
+    strcpy_s(g_username, n); g_userLen = (int)strlen(g_username);
+    SaveNames();
+    InterlockedExchange(&g_panelDirty, 1);
+    Log("[menu] username follows Steam: %s\n", g_username);
 }
 static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itself to the master server
 
@@ -1159,7 +1213,7 @@ static void RenderPanelLayer(int w, int h)
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
         mwHeader(pad, cy + S(162), S(260), L"YOUR NAME");
-        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Click to type a name", 13);
+        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Steam name (click to type your own)", 13);
         mwHeader(pad + S(290), cy + S(162), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
           mwField(pad + S(290), cy + S(186), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
@@ -1690,6 +1744,7 @@ static void OnHit(int id)
 static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     PollLobbyOpen();
+    SteamNameTick();
     LONG n = InterlockedIncrement(&g_presentCount);
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
@@ -2735,7 +2790,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     wchar_t wpass[96] = L"";
     if (a->password[0]) { wchar_t wp[40]; MultiByteToWideChar(CP_UTF8, 0, a->password, -1, wp, 40); _snwprintf_s(wpass, _TRUNCATE, L" --password %s", wp); }
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
-                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
+                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name \"%s\" --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
                                 base, wc, wname, relayPort, bridgePort, fwd, wpass); }
     else {
         // the public list: always tell the lobby where the master server is (the
@@ -2745,7 +2800,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
-        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
+        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name \"%s\" --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
     { wchar_t recoveryArgs[1100];
@@ -3221,10 +3276,18 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = focus == 3 ? 24 : 36;
             if (vk == VK_BACK) { if (*len > 0) { buf[--*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
-            else if (vk == VK_RETURN) { if (focus == 3 && !g_username[0]) ensureUsername(); InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
+            else if (vk == VK_RETURN) {
+                if (focus == 3) {
+                    if (!g_username[0]) {   // cleared: back to the Steam name (or the random default until Steam answers)
+                        g_userAuto = true;
+                        if (g_steamName[0]) { strcpy_s(g_username, g_steamName); g_userLen = (int)strlen(g_username); } else ensureUsername();
+                        Log("[menu] username cleared -> follows Steam (%s)\n", g_username);
+                    } else g_userAuto = strcmp(g_username, g_steamName) == 0;   // typed back exactly the Steam name: still follows it
+                }
+                InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
             else { char c = vkToChar((int)vk, shift);
                    bool word = c && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.');
-                   bool okc = word || (focus == 4 && (c == ' ' || c == '\'') && *len > 0);
+                   bool okc = word || ((focus == 4 || focus == 3) && c == ' ' && *len > 0) || (focus == 4 && c == '\'' && *len > 0);
                    if (okc && *len < cap) { buf[(*len)++] = c; buf[*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
         }
         else if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && passField) {
