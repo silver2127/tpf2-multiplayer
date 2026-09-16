@@ -95,6 +95,21 @@ class HostRecovery:
     def held(self):
         return self.barrier.operation is not None and self.barrier.phase != 'complete'
 
+    def world_epoch(self):
+        """The epoch every member's bridge runs in after a COMPLETED resync, else None.
+
+        The lobby advertises it as the transport lobby (welcome, roster) so a player
+        who joins later starts in the world the others are in. Before 2026-09-15 a
+        newcomer after a resync got the original nonce, a world nobody was in any
+        more: its bridge and the host's dropped each other's datagrams for the
+        rest of the lobby's life. Not before completion: while the operation runs
+        the join gate is shut anyway, and a failed or aborted one leaves the lobby
+        HELD (nobody plays, no save is served) until a later operation completes
+        and re-issues its epoch to every member, newcomers included."""
+        if self.barrier.operation is None or self.barrier.phase != 'complete':
+            return None
+        return self.barrier.epoch
+
     @property
     def roster_locked(self):
         """A recovery is in flight, so the member set must not change under it.

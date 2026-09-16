@@ -2918,6 +2918,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if dead:
                     roster_changed()
 
+            # After a resync the members run in the operation's epoch, not in
+            # this lobby's nonce. Advertise THAT from now on (welcome, roster):
+            # a player who joins later must start in the world the others are
+            # in. Their bridges take a nonce that names their current world as
+            # a rename, not a reset (net.cpp, Net_BeginLobby). Checked BEFORE
+            # the heal below so the old and the new nonce never go out back to
+            # back (reordered, the old one would reset a member's bridge).
+            # The late joiner is also served the resync snapshot from now on,
+            # not the save START GAME shared: that world was left behind.
+            if recovery:
+                world = recovery.world_epoch()
+                if world and world != transport_lobby:
+                    transport_lobby = world
+                    last_heal = now
+                    snapshot = recovery.runtime.save_directory / ('mp_' + world[:12] + '.sav')
+                    if snapshot.is_file():
+                        last_shared[0] = str(snapshot)
+                    log(f"[host] transport lobby follows the completed resync ({world[:8]}..); late joiners get {os.path.basename(last_shared[0] or '')}")
+                    io.emit(dict(type='transport_lobby', epoch=transport_lobby))
+                    send_roster_packets()
+
             if now - last_heal >= ROSTER_HEAL:
                 last_heal = now
                 send_roster_packets()
@@ -3134,6 +3155,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
 
     desired = [my_name]     # what we asked to be called
     assigned = [my_name]    # what the host actually named us (from 'welcome')
+    seen_nonces = set()     # transport lobby nonces already handed to the menu
     started = [False]
     last_roster = [None]
     host_name = [None]
@@ -3386,7 +3408,11 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             return
         if t in ("welcome", "roster"):
             lobby_epoch = m.get("transport_lobby", "")
-            if isinstance(lobby_epoch, str) and re.fullmatch(r"[0-9a-f]{32}", lobby_epoch):
+            # A nonce only ever moves forward (the lobby's own, then each completed
+            # resync's epoch); one seen before is a reordered old roster, and
+            # handing it to the menu would reset the bridge mid-game.
+            if isinstance(lobby_epoch, str) and re.fullmatch(r"[0-9a-f]{32}", lobby_epoch) and lobby_epoch not in seen_nonces:
+                seen_nonces.add(lobby_epoch)
                 io.emit(dict(type='transport_lobby', epoch=lobby_epoch))
         if t == "welcome":
             receiver.on_manifest(m.get("mods", []))

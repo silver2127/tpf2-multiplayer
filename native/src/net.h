@@ -71,12 +71,18 @@ bool Net_BeginLobby(const char* epoch, const char* ip, int port,
 uint16_t Net_LocalPort();
 
 // Diagnostics: lines discarded because no peer was alive, lines discarded
-// because the peer stopped acking, packets awaiting ack, current liveness, and
-// lines refused for exceeding the 16-bit chunk count. Every pointer is
+// because the peer stopped acking, packets awaiting ack, current liveness,
+// lines refused for exceeding the 16-bit chunk count, sessions in the cohort
+// and datagrams dropped for carrying another world epoch. Every pointer is
 // optional. droppedOversize is never expected to move; if it does, something
 // upstream is generating a multi-megabyte line.
 void Net_Stats(uint64_t* droppedNoPeer, uint64_t* droppedOverflow,
-               size_t* pending, bool* peerAlive, uint64_t* droppedOversize);
+               size_t* pending, bool* peerAlive, uint64_t* droppedOversize,
+               size_t* members = nullptr, uint64_t* droppedWorld = nullptr);
+
+// Where the transport writes its own log lines (admissions, evictions, the
+// drops that used to be silent). One line per call, newline included. Optional.
+void Net_SetLogger(void (*log)(const char* line));
 
 // Datagrams dropped because their source address was not the peer's.
 uint64_t Net_DroppedStrangers();
