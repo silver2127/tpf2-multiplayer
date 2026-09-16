@@ -62,7 +62,7 @@ add_library(tpf2_slice SHARED src/slice/slice_core.cpp src/slice/slice_install.c
             src/slice/slice_core_main.cpp src/hook_posix.cpp src/slice/slice_vehicles.cpp
             src/slice/slice_lines.cpp src/slice/slice_time.cpp src/slice/slice_proposal.cpp
             src/slice/slice_construction.cpp src/slice/slice_construction_merge.cpp src/slice/slice_terrain_assets.cpp
-            src/slice/slice_terrain_codec.cpp)
+            src/slice/slice_terrain_codec.cpp src/slice/train_order_linux.cpp)
 set_target_properties(tpf2_slice PROPERTIES PREFIX "")
 target_include_directories(tpf2_slice PRIVATE ../src src)
 # The recursion guard in slice_install.cpp compares frame addresses.
@@ -294,6 +294,14 @@ if(BUILD_TESTING)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/panel-name-data")
   add_test(NAME panel_names COMMAND test_panel_names $<TARGET_FILE:test_steam_persona>
            "${CMAKE_CURRENT_BINARY_DIR}/panel-name-data/")
+  add_executable(test_train_order ../../tools/trainorder_test.cpp)
+  target_compile_options(test_train_order PRIVATE -UNDEBUG)
+  add_test(NAME train_order COMMAND test_train_order)
+  add_executable(test_train_order_linux tests/train_order_linux_test.cpp src/slice/slice_core.cpp)
+  target_include_directories(test_train_order_linux PRIVATE ../src src)
+  target_compile_options(test_train_order_linux PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+  target_link_options(test_train_order_linux PRIVATE -Wl,--gc-sections)
+  add_test(NAME train_order_linux COMMAND test_train_order_linux)
   find_program(TPF2MP_LUA NAMES lua5.2 lua lua5.4 lua5.3)
   if(TPF2MP_LUA)
     add_test(NAME slice_line_wire COMMAND "${TPF2MP_LUA}"

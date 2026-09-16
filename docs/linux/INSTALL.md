@@ -21,12 +21,14 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree follows **0.5.6 plus Windows dev `55e97a48`**. Of 28
-shared Lua files, 27 match that commit byte for byte; lockstep.lua retains the
-previously integrated dashboard tabs alongside the new close-button behavior.
-The exact merge is hash-pinned. See [UPSTREAM_dev_55e97a48.md](UPSTREAM_dev_55e97a48.md)
-for native changes, tests and the remaining recovery-panel gap. This is not a
-new release or a claim of live cross-platform gameplay compatibility.
+This development tree combines **0.5.6 plus Windows dev `55e97a48` and
+`3edfbccd`**. It preserves the earlier dashboard tabs and vehicle diagnostics,
+and adds native train reservation ordering by name with seeded jitter.
+The cumulative Lua result is hash-pinned. See
+[UPSTREAM_dev_3edfbccd.md](UPSTREAM_dev_3edfbccd.md) for provenance, native
+changes and tests. This is not a new release or a claim of live cross-platform
+compatibility. `trainorder=0` in the root/data `tpf2_menu_flags.txt` disables
+the new ordering hook at startup; peers need matching ordering settings.
 
 **Known limits:** automatic resync, the new separate-company/shared-ownership
 operations, and automatic Workshop registration still need native Linux support.

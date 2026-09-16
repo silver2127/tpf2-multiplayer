@@ -17,6 +17,7 @@
 // only once the title menu or a game exists (C-HOOK-3, INFERRED from the callers
 // being UI and script code).
 #include "slice_core_internal.h"
+#include "train_order_linux.h"
 #include "../datadir_linux.h"
 #include "../game_image.h"
 #include "../slice_ready_linux.h"
@@ -103,13 +104,15 @@ static void InitThread()
     }
     if (SliceCoreRunRegistrations() < 0) return;   // logged: nothing registered, nothing patched
     const SliceInstallReport installed = SliceCoreInstall();
-    const bool published = SlicePublishReady(dataDir, installed.ready);
+    const bool trainOrderReady = SliceInstallTrainOrder(img.base, rootDir, dataDir);
+    const bool published = SlicePublishReady(dataDir, installed.ready && trainOrderReady);
     SliceLog("[slice] multiplayer hook readiness: %s\n",
-             installed.ready && published ? "ready" : "NOT READY -- multiplayer startup refused");
+             installed.ready && trainOrderReady && published ? "ready" : "NOT READY -- multiplayer startup refused");
 
     for (;;) {
         sleep(15);
         SliceCoreLogAlive();
+        SliceTrainOrderLogAlive();
     }
 }
 
