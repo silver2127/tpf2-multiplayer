@@ -62,7 +62,7 @@ add_library(tpf2_slice SHARED src/slice/slice_core.cpp src/slice/slice_install.c
             src/slice/slice_core_main.cpp src/hook_posix.cpp src/slice/slice_vehicles.cpp
             src/slice/slice_lines.cpp src/slice/slice_time.cpp src/slice/slice_proposal.cpp
             src/slice/slice_construction.cpp src/slice/slice_construction_merge.cpp src/slice/slice_terrain_assets.cpp
-            src/slice/slice_terrain_codec.cpp src/slice/train_order_linux.cpp)
+            src/slice/slice_terrain_codec.cpp src/slice/train_order_linux.cpp src/slice/movement_linux.cpp)
 set_target_properties(tpf2_slice PROPERTIES PREFIX "")
 target_include_directories(tpf2_slice PRIVATE ../src src)
 # The recursion guard in slice_install.cpp compares frame addresses.
@@ -294,6 +294,25 @@ if(BUILD_TESTING)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/panel-name-data")
   add_test(NAME panel_names COMMAND test_panel_names $<TARGET_FILE:test_steam_persona>
            "${CMAKE_CURRENT_BINARY_DIR}/panel-name-data/")
+  add_executable(test_menu_load tests/menu_load_test.cpp)
+  target_include_directories(test_menu_load PRIVATE ../src src)
+  target_compile_options(test_menu_load PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+  target_link_options(test_menu_load PRIVATE -Wl,--gc-sections)
+  target_link_libraries(test_menu_load PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME menu_load COMMAND test_menu_load)
+  add_executable(test_roadspace ../../tools/roadspace_test.cpp)
+  target_compile_options(test_roadspace PRIVATE -UNDEBUG -ffp-contract=off)
+  add_test(NAME roadspace COMMAND test_roadspace)
+  add_executable(test_moveorder ../../tools/moveorder_test.cpp)
+  target_compile_options(test_moveorder PRIVATE -UNDEBUG)
+  add_test(NAME moveorder COMMAND test_moveorder)
+  add_executable(test_movement_linux tests/movement_linux_test.cpp src/slice/slice_core.cpp
+                 src/slice/train_order_linux.cpp src/hook_posix.cpp)
+  target_include_directories(test_movement_linux PRIVATE ../src src)
+  target_compile_options(test_movement_linux PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+  target_link_options(test_movement_linux PRIVATE -Wl,--gc-sections)
+  target_link_libraries(test_movement_linux PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME movement_linux COMMAND test_movement_linux $<TARGET_FILE:slice_test_foreign>)
   add_executable(test_train_order ../../tools/trainorder_test.cpp)
   target_compile_options(test_train_order PRIVATE -UNDEBUG)
   add_test(NAME train_order COMMAND test_train_order)

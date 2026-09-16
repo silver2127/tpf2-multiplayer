@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the cumulative Linux Lua integration: dev cae5d370 plus retained dashboard/diagnostics."""
+"""Verify the cumulative Linux Lua integration: dev 6cb03915."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,12 +7,12 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "cae5d370798ee7d724dfc739fa9d0546fbc505d2"
+REFERENCE = "6cb03915a10a901d421f960b2d2148cc1e649eee"
 INCOMING = REFERENCE
 INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"
-# Reviewed cumulative differences are recorded in UPSTREAM_dev_cae5d370_lua.patch.
-MERGED_SHA256 = {'res/config/game_script/lockstep.lua': '911f1c4bd6d861717a7290a5b7610ffe173c8e55381395d6befed349809a0fcd'}
+# Earlier dashboard changes have converged with upstream; all Lua is exact.
+MERGED_SHA256 = {}
 
 
 def main():
@@ -40,7 +40,7 @@ def main():
         if missing or extra or different:
             return 1
         manifest = "".join(f"{hashlib.sha256(actual[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files: exact dev cae5d370 except {len(MERGED_SHA256)} pinned cumulative merges")
+        print(f"PASS: {len(expected)} Lua files: exact dev 6cb03915 except {len(MERGED_SHA256)} pinned cumulative merges")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
         return 0
     except (OSError, subprocess.CalledProcessError) as error:

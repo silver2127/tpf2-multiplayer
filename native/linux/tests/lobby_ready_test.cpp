@@ -3,10 +3,14 @@
 #include "../src/lobby_linux.cpp"
 #include <cassert>
 
-std::string MenuGame_SaveDir() { assert(false && "unexpected save lookup"); return {}; }
+static std::string fixtureSaveDir;
+static bool allowPlace=false;
+static int placed=0;
+std::string MenuGame_SaveDir() { assert(!fixtureSaveDir.empty()); return fixtureSaveDir; }
+bool MenuGame_ForceAutosave() { assert(false && "unexpected autosave"); return false; }
 bool MenuGame_NewestSave(std::string*) { assert(false && "unexpected save lookup"); return false; }
 
-bool MenuGame_PlaceSharedSave(const std::string&, std::string*) { assert(false && "unexpected load"); return false; }
+bool MenuGame_PlaceSharedSave(const std::string& source, std::string* name) { assert(allowPlace && source.find("incoming_save.sav")!=std::string::npos); ++placed; *name="mp_shared"; return true; }
 void MenuGame_RequestAutoload(const std::string&) { assert(false && "unexpected load"); }
 
 static void Write(const std::string& path, const std::string& body)
@@ -114,12 +118,45 @@ int main()
     assert(lobby::S().unpausedMs>=1010);
     lobby::MarkSaveShared(dir+"snapshot.sav");
     assert(lobby::S().sharedUnpaused==lobby::S().unpausedMs);
+    // Reuse explicitly starts a session even if it has never shared to a peer.
+    Write(dir+"snapshot.sav", "fixture"); model.isHost=true;
+    lobby::g_gameUiSeen=true; lobby::g_titleMenu=false;
+    lobby::SyncStart("hot join: first peer");
+    std::string sent; assert(lobby::ReadSmallFile(dir+"lobby_in.jsonl", &sent));
+    assert(sent.find("\"cmd\":\"start\",\"save\":\""+dir+"snapshot.sav\"")!=std::string::npos);
+    // Tokens from other processes cannot invalidate our cached snapshot.
+    Write(dir+"tpf2mp_world_gen.txt", "pid=-1\ngen=foreign\n");
+    lobby::PollWorldGen(); assert(lobby::S().worldGen.empty());
+    Write(dir+"tpf2mp_world_gen.txt", "pid="+std::to_string(getpid())+"\ngen=one\n");
+    lobby::PollWorldGen(); assert(lobby::S().worldGen=="one");
+    lobby::S().worldGenHold=true;
+    Write(dir+"tpf2mp_world_gen.txt", "gen=two\n");
+    lobby::PollWorldGen(); assert(!lobby::S().worldGenHold && !lobby::S().sharedSave.empty());
+    Write(dir+"tpf2mp_world_gen.txt", "gen=three\n");
+    lobby::PollWorldGen(); assert(lobby::S().sharedSave.empty()); // never reuse across worlds
+    unlink((dir+"tpf2mp_world_gen.txt").c_str()); unlink((dir+"snapshot.sav").c_str());
     // Stage updates are sent once and cleared when the script reports live.
     lobby::g_gameUiSeen=true; lobby::g_titleMenu=false; lobby::S().stageWatch=true;
     Write(dir+"lockstep_status_"+letter+".txt", "stage=catchup:fetch:25\n");
     lobby::StageTick(); assert(lobby::S().stageSent=="catching up: fetching history (25 s behind)");
     Write(dir+"lockstep_status_"+letter+".txt", "stage=live\n");
     lobby::StageTick(); assert(!lobby::S().stageWatch && lobby::S().stageSent.empty());
+    // A world switch consumes its own transfer once, with a manual load in-game.
+    model.players={"host","joiner"}; model.companies={1,2}; model.you="joiner";
+    model.isHost=false; model.saveReady=true; allowPlace=true;
+    lobby::Json sw; assert(lobby::ParseJson("{\"save\":true,\"switch\":true}",&sw));
+    lobby::HandleStart(sw); assert(placed==1 && !model.saveReady);
+    lobby::HandleStart(sw); assert(placed==1); // stale start cannot reuse an old transfer
+    model.isHost=true; model.saveReady=true;
+    lobby::HandleStart(sw); assert(placed==1); // host keeps its already loaded world
+    // A vanilla load queues the same session and shares its named file.
+    fixtureSaveDir=dir; Write(dir+"chosen.sav","fixture");
+    model.lobbyReady=true; lobby::OnMenuLoad("chosen");
+    assert(lobby::S().q.back().kind==lobby::Request::LoadedSave && lobby::S().q.back().gen==model.gen);
+    lobby::ShareLoadedSave("chosen"); assert(lobby::S().hostLoadedItself && lobby::S().worldGenHold);
+    assert(lobby::ReadSmallFile(dir+"lobby_in.jsonl",&sent) && sent.find("\"switch\":true")!=std::string::npos);
+    lobby::HandleStart(sw); assert(!lobby::S().hostLoadedItself && placed==1);
+    unlink((dir+"chosen.sav").c_str()); unlink((dir+"mp_company_cfg.txt").c_str());
     for (const auto& name : {"lobby_out.jsonl", "lobby_in.jsonl", "tpf2_bridge_ctl.txt"}) unlink((dir+name).c_str());
     unlink((dir+"lockstep_dash_"+letter+".txt").c_str());
     unlink((dir+"lockstep_status_"+letter+".txt").c_str());

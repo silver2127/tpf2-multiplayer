@@ -91,6 +91,7 @@
 // game's threads still call in.
 #include "menu_game_linux.h"
 #include "near_alloc.h"
+#include "hook.h"
 #include <cxxabi.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -937,6 +938,25 @@ static const int kAlWatchdogMs = 15000;
 static thread_local uint64_t t_alInFlight = 0;
 static thread_local char     t_alInFlightName[256];
 
+static std::atomic<MenuGameLoadObserver> g_loadObserver{nullptr};
+static void* g_originalStartSavegame;
+static uint8_t StartSavegameDetour(void* menu, void* params, void* info)
+{
+    // No C++ cleanup/catch encloses the foreign engine call.
+    const uint8_t accepted = reinterpret_cast<uint8_t (*)(void*,void*,void*)>(g_originalStartSavegame)(menu,params,info);
+    if (!accepted || t_alInFlight) return accepted;
+    const GStr* name = static_cast<const GStr*>(params); // libstdc++ string +0
+    if (!name || !name->p || !name->len || name->len > 200) return accepted;
+    char text[201]; memcpy(text,name->p,name->len); text[name->len]=0;
+    if (strlen(text)!=name->len || text[0]=='.' || strpbrk(text,"/\\")) return accepted;
+    if (const auto observer=g_loadObserver.load()) {
+        try { observer(text); }
+        catch (...) { Log("[menu] accepted load could not be queued for sharing\n"); }
+    }
+    return accepted;
+}
+void MenuGame_ObserveLoads(MenuGameLoadObserver observer) { g_loadObserver.store(observer); }
+
 struct AlState {
     SpinLock lock;
     std::string name;
@@ -1681,6 +1701,10 @@ static bool Install(uintptr_t base)
         return false;
     }
     if (wantAutoload) {
+        // CheckBytes includes the exact 16-byte, relocation-free prologue.
+        const bool observed = InstallHook(base+RVA_START_SAVEGAME,
+            reinterpret_cast<void*>(&StartSavegameDetour),16,&g_originalStartSavegame);
+        Log("[menu] accepted vanilla load observer %s\n", observed ? "ON" : "OFF (hook refused)");
         g_menuUpdate = (UpdateFn)(base + RVA_MENUUI_UPDATE);
         g_autoloadOn = StoreSlot(base + RVA_MENUUI_VTABLE + SLOT_UPDATE * sizeof(uintptr_t), base + RVA_MENUUI_UPDATE,
                                  (uintptr_t)&MenuUpdateDetour, "CMenuUI");

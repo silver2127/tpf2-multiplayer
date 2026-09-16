@@ -12,8 +12,10 @@ only when every current participant has confirmed. No new save/load or recovery
 hold is initiated before that point. A changed roster invalidates the request;
 old confirmations cannot carry over to another request. The system then holds
 all games, saves the host under a unique recovery name, transfers and verifies
-that exact save set, reloads all worlds in the existing processes and compares
-the freshly loaded, paused worlds. It resumes only after the shared comparison
+that exact save set, reloads every client's world in the existing processes (the
+host keeps the world it took the snapshot from, held at the same step -- the same
+shape as a hot join; in start mode, where the host picked a save for everyone, the
+host loads too) and compares the paused worlds. It resumes only after the shared comparison
 succeeds. The host's previous speed is restored, including an intentional pause.
 Changes present only on the client are replaced by the host's world.
 

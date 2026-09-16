@@ -44,6 +44,12 @@ While the panel is open, typing goes into its fields and the game does not see i
 Games load at different speeds; each player's game holds at the start until the host's game is
 running, so nobody plays ahead.
 
+**Changing world mid-session.** Whatever the host loads, everyone loads. If the host uses the
+game's own **LOAD GAME** (from the title screen or from the in-game menu), or starts a **NEW GAME**
+or **CONTINUE**, that world is sent to every player and their games load it where they are — no
+one has to go back to the title screen. Each player then catches up from the host as if they had
+just joined.
+
 ## Joining
 
 1. Title screen → **Multiplayer** → **JOIN GAME**.

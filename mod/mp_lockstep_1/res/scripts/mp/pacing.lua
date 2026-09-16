@@ -833,6 +833,7 @@ function CM.catchUpTick(now, s)
 			else
 				CM.cuPhase = "fetch"
 				CM.histEndSeen, CM.histProgressAt = false, CM.ticks
+				CM.histLive = true   -- a live clock, not a save: gaps below the feed stay owed (net.lua rxHistRange)
 				CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
 				log(string.format("CATCHUP: %.1f unit(s) behind the leader -- holding, asked the host for the command history after %.1f", behind, now))
 				return 0
@@ -1208,6 +1209,7 @@ end
 function CM.lgAskHistory(why)
 	local S = CM.lgLoadStamp()
 	CM.histEndSeen, CM.histProgressAt = false, CM.ticks
+	CM.histLive = false   -- from a save: what lies below the feed is in the file
 	CM.lgFetchAsks = (CM.lgFetchAsks or 0) + 1
 	CM.broadcast(string.format("LSNEED t=%.4f o=%s save=1", S, K.INSTANCE))
 	log(string.format("LOADGATE: %s -- asked the host for every command stamped after our save (%.1f%s)%s", why, S,

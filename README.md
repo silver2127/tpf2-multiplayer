@@ -16,8 +16,8 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration is Windows **0.5.6 plus dev through `cae5d370`**, retaining the earlier dashboard tabs. See [Linux installation](docs/linux/INSTALL.md),
-[the integration record](docs/linux/UPSTREAM_dev_cae5d370.md), and
+integration is Windows **0.5.7 plus dev through `6cb03915`** (partial native integration). See [Linux installation](docs/linux/INSTALL.md),
+[the integration record](docs/linux/UPSTREAM_dev_6cb03915.md), and
 [existing port coverage and gaps](docs/linux/RESUME_STATUS.md).
 Historical native/Proton tests in those records do not establish live gameplay
 compatibility for this development snapshot.
@@ -45,6 +45,11 @@ switches the game to the Windows Segment Heap, which makes very large maps load 
 to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
 [installer/README.md](installer/README.md).
+
+**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.py` from the same release and run
+`python3 install_proton.py`; it installs the same files into the Proton game. Details, including the lobby
+repair Wine needs: [docs/proton/INSTALL.md](docs/proton/INSTALL.md). The native Linux game has its own
+build on the `linux-native` branch.
 
 To uninstall, use **Apps → TpF2 Multiplayer → Uninstall**, or run the MSI again and choose **Remove**; the
 game's own `alut.dll` is put back. Steam's "Verify integrity of game files" also restores it, which removes the
@@ -78,6 +83,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | [docs/TESTING.md](docs/TESTING.md) | the manual test plan: what to check before pushing, and before a release |
 | [docs/re/](docs/re/README.md) | the engine reference for build 35924 that the hooks rest on |
 | [installer/README.md](installer/README.md) | the MSI: what it changes, upgrades, building it |
+| [docs/proton/INSTALL.md](docs/proton/INSTALL.md) | Linux and Steam Deck: installing into the Windows game under Proton |
 | [netpunch/README.md](netpunch/README.md) | the lobby's source |
 
 ## Repository layout

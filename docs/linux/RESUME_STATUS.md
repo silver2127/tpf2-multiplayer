@@ -1,5 +1,12 @@
 # Linux port checkpoint — 2026-09-15
 
+## Current integration — 2026-09-16
+
+Windows dev through `6cb03915` (0.5.7 plus later changes) is staged, uncommitted,
+and partially ported. See [UPSTREAM_dev_6cb03915.md](UPSTREAM_dev_6cb03915.md)
+for current coverage, tests and native recovery/in-world-load gaps. Historical
+checkpoints below describe their own revisions, not current live validation.
+
 ## Upstream update — 0.5.3
 
 Merged upstream `main` through `66da00db6a36791630d7ebb05b6bf81fb06e7959`

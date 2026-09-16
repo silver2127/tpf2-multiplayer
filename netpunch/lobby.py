@@ -2130,7 +2130,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.6"
+LOBBY_VERSION = "0.5.7"
 
 
 def version_rejection(remote):
@@ -2714,18 +2714,31 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         unstarted and get the next push (serve loop below)."""
         started[0] = True
         start_save[0] = bool(save)
-        msg = {"t": "start", "save": start_save[0]}
         targets = [a for a in list(peers) if only is None or a in only]
+        # A WORLD SWITCH is flagged PER PEER. The peers that were playing have
+        # to be told they are leaving that world (their menu loads the new save
+        # in place, without going back to the title screen); a peer that joined
+        # while the switch was being pushed is an ordinary newcomer and gets an
+        # ordinary start. A peer marked for the switch that this round did not
+        # reach keeps its flag for the round that finally serves it.
+        switching = {a for a in targets if peers[a].pop("switch", False)}
         for a in targets:
             peers[a]["started"] = True      # heal roster carries started:true
         if relay_only and upload[0] is not None and getattr(upload[0], "complete", False):
             upload[0] = None                # this upload has been distributed
         for _ in range(CHAT_BURST):
             for a in targets:
+                msg = {"t": "start", "save": start_save[0]}
+                if a in switching:
+                    msg["switch"] = True
                 _send_data(sock, a, msg)
-        io.emit({"type": "start", "save": start_save[0]})
+        event = {"type": "start", "save": start_save[0]}
+        if switching:
+            event["switch"] = True
+        io.emit(event)
         io.write_state(started=True)
-        log(f"[host] START broadcast (save={start_save[0]}) to "
+        log(f"[host] START broadcast (save={start_save[0]}"
+            f"{', world switch' if switching else ''}) to "
             f"{len(targets)} of {len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
@@ -3125,6 +3138,30 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
                                         io, log, mods=mods)
 
+    def begin_world_switch(save_path):
+        """A WORLD SWITCH: the host loaded a different world while the session
+        was running, so everybody has to leave the world they are in and load
+        this one.
+
+        Every peer goes back to 'unstarted' -- that is what makes
+        begin_save_transfer push to ALL of them rather than only to the ones
+        still waiting for a first save -- and is marked so broadcast_start
+        tells it this is a switch. ``last_shared`` is pointed at the new file
+        BEFORE any peer is unstarted: the serve-again loop fires on 'a peer is
+        unstarted', so if it runs between here and the transfer it can only
+        ever push THIS world, never the one everyone is leaving."""
+        last_shared[0] = save_path
+        playing = sum(1 for p in peers.values() if p.get("started"))
+        for p in peers.values():
+            p["started"] = False
+            p["switch"] = True
+        name = os.path.basename(save_path)
+        log(f"[host] world switch: pushing {name} to {len(peers)} player(s)"
+            f" ({playing} of them already playing)")
+        io.emit({"type": "status", "state": "connected",
+                 "detail": f"Switching everyone to {name}\u2026"})
+        begin_save_transfer(save_path)
+
     # ---- local (host's own menu) commands ---------------------------------- #
     def handle_command(cmd):
         nonlocal host_name
@@ -3173,6 +3210,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log("[host] the host is saving for a hot join -- holding the serve-again")
         elif c == "start":
             save = cmd.get("save")
+            # "switch":true -- the host's menu saw it load ANOTHER world while
+            # this session was running (see begin_world_switch). The flag rides
+            # in the queued command, so a switch that has to wait for a running
+            # transfer is still a switch when it runs.
+            switch = bool(cmd.get("switch"))
             serve_hold[0] = 0.0
             if relay_only:
                 log("[relay] 'start' from the local panel ignored -- the leader starts")
@@ -3184,11 +3226,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 elif save:
                     # never drop the host's save: it is the world the game is in NOW
                     pending_start[0] = dict(cmd)
-                    log("[host] start queued until the running save transfer ends")
+                    log("[host] start queued until the running save transfer ends"
+                        + (" (world switch)" if switch else ""))
                 else:
                     log("[host] start ignored -- a save transfer is in progress")
             elif save and not _mod_check(save, io, log):
                 pass                              # refused: made without the mod (status + chat say so)
+            elif save and switch and started[0] and peers:
+                begin_world_switch(save)          # everyone leaves the world they are in
             elif save:
                 begin_save_transfer(save)         # start(save=True) when done
             else:
@@ -3577,6 +3622,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     last_links_report = [0.0]
     reported_links = [None]
     last_ignored_start = [None]     # (save, sid) of the last start we refused
+    last_switch = [None]            # ("applied"/"ignored", receiver sid) of the last world switch
     is_relay = [False]              # the host is a relay-only server (roster/welcome say so)
     uploader = [None]               # our save going UP to the relay (we are the leader)
     uploaded = [False]              # an upload completed this session -> a start(save) is ours
@@ -3610,11 +3656,15 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
 
     recovery = ClientRecovery(sync_runtime, io, send, receiver) if sync_runtime is not None else None
 
-    def apply_start(save, via):
+    def apply_start(save, via, switch=False):
         """The save-flag rule: emit start only if save==false, or save==true
         AND our receiver completed this session (it emitted save_ready). An
         unsatisfiable start is ignored WITHOUT latching started, so a retried
-        START GAME (after the host re-sends the save) still works."""
+        START GAME (after the host re-sends the save) still works.
+
+        ``switch`` marks a WORLD SWITCH -- apply_switch_start has already
+        cleared ``started`` for it, and the menu needs to know this start
+        replaces a world it is playing rather than starting a first one."""
         if started[0] or (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask or receiver.catalogue_token or not receiver.mods_satisfied:
             return
         if receiver.need and not receiver.complete:
@@ -3629,9 +3679,36 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                     f"{'failed' if receiver.failed else 'incomplete'})")
             return
         started[0] = True
-        io.emit({"type": "start", "save": save})
+        event = {"type": "start", "save": save}
+        if switch:
+            event["switch"] = True
+        io.emit(event)
         io.write_state(started=True)
-        log(f"[client] START (save={save}) via {via}")
+        log(f"[client] START (save={save}{', world switch' if switch else ''}) via {via}")
+
+    def apply_switch_start(save):
+        """A WORLD SWITCH start: the host loaded another world and pushed it
+        here. This is the one start that is taken although we already started --
+        we are leaving the world we are playing for the save that just arrived.
+
+        Guarded by the receiver's session id, because the host sends the start
+        CHAT_BURST times: without it every copy would emit another load. A
+        switch for which nothing was received is ignored, logged once."""
+        sid = receiver.sid
+        if (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask \
+                or receiver.catalogue_token or not receiver.mods_satisfied:
+            return
+        if not bool(save) or not receiver.complete or sid is None:
+            if last_switch[0] != ("ignored", sid):
+                last_switch[0] = ("ignored", sid)
+                log("[client] start(switch) ignored -- no verified save arrived this session")
+            return
+        if last_switch[0] == ("applied", sid):
+            return                                  # another copy of the start burst
+        last_switch[0] = ("applied", sid)
+        started[0] = False                          # this start replaces the world we are in
+        send({"t": "stage", "text": "loading the host's new world"})
+        apply_start(True, via="start (world switch)", switch=True)
 
     # ---- mesh: direct links to the other joiners, relay for the rest -------- #
     def mesh_plan_dials():
@@ -3886,7 +3963,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             io.emit({"type": "chat", "from": m.get("from"),
                      "text": m.get("text"), "ts": m.get("ts")})
         elif t == "start":
-            apply_start(m.get("save", False), via="start")
+            if m.get("switch"):
+                apply_switch_start(m.get("save", False))
+            else:
+                apply_start(m.get("save", False), via="start")
         elif t == "status":
             # Advisory from the host (e.g. late joiner: game already started).
             io.emit({"type": "status",

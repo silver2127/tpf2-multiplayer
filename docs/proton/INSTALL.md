@@ -1,114 +1,104 @@
-# Windows 0.4.22 under Steam Proton
+# Linux and Steam Deck: the Windows game under Proton
 
-This compatibility setup installs the official Windows 0.4.22 DLLs and all 24 Lua
-files unchanged. Hosting on Proton needs the narrowly scoped lobby dependency repair
-below; joining already worked with the original lobby executable. It runs the Windows
-game through Steam's selected Proton version. The native Linux build remains a
-separate implementation.
+`tools/proton/install.py` installs TpF2 Multiplayer into Transport Fever 2 when
+Steam runs the Windows game through Proton. It installs the same files as the
+Windows MSI and needs only Python 3.9 or newer. Every release page carries a
+copy of it as `install_proton.py`.
 
-**The released Windows DLLs retain native fallbacks.** This package does not satisfy
-the earlier requirement that every action use strict cancellation and replay.
-Windows–Proton testing has shown matching hashes during a joined session, including
-construction; that observation does not establish determinism across every action
-and workload.
+The multiplayer mod is Windows code; under Proton it runs unchanged. The
+separate native Linux build (branch `linux-native`, releases tagged
+`-linux-dev`) is for the native Linux game and has its own installer.
 
 ## Install
 
-Select Proton in the game's Steam compatibility settings, let Steam finish downloading
-the Windows game, and close the game before installing. This setup needs Python 3.11+
-and the extracted payload from the [official v0.4.22 release](https://github.com/silver2127/tpf2-multiplayer/releases/tag/v0.4.22).
-It does not download files, run Wine, change Steam settings, or register an MSI.
+1. In Steam: **Transport Fever 2 → Properties → Compatibility → Force the use of a
+   specific Steam Play compatibility tool**, pick a Proton version (Proton 9 or
+   newer; Proton 11 is what this was tested with), and let Steam download the
+   Windows game.
+2. Start the game once and quit, so Proton creates its prefix.
+3. Download `install_proton.py` from the
+   [release](https://github.com/silver2127/tpf2-multiplayer/releases) you want,
+   close the game, and run:
 
-The official `TpF2Multiplayer.msi` SHA-256 is
-`1f7aa947bc069aaec5d14e89a28ec2ac98d284a37b3f065302bc9fa923efd08d`.
-On Linux, `msiextract -C EXTRACTED TpF2Multiplayer.msi` extracts it. Pass the resulting
-`EXTRACTED/Program Files/Steam/steamapps/common/Transport Fever 2` directory below.
+   ```sh
+   python3 install_proton.py
+   ```
 
-```sh
-python3 tools/proton/setup.py \
-  --game-dir '/path/to/Steam/steamapps/common/Transport Fever 2' \
-  --steam-root '/path/to/Steam' \
-  --payload-dir '/path/to/extracted/Program Files/Steam/steamapps/common/Transport Fever 2' \
-  --dry-run
-```
+   It finds Steam, the game and the Proton prefix (native, Snap and Flatpak
+   Steam, every library in `libraryfolders.vdf`, SD cards included), downloads that
+   release's `TpF2Multiplayer-files.zip`, checks it against the release's
+   `SHA256SUMS.txt`, and installs. `--dry-run` shows the plan and changes nothing.
 
-Remove `--dry-run` to install. Replace it with `--verify` to check the installed files.
-An optional `--prefix /path/to/pfx` overrides the default prefix at the game's Steam
-library's `steamapps/compatdata/1066780/pfx`. For Snap Steam, use the paths visible
-inside Snap, normally beneath `~/snap/steam/common/.local/share/Steam`.
+Everyone in a session needs the same version, Windows or Proton alike.
 
-The script verifies every extracted file against the checked-in release manifest and
-checks the Windows build guard. It preserves the stock audio library as `alut_real.dll`
-only when its checksum matches build 35924. Replaced files are copied to timestamped
-directories under `<game>/.tpf2mp-proton-backups/`; repeating setup with identical
-files makes no changes. Unexpected mod files, managed symlinks, and stale DLLs or a
-Python lobby under the prefix's `AppData/Local/tpf2mp` stop setup before installation.
+Other ways to get the files: `--files-zip TpF2Multiplayer-files.zip` (downloaded by
+hand), `--msi TpF2Multiplayer.msi` (needs `msiextract` from the `msitools`
+package), or `--payload-dir` (an extracted MSI's `Transport Fever 2` folder).
+`--steam-root`, `--game-dir` and `--prefix` override the detection.
 
-Windows menu and lobby paths need access to the real Steam saves and mods. Setup creates
-prefix-local links for `Steam/userdata`, `Steam/steamapps/common`, and
-`Steam/steamapps/workshop`, preserving Proton's own `steamapps/libraryfolders.vdf`.
-The links also work when created before Proton initializes the prefix. Conflicting
-links or directories containing data require manual review; empty directories can be
-replaced. A missing workshop directory is allowed until Steam creates it.
+## What it does
 
-## Repair the hosting crash
+In the game folder, the same as the MSI: keeps the game's own `alut.dll` as
+`alut_real.dll` and puts the proxy in its place, installs `tpf2_pluginhost.dll`,
+`tpf2_bridge_mp.dll`, `tpf2_menu.dll`, `tpf2_slice.dll`, `plugins/*.dll`,
+`netpunch/netpunch.exe` and the `mods/mp_lockstep_1` mod (old files of an earlier
+version are removed), and `tpf2_slice.cfg` unless one is already there. It
+refuses while the game runs, when `alut.dll` is not the game's own file (another
+mod replaced it), when the game is not Steam build 35924, and when the folder
+holds the native Linux game.
 
-The released lobby embeds a miniupnpc DLL with 64 duplicated PE relocation entries.
-When Proton loads it away from its preferred base, those pointers move twice and
-Windows thread-local storage initialization crashes. The menu remains on
-"observing NAT" because its lobby process has exited. See [the crash analysis](NAT_CRASH.md).
+In the Proton prefix, it links `drive_c/Program Files (x86)/Steam/userdata`,
+`steamapps/common` and `steamapps/workshop` to the real Steam folders, so the
+menu and the lobby find saves, mods and Workshop items. Proton's own
+`steamapps/libraryfolders.vdf` is left alone. The Segment Heap registry switch
+the MSI sets on Windows is not applied: it means nothing to Wine.
 
-Create a separate repaired lobby before installation:
+Replaced files are kept in `<game>/.tpf2mp-proton-backups/<timestamp>/`, and
+`<game>/.tpf2mp-proton-manifest.json` records what was installed.
 
-```sh
-python3 tools/proton/fix_lobby_relocations.py \
-  --input '/path/to/extracted/Program Files/Steam/steamapps/common/Transport Fever 2/netpunch/netpunch.exe' \
-  --output '/path/to/repaired/netpunch.exe'
-```
+`python3 install_proton.py --verify` checks an installation;
+`--uninstall` removes the mod and puts the game's own `alut.dll` back (the shared
+proxy and plugin host stay when another product, such as TpF2 Big Maps, still
+uses them).
 
-Add `--repaired-lobby '/path/to/repaired/netpunch.exe'` to the setup and verification
-commands above. This is explicit: setup's default remains the original release.
-Both input and repaired output are pinned by SHA-256. Only the miniupnpc relocation
-padding and PE checksums change; the lobby's Python bytecode, all other 73 archive
-members, all Windows mod DLLs, and all Lua remain unchanged. UPnP stays enabled.
-The repaired host passed an isolated Proton startup, code/roster publication, and
-clean shutdown test. Internet connectivity still depends on the network.
+## The lobby repair
 
-The repaired executable SHA-256 is
-`da4fb91961f1aed3c7e7543a837220902a7af11a0ea59412dd7b77bfd001111f`.
+`netpunch.exe` is a PyInstaller bundle. The miniupnpc DLL inside it (UPnP port
+mapping for hosts) has a malformed relocation table: 64 entries appear twice.
+Windows loads the DLL at its preferred address and never applies them; Wine
+relocates it, applies each entry twice, and the lobby crashes the moment a game
+is hosted. Joining does not touch UPnP and was never affected. The analysis is in
+[NAT_CRASH.md](NAT_CRASH.md).
 
-## Launch and test
+The installer repairs the installed `netpunch.exe` (and any copy the in-game
+updater cached in the prefix): the second copy of each entry becomes padding, the
+PE checksum is recalculated, and every other byte of every other bundle member
+is verified unchanged. The repair is pinned to the exact DLL every release has
+shipped; a different DLL is reported, not patched. Since the build that carries
+this script, `installer/build_msi.ps1` applies the same repair to the lobby before
+packaging, so newer releases need no repair at install time (the installer then
+finds nothing to do). `--repair-lobby FILE` applies it to a file by hand.
 
-Remove the native Linux preload wrapper from this game's Steam launch options and
-start the game normally through Steam. Avoid carrying Linux `TPF2MP_DATADIR` or
-`LOCALAPPDATA` overrides into Proton; the Windows DLLs and Lua need Windows paths.
-No DLL override is required when Proton loads the game's `alut.dll` normally. If logs
-show that the proxy never loaded, the explicit load-order setting is
-`WINEDLLOVERRIDES="alut=n,b" %command%`; preserve other existing overrides if any.
+## Updating
 
-Check `<prefix>/drive_c/users/steamuser/AppData/Local/tpf2mp/data/tpf2_proxy.log`
-for successful DLL loads and the game directory's `tpf2_menu.log` for the resolved
-save/lobby paths. The plugin-host and slice logs are in the runtime data directory.
-Verify the multiplayer mod is active in the test map, then compare initial hashes
-with a Windows peer before testing rail construction. Follow with vehicle/line actions,
-save transfer, late join, and resync. A successful title-screen launch alone does not
-validate multiplayer or determinism.
+Run the script again (a newer copy from the new release, or `--version X.Y.Z`).
+Do not use the in-game **DOWNLOAD UPDATE** button under Proton: it stores an
+update in the prefix that would take precedence over the installed files, and
+for releases before the repaired lobby it brings the crash back. The installer
+repairs such cached copies when it finds them.
 
-This extracted-payload setup omits the MSI's Windows Segment Heap registry setting and
-Windows Installer bookkeeping. To stop loading the multiplayer DLLs, close the game,
-verify the preserved stock `alut_real.dll`, and copy it back over `alut.dll`.
-Backups preserve previous files; saves and runtime data are not removed by setup.
+## Limits
 
-## Fixture verification
+- Tested by installing on one machine (Snap Steam, Proton 11). Hosting and
+  joining under Proton were verified with the 0.4.22 payload and the repaired
+  lobby; a full session on a current release has not been recorded here.
+- The Windows DLLs keep their native fallbacks; cross-platform determinism between
+  Windows and Proton players rests on the same code, but has had only short tests.
+- Steam's "Verify integrity of game files" restores the game's `alut.dll` and
+  removes the mod's entry point; run the installer again afterwards.
 
-The installer checks can run without changing a game or prefix:
+## Historical pinned setup
 
-```sh
-python3 tools/proton/test_setup.py \
-  --payload-dir '/path/to/extracted/Program Files/Steam/steamapps/common/Transport Fever 2' \
-  --stock-alut '/path/to/stock/alut.dll' \
-  --repaired-lobby '/path/to/repaired/netpunch.exe'
-
-python3 tools/proton/test_lobby_relocations.py \
-  --input '/path/to/extracted/Program Files/Steam/steamapps/common/Transport Fever 2/netpunch/netpunch.exe'
-```
+The [0.4.22 extracted-payload instructions](INSTALL_0.4.22.md) document
+`setup.py`, its pinned checksums and the original test scope. They remain
+available for reproducing that older setup; use the installer above for current releases.

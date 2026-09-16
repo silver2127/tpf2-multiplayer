@@ -1,0 +1,30 @@
+# shared stations: every owner/player comparison on the line-editor click path,
+# the line command path, routing and the cargo/passenger side. Build 35924.
+6095d0 ss_stationfilter_isvalid
+9df4e0 ss_make_updateline
+9d9fd0 ss_apply_updateline
+9d76a0 ss_apply_createline
+9d9b10 ss_apply_setline
+a43400 ss_linesys_entityadded
+a43910 ss_linesys_entityremoved
+a415b0 ss_linesys_a415b0
+a416a0 ss_linesys_a416a0
+a41660 ss_linesys_componentadded
+ad11d0 ss_tvs_ad11d0
+ad5f70 ss_tvs_ad5f70
+ad40b0 ss_findnextfreeterminal
+215d660 ss_getbestlineassignment
+96f3b0 ss_calclinestopterminal
+977410 ss_linesexpander_addstation
+977640 ss_linesexpander_visitlines
+218d720 ss_station_getcarriers
+2177be0 ss_movepath_default_a
+217c010 ss_movepath_default_b
+2167a30 ss_movepath_air
+22190b0 ss_vehicle_util_engine
+73d8d0 ss_getentitiesforplayer1
+8df450 ss_getentitiesforplayer2
+8e75d0 ss_getentitiesforplayer3
+5e2dc0 ss_hudiconmanager_dostep
+80b6b0 ss_itemcreator
+5fc560 ss_lineeditor_makefilter

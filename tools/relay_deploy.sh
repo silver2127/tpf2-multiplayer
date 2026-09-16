@@ -22,6 +22,9 @@ tar -C netpunch -cf - lobby.py punch.py seal.py connect.py mesh.py observe.py mo
   | ssh "$HOST" 'mkdir -p /opt/tpf2mp/netpunch && tar -C /opt/tpf2mp/netpunch -xf -'
 ssh "$HOST" "set -e
 python3 -c 'import stun' 2>/dev/null || pip3 install --quiet --break-system-packages pystun3 || apt-get install -y -qq python3-pip && pip3 install --quiet --break-system-packages pystun3
+# the mod list of a stored save is zstd-compressed inside the .sav (modshare.save_mod_list); without
+# this module the relay advertised every stored world as needing no mods until 2026-09-16
+python3 -c 'import zstandard' 2>/dev/null || pip3 install --quiet --break-system-packages zstandard
 id -u tpf2mp >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin tpf2mp
 mkdir -p /var/lib/tpf2mp/relay /etc/tpf2mp
 chown -R tpf2mp:tpf2mp /var/lib/tpf2mp

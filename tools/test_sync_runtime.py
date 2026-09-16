@@ -126,7 +126,42 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(ack['speed'], 0)
         self.assertEqual(self.runtime.tick(), ack)
 
+    def test_host_keeps_its_world_in_a_resync_and_loads_in_start_mode(self):
+        # resync: the host took the snapshot from the world it is holding; it
+        # asks the bridge for the new epoch, never loads, and acks once paused
+        self.phase('transferring')
+        self.runtime.snapshot = self.snapshot
+        self.lua()
+        self.runtime.tick()
+        self.phase('loading')
+        self.write('bridge_ctl', instance='a', peer='127.0.0.1:7773')
+        self.assertIsNone(self.runtime.tick())
+        self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
+        self.lua(world='old', held=0)
+        self.assertIsNone(self.runtime.tick())            # not held: nothing yet
+        self.assertFalse((self.root/'tpf2_native_request.txt').exists())
+        self.lua(world='old', held=1)
+        self.runtime.tick()
+        request = read_fields(self.root / 'tpf2_native_request.txt')
+        self.assertEqual(request['cmd'], 'pause')            # never 'load'
+        self.native_done('pause', 'paused')
+        ack = self.runtime.tick()
+        self.assertTrue(ack['paused'])
+        self.assertEqual(ack['digest'], self.snapshot.digest)
+        # start mode: the host chose a save for everyone, so it loads like a client
+        self.runtime = SyncParticipant(self.root, self.root, 123, 'host')
+        self.state.update(mode='start', revision=self.state['revision'] + 1, phase='transferring')
+        self.assertTrue(self.runtime.accept(self.state))
+        self.runtime.snapshot = self.snapshot
+        self.lua()
+        self.runtime.tick()
+        self.phase('loading')
+        self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
+        self.runtime.tick()
+        self.assertEqual(read_fields(self.root / 'tpf2_native_request.txt')['cmd'], 'load')
+
     def test_load_requires_bridge_epoch_native_ready_and_new_lua_world(self):
+        self.runtime = SyncParticipant(self.root, self.root, 123, 'client')
         self.phase('transferring')
         self.runtime.snapshot = self.snapshot
         self.lua()

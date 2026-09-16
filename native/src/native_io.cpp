@@ -209,10 +209,17 @@ void saveNow(uintptr_t world,const std::string& id,const std::string& basename) 
 
 using StartFn=bool(*)(uintptr_t,void*,void*);
 StartFn originalStart;
+std::atomic<StartObserver> startObserver{nullptr};
 bool startHook(uintptr_t target,void* params,void* info) {
     const bool result=originalStart(target,params,info);
-    std::lock_guard<std::mutex> lock(mutex);
-    if(state==State::Loading && target==menu) accepted=result;
+    bool ours;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ours=state==State::Loading;
+        if(ours && target==menu) accepted=result;
+    }
+    // Outside the lock: the observer writes files and talks to the lobby.
+    if(auto observer=startObserver.load()) observer(params,result,ours);
     return result;
 }
 // All 26 parameters are pointers/references or MSVC indirect by-value objects.
@@ -320,6 +327,7 @@ bool Initialize(uintptr_t image,HMODULE self,const wchar_t* saves) {
     originalLegacyScriptEvent=reinterpret_cast<LegacyScriptEvent>(scriptEvent);
     enabled=true; return true;
 }
+void ObserveStart(StartObserver observer) { startObserver.store(observer); }
 void ObserveMenu(uintptr_t target) {
     std::lock_guard<std::mutex> lock(mutex);
     menu=target;

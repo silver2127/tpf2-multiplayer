@@ -76,7 +76,13 @@ with tempfile.TemporaryDirectory(prefix="tpf2mp-installer-test-") as temp:
 
     output = run(install + ["--dry-run"], env)
     assert not installed.exists() and not (game / "mods").exists()
+    legacy = game / "mods/m3_determinism_1"
+    legacy.mkdir(parents=True)
+    (legacy / "mod.lua").write_text("obsolete probe")
+    output = run(install + ["--dry-run"], env)
+    assert legacy.is_dir() and "would remove" in output
     output = run(install, env)
+    assert not legacy.exists()
     assert "tpf2mp-launch %command%" in output
     assert (game / "run.sh").read_bytes() == stock
     assert (installed / "netpunch/netpunch").is_file()

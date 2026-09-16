@@ -172,6 +172,11 @@ if ($SkipBuild) {
     } finally { Pop-Location }
 }
 if (-not (Test-Path $netExe)) { Fail "missing: $netExe" }
+# Wine relocates the lobby's bundled miniupnpc DLL and its duplicated relocation
+# entries then crash every host under Proton; the repair (tools\proton\install.py,
+# pinned to that DLL) changes nothing else and is a no-op once applied.
+& python (Join-Path $Repo "tools\proton\install.py") --repair-lobby $netExe
+if ($LASTEXITCODE -ne 0) { Fail "lobby relocation repair failed" }
 
 # ---- 3. custom-action DLL ------------------------------------------------
 if ($SkipBuild -and (Test-Path $caDll)) {
@@ -225,6 +230,9 @@ Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $
 # Ship this alongside the MSI in the GitHub release for user-local updates.
 & python (Join-Path $Repo "tools\build_update.py")
 if ($LASTEXITCODE -ne 0) { Fail "automatic update bundle build failed" }
+# The MSI's files as a plain archive, for the Proton installer and manual installs.
+& python (Join-Path $Repo "tools\build_files_zip.py")
+if ($LASTEXITCODE -ne 0) { Fail "files archive build failed" }
 
 # ---- 5. optional validation ----------------------------------------------
 if ($Validate) {

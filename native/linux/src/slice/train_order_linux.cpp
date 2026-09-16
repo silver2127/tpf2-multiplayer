@@ -50,6 +50,11 @@ uintptr_t NameComponent(uintptr_t world, int32_t id, int type)
     return 0;
 }
 
+} // namespace
+uintptr_t SliceNameComponent(uintptr_t world, int32_t id, int type)
+{ return NameComponent(world, id, type); }
+namespace {
+
 // All allocation and sorting is private. Refusal leaves the engine array
 // untouched, so the original shuffle remains a valid fallback. Copy names to
 // avoid dereferencing live engine strings from a comparator.

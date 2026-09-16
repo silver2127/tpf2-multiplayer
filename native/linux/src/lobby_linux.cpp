@@ -143,7 +143,7 @@ struct Model {
 };
 
 struct Request {
-    enum Kind { Launch, Stop, Line, ShareStart } kind;
+    enum Kind { Launch, Stop, Line, ShareStart, LoadedSave } kind;
     uint64_t gen;
     StartRequest start;
     std::string line;
@@ -177,6 +177,8 @@ struct State {
     uint64_t syncBaseline = 0, syncAskedAt = 0, syncLastSize = 0;
     uint64_t unpausedMs = 0, unpausedLast = 0, sharedUnpaused = 0;
     std::string sharedSave, stageSent;
+    std::string worldGen;
+    bool sessionStarted = false, worldGenHold = false, switchShare = false, hostLoadedItself = false;
     bool stageWatch = false;
     std::string syncSave;
     uint64_t relayLastUp = 0;
@@ -1134,9 +1136,10 @@ static void SyncStart(const std::string& why)
     UnpausedTick();
     if (why.compare(0, 8, "hot join") == 0 && !S().sharedSave.empty() &&
         Exists(S().sharedSave) && S().unpausedMs - S().sharedUnpaused < 15000) {
+        AppendIn("{\"cmd\":\"start\",\"save\":\"" + JsonEscape(S().sharedSave) + "\"}");
         Status("Hot join: sending the recent save");
         SendChatNow("!hotjoin A game is running. Hold on: the host is sending you the world; your game loads it by itself.");
-        return; // lobby.py serves its retained snapshot to unstarted joiners
+        return; // explicit start also latches a session that previously had no joiners
     }
     std::string cur;
     uint64_t size = 0;
@@ -1144,20 +1147,54 @@ static void SyncStart(const std::string& why)
     S().syncLastSize = 0;
     S().syncSave.clear();
     Log("[sync] %s -> taking the save\n", why.c_str());
-    if (!MenuGame_ForceAutosave()) { Log("[sync] the forced autosave did not start\n"); return; }
+    if (!MenuGame_ForceAutosave()) { S().switchShare = false; Log("[sync] the forced autosave did not start\n"); return; }
     AppendIn("{\"cmd\":\"sync_taking\"}");
     S().syncAskedAt = NowMs();
     Status("Hot join: saving\xE2\x80\xA6");
     // A marked chat line for the newcomer's panel -- not for the relay's
     // periodic upload, which put it in every chat every two minutes.
-    if (why.compare(0, 6, "relay:") != 0)
+    if (why.compare(0, 12, "world switch") == 0)
+        SendChatNow("!hotjoin The host has moved to another world. Hold on: it is being sent to you.");
+    else if (why.compare(0, 6, "relay:") != 0)
         SendChatNow("!hotjoin A game is running. Hold on: the host is saving and will send you the world; your game loads it by itself.");
+}
+
+// The Lua token covers NEW GAME as well as loads. No Windows object layout.
+static void PollWorldGen()
+{
+    std::string text;
+    if (!ReadSmallFile(S().cfg.dataDir + "tpf2mp_world_gen.txt", &text)) return;
+    std::string gen, pid;
+    size_t at = 0;
+    while (at < text.size()) {
+        const size_t end = text.find_first_of("\r\n", at);
+        const std::string line = text.substr(at, end - at);
+        if (line.compare(0, 4, "gen=") == 0) gen = line.substr(4);
+        if (line.compare(0, 4, "pid=") == 0) pid = line.substr(4);
+        if (end == std::string::npos) break;
+        at = end + 1;
+    }
+    if (gen.empty() || (!pid.empty() && pid != std::to_string(getpid())) || gen == S().worldGen) return;
+    const bool first = S().worldGen.empty(), mine = S().worldGenHold;
+    S().worldGen = gen; S().worldGenHold = false;
+    if (first || mine) return;
+    // A cached snapshot of the previous world is never reusable.
+    S().sharedSave.clear();
+    bool live;
+    { std::lock_guard<std::mutex> lk(S().mtx);
+      live = S().m.isHost && S().m.lobbyReady && S().m.players.size() >= 2; }
+    if (!live || !S().sessionStarted || !InGame()) return;
+    // Invalidate any older world's pending file watcher before taking this save.
+    S().syncAskedAt = 0;
+    S().switchShare = true;
+    SyncStart("world switch");
 }
 
 static void SyncPoll()
 {
     UnpausedTick();
     StageTick();
+    PollWorldGen();
     const std::string req = S().cfg.dataDir + "tpf2_sync_save.txt";
     if (Exists(req)) {
         unlink(req.c_str());
@@ -1171,7 +1208,9 @@ static void SyncPoll()
         if (mt > S().syncBaseline && sz > 0) {
             // wait until the file stops growing (the sidecars are written after the .sav)
             if (cur == S().syncSave && sz == S().syncLastSize) {
-                AppendIn("{\"cmd\":\"start\",\"save\":\"" + JsonEscape(cur) + "\"}");
+                AppendIn("{\"cmd\":\"start\",\"save\":\"" + JsonEscape(cur) + "\"" +
+                         (S().switchShare ? ",\"switch\":true" : "") + "}");
+                S().switchShare = false;
                 MarkSaveShared(cur);
                 { std::lock_guard<std::mutex> lk(S().mtx); S().m.startSave = cur; }
                 Log("[sync] new save %s (%llu B) -> sharing with every joiner\n", cur.c_str(), (unsigned long long)sz);
@@ -1188,6 +1227,7 @@ static void SyncPoll()
     if (NowMs() - S().syncAskedAt > 90000) {
         Log("[sync] no new save appeared within 90 s -- giving up (is the save folder writable? see the game log)\n");
         Status("Sync: the save did not appear");
+        S().switchShare = false;
         S().syncAskedAt = 0;
     }
 }
@@ -1368,6 +1408,29 @@ static bool DoStartLoad(const std::string& src)
     return true;
 }
 
+// UI thread: snapshot the session identity, then leave all file IO to the lobby.
+static void OnMenuLoad(const char* name)
+{
+    uint64_t gen;
+    { std::lock_guard<std::mutex> lk(S().mtx);
+      if (!S().m.isHost || !S().m.lobbyReady || S().m.players.size()<2) return;
+      gen=S().m.gen; }
+    Queue(Request{Request::LoadedSave,gen,StartRequest(),name});
+}
+static void ShareLoadedSave(const std::string& name)
+{
+    const std::string path=MenuGame_SaveDir()+"/"+name+".sav";
+    if (!Exists(path)) { Log("[menu] accepted save %s not found; not shared\n",path.c_str()); return; }
+    const bool switching=InGame() || S().sessionStarted;
+    S().worldGenHold=true; S().hostLoadedItself=true;
+    S().syncAskedAt=0; S().switchShare=false;
+    { std::lock_guard<std::mutex> lk(S().mtx); S().m.startSave=path; }
+    WriteCompanyCfg();
+    AppendIn("{\"cmd\":\"start\",\"save\":\""+JsonEscape(path)+"\""+(switching ? ",\"switch\":true" : "")+"}");
+    MarkSaveShared(path);
+    Status("Sharing the world loaded by the host");
+}
+
 static void HandleStart(const Json& ev)
 {
     // save=true: a save transfer completed for this peer this session; absent = true
@@ -1379,6 +1442,29 @@ static void HandleStart(const Json& ev)
         saveReady = S().m.saveReady;
         isHost = S().m.isHost;
         startSave = S().m.startSave;
+    }
+    if (isHost) {
+        S().sessionStarted = true;
+        if (S().hostLoadedItself) { S().hostLoadedItself=false; return; }
+    }
+    const bool switching = JBool(ev, "switch", false);
+    if (switching) {
+        if (isHost) return; // the host already loaded the new world
+        if (!(withSave && saveReady)) {
+            Status("The host switched world but its save did not arrive."); return;
+        }
+        { std::lock_guard<std::mutex> lk(S().mtx); S().m.saveReady = false; }
+        S().worldGenHold = true;
+        if (InGame()) {
+            // Linux has no verified in-place load controller. Place the current
+            // transfer and give the player an actionable manual load fallback.
+            std::string placed;
+            WriteCompanyCfg();
+            if (MenuGame_PlaceSharedSave(S().lobbyDir + "incoming_save.sav", &placed))
+                Status("The host changed world -- open LOAD GAME and pick \"mp_shared\".");
+            else Status("Could not place the host's new save -- ask the host to START again.");
+            return;
+        }
     }
     std::string src;
     bool go = true;
@@ -1408,6 +1494,7 @@ static void HandleStart(const Json& ev)
     Status("Loading shared save\xE2\x80\xA6");
     SleepMs(400);
     // The lobby stays: since the game-frame relay it IS the lockstep transport.
+    S().worldGenHold = true;
     if (DoStartLoad(src)) {
         ReportStage("loading world"); S().stageWatch = true;
         Log("[lobby] game loading -- lobby kept alive as the game transport\n");
@@ -1552,6 +1639,7 @@ static void ForgetChild()
 {
     g_childPid = 0;
     S().child = Child();
+    S().worldGen.clear(); S().sessionStarted = S().worldGenHold = S().switchShare = S().hostLoadedItself = false;
     S().sharedSave.clear(); S().unpausedLast = 0; S().stageWatch = false; S().stageSent.clear();
     S().syncAskedAt = 0;
 }
@@ -1784,8 +1872,10 @@ static void LobbyThread()
                     break;
                 case Request::Line:
                 case Request::ShareStart:
+                case Request::LoadedSave:
                     if (S().child.pid && S().child.gen == r.gen) {
                         if (r.kind == Request::Line) AppendIn(r.line);
+                        else if (r.kind == Request::LoadedSave) ShareLoadedSave(r.line);
                         else ShareAndStart();
                     } else if (StillCurrent(r.gen)) {
                         // queued before CheckExit saw the lobby go (it looks every 200 ms)
@@ -1949,6 +2039,7 @@ void Init(const Config& cfg, Tpf2mpLogFn log, StatusFn status, DirtyFn dirty)
         S().log = log;
         S().status = status;
         S().dirty = dirty;
+        MenuGame_ObserveLoads(&OnMenuLoad);
         Program prog;
         std::string tried;
         const bool found = ResolveProgram(&prog, &tried);
