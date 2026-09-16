@@ -183,8 +183,13 @@ pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compare
 1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
    game list).
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
-3. Tag the commit `v<version>` and publish `installer\out\TpF2Multiplayer.msi` as a GitHub release asset,
-   with its SHA-256 in the notes.
+3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
+   `TpF2Multiplayer.msi`, `TpF2Multiplayer-update.zip` (the in-game updater's payload),
+   `TpF2Multiplayer-files.zip` (the MSI's files as an archive: Proton and manual installs), a
+   `SHA256SUMS.txt` listing them, and `tools/proton/install.py` uploaded as `install_proton.py` with its
+   `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release page
+   installs that release). `build_msi.ps1` repairs the lobby for Wine before packaging
+   ([proton/INSTALL.md](proton/INSTALL.md)).
 4. If the lobby changed, redeploy the relay with `sh tools/relay_deploy.sh` (it refuses while players are
    connected) and the master server with `sh tools/masterserver_deploy.sh`
    ([NETWORKING.md](NETWORKING.md#dedicated-relay)).
