@@ -133,21 +133,27 @@ buttons toggle three sections:
 
 ### Companies
 
-By default everyone plays one shared company (co-op). To play separate companies, give players
-different company chips in the lobby before START GAME: click your own chip to change its number
-(the host, or a relay lobby's leader, can change anyone's). Players with the same number share a company; different numbers
-are different companies with their own money, and buildings and vehicles stay owned by the company
-that built them.
+By default everyone plays one shared company (co-op). The host's **SEPARATE COMPANIES** checkbox
+(on the HOST A GAME card, and in the lobby) gives every player their own company instead: the host
+is company 1 and each joiner gets the next number, including players who join later. Turning it
+off puts everyone back on company 1. A relay lobby's leader has the same checkbox.
+
+The chips can still be set by hand before START GAME: left-click your own chip for the next
+company number, right-click for the previous (the host, or a relay lobby's leader, can change
+anyone's). Players with the same number share a company; different numbers are different
+companies with their own money, and buildings and vehicles stay owned by the company that built
+them.
 
 Roadside bus, tram and truck stops belong to the company that placed them, on every player's game,
 and that company pays for them. Another company cannot bulldoze them, or replace one by placing its
 own stop on the same side of the road; the game tells you whose stop it is. Stops placed before this
 version keep whatever owner each game gave them.
 
-In game, the **companies** section of the Multiplayer window shows your company and how many are
-in the session. Use **<** and **>** to select one, **switch to it** to play that company instead
-of yours, **new company** to start a fresh one, and the **company password** field with **set on
-mine** to lock yours (switching into a locked company needs its password).
+In game, the **companies** section of the Multiplayer window shows your company's colour and
+name. Pick a company from the dropdown and **switch to it** to play that company instead of yours,
+**new company** to start a fresh one, and use the **company password** field with **set on mine**
+to lock yours (switching into a locked company needs its password). A company is named in the
+game's own company window; until then it is "<player>'s company".
 
 ## Ports and firewalls
 

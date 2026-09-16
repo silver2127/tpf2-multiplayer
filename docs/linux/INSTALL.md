@@ -21,11 +21,12 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **0.5.7 plus Windows dev through `6cb03915`**.
+This development tree combines **0.5.7 plus Windows dev through `b5dade06`**.
 It includes native road-space summation, ship/aircraft order diagnostics,
-shared-station line selection and host world-switch sharing. All Lua files
+shared-station line selection, host world-switch sharing, bidirectional company
+chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). All Lua files
 exactly match that Windows revision. See
-[UPSTREAM_dev_6cb03915.md](UPSTREAM_dev_6cb03915.md) for provenance, tests and
+[UPSTREAM_dev_b5dade06.md](UPSTREAM_dev_b5dade06.md) for provenance, tests and
 remaining gaps. This is not a claim of live cross-platform compatibility.
 `trainorder=0`, `roadspace=0`, `shiporder=0`, `airorder=0` and
 `sharedstations=0` in the root/data `tpf2_menu_flags.txt` disable the respective
@@ -39,7 +40,9 @@ obsolete `mods/m3_determinism_1` probe, with removal shown in `--dry-run`.
 **Known limits:** automatic resync, the wider separate-company/shared-ownership
 operations, and automatic Workshop registration still need native Linux support.
 Some player actions, including names/colors, vehicle stop/maintenance and loans,
-remain blocked in multiplayer. A completed cross-platform gameplay test for
+remain blocked in multiplayer. In particular, the shared dashboard now uses the
+game company window for renaming, but native Linux cannot yet capture that
+rename; the player-based default names and existing saved names still display. A completed cross-platform gameplay test for
 0.5.6 has not yet been recorded; the passing 0.4.22 replay does not establish
 0.5.6 compatibility.
 

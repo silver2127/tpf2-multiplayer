@@ -2408,7 +2408,7 @@ class _PeerConn:
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False, punch_q=None, sync_runtime=None):
+             relay_only=False, punch_q=None, sync_runtime=None, companies_mode=False):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
@@ -2432,6 +2432,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                             #          "links":[names],
                                             #          "company":1..200}
     host_company = [1]                      # the host's own company id
+    # The lobby's mode (2026-09-16): "coop" puts everyone in company 1; "companies"
+    # gives every player their own. It sets the chips automatically, on a change
+    # and for each joiner; a chip click still overrides one player.
+    mode = ["companies" if companies_mode else "coop"]
     cid_counter = [0]                       # host-authoritative chat id
     started = [False]
     start_save = [False]                    # save flag of the last broadcast start
@@ -2587,6 +2591,51 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             m[p["name"]] = int(p.get("company", 1))
         return m
 
+    def free_company(taken):
+        """the lowest company id nobody in `taken` uses"""
+        for cid in range(1, MAX_COMPANIES + 1):
+            if cid not in taken:
+                return cid
+        return MAX_COMPANIES
+
+    def assign_by_mode():
+        """coop: everyone on 1. companies: the host (relay: the leader) keeps 1,
+        the others get the lowest free id in join order."""
+        changed = False
+        if mode[0] == "coop":
+            if not relay_only and host_company[0] != 1:
+                host_company[0] = 1
+                changed = True
+            for p in peers.values():
+                if int(p.get("company", 1)) != 1:
+                    p["company"] = 1
+                    remember_chip(p["name"], 1)
+                    changed = True
+            return changed
+        taken = set() if relay_only else {1}
+        if not relay_only and host_company[0] != 1:
+            host_company[0] = 1
+            changed = True
+        seen = set()
+        for p in peers.values():                     # join order: the leader first on a relay
+            cid = int(p.get("company", 1))
+            if cid in taken or cid in seen:
+                cid = free_company(taken | seen)
+            if int(p.get("company", 1)) != cid:
+                p["company"] = cid
+                remember_chip(p["name"], cid)
+                changed = True
+            seen.add(cid)
+        return changed
+
+    def set_mode(value):
+        value = "companies" if value == "companies" else "coop"
+        if value == mode[0]:
+            return False
+        mode[0] = value
+        assign_by_mode()
+        return True
+
     def set_company(name, cid):
         try:
             cid = int(cid)
@@ -2631,7 +2680,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
                                  "profiles": profiles, "links": links,
-                                 "companies": companies, "stages": roster_stages()})
+                                 "companies": companies, "stages": roster_stages(),
+                                 "mode": mode[0]})
 
     def emit_roster():
         if publisher is not None:
@@ -2639,10 +2689,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         players = roster_players()
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
-                 "relay": relay_only, "companies": roster_companies(), "stages": roster_stages()})
+                 "relay": relay_only, "companies": roster_companies(), "stages": roster_stages(),
+                 "mode": mode[0]})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=leader_name(), started=started[0],
-                       lobby=lobby_name, companies=roster_companies())
+                       lobby=lobby_name, companies=roster_companies(), mode=mode[0])
 
     def roster_changed(broadcast=True):
         """Push the roster to peers, and emit an event only if it changed."""
@@ -2659,7 +2710,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago -- the next player continues it" if spath else ""))
         if broadcast:
             send_roster_packets()
-        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())))
+        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())), mode[0])
         if last_emitted_roster[0] != key:
             last_emitted_roster[0] = key
             emit_roster()
@@ -2776,10 +2827,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[host] rejected {addr} (lobby full)")
                 return
             assigned = _dedupe(name, all_names())
+            # coop: company 1. companies: a returning name gets its chip back when
+            # nobody took it, anyone else the lowest free id.
+            if mode[0] == "companies":
+                taken = set(roster_companies().values())
+                company = chips.get(assigned) if chips.get(assigned) not in taken else None
+                company = company or free_company(taken)
+            else:
+                company = 1
             peers[addr] = {"name": assigned, "last": time.time(),
                            "started": False, "profile": profile,
                            "links": [], "mesh": bool(is_mesh),
-                           "company": chips.get(assigned, 1)}   # a returning name gets its chip back
+                           "company": company}
+            remember_chip(assigned, company)
             late = started[0]
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))
@@ -2974,6 +3034,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     roster_changed()
                 elif not allowed:
                     log(f"[host] {peers[addr]['name']} tried to set {target}'s company -- only the leader may")
+        elif t == "mode":
+            # the lobby's mode: on a relay the leader sets it; a host sets it locally (below)
+            if addr in peers and relay_only and addr == leader_addr():
+                if set_mode(str(msg.get("mode", ""))):
+                    log(f"[host] mode -> {mode[0]} (set by the leader {peers[addr]['name']}); companies {roster_companies()}")
+                    roster_changed()
         elif t == "mesh_hi":
             pass                                    # names are host-assigned
         elif t == "log":
@@ -3193,6 +3259,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             target = str(cmd.get("player") or host_name)
             if set_company(target, cmd.get("id")):
                 log(f"[host] {target} -> company {cmd.get('id')} (set by host)")
+                roster_changed()
+        elif c == "mode":
+            if set_mode(str(cmd.get("mode", ""))):
+                log(f"[host] mode -> {mode[0]} (set by host); companies {roster_companies()}")
                 roster_changed()
         elif c == "publish":
             if publisher is not None:
@@ -3937,17 +4007,19 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             mesh_plan_dials()
             companies = m.get("companies", {}) or {}
             stages = m.get("stages") or {}
-            key = (tuple(players), tuple(sorted(companies.items())), tuple(sorted(stages.items())))
+            lobby_mode = m.get("mode") or "coop"
+            key = (tuple(players), tuple(sorted(companies.items())), tuple(sorted(stages.items())), lobby_mode)
             if key != last_roster[0]:
                 last_roster[0] = key
                 io.emit({"type": "roster", "players": players,
                          "you": assigned[0], "host": m.get("host"),
                          "lobby": m.get("lobby", ""), "companies": companies, "stages": stages,
                          "relay": is_relay[0], "letters": m.get("letters") or {},
-                         "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1)})
+                         "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1),
+                         "mode": lobby_mode})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
-                               started=started[0], lobby=m.get("lobby", ""), companies=companies)
+                               started=started[0], lobby=m.get("lobby", ""), companies=companies, mode=lobby_mode)
             # Start self-heal: the host's roster carries started:true for us
             # once we were included in a start -- catches a lost start burst.
             if m.get("started") is True:
@@ -4002,6 +4074,9 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             # someone else's chip; this used to be overwritten with our own
             # name, so the leader could only ever change its own (2026-09-10)
             send({"t": "company", "player": str(cmd.get("player") or assigned[0]), "id": cmd.get("id")})
+        elif c == "mode":
+            # the relay leader's SEPARATE COMPANIES checkbox; the relay accepts it from the leader only
+            send({"t": "mode", "mode": str(cmd.get("mode", ""))})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
             m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
@@ -4295,7 +4370,8 @@ def cmd_host(args):
                  forward_logs=args.forward_log or (), publisher=publisher,
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
                  punch_q=rendezvous.queue if rendezvous is not None else None,
-                 sync_runtime=make_runtime(args) if not args.relay_only else None)
+                 sync_runtime=make_runtime(args) if not args.relay_only else None,
+                 companies_mode=bool(args.companies))
     finally:
         _STOPPING[0] = True
         if rendezvous is not None:
@@ -5790,6 +5866,8 @@ def main(argv=None):
     ap.add_argument("--publish", default="",
                     help="master server base URL; the lobby is listed there while "
                          "public (see --public and the 'publish' command)")
+    ap.add_argument("--companies", action="store_true",
+                    help="start in separate-companies mode: every player gets their own company (default: co-op, one company)")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
     ap.add_argument("--rendezvous", default="",

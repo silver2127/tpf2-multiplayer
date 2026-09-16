@@ -62,8 +62,9 @@ int main()
     }
     assert(SlicePublishReady(dir.c_str(),true));
     for (bool join : {false, true}) {
-        request.join=join;
+        request.join=join; request.separateCompanies=true;
         assert(lobby::Start(request,&why));
+        assert(lobby::S().m.separateCompanies==!join && lobby::S().q.front().start.separateCompanies);
         assert(lobby::S().q.size()==1 && lobby::S().m.active && lobby::S().m.isHost==!join);
         assert(lobby::S().q.front().start.join==join);
         const auto queued=lobby::S().q.front();
@@ -141,6 +142,35 @@ int main()
     lobby::StageTick(); assert(lobby::S().stageSent=="catching up: fetching history (25 s behind)");
     Write(dir+"lockstep_status_"+letter+".txt", "stage=live\n");
     lobby::StageTick(); assert(!lobby::S().stageWatch && lobby::S().stageSent.empty());
+    // Company chip direction, authority, no-op and mode requests use the real queue.
+    model.players={"host", "joiner", "third"}; model.companies={1,1,3};
+    model.you="host"; model.host="host"; model.isHost=true; model.lobbyReady=true;
+    model.dead=false; model.active=true;
+    auto& queue=lobby::S().q;
+    auto chip = [&](int index, bool previous, int expected) {
+        queue.clear(); lobby::CycleCompany(index,previous);
+        assert(queue.size()==1 && queue.back().gen==model.gen);
+        assert(queue.back().line.find("\"id\":"+std::to_string(expected)+"}")!=std::string::npos);
+    };
+    chip(0,false,3); chip(2,false,4); chip(2,true,1); chip(0,true,3);
+    model.companies={1,1,1}; queue.clear(); lobby::CycleCompany(0,true); assert(queue.empty());
+    model.companies={1,1,200}; chip(2,false,1);
+    model.isHost=false; queue.clear(); lobby::CycleCompany(1,false); assert(queue.empty());
+    assert(!lobby::SetSeparateCompanies(true).empty() && queue.empty());
+    model.isHost=true;
+    lobby::SetSeparateCompanies(true); assert(queue.size()==1 && queue.back().line=="{\"cmd\":\"mode\",\"mode\":\"companies\"}");
+    queue.clear(); lobby::SetSeparateCompanies(false);
+    assert(queue.size()==1 && queue.back().line=="{\"cmd\":\"mode\",\"mode\":\"coop\"}");
+    queue.clear(); model.lobbyReady=false; lobby::SetSeparateCompanies(true); assert(queue.empty());
+    model.lobbyReady=true;
+    // Empty title-menu rosters avoid engine calls; mode must reach the view even alone.
+    lobby::g_titleMenu=true;
+    lobby::Json roster;
+    assert(lobby::ParseJson("{\"players\":[],\"mode\":\"companies\"}",&roster));
+    lobby::ApplyRoster(roster); lobby::Snapshot(&view); assert(view.separateCompanies);
+    assert(lobby::ParseJson("{\"players\":[],\"mode\":\"coop\"}",&roster));
+    lobby::ApplyRoster(roster); lobby::Snapshot(&view); assert(!view.separateCompanies);
+    lobby::g_titleMenu=false;
     // A world switch consumes its own transfer once, with a manual load in-game.
     model.players={"host","joiner"}; model.companies={1,2}; model.you="joiner";
     model.isHost=false; model.saveReady=true; allowPlace=true;

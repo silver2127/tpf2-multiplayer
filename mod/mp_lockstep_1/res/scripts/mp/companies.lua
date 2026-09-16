@@ -435,12 +435,46 @@ CM.cmPw = {}   -- cid -> hash, or nil when open
 -- Company names (2026-09-16): a name is company state, not player-entity
 -- state -- a switch swaps the entities between the human and the AI player,
 -- so a NAME component would follow the wrong company. CMNAME carries it,
--- every instance stores it here, the save keeps it. Unnamed: "Company N".
+-- every instance stores it here, the save keeps it. A player names their
+-- company in the game's own company window: the slice captures that SetName
+-- and inject.lua turns it into CMNAME (nothing of ours has a name field).
 CM.cmName = {}   -- cid -> name
-function CM.cmNameOf(cid)
-	local n = CM.cmName[cid]
-	if n and n ~= "" then return n end
+-- Player names: the menu DLL writes mp_players.txt ("a=alice" per line) from
+-- the lobby roster it assigns letters from. Read in both Lua states.
+if type(CM.playerNames) ~= "table" then CM.playerNames = {} end
+function CM.readPlayerNames()
+	local f = io.open(K.BASE .. "mp_players.txt", "r")
+	if not f then return end
+	local t = {}
+	for line in f:lines() do
+		local l, n = line:match("^(%a+)=(.+)$")
+		if l and n then t[l] = n:gsub("[%c]", "") end
+	end
+	f:close()
+	CM.playerNames = t
+end
+function CM.playerNameOf(letter)
+	return CM.playerNames[letter] or letter
+end
+-- An unnamed company is "<player>'s company" after its first player (the
+-- lowest letter, so every instance agrees), or "Company N" while nobody plays
+-- it or no player name is known. `given` is the registry name, `letters` the
+-- players: the GUI passes what the dash file says, the sim what it holds.
+function CM.cmDisplayName(cid, given, letters)
+	if given and given ~= "" then return given end
+	for _, l in ipairs(letters or {}) do
+		local n = CM.playerNames[l]
+		if n and n ~= "" and n ~= l then return n .. "'s company" end
+	end
 	return "Company " .. tostring(cid)
+end
+function CM.cmNameOf(cid)
+	if not CM.cmName[cid] then
+		if CM.playerNamesRead ~= true then CM.playerNamesRead = true; pcall(CM.readPlayerNames) end
+	end
+	local letters = {}
+	pcall(function() letters = CM.cmPlayersOf(cid) or {} end)   -- never let a name lookup throw
+	return CM.cmDisplayName(cid, CM.cmName[cid], letters)
 end
 -- The game's finances / company windows show the player ENTITY's NAME. Keep
 -- every company's entity named after the company, here on every instance

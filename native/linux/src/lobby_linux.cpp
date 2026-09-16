@@ -127,6 +127,7 @@ struct Model {
     bool saveReady = false;    // joiner: save_ready this session
     bool lobbyDone = false;    // the shared save is placed
     bool relay = false;
+    bool separateCompanies = false;
     bool haveCode = false;
     std::string code, you, host, title, modsPrompt;
     std::string xfer;          // xfer= for the in-game window
@@ -1271,6 +1272,7 @@ static void ApplyRoster(const Json& ev)
         m.stages.assign(m.players.size(), std::string());
         if (const Json* stages = ev.Get("stages"))
             for (size_t i = 0; i < m.players.size(); ++i) m.stages[i] = JStr(*stages, m.players[i].c_str());
+        if (ev.Get("mode")) m.separateCompanies = JStr(ev, "mode") == "companies";
         m.companies.assign(m.players.size(), 1);
         if (const Json* co = ev.Get("companies"))
             for (size_t i = 0; i < m.players.size(); i++) {
@@ -1780,6 +1782,7 @@ static void Launch(const Request& r)
     if (!a.password.empty()) argv.push_back("--password=" + a.password);
     if (!a.join) {
         argv.push_back("--lobby-name=" + a.lobbyName);
+        if (a.separateCompanies) argv.push_back("--companies");
         if (!S().cfg.masterUrl.empty()) {
             argv.push_back("--publish=" + S().cfg.masterUrl);
             if (a.pub) argv.push_back("--public");
@@ -2100,6 +2103,7 @@ bool Start(const StartRequest& in, std::string* why)
         fresh.gen = S().m.gen + 1;
         fresh.active = true;
         fresh.isHost = !r.join;
+        fresh.separateCompanies = !r.join && r.separateCompanies;
         S().m = fresh;
         gen = fresh.gen;
     }
@@ -2152,6 +2156,20 @@ std::string StartGame()
     return std::string();
 }
 
+std::string SetSeparateCompanies(bool on)
+{
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(S().mtx);
+        if (!S().m.active || !S().m.isHost) return "Only the host can change the company mode.";
+        if (S().m.dead) return kNotRunning;
+        if (!S().m.lobbyReady) return "Lobby is starting...";
+        gen = S().m.gen;
+    }
+    QueueLine(gen, on ? "{\"cmd\":\"mode\",\"mode\":\"companies\"}" : "{\"cmd\":\"mode\",\"mode\":\"coop\"}");
+    return on ? "Separate companies: every player gets their own company." : "Co-op: everyone plays company 1 together.";
+}
+
 std::string SetPublic(bool on)
 {
     uint64_t gen;
@@ -2181,7 +2199,7 @@ std::string AnswerMods(bool yes)
 }
 
 // The next company id somebody already uses, then one brand-new id, then back to 1.
-void CycleCompany(int i)
+void CycleCompany(int i, bool previous)
 {
     std::string name;
     int next = 0;
@@ -2189,15 +2207,23 @@ void CycleCompany(int i)
     {
         std::lock_guard<std::mutex> lk(S().mtx);
         const Model& m = S().m;
-        if (!m.active || i < 0 || i >= (int)m.players.size()) return;
+        if (!m.active || m.dead || !m.lobbyReady || i < 0 || i >= (int)m.players.size()) return;
+        if (!m.isHost && m.players[(size_t)i] != m.you) return;
         name = m.players[(size_t)i];
         const int cur = m.companies[(size_t)i];
         std::vector<bool> used((size_t)MAX_COMPANIES + 2, false);
         int maxUsed = 0;
         for (int c2 : m.companies)
             if (c2 >= 1 && c2 <= MAX_COMPANIES) { used[(size_t)c2] = true; if (c2 > maxUsed) maxUsed = c2; }
-        for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[(size_t)c2]) { next = c2; break; }
-        if (!next) next = (cur <= maxUsed && maxUsed < MAX_COMPANIES) ? maxUsed + 1 : 1;
+        if (previous) {
+            for (int c2 = cur - 1; c2 >= 1; c2--) if (used[(size_t)c2]) { next = c2; break; }
+            if (!next) next = maxUsed;
+            if (next == cur) return;
+        } else {
+            for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[(size_t)c2]) { next = c2; break; }
+            if (!next) next = (cur <= maxUsed && maxUsed < MAX_COMPANIES) ? maxUsed + 1 : 1;
+        }
+        if (next < 1) next = 1;
         gen = m.gen;
     }
     if (name.empty()) return;
@@ -2226,6 +2252,7 @@ void Snapshot(View* v)
 {
     std::lock_guard<std::mutex> lk(S().mtx);
     const Model& m = S().m;
+    v->separateCompanies = m.separateCompanies;
     v->haveCode = m.haveCode;
     v->isHost = m.isHost;
     v->youAreHost = !m.you.empty() && m.you == m.host;
