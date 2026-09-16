@@ -175,43 +175,18 @@ local function stampOnPark(t, k, v)
 	end
 	rawset(t, k, v)
 end
-CM.pendingRoadc = setmetatable({}, { __newindex = stampOnPark })   -- { at, posOf, adds, rms, spos, etype, stype, ttype, cat, ord, tick }
-CM.pendingCons  = setmetatable({}, { __newindex = stampOnPark })   -- { at, file, t, params, x, y, id?, cancelled?, survivors?, srad?, ord, tick }
+CM.pendingRoadc = setmetatable({}, { __newindex = stampOnPark })   -- { at, posOf, adds, rms, spos, etype, stype, ttype, cat, ps?, ord, tick }
+CM.pendingCons  = setmetatable({}, { __newindex = stampOnPark })   -- { at, file, t, params, x, y, id?, cancelled?, ps?, hadRoadc?, survivors?, srad?, ord, tick }
+-- Placement serials whose CONXP inject.lua dropped whole (actions off, far
+-- behind): the ROADC of that serial is released instead of hunted for.
+CM.droppedConxp = CM.droppedConxp or {}
 
 -- Horizontal only, same reasoning as node matching: the engine settles z.
 function CM.conKey(x, y) return string.format("%.1f/%.1f", x, y) end
 
-local function execConP(c)
-	if c.origin == K.INSTANCE then
-		log(string.format("CONP seq=%d: originator already built it locally, skipping", c.seq))
-		return
-	end
-	local ok, err = pcall(function()
-		local t = {}
-		for tok in tostring(c.t or ""):gmatch("[^,]+") do t[#t + 1] = tonumber(tok) end
-		if #t ~= 16 then log("CONP: bad transf, " .. #t .. " numbers"); return end
-		local params = CM.deserParams(c.params) or {}
-		-- A used seed drives errorState critical, which is a fatal assert rather
-		-- than a rejected build. Strip it; the engine assigns a fresh one.
-		params.seed = nil
-		local key = CM.conKey(t[13], t[14])
-		CM.expectedCons[key] = true
-		if c.company and CM.cmMode == "companies" then CM.cmExpectedCompany[key] = tonumber(c.company); CM.cmEnsure(); CM.cmExpectedBal0[key] = CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany])
-			CM.cmLog(string.format("CM: CONP bal0 snapshot key=%s mePid=%s bal0=%s", key, tostring(CM.cmCompanyPid[CM.cmMyCompany]), tostring(CM.cmExpectedBal0[key]))) end
-		local built, newId = pcall(game.interface.buildConstruction, c.file, params, t)
-		if built and newId then
-			-- buildConstruction takes no player, so the result is unowned and the
-			-- UI will not let you click it. setPlayer fixes that (mp_bridge).
-			pcall(function() game.interface.setPlayer(newId, api.engine.util.getPlayer()) end)
-		else
-			CM.expectedCons[key] = nil
-		end
-		log(string.format("EXEC CONP seq=%s origin=%s at=%s file=%s ok=%s id=%s",
-			tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.file),
-			tostring(built and newId ~= nil), tostring(newId)))
-	end)
-	if not ok then log("execConP error: " .. tostring(err)) end
-end
+-- CONP and CONX are both executed by CM.execConX (conx.lua; lockstep.lua's
+-- dispatcher routes them there). The old execConP that lived here was dead code
+-- and still applied unreadable params as {} -- removed 2026-09-16.
 
 -- ---------- station EDITS ----------
 --
@@ -1052,7 +1027,11 @@ function CM.gatherSurvivors(cx, cy, selfId, pts)
 	local radius, from = CM.survivorRadius(cx, cy, selfId, pts)
 	local ok, err = pcall(function()
 		local near = game.interface.getEntities({ pos = { cx, cy }, radius = radius },
-			{ type = "CONSTRUCTION", includeData = false }) or {}
+			{ type = "CONSTRUCTION", includeData = false })
+		-- nil is NOT an empty list: with srad on the wire an empty list tells the
+		-- peer to level every unlisted town building in the disk, so a query that
+		-- returned nothing at all is a failed gather (no list, no radius, loud)
+		if near == nil then error("getEntities(CONSTRUCTION) returned nil") end
 		for _, sid in pairs(near) do
 			if sid ~= selfId then
 				local cco = api.engine.getComponent(sid, api.type.ComponentType.CONSTRUCTION)
@@ -1061,7 +1040,8 @@ function CM.gatherSurvivors(cx, cy, selfId, pts)
 			end
 		end
 		local assets = game.interface.getEntities({ pos = { cx, cy }, radius = radius },
-			{ type = "ASSET_GROUP", includeData = false }) or {}
+			{ type = "ASSET_GROUP", includeData = false })
+		if assets == nil then error("getEntities(ASSET_GROUP) returned nil") end
 		for _, sid in pairs(assets) do
 			local okE, e = pcall(game.interface.getEntity, sid)
 			local px = okE and e and e.position and (e.position[1] or e.position.x)
@@ -1128,8 +1108,12 @@ local function frozenNodePositions(id)
 		if not api.engine.entityExists(id) then return end
 		local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
 		if not co then return end
+		-- copy the engine's id list first: the walk below calls back into the
+		-- engine per node, and an engine container is never iterated inline
+		local frozen = {}
+		for _, nid in pairs(co.frozenNodes or {}) do frozen[#frozen + 1] = nid end
 		out = {}
-		for _, nid in pairs(co.frozenNodes or {}) do
+		for _, nid in ipairs(frozen) do
 			local nc = api.engine.getComponent(nid, api.type.ComponentType.BASE_NODE)
 			local p = nc and nc.position
 			if p then out[#out + 1] = { p.x or p[1], p.y or p[2] } end
@@ -1293,20 +1277,24 @@ end
 -- and the peers built it without its street. Now:
 --   * a NATIVE build (the record carries its entity id): the payload's nodes ARE
 --     the entity's frozen nodes, at the same world positions (roadcSharesNodes);
---   * a CANCELLED placement (CONXP, no entity): the slice writes the CONXP from
---     the CommandList::Add call of the very placement whose factory hook wrote
---     the ROADC, so its payload is the record parked right before it -- no other
---     CONXP between the two and at most one poll apart (a read of the inject file
---     can straddle the two writes). A ROADC parked earlier than that belongs to a
---     build whose cancel did not land; its native entity claims it by the first
---     rule once the catch-up scan captures it.
+--   * a CANCELLED placement (CONXP, no entity): the slice stamps ONE placement
+--     serial on the ROADC (ps=) and on the CONXP (ps= rc=) of the same
+--     placement, so the payload is the parked record with that serial -- however
+--     many polls, stalls or other placements lie between the two reads. rc=1 says
+--     a ROADC was written for it: if none with that serial is parked the line was
+--     unreadable or lost, and the placement is REFUSED loudly rather than built
+--     on every instance without its street; rc=0 is a free-standing placement,
+--     which ships as CONP at once. A record with no serial (a slice older than
+--     2026-09-16) falls back to arrival order: the ROADC parked right before it,
+--     at most one poll apart.
 -- The ROADC always precedes its construction in the inject stream (factory hook
--- first, then the cancel or the build), so a construction with no partner at
--- flush time will never get one: it ships as CONP at once, saying why. A payload
--- no construction claims is retried against the world (findConstructionForRoadc,
--- the id-reuse case) and, after K.ROADC_ORPHAN_UNITS, searched for once more over
--- the whole map before it is declared a DIVERGENCE in the log -- never dropped
--- in silence.
+-- first, then the cancel or the build). A payload no construction claims is
+-- retried against the world (findConstructionForRoadc, the id-reuse case) and,
+-- after K.ROADC_ORPHAN_UNITS, searched for once more over the whole map before it
+-- is declared a DIVERGENCE in the log -- never dropped in silence. One payload
+-- IS released without a search: the one whose CONXP inject.lua dropped whole
+-- (actions off, far behind: the cancel landed, so that placement happened on no
+-- game and there is nothing to pair or to diverge from).
 K.ROADC_ORPHAN_UNITS = 15
 K.ROADC_RESCUE_EVERY = 5     -- ticks between local rescue searches for an unclaimed payload
 function CM.flushConPairs()
@@ -1314,7 +1302,7 @@ function CM.flushConPairs()
 	if not now then return end
 	for ci = #CM.pendingCons, 1, -1 do
 		local cn = CM.pendingCons[ci]
-		local best, why
+		local best, why, refuse
 		if cn.id then
 			local fpos = frozenNodePositions(cn.id)
 			local bestN = 0
@@ -1328,9 +1316,23 @@ function CM.flushConPairs()
 				why = string.format("%s frozen node(s) on entity %d, %d payload(s) parked, none shares a node",
 					fpos and tostring(#fpos) or "unreadable", cn.id, #CM.pendingRoadc)
 			end
+		elseif tonumber(cn.cancelled or 0) == 1 and cn.ps then
+			-- IDENTITY: the same placement serial on both records
+			for ri, rc in ipairs(CM.pendingRoadc) do
+				if rc.ps == cn.ps then best = ri; break end
+			end
+			if best then
+				why = string.format("same placement serial ps=%d", cn.ps)
+			elseif tonumber(cn.hadRoadc or 0) == 1 then
+				refuse = string.format("the slice shipped a street payload for ps=%d and none is parked (%d parked) -- look for 'bad ROADC line' above",
+					cn.ps, #CM.pendingRoadc)
+			else
+				why = string.format("free-standing, the slice shipped no street payload (ps=%d rc=0)", cn.ps)
+			end
 		elseif tonumber(cn.cancelled or 0) == 1 then
-			-- the ROADC parked right before this CONXP: the newest one older than
-			-- it, unless a CONXP already sits between the two
+			-- no serial on the record (a slice older than 2026-09-16): the ROADC
+			-- parked right before this CONXP -- the newest one older than it,
+			-- unless a CONXP already sits between the two
 			local prevOrd = 0
 			for _, o in ipairs(CM.pendingCons) do
 				if o ~= cn and tonumber(o.cancelled or 0) == 1 and (o.ord or 0) < (cn.ord or 0) and (o.ord or 0) > prevOrd then
@@ -1356,7 +1358,13 @@ function CM.flushConPairs()
 			why = "record has neither an entity id nor cancelled=1"
 		end
 		table.remove(CM.pendingCons, ci)
-		if best then
+		if refuse then
+			-- Nothing is shipped: the cancel landed here, so the placement happened
+			-- on no game. Shipping the construction alone would build it on every
+			-- instance WITHOUT its street, which is worse than a lost click.
+			log(string.format("CONXP: REFUSED -- %s at (%.1f,%.1f) is NOT built anywhere: %s; place it again",
+				cn.file, cn.x or 0, cn.y or 0, refuse))
+		elseif best then
 			local rc = table.remove(CM.pendingRoadc, best)
 			log(string.format("con: %s paired with its street payload: %s", cn.file, why))
 			shipConxPair(cn, rc)
@@ -1377,7 +1385,13 @@ function CM.flushConPairs()
 	for ri = #CM.pendingRoadc, 1, -1 do
 		local rc = CM.pendingRoadc[ri]
 		local age = now - rc.at
-		if age > K.ROADC_ORPHAN_UNITS then
+		if rc.ps and CM.droppedConxp[rc.ps] then
+			-- its placement was dropped whole (actions off): the cancel landed, so
+			-- it happened on no game -- nothing to pair with, nothing to diverge from
+			CM.droppedConxp[rc.ps] = nil
+			table.remove(CM.pendingRoadc, ri)
+			log(string.format("ROADC: released -- its placement ps=%d was dropped (actions off, far behind), so it was built on no game", rc.ps))
+		elseif age > K.ROADC_ORPHAN_UNITS then
 			-- Last chance, once, over the whole map: the id-reuse case where the
 			-- entity's origin sits outside the local search disk.
 			table.remove(CM.pendingRoadc, ri)

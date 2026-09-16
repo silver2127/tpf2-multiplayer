@@ -225,13 +225,22 @@ static volatile LONG g_pendingIsConx = 0;
 static volatile LONG g_pendingIsConu = 0;
 static int32_t       g_conupOldId    = 0;
 static bool StashConupFromProposal(uint64_t r8);   // defined with the CONUP writer below
-static char  g_conxpFile[512];
+static std::string g_conxpFile;
 static float g_conxpT[16];
-// 64 KB: a modular station with a dozen modules is ~9 KB of params, and at
-// 8 KB the walk truncated, the upgrade ran natively on the host only, and the
-// peer rebuilt the station from a coalesced full-params edit -- 4 edges, the
-// track heights and the price differed (desync 2026-09-16).
-static char  g_conxpParams[65536];
+// The params literal grows with the walk: no size of ours. A 64 KB buffer here
+// used to end the walk (a modular station with a dozen modules is ~9 KB; at
+// 8 KB the upgrade ran natively on the host only and the peer rebuilt the
+// station from a coalesced full-params edit -- 4 edges, the track heights and
+// the price differed, desync 2026-09-16), and a bigger buffer would only have
+// moved that boundary.
+static std::string g_conxpParams;
+// Placement serial: one counter per process, stamped on a placement's ROADC
+// (ps=) and on its CONXP (ps= rc=), so the Lua pairs the two by IDENTITY and
+// not by which record happened to be read before which (cons.lua
+// CM.flushConPairs). g_conxpSerial / g_conxpHadRoadc ride with the stash.
+static long g_placeSerial = 0;
+static long g_conxpSerial = 0;
+static int  g_conxpHadRoadc = 0;
 // Stop/signal/waypoint cancel. Decoded off the proposal's
 // edgeObjectsToAdd record at the factory, written as STOPX from the Add hook
 // only once the cancel landed (else dropped: the poll captures the native
@@ -564,18 +573,35 @@ struct Node { float x, y, z; int32_t id; };
 // embankment ("game infers landscape instead of a bridge", 2026-08-29).
 struct Edge { int32_t node0, node1; float t0[3], t1[3]; int32_t btype, bidx; };
 
-static int DecodeEdges(uint64_t a2, Edge* out, int maxOut)
+// The decoders take the engine's vector in FULL: no count of ours. Until
+// 2026-09-16 each caller passed a fixed array and the decoder clipped to it in
+// silence (64 nodes / 64 edges / 64 removals for a construction's street, 256 /
+// 512 for a road), so a bigger placement shipped a partial street and the
+// peers welded a partial replica. The one guard left is against a MISREAD
+// vector: a span that is not a whole number of records, or one beyond
+// DECODE_SANITY_SPAN (256 MB, some two million segments -- no proposal has
+// that); tripping it says so with the span, and decodes nothing, so the
+// build is never cancelled on it.
+static const uint64_t DECODE_SANITY_SPAN = 1ULL << 28;
+static int DecodeEdges(uint64_t a2, std::vector<Edge>* outv)
 {
+    outv->clear();
     if (!Readable((void*)(a2 + 0x18), 16)) return 0;
     uint64_t begin = 0, end = 0;
     memcpy(&begin, (void*)(a2 + 0x18), 8);
     memcpy(&end, (void*)(a2 + 0x20), 8);
     if (begin < 0x10000 || end <= begin) return 0;
     uint64_t span = end - begin;
-    if (span % 120 != 0 || span > 0x20000) return 0;
+    if (span % 120 != 0) return 0;
+    if (span > DECODE_SANITY_SPAN) {
+        Log("[slice] edge vector at %llx spans %llu bytes -- a misread, not decoded\n",
+            (unsigned long long)a2, (unsigned long long)span);
+        return 0;
+    }
     int n = (int)(span / 120);
-    if (n > maxOut) n = maxOut;
     if (!Readable((void*)begin, (size_t)span)) return 0;
+    outv->resize((size_t)n);
+    Edge* out = outv->data();
     const uint8_t* b = (const uint8_t*)begin;
     for (int i = 0; i < n; i++) {
         memcpy(&out[i].node0, b + i * 120 + 0x08, 4);
@@ -588,18 +614,25 @@ static int DecodeEdges(uint64_t a2, Edge* out, int maxOut)
     return n;
 }
 
-static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
+static int DecodeNodes(uint64_t a2, std::vector<Node>* outv)
 {
+    outv->clear();
     if (!Readable((void*)a2, 16)) return 0;
     uint64_t begin = 0, end = 0;
     memcpy(&begin, (void*)a2, 8);
     memcpy(&end, (void*)(a2 + 8), 8);
     if (begin < 0x10000 || end <= begin) return 0;
     uint64_t span = end - begin;
-    if (span % 24 != 0 || span > 0x20000) return 0;
+    if (span % 24 != 0) return 0;
+    if (span > DECODE_SANITY_SPAN) {
+        Log("[slice] node vector at %llx spans %llu bytes -- a misread, not decoded\n",
+            (unsigned long long)a2, (unsigned long long)span);
+        return 0;
+    }
     int n = (int)(span / 24);
-    if (n > maxOut) n = maxOut;
     if (!Readable((void*)begin, (size_t)span)) return 0;
+    outv->resize((size_t)n);
+    Node* out = outv->data();
     const uint8_t* b = (const uint8_t*)begin;
     for (int i = 0; i < n; i++) {
         memcpy(&out[i].x,  b + i * 24 + 0x00, 4);
@@ -869,9 +902,12 @@ static bool WriteBulldozeInject(uint64_t nb, int rn, uint64_t eb, int re)
 // never needed for that classification.
 //   ROADC <n> <etype> <stype> <ttype> <cat> <m> <re>
 //         n x (id x y z)   m x (a1 a2 t0 t1)   re x (a1 a2 t0 t1)
+//         m x (btype bidx)   ps=<placement serial>
+// ps= is the same serial the placement's CONXP carries: the Lua pairs the two
+// by it (cons.lua CM.flushConPairs), never by arrival order or distance.
 static long g_conroad = 0;
 static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int m,
-                               const Edge* rme, int re, const EdgeType& et)
+                               const Edge* rme, int re, const EdgeType& et, long ps)
 {
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
@@ -895,7 +931,7 @@ static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int 
                 rme[i].t1[0], rme[i].t1[1], rme[i].t1[2]);
     // Bridge/tunnel tail (see WriteInject): <type idx> per ADDED edge.
     for (int i = 0; i < m; i++) fprintf(f, " %d %d", edges[i].btype, edges[i].bidx);
-    fprintf(f, "\n");
+    fprintf(f, " ps=%ld\n", ps);
     fclose(f);
 }
 
@@ -2055,26 +2091,44 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
 //   4 = nested map @0. Recursive, so a station's modules map is just a tag-4
 //   value and one walker covers every construction.
 // Emitted as the text lockstep.lua ser() makes (lockstep.lua:2684): [k]=v pairs,
-// %.14g numbers (Lua tostring: "1" not "1.0"), %q strings, nested {}, depth cap
-// 8. In-order tree traversal is ser()'s own order (the map compares tag then
-// value: numbers before strings, each ascending) -- and byte-equality is not
-// load-bearing anyway: the peer only load()s the string (deserParams), and the
-// edit tracker re-derives its baseline locally from the built entity (8220).
-// Tags not yet observed (bool/nil) are logged RAW and omitted, exactly as ser()
-// omits what it cannot serialise; the live dump names them.
-static const int CONXP_MAX_DEPTH = 8;      // == K.MAX_SER_DEPTH
-static const int CONXP_MAX_NODES = 2048;   // whole-tree cap, all levels
+// %.14g numbers (Lua tostring: "1" not "1.0"), %q strings, nested {}. In-order
+// tree traversal is ser()'s own order (the map compares tag then value: numbers
+// before strings, each ascending) -- and byte-equality is not load-bearing
+// anyway: the peer only load()s the string (deserParams), and the edit tracker
+// re-derives its baseline locally from the built entity (8220). Tags not yet
+// observed (nil) are logged RAW and omitted, exactly as ser() omits what it
+// cannot serialise; the live dump names them.
+//
+// NO DEPTH AND NO ENTRY COUNT OF OURS. A lua::Table nests by VALUE (a tag-4
+// Variant holds its map inline), so a real params tree has no cycle and is
+// walked to the bottom however deep a modded module nests it. Until 2026-09-16
+// depth 8 emitted a silent "{}" and 2048 entries stopped the walk -- neither
+// marked the literal, so every instance, the originator included, built from
+// hollowed params and the peer could not tell. The guards left are against a
+// MISREAD pointer only: a map that is its own ancestor, an entry the tree links
+// to that is not readable, or a tree past CONXP_SANITY_NODES entries (16 M --
+// a literal of hundreds of MB; no construction has one). Each FAILS the walk
+// loudly: nothing is shipped, the build runs natively and a NATIVE notice sends
+// the peers to their catch-up scan. Never a hollow literal.
+static const uint64_t CONXP_SANITY_NODES = 1ULL << 24;
+// A std::string claiming more than this is a misread length, not a value.
+static const uint64_t SSO_SANITY_LEN = 1ULL << 28;
 
 // MSVC std::string (len @+0x10, cap @+0x18, chars inline iff cap < 16 else heap
-// ptr @+0x00) -> out. False on anything unreadable or absurd.
-static bool ReadSsoString(uint64_t sa, char* out, size_t cap)
+// ptr @+0x00) -> out, in full. False on anything unreadable or absurd.
+static bool ReadSsoStr(uint64_t sa, std::string* out)
 {
-    out[0] = 0;
+    out->clear();
     if (!Readable((void*)sa, 0x20)) return false;
     uint64_t len = 0, scap = 0;
     memcpy(&len, (void*)(sa + 0x10), 8);
     memcpy(&scap, (void*)(sa + 0x18), 8);
-    if (len > 4096 || scap < len) return false;
+    if (scap < len) return false;
+    if (len > SSO_SANITY_LEN) {
+        Log("[slice] std::string at %llx claims %llu chars -- a misread, not read\n",
+            (unsigned long long)sa, (unsigned long long)len);
+        return false;
+    }
     const char* chars = nullptr;
     if (scap < 16) chars = (const char*)sa;
     else {
@@ -2083,32 +2137,45 @@ static bool ReadSsoString(uint64_t sa, char* out, size_t cap)
         if (IsHeapPtr(hp) && Readable((void*)hp, (size_t)len)) chars = (const char*)hp;
     }
     if (!chars) return false;
-    size_t take = (size_t)len < cap - 1 ? (size_t)len : cap - 1;
-    memcpy(out, chars, take);
+    out->assign(chars, (size_t)len);
+    return true;
+}
+// The fixed-field form, for records whose Lua reader takes one token (a stop's
+// name, a model path). A string that does not fit says so in the log instead
+// of being clipped in silence.
+static bool ReadSsoString(uint64_t sa, char* out, size_t cap)
+{
+    std::string s;
+    out[0] = 0;
+    if (!ReadSsoStr(sa, &s)) return false;
+    if (s.size() >= cap)
+        Log("[slice] a %zu-char string was clipped to %zu for a fixed field -- report this line\n",
+            s.size(), cap - 1);
+    size_t take = s.size() < cap - 1 ? s.size() : cap - 1;
+    memcpy(out, s.data(), take);
     out[take] = 0;
     return true;
 }
 
-struct ConxpOut { char* p; size_t cap; size_t n; bool trunc; };
-static void CoPut(ConxpOut* o, const char* t)
-{
-    size_t l = strlen(t);
-    if (o->n + l + 1 >= o->cap) { o->trunc = true; return; }
-    memcpy(o->p + o->n, t, l); o->n += l; o->p[o->n] = 0;
-}
+// The literal under construction. `failed` is set by a sanity guard tripping
+// somewhere below the current entry: the whole walk is then abandoned.
+struct ConxpOut { std::string* s; bool failed; };
+static void CoPut(ConxpOut* o, const char* t) { o->s->append(t); }
 // Lua %q: double-quoted, " \ and control characters escaped so load() takes it back.
-static void CoPutQ(ConxpOut* o, const char* t)
+static void CoPutQ(ConxpOut* o, const std::string& t)
 {
-    CoPut(o, "\"");
+    std::string& s = *o->s;
+    s.push_back('"');
     char tmp[8];
-    for (const unsigned char* c = (const unsigned char*)t; *c; c++) {
-        if (*c == '"' || *c == '\\') { tmp[0] = '\\'; tmp[1] = (char)*c; tmp[2] = 0; CoPut(o, tmp); }
-        else if (*c == '\n') CoPut(o, "\\n");
-        else if (*c == '\r') CoPut(o, "\\r");
-        else if (*c < 32 || *c == 127) { snprintf(tmp, sizeof(tmp), "\\%03u", (unsigned)*c); CoPut(o, tmp); }
-        else { tmp[0] = (char)*c; tmp[1] = 0; CoPut(o, tmp); }
+    for (size_t i = 0; i < t.size(); i++) {
+        const unsigned char c = (unsigned char)t[i];
+        if (c == '"' || c == '\\') { s.push_back('\\'); s.push_back((char)c); }
+        else if (c == '\n') s.append("\\n");
+        else if (c == '\r') s.append("\\r");
+        else if (c < 32 || c == 127) { snprintf(tmp, sizeof(tmp), "\\%03u", (unsigned)c); s.append(tmp); }
+        else s.push_back((char)c);
     }
-    CoPut(o, "\"");
+    s.push_back('"');
 }
 static void CoPutNum(ConxpOut* o, double d)
 {
@@ -2117,34 +2184,53 @@ static void CoPutNum(ConxpOut* o, double d)
     CoPut(o, tmp);
 }
 
-static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes);
+static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, uint64_t* nodes, std::vector<uint64_t>* path);
+
+static bool ConxpFail(ConxpOut* o, const char* what, uint64_t at, int depth, uint64_t nodes)
+{
+    o->failed = true;
+    Log("[conxp] params walk FAILED at depth %d after %llu entries: %s (%llx) -- a misread "
+        "pointer, not a params tree; nothing is shipped\n", depth, (unsigned long long)nodes, what,
+        (unsigned long long)at);
+    return false;
+}
 
 // One lua::Table (an MSVC _Tree), walked in order and emitted as a Lua literal.
-static bool SerLuaTable(ConxpOut* o, uint64_t map, int depth, int* nodes)
+// `path` holds the maps above this one: a map met again on its own path is the
+// cycle guard (the analogue of cons.lua CM.ser's visited set).
+static bool SerLuaTable(ConxpOut* o, uint64_t map, int depth, uint64_t* nodes, std::vector<uint64_t>* path)
 {
-    if (depth >= CONXP_MAX_DEPTH) { CoPut(o, "{}"); return true; }
     if (!Readable((void*)map, 0x10)) return false;
+    for (size_t i = 0; i < path->size(); i++)
+        if ((*path)[i] == map) return ConxpFail(o, "a table that is its own ancestor", map, depth, *nodes);
     uint64_t head = 0, size = 0;
     memcpy(&head, (void*)map, 8);
     memcpy(&size, (void*)(map + 8), 8);
-    if (!IsHeapPtr(head) || size > (uint64_t)CONXP_MAX_NODES || !Readable((void*)head, 0x70)) return false;
+    if (!IsHeapPtr(head) || !Readable((void*)head, 0x70)) return false;
+    if (size > CONXP_SANITY_NODES) return ConxpFail(o, "a map claiming more entries than any params tree", map, depth, size);
+    path->push_back(map);
     CoPut(o, "{");
     bool first = true;
     uint64_t node = 0;
     memcpy(&node, (void*)head, 8);                      // _Myhead->_Left = begin()
-    while (node && node != head && *nodes < CONXP_MAX_NODES) {
-        if (!Readable((void*)node, 0x70)) break;
-        (*nodes)++;
+    while (node && node != head) {
+        if (!Readable((void*)node, 0x70)) { path->pop_back(); return ConxpFail(o, "an entry the tree links to is unreadable", node, depth, *nodes); }
+        if (++(*nodes) > CONXP_SANITY_NODES) { path->pop_back(); return ConxpFail(o, "more entries than any params tree", node, depth, *nodes); }
         uint8_t ktag = *(const uint8_t*)(node + 0x40);
-        size_t mark = o->n;
+        size_t mark = o->s->size();
         bool ok = false;
         if (!first) CoPut(o, ",");
         CoPut(o, "[");
         if (ktag == 2) { double k = 0; memcpy(&k, (void*)(node + 0x20), 8); CoPutNum(o, k); ok = true; }
-        else if (ktag == 3) { char ks[256]; if (ReadSsoString(node + 0x20, ks, sizeof(ks))) { CoPutQ(o, ks); ok = true; } }
+        else if (ktag == 3) {
+            std::string ks;
+            if (ReadSsoStr(node + 0x20, &ks)) { CoPutQ(o, ks); ok = true; }
+            else { path->pop_back(); return ConxpFail(o, "a string key that cannot be read", node + 0x20, depth, *nodes); }
+        }
         else Log("[conxp]   key tag %u unknown (depth %d) -- entry skipped\n", (unsigned)ktag, depth);
-        if (ok) { CoPut(o, "]="); ok = SerLuaValue(o, node + 0x48, depth + 1, nodes); }
-        if (ok) first = false; else { o->n = mark; o->p[o->n] = 0; }
+        if (ok) { CoPut(o, "]="); ok = SerLuaValue(o, node + 0x48, depth + 1, nodes, path); }
+        if (o->failed) { path->pop_back(); return false; }
+        if (ok) first = false; else o->s->resize(mark);
         // in-order successor (MSVC _Tree): leftmost of the right subtree, else
         // climb while we are our parent's right child; the sentinel ends it.
         uint64_t nx = 0;
@@ -2174,12 +2260,13 @@ static bool SerLuaTable(ConxpOut* o, uint64_t map, int depth, int* nodes)
         }
     }
     CoPut(o, "}");
+    path->pop_back();
     return true;
 }
 
-static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes)
+static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, uint64_t* nodes, std::vector<uint64_t>* path)
 {
-    if (!Readable((void*)var, 0x28)) return false;
+    if (!Readable((void*)var, 0x28)) return ConxpFail(o, "a value slot that cannot be read", var, depth, *nodes);
     uint8_t tag = *(const uint8_t*)(var + 0x20);
     // tag 1 = boolean, value in payload byte 0 (Lua type order: nil, boolean,
     // number, string, table). A modular station carries ~20 of these in its
@@ -2188,8 +2275,14 @@ static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes)
     // construction cancel).
     if (tag == 1) { uint8_t b = 0; memcpy(&b, (void*)var, 1); CoPut(o, b ? "true" : "false"); return true; }
     if (tag == 2) { double d = 0; memcpy(&d, (void*)var, 8); CoPutNum(o, d); return true; }
-    if (tag == 3) { char t[1024]; if (!ReadSsoString(var, t, sizeof(t))) return false; CoPutQ(o, t); return true; }
-    if (tag == 4) return SerLuaTable(o, var, depth, nodes);
+    if (tag == 3) {
+        // In full: a value used to be clipped to 1023 chars in silence.
+        std::string t;
+        if (!ReadSsoStr(var, &t)) return ConxpFail(o, "a string value that cannot be read", var, depth, *nodes);
+        CoPutQ(o, t);
+        return true;
+    }
+    if (tag == 4) return SerLuaTable(o, var, depth, nodes, path);
     uint64_t q0 = 0;
     memcpy(&q0, (void*)var, 8);
     Log("[conxp]   value tag %u unknown (depth %d) payload0=%016llx -- omitted\n",
@@ -2202,25 +2295,29 @@ static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes)
 // and today's capture path takes over): never cancel on data we cannot replay.
 static bool StashConxpFromProposal(uint64_t r8)
 {
-    g_conxpFile[0] = 0; g_conxpParams[0] = 0;
+    g_conxpFile.clear(); g_conxpParams.clear();
     if (!Readable((void*)(r8 + 0x1f8), 16)) return false;
     uint64_t cb = 0, ce = 0;
     memcpy(&cb, (void*)(r8 + 0x1f8), 8);
     memcpy(&ce, (void*)(r8 + 0x200), 8);
     if (!IsHeapPtr(cb) || ce < cb + 0x8e0 || !Readable((void*)cb, 0x8e0)) return false;
-    if (!ReadSsoString(cb, g_conxpFile, sizeof(g_conxpFile)) || !g_conxpFile[0]) return false;
+    if (!ReadSsoStr(cb, &g_conxpFile) || g_conxpFile.empty()) return false;
     memcpy(g_conxpT, (void*)(cb + 0x728), sizeof(g_conxpT));
-    ConxpOut o = { g_conxpParams, sizeof(g_conxpParams), 0, false };
-    int nodes = 0;
-    bool ok = SerLuaTable(&o, cb + 0x460, 0, &nodes);
-    if (!ok || o.trunc || nodes == 0) {
-        Log("[conxp] params walk %s (nodes=%d) -- not shipped\n",
-            !ok ? "failed" : (o.trunc ? "truncated" : "found no entries"), nodes);
-        g_conxpParams[0] = 0;
+    ConxpOut o = { &g_conxpParams, false };
+    uint64_t nodes = 0;
+    std::vector<uint64_t> path;
+    bool ok = SerLuaTable(&o, cb + 0x460, 0, &nodes, &path);
+    if (!ok || o.failed || nodes == 0) {
+        Log("[conxp] params walk %s (%llu entries, %zu bytes) -- NOT shipped: the build runs "
+            "natively and the peers catch up from the NATIVE notice\n",
+            o.failed ? "hit a sanity guard (above)" : (!ok ? "failed" : "found no entries"),
+            (unsigned long long)nodes, g_conxpParams.size());
+        g_conxpParams.clear();
         return false;
     }
-    Log("[conxp] %s pos=(%.1f,%.1f,%.1f) params(%d node(s))=%s\n", g_conxpFile,
-        g_conxpT[12], g_conxpT[13], g_conxpT[14], nodes, g_conxpParams);
+    Log("[conxp] %s pos=(%.1f,%.1f,%.1f) params(%llu entries, %zu bytes)=%.600s%s\n", g_conxpFile.c_str(),
+        g_conxpT[12], g_conxpT[13], g_conxpT[14], (unsigned long long)nodes, g_conxpParams.size(),
+        g_conxpParams.c_str(), g_conxpParams.size() > 600 ? "..." : "");
     // PROBE (2026-09-08): does a construction placement carry the footprint
     // buildings the engine is about to demolish, in the proposal's toRemove
     // vector<int> at r8+0x1e0? If it does, the cancel flow can ship that exact
@@ -2248,23 +2345,26 @@ static bool StashConxpFromProposal(uint64_t r8)
     return true;
 }
 
-// CONXP <file> t=<16 floats> params=<lua literal>: the construction half of a
-// CANCELLED placement, for the Lua to seat in pendingCons where the entity poll
-// would have (there is no entity). Written from the Add hook, cancel confirmed.
+// CONXP <file> t=<16 floats> ps=<serial> rc=<0|1> params=<lua literal>: the
+// construction half of a CANCELLED placement, for the Lua to seat in pendingCons
+// where the entity poll would have (there is no entity). Written from the Add
+// hook, cancel confirmed. ps= is the placement serial its ROADC carries, rc=
+// whether one was written for it (0: free-standing, no payload to wait for).
 static void WriteInjectConxp()
 {
     ReadInstance();
-    if (!g_instance[0] || !g_conxpFile[0]) return;
+    if (!g_instance[0] || g_conxpFile.empty()) return;
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    fprintf(f, "CONXP %s t=", g_conxpFile);
+    fprintf(f, "CONXP %s t=", g_conxpFile.c_str());
     for (int i = 0; i < 16; i++) fprintf(f, "%s%.4f", i ? "," : "", g_conxpT[i]);
-    fprintf(f, " params=%s\n", g_conxpParams);
+    fprintf(f, " ps=%ld rc=%d params=%s\n", g_conxpSerial, g_conxpHadRoadc, g_conxpParams.c_str());
     fclose(f);
-    Log("[slice] CONXP shipped: %s\n", g_conxpFile);
-    g_conxpFile[0] = 0;
+    Log("[slice] CONXP shipped: %s ps=%ld rc=%d (%zu bytes of params)\n", g_conxpFile.c_str(),
+        g_conxpSerial, g_conxpHadRoadc, g_conxpParams.size());
+    g_conxpFile.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -2449,17 +2549,17 @@ static bool StashConupFromProposal(uint64_t r8)
 static void WriteInjectConup()
 {
     ReadInstance();
-    if (!g_instance[0] || !g_conxpFile[0] || g_conupOldId <= 0) return;
+    if (!g_instance[0] || g_conxpFile.empty() || g_conupOldId <= 0) return;
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    fprintf(f, "CONUP %d %s t=", g_conupOldId, g_conxpFile);
+    fprintf(f, "CONUP %d %s t=", g_conupOldId, g_conxpFile.c_str());
     for (int i = 0; i < 16; i++) fprintf(f, "%s%.4f", i ? "," : "", g_conxpT[i]);
-    fprintf(f, " params=%s\n", g_conxpParams);
+    fprintf(f, " params=%s\n", g_conxpParams.c_str());
     fclose(f);
-    Log("[slice] CONUP shipped: old=%d %s\n", g_conupOldId, g_conxpFile);
-    g_conxpFile[0] = 0; g_conupOldId = 0;
+    Log("[slice] CONUP shipped: old=%d %s (%zu bytes of params)\n", g_conupOldId, g_conxpFile.c_str(), g_conxpParams.size());
+    g_conxpFile.clear(); g_conupOldId = 0;
 }
 
 // Shape test for an upgrade proposal: something removed, a CE added, no new
@@ -3636,6 +3736,269 @@ static bool InjectAssetsFromFile(uint64_t r8)
 // (2026-08-30, access violation at exe+0x235791e, rbx = -2). Earlier cancels
 // survived only because that slot happened to hold zero. Zeroing the out handle
 // makes the caller's destructor a no-op.
+// Construction placement (BuildProposal caller 419f62). Ships the placement's
+// street vectors as a ROADC companion so the peer can weld the replica into its
+// road network, and cancels the placement itself when its params walk (CONXP);
+// if they do not walk or no session is live, the native build stands. Both
+// records carry the same placement serial (ps=), which is what the Lua pairs
+// them by. Called from DeferHandler under its __try: the vectors live here
+// because SEH and C++ unwinding cannot share a function (C2712).
+static void CaptureConstructionPlacement(uint64_t rcx, uint64_t r8)
+{
+    const long ps = ++g_placeSerial;
+    std::vector<Node> cn;
+    std::vector<Edge> ce, crm;
+    int n  = DecodeNodes(r8, &cn);
+    int m  = DecodeEdges(r8, &ce);
+    int re = DecodeEdges(r8 + 0x30, &crm);
+    EdgeType cet = DecodeEdgeType(r8);
+    bool roadc = false;
+    if (m >= 1 && cet.ok) {
+        g_conroad++;
+        Log("[slice] #%ld construction placement: %d street node(s) %d "
+            "edge(s) %d removal(s), type=%s streetType=%d -- shipping ROADC ps=%ld\n",
+            g_conroad, n, m, re, cet.type == 1 ? "TRACK" : "street",
+            cet.streetType, ps);
+        WriteInjectConRoad(cn.data(), n, ce.data(), m, crm.data(), re, cet, ps);
+        roadc = true;
+    } else if (m >= 1) {
+        // Never cancel on a failed decode: the build stands natively. Until
+        // 2026-09-16 nothing else happened here -- no notice, so the peers never
+        // learned of the construction at all. The NATIVE notice gets it to the
+        // mod's catch-up scan; it ships as CONP there, without its street, and
+        // this line says why.
+        Log("[slice] construction placement has %d street edge(s) but the "
+            "type decode failed -- NOT shipping ROADC and NOT cancelled: it builds "
+            "natively and the peers get it WITHOUT its street (report this line)\n", m);
+        if (SessionLive()) WriteNativeNotice("construction");
+        return;
+    } else {
+        // FREE-STANDING (no street edges: a station away from any road, a
+        // harbour, an airport). Nothing to ship as ROADC, but the placement
+        // itself is cancelled and replayed like a road-snapped one: the Lua
+        // ships the stashed params as CONP cancelled=1 (rc=0 says no payload is
+        // coming), and every instance builds the scripted proposal at the
+        // stamp. Until 2026-09-09 this branch built natively and the strict path
+        // then bulldozed and rebuilt the station, which is the rebuild that
+        // asserted the engine on a modular_station.
+        Log("[slice] construction placement carries no street edges "
+            "(n=%d) -- free-standing, ps=%ld\n", n, ps);
+    }
+    // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF. Walk the params off THIS
+    // proposal and stash them; if the Add hook then cancels the native build it
+    // ships them as CONXP and the Lua builds the scripted proposal at the stamp
+    // on EVERY instance, the originator included -- no native build, no
+    // bulldoze, no window. g_pendingNoCb stays 0: the placement is a TOOL and
+    // waits on its callback.
+    bool stashed = StashConxpFromProposal(r8);
+    if (stashed) { g_conxpSerial = ps; g_conxpHadRoadc = roadc ? 1 : 0; }
+    if (stashed && SessionLive()) {
+        InterlockedExchange(&g_pendingIsConx, 1);
+        InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+        InterlockedExchange(&g_pendingNoCb, 0);
+        Log("[slice] armed cancel: %sconstruction placement cmd=%llx ps=%ld -- CONXP ships if the cancel lands\n",
+            roadc ? "" : "free-standing ", (unsigned long long)rcx, ps);
+    } else if (!stashed) {
+        Log("[slice] %sconstruction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n",
+            roadc ? "" : "free-standing ");
+        if (SessionLive()) WriteNativeNotice("construction");
+    }
+}
+
+// A road / track build or upgrade off the BuildProposal factory: decode the
+// proposal, write the capture and arm the cancel. Called from DeferHandler under
+// its __try; the vectors live here because SEH and C++ unwinding cannot share a
+// function (C2712). No count of ours anywhere in it: the decoders take the
+// engine's vectors in full.
+static void CaptureRoadBuild(uint64_t rcx, uint64_t r8, bool isUpgrade)
+{
+    std::vector<Node> nodes;
+    std::vector<Edge> edges;
+    int n = DecodeNodes(r8, &nodes);
+    int m = DecodeEdges(r8, &edges);
+    // Gate on EDGES, not new nodes. A road connecting two EXISTING junctions
+    // adds ZERO new nodes (both endpoints already exist) and one edge whose
+    // node0/node1 are positive existing ids. The old n<2 guard (correct for
+    // the all-new-nodes ROADN format, wrong since ROADE) rejected exactly
+    // that case: the build was not cancelled, so it happened LOCALLY and
+    // never replicated -- observed as a one-edge desync in the two-way test.
+    // The ROADE->ROADP converter already resolves positive endpoints to
+    // positions via realPos(), so a 0-new-node road rebuilds on the peer.
+    if (m < 1) {
+        Log("[slice] %s capture: no edges (n=%d m=%d) -- not a build, "
+            "letting it proceed\n", isUpgrade ? "upgrade" : "road", n, m);
+        return;
+    }
+    g_captured++;
+    if (isUpgrade)
+        Log("[slice] #%ld captured UPGRADE, %d edges replaced\n", g_captured, m);
+    else if (n >= 1)
+        Log("[slice] #%ld captured road, %d nodes %d edges, first=(%.2f,%.2f) last=(%.2f,%.2f)\n",
+            g_captured, n, m, nodes[0].x, nodes[0].y, nodes[n - 1].x, nodes[n - 1].y);
+    else
+        Log("[slice] #%ld captured road, 0 new nodes %d edges (connects existing junctions)\n",
+            g_captured, m);
+    // STREET PROPERTY PROBE (log only, upgrades are rare so it is free).
+    // A street's bus lane (hasBus) and its tram track (tramTrackType,
+    // which also encodes electrification) live in BaseEdgeStreet beside
+    // streetType, but DecodeEdgeType never reads them for a street -- it
+    // forces trackType and returns. So adding a tram way or a bus lane
+    // cannot travel on the wire, and since the upgrade is cancelled and
+    // replayed from what IS on the wire, the road came back plain on every
+    // instance including the originator (2026-09-03).
+    //
+    // streetType sits at record +0x4c and trackType at +0x60, so both
+    // fields are somewhere in between. Capture this window for one upgrade
+    // WITH a tram/bus lane and one without: the byte that differs names the
+    // offset. Do NOT hardcode an offset from a single sample.
+    // Served its purpose (it named +0x54); keep it for the next unknown
+    // street field but off by default -- 120 bytes per upgrade is noise.
+    if (isUpgrade && DumpPropOn()) {
+        uint64_t pbegin = 0, pend = 0;
+        if (Readable((void*)(r8 + 0x18), 16)) {
+            memcpy(&pbegin, (void*)(r8 + 0x18), 8);
+            memcpy(&pend, (void*)(r8 + 0x20), 8);
+            if (pbegin >= 0x10000 && pend > pbegin
+                && (pend - pbegin) % 120 == 0 && Readable((void*)pbegin, 120)) {
+                const uint8_t* pb = (const uint8_t*)pbegin;
+                // WHOLE record. +0x51 was NOT it: it read 239 and 246 on two
+                // captures, which is noise rather than a 0/1/2 enum -- and
+                // +0x54 tracks streetType (1 for type 19, 2 for type 22), so
+                // that is a road property. Dump all 120 bytes and diff a
+                // regular-tram upgrade against an electric one on the SAME
+                // road type; the byte that differs is tramTrackType. Two
+                // guesses were enough.
+                char hex[3 * 120 + 8];
+                int o = 0;
+                for (int i = 0; i < 120 && o + 4 < (int)sizeof(hex); i++)
+                    o += snprintf(hex + o, sizeof(hex) - o, "%02x ", pb[i]);
+                Log("[slice]   STREETPROBE rec+0x00..0x77: %s\n", hex);
+            }
+        }
+    }
+    // Stride-correct removal counts, for the LOG only. removedNodes at
+    // r8+0x30 are 24-byte node records and removedSegments at r8+0x48 are
+    // 120-byte SegmentAndEntity records (r9_analysis_dem.md 1, DECOMPILED;
+    // the old DecodeIds read them at a 4-byte stride, which is how one
+    // 120-byte record became "30 removals"). DecodeNodes/DecodeEdges take a
+    // base whose vector triplets sit at +0x00/+0x18, so passing r8+0x30
+    // addresses exactly the two removal vectors.
+    // Decoded in full, like the adds: a removal list clipped short of the
+    // adds would ship every add against a truncated removal list and the
+    // peer would add edges on top of the ones it never removed (the 64-slot
+    // buffer that once sat here did exactly that on a long upgrade drag).
+    std::vector<Node> rmNodes;
+    std::vector<Edge> rmEdges;
+    int rn = DecodeNodes(r8 + 0x30, &rmNodes);
+    int re = DecodeEdges(r8 + 0x30, &rmEdges);
+    EdgeType et = DecodeEdgeType(r8);
+    Log("[slice]   type=%s streetType=%d trackType=%d%s\n",
+        et.type == 1 ? "TRACK" : "street", et.streetType, et.trackType,
+        et.ok ? "" : "  <- DECODE FAILED, falling back to defaults");
+    // Topology summary: a junction that splits one road must remove exactly
+    // one edge.
+    Log("[slice]   removed nodes=%d segs=%d (stride-correct)\n", rn, re);
+    for (int i = 0; i < m && i < 12; i++)
+        Log("[slice]     edge %d: %d -> %d  btype=%d bidx=%d%s\n", i,
+            edges[i].node0, edges[i].node1, edges[i].btype, edges[i].bidx,
+            edges[i].btype == 1 ? " (BRIDGE)" : edges[i].btype == 2 ? " (TUNNEL)" : "");
+
+    // Replicating and cancelling are ONE decision: a road built locally AND
+    // queued for replay appeared twice on the originating peer. Without a
+    // live session the capture is still written (ARMED 0) but nothing is
+    // cancelled, so the build runs natively.
+    //
+    // A FAILED DECODE MUST NOT CANCEL.
+    //
+    // This is the bug that made it impossible to build more than one road.
+    // The validation correctly rejected a bad type decode and printed
+    // "DECODE FAILED" -- and then the cancel ran anyway, because et.ok was
+    // logged but never tested. The player's build was killed locally and a
+    // garbage trackType was queued for replay, so the road vanished and
+    // nothing replaced it.
+    //
+    // "Never cancel on an error" was already the rule in the fault handler
+    // below. It just was not applied to the case where the code works fine
+    // and the DATA is unusable, which is the more likely failure by far.
+    //
+    // An UPGRADE with no decodable removals is the same class of failure.
+    // It replaces edges in place, so the adds are only half the command:
+    // shipping them alone would lay a second edge over every upgraded one on
+    // the peer, and cancelling would delete the player's upgrade locally to
+    // buy that. Empty removal list -> not usable, so it stays local too.
+    if (!et.ok) {
+        Log("[slice]   NOT cancelling: type decode failed, so this build "
+            "cannot be replicated faithfully -- it stays local\n");
+    } else if (isUpgrade && re < 1) {
+        Log("[slice]   NOT cancelling: upgrade with %d added edge(s) decoded "
+            "0 removals -- replaying the adds alone would duplicate every "
+            "edge on the peer, so it stays local\n", m);
+    } else if (isUpgrade && re < m) {
+        // Fewer removals than adds means the peer would ADD edges over ones it
+        // never removed (a decode cap, or a shape we have not seen). Never
+        // cancel on data we cannot replay faithfully -- the same rule as a
+        // failed type decode.
+        Log("[slice]   NOT cancelling: upgrade has %d add(s) but only %d "
+            "removal(s) -- would duplicate edges on the peer, stays local\n", m, re);
+    } else {
+        // Removed edges travel for the UPGRADE path only. The road tool's
+        // splits are still shipped as re=0 and re-derived on each peer
+        // (execPolyline splits its own copy); turning that on here would
+        // change a working channel's behaviour in the same commit that adds
+        // a new one, and a removal the peer cannot match now SKIPS the whole
+        // command. Flip it once upgrades have proven the matcher.
+        //
+        // EXCEPT an edge REPLACED IN PLACE (2026-09-12). A road built under a
+        // bridge makes the engine remove that bridge span and add it again between
+        // the SAME two existing nodes (capture: removed segs=1, added
+        // 111672 -> 111711 btype=1). No peer can re-derive that from positions, so
+        // with re=0 every instance laid a second span over the old one and the
+        // engine refused the whole build (critical, no collision) -- the road could
+        // never be built under a bridge. Such a removal -- both ends existing nodes,
+        // and an added edge joining exactly that pair -- now travels; a split
+        // parent never has an added edge between its own two ends.
+        const Edge* shipRm = rmEdges.data();
+        int shipRe = isUpgrade ? re : 0;
+        std::vector<Edge> inPlace;
+        if (!isUpgrade) {
+            for (int i = 0; i < re; i++) {
+                const Edge& r = rmEdges[i];
+                if (r.node0 < 0 || r.node1 < 0) continue;
+                for (int j = 0; j < m; j++) {
+                    const Edge& a = edges[j];
+                    if ((a.node0 == r.node0 && a.node1 == r.node1) || (a.node0 == r.node1 && a.node1 == r.node0)) {
+                        inPlace.push_back(r);
+                        break;
+                    }
+                }
+            }
+            if (!inPlace.empty()) {
+                Log("[slice]   %d removal(s) replaced in place (e.g. a bridge span over the new road) -- shipped with the build\n", (int)inPlace.size());
+                shipRm = inPlace.data();
+                shipRe = (int)inPlace.size();
+            }
+        }
+        const bool live = SessionLive();
+        WriteArmed(live);
+        WriteInject(nodes.data(), n, edges.data(), m, nullptr, 0, shipRm, shipRe, et);
+        if (isUpgrade && re > m)
+            Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
+                "more removals than adds, watch the peer\n", m, re);
+        // Arm the cancel. The Add hook matches on the COMMAND POINTER, not
+        // on a caller RVA, so the upgrade tool's own CommandList::Add call
+        // site is recognised with no extra constant -- and its completion
+        // callback is fired there like the build tool's (g_pendingNoCb is
+        // cleared: this tool waits on the callback, so swallowing it would wedge
+        // the upgrade cursor for the rest of the session).
+        if (live) {
+            InterlockedExchange(&g_pendingNoCb, 0);
+            InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+        } else {
+            Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
+        }
+    }
+}
+
 static void ZeroAddResult(uint64_t rdx)
 {
     if (!rdx) return;
@@ -4089,69 +4452,12 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
 
     // Construction placement (caller 419f62): ship its street vectors as a
     // ROADC companion so the peer can weld the replica into its road network,
-    // and cancel the placement itself when its params walk (CONXP, below). If
-    // the params do not walk or no session is live, the native build stands.
+    // and cancel the placement itself when its params walk (CONXP). If the
+    // params do not walk or no session is live, the native build stands. The
+    // work is in CaptureConstructionPlacement (vectors cannot live under __try).
     if (caller == 0x419f62) {
         __try {
-            Node cn[64];
-            Edge ce[64];
-            Edge crm[64];
-            int n  = DecodeNodes(r8, cn, 64);
-            int m  = DecodeEdges(r8, ce, 64);
-            int re = DecodeEdges(r8 + 0x30, crm, 64);
-            EdgeType cet = DecodeEdgeType(r8);
-            if (m >= 1 && cet.ok) {
-                g_conroad++;
-                Log("[slice] #%ld construction placement: %d street node(s) %d "
-                    "edge(s) %d removal(s), type=%s streetType=%d -- shipping ROADC\n",
-                    g_conroad, n, m, re, cet.type == 1 ? "TRACK" : "street",
-                    cet.streetType);
-                WriteInjectConRoad(cn, n, ce, m, crm, re, cet);
-                // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF. Walk the params off
-                // THIS proposal and stash them; if the Add hook then cancels the
-                // native build it ships them as CONXP and the Lua builds the
-                // scripted proposal at the stamp on EVERY instance, the originator
-                // included -- no native build, no bulldoze, no window.
-                // g_pendingNoCb stays 0: the placement is a TOOL and waits on its
-                // callback.
-                bool stashed = StashConxpFromProposal(r8);
-                if (stashed && SessionLive()) {
-                    InterlockedExchange(&g_pendingIsConx, 1);
-                    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-                    InterlockedExchange(&g_pendingNoCb, 0);
-                    Log("[slice] armed cancel: construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                        (unsigned long long)rcx);
-                } else if (!stashed) {
-                    Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
-                    if (SessionLive()) WriteNativeNotice("construction");
-                }
-            } else if (m >= 1) {
-                Log("[slice] construction placement has %d street edge(s) but the "
-                    "type decode failed -- NOT shipping ROADC (peer replica will "
-                    "stay unconnected)\n", m);
-            } else {
-                // FREE-STANDING (no street edges: a station away from any road, a
-                // harbour, an airport). Nothing to ship as ROADC, but the placement
-                // itself is cancelled and replayed like a road-snapped one: the
-                // Lua ships the stashed params as CONP cancelled=1 when no ROADC
-                // pairs with them, and every instance builds the scripted proposal
-                // at the stamp. Until 2026-09-09 this branch built natively and the
-                // strict path then bulldozed and rebuilt the station, which is the
-                // rebuild that asserted the engine on a modular_station.
-                Log("[slice] construction placement carries no street edges "
-                    "(n=%d) -- free-standing\n", n);
-                bool stashed = StashConxpFromProposal(r8);
-                if (stashed && SessionLive()) {
-                    InterlockedExchange(&g_pendingIsConx, 1);
-                    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-                    InterlockedExchange(&g_pendingNoCb, 0);
-                    Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                        (unsigned long long)rcx);
-                } else if (!stashed) {
-                    Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
-                    if (SessionLive()) WriteNativeNotice("construction");
-                }
-            }
+            CaptureConstructionPlacement(rcx, r8);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[slice] ROADC decode fault -- placement proceeds, nothing shipped\n");
         }
@@ -4222,7 +4528,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 const bool live = SessionLive();
                 Log("[slice] construction UPGRADE from caller_rva=%llx -- runs natively (params %s)%s\n",
                     (unsigned long long)caller,
-                    g_conxpParams[0] ? "readable" : "not readable",
+                    !g_conxpParams.empty() ? "readable" : "not readable",
                     live ? "; the mod's edit scan or catch-up scan ships it" : "");
                 if (live) WriteNativeNotice("upgrade");
             }
@@ -4288,192 +4594,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     }
 
     __try {
-        Node nodes[256];
-        Edge edges[512];
-        int n = DecodeNodes(r8, nodes, 256);
-        int m = DecodeEdges(r8, edges, 512);
-        // Gate on EDGES, not new nodes. A road connecting two EXISTING junctions
-        // adds ZERO new nodes (both endpoints already exist) and one edge whose
-        // node0/node1 are positive existing ids. The old n<2 guard (correct for
-        // the all-new-nodes ROADN format, wrong since ROADE) rejected exactly
-        // that case: the build was not cancelled, so it happened LOCALLY and
-        // never replicated -- observed as a one-edge desync in the two-way test.
-        // The ROADE->ROADP converter already resolves positive endpoints to
-        // positions via realPos(), so a 0-new-node road rebuilds on the peer.
-        if (m < 1) {
-            Log("[slice] %s capture: no edges (n=%d m=%d) -- not a build, "
-                "letting it proceed\n", isUpgrade ? "upgrade" : "road", n, m);
-            return 0;
-        }
-        g_captured++;
-        if (isUpgrade)
-            Log("[slice] #%ld captured UPGRADE, %d edges replaced\n", g_captured, m);
-        else if (n >= 1)
-            Log("[slice] #%ld captured road, %d nodes %d edges, first=(%.2f,%.2f) last=(%.2f,%.2f)\n",
-                g_captured, n, m, nodes[0].x, nodes[0].y, nodes[n - 1].x, nodes[n - 1].y);
-        else
-            Log("[slice] #%ld captured road, 0 new nodes %d edges (connects existing junctions)\n",
-                g_captured, m);
-        // STREET PROPERTY PROBE (log only, upgrades are rare so it is free).
-        // A street's bus lane (hasBus) and its tram track (tramTrackType,
-        // which also encodes electrification) live in BaseEdgeStreet beside
-        // streetType, but DecodeEdgeType never reads them for a street -- it
-        // forces trackType and returns. So adding a tram way or a bus lane
-        // cannot travel on the wire, and since the upgrade is cancelled and
-        // replayed from what IS on the wire, the road came back plain on every
-        // instance including the originator (2026-09-03).
-        //
-        // streetType sits at record +0x4c and trackType at +0x60, so both
-        // fields are somewhere in between. Capture this window for one upgrade
-        // WITH a tram/bus lane and one without: the byte that differs names the
-        // offset. Do NOT hardcode an offset from a single sample.
-        // Served its purpose (it named +0x54); keep it for the next unknown
-        // street field but off by default -- 120 bytes per upgrade is noise.
-        if (isUpgrade && DumpPropOn()) {
-            uint64_t pbegin = 0, pend = 0;
-            if (Readable((void*)(r8 + 0x18), 16)) {
-                memcpy(&pbegin, (void*)(r8 + 0x18), 8);
-                memcpy(&pend, (void*)(r8 + 0x20), 8);
-                if (pbegin >= 0x10000 && pend > pbegin
-                    && (pend - pbegin) % 120 == 0 && Readable((void*)pbegin, 120)) {
-                    const uint8_t* pb = (const uint8_t*)pbegin;
-                    // WHOLE record. +0x51 was NOT it: it read 239 and 246 on two
-                    // captures, which is noise rather than a 0/1/2 enum -- and
-                    // +0x54 tracks streetType (1 for type 19, 2 for type 22), so
-                    // that is a road property. Dump all 120 bytes and diff a
-                    // regular-tram upgrade against an electric one on the SAME
-                    // road type; the byte that differs is tramTrackType. Two
-                    // guesses were enough.
-                    char hex[3 * 120 + 8];
-                    int o = 0;
-                    for (int i = 0; i < 120 && o + 4 < (int)sizeof(hex); i++)
-                        o += snprintf(hex + o, sizeof(hex) - o, "%02x ", pb[i]);
-                    Log("[slice]   STREETPROBE rec+0x00..0x77: %s\n", hex);
-                }
-            }
-        }
-        // Stride-correct removal counts, for the LOG only. removedNodes at
-        // r8+0x30 are 24-byte node records and removedSegments at r8+0x48 are
-        // 120-byte SegmentAndEntity records (r9_analysis_dem.md 1, DECOMPILED;
-        // the old DecodeIds read them at a 4-byte stride, which is how one
-        // 120-byte record became "30 removals"). DecodeNodes/DecodeEdges take a
-        // base whose vector triplets sit at +0x00/+0x18, so passing r8+0x30
-        // addresses exactly the two removal vectors.
-        // rmEdges is 512 like the add vector: DecodeEdges silently CAPS at maxOut,
-        // so a 64-slot buffer on an upgrade drag covering more than 64 segments
-        // would ship every add against a truncated removal list -- the peer would
-        // add edges on top of the ones it never removed.
-        Node rmNodes[64];
-        Edge rmEdges[512];
-        int rn = DecodeNodes(r8 + 0x30, rmNodes, 64);
-        int re = DecodeEdges(r8 + 0x30, rmEdges, 512);
-        EdgeType et = DecodeEdgeType(r8);
-        Log("[slice]   type=%s streetType=%d trackType=%d%s\n",
-            et.type == 1 ? "TRACK" : "street", et.streetType, et.trackType,
-            et.ok ? "" : "  <- DECODE FAILED, falling back to defaults");
-        // Topology summary: a junction that splits one road must remove exactly
-        // one edge.
-        Log("[slice]   removed nodes=%d segs=%d (stride-correct)\n", rn, re);
-        for (int i = 0; i < m && i < 12; i++)
-            Log("[slice]     edge %d: %d -> %d  btype=%d bidx=%d%s\n", i,
-                edges[i].node0, edges[i].node1, edges[i].btype, edges[i].bidx,
-                edges[i].btype == 1 ? " (BRIDGE)" : edges[i].btype == 2 ? " (TUNNEL)" : "");
-
-        // Replicating and cancelling are ONE decision: a road built locally AND
-        // queued for replay appeared twice on the originating peer. Without a
-        // live session the capture is still written (ARMED 0) but nothing is
-        // cancelled, so the build runs natively.
-        //
-        // A FAILED DECODE MUST NOT CANCEL.
-        //
-        // This is the bug that made it impossible to build more than one road.
-        // The validation correctly rejected a bad type decode and printed
-        // "DECODE FAILED" -- and then the cancel ran anyway, because et.ok was
-        // logged but never tested. The player's build was killed locally and a
-        // garbage trackType was queued for replay, so the road vanished and
-        // nothing replaced it.
-        //
-        // "Never cancel on an error" was already the rule in the fault handler
-        // below. It just was not applied to the case where the code works fine
-        // and the DATA is unusable, which is the more likely failure by far.
-        //
-        // An UPGRADE with no decodable removals is the same class of failure.
-        // It replaces edges in place, so the adds are only half the command:
-        // shipping them alone would lay a second edge over every upgraded one on
-        // the peer, and cancelling would delete the player's upgrade locally to
-        // buy that. Empty removal list -> not usable, so it stays local too.
-        if (!et.ok) {
-            Log("[slice]   NOT cancelling: type decode failed, so this build "
-                "cannot be replicated faithfully -- it stays local\n");
-        } else if (isUpgrade && re < 1) {
-            Log("[slice]   NOT cancelling: upgrade with %d added edge(s) decoded "
-                "0 removals -- replaying the adds alone would duplicate every "
-                "edge on the peer, so it stays local\n", m);
-        } else if (isUpgrade && re < m) {
-            // Fewer removals than adds means the peer would ADD edges over ones it
-            // never removed (a decode cap, or a shape we have not seen). Never
-            // cancel on data we cannot replay faithfully -- the same rule as a
-            // failed type decode.
-            Log("[slice]   NOT cancelling: upgrade has %d add(s) but only %d "
-                "removal(s) -- would duplicate edges on the peer, stays local\n", m, re);
-        } else {
-            // Removed edges travel for the UPGRADE path only. The road tool's
-            // splits are still shipped as re=0 and re-derived on each peer
-            // (execPolyline splits its own copy); turning that on here would
-            // change a working channel's behaviour in the same commit that adds
-            // a new one, and a removal the peer cannot match now SKIPS the whole
-            // command. Flip it once upgrades have proven the matcher.
-            //
-            // EXCEPT an edge REPLACED IN PLACE (2026-09-12). A road built under a
-            // bridge makes the engine remove that bridge span and add it again between
-            // the SAME two existing nodes (capture: removed segs=1, added
-            // 111672 -> 111711 btype=1). No peer can re-derive that from positions, so
-            // with re=0 every instance laid a second span over the old one and the
-            // engine refused the whole build (critical, no collision) -- the road could
-            // never be built under a bridge. Such a removal -- both ends existing nodes,
-            // and an added edge joining exactly that pair -- now travels; a split
-            // parent never has an added edge between its own two ends.
-            Edge* shipRm = rmEdges;
-            int shipRe = isUpgrade ? re : 0;
-            static Edge inPlace[512];
-            if (!isUpgrade) {
-                int k = 0;
-                for (int i = 0; i < re && k < 512; i++) {
-                    const Edge& r = rmEdges[i];
-                    if (r.node0 < 0 || r.node1 < 0) continue;
-                    for (int j = 0; j < m; j++) {
-                        const Edge& a = edges[j];
-                        if ((a.node0 == r.node0 && a.node1 == r.node1) || (a.node0 == r.node1 && a.node1 == r.node0)) {
-                            inPlace[k++] = r;
-                            break;
-                        }
-                    }
-                }
-                if (k > 0) {
-                    Log("[slice]   %d removal(s) replaced in place (e.g. a bridge span over the new road) -- shipped with the build\n", k);
-                    shipRm = inPlace;
-                    shipRe = k;
-                }
-            }
-            const bool live = SessionLive();
-            WriteArmed(live);
-            WriteInject(nodes, n, edges, m, nullptr, 0, shipRm, shipRe, et);
-            if (isUpgrade && re > m)
-                Log("[slice]   upgrade ships %d add(s) against %d removal(s) -- "
-                    "more removals than adds, watch the peer\n", m, re);
-            // Arm the cancel. The Add hook matches on the COMMAND POINTER, not
-            // on a caller RVA, so the upgrade tool's own CommandList::Add call
-            // site is recognised with no extra constant -- and its completion
-            // callback is fired there like the build tool's (g_pendingNoCb is
-            // cleared: this tool waits on the callback, so swallowing it would wedge
-            // the upgrade cursor for the rest of the session).
-            if (live) {
-                InterlockedExchange(&g_pendingNoCb, 0);
-                InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-            } else {
-                Log("[slice] no live session (mod off, or nobody to replay it) -- the build runs natively\n");
-            }
-        }
+        CaptureRoadBuild(rcx, r8, isUpgrade);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] capture faulted -- proceeding, never cancel on an error\n");
         InterlockedExchange64(&g_pendingCmd, 0);

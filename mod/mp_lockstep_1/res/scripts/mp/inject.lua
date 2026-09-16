@@ -158,6 +158,12 @@ function CM.pollInject()
 				end
 				if K.ACTIONS_OFF_ALWAYS[o] or (K.ACTIONS_OFF_ARMED[o] and (CM.lastArmed or 0) == 1) then
 					if o == "ROADE" then CM.lastStreetBus, CM.lastStreetTram = nil, nil end
+					if o == "CONXP" then
+						-- its ROADC (parked already: it precedes the CONXP in this
+						-- file) is released by serial instead of hunted for
+						local ps = tonumber((line:match("^(.-)%s+params=") or line):match("%sps=(%d+)"))
+						if ps then CM.droppedConxp = CM.droppedConxp or {}; CM.droppedConxp[ps] = true end
+					end
 					log(string.format("ACTIONS OFF: %s dropped -- this game is %.1f game units behind, so it happens on no game", o, CM.behindBy or 0))
 					return
 				end
@@ -800,6 +806,12 @@ function CM.pollInject()
 				local cfile = w[2]
 				local tstr = tostring(w[3] or ""):match("^t=(.*)$")
 				local pstr = line:match("params=(.*)$") or "{}"
+				-- ps=<serial> rc=<0|1> sit between t= and params=: the placement
+				-- serial its ROADC carries (identity, cons.lua CM.flushConPairs) and
+				-- whether the slice wrote a ROADC for it at all
+				local head = line:match("^(.-)%s+params=") or line
+				local ps = tonumber(head:match("%sps=(%d+)"))
+				local hadRoadc = tonumber(head:match("%src=(%d)"))
 				local ct = {}
 				for tok in tostring(tstr or ""):gmatch("[^,]+") do ct[#ct + 1] = tonumber(tok) end
 				if cfile and #ct == 16 then
@@ -811,9 +823,10 @@ function CM.pollInject()
 					local base = cfile:match("([^/]+)%.con$") or "construction"
 					CM.pendingCons[#CM.pendingCons + 1] = { at = CM.gameTime() or 0, file = cfile, t = tstr, params = pstr,
 						name = CM.escName(base), x = ct[13], y = ct[14], id = nil,
-						survivors = CM.gatherSurvivors(ct[13], ct[14], nil), cancelled = 1 }
-					log(string.format("CONXP: cancelled placement %s at (%.1f,%.1f) params=%s -- parked for pairing",
-						cfile, ct[13], ct[14], pstr:sub(1, 100)))
+						survivors = CM.gatherSurvivors(ct[13], ct[14], nil), cancelled = 1,
+						ps = ps, hadRoadc = hadRoadc }
+					log(string.format("CONXP: cancelled placement %s at (%.1f,%.1f) ps=%s rc=%s params=%s -- parked for pairing",
+						cfile, ct[13], ct[14], tostring(ps), tostring(hadRoadc), pstr:sub(1, 100)))
 				else
 					log("inject: bad CONXP line: " .. line:sub(1, 70))
 				end
@@ -886,6 +899,13 @@ function CM.pollInject()
 						end
 					end
 				end
+				-- Placement serial, ps=<n> after the tail: the identity the CONXP of
+				-- the same placement carries. Absent from a slice older than 2026-09-16.
+				local ps
+				for i = 9, #w do
+					local v = tostring(w[i]):match("^ps=(%d+)$")
+					if v then ps = tonumber(v) end
+				end
 				if ok then
 					-- No classification here any more: the whole street payload
 					-- replays natively on the peer (CONX). Positive ids that still
@@ -909,11 +929,12 @@ function CM.pollInject()
 					end
 					CM.pendingRoadc[#CM.pendingRoadc + 1] = { at = CM.gameTime() or 0, posOf = posOf,
 						adds = adds, rms = rms, spos = spos, etype = etype, stype = stype,
-						ttype = ttype, cat = cat, bal0 = CM.balPrevConPoll }
-					log(string.format("ROADC: parked street payload (%d nodes, %d edges, %d removals) for pairing",
-						n, #adds, #rms))
+						ttype = ttype, cat = cat, bal0 = CM.balPrevConPoll, ps = ps }
+					log(string.format("ROADC: parked street payload (%d nodes, %d edges, %d removals, ps=%s) for pairing",
+						n, #adds, #rms, tostring(ps)))
 				else
-					log("inject: bad ROADC line: " .. line:sub(1, 70))
+					-- its CONXP (same ps) will be REFUSED for want of this payload: say which
+					log("inject: bad ROADC line (ps=" .. tostring(ps) .. "): " .. line:sub(1, 70))
 				end
 
 			elseif (o == "VBUY" or o == "VREPL") and #w >= 3 then

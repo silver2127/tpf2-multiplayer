@@ -9,7 +9,13 @@ world and checks:
   * a native build pairs with the ROADC whose nodes are its frozen nodes, even
     with the mouth 470 m from the origin, and the CONX carries the survivor
     gather radius derived from the entity's bbox + street payload (srad);
-  * a cancelled placement (CONXP) pairs with the ROADC parked right before it;
+  * a cancelled placement (CONXP) pairs with the ROADC carrying the same
+    placement serial (ps=), whatever else is parked and however many ticks
+    apart the two were read; one shipped with rc=1 whose ROADC is missing is
+    refused loudly (never built anywhere without its street); rc=0 ships as
+    CONP at once; a ROADC whose CONXP was dropped (actions off) is released;
+  * a CONXP with no serial (an older slice) pairs with the ROADC parked right
+    before it;
   * a CONXP after a ROADC parked on an older tick (a build whose cancel did
     not land) is free-standing -> CONP with the reason, the ROADC stays parked;
   * a parked ROADC whose construction the poll never captured is rescued by
@@ -99,14 +105,14 @@ function H.node(id, x, y) nodes[id] = { x, y, 0 } end
 function H.tick(t) CM.ticks = t end
 function H.time(t) now = t end
 -- a ROADC as inject.lua parks it: new nodes with positions, existing nodes' positions, one edge between each pair
-function H.roadc(newPts, oldPts)
+function H.roadc(newPts, oldPts, ps)
   local posOf, spos, adds = {}, {}, {}
   local ids = {}
   for i, p in ipairs(newPts) do posOf[-i] = { p[1], p[2], 0 }; ids[#ids + 1] = -i end
   for i, p in ipairs(oldPts) do spos[1000 + i] = { p[1], p[2], 0 }; ids[#ids + 1] = 1000 + i end
   for i = 1, #ids - 1 do adds[#adds + 1] = { ids[i], ids[i + 1], { 1, 0, 0, 1, 0, 0 }, 0, -1 } end
   CM.pendingRoadc[#CM.pendingRoadc + 1] = { at = now, posOf = posOf, adds = adds, rms = {}, spos = spos,
-    etype = 0, stype = 16, ttype = 1, cat = 0, bal0 = nil }
+    etype = 0, stype = 16, ttype = 1, cat = 0, bal0 = nil, ps = ps }
 end
 -- a captured native build (queueConCapture's record shape)
 function H.native(id)
@@ -115,10 +121,11 @@ function H.native(id)
     params = "{}", x = w.x, y = w.y, name = "", id = id }
 end
 -- a cancelled placement (inject.lua's CONXP record shape)
-function H.conxp(x, y)
+function H.conxp(x, y, ps, rc)
   CM.pendingCons[#CM.pendingCons + 1] = { at = now, file = FILE, t = "1,0,0,0,0,1,0,0,0,0,1,0," .. x .. "," .. y .. ",0,1",
-    params = "{}", name = "x", x = x, y = y, id = nil, cancelled = 1 }
+    params = "{}", name = "x", x = x, y = y, id = nil, cancelled = 1, ps = ps, hadRoadc = rc }
 end
+function H.drop(ps) CM.droppedConxp[ps] = true end
 function H.flush() CM.flushConPairs() end
 function H.nsched() return #sched end
 function H.sched(i) return sched[i].op, sched[i].args end
@@ -204,6 +211,55 @@ r, src = H.radius(0, 0, 500, None)
 check("survivorRadius: bbox corner (420,200) -> 465 + 100", 564 < r < 566, f"{r} ({src})")
 r, src = H.radius(0, 0, None, None)
 check("survivorRadius: nothing known -> margin only, says so", r == 100 and "origin only" in src, f"{r} ({src})")
+
+# ---- 7. IDENTITY by placement serial: two ROADCs parked (ps 41, 42), the CONXP for 41 read three
+#         ticks later -- it takes ITS payload, not the newest one, not the same-tick one
+H.clear()
+H.time(300)
+H.tick(300)
+H.roadc(L.table(L.table(6000, 6000), L.table(6010, 6000)), L.table(L.table(6050, 6000)), 41)
+H.roadc(L.table(L.table(7000, 7000), L.table(7010, 7000)), L.table(L.table(7050, 7000)), 42)
+H.tick(303)
+H.conxp(6000, 5980, 41, 1)
+H.flush()
+op, args = H.sched(1)
+check("CONXP ps=41 pairs with the ROADC ps=41 across 3 ticks and past a newer payload -> CONX",
+      H.nsched() == 1 and op == "CONX" and args["cancelled"] == 1, f"n={H.nsched()} op={op}")
+check("...the payload it took is the ps=41 one (its nodes at 6000)", args["snodes"] and "6000.0000" in args["snodes"], args and args["snodes"])
+check("...reason names the serial", "same placement serial ps=41" in H.logs(), H.logs()[-300:])
+check("...ROADC ps=42 still parked", H.parked() == (1, 0), str(H.parked()))
+H.clear()
+H.conxp(7000, 6980, 42, 1)
+H.flush()
+op, args = H.sched(1)
+check("CONXP ps=42 then takes the ps=42 payload", H.nsched() == 1 and op == "CONX" and "7000.0000" in args["snodes"], f"n={H.nsched()} op={op}")
+check("buffers empty", H.parked() == (0, 0), str(H.parked()))
+
+# ---- 8. rc=1 but no payload with that serial parked: REFUSED loudly, nothing shipped, nothing waits
+H.clear()
+H.roadc(L.table(L.table(8000, 8000), L.table(8010, 8000)), L.table(L.table(8050, 8000)), 50)   # someone else's
+H.conxp(9000, 9000, 51, 1)
+H.flush()
+check("CONXP rc=1 with its ROADC missing is refused: nothing scheduled", H.nsched() == 0, f"n={H.nsched()}")
+check("...loudly, naming the serial and the fix", "CONXP: REFUSED" in H.logs() and "ps=51" in H.logs() and "place it again" in H.logs(), H.logs()[-300:])
+check("...the other payload untouched, the CONXP gone", H.parked() == (1, 0), str(H.parked()))
+
+# ---- 9. rc=0: free-standing, ships as CONP at once with the reason
+H.clear()
+H.conxp(9500, 9500, 52, 0)
+H.flush()
+op, args = H.sched(1)
+check("CONXP rc=0 ships as CONP at once", H.nsched() == 1 and op == "CONP" and args["cancelled"] == 1, f"n={H.nsched()} op={op}")
+check("...saying it is free-standing by serial", "free-standing, the slice shipped no street payload (ps=52 rc=0)" in H.logs(), H.logs()[-300:])
+check("...and did not take the stray ps=50 payload", H.parked() == (1, 0), str(H.parked()))
+
+# ---- 10. the stray payload's CONXP was dropped (actions off): released, no search, no DIVERGENCE
+H.clear()
+H.drop(50)
+H.time(320)
+H.flush()
+check("ROADC of a dropped placement is released", H.parked() == (0, 0) and H.nsched() == 0, f"parked={H.parked()} n={H.nsched()}")
+check("...with the reason, not a DIVERGENCE", "ROADC: released -- its placement ps=50 was dropped" in H.logs() and "DIVERGENCE" not in H.logs(), H.logs()[-300:])
 
 print("FAILED: " + ", ".join(fails) if fails else "all passed")
 sys.exit(1 if fails else 0)
