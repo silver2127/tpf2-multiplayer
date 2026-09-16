@@ -14,7 +14,8 @@
 #   tools\auto_install.ps1 -NoBuild        install what is built, never compile
 #
 # Stop it with Ctrl+C. It never kills a game.
-param([switch]$Relaunch, [switch]$Once, [switch]$NoBuild, [int]$PollSeconds = 5, [string]$Box = 'GameAgent')
+param([switch]$Relaunch, [switch]$Once, [switch]$NoBuild, [int]$PollSeconds = 5, [string]$Box = 'GameAgent',
+      [string[]]$Boxes = @('GameAgent', 'GameAgent2', 'GameAgent3'))
 
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path $PSScriptRoot -Parent
@@ -79,18 +80,25 @@ function InstallStale {
     $log = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'tools\deploy_shipping.ps1') 2>&1
     if ($LASTEXITCODE -ne 0 -or -not ($log -match 'deploy OK')) { Say ("deploy FAILED:`n" + ($log | Select-Object -Last 8 | Out-String)) Red; return $false }
     Say 'deployed to the game folder' Green
-    if (Test-Path $Overlay) {
-        # the boxed instance reads its own overlay copy of the game folder, never the host's
+    foreach ($b in $Boxes) {
+        $ov = "C:\Sandbox\$env:USERNAME\$b\drive\C\" + ($Game -replace '^[A-Za-z]:\\', '')
+        if (-not (Test-Path $ov)) { if ($b -eq $Box) { Say "no Sandboxie overlay at $ov -- instance B not refreshed" DarkYellow }; continue }
+        # a boxed instance reads its own overlay copy of the game folder, never the host's --
+        # the multiplayer files, the lobby, the mod tree AND the plugins (Big Maps included:
+        # the boxes ran a three-day-old tpf2_bigmap.dll without its speedups, 2026-09-16)
         foreach ($f in 'alut.dll', 'tpf2_bridge_mp.dll', 'tpf2_menu.dll', 'tpf2_slice.dll', 'tpf2_pluginhost.dll') {
-            $src = Join-Path $Game $f; if (Test-Path $src) { Copy-Item $src (Join-Path $Overlay $f) -Force }
+            $src = Join-Path $Game $f; if (Test-Path $src) { Copy-Item $src (Join-Path $ov $f) -Force }
         }
-        New-Item -ItemType Directory -Force (Join-Path $Overlay 'netpunch') | Out-Null
-        Copy-Item (Join-Path $Game 'netpunch\netpunch.exe') (Join-Path $Overlay 'netpunch\netpunch.exe') -Force
-        $mod = Join-Path $Overlay 'mods\mp_lockstep_1'
+        New-Item -ItemType Directory -Force (Join-Path $ov 'netpunch'), (Join-Path $ov 'plugins') | Out-Null
+        Copy-Item (Join-Path $Game 'netpunch\netpunch.exe') (Join-Path $ov 'netpunch\netpunch.exe') -Force
+        foreach ($f in (Get-ChildItem (Join-Path $Game 'plugins') -File | Where-Object { $_.Extension -in '.dll', '.cfg' })) {
+            Copy-Item $f.FullName (Join-Path $ov ('plugins\' + $f.Name)) -Force
+        }
+        $mod = Join-Path $ov 'mods\mp_lockstep_1'
         if (Test-Path $mod) { Remove-Item $mod -Recurse -Force }
         Copy-Item (Join-Path $Game 'mods\mp_lockstep_1') $mod -Recurse -Force
-        Say "refreshed the $Box overlay" Green
-    } else { Say "no Sandboxie overlay at $Overlay -- instance B not refreshed" DarkYellow }
+        Say "refreshed the $b overlay (multiplayer files, lobby, mod, plugins)" Green
+    }
     if ($Relaunch) {
         Say 'relaunching A + B to the title menu' Cyan
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'tools\mp_menu_launch.ps1') 2>&1 | Select-String 'title menu|timed out|done' | ForEach-Object { Say $_ }
