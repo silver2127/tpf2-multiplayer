@@ -535,6 +535,7 @@ K.SIM_STEP = 0.2
 -- which is what drifted departures -- review, 2026-09-01).
 K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
 K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
+K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
 K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
 K.CMD_RING = 256          -- own commands kept for resend
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
@@ -986,6 +987,19 @@ function data()
 										-- notBeforeStep, so the buy guard above still applies to it
 										if lg > st and (not c.notBeforeStep or c.notBeforeStep < lg) then c.notBeforeStep = lg end
 									end
+								end
+								-- Line assignments land on a step GRID. Depot departures are dispatched
+								-- with frame granularity: two assignments a few steps apart fell into one
+								-- engine batch on the slower-rendering game and into two on the other,
+								-- and two long trains left the same depot in opposite order (a:58/a:59,
+								-- 2026-09-16), while ten trucks assigned on one step never drifted -- on
+								-- one step the engine orders them the same everywhere. So assignments
+								-- due within a grid cell are issued together, on its last step, on
+								-- every instance; a hold above only ever moves this later.
+								if c.op == "VLINE" then
+									local due = c.notBeforeStep or st
+									if due % K.VLINE_GRID_STEPS ~= 0 then due = due + (K.VLINE_GRID_STEPS - due % K.VLINE_GRID_STEPS) end
+									c.notBeforeStep = due
 								end
 							end
 						end
