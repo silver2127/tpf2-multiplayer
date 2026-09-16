@@ -338,6 +338,14 @@ static void PollLobbyOpen();
 static void StageTick();
 static void MarkSaveShared();
 static volatile LONG g_showOverlay = 0;   // set by the CreatePage detour (page==2)
+// LEAVING THE WORLD LEAVES THE LOBBY (2026-09-16). Set by the CreatePage detour
+// when the title menu comes up while a CGameUI was still known (a world was up
+// a frame ago) and a lobby runs; consumed on the present thread (myPresent),
+// where LEAVE's teardown already runs, so the menu build is never stalled by
+// the 1.5 s the lobby gets to quit. A joiner waiting at the title menu for a
+// save never had a CGameUI, so it is not affected; a world switch (a start with
+// switch=1) and a resync load happen in place and never build the title menu.
+static volatile LONG g_leaveOnMenu = 0;
 static HWND g_gameWnd = nullptr;
 static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
 static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
@@ -1817,6 +1825,13 @@ static void OnHit(int id)
 static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     PollLobbyOpen();
+    if (InterlockedExchange(&g_leaveOnMenu, 0)) {
+        // the player left the world for the title menu: leave the lobby with it
+        // (the host leaving ends the session for everyone, as LEAVE would)
+        Log("[menu] the world was left for the title menu -- leaving the lobby\n");
+        LeaveLobby();
+        SetStatus("Left the lobby: you left the world. HOST or JOIN to play again.");
+    }
     SteamNameTick();
     StageTick();
     PollWorldGen();
@@ -3828,6 +3843,9 @@ static void MyCreatePage(uint64_t thisp, int page)
         // captured in the last session. It used to survive "quit to menu", so a
         // start arriving while the title menu sat on another page looked like
         // "start while in game" and was ignored (relay resume, 2026-09-10).
+        // A pointer still set here means the player just left a world: with a
+        // lobby running, that leaves the lobby too (g_leaveOnMenu, myPresent).
+        if (g_gameUi != 0 && LobbyRunning()) InterlockedExchange(&g_leaveOnMenu, 1);
         g_gameUi = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
         // Keep recovery reachable at the title menu after a failed load.
