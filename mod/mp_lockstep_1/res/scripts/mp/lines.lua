@@ -570,9 +570,11 @@ function CM.execLine(c)
 				if pre and pre.stops then CM.lineHistNote(c.key, pre.stops, pre.alts) end
 				CM.lineHistNote(c.key, c.stops or "", c.alts or "")
 			end)
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
-				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s",
-					tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.key), n, tostring(success)))
+				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s step=%d +%d ticks",
+					tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.key), n, tostring(success),
+					CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
 			end)
 		elseif c.op == "LDELETE" then
 			local lid = CM.lineIdFor(c.key)

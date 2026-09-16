@@ -624,15 +624,16 @@ function CM.execVehCmd(c)
 		end
 		for _, pair in ipairs(cmds) do
 			local what, vid = pair[2], pair[3]
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(pair[1], function(res, success)
-				local why = ""
+				local why = string.format(" step=%d +%d ticks", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick)
 				if not success then
 					-- the engine's own reason, which this callback used to discard:
 					-- "success=false" alone cannot tell a refused command from a lost one
 					pcall(function()
 						local es = res and res.resultProposalData and res.resultProposalData.errorState
 						if es then
-							why = " critical=" .. tostring(es.critical)
+							why = why .. " critical=" .. tostring(es.critical)
 							for i = 1, #es.messages do why = why .. " '" .. tostring(es.messages[i]) .. "'" end
 						end
 					end)
@@ -861,10 +862,11 @@ function CM.execVBuy(c)
 				return
 			end
 			local bal0 = retry and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(cmd, function(res, success)
-				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s",
+				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s step=%d +%d ticks",
 					tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success),
-					retry and " (as our own player)" or ""))
+					retry and " (as our own player)" or "", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
 				if success then
 					-- buyVehicle is entity-returning (same shape VREPL reads): bind
 					-- this key to THAT entity, not to whichever new id sorts first
