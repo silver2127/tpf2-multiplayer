@@ -21,9 +21,12 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This experimental Linux release follows **0.5.6**. Use matching 0.5.6 peers.
-All 28 shared Lua files match the Windows release byte for byte. See
-[UPSTREAM_0.5.6.md](UPSTREAM_0.5.6.md) for technical validation details.
+This development tree follows **0.5.6 plus Windows dev `b406a913`** (dashboard
+tabs). All 28 shared Lua files match that commit byte for byte. This integration
+does not assign a new release version or establish cross-platform gameplay
+compatibility. See [UPSTREAM_dev_b406a913.md](UPSTREAM_dev_b406a913.md) for
+its scope and validation, and [UPSTREAM_0.5.6.md](UPSTREAM_0.5.6.md) for the
+previous integration.
 
 **Known limits:** automatic resync, the new separate-company/shared-ownership
 operations, and automatic Workshop registration still need native Linux support.

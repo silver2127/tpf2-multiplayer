@@ -15,17 +15,13 @@ It is unofficial, reverse-engineered without the engine's source, and **experime
 four players have been run, on one PC and between PCs on different networks. Read
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
-This branch also contains a **native Linux build-35924 port**, based on Windows release **0.4.22**.
-Build/install instructions are in [docs/linux/INSTALL.md](docs/linux/INSTALL.md), and tested coverage
-and remaining gaps are in [docs/linux/RESUME_STATUS.md](docs/linux/RESUME_STATUS.md).
-The `.desync.5` candidate passed six complete native/Proton person-state and movement
-checkpoints through simulation time 1800, including the first town-growth and resident-birth
-event, with 21 passing SDK checks. This was a controlled test on one computer: fast-forward
-previous-frame histories still differed at two checkpoints, newborn travel was not exercised,
-and complete action/replay coverage remains unfinished. All 24 Lua files are unchanged from
-Windows 0.4.22; newer Windows 0.5.x releases are outside this baseline. Linux release tags
-identify the Windows baseline, with the uncommitted Linux implementation supplied in the
-accompanying curated source overlay.
+This branch also contains a **native Linux build-35924 port**. Its current
+integration is Windows **0.5.6 plus dev `b406a913`**, which makes the in-game
+dashboard sections mutually exclusive tabs. See [Linux installation](docs/linux/INSTALL.md),
+[the integration record](docs/linux/UPSTREAM_dev_b406a913.md), and
+[existing port coverage and gaps](docs/linux/RESUME_STATUS.md).
+Historical native/Proton tests in those records do not establish live gameplay
+compatibility for this development snapshot.
 The Windows MSI instructions below apply to the Windows version.
 
 ## How it works
