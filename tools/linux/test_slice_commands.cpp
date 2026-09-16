@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -147,10 +148,10 @@ static SliceFactoryCall Call(uintptr_t rva, uintptr_t ret = 1)
 }
 static void Capture(const SliceFactoryCall& c)
 { for (const auto& h:handlers) if(h.factoryRva==c.factory->rva && h.onEntry) h.onEntry(c,nullptr); }
-static bool Add(void* done=nullptr,uintptr_t site=0)
+static bool Add(void* done=nullptr,uintptr_t site=0,void* replayCommand=command)
 {
     uintptr_t ret=1;
-    SliceAddCall add{&ret,nullptr,command,done,nullptr,0,site,0};
+    SliceAddCall add{&ret,nullptr,replayCommand,done,nullptr,0,site,0};
     overrideDone=nullptr;overrideAfter=nullptr;overrideContext=nullptr;
     for (auto f:observers) f(add,nullptr);
     if (overrideDone) {
@@ -346,6 +347,30 @@ static void TestStrictCreates()
     p.name="Identical Line";
     WriteClaim(105);create(true);command[0]=uintptr_t(&p);directUsed=false;
     slice_lines::DirectSink(nullptr,command,luaFn);assert(directUsed && !slice_lines::g_creates[1]);
+    // dev 1d0ca473: sendCommand rebuilds the maker's command. Both Add
+    // sinks must hand off once, only on the claiming thread and call site.
+    uint64_t nonce=106;
+    for (uintptr_t site : {uintptr_t(0xa2f5c2),uintptr_t(0x11225a9)}) {
+        original[2]=SliceAddr(0x10d44b0);create(false);assert(Add(original));
+        WriteClaim(nonce++);const auto maker=create(true);
+        const uint64_t heldId=slice_lines::t_carrier.id;assert(heldId);
+        CreatePayload rebuilt=p;
+        uintptr_t rebuiltCommand[7]={uintptr_t(&rebuilt)};
+        assert(uintptr_t(rebuiltCommand)!=maker.rdi && &rebuilt!=&p);
+        // An unrelated caller does not consume the reservation.
+        assert(!Add(luaFn,0x10d4c34,rebuiltCommand));assert(!overrideDone);
+        assert(slice_lines::t_carrier.id==heldId);
+        std::thread other([&] {
+            assert(!slice_lines::t_carrier.id);
+            assert(!Add(luaFn,site,rebuiltCommand));assert(!overrideDone);
+        });
+        other.join();
+        assert(slice_lines::t_carrier.id==heldId);
+        assert(!Add(luaFn,site,rebuiltCommand));assert(overrideDone);
+        assert(!slice_lines::t_carrier.id && luaFn[2]==777);
+        for (auto* h:slice_lines::g_creates) assert(!h || h->id!=heldId);
+        assert(!Add(luaFn,site,rebuiltCommand));assert(!overrideDone);
+    }
     // I/O failure restores the source function's ownership; core blocks the create.
     original[2]=SliceAddr(0x10d44b0);create(false);writeFails=true;assert(!Add(original));writeFails=false;
     assert(original[2]==SliceAddr(0x10d44b0));assert(!slice_lines::g_creates[0]);

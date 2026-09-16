@@ -2,8 +2,8 @@
 
 ## Current integration — 2026-09-16
 
-Windows dev through `b5dade06` (0.5.7 plus later changes) is staged, uncommitted,
-and partially ported. See [UPSTREAM_dev_b5dade06.md](UPSTREAM_dev_b5dade06.md)
+Windows dev through `1d0ca473` (0.5.7 plus later changes) is staged, uncommitted,
+and partially ported. See [UPSTREAM_dev_1d0ca473.md](UPSTREAM_dev_1d0ca473.md)
 for current coverage, tests and native recovery/in-world-load gaps. Historical
 checkpoints below describe their own revisions, not current live validation.
 

@@ -245,6 +245,10 @@ static HeldCreate* TakeCarrier(uintptr_t commandAddress)
     return found;
 }
 
+// Windows dev 1d0ca473 converges on this existing Linux scheme: sendCommand
+// rebuilds the maker's Command. The two verified script callers plus the
+// thread-local claim identify the replay; TakeCarrier also checks its payload.
+// See docs/re/linux/DEV_1D0CA473.md for the rechecked ELF/ABI evidence.
 static void ReplayAdd(const SliceAddCall& add, void*)
 {
     if (!t_carrier.id || (add.retRva != 0xa2f5c2 && add.retRva != 0x11225a9)) return;
