@@ -357,6 +357,24 @@ static bool doStartLoad(const wchar_t* srcSav);
 //    incoming_save.* files are complete and a 'start' with save=true may load them.
 static volatile LONG g_lobbyReady = 0;
 static volatile LONG g_saveReady  = 0;
+// WORLD SWITCH: the host loads ANOTHER world while a session is running (the
+// game's own LOAD GAME, in the title menu or in game, or NEW GAME/CONTINUE).
+// Everyone else has to leave the world they are playing and load that one, so
+// the save goes out with "switch":true and a joiner takes it even though it
+// already started. See OnStartSavegame (the load the player asked for) and
+// PollWorldGen (the loads that carry no save name).
+//  g_selfLoad         -- our own AutoLoadCall is inside StartSavegame: never share it
+//  g_hostLoadedItself -- the host shared the save its OWN menu is loading; the
+//                        'start' that comes back must not load it a second time
+//  g_sessionStarted   -- the lobby has started this session (a start event arrived)
+//  g_worldGen         -- last value read from the mod's tpf2mp_world_gen.txt
+//  g_worldGenHold     -- absorb the next change: it is a load WE caused
+//  g_switchShare      -- the save SyncPoll is about to share is a world switch
+static volatile LONG g_selfLoad = 0, g_hostLoadedItself = 0, g_lastPage = -1;
+static volatile LONG g_sessionStarted = 0;
+static volatile LONG g_worldGenHold = 0, g_switchShare = 0;
+static char g_worldGen[160] = "";
+static void PollWorldGen();
 static CRITICAL_SECTION g_lobbyCs; static bool g_lobbyCsInit = false;   // guards g_lobbyProc handle use vs close
 
 template <class T> static T rget(const char* n) { return (T)g_origGdpa(g_dev, n); }
@@ -1801,6 +1819,7 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
     PollLobbyOpen();
     SteamNameTick();
     StageTick();
+    PollWorldGen();
     LONG n = InterlockedIncrement(&g_presentCount);
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
@@ -2326,7 +2345,9 @@ static void SyncStart(const char* why)
             // ...but only for a real hot join. The relay's periodic upload
             // took the same path and every panel got "!hotjoin ..." in its
             // chat every two minutes (2026-09-10).
-            if (strncmp(why, "relay:", 6) != 0)
+            if (strncmp(why, "world switch", 12) == 0)
+                SendChat("!hotjoin The host has moved to another world. Hold on: it is being sent to you and your game loads it by itself.");
+            else if (strncmp(why, "relay:", 6) != 0)
                 SendChat("!hotjoin A game is running. Hold on: the host is saving and will send you the world; your game loads it by itself.");
         }
     }
@@ -2348,7 +2369,9 @@ static void SyncPoll()
             // wait until the file stops growing (the sidecars are written after the .sav)
             if (wcscmp(cur, g_syncSave) == 0 && sz == g_syncLastSize) {
                 std::string u = utf8Of(cur);
-                std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(u.c_str()) + "\"}";
+                const bool sw = InterlockedExchange(&g_switchShare, 0) != 0;
+                std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(u.c_str()) + "\""
+                                 + (sw ? ",\"switch\":true" : "") + "}";
                 wcscpy_s(g_startSaveW, cur);
                 LobbySend(line.c_str());
                 MarkSaveShared();
@@ -2367,7 +2390,84 @@ static void SyncPoll()
         Log("[sync] no new save appeared within 90 s -- giving up (is autosave writable? see the game log)\n");
         SetStatus("Sync: the save did not appear");
         g_syncAskedAt = 0;
+        InterlockedExchange(&g_switchShare, 0);
     }
+}
+
+// A resync loads a world too. Its load is not a world switch: everyone is
+// already being moved to it by the recovery protocol, and pushing the save
+// again would start a second transfer on top of the one that just finished.
+static bool RecoveryBusy()
+{
+    if (InterlockedCompareExchange(&g_recoveryWorldIo, 0, 0) || NativeIo::Busy()) return true;
+    bool busy = false;
+    if (g_modelCsInit) {
+        EnterCriticalSection(&g_modelCs);
+        busy = g_recoveryRequestedAt != 0
+            || (g_recoveryPhase[0] && strcmp(g_recoveryPhase, "complete") && strcmp(g_recoveryPhase, "detected")
+                && strcmp(g_recoveryPhase, "unavailable") && strcmp(g_recoveryPhase, "manual"));
+        LeaveCriticalSection(&g_modelCs);
+    }
+    return busy;
+}
+
+// ---------------- WORLD SWITCH without a save name ----------------
+// NEW GAME never passes through StartSavegame, and neither does anything else
+// that builds a world from something other than a save file, so the detour
+// above cannot see those. The MOD can: lockstep.lua stamps a fresh value into
+// tpf2mp_world_gen.txt on the first sim tick of every world it loads (with the
+// game's own pid, so a second instance sharing this data dir is not mistaken
+// for us). A change in that value means THIS game is in another world now.
+// Host only -- a joiner's own token says nothing about what anyone must load.
+static void PollWorldGen()
+{
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 500 || !g_dataDirW[0]) return;
+    last = now;
+    // A resync loads a world of its own. Arm the hold for as long as one runs,
+    // not only when the change is noticed: the token is stamped on the new
+    // world's first tick, and this poll may not see it until the recovery has
+    // already reported "complete".
+    if (RecoveryBusy()) InterlockedExchange(&g_worldGenHold, 1);
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2mp_world_gen.txt", g_dataDirW);
+    FILE* f = _wfsopen(p, L"r", _SH_DENYNO); if (!f) return;
+    char buf[400] = ""; size_t got = fread(buf, 1, sizeof(buf) - 1, f); buf[got] = 0; fclose(f);
+    char gen[160] = ""; unsigned long pid = 0; bool sawPid = false;
+    for (char* line = buf; line && *line; ) {
+        char* nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        if (!strncmp(line, "gen=", 4)) strncpy_s(gen, sizeof(gen), line + 4, _TRUNCATE);
+        else if (!strncmp(line, "pid=", 4)) { sawPid = line[4] != 0; pid = strtoul(line + 4, nullptr, 10); }
+        line = nl ? nl + 1 : nullptr;
+        while (line && (*line == '\r' || *line == '\n')) line++;
+    }
+    if (!gen[0]) return;
+    if (sawPid && pid != GetCurrentProcessId()) return;    // another instance's token
+    if (!strcmp(gen, g_worldGen)) return;
+    // The value is followed from the title menu on -- a world the game loaded
+    // before anyone hosted is still a baseline, and a token first seen at a
+    // session boundary would otherwise read as a switch. The hold says "the
+    // next value is the world WE just started loading", and is spent on the
+    // first sighting too: with no token file at all (a process that has never
+    // loaded a world) that first sighting IS our load.
+    const bool first = g_worldGen[0] == 0;
+    const bool mine = InterlockedExchange(&g_worldGenHold, 0) != 0;
+    strcpy_s(g_worldGen, gen);
+    if (first) { Log("[menu] world token %s (first seen%s)\n", gen, mine ? ", our own load" : ""); return; }
+    if (mine) { Log("[menu] world token %s -- the load we started\n", gen); return; }
+    if (!InterlockedCompareExchange(&g_isHost, 0, 0)) return;   // a joiner never switches anyone
+    if (RecoveryBusy()) { Log("[menu] world token %s during a resync -- not a switch\n", gen); return; }
+    int players = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); players = playerCount(); LeaveCriticalSection(&g_modelCs); }
+    const bool live = WorldLoaded() && InterlockedCompareExchange(&g_sessionStarted, 0, 0)
+                   && InterlockedCompareExchange(&g_lobbyReady, 0, 0);
+    if (!live || players < 2) {
+        Log("[menu] world token %s -- nobody to switch (live=%d players=%d)\n", gen, live ? 1 : 0, players);
+        return;
+    }
+    Log("[menu] world token changed to %s while %d player(s) are playing -- switching everyone\n", gen, players - 1);
+    InterlockedExchange(&g_switchShare, 1);
+    SyncStart("world switch");
 }
 
 // "/speed 2.5" typed in the lobby chat (by anyone -- the host's game script
@@ -2769,6 +2869,87 @@ static bool placeSaveNewest(const wchar_t* srcSav)
     return true;
 }
 
+// ---------------- VANILLA LOAD = SHARE (host) ----------------
+// UI::CMenuUI::StartSavegame 0x6785c0 is where every UI load path converges
+// (title menu, in-game menu, CONTINUE), so one observer sees them all. It is
+// NOT a second inline hook: native_io.cpp already detours that address with a
+// 20-byte steal, and a second InstallHook there would copy the jump the first
+// one wrote into its trampoline. NativeIo::ObserveStart calls us instead, on
+// the engine's UI thread, with the LoadGameParams the game was handed.
+// Re-verified against build 35924 (2026-09-16, capstone over the exe):
+//   rcx = UI::CMenuUI* (it reads this+0x1988, the "initialization is already
+//         active" flag), rdx = const LoadGameParams&, r8 = const SavegameInfo&
+//   prologue: push rbp/rsi/rdi/r12/r13/r14/r15 (12 B) + lea rbp,[rsp-0x3a0]
+//         (8 B) = a 20-byte steal on an instruction boundary, nothing
+//         RIP-relative before +27 (sub rsp,0x4a0 at +20).
+//   LoadGameParams holds 32-byte std::strings: the campaign/mission sizes the
+//         engine compares sit at +0x108 and +0x128, i.e. the strings at +0xF8
+//         and +0x118; the save NAME is the string at +0x00 (the field our own
+//         AutoLoadCall fills for mp_shared).
+// LoadGameParams +0x00 is the save NAME (no extension, namespace "savegame");
+// the file is <SAVE_DIR>\<name>.sav.
+static void GStringRead(const void* gs, char* out, size_t cap)
+{
+    const GString* g = (const GString*)gs;
+    const char* src = g->cap >= 16 ? *(const char* const*)g->buf : g->buf;
+    size_t n = g->size < cap - 1 ? g->size : cap - 1;
+    if (g->size > 4096 || !src) { out[0] = 0; return; }
+    memcpy(out, src, n); out[n] = 0;
+}
+// SEH only in this frame (no C++ objects): the params pointer is the engine's.
+static bool SafeParamsName(const void* params, char* out, size_t cap)
+{
+    __try { GStringRead(params, out, cap); } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
+    return out[0] != 0;
+}
+
+static void OnStartSavegame(const void* params, bool accepted, bool ours)
+{
+    // our own autoload / the resync's in-place load: not the player picking a world
+    if (ours || InterlockedCompareExchange(&g_selfLoad, 0, 0)) return;
+    if (!accepted) return;                     // the engine refused it; nothing changed
+    char name[300] = "";
+    SafeParamsName(params, name, sizeof(name));
+    const bool hosting = InterlockedCompareExchange(&g_isHost, 0, 0) != 0
+                      && InterlockedCompareExchange(&g_lobbyReady, 0, 0) != 0;
+    int players = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); players = playerCount(); LeaveCriticalSection(&g_modelCs); }
+    Log("[menu] menu load of '%s' from page %ld (hosting=%d players=%d)\n",
+        name, InterlockedCompareExchange(&g_lastPage, 0, 0), hosting ? 1 : 0, players);
+    if (!hosting || !name[0]) return;
+    if (players < 2) { Log("[menu] menu load while hosting with nobody in the lobby -- not shared\n"); return; }
+    wchar_t wn[300]; MultiByteToWideChar(CP_UTF8, 0, name, -1, wn, 300);
+    wchar_t path[600]; _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        Log("[menu] menu load: %ls not found in the save folder -- not shared\n", path);
+        return;
+    }
+    // A SWITCH is a load taken while the session is already running: the others
+    // are IN a world and have to leave it. Before that -- everyone still in the
+    // lobby -- it is the ordinary "the host picked the save to start with".
+    const bool switching = WorldLoaded() || InterlockedCompareExchange(&g_sessionStarted, 0, 0) != 0;
+    wcscpy_s(g_startSaveW, path);
+    writeCompanyCfg();
+    // the mod stamps a fresh world token the moment this world is up: that
+    // change is THIS load, not another switch
+    InterlockedExchange(&g_worldGenHold, 1);
+    std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(path).c_str()) + "\"";
+    if (switching) line += ",\"switch\":true";
+    line += "}";
+    LobbySend(line.c_str());
+    MarkSaveShared();     // a joiner arriving right after reuses this save
+    char st[240];
+    if (switching) {
+        snprintf(st, sizeof(st), "Switching everyone to '%s'\xE2\x80\xA6", name);
+        Log("[menu] world switch: the host loaded %ls mid-session -- pushing it to %d player(s)\n", path, players - 1);
+    } else {
+        InterlockedExchange(&g_hostLoadedItself, 1);
+        snprintf(st, sizeof(st), "Sharing '%s' with %d player(s)\xE2\x80\xA6", name, players - 1);
+        Log("[menu] menu load: sharing %ls with the lobby (the game loads it here)\n", path);
+    }
+    SetStatus(st);
+}
+
 // ---------------- AUTO-LOAD: start the shared save in-process ----------------
 // Every menu load ends in bool UI::CMenuUI::StartSavegame(this, const
 // LoadGameParams&, const SavegameInfo&) (0x6785c0). CONTINUE feeds it from the
@@ -2821,7 +3002,12 @@ static int AutoLoadCall(void* menu, const char* name)
         ((void* (*)(void*))(g_base + RVA_LOADPARAMS_CTOR))(params);
         g_strAssign(params + 0x00, name, strlen(name));
         stage = 3;
+        // OUR load, not the player's: the share observer (OnStartSavegame) has
+        // to pass it straight through, or a host would re-share mp_shared the
+        // moment it loaded the save it had just shared.
+        InterlockedExchange(&g_selfLoad, 1);
         char started = ((char (*)(void*, void*, void*))(g_base + RVA_START_SAVEGAME))(menu, params, info);
+        InterlockedExchange(&g_selfLoad, 0);
         stage = 4;
         ((void (*)(void*))(g_base + RVA_LOADPARAMS_DTOR))(params);
         ((void (*)(void*))(g_base + RVA_SAVEINFO_DTOR))(info);
@@ -3180,15 +3366,40 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             // {"type":"start","save":true|false}: save=true means a save
                             // transfer completed for this peer this session; absent => true.
                             bool withSave = jsonBool(rem, "save", true);
+                            // "switch":true -- the host left the world it was in and
+                            // everyone follows it into this save (see OnStartSavegame).
+                            bool isSwitch = jsonBool(rem, "switch", false);
                             bool saveReady = InterlockedCompareExchange(&g_saveReady, 0, 0) != 0;
-                            wchar_t src[600] = L""; bool go = true;
-                            if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi) {
+                            const bool amHost = InterlockedCompareExchange(&g_isHost, 0, 0) != 0;
+                            if (amHost) InterlockedExchange(&g_sessionStarted, 1);
+                            wchar_t src[600] = L""; bool go = true, inPlace = false;
+                            if (amHost && isSwitch) {
+                                // the host IS the new world: it loaded it itself
+                                Log("[menu] start(switch) on the host -- it is already in the new world\n");
+                                go = false;
+                            } else if (amHost && InterlockedExchange(&g_hostLoadedItself, 0)) {
+                                // the host loaded the save from the game's own LOAD GAME:
+                                // the game is already loading it, the joiners load theirs
+                                Log("[menu] start: the host loaded its save itself -- nothing to load here\n");
+                                go = false;
+                            } else if (isSwitch) {
+                                // A WORLD SWITCH is for us even though we are playing.
+                                if (!(withSave && saveReady)) {
+                                    Log("[menu] start(switch) but no save arrived this session -- staying in this world\n");
+                                    SetStatus("The host switched world but its save did not arrive."); go = false;
+                                } else {
+                                    _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
+                                    inPlace = WorldLoaded();
+                                    // g_saveReady is latched for the session; a LATER switch
+                                    // must wait for its own transfer, not reuse this one
+                                    InterlockedExchange(&g_saveReady, 0);
+                                }
+                            } else if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi) {
                                 // HOT JOIN: we are already playing; this start is the
                                 // sync save going out to a newcomer. Nothing to load here.
                                 Log("[menu] start while in game -- a sync for a newcomer, ignored here\n");
                                 go = false;
-                            }
-                            if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
+                            } else if (amHost && !(withSave && saveReady)) {
                                 // our own save (the one we shared / uploaded); a leader that RECEIVED a
                                 // save this session (a relay loading its stored world) falls through and loads that.
                                 // No guessing: our newest save need not be what anyone else has.
@@ -3205,9 +3416,28 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 Log("[menu] start(save=%d) but no save_ready this session -- not loading\n", withSave ? 1 : 0);
                                 SetStatus("Start received but no save arrived -- ask the host to START again"); go = false;
                             }
-                            if (go) {
+                            if (go && inPlace) {
+                                // IN GAME: there is no menu to hand the load to. Place the
+                                // save as mp_shared and ask the engine for it the way the
+                                // resync does (NativeIo::Load -> CMenuUI::StartSavegame on
+                                // the engine's own thread). The mod re-initialises on the
+                                // new world and catches up from the host like a hot joiner.
                                 writeCompanyCfg();
-                                SetStatus("Loading shared save…"); Sleep(400);
+                                SetStatus("Loading the host's new world\xE2\x80\xA6");
+                                char op[64]; snprintf(op, sizeof(op), "world_switch_%lu", (unsigned long)GetTickCount64());
+                                InterlockedExchange(&g_worldGenHold, 1);   // the token the new world stamps is ours
+                                bool queued = placeSaveNewest(src) && NativeIo::Load(op, "mp_shared");
+                                if (queued) {
+                                    Log("[menu] world switch: loading mp_shared in place (%s)\n", op);
+                                    ReportStage("loading the host's new world"); InterlockedExchange(&g_stageWatch, 1);
+                                } else {
+                                    Log("[menu] world switch: the engine would not take the in-place load -- the player loads mp_shared\n");
+                                    SetStatus("The host changed world -- open LOAD GAME and pick \"mp_shared\".");
+                                }
+                            } else if (go) {
+                                writeCompanyCfg();
+                                InterlockedExchange(&g_worldGenHold, 1);   // the token the new world stamps is ours
+                                SetStatus(isSwitch ? "Loading the host's new world…" : "Loading shared save…"); Sleep(400);
                                 if (doStartLoad(src)) {
                                     ReportStage("loading world"); InterlockedExchange(&g_stageWatch, 1);
                                     // The game is loading. The lobby process STAYS ALIVE: since the
@@ -3318,6 +3548,11 @@ static void StartLobby(int join)
     if (g_lobbyProc || g_lobbyThread) TeardownLobby(1500, true);
     InterlockedExchange(&g_lobbyReady, 0);
     InterlockedExchange(&g_saveReady, 0);
+    InterlockedExchange(&g_sessionStarted, 0);
+    InterlockedExchange(&g_hostLoadedItself, 0);
+    InterlockedExchange(&g_worldGenHold, 0);
+    InterlockedExchange(&g_switchShare, 0);
+    g_worldGen[0] = 0;
     InterlockedExchange(&g_isHost, join ? 0 : 1);
     InterlockedExchange(&g_lobbyDone, 0);   // a new lobby captures typing again
     InterlockedExchange(&g_uiState, 2); InterlockedExchange(&g_panelDirty, 1);
@@ -3500,6 +3735,7 @@ static void MyCreatePage(uint64_t thisp, int page)
 {
     NativeIo::ObserveMenu(thisp);
     g_origCreatePage(thisp, page);
+    InterlockedExchange(&g_lastPage, page);
     // The main menu builds pages 0 -> 2 -> 1 (2 is the main content, 0/1 are its
     // sub-layers). Full-screen replacements (Settings/Campaign/Load...) are all
     // page >= 3. So SET on 2, CLEAR only on >= 3; leave 0/1 alone -- otherwise
@@ -3610,6 +3846,10 @@ static DWORD WINAPI Init(LPVOID)
     // the runtime data dir the bridge uses for tpf2_instance.txt / tpf2_bridge_ctl.txt
     if (!Tpf2mpDataDirW(g_dataDirW, MAX_PATH, (const void*)&Init)) wcscpy_s(g_dataDirW, ourDirW());
     NativeControl::Start(g_dataDirW, NativeIo::Initialize(g_base, g_nativeModule, g_saveDirW));
+    // Every UI load reaches us through the StartSavegame detour native_io.cpp
+    // already owns (one hook, one steal): a host that loads another world
+    // shares it, mid-session as a world switch (see OnStartSavegame).
+    NativeIo::ObserveStart(&OnStartSavegame);
     InitializeCriticalSection(&g_statusCs); g_csInit = true;
     InitializeCriticalSection(&g_modelCs); g_modelCsInit = true;
     InitializeCriticalSection(&g_lobbyCs); g_lobbyCsInit = true;

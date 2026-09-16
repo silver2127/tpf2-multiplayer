@@ -9,6 +9,17 @@ namespace NativeIo {
 struct Event { std::string operation, step, detail; bool success; };
 bool Initialize(uintptr_t imageBase, HMODULE module, const wchar_t* saveDirectory);
 void ObserveMenu(uintptr_t menu);
+// Every UI load path -- the title menu, the in-game menu, our own menu-frame
+// autoload and Load() below -- converges on UI::CMenuUI::StartSavegame, which
+// this file already detours. A second InstallHook at that address would steal
+// the bytes the first one wrote, so an observer is registered instead of a
+// second hook. It runs on the engine's UI thread right after the engine
+// answered, with:
+//   params    const LoadGameParams& (rdx at the call); +0x00 is the save NAME
+//   accepted  what StartSavegame returned (false = the load did not start)
+//   ours      the load was queued by Load() here, not asked for by the player
+using StartObserver = void (*)(const void* params, bool accepted, bool ours);
+void ObserveStart(StartObserver observer);
 bool Save(const std::string& operation, const std::string& basename);
 bool Load(const std::string& operation, const std::string& basename);
 // Owner must first stop Lua/network action producers. The native pause command

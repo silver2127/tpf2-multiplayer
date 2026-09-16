@@ -798,6 +798,33 @@ function data()
 		update = function()
 			CM.ticks = CM.ticks + 1
 			if not K.INSTANCE and not CM.detectInstance() then return end
+			-- WORLD TOKEN: which world this game is in, one line, rewritten on
+			-- the first sim tick of every load. The menu DLL cannot see a NEW
+			-- GAME (it never reaches the engine's StartSavegame) and a CONTINUE
+			-- carries no name it could recognise, so the host's menu reads a
+			-- CHANGE here as "this game has moved to another world" and pushes
+			-- it to everyone. The pid addresses the file to THIS game: a second
+			-- instance sharing the data dir must not be taken for us. Written
+			-- from the sim side only -- the dashboard's guiUpdate runs this same
+			-- chunk in its own Lua state, and a second value per load would read
+			-- as a second switch -- and BEFORE the recovery hold below, so a
+			-- resync's own load is stamped while the menu knows it is busy.
+			if not CM.worldGenWritten then
+				CM.worldGenWritten = true
+				pcall(function()
+					local f = io.open(K.BASE .. "tpf2mp_world_gen.txt", "w")
+					if not f then return end
+					-- the wall clock, this process's own clock, the address of a
+					-- fresh table and a draw: two loads cannot land on one value,
+					-- not even two in the same second of a run that never reseeded
+					local uniq = tostring({}):gsub("%W", "")
+					f:write("pid=" .. tostring(K.PROCESS_ID or "") .. "\n")
+					f:write("gen=" .. os.time() .. "-"
+						.. math.floor((os.clock() or 0) * 1000) % 1000000 .. "-"
+						.. uniq .. "-" .. math.random(0, 999999) .. "\n")
+					f:close()
+				end)
+			end
 			-- Recovery is checked before every command producer, including deferred
 			-- company repairs. Recovery control uses the separate lobby connection.
 			if CM.autoSyncPump(CM.gameTime() or 0) then return end
