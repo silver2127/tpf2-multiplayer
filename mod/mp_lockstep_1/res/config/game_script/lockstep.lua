@@ -559,6 +559,7 @@ K.SIM_STEP = 0.2
 -- which is what drifted departures -- review, 2026-09-01).
 K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
 K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
+K.VCOLOR_RETRY_MAX = 50      -- a company paint waits up to 50 of those for its vehicle's key (vehicles.lua execSetColor)
 K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
 K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
 -- Own commands are kept for resend until every live peer has acknowledged them

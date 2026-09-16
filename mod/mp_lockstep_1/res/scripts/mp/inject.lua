@@ -1115,6 +1115,10 @@ function CM.pollInject()
 								-- strict buys went in).
 								CM.scheduleLocal("VBUY", bargs)
 								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp (key binds on replay)")
+								-- COMPANY PAINT (2026-09-16): the buy's key is ours, so the paint
+								-- goes out right behind it, as the parked path has done since
+								-- 0.4.12 -- this strict path, the one every buy takes, never did.
+								pcall(CM.cmColorNewVehicle, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 							else
 								-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
 								CM.parkedBuys[#CM.parkedBuys + 1] = {

@@ -648,11 +648,27 @@ end
 
 function CM.execSetColor(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+	-- A vehicle paint whose key is not bound yet (its buy is still draining, one
+	-- per tick, or its VBUY arrived behind this) retries on the same step grid
+	-- as a VLINE, K.VCOLOR_RETRY_MAX times: the company paint follows the buy by
+	-- a few units and a batch of buys drains slower than that (2026-09-16).
+	if tostring(c.kind or "") == "veh" and c.key and not targetFor("veh", tostring(c.key)) then
+		c.tries = (c.tries or 0) + 1
+		if c.tries <= (K.VCOLOR_RETRY_MAX or 50) then
+			c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+			CM.retryQueue = CM.retryQueue or {}
+			CM.retryQueue[#CM.retryQueue + 1] = c
+			if c.tries == 1 or c.tries == 10 then
+				log(string.format("VCOLOR seq=%s: vehicle key %s not bound yet -- retry %d (step %d)", tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep))
+			end
+			return
+		end
+	end
 	local ok, err = pcall(function()
 		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
 		if not id then
-			log(string.format("VCOLOR seq=%s: no local %s for key %s -- skipped",
-				tostring(c.seq), tostring(c.kind), tostring(c.key)))
+			log(string.format("VCOLOR seq=%s: no local %s for key %s -- skipped%s",
+				tostring(c.seq), tostring(c.kind), tostring(c.key), (c.tries or 0) > 0 and string.format(" after %d retries", c.tries) or ""))
 			return
 		end
 		local r, g, b = tonumber(c.r) or 0, tonumber(c.g) or 0, tonumber(c.b) or 0
