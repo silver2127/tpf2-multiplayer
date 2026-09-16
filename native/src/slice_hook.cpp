@@ -5745,6 +5745,259 @@ static void InstallRoadSpace()
 }
 
 // ---------------------------------------------------------------------------
+// SHARED STATIONS -- one comparison in the line editor is the whole gate.
+//
+// THE FINDING (RE pass on build 35924, 2026-09-16). In companies mode a player
+// clicking ANOTHER company's station in the line editor got nothing: no stop,
+// no message, no sound. Walking the click path from the top:
+//
+//   UI::LineEditor's "add station" tool is a UI::_anon_46B7A670::StationSelector
+//   (vftable 0x3010860) paired with a UI::_anon_46B7A670::StationFilter
+//   (vftable 0x3010848). Both are built together in the line editor's creation
+//   chain, 0x5fc5bc and 0x5fc83a inside 0x5fc560. The selector asks the filter
+//   whether an entity under the cursor may be reported at all (UI::IFilter slot
+//   1, through the accept helper at 0x439ea0), so a filter that says no makes
+//   the entity invisible to the tool: the click lambdas (0x60bea0, which adds
+//   the stop, and 0x60c040, the cursor hint) never see it. THAT is why the
+//   rejection is silent -- neither of those two has an owner test of its own.
+//
+//   StationFilter::IsValid is 0x6095d0. It calls
+//   AddStationInputComponentChecker::IsValidInput (0x609b00, funcsig-named),
+//   which classifies what was clicked into
+//   UI::`anonymous namespace'::ValidAddStationSelection and pairs it with the
+//   entity to add: Station -> its station group (0), StationGroup (0), a track
+//   or road edge the line may put a waypoint on (1), Town (2), depot/other (3),
+//   nothing usable (4). IsValidInput itself has NO owner test -- the earlier
+//   note in docs/SHARED_INFRA.md was right about that function and wrong about
+//   where to look. The owner test is in its CALLER:
+//
+//     0x609610  lea  rcx, [rbx+8]
+//     0x609614  call 0x8b9e60            ; the engine, off the filter
+//     0x609619  lea  rdx, [rsp+0x34]     ; the entity IsValidInput paired
+//     0x60961e  mov  rcx, rax
+//     0x609621  call 0x472900            ; GetComponentPtr<component::PlayerOwned>
+//     0x609626  test rax, rax
+//     0x609629  je   0x609605            ; no owner    -> accept
+//     0x60962b  mov  eax, [rax]          ; PlayerOwned.player
+//     0x60962d  test eax, eax
+//     0x60962f  js   0x609605            ; owner < 0   -> accept
+//     0x609631  cmp  eax, [rbx+0x28]     ; <-- THE GATE
+//     0x609634  je   0x609605            ; same owner  -> accept
+//     0x609636  xor  eax, eax            ; another company -> REJECT, silently
+//
+//   and it runs only for classes 0 and 1 -- exactly the station, station group
+//   and line-usable edge cases. Classes 2, 3 and 4 skip it. So the comparison
+//   this patch answers can only ever be about a stop the line editor was about
+//   to accept, never about anything else.
+//
+//   StationFilter+0x28 is the local human player entity. It is threaded from
+//   UI::CGameUI::CreateUI (0x56a121 `call 0x8bb7f0` -- the view manager's game
+//   state -- then `mov edi,[rax+0x214]`) through the line list (0x613340) and
+//   the LineEditor constructor (0x5fa970, argument 15 at [rbp+0x1f0]) into the
+//   filter (0x5fc857 `mov [rcx+0x28], eax`). GameState+0x214 is the same field
+//   two other UI owner gates compare against -- 0x8b3020 `cmp *PlayerOwned,
+//   [gameState+0x214]` and 0x8a3c20 -- and the one GameState::Replicate copies.
+//
+// EVERYTHING DOWNSTREAM WAS WALKED AND HAS NO SUCH TEST. The complete set of
+// PlayerOwned readers in the binary is 43 inlined type-descriptor sites plus
+// the callers of the two accessors (0x472900, 0xc5e20); none of the ones on
+// this path compares two entities' owners:
+//   make_cmd::UpdateLine 0x9df4e0 and its sim-thread handler 0x9d9fd0 (variant
+//   tag 5) assert only `lineEntity != ecs::Entity()` and write the new Line
+//   component -- a foreign station id in a replayed updateLine is NOT stripped;
+//   ecs::LineSystem::EntityAdded 0xa43400 asserts only that each stop's station
+//   group exists; line_util::GetBestLineAssignment 0x215d660,
+//   line_util::CalcSectionPaths 0x215a050, CalcLineStopTerminal 0x96f3b0,
+//   FindNextFreeTerminal 0xad40b0, ecs::ComputeTerminalConnectivity 0xa42540,
+//   station_util::GetCarriers 0x218d720 and GetTerminalPersonEdges 0x218f370,
+//   and the person-side LinesExpander (AddStation 0x977410, VisitLines
+//   0x977640) contain no PlayerOwned read at all.
+// The owner reads that do exist on neighbouring paths are all "charge or
+// attribute to the vehicle's own company" (TransportVehicleSystem::
+// ChargeRunningCosts 0xad11d0, HandleVehicleArrived 0xad5f70) or UI "is this
+// mine" display gates (UI::GetEntitiesForPlayer 0x73d8d0, the entity window
+// 0x8b3020 and 0x8a3c20). ONE genuine gate is left deliberately alone:
+// vehicle_util::common::FindPathToDepot's search (the compare at 0x216fa52)
+// requires the depot's PlayerOwned to equal the vehicle's, so B's vehicles
+// still only ever service in B's own depots.
+//
+// THE PATCH. Five bytes at 0x609631 -- the `cmp` and the `je`, two whole
+// instructions, nothing branches into them -- become a jump into a stub that
+// asks a helper and then jumps to the engine's own accept (0x609605) or reject
+// (0x609636) label. The helper answers "same owner" for a foreign owner ONLY
+// while companies mode is live (line 1 of mp_company_cfg.txt, the file the menu
+// dll writes at session start and companies.lua reads); otherwise it replays
+// the engine's comparison exactly. Outside companies mode there is only one
+// player entity, so that comparison cannot fail and the patch is a no-op --
+// the mode check is belt and braces, not the safety.
+//
+// At 0x609631 the function has done `push rbx; sub rsp,0x20`, so rsp is
+// 16-aligned and a call from the stub is ABI-correct; rbx is the filter and is
+// preserved; eax is dead on both branch targets (they set it themselves), and
+// no other register is read after this point, so the stub may clobber rax, rcx
+// and rdx freely.
+//
+// WHAT THIS DOES NOT DO. Ownership does not change: the station stays A's, the
+// mod still refuses B's edits and demolition (shared_infra.lua cmMayModify),
+// station maintenance stays on A's books and the line's income stays on B's.
+//
+// KILL SWITCH: `sharedstations=0` in tpf2_menu_flags.txt leaves the comparison
+// alone and foreign stations stay unusable.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_SHAREDSTATIONS_GUARD  = 0x609610;  // start of the owner test
+static const uintptr_t RVA_SHAREDSTATIONS_SITE   = 0x609631;  // cmp eax,[rbx+0x28]
+static const uintptr_t RVA_SHAREDSTATIONS_ACCEPT = 0x609605;  // mov eax,1; ret
+static const uintptr_t RVA_SHAREDSTATIONS_REJECT = 0x609636;  // xor eax,eax; ret
+static const uintptr_t RVA_SS_GETENGINE          = 0x8b9e60;  // the filter's engine accessor
+static const uintptr_t RVA_SS_GETPLAYEROWNED     = 0x472900;  // GetComponentPtr<PlayerOwned>
+static const int       SHAREDSTATIONS_STEAL      = 5;         // cmp (3) + je (2)
+
+// The whole test, from the engine lookup to the two labels the stub jumps to.
+// A build that matches all 46 bytes is the build these RVAs were measured on.
+static const uint8_t SHAREDSTATIONS_EXPECT[46] = {
+    0x48, 0x8D, 0x4B, 0x08,              // lea  rcx, [rbx+8]
+    0xE8, 0x47, 0x08, 0x2B, 0x00,        // call 0x8b9e60
+    0x48, 0x8D, 0x54, 0x24, 0x34,        // lea  rdx, [rsp+0x34]
+    0x48, 0x8B, 0xC8,                    // mov  rcx, rax
+    0xE8, 0xDA, 0x92, 0xE6, 0xFF,        // call 0x472900
+    0x48, 0x85, 0xC0,                    // test rax, rax
+    0x74, 0xDA,                          // je   0x609605
+    0x8B, 0x00,                          // mov  eax, [rax]
+    0x85, 0xC0,                          // test eax, eax
+    0x78, 0xD4,                          // js   0x609605
+    0x3B, 0x43, 0x28,                    // cmp  eax, [rbx+0x28]   <- the 5 stolen
+    0x74, 0xCF,                          // je   0x609605
+    0x33, 0xC0,                          // xor  eax, eax
+    0x48, 0x83, 0xC4, 0x20,              // add  rsp, 0x20
+    0x5B,                                // pop  rbx
+    0xC3                                 // ret
+};
+
+static bool  g_ssOn = false;
+static long  g_ssCalls = 0;     // foreign owners this filter was asked about
+static long  g_ssOpened = 0;    // ...of which were let through
+static bool  g_ssSaidOnce = false;
+
+// Companies mode, from the file both sides already share: line 1 of
+// mp_company_cfg.txt is "companies" or "coop" (menu_hook.cpp writeCompanyCfg,
+// companies.lua cmReadConfig). Cached, because the filter runs on hover.
+// A stale answer is harmless: outside companies mode the comparison it guards
+// cannot fail anyway.
+static bool SharedStationsCompaniesLive()
+{
+    static ULONGLONG last = 0;
+    static bool cached = false;
+    const ULONGLONG now = GetTickCount64();
+    if (last && now - last < 2000) return cached;
+    last = now;
+    cached = false;
+    if (!g_dataDir[0]) return cached;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%smp_company_cfg.txt", g_dataDir);
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return cached;
+    char line[64] = {0};
+    if (fgets(line, sizeof(line), f)) cached = strncmp(line, "companies", 9) == 0;
+    fclose(f);
+    return cached;
+}
+
+// The engine's comparison, with one extra answer. Returns 1 = accept (the line
+// editor may add this stop), 0 = reject (what the engine would have said).
+extern "C" int SharedStationsAllow(int owner, int mine)
+{
+    if (owner == mine) return 1;
+    InterlockedIncrement(&g_ssCalls);
+    int live = 0;
+    __try { live = SharedStationsCompaniesLive() ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
+    if (!live) return 0;
+    InterlockedIncrement(&g_ssOpened);
+    if (!g_ssSaidOnce) {
+        g_ssSaidOnce = true;
+        Log("[sharedstations] line editor accepted a stop owned by player %d (we are %d) -- "
+            "companies mode is live; the line, its vehicles and its income stay with us\n",
+            owner, mine);
+    }
+    return 1;
+}
+
+static void InstallSharedStations()
+{
+    if (FlagsSayOff("sharedstations")) {
+        Log("[sharedstations] OFF (sharedstations=0 in tpf2_menu_flags.txt) -- the line editor "
+            "keeps refusing another company's stations\n");
+        return;
+    }
+    if (!BytesAre(RVA_SHAREDSTATIONS_GUARD, SHAREDSTATIONS_EXPECT,
+                  sizeof(SHAREDSTATIONS_EXPECT), "sharedstations")) return;
+    // Both rel32 calls inside the guarded window must resolve where the finding
+    // says: a byte match that landed on some other function cannot pass.
+    int32_t rel = 0;
+    memcpy(&rel, SHAREDSTATIONS_EXPECT + 5, 4);
+    uintptr_t target = (uintptr_t)((int64_t)RVA_SHAREDSTATIONS_GUARD + 9 + rel);
+    if (target != RVA_SS_GETENGINE) {
+        Log("[sharedstations] NOT installed: the call at rva=%llx resolves to %llx, not the "
+            "engine accessor %llx\n", (unsigned long long)(RVA_SHAREDSTATIONS_GUARD + 4),
+            (unsigned long long)target, (unsigned long long)RVA_SS_GETENGINE);
+        return;
+    }
+    memcpy(&rel, SHAREDSTATIONS_EXPECT + 18, 4);
+    target = (uintptr_t)((int64_t)RVA_SHAREDSTATIONS_GUARD + 22 + rel);
+    if (target != RVA_SS_GETPLAYEROWNED) {
+        Log("[sharedstations] NOT installed: the call at rva=%llx resolves to %llx, not "
+            "GetComponentPtr<PlayerOwned> %llx\n",
+            (unsigned long long)(RVA_SHAREDSTATIONS_GUARD + 17),
+            (unsigned long long)target, (unsigned long long)RVA_SS_GETPLAYEROWNED);
+        return;
+    }
+    // The stub, assembled here rather than in MASM because it is a jump target
+    // in the middle of a function, not a call: no prologue, no frame, and it
+    // must leave rbx and rsp exactly as it found them.
+    //   mov  ecx, eax              ; PlayerOwned.player
+    //   mov  edx, [rbx+0x28]       ; the filter's own player entity
+    //   sub  rsp, 0x20             ; shadow space; rsp was 16-aligned here
+    //   mov  rax, SharedStationsAllow ; call rax ; add rsp, 0x20
+    //   test al, al ; jne accept
+    //   mov  rax, reject ; jmp rax
+    // accept:
+    //   mov  rax, accept ; jmp rax
+    uint8_t* stub = NearAlloc(64);
+    if (!stub) {
+        Log("[sharedstations] NOT installed: no page within reach of a rel32 for the stub\n");
+        return;
+    }
+    size_t n = 0;
+    const uintptr_t helper = (uintptr_t)&SharedStationsAllow;
+    const uintptr_t accept = g_base + RVA_SHAREDSTATIONS_ACCEPT;
+    const uintptr_t reject = g_base + RVA_SHAREDSTATIONS_REJECT;
+    stub[n++] = 0x8B; stub[n++] = 0xC8;                                      // mov ecx, eax
+    stub[n++] = 0x8B; stub[n++] = 0x53; stub[n++] = 0x28;                    // mov edx,[rbx+0x28]
+    stub[n++] = 0x48; stub[n++] = 0x83; stub[n++] = 0xEC; stub[n++] = 0x20;  // sub rsp, 0x20
+    stub[n++] = 0x48; stub[n++] = 0xB8; memcpy(stub + n, &helper, 8); n += 8;// mov rax, helper
+    stub[n++] = 0xFF; stub[n++] = 0xD0;                                      // call rax
+    stub[n++] = 0x48; stub[n++] = 0x83; stub[n++] = 0xC4; stub[n++] = 0x20;  // add rsp, 0x20
+    stub[n++] = 0x84; stub[n++] = 0xC0;                                      // test al, al
+    stub[n++] = 0x75; stub[n++] = 0x0C;                                      // jne +12 (accept)
+    stub[n++] = 0x48; stub[n++] = 0xB8; memcpy(stub + n, &reject, 8); n += 8;// mov rax, reject
+    stub[n++] = 0xFF; stub[n++] = 0xE0;                                      // jmp rax
+    stub[n++] = 0x48; stub[n++] = 0xB8; memcpy(stub + n, &accept, 8); n += 8;// mov rax, accept
+    stub[n++] = 0xFF; stub[n++] = 0xE0;                                      // jmp rax
+    FlushInstructionCache(GetCurrentProcess(), stub, n);
+    if (!PatchJumpNear(g_base + RVA_SHAREDSTATIONS_SITE, stub, SHAREDSTATIONS_STEAL, nullptr)) {
+        Log("[sharedstations] NOT installed: could not write the detour at rva=%llx\n",
+            (unsigned long long)RVA_SHAREDSTATIONS_SITE);
+        return;
+    }
+    g_ssOn = true;
+    Log("[sharedstations] installed rva=%llx steal=%d accept=%llx reject=%llx -- in companies "
+        "mode the line editor takes another company's station as a stop; ownership, edits and "
+        "demolition are unchanged\n", (unsigned long long)RVA_SHAREDSTATIONS_SITE,
+        SHAREDSTATIONS_STEAL, (unsigned long long)RVA_SHAREDSTATIONS_ACCEPT,
+        (unsigned long long)RVA_SHAREDSTATIONS_REJECT);
+}
+
+// ---------------------------------------------------------------------------
 // SHIP AND AIRCRAFT CLAIM ORDER -- measured, not enforced, and here is why.
 //
 // THE FINDING (RE pass on build 35924). ecs::ShipMoveSystem::Update2 (0xa6c1e0,
@@ -6172,6 +6425,10 @@ static DWORD WINAPI Init(LPVOID)
     InstallMoveOrder(g_airChan, "airorder", RVA_AIR_UPDATE2, MOVEORDER_EXPECT_AIR,
                      sizeof(MOVEORDER_EXPECT_AIR), (void*)&AirOrderRelay,
                      &g_airOrderResume, "aircraft");
+    // The line editor's owner gate ("SHARED STATIONS"). Installed the same way
+    // and for the same reason: it only ever answers a comparison the engine was
+    // about to make, and outside companies mode that comparison cannot fail.
+    InstallSharedStations();
 
     for (;;) {
         Sleep(15000);
@@ -6181,6 +6438,9 @@ static DWORD WINAPI Init(LPVOID)
             Log("[trainorder] alive: steps=%ld reorders=%ld refused=%ld lastSeed=%lu lastN=%lld maxUs=%ld\n",
                 g_toCalls, g_toReorders, g_toRefusals,
                 (unsigned long)(ULONG)g_toLastSeed, (long long)g_toLastN, g_toMaxUs);
+        if (g_ssOn && g_ssCalls)
+            Log("[sharedstations] alive: foreignAsked=%ld opened=%ld\n",
+                g_ssCalls, g_ssOpened);
         if (g_rsOn)
             Log("[roadspace] alive: calls=%ld filtered=%ld changed=%ld handed=%ld faults=%ld maxN=%ld\n",
                 g_rsCallsA, g_rsCallsB, g_rsDiffs, g_rsHanded, g_rsFaults, g_rsMaxN);
