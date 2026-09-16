@@ -43,6 +43,11 @@ $Plugins = @(
        src = @('src\*', 'mod\minimap\*', 'tools\embed_lua.ps1', 'build.bat') }
 )
 
+# Mods to REMOVE from the game folder and every box overlay at the next install:
+# old recon/test mods that must not stay in anyone's mod list (m3_determinism_1
+# was the day-hash determinism probe, 2026-09-16). A running game keeps its
+# loaded copy in memory, so this waits for the games to close like everything else.
+$RemoveMods = @('m3_determinism_1')
 function Say($m, $c = 'Gray') { Write-Host ("[auto-install {0:HH:mm:ss}] {1}" -f (Get-Date), $m) -ForegroundColor $c }
 function Newest($paths, $root = $Repo) {
     $t = [datetime]0
@@ -102,6 +107,10 @@ function InstallStale {
             $why += "$($p.name) from $((Get-Item $out).LastWriteTime)"
         }
     }
+    foreach ($m in $RemoveMods) {
+        $paths = @(Join-Path $Game "mods\$m") + ($Boxes | ForEach-Object { "C:\Sandbox\$env:USERNAME\$_\drive\C\" + ($Game -replace '^[A-Za-z]:\\', '') + "\mods\$m" })
+        if ($paths | Where-Object { Test-Path $_ }) { $why += "remove $m" }
+    }
     if ($why.Count -eq 0) { return $false }
     if ((GamesRunning) -gt 0) {
         $pending = $why -join ', '
@@ -114,6 +123,11 @@ function InstallStale {
     $log = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'tools\deploy_shipping.ps1') 2>&1
     if ($LASTEXITCODE -ne 0 -or -not ($log -match 'deploy OK')) { Say ("deploy FAILED:`n" + ($log | Select-Object -Last 8 | Out-String)) Red; return $false }
     Say 'deployed to the game folder' Green
+    foreach ($m in $RemoveMods) {
+        foreach ($d in @(Join-Path $Game "mods\$m") + ($Boxes | ForEach-Object { "C:\Sandbox\$env:USERNAME\$_\drive\C\" + ($Game -replace '^[A-Za-z]:\\', '') + "\mods\$m" })) {
+            if (Test-Path $d) { Remove-Item $d -Recurse -Force; Say "removed the old mod $d" Green }
+        }
+    }
     foreach ($b in $Boxes) {
         $ov = "C:\Sandbox\$env:USERNAME\$b\drive\C\" + ($Game -replace '^[A-Za-z]:\\', '')
         if (-not (Test-Path $ov)) { if ($b -eq $Box) { Say "no Sandboxie overlay at $ov -- instance B not refreshed" DarkYellow }; continue }
