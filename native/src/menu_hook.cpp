@@ -709,8 +709,19 @@ static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, siz
 {
     size_t need = (size_t)w * 4 * h;
     if (g_stageSz < need) { free(g_stage); g_stage = (unsigned char*)malloc(need); g_stageSz = need; }
-    for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, bg + y * bgPitch, (size_t)w * 4);
-    BlurStage(w, h);
+    if (bg) {
+        for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, bg + y * bgPitch, (size_t)w * 4);
+        BlurStage(w, h);
+    } else {
+        // Opaque sheet (bg == nullptr): no read-back of the game frame, no blur.
+        // 40,25,5 is MW_BG = RGB(5,25,40) in the swapchain's B,G,R,A order; the
+        // layer's own background rect is that same colour, so the panel keeps its
+        // look and only loses the game showing through it.
+        for (int y = 0; y < h; y++) {
+            unsigned char* d = g_stage + (size_t)y * w * 4;
+            for (int x = 0; x < w; x++, d += 4) { d[0] = 40; d[1] = 25; d[2] = 5; d[3] = 255; }
+        }
+    }
     const Hit* hv = hoveredHit();
     if (hv) {
         int fill = g_active ? 100 : 50;
@@ -1339,19 +1350,41 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
     if (imgIndex >= g_scImgCount) return;
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) { g_hitCount = 0; return; }   // collapsed: the native list entry IS the button
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 1) PubPoll();
-    if (!BuildPanelImage() || !BuildBackdropImage()) return;
+    if (!BuildPanelImage()) return;
     PanelLayout();
-    // the caret blinks and chat arrives asynchronously: re-render the layer at most 2x/s when not dirty
+    // THE PANEL IS COMPOSED ONLY WHEN IT CHANGES, AND IT IS OPAQUE.
+    //
+    // It used to be composited over a blurred read-back of the live game frame on
+    // EVERY present: CopyBackdrop submits a GPU copy and waits on a fence, then
+    // BlurStage runs over ~1.5M pixels. That measured 40-65 ms per frame
+    // (tpf2_menu.log: "panel blend 1502x1040 hover=0 48.58 ms"), i.e. 20 FPS before
+    // the game does anything of its own. In the main menu the GPU is idle and the
+    // fence wait is nearly free, which is why it went unnoticed there; with a
+    // savegame loaded it stalls a busy pipeline, so hosting from inside a game fell
+    // to 10-15 FPS and clicks started missing (PollClick samples the mouse once per
+    // frame, so at 10 FPS a normal click can land entirely between samples and the
+    // window cannot be closed). Reported 2026-09-15.
+    //
+    // Now a normal frame only blits the ready panel image. CopyBackdrop, BlurStage
+    // and BuildBackdropImage are kept, unused, for the frosted look if it is ever
+    // wanted back -- but it must not go back on a per-frame path.
     static ULONGLONG lastRender = 0; ULONGLONG now = GetTickCount64();
-    if (InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1 || g_layer.w != g_copyW || g_layer.h != g_copyH || now - lastRender > 500) {
+    static int lastHover = -1, lastActive = -1;
+    // the caret blinks and chat arrives asynchronously: re-render at most 2x/s when not dirty
+    const bool dirty = InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1
+                    || g_layer.w != g_copyW || g_layer.h != g_copyH
+                    || g_hover != lastHover || g_active != lastActive   // hover wash is composed in
+                    || now - lastRender > 500;
+    if (dirty) {
+        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
         RenderPanelLayer(g_copyW, g_copyH); lastRender = now;
+        lastHover = g_hover; lastActive = g_active;
+        ComposeLayer(nullptr, 0, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
+        if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
+        QueryPerformanceCounter(&t1);
+        static int n = 0; if (++n % 60 == 1) Log("[menu] panel compose %dx%d hover=%d %.2f ms (only when changed)\n",
+            g_copyW, g_copyH, g_hover, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
     }
-    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-    if (!CopyBackdrop(q, imgIndex)) return;
-    ComposeLayer((const unsigned char*)g_bdPtr, g_bdPitch, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
-    if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
-    QueryPerformanceCounter(&t1);
-    static int n = 0; if (++n % 600 == 1) Log("[menu] panel blend %dx%d hover=%d %.2f ms\n", g_copyW, g_copyH, g_hover, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
     VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     pBeginCB(cb, &bi);
@@ -3016,7 +3049,19 @@ static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
 {
     static bool captured=false;
     if(code==HC_ACTION && wp==WM_LBUTTONUP && captured) { captured=false; return 1; }
-    if(code==HC_ACTION && wp==WM_LBUTTONDOWN && gameHasFocus() && g_uiState!=0 && (g_showOverlay || g_recoveryPresent) && !g_recoveryWorldIo && !NativeIo::Busy()) {
+    // g_ingameOverlay belongs here just as much as g_showOverlay: the title-menu
+    // detour sets g_showOverlay (page 2 only), while the panel opened from inside a
+    // loaded game sets g_ingameOverlay (PollLobbyOpen). Without the second flag this
+    // hook captured nothing in-game, and PollClick's GetAsyncKeyState fallback is
+    // disabled whenever this hook installed (see g_mouseInstalled), so NO in-game
+    // panel button worked -- including the "x" that closes it, which is the only way
+    // out in game (LEAVE is drawn only when no world is loaded). The present gate and
+    // the keyboard hook already test both flags; this one was the odd man out.
+    if(code==HC_ACTION && wp==WM_LBUTTONDOWN && gameHasFocus() && g_uiState!=0
+       && (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0
+           || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) != 0
+           || g_recoveryPresent)
+       && !g_recoveryWorldIo && !NativeIo::Busy()) {
         const auto data=reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
         POINT origin{}; if(g_gameWnd) ClientToScreen(g_gameWnd,&origin);
         const int x=data->pt.x-origin.x-g_panelX, y=data->pt.y-origin.y-g_panelY;
