@@ -60,3 +60,8 @@ bool MenuGame_ForceAutosave();
 // copy the name and enqueue work, never load another world in this callback.
 using MenuGameLoadObserver = void (*)(const char* name);
 void MenuGame_ObserveLoads(MenuGameLoadObserver observer);
+
+// Capture the menu from the verified CreatePage hook; safe reads, no game calls.
+void MenuGame_ObserveMenu(void* menu);
+// -1 unavailable; otherwise floored 0..100 from the verified ProgressMonitor.
+int MenuGame_LoadPercent();

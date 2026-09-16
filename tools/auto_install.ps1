@@ -64,7 +64,7 @@ function BuildStale {
         if ((Newest $t.src) -gt $outT) {
             Say "building $($t.name) (sources newer than $($t.out))" Cyan
             $env:TPF2_BUILD_NO_DEPLOY = '1'
-            $log = cmd /c "`"$Repo\native\build.bat`" $($t.name)" 2>&1
+            $log = cmd /c "`"$Repo\native\build.bat`" $($t.name) 2>&1"   # redirect INSIDE cmd: PS 5.1 turns a native stderr line (a stray vswhere message, 2026-09-16) into a terminating error
             if ($LASTEXITCODE -ne 0 -or -not ($log -match 'BUILD .* OK')) { Say ("build $($t.name) FAILED:`n" + ($log | Select-String 'error' | Out-String)) Red; continue }
             Say "built $($t.name)" Green
         }
@@ -75,7 +75,7 @@ function BuildStale {
         $outT = if (Test-Path $out) { (Get-Item $out).LastWriteTime } else { [datetime]0 }
         if ((Newest $p.src $p.repo) -gt $outT) {
             Say "building $($p.name) (sources newer than $out)" Cyan
-            $log = cmd /c "`"$($p.repo)\build.bat`"" 2>&1
+            $log = cmd /c "`"$($p.repo)\build.bat`" 2>&1"
             if ($LASTEXITCODE -ne 0 -or -not ($log -match $p.ok)) { Say ("build $($p.name) FAILED:`n" + ($log | Select-String 'error' | Out-String)) Red; continue }
             Say "built $($p.name)" Green
         }

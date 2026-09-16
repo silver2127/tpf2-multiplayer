@@ -6,6 +6,8 @@
 static std::string fixtureSaveDir;
 static bool allowPlace=false;
 static int placed=0;
+static int loadPercent=-1;
+int MenuGame_LoadPercent() { return loadPercent; }
 std::string MenuGame_SaveDir() { assert(!fixtureSaveDir.empty()); return fixtureSaveDir; }
 bool MenuGame_ForceAutosave() { assert(false && "unexpected autosave"); return false; }
 bool MenuGame_NewestSave(std::string*) { assert(false && "unexpected save lookup"); return false; }
@@ -22,6 +24,13 @@ static void Write(const std::string& path, const std::string& body)
 
 int main()
 {
+    using namespace lobby;
+    S().m.active=true; g_childPid=123; g_gameUiSeen=false;
+    OnMenuPage(2); assert(S().m.active && S().q.empty()); // waiting joiner
+    OnGameUiFrame(); OnMenuPage(16); assert(S().m.active && S().q.empty()); // switch
+    OnMenuPage(2); assert(!S().m.active && S().q.size()==1 && S().q.front().kind==Request::Stop);
+    OnMenuPage(2); assert(S().q.size()==1); // only once
+    g_childPid=0; S().q.clear();
     char temporary[] = "/tmp/tpf2mp-ready.XXXXXX";
     assert(mkdtemp(temporary));
     const std::string dir = std::string(temporary)+"/";
@@ -141,7 +150,18 @@ int main()
     Write(dir+"lockstep_status_"+letter+".txt", "stage=catchup:fetch:25\n");
     lobby::StageTick(); assert(lobby::S().stageSent=="catching up: fetching history (25 s behind)");
     Write(dir+"lockstep_status_"+letter+".txt", "stage=live\n");
-    lobby::StageTick(); assert(!lobby::S().stageWatch && lobby::S().stageSent.empty());
+    lobby::S().stageNext=0; lobby::StageTick(); assert(!lobby::S().stageWatch && lobby::S().stageSent.empty());
+    // Previous load's 100% and old-world status cannot prematurely clear a switch.
+    loadPercent=100; lobby::ArmStageWatch("loading world");
+    lobby::StageTick(); assert(lobby::S().stageWatch && lobby::S().stageSent=="loading world");
+    loadPercent=42; lobby::S().stageNext=0; lobby::StageTick();
+    assert(lobby::S().stageSent=="loading world 42%");
+    loadPercent=100; lobby::S().stageNext=0; lobby::StageTick();
+    assert(!lobby::S().stageWatch && lobby::S().stageSent.empty());
+    lobby::g_gameUiSeen=false; lobby::ArmStageWatch("loading world");
+    lobby::StageTick(); assert(lobby::S().stageSent=="loading world");
+    loadPercent=-1; lobby::g_gameUiSeen=true; lobby::S().stageNext=0; lobby::StageTick();
+    assert(!lobby::S().stageWatch); // unavailable percentage falls back to script stage
     // Company chip direction, authority, no-op and mode requests use the real queue.
     model.players={"host", "joiner", "third"}; model.companies={1,1,3};
     model.you="host"; model.host="host"; model.isHost=true; model.lobbyReady=true;

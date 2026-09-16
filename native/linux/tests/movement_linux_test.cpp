@@ -61,7 +61,25 @@ int main(int argc,char** argv)
     assert(image!=MAP_FAILED);
     for (const auto& c:kRoadChecks) memcpy(image+c.rva,c.bytes,c.size);
     assert(Check(uintptr_t(image),kRoadChecks)); image[kRoadChecks[0].rva+50]^=1;
-    assert(!Check(uintptr_t(image),kRoadChecks)); munmap(image,size);
+    assert(!Check(uintptr_t(image),kRoadChecks));
+    for (const auto& c:kPausedChecks) memcpy(image+c.rva,c.bytes,c.size);
+    image[kPausedChecks[4].rva]^=1;
+    assert(!InstallPausedTick(uintptr_t(image),"",""));
+    assert(!memcmp(image+0xa61860,kPausedChecks[1].bytes+16,5));
+    image[kPausedChecks[4].rva]^=1;
+    assert(InstallPausedTick(uintptr_t(image),"",""));
+    assert(!memcmp(image+0xa61860,"\x0f\x1f\x44\x00\x00",5));
+    assert(!memcmp(image+0xa617c3,kPausedChecks[2].bytes,kPausedChecks[2].size));
+    munmap(image,size);
+    char dir[]="/tmp/tpf2mp-companies.XXXXXX"; assert(mkdtemp(dir));
+    const std::string cfg=std::string(dir)+"/mp_company_cfg.txt";
+    const std::string status=std::string(dir)+"/lockstep_status_a.txt";
+    auto write=[](const std::string& path,const char* text) { FILE* f=fopen(path.c_str(),"w"); assert(f); fputs(text,f); fclose(f); };
+    write(cfg,"coop\n"); assert(!ReadCompanies(dir,"a"));
+    write(status,"t=1 cm=companies\n"); assert(ReadCompanies(dir,"a")); assert(!ReadCompanies(dir,"b"));
+    write(status,"t=2 cm=coop\n"); assert(!ReadCompanies(dir,"a"));
+    write(cfg,"companies\n"); assert(ReadCompanies(dir,"a")); assert(ReadCompanies(dir,""));
+    unlink(cfg.c_str()); unlink(status.c_str()); rmdir(dir);
     // Execute only the handwritten relay and synthetic frame, no ELF code.
     SliceStationResume=uintptr_t(&StationReturn);
     assert(StationFixture(4,4)==1); assert(StationFixture(4,5)==0);

@@ -238,6 +238,7 @@ static uintptr_t MainBuildDetour(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_
 
 static void CreatePageDetour(void* menu, int page)
 {
+    MenuGame_ObserveMenu(menu);
     ((CreatePageFn)g_createPageTramp)(menu, page);
     panel::OnMenuPage(page);
 }

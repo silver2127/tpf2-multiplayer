@@ -338,6 +338,14 @@ static void PollLobbyOpen();
 static void StageTick();
 static void MarkSaveShared();
 static volatile LONG g_showOverlay = 0;   // set by the CreatePage detour (page==2)
+// LEAVING THE WORLD LEAVES THE LOBBY (2026-09-16). Set by the CreatePage detour
+// when the title menu comes up while a CGameUI was still known (a world was up
+// a frame ago) and a lobby runs; consumed on the present thread (myPresent),
+// where LEAVE's teardown already runs, so the menu build is never stalled by
+// the 1.5 s the lobby gets to quit. A joiner waiting at the title menu for a
+// save never had a CGameUI, so it is not affected; a world switch (a start with
+// switch=1) and a resync load happen in place and never build the title menu.
+static volatile LONG g_leaveOnMenu = 0;
 static HWND g_gameWnd = nullptr;
 static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
 static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
@@ -1850,6 +1858,13 @@ static void OnHit(int id, int button)
 static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     PollLobbyOpen();
+    if (InterlockedExchange(&g_leaveOnMenu, 0)) {
+        // the player left the world for the title menu: leave the lobby with it
+        // (the host leaving ends the session for everyone, as LEAVE would)
+        Log("[menu] the world was left for the title menu -- leaving the lobby\n");
+        LeaveLobby();
+        SetStatus("Left the lobby: you left the world. HOST or JOIN to play again.");
+    }
     SteamNameTick();
     StageTick();
     PollWorldGen();
@@ -2520,11 +2535,59 @@ static char g_xfer[48] = "";        // save transfer progress for the in-game wi
 static char g_transportLobby[33] = ""; // owned by LobbyThread
 static void writeBridgeCtl(bool isHost);
 // Our own hot-join stage for the roster (2026-09-16). Sent as {"cmd":"stage"}
-// when it changes: "loading world" as the shared save starts loading, then
-// what the mod's status line says (stage=starting / catchup / behind / live)
-// once the world is up, and "" (cleared) at live.
+// when it changes: "loading world" as the shared save starts loading, "loading
+// world N%" from the engine's own loading bar while it loads, then what the
+// mod's status line says (stage=starting / catchup / behind / live) once the
+// world is up, and "" (cleared) at live.
 static char g_stageSent[80] = "";
 static volatile LONG g_stageWatch = 0;
+// The engine's loading bar (RE 2026-09-16, build 35924 -- static: decompiled
+// and byte-scanned, the live values are what a run has to confirm):
+//   UI::CMenuUI + 0x498   UI::CProgressBar* m_progressBar, stored by the CMenuUI
+//                         ctor 0x64e220, asserted non-null by the load's
+//                         completion lambda 0x67ca00 (MenuUI.cpp:0xe65)
+//   CProgressBar + 0x440  shared_ptr<UI::ProgressMonitor> (ptr; control block at
+//                         +0x448), made in the bar's creator 0x22e3140
+//                         (lib\ui\popupmanager.cpp), handed out by 0x22e3c50
+//   ProgressMonitor+0x08  float 0..1, written atomically by SetProgress (vslot 1,
+//                         0x22e3dc0) and read by GetProgress (vslot 2, 0x156720);
+//                         vftable 0x389b4a8 is the sanity check below
+// The load launcher 0x65a0f0 (the task StartSavegame 0x6785c0 posts) resets
+// the bar to menu+0x19b4 and titles it "Loading..."; the loader job 0x67d130
+// owns the span up to 0.7 (LoadGame 0x2e5ec0 splits it 0.1 header+mods / 0.9
+// CGame::Load through SubProgressMonitor 0x2380000, whose dtor 0x2380050 lands
+// the parent on base+span) and the completion lambda 0x67ca00 hands StartGame
+// 0x676480 the rest, so 1.0 means the new CGameUI exists. Between loads the
+// value keeps the last one (1.0 after a load, 0 from the ctor): a 100 is never
+// shown as a number, it is the previous load until the launcher resets it.
+static const uintptr_t RVA_PROGRESSMON_VFT  = 0x389b4a8;   // UI::ProgressMonitor::vftable
+static const size_t    MENU_OFF_PROGRESSBAR = 0x498;
+static const size_t    BAR_OFF_MONITOR      = 0x440;
+static const size_t    PM_OFF_PROGRESS      = 0x8;
+static volatile uint64_t g_menuUiPtr = 0;          // UI::CMenuUI 'this' (from CreatePage)
+static volatile LONG g_stageArmedInWorld = 0;      // armed while a world was up: an in-place switch
+static volatile LONG g_stageSawLoad = 0;           // the bar moved, or the old world went, since arming
+static volatile LONG g_stageNoPctLogged = 0;
+static ULONGLONG     g_stageArmedAt = 0;
+// SEH only in this frame (no C++ objects): the pointers are the engine's.
+// -1 no menu yet, -2 no bar / monitor, -3 not a ProgressMonitor or out of range,
+// -4 faulted; else 0..100 (floored: 100 only at exactly 1.0).
+static int ReadLoadPercent()
+{
+    uint64_t menu = g_menuUiPtr;
+    if (!menu) return -1;
+    __try {
+        uint64_t bar = *(volatile uint64_t*)(menu + MENU_OFF_PROGRESSBAR);
+        if (!bar) return -2;
+        uint64_t pm = *(volatile uint64_t*)(bar + BAR_OFF_MONITOR);
+        if (!pm) return -2;
+        if (*(volatile uint64_t*)pm != (uint64_t)(g_base + RVA_PROGRESSMON_VFT)) return -3;
+        float f = *(volatile float*)(pm + PM_OFF_PROGRESS);
+        if (!(f >= 0.0f && f <= 1.0f)) return -3;
+        int pct = (int)(f * 100.0f);
+        return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -4; }
+}
 static void ReportStage(const char* text)
 {
     if (strcmp(text, g_stageSent) == 0) return;
@@ -2536,12 +2599,38 @@ static void ReportStage(const char* text)
     LobbySend(line);
     Log("[menu] stage: %s\n", text[0] ? text : "(clear)");
 }
+static void ArmStageWatch(const char* text)
+{
+    ReportStage(text);
+    g_stageArmedAt = GetTickCount64();
+    InterlockedExchange(&g_stageArmedInWorld, (NativeIo::HasWorld() || WorldLoaded()) ? 1 : 0);
+    InterlockedExchange(&g_stageSawLoad, 0);
+    InterlockedExchange(&g_stageWatch, 1);
+}
 static void StageTick()
 {
     static ULONGLONG next = 0;
     if (!InterlockedCompareExchange(&g_stageWatch, 0, 0)) return;
     ULONGLONG now = GetTickCount64(); if (now < next) return; next = now + 1000;
-    if (!WorldLoaded()) return;
+    // 1. the engine's loading bar: "loading world N%" while it is short of 1.0
+    const int pct = ReadLoadPercent();
+    if (pct >= 0 && pct < 100) {
+        InterlockedExchange(&g_stageSawLoad, 1);
+        char t[48]; snprintf(t, sizeof(t), "loading world %d%%", pct); ReportStage(t); return;
+    }
+    if (pct < 0 && !InterlockedExchange(&g_stageNoPctLogged, 1))
+        Log("[menu] stage: the engine's load progress is not readable (menu=%llx code=%d) -- no percentage\n",
+            (unsigned long long)g_menuUiPtr, pct);
+    // 2. is the world up? NativeIo sees the CGameUI constructor and the world
+    // destructor (g_gameUi stays stale through an in-place switch); the per-frame
+    // CGameUI relay covers a title-menu load should the native hooks be off.
+    const bool inWorldArm = InterlockedCompareExchange(&g_stageArmedInWorld, 0, 0) != 0;
+    const bool worldUp = NativeIo::HasWorld() || (!inWorldArm && WorldLoaded());
+    if (!worldUp) { InterlockedExchange(&g_stageSawLoad, 1); return; }   // pct 100 here is the LAST load's: keep the arm text
+    // 3. an in-place switch: the old world stays up until StartGame swaps it, so a
+    // fresh arm must not read the old world's status line as the new world's
+    if (inWorldArm && !InterlockedCompareExchange(&g_stageSawLoad, 0, 0) && now - g_stageArmedAt < 20000) return;
+    // 4. the world is up: what the mod's status line says
     char letter[3] = "a";
     if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_you.empty()) strcpy_s(letter, originLetterFor(g_you).c_str()); LeaveCriticalSection(&g_modelCs); }
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%slockstep_status_%hs.txt", g_dataDirW, letter);
@@ -2990,6 +3079,7 @@ static void OnStartSavegame(const void* params, bool accepted, bool ours)
         Log("[menu] menu load: sharing %ls with the lobby (the game loads it here)\n", path);
     }
     SetStatus(st);
+    ArmStageWatch("loading world");   // the host's own row shows its percentage too (2026-09-16)
 }
 
 // ---------------- AUTO-LOAD: start the shared save in-process ----------------
@@ -3472,7 +3562,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 bool queued = placeSaveNewest(src) && NativeIo::Load(op, "mp_shared");
                                 if (queued) {
                                     Log("[menu] world switch: loading mp_shared in place (%s)\n", op);
-                                    ReportStage("loading the host's new world"); InterlockedExchange(&g_stageWatch, 1);
+                                    ArmStageWatch("loading the host's new world");
                                 } else {
                                     Log("[menu] world switch: the engine would not take the in-place load -- the player loads mp_shared\n");
                                     SetStatus("The host changed world -- open LOAD GAME and pick \"mp_shared\".");
@@ -3482,7 +3572,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 InterlockedExchange(&g_worldGenHold, 1);   // the token the new world stamps is ours
                                 SetStatus(isSwitch ? "Loading the host's new world…" : "Loading shared save…"); Sleep(400);
                                 if (doStartLoad(src)) {
-                                    ReportStage("loading world"); InterlockedExchange(&g_stageWatch, 1);
+                                    ArmStageWatch("loading world");
                                     // The game is loading. The lobby process STAYS ALIVE: since the
                                     // game-frame relay (--game-relay-port) the lobby IS the lockstep
                                     // transport between machines -- quitting it here left both bridges
@@ -3782,6 +3872,7 @@ static DWORD WINAPI KbHookThread(LPVOID)
 // button visible on the main page (page 2), hidden elsewhere.
 static void MyCreatePage(uint64_t thisp, int page)
 {
+    g_menuUiPtr = thisp;
     NativeIo::ObserveMenu(thisp);
     g_origCreatePage(thisp, page);
     InterlockedExchange(&g_lastPage, page);
@@ -3795,6 +3886,9 @@ static void MyCreatePage(uint64_t thisp, int page)
         // captured in the last session. It used to survive "quit to menu", so a
         // start arriving while the title menu sat on another page looked like
         // "start while in game" and was ignored (relay resume, 2026-09-10).
+        // A pointer still set here means the player just left a world: with a
+        // lobby running, that leaves the lobby too (g_leaveOnMenu, myPresent).
+        if (g_gameUi != 0 && LobbyRunning()) InterlockedExchange(&g_leaveOnMenu, 1);
         g_gameUi = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
         // Keep recovery reachable at the title menu after a failed load.

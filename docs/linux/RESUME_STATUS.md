@@ -1,3 +1,11 @@
+## Latest Windows integration: dev 38432b5f (2026-09-16)
+
+See [UPSTREAM_dev_38432b5f.md](UPSTREAM_dev_38432b5f.md) for the staged merge,
+paused-counter patch, load percentages, automatic lobby leave, live companies
+gate, exact Lua provenance and verification. Native build: 44/44 tests passed.
+Windows MSI in-app updates remain unsupported on native Linux; earlier gaps
+below remain. No live gameplay validation was performed for this integration.
+
 # Linux port checkpoint — 2026-09-15
 
 ## Current integration — 2026-09-16

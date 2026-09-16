@@ -1156,6 +1156,27 @@ def _mid_transfer(addr, *transfers):
     return False
 
 
+def _merge_sender_stage(current, text, pct):
+    """What the roster should say for a peer when the host's own SAVE SENDER
+    reports ``text`` (pct = the send progress, None = the transfer is done),
+    given the peer's current stage: the new text, or None to leave it.
+
+    The joiner's own "receiving save M%" wins while it is at least as far
+    along (its report is the newer one); anything else the peer said is older
+    than a transfer that is running now, except a load already under way
+    ("loading world ..."), which only the peer's own DLL can see (2026-09-16).
+    """
+    current = current or ""
+    if current.startswith("loading world"):
+        return None
+    if pct is None:
+        return text
+    m = re.match(r"receiving save (\d+)%$", current)
+    if m and int(m.group(1)) >= pct:
+        return None
+    return text
+
+
 class _HostSaveTransfer:
     """Reliable host -> all-joiners file push, PUMPED from the host's main loop.
 
@@ -1208,9 +1229,15 @@ class _HostSaveTransfer:
         """
         return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
 
-    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save"):
+    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save", stage_cb=None):
         self.sock = sock
         self.kind = kind                      # "save" or "mods" (the round after it)
+        # The host loop's view of how far each peer's SAVE is, as this sender
+        # sees it, so the roster shows "receiving save N%" before the joiner
+        # itself reports it (2026-09-16): stage_cb(name, text, pct), pct None
+        # once the peer verified the file. Only the save round: a mods round
+        # is the player's own download, reported by the receiver.
+        self.stage_cb = stage_cb if kind == "save" else None
         # [(id, ver)] the save needs, told in fbegin. None means the host could
         # not READ the list (modshare.save_mod_list failed): the save still
         # goes out, but every receiver is told the list is unknown rather than
@@ -1260,6 +1287,8 @@ class _HostSaveTransfer:
             p["last_pct"] = pct
             self.io.emit({"type": "transfer", "role": "send",
                           "peer": p["name"], "pct": pct})
+            if self.stage_cb:
+                self.stage_cb(p["name"], f"receiving save {pct}%", pct)
 
     # -- outbound chunk ---------------------------------------------------- #
     def _send_chunk(self, addr, seq):
@@ -1359,6 +1388,8 @@ class _HostSaveTransfer:
                 self.io.emit({"type": "transfer", "role": "send",
                               "peer": p["name"], "state": "done"})
                 self.log(f"[host] {p['name']} verified save transfer")
+                if self.stage_cb:
+                    self.stage_cb(p["name"], "save received, loading", None)
         elif msg.get("final"):
             if p["state"] == "active":
                 p["state"] = "failed"
@@ -2432,6 +2463,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                             #          "links":[names],
                                             #          "company":1..200}
     host_company = [1]                      # the host's own company id
+    host_stage = [""]                       # what the host itself is doing (its own load / a world switch), "" = nothing (2026-09-16)
     # The lobby's mode (2026-09-16): "coop" puts everyone in company 1; "companies"
     # gives every player their own. It sets the chips automatically, on a change
     # and for each joiner; a chip click still overrides one player.
@@ -2657,7 +2689,25 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # what each joiner is doing right now ("receiving save 40%", "loading
         # world", "catching up (12 s behind)"): shown beside the name in every
         # panel while a hot join runs; empty once in sync (2026-09-16)
-        return {p["name"]: p["stage"] for p in peers.values() if p.get("stage")}
+        stages = {p["name"]: p["stage"] for p in peers.values() if p.get("stage")}
+        if host_stage[0] and not relay_only:
+            stages[host_name] = host_stage[0]
+        return stages
+
+    def sender_stage(name, text, pct=None):
+        # The host's own save sender knows how far a joiner's save is before the
+        # joiner says so: put it in the roster right away (2026-09-16). The
+        # joiner's own report still overrides -- see _merge_sender_stage.
+        for p in peers.values():
+            if p["name"] != name:
+                continue
+            new = _merge_sender_stage(p.get("stage", ""), text, pct)
+            if new is not None and new != p.get("stage", ""):
+                p["stage"] = new
+                log(f"[host] {name} stage <- sender: {new}")
+                send_roster_packets()
+                emit_roster()
+            return
 
     def send_roster_packets():
         # Doubles as the start self-heal: a joiner that lost the whole start
@@ -3202,7 +3252,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
                 + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
-                                        io, log, mods=mods)
+                                        io, log, mods=mods, stage_cb=sender_stage)
 
     def begin_world_switch(save_path):
         """A WORLD SWITCH: the host loaded a different world while the session
@@ -3260,6 +3310,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if set_company(target, cmd.get("id")):
                 log(f"[host] {target} -> company {cmd.get('id')} (set by host)")
                 roster_changed()
+        elif c == "stage":
+            # the host's own menu says what it is doing (loading the world it
+            # picked, a world switch); "" clears it (2026-09-16)
+            text = str(cmd.get("text", ""))[:80]
+            if text != host_stage[0]:
+                host_stage[0] = text
+                send_roster_packets()
+                emit_roster()
         elif c == "mode":
             if set_mode(str(cmd.get("mode", ""))):
                 log(f"[host] mode -> {mode[0]} (set by host); companies {roster_companies()}")

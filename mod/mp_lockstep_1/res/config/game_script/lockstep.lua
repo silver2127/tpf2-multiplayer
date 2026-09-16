@@ -204,6 +204,14 @@ K.RTT_MIN_SAMPLES = 8
 K.GAP_HOLD_GRACE_TICKS = 1     -- ordinary reordering never stutters the game
 K.GAP_HOLD_ENGAGE_TICKS = 3    -- engage this many ticks of sim progress ahead of the stamp
 K.GAP_HOLD_MAX_TICKS = 55      -- ~10 s: then give up on that command (it applies late if it comes)
+K.HOLD_NACK_EVERY = 3          -- ticks between NACKs for the command a hold is waiting for (net.lua gapHoldTick)
+-- A LOST COMMAND IS NOT RECOVERED, IT IS NOT LOST (2026-09-16). Every command goes out
+-- CMD_SEND_COPIES times back to back and once more on each of the next CMD_REPEATS
+-- ticks (net.lua scheduleLocal / txRepeatTick); the delay pays DELAY_REPEAT_TICKS
+-- ticks for the repeat (execDelayTick). Recovery (NACK + resend) stays as the backstop.
+K.CMD_SEND_COPIES = 2
+K.CMD_REPEATS = 1
+K.DELAY_REPEAT_TICKS = 1
 
 -- The most peer lead a command's stamp will pay for: a live session was seen
 -- 9.2 units apart (net.lua scheduleLocal).
@@ -387,11 +395,15 @@ function CM.statusLine(now)
 	if not CM.peerSeen then stage = "starting"
 	elseif CM.catchingUp2 then stage = string.format("catchup:%s:%.1f", tostring(CM.cuPhase or "run"), CM.behindBy or 0)
 	elseif (CM.behindBy or 0) > 2 then stage = string.format("behind:%.1f", CM.behindBy or 0) end
-	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s",
+	-- cm= (2026-09-16): companies mode as the SIM knows it. The lobby's
+	-- mp_company_cfg.txt says what the roster was at START; a company created
+	-- in game never reaches that file, so the slice's shared-stations gate read
+	-- "coop" on both machines and opened nothing (foreignAsked=2344 opened=0).
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s  cm=%s",
 		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
 		pt and string.format("%+.1f", now - pt) or "?",
 		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage)
+		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage, CM.cmMode == "companies" and "companies" or "coop")
 end
 -- Letter -> 0..7, for anything that needs a per-origin namespace.
 function CM.originIdx(o)
@@ -928,6 +940,7 @@ function data()
 					if f then f:write(CM.statusLine(CM.gameTime() or 0)); f:close() end
 				end)
 			end
+			if CM.txRepeatTick then CM.txRepeatTick() end   -- the extra copies of our recent commands
 			if CM.ticks % 10 == 5 then CM.nackScan() end
 			CM.flushConPairs()
 			CM.primeConstructions()
@@ -981,6 +994,8 @@ function data()
 			if CM.retryQueue and #CM.retryQueue > 0 then
 				for _, rc in ipairs(CM.retryQueue) do
 					executed[CM.cmdKey(rc)] = nil
+					CM.queuedKeys = CM.queuedKeys or {}
+					CM.queuedKeys[CM.cmdKey(rc)] = true   -- a copy arriving during the retry is not queued beside it
 					CM.queue[#CM.queue + 1] = rc
 				end
 				CM.retryQueue = {}
@@ -1081,6 +1096,7 @@ function data()
 							keep[#keep + 1] = c
 						else
 						local k = CM.cmdKey(c)
+						if CM.queuedKeys then CM.queuedKeys[k] = nil end   -- the queue's copy is done with (net.lua: one copy queued per key)
 						if not executed[k] then
 							executed[k] = true
 							-- remember insertion order so this cannot grow for the life of
@@ -1275,8 +1291,10 @@ function data()
 			end
 		end,
 
-		-- the company state, the drift check's off switch and the hash grid ride in the
-		-- save (companies.lua cmSaveState, hash.lua vposSaveState / hashGridSave)
+		-- the company state, the drift check's off switch, the hash grid and the
+		-- vehicle / line key registries ride in the save (companies.lua cmSaveState,
+		-- hash.lua vposSaveState / hashGridSave, vehicles.lua vehKeysSaveState,
+		-- lines.lua lineKeysSaveState)
 		save = function()
 			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
 			local ok, st = pcall(CM.cmSaveState)
@@ -1287,6 +1305,8 @@ function data()
 			-- early would replay commands the save already holds (a double build).
 			return { cm = ok and st or nil, vposOff = CM.vposSaveState and CM.vposSaveState() or nil,
 			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
+			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
+			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
 			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
@@ -1295,6 +1315,9 @@ function data()
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
 			if type(s) == "table" and s.hashGrid and CM.hashGridLoad then pcall(CM.hashGridLoad, s.hashGrid) end
+			-- a save from before 2026-09-16 has neither: every save vehicle / line primes s:<id> as before
+			if type(s) == "table" and s.vehKeys and CM.vehKeysLoadState then pcall(CM.vehKeysLoadState, s.vehKeys) end
+			if type(s) == "table" and s.lineKeys and CM.lineKeysLoadState then pcall(CM.lineKeysLoadState, s.lineKeys) end
 		end,
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------

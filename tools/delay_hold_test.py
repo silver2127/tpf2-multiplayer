@@ -25,6 +25,10 @@ NET = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp", "net.lu
 fails = []
 
 
+def lua_list(t):
+    return [t[i] for i in range(1, len(t) + 1)]
+
+
 def check(name, cond, extra=""):
     print(("ok   " if cond else "FAIL ") + name + (f"  ({extra})" if extra else ""))
     if not cond:
@@ -283,6 +287,7 @@ r = rx(h, stamp2=50.4, stamp3=50.6)
 need = h.CM.gapHoldNeed(50.0)
 check("missing seq 2 due in 0.4: hold", need is not None and need.seq == 2 and abs(need.at - 50.4) < 1e-9)
 check("gapHoldTick engages and logs", h.CM.gapHoldTick(50.0) is True and "HOLD: b's command seq=2" in h.logs())
+h.CM.gapHold = None   # the cases below are about gapHoldNeed with no hold in progress (a held command stays held, 2026-09-16)
 r.stamp[2] = 55.0
 check("due in 5 units: no hold yet", h.CM.gapHoldNeed(50.0) is None)
 r.stamp[2] = 49.6
@@ -292,7 +297,9 @@ check("stamp unknown but newer commands still due: hold", h.CM.gapHoldNeed(50.0)
 r.stamp[3] = 49.0
 check("stamp unknown and even the newest is past: no hold", h.CM.gapHoldNeed(50.0) is None)
 r = rx(h, missing_age=0, stamp2=50.4)
-check("inside the grace: no hold", h.CM.gapHoldNeed(50.0) is None)
+check("inside the grace but its own stamp is within the engage window: hold now (2026-09-16)", h.CM.gapHoldNeed(50.0) is not None)
+r = rx(h, missing_age=0, stamp2=55.0)
+check("inside the grace and its own stamp is far off: wait out the grace", h.CM.gapHoldNeed(50.0) is None)
 r = rx(h, stamp2=50.4, nack=10)
 check("out of NACKs: no hold", h.CM.gapHoldNeed(50.0) is None)
 # the relay case: 53 applied, 55 held and due next step, 54 missing with no stamp, gap just seen
@@ -305,10 +312,26 @@ L, h = runtime()
 h_lua = L
 h.CM.simRate, h.CM.tickSec = 0.9, 0.19
 r = rx(h, stamp2=50.4, stamp3=50.6)
+h.clearSent()
 check("hold engages", h.CM.gapHoldTick(50.0) is True)
+check("and NACKs the held command at once, not after the scan's grace", any(x == "LSNACK o=b seq=2 by=a" for x in lua_list(h.sent())) and "NACK b seq=2 (holding for it)" in h.logs(), lua_list(h.sent()))
+h.clearSent()
+h.CM.gapHoldTick(50.0)
+check("not again on the very next tick", not any(x.startswith("LSNACK") for x in lua_list(h.sent())))
+h.CM.ticks = h.CM.ticks + 3
+h.CM.gapHoldTick(50.0)
+check("again HOLD_NACK_EVERY ticks later", any(x == "LSNACK o=b seq=2 by=a" for x in lua_list(h.sent())))
+check("only the first hold NACK counts against NACK_MAX", r.nackN[2] == 1, r.nackN[2])
+# the batch in flight ran past the stamp while holding: still held (2026-09-16)
+h.setNow(50.8)
+need = h.CM.gapHoldNeed(50.8)
+check("once held, held: the stamp fell behind and the hold stays on it", need is not None and need.seq == 2, need and need.seq)
+check("gapHoldTick keeps holding", h.CM.gapHoldTick(50.8) is True and h.CM.gapHold is not None)
+h.setNow(50.0)
 r.seen[2] = True
 h.clearLogs()
 check("the command arrives: released", h.CM.gapHoldTick(50.0) is False and "HOLD: released" in h.logs() and h.CM.gapHold is None)
+check("the release says it arrived", "seq=2 arrived" in h.logs())
 
 L, h = runtime()
 h_lua = L
@@ -319,6 +342,42 @@ h.CM.ticks = h.CM.ticks + 56
 h.clearLogs()
 check("past GAP_HOLD_MAX_TICKS: gives up and runs on", h.CM.gapHoldTick(50.0) is False and "gave up" in h.logs())
 check("and does not hold for that command again", h.CM.gapHoldNeed(50.0) is None and r.holdDone[2] is True)
+
+# ---- a command is sent more than once (2026-09-16) ----
+L, h = runtime()
+h.K.CMD_SEND_COPIES, h.K.CMD_REPEATS = 2, 1
+h.setNow(50.0)
+h.clearSent()
+h.CM.scheduleLocal("ROAD", L.table_from({"x": 7}))
+s = lua_list(h.sent())
+cmds = [x for x in s if x.startswith("LSCMD")]
+check("two copies go out back to back, then the LSHI", len(cmds) == 2 and cmds[0] == cmds[1] and s[-1].startswith("LSHI o=a s=1"), s)
+h.clearSent()
+h.CM.txRepeatTick()
+check("nothing more on the same tick", not lua_list(h.sent()))
+h.CM.ticks = h.CM.ticks + 1
+h.CM.txRepeatTick()
+s = lua_list(h.sent())
+check("the next tick repeats the command with its LSHI", len(s) == 2 and s[0] == cmds[0] and s[1].startswith("LSHI o=a s=1"), s)
+h.clearSent()
+h.CM.ticks = h.CM.ticks + 1
+h.CM.txRepeatTick()
+check("and then it is done", not lua_list(h.sent()) and len(h.CM.txRepeat) == 0)
+h.CM.dropNextCmd = True
+h.clearSent()
+h.CM.scheduleLocal("ROAD", L.table_from({"x": 8}))
+h.CM.ticks = h.CM.ticks + 1
+h.CM.txRepeatTick()
+check("DROPNEXT drops the copies and the repeat too", not any(x.startswith("LSCMD") for x in lua_list(h.sent())))
+
+# ---- the delay pays for the repeat ----
+L, h = runtime()
+h.K.DELAY_REPEAT_TICKS = 1
+h.CM.simRate, h.CM.effSpeed, h.CM.tickSec = 3.6, 4, 0.19
+peer(h, "b", 300, 40)
+tick(h)
+# one way 240 ms + one tick 190 ms = 430 ms at 3.6 u/s = 1.548 -> 1.6 (was 1.0 without the repeat)
+check("speed 4: 300+-40 ms plus one tick for the repeat -> 1.6 units", abs(h.CM.execDelayCur - 1.6) < 1e-9, h.CM.execDelayCur)
 
 print("FAILED: " + ", ".join(fails) if fails else "ALL OK")
 sys.exit(1 if fails else 0)

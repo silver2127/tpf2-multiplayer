@@ -5898,6 +5898,12 @@ static bool  g_ssSaidOnce = false;
 // companies.lua cmReadConfig). Cached, because the filter runs on hover.
 // A stale answer is harmless: outside companies mode the comparison it guards
 // cannot fail anyway.
+// Companies mode is live when the SIM says so: `cm=companies` on the mod's
+// status line (lockstep_status_<letter>.txt, written every 15 ticks, the file
+// SessionLive already reads). The lobby's mp_company_cfg.txt only says what
+// the roster was at START; a company created in game (CMNEW) never reaches
+// it, so the gate read "coop" on both machines and opened nothing while being
+// asked 2,344 times (2026-09-16). The file is still honoured as a second yes.
 static bool SharedStationsCompaniesLive()
 {
     static ULONGLONG last = 0;
@@ -5908,12 +5914,25 @@ static bool SharedStationsCompaniesLive()
     cached = false;
     if (!g_dataDir[0]) return cached;
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%smp_company_cfg.txt", g_dataDir);
-    FILE* f = _fsopen(p, "r", _SH_DENYNO);
-    if (!f) return cached;
-    char line[64] = {0};
-    if (fgets(line, sizeof(line), f)) cached = strncmp(line, "companies", 9) == 0;
-    fclose(f);
+    ReadInstance();
+    if (g_instance[0]) {
+        snprintf(p, sizeof(p), "%slockstep_status_%s.txt", g_dataDir, g_instance);
+        FILE* f = _fsopen(p, "r", _SH_DENYNO);
+        if (f) {
+            char line[512] = {0};
+            if (fgets(line, sizeof(line), f) && strstr(line, " cm=companies")) cached = true;
+            fclose(f);
+        }
+    }
+    if (!cached) {
+        snprintf(p, sizeof(p), "%smp_company_cfg.txt", g_dataDir);
+        FILE* f = _fsopen(p, "r", _SH_DENYNO);
+        if (f) {
+            char line[64] = {0};
+            if (fgets(line, sizeof(line), f)) cached = strncmp(line, "companies", 9) == 0;
+            fclose(f);
+        }
+    }
     return cached;
 }
 
@@ -5935,6 +5954,91 @@ extern "C" int SharedStationsAllow(int owner, int mine)
             owner, mine);
     }
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// PAUSED TICK -- a counter that advances per render batch while paused.
+//
+// ecs::component::GameTime carries two counters, both saved. +0x34 counts sim
+// iterations. +0x30 counts them too -- and, in the PAUSED branch of
+// GameSim::Step (0x15aa39: speed 0 -> 0xaea970(engine, timeEntity, false)),
+// one more per render batch, i.e. at each machine's own frame rate. Every
+// pause -- a speed vote of 0, the load gate a hot joiner sits in, a catch-up
+// hold, the gap hold -- therefore leaves +0x30 a machine-specific number of
+// batches ahead, for good, because the save carries it.
+//
+// The sim reads +0x30 through the accessor 0x2877c0 in: TownDeveloper::Develop
+// (0x943c7d, via 0x9439f0) and town creation (0x9372d6, via 0x937180), which
+// stamp {+0x30, -1} into every town building and street they propose;
+// street_developer_util 0x987f89 and MakeStreetProposal 0xa1a60f, the same
+// stamp; AccountSystem::Update 0xa26af1, `+0x30 % accounts`, which account this
+// step processes; TrainMoveSystem::Update2 0xabe035, its shuffle seed (and the
+// TRAIN RESERVATION ORDER jitter above reads the same field). Two peers that
+// ever paused for a different number of frames -- a hot joiner always has --
+// therefore stamp, pick and seed differently from then on, while every world
+// hash still matches: the towns then grow apart (the same-save, no-command
+// splits of 2026-09-16). Persons and industries seed from +0x34 and were never
+// affected.
+//
+// The fix is one call: the paused branch's increment is NOPed, so +0x30 only
+// ever advances with +0x34, in lockstep. A save written before this build
+// carries whatever skew it had; every peer that loads it starts from the same
+// value, so it is a constant, not a divergence. The call's only other effect
+// was the component's change notification while paused, which nothing in the
+// sim can observe (the sim is not stepping).
+// KILL SWITCH: `pausedtick=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_PAUSED_TICK_SITE = 0x15aa39;   // the paused branch, GameSim::Step
+static const uintptr_t RVA_PAUSED_TICK_CALL = 0x15aa4a;   // call 0xaea970 (bool = false)
+static const uintptr_t RVA_GAMETIME_ADVANCE = 0xaea970;   // GameTime advance(engine, entity, bool stepped)
+static const uint8_t PAUSED_TICK_EXPECT[22] = {
+    0x49, 0x8B, 0x4E, 0x08,              // mov rcx, [r14+8]               (0x15aa39)
+    0x45, 0x33, 0xC0,                    // xor r8d, r8d   <- stepped = false
+    0x8B, 0x91, 0x10, 0x02, 0x00, 0x00,  // mov edx, [rcx+0x210]           (the time entity)
+    0x48, 0x8B, 0x49, 0x28,              // mov rcx, [rcx+0x28]            (the ecs engine)
+    0xE8, 0x21, 0xFF, 0x98, 0x00         // call 0xaea970                  (0x15aa4a)
+};
+// ...and the advance itself: `inc dword [rax+0x30]` unconditionally, then
+// `test bpl,bpl ; je` around `inc dword [rax+0x34]` -- the bool is the step.
+static const uintptr_t RVA_GAMETIME_ADVANCE_INC = 0xaeaa23;
+static const uint8_t GAMETIME_ADVANCE_EXPECT[16] = {
+    0xFF, 0x40, 0x30,                    // inc dword ptr [rax+0x30]
+    0x40, 0x84, 0xED,                    // test bpl, bpl
+    0x74, 0x08,                          // je +8
+    0x48, 0x8B, 0x44, 0x24, 0x38,        // mov rax, [rsp+0x38]
+    0xFF, 0x40, 0x34                     // inc dword ptr [rax+0x34]
+};
+
+static void InstallPausedTick()
+{
+    if (FlagsSayOff("pausedtick")) {
+        Log("[pausedtick] OFF (pausedtick=0 in tpf2_menu_flags.txt) -- GameTime+0x30 keeps "
+            "advancing per render batch while paused\n");
+        return;
+    }
+    if (!BytesAre(RVA_PAUSED_TICK_SITE, PAUSED_TICK_EXPECT, sizeof(PAUSED_TICK_EXPECT), "pausedtick")) return;
+    if (!BytesAre(RVA_GAMETIME_ADVANCE_INC, GAMETIME_ADVANCE_EXPECT, sizeof(GAMETIME_ADVANCE_EXPECT), "pausedtick")) return;
+    int32_t rel = 0;
+    memcpy(&rel, PAUSED_TICK_EXPECT + 18, 4);
+    if ((uintptr_t)((int64_t)RVA_PAUSED_TICK_CALL + 5 + rel) != RVA_GAMETIME_ADVANCE) {
+        Log("[pausedtick] NOT installed: the call at rva=%llx does not resolve to the GameTime "
+            "advance at %llx\n", (unsigned long long)RVA_PAUSED_TICK_CALL,
+            (unsigned long long)RVA_GAMETIME_ADVANCE);
+        return;
+    }
+    const uintptr_t at = g_base + RVA_PAUSED_TICK_CALL;
+    DWORD old = 0;
+    if (!VirtualProtect((void*)at, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[pausedtick] NOT installed: could not unprotect rva=%llx\n", (unsigned long long)RVA_PAUSED_TICK_CALL);
+        return;
+    }
+    static const uint8_t nop5[5] = { 0x0F, 0x1F, 0x44, 0x00, 0x00 };   // one 5-byte nop
+    memcpy((void*)at, nop5, 5);
+    VirtualProtect((void*)at, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 5);
+    Log("[pausedtick] installed: the paused branch of GameSim::Step (rva=%llx) no longer "
+        "advances GameTime+0x30 per render batch; it moves only with the step count\n",
+        (unsigned long long)RVA_PAUSED_TICK_CALL);
 }
 
 static void InstallSharedStations()
@@ -6444,6 +6548,10 @@ static DWORD WINAPI Init(LPVOID)
     // and for the same reason: it only ever answers a comparison the engine was
     // about to make, and outside companies mode that comparison cannot fail.
     InstallSharedStations();
+    // The counter that ticked per render batch while paused ("PAUSED TICK"):
+    // the town developer stamps it into every building it proposes, and the
+    // account and train systems pick and seed by it.
+    InstallPausedTick();
 
     for (;;) {
         Sleep(15000);

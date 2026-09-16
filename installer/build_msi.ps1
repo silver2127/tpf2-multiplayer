@@ -227,7 +227,11 @@ if ($rc -ne 0) { Fail "wix build failed (exit $rc)" }
 if (-not (Test-Path $Msi)) { Fail "wix reported success but $Msi is missing" }
 Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $Version)" Green
 
-# Ship this alongside the MSI in the GitHub release for user-local updates.
+# The user-local update bundle, built from the same outputs. It is NOT a release
+# asset: the release publishes only the MSI and the in-game updater extracts its
+# payload from that (netpunch/updater.py msi_payload). The zip is the offline test
+# fixture and a fallback the updater still accepts; tools/updater_test.py checks
+# that the two payloads agree byte for byte.
 & python (Join-Path $Repo "tools\build_update.py")
 if ($LASTEXITCODE -ne 0) { Fail "automatic update bundle build failed" }
 # The MSI's files as a plain archive, for the Proton installer and manual installs.

@@ -804,6 +804,41 @@ using StepFn   = void (*)(void* component, int64_t t, int64_t dt);
 using UpdateFn = void (*)(void* self, int64_t t, int64_t dt);
 
 static uintptr_t g_base = 0;
+#include "progress_checks_linux.h"
+#include <sys/uio.h>
+static std::atomic<uintptr_t> g_progressMenu{0};
+static std::atomic<bool> g_progressReady{false};
+static bool ProgressRead(uintptr_t address, void* out, size_t size)
+{
+    if (!address || address+size<address) return false;
+    iovec local{out,size}, remote{reinterpret_cast<void*>(address),size};
+    return process_vm_readv(getpid(),&local,1,&remote,1,0)==ssize_t(size);
+}
+void MenuGame_ObserveMenu(void* menu) { g_progressMenu=uintptr_t(menu); }
+int MenuGame_LoadPercent()
+{
+    if (!g_progressReady.load()) return -1;
+    const uintptr_t menu=g_progressMenu.load();
+    uintptr_t bar=0, monitor=0, vtable=0;
+    float value=0;
+    if (!menu || !ProgressRead(menu+0x498,&bar,sizeof(bar)) || !bar ||
+        !ProgressRead(bar+0x440,&monitor,sizeof(monitor)) || !monitor ||
+        !ProgressRead(monitor,&vtable,sizeof(vtable)) || vtable!=g_base+0x59d8c60 ||
+        !ProgressRead(monitor+8,&value,sizeof(value)) || !(value>=0 && value<=1)) return -1;
+    return int(value*100);
+}
+static bool CheckProgress(uintptr_t base)
+{
+    for (const auto& check:kProgressChecks) {
+        uint8_t bytes[64];
+        if (!ProgressRead(base+check.rva,bytes,check.size) || memcmp(bytes,check.bytes,check.size)) return false;
+    }
+    uintptr_t slots[4];
+    if (!ProgressRead(base+0x59d8c60,slots,sizeof(slots))) return false;
+    return slots[0]==base+0x30ebcd0 && slots[1]==base+0x30ebe00 &&
+           slots[2]==base+0x30ebd30 && slots[3]==base+0x30ebd10;
+}
+
 static std::atomic<bool> g_gateOk{false};
 
 // The Step wrappers a thread is inside, by frame address. The stack grows down,
@@ -1682,6 +1717,8 @@ static bool Install(uintptr_t base)
         return false;
     }
     g_base = base;
+    g_progressReady=CheckProgress(base);
+    Log("[menugame] load percentage %s\n",g_progressReady ? "verified" : "OFF (byte/vtable check failed)");
     const bool guard = ResolveGameRuntime();
     const uint8_t bad = CheckBytes(base);
     const bool menuVt = VtableIs(base, "CMenuUI", RVA_MENUUI_VTABLE, RVA_MENUUI_TYPEINFO, RVA_MENUUI_TYPENAME,

@@ -180,7 +180,8 @@ struct State {
     std::string sharedSave, stageSent;
     std::string worldGen;
     bool sessionStarted = false, worldGenHold = false, switchShare = false, hostLoadedItself = false;
-    bool stageWatch = false;
+    bool stageWatch = false, stageArmedInWorld = false, stageSawLoad = false;
+    uint64_t stageArmedAt = 0, stageNext = 0;
     std::string syncSave;
     uint64_t relayLastUp = 0;
     bool loggedNoGameUi = false;
@@ -1101,9 +1102,25 @@ static void ReportStage(const std::string& text)
     AppendIn("{\"cmd\":\"stage\",\"text\":\"" + JsonEscape(text) + "\"}");
     S().stageSent = text;
 }
+static void ArmStageWatch(const std::string& text)
+{
+    ReportStage(text);
+    S().stageArmedInWorld=InGame(); S().stageSawLoad=false;
+    S().stageArmedAt=NowMs(); S().stageNext=0; S().stageWatch=true;
+}
 static void StageTick()
 {
-    if (!S().stageWatch || !InGame()) return;
+    const uint64_t now=NowMs();
+    if (!S().stageWatch || now<S().stageNext) return;
+    S().stageNext=now+1000;
+    const int pct=MenuGame_LoadPercent();
+    if (pct>=0 && pct<100) {
+        S().stageSawLoad=true;
+        ReportStage("loading world "+std::to_string(pct)+"%"); return;
+    }
+    if (!InGame()) { S().stageSawLoad=true; return; }
+    // A switch's previous world may still be stepping with an old status file.
+    if (S().stageArmedInWorld && !S().stageSawLoad && now-S().stageArmedAt<20000) return;
     std::string status;
     ReadSmallFile(S().cfg.dataDir + "lockstep_status_" + OwnLetter() + ".txt", &status);
     auto start = status.find("stage=");
@@ -1431,6 +1448,7 @@ static void ShareLoadedSave(const std::string& name)
     AppendIn("{\"cmd\":\"start\",\"save\":\""+JsonEscape(path)+"\""+(switching ? ",\"switch\":true" : "")+"}");
     MarkSaveShared(path);
     Status("Sharing the world loaded by the host");
+    ArmStageWatch("loading world");
 }
 
 static void HandleStart(const Json& ev)
@@ -1498,7 +1516,7 @@ static void HandleStart(const Json& ev)
     // The lobby stays: since the game-frame relay it IS the lockstep transport.
     S().worldGenHold = true;
     if (DoStartLoad(src)) {
-        ReportStage("loading world"); S().stageWatch = true;
+        ArmStageWatch("loading world");
         Log("[lobby] game loading -- lobby kept alive as the game transport\n");
     }
 }
@@ -2368,7 +2386,12 @@ void OnMenuPage(int page)
         g_titleMenu = true;
         // the title menu exists only when no game runs: forget the last session's
         // CGameUI, or a start at the title menu would look like one in a game
-        g_gameUiSeen = false;
+        if (g_gameUiSeen.exchange(false) && g_childPid.load()) {
+            // Leave only enqueues teardown: never wait for the child in CreatePage.
+            Leave();
+            Status("Left the lobby: you left the world. HOST or JOIN to play again.");
+            Dirty();
+        }
     } else if (page >= 3) {
         g_titleMenu = false;
     }

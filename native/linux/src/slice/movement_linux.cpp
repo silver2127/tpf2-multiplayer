@@ -1,6 +1,8 @@
 // Linux SysV counterparts of 3217497/a64e4ea. No engine-owned order is changed.
 #include "movement_linux.h"
 #include "movement_checks.h"
+#include "../paused_checks_linux.h"
+#include "../codewrite_linux.h"
 #include "train_order_checks.h"
 #include "train_order_linux.h"
 #include "slice_core.h"
@@ -34,7 +36,7 @@ bool FlagOff(const char* root, const char* data, const char* key)
     }
     return false;
 }
-template<size_t N> bool Check(uintptr_t base, const MovementCheck (&checks)[N])
+template<class T, size_t N> bool Check(uintptr_t base, const T (&checks)[N])
 {
     for (const auto& c : checks) {
         std::vector<char> bytes(c.size);
@@ -136,6 +138,23 @@ void ShipHook(uintptr_t self,uintptr_t world,int n,float dt)
 void AirHook(uintptr_t self,uintptr_t world,int n,float dt)
 { Observe(1,self,world,n); reinterpret_cast<UpdateFn>(moveOriginal[1])(self,world,n,dt); }
 
+bool ReadCompanies(const std::string& data, const char* letter)
+{
+    if (data.empty()) return false;
+    if (letter && *letter) {
+        FILE* f=fopen((data+"/lockstep_status_"+letter+".txt").c_str(),"r");
+        if (f) {
+            char line[512]{};
+            const bool yes=fgets(line,sizeof(line),f) && strstr(line," cm=companies");
+            fclose(f);
+            if (yes) return true;
+        }
+    }
+    FILE* f=fopen((data+"/mp_company_cfg.txt").c_str(),"r");
+    bool yes=false;
+    if (f) { char line[64]{}; yes=fgets(line,sizeof(line),f) && !strncmp(line,"companies",9); fclose(f); }
+    return yes;
+}
 bool Companies()
 {
     static std::mutex mutex;
@@ -144,10 +163,23 @@ bool Companies()
     static bool cached=false;
     const auto now=std::chrono::steady_clock::now();
     if (now-last<std::chrono::seconds(2)) return cached;
-    last=now; cached=false;
-    FILE* f=fopen((movementData+"/mp_company_cfg.txt").c_str(),"r");
-    if (f) { char line[64]{}; if (fgets(line,sizeof(line),f)) cached=!strncmp(line,"companies",9); fclose(f); }
-    return cached;
+    last=now;
+    char letter[8]{};
+    SliceInstance(letter,sizeof(letter));
+    return cached=ReadCompanies(movementData,letter);
+}
+bool InstallPausedTick(uintptr_t base, const char* root, const char* data)
+{
+    if (FlagOff(root,data,"pausedtick")) {
+        SliceLog("[pausedtick] OFF (pausedtick=0)\n"); return true;
+    }
+    if (!Check(base,kPausedChecks)) return false;
+    static const uint8_t nop[] = {0x0f,0x1f,0x44,0x00,0x00};
+    int error=0;
+    const int result=Tpf2mpCodeWriteSelf(base+0xa61860,nop,sizeof(nop),&error);
+    SliceLog("[pausedtick] %s: paused GameTime advance at a61860 (write=%d errno=%d)\n",
+        result==TPF2MP_CW_OK ? "installed" : "OFF",result,error);
+    return result==TPF2MP_CW_OK;
 }
 }
 extern "C" {
@@ -175,7 +207,7 @@ asm(".text\n.hidden SliceStationRelay\n.type SliceStationRelay,@function\n"
 bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
 {
     movementBase=base; movementData=data ? data : "";
-    bool ok=true;
+    bool ok=InstallPausedTick(base,root,data);
     if (!FlagOff(root,data,"roadspace")) {
         void* unusedPlainA=nullptr; void* unusedPlainB=nullptr;
         SliceRoadResumeA=base+0x2e558eb; SliceRoadResumeB=base+0x2e55988;
