@@ -27,8 +27,8 @@ Two layers ride the same ``NP1:`` wire:
     both handle it unchanged.
 
 Lobby message types (the ``"t"`` field):
-    join    {t:join, name}                       joiner -> host
-    welcome {t:welcome, you, host}               host -> one joiner (your final,
+    join    {t:join, name, version}              joiner -> host (exact release match)
+    welcome {t:welcome, you, host, version}      host -> one joiner (your final,
                                                   de-duplicated, username)
     roster  {t:roster, players[sorted], host,
              started, start_save}                 host -> all (also the ~2 s heal).
@@ -158,6 +158,7 @@ for the Windows DLL's kill-on-close Job object.
 from __future__ import annotations
 
 import argparse
+from sync_lobby import HostRecovery, ClientRecovery, make_runtime
 import collections
 import hashlib
 import json
@@ -521,6 +522,32 @@ class LobbyIO:
                 f.write(json.dumps(event) + "\n")
                 f.flush()
 
+    def _write_lobby_panel(self):
+        """Small display-only snapshot for the in-game Lua UI (no join secrets)."""
+        s = self._state
+        def clean(value):
+            return " ".join(str(value or "").split())[:160]
+        state = s.get("state", "connecting")
+        connected = state == "connected"
+        players = s.get("players", []) if connected else []
+        companies = s.get("companies", {}) or {}
+        lines = ["Connected" if connected else clean(state).capitalize(),
+                 clean(s.get("lobby")) or "Multiplayer lobby",
+                 "Host: " + (clean(s.get("host")) or "waiting")]
+        for name in players[:200]:
+            tags = []
+            if name == s.get("host"): tags.append("host")
+            if name == s.get("you"): tags.append("you")
+            suffix = " (" + ", ".join(tags) + ")" if tags else ""
+            lines.append(clean(name) + suffix + " - company " + clean(companies.get(name, "-")))
+        path = os.path.join(self.dir, "lobby_panel.txt")
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass  # Advisory UI: never stop networking because it cannot be drawn.
+
     def write_state(self, **fields):
         with self._lock:
             self._state.update(fields)
@@ -544,6 +571,7 @@ class LobbyIO:
                         f.flush()
                 except OSError:
                     pass
+            self._write_lobby_panel()
 
     def poll_commands(self):
         """Return a list of newly-appended command dicts (whole lines only)."""
@@ -887,13 +915,8 @@ class GameRelay:
 # All files (.sav + optional .sav.lua + .jpg) are concatenated into ONE byte
 # stream with a single sequence space; the receiver splits them back out using
 # the per-file sizes in `fbegin`. Integrity is SHA-256 per file AND overall.
-# OFF since 2026-09-11 (--share-mods turns it on, host side). Live on the rig a
-# joiner whose game could not see the save's Workshop mods -- their folders were
-# there, the game still loaded without them -- was never asked, and its refused
-# autoload left it stuck on LOAD GAME. Copying a Workshop item into the workshop
-# folder is unlikely to make the game load it either. Every player installs the
-# save's mods themselves until that is solved.
-SHARE_MODS = [False]
+# Required mods are offered to joiners; approval and engine registration gate loading.
+SHARE_MODS = [True]
 MODS_ANSWER_WAIT = 90.0    # s the host waits for a joiner to answer the download prompt
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
@@ -1226,6 +1249,7 @@ class _HostSaveTransfer:
             if p["need"]:
                 self.log(f"[host] {p['name']} declined the mod download")
             p["need"] = []
+            p["state"] = "failed"
         elif p["need"]:
             self.log(f"[host] {p['name']} accepted the mod download")
 
@@ -1241,6 +1265,7 @@ class _HostSaveTransfer:
                 self.log(f"[host] {p['name']} did not answer the mod download prompt in {MODS_ANSWER_WAIT:.0f} s -- treating it as no")
                 p["ask"] = False
                 p["need"] = []
+                p["state"] = "failed"
                 continue
             if not p["ask_logged"]:
                 p["ask_logged"] = True
@@ -1271,8 +1296,9 @@ class _ClientSaveReceiver:
     the lobby IO directory as incoming_save.*, and emits ``save_ready``.
     """
 
-    def __init__(self, conn, io, log):
+    def __init__(self, conn, io, log, server_cache=None):
         self.conn = conn
+        self.server_cache=server_cache
         self.io = io
         self.log = log
         self.sid = None
@@ -1305,19 +1331,74 @@ class _ClientSaveReceiver:
         # are installed; the yes covers one round.
         self.offered = []          # folder names the player was asked about (the last save round)
         self.approved = set()      # of those, what the player said yes to
+        self.mods_satisfied = True
+        self.last_mod_request = 0
+        self.consent_id=0
+        self.cancel_reason = "Required mods were cancelled or could not be installed."
+        self.cancelled = False
+        self.catalogue_token = None
+        self.catalogue_since = 0
+        self.required = []
+        self.manifest = []
+        self.manifest_key = None
+        self.preflight = False
         self.save_done = False     # the save round before a mods round verified here
 
-    def answer_mods(self, accept):
-        """The player (or the panel's share_mods flag) said yes or no."""
-        if self.sid is None:
+    def on_manifest(self, entries):
+        if not isinstance(entries,list) or len(entries)>128:
+            self.cancelled=True
             return
-        self.ask = False
-        self.approved = set(self.offered) if accept else set()
-        self._send({"t": "mods_answer", "sid": self.sid, "accept": bool(accept)})
-        self.log(f"[client] mod download {'accepted' if accept else 'declined'}")
-        if not accept and self.need:
-            self.io.emit({"type": "chat", "from": "MULTIPLAYER",
-                          "text": "Mod download declined: the game will report the missing mods when the save loads."})
+        mods=[]
+        for entry in entries:
+            if not isinstance(entry,(list,tuple)) or len(entry)!=2 or not modshare.valid_mod(entry[0],entry[1]):
+                self.cancelled=True
+                return
+            mods.append(tuple(entry))
+        key=tuple(mods)
+        if self.manifest_key==key:
+            return
+        self.manifest_key=key
+        self.manifest=mods
+        self.io.emit({"type":"mods_manifest", "mods":mods})
+        # A fresh save supersedes earlier advertisements in on_begin.
+        if self.active() or self.catalogue_token:
+            return
+        self.required=mods
+        missing_dlc=[m for m,v in mods if modshare.is_dlc(m) and modshare.installed_mod(m,v) is None]
+        if missing_dlc:
+            self.cancelled=True
+            self.cancel_reason="Required DLC is not installed: " + ", ".join(missing_dlc) + ". DLC is never transferred."
+            self.io.emit({"type":"mods_cancelled","text":"Required DLC is not installed: " + ", ".join(missing_dlc) + ". DLC is never transferred."})
+            return
+        self.need=[modshare.mod_folder_name(m,v) for m,v in mods if modshare.installed_mod(m,v) is None]
+        self.offered=list(self.need)
+        self.approved=set()
+        self.preflight=True
+        self.ask=bool(self.need)
+        self.mods_satisfied=not self.need
+        if self.ask:
+            self.consent_id+=1
+            self.io.emit({"type":"mods_prompt", "offer":self.consent_id, "count":len(self.need), "text":", ".join(self.need)})
+        else:
+            self.io.emit({"type":"mods_clear"})
+
+    def answer_mods(self, accept, offer=None):
+        if offer is not None and offer != self.consent_id: return
+        if not self.ask or self.cancelled:
+            return
+        self.ask=False
+        self.approved=set(self.offered) if accept else set()
+        if not accept:
+            self.cancelled=True
+            self._send({"t":"leave"})
+            self.io.emit({"type":"mods_cancelled", "text":"Mod download cancelled; left the lobby."})
+            return
+        if self.preflight:
+            self.last_mod_request=time.time()
+            self._send({"t":"mods_request", "need":list(self.offered)})
+        else:
+            self._send({"t":"mods_answer", "sid":self.sid, "accept":True})
+        self.log("[client] mod download accepted")
 
     def _refusal(self, kind, files):
         """Why this proposed transfer must not be taken, or None."""
@@ -1325,7 +1406,7 @@ class _ClientSaveReceiver:
         if kind == "save":
             bad = [n for n in names if n not in ALLOWED_INCOMING or not _safe_incoming_name(n)]
             return f"refused: sender proposed unexpected filename(s) {bad}" if bad else None
-        if not self.save_done:
+        if not self.save_done and not self.preflight:
             return "refused a mods transfer that did not follow a verified save transfer"
         if not self.approved:
             return "refused a mods transfer this player did not agree to"
@@ -1341,6 +1422,7 @@ class _ClientSaveReceiver:
         installed, the host hears a final failure (it starts us anyway), and the
         player is told. Not a status line: the save itself arrived fine."""
         self.failed = True
+        self.cancelled = True
         self.approved = set()
         self.log(f"[client] {detail}")
         self.io.emit({"type": "chat", "from": "MULTIPLAYER",
@@ -1362,12 +1444,17 @@ class _ClientSaveReceiver:
         final) so the host resolves us as failed NOW rather than after
         PEER_XFER_TIMEOUT."""
         self.failed = True
+        if self.kind=="mods":
+            self.cancelled=True
+            self.cancel_reason=detail
         self.io.emit({"type": "status", "state": "failed",
                       "detail": f"save transfer failed: {detail}"})
         self._send({"t": "fdone", "sid": self.sid, "ok": False, "final": True})
 
     # -- inbound ----------------------------------------------------------- #
     def on_begin(self, msg):
+        if self.cancelled:
+            return
         sid = msg.get("sid")
         if sid == self.sid:
             if self.failed:
@@ -1406,23 +1493,44 @@ class _ClientSaveReceiver:
         self.kind = kind
         # the mods this save needs that are not installed here (told back in the ack)
         self.need = []
+        previous_approval=set(self.approved) if self.preflight else set()
         if kind == "save":
+            self.preflight=False
+            self.required=[]
             self.save_done = False
             for ent in (msg.get("mods") or []):
                 try:
                     m, v = str(ent[0]), int(ent[1])
                 except (TypeError, ValueError, IndexError):
                     continue
-                if modshare.installed_mod(m, v) is None:
+                if not modshare.valid_mod(m,v):
+                    self.cancelled=True
+                    return
+                self.required.append((m,v))
+                if self.server_cache:
+                    present=modshare.is_dlc(m) or os.path.isfile(os.path.join(self.server_cache,modshare.cache_name(m,v)))
+                else:
+                    present=modshare.installed_mod(m,v) is not None
+                    if not present and modshare.is_dlc(m):
+                        self.cancelled=True
+                        self.cancel_reason="Required DLC is missing. Deluxe and Early Supporter content cannot be downloaded from the host."
+                        self.io.emit({"type":"mods_cancelled","text":"Required DLC is missing. Deluxe and Early Supporter content cannot be downloaded from the host."})
+                        return
+                if not present:
                     self.need.append(modshare.mod_folder_name(m, v))
             # a new save round asks afresh: an earlier yes does not carry over
             self.offered = list(self.need)
-            self.approved = set()
-        self.ask = bool(self.need) and kind == "save"
-        if self.need:
+            self.approved = previous_approval.intersection(self.offered)
+        self.ask = bool(self.need) and kind == "save" and not set(self.need).issubset(self.approved)
+        if kind=="save": self.mods_satisfied=not self.need
+        if self.server_cache and kind=="save":
+            self.approved=set(self.offered)
+            self.ask=False
+        if self.ask:
             self.log(f"[client] the save needs mods we lack: {', '.join(self.need)} -- asking the player")
             # the panel shows YES / NO (or answers from its share_mods flag)
-            self.io.emit({"type": "mods_prompt", "count": len(self.need), "mods": list(self.need),
+            self.consent_id+=1
+            self.io.emit({"type": "mods_prompt", "offer":self.consent_id, "count": len(self.need), "mods": list(self.need),
                           "text": ", ".join(self.need)})
             self.io.emit({"type": "chat", "from": "MULTIPLAYER",
                           "text": "Mods are code that runs in your game, and these come from the host's "
@@ -1492,6 +1600,29 @@ class _ClientSaveReceiver:
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
+        if self.cancelled:
+            return
+        if self.preflight and self.approved and not self.active() and not self.catalogue_token and now-self.last_mod_request>1:
+            self.last_mod_request=now
+            self._send({"t":"mods_request","need":list(self.offered)})
+        if self.catalogue_token:
+            token, entries = modshare.catalogue()
+            if token == self.catalogue_token:
+                missing=[modshare.mod_folder_name(m,v) for m,v in self.required if (m,str(v)) not in entries]
+                self.catalogue_token=None
+                if missing:
+                    self._fail("mods not recognised by game: " + ", ".join(missing))
+                    self.cancelled=True
+                    return
+                self.complete=True
+                self.mods_satisfied=True
+                self.io.emit(dict({"type":"mods_ready", "failed":[]}, **getattr(self,"install_result",{})))
+                self._maybe_send_done(force=True)
+            elif now-self.catalogue_since>45:
+                self._fail("game did not refresh its mod catalogue")
+                self.cancelled=True
+                self.catalogue_token=None
+            return
         if self.sid is None or self.failed:
             return
         if self.complete:
@@ -1567,9 +1698,22 @@ class _ClientSaveReceiver:
             for v in parts.values():
                 v.release()
             view.release()
-            self.complete = True
-            self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
-            self._maybe_send_done(force=True)
+            if self.failed:
+                self.cancelled=True
+                return
+            if self.server_cache:
+                self.complete=True
+                self.mods_satisfied=True
+                self._maybe_send_done(force=True)
+                return
+            self.complete = False
+            try:
+                self.catalogue_token=modshare.request_catalogue()
+            except (OSError,ValueError) as e:
+                self._fail("cannot publish mod registry: " + str(e))
+                return
+            self.catalogue_since=time.time()
+            self.io.emit({"type":"mods_refresh"})
             return
         written = []
         try:
@@ -1621,7 +1765,21 @@ class _ClientSaveReceiver:
                     skipped.append(label)
                 self.log(f"[client] mod {label}: not agreed to here -- not installed")
                 continue
-            st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
+            if self.server_cache:
+                if modshare.is_dlc(idv[0]):
+                    bad.append(label); continue
+                try:
+                    os.makedirs(self.server_cache,exist_ok=True)
+                    path=os.path.join(self.server_cache,modshare.cache_name(*idv))
+                    with open(path+".tmp","wb") as f: f.write(part)
+                    os.replace(path+".tmp",path)
+                    st="installed"
+                except OSError as e:
+                    self.log(f"[relay] cannot cache {label}: {e}")
+                    bad.append(label)
+                    continue
+            else:
+                st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
             (done if st == "installed" else kept if st == "present" else bad).append(label)
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
         text = []
@@ -1631,7 +1789,10 @@ class _ClientSaveReceiver:
         if skipped: text.append("not installed (you did not agree to them): " + ", ".join(skipped))
         if text:
             self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": "; ".join(text)})
-        self.io.emit({"type": "mods_ready", "installed": done, "present": kept, "failed": bad})
+        self.install_result={"installed":done,"present":kept,"failed":bad}
+        absent=approved-set(done)-set(kept)
+        if bad or absent:
+            self._fail("required mod installation failed: " + ", ".join(sorted(set(bad)|absent)))
 
 
 def _clear_stale_incoming(directory, log=_log):
@@ -1655,7 +1816,18 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.4.22"
+LOBBY_VERSION = "0.5.3"
+
+
+def version_rejection(remote):
+    """Exact release match; legacy peers without a version fail closed."""
+    if isinstance(remote, str) and remote == LOBBY_VERSION:
+        return None
+    label = remote[:64] if isinstance(remote, str) and remote else "unknown (older build)"
+    return (f"Multiplayer version mismatch: you have {LOBBY_VERSION}; "
+            f"the other side has {label}. Install the same multiplayer version on both sides.")
+
+
 PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
 
 
@@ -1921,7 +2093,7 @@ class _PeerConn:
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False, punch_q=None):
+             relay_only=False, punch_q=None, sync_runtime=None):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
@@ -1936,6 +2108,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     sock.setblocking(False)
     _boost_socket_buffers(sock)             # help bursty save-transfer traffic
 
+    transport_lobby = os.urandom(16).hex()
+    io.emit(dict(type='transport_lobby', epoch=transport_lobby))
     host_name = _dedupe(my_name, set())     # reassigned by the 'name' command
     peers = collections.OrderedDict()       # addr -> {"name":str, "last":float,
                                             #          "started":bool,
@@ -2061,6 +2235,32 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return sorted(p["name"] for p in peers.values())
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
+    def recovery_supported():
+        return (sync_runtime is not None and not relay_only and len(peers) >= 1
+                and all(p.get("recovery") == 4 for p in peers.values())
+                and started[0] and transfer[0] is None)
+
+    def recovery_unavailable_reason():
+        if not peers:
+            return "Resync needs at least one connected player."
+        if not all(p.get("recovery") == 4 for p in peers.values()):
+            return "Every player needs a version that supports resync."
+        if not started[0]:
+            return "Start the multiplayer game before requesting resync."
+        if transfer[0] is not None:
+            return "A player is receiving the save. Wait for that transfer to finish, then try again."
+        return "Resync is not ready yet."
+
+    def recovery_send(name, message):
+        for address, peer in peers.items():
+            if peer["name"] == name:
+                _send_data(sock, address, message)
+
+    recovery = HostRecovery(sync_runtime, host_name, io, recovery_send,
+        roster_players, lambda: [(a, p["name"]) for a, p in peers.items()],
+        lambda sid, blob, files, targets: _HostSaveTransfer(sock, sid, blob, files, targets, io, log),
+        available=recovery_supported, unavailable_reason=recovery_unavailable_reason) if sync_runtime is not None and not relay_only else None
+
     def roster_companies():
         """name -> company id. Same id = same company (co-op); different ids =
         separate companies. Everyone starts on 1, so nothing changes until
@@ -2098,9 +2298,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         links = {p["name"]: p.get("links", []) for p in peers.values()}
         companies = roster_companies()
         for a, p in list(peers.items()):
-            _send_data(sock, a, {"t": "roster", "players": players,
+            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "transport_lobby": transport_lobby, "players": players, "recovery": 4 if recovery_supported() else 0,
                                  "host": leader_name(), "lobby": lobby_name,
-                                 "relay": relay_only,
+                                 "relay": relay_only, "mods": advertised[1],
                                  "stored_age": stored_age() if relay_only else -1,
                                  "stored_max": int(HOTJOIN_STORED_MAX) if relay_only else -1,
                                  "letters": {p2["name"]: letter_for(p2["name"]) for p2 in peers.values()} if relay_only else None,
@@ -2117,7 +2317,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
                  "relay": relay_only, "companies": roster_companies()})
         io.write_state(state="connected", code=code, players=players,
-                       you=host_name, host=leader_name(), started=started[0])
+                       you=host_name, host=leader_name(), started=started[0],
+                       lobby=lobby_name, companies=roster_companies())
 
     def roster_changed(broadcast=True):
         """Push the roster to peers, and emit an event only if it changed."""
@@ -2139,6 +2340,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             last_emitted_roster[0] = key
             emit_roster()
 
+    def mod_package(m,v):
+        if modshare.is_dlc(m) or not SHARE_MODS[0]: return None
+        if relay_only:
+            path=os.path.join(io.dir,"mod_cache",modshare.cache_name(m,v))
+            try:
+                with open(path,"rb") as f: data=f.read(modshare.MAX_MOD_ZIP+1)
+                return data if len(data)<=modshare.MAX_MOD_ZIP else None
+            except OSError: return None
+        return modshare.package_mod(m,v)
+
     def broadcast_chat(frm, text):
         cid_counter[0] += 1
         ts = int(time.time())
@@ -2149,6 +2360,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 _send_data(sock, a, msg)
         io.emit({"type": "chat", "from": frm, "text": text, "ts": ts})
 
+    cached_world = stored_save()[0] if relay_only else None
+    advertised = [cached_world, (modshare.save_mod_list(cached_world) or []) if cached_world else []]
+    preflight_requests = {}
+    mod_preflight = [False]
+    pending_start = [None]
     mod_round = [None]        # the addrs to start once a mods round resolves
 
     def broadcast_start(save, only=None):
@@ -2175,7 +2391,28 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             f"{len(targets)} of {len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
-    def do_join(addr, name, profile=None, is_mesh=False):
+    def do_join(addr, name, profile=None, is_mesh=False, version=None, recovery_protocol=0):
+        reason = version_rejection(version)
+        if reason:
+            # Phrase the error from the joining player's perspective.
+            remote = version[:64] if isinstance(version, str) and version else "unknown (older build)"
+            reason = (f"Multiplayer version mismatch: you have {remote}; the host has "
+                      f"{LOBBY_VERSION}. Install the same multiplayer version on both sides.")
+            _send_data(sock, addr, {"t": "reject", "reason": reason})
+            if addr in peers:
+                del peers[addr]
+                if transfer[0] is not None:
+                    transfer[0].on_peer_dropped(addr)
+                roster_changed()
+            log(f"[host] rejected incompatible multiplayer version: {remote!r}")
+            return
+        # Only while a recovery is actually in flight (HostRecovery.roster_locked).
+        # Testing the bare operation token here kept rejecting every new joiner
+        # after the first resync, for as long as this lobby process lived --
+        # including in the next NEW game, since the lobby outlives the world.
+        if recovery and recovery.roster_locked and addr not in peers:
+            _send_data(sock, addr, {"t": "reject", "reason": "A world recovery is in progress and the player list is fixed until it finishes. Try again in a moment."})
+            return
         late = False
         if addr in peers:                                   # rename in place
             peers[addr]["name"] = _dedupe(name, all_names(exclude_addr=addr))
@@ -2196,11 +2433,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if late else ""))
         peers[addr]["last"] = time.time()
+        peers[addr]["recovery"] = recovery_protocol
         if relay_only:
             letter_for(peers[addr]["name"])
-        _send_data(sock, addr, {"t": "welcome",
+        _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
                                 "you": peers[addr]["name"], "host": leader_name(),
-                                "lobby": lobby_name, "relay": relay_only})
+                                "recovery": 4 if recovery_supported() else 0,
+                                "lobby": lobby_name, "relay": relay_only, "mods": advertised[1]})
         if relay_only and started[0] and addr != leader_addr() and not peers[addr].get("started"):
             age = stored_age()
             if 0 <= age <= HOTJOIN_STORED_MAX:
@@ -2315,9 +2554,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return
+        if not isinstance(msg, dict):
+            return
         t = msg.get("t")
+        if t != "join" and addr not in peers:
+            return
         if addr in peers:
             peers[addr]["last"] = time.time()
+        if recovery and addr in peers:
+            if recovery.command(peers[addr]["name"], msg) or recovery.feedback(addr, msg):
+                return
         if relay_only and t in ("fbegin", "start") and addr in peers:
             if addr != leader_addr():
                 log(f"[relay] {t} from {peers[addr]['name']!r} ignored -- only the leader "
@@ -2332,17 +2578,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             u = upload[0]
             if u is not None and u.complete and u.sid == msg.get("sid"):
                 return                                      # a late duplicate fbegin of a finished upload
-            if u is None or u.complete or u.failed or u.sid != msg.get("sid"):
+            if u is None or (msg.get("kind")!="mods" and (u.complete or u.failed or u.sid != msg.get("sid"))):
                 # the stored save is NOT cleared first: the receiver holds the new
                 # one in memory and overwrites the files only once it has verified,
                 # so a failed upload leaves the previous world intact for the next session
-                upload[0] = _ClientSaveReceiver(_PeerConn(sock, addr), io, log)
+                upload[0] = _ClientSaveReceiver(_PeerConn(sock, addr), io, log, server_cache=os.path.join(io.dir,"mod_cache"))
                 log(f"[relay] save upload from the leader {peers[addr]['name']!r} begins")
             upload[0].on_begin(msg)
             return
         if t == "join":
             do_join(addr, msg.get("name", "player"), msg.get("profile"),
-                    msg.get("mesh", False))
+                    msg.get("mesh", False), msg.get("version"), msg.get("recovery", 0))
         elif t == "links":
             if addr in peers:
                 new = [str(x) for x in msg.get("direct", [])][:CAP]
@@ -2432,6 +2678,24 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "fdone":
             if transfer[0] is not None:
                 transfer[0].on_fdone(addr, msg)
+        elif t == "mods_request":
+            if transfer[0] is not None and addr in transfer[0].peers:
+                # A joiner prompted BEFORE the save is in "preflight" mode, and
+                # answers yes with mods_request -- never the mods_answer this
+                # host is waiting for (see _ClientMods.answer_mods). Dropping it
+                # outright meant the player pressed yes, the host waited the full
+                # MODS_ANSWER_WAIT for a message that mode never sends, called it
+                # a no and failed the save transfer (seen 2026-09-15). Count it as
+                # the consent it is; the queued preflight request is still skipped
+                # while a transfer to this peer is open.
+                pr = transfer[0].peers.get(addr)
+                if pr and pr.get("ask"):
+                    transfer[0].on_mods_answer(addr, {"sid": transfer[0].sid, "accept": True})
+                return
+            allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in advertised[1]}
+            requested=msg.get("need",[])
+            if isinstance(requested,list) and len(requested)<=128:
+                preflight_requests[addr]=[allowed[n] for n in requested if isinstance(n,str) and n in allowed]
         elif t == "mods_answer":
             if transfer[0] is not None:
                 transfer[0].on_mods_answer(addr, msg)
@@ -2491,7 +2755,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
-        mods = [] if (relay_only or not SHARE_MODS[0]) else (modshare.save_mod_list(save_path) or [])
+        mods = modshare.save_mod_list(save_path) or []
+        advertised[:]=[save_path,mods]
+        for a,_ in targets: preflight_requests.pop(a,None)
         if mods:
             log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
                 + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
@@ -2501,12 +2767,28 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     # ---- local (host's own menu) commands ---------------------------------- #
     def handle_command(cmd):
         nonlocal host_name
+        if recovery and recovery.command(host_name, cmd):
+            return
+        if recovery and recovery.held and cmd.get("cmd") in ("start", "name", "company"):
+            return
         c = cmd.get("cmd")
+        if c == "advertise_mods":
+            path=str(cmd.get("save", ""))
+            mods=modshare.save_mod_list(path)
+            if mods is not None:
+                advertised[:]=[path,mods]
+                for a in list(peers): _send_data(sock,a,{"t":"mods_manifest","mods":mods})
+                io.emit({"type":"mods_manifest","mods":mods})
+            return
+
         if c == "chat":
             broadcast_chat(host_name, str(cmd.get("text", "")))
         elif c == "name":
             host_name = _dedupe(str(cmd.get("name", "player")),
                                 {p["name"] for p in peers.values()})
+            if recovery:
+                recovery.barrier.host = host_name
+                recovery.runtime.player = host_name
             roster_changed()
         elif c == "company":
             target = str(cmd.get("player") or host_name)
@@ -2524,7 +2806,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if relay_only:
                 log("[relay] 'start' from the local panel ignored -- the leader starts")
             elif transfer[0] is not None:
-                log("[host] start ignored -- a save transfer is in progress")
+                if mod_preflight[0]:
+                    pending_start[0] = dict(cmd)
+                    io.emit({"type": "status", "state": "connected",
+                             "detail": "Waiting for mod downloads before starting the game."})
+                else:
+                    log("[host] start ignored -- a save transfer is in progress")
             elif save and not _mod_check(save, io, log):
                 pass                              # refused: made without the mod (status + chat say so)
             elif save:
@@ -2556,7 +2843,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         while not stop.is_set():
             # While a transfer runs, poll fast so we pump chunks + absorb ACKs
             # promptly; otherwise idle at 0.2 s to keep the loop cheap.
-            timeout = XFER_SELECT_TIMEOUT if transfer[0] is not None else 0.2
+            timeout = (XFER_SELECT_TIMEOUT if transfer[0] is not None or (recovery and recovery.transfer is not None)
+                       else 0.05 if recovery and recovery.held else 0.2)
             try:
                 ready, _, _ = select.select(rlist, [], [], timeout)
             except (OSError, ValueError):
@@ -2668,6 +2956,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             for cmd in io.poll_commands():
                 handle_command(cmd)
+            if recovery:
+                recovery.tick(now)
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
@@ -2689,7 +2979,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # Anyone who joined during a transfer is still unstarted: serve them
             # from the same save now that the pipe is free (relay: its stored
             # world; host: the file START GAME shared). One push per batch.
-            if started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
+            if not (recovery and recovery.held) and started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
                 last_serve_check[0] = now
                 waiting = [a for a in peers if not peers[a].get("started")]
                 fresh = (not relay_only) or (0 <= stored_age() <= HOTJOIN_STORED_MAX)
@@ -2716,11 +3006,31 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if u is not None and u.failed:
                     log("[relay] the leader's upload failed -- waiting for a new START")
                     upload[0] = None
-                elif u is not None and u.complete and transfer[0] is None and not getattr(u, "handed", False):
+                elif u is not None and u.complete and u.mods_satisfied and transfer[0] is None and not getattr(u, "handed", False):
                     u.handed = True
                     path = os.path.join(io.dir, INCOMING_BASENAME + ".sav")
                     log(f"[relay] upload complete -> pushing {path} to the waiting peers")
                     begin_save_transfer(path)
+            if transfer[0] is None and pending_start[0] is not None:
+                queued, pending_start[0] = pending_start[0], None
+                handle_command(queued)
+            if transfer[0] is None and preflight_requests:
+                a, wanted = preflight_requests.popitem()
+                if a in peers and wanted:
+                    blob, meta = bytearray(), []
+                    for m,v in wanted:
+                        folder=modshare.find_mod(m,v)
+                        data=mod_package(m,v)
+                        if data is None: break
+                        meta.append({"name":modshare.mod_zip_name(m,v),"size":len(data),"sha256":hashlib.sha256(data).hexdigest()})
+                        blob+=data
+                    if len(meta)!=len(wanted):
+                        _send_data(sock,a,{"t":"reject","reason":"The host cannot supply all required mods."})
+                        del peers[a]
+                        roster_changed()
+                    else:
+                        mod_preflight[0]=True
+                        transfer[0]=_HostSaveTransfer(sock,int.from_bytes(os.urandom(4), "big"),blob,meta,[(a,peers[a]["name"])],io,log,kind="mods")
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
             #   any FAILED -> failed status naming them, NO start, and the
@@ -2729,20 +3039,24 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 try:
                     transfer[0].pump(now)
                     if transfer[0].all_resolved() and transfer[0].kind == "mods":
-                        # THE MODS ROUND is done: start everyone the save reached.
-                        # A peer whose mods did not verify is started too -- the
-                        # game tells them what is missing on load, and the chat
-                        # line names it -- rather than left behind silently.
+                        # Only recipients with a successful catalogue receipt may start.
                         xfer, transfer[0] = transfer[0], None
                         got = set(mod_round[0] or set())
+                        was_preflight,mod_preflight[0]=mod_preflight[0],False
                         mod_round[0] = None
                         bad = xfer.failed_names()
                         if bad:
-                            log(f"[host] mod transfer failed for {', '.join(bad)} -- starting them anyway")
+                            for a,p in list(xfer.peers.items()):
+                                if p["state"] != "done" and a in peers:
+                                    _send_data(sock,a,{"t":"reject","reason":"Required mod download failed."})
+                                    del peers[a]
+                            roster_changed()
+                            log(f"[host] mod transfer failed for {', '.join(bad)} -- they will not be started")
                             broadcast_chat("MULTIPLAYER", "Mod transfer failed for " + ", ".join(bad)
                                            + " -- they may be missing mods this save needs.")
                         log(f"[host] mods shared -- starting {len(got)} peer(s)")
-                        broadcast_start(save=True, only=got)
+                        got -= {a for a,p in xfer.peers.items() if p["state"] != "done"}
+                        if got and not was_preflight: broadcast_start(save=True, only=got)
                     elif transfer[0].all_resolved() and not transfer[0].awaiting_answers(now):
                         xfer, transfer[0] = transfer[0], None
                         failed = xfer.failed_names()
@@ -2781,7 +3095,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                 blob2, meta2, missing = bytearray(), [], []
                                 for (m, v) in wanted:
                                     folder = modshare.find_mod(m, v)
-                                    data = folder and modshare.zip_mod(folder)
+                                    data = mod_package(m,v)
                                     if not data:
                                         missing.append(modshare.mod_folder_name(m, v))
                                         continue
@@ -2792,7 +3106,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                     log(f"[host] cannot share {', '.join(missing)} (not installed here, or over the size cap)")
                                     broadcast_chat("MULTIPLAYER", "Cannot share " + ", ".join(missing)
                                                    + " -- not found on the host; install it by hand.")
-                                if meta2:
+                                if missing:
+                                    for a in needs:
+                                        _send_data(sock,a,{"t":"reject","reason":"Host cannot supply required mods."})
+                                    got -= set(needs)
+                                if meta2 and not missing:
                                     targets2 = [(a, peers[a]["name"]) for a in needs if a in peers]
                                     names2 = ", ".join(n for _, n in targets2)
                                     mb = len(blob2) / (1024.0 * 1024.0)
@@ -2837,7 +3155,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 # --------------------------------------------------------------------------- #
 def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                log=_log, receiver_cls=_ClientSaveReceiver, relay=None,
-               mesh=None, profile_code=None, forward_logs=()):
+               mesh=None, profile_code=None, forward_logs=(), sync_runtime=None):
     """Participate in the lobby over a connected ``punch.Connection`` (blocks).
 
     ``receiver_cls`` is the save-receive implementation (the self-test swaps in
@@ -2852,6 +3170,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     started = [False]
     last_roster = [None]
     host_name = [None]
+    version_checked = [False]
     participants = [[]]     # every player name, from the roster
     roster_links = [{}]     # name -> [names it has direct links to]
     roster_profiles = [{}]  # name -> profile code (how to punch it)
@@ -2874,11 +3193,11 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     fwd = LogForwarder(forward_logs)        # our log lines -> the host's merged log
     _log_sinks.append(fwd.add)
 
-    io.emit({"type": "status", "state": "connected",
+    io.emit({"type": "status", "state": "connecting",
              # no address in the panel: a joiner's screen (or a stream of it)
              # must not show the host's IP. The redacted log still has it.
-             "detail": "joined the host"})
-    io.write_state(state="connected", you=desired[0], started=False)
+             "detail": "checking multiplayer version..."})
+    io.write_state(state="connecting", you=desired[0], started=False)
 
     def send(msg):
         try:
@@ -2886,12 +3205,16 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         except (RuntimeError, OSError):
             pass
 
+    recovery = ClientRecovery(sync_runtime, io, send, receiver) if sync_runtime is not None else None
+
     def apply_start(save, via):
         """The save-flag rule: emit start only if save==false, or save==true
         AND our receiver completed this session (it emitted save_ready). An
         unsatisfiable start is ignored WITHOUT latching started, so a retried
         START GAME (after the host re-sends the save) still works."""
-        if started[0]:
+        if started[0] or (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask or receiver.catalogue_token or not receiver.mods_satisfied:
+            return
+        if receiver.need and not receiver.complete:
             return
         save = bool(save)
         if save and not receiver.complete and not uploaded[0]:
@@ -2993,6 +3316,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     def handle_peer(addr, payload):
         """Traffic from a NON-host address: a direct peer's bridge frame, a
         relay envelope (for us, or to forward), or a mesh_hi."""
+        if not version_checked[0] or stop.is_set():
+            return
         if payload[:1] == MESH_RELAY_MAGIC:
             env = _relay_unwrap(payload)
             if env is None:
@@ -3028,6 +3353,29 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         conn.on_peer = handle_peer
 
     def handle_msg(raw):
+        if stop.is_set():
+            return
+        if not version_checked[0]:
+            try:
+                greeting = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(greeting, dict):
+                return
+            if greeting.get("t") in ("welcome", "roster"):
+                reason = version_rejection(greeting.get("version"))
+                if reason:
+                    send({"t": "leave"})
+                    io.emit({"type": "status", "state": "failed", "detail": reason})
+                    io.write_state(state="failed", detail=reason, started=False)
+                    log(f"[client] {reason}")
+                    stop.set()
+                    return
+                version_checked[0] = True
+                io.emit({"type": "status", "state": "connected", "detail": "joined the host"})
+                io.write_state(state="connected")
+            elif greeting.get("t") not in ("reject", "bye"):
+                return
         # Two binary payload kinds are NOT JSON: a relayed bridge frame (first
         # byte GAME_RELAY_MAGIC) and a save chunk (CHUNK_MAGIC); everything
         # else is a JSON lobby message.
@@ -3053,23 +3401,42 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         except (ValueError, UnicodeDecodeError):
             return
         t = m.get("t")
+        if t == "mods_manifest":
+            receiver.on_manifest(m.get("mods"))
+            return
+        if recovery and recovery.message(m):
+            return
         if t == "fbegin":
+            if recovery and recovery.begin(m):
+                return
+            if recovery and recovery.held:
+                return
             receiver.on_begin(m)
             return
         if t in ("fbegin_ack", "fack", "fdone"):
             if uploader[0] is not None:
                 getattr(uploader[0], "on_" + t.replace("fbegin_ack", "begin_ack"))(conn.peer, m)
             return
+        if t in ("welcome", "roster"):
+            lobby_epoch = m.get("transport_lobby", "")
+            if isinstance(lobby_epoch, str) and re.fullmatch(r"[0-9a-f]{32}", lobby_epoch):
+                io.emit(dict(type='transport_lobby', epoch=lobby_epoch))
         if t == "welcome":
+            receiver.on_manifest(m.get("mods", []))
             assigned[0] = m.get("you", desired[0])
             host_name[0] = m.get("host")
             is_relay[0] = bool(m.get("relay"))
+            if recovery:
+                recovery.identify(assigned[0], host_name[0], m.get("recovery") == 4 and not is_relay[0])
             io.write_state(you=assigned[0], host=m.get("host"))
             log(f"[client] host named us {assigned[0]!r}")
         elif t == "roster":
+            receiver.on_manifest(m.get("mods", []))
             players = m.get("players", [])
             host_name[0] = m.get("host", host_name[0])
             is_relay[0] = bool(m.get("relay", is_relay[0]))
+            if recovery:
+                recovery.identify(assigned[0], host_name[0], m.get("recovery") == 4 and not is_relay[0])
             participants[0] = list(players)
             roster_links[0] = m.get("links", {}) or {}
             roster_profiles[0] = m.get("profiles", {}) or {}
@@ -3085,7 +3452,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                          "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1)})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
-                               started=started[0])
+                               started=started[0], lobby=m.get("lobby", ""), companies=companies)
             # Start self-heal: the host's roster carries started:true for us
             # once we were included in a start -- catches a lost start burst.
             if m.get("started") is True:
@@ -3111,6 +3478,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         elif t == "reject":
             io.emit({"type": "status", "state": "failed",
                      "detail": m.get("reason", "rejected")})
+            io.write_state(state="failed", detail=m.get("reason", "rejected"), started=False)
             stop.set()
         elif t == "bye":
             io.emit({"type": "status", "state": "failed",
@@ -3118,11 +3486,17 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             stop.set()
 
     def handle_command(cmd):
+        if recovery and recovery.command(cmd):
+            return
+        if recovery and recovery.held and cmd.get("cmd") in ("start", "name", "company"):
+            return
         c = cmd.get("cmd")
+        if not version_checked[0] and c not in ("quit", "name"):
+            return
         if c == "chat":
             send({"t": "chat", "text": str(cmd.get("text", ""))})
         elif c == "mods":
-            receiver.answer_mods(bool(cmd.get("accept")))
+            receiver.answer_mods(bool(cmd.get("accept")),cmd.get("offer"))
         elif c == "company":
             # the panel names a player when the leader of a relay lobby clicks
             # someone else's chip; this used to be overwritten with our own
@@ -3130,7 +3504,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "company", "player": str(cmd.get("player") or assigned[0]), "id": cmd.get("id")})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
-            m2 = {"t": "join", "name": desired[0], "mesh": mesh is not None}
+            m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
             if profile_code:
                 m2["profile"] = profile_code
             send(m2)
@@ -3154,7 +3528,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                     return
                 sid = int(time.time() * 1000) & 0xFFFFFFFF
                 uploader[0] = _HostSaveTransfer(conn.sock, sid, blob, files_meta,
-                                                [(conn.peer, "relay")], io, log)
+                                                [(conn.peer, "relay")], io, log, mods=modshare.save_mod_list(str(cmd.get("save"))) or [])
                 io.emit({"type": "status", "state": "connected",
                          "detail": "uploading the save to the relay..."})
                 log(f"[client] uploading {cmd.get('save')} ({len(blob)} B) to the relay")
@@ -3174,6 +3548,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     relay_thread = None
     if relay is not None:
         def relay_forward(payload):
+            if not version_checked[0] or stop.is_set():
+                return 0
             if mesh is not None:
                 return mesh_forward(payload)
             conn.send(payload)          # RuntimeError (no peer yet) -> pump
@@ -3185,7 +3561,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                                         daemon=True)
         relay_thread.start()
 
-    join_msg = {"t": "join", "name": desired[0], "mesh": mesh is not None}
+    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
     if profile_code:
         join_msg["profile"] = profile_code
     send(join_msg)                                          # announce ourselves
@@ -3194,6 +3570,12 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     welcomed = [False]
     try:
         while not stop.is_set():
+            if not version_checked[0] and time.time() - join_sent_at > 15.0:
+                reason = "Host did not confirm a compatible multiplayer version. Install the same version on both sides."
+                send({"t": "leave"})
+                io.emit({"type": "status", "state": "failed", "detail": reason})
+                io.write_state(state="failed", detail=reason, started=False)
+                break
             if conn.last_seen_age() > host_gone_after:
                 io.emit({"type": "status", "state": "failed",
                          "detail": "host unreachable"})
@@ -3218,9 +3600,19 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 if drained >= DRAIN_CAP:
                     break
                 raw = conn.recv(timeout=0.0)
+            if stop.is_set():
+                break
             now = time.time()
             mesh_housekeeping(now)
             receiver.tick(now)                              # facks / fdone cadence
+            if receiver.cancelled:
+                send({"t":"leave"})
+                io.emit({"type":"mods_cancelled", "text":receiver.cancel_reason})
+                io.write_state(state="disconnected",started=False)
+                stop.set()
+                continue
+            if recovery:
+                recovery.tick(now)
             if uploader[0] is not None:
                 try:
                     uploader[0].pump(now)
@@ -3230,6 +3622,15 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                             io.emit({"type": "status", "state": "failed",
                                      "detail": "upload to the relay failed -- press START GAME to retry"})
                             log("[client] upload to the relay FAILED")
+                        elif up.kind=="save" and up.mod_needs():
+                            needed=up.mod_needs().get(conn.peer,[])
+                            blob2,meta2=bytearray(),[]
+                            for m,v in needed:
+                                data=modshare.package_mod(m,v)
+                                if data is None: raise ValueError("cannot upload required mod " + m)
+                                meta2.append({"name":modshare.mod_zip_name(m,v),"size":len(data),"sha256":hashlib.sha256(data).hexdigest()})
+                                blob2+=data
+                            uploader[0]=_HostSaveTransfer(conn.sock,(up.sid+1)&0xffffffff,blob2,meta2,[(conn.peer,"relay")],io,log,kind="mods")
                         else:
                             uploaded[0] = True
                             io.emit({"type": "status", "state": "connected",
@@ -3259,6 +3660,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         send({"t": "leave"})
     finally:
         _STOPPING[0] = True
+        io.write_state(state="failed" if io._state.get("state") == "failed" else "disconnected", started=False)
         lines = fwd.drain(time.time() + LOG_FLUSH_INTERVAL)   # last words
         if lines:
             send({"t": "log", "lines": lines})
@@ -3386,7 +3788,8 @@ def cmd_host(args):
         run_host(sock, args.name, io, code=code, relay=None if args.relay_only else relay,
                  forward_logs=args.forward_log or (), publisher=publisher,
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
-                 punch_q=rendezvous.queue if rendezvous is not None else None)
+                 punch_q=rendezvous.queue if rendezvous is not None else None,
+                 sync_runtime=make_runtime(args) if not args.relay_only else None)
     finally:
         _STOPPING[0] = True
         if rendezvous is not None:
@@ -3461,7 +3864,7 @@ def cmd_join(args):
         mesh, conn = _mesh_from_conn(conn)
         _log("[join] mesh: direct links to other joiners enabled")
     run_client(conn, args.name, io, relay=relay, mesh=mesh,
-               profile_code=profile_code, forward_logs=args.forward_log or ())
+               profile_code=profile_code, forward_logs=args.forward_log or (), sync_runtime=make_runtime(args))
     return 0
 
 
@@ -4086,6 +4489,9 @@ def _run_transfer_mods(tag):
             f.write("return " + repr(mid) + "\n")
         src[mid] = d
     dest = os.path.join(base, "joinermods")
+    registry_real=(modshare.request_catalogue,modshare.catalogue)
+    modshare.request_catalogue=lambda: "test-catalogue"
+    modshare.catalogue=lambda: ("test-catalogue",{("mod_zz","1"),("mod_have","1")})
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
     share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
     modshare.save_mod_list = lambda p: [("mod_zz", 1), ("mod_have", 1)]
@@ -4167,6 +4573,27 @@ def _run_transfer_mods(tag):
             if idx_start and idx_ready >= 0 and idx_start[-1] < idx_ready:
                 print(f"[mods:{tag}] FAIL: {k} was started before its mods arrived")
                 ok = False
+        lateio=LobbyIO(os.path.join(base,"late"))
+        lateSock=open_socket(29533,socket.AF_INET)
+        late=race(lateSock,peer,"dial",29533,12,my_has_v6=False)
+        if not late:
+            ok=False
+        else:
+            conns.append(late)
+            threading.Thread(target=run_client,name="late",args=(late,"dave",lateio),kwargs={"stop":stop},daemon=True).start()
+            answered_late=[0]
+            def late_settled():
+                events=_read_events(lateio.out_path)
+                prompts=sum(e.get("type")=="mods_prompt" for e in events)
+                if prompts>answered_late[0]:
+                    answered_late[0]=prompts
+                    with open(lateio.in_path,"a",encoding="utf-8") as f: f.write(json.dumps({"cmd":"mods","accept":True})+"\n")
+                return _has_start(lateio.out_path,save=True) and any(e.get("type")=="mods_ready" for e in events)
+            if not _wait_until(late_settled,timeout=30):
+                print("[mods] FAIL: hotjoin mods did not complete before start")
+                ok=False
+            else:
+                print("[mods] OK: hotjoin downloaded and registered required mods before start")
         hev = _read_events(ios["host"].out_path)
         chat = [e.get("text", "") for e in hev if e.get("type") == "chat"]
         if not any("Sharing 1 mod(s)" in t for t in chat):
@@ -4181,6 +4608,7 @@ def _run_transfer_mods(tag):
             except Exception:
                 pass
         (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target) = real
+        modshare.request_catalogue,modshare.catalogue=registry_real
         SHARE_MODS[0] = share_was
         shutil.rmtree(base, ignore_errors=True)
     print(f"[mods:{tag}] {'OK' if ok else 'FAIL'}  ({time.time() - t0:.1f}s)")
@@ -4217,6 +4645,8 @@ def _run_mods_gate(tag):
     that skips the prompt would."""
     base = tempfile.mkdtemp(prefix="lobby_modgate_")
     dest = os.path.join(base, "mods")
+    registry_request_real=modshare.request_catalogue
+    modshare.request_catalogue=lambda: "consent-test"
     real = (modshare.installed_mod, modshare.install_target)
     modshare.installed_mod = lambda m, v: None
     modshare.install_target = lambda m, v: os.path.join(dest, f"{m}_{v}")
@@ -4297,6 +4727,7 @@ def _run_mods_gate(tag):
         push(r, 52, "mods", mzz + [(INCOMING_BASENAME + ".sav", b"x" * 10)])
         check("a mods round carrying a non-mod file is refused", not installed("mod_zz"))
     finally:
+        modshare.request_catalogue=registry_request_real
         modshare.installed_mod, modshare.install_target = real
         shutil.rmtree(base, ignore_errors=True)
     return all(results)
@@ -4822,10 +5253,17 @@ def _run_mode(fn, args):
 # CLI
 # --------------------------------------------------------------------------- #
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if "--update" in argv:
+        import updater
+        return updater.main(argv, LOBBY_VERSION)
     ap = argparse.ArgumentParser(description="netpunch N-player lobby")
     ap.add_argument("mode", nargs="?", choices=["host", "join"],
                     help="host a lobby or join one with a CODE")
     ap.add_argument("code", nargs="?", help="peer CODE (join mode)")
+    ap.add_argument("--sync-runtime-dir")
+    ap.add_argument("--save-dir")
+    ap.add_argument("--game-pid", type=int)
     ap.add_argument("--name", default="player", help="your username")
     ap.add_argument("--local-port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--timeout", type=int, default=40,
@@ -4888,7 +5326,7 @@ def main(argv=None):
                     help="not on Windows: leave the lobby once process PID (the "
                          "game that started it) has exited")
     args = ap.parse_args(argv)
-    SHARE_MODS[0] = bool(getattr(args, "share_mods", False)) and not getattr(args, "no_share_mods", False)
+    SHARE_MODS[0] = not getattr(args, "no_share_mods", False)
 
     ca_bundle = None
     if sys.platform != "win32":

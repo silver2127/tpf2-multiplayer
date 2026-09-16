@@ -21,13 +21,13 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This Linux development build follows Windows release 0.4.22. The core libraries,
-lobby and shared scripts are included. The `.desync.5` candidate passed controlled
-native/Proton checkpoints through simulation time 1800, including initial town
-growth and resident creation. Extended play, newborn travel and all player actions
-still need validation; fast-forward previous-frame histories differed at two
-checkpoints. All Lua files are byte-identical to Windows 0.4.22, and newer Windows
-0.5.x releases are outside this baseline. Supported
+The source branch now includes Windows release **0.5.3** (`66da00d`). All 28
+Lua files are byte-identical to that release. The Linux transport implements
+protocol 5, per-peer streams and world/lobby epoch resets. See
+[UPSTREAM_0.5.3.md](UPSTREAM_0.5.3.md) for validation and remaining platform gaps.
+The earlier 0.4.22 native/Proton replay results do not validate this new baseline;
+published Linux packages and the currently running lab remain on that earlier
+build until a matched 0.5.3 live test is completed. Supported
 native player actions use cancellation and scheduled replay; uncovered known
 player actions are blocked in multiplayer. Names/colors, vehicle stop/maintenance,
 loans and distinguishing other Lua commands from synchronized replay remain gaps

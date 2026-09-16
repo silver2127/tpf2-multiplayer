@@ -64,6 +64,8 @@ function CM.detectInstance()
 	local f = io.open(K.IDENTITY_FILE, "r")
 	if not f then return false end
 	local s = f:read("*l")
+	local owner = f:read("*l")
+	K.PROCESS_ID = owner and owner:match("^pid=(%d+)$")
 	f:close()
 	if not s or #s == 0 then return false end
 	local inst = s:gsub("%s", "")

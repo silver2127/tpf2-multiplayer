@@ -1,11 +1,32 @@
 -- Scoped compatibility for simulation callbacks. No persistent global patches:
 -- networking, GUI callbacks and other mods retain their original clocks/RNG.
 local M = {}
-local unpack = table.unpack or unpack
+-- The game's init.lua replaces table.unpack with a one-argument wrapper.
+-- Passing (results, 2, n) to it returns pcall's success flag as the payload.
+-- Explicit bounds also preserve nil and trailing nil callback return values.
+local function unpackRange(values, first, last)
+	if first > last then return end
+	return values[first], unpackRange(values, first + 1, last)
+end
 local floor = math.floor
 local KEY = "__tpf2mp_deterministic_v1"
 local MOD = 2147483647
 local EPOCH = 946684800 -- 2000-01-01 UTC; independent of the host's clock.
+-- DETERMINISTIC UPDATE GRID. A wrapped script's update must run at the SAME
+-- simulation times on every instance, not on whatever frames each machine
+-- happens to render. Natural Town Growth gates on "10 virtual seconds since
+-- the last update" and then SNAPS its deadline to the tick it happened to
+-- fire on, so a game catching up at 4x (sim time arriving in ~0.8 jumps rather
+-- than 0.2) crossed that gate at 10.4 where a 1x game crossed at 10.0, and the
+-- two towns grew on permanently different schedules: town lane -5, +2, +5 with
+-- every other hash lane matching (2026-09-15). Frame rate alone can do it too.
+-- So update runs once per whole virtual second, in order, each with the clock
+-- pinned to that second: at any sim time T every instance has run exactly the
+-- ticks <= T, which is what makes comparing a hash at a stamp meaningful.
+local UPDATE_GRID = 1
+-- A bound so a state from far in the past cannot spin. Both sides compute the
+-- same jump from the same saved tick and the same sim clock, so it stays equal.
+local MAX_CATCHUP_TICKS = 600
 local function pack(...) return {n = select("#", ...), ...} end
 local function copy(t)
 	local out = {}
@@ -49,6 +70,12 @@ function M.wrap(script, id, options)
 			"deterministic script requires the simulation clock")
 		return floor(t * 5 + 0.5) / 5
 	end
+	-- The grid tick the update sequence resumes AFTER. Taken at load/init, which
+	-- run at the same simulation time on every instance -- never at the first
+	-- rendered frame, whose timing differs per machine and per catch-up speed.
+	-- It is the tick BEFORE the current one, so the tick a load lands on still runs
+	-- once, on every instance alike.
+	local function anchorTick() return floor(simTime() / UPDATE_GRID) * UPDATE_GRID - UPDATE_GRID end
 	local function random(...)
 		local args = pack(...)
 		assert(args.n <= 2, "wrong number of arguments to random")
@@ -74,8 +101,7 @@ function M.wrap(script, id, options)
 		assert(integer(n), "randomseed requires an integer")
 		seed = hash(id .. ":" .. string.format("%.0f", n))
 	end
-	local function invoke(fn, ...)
-		local t = simTime()
+	local function invokeAt(t, fn, ...)
 		local oldRandom, oldSeed = math.random, math.randomseed
 		local oldTime, oldDate, oldClock = os.time, os.date, os.clock
 		local oldTowns = game.interface.getTowns
@@ -106,20 +132,41 @@ function M.wrap(script, id, options)
 		game.interface.getTowns = oldTowns
 		if collections then collections.keys = oldKeys end
 		if not result[1] then error(result[2], 0) end
-		return unpack(result, 2, result.n)
+		return unpackRange(result, 2, result.n)
 	end
+	local function invoke(fn, ...) return invokeAt(simTime(), fn, ...) end
 	for _, name in ipairs({"init", "handleEvent"}) do
 		local fn = script[name]
 		if fn then out[name] = function(...) return invoke(fn, ...) end end
 	end
+	-- A new game never calls load, so init anchors the grid instead.
+	if script.init then
+		local wrapped = out.init
+		out.init = function(...)
+			local r = pack(wrapped(...))
+			lastUpdate = anchorTick()
+			return unpackRange(r, 1, r.n)
+		end
+	end
 	if script.update then
 		out.update = function(...)
-			local now = simTime()
-			-- Pause/render frequency must not cause extra RNG draws or mutations.
-			if lastUpdate == now then return end
-			local result = pack(invoke(script.update, ...))
-			lastUpdate = now
-			return unpack(result, 1, result.n)
+			local tick = floor(simTime() / UPDATE_GRID) * UPDATE_GRID
+			-- load/init normally anchor the grid. This fallback covers a script wrapped
+			-- and driven directly (no load, no init): run the current tick rather than
+			-- silently nothing, which would leave such a script never updating at all.
+			if lastUpdate == nil then lastUpdate = tick - UPDATE_GRID end
+			if tick <= lastUpdate then return end   -- pause/render frequency draws nothing
+			if tick - lastUpdate > MAX_CATCHUP_TICKS * UPDATE_GRID then
+				lastUpdate = tick - MAX_CATCHUP_TICKS * UPDATE_GRID
+			end
+			local result
+			local at = lastUpdate + UPDATE_GRID
+			while at <= tick do
+				result = pack(invokeAt(at, script.update, ...))
+				lastUpdate = at
+				at = at + UPDATE_GRID
+			end
+			if result then return unpackRange(result, 1, result.n) end
 		end
 	end
 	out.save = function(...)
@@ -131,13 +178,13 @@ function M.wrap(script, id, options)
 		return saved
 	end
 	out.load = function(saved, ...)
-		seed, lastUpdate = hash(id), nil
+		seed, lastUpdate = hash(id), anchorTick()
 		local payload = saved
 		local meta = type(saved) == "table" and saved[KEY]
 		if meta then
 			assert(meta.version == 1 and meta.id == id and integer(meta.seed) and meta.seed > 0 and meta.seed < MOD,
 				"invalid deterministic script save state")
-			seed, lastUpdate = meta.seed, meta.lastUpdate
+			seed, lastUpdate = meta.seed, meta.lastUpdate or anchorTick()
 			payload = copy(saved)
 			payload[KEY] = nil
 			if meta.empty then payload = nil end

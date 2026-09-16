@@ -109,6 +109,8 @@ static Runtime g_rt;
 static std::mutex   g_tailMtx;
 static std::wstring g_tailPath;
 static unsigned     g_tailGen = 0;
+static std::string g_tailEpoch(32, '0');
+static bool g_tailFromZero = false;
 
 static void SetTailPath(const std::wstring& p)
 {
@@ -138,6 +140,7 @@ struct Config {
 // which is exactly the view the mod shares. `warnMismatch` = complain if the
 // file already names a different instance (only meaningful at startup; a
 // control-file re-identify differs by definition).
+static bool g_entityOwnerReady = false;
 static void WriteIdentity(const std::string& inst, bool warnMismatch)
 {
     std::wstring idPath = g_dataDir + L"tpf2_instance.txt";
@@ -185,6 +188,10 @@ static void WriteIdentity(const std::string& inst, bool warnMismatch)
             int m = _snprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, "port=%u\n", port);
             if (m > 0) n += m;
         }
+        if (g_entityOwnerReady) {
+            int m = _snprintf_s(buf + n, sizeof(buf) - n, _TRUNCATE, "entity_owner_v1=1\n");
+            if (m > 0) n += m;
+        }
         DWORD written;
         WriteFile(ih, buf, (DWORD)n, &written, nullptr);
         CloseHandle(ih);
@@ -230,6 +237,7 @@ static DWORD WINAPI TailThread(LPVOID)
     unsigned gen = ~0u;
     uint64_t offset = 0;
     bool started = false;
+    std::string epoch(32, '0');
     std::string line;
     while (!g_stopping) {
         Sleep(25);
@@ -238,8 +246,9 @@ static DWORD WINAPI TailThread(LPVOID)
             if (gen != g_tailGen) {
                 gen = g_tailGen;
                 capPath = g_tailPath;
+                epoch = g_tailEpoch;
                 offset = 0;
-                started = false;
+                started = g_tailFromZero;
                 Log("[tail] target: %S\n", capPath.c_str());
             }
         }
@@ -277,7 +286,7 @@ static DWORD WINAPI TailThread(LPVOID)
             if (!sawNewline) { offset = (uint64_t)lineStart; break; }
             while (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) { offset = (uint64_t)_ftelli64(f); continue; }
-            Net_QueueLine(line.c_str());
+            Net_QueueLine(line.c_str(), epoch.c_str());
             Log("[tail] sent (%zu b): %.200s\n", line.size(), line.c_str());
             offset = (uint64_t)_ftelli64(f);
         }
@@ -382,9 +391,40 @@ static bool HealIdentity()
     return true;
 }
 
+static std::string g_epochReadyText;
+static void PublishEpochReady()
+{
+    if(g_epochReadyText.empty()) return;
+    const auto target=g_dataDir+L"tpf2_epoch_ready.txt", temporary=target+L".tmp";
+    FILE* file=nullptr; _wfopen_s(&file,temporary.c_str(),L"wb");
+    if(!file) return;
+    const bool ok=fwrite(g_epochReadyText.data(),1,g_epochReadyText.size(),file)==g_epochReadyText.size();
+    const bool closed=fclose(file)==0;
+    if(ok && closed) MoveFileExW(temporary.c_str(),target.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+}
+
+static void ResetWorldFiles(const char* epoch)
+{
+    std::string inst;
+    { std::lock_guard<std::mutex> lock(g_rt.mtx); inst=g_rt.instance; }
+    OpenEventsFile(inst);
+    bool ok;
+    { std::lock_guard<std::mutex> lock(g_eventsMtx); ok=g_events!=nullptr; }
+    {
+        std::lock_guard<std::mutex> lock(g_tailMtx);
+        HANDLE file=CreateFileW(g_tailPath.c_str(),GENERIC_WRITE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,CREATE_ALWAYS,0,nullptr);
+        if(file==INVALID_HANDLE_VALUE) ok=false; else CloseHandle(file);
+        g_tailEpoch=epoch; g_tailFromZero=true; ++g_tailGen;
+    }
+    g_epochReadyText="epoch="+std::string(epoch)+"\nok="+(ok?"1":"0")+"\npid="+std::to_string(GetCurrentProcessId())+"\n";
+    PublishEpochReady();
+    Log("[ctl] world epoch reset, local files %s\n",ok ? "ready" : "FAILED");
+}
+
 static void ApplyControl(const std::string& text)
 {
-    std::string wantInst, wantIp;
+    std::string wantInst, wantIp, wantEpoch, wantLobby;
     int wantPort = 0;
     bool havePeer = false;
     size_t pos = 0;
@@ -400,6 +440,10 @@ static void ApplyControl(const std::string& text)
         if ((ln.size() == 10 || ln.size() == 11) && ln.rfind("instance=", 0) == 0 && ln[9] >= 'a' && ln[9] <= 'z'
             && (ln.size() == 10 || (ln[10] >= 'a' && ln[10] <= 'z'))) {   // a..z, then aa..: up to 702 players
             wantInst = ln.substr(9);
+        } else if (ln.rfind("lobby=", 0) == 0) {
+            wantLobby = ln.substr(6);
+        } else if (ln.rfind("epoch=", 0) == 0) {
+            wantEpoch = ln.substr(6);
         } else if (sscanf(ln.c_str(), "peer=%63[0-9.]:%d", ip, &port) == 2) {
             wantIp = ip; wantPort = port; havePeer = true;
         } else if (sscanf(ln.c_str(), "pid=%lu", &ctlPid) == 1) {
@@ -431,6 +475,14 @@ static void ApplyControl(const std::string& text)
         }
         if (differs) Reidentify(wantInst);
     }
+    if (!wantLobby.empty()) {
+        if(!havePeer || !Net_BeginLobby(wantLobby.c_str(),wantIp.c_str(),wantPort,ResetWorldFiles)) {
+            Log("[ctl] invalid lobby boundary rejected\n");
+            return;
+        }
+    }
+    if (!wantEpoch.empty() && !Net_SetWorldEpoch(wantEpoch.c_str(), ResetWorldFiles))
+        Log("[ctl] invalid world epoch rejected\n");
     if (havePeer) {
         bool differs;
         std::string oldIp; int oldPort;
@@ -463,9 +515,19 @@ static DWORD WINAPI CtlThread(LPVOID)
     // A target left behind by a previous session would dither THIS game from
     // its first frame (seen 2026-09-09: a stale 0.5 made speed 4 slower than 1).
     if (DeleteFileW(speedPath.c_str())) Log("[speed] removed a stale tpf2_speed.txt from a previous session\n");
-    std::string last, cur, lastSpeed, curSpeed;
+    std::string last, cur, lastSpeed, curSpeed, lastEpoch, epochControl;
     while (!g_stopping) {
         Sleep(500);
+        PublishEpochReady();
+        if (ReadSmallFile(g_dataDir + L"tpf2_epoch_request.txt", epochControl) && epochControl != lastEpoch) {
+            // Recovery requests require our exact live PID, unlike legacy
+            // identity recovery for a Steam sibling process.
+            const auto owner = epochControl.find("pid=");
+            unsigned long pid = 0;
+            if (owner != std::string::npos) sscanf_s(epochControl.c_str()+owner, "pid=%lu", &pid);
+            if (pid == GetCurrentProcessId()) ApplyControl(epochControl);
+            lastEpoch = epochControl;
+        }
         if (!ReadSmallFile(speedPath, curSpeed)) curSpeed.clear();
         if (curSpeed != lastSpeed) {
             lastSpeed = curSpeed;
@@ -643,7 +705,8 @@ static DWORD WINAPI InitThread(LPVOID)
     // setPlayer on a track, road, node, signal, station or line-less vehicle
     // re-owns it instead of asserting with a crash dump (setplayer_patch.cpp):
     // a company switch calls it on everything the player owns.
-    SetPlayerPatch_Install(Log);
+    g_entityOwnerReady = SetPlayerPatch_Install(Log);
+    WriteIdentity(cfg.instance, false);
 
     // Transport health, from our own thread every 10 s. A line is written only
     // when a figure moved, so an idle bridge does not repeat itself all session.

@@ -99,6 +99,12 @@ static const uintptr_t CALLER_CMDADD        = 0x459eb7;
 // SECOND edge on top of the old one on the peer) and that there is nothing to
 // log about new nodes, because there are none.
 static const uintptr_t CALLER_UPGRADE       = 0x4790fc;
+// Clicking a bridge and confirming its replacement model uses a separate UI
+// path. Live capture 2026-09-14: 0 new nodes, 10 added/10 removed bridge edges.
+// Build 35924: 0x898680 calls BuildProposal, followed by CommandList::Add at
+// 0x89869e. Use the same strict replacement path (including the callback) as
+// the road/track upgrade brush; otherwise this applies only on the clicking peer.
+static const uintptr_t CALLER_BRIDGE_UPGRADE = 0x898685;
 // UI::StreetTerminalBuilder::commit -> make_cmd::BuildProposal return address.
 // ONE tool covers roadside stops, rail signals and waypoints (measured
 // 2026-09-08: all three placements arrived on this caller, shape addEdges=1
@@ -137,13 +143,19 @@ static bool IsScriptCaller(uint64_t caller)
 static const int ID_BUILDPROPOSAL = 0;
 static const int ID_CMDADD        = 1;
 // SetGameSpeed (make_cmd 0x9de9e0, steal 21) is acted on for the clock
-// widget's speed controls only: UI::Clock::TogglePause and the clock's two
-// other calls, identified by the factory's return address (docs/re/COMMANDS.md).
+// widget's speed controls only, identified by the factory's return address
+// (docs/re/COMMANDS.md): the speed buttons (0x4f0097, in 0x4eff50) and the pause
+// toggle, whose two bodies are both UI::Clock::TogglePause (0x4efb8f in
+// 0x4efab0, 0x4f26ef in 0x4f2640). The mod counts a speed button as the player's
+// vote for the session speed and a toggle only as a pause or a resume -- a
+// toggle's speed is just what the lever read before the pause -- so the inject
+// line says which control it was.
 // Every other caller (the menu switching to the game, CGameUI::GameStep, the
 // camera-path tool, a debug view, and the Lua maker that pacing's own speed
 // changes go through, which returns to 0xc17eff) is left alone.
 static const int ID_SETGAMESPEED = 15;
 static const uintptr_t CALLER_SPEED_BUTTONS[] = { 0x4efb8f, 0x4f0097, 0x4f26ef };
+static const uintptr_t CALLER_PAUSE_TOGGLE[]  = { 0x4efb8f, 0x4f26ef };
 // SetDate (make_cmd 0x9de9b0) and SetCalendarSpeed (0x9de870), steal 21 each:
 // the same shape as SetGameSpeed, no Engine, the value in the low 32 bits of rdx.
 // SetDate carries boost::gregorian's day number (the Julian Day Number: the
@@ -1281,10 +1293,20 @@ static void WriteNativeNotice(const char* kind)
 // and the peers read back as before). The first stop's raw fields are logged
 // on every decode so one real edit pins the predicted offsets.
 struct LineAlt  { int32_t station, terminal; };                   // StationTerminal, 8 B (t16: span 8*i at stop+0x10)
-struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[8]; };
+struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; LineAlt alt[8]; int nWp; int32_t wp[64][2]; };
 struct LineDecode { int32_t wait; int n; LineStop st[64]; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
+
+static void WriteLineWaypoints(FILE* f, const LineDecode& d)
+{
+    bool first = true;
+    for (int i = 0; i < d.n; i++) for (int w = 0; w < d.st[i].nWp; w++) {
+        fprintf(f, "%s%d:%d:%d", first ? " wp=" : ",", i + 1,
+                d.st[i].wp[w][0], d.st[i].wp[w][1]);
+        first = false;
+    }
+}
 
 static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
 {
@@ -1343,6 +1365,16 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
                 return false;
         }
         t.nAlt = na;
+        // vector<transport::SignalId> {entity,index}, after this station stop.
+        uint64_t wb = 0, we = 0;
+        memcpy(&wb, b + 0x38, 8); memcpy(&we, b + 0x40, 8);
+        if (we < wb || (we - wb) % 8 || (we - wb) > sizeof(t.wp)) return false;
+        t.nWp = (int)((we - wb) / 8);
+        if (t.nWp && !Readable((void*)wb, (size_t)(we - wb))) return false;
+        for (int w = 0; w < t.nWp; w++) {
+            memcpy(t.wp[w], (void*)(wb + w * 8), 8);
+            if (t.wp[w][0] <= 0 || t.wp[w][1] < 0 || t.wp[w][1] > 64) return false;
+        }
     }
     return true;
 }
@@ -1616,6 +1648,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
+            WriteLineWaypoints(f, d);
             fprintf(f, " name=%s\n", g_lcDecode.nameEnc);
             Log("[slice] LCREATEX shipped: name=%s stops=%d\n", g_lcDecode.nameEnc, d.n);
         } else {
@@ -1635,6 +1668,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
+            WriteLineWaypoints(f, d);
             fprintf(f, "\n");
             if (d.n > 0)
                 Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%d..%d)\n",
@@ -1717,11 +1751,12 @@ static bool VehiclePayloadReadable(int fid, uint64_t r8, uint64_t r9, uint64_t s
 
 // A click on the clock's speed controls while a session is live: cancelled
 // fire-and-forget (the clock reads the speed back every frame; nothing waits on
-// the command) and written as SPEEDBTN <speed>. The leader's mod makes it the
-// session speed and a follower's ignores it, so a lever only moves through
-// pacing. Not live, not a clock caller, or a value out of range: the click runs
-// natively, as in a stock game.
-static bool WriteInjectSpeedButton(int speed)
+// the command) and written as SPEEDBTN <speed> <toggle|button>. The mod makes a
+// speed button this player's vote for the session speed, which every instance
+// counts at its stamp, and the host's pause toggle a pause or a resume, so a
+// lever only moves through pacing. Not live, not a clock caller, or a value out
+// of range: the click runs natively, as in a stock game.
+static bool WriteInjectSpeedButton(int speed, const char* kind)
 {
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
@@ -1729,7 +1764,7 @@ static bool WriteInjectSpeedButton(int speed)
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return false; }
-    fprintf(f, "SPEEDBTN %d\n", speed);
+    fprintf(f, "SPEEDBTN %d %s\n", speed, kind);
     fclose(f);
     return true;
 }
@@ -1737,8 +1772,9 @@ static bool WriteInjectSpeedButton(int speed)
 static void CaptureSpeedButton(uint64_t rcx, uint64_t rdx, uint64_t caller)
 {
     const int speed = (int)(int32_t)(uint32_t)rdx;   // no Engine argument: the speed is the low 32 bits of rdx
-    bool button = false;
+    bool button = false, toggle = false;
     for (uintptr_t c : CALLER_SPEED_BUTTONS) if (caller == c) button = true;
+    for (uintptr_t c : CALLER_PAUSE_TOGGLE) if (caller == c) toggle = true;
     if (!button) {
         static uint64_t seen[8] = {};
         for (int i = 0; i < 8; i++) {
@@ -1760,15 +1796,16 @@ static void CaptureSpeedButton(uint64_t rcx, uint64_t rdx, uint64_t caller)
         Log("[slice] speed button %d: no live session -- left alone\n", speed);
         return;
     }
-    if (!WriteInjectSpeedButton(speed)) {
+    const char* kind = toggle ? "toggle" : "button";
+    if (!WriteInjectSpeedButton(speed, kind)) {
         Log("[slice] speed button %d: not shipped -- left alone\n", speed);
         return;
     }
     InterlockedExchange(&g_pendingNoCb, 1);
     InterlockedExchange(&g_pendingHonour, 0);
     InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-    Log("[slice] armed cancel: speed button %d (caller_rva=%llx) -- the mod applies it\n",
-        speed, (unsigned long long)caller);
+    Log("[slice] armed cancel: speed %s %d (caller_rva=%llx) -- the mod applies it\n",
+        kind, speed, (unsigned long long)caller);
 }
 
 // The editor's date picker and date speed slider while a session is live:
@@ -2247,7 +2284,7 @@ static bool StashStopFromProposal(uint64_t r8)
     memcpy(&kind, (void*)(ob + 0x04), 4);
     memcpy(&model, (void*)(ob + 0x10), 4);
     memcpy(&player, (void*)(ob + 0xf8), 4);
-    if ((kind != 0 && kind != 2) || model <= 0) return false;
+    if ((kind < 0 || kind > 2) || model <= 0) return false;
     float pos[3];
     memcpy(pos, (void*)(ob + 0x44), 12);
     uint8_t b0 = *(const uint8_t*)(ob + 0xd0), left = *(const uint8_t*)(ob + 0xd1);
@@ -2498,9 +2535,11 @@ static void DumpProposal(int c, uint64_t r8, uint64_t r9)
 // Segment record (120 B): placeholder id @0, node0 @0x08, node1 @0x0c,
 // t0 @0x10, t1 @0x1c, ... construction @0x68, player @0x70, owned @0x74.
 static const uint32_t NODE_FLAGS_TEMPLATE = 0x7f00;
+#include "station_weld.h"
 
 static bool MergeTemplateStreet(uint64_t r8)
 {
+    if (MergeStationEndpoint(r8)) return true;
     // v3 (2026-08-28). Ghidra (research-construction-linkage): the construction
     // is tied to its street pieces by INDICES -- ConstructionEntity+0x768
     // frozenNodes = indices into addedNodes, +0x780 segmentsBefore = segment
@@ -4119,7 +4158,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         }
         return 0;
     }
-    const bool isUpgrade = (caller == CALLER_UPGRADE);
+    const bool isUpgrade = (caller == CALLER_UPGRADE || caller == CALLER_BRIDGE_UPGRADE);
 
     if (caller != CALLER_BUILDPROPOSAL && !isUpgrade) {
         // Log and move on. The previous version returned here in silence, so a

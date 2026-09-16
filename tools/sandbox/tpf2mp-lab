@@ -185,13 +185,11 @@ def setup(args):
     soldier = steam / "steamapps/common/SteamLinuxRuntime_soldier/_v2-entry-point"
     require(proton.is_file() and runtime4.is_file() and soldier.is_file(), "Install Proton 11, Steam Linux Runtime 4, and Steam Linux Runtime soldier")
     container_helper(runtime4)
-    lua_manifest = json.loads((REPO / "tools/proton/windows-0.4.22.json").read_text())
-    lua_expected = {row["path"].removeprefix("mods/mp_lockstep_1/"): row["sha256"]
-                    for row in lua_manifest["files"] if row["path"].startswith("mods/mp_lockstep_1/") and row["path"].endswith(".lua")}
-    source_mod = game / "mods/mp_lockstep_1"
-    require({p.relative_to(source_mod).as_posix() for p in source_mod.rglob("*.lua")} == lua_expected.keys(), "Installed Windows Lua file set differs from 0.4.22")
-    for relative, expected in lua_expected.items():
-        require(hashlib.sha256((source_mod / relative).read_bytes()).hexdigest() == expected, f"Windows Lua differs: {relative}")
+    # Check the same pinned upstream baseline as the native release builder.
+    # The separate Proton 0.4.22 setup manifest is an archived package, not the
+    # current mod's source of truth.
+    subprocess.run([sys.executable, str(REPO / "tools/linux/verify_lua_release.py"),
+                    "--mod-dir", str(game / "mods/mp_lockstep_1")], check=True)
     root.mkdir(parents=True, exist_ok=True)
     for name in ("native", "proton"):
         actor = root / name

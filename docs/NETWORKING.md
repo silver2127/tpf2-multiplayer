@@ -98,10 +98,13 @@ host, or, if the host has been silent for 12 s, through any peer that has a dire
   bridge's `net.cpp` link and the Lua layer's per-origin sequence numbers with NACK and
   resend (see [ARCHITECTURE.md](ARCHITECTURE.md#reliability)).
 
-The bridge link's packets: a 21-byte header (magic `TPF2`, a per-process session id, sequence
-number, acknowledgement and a 32-bit acknowledgement bitmap, type 0 keepalive or 1 event) and, for
-events, a 1,029-byte body (chunk index, chunk count, up to 1,024 bytes of text). An event packet is
-always 1,050 bytes, well under the lobby's 1,400-byte frame limit. Unacknowledged packets are resent
+The bridge link's packets: a 57-byte header (magic `FPT5`, the world epoch, a per-process session
+id, the session an acknowledgement is for, sequence number, acknowledgement and a 32-bit
+acknowledgement bitmap, type 0 keepalive or 1 event) and, for events, a 5-byte chunk header (type,
+chunk index, chunk count) followed by the chunk's text and its terminating NUL, at most 1,024 bytes.
+A keepalive is 57 bytes and an event 63 to 1,086 bytes, only as long as its text (protocol 5; every
+event used to be a full 1,086 bytes), well under the lobby's 1,400-byte frame limit. A receiver
+drops an event whose text does not end inside the datagram. Unacknowledged packets are resent
 every 250 ms; with more than 512 pending the backlog is dropped; a peer is considered gone after
 10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
 other directly.
@@ -208,24 +211,22 @@ status message.
 4. The receiver checks the proposed filenames against a whitelist before allocating, refuses
    writes past the end, verifies every hash (retrying the whole transfer up to three
    times), writes the files and emits `save_ready`.
-5. **Mods the save needs (off by default since 2026-09-11; `lobby.py host --share-mods`
-   turns it on).** A joiner whose game could not see the save's Workshop mods was never
-   asked (their folders existed) and its load was refused, and copying a Workshop item
-   into the workshop folder is unlikely to make the game load it; players install the
-   save's mods themselves until that is solved. With the flag, the host reads the save's active mod list off the `.sav`
-   (a Zstandard frame; the list sits before the game settings and is parsed from that
-   anchor) and lists it in `fbegin` as `mods`. Each receiver answers in `fbegin_ack` with
-   `need`, the ids it has no folder for (`<id>_<version>` under the game's `mods`, the
-   profile's `local/mods`, or `steamapps/workshop/content/1066780/<id>` for a `*<id>`
-   workshop item). When the save has verified everywhere and somebody needs something,
-   the host zips each such mod folder and sends the union as a second transfer
-   (`kind: "mods"`, files `incoming_mod_<id>_<version>.zip`, same chunking, hashes and
-   window); a receiver unpacks each into its game's `mods` folder (never over an existing
-   one, paths inside the zip are checked) and emits `mods_ready`. The multiplayer mod
-   itself is never sent. A mod the host cannot find, or one over 512 MB, is named in chat
-   and skipped. A receiver takes a mods round only right after a verified save round, only
-   after its player said YES, and installs only the mods it was asked about. A dedicated
-   relay never shares mods. Per-save mod settings need nothing: they are inside the save.
+5. **Required mods.** The host advertises the selected save's mod list in the
+   welcome/roster and rechecks it when sending a save. Joiners compare it with
+   their engine catalogue. Download Mods approves the missing items; Cancel
+   leaves the lobby. The saved Auto-accept checkbox answers future prompts.
+   Mods may download before the initial save, or in a second round after it.
+   Hotjoins use the same protocol and current save list.
+   Workshop files go into the multiplayer data folder's `workshop/<id>` directory.
+   Local mods use the game's local mod folders. Existing installations are not
+   overwritten. Archive paths and unpacked sizes are checked. A fresh registry
+   token and native catalogue receipt gate the final acknowledgement: a disk
+   copy alone is not ready. Failures leave the lobby rather than loading without
+   the mod. The installer provides the native Workshop registrar.
+   A dedicated relay caches mod archives uploaded by its leader and supplies them
+   to later joiners; it never executes them. Deluxe and Early Supporter DLC are
+   advertised as requirements but never packaged, cached, or installed through
+   this protocol. Per-save mod settings remain in the save.
 6. When every receiver has verified (and any mods round has resolved), the host sends `start` to them. On each joiner the menu
    DLL copies the files into the game's save folder as `mp_shared.sav` (+ sidecars) and the
    player loads **mp_shared** from LOAD GAME. A failed transfer leaves the host with

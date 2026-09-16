@@ -24,13 +24,60 @@ function CM.soloDrop(line)
 	end
 end
 
+-- FAR BEHIND, THE PLAYER'S ACTIONS ARE OFF (2026-09-15). A command's stamp pays at
+-- most CM.MAX_LEAD (15 units) of lead over the fastest game (CM.scheduleLocal). A
+-- game further behind than that would stamp its player's actions into the other
+-- games' past, where they apply late: a desync. So past K.ACTIONS_OFF_BEHIND the
+-- player's actions are off until the game is back within K.ACTIONS_ON_BEHIND
+-- (CM.actionsBlockTick, every tick):
+--   * dropped: a capture whose native command the slice CANCELLED -- ARMED 1 ahead
+--     of it, or one the slice only writes once its cancel landed (CONXP, CONUP,
+--     CDEMO) -- and the GUI's own requests (calendar, companies). The action then
+--     happens on no game at all. A terraform or asset stroke's held tool lets go
+--     after the slice's 4 s safety valve.
+--   * held until caught up: a line creation (LCREATEX behind ARMED 1). The line
+--     editor's callback waits in the slice's stash for our own replay, and the next
+--     line created would take that stale callback; so it is replayed, and stamped,
+--     once the game has caught up.
+--   * still shipped: anything that already ran natively here (ARMED 0; EDEMO, whose
+--     bulldoze has applied; a construction's street companion, ROADC, which pairs or
+--     times out) -- dropping it would leave it on this game only -- and speed
+--     buttons, pauses and diagnostics.
+K.ACTIONS_OFF_BEHIND = CM.MAX_LEAD or 15
+K.ACTIONS_ON_BEHIND = 2
+K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
+                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true }
+K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
+                        VREV = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
+                        STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true }
+CM.actionsOff = false
+CM.actionsHeld = {}   -- LCREATEX lines waiting for this game to catch up
+CM.behindBy = 0
+
+function CM.actionsBlockTick(now)
+	local fastT = now and CM.fastestPeerClock and CM.fastestPeerClock()
+	local behind = fastT and (fastT - now) or 0
+	CM.behindBy = behind
+	if not CM.actionsOff and behind > K.ACTIONS_OFF_BEHIND then
+		CM.actionsOff = true
+		log(string.format("ACTIONS OFF: this game is %.1f game units behind the fastest game (over %d) -- the player's actions are dropped until it is within %d",
+			behind, K.ACTIONS_OFF_BEHIND, K.ACTIONS_ON_BEHIND))
+	elseif CM.actionsOff and behind <= K.ACTIONS_ON_BEHIND then
+		CM.actionsOff = false
+		log(string.format("ACTIONS ON: %.1f game units behind -- the player's actions replicate again%s", behind,
+			#CM.actionsHeld > 0 and string.format("; %d held line creation(s) go out now", #CM.actionsHeld) or ""))
+	end
+end
+
 function CM.pollInject()
 	if not K.INJECT_FILE then return end
 	local data, newOff = CM.readFrom(K.INJECT_FILE, CM.injectOffset)
 	CM.injectOffset = newOff
 	local carry = CM.injectCarry
 	CM.injectCarry = nil
-	if not data and not carry then return end
+	-- line creations held while this game was far behind, due now that it has caught up
+	local release = not CM.actionsOff and #CM.actionsHeld > 0
+	if not data and not carry and not release then return end
 
 	local lines = {}
 	if carry then lines[1] = carry end
@@ -42,10 +89,20 @@ function CM.pollInject()
 	if data and #lines > 0 and lines[#lines]:match("^%s*VBUY%s") then
 		CM.injectCarry = table.remove(lines)
 	end
+	-- The held line creations (CM.actionsBlockTick) go LAST, after this read's own
+	-- records, so a VBUY's VBUYLINE stays right behind it. Each is read as it was
+	-- written, behind ARMED 1, and the ARMED state is put back after it.
+	local heldFrom = #lines + 1
+	if release then
+		for _, held in ipairs(CM.actionsHeld) do lines[#lines + 1] = held end
+		CM.actionsHeld = {}
+	end
 
 	for li = 1, #lines do
 		local line = lines[li]
 		CM.injectNext = lines[li + 1]
+		local armedBefore = CM.lastArmed
+		if li >= heldFrom then CM.lastArmed = 1 end
 		line = line:gsub("^%s+", ""):gsub("%s+$", "")
 		if line ~= "" and line:sub(1, 1) ~= "#" then
 			local w = {}
@@ -82,6 +139,19 @@ function CM.pollInject()
 				log(string.format("STREETP: hasBus=%s tramTrackType=%s",
 					tostring(CM.lastStreetBus), tostring(CM.lastStreetTram)))
 				return
+			end
+			-- FAR BEHIND: the player's actions are off (CM.actionsBlockTick, above)
+			if CM.actionsOff then
+				if o == "LCREATEX" and (CM.lastArmed or 0) == 1 then
+					CM.actionsHeld[#CM.actionsHeld + 1] = line
+					log(string.format("ACTIONS OFF: a line creation is held until this game catches up (%.1f game units behind)", CM.behindBy or 0))
+					return
+				end
+				if K.ACTIONS_OFF_ALWAYS[o] or (K.ACTIONS_OFF_ARMED[o] and (CM.lastArmed or 0) == 1) then
+					if o == "ROADE" then CM.lastStreetBus, CM.lastStreetTram = nil, nil end
+					log(string.format("ACTIONS OFF: %s dropped -- this game is %.1f game units behind, so it happens on no game", o, CM.behindBy or 0))
+					return
+				end
 			end
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
@@ -131,11 +201,12 @@ function CM.pollInject()
 				log("DROPNEXT: the next command's LSCMD will not be sent (gap hold test)")
 
 			elseif o == "SPEEDBTN" then
-				-- a speed-button click the slice cancelled: on the leader it sets the session speed (CM.speedButton)
-				CM.speedButton(tonumber(w[2]))
+				-- SPEEDBTN <v> <toggle|button>: a click on the clock's speed controls the slice
+				-- cancelled -- a speed button is our vote, the host's pause toggle pauses or resumes (CM.speedButton)
+				CM.speedButton(tonumber(w[2]), w[3])
 
 			elseif o == "SPEEDSET" then
-				-- the host's dashboard speed buttons (GUI state): the session speed, fractions included (CM.guiSpeedSet)
+				-- the Multiplayer window's speed row (GUI state): our speed vote, fractions included (CM.guiSpeedSet)
 				CM.guiSpeedSet(tonumber(w[2]))
 
 			elseif o == "SETDATE" or o == "CALSPEED" then
@@ -238,6 +309,10 @@ function CM.pollInject()
 						rmv[#rmv + 1] = { a1, a2 }
 					end
 				end
+				if ok and CM.cmMayReplaceEdges and not CM.cmMayReplaceEdges(rmv, etype == 1) then
+					ok = false
+					log("ROADE: refused change to foreign or unresolved infrastructure")
+				end
 				-- Bridge/tunnel tail: <type idx> per added edge, appended AFTER the
 				-- legacy payload (old captures simply lack it -> ground).
 				if ok then
@@ -287,12 +362,14 @@ function CM.pollInject()
 						-- under a BRIDGE is inside the bridge's footprint in plan view only. Taken
 						-- as a split, the bridge span the engine replaced in place counted as a
 						-- split parent and its removal was not shipped (2026-09-12). A real split
-						-- point sits on the edge's surface; 2.5 m is well clear of that and well
-						-- under any bridge's clearance.
+						-- point normally sits on the edge's surface. Keep the 2.5 m guard
+						-- except for an explicitly captured pair of ground-road split halves:
+						-- the native crossing tool can move that road to the rail's height.
 						if hitEid and CM.edgeZAt then
 							local ez
 							pcall(function() ez = CM.edgeZAt(hitEid, hitU) end)
-							if ez and math.abs(ez - xyz[3]) > 2.5 then hitEid = nil end
+							local maxDz = CM.captureSplitHeightLimit and CM.captureSplitHeightLimit(isTrack, hitEid, id, raw) or 2.5
+							if ez and math.abs(ez - xyz[3]) > maxDz then hitEid = nil end
 						end
 						if hitEid then
 							local ends = { -1, -1 }
@@ -594,7 +671,9 @@ function CM.pollInject()
 					end
 				end)
 				if not x and #ct == 16 then x, y = ct[13], ct[14] end
-				if cfile and x and y then
+				if CM.cmMayModify and not CM.cmMayModify(oldId) then
+					log("CONUP: refused change to foreign or unresolved construction")
+				elseif cfile and x and y then
 					-- Ship the DIFF against the entity as it stands NOW (see CM.conDiff):
 					-- the proposal was built from this same entity, so the difference
 					-- is exactly this click. Falls back to the full set if the entity
@@ -1145,6 +1224,7 @@ function CM.pollInject()
 						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 					alts[#alts + 1] = table.concat(al, "/")
 				end
+				if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
 				if armed ~= 1 then
 					CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
 				elseif bad or not (r and g and b) or not nameTok then
@@ -1208,6 +1288,7 @@ function CM.pollInject()
 								.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 							alts[#alts + 1] = table.concat(al, "/")
 						end
+						if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
 						local armed = CM.lastArmed or 0
 						if bad then
 							-- The DLL's +0x00 stationGroup slot is INFERRED; this is
@@ -1393,7 +1474,9 @@ function CM.pollInject()
 							end
 						end)
 					end
-					if co and co.transf then
+					if co and CM.cmMayModify and not CM.cmMayModify(id) then
+						log("CDEMO: refused demolition of foreign construction")
+					elseif co and co.transf then
 						local x, y = co.transf[13], co.transf[14]
 						local file = tostring(co.fileName or "")
 						CM.scheduleLocal("DEMOLISH", { x = x, y = y, z = CM.groundAt(x, y), file = file, strict = 1 })
@@ -1465,6 +1548,7 @@ function CM.pollInject()
 				log("inject dispatch error: " .. tostring(errLine) .. " -- " .. line:sub(1, 60))
 			end
 		end
+		if li >= heldFrom then CM.lastArmed = armedBefore end
 	end
 end
 end

@@ -9,5 +9,6 @@
 
 typedef void (*SetPlayerLogFn)(const char* fmt, ...);
 
-// Verifies the bytes first; refuses on a mismatch and changes nothing.
+// Each patch verifies its own bytes first. Returns true only when both the
+// generic-entity fix and the explicit entity-only ownership extension installed.
 bool SetPlayerPatch_Install(SetPlayerLogFn log);

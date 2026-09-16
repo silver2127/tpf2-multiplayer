@@ -4,10 +4,14 @@ from natural_town_growth_probe import runtime
 
 REPO = Path(__file__).resolve().parents[1]
 SOURCE = (REPO / 'mod/mp_lockstep_1/res/scripts/mp/deterministic_script.lua').read_text()
+GAME_INIT = Path(r'C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\res\scripts\init.lua').read_text()
+# Use the shipped override, which discards unpack's start/end arguments.
+GAME_UNPACK = GAME_INIT[GAME_INIT.index('local unpackhelper'):GAME_INIT.index('api = {}')]
 
 
 def peer(wall):
     lua = runtime(wall)
+    lua.execute(GAME_UNPACK)
     lua.globals().compat_source = SOURCE
     lua.execute('''
         compat = assert(load(compat_source))()
@@ -92,6 +96,12 @@ a.execute('''
         assert(os.time({year=2000,month=13,day=1,hour=0}) == 978307200)
     end}, 'clock')
     clock.update()
+    local returns = compat.wrap({handleEvent=function() return false,nil,42,nil end}, 'returns')
+    local function capture(...) return {n=select('#',...),...} end
+    local r=capture(returns.handleEvent())
+    assert(r.n==4 and r[1]==false and r[2]==nil and r[3]==42 and r[4]==nil)
+    local empty=compat.wrap({save=function() return nil end},'empty')
+    assert(empty.save().__tpf2mp_deterministic_v1.empty)
 ''')
 print('PASS: RNG save/reload, stream isolation, GUI exclusion, exception cleanup, UTC calendar')
 
@@ -108,3 +118,59 @@ a.execute('''
     assert(modifier('natural_town_growth.lua', untouched) ~= untouched)
 ''')
 print('PASS: resource modifier wraps only Natural Town Growth')
+
+# --- the 2026-09-15 town desync -------------------------------------------- #
+# A game catching up at 4x advances the simulation clock in ~0.8 jumps where a 1x
+# game advances 0.2. Natural Town Growth gates on "10 virtual seconds since the
+# last update" and then SNAPS its deadline to the tick it happened to fire on, so
+# the two crossed that gate at 10.4 vs 10.0 and their towns grew on permanently
+# different schedules -- town lane -5, +2, +5 while every other hash lane matched.
+# The wrapper now runs update once per whole virtual second, in order, so the tick
+# sequence at any sim time is the same on every instance whatever its frame rate.
+def run_sims(wall, start, sims):
+    """One peer, driven frame by frame through the given simulation times."""
+    p = peer(wall)
+    p.execute('load_identical(200,%d,%d)' % (start, start))
+    for sim in sims:
+        p.globals().sim = sim
+        p.execute('script.update()')
+    return p
+
+
+# Absolute times, never an accumulated sum: the engine's clock does not drift, and
+# a harness that drifts would change the final floor() and fake a disagreement.
+def evenly(step, start, stop):
+    n = int(round((stop - start) / step))
+    return [round(start + i * step, 6) for i in range(1, n + 1)]
+
+
+def jitter(start, stop, seed=12345):
+    """Irregular frame pacing: a machine whose frame rate wanders."""
+    out, sim, s = [], float(start), seed
+    while sim < stop:
+        s = (s * 1103515245 + 12345) % 2147483648
+        sim = min(stop, round(sim + 0.2 * (1 + s % 20), 6))   # 0.2 .. 4.0 units a frame
+        out.append(sim)
+    return out
+
+
+START, STOP = 500, 900
+one_x = run_sims(1000, START, evenly(0.2, START, STOP))           # 1x
+four_x = run_sims(999999, START, evenly(0.8, START, STOP))        # 4x catch-up
+coarse = run_sims(4242, START, evenly(3.2, START, STOP))          # a very fast catch-up
+rough = run_sims(777, START, jitter(START, STOP))                 # a wandering frame rate
+
+base = capacities(one_x)
+assert len(base) > 0, 'the fixture produced no capacity writes'
+for name, p in (('4x catch-up', four_x), ('16x catch-up', coarse), ('jittery frame rate', rough)):
+    got = capacities(p)
+    assert got == base, (f'{name} grew towns differently: {len(got)} writes vs {len(base)}; '
+                         f'first difference at '
+                         f'{next((i for i, (x, y) in enumerate(zip(got, base)) if x != y), min(len(got), len(base)))}')
+
+# and the wrapper's own tick bookkeeping must land on the same tick
+ticks = {name: p.eval("script.save().__tpf2mp_deterministic_v1.lastUpdate")
+         for name, p in (('1x', one_x), ('4x', four_x), ('16x', coarse), ('jitter', rough))}
+assert len(set(ticks.values())) == 1, ticks
+print(f'PASS: 1x, 4x, 16x and jittery pacing all grow towns identically '
+      f'({len(base)} writes, last tick {list(ticks.values())[0]})')

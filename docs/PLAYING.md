@@ -4,8 +4,8 @@
 
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
-- Every mod the save uses must be installed on every machine: local mods copied into each game's
-  `mods` folder, Steam Workshop mods subscribed by each player. Mods are not sent with the save.
+- The host advertises the save's required mods. Missing mods are offered in a **Download Mods / Cancel** dialog; Cancel leaves the lobby. **Auto-accept mod downloads** in the multiplayer menu saves your choice for future joins and hotjoins. Downloads must be recognised by the game before it loads the save.
+- Deluxe and Early Supporter content are DLC, never transferred. Each player must have the required DLC installed.
   Per-save mod settings need nothing: they travel inside the save. The multiplayer mod itself
   (**Transport Fever 2 Multiplayer**) comes with the installer.
 - **The multiplayer mod has to be enabled in the save.** New games get it automatically: each time the
@@ -80,32 +80,47 @@ list while it is up.
 A small **Multiplayer** window sits at the top left. **Ctrl+Shift+D** hides and shows it. Its
 buttons toggle three sections:
 
+- **lobby** (hidden at first): show or hide the session name, host, connected players and their companies. Available to hosts and joiners during play; larger rosters have previous/next page buttons. Your visibility choice stays in place when the roster changes.
 - **stats** (hidden at first): a status line that says whether the worlds match. After a desync
   it says what differs (for example "roads and tracks" or "town buildings (5 fewer here)"), when
   it was first noticed, and that the fix is to reload a save the host makes. Below it, one row per
   player: whether that player's world matches, whether their clock is in step, and for your own
-  row the speed and anything that needs attention (late or lost commands, vehicles drifting apart).
+  row the speed and anything that needs attention (late or lost commands, vehicles drifting apart;
+  that vehicle check turns off for good once the world has more than 200 vehicles).
   **numbers** shows the raw counters (game times, skew, apply lag, drift, balance) for debugging.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
+- **speed** (shown): your speed vote (1 to 4.5, and -0.25 / +0.25 from your last vote), with the
+  session speed and the votes it is the average of. See [Speed and pause](#speed-and-pause).
 
 ### Speed and pause
 
-- **Everyone plays at the host's speed.** The host's own speed buttons and pause set the speed for
-  the whole session. The other players' speed buttons do nothing while a session runs: the click is
-  cancelled, so no game can run off at its own speed.
+- **The session runs at the average of everyone's speed votes.** Pressing a speed button, in the
+  game's own clock or in the Multiplayer window's speed row, is your vote. It does not change your
+  game's speed by itself: the click is cancelled, every game records your vote at the same moment,
+  and the whole session then runs at the average of the votes, rounded to 0.05. For example, the
+  host at 4x and one player voting 1x gives 2.5x.
+- Until you vote you have no say, except the host, whose own speed counts until they vote. A player
+  who leaves stops counting about 30 seconds later.
+- **Only the host pauses.** The host's pause stops the whole session and the host's play resumes it
+  at the votes' speed. Resuming with the pause button is not a vote; resuming with a speed button
+  also votes for that speed. Other players' pause buttons do nothing.
 - A pause is also a sync point: games that are slightly behind run up to the leader's clock before
   they stop.
-- `/speed 2.5` in the chat sets a session speed, fractions allowed. Whichever came last counts: a
-  host speed button pressed after `/speed` takes over again, and `/speed off` hands the speed back
-  to the host's buttons.
+- **Far behind, your actions are off.** If your game falls more than 15 game units behind the
+  fastest other game, anything you build, buy or edit is cancelled until it is back within 2 units,
+  and the top of the Multiplayer window says so. A line you create is kept and made once you have
+  caught up. Bulldozing a road or track still goes through, and speed buttons and pause still work.
+- `/speed 2.5` in the chat sets a session speed for everyone, fractions allowed, overriding the
+  votes. Whichever came last counts: a vote after `/speed` hands the speed back to the votes, and
+  so does `/speed off`.
 
 ### Chat commands
 
 | command | who | does |
 |---|---|---|
-| `/speed <x>` | anyone | set the session speed (0 < x < 64) |
-| `/speed off` | anyone | back to the host's speed buttons |
+| `/speed <x>` | anyone | set the session speed until the next speed vote (0 < x < 64) |
+| `/speed off` | anyone | back to the average of the speed votes |
 | `/sync` | anyone | the host's game saves and shares the save (what a hot join does); `/sync off` cancels |
 | `/new` | relay leader, before the world is sent | discard the relay's stored world; START GAME then shares your own save |
 | `/desynclogs always`, `ask`, `never` | anyone | what happens to your logs after a desync (see [When something goes wrong](#when-something-goes-wrong)); `/desynclogs` alone shows the current choice |
@@ -157,10 +172,12 @@ The panel shows the lobby's status line. The common ones:
 When a shared save is ready it loads by itself. If it does not (the panel says so), open
 **LOAD GAME** and pick **mp_shared**.
 
-If the Multiplayer window shows **DESYNC**, the worlds have drifted apart and will not come back by
-themselves. Players who are already in the game ignore a new shared save (`/sync` only helps
-someone joining), so to recover: the host saves, everyone returns to the title menu and leaves
-the lobby, and the host hosts again and presses START GAME, which shares that save.
+If the Multiplayer window shows **DESYNC**, a Resync section appears at its top: press **Resync now** once.
+In a two-player host lobby, this pauses both games, saves and transfers the host world,
+reloads both players and compares the fresh worlds before resuming. An intentional
+pause is preserved. Client-only changes are discarded. See [One-click recovery](RESYNC.md)
+for progress, retry and supported-session limits. `/sync` serves joining players; it does not reload
+players already in the game. The Resync section is independent of log reporting below.
 
 The first desync in a session also opens a **Desync detected** window that asks whether to send
 that game's logs to the developers:

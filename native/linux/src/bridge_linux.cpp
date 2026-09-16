@@ -84,6 +84,9 @@ struct State {
     std::mutex tailMtx;
     std::string tailPath;
     unsigned tailGen = 0;
+    std::string tailEpoch = std::string(32, '0');
+    bool tailFromZero = false;
+    std::string epochReadyText;
 };
 static State& S()
 {
@@ -201,6 +204,7 @@ static void OpenEventsFile(const std::string& inst)
 static void TailThread()
 {
     std::string capPath;
+    std::string epoch(32, '0');
     unsigned gen = ~0u;
     uint64_t offset = 0;
     bool started = false;
@@ -213,7 +217,8 @@ static void TailThread()
                 gen = S().tailGen;
                 capPath = S().tailPath;
                 offset = 0;
-                started = false;
+                epoch = S().tailEpoch;
+                started = S().tailFromZero;
                 Log("[tail] target: %s\n", capPath.c_str());
             }
         }
@@ -245,7 +250,7 @@ static void TailThread()
             if (!sawNewline) { offset = (uint64_t)lineStart; break; }
             while (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) { offset = (uint64_t)ftello(f); continue; }
-            Net_QueueLine(line.c_str());
+            Net_QueueLine(line.c_str(), epoch.c_str());
             Log("[tail] sent (%zu b): %.200s\n", line.size(), line.c_str());
             offset = (uint64_t)ftello(f);
         }
@@ -314,9 +319,41 @@ static bool HealIdentity()
     return true;
 }
 
+// The epoch reset runs under the transport reset lock. An already-read tail
+// line carries its old epoch and is rejected rather than sent into a new world.
+static void PublishEpochReady()
+{
+    if (S().epochReadyText.empty()) return;
+    const auto target = S().dataDir + "tpf2_epoch_ready.txt", temporary = target + ".tmp";
+    FILE* file = fopen(temporary.c_str(), "wb");
+    if (!file) return;
+    const bool written = fwrite(S().epochReadyText.data(), 1, S().epochReadyText.size(), file) == S().epochReadyText.size();
+    const bool closed = fclose(file) == 0;
+    if (written && closed) rename(temporary.c_str(), target.c_str());
+}
+
+static void ResetWorldFiles(const char* epoch)
+{
+    std::string instance;
+    { std::lock_guard<std::mutex> lock(S().rt.mtx); instance = S().rt.instance; }
+    OpenEventsFile(instance);
+    bool ok;
+    { std::lock_guard<std::mutex> lock(S().eventsMtx); ok = S().events != nullptr; }
+    {
+        std::lock_guard<std::mutex> lock(S().tailMtx);
+        FILE* file = fopen(S().tailPath.c_str(), "wb");
+        if (!file) ok = false; else if (fclose(file) != 0) ok = false;
+        S().tailEpoch = epoch; S().tailFromZero = true; ++S().tailGen;
+    }
+    S().epochReadyText = "epoch=" + std::string(epoch) + "\nok=" + (ok ? "1" : "0")
+        + "\npid=" + std::to_string(getpid()) + "\n";
+    PublishEpochReady();
+    Log("[ctl] world epoch reset, local files %s\n", ok ? "ready" : "FAILED");
+}
+
 static void ApplyControl(const std::string& text)
 {
-    std::string wantInst, wantIp;
+    std::string wantInst, wantIp, wantEpoch, wantLobby;
     int wantPort = 0;
     bool havePeer = false;
     size_t pos = 0;
@@ -332,6 +369,10 @@ static void ApplyControl(const std::string& text)
         if ((ln.size() == 10 || ln.size() == 11) && ln.rfind("instance=", 0) == 0 && ln[9] >= 'a' && ln[9] <= 'z'
             && (ln.size() == 10 || (ln[10] >= 'a' && ln[10] <= 'z'))) {
             wantInst = ln.substr(9);
+        } else if (ln.rfind("lobby=", 0) == 0) {
+            wantLobby = ln.substr(6);
+        } else if (ln.rfind("epoch=", 0) == 0) {
+            wantEpoch = ln.substr(6);
         } else if (sscanf(ln.c_str(), "peer=%63[0-9.]:%d", ip, &port) == 2) {
             wantIp = ip; wantPort = port; havePeer = true;
         } else if (sscanf(ln.c_str(), "pid=%lu", &ctlPid) == 1) {
@@ -357,6 +398,12 @@ static void ApplyControl(const std::string& text)
         }
         if (differs) Reidentify(wantInst);
     }
+    if (!wantLobby.empty() && (!havePeer ||
+        !Net_BeginLobby(wantLobby.c_str(), wantIp.c_str(), wantPort, ResetWorldFiles))) {
+        Log("[ctl] invalid lobby boundary rejected\n"); return;
+    }
+    if (!wantEpoch.empty() && !Net_SetWorldEpoch(wantEpoch.c_str(), ResetWorldFiles))
+        Log("[ctl] invalid world epoch rejected\n");
     if (havePeer) {
         bool differs;
         std::string oldIp; int oldPort;
@@ -386,9 +433,17 @@ static void CtlThread()
     // session must not dither this game from its first frame.
     const std::string speedPath = S().dataDir + "tpf2_speed.txt";
     if (unlink(speedPath.c_str()) == 0) Log("[speed] removed a stale tpf2_speed.txt from a previous session\n");
-    std::string last, cur, lastSpeed, curSpeed;
+    std::string last, cur, lastSpeed, curSpeed, epochControl, lastEpoch;
     while (!g_stopping) {
         SleepMs(500);
+        PublishEpochReady();
+        if (ReadSmallFile(S().dataDir + "tpf2_epoch_request.txt", epochControl) && epochControl != lastEpoch) {
+            const auto owner = epochControl.find("pid=");
+            unsigned long pid = 0;
+            if (owner != std::string::npos) sscanf(epochControl.c_str() + owner, "pid=%lu", &pid);
+            if (pid == static_cast<unsigned long>(getpid())) ApplyControl(epochControl);
+            lastEpoch = epochControl;
+        }
         if (!ReadSmallFile(speedPath, curSpeed)) curSpeed.clear();
         if (curSpeed != lastSpeed) {
             lastSpeed = curSpeed;
@@ -549,6 +604,7 @@ static void InitThread()
     Log("[ctl] polling %stpf2_bridge_ctl.txt every 500 ms\n", dataDir);
 }
 
+#ifndef TPF2MP_BRIDGE_TEST
 __attribute__((constructor))
 static void BridgeLoad()
 {
@@ -563,3 +619,4 @@ static void BridgeUnload()
     g_stopping = true;
     Net_SignalShutdown();
 }
+#endif

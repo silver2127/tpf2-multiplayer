@@ -33,6 +33,7 @@ def check(name, cond, extra=""):
 
 def runtime():
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.globals().package.path = os.path.join(REPO, "mod/mp_lockstep_1/res/scripts/?.lua").replace("\\", "/") + ";" + L.globals().package.path
     L.globals().NET_SRC = open(NET, encoding="utf-8").read()
     L.globals().EVENTS = os.path.join(tempfile.mkdtemp(), "events.txt").replace("\\", "/")
     h = L.execute(r'''
@@ -173,6 +174,25 @@ h.CM.execDelayCur = 0.4
 tick(h, 40)
 check("a peer with fewer than RTT_MIN_SAMPLES is not trusted yet", abs(h.CM.execDelayCur - 0.4) < 1e-9, h.CM.execDelayCur)
 
+# a requirement on a step boundary: 392+-3 ms is 249 ms one way, 1.02 units at 4.10 u/s and 0.99 at 3.99
+L, h = runtime()
+h.CM.effSpeed = 4
+peer(h, "b", 392, 3)
+h.CM.simRate = 4.10
+tick(h)
+check("392+-3 ms at 4.10 u/s -> 1.2", abs(h.CM.execDelayCur - 1.2) < 1e-9, h.CM.execDelayCur)
+flips = 0
+for i in range(400):
+    h.CM.simRate = 3.99 if i % 40 < 30 else 4.10    # 30 ticks just under the 1.0 step, 10 just over
+    before = h.CM.execDelayCur
+    tick(h)
+    flips += abs(h.CM.execDelayCur - before) > 1e-9
+check("a requirement on the 1.0/1.2 boundary does not step down and back up", flips == 0, flips)
+peer(h, "b", 300, 3)                                 # 203 ms one way at 4.0 u/s = 0.81, clear of 1.0
+h.CM.simRate = 4.0
+tick(h, 26)
+check("a clearly lower one still steps down after DELAY_DOWN_TICKS (1.0)", abs(h.CM.execDelayCur - 1.0) < 1e-9, h.CM.execDelayCur)
+
 
 # ---- heartbeat parse and echo ----
 L, h = runtime()
@@ -190,6 +210,33 @@ check("our echo becomes a 160 ms round trip", pb.srtt is not None and abs(pb.srt
 h.feed("LSTICK t=52 o=b s=260 hi=4 ha=53.2000 ms=77800")
 rb = h.CM.rx["b"]
 check("hi=/ha= record the stamp of the high-water command", rb is not None and rb.stamp is not None and abs(rb.stamp[4] - 53.2) < 1e-9)
+
+
+# ---- round trips across a freeze ----
+L, h = runtime()
+
+
+def beat(clk, i, ping_at):
+    L.globals().CLK = clk
+    h.feed("LSTICK t=%d o=b s=%d hi=0 ms=%d e=a:%d:0" % (60 + i, 300 + i, 90000 + i * 370, int(ping_at * 1000)))
+
+
+for i in range(12):                                    # b's heartbeat every 0.37 s, each timing a 390 ms round trip
+    beat(500.0 + i * 0.37, i, 500.0 + i * 0.37 - 0.39)
+pb = h.CM.peers["b"]
+n0, s0 = pb.rttN, pb.srtt
+check("steady 390 ms round trips through LSTICK are samples", n0 == 12 and abs(s0 - 390) < 1.0, f"{n0} {s0:.1f}")
+end0 = 500.0 + 11 * 0.37 + 1.3                         # 1.3 s of silence (an autosave)
+beat(end0, 12, end0 - 1.1)                            # its echo of a ping sent before the silence: 1,100 ms
+check("a round trip that waited out a 1.3 s silence is not a sample", pb.rttN == n0 and abs(pb.srtt - s0) < 1e-9,
+      f"{pb.rttN} {pb.srtt:.1f}")
+check("the silence is logged", "b was silent for 1.3 s" in h.logs(), h.logs().splitlines()[-1] if h.logs() else "")
+beat(end0 + 0.37, 13, end0 - 0.02)                    # a ping sent while b was still silent: not a sample either
+check("nor one whose ping went out before the silence ended", pb.rttN == n0)
+beat(end0 + 0.74, 14, end0 + 0.35)                    # sent after it: a sample again
+check("a ping sent after the silence is a sample again", pb.rttN == n0 + 1, pb.rttN)
+beat(end0 + 0.74 + 0.55, 15, end0 + 0.74 + 0.16)      # 0.55 s against a usual 0.37: ordinary jitter
+check("0.55 s between heartbeats (usual 0.37) is no silence", pb.rttN == n0 + 2, pb.rttN)
 
 
 # ---- scheduleLocal ----

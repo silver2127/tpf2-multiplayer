@@ -25,7 +25,7 @@ netpunch.exe ............. the lobby (separate process): NAT traversal, sealed t
 | proxy | `native/src/proxy_alut.cpp` | The game imports `alut.dll` statically, so the proxy is loaded at process start. It forwards all 20 exports to `alut_real.dll` and, from a thread started in `DllMain`, loads the bridge, menu, slice and plugin-host DLLs, each from `%LOCALAPPDATA%\tpf2mp\` if present, else from its own folder. |
 | bridge | `native/src/bridge_main.cpp`, `net.cpp`, `speedhook.cpp` | Elects and records the instance identity (`tpf2_instance.txt`), tails the mod's capture file and sends each line over its UDP link, writes received lines to the events file, follows `tpf2_bridge_ctl.txt`, and hooks the sim loop for fractional speed. It has no settings file. The UDP socket is bound to 127.0.0.1 in lobby sessions and drops datagrams that are not from its peer. |
 | slice | `native/src/slice_hook.cpp` | Hooks the `make_cmd::*` factories and `CommandList::Add`. Decodes a player's command, writes it to the inject file, and cancels the native command when a session is live. Welds the template connector into replayed construction proposals. Checks the exe's build before patching; only one instance per Windows session gets it (a named mutex). |
-| menu | `native/src/menu_hook.cpp` | Adds a Multiplayer entry to the title menu's list and draws the panel into the game's Vulkan frames (GDI-rendered, composited over a blurred copy of the frame). Runs `netpunch.exe` in a job object, tails its events, writes `tpf2_bridge_ctl.txt` and `mp_company_cfg.txt`, places the shared save, forces the game's autosave for hot joins and relay uploads, fetches the public list, and adds the mod to new games' mod list. |
+| menu | `native/src/menu_hook.cpp` | Adds a Multiplayer entry to the title menu's list and draws the panel into the game's Vulkan frames (GDI-rendered into an opaque sheet, composed only when the panel changes and blitted every frame; it is never composited over a read-back of the frame, which cost 40-65 ms per frame). Runs `netpunch.exe` in a job object, tails its events, writes `tpf2_bridge_ctl.txt` and `mp_company_cfg.txt`, places the shared save, forces the game's autosave for hot joins and relay uploads, fetches the public list, and adds the mod to new games' mod list. |
 | plugin host | `native/src/plugin/` | Loads `*.dll` from `plugins\` in the data folder, then in the game folder, and calls their `Tpf2mpPluginInit` export (ABI 1). The multiplayer DLLs are not plugins. |
 | mod | `mod/mp_lockstep_1` | `lockstep.lua` plus modules in `res/scripts/mp/`: turns captures into position-based commands, stamps and ships them, replays everyone's commands through the game-script API, keeps the clocks together, detects divergence, runs companies mode and the in-game Multiplayer window. |
 | lobby | `netpunch/` | See [NETWORKING.md](NETWORKING.md). |
@@ -49,7 +49,8 @@ Building a road, with other players connected:
 4. **Transport.** The bridge sends the line to its lobby process over loopback UDP; the lobbies
    carry it to every other player; each receiving bridge appends it to
    `tpf2_events_<letter>.txt`. Between a bridge and its lobby a line travels in the bridge's own
-   framing: chunks of up to 1,023 bytes in 1,050-byte UDP packets.
+   framing: chunks of up to 1,023 bytes, each UDP packet only as long as its chunk (at most 1,086
+   bytes).
 5. **Receive.** Each mod reads its events file every tick, tracks per-sender sequence gaps, and
    queues the command.
 6. **Apply.** Every tick each instance sorts its queue by (stamp, sender letter, sequence) and
@@ -96,12 +97,18 @@ Game frames are best-effort in the lobby layer. Above it:
 ## Pacing and game speed
 
 - **The leader is the session clock.** It is the host (letter `a`), or in a relay lobby the
-  player the relay names. Its player's speed buttons set the **session speed**, or `/speed x` when
-  that is newer, and it broadcasts the result (`LSEFF`). While a session is live the slice cancels
-  every click on a game's speed buttons and pause toggle (`UI::Clock`) and writes `SPEEDBTN <v>` to
-  the inject file; the leader's mod takes it as the session speed and a follower's ignores it, so
-  a lever only moves through pacing. Speed 0 is a sync point: games behind the leader run until
-  they reach its clock, then stop.
+  player the relay names. It runs the **session speed** and broadcasts it (`LSEFF`, with the votes
+  it counted as `vt=`).
+- **The session speed is the players' vote.** While a session is live the slice cancels every
+  click on a game's speed buttons and pause toggle (`UI::Clock`) and writes
+  `SPEEDBTN <v> <toggle|button>` to the inject file; the Multiplayer window's speed row writes
+  `SPEEDSET <v>`. A speed button or the row is that player's vote: a `SPEEDVOTE` command that every
+  instance, the voter's included, records at its stamp, so no lever moves where the click was made
+  and every game holds the same votes. The leader runs the session at the mean of the votes it
+  counts, rounded to 0.05: its own (its speed until it votes) and those of the players it has heard
+  in the last ~30 s. `/speed x` overrides the votes until the next vote lands. Only the leader's
+  pause toggle pauses and resumes the session, and it is not a vote. Speed 0 is a sync point: games
+  behind the leader run until they reach its clock, then stop.
 - **Followers trim their own speed** around the session speed to track the leader's clock, with
   a PID controller (fixed gains, one decision every 8 ticks, 0.7-1.2x, slew limited). A follower
   more than 3 units ahead of the leader drops to a quarter of the session speed, rising as the gap
@@ -116,6 +123,12 @@ Game frames are best-effort in the lobby layer. Above it:
   is within half a unit. Meanwhile its heartbeat carries `cu=1` so nobody paces against it. The
   leader never catches up: it is the clock. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md#lockstep-and-pacing)
   for pacing rules that do not always behave as described.
+- **Far behind, actions are off.** A stamp pays at most 15 units of lead over the fastest game, so
+  a game more than 15 units behind it would stamp its player's actions into the others' past. Until
+  it is back within 2 units, `inject.lua` drops every capture the slice cancelled (`ARMED 1`, and
+  `CONXP`, `CONUP`, `CDEMO`) and the window's calendar and company requests, holds line creations
+  until it has caught up (their editor callback waits in the slice's stash), and still ships what
+  already ran natively (`ARMED 0`, `EDEMO`, `ROADC`).
 
 ## Sessions
 

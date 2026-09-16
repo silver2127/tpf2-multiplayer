@@ -1,6 +1,20 @@
 # Linux port checkpoint — 2026-09-15
 
-## Latest work — exact replay with tree draw-order fix
+## Upstream update — 0.5.3
+
+Merged upstream `main` through `66da00db6a36791630d7ebb05b6bf81fb06e7959`
+(release 0.5.3), retaining the native port and the desync fixes below. Resolved
+lobby/mod-share conflicts while preserving Linux paths and orderly shutdown.
+Ported protocol 5 and the bridge's world/lobby reset and readiness files.
+The release Lua guard now checks all 28 files against 0.5.3, and lab creation
+uses that same baseline instead of the historical Proton package manifest.
+
+See [UPSTREAM_0.5.3.md](UPSTREAM_0.5.3.md). The new source builds and passes
+isolated tests; a new native/Windows 0.5.3 game replay has **not** been run.
+The running lab and published binaries were not replaced. Do not mix these
+new Lua files with the running 0.4.22 libraries or lobby.
+
+## Previous baseline — 0.4.22 replay with tree draw-order fix
 
 The exact replay exposed missing public-transport/PathFactory hashes and two
 missing traversal stages. Those adapters now match route choices and arrival

@@ -15,6 +15,19 @@
 return function(CM, K, log)
 local NL = string.char(10)
 
+-- Shared by hosts and joiners; page the roster so large lobbies fit on screen.
+function CM.lobbyPanelPage(body, requested)
+	local lines = {}
+	for line in tostring(body or ""):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+	if #lines < 3 then return "", 1, 1 end
+	local count = #lines - 3
+	local pages = math.max(1, math.ceil(count / 8))
+	local page = math.max(1, math.min(pages, tonumber(requested) or 1))
+	local out = { lines[2], lines[1] .. " - " .. lines[3], string.format("%d player(s) - page %d/%d", count, page, pages) }
+	for i = 4 + (page - 1) * 8, math.min(#lines, 3 + page * 8) do out[#out + 1] = lines[i] end
+	return table.concat(out, NL), page, pages
+end
+
 -- the hash lanes (hash.lua worldHash detail) in words
 local LANES = {
 	e = "roads and tracks", z = "road and track heights", c = "player buildings and stations",
@@ -125,6 +138,10 @@ end
 -- The status line. kv: our dash values; npeers: players heard right now.
 -- CM.guiFirstDesync remembers the first desync this GUI state saw.
 function CM.statusWords(kv, npeers)
+	if kv.resync == "1" then
+		return "Resync: " .. tostring(kv.resyncstatus or "waiting")
+			.. ". Saving, transfer, reload and comparison run automatically. Closing the window does not resume play."
+	end
 	local state, who, what = CM.verdictWords(kv.verdict)
 	local desyncs = tonumber(kv.desyncs) or 0
 	local t = tonumber(kv.t)
@@ -150,7 +167,7 @@ function CM.statusWords(kv, npeers)
 			lines[#lines + 1] = string.format("First noticed at game time %s (%s)%s.", tostring(fd.t or "?"), fd.clock,
 				fd.what and (": " .. fd.what) or "")
 		end
-		lines[#lines + 1] = "It does not fix itself: the host saves, then everyone loads that save again."
+		lines[#lines + 1] = "Use Resync now in the Multiplayer Resync panel to restore the host world."
 		return table.concat(lines, NL)
 	end
 	if state == "sync" then

@@ -10,11 +10,11 @@ from lupa.lua52 import LuaRuntime
 
 ROOT = Path(__file__).resolve().parents[1]
 lua = LuaRuntime(unpack_returned_tuples=True)
-for name in ("geom", "roads"):
+for name in ("geom", "roads", "shared_infra", "inject"):
     lua.globals()[name.upper()] = (ROOT / "mod/mp_lockstep_1/res/scripts/mp" / f"{name}.lua").read_text(encoding="utf-8")
 lua.execute(r'''
-local nodes, edges, streetMap, trackMap, proposals, logs
-local CT = {BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_STREET=3,BASE_EDGE_TRACK=4}
+local nodes, edges, streetMap, trackMap, proposals, logs, models
+local CT = {BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_STREET=3,BASE_EDGE_TRACK=4,MODEL_INSTANCE_LIST=5}
 local function vec(x,y,z) return {x=x,y=y,z=z} end
 local function edgeNew() return {comp={objects={}}} end
 api={type={ComponentType=CT,Vec3f={new=vec},
@@ -28,6 +28,7 @@ api={type={ComponentType=CT,Vec3f={new=vec},
     getNode2StreetEdgeMap=function() return streetMap end,
     getNode2TrackEdgeMap=function() return trackMap end}},
     getComponent=function(id,kind)
+      if kind==CT.MODEL_INSTANCE_LIST then return models[id] end
       if kind==CT.BASE_NODE then return nodes[id] end
       local e=edges[id]
       if not e then return nil end
@@ -36,11 +37,12 @@ api={type={ComponentType=CT,Vec3f={new=vec},
       if kind==CT.BASE_EDGE_STREET and e.type==0 then return e.streetEdge end
     end},
   cmd={make={buildProposal=function(sp,ctx) return {sp=sp,ctx=ctx} end},
-    sendCommand=function(c) proposals[#proposals+1]=c end}}
+    sendCommand=function(c,cb) c.callback=cb; proposals[#proposals+1]=c end}}
 game={}
 local CM,K
 local function reset()
   nodes,edges,streetMap,trackMap,proposals,logs={},{},{},{},{},{}
+  models={}
   local function log(s) logs[#logs+1]=s end
   CM={cmLog=log,originIdx=function(o) return string.byte(o)-string.byte('a') end,xingApiProbed=true}
   K={INSTANCE='a',ROAD_GATHER_BUILDINGS=true}
@@ -88,6 +90,40 @@ local function execute(c,keepPlan)
   end
   return sp,xv
 end
+function test_company_build()
+  for _, companyPid in ipairs({2002,3003}) do
+    reset()
+    CM.cmMode='companies'; CM.cmCompanyPid={[2]=companyPid}
+    CM.cmEnsure=function() end
+    assert(load(SHARED_INFRA))()(CM,K)
+    local settlements=0
+    CM.cmSettleBuild=function() settlements=settlements+1 end
+    CM.roadAuditLog=function() end
+    execute({company=2,etype=1,pts='0,0,0,10,0,0,20,0,0',links='1,2,2,3',fv='1,2,3'})
+    assert(proposals[1].ctx.player==companyPid,'road context must use origin company on each peer')
+    proposals[1].callback({resultEntities={},resultProposalData={costs=1234}},true)
+    assert(settlements==0,'native company charge must not be charged twice')
+  end
+end
+function test_signal_split(reverse)
+  reset()
+  node(101,0,-20,0);node(102,0,20,0)
+  edge(201,reverse and 102 or 101,reverse and 101 or 102,1)
+  edges[201].comp.objects={{301,2},{302,2}}
+  models[301]={fatInstances={{transf={[13]=1,[14]=-10,[15]=0}}}}
+  models[302]={fatInstances={{transf={[13]=1,[14]=10,[15]=0}}}}
+  local sp=execute({etype=1,pts='0,0,0,20,0,0',links='1,2',fv='2'})
+  local seen={}
+  for _,e in ipairs(sp.edgesToAdd) do
+    for _,o in ipairs(e.comp.objects or {}) do
+      assert(not seen[o[1]],'signal duplicated');seen[o[1]]=true
+      local endNode=o[1]==301 and 101 or 102
+      assert(e.comp.node0==endNode or e.comp.node1==endNode,'signal assigned to wrong half')
+      assert(o[2]==2,'signal kind changed')
+    end
+  end
+  assert(seen[301] and seen[302],'signals dropped during switch build')
+end
 function test_rail(origin)
   reset()
   node(101,0,-20,0);node(102,0,20,0);edge(201,101,102,0)
@@ -115,6 +151,75 @@ function test_road(count)
   local removed={};for _,id in ipairs(sp.edgesToRemove) do removed[id]=true end
   for i=1,count do assert(removed[200+i],'wrong split parent') end
   for i=2,count+1 do assert(xv:find(i..',S,',1,true),'crossing missing from wire plan') end
+end
+function test_rail_multiple_roads(count)
+  reset()
+  local coords={{-20,0,3}}
+  local added, removed={},{}
+  for i=1,count do
+    local x=i*30
+    -- One ordinary crossing and subsequent roads moved more than 2.5 m.
+    local z=i==1 and 5 or 9
+    node(100+i*2,x,-20,z);node(101+i*2,x,20,z)
+    edge(200+i,100+i*2,101+i*2,0)
+    coords[#coords+1]={x,0,3}
+    added[#added+1]=string.format('%d %d 0 20 0 0 20 0',100+i*2,-#coords)
+    added[#added+1]=string.format('%d %d 0 20 0 0 20 0',-#coords,101+i*2)
+    removed[#removed+1]=string.format('%d %d 0 40 0 0 40 0',100+i*2,101+i*2)
+  end
+  coords[#coords+1]={count*30+20,0,3}
+  local rail={}
+  for i=1,#coords-1 do
+    local dx=coords[i+1][1]-coords[i][1]
+    rail[#rail+1]=string.format('%d %d %g 0 0 %g 0 0',-i,-i-1,dx,dx)
+  end
+  for _,v in ipairs(added) do rail[#rail+1]=v end
+  local ns={}
+  for i,p in ipairs(coords) do ns[#ns+1]=string.format('%d %g %g %g',-i,p[1],p[2],p[3]) end
+  local record=string.format('ARMED 1\nROADE %d 1 0 1 0 %d 0 %d %s %s %s\n',
+    #coords,#rail,count,table.concat(ns,' '),table.concat(rail,' '),table.concat(removed,' '))
+  K.INJECT_FILE='memory'
+  CM.readFrom=function() return record,#record end
+  CM.peerSeen=true;CM.seqNo=8;CM.ticks=0
+  CM.originIdx=function(o) return string.byte(o or 'a')-string.byte('a') end
+  CM.gameTime=function() return 100 end
+  local captured
+  CM.scheduleLocal=function(op,args) assert(op=='ROADP');captured=args end
+  assert(load(INJECT))()(CM,K,function(s) logs[#logs+1]=s end)
+  CM.pollInject()
+  assert(captured,'capture failed: '..table.concat(logs,'\n'))
+  local links=0;for _ in captured.links:gmatch('[^,]+') do links=links+1 end
+  assert(links==2*(count+1),'road halves leaked into rail links')
+  assert(captured.xv,'capture plan failed: '..table.concat(logs,'\n'))
+  local sp,xv=execute(captured,true)
+  assert(#sp.edgesToRemove==count,'not all roads removed')
+  local seen={};for _,id in ipairs(sp.edgesToRemove) do assert(not seen[id]);seen[id]=true end
+  local roads=0
+  for _,e in ipairs(sp.edgesToAdd) do if e.type==0 then roads=roads+1 end end
+  assert(roads==2*count,'each road needs two road-typed replacement halves')
+  assert(#sp.edgesToAdd==3*count+1,'unexpected rail edges')
+  for i=1,count do
+    assert(seen[200+i],'wrong road removed')
+    assert(captured.xv:find((i+1)..',S,',1,true),'crossing missing from captured plan')
+  end
+end
+function test_raised_ground_crossing()
+  reset()
+  node(101,0,-20,9);node(102,0,20,9);edge(201,101,102,0)
+  local halves={{101,-1},{-1,102}}
+  assert(CM.captureSplitHeightLimit(true,201,-1,halves)==7)
+  assert(CM.captureSplitHeightLimit(true,201,-1,{{101,-1}})==2.5)
+  assert(CM.captureSplitHeightLimit(false,201,-1,halves)==2.5)
+  for _,kind in ipairs({1,2}) do
+    edges[201].comp.type=kind
+    assert(CM.captureSplitHeightLimit(true,201,-1,halves)==2.5)
+  end
+  edges[201].comp.type=0
+  local sp=execute({etype=1,pts='-20,0,3,0,0,3,20,0,3',links='1,2,2,3',fv='1,3'})
+  assert(#sp.edgesToRemove==1 and sp.edgesToRemove[1]==201)
+  local roads=0
+  for _,e in ipairs(sp.edgesToAdd) do if e.type==0 then roads=roads+1 end end
+  assert(roads==2,'crossing must replace the road with two road halves')
 end
 function test_no_crossing(isTrack,bridge,planned)
   reset()
@@ -215,3 +320,13 @@ if __name__ == "__main__":
         for is_track in (False, True):
             lua.globals().test_same_network_companion(is_track)
         print("PASS: bridge replacement kinds (both networks), properties, objects, orientation and mismatch rejection")
+    lua.globals().test_company_build()
+    lua.globals().test_raised_ground_crossing()
+    for count in (2, 4):
+        lua.globals().test_rail_multiple_roads(count)
+    print('PASS: native rail capture across 2/4 roads; mixed heights, all road halves stripped and rebuilt')
+    print('PASS: six-metre ground-road adjustment; bridge/tunnel and unproven splits retain narrow capture guard')
+    print('PASS: company road contexts use per-peer player IDs; no duplicate settlement with empty resultEntities')
+    lua.globals().test_signal_split(False)
+    lua.globals().test_signal_split(True)
+    print('PASS: rail switch split retains signals on both halves, including reversed edge orientation')

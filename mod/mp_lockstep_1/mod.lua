@@ -1,4 +1,9 @@
 function data()
+    if os.getenv("TPF2MP_RELEASE_ROOT") then
+        require("mp/update_bootstrap").setup()
+        local path = os.getenv("TPF2MP_RELEASE_ROOT") .. "/mod/res/scripts/mp/mod_data.lua"
+        return assert(loadfile(path, "t", _ENV))()()
+    end
 	return {
 		info = {
 			minorVersion = 0,

@@ -148,7 +148,7 @@ if ($SkipBuild) {
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
-foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll, (Join-Path $BridgeOut "tpf2_previews.dll"))) {
+foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll, (Join-Path $BridgeOut "tpf2_previews.dll"), (Join-Path $BridgeOut "tpf2_workshop_register.dll"))) {
     if (-not (Test-Path $f)) { Fail "missing: $f" }
 }
 
@@ -217,6 +217,10 @@ if (($wixOut -join "`n") -match "WIX7015") { Fail "WiX v7 needs its OSMF EULA ac
 if ($rc -ne 0) { Fail "wix build failed (exit $rc)" }
 if (-not (Test-Path $Msi)) { Fail "wix reported success but $Msi is missing" }
 Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $Version)" Green
+
+# Ship this alongside the MSI in the GitHub release for user-local updates.
+& python (Join-Path $Repo "tools\build_update.py")
+if ($LASTEXITCODE -ne 0) { Fail "automatic update bundle build failed" }
 
 # ---- 5. optional validation ----------------------------------------------
 if ($Validate) {

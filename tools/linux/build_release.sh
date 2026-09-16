@@ -182,7 +182,7 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows release 0.4.22 (7990a86edd94), verified byte-identical"
+  echo "Lua: Windows release 0.5.3 (66da00d), verified byte-identical"
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"
   if [ "$HOST_BUILD" = 1 ]; then echo "native runtime: host build (development only)"

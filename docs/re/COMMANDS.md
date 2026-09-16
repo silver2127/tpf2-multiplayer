@@ -205,7 +205,7 @@ sees Add's. They are different numbers for the same click.
 | CreateLine via `line_util` | `0x215c26b` | | MEASURED |
 | line editor UpdateLine | `0x6043fd`, `0x6074b5` | | MEASURED |
 | vehicle window Reverse (`viewcreator.cpp`) | `0x8b556d` | | MEASURED |
-| `UI::Clock` speed buttons and pause toggle (SetGameSpeed) | `0x4efb8f`, `0x4f0097`, `0x4f26ef` | `0x4f00ba` (the buttons) | MEASURED (`0x4f0097`), in code |
+| `UI::Clock` speed buttons and pause toggle (SetGameSpeed): `0x4f0097` is the speed buttons (in `0x4eff50`), `0x4efb8f` and `0x4f26ef` the two `TogglePause` bodies (`0x4efab0`, `0x4f2640`, funcsig), which `SPEEDBTN` names `button` and `toggle` | `0x4efb8f`, `0x4f0097`, `0x4f26ef` | `0x4f00ba` (the buttons) | MEASURED (`0x4f0097`), in code |
 | Lua `api.cmd.make.setGameSpeed` | `0xc17eff` | | MEASURED |
 | Lua `api.cmd.make.setColor` | `0xc3848e` (a `gamescriptrep.cpp` lambda, outside the wrapper block) | | MEASURED |
 | Lua `api.cmd.make.*` sol2 wrappers | `0xcec000`-`0xcf2000` (buildProposal `0xced378`, buyVehicle `0xceefae`) | | MEASURED, in code |

@@ -37,6 +37,7 @@ tools/shots/
 *.sav.lua
 
 # local scratch
+installer/.wix/
 backup/
 .claude/
 *.orig

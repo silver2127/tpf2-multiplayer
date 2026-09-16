@@ -122,6 +122,9 @@
   <!-- ===== files ===== -->
   <Fragment>
     <ComponentGroup Id="GameFolderFiles" Directory="INSTALLFOLDER">
+      <Component Id="BootstrapVersion" Guid="*">
+        <File Id="BootstrapVersionFile" Name="tpf2mp_version.txt" Source="VERSION" KeyPath="yes" />
+      </Component>
       <!-- alut.dll and tpf2_pluginhost.dll: PluginHost.wxs (shared). -->
       <Component Id="BridgeDll">
         <File Id="tpf2_bridge_mp.dll" Name="tpf2_bridge_mp.dll" Source="$(BridgeDll)" />
@@ -131,6 +134,9 @@
       </Component>
       <Component Id="SliceDll">
         <File Id="tpf2_slice.dll" Name="tpf2_slice.dll" Source="$(SliceDll)" />
+      </Component>
+      <Component Id="WorkshopRegisterDll" Directory="PreviewPluginsFolder">
+        <File Id="tpf2_workshop_register.dll" Name="tpf2_workshop_register.dll" Source="$(BridgeOut)\tpf2_workshop_register.dll" />
       </Component>
       <Component Id="PreviewDll" Directory="PreviewPluginsFolder">
         <File Id="tpf2_previews.dll" Name="tpf2_previews.dll" Source="$(BridgeOut)\tpf2_previews.dll" />
@@ -207,9 +213,12 @@
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
 
+      <!-- WiX 5's stock BrowseDlg already supplies these events. -->
+      <?ifndef Wix5BrowseDialog ?>
       <Publish Dialog="BrowseDlg" Control="OK" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
       <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+      <?endif ?>
 
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1" Condition="NOT Installed" />
       <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />

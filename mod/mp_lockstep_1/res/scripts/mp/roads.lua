@@ -7,6 +7,23 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+-- Native rail crossings can lower/raise a ground road to the new rail height.
+-- Only widen capture's height allowance when BOTH replacement halves prove
+-- that this road is actually being split; proximity alone also finds bridges.
+function CM.captureSplitHeightLimit(isTrack, eid, nodeId, raw)
+	if not isTrack then return 2.5 end
+	local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+	local street = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE_STREET)
+	if not be or not street or be.type ~= 0 then return 2.5 end
+	local first, second = false, false
+	for _, e in ipairs(raw) do
+		local other
+		if e[1] == nodeId then other = e[2] elseif e[2] == nodeId then other = e[1] end
+		if other == be.node0 then first = true end
+		if other == be.node1 then second = true end
+	end
+	return first and second and (K.XING_MAX_DZ or 7.0) or 2.5
+end
 -- ---------- command execution ----------
 -- Deterministic order is mandatory. Two commands due at the same stamp must be
 -- applied in the same sequence on every peer, or the worlds diverge even though
@@ -267,11 +284,14 @@ end
 -- that nothing replaces one for one (split, rerouted) is not something the replay
 -- can build safely, and the caller skips the command -- identically everywhere,
 -- since every instance has the same stops.
-function CM.carryEdgeObjects(removeEdges, addEdges)
+function CM.carryEdgeObjects(removeEdges, addEdges, splitObjects)
 	local carried = 0
 	for _, rid in ipairs(removeEdges) do
 		local objs, n = CM.objectsOnEdge(rid)
-		if (n or 0) > 0 then
+		if splitObjects and splitObjects[rid] then
+			-- splitEdgeAt assigned every object to exactly one oriented half.
+			carried = carried + splitObjects[rid]
+		elseif (n or 0) > 0 then
 			if not objs then
 				return false, string.format("edge %d: its %d stop(s)/signal(s) could not be read", rid, n or -1)
 			end
@@ -379,12 +399,13 @@ function CM.execEdge(c)
 		local ctxKind = (tonumber(c.skipOrigin or 0) == 1) and "plain(skipOrigin)"
 			or (K.ROAD_GATHER_BUILDINGS and "gather" or "plain")
 		local snap = CM.roadAuditSnapshot({ { c.x0, c.y0 }, { c.x1, c.y1 } })
+		local companyPaid = CM.cmRoadPlayer and CM.cmRoadPlayer(c, ctx)
 		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, ctx, true),
 			function(res, success)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s success=%s",
 					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(success)))
 				CM.roadAuditLog(c.op, c, success, ctxKind, snap)
-				pcall(CM.cmSettleBuild, c, res, success, c.op)   -- companies: owner + cost
+				if not companyPaid then pcall(CM.cmSettleBuild, c, res, success, c.op) end
 			end)
 	end)
 	if not ok then log("exec error: " .. tostring(err)) end
@@ -654,6 +675,7 @@ function CM.execPolyline(c, planOnly)
 		end
 
 		local splitRoads = {}   -- ANY existing edge (road or track) eid -> its split node, once per proposal
+		local splitObjects = {}
 		local splitParentEnds = {}   -- end node -> the split parent it belongs to (see crossingsFor)
 		-- ONE split for every "new edge crosses an existing edge mid-span" case.
 		-- Three separate implementations (vertex/road, vertex/track, segment/road)
@@ -719,9 +741,26 @@ function CM.execPolyline(c, planOnly)
 				h.type = crossedIsTrack and 1 or 0
 				CM.copyEdgeProps(h, eid, crossedIsTrack, nil)   -- the CROSSED edge's own props
 				addEdges[#addEdges + 1] = h
+				return h
 			end
-			half(comp.node0, mid, ta, tm, u)
-			half(mid, comp.node1, tm, tb, 1 - u)
+			local h0 = half(comp.node0, mid, ta, tm, u)
+			local h1 = half(mid, comp.node1, tm, tb, 1 - u)
+			local objects, count = CM.objectsOnEdge(eid)
+			if (count or 0) > 0 then
+				if not objects or not h0 or not h1 then error("Cannot preserve objects on split edge " .. eid) end
+				local lists = {{}, {}}
+				for _, ob in ipairs(objects) do
+					local mil = api.engine.getComponent(ob[1], api.type.ComponentType.MODEL_INSTANCE_LIST)
+					local fi = mil and mil.fatInstances and mil.fatInstances[1]
+					if not fi then error("Cannot locate split edge object " .. ob[1]) end
+					local ou = CM.uOnEdgeFine(eid, fi.transf[13], fi.transf[14])
+					if not ou then error("Cannot project split edge object " .. ob[1]) end
+					local list = lists[ou < u and 1 or 2]
+					list[#list + 1] = {ob[1], ob[2]}
+				end
+				h0.comp.objects, h1.comp.objects = lists[1], lists[2]
+				splitObjects[eid] = #objects
+			end
 			splitRoads[eid] = mid
 			splitParentEnds[comp.node0] = eid
 			splitParentEnds[comp.node1] = eid
@@ -1428,7 +1467,7 @@ function CM.execPolyline(c, planOnly)
 		-- the edges are copied into the proposal (CM.carryEdgeObjects). The plan
 		-- pass builds nothing, so it does not need them.
 		if not planOnly then
-			local okC, carried = CM.carryEdgeObjects(removeEdges, addEdges)
+			local okC, carried = CM.carryEdgeObjects(removeEdges, addEdges, splitObjects)
 			if not okC then
 				local msg = string.format("ROADP seq=%s: %s -- COMMAND SKIPPED on every instance "
 					.. "(a stop left on a removed edge crashes the engine)", tostring(c.seq), tostring(carried))
@@ -1475,10 +1514,14 @@ function CM.execPolyline(c, planOnly)
 		local corridor = {}
 		for i = 1, np do corridor[#corridor + 1] = { pts[i * 3 - 2], pts[i * 3 - 1] } end
 		local snap = CM.roadAuditSnapshot(corridor)
+		-- Build as the origin company: resultEntities is empty for polylines,
+		-- so post-build ownership guessing cannot assign these reliably. The
+		-- engine also charges this player; do not charge them a second time.
+		local companyPaid = CM.cmRoadPlayer and CM.cmRoadPlayer(c, ctx)
 		api.cmd.sendCommand(api.cmd.make.buildProposal(sp, ctx, true),
 			function(res, success)
 				CM.roadAuditLog("ROADP", c, success, ctxKind, snap)
-				pcall(CM.cmSettleBuild, c, res, success, "ROADP")   -- companies: owner + cost
+				if not companyPaid then pcall(CM.cmSettleBuild, c, res, success, "ROADP") end
 				-- LEVEL-CROSSING PROBE. The engine models a crossing as its own ECS
 				-- component (RAILROAD_CROSSING, added by construction_util_engine).
 				-- Log whether the node we routed the rail through actually got it,

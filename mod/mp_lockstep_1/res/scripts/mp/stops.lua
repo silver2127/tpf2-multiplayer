@@ -615,7 +615,9 @@ function CM.execStopAdd(c)
 			engL = (tonumber(c.eleft) == 1)
 			if flipped then engL = not engL end
 		end
-		local side = (hostSide == 2 or tonumber(c.kind) == 2) and 2 or (engL and 0 or 1)
+		-- Road waypoints have SIGNAL_LIST too, but occupy a street lane (0/1).
+		-- kind identifies the object; track identifies its transport network.
+		local side = wantTrack and 2 or (engL and 0 or 1)
 		local objs, n = CM.objectsOnEdge(eid)
 		if not objs then
 			log(string.format("%s: edge %d: could not read its %d object(s) -- skipped (DIVERGENCE)", tag, eid, n or -1))
