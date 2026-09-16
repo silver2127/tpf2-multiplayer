@@ -165,8 +165,9 @@ def request_catalogue():
             path = os.path.abspath(os.path.join(managed_workshop(), item))
             if item.isdigit() and len(item) <= 20 and os.path.isfile(os.path.join(path, "mod.lua")):
                 lines.append(item + "\t" + path)
-    if len(lines) > 129:
-        raise ValueError("too many registered Workshop mods")
+    # No cap on the number of rows: the reader (native/src/workshop_register.cpp)
+    # registers every row, and refusing here would leave every consented mod
+    # unregistered on this peer alone.
     target = os.path.join(root, "mods_registry.txt")
     with open(target + ".tmp", "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")

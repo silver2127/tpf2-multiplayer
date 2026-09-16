@@ -99,4 +99,20 @@ class Downloads(unittest.TestCase):
         self.assertTrue(r.complete and r.mods_satisfied)
         self.assertTrue((self.root/'cache'/modshare.cache_name('*9876543210',1)).exists())
 
+    def test_registry_has_no_row_cap(self):
+        # 128 rows used to reject the WHOLE registry on the reader (workshop_register.cpp)
+        # and raise here on the writer: every consented mod then went unregistered on
+        # that peer and its game loaded a different mod set from everyone else's.
+        managed=Path(modshare.managed_workshop()); managed.mkdir(parents=True,exist_ok=True)
+        ids=[str(3000000000+i) for i in range(300)]
+        for mid in ids:
+            (managed/mid).mkdir(); (managed/mid/'mod.lua').write_text('function data() return {} end')
+        (managed/'notamod').mkdir()   # not an id and no mod.lua: never a row
+        token=modshare.request_catalogue()
+        rows=(self.root/'mods_registry.txt').read_text(encoding='utf-8').split('\n')
+        self.assertEqual(rows[0],token); self.assertEqual(rows[-1],'')
+        self.assertEqual(sorted(r.split('\t')[0] for r in rows[1:-1]),sorted(ids))
+        for r in rows[1:-1]:
+            mid,folder=r.split('\t'); self.assertTrue(os.path.isfile(os.path.join(folder,'mod.lua')),folder)
+
 if __name__=='__main__': unittest.main()
