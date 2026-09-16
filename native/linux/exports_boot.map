@@ -1,0 +1,9 @@
+/* The loader's dynamic exports: clock() and the caller-gated __sprintf_chk
+   compatibility adapter. It is in LD_PRELOAD,
+   so anything it exported would take precedence over the game's own symbol of
+   the same name -- including std::string members instantiated from libstdc++'s
+   headers, which --exclude-libs does not cover. */
+{
+  global: clock; __sprintf_chk;
+  local: *;
+};

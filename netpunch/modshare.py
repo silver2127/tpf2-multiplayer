@@ -24,6 +24,9 @@ Mod ids: a folder ``<id>_<version>`` under the game's ``mods`` or the profile's
 ``local/mods``; a Steam Workshop item is ``*<workshopid>`` and lives under
 ``steamapps/workshop/content/1066780/<workshopid>`` (assumed from the game's
 naming; no local save with a workshop mod was available to measure).
+
+On Linux the folders come from linuxpaths.py (every Steam root and library,
+the TransportFever2 binary) instead of the registry.
 """
 from __future__ import annotations
 import io
@@ -47,7 +50,12 @@ _ID_RE = re.compile(r"^[A-Za-z0-9_*.-]{1,120}$")
 # ---------------------------------------------------------------------------
 def steam_root():
     """Steam's install folder, from the registry (the same keys the menu DLL
-    reads), else the default. None only if nothing looks like Steam."""
+    reads), else the default. None only if nothing looks like Steam. On Linux
+    the first Steam root linuxpaths finds (native, snap, Flatpak)."""
+    if sys.platform != "win32":
+        import linuxpaths
+        roots = linuxpaths.steam_roots()
+        return roots[0] if roots else None
     cands = []
     if sys.platform == "win32":
         try:
@@ -75,8 +83,12 @@ def steam_root():
 
 def game_dir():
     """The Transport Fever 2 folder: beside the frozen lobby when it runs from
-    <gamedir>\\netpunch (the installed layout), else via Steam."""
+    <gamedir>\\netpunch (the installed layout), else via Steam. On Linux:
+    TPF2MP_GAME_DIR, beside the lobby, then every Steam library."""
     here = os.path.dirname(os.path.abspath(getattr(sys, "frozen", False) and sys.executable or __file__))
+    if sys.platform != "win32":
+        import linuxpaths
+        return linuxpaths.game_dir(beside=here)
     parent = os.path.dirname(here)
     if os.path.isfile(os.path.join(parent, "TransportFever2.exe")):
         return parent
@@ -90,7 +102,11 @@ def game_dir():
 
 def userdata_mods_dir():
     """<steam>\\userdata\\<account>\\1066780\\local\\mods -- the account that has a
-    save folder (newest wins), like the menu DLL's resolveSaveDir."""
+    save folder (newest wins), like the menu DLL's resolveSaveDir. On Linux
+    across every Steam root."""
+    if sys.platform != "win32":
+        import linuxpaths
+        return linuxpaths.userdata_mods_dir()
     root = steam_root()
     if not root:
         return None
@@ -109,6 +125,9 @@ def userdata_mods_dir():
 
 
 def workshop_dir():
+    if sys.platform != "win32":
+        import linuxpaths                     # the library the game is installed in
+        return linuxpaths.workshop_dir(game_dir())
     root = steam_root()
     return os.path.join(root, "steamapps", "workshop", "content", TF2_APPID) if root else None
 

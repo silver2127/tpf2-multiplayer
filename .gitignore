@@ -1,6 +1,8 @@
 # build output -- rebuild with native/build.bat, installer/build_msi.ps1
 native/out/
+native/linux/out*/
 installer/out/
+dist/linux/
 *.obj
 *.exp
 *.lib
@@ -10,6 +12,8 @@ installer/out/
 # frozen lobby exe -- rebuild with PyInstaller, see netpunch/README.md
 netpunch/dist/
 netpunch/build/
+netpunch/dist-linux/
+netpunch/build-linux/
 
 # python
 __pycache__/

@@ -15,6 +15,19 @@ It is unofficial, reverse-engineered without the engine's source, and **experime
 four players have been run, on one PC and between PCs on different networks. Read
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
+This branch also contains a **native Linux build-35924 port**, based on Windows release **0.4.22**.
+Build/install instructions are in [docs/linux/INSTALL.md](docs/linux/INSTALL.md), and tested coverage
+and remaining gaps are in [docs/linux/RESUME_STATUS.md](docs/linux/RESUME_STATUS.md).
+The `.desync.5` candidate passed six complete native/Proton person-state and movement
+checkpoints through simulation time 1800, including the first town-growth and resident-birth
+event, with 21 passing SDK checks. This was a controlled test on one computer: fast-forward
+previous-frame histories still differed at two checkpoints, newborn travel was not exercised,
+and complete action/replay coverage remains unfinished. All 24 Lua files are unchanged from
+Windows 0.4.22; newer Windows 0.5.x releases are outside this baseline. Linux release tags
+identify the Windows baseline, with the uncommitted Linux implementation supplied in the
+accompanying curated source overlay.
+The Windows MSI instructions below apply to the Windows version.
+
 ## How it works
 
 The game has no network code, so this adds lockstep multiplayer from outside. A forwarding `alut.dll`
@@ -77,6 +90,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | path | contents |
 |---|---|
 | `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
+| `native/linux/`, `tools/linux/` | native Linux libraries, tests, Steam Runtime builds and `.run`/tarball packaging |
 | `mod/mp_lockstep_1/` | the game-script mod |
 | `netpunch/` | the lobby, dedicated relay and master server (Python) |
 | `installer/` | the WiX package |

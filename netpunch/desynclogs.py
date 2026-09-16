@@ -12,7 +12,8 @@ endpoint. The result comes back to the player as a local chat line from
 MULTIPLAYER.
 
 What is sent:
-  data/   the mod's data folder (%LOCALAPPDATA%\\tpf2mp\\data or TPF2MP_DATADIR):
+  data/   the mod's data folder (%LOCALAPPDATA%\\tpf2mp\\data or TPF2MP_DATADIR;
+          on Linux $XDG_DATA_HOME/tpf2mp/data or ~/.local/share/tpf2mp/data):
           *.log, *.txt and *.cfg -- the DLL logs, dash/status/inject files
   game/   stdout.txt (the game's log with the mod's script lines), settings.lua,
           tpf2_menu.log and the game folder's tpf2_slice.cfg / tpf2_menu_flags.txt
@@ -22,9 +23,10 @@ What is not: the lobby's own logs (they hold every player's IP address),
 tpf2_names.txt, saves, crash dumps.
 
 Scrubbed from every file: Windows user and computer names (in paths and as
-words), the Steam account id in userdata paths, IPv4 and IPv6 addresses
-(127.0.0.1 and 0.0.0.0 are kept) and anything shaped like a lobby code.
-Player names and chat text can remain.
+words), on Linux the login and host names and /home/<user> in paths, the Steam
+account id in userdata paths, IPv4 and IPv6 addresses (127.0.0.1 and 0.0.0.0
+are kept) and anything shaped like a lobby code. Player names and chat text
+can remain.
 
 Standalone, for testing:
     python desynclogs.py --dry-run report.zip
@@ -59,6 +61,9 @@ _sent = []                  # ids of the reports this lobby run sent: one per se
 # where the logs are
 # --------------------------------------------------------------------------- #
 def data_dir():
+    if sys.platform != "win32":
+        import linuxpaths                       # the datadir_linux.h chain
+        return linuxpaths.data_dir()
     d = os.environ.get("TPF2MP_DATADIR")
     if d:
         return d
@@ -67,6 +72,9 @@ def data_dir():
 
 
 def steam_dir():
+    if sys.platform != "win32":
+        dirs = steam_dirs()
+        return dirs[0] if dirs else None
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as k:
@@ -81,8 +89,21 @@ def steam_dir():
     return None
 
 
+def steam_dirs():
+    """The Steam folders to look in: the one steam_dir() finds on Windows; on
+    Linux every root that exists (native, snap, Flatpak)."""
+    if sys.platform != "win32":
+        import linuxpaths
+        return linuxpaths.steam_roots()
+    s = steam_dir()
+    return [s] if s else []
+
+
 def game_dir():
     here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    if sys.platform != "win32":
+        import linuxpaths                       # TransportFever2 in any Steam library
+        return linuxpaths.game_dir(beside=here)
     for cand in (os.path.dirname(here), here):
         if os.path.isfile(os.path.join(cand, "TransportFever2.exe")):
             return cand
@@ -119,13 +140,12 @@ def gather():
                     continue
                 seen.add(n.lower())
                 out.append(("data/" + n, p))
-    s = steam_dir()
-    if s:
-        local = os.path.join(s, "userdata", "*", "1066780", "local")
-        so = _newest(glob.glob(os.path.join(local, "crash_dump", "stdout.txt")))
+    locals_ = [os.path.join(s, "userdata", "*", "1066780", "local") for s in steam_dirs()]
+    if locals_:
+        so = _newest([p for local in locals_ for p in glob.glob(os.path.join(local, "crash_dump", "stdout.txt"))])
         if so:
             out.append(("game/stdout.txt", so))
-        st = _newest(glob.glob(os.path.join(local, "settings.lua")))
+        st = _newest([p for local in locals_ for p in glob.glob(os.path.join(local, "settings.lua"))])
         if st:
             out.append(("game/settings.lua", st))
     g = game_dir()
@@ -147,14 +167,19 @@ _IPV6 = re.compile(
     % (_HEX, _HEX, _HEX, _HEX, _HEX, _HEX))
 _KEEP_IP = {"127.0.0.1", "0.0.0.0"}
 _PROFILE = re.compile(r"(?i)([\\/](?:users|sandbox)[\\/])[^\\/\r\n\"'<>|:*?]+")
+_HOME = re.compile(r"(/home/)[^/\s\"'<>|:*?]+")         # Linux: /home/<user>, also /var/home and /run/host/home (login names hold no spaces)
 _STEAMID = re.compile(r"(?i)(userdata[\\/])\d+")
 _CODE = re.compile(r"(?<![A-Za-z0-9])[A-Z2-7]{24,}={0,6}(?![A-Za-z0-9=])")
 
 
 def _private_words():
     words = set()
-    for v in (os.environ.get("USERNAME"), os.environ.get("COMPUTERNAME"),
-              os.path.basename(os.environ.get("USERPROFILE") or "")):
+    vals = [os.environ.get("USERNAME"), os.environ.get("COMPUTERNAME"),
+            os.path.basename(os.environ.get("USERPROFILE") or "")]
+    if sys.platform != "win32":
+        import linuxpaths                       # login, home folder and host names
+        vals += linuxpaths.private_words()
+    for v in vals:
         if v and len(v) >= 3:
             words.add(v)
     return sorted(words, key=len, reverse=True)
@@ -164,6 +189,8 @@ def scrub(data, words=None):
     words = _private_words() if words is None else words
     text = data.decode("utf-8", "surrogateescape")
     text = _PROFILE.sub(r"\1<user>", text)
+    if sys.platform != "win32":
+        text = _HOME.sub(r"\1<user>", text)
     text = _STEAMID.sub(r"\1<steamid>", text)
     for w in words:
         text = re.sub(r"(?i)(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(w), "<user>", text)
@@ -304,6 +331,9 @@ def main(argv=None):
     ap.add_argument("--dry-run", metavar="ZIP", help="write the report here instead of sending it")
     ap.add_argument("--send", metavar="URL", help="send the report to this /desync URL")
     a = ap.parse_args(argv)
+    if sys.platform != "win32":
+        import linuxpaths                       # lobby.main does this for the lobby
+        linuxpaths.ssl_cert_fallback()
     meta = _meta({"reason": "manual", "instance": "?"}, "manual")
     blob, about = build_capped(meta)
     for f in about["files"]:

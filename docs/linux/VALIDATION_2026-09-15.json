@@ -1,0 +1,173 @@
+{
+  "candidate_boot_sha256": "4c63bbe2b6bb3b0c9bae3a35ed613caae18e4ec821103bbd1cb0273750f6950b",
+  "scenario": "User reported building two stations and assigning two vehicles; manually driven native/Proton session.",
+  "common_samples": 24,
+  "first_stamp": 1800.0,
+  "last_stamp": 2076.0,
+  "all_hashes_equal": true,
+  "all_spatial_people_counts_equal_at_equal_times": true,
+  "vehicle_positions": {
+    "verified_stamp": 2076,
+    "vehicles_per_peer": 2,
+    "mean_difference_m": 0.0,
+    "max_difference_m": 0.0
+  },
+  "sdk_ctests_passed": 29,
+  "lua_release": "Windows 0.4.22, all 24 files byte-identical",
+  "limitations": [
+    "Aggregate hashes and sampled spatial counts do not establish complete person-state equality.",
+    "This manual play test is not the exact previous first-terminal reproduction.",
+    "Extended play, full person snapshots and complete strict command coverage remain unproven."
+  ],
+  "outcome": "FAIL: later person-count divergence followed by vehicle drift",
+  "earlier_sample_scope": "The 24 passing samples above end at t=2076 and do not describe the completed play test.",
+  "later_failure": {
+    "last_matching_vehicle_sample": 2136,
+    "first_person_count_difference": {
+      "stamp": 2136,
+      "native": 346,
+      "proton": 347,
+      "vehicle_max_difference_m": 0.0
+    },
+    "first_vehicle_desync": {
+      "stamp": 2148,
+      "max_difference_m": 11.89,
+      "mean_difference_m": 5.95,
+      "native_spatial_people": 343,
+      "proton_spatial_people": 346
+    },
+    "subsequent_vehicle_desync": {
+      "stamp": 2160,
+      "max_difference_m": 54.61
+    },
+    "geometry_verdict_hashes_equal_through": 2160,
+    "cause": "Missing public-transport and PathFactory hashes, affected-person path-restoration ordering, and PrepareSimPersonData map ordering; see LINE_COST_DESYNC.md.",
+    "evidence_directory": "~/.cache/tpf2mp/resume-20260915/desync/"
+  },
+  "fix_candidate": {
+    "boot_sha256": "78d89ebfdeb4edf650e50735995bed535fcd005d97dcc9bb43d6cdbf830655e8",
+    "scenario": "Exact replay of ten original commands from the same pre-terminal save; native Linux versus Windows under Proton",
+    "outcome": "PASS for the recorded replay from t=1800 through t=3600",
+    "sdk_ctests_passed": 29,
+    "sandbox_tests_passed": 22,
+    "lobby_shutdown_checks_passed": 16,
+    "lua_files_unchanged": 24,
+    "original_windows_hash_instruction_cases": 300343,
+    "original_windows_tree_float_instruction_cases": 10025,
+    "tree_draw_window_cases": 4026,
+    "movement_schema": 4,
+    "current_state_checkpoints": [
+      {
+        "target": 1812,
+        "people": 721,
+        "equal": true
+      },
+      {
+        "target": 1914,
+        "people": 721,
+        "equal": true
+      },
+      {
+        "target": 1980,
+        "people": 721,
+        "equal": true
+      },
+      {
+        "target": 2084,
+        "people": 721,
+        "equal": true
+      },
+      {
+        "target": 2160,
+        "people": 721,
+        "equal": true
+      },
+      {
+        "target": 2220,
+        "people": 725,
+        "equal": true
+      },
+      {
+        "target": 2280,
+        "people": 725,
+        "equal": true
+      },
+      {
+        "target": 2400,
+        "people": 728,
+        "equal": true
+      },
+      {
+        "target": 2700,
+        "people": 738,
+        "equal": true
+      },
+      {
+        "target": 3000,
+        "people": 738,
+        "equal": true
+      },
+      {
+        "target": 3300,
+        "people": 738,
+        "equal": true
+      },
+      {
+        "target": 3600,
+        "people": 738,
+        "equal": true
+      }
+    ],
+    "excluded_previous_frame_fields": [
+      "walker.value.dist0",
+      "movePath.value.dyn0"
+    ],
+    "all_current_state_checkpoints_equal": true,
+    "aggregate_samples": 151,
+    "aggregate_first_stamp": 1800.0,
+    "aggregate_last_stamp": 3600.0,
+    "all_geometry_hashes_equal": true,
+    "all_spatial_people_counts_equal": true,
+    "vehicle_samples": 147,
+    "vehicle_last_stamp": 3600.0,
+    "vehicle_max_separation_m": 0,
+    "desyncs": 0,
+    "tree_entity_records_compared": 13,
+    "evidence_directory": "~/.cache/tpf2mp/resume-20260915/desync/tree-draw-validation/",
+    "status": {
+      "native": "t=3600  peer=3600  skew=+0.4  desyncs=0  late=0  applylag=5.0/2 of 12  queued=0  mp=2",
+      "proton": "t=3600  peer=3600  skew=+0.4  desyncs=0  late=0  applylag=5.0/2 of 12  queued=0  mp=2"
+    },
+    "limitations": [
+      "Previous-render-frame dist0/dyn0 fields differ at 4x speed; current simulation state and geometry match at every sampled checkpoint.",
+      "This validates the recorded station/line/vehicle replay and subsequent town growth, not every command or arbitrarily long sessions.",
+      "Candidate installed only in the lab; published packages unchanged."
+    ],
+    "installer_smoke": "Unchanged installer scripts passed extraction/install/upgrade/uninstall tests using the prior desync.5 package; no new package published."
+  },
+  "previous_fix_candidate": {
+    "boot_sha256": "895f62687b0b305029312a111f245bc4e874b37faff123371a54fa93659b4904",
+    "original_windows_instruction_cases": 300343,
+    "sdk_ctests_passed": 29,
+    "lua_files_unchanged": 24,
+    "scenario": "Exact replay of ten original commands from the same pre-terminal save",
+    "outcome": "PARTIAL: current person state matches through t=2160; later town construction IDs differ, followed by more state differences",
+    "movement_schema": 4,
+    "evidence_directory": "~/.cache/tpf2mp/resume-20260915/desync/prepareorder-validation/",
+    "current_state_equal_through": 2160,
+    "excluded_previous_frame_fields": [
+      "walker.value.dist0",
+      "movePath.value.dyn0"
+    ],
+    "later_failure": {
+      "first_sample": 2280,
+      "differing_people": [
+        22009,
+        28420
+      ],
+      "native_destination": 28434,
+      "windows_destination": 28435,
+      "cause_under_investigation": "Same new industrial construction receives different entity IDs"
+    }
+  }
+}
