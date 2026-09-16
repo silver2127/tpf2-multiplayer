@@ -8,7 +8,8 @@
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
 -- ---------- command reliability (NACK + resend) ----------
-CM.sentRing = {}       -- our seq -> encoded LSCMD line
+CM.sentRing = {}       -- our seq -> encoded LSCMD line, kept until every live peer has it (CM.sentPrune)
+CM.sentLo = 1          -- the lowest of our seqs still in sentRing
 CM.rx = {}             -- origin letter -> receive-side tracking
 CM.resendAt = {}       -- our seq -> tick we last rebroadcast it
 CM.nackSent = 0
@@ -17,8 +18,50 @@ CM.recovered = 0
 
 function CM.recordSent(seq, line)
 	CM.sentRing[seq] = line
-	local drop = seq - K.CMD_RING
-	if drop > 0 and CM.sentRing[drop] then CM.sentRing[drop] = nil end
+end
+
+-- RETAINED BY ACKNOWLEDGEMENT, NOT BY COUNT (2026-09-16). Our own commands used
+-- to be kept 256 deep (K.CMD_RING): a NACK for anything older found nothing,
+-- and a burst of 300 commands (a big batch buy, a long road) could have its
+-- first ones asked for after they were gone. Now every heartbeat carries
+-- ak=<origin>:<n>,... -- for each origin this instance hears, the seq through
+-- which it holds EVERY command (its contiguous high-water; a gap it gave up
+-- NACKing counts as passed). A line of ours is dropped only once every live
+-- peer has reported past it. With no live peer, or a live peer that has not
+-- reported about us yet, nothing is dropped. What this no longer holds, the
+-- leader's history (CM.hist, below) still does: onNack falls back to it.
+function CM.rxAckOf(r)
+	local a = r.ack or r.firstSeq or 0
+	local top = math.max(r.maxSeq or 0, r.advMax or 0)
+	while a < top and (r.seen[a + 1] or (r.nackN[a + 1] or 0) >= K.NACK_MAX) do a = a + 1 end
+	r.ack = a
+	return a
+end
+-- " ak=b:120,c:77" for our heartbeat, "" before anything was heard
+function CM.ackReport()
+	local parts = {}
+	for o, r in pairs(CM.rx) do
+		if o ~= K.INSTANCE then parts[#parts + 1] = o .. ":" .. CM.rxAckOf(r) end
+	end
+	if #parts == 0 then return "" end
+	table.sort(parts)
+	return " ak=" .. table.concat(parts, ",")
+end
+function CM.sentPrune()
+	local floor
+	for _, pr in pairs(CM.peers or {}) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
+			if pr.ackMine == nil then return end   -- a live peer that has said nothing about us: keep everything
+			if not floor or pr.ackMine < floor then floor = pr.ackMine end
+		end
+	end
+	if not floor then return end                 -- nobody live: nobody to have acknowledged anything
+	local n = 0
+	while CM.sentLo <= floor and CM.sentLo <= (CM.seqNo or 0) do
+		if CM.sentRing[CM.sentLo] then CM.sentRing[CM.sentLo] = nil; n = n + 1 end
+		CM.sentLo = CM.sentLo + 1
+	end
+	if n > 0 then CM.sentPruned = (CM.sentPruned or 0) + n end
 end
 
 -- an LSCMD arrived from origin o with sequence number seq
@@ -147,28 +190,101 @@ end
 
 -- someone asked us (or another origin) to resend a command
 -- COMMAND HISTORY (2026-09-09): every command that crossed this instance --
--- ours and everyone else's -- with its stamp, K.HIST_RING deep. The Factorio
--- shape of hot join: a newcomer loads a save taken at step S and asks for
--- everything stamped after S (LSNEED); the host answers from this ring. Lines
--- are re-sent with hist=1 hfor=<letter>, so nobody else pays attention.
-K.HIST_RING = 4096
-CM.hist = {}
+-- ours and everyone else's -- with its stamp. The Factorio shape of hot join:
+-- a newcomer loads a save taken at step S and asks for everything stamped
+-- after S (LSNEED); the host answers from this history. Lines are re-sent with
+-- hist=1 hfor=<letter>, so nobody else pays attention.
+--
+-- RETAINED BY NEED, NOT BY COUNT (2026-09-16). It used to be a ring of 4,096
+-- lines: a joiner whose save predated the oldest retained command got a hole
+-- -- a desync at the moment it joined -- and nothing said so. What a joiner
+-- can ask for is bounded by the SAVE it loads: every command stamped at or
+-- before the save's step is inside the save, so only later ones are ever
+-- needed. Every save handed to a joiner is at least as new as the one before
+-- (a hot join takes a fresh autosave; a relay hands out its newest upload), so
+-- once a joiner has loaded a save taken at S (its LSNEED ... save=1 says so,
+-- and every instance hears it: the leader role can move), nothing at or
+-- before S can be asked for again -- by anyone who is IN. Someone still
+-- loading may hold an older save, so the prune waits until the lobby roster
+-- (players= in the bridge ctl) is fully heard and nobody is catching up. Until
+-- a floor is known, everything is kept and its size logged every 4,096 lines
+-- (~200 B a command: an hour of busy play is about a megabyte).
+CM.hist = {}          -- { at=, line=, o=, seq= } in arrival order
+CM.histIdx = {}       -- "origin:seq" -> entry
+CM.histBytes = 0
+CM.histFloor = nil    -- the stamp of the newest save a joiner loaded
+CM.histPrunedTo = nil -- the highest stamp ever pruned: a request below it cannot be served in full
+function CM.histWhyKept()
+	local why = CM.histHold()
+	return why and (" -- kept in full: " .. why) or string.format(" -- prunable at or before %.1f", CM.histFloor or 0)
+end
 function CM.histPush(line, at)
+	local o = line:match("origin=(%a+)")
+	local seq = tonumber(line:match("seq=(%d+)"))
+	local k = o and seq and (o .. ":" .. seq) or nil
+	if k and CM.histIdx[k] then return end   -- a resend of a line we hold
+	local e = { at = at or 0, line = line, o = o, seq = seq }
 	local h = CM.hist
-	h[#h + 1] = { at = at or 0, line = line }
-	if #h > K.HIST_RING then table.remove(h, 1) end
+	h[#h + 1] = e
+	if k then CM.histIdx[k] = e end
+	CM.histBytes = CM.histBytes + #line
+	if #h % 4096 == 0 then
+		log(string.format("HIST: %d command(s) retained (%d KB)%s", #h, math.floor(CM.histBytes / 1024), CM.histWhyKept()))
+	end
 end
 function CM.histFind(o, seq)
-	local want = string.format("origin=%s seq=%d", tostring(o), seq)
-	for i = #CM.hist, 1, -1 do
-		local l = CM.hist[i].line
-		if l:find(want, 1, true) and l:sub(1, 6) == "LSCMD " then return l end
+	local e = CM.histIdx[tostring(o) .. ":" .. tostring(seq)]
+	return e and e.line or nil
+end
+-- LSNEED ... save=1 from L: L loaded a save taken at S. Heard by everyone.
+function CM.histFloorNote(S, L)
+	if CM.histFloor and S <= CM.histFloor then return end
+	CM.histFloor = S
+	log(string.format("HIST: %s loaded a save taken at %.1f -- every later save holds what was stamped at or before it; prunable once everyone is in", L, S))
+end
+-- Why the history cannot be pruned right now (nil = it can)
+function CM.histHold()
+	if not CM.histFloor then return "no joiner has loaded a save yet" end
+	local roster = tonumber(CM.rosterPlayers)
+	if not roster then return "the lobby roster size is unknown" end
+	local live = CM.livePeers and CM.livePeers() or 0
+	if live < roster - 1 then
+		return string.format("%d of %d other roster member(s) not heard (still loading?)", roster - 1 - live, roster - 1)
 	end
+	for o, pr in pairs(CM.peers or {}) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and pr.cu then return o .. " is catching up" end
+	end
+	if CM.histSend then return "a history feed is in flight" end
+	if CM.catchingUp2 or (CM.lgFetch and CM.lgFetch ~= "done") then return "we are catching up ourselves" end
 	return nil
+end
+function CM.histPrune()
+	if CM.speedRequest then pcall(CM.speedRequest) end   -- players= and leader=, re-read every ~2 s inside
+	local F = CM.histFloor
+	if not F then return end
+	if CM.histPrunedFor == F and (CM.ticks - (CM.histPrunedAt or 0)) < 512 then return end
+	if CM.histHold() then return end
+	local keep, dropped, bytes = {}, 0, 0
+	for _, e in ipairs(CM.hist) do
+		if e.at > F then
+			keep[#keep + 1] = e; bytes = bytes + #e.line
+		else
+			dropped = dropped + 1
+			if e.o and e.seq then CM.histIdx[e.o .. ":" .. e.seq] = nil end
+		end
+	end
+	CM.histPrunedFor, CM.histPrunedAt = F, CM.ticks
+	if dropped == 0 then return end
+	CM.hist, CM.histBytes = keep, bytes
+	if not CM.histPrunedTo or F > CM.histPrunedTo then CM.histPrunedTo = F end
+	log(string.format("HIST: pruned %d command(s) stamped at or before %.1f (everyone is in and holds a save at least that new) -- %d retained (%d KB)",
+		dropped, F, #keep, math.floor(bytes / 1024)))
 end
 -- LSNEED t=S o=L: gather what L is missing, tell it the per-origin ranges
 -- (LSHIST), then feed the lines K.HIST_PER_TICK per tick (histPump) and close
--- with LSHISTEND. Only the host serves: it hears everything.
+-- with LSHISTEND. Only the host serves: it hears everything. A request for
+-- history that was pruned is refused LOUDLY: what is left is sent, and the end
+-- marker carries hole=<stamp> so the requester knows its world is forked.
 K.HIST_PER_TICK = 40
 function CM.histServe(S, L)
 	if not CM.isLeader() then return end
@@ -176,8 +292,7 @@ function CM.histServe(S, L)
 	for _, e in ipairs(CM.hist) do
 		if e.at > S then
 			lines[#lines + 1] = e.line
-			local o = e.line:match("origin=(%a+)")
-			local seq = tonumber(e.line:match("seq=(%d+)"))
+			local o, seq = e.o, e.seq
 			if o and seq then
 				local r = per[o] or { lo = seq, hi = seq }
 				if seq < r.lo then r.lo = seq end
@@ -186,12 +301,21 @@ function CM.histServe(S, L)
 			end
 		end
 	end
+	local hole = nil
+	if CM.histPrunedTo and S < CM.histPrunedTo then
+		hole = CM.histPrunedTo
+		log(string.format("!! HIST: %s needs every command after %.1f but everything at or before %.1f was pruned (the roster was complete and a joiner had loaded a save taken at %.1f) -- its history has a HOLE; only a resync repairs that",
+			L, S, hole, CM.histFloor or hole))
+	end
 	for o, r in pairs(per) do
 		CM.broadcast(string.format("LSHIST for=%s o=%s from=%d to=%d", L, o, r.lo, r.hi))
 	end
-	CM.histSend = { fr = L, lines = lines, i = 1 }
+	CM.histSend = { fr = L, lines = lines, i = 1, hole = hole }
 	log(string.format("HIST: %s needs everything after %.1f -- %d command(s) from %d origin(s) queued", L, S, #lines, (function() local n = 0; for _ in pairs(per) do n = n + 1 end; return n end)()))
-	if #lines == 0 then CM.broadcast(string.format("LSHISTEND for=%s n=0", L)); CM.histSend = nil end
+	if #lines == 0 then CM.broadcast(CM.histEndLine(CM.histSend)); CM.histSend = nil end
+end
+function CM.histEndLine(hs)
+	return string.format("LSHISTEND for=%s n=%d%s", hs.fr, #hs.lines, hs.hole and string.format(" hole=%.4f", hs.hole) or "")
 end
 function CM.histPump()
 	local hs = CM.histSend
@@ -202,7 +326,7 @@ function CM.histPump()
 		hs.i = hs.i + 1; n = n + 1
 	end
 	if hs.i > #hs.lines then
-		CM.broadcast(string.format("LSHISTEND for=%s n=%d", hs.fr, #hs.lines))
+		CM.broadcast(CM.histEndLine(hs))
 		log(string.format("HIST: %d command(s) sent to %s", #hs.lines, hs.fr))
 		CM.histSend = nil
 	end
@@ -222,9 +346,10 @@ function CM.onNack(o, seq)
 		log(string.format("RESEND %s seq=%d from history (answering a NACK for %s)", o, seq, o))
 		return
 	end
-	local line = CM.sentRing[seq]
+	local line = CM.sentRing[seq] or CM.histFind(K.INSTANCE, seq)
 	if not line then
-		log(string.format("NACK for our seq=%d but it is no longer in the ring (>%d old)", seq, K.CMD_RING))
+		log(string.format("!! NACK for our seq=%d but it is no longer kept: every live peer had acknowledged past it (our ring starts at %d) and the history below %s was pruned",
+			seq, CM.sentLo, CM.histPrunedTo and string.format("%.1f", CM.histPrunedTo) or "nothing"))
 		return
 	end
 	if CM.resendAt[seq] and CM.ticks - CM.resendAt[seq] < K.RESEND_MIN_GAP then return end
@@ -806,6 +931,14 @@ local function onLine(line)
 			if hi then pcall(CM.rxAdvertise, o, hi) end
 			local ha = tonumber(line:match(" ha=([%-%d%.]+)"))
 			if hi and ha then pcall(CM.rxStampNote, o, hi, ha) end
+			-- what it holds of OURS, contiguously: our sent ring keeps a line until every
+			-- live peer reports past it (CM.sentPrune)
+			local ak = line:match(" ak=(%S+)")
+			if ak then
+				for ao, an in ak:gmatch("(%a+):(%d+)") do
+					if ao == K.INSTANCE then pr.ackMine = tonumber(an) end
+				end
+			end
 			-- round trips: remember the peer's clock for our echo, and time our own echoed back
 			local ms = tonumber(line:match(" ms=(%d+)"))
 			if ms then pr.ms, pr.msClk = ms, os.clock() end
@@ -861,10 +994,16 @@ local function onLine(line)
 	elseif op == "LSNEED" then
 		local S = tonumber(line:match(" t=([%d%.]+)"))
 		local L = line:match(" o=(%a+)")
-		if S and L and L ~= K.INSTANCE then pcall(CM.histServe, S, L) end
+		if S and L and L ~= K.INSTANCE then
+			-- save=1: L loaded a save taken at S (the load gate's request). A plain
+			-- catch-up request names a live clock, not a save, and moves no floor.
+			if line:find(" save=1", 1, true) then CM.histFloorNote(S, L) end
+			pcall(CM.histServe, S, L)
+		end
 	elseif op == "LSHIST" then
 		local fr = line:match(" for=(%a)")
 		if fr == K.INSTANCE then
+			CM.histProgressAt = CM.ticks
 			local o = line:match(" o=(%a+)")
 			local lo = tonumber(line:match(" from=(%d+)"))
 			local hi = tonumber(line:match(" to=(%d+)"))
@@ -877,13 +1016,20 @@ local function onLine(line)
 		end
 	elseif op == "LSHISTEND" then
 		if line:match(" for=(%a)") == K.INSTANCE then
+			CM.histProgressAt = CM.ticks
 			CM.histEndSeen = true
-			log(string.format("HIST: end of history (%s lines announced)", tostring(line:match(" n=(%d+)"))))
+			local hole = tonumber(line:match(" hole=([%d%.]+)"))
+			if hole then
+				CM.histHole = hole
+				log(string.format("!! HIST: the host had pruned its history at or below %.1f -- commands stamped between our save and that never reach this game. THIS GAME IS FORKED from here; a resync is the only repair", hole))
+			end
+			log(string.format("HIST: end of history (%s lines announced, %d received)", tostring(line:match(" n=(%d+)")), CM.histGot or 0))
 		end
 	elseif op == "LSCMD" then
 		local c = decodeCmd(line)
 		if c and c.hist then
-			if c.hfor ~= K.INSTANCE then c = nil end   -- someone else's catch-up
+			if c.hfor ~= K.INSTANCE then c = nil   -- someone else's catch-up
+			else CM.histProgressAt = CM.ticks; CM.histGot = (CM.histGot or 0) + 1 end
 		elseif c and c.origin ~= K.INSTANCE then
 			CM.histPush(line, c.at)
 		end
@@ -966,6 +1112,8 @@ end
 
 function CM.pollEvents()
 	if not CM.resyncHold then CM.histPump() end
+	if CM.ticks % 32 == 0 then pcall(CM.sentPrune) end
+	if CM.ticks % 64 == 0 then pcall(CM.histPrune) end
 	if not K.EVENTS_FILE then return end
 	local data, newOff = CM.readFrom(K.EVENTS_FILE, CM.eventsOffset)
 	CM.eventsOffset = newOff

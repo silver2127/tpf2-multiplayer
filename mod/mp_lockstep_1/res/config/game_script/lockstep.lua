@@ -330,11 +330,15 @@ end
 
 -- cu=1 on our heartbeat: catching up, or far behind the leader, so nobody
 -- paces against our clock. Never on the leader: it IS the clock.
+-- Also from the FIRST heartbeat after a load until the load gate has the
+-- command history since our save (CM.lgFetch, pacing.lua): the leader prunes
+-- its history only while nobody is catching up, and a game that has just
+-- loaded is about to ask for it.
 function CM.heartbeatCu(now)
 	if CM.isLeader() then CM.farBehind = false; return false end
 	local ref = CM.leaderPrecise() or CM.peerFastPrecise()
 	CM.farBehind = (ref ~= nil) and (ref - now) > K.CATCHUP_MIN
-	return (CM.catchingUp2 or CM.farBehind) and true or false
+	return (CM.catchingUp2 or CM.farBehind or (CM.lgFetch ~= nil and CM.lgFetch ~= "done")) and true or false
 end
 
 function CM.peerBounds()
@@ -537,7 +541,9 @@ K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
 K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
 K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
 K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
-K.CMD_RING = 256          -- own commands kept for resend
+-- Own commands are kept for resend until every live peer has acknowledged them
+-- (ak= on the heartbeat, net.lua CM.sentPrune) -- no count (K.CMD_RING, 256,
+-- until 2026-09-16), and the history answers what the ring no longer holds.
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
 K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
 -- How close a peer's node must be to a shipped demolish endpoint to be
@@ -901,10 +907,12 @@ function data()
 				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
 				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
 				-- hc= our world hash's cost in ms, which the leader sets the hash cadence by
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+				-- ak= what we hold of each origin, contiguously (its sent ring prunes by this)
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
 					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
 					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
-					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.hashCostReport and CM.hashCostReport() or "", CM.resyncToken))
+					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.hashCostReport and CM.hashCostReport() or "",
+					CM.ackReport and CM.ackReport() or "", CM.resyncToken))
 			end
 
 			CM.paceTick(now)
@@ -1211,11 +1219,18 @@ function data()
 		save = function()
 			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
 			local ok, st = pcall(CM.cmSaveState)
+			-- savedAt: the sim time this save was taken at, EXACTLY. A game that loads
+			-- it asks the host for every command stamped after it (the load gate's
+			-- LSNEED ... save=1, pacing.lua): a clock read after a few ticks of play
+			-- would skip the commands stamped in between (a hole), a clock read too
+			-- early would replay commands the save already holds (a double build).
 			return { cm = ok and st or nil, vposOff = CM.vposSaveState and CM.vposSaveState() or nil,
-			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil }
+			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
+			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
 			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and tonumber(s.savedAt) and CM.savedAt == nil then CM.savedAt = tonumber(s.savedAt) end
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
 			if type(s) == "table" and s.hashGrid and CM.hashGridLoad then pcall(CM.hashGridLoad, s.hashGrid) end

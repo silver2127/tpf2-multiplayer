@@ -296,22 +296,47 @@ CM.lineDistance = lineDistance
 -- NEWEST recent list it is at most one change away from (one click is one change:
 -- an add, a removal or a re-set); failing that, the closest, newest first.
 -- Newest first keeps "remove the stop just added" a removal, not a no-op.
+--
+-- RETAINED UNTIL THE LINE'S EDITS DRAIN, NOT BY COUNT OR AGE (2026-09-16). The
+-- lists were kept 12 deep and only the last 8 game units of them: a burst of
+-- 13+ quick clicks, or one slower than that, had a click's true base evicted
+-- and merged against the wrong list -- a stop list the player never made. A
+-- list can be the editor's base for as long as an edit of this line is still
+-- on its way: queued for its stamp (any origin), waiting on its line, or sent
+-- by us and not yet confirmed by the engine (CM.lineSent, cleared by the
+-- updateLine callback -- not by a 3-unit clock). Once nothing is in flight the
+-- editor shows the entity, and the last update's before/after lists cover an
+-- editor one refresh behind; everything older is dropped then.
 function CM.lineHistNote(key, stops, alts)
 	if not key then return end
 	CM.lineHist = CM.lineHist or {}
 	local h = CM.lineHist[key] or {}
 	h[#h + 1] = { stops = stops or "", alts = alts or "", t = CM.gameTime() or 0 }
-	while #h > 12 do table.remove(h, 1) end
 	CM.lineHist[key] = h
 end
+-- an edit of `key` still on its way somewhere?
+function CM.lineEditsInFlight(key)
+	for _, c in ipairs(CM.queue or {}) do
+		if c.op == "LUPDATE" and c.key == key then return true end
+	end
+	for _, c in ipairs(CM.retryQueue or {}) do
+		if c.op == "LUPDATE" and c.key == key then return true end
+	end
+	if CM.lineSent and CM.lineSent[key] then return true end
+	return false
+end
+function CM.lineHistTrim(key)
+	local h = CM.lineHist and CM.lineHist[key]
+	if not h or #h <= 2 then return end
+	if CM.lineEditsInFlight(key) then return end
+	CM.lineHist[key] = { h[#h - 1], h[#h] }
+end
 function CM.lineBaseFor(key, clickS, snap)
+	CM.lineHistTrim(key)
 	local cands = {}
 	if snap and snap.stops then cands[#cands + 1] = snap end
-	local now = CM.gameTime() or 0
 	local h = (CM.lineHist or {})[key] or {}
-	for k = #h, 1, -1 do
-		if now - (h[k].t or 0) <= 8 then cands[#cands + 1] = h[k] end
-	end
+	for k = #h, 1, -1 do cands[#cands + 1] = h[k] end
 	local best, bestD
 	for _, cand in ipairs(cands) do
 		local d = lineDistance(cand.stops, clickS)
@@ -322,23 +347,30 @@ function CM.lineBaseFor(key, clickS, snap)
 end
 
 -- The newest update for `key` that may not show on the entity yet: one still
--- queued (any origin), or one of ours captured in the last few game units.
+-- queued (any origin) or waiting on its line, or one of ours the engine has not
+-- confirmed yet (CM.lineSentDone).
 function CM.linePending(key)
 	local best
-	for _, c in ipairs(CM.queue or {}) do
+	local function consider(c)
 		if c.op == "LUPDATE" and c.key == key and c.stops then
 			local at, bat = tonumber(c.at) or 0, best and (tonumber(best.at) or 0) or nil
 			if not best or at > bat or (at == bat and (tonumber(c.seq) or 0) > (tonumber(best.seq) or 0)) then best = c end
 		end
 	end
+	for _, c in ipairs(CM.queue or {}) do consider(c) end
+	for _, c in ipairs(CM.retryQueue or {}) do consider(c) end
 	if best then return best end
-	local sent = CM.lineSent and CM.lineSent[key]
-	if sent and ((CM.gameTime() or 0) - (sent.t or 0)) < 3 then return sent end
-	return nil
+	return CM.lineSent and CM.lineSent[key] or nil
 end
 function CM.noteLineSent(key, stops, alts)
 	CM.lineSent = CM.lineSent or {}
 	CM.lineSent[key] = { stops = stops, alts = alts, t = CM.gameTime() or 0 }
+end
+-- the engine answered our own update (success or not): that list is no longer
+-- on its way; a failed one is lost and the next click builds on the entity
+function CM.lineSentDone(key, stops)
+	local sent = CM.lineSent and CM.lineSent[key]
+	if sent and sent.stops == stops then CM.lineSent[key] = nil end
 end
 
 function CM.primeLineKeys()
@@ -497,20 +529,20 @@ end
 -- (move_path_util_common) and the assignment was simply lost -- the "set line
 -- in a batch never arrived" case (2026-09-08). Retry on the SAME deterministic
 -- step cadence the VLINE paths use (advanced from the AGREED stamp, never local
--- game-time) so every peer retries on identical steps, then give up loudly.
+-- game-time) so every peer retries on identical steps. FOR AS LONG AS IT TAKES
+-- (2026-09-16): the 30-try cap dropped the op when a big batch bound its lines
+-- slowly -- a limit on how much a player may do at once. Nothing here can tell
+-- "not yet" from "never"; the wait costs one queue entry and a log line at
+-- tries 1, 10 and every 100th, and every instance waits identically.
 local function retryLineDep(c)
 	c.tries = (tonumber(c.tries) or 0) + 1
-	if c.tries <= 30 then
-		c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
-		CM.retryQueue = CM.retryQueue or {}
-		CM.retryQueue[#CM.retryQueue + 1] = c
-		if c.tries == 1 or c.tries % 10 == 0 then
-			log(string.format("%s seq=%s: line key %s not bound yet -- retry %d (step %d)",
-				tostring(c.op), tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep))
-		end
-	else
-		log(string.format("%s seq=%s: line key %s never bound after %d tries -- dropped (DIVERGENCE)",
-			tostring(c.op), tostring(c.seq), tostring(c.key), c.tries))
+	c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+	CM.retryQueue = CM.retryQueue or {}
+	CM.retryQueue[#CM.retryQueue + 1] = c
+	if c.tries == 1 or c.tries == 10 or c.tries % 100 == 0 then
+		log(string.format("%s seq=%s: line key %s not bound yet -- retry %d (step %d)%s",
+			tostring(c.op), tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep,
+			c.tries >= 100 and "; if its LCREATE failed here this line is missing on this game (DIVERGENCE)" or ""))
 	end
 end
 
@@ -520,6 +552,8 @@ function CM.execLine(c)
 	-- decoded (LCREATEX); the old read-back path ships armed=0 and is skipped here.
 	if c.origin == K.INSTANCE and (not K.STRICT_OPS[c.op] or tonumber(c.armed or 1) == 0) then
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
+		-- the native update is on the entity: that list is no longer on its way
+		if c.op == "LUPDATE" then CM.lineSentDone(c.key, c.stops) end
 		return
 	end
 	if c.origin == K.INSTANCE then
@@ -575,6 +609,7 @@ function CM.execLine(c)
 				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s step=%d +%d ticks",
 					tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.key), n, tostring(success),
 					CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
+				if c.origin == K.INSTANCE then CM.lineSentDone(c.key, c.stops) end
 			end)
 		elseif c.op == "LDELETE" then
 			local lid = CM.lineIdFor(c.key)

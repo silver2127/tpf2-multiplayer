@@ -534,19 +534,20 @@ function CM.execVehCmd(c)
 		if c.key and not vehIdFor(c.key) then haveAll = false end
 		if not haveAll then
 			c.tries = (c.tries or 0) + 1
-			if c.tries <= 30 then
-				-- advance by a FIXED number of steps from this command's own
-				-- (agreed) target, never from local game-time: the retry schedule
-				-- is then the same sim-steps on every instance
-				c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
-				CM.retryQueue = CM.retryQueue or {}
-				CM.retryQueue[#CM.retryQueue + 1] = c
-				if c.tries == 1 or c.tries % 10 == 0 then
-					log(string.format("VLINE seq=%s: vehicle key not bound yet -- retry %d (step %d)", tostring(c.seq), c.tries, c.notBeforeStep))
-				end
-				return
+			-- advance by a FIXED number of steps from this command's own
+			-- (agreed) target, never from local game-time: the retry schedule
+			-- is then the same sim-steps on every instance. FOR AS LONG AS IT
+			-- TAKES (2026-09-16): the 30-try cap left a vehicle unassigned when a
+			-- big batch's buys drained one per tick for longer than that -- a limit
+			-- on how many vehicles a player may buy at once. Only a buy that failed
+			-- here never binds, and that is already a missing vehicle on this game.
+			c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+			CM.retryQueue = CM.retryQueue or {}
+			CM.retryQueue[#CM.retryQueue + 1] = c
+			if c.tries == 1 or c.tries == 10 or c.tries % 100 == 0 then
+				log(string.format("VLINE seq=%s: vehicle key %s not bound yet -- retry %d (step %d)%s", tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep,
+					c.tries >= 100 and "; if its buy failed here this vehicle is missing on this game (DIVERGENCE)" or ""))
 			end
-			log(string.format("VLINE seq=%s: vehicle key never bound after %d tries -- left unassigned (DIVERGENCE)", tostring(c.seq), c.tries))
 			return
 		end
 	end
@@ -580,26 +581,23 @@ function CM.execVehCmd(c)
 			-- failed).
 			if id and not line then
 				c.tries = (tonumber(c.tries) or 0) + 1
-				if c.tries <= 20 then
-					-- DETERMINISTIC retry step from the AGREED stamp, never local
-					-- game-time: rewriting c.at to nowG+1 put the retry on a
-					-- different sim-step on each instance, so a vehicle that needed
-					-- one retry left the depot a step apart on host and peers -- the
-					-- "vehicles left at different times" drift (2026-09-08). Matches
-					-- the vehicle-key retry above. NOT straight back onto `queue`:
-					-- the pump rebuilds that table (`queue = keep`) and would discard
-					-- the append; the retry list is merged in, and the seq forgiven,
-					-- at the top of the next pump.
-					c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
-					CM.retryQueue = CM.retryQueue or {}
-					CM.retryQueue[#CM.retryQueue + 1] = c
-					if c.tries == 1 or c.tries % 10 == 0 then
-						log(string.format("VLINE seq=%s: line %s not here yet -- retry %d (step %d)",
-							tostring(c.seq), tostring(c.line), c.tries, c.notBeforeStep))
-					end
-				else
-					log(string.format("VLINE seq=%s: line %s never arrived -- vehicle %s left unassigned (DIVERGENCE)",
-						tostring(c.seq), tostring(c.line), tostring(c.key)))
+				-- DETERMINISTIC retry step from the AGREED stamp, never local
+				-- game-time: rewriting c.at to nowG+1 put the retry on a
+				-- different sim-step on each instance, so a vehicle that needed
+				-- one retry left the depot a step apart on host and peers -- the
+				-- "vehicles left at different times" drift (2026-09-08). Matches
+				-- the vehicle-key retry above. NOT straight back onto `queue`:
+				-- the pump rebuilds that table (`queue = keep`) and would discard
+				-- the append; the retry list is merged in, and the seq forgiven,
+				-- at the top of the next pump. No try cap (it was 20, 2026-09-16):
+				-- a line still on its way through a big batch is not a lost one.
+				c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+				CM.retryQueue = CM.retryQueue or {}
+				CM.retryQueue[#CM.retryQueue + 1] = c
+				if c.tries == 1 or c.tries == 10 or c.tries % 100 == 0 then
+					log(string.format("VLINE seq=%s: line %s not here yet -- retry %d (step %d)%s",
+						tostring(c.seq), tostring(c.line), c.tries, c.notBeforeStep,
+						c.tries >= 100 and string.format("; if its LCREATE failed here vehicle %s stays unassigned on this game (DIVERGENCE)", tostring(c.key)) or ""))
 				end
 				return
 			end

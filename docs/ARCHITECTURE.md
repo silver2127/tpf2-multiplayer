@@ -88,10 +88,19 @@ Game frames are best-effort in the lobby layer. Above it:
   chunked lines in order. It tracks one remote sender at a time, though, and with three or more
   players one bridge socket hears several senders through the lobby, so its ordering and resends
   cannot be relied on there. The mod's own layer is what recovers lost commands.
-- **Per-sender sequence numbers in the mod.** Every sender keeps its last 256 lines. A receiver
-  that sees a gap in a sender's sequence sends `LSNACK` after 15 ticks and again every 30 ticks
-  (up to 10 times); the heartbeat's `hi=` field exposes a lost last command. The leader also
-  answers for other senders from its history ring (4,096 lines).
+- **Per-sender sequence numbers in the mod.** Every sender keeps each of its lines until every
+  live peer has acknowledged past it (the heartbeat's `ak=` field: per origin, the seq through
+  which that game holds every command). A receiver that sees a gap in a sender's sequence sends
+  `LSNACK` after 15 ticks and again every 30 ticks (up to 10 times); the heartbeat's `hi=` field
+  exposes a lost last command. The leader also answers for other senders from its history.
+- **The command history is retained by need, not by count.** Every instance keeps every command
+  it hears. What a joiner can ask for is bounded by the save it loads (everything stamped at or
+  before the save's step is inside it), and every save handed to a joiner is at least as new as
+  the last, so once a joiner reports the stamp of the save it loaded (`LSNEED ... save=1`) and the
+  whole lobby roster is heard with nobody catching up, everything at or before that stamp is
+  pruned. Until then it is kept in full and its size logged every 4,096 lines. A request for
+  history that was pruned is answered with what is left and `hole=` on `LSHISTEND`, logged loudly
+  on both ends.
 - **Duplicates are harmless:** a command's `at|origin|seq` is remembered (2,048 entries).
 
 ## Pacing and game speed
@@ -115,14 +124,20 @@ Game frames are best-effort in the lobby layer. Above it:
   closes. Fractional speeds are written to `tpf2_speed.txt`; the bridge's speed hook scales
   the engine's sim batch interval to match, so every iteration stays an ordinary sim step and
   the game's speed buttons never flip.
-- **Load gate.** After loading, a follower holds at speed 0 until it hears the leader (or the
-  expected number of players), so nobody starts ahead. The leader never waits. The gate gives up
-  after 900 ticks.
+- **Load gate.** After loading, a follower holds at speed 0 until it hears the leader and then
+  until it has the command history since the save it loaded (`LSNEED t=<the save's stamp> save=1`,
+  the same feed a hot joiner gets; the stamp rides in the save as `savedAt`). A game that finishes
+  loading after the session moved on therefore takes the hot-join path and misses nothing. There
+  is no tick budget: the request is repeated whenever the feed stalls for ~5 s. The leader never
+  waits. The player's override is two play presses: the first is put back and names what is
+  missing, the second starts and logs that what the others did meanwhile lands out of step.
 - **Catch-up.** A follower more than 8 units behind the leader asks it for the command history
-  after its clock (`LSNEED`), holds until the history is complete, then runs at up to 4x until it
-  is within half a unit. Meanwhile its heartbeat carries `cu=1` so nobody paces against it. The
-  leader never catches up: it is the clock. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md#lockstep-and-pacing)
-  for pacing rules that do not always behave as described.
+  after its clock (`LSNEED`), holds until the history is complete (re-asking whenever the feed
+  stalls, never running on without it), then runs at up to 4x until it is within half a unit.
+  Meanwhile its heartbeat carries `cu=1` so nobody paces against it -- from its first heartbeat
+  after a load until the gate has its history. The leader never catches up: it is the clock. See
+  [KNOWN_ISSUES.md](KNOWN_ISSUES.md#lockstep-and-pacing) for pacing rules that do not always
+  behave as described.
 - **Far behind, actions are off.** A stamp pays at most 15 units of lead over the fastest game, so
   a game more than 15 units behind it would stamp its player's actions into the others' past. Until
   it is back within 2 units, `inject.lua` drops every capture the slice cancelled (`ARMED 1`, and
