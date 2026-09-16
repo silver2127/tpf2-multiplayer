@@ -1431,14 +1431,17 @@ function data()
 					CM.dashShowChat = (CM.dashShowChat ~= false)
 					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", function()
+					-- Hiding is one thing done from two places: this button and the
+					-- window's own title-bar "x" (below). Both write the flag the
+					-- menu DLL's Ctrl+Shift+D reads, so the next chord SHOWS it.
+					local function hideDash()
 						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
-						if f then
-							f:write("0\n"); f:close()
-							D.shown = false
-							D.win:setVisible(false, false)
-						end
-					end))
+						if f then f:write("0\n"); f:close() end
+						D.shown = false
+						if D.win then D.win:setVisible(false, false) end
+					end
+					D.hideDash = hideDash
+					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", hideDash))
 					tog:addItem(toggleBtn("  lobby  ", function()
 						CM.dashShowLobby = not CM.dashShowLobby
 						D.lobbyBox:setVisible(CM.dashShowLobby, false)
@@ -1709,6 +1712,13 @@ function data()
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
 					D.win:setPosition(20, 120)
+					-- The title-bar "x" (2026-09-16): a Window has no close behaviour
+					-- of its own, so the button did nothing. Closing is hiding (the
+					-- window is rebuilt from D on every refresh and must survive),
+					-- and it goes through the same flag as the hide button, or the
+					-- poll below would put it straight back.
+					pcall(function() D.win:addHideOnCloseHandler() end)
+					pcall(function() D.win:onClose(function() D.hideDash() end) end)
 				end
 				-- A column with a fresh local file shows everything. A peer known only
 				-- over the wire shows what we know of it: its game time, our skew to
