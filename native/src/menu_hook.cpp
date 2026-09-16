@@ -483,7 +483,11 @@ static void ModDownloadPreference(bool save) {
 }
 
 // lobby model (fed from lobby_out.jsonl)
-static char g_players[200][40]; static int g_playerCount = 0;
+// Player and lobby names (2026-09-16: longer names). A Steam persona is up to 32
+// characters, in UTF-8 up to 96 bytes; the panel takes 64 typed characters.
+#define NAME_MAX 128
+#define NAME_TYPED_MAX 64
+static char g_players[200][NAME_MAX]; static int g_playerCount = 0;
 static int  g_companies[200];   // company id per roster entry (1..200), 0 = unset -> 1
 // Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
 static COLORREF coColor(int cid)
@@ -504,7 +508,7 @@ static void originName(int idx, char* out)
     if (idx < 26) { out[0] = (char)('a' + idx); out[1] = 0; return; }
     idx -= 26; out[0] = (char)('a' + (idx / 26) % 26); out[1] = (char)('a' + idx % 26); out[2] = 0;
 }
-static char g_you[40] = ""; static char g_host[40] = ""; static char g_lobbyTitle[40] = "";   // the lobby's name, from the roster
+static char g_you[NAME_MAX] = ""; static char g_host[NAME_MAX] = ""; static char g_lobbyTitle[NAME_MAX] = "";   // the lobby's name, from the roster
 static volatile LONG g_lobbyRelay = 0;   // the host is a relay-only server: "host" in the roster is the LEADER (oldest joiner)
 static char g_letters[200][3];           // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
@@ -769,8 +773,8 @@ static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, siz
 #define MW_YOU    RGB(150, 210, 170)
 static char g_joinCode[256] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
 static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
-static char g_username[40] = "";   // the player name (random two-word default, see ensureUsername)
-static char g_lobbyName[40] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
+static char g_username[NAME_MAX] = "";   // the player name (random two-word default, see ensureUsername)
+static char g_lobbyName[NAME_MAX] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
 static int  g_userLen = 0;
 static void ensureUsername();
 static void SaveNames();
@@ -779,7 +783,7 @@ static void SaveNames();
 // every launch (the persona can change), a typed one is kept as typed. Clearing
 // the field and pressing Enter goes back to Steam.
 static bool g_userAuto = true;
-static char g_steamName[40] = "";
+static char g_steamName[NAME_MAX] = "";
 static bool SteamPersonaName(char* out, size_t cap)
 {
     HMODULE h = GetModuleHandleW(L"steam_api64.dll"); if (!h) return false;
@@ -811,12 +815,12 @@ static void LoadNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
     FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: follow Steam from now on
-    char line[128]; bool sawAuto = false, sawPlayer = false;
+    char line[512]; bool sawAuto = false, sawPlayer = false;
     while (fgets(line, sizeof(line), f)) {
         char* e = line + strlen(line); while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
         char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
-        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, 30); sawPlayer = true; }
-        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, 36); }
+        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, NAME_MAX - 1); sawPlayer = true; }
+        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, NAME_MAX - 1); }
         else if (!strcmp(line, "auto")) { sawAuto = true; g_userAuto = v[0] == '1'; }
     }
     fclose(f);
@@ -840,7 +844,7 @@ static void SteamNameTick()
     ULONGLONG now = GetTickCount64();
     if (now < next) return;
     next = now + (g_steamName[0] ? 30000 : 2000);
-    char n[40];
+    char n[NAME_MAX];
     if (!SteamPersonaName(n, sizeof(n))) return;
     if (strcmp(n, g_steamName) != 0) { strcpy_s(g_steamName, n); Log("[menu] steam persona: %s\n", n); }
     if (!g_userAuto || InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3) return;   // typed, or being typed right now
@@ -858,7 +862,7 @@ static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itsel
 // HOST/JOIN page is up; rows render below the password field and a click
 // drops the row's code into the join field. The list is what hosts chose to
 // publish (see _Publisher in lobby.py); nothing here talks to a host directly.
-struct PubRow { char name[48]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
+struct PubRow { char name[NAME_MAX]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
 static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
@@ -1081,7 +1085,7 @@ static void RenderPanelLayer(int w, int h)
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
         int titleW = S(90);
-        { wchar_t wt[64] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, 48); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
+        { wchar_t wt[NAME_MAX + 16] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, NAME_MAX); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
           mwTitle(wt); HFONT ft = mkLato(S(18)); titleW = textW(wt, ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
             // ROOM CODE, DELIBERATELY NOT RENDERED.
@@ -1115,7 +1119,7 @@ static void RenderPanelLayer(int w, int h)
         mwHeader(pad, cy, listW, whdr);
         HFONT fr = mkLato(S(14)), fs = mkLato(S(11));
         for (int i = 0; i < n && i < ROSTER_ROWS; i++) {
-            wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, 64);
+            wchar_t wn[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, NAME_MAX);
             bool isYou = strcmp(g_players[i], g_you) == 0, isHost = strcmp(g_players[i], g_host) == 0;
             int ry = cy + S(30) + i * S(26);
             // company chip: colour + number; click your own (the host: anyone's) to cycle 1..16
@@ -1195,7 +1199,7 @@ static void RenderPanelLayer(int w, int h)
         // NOT ensureUsername() here: this runs every frame, so emptying the name
         // field made the next frame roll a new random name before anything could be
         // typed (2026-09-11). An empty name is filled only on HOST/JOIN or Enter.
-        { char def[64];
+        { char def[NAME_MAX + 48];
           if (g_username[0]) snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
           else snprintf(def, sizeof(def), "Your game  (click to name the lobby)");
           wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
@@ -1716,14 +1720,14 @@ static void OnHit(int id)
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game list…"); break;
     case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
-        int i = id - 40; char code[256] = ""; char name[48] = ""; bool locked = false;
+        int i = id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
         if (code[0]) { strcpy_s(g_joinCode, code); g_joinLen = (int)strlen(g_joinCode); InterlockedExchange(&g_joinFocus, 1);
                        char st[200]; snprintf(st, sizeof(st), locked ? "%s's game needs its password: type it below, then JOIN GAME." : "%s's code is filled in -- press JOIN GAME.", name); SetStatus(st); }
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
     case 28: case 29: case 30: case 31: case 32: case 33: case 34: case 35: {   // company chip
-        int i = id - 20; char name[40] = ""; int cur = 1;
+        int i = id - 20; char name[NAME_MAX] = ""; int cur = 1;
         if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < g_playerCount) { strcpy_s(name, g_players[i]); cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
         // cycle: the next company id somebody already uses, then one brand-new id, then back to 1
         bool used[MAX_COMPANIES + 2] = {}; int maxUsed = 0;
@@ -2443,7 +2447,7 @@ static void applyRoster(const char* s)
         if (pa && end) { const char* q = pa;
             while (g_playerCount < MAX_PLAYERS) {
                 q = strchr(q, '"'); if (!q || q > end) break; q++;
-                int k = 0; while (*q && *q != '"' && k < 38) g_players[g_playerCount][k++] = *q++;
+                int k = 0; while (*q && *q != '"' && k < NAME_MAX - 1) g_players[g_playerCount][k++] = *q++;
                 g_players[g_playerCount][k] = 0; g_playerCount++;
                 if (*q == '"') q++;
             } } }
@@ -2452,11 +2456,11 @@ static void applyRoster(const char* s)
     for (int i = 0; i < g_playerCount; i++) {
         g_companies[i] = 1;
         if (!co) continue;
-        char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+        char keyq[NAME_MAX + 8]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
         const char* k = strstr(co, keyq);
         if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
     }
-    char v[40];
+    char v[NAME_MAX];
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
     jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
@@ -2467,7 +2471,7 @@ static void applyRoster(const char* s)
     { const char* lm = strstr(s, "\"letters\"");
       if (lm && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
           for (int i = 0; i < g_playerCount; i++) {
-              char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+              char keyq[NAME_MAX + 8]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
               const char* k = strstr(lm, keyq);
               if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; int j = 0; while (*k && *k != '"' && j < 2) g_letters[i][j++] = *k++; g_letters[i][j] = 0; } }
           }
@@ -2751,13 +2755,13 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char lobby[48]; };
+struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; char lobby[NAME_MAX]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
     g_transportLobby[0]=0;
-    wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
+    wchar_t wname[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, NAME_MAX);
     wchar_t cmd[4096];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
     // the target machine); fall back to `python lobby.py` when only the scripts are there.
@@ -2795,8 +2799,8 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     else {
         // the public list: always tell the lobby where the master server is (the
         // PUBLIC checkbox can be flipped later, in the lobby); --public starts listed
-        wchar_t wpub[560] = L"";
-        { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, 48); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
+        wchar_t wpub[560 + NAME_MAX] = L"";
+        { wchar_t wl[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, NAME_MAX); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
@@ -3274,7 +3278,7 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
         if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && nameField) {
             // player name: one word (it is a bare --name argument); lobby name: words, digits, ' - _ .
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = focus == 3 ? 24 : 36;
+            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = NAME_TYPED_MAX;
             if (vk == VK_BACK) { if (*len > 0) { buf[--*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
             else if (vk == VK_RETURN) {
                 if (focus == 3) {
