@@ -596,7 +596,22 @@ local function logLaneDiff(dm, dt)
 		local other = dt:match("(" .. name .. "[^,]*)")
 		if other and other ~= comp then
 			if name ~= "t" then diffLanes[#diffLanes + 1] = name end
-			if name == "p" then
+			if name == "r" then
+				-- r<count>:<names in entity-id order>/<names sorted>
+				local an, ah, as = comp:match("^r(%d+):([^/]+)/(.+)$")
+				local bn, bh, bs = other:match("^r(%d+):([^/]+)/(.+)$")
+				if an and bn and as ~= bs then
+					log(string.format("   -> train names differ: %s vs %s trains, name hash %s vs %s "
+						.. "-- the native patch ranks trains BY NAME, so the two games "
+						.. "will let trains through a junction in different orders", an, bn, as, bs))
+				elseif an and bn and ah ~= bh then
+					log(string.format("   -> train names MATCH (%s trains) but sit in a different "
+						.. "entity-id order (%s vs %s) -- the name ranking agrees, its id "
+						.. "tie-break may not", an, ah, bh))
+				else
+					log(string.format("   -> r DIFFERS: %s vs %s", comp, other))
+				end
+			elseif name == "p" then
 				-- vehicles: only a difference if both looked at the same sim time
 				local tm, tp = comp:match("@([%-%d%.]+):"), other:match("@([%-%d%.]+):")
 				if tm and tp and tm ~= tp then
@@ -666,6 +681,42 @@ function CM.compareOne(stamp, origin, theirs, dt)
 						end
 					end
 				end
+			end
+		end
+	end
+	-- TRAIN NAMES AS A DESYNC OF THEIR OWN. The verdict hash covers geometry;
+	-- names are not in it, and two peers whose trains are named differently have
+	-- identical geometry right up to the moment the native reservation-order
+	-- patch -- which ranks trains BY NAME to decide who reserves a junction
+	-- first (native/src/slice_hook.cpp, "TRAIN RESERVATION ORDER") -- sends them
+	-- through in different orders. SYNC, SYNC, SYNC, and then the worlds are
+	-- apart with nothing in the log. So this lane is compared on EVERY stamp,
+	-- not only once something else has already gone wrong.
+	--
+	-- Two stamps before it counts, like the town lane: a rename travels as a
+	-- command and the instances apply it a stamp apart, which shows up as a
+	-- difference at one sample and nothing at the next. A peer too old to send
+	-- the lane simply has no r: in its detail, and the comparison is skipped.
+	do
+		local dm = CM.myDetails[stamp]
+		if dm and dt then
+			local as = dm:match("r%d+:[^/,]+/([^,]+)")
+			local bs = dt:match("r%d+:[^/,]+/([^,]+)")
+			CM.trainNameStreak = CM.trainNameStreak or {}
+			if as and bs and as ~= bs then
+				CM.trainNameStreak[origin] = (CM.trainNameStreak[origin] or 0) + 1
+				if CM.trainNameStreak[origin] == 1 then
+					log(string.format("~~ train names differ t=%d vs %s: %s vs %s (waiting a stamp for a rename to settle)",
+						stamp, origin, as, bs))
+				elseif CM.trainNameStreak[origin] == 2 then
+					CM.dashVerdict = "DESYNC train names vs " .. tostring(origin)
+					CM.noteDesync(CM.dashVerdict, stamp)
+					log(string.format("!! DESYNC (train names) t=%d vs %s: %s vs %s (persisted) -- trains are "
+						.. "ranked by name, so the two games will let them through a junction in "
+						.. "different orders -- total %d", stamp, origin, as, bs, CM.desyncs))
+				end
+			elseif as and bs then
+				CM.trainNameStreak[origin] = 0
 			end
 		end
 	end
