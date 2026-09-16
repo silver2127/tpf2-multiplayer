@@ -80,5 +80,21 @@ class Updates(unittest.TestCase):
         with patch.object(updater, "fetch", return_value=json.dumps(release).encode()), self.assertRaises(ValueError):
             updater.latest("0.4.23")
 
+    def test_four_part_bugfix_versions_order_after_their_feature(self):
+        # 0.x = major feature, 0.x.y = minor feature, 0.x.y.z = bugfix (2026-09-16)
+        self.assertLess(updater.version("0.5.7"), updater.version("0.5.7.1"))
+        self.assertLess(updater.version("0.5.7.1"), updater.version("0.5.7.2"))
+        self.assertLess(updater.version("0.5.7.9"), updater.version("0.5.8"))
+        self.assertLess(updater.version("0.5.8"), updater.version("0.6"))
+        release = {"tag_name": "v0.5.7.1", "assets": [{"name": updater.ASSET,
+            "size": 100, "digest": "sha256:" + "a" * 64}]}
+        with patch.object(updater, "fetch", return_value=json.dumps(release).encode()):
+            self.assertEqual(updater.latest("0.5.7")[0], "0.5.7.1")
+            self.assertIsNone(updater.latest("0.5.7.1"))
+            self.assertIsNone(updater.latest("0.5.8"))
+        for bad in ("5", "0.5.7.1.2", "0.5.7.", "v0.5.7.1", "0.5.7a"):
+            with self.assertRaises(ValueError, msg=bad):
+                updater.version(bad)
+
 
 if __name__ == "__main__": unittest.main()

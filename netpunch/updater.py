@@ -21,7 +21,9 @@ REQUIRED = {"tpf2_bridge_mp.dll", "tpf2_menu.dll", "tpf2_slice.dll",
 
 
 def version(value):
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}", value):
+    # 0.x = a major feature, 0.x.y = a minor one, 0.x.y.z = a bugfix (2026-09-16):
+    # two to four parts. Tuples compare part by part, so 0.5.7 < 0.5.7.1 < 0.5.8 < 0.6.
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,5}(\.[0-9]{1,5}){1,3}", value):
         raise ValueError("Invalid release version")
     return tuple(map(int, value.split(".")))
 

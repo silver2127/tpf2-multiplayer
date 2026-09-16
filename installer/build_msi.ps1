@@ -44,7 +44,7 @@ After building, extract the MSI with msiexec /a into a temp folder and list it.
 Pass --acceptEula wix7 to wix for this run.
 
 .PARAMETER Version
-Package version (three-part). Defaults to the contents of installer\VERSION, which
+Package version (0.x.y, or 0.x.y.z for a bugfix). Defaults to the contents of installer\VERSION, which
 is the single source of truth for what a release is called -- every 0.1.x MSI up to
 2026-08-30 shipped as ProductVersion 0.1.0 because this defaulted to a literal, so
 Windows showed the same version for every build and could not tell an upgrade from
@@ -71,7 +71,11 @@ if (-not $Version) {
     $vf = Join-Path $PSScriptRoot "VERSION"
     if (-not (Test-Path $vf)) { throw "installer\VERSION is missing and no -Version was given" }
     $Version = (Get-Content $vf -Raw).Trim()
-    if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "installer\VERSION does not contain a three-part version: '$Version'" }
+    # 0.x (a major feature), 0.x.y (a minor one) or 0.x.y.z (a bugfix). Windows
+    # Installer wants at least three parts and ignores a fourth when it compares
+    # versions; AllowSameVersionUpgrades in Package.wxs is what lets 0.5.7.1 install
+    # over 0.5.7. A two-part version is padded to 0.x.0 for the package only.
+    if ($Version -notmatch '^\d+\.\d+(\.\d+){0,2}$') { throw "installer\VERSION does not contain a version of two to four parts: '$Version'" }
 }
 $Repo      = Split-Path -Parent $Installer
 $Bridge    = Join-Path $Repo "native"
@@ -195,7 +199,7 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 $wixArgs = @("build") + $eula + @(
     "-arch", "x64",
     "-ext", "WixToolset.UI.wixext",
-    "-d", "ProductVersion=$Version",
+    "-d", "ProductVersion=$(if ($Version -match '^\d+\.\d+$') { "$Version.0" } else { $Version })",
     "-d", "ProxyDll=$proxyDll",
     "-d", "HostDll=$hostDll",
     "-d", "MenuDll=$menuDll",
