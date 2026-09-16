@@ -56,8 +56,13 @@ Replay details for constructions:
   from the payload (the template regenerates them).
 - A cancelled placement builds with `gatherBuildings=true`, so the engine demolishes the
   footprint's town buildings identically everywhere. For the non-cancelled path the originator
-  ships the town buildings it still has nearby ("survivors"), and the replay removes others
-  within 190 m.
+  ships the town buildings it still has nearby ("survivors") together with the radius it gathered
+  them in (`srad`: the construction's bounding box + its street payload + 100 m), and the replay
+  removes the others 10 m inside that radius. No fixed radius and no cap on the removal count: a
+  list whose survivors mostly do not exist on the peer is refused as a `DIVERGENCE`, loudly. The
+  street payload pairs with its construction by identity (the entity's frozen nodes, or for a
+  cancelled placement the record parked right before it), never by distance; an unclaimed
+  payload is logged as a `DIVERGENCE`.
 - On failure the replay retries once after clearing the footprint, then asks the originator to
   roll back (`CONFAIL`: it bulldozes its own copy, same file within 1 m).
 - The construction gets a name in the proposal (the shipped one, or "`<town> <type>`"), which
