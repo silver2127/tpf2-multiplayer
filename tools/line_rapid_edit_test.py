@@ -13,8 +13,15 @@ an update "applies" the way execLine records it (the list before and after it).
   - click 3 built from the EMPTY list after click 1 applied: all three stops, none lost
   - click 4 built from the one-stop list: four stops
   - removing the stop just added (nothing waiting): a removal, not a no-op
+  - A BURST OF 14 (2026-09-16): the engine's confirmations lag the whole burst, the editor
+    never refreshes past the first stop, and every click is built from that one-stop list.
+    The bases used to be kept 12 deep and 8 game units back, so from the 8th click on the
+    true base was gone and the merge shipped a list the player never made. Bases are now
+    kept until the line's edits drain (nothing queued, nothing unconfirmed); once they do,
+    only the last update's before/after lists remain.
 
     python tools/line_rapid_edit_test.py
+    TPF2_LINES_LUA=<path> python tools/line_rapid_edit_test.py   # another lines.lua (an older build)
 """
 import os
 import sys
@@ -24,8 +31,9 @@ import lupa.lua52 as lupa
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MP = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp")
+LINES_LUA = os.environ.get("TPF2_LINES_LUA") or os.path.join(MP, "lines.lua")
 LID = 108664
-POS = {107158: 10, 107161: 20, 107164: 30, 107167: 40}
+POS = {107158 + 3 * i: 10 * (i + 1) for i in range(16)}   # station group -> x
 
 fails = []
 
@@ -52,8 +60,9 @@ def runtime(inject_path):
     L.globals().package.path = os.path.join(REPO, "mod/mp_lockstep_1/res/scripts/?.lua").replace("\\", "/") + ";" + L.globals().package.path
     g = L.globals()
     g.INJECT_SRC = open(os.path.join(MP, "inject.lua"), encoding="utf-8").read()
-    g.LINES_SRC = open(os.path.join(MP, "lines.lua"), encoding="utf-8").read()
+    g.LINES_SRC = open(LINES_LUA, encoding="utf-8").read()
     g.INJECT = inject_path.replace("\\", "/")
+    g.STATION_POS = " ".join("%d=%d" % kv for kv in POS.items())
     return L.execute(r'''
 local logs, sched = {}, {}
 local function sink()
@@ -69,6 +78,7 @@ local now = 100
 function CM.gameTime() return now end
 function CM.stepOf(t) return math.floor((t or 0) / 0.2 + 0.5) end
 function CM.scheduleLocal(op, args)
+  if CM.resyncHold then return end   -- as the real one: nothing is queued under a resync hold
   CM.seqNo = CM.seqNo + 1
   args.op, args.seq, args.at = op, CM.seqNo, now + 0.8
   sched[#sched + 1] = args
@@ -99,12 +109,14 @@ CM.lineKeyOf[108664] = "b:6"
 function CM.lineKeyFor(lid) return lid == 108664 and "b:6" or nil end
 function CM.lineIdFor(k) return k == "b:6" and 108664 or nil end
 function CM.lineSnapshot(lid) return { name = "Line%201", color = "0.9,0.2,0.2", wait = 180, stops = entity, alts = "" } end
-local P = { [107158] = 10, [107161] = 20, [107164] = 30, [107167] = 40 }
+local P = {}
+for sg, x in STATION_POS:gmatch("(%d+)=(%d+)") do P[tonumber(sg)] = tonumber(x) end
 function CM.stationGroupPos(sg) if P[sg] then return P[sg], 0 end end
 function CM.stationPosInGroup() return nil end
 local H = {}
 function H.poll() CM.pollInject() end
--- apply the oldest waiting update the way execLine records it: the list before, then after
+-- apply the oldest waiting update the way execLine records it: the list before, then after.
+-- The engine's own confirmation (the updateLine callback) is H.confirm: it lags the apply.
 function H.applyNext()
   local c = table.remove(CM.queue, 1)
   if not c then return nil end
@@ -114,10 +126,16 @@ function H.applyNext()
   now = now + 0.4
   return c.seq
 end
+function H.confirm() if CM.lineSentDone then CM.lineSentDone("b:6", entity) end end
 function H.lastStops() local s = sched[#sched]; return s and s.stops end
 function H.nsched() return #sched end
 function H.entity() return entity end
+function H.nbases() local h = CM.lineHist and CM.lineHist["b:6"]; return h and #h or 0 end
+function H.baseFor(stops) local b = CM.lineBaseFor("b:6", stops, { stops = entity, alts = "" }); return b and b.stops end
 function H.logs() return table.concat(logs, "\n") end
+function H.holdResync(on) CM.resyncHold = on or nil end
+function H.sentStops() local s = CM.lineSent and CM.lineSent["b:6"]; return s and s.stops end
+function H.pendingStops() local p = CM.linePending("b:6"); return p and p.stops end
 return H
 ''')
 
@@ -166,6 +184,62 @@ def main():
     # 5. remove the stop just added, nothing waiting: a removal, not a no-op
     click([107158, 107161, 107164])
     check("remove the last stop: three stops scheduled", H.lastStops() == f"{s158};{s161};{s164}", str(H.lastStops()))
+
+    # 6. A BURST OF 14 with the engine's confirmations lagging the whole way: the editor
+    # still shows the one-stop list after click 1, every later click adds one station to
+    # THAT list, and each applies before the next is read.
+    print("== a burst of 14 clicks, nothing confirmed until the end")
+    path = os.path.join(tempfile.mkdtemp(), "lockstep_inject_b.txt")
+    open(path, "wb").close()
+    H = runtime(path)
+
+    def click2(sgs):
+        with open(path, "ab") as f:
+            f.write(("ARMED 1\n" + click_line(sgs) + "\n").encode())
+        H.poll()
+
+    sgs = sorted(POS)[:14]
+    strs = [stop_str(x) for x in sgs]
+    click2([sgs[0]])
+    H.applyNext()
+    burst_ok = True
+    for k in range(1, 14):
+        click2([sgs[0], sgs[k]])                       # built from the stale one-stop list
+        want = ";".join(strs[:k + 1])
+        if H.lastStops() != want:
+            burst_ok = False
+            check(f"click {k + 1} of the burst keeps every earlier stop ({k + 1} stops)", False,
+                  f"got {H.lastStops().count(';') + 1} stop(s); bases kept: {H.nbases()}")
+            break
+        H.applyNext()
+    check("every click of a 14-click burst merged against its true base", burst_ok)
+    check("the line holds all 14 stops", H.entity() == ";".join(strs), f"{H.entity().count(';') + 1} stops")
+    check("no base was evicted while the burst was in flight (28 lists kept)", H.nbases() >= 28, str(H.nbases()))
+    # nothing queued, nothing confirmed yet: the lists stay
+    H.baseFor(";".join(strs[:1] + strs[13:14]))
+    check("still unconfirmed: the lists stay", H.nbases() >= 28, str(H.nbases()))
+    # the engine confirms the last update: the line's edits have drained
+    H.confirm()
+    base = H.baseFor(";".join(strs[:13]))
+    check("drained: a click one stop short of the entity bases on the entity", base == ";".join(strs), str(base))
+    check("drained: only the last update's before/after lists remain", H.nbases() == 2, str(H.nbases()))
+
+    # 7. A CLICK THE SCHEDULER DID NOT QUEUE (a resync hold): it must not be noted as "on
+    # its way", or the next click merges onto a list the player never made and the
+    # phantom pins every base of the line until the next send overwrites it.
+    print("== a click under a resync hold: nothing queued, nothing noted")
+    H.holdResync(True)
+    n = H.nsched()
+    click2([sgs[0]])                                    # would cut the line to one stop
+    check("under a resync hold nothing is scheduled", H.nsched() == n, f"{H.nsched()} vs {n}")
+    check("...and no list is noted as on its way", H.sentStops() is None and H.pendingStops() is None,
+          f"sent={H.sentStops()} pending={H.pendingStops()}")
+    check("...loudly", "b:6 was not queued (a resync hold, or no clock yet)" in H.logs())
+    check("...and the line's bases are not pinned by it", H.nbases() == 2, str(H.nbases()))
+    H.holdResync(False)
+    click2(sgs[:13])                                    # remove the last stop, built from the entity
+    check("the next click builds on the entity, not on the phantom list: 13 stops",
+          H.lastStops() == ";".join(strs[:13]), f"{H.lastStops().count(';') + 1} stop(s)")
 
     print()
     if fails:
