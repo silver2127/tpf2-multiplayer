@@ -1292,7 +1292,7 @@ static void RenderPanelLayer(int w, int h)
           mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
         { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
           if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
-          mwCheck(lx, cy + S(130), L"SEPARATE COMPANIES (each player their own; off = one company together)", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
+          mwCheck(lx, cy + S(128), L"SEPARATE COMPANIES (each player their own)", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
         mwHeader(rx, cy, colW, L"JOIN A GAME");
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
@@ -1300,7 +1300,7 @@ static void RenderPanelLayer(int w, int h)
         mwCheck(rx + S(150), cy + S(98), L"Auto-accept mod downloads", g_flagShareMods==1, 19);
         // The mod has to be on in the shared save: without it nothing replicates,
         // and START GAME refuses such a save (2026-09-10). Said up front here.
-        mwBody(pad, cy + S(136), w - 2 * pad, S(20), L"Everyone needs the Transport Fever 2 Multiplayer mod, and the shared save must have it enabled.");
+        mwBody(rx, cy + S(134), colW, S(20), L"The shared save must have the Multiplayer mod enabled.");
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
         mwHeader(pad, cy + S(162), S(260), L"YOUR NAME");
@@ -1311,7 +1311,7 @@ static void RenderPanelLayer(int w, int h)
         // ---- PUBLIC GAMES: the server browser (OpenTTD style) ----
         if (g_flagMaster[0]) {
             int ly = cy + S(230); int lw = w - 2 * pad;
-            mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row to fill in its code, then JOIN GAME");
+            mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row, then JOIN GAME");
             { int rb = mwButtonW(L"REFRESH"); mwButton(w - pad - rb, ly - S(4), rb, S(30), L"REFRESH", 12); }
             ly += S(26);
             PubRow rows[8]; int cnt = 0; char note[96] = "";
