@@ -26,9 +26,13 @@ static bool Hook(void* rep, const Result* source) {
         std::string line;
         if (std::getline(in, line) && line.size()==32 && line.find_first_not_of("0123456789abcdef")==std::string::npos) {
             token=line;
-            unsigned count=0;
+            // No entry or line cap: the registry lists every Workshop mod this
+            // player downloaded through multiplayer (modshare.request_catalogue
+            // writes it whole), and a row is a Workshop id plus a folder path of
+            // any length the OS allows. Until 2026-09-16 the 129th entry or a
+            // 4 KB row rejected the ENTIRE registry. A malformed row still does,
+            // loudly (below).
             while (std::getline(in,line)) {
-                if (++count>128 || line.size()>4096) throw std::runtime_error("registry limit");
                 auto tab=line.find('\t');
                 if (tab==std::string::npos) throw std::runtime_error("registry row");
                 auto id=line.substr(0,tab);

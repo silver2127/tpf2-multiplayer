@@ -31,6 +31,7 @@ bool PauseAndDrain(const std::string& id) {
 }
 bool Poll(Event& e) { std::lock_guard<std::mutex> l(eventMutex); if(events.empty())return false; e=events.front();events.pop();return true; }
 bool HasWorld(){return true;} bool Busy(){return false;} bool SetActionsHeld(bool){return true;}
+void WorkThreads(DWORD& ui,DWORD& command){ui=GetCurrentThreadId();command=0;}
 }
 #include "CONTROL_CPP"
 std::string read(const char* path) {std::ifstream f(path);return std::string(std::istreambuf_iterator<char>(f),{});}
@@ -48,6 +49,11 @@ int main() {
     Sleep(300);
     assert(read(event).find("old acknowledgement")!=std::string::npos);
     assert(read("tpf2_native_status.txt").find("event_published=0")!=std::string::npos);
+    // the liveness fields the lobby reads: this thread's CPU time (the stub's
+    // "UI thread"), no command thread yet, the process's IO counters
+    { auto status=read("tpf2_native_status.txt");
+      assert(status.find("\ncpu_ui=")!=std::string::npos && status.find("\ncpu_command=0\n")!=std::string::npos);
+      assert(status.find("\nio_read=")!=std::string::npos && status.find("\nio_write=")!=std::string::npos); }
     CloseHandle(held);
     waitFor([&]{return read(event).find("step=paused\nsuccess=1")!=std::string::npos;});
     assert(pauses==1); // completion was repeated, never the engine command

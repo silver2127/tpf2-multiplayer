@@ -242,6 +242,9 @@ BEGIN_INTERVAL = 0.2        # host re-sends 'fbegin' this often until a peer is 
 RESEND_AFTER = 0.5          # if a peer's facks go silent this long, rewind its send
                             # cursor and re-stream the window (recovers lost facks).
 PEER_XFER_TIMEOUT = 30.0    # no forward progress for this long -> skip that peer.
+FINALIZE_SLICE = 8 << 20    # a receiver hashes and writes its completed save in these steps,
+                            # reporting each in its facks; a slow disk moves one in well under a second
+_UNSET = object()           # "no verify progress reported yet" (a reported None must differ from it)
 MAX_NACK = 128              # holes a receiver reports per fack (rest next round).
 DRAIN_CAP = 2048            # inbound datagrams a joiner drains per loop iteration.
 HOST_DRAIN = 128            # inbound datagrams the host drains per ready cycle.
@@ -1087,6 +1090,30 @@ def _read_save_files(save_path):
     return blob, files_meta
 
 
+def _keepalive_sweep(peers, now, drop_after, transfers, log):
+    """The host's keepalive eviction: the addresses of the peers to drop --
+    silent for longer than ``drop_after`` and NOT mid-transfer. A peer that
+    is receiving a save is judged by the transfer's own PEER_XFER_TIMEOUT,
+    never by the lobby keepalive: a joiner verifying and writing a 1 GB save
+    on an HDD (plus a mod unzip) went quiet for longer than DROP_AFTER and
+    was evicted mid-transfer, which failed the transfer for everyone
+    (2026-09-16). Such a peer is logged once (drop_deferred) until it is
+    heard from again."""
+    dead = []
+    for a, p in peers.items():
+        if now - p["last"] <= drop_after:
+            p.pop("drop_deferred", None)
+            continue
+        if _mid_transfer(a, *transfers):
+            if not p.get("drop_deferred"):
+                p["drop_deferred"] = True
+                log(f"[host] {p['name']} silent for {now - p['last']:.0f} s but mid-transfer "
+                    "-- not dropped (the transfer's own timeout decides)")
+            continue
+        dead.append(a)
+    return dead
+
+
 def _mid_transfer(addr, *transfers):
     """True while ``addr`` is an ACTIVE target of any of the given
     _HostSaveTransfer objects (None entries are skipped). The host's keepalive
@@ -1252,12 +1279,18 @@ class _HostSaveTransfer:
         elif base >= self.total_chunks:
             # Everything is delivered and the receiver is verifying and
             # writing it (a 1 GB save on an HDD, then a mod unzip). Its facks
-            # keep coming while it works (base = total, "verifying": true),
-            # and that IS progress: the 30 s no-advance timeout used to fail
-            # exactly the peers that had the whole file and were busiest with
-            # it (2026-09-16). Silence -- no facks at all -- still times out.
-            p["last_advance"] = now
-            self.progress_at = now
+            # keep coming while it works (base = total, "verifying": true,
+            # "progress": bytes hashed/written/unpacked so far), and a MOVED
+            # progress count is progress: the 30 s no-advance timeout used to
+            # fail exactly the peers that had the whole file and were busiest
+            # with it (2026-09-16). A fack whose count has not moved is not:
+            # a worker stuck in a disk hang or a wedged unzip would otherwise
+            # hold transfer[0] (and every resync) open for ever.
+            mark = msg.get("progress")
+            if mark != p.get("verify_progress", _UNSET):
+                p["verify_progress"] = mark
+                p["last_advance"] = now
+                self.progress_at = now
         elif base < p["base"]:
             # REWIND: the receiver restarted from scratch (hash mismatch ->
             # whole-file re-request). Without this the host would filter every
@@ -1277,6 +1310,14 @@ class _HostSaveTransfer:
         holes |= {s for s in p["nack"] if s >= p["base"]}
         p["nack"] = sorted(holes)
         self._emit_pct(p)
+
+    def progress_tokens(self):
+        """(member name, token) per receiver, the token changing whenever that
+        receiver's part of the transfer moved: its chunk cursor, its
+        verify/write count, its final state. The host feeds these to the
+        resync barrier per member (sync_lobby.HostRecovery.tick)."""
+        return [(p["name"], "transfer:%s/%s/%s" % (p["base"], p.get("verify_progress", ""), p["state"]))
+                for p in self.peers.values()]
 
     def on_fdone(self, addr, msg):
         p = self.peers.get(addr)
@@ -1463,6 +1504,7 @@ class _ClientSaveReceiver:
         self.preflight = False
         self.save_done = False     # the save round before a mods round verified here
         self.finalizing = False    # a worker thread is verifying/writing the completed transfer
+        self.finalize_progress = 0 # bytes that worker has hashed, written or unpacked so far (read by the loop)
         self._worker = None
         self._results = queue.Queue()
         self.deferred_begin = None # sid of an fbegin held back while finalizing (logged once)
@@ -1797,8 +1839,10 @@ class _ClientSaveReceiver:
             if not self.have[s]:
                 nack.append(s)
             s += 1
-        self._send({"t": "fack", "sid": self.sid, "base": self.base,
-                    "nack": nack, "verifying": self.finalizing})
+        msg = {"t": "fack", "sid": self.sid, "base": self.base, "nack": nack, "verifying": self.finalizing}
+        if self.finalizing:
+            msg["progress"] = self.finalize_progress    # the host times out a count that stops moving
+        self._send(msg)
 
     def _maybe_send_done(self, now=None, force=False):
         # After completion the host may not have heard our fdone (it can be
@@ -1830,6 +1874,7 @@ class _ClientSaveReceiver:
         if self.finalizing:
             return
         self.finalizing = True
+        self.finalize_progress = 0
         approved = None
         if self.kind == "mods":
             approved, self.approved = self.approved, set()   # the yes is used up by this round
@@ -1840,9 +1885,26 @@ class _ClientSaveReceiver:
                                         name=f"{threading.current_thread().name}/save-finalize", daemon=True)
         self._worker.start()
 
+    def _advance(self, count):
+        """WORKER THREAD: another ``count`` bytes hashed, written or unpacked.
+        The loop reads the total into every fack while verifying (an int
+        assignment is atomic; nothing else writes it while the worker runs)."""
+        self.finalize_progress += count
+
+    def _sha256(self, data):
+        """A SHA-256 hex digest computed in FINALIZE_SLICE windows so the
+        count moves while a 1 GB buffer is hashed."""
+        h = hashlib.sha256()
+        for i in range(0, len(data), FINALIZE_SLICE):
+            piece = data[i:i + FINALIZE_SLICE]
+            h.update(piece)
+            self._advance(len(piece))
+        return h.hexdigest()
+
     def _finalize_work(self, job):
         """WORKER THREAD: hash, then write the save or unpack the mods. Touches
-        no receiver state; everything it learns goes into the result."""
+        no receiver state but finalize_progress; everything it learns goes
+        into the result."""
         res = {"sid": job["sid"], "ok": True, "seconds": 0.0}
         t0 = time.time()
         try:
@@ -1853,12 +1915,12 @@ class _ClientSaveReceiver:
                 size = int(meta.get("size", 0))
                 part = view[off:off + size]                  # a window, not a copy
                 off += size
-                if hashlib.sha256(part).hexdigest() != meta.get("sha256"):
+                if self._sha256(part) != meta.get("sha256"):
                     res["ok"] = False
                     break
                 parts[meta.get("name")] = part
             if res["ok"] and job["overall_sha"]:
-                if hashlib.sha256(job["buf"]).hexdigest() != job["overall_sha"]:
+                if self._sha256(view) != job["overall_sha"]:
                     res["ok"] = False
             res["seconds"] = time.time() - t0
             if res["ok"]:
@@ -1872,8 +1934,11 @@ class _ClientSaveReceiver:
                             if not _safe_incoming_name(name):
                                 res["error"] = f"refused: unexpected filename {name!r}"
                                 break
+                            part = parts[name]
                             with open(os.path.join(self.io.dir, name), "wb") as f:
-                                f.write(parts[name])                 # memoryview: no copy
+                                for i in range(0, len(part), FINALIZE_SLICE):
+                                    f.write(part[i:i + FINALIZE_SLICE])   # memoryview: no copy
+                                    self._advance(min(FINALIZE_SLICE, len(part) - i))
                             written.append(name)
                     except OSError as e:
                         res["error"] = f"write error: {e}"
@@ -1991,7 +2056,7 @@ class _ClientSaveReceiver:
                     bad.append(label)
                     continue
             else:
-                st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
+                st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log, progress=self._advance)
             (done if st == "installed" else kept if st == "present" else bad).append(label)
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
         return {"done": done, "kept": kept, "bad": bad, "skipped": skipped, "approved": sorted(approved)}
@@ -3200,24 +3265,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if now - last_drop >= 1.0:
                 last_drop = now
                 frags.expire(now)
-                dead = []
-                for a, p in peers.items():
-                    if now - p["last"] <= drop_after:
-                        p.pop("drop_deferred", None)
-                        continue
-                    if _mid_transfer(a, transfer[0], recovery.transfer if recovery else None):
-                        # A peer that is receiving a save is judged by the
-                        # transfer's own PEER_XFER_TIMEOUT, never by the lobby
-                        # keepalive: a joiner verifying and writing a 1 GB save
-                        # on an HDD (plus a mod unzip) went quiet for longer
-                        # than DROP_AFTER and was evicted mid-transfer, which
-                        # failed the transfer for everyone (2026-09-16).
-                        if not p.get("drop_deferred"):
-                            p["drop_deferred"] = True
-                            log(f"[host] {p['name']} silent for {now - p['last']:.0f} s but mid-transfer "
-                                "-- not dropped (the transfer's own timeout decides)")
-                        continue
-                    dead.append(a)
+                dead = _keepalive_sweep(peers, now, drop_after,
+                                        (transfer[0], recovery.transfer if recovery else None), log)
                 for a in dead:
                     log(f"[host] DROP {a} ({peers[a]['name']}) -- silent")
                     del peers[a]

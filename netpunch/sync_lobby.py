@@ -79,7 +79,6 @@ class HostRecovery:
         self.barrier.revision = int(time.time() * 1000)
         self.transfer = None
         self.transfer_epoch = None
-        self.transfer_progress = None   # the transfer's last progress_at fed to the barrier
         self.seen = collections.deque(maxlen=512)
         self.local_seen = runtime._read('tpf2_sync_request.txt').get('id')
         self.sent = self.available = 0
@@ -215,11 +214,14 @@ class HostRecovery:
             self.barrier.abort(sender, message.get('operation'))
         return True
 
-    def _local_progress(self, token):
-        """The host's own progress -- its engine, or the transfer it drives --
-        counts for the barrier like any member's report."""
+    def _local_progress(self, token, member=None):
+        """The host's own progress -- its engine -- counts for the barrier
+        like any member's report; the transfer it drives is reported per
+        RECEIVING member (``member``), since that is whose part is advancing:
+        the host has long acknowledged 'transferring' itself, and an
+        acknowledged member's reports do not count."""
         if isinstance(token, str) and token:
-            self.barrier.progress(self.barrier.host, dict(
+            self.barrier.progress(member or self.barrier.host, dict(
                 {k: getattr(self.barrier, k) for k in ('operation', 'revision', 'epoch', 'phase')},
                 progress=token))
 
@@ -272,10 +274,10 @@ class HostRecovery:
                     self.transfer.begin_msg.update(operation=self.barrier.operation, epoch=self.barrier.epoch)
                     self.transfer_epoch = self.barrier.epoch
                 self.transfer.pump(now)
-                if self.transfer.progress_at != self.transfer_progress:
-                    # a receiver advanced, or reported that it is verifying: progress
-                    self.transfer_progress = self.transfer.progress_at
-                    self._local_progress('transfer:%s' % (self.transfer.progress_at,))
+                for member, token in self.transfer.progress_tokens():
+                    # a receiver got further, or its verify/write moved on: progress
+                    # for THAT member (the barrier ignores a token it saw before)
+                    self._local_progress(token, member)
                 if self.transfer.failed_names():
                     self.barrier.fail('Snapshot transfer failed')
             except (OSError, ValueError, RuntimeError, AttributeError) as error:

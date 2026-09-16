@@ -139,12 +139,12 @@ class OperationTests(unittest.TestCase):
         self.op.phase = 'holding'                      # a fixed-wait phase never extends
         self.assertFalse(self.progress('client', 'x'))
 
-    def test_saving_and_loading_extend_on_engine_heartbeat(self):
+    def test_saving_and_loading_extend_on_engine_work(self):
         self.both()                                     # -> saving
         self.assertEqual(self.op.phase, 'saving')
         for beat in range(10):
             self.now += 100
-            self.assertTrue(self.progress('host', f'saving:busy@{beat}'))
+            self.assertTrue(self.progress('host', f'saving:engine:cpu_command={beat}'))
             self.op.tick(self.op.members)
             self.assertEqual(self.op.phase, 'saving')
         self.ack('host')                                # -> transferring
@@ -152,12 +152,32 @@ class OperationTests(unittest.TestCase):
         self.assertEqual(self.op.phase, 'loading')
         for beat in range(10):
             self.now += 250
-            self.assertTrue(self.progress('client', f'loading:busy@{beat}'))
+            self.assertTrue(self.progress('client', f'loading:engine:cpu_ui={beat}'))
             self.op.tick(self.op.members)
             self.assertEqual(self.op.phase, 'loading')
         self.now += 300
         self.op.tick(self.op.members)
         self.assertEqual(self.op.error['step'], 'loading')
+
+    def test_an_acknowledged_member_cannot_stand_for_the_others(self):
+        # The host's world is ready and acknowledged; the client's engine is
+        # hung mid-load. Whatever the host's engine reports afterwards
+        # (rendering, idling) is not the client's progress: the phase fails
+        # after SILENCE, it does not stay held for ever.
+        self.transfer()
+        self.both()                                     # -> loading
+        self.assertEqual(self.op.phase, 'loading')
+        self.assertTrue(self.progress('client', 'loading:engine:cpu_ui=1'))
+        self.assertTrue(self.progress('host', 'loading:engine:cpu_ui=1'))
+        self.ack('host')                                # the host's part is done
+        self.assertEqual(self.op.phase, 'loading')
+        self.now += 100
+        self.assertFalse(self.progress('host', 'loading:engine:cpu_ui=2'))
+        self.assertFalse(self.progress('host', 'loading:engine:cpu_ui=3'))
+        self.now += SILENCE['loading'] - 100
+        self.op.tick(self.op.members)
+        self.assertEqual(self.op.phase, 'error')
+        self.assertIn('No progress for 300 s', self.op.error['detail'])
 
     def test_progress_tokens_reset_on_every_phase(self):
         self.transfer()

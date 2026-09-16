@@ -293,7 +293,13 @@ def _decompress_until(path, marker, tail=64):
                 if len(out) >= at + len(marker) + tail:
                     del out[at + len(marker) + tail:]
                     break
-            scanned = len(out)
+                # found, but the tail is not all here yet: search from the
+                # marker again next chunk. Resuming past it (scanned = len(out))
+                # never saw it again and decompressed the WHOLE save into
+                # memory (2026-09-16).
+                scanned = at
+            else:
+                scanned = len(out)
     return bytes(out)
 
 
@@ -418,10 +424,13 @@ def parse_mod_zip_name(name):
     return (mod_id, version) if valid_mod(mod_id, version) else None
 
 
-def install_mod_zip(data, mod_id, version, log=None):
+def install_mod_zip(data, mod_id, version, log=None, progress=None):
     """Unpack one received mod. Returns (status, path): status is
-    'installed', 'present' (left alone), or 'failed'."""
+    'installed', 'present' (left alone), or 'failed'. ``progress(n)`` is
+    told every ``n`` bytes unpacked, so a caller working off its loop can
+    show and report that a long unzip is moving."""
     log = log or (lambda s: None)
+    progress = progress or (lambda n: None)
     if not valid_mod(mod_id, version) or is_dlc(mod_id):
         return "failed", None
     target = install_target(mod_id, version)
@@ -465,6 +474,7 @@ def install_mod_zip(data, mod_id, version, log=None):
                         if not b:
                             break
                         dst.write(b)
+                        progress(len(b))
         if not os.path.isfile(os.path.join(tmp, "mod.lua")):
             raise ValueError("no mod.lua at the top of the zip")
         os.rename(tmp, target)

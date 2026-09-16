@@ -8,10 +8,13 @@ lobby loop so the joiner keeps pinging.
     python tools/test_lobby_limits.py
 """
 import hashlib
+import inspect
 import json
 import os
+import socket
 import struct
 import sys
+import types
 import tempfile
 import time
 import unittest
@@ -238,6 +241,32 @@ class ModList(unittest.TestCase):
             r.on_manifest("garbage")
             self.assertTrue(r.cancelled)
 
+    def test_settings_anchor_short_of_its_tail_is_not_lost(self):
+        """The anchor lands 20 B before the end of a decompressed chunk, so its
+        64 B tail is not in yet. The next search must start AT the anchor:
+        starting past it never saw it again and decompressed the whole save
+        into memory (a repro returned the entire stream, 2026-09-16)."""
+        anchor = modshare.SETTINGS_ANCHOR
+        plain = bytearray(os.urandom(5000))
+        at = 980
+        plain[at:at + len(anchor)] = anchor
+        class Obj:
+            def __init__(self): self.pos = 0
+            def decompress(self, chunk):
+                out = bytes(plain[self.pos:self.pos + 1000])
+                self.pos += 1000
+                return out
+        fake = types.SimpleNamespace(ZstdDecompressor=lambda: types.SimpleNamespace(decompressobj=Obj),
+                                     ZstdError=Exception)
+        with tempfile.TemporaryDirectory() as td, patch.dict(sys.modules, {"zstandard": fake}), \
+                patch.object(modshare, "DECOMPRESS_CHUNK", 1):
+            path = os.path.join(td, "x.sav")
+            with open(path, "wb") as f:
+                f.write(b"z" * 5)                                   # five 1 B reads -> five 1000 B chunks
+            out = modshare._decompress_until(path, anchor)
+        self.assertEqual(len(out), at + len(anchor) + 64)
+        self.assertEqual(out[at:at + len(anchor)], anchor)
+
     def test_registry_has_no_count_cap(self):
         with tempfile.TemporaryDirectory() as td, patch.object(modshare, "data_dir", return_value=td):
             for i in range(300):
@@ -279,6 +308,67 @@ class MidTransfer(unittest.TestCase):
         self.assertFalse(lobby._mid_transfer(addr, None))
         t.peers[addr]["state"] = "done"
         self.assertFalse(lobby._mid_transfer(addr, t))
+
+    def test_host_eviction_loop_keeps_a_silent_mid_transfer_peer(self):
+        """The keepalive sweep run_host runs once a second: a silent peer that
+        is mid-transfer (in either transfer slot) is deferred and logged once,
+        a silent idle peer is dropped, and the deferral ends with the transfer."""
+        t, addr = self.transfer()
+        other = ("10.0.0.9", 7)
+        peers = {addr: {"name": "joiner", "last": 0.0}, other: {"name": "idle", "last": 0.0}}
+        logged = []
+        now = lobby.DROP_AFTER + 5
+        self.assertEqual(lobby._keepalive_sweep(peers, now, lobby.DROP_AFTER, (t, None), logged.append), [other])
+        self.assertTrue(peers[addr]["drop_deferred"])
+        self.assertEqual(len(logged), 1)
+        self.assertIn("mid-transfer", logged[0])
+        # the recovery transfer slot counts the same, and the line is logged once
+        self.assertEqual(lobby._keepalive_sweep(peers, now + 1, lobby.DROP_AFTER, (None, t), logged.append), [other])
+        self.assertEqual(len(logged), 1)
+        # heard again: the deferral clears
+        peers[addr]["last"] = now + 1
+        self.assertEqual(lobby._keepalive_sweep(peers, now + 1, lobby.DROP_AFTER, (t, None), logged.append), [other])
+        self.assertNotIn("drop_deferred", peers[addr])
+        # the transfer resolved: a silent peer is an ordinary silent peer
+        t.peers[addr]["state"] = "done"
+        peers[addr]["last"] = 0.0
+        self.assertEqual(sorted(lobby._keepalive_sweep(peers, now + 30, lobby.DROP_AFTER, (t, None), logged.append)),
+                         sorted([addr, other]))
+        # and run_host's loop is that sweep, over both transfer slots
+        self.assertIn("_keepalive_sweep(peers, now, drop_after", inspect.getsource(lobby.run_host))
+        self.assertIn("(transfer[0], recovery.transfer if recovery else None)", inspect.getsource(lobby.run_host))
+
+    def test_a_verifier_whose_count_stops_moving_times_out(self):
+        """A joiner that has every chunk reports its verify/write count in
+        each fack. A moving count keeps it alive however long the work takes;
+        a count that stops (a disk hang, a wedged unzip) is no progress and
+        the transfer's timeout resolves the peer instead of holding transfer[0]
+        -- and every resync -- open for ever."""
+        t, addr = self.transfer()
+        p = t.peers[addr]
+        total = t.total_chunks
+        def fack(t_, a, progress):
+            t_.on_fack(a, {"t": "fack", "sid": 5, "base": total, "nack": [], "verifying": True, "progress": progress})
+        fack(t, addr, 0)
+        fack(t, addr, 8 << 20)
+        self.assertEqual(p["verify_progress"], 8 << 20)
+        p["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+        fack(t, addr, 8 << 20)                            # the worker stopped moving
+        t.pump(time.time())
+        self.assertEqual(p["state"], "failed")
+        t2, addr2 = self.transfer()
+        p2 = t2.peers[addr2]
+        for i in range(4):                                # a moving count: alive past the timeout, every time
+            p2["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+            fack(t2, addr2, i * 4096)
+            t2.pump(time.time())
+            self.assertEqual(p2["state"], "active")
+        # the barrier hears the same, per receiving member
+        tokens = dict(t2.progress_tokens())
+        self.assertEqual(list(tokens), ["joiner"])
+        self.assertEqual(tokens["joiner"], "transfer:%d/%d/active" % (total, 3 * 4096))
+        t2.on_fdone(addr2, {"t": "fdone", "sid": 5, "ok": True})
+        self.assertEqual(dict(t2.progress_tokens())["joiner"], "transfer:%d/%d/done" % (total, 3 * 4096))
 
     def test_verifying_facks_are_progress_for_the_transfer_timeout(self):
         t, addr = self.transfer()
@@ -332,6 +422,7 @@ class MidTransfer(unittest.TestCase):
                 r.tick(time.time() + 1)
                 facks = [m for m in conn.sent if m["t"] == "fack"]
                 self.assertTrue(facks and facks[-1]["base"] == chunks and facks[-1]["verifying"] is True)
+                self.assertEqual(facks[-1]["progress"], 0)                  # the worker has not started
                 r.on_begin({"sid": 10, "kind": "save", "files": meta, "total_bytes": 1, "total_chunks": 1,
                             "chunk": 1, "sha256": "0" * 64, "mods": []})   # deferred until the worker is done
                 self.assertEqual(r.sid, 9)
@@ -339,6 +430,8 @@ class MidTransfer(unittest.TestCase):
                 r.settle()
             self.assertFalse(r.finalizing)
             self.assertTrue(r.complete and r.save_done)
+            # the count the facks carry moved through both hashes and the write
+            self.assertEqual(r.finalize_progress, 3 * len(blob))
             with open(os.path.join(td, "incoming_save.sav"), "rb") as f:
                 self.assertEqual(f.read(), blob)
             self.assertIn({"type": "save_ready", "name": "incoming_save", "dir": os.path.abspath(td),
@@ -363,6 +456,36 @@ class MidTransfer(unittest.TestCase):
             self.assertEqual(r.base, 0)                                     # re-requested
 
 
+class SendFailures(unittest.TestCase):
+    """A joiner's control message the socket refused is never silent: the
+    punch connection raises it and the lobby's send wrappers log it."""
+
+    def test_a_joiner_send_failure_is_raised_and_logged(self):
+        import punch
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+        conn = punch.Connection(sock, [], listen=True)
+        try:
+            class Refusing:
+                family = socket.AF_INET
+                def fileno(self):
+                    return sock.fileno()                              # the punch thread's select keeps working
+                def sendto(self, data, addr):
+                    raise OSError(10040, "WSAEMSGSIZE")
+            conn.sock = Refusing()
+            conn.peer = ("127.0.0.1", 9)
+            conn._send_to(punch.TYPE_HELLO, b"", conn.peer)           # punch traffic: retried, never raised
+            with self.assertRaises(OSError):
+                conn.send(b'{"t": "join"}')
+            logged = []
+            r = lobby._ClientSaveReceiver(conn, MidTransfer.IO(), logged.append)
+            r._send({"t": "fack", "sid": 1})
+            self.assertTrue(any("send of" in line and "failed" in line for line in logged), logged)
+        finally:
+            conn.sock = sock
+            conn.close()
+
+
 class ProgressPlumbing(unittest.TestCase):
     """The host counts a member's sync_progress and its own transfer's
     progress; a joiner reports progress while a silence-timed phase runs."""
@@ -382,13 +505,32 @@ class ProgressPlumbing(unittest.TestCase):
         self.assertTrue(h.command('p1', dict(ids, t='sync_progress', progress='recv=1')))
         self.assertGreater(h.barrier.deadline, 0)
         h.barrier.deadline = 0
-        h._local_progress('transfer:1')
+        h._local_progress('transfer:1', 'p1')               # the transfer's progress, per receiver
         self.assertGreater(h.barrier.deadline, 0)
         h.barrier.deadline = 0
-        h._local_progress('transfer:1')                    # same token: no
+        h._local_progress('transfer:1', 'p1')               # same token: no
         self.assertEqual(h.barrier.deadline, 0)
-        h._local_progress(Mock())                           # a non-string never counts
+        h._local_progress(Mock(), 'p1')                     # a non-string never counts
         self.assertEqual(h.barrier.deadline, 0)
+        # the host's own engine token counts only until the host has acked
+        h._local_progress('transferring:engine:cpu_ui=1')
+        self.assertGreater(h.barrier.deadline, 0)
+        h.barrier.deadline = 0
+        h.barrier.acks['host'] = {}
+        h._local_progress('transferring:engine:cpu_ui=2')
+        self.assertEqual(h.barrier.deadline, 0)
+        h._local_progress('transfer:2', 'p1')               # a receiver still working does
+        self.assertGreater(h.barrier.deadline, 0)
+        # tick feeds every receiver's transfer token to the barrier under that member's name
+        h.barrier.deadline = None
+        h.barrier.snapshot = None
+        transfer = Mock(progress_tokens=lambda: [('p1', 'transfer:5//active')], failed_names=lambda: [])
+        h.transfer, h.transfer_epoch = transfer, h.barrier.epoch
+        runtime.accept.return_value = False
+        runtime.tick.return_value = None
+        h.tick(1000.0)
+        self.assertGreater(h.barrier.deadline, 0)
+        self.assertEqual(h.barrier.progress_seen.get('p1'), 'transfer:5//active')
 
     def test_client_reports_progress_once_a_second_until_acked(self):
         from unittest.mock import Mock
@@ -396,7 +538,7 @@ class ProgressPlumbing(unittest.TestCase):
         runtime = Mock(state={'operation': 'o', 'revision': 3, 'epoch': 'e', 'phase': 'loading'})
         runtime._read.return_value = {}
         runtime.tick.return_value = None
-        runtime.progress.return_value = 'loading:busy@1'
+        runtime.progress.return_value = 'loading:engine:cpu_ui=1'
         receiver = Mock(recv_count=0, finalizing=False, complete=False)
         c = ClientRecovery(runtime, Mock(), sent.append, receiver)
         c.tick(100.0)
@@ -405,7 +547,7 @@ class ProgressPlumbing(unittest.TestCase):
         prog = [m for m in sent if m.get('t') == 'sync_progress']
         self.assertEqual(len(prog), 2)
         self.assertEqual(prog[0]['phase'], 'loading')
-        self.assertIn('loading:busy@1', prog[0]['progress'])
+        self.assertIn('loading:engine:cpu_ui=1', prog[0]['progress'])
         runtime.state['phase'] = 'holding'                 # a fixed-wait phase: nothing to report
         c.tick(103.0)
         self.assertEqual(len([m for m in sent if m.get('t') == 'sync_progress']), 2)

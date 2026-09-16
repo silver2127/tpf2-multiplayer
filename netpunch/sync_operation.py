@@ -21,10 +21,15 @@ TIMEOUT = {'holding': 45, 'checking': 60, 'releasing': 30}
 # A 1 GB save to a slow uplink is however long it is. What ends them early is
 # SILENCE: no member reported any progress for this long (the same numbers
 # that were the total limits until 2026-09-16, now measured from the last
-# progress report, not from entry). Progress is anything that advances:
-# bytes acknowledged by a receiver, the engine's native busy heartbeat, a
-# save file growing, a member's control stage changing (see
-# SyncParticipant.progress, HostRecovery.tick, ClientRecovery.tick).
+# progress report, not from entry). Progress is anything that advances, by a
+# member that has not finished its part: bytes acknowledged by a receiver
+# (and its verify/write work once it has them all), the engine's own work --
+# CPU time of the thread saving or loading, bytes through the disk -- a save
+# file growing, a member's control stage changing (see SyncParticipant.progress,
+# sync_runtime.engine_work, HostRecovery.tick, ClientRecovery.tick). Never a
+# heartbeat that ticks regardless of the engine, and never a member that has
+# already acknowledged the phase: what that member's engine does afterwards
+# (rendering, idling) says nothing about the members still working.
 SILENCE = {'saving': 120, 'transferring': 300, 'loading': 300}
 
 
@@ -90,8 +95,12 @@ class SyncOperation:
         ``message`` names the operation, revision, epoch and phase like an
         acknowledgement and carries a ``progress`` token; a token that differs
         from the member's previous one moves the silence deadline out again. A
-        repeated token is not progress. Returns True when the deadline moved."""
-        if self.phase not in SILENCE or sender not in self.members:
+        repeated token is not progress, and neither is anything from a member
+        that has already acknowledged this phase: its part is done, so nothing
+        it reports can stand for the members still working (a host rendering
+        away after its own quick install kept a hung joiner's load 'alive').
+        Returns True when the deadline moved."""
+        if self.phase not in SILENCE or sender not in self.members or sender in self.acks:
             return False
         if not isinstance(message, dict):
             return False
