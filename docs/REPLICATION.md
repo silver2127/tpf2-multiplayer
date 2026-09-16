@@ -151,6 +151,21 @@ never by entity id, and compares with the others at common stamps.
   every instance reads from the same save, so no instance hashes on a grid another never reaches.
 - **Verdict.** A match logs `SYNC`. A mismatch logs `~~ LAG n/3` twice (a late hash is not a
   desync), then `!! DESYNC` with the differing lanes named.
+- **A hash is a sample at a sim time, not a property of the stamp** (2026-09-16). The stamp only
+  says which interval the sample fell in; what it describes is the world at the moment it was
+  taken. So a game that ENTERS an interval part way through -- every game does, on the first
+  update after a load, because the clock resumes at the save's own step -- takes its hash (the
+  first one still sets the cadence from the edge count) but does not publish it, and two samples
+  of one stamp taken at different sim times are not compared at all: no verdict, no town streak,
+  no `$$` gaps, logged as `not comparable, skipped`. Until then they were compared, and every hot
+  join reported a desync at its first stamp that was nothing of the kind: on the rig of
+  2026-09-16 the joiner loaded a save taken at sim time 31.4 and published its stamp-0 sample at
+  31.6 against the host's at 1.8, so 30 game units of ordinary town growth showed up as `t: 8899
+  vs 8975`, an edge lane one edge apart and `!! DESYNC t=0`, with both worlds correct. A save is
+  taken from a world that is not simulating (the engine's save blocks the game loop for its whole
+  duration -- "Saving...: 8319 ms", during which `update()` is not called at all and the saving
+  game loses exactly that much game time to its peers), so `savedAt` is the step the file's world
+  is at, and a hot joiner starts from the step it says.
 - **Vehicle drift.** Instances also exchange sampled vehicle positions; a maximum drift over
   10 m between samples taken at the same sim time counts as a desync. The check pairs every
   vehicle with every other, once per player, so it turns off for good the first time a world

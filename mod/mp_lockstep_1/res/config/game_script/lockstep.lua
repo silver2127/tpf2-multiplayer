@@ -751,6 +751,20 @@ local function checkHash(now)
 	-- the first hash (the same on every instance: same save; the base interval
 	-- until then), then whatever the leader's HASHEVERY moved every instance to.
 	local stamp = CM.hashStampOf(now)
+	-- A HASH IS A SAMPLE AT A SIM TIME, not a property of the stamp (2026-09-16).
+	-- The stamp only says which interval the sample fell in; the world it describes
+	-- is the world at `now`. A game that ENTERS an interval part way through --
+	-- every game does, on the first update after a load -- would publish a sample
+	-- from the middle of it under the same stamp as a game that crossed its start,
+	-- and the two are not the same world: the hot join of 2026-09-16 had the host
+	-- sample stamp 0 at 1.8 and the joiner (which loaded a save taken at 31.4) at
+	-- 31.6, 30 game units of town growth apart, and it read as a desync at the very
+	-- first stamp. So a stamp is published only when this game watched its clock
+	-- CROSS it. The hash is still taken (the first one sets the cadence from the
+	-- edge count, hash.lua) and still shown on the dash; it is simply nobody
+	-- else's to compare.
+	local sawCrossing = CM.hashPrevNow ~= nil and CM.hashPrevNow < stamp
+	CM.hashPrevNow = now
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
 	local ph0 = os.clock()
@@ -762,6 +776,11 @@ local function checkHash(now)
 		local pf = CM.perfHash or { n = 0, sum = 0, max = 0 }
 		pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
 		CM.perfHash = pf
+	end
+	if not sawCrossing then
+		CM.dashLastDetail = detail
+		log(string.format("hash t=%d: this game entered that interval at %.1f rather than crossing its start (a load) -- the sample is not comparable with anyone else's and is not published", stamp, now))
+		return
 	end
 	CM.myHashes[stamp] = h
 	CM.myDetails[stamp] = detail
