@@ -12,7 +12,11 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-static const uint32_t MAGIC = 0x34545046;  // protocol 4: process + world-scoped ACKs
+// protocol 4: process + world-scoped ACKs. Protocol 5 (2026-09-15): an event
+// datagram is only as long as its text ("FPT5"); every one used to be a full
+// 1,086 bytes. A protocol-4 bridge would drop the short events by size, so the
+// magic moves with it and a stale DLL fails loudly instead.
+static const uint32_t MAGIC = 0x35545046;
 static const int RESEND_MS = 250;
 
 #pragma pack(push, 1)
@@ -124,8 +128,16 @@ static void SendRaw(uint32_t seq, uint32_t type, const NetEvent* ev,
         std::lock_guard<std::mutex> lk(g_peerMtx);
         peer = g_peer;
     }
-    sendto(g_sock, (const char*)&p, ev ? sizeof(p) : sizeof(Header), 0,
-           (sockaddr*)&peer, sizeof(peer));
+    // A keepalive is the header alone. An event is its chunk header and its text
+    // up to and including the NUL, not the whole 1,024-byte buffer: a heartbeat
+    // line is ~200 bytes on the wire, not 1,086. A text with no NUL (never from
+    // Net_QueueLine) goes out whole, and the receiver refuses it.
+    size_t size = sizeof(Header);
+    if (ev) {
+        size_t n = strnlen(ev->text, NET_CHUNK_TEXT);
+        size += offsetof(NetEvent, text) + (n < NET_CHUNK_TEXT ? n + 1 : NET_CHUNK_TEXT);
+    }
+    sendto(g_sock, (const char*)&p, (int)size, 0, (sockaddr*)&peer, sizeof(peer));
 }
 
 static void ProcessAck(uint32_t sender, uint32_t ack, uint32_t bits)
@@ -312,7 +324,14 @@ static DWORD WINAPI NetThread(LPVOID)
                 // Old data and old ACK-only packets are equally inadmissible.
                 if(memcmp(p.h.world,g_worldEpoch.data(),32)!=0) continue;
                 if (p.h.session == 0 || (p.h.type != 0 && p.h.type != 1)) continue;
-                if (p.h.type == 1 && got != sizeof(Packet)) continue;
+                // An event holds its chunk header and a text that ENDS inside the
+                // datagram (p is zeroed, so nothing past `got` can supply the NUL).
+                // A truncated one is dropped, never delivered as a shorter line; a
+                // full-size one still reads.
+                if (p.h.type == 1) {
+                    const int head = (int)(sizeof(Header) + offsetof(NetEvent, text));
+                    if (got <= head || !memchr(p.ev.text, 0, (size_t)(got - head))) continue;
+                }
                 if (p.h.session == g_session) continue;
                 auto found = g_streams.find(p.h.session);
                 // World changes preserve the complete established cohort, not

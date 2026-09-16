@@ -98,10 +98,13 @@ host, or, if the host has been silent for 12 s, through any peer that has a dire
   bridge's `net.cpp` link and the Lua layer's per-origin sequence numbers with NACK and
   resend (see [ARCHITECTURE.md](ARCHITECTURE.md#reliability)).
 
-The bridge link's packets: a 21-byte header (magic `TPF2`, a per-process session id, sequence
-number, acknowledgement and a 32-bit acknowledgement bitmap, type 0 keepalive or 1 event) and, for
-events, a 1,029-byte body (chunk index, chunk count, up to 1,024 bytes of text). An event packet is
-always 1,050 bytes, well under the lobby's 1,400-byte frame limit. Unacknowledged packets are resent
+The bridge link's packets: a 57-byte header (magic `FPT5`, the world epoch, a per-process session
+id, the session an acknowledgement is for, sequence number, acknowledgement and a 32-bit
+acknowledgement bitmap, type 0 keepalive or 1 event) and, for events, a 5-byte chunk header (type,
+chunk index, chunk count) followed by the chunk's text and its terminating NUL, at most 1,024 bytes.
+A keepalive is 57 bytes and an event 63 to 1,086 bytes, only as long as its text (protocol 5; every
+event used to be a full 1,086 bytes), well under the lobby's 1,400-byte frame limit. A receiver
+drops an event whose text does not end inside the datagram. Unacknowledged packets are resent
 every 250 ms; with more than 512 pending the backlog is dropped; a peer is considered gone after
 10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
 other directly.
