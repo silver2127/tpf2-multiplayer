@@ -430,6 +430,16 @@ end
 -- disk. A hash never parses as a number (the "h" prefix), so decodeCmd
 -- leaves it a string. Empty password = open company.
 CM.cmPw = {}   -- cid -> hash, or nil when open
+-- Company names (2026-09-16): a name is company state, not player-entity
+-- state -- a switch swaps the entities between the human and the AI player,
+-- so a NAME component would follow the wrong company. CMNAME carries it,
+-- every instance stores it here, the save keeps it. Unnamed: "Company N".
+CM.cmName = {}   -- cid -> name
+function CM.cmNameOf(cid)
+	local n = CM.cmName[cid]
+	if n and n ~= "" then return n end
+	return "Company " .. tostring(cid)
+end
 function CM.cmHashPw(cid, pw)
 	pw = tostring(pw or "")
 	if pw == "" or pw == "-" then return nil end
@@ -628,6 +638,8 @@ function CM.cmSaveState()
 	st.origin[K.INSTANCE] = CM.cmMyCompany
 	for cid, h in pairs(CM.cmPw or {}) do st.pw[tostring(cid)] = h end
 	for cid, pid in pairs(CM.cmCompanyPid or {}) do st.pid[tostring(cid)] = pid end
+	st.names = {}
+	for cid, n in pairs(CM.cmName or {}) do st.names[tostring(cid)] = n end
 	return st
 end
 function CM.cmLoadState(st)
@@ -650,6 +662,8 @@ function CM.cmApplySaved()
 	for k, h in pairs(sv.pw or {}) do CM.cmPw[tonumber(k)] = h end
 	CM.cmCompanyPid = {}
 	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid end
+	CM.cmName = {}
+	for k, n in pairs(sv.names or {}) do if type(n) == "string" and n ~= "" then CM.cmName[tonumber(k)] = n end end
 	local want = CM.cmMyCompany   -- the lobby's chip for us (may be nil in coop)
 	if sv.origin and sv.origin[K.INSTANCE] then want = tonumber(sv.origin[K.INSTANCE]) end
 	if not want or not CM.cmRosterHas(want) then want = tonumber(sv.mine) end
@@ -711,7 +725,16 @@ function CM.execCompanyCmd(c)
 		for i = #CM.cmRoster, 1, -1 do if CM.cmRoster[i] == cid then table.remove(CM.cmRoster, i) end end
 		CM.cmCompanyPid[cid] = nil
 		CM.cmPw[cid] = nil
+		CM.cmName[cid] = nil
 		CM.cmNote(string.format("%s dissolved company %d into %d (%d entities, balance %s, loan %s)", tostring(o), cid, intoCid, n, tostring(bf), tostring(lf)))
+	elseif c.op == "CMNAME" then
+		-- name / unname a company: only someone playing it may (like CMPW)
+		if not CM.cmRosterHas(cid) then CM.cmNote("cannot name a company: no company " .. cid); return end
+		local mineCid = (o == K.INSTANCE) and CM.cmMyCompany or CM.cmOriginCompany[o]
+		if mineCid ~= cid then CM.cmNote(string.format("%s cannot name company %d (plays %s)", tostring(o), cid, tostring(mineCid))); return end
+		local name = CM.unescName(c.name or ""):gsub("[%c]", ""):gsub("^%s+", ""):gsub("%s+$", "")
+		CM.cmName[cid] = (name ~= "") and name or nil
+		CM.cmNote(string.format("%s named company %d %s", tostring(o), cid, name ~= "" and ('"' .. name .. '"') or "(unnamed)"))
 	elseif c.op == "CMPW" then
 		-- set / clear a company's password: only someone playing it may
 		if not CM.cmRosterHas(cid) then CM.cmNote("cannot set a password: no company " .. cid); return end

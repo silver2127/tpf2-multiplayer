@@ -2359,6 +2359,24 @@ static void writeCompanyCfg()
     Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3, l4);
 }
 
+// mp_players.txt: "letter=name" per roster entry, with the same letters the
+// bridge ctl and the company cfg use. The in-game dashboard's company picker
+// shows player names instead of origin letters from it (2026-09-16). Written on
+// every roster change so a hot joiner appears by name too.
+static void writePlayerNames()
+{
+    std::string content;
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    for (int i = 0; i < g_playerCount; i++) {
+        content += originLetterFor(g_players[i]); content += '='; content += g_players[i]; content += '\n';
+    }
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_players.txt", g_dataDirW);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0; WriteFile(h, content.c_str(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
+}
+
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
 static void applyRoster(const char* s)
 {
@@ -2426,6 +2444,7 @@ static void applyRoster(const char* s)
     // start path) and catches up on the command history. No button, no
     // pause, no ordering to get right.
     static int lastCount = 0;
+    writePlayerNames();
     bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
     if (isHost && inGame && count > lastCount && lastCount > 0) {
         LONG age = InterlockedCompareExchange(&g_storedAge, 0, 0), mx = InterlockedCompareExchange(&g_storedMax, 0, 0);
