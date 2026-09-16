@@ -706,7 +706,7 @@ function CM.vposShip(stamp)
 	for i = 1, m do
 		local seg = {}
 		for j = (i - 1) * K.VPOS_PER_PART + 1, math.min(i * K.VPOS_PER_PART, #pts) do
-			seg[#seg + 1] = string.format("%.1f,%.1f", pts[j][1], pts[j][2])
+			seg[#seg + 1] = string.format("%.1f,%.1f,%s", pts[j][1], pts[j][2], pts[j][3] or "-")
 		end
 		CM.broadcast(string.format("LSVPOS t=%d s=%.1f o=%s i=%d m=%d n=%d d=%s",
 			stamp, st, K.INSTANCE, i, m, #pts, #seg > 0 and table.concat(seg, ";") or "-"))

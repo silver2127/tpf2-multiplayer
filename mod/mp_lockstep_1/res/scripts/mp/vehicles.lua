@@ -90,6 +90,7 @@ local function vehIdFor(key)
 	if id and CM.primedVeh[id] then return id end
 	return nil
 end
+function CM.vehIdForKey(key) return vehIdFor(key) end   -- the drift check names the vehicle that drifts
 
 -- Prime knownVeh from every player depot once constructions are primed.
 function CM.primeVehKeys()
