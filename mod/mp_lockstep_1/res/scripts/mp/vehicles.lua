@@ -524,7 +524,12 @@ function CM.execVehCmd(c)
 	-- left the vehicle unassigned on the peer while the host assigned it, and a
 	-- setLine on the unresolved id crashed both peers on GetComponentDataIndex
 	-- (2026-09-01). Same retry the "line not here yet" path uses.
-	if c.op == "VLINE" and c.origin ~= K.INSTANCE then
+	-- EVERY instance, the originator included (2026-09-16): its strict buy
+	-- replays like everyone's, so its key binds a tick after the stamp too. The
+	-- originator used to fall through to "unknown vehicle key" and DROP the
+	-- assignment while the peers retried and assigned: seven cloned trucks
+	-- stayed parked on the host and ran on the joiner (a:40..a:46, v64 vs v65).
+	if c.op == "VLINE" then
 		local haveAll = true
 		if c.key and not vehIdFor(c.key) then haveAll = false end
 		if not haveAll then

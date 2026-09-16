@@ -64,7 +64,7 @@ api.cmd = {
 }
 game = setmetatable({}, { __index = function() return sink() end })
 local K = setmetatable({ INSTANCE = "a", PEER = "b", INJECT_FILE = INJECT, STRICT_OPS = { VBUY = true },
-                         BIND_GUARD_STEPS = 10 },
+                         BIND_GUARD_STEPS = 10, VLINE_RETRY_STEPS = 5 },
   { __index = function() return nil end })
 local CM = { peerSeen = true, injectOffset = 0, consByKey = { d = { id = 900 } }, seqNo = 0, ticks = 0 }
 function CM.gameTime() return 100 end
@@ -104,6 +104,16 @@ function H.logs() return table.concat(logs, "\n") end
 function H.clone(cline, key) CM.queueCloneAssign({ seq = 7, origin = "a", at = 100, cline = cline }, key) end
 function H.nretry() return #(CM.retryQueue or {}) end
 function H.retry(i, k) local r = (CM.retryQueue or {})[i]; return r and r[k] end
+-- the originator's own strict VLINE for a key that has not bound yet
+function H.execVLineUnbound()
+  K.STRICT_OPS.VLINE = true
+  local before = #(CM.retryQueue or {})
+  CM.execVehCmd({ op = "VLINE", origin = "a", seq = 40.5, at = 100, key = "a:40", line = "a:87", stop = 0, armed = 1 })
+  local q = CM.retryQueue or {}
+  local last = q[#q]
+  if #q == before + 1 and last and last.key == "a:40" and last.tries == 1 and last.notBeforeStep == 505 then return "retried" end
+  return "dropped"
+end
 return H
 ''')
 
@@ -170,6 +180,15 @@ def main():
     check("queueCloneAssign: due BIND_GUARD_STEPS after the stamp (step 500 + 10)",
           H.retry(1, "notBeforeStep") == 510, str(H.retry(1, "notBeforeStep")))
     check("queueCloneAssign: nothing sent directly", H.nsent() == 0)
+
+    # 7. the ORIGINATOR's strict assignment with a key not bound yet retries like a peer's.
+    # It used to fall through to "unknown vehicle key" and drop the assignment: seven cloned
+    # trucks stayed parked on the host and ran on the joiner (2026-09-16, a:40..a:46).
+    H.clearSent()
+    n0 = H.nretry()
+    check("originator with an unbound key: retried, not dropped",
+          H.execVLineUnbound() == "retried" and H.nretry() == n0 + 1 and "unknown vehicle key" not in H.logs())
+    check("originator with an unbound key: nothing sent to the engine", H.nsent() == 0)
 
     print()
     if fails:
