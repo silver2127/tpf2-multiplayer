@@ -182,9 +182,14 @@ pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compare
 
 1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
    game list).
-2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
-3. Tag the commit `v<version>` and publish `installer\out\TpF2Multiplayer.msi` as a GitHub release asset,
-   with its SHA-256 in the notes.
+2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`. This also
+   builds `installer\out\TpF2Multiplayer-update.zip`; `python tools\updater_test.py` then checks that the
+   in-game updater extracts from the MSI exactly what that zip holds.
+3. Tag the commit `v<version>` and publish `installer\out\TpF2Multiplayer.msi` as the release's ONE asset,
+   with its SHA-256 in the notes. Do not attach the zip: the in-game updater downloads the MSI, extracts its
+   payload by an administrative install into the user's temp folder and installs that as the user-local
+   release ([automatic-updates.md](automatic-updates.md)). The updater needs GitHub's `sha256:` digest on the
+   asset (check the release JSON the first time) and a stable release: a pre-release is not offered.
 4. If the lobby changed, redeploy the relay with `sh tools/relay_deploy.sh` (it refuses while players are
    connected) and the master server with `sh tools/masterserver_deploy.sh`
    ([NETWORKING.md](NETWORKING.md#dedicated-relay)).
