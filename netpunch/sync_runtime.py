@@ -251,6 +251,21 @@ class SyncParticipant:
                 return None
             if ready.get('ok') != '1':
                 raise RuntimeError('Bridge could not clear the previous world')
+            if self.player == self.state['host'] and self.state['mode'] != 'start':
+                # THE HOST KEEPS ITS WORLD (2026-09-16). The snapshot was taken
+                # from this very world while it was held, so reloading it here
+                # only cost the host a full load for nothing. The clients load
+                # the file; the host stays held at the same step -- the shape a
+                # hot join already has (the joiner loads, the host does not) --
+                # and the checking phase still compares its fingerprint with the
+                # freshly loaded ones. Start mode (the host picked a save to load
+                # for everyone) still loads on the host too.
+                lua = self._lua()
+                if lua.get('held') != '1':
+                    return None
+                if self._native('pause', 'paused'):
+                    return self._ack(paused=True, digest=self.snapshot.digest)
+                return None
             if not self._native('load', 'world_ready', basename):
                 return None
             lua = self._lua()
