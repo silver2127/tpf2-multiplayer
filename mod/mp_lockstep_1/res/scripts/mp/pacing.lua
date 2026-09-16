@@ -582,8 +582,25 @@ K.GOV_UP = 1.02          -- per decision while everyone keeps up
 K.GOV_MIN = 0.25         -- never below this fraction of the voted speed: below the slow
                          -- machine's own ceiling, or it can never make up what it lost
 K.GOV_UP_HOLD = 4        -- decisions everyone must keep up before a raise
+-- KILL SWITCH (2026-09-16): a file tpf2mp_governor_off.txt in the data dir turns
+-- the governor off (checked at most every 1.5 s, logged on change). Every town
+-- split of 2026-09-16 happened while the governor held the host at a
+-- fractional speed during a joiner's catch-up; this is the A/B test for it.
+function CM.governorOff()
+	if CM.govOffAt and (CM.ticks - CM.govOffAt) < 8 then return CM.govOff end
+	CM.govOffAt = CM.ticks
+	local f = io.open(K.BASE .. "tpf2mp_governor_off.txt", "r")
+	local off = f ~= nil
+	if f then f:close() end
+	if off ~= CM.govOff then
+		CM.govOff = off
+		log(off and "GOV: off (tpf2mp_governor_off.txt present) -- the session runs at the voted speed" or "GOV: on")
+	end
+	return off
+end
 function CM.governSpeed(now, eff)
 	if not eff or eff <= 0 then CM.govPrevNow, CM.govPrevTick = nil, nil; return eff end
+	if CM.governorOff() then CM.govFactor, CM.govWorst, CM.govWho = 1, 0, nil; return eff end
 	-- our own clock rate, to project a heartbeat forward by its age
 	if CM.govPrevTick and CM.ticks > CM.govPrevTick then
 		local r = (now - CM.govPrevNow) / (CM.ticks - CM.govPrevTick)
