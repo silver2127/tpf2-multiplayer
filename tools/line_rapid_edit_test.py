@@ -78,6 +78,7 @@ local now = 100
 function CM.gameTime() return now end
 function CM.stepOf(t) return math.floor((t or 0) / 0.2 + 0.5) end
 function CM.scheduleLocal(op, args)
+  if CM.resyncHold then return end   -- as the real one: nothing is queued under a resync hold
   CM.seqNo = CM.seqNo + 1
   args.op, args.seq, args.at = op, CM.seqNo, now + 0.8
   sched[#sched + 1] = args
@@ -132,6 +133,9 @@ function H.entity() return entity end
 function H.nbases() local h = CM.lineHist and CM.lineHist["b:6"]; return h and #h or 0 end
 function H.baseFor(stops) local b = CM.lineBaseFor("b:6", stops, { stops = entity, alts = "" }); return b and b.stops end
 function H.logs() return table.concat(logs, "\n") end
+function H.holdResync(on) CM.resyncHold = on or nil end
+function H.sentStops() local s = CM.lineSent and CM.lineSent["b:6"]; return s and s.stops end
+function H.pendingStops() local p = CM.linePending("b:6"); return p and p.stops end
 return H
 ''')
 
@@ -219,6 +223,23 @@ def main():
     base = H.baseFor(";".join(strs[:13]))
     check("drained: a click one stop short of the entity bases on the entity", base == ";".join(strs), str(base))
     check("drained: only the last update's before/after lists remain", H.nbases() == 2, str(H.nbases()))
+
+    # 7. A CLICK THE SCHEDULER DID NOT QUEUE (a resync hold): it must not be noted as "on
+    # its way", or the next click merges onto a list the player never made and the
+    # phantom pins every base of the line until the next send overwrites it.
+    print("== a click under a resync hold: nothing queued, nothing noted")
+    H.holdResync(True)
+    n = H.nsched()
+    click2([sgs[0]])                                    # would cut the line to one stop
+    check("under a resync hold nothing is scheduled", H.nsched() == n, f"{H.nsched()} vs {n}")
+    check("...and no list is noted as on its way", H.sentStops() is None and H.pendingStops() is None,
+          f"sent={H.sentStops()} pending={H.pendingStops()}")
+    check("...loudly", "b:6 was not queued (a resync hold, or no clock yet)" in H.logs())
+    check("...and the line's bases are not pinned by it", H.nbases() == 2, str(H.nbases()))
+    H.holdResync(False)
+    click2(sgs[:13])                                    # remove the last stop, built from the entity
+    check("the next click builds on the entity, not on the phantom list: 13 stops",
+          H.lastStops() == ";".join(strs[:13]), f"{H.lastStops().count(';') + 1} stop(s)")
 
     print()
     if fails:

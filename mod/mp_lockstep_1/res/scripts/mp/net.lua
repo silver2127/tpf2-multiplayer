@@ -31,7 +31,13 @@ end
 -- reported about us yet, nothing is dropped. What this no longer holds, the
 -- leader's history (CM.hist, below) still does: onNack falls back to it.
 function CM.rxAckOf(r)
-	local a = r.ack or r.firstSeq or 0
+	-- From the HIGHER of the last answer and firstSeq. CM.rxAdvance (the NACK
+	-- scan, on ticks no heartbeat falls on) moves firstSeq past every held run
+	-- and nils seen[] behind it, so a walk resumed from a stale r.ack below
+	-- firstSeq found nothing and stalled there for the rest of the session
+	-- (review 2026-09-16: ak=b:3 forever after one scan, every sender's ring
+	-- then grew without bound). seen[] is nil at or below firstSeq by construction.
+	local a = math.max(r.ack or 0, r.firstSeq or 0)
 	local top = math.max(r.maxSeq or 0, r.advMax or 0)
 	while a < top and (r.seen[a + 1] or (r.nackN[a + 1] or 0) >= K.NACK_MAX) do a = a + 1 end
 	r.ack = a
@@ -125,6 +131,7 @@ function CM.rxAdvance(r)
 		if r.missSince then r.missSince[g] = nil end
 		if r.nackAt then r.nackAt[g] = nil end
 		if r.nackN then r.nackN[g] = nil end
+		if r.notOwed then r.notOwed[g] = nil end
 		if r.stamp then r.stamp[g] = nil end
 		if r.holdDone then r.holdDone[g] = nil end
 		r.firstSeq = g
@@ -210,10 +217,12 @@ end
 -- a floor is known, everything is kept and its size logged every 4,096 lines
 -- (~200 B a command: an hour of busy play is about a megabyte).
 CM.hist = {}          -- { at=, line=, o=, seq= } in arrival order
-CM.histIdx = {}       -- "origin:seq" -> entry
+CM.histIdx = {}       -- "origin:seq" -> the NEWEST entry with that origin and seq (what a NACK wants)
+CM.histKeys = {}      -- "at|origin|seq" -> true: exactly what is held (CM.cmdKey's shape)
 CM.histBytes = 0
 CM.histFloor = nil    -- the stamp of the newest save a joiner loaded
 CM.histPrunedTo = nil -- the highest stamp ever pruned: a request below it cannot be served in full
+CM.histFeeds = {}     -- requester letter -> { fr=, S=, lines=, i=, hole=, segs= }: every feed in flight, one per requester
 function CM.histWhyKept()
 	local why = CM.histHold()
 	return why and (" -- kept in full: " .. why) or string.format(" -- prunable at or before %.1f", CM.histFloor or 0)
@@ -221,12 +230,33 @@ end
 function CM.histPush(line, at)
 	local o = line:match("origin=(%a+)")
 	local seq = tonumber(line:match("seq=(%d+)"))
-	local k = o and seq and (o .. ":" .. seq) or nil
-	if k and CM.histIdx[k] then return end   -- a resend of a line we hold
-	local e = { at = at or 0, line = line, o = o, seq = seq }
+	at = at or 0
+	-- A RESEND IS THE SAME LINE: the same origin, seq AND stamp. Origin and seq
+	-- alone are not a command's identity: CM.seqNo lives in memory only and the
+	-- lobby keeps a player's letter, so one who crashes and rejoins restarts at
+	-- seq 1, and its new b:1.. collide with its earlier life's. Keyed by
+	-- origin:seq the second life was dropped here as "a resend" and the next
+	-- joiner was fed a history with a silent hole (review 2026-09-16). Both
+	-- lives are kept and served; the index answers a NACK with the newest.
+	local full = o and seq and (at .. "|" .. o .. "|" .. seq) or nil
+	if full and CM.histKeys[full] then return end
+	local e = { at = at, line = line, o = o, seq = seq }
 	local h = CM.hist
 	h[#h + 1] = e
-	if k then CM.histIdx[k] = e end
+	if full then
+		CM.histKeys[full] = true
+		local k = o .. ":" .. seq
+		local prev = CM.histIdx[k]
+		if prev then
+			CM.histRestarts = CM.histRestarts or {}
+			if not CM.histRestarts[o] then
+				CM.histRestarts[o] = true
+				log(string.format("HIST: %s's seq %d seen again with a new stamp (%.1f, was %.1f) -- %s rejoined and restarted its sequence; both lives are kept and served",
+					o, seq, at, prev.at, o))
+			end
+		end
+		if not prev or at >= prev.at then CM.histIdx[k] = e end
+	end
 	CM.histBytes = CM.histBytes + #line
 	if #h % 4096 == 0 then
 		log(string.format("HIST: %d command(s) retained (%d KB)%s", #h, math.floor(CM.histBytes / 1024), CM.histWhyKept()))
@@ -254,7 +284,7 @@ function CM.histHold()
 	for o, pr in pairs(CM.peers or {}) do
 		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and pr.cu then return o .. " is catching up" end
 	end
-	if CM.histSend then return "a history feed is in flight" end
+	if next(CM.histFeeds) then return "a history feed is in flight" end
 	if CM.catchingUp2 or (CM.lgFetch and CM.lgFetch ~= "done") then return "we are catching up ourselves" end
 	return nil
 end
@@ -270,7 +300,11 @@ function CM.histPrune()
 			keep[#keep + 1] = e; bytes = bytes + #e.line
 		else
 			dropped = dropped + 1
-			if e.o and e.seq then CM.histIdx[e.o .. ":" .. e.seq] = nil end
+			if e.o and e.seq then
+				CM.histKeys[e.at .. "|" .. e.o .. "|" .. e.seq] = nil
+				local k = e.o .. ":" .. e.seq
+				if CM.histIdx[k] == e then CM.histIdx[k] = nil end
+			end
 		end
 	end
 	CM.histPrunedFor, CM.histPrunedAt = F, CM.ticks
@@ -280,24 +314,43 @@ function CM.histPrune()
 	log(string.format("HIST: pruned %d command(s) stamped at or before %.1f (everyone is in and holds a save at least that new) -- %d retained (%d KB)",
 		dropped, F, #keep, math.floor(bytes / 1024)))
 end
--- LSNEED t=S o=L: gather what L is missing, tell it the per-origin ranges
--- (LSHIST), then feed the lines K.HIST_PER_TICK per tick (histPump) and close
--- with LSHISTEND. Only the host serves: it hears everything. A request for
--- history that was pruned is refused LOUDLY: what is left is sent, and the end
--- marker carries hole=<stamp> so the requester knows its world is forked.
+-- LSNEED t=S o=L: gather what L is missing, tell it the per-origin seq ranges
+-- (LSHIST: one line per contiguous run, so an origin that rejoined and
+-- restarted its sequence shows as two runs), then feed the lines (histPump)
+-- and close with LSHISTEND. Only the host serves: it hears everything. A
+-- request for history that was pruned is refused LOUDLY: what is left is
+-- sent, and the end marker carries hole=<stamp> so the requester knows its
+-- world is forked.
+--
+-- ONE FEED PER REQUESTER (2026-09-16). There was a single slot: a second
+-- request replaced the feed in flight, whose requester never saw its end,
+-- re-asked, and replaced the second -- two late loaders on a long history
+-- restarted each other from line 1 forever. Every requester has its own feed;
+-- a requester that asks again for the same stamp while its feed is still going
+-- out is not restarted (its ask was delayed, or our lines have not reached it
+-- yet: restarting from line 1 only pushes the end further away); a request for
+-- a different stamp, or after its feed ended (a lost end marker), is a fresh
+-- feed. The tick's line budget is shared between the feeds in flight, and
+-- every feed moves at least a line a tick, so no requester reads a stall.
 K.HIST_PER_TICK = 40
 function CM.histServe(S, L)
 	if not CM.isLeader() then return end
+	local cur = CM.histFeeds[L]
+	if cur and cur.S == S and cur.i <= #cur.lines then
+		for _, seg in ipairs(cur.segs) do CM.broadcast(seg) end   -- the ranges again, in case the first were lost
+		log(string.format("HIST: %s asked again for everything after %.1f while its feed is at %d of %d -- continuing, not restarting",
+			L, S, cur.i - 1, #cur.lines))
+		return
+	end
 	local lines, per = {}, {}
 	for _, e in ipairs(CM.hist) do
 		if e.at > S then
 			lines[#lines + 1] = e.line
 			local o, seq = e.o, e.seq
 			if o and seq then
-				local r = per[o] or { lo = seq, hi = seq }
-				if seq < r.lo then r.lo = seq end
-				if seq > r.hi then r.hi = seq end
-				per[o] = r
+				local set = per[o]
+				if not set then set = {}; per[o] = set end
+				set[seq] = true
 			end
 		end
 	end
@@ -307,28 +360,57 @@ function CM.histServe(S, L)
 		log(string.format("!! HIST: %s needs every command after %.1f but everything at or before %.1f was pruned (the roster was complete and a joiner had loaded a save taken at %.1f) -- its history has a HOLE; only a resync repairs that",
 			L, S, hole, CM.histFloor or hole))
 	end
-	for o, r in pairs(per) do
-		CM.broadcast(string.format("LSHIST for=%s o=%s from=%d to=%d", L, o, r.lo, r.hi))
+	-- the contiguous runs of each origin's seqs, by origin then seq (numerically:
+	-- the requester marks what lies between two runs as not owed): it tracks gaps inside a run
+	local runs, nOrig = {}, 0
+	for o, set in pairs(per) do
+		nOrig = nOrig + 1
+		local seqs = {}
+		for seq in pairs(set) do seqs[#seqs + 1] = seq end
+		table.sort(seqs)
+		local lo, hi = seqs[1], seqs[1]
+		for i = 2, #seqs do
+			if seqs[i] == hi + 1 then hi = seqs[i]
+			else
+				runs[#runs + 1] = { o = o, lo = lo, hi = hi }
+				lo, hi = seqs[i], seqs[i]
+			end
+		end
+		runs[#runs + 1] = { o = o, lo = lo, hi = hi }
 	end
-	CM.histSend = { fr = L, lines = lines, i = 1, hole = hole }
-	log(string.format("HIST: %s needs everything after %.1f -- %d command(s) from %d origin(s) queued", L, S, #lines, (function() local n = 0; for _ in pairs(per) do n = n + 1 end; return n end)()))
-	if #lines == 0 then CM.broadcast(CM.histEndLine(CM.histSend)); CM.histSend = nil end
+	table.sort(runs, function(x, y) if x.o ~= y.o then return x.o < y.o end return x.lo < y.lo end)
+	local segs = {}
+	for _, run in ipairs(runs) do segs[#segs + 1] = string.format("LSHIST for=%s o=%s from=%d to=%d", L, run.o, run.lo, run.hi) end
+	for _, seg in ipairs(segs) do CM.broadcast(seg) end
+	local hs = { fr = L, S = S, lines = lines, i = 1, hole = hole, segs = segs }
+	CM.histFeeds[L] = hs
+	local prev = CM.histDone and CM.histDone[L]
+	log(string.format("HIST: %s needs everything after %.1f -- %d command(s) from %d origin(s) in %d run(s) queued%s", L, S, #lines, nOrig, #segs,
+		(prev and prev.S == S) and string.format(" (a fresh feed: its last one, %d line(s), ended %d tick(s) ago -- its end marker or lines were lost)", prev.n, CM.ticks - prev.at) or ""))
+	if #lines == 0 then CM.broadcast(CM.histEndLine(hs)); CM.histFeeds[L] = nil end
 end
 function CM.histEndLine(hs)
 	return string.format("LSHISTEND for=%s n=%d%s", hs.fr, #hs.lines, hs.hole and string.format(" hole=%.4f", hs.hole) or "")
 end
 function CM.histPump()
-	local hs = CM.histSend
-	if not hs then return end
-	local n = 0
-	while hs.i <= #hs.lines and n < K.HIST_PER_TICK do
-		CM.broadcast(hs.lines[hs.i] .. string.format(" hist=1 hfor=%s", hs.fr))
-		hs.i = hs.i + 1; n = n + 1
-	end
-	if hs.i > #hs.lines then
-		CM.broadcast(CM.histEndLine(hs))
-		log(string.format("HIST: %d command(s) sent to %s", #hs.lines, hs.fr))
-		CM.histSend = nil
+	local feeds = {}
+	for _, hs in pairs(CM.histFeeds) do feeds[#feeds + 1] = hs end
+	if #feeds == 0 then return end
+	table.sort(feeds, function(x, y) return x.fr < y.fr end)
+	local each = math.max(1, math.floor(K.HIST_PER_TICK / #feeds))
+	for _, hs in ipairs(feeds) do
+		local n = 0
+		while hs.i <= #hs.lines and n < each do
+			CM.broadcast(hs.lines[hs.i] .. string.format(" hist=1 hfor=%s", hs.fr))
+			hs.i = hs.i + 1; n = n + 1
+		end
+		if hs.i > #hs.lines then
+			CM.broadcast(CM.histEndLine(hs))
+			log(string.format("HIST: %d command(s) sent to %s", #hs.lines, hs.fr))
+			CM.histFeeds[hs.fr] = nil
+			CM.histDone = CM.histDone or {}
+			CM.histDone[hs.fr] = { S = hs.S, n = #hs.lines, at = CM.ticks }   -- so a re-ask can say what it repeats
+		end
 	end
 end
 
@@ -804,6 +886,59 @@ function CM.execDelayTick()
 	CM.execDelayCur = cur
 end
 
+-- LSHIST for=us o=o from=lo to=hi: the host's history feed holds o's seqs lo..hi.
+-- Track this origin from the run's first seq, so gaps in the burst are NACKed
+-- and the host answers them from its history. MERGED into what is already
+-- tracked, never a reset (2026-09-16): a range repeated on a re-ask, or heard
+-- after the origin's live heartbeat, keeps seen[] -- nothing held is asked for
+-- twice. A second, higher run for the same origin (its sequence restarted: a
+-- rejoin) leaves the seqs between the runs marked as not owed, since the
+-- history does not hold them; a later run that covers them makes them owed
+-- again. Every seq of a run is owed from the announcement, so a lost line --
+-- the run's tail included, even from an origin that has since gone -- is
+-- NACKed, never silently missing.
+function CM.rxHistRange(o, lo, hi)
+	local r = CM.rx[o]
+	if not r then
+		r = { seen = {}, maxSeq = lo - 1, firstSeq = lo - 1, advMax = lo - 1, missSince = {}, nackAt = {}, nackN = {} }
+		CM.rx[o] = r
+	end
+	r.runs = r.runs or {}
+	for _, run in ipairs(r.runs) do
+		if run.lo == lo and run.hi == hi then return end   -- the same run again (a re-ask): already tracked
+	end
+	r.runs[#r.runs + 1] = { lo = lo, hi = hi }
+	table.sort(r.runs, function(x, y) return x.lo < y.lo end)   -- in any arrival order
+	-- a seq this run covers that lay between two earlier runs is owed after all
+	r.notOwed = r.notOwed or {}
+	for g = lo, hi do
+		if r.notOwed[g] then r.notOwed[g] = nil; r.nackN[g] = nil end
+	end
+	-- what lies between two runs is in none: not in the history, not owed
+	for i = 2, #r.runs do
+		local a, b = r.runs[i - 1], r.runs[i]
+		if b.lo > a.hi + 1 then
+			local n = 0
+			for g = a.hi + 1, b.lo - 1 do
+				if not r.seen[g] and not r.notOwed[g] then r.notOwed[g] = true; r.nackN[g] = K.NACK_MAX; n = n + 1 end
+			end
+			if n > 0 then log(string.format("HIST: %s seq %d..%d are not in the history (its sequence restarted) -- not owed", o, a.hi + 1, b.lo - 1)) end
+		end
+	end
+	if lo - 1 < r.firstSeq then r.firstSeq = lo - 1 end
+	-- every seq of the run is known to exist from here: one the feed does not
+	-- bring (a lost line, or the run's tail from an origin that has since gone
+	-- and advertises nothing) is a gap timed from now, NACKed after the grace
+	-- and answered from the host's history. The scan asks from the feed's
+	-- front, so a long feed costs a few resends of lines that were about to
+	-- arrive anyway -- never a hole.
+	for g = lo, hi do
+		if not r.seen[g] and not r.missSince[g] then r.missSince[g] = CM.ticks end
+	end
+	if hi > (r.advMax or 0) then r.advMax = hi end
+	log(string.format("HIST: expecting %s seq %d..%d", o, lo, hi))
+end
+
 -- the stamp an origin announced for one of its commands (LSHI, or ha= for hi=)
 function CM.rxStampNote(o, seq, at)
 	local r = CM.rx[o]
@@ -1007,12 +1142,7 @@ local function onLine(line)
 			local o = line:match(" o=(%a+)")
 			local lo = tonumber(line:match(" from=(%d+)"))
 			local hi = tonumber(line:match(" to=(%d+)"))
-			if o and lo and hi and o ~= K.INSTANCE then
-				-- track this origin from the first history seq: gaps in the
-				-- burst are NACKed and the host answers them from its ring
-				CM.rx[o] = { seen = {}, maxSeq = lo - 1, firstSeq = lo - 1, advMax = lo - 1, missSince = {}, nackAt = {}, nackN = {} }
-				log(string.format("HIST: expecting %s seq %d..%d", o, lo, hi))
-			end
+			if o and lo and hi and o ~= K.INSTANCE then pcall(CM.rxHistRange, o, lo, hi) end
 		end
 	elseif op == "LSHISTEND" then
 		if line:match(" for=(%a)") == K.INSTANCE then

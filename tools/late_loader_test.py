@@ -7,8 +7,13 @@ does) for one joiner against a stub engine:
     takes (the gate used to give up after 900 ticks)
   - once the leader is in, asks for every command stamped after the SAVE'S stamp
     (LSNEED t=<savedAt> o=b save=1), not after a clock read some ticks into play
-  - re-asks whenever the feed stalls (K.HIST_STALL_TICKS), and releases only when the end
-    marker is in and no gap is left; then the save's own speed is restored
+  - re-asks whenever the feed stalls (K.HIST_STALL_TICKS), and once the end marker is in
+    with no gap left waits for the lobby roster: a member not heard is still loading
+  - releases when every roster member is heard (or the roster shrinks to those heard);
+    then the save's own speed is restored, and the catch-up that follows does not fetch
+    the history the gate just did
+  - the LEADER holds for the roster too; its two-press override logs who is left to
+    catch up
   - its heartbeat says cu=1 from the first tick until then
   - the override is two play presses (the slice's SPEEDBTN or the lever): the first is put
     back with a warning, the second starts and logs what lands out of step
@@ -162,9 +167,22 @@ tick(1, 1251.0)
 check("the end marker with a gap left: still holding", CM.lgHolding is True and CM.lgFetch == "fetch")
 SIM.gaps = 0
 tick(1, 1252.0)
-check("history complete: released at the save's own speed", CM.lgFetch == "done" and CM.lgHolding is False and SIM.lever == 2, f"lever={SIM.lever}")
-check("...and logged", logged("the command history since our save is complete") and logged("-- releasing"))
+check("history complete -- but the roster is 3 and only the leader is heard: still holding",
+      CM.lgFetch == "done" and CM.lgHolding is True and SIM.lever == 0
+      and logged("the command history since our save is complete"), f"lever={SIM.lever}")
+tick(60, 1260.0)
+check("...for as long as that takes, saying who is missing", CM.lgHolding is True and SIM.lever == 0
+      and logged("1 of 2 other roster member(s) not heard yet, still loading (heard: a)"))
+rt.execute('SIM.CM.peers.c = { at = SIM.CM.ticks, hashes = {}, details = {}, streak = 0 }')
+tick(1, 1261.0)
+check("the third member is heard: released at the save's own speed", CM.lgReleased is True and CM.lgHolding is False and SIM.lever == 2, f"lever={SIM.lever}")
+check("...and logged", logged("the history since our save is complete and every roster member is in (a,c) -- releasing"))
 check("nothing was ever given up on", not logged("giving up") and not logged("running anyway"))
+n_asks = len(lua_list(sent("LSNEED")))
+tick(2, 1262.0)
+check("the catch-up that follows does not fetch the gate's history again (runs at once)",
+      len(lua_list(sent("LSNEED"))) == n_asks and CM.cuPhase == "run"
+      and logged("the load gate's history (everything after 1000.0) covers it"), f"asks={len(lua_list(sent('LSNEED')))} phase={CM.cuPhase}")
 
 # ---- the override: two presses (SPEEDBTN) ----
 rt = make()
@@ -213,11 +231,44 @@ check("no stamp in the save: asks after the first clock it read (approximate, an
       len(asks) == 1 and asks[0].startswith("LSNEED t=1000.37") and asks[0].endswith(" o=b save=1")
       and logged("an older build's save carries no stamp"), str(asks))
 
+# ---- the leader holds for the roster, and its override says who is left to catch up ----
+rt = make()
+CM = rt.eval('newInst({ T0 = 1000.0, savedAt = 1000.0, lever = 2, ctl = "players=3\\nleader=b\\n" })')
+tick, sent, logged, SIM = rt.globals().tick, rt.globals().sentMatching, rt.globals().logged, rt.globals().SIM
+tick(1)
+check("the leader (us) holds at the loaded save for the roster", CM.leader == "b" and CM.lgHolding is True and SIM.lever == 0
+      and logged("we are the leader -- the session clock; holding only for roster members still loading"))
+tick(60)
+check("...for as long as that takes, saying who is missing", CM.lgHolding is True
+      and logged("2 of 2 other roster member(s) not heard yet, still loading (heard: nobody)"))
+check("the leader asks for no history", len(lua_list(sent("LSNEED"))) == 0)
+tick(1, 1000.0)                        # a is heard
+tick(12, 1000.0)
+check("one heard, one to go: still holding", CM.lgHolding is True and logged("1 of 2 other roster member(s) not heard yet, still loading (heard: a)"))
+CM.speedButton(2, "button")
+tick(1, 1000.0)
+check("first press: held, with who is missing", CM.lgHolding is True and logged("play pressed while 1 of 2 other roster member(s) not heard yet, still loading (heard: a) -- held"))
+CM.speedButton(2, "button")
+tick(1, 1000.0)
+check("second press: started, logging who is left to catch up", CM.lgHolding is False and CM.lgReleased is True and SIM.lever == 2
+      and logged("!! LOADGATE: started manually at speed 2 while 1 of 2 other roster member(s) not heard yet, still loading (heard: a) -- releasing; 1 roster member(s) left to catch up from the history"))
+
+# ---- a member that leaves while the others load: the roster shrinks and the gate releases ----
+rt = make()
+CM = rt.eval('newInst({ T0 = 1000.0, savedAt = 1000.0, lever = 2, ctl = "players=3\\nleader=b\\n" })')
+tick, sent, logged, SIM = rt.globals().tick, rt.globals().sentMatching, rt.globals().logged, rt.globals().SIM
+tick(2, 1000.0)
+check("leader, roster 3, one heard: holding", CM.lgHolding is True)
+SIM.fs["mem://b/tpf2_bridge_ctl.txt"] = "players=2\nleader=b\n"
+tick(12, 1000.0)                       # the ctl is re-read every ~10 ticks
+check("the roster shrank to those heard: released", CM.lgReleased is True and CM.lgHolding is False and SIM.lever > 0
+      and logged("every roster member is in (a) -- releasing"), f"lever={SIM.lever}")
+
 # ---- the catch-up feed of a live game far behind: bound by progress, never by a clock ----
 rt = make()
 CM = rt.eval('newInst({ T0 = 1000.0, savedAt = 1000.0, lever = 2 })')
 tick, sent, logged, SIM = rt.globals().tick, rt.globals().sentMatching, rt.globals().logged, rt.globals().SIM
-CM.lgFetch = "done"
+CM.lgFetch, CM.lgReleased = "done", True
 tick(1, 1040.0)                        # paceV2 runs the catch-up: 40 behind the leader
 asks = lua_list(sent("LSNEED"))
 r = CM.catchUpTick(SIM.T, 2)

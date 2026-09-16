@@ -24,10 +24,14 @@ K.LOADGATE_MIN_TICKS = 1
 -- hears the leader AND has the command history since its save (CM.lgFetch:
 -- LSNEED ... save=1, the same feed a hot joiner gets), however long that
 -- takes; the feed is re-asked for whenever it stalls (K.HIST_STALL_TICKS),
--- never abandoned. The leader waits for nobody (it is the session clock; a
--- late loader catches up to it). The player's override is two play presses:
--- the first is put back and says who is missing, the second starts and logs
--- what this game will apply out of step.
+-- never abandoned. Then EVERY game, the leader included, holds while a member
+-- of the lobby roster (players= in the bridge ctl, re-read as it changes) has
+-- not been heard: that member is still loading, and holding is what keeps it
+-- from loading into a session that has moved on. The player's override is two
+-- play presses: the first is put back and says who is missing, the second
+-- starts and logs who it leaves to catch up (a late loader still takes the
+-- hot-join path above and loses nothing; the override only decides whether
+-- the others wait for it).
 K.HIST_STALL_TICKS = 30      -- ~5.5 s without a history line: ask again (a request or its end can be lost)
 CM.lgFetch = "wait"          -- "wait" until the leader is heard, "fetch" while the history since our save arrives, "done"
 
@@ -817,14 +821,25 @@ function CM.catchUpTick(now, s)
 	if not CM.catchingUp2 then
 		if behind > K.CATCHUP_MIN then
 			CM.catchingUp2 = true
-			CM.cuPhase = "fetch"
 			CM.cuSince, CM.cuFrom, CM.cuAsks = CM.ticks, now, 1
-			CM.histEndSeen, CM.histProgressAt = false, CM.ticks
-			CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
-			log(string.format("CATCHUP: %.1f unit(s) behind the leader -- holding, asked the host for the command history after %.1f", behind, now))
-			return 0
+			if CM.lgFetchedFrom and now >= CM.lgFetchedFrom - 1e-6 then
+				-- straight out of the load gate: its feed (everything after the save's
+				-- stamp) is this history, and we have been listening since -- asking
+				-- again cost a long history twice (review 2026-09-16)
+				CM.cuPhase = "run"
+				log(string.format("CATCHUP: %.1f unit(s) behind the leader -- the load gate's history (everything after %.1f) covers it; running at %gx",
+					behind, CM.lgFetchedFrom, math.max(K.CATCHUP_SPEED_MAX, CM.effSpeed or 1)))
+				CM.lgFetchedFrom = nil
+			else
+				CM.cuPhase = "fetch"
+				CM.histEndSeen, CM.histProgressAt = false, CM.ticks
+				CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
+				log(string.format("CATCHUP: %.1f unit(s) behind the leader -- holding, asked the host for the command history after %.1f", behind, now))
+				return 0
+			end
+		else
+			return nil
 		end
-		return nil
 	end
 	if CM.cuPhase == "fetch" then
 		local gaps = CM.rxGaps()
@@ -1101,7 +1116,7 @@ end
 local didInitialUnpause = false
 function CM.recoveryReleasePacing(speed)
 	didInitialUnpause = true
-	CM.lgHolding, CM.lgHeld, CM.lgFetch = false, false, "done"   -- a resync starts everyone from one save at one step
+	CM.lgHolding, CM.lgHeld, CM.lgFetch, CM.lgReleased = false, false, "done", true   -- a resync starts everyone from one save at one step
 	CM.myCeiling, CM.effSpeed = speed, speed
 	CM.pidHold, CM.pidI, CM.pidLastE = nil, 0, nil
 	CM.catchingUp2, CM.cuPhase = false, nil
@@ -1158,23 +1173,37 @@ end
 -- needs no watchdog of its own: the player pressing play is a first-class
 -- override, handled by the s ~= 0 branch in ensureRunning below.
 --
--- What it waits for (2026-09-16): the LEADER, and then the command history
--- since the save we loaded. A game that finishes loading after the session
--- has moved on -- the slow machine with the 600 MB save, or a hot joiner --
--- takes exactly the hot-join path: it asks the host for every command stamped
--- after its save (LSNEED t=<savedAt> save=1, served from the host's history)
--- and holds until that history is complete, then plays it through the
--- ordinary queue and catches up (CM.catchUpTick). No roster count, no tick
--- budget: the roster is only consulted to find out that we loaded alone. The
--- leader never waits: it is the session clock.
+-- What it waits for (2026-09-16): the LEADER, then the command history since
+-- the save we loaded, then the ROSTER. A game that finishes loading after the
+-- session has moved on -- the slow machine with the 600 MB save, or a hot
+-- joiner -- takes exactly the hot-join path: it asks the host for every
+-- command stamped after its save (LSNEED t=<savedAt> save=1, served from the
+-- host's history) and holds until that history is complete, then plays it
+-- through the ordinary queue and catches up (CM.catchUpTick, which does not
+-- fetch again what the gate just did). Then every game, the leader included,
+-- holds while a lobby roster member (players= in the bridge ctl, re-read)
+-- has not been heard: it is still loading. No tick budget.
 -- What a game held here misses: nothing. Its bridge started listening when
 -- its script did, so the commands issued while it loaded are exactly the
 -- history the gate fetches; anything issued after arrives live and waits for
 -- its stamp like everywhere else.
 -- Who this can still strand: nobody, unless the player overrides it (two play
--- presses, CM.ensureRunning) -- then the log names what will land out of step.
+-- presses, CM.ensureRunning) -- then the log names who is left to catch up
+-- (the leader's override) or what will land out of step (a joiner's, pressed
+-- before its own history was complete).
 function CM.lgLoadStamp()
 	return tonumber(CM.loadStamp) or tonumber(CM.savedAt) or CM.gameTime() or 0
+end
+-- the lobby roster against the peers heard: how many members are still loading, and who is in
+function CM.lgRosterMissing()
+	local roster = tonumber(CM.rosterPlayers)
+	local heard, names = 0, {}
+	for o, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then heard = heard + 1; names[#names + 1] = o end
+	end
+	table.sort(names)
+	local missing = roster and math.max(0, roster - 1 - heard) or 0
+	return missing, roster, (#names > 0 and table.concat(names, ",") or "nobody")
 end
 function CM.lgAskHistory(why)
 	local S = CM.lgLoadStamp()
@@ -1187,71 +1216,92 @@ function CM.lgAskHistory(why)
 end
 -- one line for the player and the log: what the gate is still waiting for
 function CM.lgWaitingFor()
-	local ld = CM.peers[CM.leader or "a"]
-	local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
-	if not leaderIn then return string.format("the leader (%s) has not been heard", CM.leader or "a") end
-	if CM.lgFetch ~= "done" then
-		local gaps = CM.rxGaps and CM.rxGaps() or 0
-		return string.format("the command history since our save (%.1f) is incomplete: %d line(s) received, end %s, %d gap(s)",
-			CM.lgLoadStamp(), CM.histGot or 0, CM.histEndSeen and "seen" or "not seen", gaps)
+	if not CM.isLeader() then
+		local ld = CM.peers[CM.leader or "a"]
+		local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
+		if not leaderIn then return string.format("the leader (%s) has not been heard", CM.leader or "a") end
+		if CM.lgFetch ~= "done" then
+			local gaps = CM.rxGaps and CM.rxGaps() or 0
+			return string.format("the command history since our save (%.1f) is incomplete: %d line(s) received, end %s, %d gap(s)",
+				CM.lgLoadStamp(), CM.histGot or 0, CM.histEndSeen and "seen" or "not seen", gaps)
+		end
+	end
+	local missing, roster, heard = CM.lgRosterMissing()
+	if missing > 0 then
+		return string.format("%d of %d other roster member(s) not heard yet, still loading (heard: %s)", missing, roster - 1, heard)
 	end
 	return nil
 end
 function CM.loadGateReady()
-	-- THE LEADER NEVER WAITS. It is the session clock: whoever loads later is
-	-- a hot joiner and catches up to it (LSNEED + the history). Holding
-	-- the leader for a roster member whose game is still downloading the save
-	-- froze the leader for minutes (live 2026-09-09, twice).
-	if CM.isLeader() then
-		CM.lgFetch = "done"
-		if not CM.lgAnnounced then CM.lgAnnounced = true; log("LOADGATE: we are the leader -- the session clock waits for nobody") end
-		return true
-	end
-	if CM.lgFetch == "done" then return true end
+	if CM.lgReleased then return true end
 	-- the lobby roster (players=) and the session clock (leader=), re-read every
-	-- ~2 s inside: a relay lobby names another leader when the host leaves
+	-- ~2 s inside: a relay lobby names another leader when the host leaves, and
+	-- the roster shrinks when a member leaves while the others load
 	if CM.speedRequest then pcall(CM.speedRequest) end
-	if tonumber(CM.rosterPlayers) == 1 then
+	if CM.isLeader() then
+		-- the session clock has nothing to catch up with; it still waits for the
+		-- roster below (its override is what lets it start without a slow loader)
+		if CM.lgFetch ~= "done" then
+			CM.lgFetch = "done"
+			log("LOADGATE: we are the leader -- the session clock; holding only for roster members still loading")
+		end
+	elseif tonumber(CM.rosterPlayers) == 1 then
 		CM.lgFetch = "done"
 		log("LOADGATE: loaded alone (roster of one) -- nothing to wait for")
-		return true
-	end
-	local n = CM.livePeers()
-	local ld = CM.peers[CM.leader or "a"]
-	local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
-	if not leaderIn then
-		-- roughly every two seconds, so the player can see WHY it is paused
-		if (CM.ticks % 12) == 0 then
-			log(string.format("LOADGATE: holding at the loaded save -- %s; %d peer(s) heard%s. Press play twice to start without it.",
-				CM.lgWaitingFor(), n, tonumber(CM.rosterPlayers) and string.format(", roster of %d", CM.rosterPlayers) or ""))
+	elseif CM.lgFetch ~= "done" then
+		local n = CM.livePeers()
+		local ld = CM.peers[CM.leader or "a"]
+		local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
+		if not leaderIn then
+			-- roughly every two seconds, so the player can see WHY it is paused
+			if (CM.ticks % 12) == 0 then
+				log(string.format("LOADGATE: holding at the loaded save -- %s; %d peer(s) heard%s. Press play twice to start without it.",
+					CM.lgWaitingFor(), n, tonumber(CM.rosterPlayers) and string.format(", roster of %d", CM.rosterPlayers) or ""))
+			end
+			return false
 		end
-		return false
-	end
-	if CM.lgFetch == "wait" then
-		CM.lgFetch = "fetch"
-		local lt = ld.step and (ld.step * K.SIM_STEP) or ld.time
-		CM.lgAskHistory(string.format("the leader is in at %s", lt and string.format("%.1f", lt) or "?"))
-		return false
-	end
-	-- "fetch": the history since our save is arriving
-	local gaps = CM.rxGaps and CM.rxGaps() or 0
-	if CM.histEndSeen and gaps == 0 then
-		CM.lgFetch = "done"
-		if not CM.lgAnnounced then
-			CM.lgAnnounced = true
-			log(string.format("LOADGATE: the command history since our save is complete (%d line(s)%s) -- releasing", CM.histGot or 0,
+		if CM.lgFetch == "wait" then
+			CM.lgFetch = "fetch"
+			local lt = ld.step and (ld.step * K.SIM_STEP) or ld.time
+			CM.lgAskHistory(string.format("the leader is in at %s", lt and string.format("%.1f", lt) or "?"))
+			return false
+		end
+		-- "fetch": the history since our save is arriving
+		local gaps = CM.rxGaps and CM.rxGaps() or 0
+		if CM.histEndSeen and gaps == 0 then
+			CM.lgFetch = "done"
+			-- what the feed covered: the catch-up that follows must not fetch it again
+			CM.lgFetchedFrom = CM.lgLoadStamp()
+			log(string.format("LOADGATE: the command history since our save is complete (%d line(s)%s)", CM.histGot or 0,
 				CM.histHole and string.format("; !! the host had pruned below %.1f: this game is FORKED", CM.histHole) or ""))
+		else
+			if CM.ticks - (CM.histProgressAt or CM.ticks) > K.HIST_STALL_TICKS then
+				CM.lgAskHistory(string.format("no history line for ~%d s (end %s, %d gap(s))", math.floor(K.HIST_STALL_TICKS / 5.4),
+					CM.histEndSeen and "seen" or "not seen", gaps))
+			end
+			if (CM.ticks % 12) == 0 then
+				log(string.format("LOADGATE: holding at the loaded save -- %s. Press play twice to start without it.", CM.lgWaitingFor()))
+			end
+			return false
 		end
-		return true
 	end
-	if CM.ticks - (CM.histProgressAt or CM.ticks) > K.HIST_STALL_TICKS then
-		CM.lgAskHistory(string.format("no history line for ~%d s (end %s, %d gap(s))", math.floor(K.HIST_STALL_TICKS / 5.4),
-			CM.histEndSeen and "seen" or "not seen", gaps))
+	-- EVERYONE, the leader included: the roster. A member not heard is still
+	-- loading (the lobby's players= counts it), and a session that runs on
+	-- meanwhile is one it must catch up with. No tick budget: the hold lasts
+	-- while it is missing, or until the player's two presses (CM.ensureRunning),
+	-- which log who is left to catch up.
+	local missing, roster, heard = CM.lgRosterMissing()
+	if missing > 0 then
+		if (CM.ticks % 12) == 0 then
+			log(string.format("LOADGATE: holding at the loaded save -- %d of %d other roster member(s) not heard yet, still loading (heard: %s). Press play twice to start without them.",
+				missing, roster - 1, heard))
+		end
+		return false
 	end
-	if (CM.ticks % 12) == 0 then
-		log(string.format("LOADGATE: holding at the loaded save -- %s. Press play twice to start without it.", CM.lgWaitingFor()))
-	end
-	return false
+	CM.lgReleased = true
+	log(string.format("LOADGATE: %s -- releasing", CM.isLeader() and string.format("every roster member is in (%s)", heard)
+		or (tonumber(CM.rosterPlayers) == 1 and "loaded alone" or string.format("the history since our save is complete and every roster member is in (%s)", heard))))
+	return true
 end
 
 function CM.ensureRunning()
@@ -1284,9 +1334,17 @@ function CM.ensureRunning()
 		-- click is absorbed, a deliberate one is honoured at once.
 		local function forced(speed)
 			didInitialUnpause = true
-			CM.lgHolding, CM.lgFetch = false, "done"
-			log(string.format("!! LOADGATE: started manually at speed %d while %s -- releasing. What the others did meanwhile lands here late, OUT OF STEP: this game may fork from the session.",
-				speed, CM.lgWaitingFor() or "waiting"))
+			local why = CM.lgWaitingFor() or "waiting"
+			local missing = CM.lgRosterMissing()
+			local ownHist = not CM.isLeader() and CM.lgFetch ~= "done"
+			CM.lgHolding, CM.lgFetch, CM.lgReleased = false, "done", true
+			if ownHist then
+				log(string.format("!! LOADGATE: started manually at speed %d while %s -- releasing. What the others did meanwhile lands here late, OUT OF STEP: this game may fork from the session.",
+					speed, why))
+			else
+				log(string.format("!! LOADGATE: started manually at speed %d while %s -- releasing; %s left to catch up from the history when they arrive (a hot join: nothing is lost for them, they just come in later).",
+					speed, why, missing > 0 and string.format("%d roster member(s)", missing) or "nobody"))
+			end
 		end
 		local function warn()
 			CM.lgPressWarned = true
@@ -1315,8 +1373,9 @@ function CM.ensureRunning()
 			-- so the speed controller recognises the 0 as OURS. A raw send once had
 			-- the gate's pause taken for the player's lever and shared with every
 			-- joiner, which is how a three-player start broke.
-			CM.setSpeed(0, "load gate: holding until the other players are in")
-			log(string.format("LOADGATE: pausing (was speed %d) until the leader is heard and the history since our save is in", s))
+			CM.setSpeed(0, "load gate: holding until the session can start")
+			log(string.format("LOADGATE: pausing (was speed %d) until %s", s,
+				CM.isLeader() and "every roster member is in" or "the leader is heard, the history since our save is in and every roster member is in"))
 		elseif CM.lgSawZero and not CM.lgPressWarned then
 			-- The player pressed play while we wait. Put it back and say why; a
 			-- second press is the override.

@@ -362,8 +362,20 @@ function CM.linePending(key)
 	if best then return best end
 	return CM.lineSent and CM.lineSent[key] or nil
 end
+-- Only an update that was actually QUEUED is on its way: scheduleLocal queues
+-- nothing under a resync hold or before the clock answers, and a list noted
+-- then was the merge target for the next click on this line with nothing ever
+-- confirming it -- one click merged onto a list the player never made, and the
+-- entry pinned every base of the line (review 2026-09-16). The queue's newest
+-- entry is the one just scheduled, or the send did not happen.
 function CM.noteLineSent(key, stops, alts)
 	CM.lineSent = CM.lineSent or {}
+	local q = CM.queue and CM.queue[#CM.queue]
+	local queued = q and q.op == "LUPDATE" and q.key == key and q.stops == stops and (q.origin == nil or q.origin == K.INSTANCE)
+	if not queued then
+		log(string.format("LUPDATE: %s was not queued (a resync hold, or no clock yet) -- not on its way; the next click builds on the entity", tostring(key)))
+		return
+	end
 	CM.lineSent[key] = { stops = stops, alts = alts, t = CM.gameTime() or 0 }
 end
 -- the engine answered our own update (success or not): that list is no longer

@@ -12,6 +12,15 @@ moment it joined) and a NACK for an old command found nothing. Now:
   - CM.sentRing keeps a line until every live peer acknowledges past it (ak= on the
     heartbeat, CM.ackReport); a live peer that has not reported keeps everything; a NACK
     for a pruned line is answered from the history, else logged loudly
+  - the ack keeps advancing across the NACK scan (CM.rxAdvance moves firstSeq and drops
+    seen[] behind it; the ack used to stall there for good)
+  - a rejoined origin restarts at seq 1: both lives are kept (keyed by stamp|origin|seq),
+    served, and announced as separate runs; a NACK gets the newest
+  - one feed per requester: a second LSNEED while a feed is in flight does not abandon it,
+    a re-ask for the same stamp continues the feed, the tick budget is shared
+  - the requester merges announced runs into what it tracks, in any arrival order (no reset
+    on a re-ask; the seqs between two runs are not owed until a run covers them; every seq
+    of a run is owed from its announcement, so a lost tail is NACKed even from a gone origin)
   - the heartbeat and the LSNEED/LSHISTEND readers are wired (text checks on lockstep.lua)
 
     python tools/hist_retention_test.py
@@ -133,7 +142,7 @@ h.feed("LSNEED t=400.0 o=c save=1")
 check("LSNEED ... save=1 sets the floor at the save's stamp", CM.histFloor == 400.0, str(CM.histFloor))
 served = [l for l in lua_list(h.sent()) if l.startswith("LSHIST for=c")]
 check("the leader serves c the commands stamped after 400 (b seq 2001..5000)", served == ["LSHIST for=c o=b from=2001 to=5000"], str(served))
-check("the feed is queued (3,000 lines)", CM.histSend is not None and len(CM.histSend.lines) == 3000)
+check("the feed is queued (3,000 lines)", CM.histFeeds.c is not None and len(CM.histFeeds.c.lines) == 3000)
 for _ in range(80):
     CM.histPump()
 ends = [l for l in lua_list(h.sent()) if l.startswith("LSHISTEND")]
@@ -158,11 +167,11 @@ check("a plain catch-up LSNEED (a live clock, not a save) moves no floor",
 check("an older save's stamp does not lower the floor", (h.feed("LSNEED t=100.0 o=d save=1"), CM.histFloor)[1] == 400.0)
 
 # ---- a request below the prune is refused loudly ----
-h.clearLogs(); h.clearSent()
+h.clearSent()                          # d's request above was already refused loudly; its feed is pumped here
 h.feed("LSNEED t=100.0 o=d save=1")
-for _ in range(80):
+for _ in range(120):                   # b's catch-up feed above shares the budget until it ends
     CM.histPump()
-ends = [l for l in lua_list(h.sent()) if l.startswith("LSHISTEND")]
+ends = [l for l in lua_list(h.sent()) if l.startswith("LSHISTEND for=d")]
 check("the end marker names the hole", ends == ["LSHISTEND for=d n=3000 hole=400.0000"], str(ends))
 check("...and the host logs it loudly", "!! HIST: d needs every command after 100.0 but everything at or before 400.0 was pruned" in h.logs())
 h.clearLogs()
@@ -220,6 +229,122 @@ check("ak= reports the contiguous high-water per origin (b:3, a:7)", CM.ackRepor
 h.feed("LSCMD op=T at=60.0000 origin=b seq=4 x=1")
 check("...advancing once the gap fills", CM.ackReport() == " ak=a:7,b:5", repr(CM.ackReport()))
 check("nothing heard: no ak= field", runtime("d", False)[1].CM.ackReport() == "")
+
+# ---- the ack keeps advancing across the NACK scan ----
+L, h = runtime("c", False)
+CM = h.CM
+for seq in (1, 2, 3):
+    h.feed(f"LSCMD op=T at=60.0000 origin=b seq={seq} x=1")
+check("b:3 after 1..3", CM.ackReport() == " ak=b:3", repr(CM.ackReport()))
+for seq in (4, 5, 6):
+    h.feed(f"LSCMD op=T at=60.0000 origin=b seq={seq} x=1")
+CM.nackScan()          # rxAdvance: firstSeq moves to 6 and seen[] behind it is dropped
+check("...b:6 after a NACK scan advanced past them (the ack used to stall at 3 for good)",
+      CM.ackReport() == " ak=b:6", f"{CM.ackReport()!r} firstSeq={CM.rx.b.firstSeq}")
+for seq in range(7, 40):
+    h.feed(f"LSCMD op=T at=60.0000 origin=b seq={seq} x=1")
+check("...b:39 after more", CM.ackReport() == " ak=b:39", repr(CM.ackReport()))
+h.feed("LSCMD op=T at=60.0000 origin=b seq=41 x=1")
+CM.nackScan()
+check("a gap (40) holds it at 39, through a scan", CM.ackReport() == " ak=b:39", repr(CM.ackReport()))
+h.feed("LSCMD op=T at=60.0000 origin=b seq=40 x=1")
+check("...filled: b:41", CM.ackReport() == " ak=b:41", repr(CM.ackReport()))
+
+# ---- a rejoined origin restarts its sequence: both lives are kept and served ----
+L, h = runtime()
+CM = h.CM
+h.pushMany("b", 5000, 0)                                   # b's first life: seq 1..5000, stamped 0.2..1000
+h.clearLogs()
+h.feed("LSCMD op=T at=1500.0000 origin=b seq=1 x=2")       # b crashed, rejoined, and starts again at 1
+h.feed("LSCMD op=T at=1500.2000 origin=b seq=2 x=2")
+check("the restarted seqs are kept beside the first life's (5,002 lines, not 5,000)", h.count() == 5002, str(h.count()))
+check("...logged once, naming the origin", "b's seq 1 seen again with a new stamp (1500.0, was 0.2)" in h.logs())
+check("a NACK for b:1 is answered with the newest life's line", CM.histFind("b", 1) == "LSCMD op=T at=1500.0000 origin=b seq=1 x=2")
+check("a resend (same stamp) is still not kept twice", (h.feed("LSCMD op=T at=1500.0000 origin=b seq=1 x=2"), h.count())[1] == 5002)
+h.clearSent(); h.clearLogs()
+h.feed("LSNEED t=999.0 o=c save=1")                        # c needs everything after 999: b 4996..5000 and the new 1..2
+ranges = [l for l in lua_list(h.sent()) if l.startswith("LSHIST for=c")]
+check("the feed announces the two runs", ranges == ["LSHIST for=c o=b from=1 to=2", "LSHIST for=c o=b from=4996 to=5000"], str(ranges))
+for _ in range(10):
+    CM.histPump()
+fed = [l for l in lua_list(h.sent()) if l.startswith("LSCMD") and l.endswith(" hfor=c")]
+check("...and feeds all 7, no hole", len(fed) == 7 and any("at=1500.0000 origin=b seq=1 " in l for l in fed)
+      and [l for l in lua_list(h.sent()) if l.startswith("LSHISTEND")] == ["LSHISTEND for=c n=7"], str(len(fed)))
+CM.histFloor, CM.rosterPlayers = 1000.0, 2
+h.peer("b", True)
+CM.histPrune()
+check("a prune keeps the index pointing at what is left", h.count() == 2 and CM.histFind("b", 1) is not None
+      and CM.histFind("b", 3) is None, f"{h.count()} {CM.histFind('b', 3)}")
+
+# ---- one feed per requester ----
+L, h = runtime()
+CM = h.CM
+h.pushMany("b", 3000, 0)
+h.clearSent(); h.clearLogs()
+CM.histFloor, CM.rosterPlayers = 1.0, 1        # so the hold's only reason can be the feeds
+CM.histServe(0.0, "c")                          # (served directly: h.feed would pump once first)
+CM.histPump()
+CM.histServe(0.0, "d")                          # d asks while c's feed is going out
+check("d's request does not abandon c's feed (c at 41, d at 1)",
+      CM.histFeeds.c is not None and CM.histFeeds.c.i == 41 and CM.histFeeds.d is not None and CM.histFeeds.d.i == 1)
+check("...and the hold says a feed is in flight", CM.histHold() == "a history feed is in flight", str(CM.histHold()))
+CM.histPump()
+check("the tick budget is shared: 20 lines each (c at 61, d at 21)", CM.histFeeds.c.i == 61 and CM.histFeeds.d.i == 21,
+      f"c={CM.histFeeds.c.i} d={CM.histFeeds.d.i}")
+h.clearLogs()
+CM.histServe(0.0, "c")                          # c saw nothing for a while and asks again
+check("a re-ask for the same stamp continues c's feed (still at 61), re-sending its ranges",
+      CM.histFeeds.c.i == 61 and "asked again for everything after 0.0 while its feed is at 60 of 3000 -- continuing" in h.logs()
+      and lua_list(h.sent()).count("LSHIST for=c o=b from=1 to=3000") == 2, str(CM.histFeeds.c.i))
+for _ in range(400):
+    CM.histPump()
+sent = lua_list(h.sent())
+check("both feeds run to their end", sorted(l for l in sent if l.startswith("LSHISTEND")) == ["LSHISTEND for=c n=3000", "LSHISTEND for=d n=3000"])
+check("...each requester got every line once", sum(1 for l in sent if l.endswith(" hfor=c")) == 3000 and sum(1 for l in sent if l.endswith(" hfor=d")) == 3000)
+check("...and the hold no longer names a feed", CM.histHold() is None, str(CM.histHold()))
+h.clearLogs()
+CM.histServe(0.0, "c")                          # c lost the end marker: a fresh feed
+check("after its feed ended a re-ask is a fresh feed", CM.histFeeds.c is not None and CM.histFeeds.c.i == 1 and "a fresh feed: its last one, 3000 line(s), ended" in h.logs())
+
+# ---- the requester merges announced runs into what it tracks ----
+L, h = runtime("c", False)
+CM = h.CM
+h.feed("LSTICK t=50 o=b s=250 hi=5000 ms=1")               # b's heartbeat first: first contact at 5000, nothing owed below
+h.feed("LSHIST for=c o=b from=1 to=2")
+h.feed("LSHIST for=c o=b from=4996 to=5000")
+check("the runs are tracked from their first seq", CM.rx.b.firstSeq == 0, str(CM.rx.b.firstSeq))
+check("the seqs between the runs are not owed: 7 gaps, not 5,000", CM.rxGaps()[0] == 7, str(CM.rxGaps()[0]))
+check("...and logged", "b seq 3..4995 are not in the history (its sequence restarted) -- not owed" in h.logs())
+for seq in (1, 2, 4996, 4997, 4998, 4999):
+    h.feed(f"LSCMD op=T at=999.2000 origin=b seq={seq} x=1 hist=1 hfor=c")
+check("six of seven arrived: one gap (the tail, 5000)", CM.rxGaps()[0] == 1 and CM.rxGaps()[3] == 5000, str(CM.rxGaps()))
+h.feed("LSHIST for=c o=b from=4996 to=5000")               # the range again (a re-ask): no reset
+check("a repeated range keeps what is held (still one gap)", CM.rxGaps()[0] == 1, str(CM.rxGaps()[0]))
+h.clearSent()
+CM.ticks = CM.ticks + 20
+CM.nackScan()
+check("the known, missing tail is NACKed", "LSNACK o=b seq=5000 by=c" in lua_list(h.sent()), str(lua_list(h.sent())))
+h.feed("LSCMD op=T at=999.4000 origin=b seq=5000 x=1 hist=1 hfor=c")
+check("complete: no gap, ack b:5000", CM.rxGaps()[0] == 0 and CM.ackReport() == " ak=b:5000", CM.ackReport())
+# runs in any arrival order, and a later run that covers a "not owed" seq
+L, h = runtime("c", False)
+CM = h.CM
+h.feed("LSHIST for=c o=b from=30 to=40")               # the higher run first (reordered on the wire)
+h.feed("LSHIST for=c o=b from=5 to=6")
+check("runs arriving out of order: 7..29 are not owed, 13 gaps", CM.rxGaps()[0] == 13 and CM.rx.b.firstSeq == 4, f"{CM.rxGaps()[0]} first={CM.rx.b.firstSeq}")
+h.feed("LSHIST for=c o=b from=7 to=29")                # a later feed (another stamp) holds the middle after all
+check("a run covering them makes 7..29 owed again: 36 gaps", CM.rxGaps()[0] == 36, str(CM.rxGaps()[0]))
+# the host announces runs by origin then seq, numerically
+L, h = runtime()
+CM = h.CM
+for seq in (5, 6, 30, 31):
+    h.feed(f"LSCMD op=T at=60.0000 origin=b seq={seq} x=1")
+h.feed("LSCMD op=T at=60.0000 origin=a seq=9 x=1")
+h.clearSent()
+CM.histServe(0.0, "c")
+runs = [l for l in lua_list(h.sent()) if l.startswith("LSHIST")]
+check("runs are announced by origin then seq, numerically (5..6 before 30..31)",
+      runs == ["LSHIST for=c o=b from=5 to=6", "LSHIST for=c o=b from=30 to=31"], str(runs))
 
 # ---- wiring ----
 lockstep = open(LOCKSTEP, encoding="utf-8").read()
