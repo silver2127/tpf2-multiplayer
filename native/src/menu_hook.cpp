@@ -2322,10 +2322,16 @@ static void SyncStart(const char* why)
     else if (strncmp(why, "hot join", 8) == 0 && g_syncSharedValid && g_startSaveW[0]
              && GetFileAttributesW(g_startSaveW) != INVALID_FILE_ATTRIBUTES
              && g_unpausedMs - g_syncSharedUnpaused < HOTJOIN_REUSE_MS) {
-        // the lobby's serve-again pushes the last shared save to anyone unstarted
-        // within a second (no sync_taking hold here, so nothing stops it)
-        Log("[sync] %s -> the save shared %.1f s of unpaused play ago is fresh enough: the lobby serves it again, no new save\n",
+        // Re-send the start with the file we already shared: the lobby transfers
+        // it to whoever is unstarted. Its serve-again would do that on its own
+        // only for a session it has latched as started -- a host that loaded a
+        // world ALONE never latched (nobody to share with), so the first joiner
+        // got nothing at all (2026-09-16: "fresh enough ... no new save", then
+        // silence). The explicit start covers both cases.
+        Log("[sync] %s -> the save shared %.1f s of unpaused play ago is fresh enough: sharing it again, no new save\n",
             why, (g_unpausedMs - g_syncSharedUnpaused) / 1000.0);
+        std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(g_startSaveW).c_str()) + "\"}";
+        LobbySend(line.c_str());
         SetStatus("Hot join: sending the recent save\xE2\x80\xA6");
         SendChat("!hotjoin A game is running. Hold on: the host is sending you the world; your game loads it by itself.");
     }
