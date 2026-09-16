@@ -1074,6 +1074,7 @@ static void SyncStart(const std::string& why)
     S().syncSave.clear();
     Log("[sync] %s -> taking the save\n", why.c_str());
     if (!MenuGame_ForceAutosave()) { Log("[sync] the forced autosave did not start\n"); return; }
+    AppendIn("{\"cmd\":\"sync_taking\"}");
     S().syncAskedAt = NowMs();
     Status("Hot join: saving\xE2\x80\xA6");
     // A marked chat line for the newcomer's panel -- not for the relay's

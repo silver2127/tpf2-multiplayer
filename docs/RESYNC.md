@@ -100,7 +100,8 @@ under Windows sharing violations. They do not prove in-game save/load behavior.
 
 Run `tools/resync_test.py`, `tools/test_sync_operation.py`,
 `tools/test_sync_snapshot.py`, `tools/test_sync_runtime.py`,
-`tools/test_auto_sync_lobby.py`, `tools/test_net_epoch.py` and
+`tools/test_auto_sync_lobby.py`, `tools/test_net_epoch.py`,
+`tools/test_net_multipeer.py`, `tools/test_net_restart.py` and
 `tools/test_native_control.py` before a release.
 The native tests require Windows and the repository MSVC environment helper.
 
@@ -150,14 +151,32 @@ but failed post-recovery connectivity: each instance heard only one peer.
 The previous native transport retained a single peer session and rejected other
 senders once the world epoch was nonzero. The replacement maintains independent
 receive ordering, chunk assembly and ACKs for each established process. A sent
-packet stays pending until every recipient present at send time acknowledges it;
-timeouts never silently remove a recipient. World changes reset all streams but
-preserve the established process cohort and reject stale worlds or unknown processes.
+packet stays pending until every recipient present at send time acknowledges it.
+World changes reset all streams but keep the established members, and reject
+stale worlds. The world epoch is the credential: a process only has it from the
+lobby's own control path, so a sender that presents the current epoch under a
+session the cohort has not seen is admitted (a game that restarted, or a player
+who joined after the resync). Until 2026-09-15 such a sender was refused for the
+rest of the lobby's life and every broadcast waited for its dead session, which
+held the 32-packet send window for everybody ("pending=33"). A member silent for
+the peer timeout (10 s, not even a keepalive) now leaves the cohort and releases
+the packets that waited for it (the last one leaving puts the transport back to
+"nobody is listening": queued lines are dropped, nothing is kept for the next
+joiner); a receiver whose sender no longer retains the packet it waits for
+delivers what it had already stashed and acknowledged, then skips to the sender's
+floor (logged, the Lua layer NACKs a command gap). After a resync completes, the host lobby advertises the resync epoch
+as its transport lobby and serves late joiners the resync snapshot, so a later
+joiner starts in the members' world; a member already in that world takes the
+new nonce as a rename, not a reset, and a client ignores a nonce it has seen
+before (a reordered old roster).
 
 `tools/test_net_multipeer.py` compiles the production C++ transport and tests real
 UDP frames from independent simulated peers with 2, 3, 5 and 8 participants across
 three world resets each. Coverage includes interleaved/reordered chunks,
-duplicates, per-peer ACKs, retransmission and stale world/process rejection.
+duplicates, per-peer ACKs, retransmission, stale world rejection and current-world
+admission. `tools/test_net_restart.py` drives the restarted-joiner case: admission,
+eviction of the silent old session, the old world rejected, the floor skip, and
+re-admission after an eviction.
 The lobby recovery test also passes with 5 and 8 simulated engines, including a
 delayed final participant and its disconnect. These are automated correctness
 tests, not game or load tests.

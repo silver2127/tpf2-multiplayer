@@ -1,4 +1,4 @@
-// Adapted from upstream tools/test_net_epoch.py (0.5.3).
+// Adapted from upstream 0.5.5 transport tests; uses real POSIX UDP sockets.
 #include "../src/net_posix.cpp"
 #include <cassert>
 static void TestSleep(unsigned ms) { usleep(ms * 1000); }
@@ -24,7 +24,6 @@ static size_t pending() { size_t n; Net_Stats(nullptr,nullptr,&n,nullptr,nullptr
 static bool alive() { bool yes; Net_Stats(nullptr,nullptr,nullptr,&yes,nullptr); return yes; }
 int main() {
     // CI has no interactive desktop: failed assertions must not open a dialog.
-
     int peer=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
     sockaddr_in endpoint{}; endpoint.sin_family=AF_INET; endpoint.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     assert(bind(peer,(sockaddr*)&endpoint,sizeof(endpoint))==0);
@@ -80,7 +79,7 @@ int main() {
     assert(Net_BeginLobby(lobbyEpoch.c_str(),"127.0.0.1",ntohs(endpoint.sin_port),reset));
     assert(g_session!=oldSession && pending()==0 && !alive());
     { std::lock_guard<std::mutex> l(g_epochMtx);
-      assert(g_streams.empty() && g_awaiting.empty() && g_outQueue.empty() && !g_rosterFrozen); }
+      assert(g_streams.empty() && g_awaiting.empty() && g_outQueue.empty()); }
     const int lobbyResets=resets;
     send(second,0,"old-lobby-data",32);
     TestSleep(100); assert(!alive() && count()==3);
@@ -94,6 +93,18 @@ int main() {
     assert(Net_BeginLobby(lobbyEpoch.c_str(),"127.0.0.1",ntohs(endpoint.sin_port),reset));
     assert(Net_WorldEpoch()==recovered && resets==lobbyResets+1); // no undo of resync
     assert(!Net_BeginLobby("invalid","127.0.0.1",1,reset));
+    // After a resync the lobby advertises the resync epoch as its nonce, so a
+    // later joiner starts in that world. For a member already in it the new
+    // nonce is a rename: no reset, same session, the cohort and its traffic kept.
+    send(recovered,0,nullptr); waitFor(alive);
+    Net_QueueLine("after resync",recovered.c_str()); waitFor([]{return pending()==1;});
+    const uint32_t resyncSession=g_session;
+    assert(Net_BeginLobby(recovered.c_str(),"127.0.0.1",ntohs(endpoint.sin_port),reset));
+    assert(g_session==resyncSession && pending()==1 && alive() && resets==lobbyResets+1);
+    assert(Net_WorldEpoch()==recovered);
+    { std::lock_guard<std::mutex> l(g_epochMtx); assert(g_streams.count(77)==1 && g_lobbyEpoch==recovered); }
+    assert(Net_BeginLobby(recovered.c_str(),"127.0.0.1",ntohs(endpoint.sin_port),reset));
+    assert(g_session==resyncSession && pending()==1); // and idempotent from then on
     Net_Shutdown(); close(peer);
-    puts("PASS: real UDP world reset, stale ACK/data/tail, duplicate control, reordered data, partial chunks");
+    puts("PASS: real UDP world reset, stale ACK/data/tail, duplicate control, reordered data, partial chunks, lobby nonce catching up with a resync");
 }

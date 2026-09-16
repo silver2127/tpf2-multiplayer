@@ -108,6 +108,12 @@ with tempfile.TemporaryDirectory() as temporary:
         def ready_event(name):
             events = [json.loads(line) for line in Path(ios[name].out_path).read_text(encoding='utf-8').splitlines()]
             return next((e for e in reversed(events) if e.get('type') == 'sync_ready_state'), {})
+        def last_nonce(name):
+            events = [json.loads(line) for line in Path(ios[name].out_path).read_text(encoding='utf-8').splitlines()]
+            return next((e['epoch'] for e in reversed(events) if e.get('type') == 'transport_lobby'), None)
+        def nonce_follows_world():
+            # every menu's newest transport lobby nonce is the completed epoch
+            wait_for(lambda: all(last_nonce(n) == runtimes['host'].state['epoch'] for n in ios))
         def confirm_ready():
             global ready_token
             if players == 2:
@@ -156,6 +162,7 @@ with tempfile.TemporaryDirectory() as temporary:
             assert all(r.state['phase'] == 'holding' and r.saves == 0 and r.loads == 0 for r in runtimes.values())
             runtimes[last].blocked_phase = None
         wait_for(lambda: all(r.finished for r in runtimes.values()))
+        nonce_follows_world()
         first = runtimes['host'].state['operation']
         assert all(r.state['operation'] == first for r in runtimes.values())
         assert runtimes['host'].state['resume_speed'] == 0
@@ -185,6 +192,7 @@ with tempfile.TemporaryDirectory() as temporary:
         runtimes['host']._write('tpf2_sync_request.txt', dict(cmd='sync_retry', id='retry', operation=operation))
         confirm_ready()
         wait_for(lambda: all(r.finished and r.state['epoch'] != epoch for r in runtimes.values()))
+        nonce_follows_world()
         assert runtimes['host'].saves == 2
         assert all(r.state['operation'] == operation and r.loads == 3 for r in runtimes.values())
         assert all(worker.is_alive() for worker in workers)

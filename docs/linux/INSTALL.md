@@ -21,16 +21,16 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This experimental Linux release follows **0.5.3**. Use matching 0.5.3 peers.
+This experimental Linux release follows **0.5.5**. Use matching 0.5.5 peers.
 All 28 shared Lua files match the Windows release byte for byte. See
-[UPSTREAM_0.5.3.md](UPSTREAM_0.5.3.md) for technical validation details.
+[UPSTREAM_0.5.5.md](UPSTREAM_0.5.5.md) for technical validation details.
 
 **Known limits:** automatic resync, the new separate-company/shared-ownership
 operations, and automatic Workshop registration still need native Linux support.
 Some player actions, including names/colors, vehicle stop/maintenance and loans,
 remain blocked in multiplayer. A completed cross-platform gameplay test for
-0.5.3 has not yet been recorded; the passing 0.4.22 replay does not establish
-0.5.3 compatibility.
+0.5.5 has not yet been recorded; the passing 0.4.22 replay does not establish
+0.5.5 compatibility.
 
 Download the `.run` installer, then run:
 

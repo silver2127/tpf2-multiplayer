@@ -632,6 +632,10 @@ static DWORD WINAPI InitThread(LPVOID)
     // port the socket really bound)
     OpenEventsFile(cfg.instance);
 
+    // The transport's own lines: who joined the cohort, who was evicted, what
+    // was dropped and why. Until 2026-09-15 a joiner that could never hear the
+    // host showed nothing here but "peer=DOWN".
+    Net_SetLogger([](const char* line) { Log("%s", line); });
     bool netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
 
     // The election is CHECK-then-BIND, and the two halves are seconds apart:
@@ -714,15 +718,15 @@ static DWORD WINAPI InitThread(LPVOID)
         char last[192] = "";
         while (!g_stopping) {
             Sleep(10000);
-            uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0;
-            size_t pending = 0; bool alive = false;
-            Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize);
+            uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0, dWorld = 0;
+            size_t pending = 0, members = 0; bool alive = false;
+            Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize, &members, &dWorld);
             char cur[192];
             _snprintf_s(cur, sizeof(cur), _TRUNCATE,
-                "peer=%s pending=%zu dropped=%llu/%llu/%llu strangers=%llu",
-                alive ? "up" : "DOWN", pending,
+                "peer=%s members=%zu pending=%zu dropped=%llu/%llu/%llu other-world=%llu strangers=%llu",
+                alive ? "up" : "DOWN", members, pending,
                 (unsigned long long)dNoPeer, (unsigned long long)dOverflow,
-                (unsigned long long)dOversize,
+                (unsigned long long)dOversize, (unsigned long long)dWorld,
                 (unsigned long long)Net_DroppedStrangers());
             if (strcmp(cur, last) == 0) continue;
             strcpy_s(last, cur);

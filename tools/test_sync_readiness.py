@@ -137,6 +137,31 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(h.barrier.phase, 'aborted')
         self.assertFalse(h.roster_locked)
 
+    def test_transport_lobby_follows_a_completed_resync_only(self):
+        # After a resync every member's bridge runs in the operation's epoch. A
+        # player who joins later takes the lobby nonce from welcome/roster, so that
+        # nonce must BE the epoch once the operation completes -- and not before
+        # (the join gate is shut while it runs; an abort leaves the old world).
+        h = self.make_host(2)
+        self.assertIsNone(h.world_epoch())
+        h.command('host', dict(cmd='sync_request', id='start'))
+        epoch = h.barrier.epoch
+        self.assertEqual(h.barrier.phase, 'holding')
+        self.assertRegex(epoch, r'^[0-9a-f]{32}$')
+        for phase in ('holding', 'saving', 'transferring', 'loading', 'checking', 'releasing'):
+            h.barrier._enter(phase)
+            self.assertIsNone(h.world_epoch(), phase)
+        h.barrier._enter('complete')
+        self.assertEqual(h.world_epoch(), epoch)
+        h = self.make_host(2)
+        h.command('host', dict(cmd='sync_request', id='again'))
+        h.barrier.abort('host', h.barrier.operation)
+        self.assertIsNone(h.world_epoch())
+        h = self.make_host(2)
+        h.command('host', dict(cmd='sync_request', id='third'))
+        h.barrier.fail('test failure')
+        self.assertIsNone(h.world_epoch())
+
 
 if __name__ == '__main__':
     unittest.main()

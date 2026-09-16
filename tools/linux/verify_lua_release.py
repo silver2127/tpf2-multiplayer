@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that Linux ships the exact Lua sources from Windows release 0.5.3."""
+"""Verify that Linux ships the exact Lua sources from Windows release 0.5.5."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "66da00db6a36791630d7ebb05b6bf81fb06e7959"
+REFERENCE = "ecbaf1d8752f7636d88ebc13d0d3084dd3977996"
 PREFIX = "mod/mp_lockstep_1/"
 
 
@@ -33,7 +33,7 @@ def main():
         if missing or extra or different:
             return 1
         manifest = "".join(f"{hashlib.sha256(expected[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files match Windows 0.5.3 ({commit}) byte for byte")
+        print(f"PASS: {len(expected)} Lua files match Windows 0.5.5 ({commit}) byte for byte")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
         return 0
     except (OSError, subprocess.CalledProcessError) as error:

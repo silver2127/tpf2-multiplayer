@@ -66,9 +66,12 @@ int main(int argc, char** argv) {
         const size_t before=count();
         assert(Net_SetWorldEpoch(epoch.c_str()));
         // Interleave partial lines, reverse chunk order, repeat duplicates.
-        // Keepalives ahead of a missing seq 0 must not skip that hole.
+        // A keepalive names the sender's oldest RETAINED packet; after the
+        // coordinated reset that is 0 while 0 is unacknowledged, so a keepalive
+        // ahead of the data must not skip the hole. (A floor ABOVE what we wait
+        // for is the sender saying it dropped those: test_net_restart.py.)
         for(int i=0;i<peers;i++) {
-            send(i,epoch,2,nullptr);
+            send(i,epoch,0,nullptr);
             send(i,epoch,1,"tail",NO_ACK,1,2);
             send(i,epoch,1,"tail",NO_ACK,1,2);
         }
@@ -87,9 +90,16 @@ int main(int argc, char** argv) {
         waitFor([]{return pending()==1;});
         for(int i=0;i<peers-1;i++) send(i,epoch,2,nullptr,0);
         send(peers-1,zero,2,"stale-world",99);
+        // A process the cohort has not seen, presenting the CURRENT world: it is
+        // a member (the epoch only comes from the lobby), so it is admitted --
+        // but its data is not delivered before its keepalive names a floor, and
+        // its ACK cannot stand in for the lagging member's.
         send(peers+20,epoch,0,"restarted-process",99);
         send(peers-1,epoch,2,nullptr,0,0,1,g_session+1);
         Sleep(100); assert(pending()==1 && count()==before+peers);
+        { std::lock_guard<std::mutex> l(g_epochMtx);
+          assert(g_streams.count(1000+peers+20)==1 && !g_streams[1000+peers+20].sequenceReady);
+          g_streams.erase(1000+peers+20); }   // it never speaks again; test_net_restart.py covers the eviction
         // Observe a real retransmission and an ACK stream for EVERY sender.
         int transmissions=0;
         std::set<uint32_t> acknowledgements;
@@ -111,7 +121,7 @@ int main(int argc, char** argv) {
         Sleep(50); assert(count()==before+peers);
     }
     Net_Shutdown(); closesocket(relay);
-    printf("PASS: %d players, 3 epochs, interleaved/reordered chunks, duplicates, all-peer ACKs, retransmission, stale world/process rejection\n",peers+1);
+    printf("PASS: %d players, 3 epochs, interleaved/reordered chunks, duplicates, all-peer ACKs, retransmission, stale world rejection, current-world admission\n",peers+1);
 }
 ''', encoding='utf-8')
 (out / 'build.cmd').write_text(f'@echo off\ncall "{root / "tools/msvc_env.bat"}" || exit /b 1\n'

@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -70,14 +71,15 @@ struct PeerStream {
     uint32_t expectedSeq = 0;
     uint32_t lastReceivedSeq = NO_ACK;
     uint32_t receivedBits = 0;
+    uint64_t lastRecvMs = 0;    // its last admitted packet; silence this long evicts it
     std::map<uint32_t, Packet> early;
     std::string rxAccum;
 };
 static std::map<uint32_t, PeerStream> g_streams; // protected by g_epochMtx
 // A broadcast remains pending until EVERY recipient present at send time ACKs.
-// Do not remove a missing recipient on a timeout: that would silently lose data.
+// A recipient leaves that set only when it leaves the cohort (see the eviction
+// pass in NetThread): silence for the peer timeout, i.e. not even a keepalive.
 static std::map<uint32_t, std::set<uint32_t>> g_awaiting; // under g_mtx
-static bool g_rosterFrozen = false;
 
 // --- peer liveness -----------------------------------------------------------
 // Without this, a host with no joiner queued every event forever: g_pending grew
@@ -85,29 +87,58 @@ static bool g_rosterFrozen = false;
 // appeared it received the entire backlog at once. Events from before a joiner
 // existed are meaningless to it anyway -- it starts from a transferred save --
 // so the right behaviour is to drop them.
-static const uint32_t PEER_TIMEOUT_MS   = 10000;
+//
+// The same silence takes a member OUT of the cohort. Every broadcast waits for
+// every member it was sent to, and the send window (32 packets) then holds
+// everything behind the oldest unacknowledged one. A member whose process died
+// -- or a joiner's OLD process after its game restarted -- therefore stalled
+// the host for every other player, forever: "pending=33" in the field. A
+// variable, not a constant, so the transport tests can shorten it.
+static uint32_t g_peerTimeoutMs         = 10000;
 static const uint32_t KEEPALIVE_MS      = 500;
-static const size_t   MAX_PENDING       = 512;
 static uint64_t g_lastRecvMs   = 0;
 static bool     g_peerEverSeen = false;
 static uint64_t g_droppedNoPeer = 0;
 static uint64_t g_droppedOverflow = 0;
 static uint64_t g_droppedOversize = 0;
+static uint64_t g_droppedWorld = 0;     // datagrams from another world epoch
+
+// The bridge's log, when it gives us one. Every drop used to be silent, and a
+// joiner that could never hear the host showed nothing but "peer=DOWN".
+static void (*g_logger)(const char*) = nullptr;
+static void NetLog(const char* fmt, ...)
+{
+    if (!g_logger) return;
+    char buf[400];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    g_logger(buf);
+}
+void Net_SetLogger(void (*log)(const char* line)) { g_logger = log; }
+
+// A sender in another world is logged once per world it claims, not per
+// datagram (a stuck member resends every 250 ms). Under g_epochMtx.
+static std::map<uint32_t, std::string> g_worldNoted;
 
 static bool PeerAlive()
 {
-    return g_peerEverSeen && (GetTickCount64() - g_lastRecvMs) < PEER_TIMEOUT_MS;
+    return g_peerEverSeen && (GetTickCount64() - g_lastRecvMs) < g_peerTimeoutMs;
 }
 
 void Net_Stats(uint64_t* droppedNoPeer, uint64_t* droppedOverflow,
-               size_t* pending, bool* peerAlive, uint64_t* droppedOversize)
+               size_t* pending, bool* peerAlive, uint64_t* droppedOversize,
+               size_t* members, uint64_t* droppedWorld)
 {
+    std::lock_guard<std::mutex> epochLock(g_epochMtx);   // g_streams; outer lock first
     std::lock_guard<std::mutex> lk(g_mtx);
     if (droppedNoPeer)   *droppedNoPeer = g_droppedNoPeer;
     if (droppedOverflow) *droppedOverflow = g_droppedOverflow;
     if (pending)         *pending = g_pending.size();
     if (peerAlive)       *peerAlive = PeerAlive();
     if (droppedOversize) *droppedOversize = g_droppedOversize;
+    if (members)         *members = g_streams.size();
+    if (droppedWorld)    *droppedWorld = g_droppedWorld;
 }
 
 static void SendRaw(uint32_t seq, uint32_t type, const NetEvent* ev,
@@ -148,9 +179,12 @@ static void ProcessAck(uint32_t sender, uint32_t ack, uint32_t bits)
         uint32_t s = it->first;
         bool acked = (s == ack) ||
                      (s < ack && ack - s <= 32 && (bits & (1u << (ack - s - 1))));
-        if (acked) g_awaiting[s].erase(sender);
-        if (g_awaiting[s].empty()) {
-            g_awaiting.erase(s);
+        // find, never operator[]: a pending packet without an awaiting set
+        // must not be released by whoever happens to ACK something else.
+        auto waiting = g_awaiting.find(s);
+        if (acked && waiting != g_awaiting.end()) waiting->second.erase(sender);
+        if (waiting != g_awaiting.end() && waiting->second.empty()) {
+            g_awaiting.erase(waiting);
             g_lastSent.erase(s);
             it = g_pending.erase(it);
         } else { ++it; }
@@ -213,6 +247,19 @@ static void NoteReceived(PeerStream& stream, uint32_t s)
     }
 }
 
+// deliver whatever the stash holds from expectedSeq onwards
+static void DrainEarly(PeerStream& stream)
+{
+    for (;;) {
+        auto it = stream.early.find(stream.expectedSeq);
+        if (it == stream.early.end()) break;
+        if (it->second.h.type == 1) Reassemble(stream, it->second.ev);
+        NoteReceived(stream, stream.expectedSeq);            // already acked when stashed; idempotent
+        stream.early.erase(it);
+        stream.expectedSeq++;
+    }
+}
+
 static void DeliverInOrder(PeerStream& stream, const Packet& p)
 {
     uint32_t s = p.h.seq;
@@ -232,14 +279,47 @@ static void DeliverInOrder(PeerStream& stream, const Packet& p)
     if (p.h.type == 1) Reassemble(stream, p.ev);
     NoteReceived(stream, s);
     stream.expectedSeq++;
-    for (;;) {
-        auto it = stream.early.find(stream.expectedSeq);
-        if (it == stream.early.end()) break;
+    DrainEarly(stream);
+}
+
+// The sender's oldest retained packet (every keepalive advertises it) is past
+// the one we are waiting for. It only drops a packet its whole cohort has
+// acknowledged, so the holes below the floor went by while we were not in
+// that cohort: evicted for silence, or admitted with a floor the others had
+// already cleared. Waiting would be forever -- the sender has nothing to
+// resend -- and behind a stuck stream nothing from this sender ever reaches
+// Lua again. Skip to the floor.
+//
+// What we STASHED below the floor is delivered first, in order: we
+// acknowledged those packets and the sender erased them on the strength of
+// that ACK, so nobody will ever send them again (found in review 2026-09-16:
+// erasing the stash lost every line sent between an admission and the first
+// packet the newcomer was awaited for). A line cut by a hole is abandoned,
+// never delivered short. The Lua layer recovers a command gap (NACK + resend).
+static void SkipToFloor(PeerStream& stream, uint32_t floor, uint32_t session)
+{
+    uint32_t lost = 0, delivered = 0, next = stream.expectedSeq;
+    stream.assembling = false;                  // expectedSeq itself is a hole
+    stream.rxAccum.clear();
+    for (auto it = stream.early.begin(); it != stream.early.end() && it->first < floor;) {
+        if (it->first != next) {                // a hole before this one
+            stream.assembling = false; stream.rxAccum.clear();
+            lost += it->first - next;
+        }
         if (it->second.h.type == 1) Reassemble(stream, it->second.ev);
-        NoteReceived(stream, stream.expectedSeq);            // already acked when stashed; idempotent
-        stream.early.erase(it);
-        stream.expectedSeq++;
+        ++delivered;
+        next = it->first + 1;
+        it = stream.early.erase(it);
     }
+    if (next != floor) {                        // a hole up to the floor
+        stream.assembling = false; stream.rxAccum.clear();
+        lost += floor - next;
+    }
+    NetLog("[net] session %08x retains nothing before seq %u and we waited for %u: "
+           "%u stashed packet(s) delivered, %u went by while we were out of its cohort -- skipping ahead\n",
+           session, floor, stream.expectedSeq, delivered, lost);
+    stream.expectedSeq = floor;
+    DrainEarly(stream);
 }
 
 static DWORD WINAPI NetThread(LPVOID)
@@ -259,6 +339,13 @@ static DWORD WINAPI NetThread(LPVOID)
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
                 if (g_outQueue.empty()) break;
+                // Nobody to send to: a packet with an empty awaiting set could
+                // never be released and would hold the window for good.
+                if (g_streams.empty()) {
+                    g_droppedNoPeer += g_outQueue.size();
+                    while (!g_outQueue.empty()) g_outQueue.pop();
+                    break;
+                }
                 // Selective acknowledgements cover only 32 earlier packets.
                 // Never advance beyond an unacknowledged gap's visibility.
                 if (!g_pending.empty() && g_nextSeq - g_pending.begin()->first > 32) break;
@@ -301,6 +388,60 @@ static DWORD WINAPI NetThread(LPVOID)
                     SendRaw(g_pending.empty() ? g_nextSeq : g_pending.begin()->first, 0, nullptr, peer.first, &peer.second);
             }
         }
+
+        // 2c. eviction: a member that has sent nothing for the peer timeout --
+        // not even the keepalive it owes every 500 ms -- is out of the cohort.
+        // Its process is gone (a crash, or a game restart that came back under
+        // a new session id) or its link is. Every broadcast that still waits
+        // for it is released to the members that did acknowledge; if it speaks
+        // again it is admitted afresh and told the current floor.
+        {
+            static uint64_t lastPass = 0;
+            uint64_t now = GetTickCount64();
+            std::lock_guard<std::mutex> lk(g_mtx);
+            // Silence this thread did not observe is not the members' silence:
+            // after standby, or a stall under a world reset, their keepalives
+            // are sitting in the socket buffer. Restart every clock instead of
+            // evicting the whole cohort on the first pass back.
+            if (lastPass && now - lastPass > g_peerTimeoutMs / 2) {
+                for (auto& s : g_streams) s.second.lastRecvMs = now;
+                NetLog("[net] net thread was away for %llu ms -- members' silence clocks restarted\n",
+                       (unsigned long long)(now - lastPass));
+            }
+            lastPass = now;
+            bool evicted = false;
+            size_t releasedAll = 0;
+            for (auto it = g_streams.begin(); it != g_streams.end();) {
+                if (now - it->second.lastRecvMs <= g_peerTimeoutMs) { ++it; continue; }
+                const uint32_t gone = it->first;
+                size_t released = 0;
+                for (auto a = g_awaiting.begin(); a != g_awaiting.end();) {
+                    a->second.erase(gone);
+                    if (a->second.empty()) {
+                        g_pending.erase(a->first); g_lastSent.erase(a->first);
+                        a = g_awaiting.erase(a); ++released;
+                    } else ++a;
+                }
+                it = g_streams.erase(it);
+                evicted = true;
+                releasedAll += released;
+                NetLog("[net] session %08x silent for %u ms -- out of the cohort; %zu packet(s) "
+                       "stop waiting for it, %zu member(s) remain\n",
+                       gone, g_peerTimeoutMs, released, g_streams.size());
+            }
+            // The last one gone: back to "nobody is listening". Lines are
+            // dropped at the queue again, and nothing is kept for whoever
+            // comes next -- it starts from a transferred save, and a backlog
+            // delivered in one burst is exactly what that rule exists against.
+            if (evicted && g_streams.empty()) {
+                const size_t dropped = releasedAll + g_pending.size() + g_outQueue.size();
+                g_pending.clear(); g_lastSent.clear(); g_awaiting.clear();
+                while (!g_outQueue.empty()) g_outQueue.pop();
+                g_droppedNoPeer += dropped;
+                g_peerEverSeen = false; g_lastRecvMs = 0;
+                NetLog("[net] cohort empty -- %zu pending/queued line(s) dropped, nobody is listening\n", dropped);
+            }
+        }
         }
         // Never hold the reset lock across select: an idle receive loop must
         // not starve the control/tail threads trying to switch worlds.
@@ -322,7 +463,20 @@ static DWORD WINAPI NetThread(LPVOID)
             }
             if (got >= (int)sizeof(Header) && p.h.magic == MAGIC) {
                 // Old data and old ACK-only packets are equally inadmissible.
-                if(memcmp(p.h.world,g_worldEpoch.data(),32)!=0) continue;
+                if (memcmp(p.h.world, g_worldEpoch.data(), 32) != 0) {
+                    { std::lock_guard<std::mutex> lk(g_mtx); ++g_droppedWorld; }
+                    const std::string theirs(p.h.world, 32);
+                    auto noted = g_worldNoted.find(p.h.session);
+                    if (noted == g_worldNoted.end() || noted->second != theirs) {
+                        if (g_worldNoted.size() >= 64) g_worldNoted.clear();
+                        g_worldNoted[p.h.session] = theirs;
+                        NetLog("[net] dropped: session %08x is in world %.8s.., we are in %.8s.. -- "
+                               "a member the lobby has not moved to this epoch yet, or a process "
+                               "from an earlier one (logged once per world it claims)\n",
+                               p.h.session, theirs.c_str(), g_worldEpoch.c_str());
+                    }
+                    continue;
+                }
                 if (p.h.session == 0 || (p.h.type != 0 && p.h.type != 1)) continue;
                 // An event holds its chunk header and a text that ENDS inside the
                 // datagram (p is zeroed, so nothing past `got` can supply the NUL).
@@ -334,16 +488,25 @@ static DWORD WINAPI NetThread(LPVOID)
                 }
                 if (p.h.session == g_session) continue;
                 auto found = g_streams.find(p.h.session);
-                // World changes preserve the complete established cohort, not
-                // just the most recently seen sender. A restarted process still
-                // needs a fresh shared-save session before it can participate.
                 if (found == g_streams.end()) {
-                    if (g_rosterFrozen) continue;
+                    // The world epoch is the credential. A process has it only
+                    // from the lobby's own control path (lobby= at a join, epoch=
+                    // from a sync operation it took part in), so whatever process
+                    // id it now runs under, this sender is a member of THIS world.
+                    // Until 2026-09-15 the roster froze at every world change and
+                    // a member whose game had restarted -- a new random session --
+                    // was refused for the rest of the lobby's life, both ways: its
+                    // datagrams died here and the host's died on its side, while
+                    // every broadcast waited for its dead session. It sat in the
+                    // load gate with "0 peer(s) in" and the host read pending=33.
                     found = g_streams.emplace(p.h.session, PeerStream{}).first;
+                    NetLog("[net] session %08x joins world %.8s.. -- %zu member(s) in the cohort\n",
+                           p.h.session, g_worldEpoch.c_str(), g_streams.size());
                 }
+                found->second.lastRecvMs = GetTickCount64();
                 {
                     std::lock_guard<std::mutex> lk(g_mtx);
-                    g_lastRecvMs = GetTickCount64();
+                    g_lastRecvMs = found->second.lastRecvMs;
                     g_peerEverSeen = true;
                 }
                 if (p.h.ackSession == g_session) ProcessAck(p.h.session, p.h.ack, p.h.ackBits);
@@ -354,6 +517,8 @@ static DWORD WINAPI NetThread(LPVOID)
                     if (p.h.type != 0) continue;
                     found->second.expectedSeq = p.h.seq;
                     found->second.sequenceReady = true;
+                } else if (p.h.type == 0 && p.h.seq > found->second.expectedSeq) {
+                    SkipToFloor(found->second, p.h.seq, p.h.session);
                 }
                 if (p.h.type == 1) {
                     DeliverInOrder(found->second, p);
@@ -464,7 +629,7 @@ bool Net_Init(uint16_t localPort, const char* peerIp, uint16_t peerPort,
     g_nextSeq = 0;
     g_streams.clear();
     g_awaiting.clear();
-    g_rosterFrozen = false;
+    g_worldNoted.clear();
     g_session = (uint32_t)(GetTickCount64() ^ (uintptr_t)&g_session);
     if (g_session == 0) g_session = 1;
     g_running = true;
@@ -523,19 +688,24 @@ bool Net_SetWorldEpoch(const char* epoch,void (*resetLocal)(const char*)) {
         std::lock_guard<std::mutex> lock(g_mtx);
         g_worldEpoch=epoch;
         g_nextSeq=0;
-        g_rosterFrozen=true;
+        const uint64_t now = GetTickCount64();
         for (auto& peer : g_streams) {
             peer.second = PeerStream{};
             // Coordinated resets really do start at zero, even if the first
             // keepalive arrives ahead of a missing/reordered packet zero.
             peer.second.sequenceReady = true;
+            peer.second.lastRecvMs = now;   // the silence clock restarts with the world
         }
         g_pending.clear(); g_lastSent.clear(); g_awaiting.clear();
         while(!g_outQueue.empty()) g_outQueue.pop();
         g_lastRecvMs=0; g_peerEverSeen=false;
-        // Keep process identities: changing worlds does not admit a restarted
-        // peer process that has lost its lobby/world state.
+        g_worldNoted.clear();
+        // The established members keep their streams (they start at zero
+        // together). Anyone else who presents this epoch is admitted on
+        // arrival: it can only have it from the same operation. A member that
+        // never speaks in the new world leaves the cohort by the timeout.
     }
+    NetLog("[net] world %.8s.. -- %zu member(s) carried over\n", epoch, g_streams.size());
     if(resetLocal) resetLocal(epoch);
     return true;
 }
@@ -549,6 +719,16 @@ bool Net_BeginLobby(const char* epoch, const char* ip, int port,
     std::lock_guard<std::mutex> epochLock(g_epochMtx);
     if(!Net_SetPeer(ip,port)) return false;
     if(g_lobbyEpoch==epoch) return true;
+    // The lobby's nonce has caught up with the world we already run: after a
+    // resync the host lobby advertises the resync epoch, so a player who joins
+    // later starts in it instead of in a lobby nonce nobody else is in any more.
+    // The members that did the resync are here already; keep every stream.
+    if(g_worldEpoch==epoch) {
+        std::lock_guard<std::mutex> lock(g_mtx);
+        g_lobbyEpoch=epoch;
+        NetLog("[net] lobby nonce now names our world %.8s.. -- nothing resets\n", epoch);
+        return true;
+    }
     {
         std::lock_guard<std::mutex> lock(g_mtx);
         g_lobbyEpoch=epoch;
@@ -558,9 +738,10 @@ bool Net_BeginLobby(const char* epoch, const char* ip, int port,
         g_streams.clear(); g_awaiting.clear();
         g_pending.clear(); g_lastSent.clear();
         while(!g_outQueue.empty()) g_outQueue.pop();
-        g_rosterFrozen=false;
         g_lastRecvMs=0; g_peerEverSeen=false;
+        g_worldNoted.clear();
     }
+    NetLog("[net] lobby %.8s.. -- new cohort, our session is now %08x\n", epoch, g_session);
     if(resetLocal) resetLocal(epoch);
     return true;
 }
@@ -629,7 +810,7 @@ void Net_Shutdown()
         g_lastSent.clear();
         g_streams.clear();
         g_awaiting.clear();
-        g_rosterFrozen=false;
+        g_worldNoted.clear();
         g_outQueue = std::queue<NetEvent>{};
         g_peerEverSeen = false;
     }

@@ -469,15 +469,15 @@ static void HealthThread()
     char last[192] = "";
     while (!g_stopping) {
         SleepMs(10000);
-        uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0;
-        size_t pending = 0; bool alive = false;
-        Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize);
+        uint64_t dNoPeer = 0, dOverflow = 0, dOversize = 0, dWorld = 0;
+        size_t pending = 0, members = 0; bool alive = false;
+        Net_Stats(&dNoPeer, &dOverflow, &pending, &alive, &dOversize, &members, &dWorld);
         char cur[192];
         snprintf(cur, sizeof(cur),
-            "peer=%s pending=%zu dropped=%llu/%llu/%llu strangers=%llu",
-            alive ? "up" : "DOWN", pending,
+            "peer=%s members=%zu pending=%zu dropped=%llu/%llu/%llu other-world=%llu strangers=%llu",
+            alive ? "up" : "DOWN", members, pending,
             (unsigned long long)dNoPeer, (unsigned long long)dOverflow,
-            (unsigned long long)dOversize,
+            (unsigned long long)dOversize, (unsigned long long)dWorld,
             (unsigned long long)Net_DroppedStrangers());
         if (strcmp(cur, last) == 0) continue;
         snprintf(last, sizeof(last), "%s", cur);
@@ -537,6 +537,7 @@ static void InitThread()
 
     OpenEventsFile(cfg.instance);
 
+    Net_SetLogger([](const char* line) { Log("%s", line); });
     bool netUp = Net_Init(cfg.localPort, cfg.peerIp, cfg.peerPort, OnPeerLine);
 
     // Losing the bind after the availability check is itself an election

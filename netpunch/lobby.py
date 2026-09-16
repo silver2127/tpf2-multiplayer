@@ -1816,7 +1816,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.3"
+LOBBY_VERSION = "0.5.5"
 
 
 def version_rejection(remote):
@@ -2365,6 +2365,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     preflight_requests = {}
     mod_preflight = [False]
     pending_start = [None]
+    serve_hold = [0.0]        # until when the serve-again waits for the host's hot-join save
     mod_round = [None]        # the addrs to start once a mods round resolves
 
     def broadcast_start(save, only=None):
@@ -2801,8 +2802,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[host] public listing {'ON' if publisher.on else 'OFF'}")
             else:
                 log("[host] publish requested but no --publish URL was given")
+        elif c == "sync_taking":
+            # The host's menu is taking a hot-join save for the newcomer(s). The
+            # serve-again below must not push the save START GAME shared meanwhile
+            # -- it did, within a second of the join, and the fresh autosave then
+            # arrived to "a save transfer is in progress" (2026-09-16). Its start
+            # lifts the hold; if the save never appears the hold expires.
+            serve_hold[0] = time.time() + 120
+            log("[host] the host is saving for a hot join -- holding the serve-again")
         elif c == "start":
             save = cmd.get("save")
+            serve_hold[0] = 0.0
             if relay_only:
                 log("[relay] 'start' from the local panel ignored -- the leader starts")
             elif transfer[0] is not None:
@@ -2810,6 +2820,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     pending_start[0] = dict(cmd)
                     io.emit({"type": "status", "state": "connected",
                              "detail": "Waiting for mod downloads before starting the game."})
+                elif save:
+                    # never drop the host's save: it is the world the game is in NOW
+                    pending_start[0] = dict(cmd)
+                    log("[host] start queued until the running save transfer ends")
                 else:
                     log("[host] start ignored -- a save transfer is in progress")
             elif save and not _mod_check(save, io, log):
@@ -2950,6 +2964,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if dead:
                     roster_changed()
 
+            # After a resync the members run in the operation's epoch, not in
+            # this lobby's nonce. Advertise THAT from now on (welcome, roster):
+            # a player who joins later must start in the world the others are
+            # in. Their bridges take a nonce that names their current world as
+            # a rename, not a reset (net.cpp, Net_BeginLobby). Checked BEFORE
+            # the heal below so the old and the new nonce never go out back to
+            # back (reordered, the old one would reset a member's bridge).
+            # The late joiner is also served the resync snapshot from now on,
+            # not the save START GAME shared: that world was left behind.
+            if recovery:
+                world = recovery.world_epoch()
+                if world and world != transport_lobby:
+                    transport_lobby = world
+                    last_heal = now
+                    snapshot = recovery.runtime.save_directory / ('mp_' + world[:12] + '.sav')
+                    if snapshot.is_file():
+                        last_shared[0] = str(snapshot)
+                    log(f"[host] transport lobby follows the completed resync ({world[:8]}..); late joiners get {os.path.basename(last_shared[0] or '')}")
+                    io.emit(dict(type='transport_lobby', epoch=transport_lobby))
+                    send_roster_packets()
+
             if now - last_heal >= ROSTER_HEAL:
                 last_heal = now
                 send_roster_packets()
@@ -2979,7 +3014,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # Anyone who joined during a transfer is still unstarted: serve them
             # from the same save now that the pipe is free (relay: its stored
             # world; host: the file START GAME shared). One push per batch.
-            if not (recovery and recovery.held) and started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
+            if not (recovery and recovery.held) and started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0 and now >= serve_hold[0]:
                 last_serve_check[0] = now
                 waiting = [a for a in peers if not peers[a].get("started")]
                 fresh = (not relay_only) or (0 <= stored_age() <= HOTJOIN_STORED_MAX)
@@ -3167,6 +3202,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
 
     desired = [my_name]     # what we asked to be called
     assigned = [my_name]    # what the host actually named us (from 'welcome')
+    seen_nonces = set()     # transport lobby nonces already handed to the menu
     started = [False]
     last_roster = [None]
     host_name = [None]
@@ -3419,7 +3455,11 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             return
         if t in ("welcome", "roster"):
             lobby_epoch = m.get("transport_lobby", "")
-            if isinstance(lobby_epoch, str) and re.fullmatch(r"[0-9a-f]{32}", lobby_epoch):
+            # A nonce only ever moves forward (the lobby's own, then each completed
+            # resync's epoch); one seen before is a reordered old roster, and
+            # handing it to the menu would reset the bridge mid-game.
+            if isinstance(lobby_epoch, str) and re.fullmatch(r"[0-9a-f]{32}", lobby_epoch) and lobby_epoch not in seen_nonces:
+                seen_nonces.add(lobby_epoch)
                 io.emit(dict(type='transport_lobby', epoch=lobby_epoch))
         if t == "welcome":
             receiver.on_manifest(m.get("mods", []))
