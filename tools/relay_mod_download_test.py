@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'netpunch'))
 import lobby as l
+def who(): return threading.current_thread().name.split('/')[0]   # the player: its loop thread, or that thread's save-finalize worker
 import modshare as m
 
 def main():
@@ -14,11 +15,11 @@ def main():
         stop=threading.Event();threads=[];conns=[];ios={}
         hs=l.open_socket(0,socket.AF_INET);port=hs.getsockname()[1]
         def installed(mid,v):
-            if m.is_dlc(mid) or threading.current_thread().name=='leader': return str(src)
-            p=root/threading.current_thread().name/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_")
+            if m.is_dlc(mid) or who()=='leader': return str(src)
+            p=root/who()/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_")
             return str(p) if (p/'mod.lua').exists() else None
         def catalogue():
-            return threading.current_thread().name,{(mid,str(v)) for mid,v in mods if installed(mid,v)}
+            return who(),{(mid,str(v)) for mid,v in mods if installed(mid,v)}
         def command(io,msg):
             with open(io.in_path,'a',encoding='utf8') as f: f.write(json.dumps(msg)+'\n')
         def connect(name):
@@ -28,7 +29,7 @@ def main():
             c=l.race(s,peer,'dial',s.getsockname()[1],8,my_has_v6=False);assert c,'connect failed'
             conns.append(c)
             t=threading.Thread(target=l.run_client,name=name,args=(c,name,io),kwargs={'stop':stop},daemon=True);t.start();threads.append(t)
-        with patch.object(m,'save_mod_list',return_value=mods), patch.object(m,'find_mod',return_value=str(src)), patch.object(m,'installed_mod',side_effect=installed), patch.object(m,'install_target',side_effect=lambda mid,v:str(root/threading.current_thread().name/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_"))), patch.object(m,'request_catalogue',side_effect=lambda:threading.current_thread().name), patch.object(m,'catalogue',side_effect=catalogue):
+        with patch.object(m,'save_mod_list',return_value=mods), patch.object(m,'find_mod',return_value=str(src)), patch.object(m,'installed_mod',side_effect=installed), patch.object(m,'install_target',side_effect=lambda mid,v:str(root/who()/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_"))), patch.object(m,'request_catalogue',side_effect=lambda:who()), patch.object(m,'catalogue',side_effect=catalogue):
             server=l.LobbyIO(str(root/'relay'))
             t=threading.Thread(target=l.run_host,args=(hs,'relay',server),kwargs={'relay_only':True,'stop':stop},daemon=True);t.start();threads.append(t)
             try:

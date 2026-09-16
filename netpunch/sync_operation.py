@@ -14,8 +14,23 @@ import time
 PHASES = ('holding', 'waiting', 'saving', 'transferring', 'loading', 'checking',
           'releasing', 'complete', 'error', 'aborted')
 ACTIVE = frozenset(PHASES[:-3])
-TIMEOUT = {'holding': 45, 'saving': 120, 'transferring': 300,
-           'loading': 300, 'checking': 60, 'releasing': 30}
+# Phases whose length does not depend on the world: a fixed wait from entry.
+TIMEOUT = {'holding': 45, 'checking': 60, 'releasing': 30}
+# Phases whose length DOES depend on the world -- the engine writing the save,
+# the bytes crossing the wire, every engine loading it -- have no total limit.
+# A 1 GB save to a slow uplink is however long it is. What ends them early is
+# SILENCE: no member reported any progress for this long (the same numbers
+# that were the total limits until 2026-09-16, now measured from the last
+# progress report, not from entry). Progress is anything that advances, by a
+# member that has not finished its part: bytes acknowledged by a receiver
+# (and its verify/write work once it has them all), the engine's own work --
+# CPU time of the thread saving or loading, bytes through the disk -- a save
+# file growing, a member's control stage changing (see SyncParticipant.progress,
+# sync_runtime.engine_work, HostRecovery.tick, ClientRecovery.tick). Never a
+# heartbeat that ticks regardless of the engine, and never a member that has
+# already acknowledged the phase: what that member's engine does afterwards
+# (rendering, idling) says nothing about the members still working.
+SILENCE = {'saving': 120, 'transferring': 300, 'loading': 300}
 
 
 def snapshot_digest(files):
@@ -57,6 +72,7 @@ class SyncOperation:
         self.resume_speed = None
         self.error = None
         self.deadline = None
+        self.progress_seen = {}     # member -> its last progress token in this phase
         self.effects = []
         self.confirmed = True
 
@@ -64,8 +80,40 @@ class SyncOperation:
         self.phase = phase
         self.revision += 1
         self.acks = {}
-        self.deadline = self.clock() + TIMEOUT[phase] if phase in TIMEOUT else None
+        self.progress_seen = {}
+        if phase in TIMEOUT:
+            self.deadline = self.clock() + TIMEOUT[phase]
+        elif phase in SILENCE:
+            self.deadline = self.clock() + SILENCE[phase]
+        else:
+            self.deadline = None
         self.effects.append(self.view())
+
+    def progress(self, sender, message):
+        """A member reports that its part of the current phase is advancing.
+
+        ``message`` names the operation, revision, epoch and phase like an
+        acknowledgement and carries a ``progress`` token; a token that differs
+        from the member's previous one moves the silence deadline out again. A
+        repeated token is not progress, and neither is anything from a member
+        that has already acknowledged this phase: its part is done, so nothing
+        it reports can stand for the members still working (a host rendering
+        away after its own quick install kept a hung joiner's load 'alive').
+        Returns True when the deadline moved."""
+        if self.phase not in SILENCE or sender not in self.members or sender in self.acks:
+            return False
+        if not isinstance(message, dict):
+            return False
+        if any(message.get(k) != getattr(self, k) for k in ('operation', 'revision', 'epoch', 'phase')):
+            return False
+        token = message.get('progress')
+        if not isinstance(token, str) or not token:
+            return False
+        if self.progress_seen.get(sender) == token:
+            return False
+        self.progress_seen[sender] = token
+        self.deadline = self.clock() + SILENCE[self.phase]
+        return True
 
     def view(self):
         return {'operation': self.operation, 'revision': self.revision,
@@ -112,7 +160,10 @@ class SyncOperation:
         if set(members) != set(self.members):
             self.fail('Player disconnected or roster changed')
         elif self.deadline is not None and self.clock() >= self.deadline:
-            self.fail('Timed out waiting for all players')
+            if self.phase in SILENCE:
+                self.fail(f'No progress for {SILENCE[self.phase]} s while {self.phase}')
+            else:
+                self.fail('Timed out waiting for all players')
 
     def retry(self, sender, operation, members):
         if sender not in self.members or operation != self.operation or self.phase != 'error':

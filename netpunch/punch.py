@@ -157,12 +157,17 @@ class Connection:
 
     # -- internal reader / sender loop ------------------------------------- #
     def _send_to(self, ptype, payload, addr):
+        """One frame out. Punch traffic (HELLO/ACK/KEEPALIVE) swallows a
+        failure: Windows spits ICMP-port-unreachable back as an exception when
+        the peer isn't listening yet, and the punch loop keeps retrying. An
+        APPLICATION frame's failure is raised to the caller (send), which
+        logs it: a joiner's control message that never left the socket was
+        invisible until 2026-09-16."""
         try:
             self.sock.sendto(_pack(ptype, payload), addr)
         except (ConnectionResetError, OSError):
-            # Windows spits ICMP-port-unreachable back as an exception when the
-            # peer isn't listening yet. Ignore; the punch loop keeps retrying.
-            pass
+            if ptype in (TYPE_DATA, TYPE_EDATA, TYPE_ADATA):
+                raise
 
     def _hello_destinations(self):
         """Where to aim HELLOs right now."""
@@ -297,6 +302,9 @@ class Connection:
         return self.connected.wait(timeout)
 
     def send(self, data: bytes):
+        """Send one application datagram. Raises RuntimeError before a peer
+        is resolved and OSError when the socket refused the frame (too big
+        for the path, peer gone): a failed send is never silent."""
         if self.peer is None:
             raise RuntimeError("no peer resolved yet")
         if self.cipher is not None:

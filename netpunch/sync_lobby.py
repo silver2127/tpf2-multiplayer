@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 
-from sync_operation import SyncOperation, SyncReplica, ACTIVE
+from sync_operation import SyncOperation, SyncReplica, ACTIVE, SILENCE
 from sync_runtime import SyncParticipant
 
 
@@ -138,12 +138,16 @@ class HostRecovery:
 
     def command(self, sender, message):
         kind = message.get('cmd', message.get('t'))
-        if kind not in ('sync_request', 'sync_retry', 'sync_abort', 'sync_ack', 'sync_ready', 'sync_decline'):
+        if kind not in ('sync_request', 'sync_retry', 'sync_abort', 'sync_ack', 'sync_ready', 'sync_decline', 'sync_progress'):
             return False
         if sender not in self.members():
             return True
         if kind == 'sync_ack':
             self.barrier.acknowledge(sender, message)
+            return True
+        if kind == 'sync_progress':
+            # a member's engine or receiver is advancing: the phase's silence timeout moves out
+            self.barrier.progress(sender, message)
             return True
         request = message.get('id')
         if not isinstance(request, str) or not 1 <= len(request) <= 128:
@@ -210,6 +214,17 @@ class HostRecovery:
             self.barrier.abort(sender, message.get('operation'))
         return True
 
+    def _local_progress(self, token, member=None):
+        """The host's own progress -- its engine -- counts for the barrier
+        like any member's report; the transfer it drives is reported per
+        RECEIVING member (``member``), since that is whose part is advancing:
+        the host has long acknowledged 'transferring' itself, and an
+        acknowledged member's reports do not count."""
+        if isinstance(token, str) and token:
+            self.barrier.progress(member or self.barrier.host, dict(
+                {k: getattr(self.barrier, k) for k in ('operation', 'revision', 'epoch', 'phase')},
+                progress=token))
+
     def feedback(self, address, message):
         if self.transfer is None or message.get('sid') != self.transfer.sid:
             return False
@@ -250,6 +265,7 @@ class HostRecovery:
         ack = self.runtime.tick()
         if ack:
             self.barrier.acknowledge(self.barrier.host, ack)
+        self._local_progress(self.runtime.progress())
         if self.barrier.phase == 'transferring':
             try:
                 if self.transfer_epoch != self.barrier.epoch:
@@ -258,6 +274,10 @@ class HostRecovery:
                     self.transfer.begin_msg.update(operation=self.barrier.operation, epoch=self.barrier.epoch)
                     self.transfer_epoch = self.barrier.epoch
                 self.transfer.pump(now)
+                for member, token in self.transfer.progress_tokens():
+                    # a receiver got further, or its verify/write moved on: progress
+                    # for THAT member (the barrier ignores a token it saw before)
+                    self._local_progress(token, member)
                 if self.transfer.failed_names():
                     self.barrier.fail('Snapshot transfer failed')
             except (OSError, ValueError, RuntimeError, AttributeError) as error:
@@ -279,6 +299,7 @@ class ClientRecovery:
         self.local_seen = runtime._read('tpf2_sync_request.txt').get('id')
         self.received_epoch = None
         self.sent = self.available = 0
+        self.progress_sent = 0
         self.supported = False
         self.readiness = None
 
@@ -362,6 +383,14 @@ class ClientRecovery:
                 except (ValueError, OSError) as error:
                     self.runtime._failure(error)
         ack = self.runtime.tick()
+        if state and not ack and state['phase'] in SILENCE and now - self.progress_sent >= 1:
+            # not done with this phase yet: tell the host how far along we are, so a
+            # long save, transfer or load is judged by its progress, not by a clock
+            self.progress_sent = now
+            token = '%s|recv=%s/%s' % (self.runtime.progress(), getattr(self.receiver, 'recv_count', 0),
+                                       getattr(self.receiver, 'finalizing', False))
+            self.send(dict({k: state[k] for k in ('operation', 'revision', 'epoch', 'phase')},
+                           t='sync_progress', progress=token))
         if now - self.sent >= .25:
             self.sent = now
             for command in list(self.pending.values()):

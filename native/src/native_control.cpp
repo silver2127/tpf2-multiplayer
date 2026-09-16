@@ -2,6 +2,7 @@
 #include "native_io.h"
 #include <windows.h>
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <cstdio>
 
@@ -12,6 +13,7 @@ std::wstring directory;
 bool supported=false;
 std::string latestEvent, latestEventId;
 std::string initialRequest;
+uint64_t ownWrites=0;        // bytes this thread wrote to the mailbox files (netted out of io_write)
 std::string clean(std::string text) {
     for(auto& c:text) if(c=='\r' || c=='\n' || c=='\0') c=' ';
     return text;
@@ -42,8 +44,41 @@ bool write(const wchar_t* name,const std::string& text) {
     FILE* file=nullptr; _wfopen_s(&file,temporary.c_str(),L"wb");
     if(!file) return false;
     const bool ok=fwrite(text.data(),1,text.size(),file)==text.size();
+    if(ok) ownWrites+=text.size();
     const bool closed=fclose(file)==0;
     return ok && closed && MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+}
+// Whether a save or load is ALIVE cannot be read from this thread's own
+// heartbeat (it ticks whether or not the engine advances -- a game thread hung
+// mid-save kept the lobby's silence timeout from ever firing, 2026-09-16). What
+// can be read from outside the engine is the work itself: CPU time burnt by
+// the thread doing it (GetThreadTimes, kernel+user, in ms) and the bytes the
+// process moved through the disk (its IO counters, writes net of this
+// mailbox's own). A deadlocked or dialog-blocked thread burns none and moves
+// none; the lobby quantises these so that idle noise never reads as progress
+// (sync_runtime.engine_work).
+struct ThreadClock { DWORD id=0; HANDLE handle=nullptr; };
+ThreadClock uiClock, commandClock;
+uint64_t cpuMilliseconds(ThreadClock& clock,DWORD id) {
+    if(clock.id!=id) {
+        if(clock.handle) CloseHandle(clock.handle);
+        clock.handle=id ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,id) : nullptr;
+        clock.id=id;
+    }
+    FILETIME created{},exited{},kernel{},user{};
+    if(!clock.handle || !GetThreadTimes(clock.handle,&created,&exited,&kernel,&user)) return 0;
+    ULARGE_INTEGER k{{kernel.dwLowDateTime,kernel.dwHighDateTime}}, u{{user.dwLowDateTime,user.dwHighDateTime}};
+    return (k.QuadPart+u.QuadPart)/10000;
+}
+std::string liveness() {
+    DWORD uiThread=0,command=0;
+    NativeIo::WorkThreads(uiThread,command);
+    IO_COUNTERS io{};
+    if(!GetProcessIoCounters(GetCurrentProcess(),&io)) io=IO_COUNTERS{};
+    const uint64_t written=io.WriteTransferCount>ownWrites ? io.WriteTransferCount-ownWrites : 0;
+    return "\ncpu_ui="+std::to_string(cpuMilliseconds(uiClock,uiThread))+
+        "\ncpu_command="+std::to_string(cpuMilliseconds(commandClock,command))+
+        "\nio_read="+std::to_string(io.ReadTransferCount)+"\nio_write="+std::to_string(written);
 }
 void event(const NativeIo::Event& value) {
     latestEventId=value.operation;
@@ -91,7 +126,7 @@ DWORD WINAPI work(void*) {
         const bool published=latestEvent.empty() || write(L"tpf2_native_event.txt",latestEvent);
         write(L"tpf2_native_status.txt","pid="+pid+"\nsupported="+(supported?"1":"0")+
             "\nhas_world="+(NativeIo::HasWorld()?"1":"0")+"\nbusy="+(NativeIo::Busy()?"1":"0")+
-            "\nlast_request="+last+"\nlast_event="+latestEventId+"\nevent_published="+(published?"1":"0")+"\n");
+            "\nlast_request="+last+"\nlast_event="+latestEventId+"\nevent_published="+(published?"1":"0")+liveness()+"\n");
         Sleep(100);
     }
     return 0;
