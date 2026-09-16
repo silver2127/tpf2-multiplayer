@@ -3,7 +3,11 @@
 A company's name is replicated company state, not the player entity's NAME
 component (a switch swaps the entities, so a NAME would follow the wrong
 company). This loads the real companies.lua and checks:
-  - an unnamed company reads as "Company N"
+  - an unnamed company reads as "<player>'s company" after its first player,
+    or "Company N" while nobody plays it or no player name is known
+  - the game's own company window is the rename: a SetName captured on our
+    company's player entity becomes CMNAME (inject.lua); the dashboard has no
+    name field
   - the origin playing a company may name it; the name arrives percent-escaped
     and is stored unescaped and trimmed
   - an origin playing another company may not name it
@@ -78,6 +82,15 @@ function T.swapSwitch()
 end
 function T.name(origin, cid, name) CM.execCompanyCmd({ op = "CMNAME", cid = cid, origin = origin, name = CM.escName(name) }) return notes[#notes] end
 function T.raw(cid) return CM.cmName[cid] end
+function T.defaults()
+  CM.playerNames = { a = "Ada", b = "bob" }
+  local saved = CM.cmPlayersOf
+  CM.cmPlayersOf = function(cid) return ({ [1] = { "a" }, [2] = { "b", "c" }, [3] = {} })[cid] or {} end
+  local r = { CM.cmNameOf(1), CM.cmNameOf(2), CM.cmNameOf(3), CM.cmDisplayName(2, "Acme", { "b" }), CM.cmDisplayName(4, nil, { "c" }) }
+  CM.cmPlayersOf = saved
+  CM.playerNames = {}
+  return table.concat(r, "|")
+end
 function T.dissolve(cid) CM.peers = {}; CM.cmPlayersOf = function() return {} end; CM.cmMoveAssets = function() return 0 end; CM.cmWallet = function() return 0, 0 end; CM.cmSetWallet = function() end; CM.cmPwOk = function() return true end
   CM.execCompanyCmd({ op = "CMDEL", cid = cid, origin = "a" }) return notes[#notes] end
 function T.roundTrip()
@@ -98,7 +111,10 @@ end
 return T
 ''')
 
-check("unnamed reads as Company N", T.nameOf(2) == "Company 2", T.nameOf(2))
+check("unnamed reads as Company N with no player names", T.nameOf(2) == "Company 2", T.nameOf(2))
+d = T.defaults()
+check("unnamed reads as <player>'s company; a given name wins; an unknown player name falls back",
+      d == "Ada's company|bob's company|Company 3|Acme|Company 4", d)
 n = T.name("b", 2, "  Acme & Sons  ")
 check("the origin playing it names it (trimmed, unescaped)", T.raw(2) == "Acme & Sons", repr(T.raw(2)))
 check("the note says who named what", "b named company 2" in n and "Acme & Sons" in n, n)
@@ -126,7 +142,10 @@ lockstep = open(LOCKSTEP, encoding="utf-8", errors="replace").read()
 check("inject.lua parses CMNAME cid name...", 'o == "CMNAME"' in inject and 'CM.scheduleLocal("CMNAME"' in inject)
 check("CMNAME is never solo-dropped nor actions-off dropped", 'and o ~= "CMNAME" then' in inject and 'CMNAME = true' in inject)
 check("the dispatcher routes CMNAME to execCompanyCmd", 'c.op == "CMNAME" then CM.execCompanyCmd(c)' in lockstep)
-check("the dashboard reads the names and picks from a ComboBox", 'conames=' in lockstep and 'api.gui.comp.ComboBox.new()' in lockstep and 'CMNAME ' in lockstep)
+check("the dashboard reads the names and picks from a ComboBox", 'conames=' in lockstep and 'api.gui.comp.ComboBox.new()' in lockstep)
+check("the dashboard has no name field: the game's company window renames", 'name mine' not in lockstep and 'coNameInput' not in lockstep)
+check("a rename of our company's player entity becomes CMNAME",
+      'CM.scheduleLocal("CMNAME", { cid = CM.cmMyCompany, name = w[3] })' in inject and 'id == myCompanyPid' in inject)
 
 print("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")
 raise SystemExit(1 if fails else 0)

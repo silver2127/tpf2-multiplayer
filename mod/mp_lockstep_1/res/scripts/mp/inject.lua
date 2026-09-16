@@ -1177,8 +1177,22 @@ function CM.pollInject()
 						key = CM.vehKeyFor(id); if key then kind = "veh" end
 					end
 				end
+				-- A rename of our own company's player entity (the game's company
+				-- window) is the company's name: it travels as CMNAME (companies.lua)
+				-- and every instance names its own entity for that company. The
+				-- instance that renamed it has the new name already; CMNAME then
+				-- finds nothing to change there. (cmApplyNames renames through
+				-- make.setName, which the slice does not ship, so nothing echoes.)
+				local myCompanyPid = nil
+				if o == "VNAME" and id and not key and CM.cmMode == "companies" and CM.cmMyCompany then
+					myCompanyPid = CM.cmCompanyPid and CM.cmCompanyPid[CM.cmMyCompany]
+					if not myCompanyPid then pcall(function() myCompanyPid = api.engine.util.getPlayer() end) end
+				end
 				if echo then
 					log(string.format("VCOLOR: entity %s is our own replay coming back -- not shipped", tostring(w[2])))
+				elseif o == "VNAME" and id and id == myCompanyPid then
+					log(string.format("VNAME: entity %s is company %d's player -> CMNAME %s", tostring(id), CM.cmMyCompany, tostring(w[3])))
+					CM.scheduleLocal("CMNAME", { cid = CM.cmMyCompany, name = w[3] })
 				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
