@@ -1666,7 +1666,12 @@ function data()
 					-- The GUI state cannot reach the lockstep queue, so a button
 					-- appends "CMSWITCH 3" to the inject file; inject.lua schedules
 					-- the command and every peer applies it on the same step.
-					D.coText = api.gui.comp.TextView.new("company: -")
+					-- LAYOUT (2026-09-16): three short rows instead of one dense line.
+					--   [swatch] You play Acme Co (#3) with alice, bob
+					--   Join: [dropdown of every company] [swatch] [ Join Acme Co ]   [ New company ]
+					--   Yours:  name [input] [Rename]   password [input] [Set]
+					--   (note / hint)
+					D.coText = api.gui.comp.TextView.new("You play: -")
 					D.coSel = nil
 					local function coPw()
 						local t = ""
@@ -1703,7 +1708,8 @@ function data()
 					D.coSwSel = api.gui.comp.TextView.new("  ##  ")
 					crow:addItem(D.coSwMine)
 					crow:addItem(D.coText)
-					crow:addItem(D.coSwSel)
+					local jrow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					jrow:addItem(api.gui.comp.TextView.new("Join: "))
 					-- The picker (2026-09-16): a dropdown of every company, "player -- company
 					-- name", alphabetical, in place of the < > stepper. Rebuilt only when
 					-- its labels change (see D.coItemsSig below), so a click is never lost
@@ -1712,9 +1718,14 @@ function data()
 					D.coPickL = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					D.coPick = api.gui.comp.Component.new("mpCompanyPick")
 					D.coPick:setLayout(D.coPickL)
-					crow:addItem(D.coPick)
-					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
-					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
+					jrow:addItem(D.coPick)
+					jrow:addItem(D.coSwSel)
+					D.coJoinLbl = api.gui.comp.TextView.new("  Join  ")
+					local joinBtn = api.gui.comp.Button.new(D.coJoinLbl, true)
+					joinBtn:onClick(function() if D.coSel and D.coSel ~= D.coMine then coRequest("CMSWITCH", D.coSel) end end)
+					jrow:addItem(joinBtn)
+					jrow:addItem(api.gui.comp.TextView.new("      "))
+					jrow:addItem(speedBtn("  New company  ", function() coRequest("CMNEW") end))
 					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
 					D.coNote = api.gui.comp.TextView.new("")
 					-- password: used by "new company" (locks the new one), by "switch"/"dissolve"
@@ -1728,9 +1739,9 @@ function data()
 						pcall(function() D.coPwInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
 					end)
 					local prow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					prow:addItem(api.gui.comp.TextView.new("company password: "))
+					prow:addItem(api.gui.comp.TextView.new("Yours:   password "))
 					if D.coPwInput then prow:addItem(D.coPwInput) end
-					prow:addItem(speedBtn("  set on mine  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on company " .. D.coMine .. "..."; coRequest("CMPW", D.coMine) end end))
+					prow:addItem(speedBtn("  Set  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on " .. (D.coNames and D.coNames[D.coMine] or ("company " .. D.coMine)) .. "..."; coRequest("CMPW", D.coMine) end end))
 					-- the name of our own company (empty = back to "Company N")
 					pcall(function()
 						local mk = api.gui.comp.TextInputField
@@ -1740,9 +1751,9 @@ function data()
 						pcall(function() D.coNameInput:setMinimumSize(api.gui.util.Size.new(180, 26)) end)
 						pcall(function() D.coNameInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
 					end)
-					prow:addItem(api.gui.comp.TextView.new("   company name: "))
+					prow:addItem(api.gui.comp.TextView.new("     name "))
 					if D.coNameInput then prow:addItem(D.coNameInput) end
-					prow:addItem(speedBtn("  name mine  ", function()
+					prow:addItem(speedBtn("  Rename  ", function()
 						if not D.coMine then return end
 						local t = ""
 						pcall(function() t = D.coNameInput and D.coNameInput:getText() or "" end)
@@ -1756,7 +1767,9 @@ function data()
 					local crowC = api.gui.comp.Component.new("mpCompanyRow")
 					crowC:setLayout(crow)
 					local coL = api.gui.layout.BoxLayout.new("VERTICAL")
-					coL:addItem(crowC); coL:addItem(prowC); coL:addItem(D.coNote)
+					local jrowC = api.gui.comp.Component.new("mpCompanyJoinRow")
+					jrowC:setLayout(jrow)
+					coL:addItem(crowC); coL:addItem(jrowC); coL:addItem(prowC); coL:addItem(D.coNote)
 					D.coBox = api.gui.comp.Component.new("mpCompanies")
 					D.coBox:setLayout(coL)
 					box:addItem(D.coBox)
@@ -1945,10 +1958,19 @@ function data()
 						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, sel or D.coMine or 1)))
 						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
 						if D.coSwSel and D.coSwSelCls ~= selCls then D.coSwSelCls = selCls; pcall(function() D.coSwSel:setStyleClassList({ selCls }) end) end
-						D.coText:setText(string.format("company: mine %s (%s)   |  %d in session   |  selected: %s%s%s   ",
-							D.coMine and coName(D.coMine) or "?", tostring(D.coMine or "?"), #roster, sel and (coName(sel) .. " (" .. sel .. ")") or "-",
-							(sel == D.coMine and " (mine)" or "") .. (sel and locked[sel] and " [password]" or ""),
-							selWho and (" played by " .. table.concat(whoNames(sel), ", ")) or (sel and " (empty)" or "")))
+						local mineWho = D.coMine and whoNames(D.coMine) or {}
+						local others = {}
+						for _, l in ipairs(mineWho) do if l ~= CM.playerNameOf(K.INSTANCE or "?") then others[#others + 1] = l end end
+						D.coText:setText(string.format("You play %s (#%s)%s   %d compan%s in the session",
+							D.coMine and coName(D.coMine) or "?", tostring(D.coMine or "?"),
+							#others > 0 and (" with " .. table.concat(others, ", ")) or "",
+							#roster, #roster == 1 and "y" or "ies"))
+						if D.coJoinLbl then
+							local label
+							if not sel or sel == D.coMine then label = "  (this is yours)  "
+							else label = "  Join " .. coName(sel) .. (locked[sel] and "  [password]" or "") .. (selWho and "" or "  (empty)") .. "  " end
+							if D.coJoinLblText ~= label then D.coJoinLblText = label; pcall(function() D.coJoinLbl:setText(label) end) end
+						end
 						local note = mine.conote or ""
 						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
 						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end
