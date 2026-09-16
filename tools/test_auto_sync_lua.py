@@ -44,7 +44,8 @@ with TemporaryDirectory() as temporary:
     lua.execute('assert(CM.autoSyncPump(100)); assert(changes==1)')
     control(5, 'complete')
     path = directory / 'tpf2_sync_lua.txt'
-    path.write_text(path.read_text().replace('resume_speed=0', 'resume_speed=3'))
+    # 3 is a real engine speed (a session sat at it, 2026-09-16); 7 is not
+    path.write_text(path.read_text().replace('resume_speed=0', 'resume_speed=7'))
     lua.execute('assert(CM.autoSyncPump(100)); assert(not didInitialUnpause)')
     path.write_text('pid=123\nphase=complete')
     lua.execute('assert(CM.autoSyncPump(100))')
