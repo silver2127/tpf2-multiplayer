@@ -151,7 +151,8 @@ balances must stay equal.
 - [ ] **V5** Send a vehicle to a depot; reverse a vehicle, including one on its way to a depot; sell one.
 - [ ] **V6** Replace a vehicle with a newer model.
 - [ ] **V7** Rename a vehicle and change its colour.
-- [ ] **V8** Ten minutes at 4x: the stats' vehicle drift stays under 10 m and the verdict `SYNC`.
+- [ ] **V8** Ten minutes at 4x on a save with at most 200 vehicles: the stats' vehicle drift stays
+  under 10 m and the verdict `SYNC`. Past 200 vehicles the row reads `off`, and stays off after a reload.
 
 Not replicated, so not tested: vehicle stop/start, manual departure, maintenance settings.
 

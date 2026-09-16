@@ -313,17 +313,7 @@ function CM.scheduleLocal(op, args)
 	-- leader's past. Pay the peer's lead plus a margin when there is one; when
 	-- the clocks are together this is exactly K.EXEC_DELAY again.
 	local lead = 0
-	local _, fastT = CM.peerBounds()
-	-- PROJECTED, not the last heartbeat (2026-09-10). peerBounds hands back t=,
-	-- a whole unit rounded DOWN, as it was when the heartbeat left. At speed 2 a
-	-- joiner read the leader as 0.2 ahead while it was 1.4 ahead, stamped 0.8
-	-- out, and the leader applied four of its commands 1-3 steps late: two
-	-- vehicles bought and put on a line at different sim steps, a vehicle drift
-	-- desync for everyone. The peer's sim STEP moved forward by the wall time
-	-- since it arrived, at our own measured sim rate, plus a step of margin,
-	-- covers that. The barrier still reads peerBounds unchanged.
-	local projT = CM.projectedPeerMax and CM.projectedPeerMax() or nil
-	if projT and (not fastT or projT + K.SIM_STEP > fastT) then fastT = projT + K.SIM_STEP end
+	local fastT = CM.fastestPeerClock()
 	if fastT then
 		lead = fastT - now
 		if lead < 0 then lead = 0 end
@@ -386,6 +376,35 @@ function CM.noteDesync(why, stamp)
 end
 
 CM.comparedAt = {}
+-- Which lanes differ between two detail strings, logged one per lane. Used for
+-- EVERY mismatch, not only the third: the first two after a hot join were
+-- blind, and they are exactly the ones that show where a join goes wrong
+-- (2026-09-15: a divergence at the first stamp after a join stayed invisible
+-- until it had compounded through town growth into a declared desync).
+-- Returns the verdict lanes (t is counted separately, see the town streak).
+local function logLaneDiff(dm, dt)
+	local diffLanes = {}
+	for comp in dm:gmatch("[^,]+") do
+		local name = comp:match("^(%a+)")
+		local other = dt:match("(" .. name .. "[^,]*)")
+		if other and other ~= comp then
+			if name ~= "t" then diffLanes[#diffLanes + 1] = name end
+			if name == "p" then
+				-- vehicles: only a difference if both looked at the same sim time
+				local tm, tp = comp:match("@([%-%d%.]+):"), other:match("@([%-%d%.]+):")
+				if tm and tp and tm ~= tp then
+					log(string.format("   -> p sampled at different sim times (%s vs %s) -- not comparable", tm, tp))
+				else
+					log(string.format("   -> p DIFFERS at sim time %s: %s vs %s", tostring(tm), comp, other))
+				end
+			else
+				log(string.format("   -> %s DIFFERS: %s vs %s", name, comp, other))
+			end
+		end
+	end
+	return diffLanes
+end
+
 -- One peer's hash for one stamp against ours. compareAt (below) runs this for
 -- every peer that has reported the stamp, once each.
 function CM.compareOne(stamp, origin, theirs, dt)
@@ -456,6 +475,8 @@ function CM.compareOne(stamp, origin, theirs, dt)
 		if pr.streak < 3 then
 			log(string.format("~~ LAG t=%d vs %s (mismatch %d/3, waiting for convergence)",
 				stamp, origin, pr.streak))
+			local dm = CM.myDetails[stamp]
+			if dm and dt then log("   mine " .. dm); log("   peer " .. dt); logLaneDiff(dm, dt) end
 			return
 		end
 		CM.noteDesync("DESYNC vs " .. tostring(origin), stamp)
@@ -473,31 +494,9 @@ function CM.compareOne(stamp, origin, theirs, dt)
 		if dm and dt then
 			log("   mine " .. dm)
 			log("   peer " .. dt)
-			local diffLanes = {}
-			for comp in dm:gmatch("[^,]+") do
-				local name = comp:match("^(%a+)")
-				local other = dt:match("(" .. name .. "[^,]*)")
-				if other and other ~= comp and name ~= "t" then diffLanes[#diffLanes + 1] = name end
-			end
+			local diffLanes = logLaneDiff(dm, dt)
 			CM.dashVerdict = "DESYNC " .. (#diffLanes > 0 and table.concat(diffLanes, "+") or "?") .. " vs " .. tostring(origin)
 			if CM.firstDesync and CM.firstDesync.t == stamp then CM.firstDesync.why = CM.dashVerdict end
-			for comp in dm:gmatch("[^,]+") do
-				local name = comp:match("^(%a+)")
-				local other = dt:match("(" .. name .. "[^,]*)")
-				if other and other ~= comp then
-					if name == "p" then
-						-- vehicles: only a difference if both looked at the same sim time
-						local tm, tp = comp:match("@([%-%d%.]+):"), other:match("@([%-%d%.]+):")
-						if tm and tp and tm ~= tp then
-							log(string.format("   -> p sampled at different sim times (%s vs %s) -- not comparable", tm, tp))
-						else
-							log(string.format("   -> p DIFFERS at sim time %s: %s vs %s", tostring(tm), comp, other))
-						end
-					else
-						log(string.format("   -> %s DIFFERS: %s vs %s", name, comp, other))
-					end
-				end
-			end
 		end
 	end
 end
@@ -536,6 +535,25 @@ function CM.projectedPeerMax()
 	return best
 end
 
+-- The clock a command's stamp has to clear (CM.scheduleLocal): the fastest fresh
+-- peer's, PROJECTED, not its last heartbeat (2026-09-10). peerBounds hands back
+-- t=, a whole unit rounded DOWN, as it was when the heartbeat left. At speed 2 a
+-- joiner read the leader as 0.2 ahead while it was 1.4 ahead, stamped 0.8 out,
+-- and the leader applied four of its commands 1-3 steps late: two vehicles bought
+-- and put on a line at different sim steps, a vehicle drift desync for everyone.
+-- The peer's sim STEP moved forward by the wall time since it arrived, at our own
+-- measured sim rate, plus a step of margin, covers that. The barrier still reads
+-- peerBounds unchanged. nil while no peer is fresh. How far behind this clock we
+-- are is also what turns the player's actions off (inject.lua CM.actionsBlockTick).
+-- Not defined above scheduleLocal: tools/bridge_companion_test.py cuts the wire
+-- codec out of this file as the text between encodeCmd and scheduleLocal.
+function CM.fastestPeerClock()
+	local _, fastT = CM.peerBounds()
+	local projT = CM.projectedPeerMax and CM.projectedPeerMax() or nil
+	if projT and (not fastT or projT + K.SIM_STEP > fastT) then fastT = projT + K.SIM_STEP end
+	return fastT
+end
+
 -- ---------- measured round trips, the command delay, the gap hold (2026-09-11) ----------
 --
 -- ROUND TRIP. Every heartbeat carries ms= (our os.clock in ms) and e=, the last
@@ -543,10 +561,49 @@ end
 -- echo of OUR ms therefore times the whole path both ways -- file relay, lobby,
 -- network, the tick that reads it -- minus the time it sat on the other side.
 -- Smoothed like TCP's RTO (RFC 6298): srtt and rttvar per peer.
+--
+-- FREEZES ARE NOT LATENCY (2026-09-15). An autosave freezes every game for about
+-- a second, and the round trips timed across it read 640-730 +-250-320 ms against a
+-- steady 392 +-3: one of them lifted the delay from 1.2 to 2.4 or 2.8 units, which
+-- then took minutes to step back down (players' logs, 2026-09-13: 8 of the 12
+-- biggest raises came straight after "Saving..."). A freeze on either side shows
+-- here as a silence from that peer -- ours stops us reading its heartbeats, its own
+-- stops them coming. A silence longer than K.RTT_FREEZE_MIN_SEC and than
+-- K.RTT_FREEZE_MULT times its usual heartbeat spacing marks when it ended
+-- (pr.freezeEnd, CM.heartbeatGapNote), and a round trip whose ping went out before
+-- that waited it out and is not a sample. A real change of latency makes no
+-- silence and still moves the delay at once.
+K.RTT_FREEZE_MIN_SEC = 0.3
+K.RTT_FREEZE_MULT = 2.5
+K.DELAY_DOWN_MARGIN = 0.1   -- game units the lower step must clear the requirement by (CM.execDelayTick)
+
+-- Every LSTICK from o, BEFORE its echo is read (onLine).
+function CM.heartbeatGapNote(o, pr, clk)
+	local prev = pr.hbClk
+	pr.hbClk = clk
+	if not prev then return end
+	local gap = clk - prev
+	if gap < 0.02 then return end   -- read in the same tick as the heartbeat before it
+	if not pr.hbGap then pr.hbGap = math.min(gap, 0.5); return end
+	if gap > math.max(K.RTT_FREEZE_MIN_SEC, K.RTT_FREEZE_MULT * pr.hbGap) then
+		pr.freezeEnd = clk
+		if gap >= 1 then
+			log(string.format("RTT: %s was silent for %.1f s -- round trips that waited it out are not latency samples", tostring(o), gap))
+		end
+	else
+		pr.hbGap = pr.hbGap * 0.9 + gap * 0.1
+	end
+end
+
 function CM.rttNote(o, sentMs, heldMs)
 	local r = os.clock() * 1000 - sentMs - heldMs
 	if r < 0 or r > 10000 then return end
 	local pr = CM.peerFor(o)
+	-- the ping went out before this peer's last silence ended: it waited that out (above)
+	if pr.freezeEnd and sentMs / 1000 <= pr.freezeEnd then
+		pr.rttSkipped = (pr.rttSkipped or 0) + 1
+		return
+	end
 	if not pr.srtt then
 		pr.srtt, pr.rttvar = r, r / 2
 	else
@@ -591,9 +648,10 @@ function CM.execDelayTick()
 			if not worstMs or oneway > worstMs then worstMs, who = oneway, o end
 		end
 	end
-	local want = K.EXEC_DELAY
+	local want, raw = K.EXEC_DELAY, nil
 	if worstMs then
-		want = math.ceil((worstMs / 1000 * rate) / K.SIM_STEP - 1e-6) * K.SIM_STEP
+		raw = worstMs / 1000 * rate
+		want = math.ceil(raw / K.SIM_STEP - 1e-6) * K.SIM_STEP
 		if want < K.EXEC_DELAY_MIN then want = K.EXEC_DELAY_MIN end
 		if want > K.EXEC_DELAY_MAX then want = K.EXEC_DELAY_MAX end
 	end
@@ -604,7 +662,11 @@ function CM.execDelayTick()
 	if want > cur + 1e-6 then
 		log(string.format("EXEC_DELAY auto: %.1f -> %.1f (%s)", cur, want, why))
 		cur, CM.execDelayLowSince = want, nil
-	elseif want < cur - 1e-6 then
+	-- DOWN ONLY WITH A MARGIN (2026-09-15): the step below must clear the requirement by
+	-- K.DELAY_DOWN_MARGIN. A requirement sitting on a step boundary -- 249 ms one way is
+	-- 0.99 units at 3.99 u/s and 1.02 at 4.10 -- otherwise stepped down and straight
+	-- back up for a whole session (1.2 -> 1.0 -> 1.2, players' logs, 2026-09-13).
+	elseif want < cur - 1e-6 and (not raw or raw <= cur - K.SIM_STEP - K.DELAY_DOWN_MARGIN) then
 		CM.execDelayLowSince = CM.execDelayLowSince or CM.ticks
 		if CM.ticks - CM.execDelayLowSince >= K.DELAY_DOWN_TICKS then
 			local nxt = snapStep(math.max(want, cur - K.SIM_STEP))
@@ -723,7 +785,10 @@ local function onLine(line)
 			local o = line:match(" o=(%a+)") or "?"
 			local pr = CM.peerFor(o)
 			if CM.resyncHeartbeat then CM.resyncHeartbeat(pr, line) end
-			pr.time = t; pr.at = CM.ticks; pr.clk = os.clock()   -- wall clock at arrival: stamping projects the peer forward from here
+			local clk = os.clock()
+			-- a silence before this heartbeat voids the round trips that waited it out (CM.rttNote)
+			CM.heartbeatGapNote(o, pr, clk)
+			pr.time = t; pr.at = CM.ticks; pr.clk = clk   -- wall clock at arrival: stamping projects the peer forward from here
 			-- LSTICK has always carried the SIM STEP as well, and nothing read
 			-- it. t= is math.floor(now), so it is quantised to a whole unit --
 			-- a controller cannot hold a lead tighter than its own measurement
@@ -744,6 +809,8 @@ local function onLine(line)
 			-- round trips: remember the peer's clock for our echo, and time our own echoed back
 			local ms = tonumber(line:match(" ms=(%d+)"))
 			if ms then pr.ms, pr.msClk = ms, os.clock() end
+			-- its world hash's cost: the leader sets the hash cadence by the slowest (hash.lua)
+			pr.hashMs = tonumber(line:match(" hc=(%d+)"))
 			local e = line:match(" e=(%S+)")
 			if e then
 				for eo, sms, held in e:gmatch("(%a+):(%d+):(%d+)") do
@@ -769,9 +836,10 @@ local function onLine(line)
 	elseif op == "LSEFF" then
 		-- SPEED V2: the host broadcasts the session's effective speed; joiners
 		-- apply it. Not while the load gate holds (only the local lever releases
-		-- us).
+		-- us). vt= is the votes it is the mean of, for the Multiplayer window.
+		CM.voteCounted = line:match(" vt=(%S+)") or ""
 		if not CM.lgHolding then
-			local v = tonumber(line:match("v=([%d%.]+)"))
+			local v = tonumber(line:match(" v=([%d%.]+)"))
 			if v then
 				CM.effSpeed = v
 				-- The host unpaused the session: a ceiling of 0 of our own is lifted

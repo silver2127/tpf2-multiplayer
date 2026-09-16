@@ -127,11 +127,25 @@ never by entity id, and compares with the others at common stamps.
 | `t` | town construction count | desync after it differs at two stamps in a row |
 | `n` | number of people | logged as `$$` |
 
-- **Cadence.** A stamp every 12 game-time units, times min(8, edges/2000 + 1) on big maps.
+- **Cadence.** The interval starts at 12 game-time units, times min(64, edges/2000 + 1) on big
+  maps, then follows the hash's measured cost so every map loses the same share of time to it.
+  Each player reports its hash's cost on its heartbeat (`hc=`, the median of its last five stamps),
+  and the leader moves every game to the interval on a ladder (12, 24, 36, 48, 72, 96, 144 ... 1536
+  units) that keeps the slowest one at or under 8 ms of hash per game unit. It does that with a
+  stamped `HASHEVERY` command, so every game switches to the new grid at the same stamp: longer
+  at once, shorter only with 25% headroom, at most once a minute. The grid is saved with the world.
+- **Big maps are checked too.** Between 2026-09-12 and 2026-09-15 the hash was switched off
+  entirely above vanilla's largest size (96 x 96 tiles), because a 224-tile world cost 3.0-3.5 s
+  per stamp -- which left the biggest worlds with no desync detection at all. The cadence above
+  replaces that: such a world starts at 168 units and settles near 576, so it hashes about once
+  every ten minutes at 1x instead of never. The starting interval comes from the edge count, which
+  every instance reads from the same save, so no instance hashes on a grid another never reaches.
 - **Verdict.** A match logs `SYNC`. A mismatch logs `~~ LAG n/3` twice (a late hash is not a
   desync), then `!! DESYNC` with the differing lanes named.
 - **Vehicle drift.** Instances also exchange sampled vehicle positions; a maximum drift over
-  10 m between samples taken at the same sim time counts as a desync.
+  10 m between samples taken at the same sim time counts as a desync. The check pairs every
+  vehicle with every other, once per player, so it turns off for good the first time a world
+  has more than 200 vehicles; the switch is saved with the world. The `p` lane stays.
 - **`dump_egeo=1`** writes every edge to `egeo_<letter>.txt` in the game folder so two instances
   can be diffed (ignore the first line, a per-instance stamp).
 

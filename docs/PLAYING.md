@@ -85,28 +85,42 @@ buttons toggle three sections:
   it says what differs (for example "roads and tracks" or "town buildings (5 fewer here)"), when
   it was first noticed, and that the fix is to reload a save the host makes. Below it, one row per
   player: whether that player's world matches, whether their clock is in step, and for your own
-  row the speed and anything that needs attention (late or lost commands, vehicles drifting apart).
+  row the speed and anything that needs attention (late or lost commands, vehicles drifting apart;
+  that vehicle check turns off for good once the world has more than 200 vehicles).
   **numbers** shows the raw counters (game times, skew, apply lag, drift, balance) for debugging.
 - **chat** (shown): the last lines of the lobby chat, and a **say:** field (Enter sends).
 - **companies** (hidden at first): see [Companies](#companies).
+- **speed** (shown): your speed vote (1 to 4.5, and -0.25 / +0.25 from your last vote), with the
+  session speed and the votes it is the average of. See [Speed and pause](#speed-and-pause).
 
 ### Speed and pause
 
-- **Everyone plays at the host's speed.** The host's own speed buttons and pause set the speed for
-  the whole session. The other players' speed buttons do nothing while a session runs: the click is
-  cancelled, so no game can run off at its own speed.
+- **The session runs at the average of everyone's speed votes.** Pressing a speed button, in the
+  game's own clock or in the Multiplayer window's speed row, is your vote. It does not change your
+  game's speed by itself: the click is cancelled, every game records your vote at the same moment,
+  and the whole session then runs at the average of the votes, rounded to 0.05. For example, the
+  host at 4x and one player voting 1x gives 2.5x.
+- Until you vote you have no say, except the host, whose own speed counts until they vote. A player
+  who leaves stops counting about 30 seconds later.
+- **Only the host pauses.** The host's pause stops the whole session and the host's play resumes it
+  at the votes' speed. Resuming with the pause button is not a vote; resuming with a speed button
+  also votes for that speed. Other players' pause buttons do nothing.
 - A pause is also a sync point: games that are slightly behind run up to the leader's clock before
   they stop.
-- `/speed 2.5` in the chat sets a session speed, fractions allowed. Whichever came last counts: a
-  host speed button pressed after `/speed` takes over again, and `/speed off` hands the speed back
-  to the host's buttons.
+- **Far behind, your actions are off.** If your game falls more than 15 game units behind the
+  fastest other game, anything you build, buy or edit is cancelled until it is back within 2 units,
+  and the top of the Multiplayer window says so. A line you create is kept and made once you have
+  caught up. Bulldozing a road or track still goes through, and speed buttons and pause still work.
+- `/speed 2.5` in the chat sets a session speed for everyone, fractions allowed, overriding the
+  votes. Whichever came last counts: a vote after `/speed` hands the speed back to the votes, and
+  so does `/speed off`.
 
 ### Chat commands
 
 | command | who | does |
 |---|---|---|
-| `/speed <x>` | anyone | set the session speed (0 < x < 64) |
-| `/speed off` | anyone | back to the host's speed buttons |
+| `/speed <x>` | anyone | set the session speed until the next speed vote (0 < x < 64) |
+| `/speed off` | anyone | back to the average of the speed votes |
 | `/sync` | anyone | the host's game saves and shares the save (what a hot join does); `/sync off` cancels |
 | `/new` | relay leader, before the world is sent | discard the relay's stored world; START GAME then shares your own save |
 | `/desynclogs always`, `ask`, `never` | anyone | what happens to your logs after a desync (see [When something goes wrong](#when-something-goes-wrong)); `/desynclogs` alone shows the current choice |

@@ -180,6 +180,39 @@ CM.vposHist = {}      -- letter -> { {t=, mean=, max=}, ... }
 CM.vposSkipped = 0
 CM.vposDone = {}      -- letter..":"..stamp -> true
 
+-- CAPPED AT 200 VEHICLES, FOR GOOD (2026-09-15). The pairing in CM.vposCompare
+-- is an all-pairs search, once per other player per stamp, on the sim thread:
+-- timed in Lua 5.2 at 26 ms per player for 1,000 vehicles, 108 ms for 2,000 and
+-- 446 ms for 4,000. The first time a stamp counts more than K.VPOS_MAX_VEHICLES
+-- -- in our world, or in a peer's (its n=; it is the same save) -- the metric
+-- turns off and stays off: nothing is collected, shipped, received or compared
+-- again, even if vehicles are sold back under the cap. The switch rides in the
+-- save (CM.vposSaveState), so a reload, a resync or a hot joiner's copy of the
+-- world starts with it off. The hash's p detail lane keeps the positions; only
+-- this metric, and the DESYNC vpos it raises, stop.
+K.VPOS_MAX_VEHICLES = 200
+CM.vposOff = nil      -- the vehicle count that turned the metric off; nil while it runs
+
+function CM.vposCapReached(n, where)
+	if CM.vposOff then return true end
+	n = tonumber(n)
+	if not n or n <= K.VPOS_MAX_VEHICLES then return false end
+	CM.vposOff, CM.vposOffSaid = n, true
+	CM.vposMine, CM.vposPeer, CM.vposHist, CM.vposDone = {}, {}, {}, {}
+	CM.vposLast, CM.lastVposRaw, CM.lastVposT = nil, nil, nil
+	log(string.format("VPOS: %d vehicles %s, over the cap of %d -- the vehicle drift check is off for good in this world",
+		n, where, K.VPOS_MAX_VEHICLES))
+	return true
+end
+
+-- The switch in the save (lockstep.lua save/load): a world that passed the cap keeps it off.
+-- Load is also the GUI state's per-frame sync, so it stays silent and cheap.
+function CM.vposSaveState() return CM.vposOff end
+function CM.vposLoadState(n)
+	n = tonumber(n)
+	if n and not CM.vposOff then CM.vposOff = n end
+end
+
 local function vposPrune(tbl, keep)
 	local ks = {}
 	for k in pairs(tbl) do ks[#ks + 1] = k end
@@ -189,6 +222,7 @@ local function vposPrune(tbl, keep)
 end
 
 function CM.vposCompare(stamp, o)
+	if CM.vposOff then return end
 	local key = o .. ":" .. tostring(stamp)
 	if CM.vposDone[key] then return end
 	local mine, theirs = CM.vposMine[stamp], CM.vposPeer[o] and CM.vposPeer[o][stamp]
@@ -263,6 +297,8 @@ function CM.vposRecv(line)
 	local i, m, n = tonumber(line:match(" i=(%d+)")), tonumber(line:match(" m=(%d+)")), tonumber(line:match(" n=(%d+)"))
 	local d = line:match(" d=(%S*)")
 	if not (stamp and st and o and i and m) then return end
+	-- past the cap in a peer's world is past it in ours (the same save): off here too
+	if CM.vposCapReached(n, "in " .. o .. "'s game") then return end
 	CM.vposPeer[o] = CM.vposPeer[o] or {}
 	local rec = CM.vposPeer[o][stamp]
 	if not rec then
@@ -279,6 +315,144 @@ function CM.vposRecv(line)
 		end
 	end
 	CM.vposCompare(stamp, o)
+end
+
+-- ---------- hash cadence: the same slowdown on every map ----------
+--
+-- COST-PROPORTIONAL CADENCE (2026-09-15). A stamp freezes the sim thread for as
+-- long as the hash takes: ~60 ms on a small map, ~600 ms on an 8,000-edge one
+-- (players' logs, 2026-09-13). A fixed interval therefore made a big map several
+-- times slower than a small one. The interval now follows the measured cost, so
+-- every map spends the same share of its game time hashing: at most
+-- K.HASH_MS_PER_UNIT ms of hash per game unit between stamps, on a coarse ladder.
+-- 8 is what the smallest maps in those logs cost at the base 12 units, so they
+-- keep hashing as often as before and everything bigger slows down to match.
+--
+-- The STAMP GRID must stay identical on every instance -- a stamp is
+-- floor(now / interval) * interval, and two grids never share a stamp -- while a
+-- measured cost differs per machine. So no instance tunes its own:
+--   * each instance times its stamps (CM.hashCostNote) and reports the median of
+--     its last K.HASH_COST_SAMPLES on its heartbeat (hc=, CM.hashCostReport)
+--   * the LEADER picks the interval for the slowest cost it hears
+--     (CM.hashCadenceTick): up when the cost needs it, down only with headroom
+--     (K.HASH_DOWN_HEADROOM), at most once every K.HASH_CADENCE_MIN_TICKS
+--   * the pick is a HASHEVERY command: every instance applies it at its stamp
+--     (CM.execHashEvery). The new grid starts at the first multiple of the new
+--     interval at or after that stamp; the leader's old interval runs until then
+--   * the grid rides in the save (CM.hashGridSave), so a reload or a hot joiner's
+--     world starts on it
+-- Until a HASHEVERY lands, the edge-count interval applies (CM.hashEveryFor).
+K.HASH_MS_PER_UNIT = 8
+-- Every rung is a multiple of K.HASH_EVERY_GAMETIME (execHashEvery rejects anything
+-- else). The top two are for worlds far past vanilla, which hash on the order of
+-- seconds: 1152 and 1536 units keep even those to one hitch every ~20-28 minutes at
+-- 1x, which is what lets the check stay ON there instead of being switched off.
+K.HASH_EVERY_LADDER = { 12, 24, 36, 48, 72, 96, 144, 192, 288, 384, 576, 768, 1152, 1536 }
+K.HASH_COST_SAMPLES = 5
+K.HASH_CADENCE_MIN_TICKS = 300   -- ~1 min between changes
+K.HASH_DOWN_HEADROOM = 0.8       -- a shorter interval only once the cost fits it with 25% to spare
+CM.hashCostSamples = {}          -- ms per stamp, newest last
+CM.hashCostMs = nil              -- their median
+CM.hashGrid = nil                -- { every =, prev =, from = }: from a HASHEVERY, or the save
+
+-- The stamp for `now` on the agreed grid, and the interval it lies on.
+function CM.hashStampOf(now)
+	local g, every = CM.hashGrid, nil
+	if g and g.prev and now < g.from then every = g.prev
+	elseif g then every = g.every
+	else every = CM.hashEvery or K.HASH_EVERY_GAMETIME end
+	return math.floor(now / every) * every, every
+end
+
+-- One stamp's cost in ms: its hash, broadcast, drift ship and compare.
+function CM.hashCostNote(ms)
+	ms = tonumber(ms)
+	if not ms or ms < 0 then return end
+	local s = CM.hashCostSamples
+	s[#s + 1] = ms
+	while #s > K.HASH_COST_SAMPLES do table.remove(s, 1) end
+	local sorted = {}
+	for i = 1, #s do sorted[i] = s[i] end
+	table.sort(sorted)
+	local n = #sorted
+	CM.hashCostMs = (n % 2 == 1) and sorted[(n + 1) / 2] or (sorted[n / 2] + sorted[n / 2 + 1]) / 2
+end
+
+-- " hc=<ms>" for the heartbeat once two stamps are timed, "" before.
+function CM.hashCostReport()
+	if #CM.hashCostSamples < 2 or not CM.hashCostMs then return "" end
+	return string.format(" hc=%d", math.floor(CM.hashCostMs + 0.5))
+end
+
+-- The ladder rung that keeps `ms` of hash within K.HASH_MS_PER_UNIT per game unit.
+function CM.hashEveryForCost(ms)
+	local want = (tonumber(ms) or 0) / K.HASH_MS_PER_UNIT
+	local ladder = K.HASH_EVERY_LADDER
+	for _, rung in ipairs(ladder) do
+		if rung >= want then return rung end
+	end
+	return ladder[#ladder]
+end
+
+-- The slowest hash cost we know: ours once timed twice, and each fresh peer's hc=.
+function CM.hashCostSlowest()
+	local worst, who = nil, nil
+	if #CM.hashCostSamples >= 2 and CM.hashCostMs then worst, who = CM.hashCostMs, K.INSTANCE end
+	for o, pr in pairs(CM.peers) do
+		if pr.hashMs and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS and (not worst or pr.hashMs > worst) then
+			worst, who = pr.hashMs, o
+		end
+	end
+	return worst, who
+end
+
+-- THE LEADER, after each of its own stamps: move every instance's interval when
+-- the slowest cost calls for it.
+function CM.hashCadenceTick(now)
+	if not CM.isLeader() then return end
+	local g = CM.hashGrid
+	if g and g.prev and now < g.from then return end   -- the last switch has not started yet
+	if CM.hashCadenceAt and CM.ticks - CM.hashCadenceAt < K.HASH_CADENCE_MIN_TICKS then return end
+	local cost, who = CM.hashCostSlowest()
+	if not cost then return end
+	local _, cur = CM.hashStampOf(now)
+	local up = CM.hashEveryForCost(cost)
+	local down = CM.hashEveryForCost(cost / K.HASH_DOWN_HEADROOM)
+	local want = nil
+	if up > cur then want = up elseif down < cur then want = down end
+	if not want then return end
+	CM.hashCadenceAt = CM.ticks
+	CM.scheduleLocal("HASHEVERY", { every = want, prev = cur })
+	log(string.format("HASH CADENCE: the slowest hash is %d ms (%s) -- every %d game units instead of %d",
+		math.floor(cost + 0.5), string.upper(tostring(who)), want, cur))
+end
+
+-- HASHEVERY at its stamp, on every instance.
+function CM.execHashEvery(c)
+	local every, prev, at = tonumber(c.every), tonumber(c.prev), tonumber(c.at)
+	local base = K.HASH_EVERY_GAMETIME
+	local function onGrid(v) return v ~= nil and v >= base and v % base == 0 end
+	if not (onGrid(every) and onGrid(prev) and at) then
+		log(string.format("EXEC HASHEVERY seq=%s origin=%s: bad interval every=%s prev=%s -- not applied",
+			tostring(c.seq), tostring(c.origin), tostring(c.every), tostring(c.prev)))
+		return
+	end
+	local from = math.ceil(at / every - 1e-9) * every
+	CM.hashGrid = { every = every, prev = prev, from = from }
+	log(string.format("EXEC HASHEVERY seq=%s origin=%s: world hash every %d game units from stamp %d (every %d until then)",
+		tostring(c.seq), tostring(c.origin), every, from, prev))
+end
+
+-- The grid in the save (lockstep.lua save/load). Load is also the GUI state's
+-- per-frame sync, so it is silent and never replaces a grid already in place.
+function CM.hashGridSave()
+	local g = CM.hashGrid
+	return g and { every = g.every, prev = g.prev, from = g.from } or nil
+end
+function CM.hashGridLoad(t)
+	if CM.hashGrid or type(t) ~= "table" then return end
+	local every, prev, from = tonumber(t.every), tonumber(t.prev), tonumber(t.from)
+	if every and prev and from then CM.hashGrid = { every = every, prev = prev, from = from } end
 end
 
 local function worldHash(now)
@@ -309,7 +483,7 @@ local function worldHash(now)
 		-- lane that never decides anything (review, 2026-08-31).
 		local t = game.interface.getEntities({ radius = 999999 },
 			{ type = "VEHICLE", includeData = true }) or {}
-		local raw = {}
+		local raw = (not CM.vposOff) and {} or nil
 		for vid, e in pairs(t) do
 			nv = nv + 1
 			local p = type(e) == "table" and e.position or nil
@@ -321,12 +495,13 @@ local function worldHash(now)
 				-- quantised exactly as it ships (0.1 m), so a peer's copy of an
 				-- identical world compares at 0.00 and not at the rounding floor
 				-- (measured 0.04-0.05 m before this)
-				raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10 }
+				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10 } end
 			end
 		end
 		-- the raw positions feed the drift METRIC (CM.vposShip / CM.vposCompare):
-		-- the hash says equal-or-not, the metric says by how many metres
-		CM.lastVposRaw, CM.lastVposT = raw, now
+		-- the hash says equal-or-not, the metric says by how many metres. Never
+		-- past K.VPOS_MAX_VEHICLES, and never again once past it (CM.vposCapReached).
+		if raw and not CM.vposCapReached(nv, "in this game") then CM.lastVposRaw, CM.lastVposT = raw, now end
 	end)
 	table.sort(vpos)
 	local tV = os.clock()

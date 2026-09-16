@@ -1,17 +1,22 @@
-"""Offline checks that the desync hash is off on maps larger than vanilla allows, on Lua 5.2.
+"""Offline checks that big maps still run the desync hash, just rarely, on Lua 5.2.
 
 The world hash walks every vehicle, construction and edge on the sim thread. On a 224-tile
-map (27k edges) that measured 3.0-3.5 s per stamp -- a freeze every few minutes, even in a
-solo game (2026-09-12). lockstep.lua's CM.mapTooBigToHash now turns the hash off for the
-whole game when the terrain is bigger than the stock New Game menu builds (Megalomaniac:
-at most 96 x 96 = 9,216 tiles, and 192 tiles on an axis for 1:4).
+map (27k edges) that measured 3.0-3.5 s per stamp, so from 2026-09-12 the hash was switched
+OFF for the whole game above vanilla's largest size -- which left exactly the biggest worlds
+with NO desync detection.
 
-This runs the REAL function text cut out of lockstep.lua, and the real stats.lua, and checks:
-  - every vanilla preset shape keeps hashing; anything past the area or the axis does not
-  - an unreadable terrain keeps hashing (the safe side), and says so
-  - the answer is read once per game, then cached
-  - checkHash returns before any hashing when the map is too big
-  - the stats panel says the check is OFF instead of "checking" forever
+Since 2026-09-15 the cost-proportional cadence (hash.lua) carries that load instead: the
+interval starts from the EDGE COUNT (identical on every instance, read from the same save,
+so the stamp grids agree) and the leader then moves everyone with a stamped HASHEVERY. A
+huge world hashes seldom rather than never.
+
+This runs the REAL functions cut out of lockstep.lua and hash.lua and checks:
+  - the size-based switch-off is GONE: no mapTooBigToHash, no early return in checkHash
+  - the starting interval grows with the edge count and caps at the ladder's top rung
+  - the ladder is ascending and every rung is a multiple of the base (execHashEvery's rule)
+  - a cost picks a rung that keeps it within K.HASH_MS_PER_UNIT ms per game unit
+  - a 3.5 s hash on a 224-tile map lands on a rung that is minutes apart, not off
+  - the stats panel still renders the verdicts (an older peer can still report OFF)
 
     python tools/hash_bigmap_test.py
 """
@@ -23,6 +28,7 @@ import lupa.lua52 as lupa
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCKSTEP = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "config", "game_script", "lockstep.lua")
+HASH = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp", "hash.lua")
 STATS = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp", "stats.lua")
 
 fails = []
@@ -34,43 +40,38 @@ def check(name, cond, extra=""):
         fails.append(name)
 
 
-def size_check_source():
-    src = open(LOCKSTEP, encoding="utf-8").read().replace("\r\n", "\n")
-    m = re.search(r"^K\.VANILLA_MAX_TILES\s*=.*?(?=^local function checkHash\(now\))", src, re.S | re.M)
+def read(path):
+    return open(path, encoding="utf-8").read().replace("\r\n", "\n")
+
+
+def cut(src, pattern, what):
+    m = re.search(pattern, src, re.S | re.M)
     if not m:
-        sys.exit("could not find the CM.mapTooBigToHash block in lockstep.lua")
-    early = re.search(r"^local function checkHash\(now\)\n\tif CM\.mapTooBigToHash\(\) then\n"
-                      r"\t\tCM\.dashVerdict = \"OFF\"\n\t\treturn\n\tend\n", src, re.M)
-    return m.group(0), early is not None
+        sys.exit(f"could not cut {what}")
+    return m.group(0)
 
 
-def size_runtime(block, tiles):
-    """tiles: (x, y), or None for a terrain read that throws."""
+def runtime():
+    """The real interval functions, run together in one Lua state."""
+    lock, hsh = read(LOCKSTEP), read(HASH)
+    block = "\n".join([
+        cut(lock, r"^K\.HASH_EVERY_GAMETIME\s*=.*?$", "K.HASH_EVERY_GAMETIME"),
+        cut(lock, r"^K\.HASH_EDGES_PER_STEP\b.*?^end$", "CM.hashEveryFor"),
+        cut(hsh, r"^K\.HASH_MS_PER_UNIT\s*=.*?$", "K.HASH_MS_PER_UNIT"),
+        cut(hsh, r"^K\.HASH_EVERY_LADDER\s*=.*?$", "K.HASH_EVERY_LADDER"),
+        cut(hsh, r"^function CM\.hashEveryForCost\(ms\).*?^end$", "CM.hashEveryForCost"),
+    ])
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
-    g = L.globals()
-    g.BLOCK = block
-    g.TX, g.TY = (tiles if tiles else (None, None))
-    g.BROKEN = tiles is None
+    L.globals().BLOCK = block
     return L.execute(r'''
-local logs, reads = {}, 0
-api = {
-  engine = {
-    util = { getWorld = function() return 1 end },
-    getComponent = function(e, t)
-      reads = reads + 1
-      if BROKEN then error("no terrain component") end
-      return { size = { x = TX, y = TY } }
-    end,
-  },
-  type = { ComponentType = { TERRAIN = 42 } },
-}
 local K, CM = {}, {}
-local log = function(s) logs[#logs + 1] = s end
-assert(load("return function(K, CM, log) " .. BLOCK .. " end", "@lockstep.lua"))()(K, CM, log)
+assert(load("return function(K, CM) " .. BLOCK .. " end", "@cut"))()(K, CM)
 local H = {}
-function H.off() return CM.mapTooBigToHash() end
-function H.reads() return reads end
-function H.logs() return table.concat(logs, "\n") end
+function H.every(edges) return CM.hashEveryFor(edges) end
+function H.forCost(ms) return CM.hashEveryForCost(ms) end
+function H.base() return K.HASH_EVERY_GAMETIME end
+function H.msPerUnit() return K.HASH_MS_PER_UNIT end
+function H.ladder() return table.concat(K.HASH_EVERY_LADDER, ",") end
 return H
 ''')
 
@@ -83,71 +84,64 @@ local CM = { guiLeader = function() return "a" end }
 local K = {}
 local log = function() end
 assert(load(SRC, "@stats.lua"))()(CM, K, log)
-local function view() local v = { text = "" }; function v:setText(s) self.text = s end; return v end
 local H = {}
 function H.words(v) return (CM.verdictWords(v)) end
-function H.status(verdict, npeers) return CM.statusWords({ verdict = verdict, desyncs = "0", t = "100" }, npeers) end
--- the sync column for us (a) and one peer (b), with our verdict as given
-function H.cells(verdict)
-  local cells = {}
-  for _, l in ipairs({ "a", "b" }) do cells[l] = { name = view(), sync = view(), clock = view(), notes = view() } end
-  local status = view()
-  CM.statsInWords(status, cells, "a", { "a", "b" },
-    { a = { verdict = verdict, desyncs = "0", t = "100", speed = "1" } },
-    { b = { t = 100, skew = 0, verdict = "-" } })
-  return cells.a.sync.text, cells.b.sync.text, status.text
-end
 return H
 ''')
 
 
 def main():
-    block, early = size_check_source()
-    print("size check, cut from lockstep.lua")
+    lock = read(LOCKSTEP)
+
+    print("the size-based switch-off is gone")
+    check("no CM.mapTooBigToHash in lockstep.lua", "mapTooBigToHash" not in lock)
+    check("no vanilla size constants", "VANILLA_MAX_TILES" not in lock)
+    early = re.search(r"^local function checkHash\(now\)\n\tif .*?\n\t\tCM\.dashVerdict = \"OFF\"", lock, re.M)
+    check("checkHash no longer returns early before hashing", early is None)
+
+    R = runtime()
+    base, mspu = R.base(), R.msPerUnit()
+    ladder = [int(v) for v in R.ladder().split(",")]
+
+    print("\nthe ladder")
+    check("ascending", all(b > a for a, b in zip(ladder, ladder[1:])), R.ladder())
+    check(f"every rung is a multiple of the base ({base})", all(v % base == 0 for v in ladder), R.ladder())
+    check("starts at the base", ladder[0] == base, str(ladder[0]))
+    check("reaches past 768 for worlds far past vanilla", ladder[-1] >= 1152, str(ladder[-1]))
+
+    print("\nthe starting interval follows the edge count")
     cases = [
-        ((96, 96), False, "Megalomaniac 1:1"),
-        ((66, 132), False, "Megalomaniac 1:2"),
-        ((54, 162), False, "Megalomaniac 1:3"),
-        ((48, 192), False, "Megalomaniac 1:4"),
-        ((18, 54), False, "Small 1:3"),
-        ((100, 90), False, "under both limits, not a preset"),
-        ((98, 96), True, "a little past the area"),
-        ((40, 200), True, "past the axis, under the area"),
-        ((128, 128), True, "the smallest Big Maps row"),
-        ((224, 224), True, "the 57 km map"),
-        ((448, 224), True, "a Big Maps rectangle"),
+        (0, base, "an empty world"),
+        (1999, base, "under one step"),
+        (2000, base * 2, "one step"),
+        (27000, base * 14, "a 224-tile map (27k edges)"),
     ]
-    for tiles, want, what in cases:
-        R = size_runtime(block, tiles)
-        got = R.off()
-        check(f"{tiles[0]} x {tiles[1]} ({what}): hash {'OFF' if want else 'on'}", got == want,
-              f"got {'OFF' if got else 'on'}; log: {R.logs()}")
+    for edges, want, what in cases:
+        got = int(R.every(edges))
+        check(f"{edges} edges ({what}) -> every {want}", got == want, f"got {got}")
+    huge = int(R.every(10 ** 7))
+    check("an enormous world caps at the ladder's top rung", huge == ladder[-1] or huge == base * 64,
+          f"got {huge}")
+    check("...and is never switched off (always a positive interval)", huge > 0, str(huge))
 
-    R = size_runtime(block, (224, 224))
-    R.off(); R.off(); R.off()
-    check("the terrain is read once per game", R.reads() == 1, str(R.reads()))
-    check("the decision is logged with the size", "224 x 224" in R.logs() and "OFF" in R.logs(), R.logs())
+    print("\na cost picks a rung that fits the budget")
+    for ms in (0, 100, 380, 1000, 3500, 10000):
+        rung = int(R.forCost(ms))
+        fits = ms / rung <= mspu + 1e-9
+        top = rung == ladder[-1]
+        check(f"{ms} ms -> every {rung} units ({ms / rung:.1f} ms/unit)", fits or top,
+              f"budget is {mspu} ms/unit")
 
-    R = size_runtime(block, None)
-    check("an unreadable terrain keeps hashing", R.off() is False)
-    check("...and says so", "unreadable" in R.logs(), R.logs())
+    print("\nthe 224-tile map that caused the switch-off")
+    rung = int(R.forCost(3500))
+    check("a 3.5 s hash lands on a rung, not off", rung in ladder, str(rung))
+    check("...and that rung is minutes apart (>= 288 units)", rung >= 288, str(rung))
 
-    check("checkHash returns before hashing when the map is too big", early)
-
-    print("stats panel")
+    print("\nstats panel")
     S = stats_runtime()
-    check('verdict "OFF" reads as off', S.words("OFF") == "off", str(S.words("OFF")))
-    check('"SYNC" still reads as sync', S.words("SYNC") == "sync")
-    check('"-" still reads as checking', S.words("-") == "checking")
-    st = S.status("OFF", 1)
-    check("status line says the check is OFF and why", "OFF" in st and "larger than vanilla" in st, st)
-    check("no peer heard still says so first", S.status("OFF", 0).startswith("No other player heard"))
-    own, peer, _ = S.cells("OFF")
-    check("our row reads 'not checked'", own.strip() == "not checked", repr(own))
-    check("a peer's row reads 'not checked'", peer.strip() == "not checked", repr(peer))
-    own, peer, _ = S.cells("SYNC")
-    check("a synced game still reads 'match' / 'checking'", own.strip() == "match" and peer.strip() == "checking",
-          f"{own!r} {peer!r}")
+    check('"SYNC" reads as sync', S.words("SYNC") == "sync")
+    check('"-" reads as checking', S.words("-") == "checking")
+    check('"OFF" still understood (an older peer can report it)', S.words("OFF") == "off")
 
     print()
     print("ALL PASS" if not fails else f"{len(fails)} FAILURE(S)")

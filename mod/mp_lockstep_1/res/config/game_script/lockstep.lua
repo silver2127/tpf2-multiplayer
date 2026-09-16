@@ -177,7 +177,9 @@ K.EXEC_DELAY = 0.4   -- two sim steps; was 0.6 until 2026-09-11 (RECV logs spare
 -- half the worst peer's smoothed round trip plus K.DELAY_DEV_MULT deviations and
 -- a slack, converted to game units at the current sim rate, snapped up to the step
 -- grid. K.EXEC_DELAY above is only the starting value until a peer has been
--- measured. It rises at once and falls one step at a time after K.DELAY_DOWN_TICKS.
+-- measured. It rises at once and falls one step at a time after K.DELAY_DOWN_TICKS,
+-- and only with K.DELAY_DOWN_MARGIN to spare; a round trip timed across a freeze
+-- (an autosave, the world hash) is not a sample (net.lua, FREEZES ARE NOT LATENCY).
 --
 -- ONE deviation, not two (first rig run, 2026-09-11): on one PC the round trip is
 -- 200-300 ms of which almost all is each side waiting for its next script tick,
@@ -225,11 +227,13 @@ K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a
 -- stamp is floor(now / interval) * interval, so two instances with different
 -- intervals produce DISJOINT stamp sets and never compare a single one. (That
 -- exact failure is recorded at the checkHash call site: one SYNC verdict for a
--- whole session while a real divergence sat invisible.) So it is derived from
--- the EDGE COUNT instead, which every instance reads from the same save, and
--- bucketed coarsely so a few edges of drift cannot change the answer.
+-- whole session while a real divergence sat invisible.) So it STARTS from the
+-- EDGE COUNT, which every instance reads from the same save, bucketed coarsely so
+-- a few edges of drift cannot change the answer. Since 2026-09-15 the leader then
+-- moves every instance to an interval that follows the measured cost, with a
+-- stamped HASHEVERY command (hash.lua, COST-PROPORTIONAL CADENCE).
 K.HASH_EDGES_PER_STEP = 2000   -- edges per extra interval step
-K.HASH_EVERY_MAX_MULT = 8      -- never stretch beyond this
+K.HASH_EVERY_MAX_MULT = 64     -- up to 12 * 64 = 768 units to START with, so a map far past vanilla begins rare rather than unchecked; the leader's cost ladder takes it from there
 function CM.hashEveryFor(edges)
 	local mult = math.floor((tonumber(edges) or 0) / K.HASH_EDGES_PER_STEP) + 1
 	if mult > K.HASH_EVERY_MAX_MULT then mult = K.HASH_EVERY_MAX_MULT end
@@ -632,6 +636,8 @@ local function execute(c)
 		end
 	elseif c.op == "LOAN" then CM.execLoan(c)
 	elseif c.op == "SETDATE" or c.op == "CALSPEED" then CM.execCalendar(c)
+	elseif c.op == "HASHEVERY" then CM.execHashEvery(c)
+	elseif c.op == "SPEEDVOTE" then CM.execSpeedVote(c)
 	elseif c.op == "TERRAIN" then CM.execTerrain(c)
 	elseif c.op == "ASSETS" then CM.execAssets(c)
 	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" then CM.execCompanyCmd(c)
@@ -684,6 +690,15 @@ end
 -- global of that name (luacheck's use-before-definition class of bug).
 -- called from checkHash right after the hash is broadcast
 function CM.vposShip(stamp)
+	-- off for good past K.VPOS_MAX_VEHICLES (hash.lua CM.vposCapReached), saved with the world
+	if CM.vposOff then
+		if not CM.vposOffSaid then
+			CM.vposOffSaid = true
+			log(string.format("VPOS: the vehicle drift check is off in this world -- it had %d vehicles, over the cap of %d",
+				CM.vposOff, K.VPOS_MAX_VEHICLES))
+		end
+		return
+	end
 	local pts, st = CM.lastVposRaw or {}, CM.lastVposT or -1
 	CM.vposMine[stamp] = { s = st, pts = pts }
 	vposPrune(CM.vposMine, K.VPOS_KEEP)
@@ -700,41 +715,26 @@ function CM.vposShip(stamp)
 	for o in pairs(CM.vposPeer) do CM.vposCompare(stamp, o) end
 end
 
--- NO HASH ON MAPS BIGGER THAN VANILLA. The hash walks the whole world on the sim
--- thread, and on a 224-tile map (27k edges) that measured 3.0-3.5 s per stamp: a
--- freeze every few minutes, in solo games too. Above what the stock New Game menu
--- builds -- Megalomaniac, at most 96 x 96 = 9,216 tiles and 192 on an axis (1:4)
--- -- the check is off for the whole game, and desync detection with it. Decided
--- from the terrain size, which every instance reads from the same save, so no
--- instance hashes while another waits for stamps that never come.
-K.VANILLA_MAX_TILES      = 96 * 96
-K.VANILLA_MAX_TILES_AXIS = 192
-function CM.mapTooBigToHash()
-	if CM.hashOffBigMap ~= nil then return CM.hashOffBigMap end
-	local ok, tx, ty = pcall(function()
-		local terrain = api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.TERRAIN)
-		return terrain.size.x, terrain.size.y
-	end)
-	if not ok or type(tx) ~= "number" or type(ty) ~= "number" then
-		CM.hashOffBigMap = false
-		log("hash check: map size unreadable (" .. tostring(tx) .. ") -- hashing as usual")
-		return false
-	end
-	CM.hashOffBigMap = tx * ty > K.VANILLA_MAX_TILES or math.max(tx, ty) > K.VANILLA_MAX_TILES_AXIS
-	log(string.format("hash check: map %d x %d tiles -- %s", tx, ty, CM.hashOffBigMap
-		and "larger than vanilla allows, the desync hash is OFF for this game" or "hashing as usual"))
-	return CM.hashOffBigMap
-end
-
+-- BIG MAPS HASH, JUST RARELY. Until 2026-09-15 the hash was switched OFF for the
+-- whole game above vanilla's largest size (96 x 96, or 192 on an axis), because on
+-- a 224-tile map (27k edges) it measured 3.0-3.5 s per stamp -- a freeze every few
+-- minutes. That bought smoothness with the thing the hash exists for: those were
+-- exactly the games running with NO desync detection at all.
+--
+-- The cost-proportional cadence (hash.lua) makes the trade unnecessary: the
+-- interval follows the measured cost, so a huge world hashes seldom instead of
+-- never. The starting interval still comes from the EDGE COUNT, which every
+-- instance reads from the same save -- that is what keeps the stamp grids
+-- identical, and it is why this decision must never be made from a machine's own
+-- speed. The leader then moves everyone with a stamped HASHEVERY.
+--
+-- A 224-tile map starts at 12 * 14 = 168 units and settles near the 576 rung at
+-- 3.5 s a stamp: one hitch roughly every ten minutes at 1x, against none before.
 local function checkHash(now)
-	if CM.mapTooBigToHash() then
-		CM.dashVerdict = "OFF"
-		return
-	end
-	-- CM.hashEvery is set from the map size on the first hash and is the same
-	-- on every instance (same save); until then the base interval applies.
-	local every = CM.hashEvery or K.HASH_EVERY_GAMETIME
-	local stamp = math.floor(now / every) * every
+	-- THE AGREED GRID (hash.lua CM.hashStampOf): CM.hashEvery from the map size on
+	-- the first hash (the same on every instance: same save; the base interval
+	-- until then), then whatever the leader's HASHEVERY moved every instance to.
+	local stamp = CM.hashStampOf(now)
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
 	local ph0 = os.clock()
@@ -764,6 +764,10 @@ local function checkHash(now)
 	-- One shared comparison, used from here and from the LSHASH handler, so the
 	-- check fires whichever side's hash lands second.
 	CM.compareAt(stamp)
+	-- what this stamp cost, and on the leader the interval that cost calls for
+	-- (hash.lua CM.hashCostNote, CM.hashCadenceTick)
+	CM.hashCostNote((os.clock() - ph0) * 1000)
+	pcall(CM.hashCadenceTick, now)
 end
 
 if CM.bootFailed then
@@ -821,7 +825,9 @@ function data()
 
 			-- Both every tick. pollInject at every 10th tick added up to 1.9s of
 			-- pure dead time before a build was even scheduled; a file stat per
-			-- tick is far cheaper than that.
+			-- tick is far cheaper than that. First, whether this game is so far
+			-- behind that the player's actions are off (inject.lua).
+			pcall(CM.actionsBlockTick, now)
 			CM.pollInject()
 			-- NO WORLD SCANS ON A TIMER. The construction and stop polls walked every
 			-- construction and every edge object on the map every 10 steps -- ~300 ms of frozen
@@ -891,10 +897,11 @@ function data()
 				-- (CM.heartbeatCu: measured against the LEADER, never set on the leader)
 				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
 				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+				-- hc= our world hash's cost in ms, which the leader sets the hash cadence by
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
 					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
 					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
-					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.resyncToken))
+					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.hashCostReport and CM.hashCostReport() or "", CM.resyncToken))
 			end
 
 			CM.paceTick(now)
@@ -1056,8 +1063,11 @@ function data()
 					if f then
 						local sp = "?"
 						pcall(function() sp = tostring(game.interface.getGameSpeed()) end)
-						f:write(string.format("eff=%s\nspeedreq=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
-							CM.spdReqInForce and (CM.guiReq or CM.spdReq) and string.format("%g", CM.guiReq or CM.spdReq) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+						-- votes: what the session speed is the mean of; myvote: our own latest vote
+						local myVote = CM.myVoteCast or CM.speedVotes[K.INSTANCE]
+						f:write(string.format("eff=%s\nspeedreq=%s\nvotes=%s\nmyvote=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
+							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.voteWords(CM.voteCounted),
+							myVote and string.format("%g", myVote.v) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1078,13 +1088,17 @@ function data()
 							#CM.queue, tonumber(sp) == 0 and "yes" or "no", sp, CM.dashVerdict or "-", tostring(CM.dashLastDetail or "-")))
 						-- vehicle drift: worst peer's latest mean/max, plus skipped count
 						local vd = "-"
-						if CM.vposLast then
+						if CM.vposOff then
+							vd = string.format("off (over %d vehicles)", K.VPOS_MAX_VEHICLES)
+						elseif CM.vposLast then
 							local parts = {}
 							for o, r in pairs(CM.vposLast) do parts[#parts + 1] = string.format("%s:%.1f/%.1fm", o, r.mean, r.max) end
 							table.sort(parts)
 							if #parts > 0 then vd = table.concat(parts, " ") end
 						end
 						f:write("vdrift=" .. vd .. "\n")
+						-- actionsoff: how far behind this game is while the player's actions are off
+						f:write("actionsoff=" .. (CM.actionsOff and string.format("%.1f", CM.behindBy or 0) or "-") .. "\n")
 						f:write("money=" .. tostring(CM.dashMoney or "-") .. " / loan " .. tostring(CM.dashLoan or "-") .. "\n")
 						-- The GUI used to decide which columns exist by which
 						-- lockstep_dash_<x>.txt files it could open. That is wrong
@@ -1175,15 +1189,19 @@ function data()
 			end
 		end,
 
-		-- the company state rides in the save (companies.lua cmSaveState)
+		-- the company state, the drift check's off switch and the hash grid ride in the
+		-- save (companies.lua cmSaveState, hash.lua vposSaveState / hashGridSave)
 		save = function()
 			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
 			local ok, st = pcall(CM.cmSaveState)
-			return { cm = ok and st or nil }
+			return { cm = ok and st or nil, vposOff = CM.vposSaveState and CM.vposSaveState() or nil,
+			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil }
 		end,
 		load = function(s)
 			-- also the per-frame engine -> GUI sync in the GUI state: no log here
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
+			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
+			if type(s) == "table" and s.hashGrid and CM.hashGridLoad then pcall(CM.hashGridLoad, s.hashGrid) end
 		end,
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
@@ -1268,6 +1286,30 @@ function data()
 						end
 					end
 					return CM.chatLines
+				end
+				-- The chat view is a plain TextView, which does not wrap: a long
+				-- message ran off the side of the window and was unreadable. Break
+				-- at the last space that fits, hard-break a word longer than the
+				-- limit, and indent the continuation so "name:" still starts a
+				-- message. Width is in BYTES, so a line of non-ASCII wraps a little
+				-- early -- harmless, and it keeps this off the per-frame path.
+				function CM.chatWrap(lines, width)
+					width = width or 64
+					if width < 12 then width = 12 end
+					local out = {}
+					for _, line in ipairs(lines) do
+						while #line > width do
+							local cut = nil
+							for i = width, math.floor(width / 2), -1 do
+								if line:byte(i) == 32 then cut = i break end
+							end
+							cut = cut or width
+							out[#out + 1] = (line:sub(1, cut):gsub("%s+$", ""))
+							line = "    " .. (line:sub(cut + 1):gsub("^%s+", ""))
+						end
+						out[#out + 1] = (line:gsub("%s+$", ""))
+					end
+					return out
 				end
 				local function readDash(inst)
 					local bases = { K.BASE }
@@ -1396,16 +1438,19 @@ function data()
 						CM.dashShowCompanies = not CM.dashShowCompanies
 						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
 					end))
-					-- the host's speed buttons: shown by default, this toggle (host only) hides them
-					CM.dashShowHostSpeed = (CM.dashShowHostSpeed ~= false)
-					D.speedTog = toggleBtn("  speed  ", function()
-						CM.dashShowHostSpeed = not CM.dashShowHostSpeed
-						D.hostSpeedShown = nil   -- the GUI tick re-applies the row's visibility
-					end)
-					tog:addItem(D.speedTog)
-					pcall(function() D.speedTog:setVisible(false, false) end)
+					-- the speed vote row: shown by default, this toggle hides it
+					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)
+					tog:addItem(toggleBtn("  speed  ", function()
+						CM.dashShowSpeed = not CM.dashShowSpeed
+						D.speedShown = nil   -- the GUI tick re-applies the row's visibility
+					end))
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
+					-- far behind the other games, the player's actions are off: said at the very
+					-- top, whatever sections are shown (inject.lua CM.actionsBlockTick)
+					D.alertText = api.gui.comp.TextView.new("")
+					box:addItem(D.alertText)
+					pcall(function() D.alertText:setVisible(false, false) end)
 					box:addItem(togC)
 					local lobbyL = api.gui.layout.BoxLayout.new("VERTICAL")
 					D.lobbyText = api.gui.comp.TextView.new("")
@@ -1429,36 +1474,41 @@ function data()
 					D.lobbyBox:setLayout(lobbyL)
 					D.lobbyBox:setVisible(CM.dashShowLobby == true, false)
 					box:addItem(D.lobbyBox)
-					-- ---- host speed buttons (2026-09-12) ----
-					-- Shown on the host's window only. A press appends SPEEDSET <v> to our
-					-- inject file; the host's pacer makes it the session speed
-					-- (CM.guiSpeedSet) and every joiner follows it through LSEFF.
-					local function hostSpeed(v)
+					-- ---- speed votes (2026-09-12 as the host's speed buttons; every player's since 2026-09-15) ----
+					-- A press appends SPEEDSET <v> to our inject file: our vote for the
+					-- session speed (CM.guiSpeedSet). Every game counts it at its stamp,
+					-- and the session runs at the mean of the votes the line above the
+					-- buttons lists.
+					local function speedVote(v)
 						v = math.max(0.25, math.min(4.5, math.floor(v * 4 + 0.5) / 4))
 						D.speedAsked, D.speedAskedAt = v, os.time()
 						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
 						if f then f:write(string.format("SPEEDSET %g", v) .. string.char(10)); f:close() end
-						pcall(function() D.hostSpeedText:setText(string.format("session speed: %gx   ", v)) end)
+						pcall(function() D.speedText:setText(string.format("your vote: %gx -- the session speed follows in a moment   ", v)) end)
 					end
-					-- -/+0.25 step from the last press for a few seconds: the session speed
-					-- read back from the dash file lags a press by a second or two
-					local function hostSpeedBase()
+					-- -/+0.25 steps our own vote: the last press for a few seconds (the
+					-- dash file lags a press by a second or two), then the vote it reports
+					local function speedVoteBase()
 						if D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5 then return D.speedAsked end
-						return (D.speedEff and D.speedEff > 0) and D.speedEff or D.speedAsked or 1
+						return D.speedMine or ((D.speedEff and D.speedEff > 0) and D.speedEff) or D.speedAsked or 1
 					end
+					local svCol = api.gui.layout.BoxLayout.new("VERTICAL")
+					D.speedText = api.gui.comp.TextView.new("session speed: -   ")
+					svCol:addItem(D.speedText)
 					local hsRow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					D.hostSpeedText = api.gui.comp.TextView.new("session speed: -   ")
-					hsRow:addItem(D.hostSpeedText)
-					hsRow:addItem(toggleBtn("  -0.25  ", function() hostSpeed(hostSpeedBase() - 0.25) end))
+					hsRow:addItem(api.gui.comp.TextView.new("your vote:   "))
+					hsRow:addItem(toggleBtn("  -0.25  ", function() speedVote(speedVoteBase() - 0.25) end))
 					for _, sv in ipairs({ 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5 }) do
-						hsRow:addItem(toggleBtn(string.format("  %g  ", sv), function() hostSpeed(sv) end))
+						hsRow:addItem(toggleBtn(string.format("  %g  ", sv), function() speedVote(sv) end))
 					end
-					hsRow:addItem(toggleBtn("  +0.25  ", function() hostSpeed(hostSpeedBase() + 0.25) end))
-					D.hostSpeedBox = api.gui.comp.Component.new("mpHostSpeed")
-					D.hostSpeedBox:setLayout(hsRow)
-					box:addItem(D.hostSpeedBox)
-					D.hostSpeedShown = false
-					pcall(function() D.hostSpeedBox:setVisible(false, false) end)
+					hsRow:addItem(toggleBtn("  +0.25  ", function() speedVote(speedVoteBase() + 0.25) end))
+					local hsRowC = api.gui.comp.Component.new("mpSpeedVoteButtons")
+					hsRowC:setLayout(hsRow)
+					svCol:addItem(hsRowC)
+					D.speedBox = api.gui.comp.Component.new("mpSpeedVote")
+					D.speedBox:setLayout(svCol)
+					box:addItem(D.speedBox)
+					D.speedShown = nil   -- the GUI tick applies the toggle
 					-- ---- stats, in words (2026-09-11) ----
 					-- A status line (do the worlds match; if not, what differs, since when
 					-- and what to do) and one row per player (stats.lua). The raw counters
@@ -1659,6 +1709,14 @@ function data()
 					end
 				end
 				local mine = fresh[own]
+				if D.alertText then
+					local behind = mine and tonumber(mine.actionsoff)
+					local text = behind and string.format("Your game is %.0f game units behind the others: your actions are off until it catches up.", behind) or ""
+					if text ~= D.alertShown then
+						D.alertShown = text
+						pcall(function() D.alertText:setText(text); D.alertText:setVisible(text ~= "", false) end)
+					end
+				end
 				if CM.dashShowLobby and D.lobbyText and CM.lobbyPanelPage then
 					local dir = CM.netDir()
 					local f = dir and io.open(dir .. "/lobby_panel.txt", "r")
@@ -1706,7 +1764,7 @@ function data()
 					end
 					if D.chatText and (guiTick % 30) == 0 then
 						local lines = CM.chatTail(8)
-						if #lines > 0 then D.chatText:setText(table.concat(lines, string.char(10))) end
+						if #lines > 0 then D.chatText:setText(table.concat(CM.chatWrap(lines), string.char(10))) end
 					end
 					-- an open chat input nobody has typed into for 30 s closes itself
 					if D.chatOpen and CM.chatCloseInput and (guiTick % 30) == 0 then
@@ -1715,22 +1773,20 @@ function data()
 						if t ~= D.chatIdleText then D.chatIdleText, D.chatIdleSince = t, os.time()
 						elseif os.time() - (D.chatIdleSince or 0) > 30 then CM.chatCloseInput() end
 					end
-					-- the host speed row: on the host's window only, with the session speed
-					if D.hostSpeedBox and (guiTick % 10) == 0 or (D.hostSpeedBox and D.hostSpeedShown == nil) then
-						local isHost = (CM.guiLeader and CM.guiLeader() or "a") == own
-						local showRow = isHost and CM.dashShowHostSpeed ~= false
-						if D.hostSpeedShown ~= showRow then
-							D.hostSpeedShown = showRow
-							D.hostSpeedBox:setVisible(showRow, false)
+					-- the speed vote row, with the session speed and the votes it is the mean of
+					if D.speedBox and ((guiTick % 10) == 0 or D.speedShown == nil) then
+						local showRow = CM.dashShowSpeed ~= false
+						if D.speedShown ~= showRow then
+							D.speedShown = showRow
+							D.speedBox:setVisible(showRow, false)
 						end
-						if D.speedTog and D.speedTogShown ~= isHost then
-							D.speedTogShown = isHost
-							pcall(function() D.speedTog:setVisible(isHost, false) end)
-						end
-						if isHost and mine then
-							D.speedEff = tonumber(mine.eff)
+						if mine then
+							D.speedEff, D.speedMine = tonumber(mine.eff), tonumber(mine.myvote)
 							if not (D.speedAsked and os.time() - (D.speedAskedAt or 0) <= 5) then
-								D.hostSpeedText:setText("session speed: " .. (D.speedEff and string.format("%gx", D.speedEff) or "-") .. "   ")
+								local sp = (D.speedEff == 0 and "paused") or (D.speedEff and string.format("%gx", D.speedEff)) or "-"
+								if mine.speedreq and mine.speedreq ~= "-" then sp = sp .. " (/speed in the chat)" end
+								local votes = (mine.votes and mine.votes ~= "") and ("   |   votes: " .. mine.votes) or ""
+								D.speedText:setText("session speed: " .. sp .. votes .. "   ")
 							end
 						end
 					end
