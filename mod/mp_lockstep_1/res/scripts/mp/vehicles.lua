@@ -258,6 +258,78 @@ function CM.watchDepartures()
 	end
 end
 
+-- TRAIN PATHS AND HALTS, STEP-STAMPED (2026-09-16). A desync at t=19008 had no
+-- command in 1,450 game units, identical positions 288 units earlier, identical
+-- edge/node ids at the junction, and the world hash still equal -- yet on one
+-- game two trains queued on one track while the other track's train went
+-- through, and on the other game the opposite. That is something the engine
+-- decides on its own: which train gets a junction, when a path result lands.
+-- Every train's path signature (edge count, first and last edge) and its
+-- stop/go transitions are logged with the SIM STEP, so two games' logs can be
+-- diffed to the step: a path that changes on step N here and N+2 there is the
+-- finding. Rail only, refreshed every 300 ticks, one MOVE_PATH read per train
+-- per update; off past 200 trains.
+CM.trainWatch = { list = {}, last = {}, at = -1e9, off = false }
+function CM.watchTrains()
+	local W = CM.trainWatch
+	if W.off then return end
+	local step = CM.stepOf(CM.gameTime() or 0)
+	if CM.ticks - W.at >= 300 then
+		W.at = CM.ticks
+		local list, ok = {}, pcall(function()
+			local rail = api.type.enum.Carrier.RAIL
+			local t = game.interface.getEntities({ radius = 999999 }, { type = "VEHICLE" }) or {}
+			for _, vid in pairs(t) do
+				local tv = api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
+				if tv and tv.carrier == rail then list[#list + 1] = vid end
+			end
+		end)
+		if not ok then W.off = true; log("TRAIN watch: cannot list rail vehicles -- off"); return end
+		if #list > 200 then W.off = true; log(string.format("TRAIN watch: %d trains -- off", #list)); return end
+		table.sort(list)
+		W.list = list
+		local keep = {}
+		for _, vid in ipairs(list) do keep[vid] = W.last[vid] end
+		W.last = keep
+	end
+	for _, vid in ipairs(W.list) do
+		local okR, err = pcall(function()
+			local mp = api.engine.getComponent(vid, api.type.ComponentType.MOVE_PATH)
+			if not mp then return end
+			local edges = mp.path.edges
+			local n = #edges
+			local sig = n .. ":" .. (n > 0 and tostring(edges[1].edgeId.entity) or "-") .. ":" .. (n > 0 and tostring(edges[n].edgeId.entity) or "-")
+			local speed = mp.dyn.speed or 0
+			local idx = mp.dyn.pathPos and mp.dyn.pathPos.edgeIndex or -1
+			local key = CM.vehKeyOf[vid] or (CM.primedVeh[vid] and ("s:" .. tostring(vid))) or ("id " .. tostring(vid))
+			local L = W.last[vid]
+			if not L then W.last[vid] = { sig = sig, speed = speed, since = step }; return end
+			if sig ~= L.sig then
+				log(string.format("TRAIN %s path -> %s at step %d (was %s; idx %d)", key, sig, step, L.sig, idx))
+				L.sig = sig
+			end
+			local wasMoving, moving = (L.speed or 0) > 0.01, speed > 0.01
+			if wasMoving ~= moving then
+				local state = "?"
+				pcall(function() state = tostring(api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE).state) end)
+				local edge = (idx >= 0 and idx < n) and tostring(edges[idx + 1].edgeId.entity) or "?"
+				if moving then
+					log(string.format("TRAIN %s moving at step %d after %d steps halted (edge %s idx %d/%d state %s)", key, step, step - (L.since or step), edge, idx, n, state))
+				else
+					log(string.format("TRAIN %s halted at step %d (edge %s idx %d/%d state %s)", key, step, edge, idx, n, state))
+				end
+				L.since = step
+			end
+			L.speed = speed
+		end)
+		if not okR then
+			W.off = true
+			log("TRAIN watch: MOVE_PATH unreadable (" .. tostring(err) .. ") -- off")
+			return
+		end
+	end
+end
+
 function CM.pollVehKeys()
 	if #pendingVehKeys == 0 then return end
 	local now = CM.gameTime()
