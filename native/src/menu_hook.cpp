@@ -335,6 +335,7 @@ static bool LobbyRunning();
 static void SyncStart(const char* why);
 static void PollLobbyOpen();
 static void StageTick();
+static void MarkSaveShared();
 static volatile LONG g_showOverlay = 0;   // set by the CreatePage detour (page==2)
 static HWND g_gameWnd = nullptr;
 static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
@@ -1711,6 +1712,7 @@ static void OnHit(int id)
             char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
             char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
             LobbySend(line); SetStatus("Sharing save & starting game…");
+            MarkSaveShared();
         } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
@@ -2209,6 +2211,33 @@ static ULONGLONG saveMtime(const wchar_t* path, ULONGLONG* size)
     return ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
 }
 static ULONGLONG g_syncBaseline = 0, g_syncAskedAt = 0, g_syncLastSize = 0;
+// A RECENT SAVE SERVES THE NEXT HOT JOINER (2026-09-16). Every roster increase
+// used to take a fresh autosave; three people joining a minute apart meant
+// three saves (each a multi-second freeze for everyone). If the save last
+// shared is younger than HOTJOIN_REUSE_MS of UNPAUSED play, the lobby's
+// serve-again pushes that one to the newcomer instead. Paused time does not
+// count: g_unpausedMs advances only while the mod's dash says paused=no.
+static const ULONGLONG HOTJOIN_REUSE_MS = 15000;
+static ULONGLONG g_unpausedMs = 0, g_unpausedLast = 0, g_syncSharedUnpaused = 0;
+static bool g_syncSharedValid = false;
+static void UnpausedTick()
+{
+    static ULONGLONG nextRead = 0; static bool paused = false;
+    ULONGLONG now = GetTickCount64();
+    if (now >= nextRead) {
+        nextRead = now + 500;
+        // the host's dash file (letter a on a plain host; the roster's letter otherwise)
+        char letter[3] = "a";
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (g_you[0]) strcpy_s(letter, originLetterFor(g_you)); LeaveCriticalSection(&g_modelCs); }
+        wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%slockstep_dash_%hs.txt", g_dataDirW, letter);
+        paused = false;   // unknown counts as running: the window then closes, never lingers
+        FILE* f = _wfsopen(p, L"r", _SH_DENYNO);
+        if (f) { char line[200]; while (fgets(line, sizeof(line), f)) if (!strncmp(line, "paused=yes", 10)) { paused = true; break; } fclose(f); }
+    }
+    if (g_unpausedLast && !paused) g_unpausedMs += now - g_unpausedLast;
+    g_unpausedLast = now;
+}
+static void MarkSaveShared() { g_syncSharedUnpaused = g_unpausedMs; g_syncSharedValid = true; }
 static wchar_t   g_syncSave[600] = L"";
 static CRITICAL_SECTION g_syncCs; static bool g_syncCsInit = false;
 // Take the sync save now (host, in game). Called for a "/sync" request and,
@@ -2219,6 +2248,16 @@ static void SyncStart(const char* why)
     if (!g_gameUi) { Log("[sync] %s before the game is running -- ignored\n", why); return; }
     if (g_syncCsInit) EnterCriticalSection(&g_syncCs);
     if (g_syncAskedAt) { Log("[sync] %s while a save is pending -- one save serves everyone who joined\n", why); }
+    else if (strncmp(why, "hot join", 8) == 0 && g_syncSharedValid && g_startSaveW[0]
+             && GetFileAttributesW(g_startSaveW) != INVALID_FILE_ATTRIBUTES
+             && g_unpausedMs - g_syncSharedUnpaused < HOTJOIN_REUSE_MS) {
+        // the lobby's serve-again pushes the last shared save to anyone unstarted
+        // within a second (no sync_taking hold here, so nothing stops it)
+        Log("[sync] %s -> the save shared %.1f s of unpaused play ago is fresh enough: the lobby serves it again, no new save\n",
+            why, (g_unpausedMs - g_syncSharedUnpaused) / 1000.0);
+        SetStatus("Hot join: sending the recent save\xE2\x80\xA6");
+        SendChat("!hotjoin A game is running. Hold on: the host is sending you the world; your game loads it by itself.");
+    }
     else {
         wchar_t cur[600] = L""; ULONGLONG sz = 0;
         g_syncBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
@@ -2243,6 +2282,7 @@ static void SyncStart(const char* why)
 }
 static void SyncPoll()
 {
+    UnpausedTick();
     wchar_t req[MAX_PATH]; _snwprintf_s(req, _TRUNCATE, L"%stpf2_sync_save.txt", g_dataDirW);
     if (GetFileAttributesW(req) != INVALID_FILE_ATTRIBUTES) {
         DeleteFileW(req);
@@ -2260,6 +2300,7 @@ static void SyncPoll()
                 char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
                 wcscpy_s(g_startSaveW, cur);
                 LobbySend(line);
+                MarkSaveShared();
                 Log("[sync] new save %ls (%llu B) -> sharing with every joiner\n", cur, (unsigned long long)sz);
                 SetStatus("Sync: sharing the save\xE2\x80\xA6");
                 wchar_t sent[MAX_PATH]; _snwprintf_s(sent, _TRUNCATE, L"%stpf2_sync_sent.txt", g_dataDirW);
