@@ -334,6 +334,7 @@ static bool WorldLoaded();
 static bool LobbyRunning();
 static void SyncStart(const char* why);
 static void PollLobbyOpen();
+static void StageTick();
 static volatile LONG g_showOverlay = 0;   // set by the CreatePage detour (page==2)
 static HWND g_gameWnd = nullptr;
 static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
@@ -489,6 +490,7 @@ static void ModDownloadPreference(bool save) {
 #define NAME_TYPED_MAX 64
 static char g_players[200][NAME_MAX]; static int g_playerCount = 0;
 static int  g_companies[200];   // company id per roster entry (1..200), 0 = unset -> 1
+static char g_stages[200][80];  // hot-join progress per roster entry ("loading world"), "" = none (2026-09-16)
 // Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
 static COLORREF coColor(int cid)
 {
@@ -1129,8 +1131,13 @@ static void RenderPanelLayer(int w, int h)
             layerText(pad, ry + S(4), S(22), S(16), wc, fs, RGB(0, 0, 0), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             bool amHost = strcmp(g_you, g_host) == 0;
             if (isYou || amHost) addHit(pad, ry + S(2), S(24), S(20), 20 + i, true);   // chip ids 20..35
-            layerText(pad + S(30), ry, listW - S(80), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
+            bool staged = g_stages[i][0] != 0;
+            layerText(pad + S(30), ry, listW - (staged ? S(150) : S(80)), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (staged) {   // hot-join progress, dim, in place of the HOST tag (a host has none)
+                wchar_t ws[80]; MultiByteToWideChar(CP_UTF8, 0, g_stages[i], -1, ws, 80);
+                layerText(pad + listW - S(120), ry, S(120), S(24), ws, fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 200);
+            }
+            else if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
         }
         { HFONT fl = mkLato(S(11));
           int shown = n < ROSTER_ROWS ? n : ROSTER_ROWS;
@@ -1750,6 +1757,7 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     PollLobbyOpen();
     SteamNameTick();
+    StageTick();
     LONG n = InterlockedIncrement(&g_presentCount);
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
@@ -2280,6 +2288,49 @@ static int  g_syncReq = 0;
 static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")
 static char g_transportLobby[33] = ""; // owned by LobbyThread
 static void writeBridgeCtl(bool isHost);
+static const char* originLetterFor(const char* name);
+// Our own hot-join stage for the roster (2026-09-16). Sent as {"cmd":"stage"}
+// when it changes: "loading world" as the shared save starts loading, then
+// what the mod's status line says (stage=starting / catchup / behind / live)
+// once the world is up, and "" (cleared) at live.
+static char g_stageSent[80] = "";
+static volatile LONG g_stageWatch = 0;
+static void ReportStage(const char* text)
+{
+    if (strcmp(text, g_stageSent) == 0) return;
+    strcpy_s(g_stageSent, text);
+    char esc[200]; int j = 0;
+    for (int i = 0; text[i] && j < 190; i++) { if (text[i] == '"' || text[i] == '\\') esc[j++] = '\\'; esc[j++] = text[i]; }
+    esc[j] = 0;
+    char line[260]; snprintf(line, sizeof(line), "{\"cmd\":\"stage\",\"text\":\"%s\"}", esc);
+    LobbySend(line);
+    Log("[menu] stage: %s\n", text[0] ? text : "(clear)");
+}
+static void StageTick()
+{
+    static ULONGLONG next = 0;
+    if (!InterlockedCompareExchange(&g_stageWatch, 0, 0)) return;
+    ULONGLONG now = GetTickCount64(); if (now < next) return; next = now + 1000;
+    if (!WorldLoaded()) return;
+    char letter[3] = "a";
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (g_you[0]) strcpy_s(letter, originLetterFor(g_you)); LeaveCriticalSection(&g_modelCs); }
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%slockstep_status_%hs.txt", g_dataDirW, letter);
+    FILE* f = _wfsopen(p, L"r", _SH_DENYNO); if (!f) { ReportStage("world loaded"); return; }
+    char line[512] = ""; fgets(line, sizeof(line), f); fclose(f);
+    const char* st = strstr(line, "stage=");
+    if (!st) { ReportStage("world loaded"); return; }
+    st += 6; char stage[64]; int k = 0; while (st[k] && st[k] > ' ' && k < 63) { stage[k] = st[k]; k++; } stage[k] = 0;
+    if (strcmp(stage, "live") == 0) { ReportStage(""); InterlockedExchange(&g_stageWatch, 0); return; }
+    if (strcmp(stage, "starting") == 0) { ReportStage("world loaded, waiting for the session"); return; }
+    if (strncmp(stage, "catchup:", 8) == 0) {
+        const char* ph = stage + 8; const char* b = strchr(ph, ':'); double behind = b ? atof(b + 1) : 0;
+        char t[80];
+        if (strncmp(ph, "fetch", 5) == 0) snprintf(t, sizeof(t), "catching up: fetching history (%.0f s behind)", behind);
+        else snprintf(t, sizeof(t), "catching up (%.0f s behind)", behind);
+        ReportStage(t); return;
+    }
+    if (strncmp(stage, "behind:", 7) == 0) { char t[80]; snprintf(t, sizeof(t), "%.0f s behind", atof(stage + 7)); ReportStage(t); return; }
+}
 static void speedFromChat(const char* text)
 {
     if (strncmp(text, "/sync", 5) == 0) {
@@ -2461,6 +2512,16 @@ static void applyRoster(const char* s)
         const char* k = strstr(co, keyq);
         if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
     }
+    // "stages":{"name":"text",...} -> g_stages[i]: what each joiner is doing
+    { const char* sg = strstr(s, "\"stages\"");
+      for (int i = 0; i < g_playerCount; i++) {
+          g_stages[i][0] = 0;
+          if (!sg) continue;
+          char keyq[NAME_MAX + 8]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
+          const char* k = strstr(sg, keyq);
+          if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++;
+                   if (*k == '"') { k++; int j = 0; while (*k && *k != '"' && j < 79) g_stages[i][j++] = *k++; g_stages[i][j] = 0; } }
+      } }
     char v[NAME_MAX];
     jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
     jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
@@ -3050,6 +3111,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 writeCompanyCfg();
                                 SetStatus("Loading shared save…"); Sleep(400);
                                 if (doStartLoad(src)) {
+                                    ReportStage("loading world"); InterlockedExchange(&g_stageWatch, 1);
                                     // The game is loading. The lobby process STAYS ALIVE: since the
                                     // game-frame relay (--game-relay-port) the lobby IS the lockstep
                                     // transport between machines -- quitting it here left both bridges

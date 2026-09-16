@@ -375,11 +375,19 @@ function CM.statusLine(now)
 	-- reads it so a build in that window is cancelled and replayed like any other,
 	-- instead of running natively on one instance only (2026-09-11: two tracks laid
 	-- 2 s after loading existed on A and nowhere else).
-	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d",
+	-- stage= (2026-09-16): what a hot joiner is doing, for the lobby roster
+	-- (the menu DLL reads it and tells the host): starting until a peer is
+	-- heard, catchup:<fetch|run>:<behind> while the catch-up runs, behind:<n>
+	-- while more than 2 units back, live otherwise.
+	local stage = "live"
+	if not CM.peerSeen then stage = "starting"
+	elseif CM.catchingUp2 then stage = string.format("catchup:%s:%.1f", tostring(CM.cuPhase or "run"), CM.behindBy or 0)
+	elseif (CM.behindBy or 0) > 2 then stage = string.format("behind:%.1f", CM.behindBy or 0) end
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s",
 		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
 		pt and string.format("%+.1f", now - pt) or "?",
 		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-		#CM.queue, tonumber(CM.rosterPlayers) or 0)
+		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage)
 end
 -- Letter -> 0..7, for anything that needs a per-origin namespace.
 function CM.originIdx(o)

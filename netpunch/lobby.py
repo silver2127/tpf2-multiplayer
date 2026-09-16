@@ -1576,6 +1576,7 @@ class _ClientSaveReceiver:
         if pct // 10 > self.last_pct // 10:
             self.last_pct = pct
             self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
+            self._send({"t": "stage", "text": f"receiving save {pct}%"})
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
@@ -2260,6 +2261,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return True
         return False
 
+    def roster_stages():
+        # what each joiner is doing right now ("receiving save 40%", "loading
+        # world", "catching up (12 s behind)"): shown beside the name in every
+        # panel while a hot join runs; empty once in sync (2026-09-16)
+        return {p["name"]: p["stage"] for p in peers.values() if p.get("stage")}
+
     def send_roster_packets():
         # Doubles as the start self-heal: a joiner that lost the whole start
         # burst sees started:true here (~2 s later) and starts. The flag is
@@ -2280,7 +2287,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
                                  "profiles": profiles, "links": links,
-                                 "companies": companies})
+                                 "companies": companies, "stages": roster_stages()})
 
     def emit_roster():
         if publisher is not None:
@@ -2288,7 +2295,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         players = roster_players()
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
-                 "relay": relay_only, "companies": roster_companies()})
+                 "relay": relay_only, "companies": roster_companies(), "stages": roster_stages()})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=leader_name(), started=started[0],
                        lobby=lobby_name, companies=roster_companies())
@@ -2569,6 +2576,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if new != peers[addr].get("links"):
                     peers[addr]["links"] = new
                     send_roster_packets()          # let everyone re-plan relays
+        elif t == "stage":
+            # a joiner says what it is doing (hot-join progress); "" clears it
+            if addr in peers:
+                text = str(msg.get("text", ""))[:80]
+                if peers[addr].get("stage", "") != text:
+                    peers[addr]["stage"] = text
+                    send_roster_packets()
+                    emit_roster()
         elif t == "company":
             # a joiner may set ITS OWN company; the host sets anyone's -- and on
             # a relay the leader stands in for the host
@@ -3453,12 +3468,13 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             roster_profiles[0] = m.get("profiles", {}) or {}
             mesh_plan_dials()
             companies = m.get("companies", {}) or {}
-            key = (tuple(players), tuple(sorted(companies.items())))
+            stages = m.get("stages") or {}
+            key = (tuple(players), tuple(sorted(companies.items())), tuple(sorted(stages.items())))
             if key != last_roster[0]:
                 last_roster[0] = key
                 io.emit({"type": "roster", "players": players,
                          "you": assigned[0], "host": m.get("host"),
-                         "lobby": m.get("lobby", ""), "companies": companies,
+                         "lobby": m.get("lobby", ""), "companies": companies, "stages": stages,
                          "relay": is_relay[0], "letters": m.get("letters") or {},
                          "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1)})
                 io.write_state(state="connected", players=players,
@@ -3508,6 +3524,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "chat", "text": str(cmd.get("text", ""))})
         elif c == "mods":
             receiver.answer_mods(bool(cmd.get("accept")),cmd.get("offer"))
+        elif c == "stage":
+            send({"t": "stage", "text": str(cmd.get("text", ""))[:80]})
         elif c == "company":
             # the panel names a player when the leader of a relay lobby clicks
             # someone else's chip; this used to be overwritten with our own
