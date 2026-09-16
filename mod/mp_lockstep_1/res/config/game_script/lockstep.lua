@@ -1084,6 +1084,7 @@ function data()
 						f:write(string.format("eff=%s\nspeedreq=%s\nvotes=%s\nmyvote=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
 							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.voteWords(CM.voteCounted),
 							myVote and string.format("%g", myVote.v) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+						f:write("gov=" .. ((CM.govFactor and CM.govFactor < 1) and string.format("x%.2f (%s %.1f behind)", CM.govFactor, tostring(CM.govWho or "?"), CM.govWorst or 0) or "-") .. "\n")
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}

@@ -1364,11 +1364,16 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         memcpy(&t.loadMode, b + 0x28, 4);
         memcpy(&f2c,        b + 0x2c, 4);
         memcpy(&f30,        b + 0x30, 4);
-        // floats (see the layout note); only NaN is refused -- a huge or infinite
-        // wait is the slider's "unlimited", shipped as %.9g ("inf" round-trips)
+        // floats (see the layout note); only NaN is refused -- a huge, infinite
+        // or negative wait is the slider's own encoding, shipped as %.9g
         if (f2c != f2c || f30 != f30) LINE_REFUSE("stop %d waits %g/%g", i + 1, f2c, f30);
-        // which of +0x2c/+0x30 is min is unpinned; min <= max always holds
-        if (f2c <= f30) { t.minWait = f2c; t.maxWait = f30; } else { t.minWait = f30; t.maxWait = f2c; }
+        // +0x2c is minWaitingTime and +0x30 maxWaitingTime: the API's field
+        // order (stationGroup, station, terminal, alternativeTerminals,
+        // loadMode, minWaitingTime, maxWaitingTime, waypoints) laid out in
+        // memory. This used to SORT the two ("min <= max always holds"), and
+        // a max below the min -- the cargo slider's unlimited wait -- came out
+        // swapped on every peer (2026-09-16: "min and max confused").
+        t.minWait = f2c; t.maxWait = f30;
         if (t.sg <= 0 || t.station < 0 || t.terminal < 0
             || t.loadMode < 0 || t.loadMode > 3)
             LINE_REFUSE("stop %d sg=%d station=%d terminal=%d loadMode=%d", i + 1, t.sg, t.station, t.terminal, t.loadMode);
