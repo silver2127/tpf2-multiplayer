@@ -5883,6 +5883,12 @@ static bool  g_ssSaidOnce = false;
 // companies.lua cmReadConfig). Cached, because the filter runs on hover.
 // A stale answer is harmless: outside companies mode the comparison it guards
 // cannot fail anyway.
+// Companies mode is live when the SIM says so: `cm=companies` on the mod's
+// status line (lockstep_status_<letter>.txt, written every 15 ticks, the file
+// SessionLive already reads). The lobby's mp_company_cfg.txt only says what
+// the roster was at START; a company created in game (CMNEW) never reaches
+// it, so the gate read "coop" on both machines and opened nothing while being
+// asked 2,344 times (2026-09-16). The file is still honoured as a second yes.
 static bool SharedStationsCompaniesLive()
 {
     static ULONGLONG last = 0;
@@ -5893,12 +5899,25 @@ static bool SharedStationsCompaniesLive()
     cached = false;
     if (!g_dataDir[0]) return cached;
     char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%smp_company_cfg.txt", g_dataDir);
-    FILE* f = _fsopen(p, "r", _SH_DENYNO);
-    if (!f) return cached;
-    char line[64] = {0};
-    if (fgets(line, sizeof(line), f)) cached = strncmp(line, "companies", 9) == 0;
-    fclose(f);
+    ReadInstance();
+    if (g_instance[0]) {
+        snprintf(p, sizeof(p), "%slockstep_status_%s.txt", g_dataDir, g_instance);
+        FILE* f = _fsopen(p, "r", _SH_DENYNO);
+        if (f) {
+            char line[512] = {0};
+            if (fgets(line, sizeof(line), f) && strstr(line, " cm=companies")) cached = true;
+            fclose(f);
+        }
+    }
+    if (!cached) {
+        snprintf(p, sizeof(p), "%smp_company_cfg.txt", g_dataDir);
+        FILE* f = _fsopen(p, "r", _SH_DENYNO);
+        if (f) {
+            char line[64] = {0};
+            if (fgets(line, sizeof(line), f)) cached = strncmp(line, "companies", 9) == 0;
+            fclose(f);
+        }
+    }
     return cached;
 }
 
