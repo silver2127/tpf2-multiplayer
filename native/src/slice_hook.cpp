@@ -1698,6 +1698,15 @@ static SRWLOCK g_lcLock = SRWLOCK_INIT;
 static std::vector<LcStash> g_lcStash;
 static volatile LONG g_pendingStashCb = 0;        // the pending cancel is a CreateLine: stash its callback at Add
 static volatile LONG64 g_lcCarrierCmd = 0;        // our claimed Lua createLine, whose Add takes the stashed callback
+// The factory's `this` is NOT what reaches Add for a Lua create: api.cmd.sendCommand
+// copies the command into its own object first (2026-09-16: every claim logged
+// "carries the line editor's callback", none ever "rides on our replay", and the
+// line editor never got its new line). The replay's Add is recognised instead as
+// the first Add from sendCommand's own call site (docs/re/COMMANDS.md: returns to
+// 0x1126f1a) on the thread that made the claim -- one Lua statement, no other Add
+// between the factory and it.
+static const uintptr_t CALLER_SCRIPT_SENDCOMMAND = 0x1126f1a;
+static volatile LONG g_lcCarrierTid = 0;
 static uint8_t* g_lcCarrierFn = nullptr;          // the std::function object handed to that Add
 static uint8_t* g_lcSpentFn = nullptr;            // the previous carrier's object, emptied by Add; freed on the next swap
 static long g_lcClaimSeen = 0;
@@ -1799,6 +1808,7 @@ static void ClaimLineCreateCarrier(uint64_t rcx)
     if (!fn) { Log("[slice] CreateLine: claim %ld but no held callback -- the replay runs with the Lua's own\n", claim); return; }
     if (g_lcCarrierFn) Log("[slice] CreateLine: a previous carrier never reached Add -- its callback is dropped\n");
     g_lcCarrierFn = fn;
+    InterlockedExchange(&g_lcCarrierTid, (LONG)GetCurrentThreadId());
     InterlockedExchange64(&g_lcCarrierCmd, (LONG64)rcx);
     Log("[slice] CreateLine: claim %ld -- our replay cmd=%llx carries the line editor's callback\n", claim, (unsigned long long)rcx);
 }
@@ -4267,10 +4277,15 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             else if (GetTickCount64() - g_terrainHeldAt > TERRAIN_HOLD_MAX_MS) ReleaseTerrainTool("timeout -- no completion marker arrived");
         }
         // Our claimed createLine replay: give its Add the line editor's held callback.
+        // Matched by pointer when the command reaches Add as built, else as the first
+        // Add from sendCommand's call site on the claiming thread (see g_lcCarrierTid).
         {
             const uint64_t lc = (uint64_t)InterlockedCompareExchange64(&g_lcCarrierCmd, 0, 0);
-            if (lc && r8 == lc) {
+            const bool viaScript = lc && caller == CALLER_SCRIPT_SENDCOMMAND
+                                   && (DWORD)InterlockedCompareExchange(&g_lcCarrierTid, 0, 0) == GetCurrentThreadId();
+            if (lc && (r8 == lc || viaScript)) {
                 InterlockedExchange64(&g_lcCarrierCmd, 0);
+                if (r8 != lc) Log("[slice] CreateLine: our replay reached Add as %llx (built as %llx) from sendCommand\n", (unsigned long long)r8, (unsigned long long)lc);
                 __try { SwapInLineCreateCallback(r9, calleeRsp); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] CreateLine: swap fault -- the replay runs with the Lua's callback\n"); }
                 return 0;

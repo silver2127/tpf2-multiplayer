@@ -1678,12 +1678,6 @@ function data()
 					-- The GUI state cannot reach the lockstep queue, so a button
 					-- appends "CMSWITCH 3" to the inject file; inject.lua schedules
 					-- the command and every peer applies it on the same step.
-					-- LAYOUT (2026-09-16): three short rows instead of one dense line.
-					--   [swatch] You play Acme Co (#3) with alice, bob
-					--   Join: [dropdown of every company] [swatch] [ Join Acme Co ]   [ New company ]
-					--   Yours:  name [input] [Rename]   password [input] [Set]
-					--   (note / hint)
-					D.coText = api.gui.comp.TextView.new("You play: -")
 					D.coSel = nil
 					local function coPw()
 						local t = ""
@@ -1695,49 +1689,29 @@ function data()
 						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
 						if f then f:write(op .. (cid and (" " .. cid) or "") .. (pw ~= "" and (" " .. pw) or "") .. string.char(10)); f:close() end
 					end
-					-- Player names for the dropdown: the menu DLL writes mp_players.txt
-					-- ("a=alice" per line) from the roster it assigns letters from.
-					CM.playerNames = CM.playerNames or {}
-					function CM.readPlayerNames()
-						local f = io.open(K.BASE .. "mp_players.txt", "r")
-						if not f then return end
-						local t = {}
-						for line in f:lines() do
-							local l, n = line:match("^(%a+)=(.+)$")
-							if l and n then t[l] = n:gsub("[%c]", "") end
-						end
-						f:close()
-						CM.playerNames = t
-					end
-					function CM.playerNameOf(letter)
-						return CM.playerNames[letter] or letter
-					end
-					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					-- company colour swatches (2026-09-10): the chip colour the lobby roster shows
-					-- (style classes !mpCo1..!mpCo200 in res/config/style_sheet/mp_lockstep.lua),
-					-- for our company before the text and for the selected one after it
+					-- Your company (2026-09-16): its colour swatch (the lobby chip colour: style
+					-- classes !mpCo1..!mpCo200 in res/config/style_sheet/mp_lockstep.lua) and its
+					-- name. A company is named in the game's own company window; that rename
+					-- reaches every player through CMNAME (inject.lua). Unnamed, it is
+					-- "<player>'s company" (companies.lua CM.cmNameOf).
+					local mrow = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					D.coSwMine = api.gui.comp.TextView.new("  ##  ")
-					D.coSwSel = api.gui.comp.TextView.new("  ##  ")
-					crow:addItem(D.coSwMine)
-					crow:addItem(D.coText)
-					local jrow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					jrow:addItem(api.gui.comp.TextView.new("Join: "))
-					-- The picker (2026-09-16): a dropdown of every company, "player -- company
-					-- name", alphabetical, in place of the < > stepper. Rebuilt only when
-					-- its labels change (see D.coItemsSig below), so a click is never lost
-					-- to a refresh; the box sits in its own component so a rebuild
-					-- swaps it in place.
+					D.coNameText = api.gui.comp.TextView.new("")
+					mrow:addItem(D.coSwMine)
+					mrow:addItem(D.coNameText)
+					local mrowC = api.gui.comp.Component.new("mpCompanyMine")
+					mrowC:setLayout(mrow)
+					-- The picker: a dropdown of every company by name, alphabetical. Rebuilt
+					-- only when its labels change (see D.coItemsSig below), so a click is
+					-- never lost to a refresh; the box sits in its own component so a
+					-- rebuild swaps it in place.
+					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					D.coPickL = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					D.coPick = api.gui.comp.Component.new("mpCompanyPick")
 					D.coPick:setLayout(D.coPickL)
-					jrow:addItem(D.coPick)
-					jrow:addItem(D.coSwSel)
-					D.coJoinLbl = api.gui.comp.TextView.new("  Join  ")
-					local joinBtn = api.gui.comp.Button.new(D.coJoinLbl, true)
-					joinBtn:onClick(function() if D.coSel and D.coSel ~= D.coMine then coRequest("CMSWITCH", D.coSel) end end)
-					jrow:addItem(joinBtn)
-					jrow:addItem(api.gui.comp.TextView.new("      "))
-					jrow:addItem(speedBtn("  New company  ", function() coRequest("CMNEW") end))
+					crow:addItem(D.coPick)
+					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
+					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
 					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
 					D.coNote = api.gui.comp.TextView.new("")
 					-- password: used by "new company" (locks the new one), by "switch"/"dissolve"
@@ -1751,37 +1725,15 @@ function data()
 						pcall(function() D.coPwInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
 					end)
 					local prow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					prow:addItem(api.gui.comp.TextView.new("Yours:   password "))
+					prow:addItem(api.gui.comp.TextView.new("company password: "))
 					if D.coPwInput then prow:addItem(D.coPwInput) end
-					prow:addItem(speedBtn("  Set  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on " .. (D.coNames and D.coNames[D.coMine] or ("company " .. D.coMine)) .. "..."; coRequest("CMPW", D.coMine) end end))
-					-- the name of our own company (empty = back to "Company N")
-					pcall(function()
-						local mk = api.gui.comp.TextInputField
-						local ok1, inp = pcall(function() return mk.new() end)
-						if not ok1 then inp = mk.new("") end
-						D.coNameInput = inp
-						pcall(function() D.coNameInput:setMinimumSize(api.gui.util.Size.new(180, 26)) end)
-						pcall(function() D.coNameInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
-					end)
-					prow:addItem(api.gui.comp.TextView.new("     name "))
-					if D.coNameInput then prow:addItem(D.coNameInput) end
-					prow:addItem(speedBtn("  Rename  ", function()
-						if not D.coMine then return end
-						local t = ""
-						pcall(function() t = D.coNameInput and D.coNameInput:getText() or "" end)
-						t = (t or ""):gsub("[%c]", ""):gsub("^%s+", ""):gsub("%s+$", "")
-						D.coHint = (t ~= "" and ("naming company " .. D.coMine .. ' "' .. t .. '"...') or ("unnaming company " .. D.coMine .. "..."))
-						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
-						if f then f:write("CMNAME " .. D.coMine .. (t ~= "" and (" " .. t) or "") .. string.char(10)); f:close() end
-					end))
+					prow:addItem(speedBtn("  set on mine  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on company " .. D.coMine .. "..."; coRequest("CMPW", D.coMine) end end))
 					local prowC = api.gui.comp.Component.new("mpCompanyPwRow")
 					prowC:setLayout(prow)
 					local crowC = api.gui.comp.Component.new("mpCompanyRow")
 					crowC:setLayout(crow)
 					local coL = api.gui.layout.BoxLayout.new("VERTICAL")
-					local jrowC = api.gui.comp.Component.new("mpCompanyJoinRow")
-					jrowC:setLayout(jrow)
-					coL:addItem(crowC); coL:addItem(jrowC); coL:addItem(prowC); coL:addItem(D.coNote)
+					coL:addItem(mrowC); coL:addItem(crowC); coL:addItem(prowC); coL:addItem(D.coNote)
 					D.coBox = api.gui.comp.Component.new("mpCompanies")
 					D.coBox:setLayout(coL)
 					box:addItem(D.coBox)
@@ -1910,7 +1862,7 @@ function data()
 					if not okW and not D.statsErrLogged then D.statsErrLogged = true; print("[ls-gui] stats in words: " .. tostring(errW)) end
 				end
 				pcall(function()
-					if D.coText and mine then
+					if D.coNameText and mine then
 						local roster = {}
 						for id in tostring(mine.roster or ""):gmatch("%d+") do roster[#roster + 1] = tonumber(id) end
 						local played = {}
@@ -1920,20 +1872,23 @@ function data()
 						local names = {}
 						for id, n in tostring(mine.conames or ""):gmatch("(%d+):(%S+)") do names[tonumber(id)] = CM.unescName(n) end
 						D.coRoster, D.coPlayed, D.coMine, D.coLocked, D.coNames = roster, played, tonumber(mine.company), locked, names
-						local function coName(cid) return (names[cid] and names[cid] ~= "") and names[cid] or ("Company " .. tostring(cid)) end
-						local function whoNames(cid)
-							local out = {}
-							for l in tostring(played[cid] or ""):gmatch("%a+") do out[#out + 1] = CM.playerNameOf(l) end
-							return out
-						end
 						if (guiTick % 30) == 0 or not D.coNamesRead then D.coNamesRead = true; pcall(CM.readPlayerNames) end
+						-- a company's name: the one given in the game's company window, else
+						-- "<player>'s company" (the same rule the sim applies to the entities)
+						local function coName(cid)
+							local letters = {}
+							for l in tostring(played[cid] or ""):gmatch("%a+") do letters[#letters + 1] = l end
+							return CM.cmDisplayName(cid, names[cid], letters)
+						end
 						if not D.coSel then D.coSel = D.coMine end
-						-- the dropdown: "player, player -- company name", alphabetical
+						-- the dropdown: every company by name, alphabetical; a company with more
+						-- than one player also lists the others
 						local items = {}
 						for _, cid in ipairs(roster) do
-							local who = whoNames(cid)
-							local label = (#who > 0 and table.concat(who, ", ") or "(empty)") .. " -- " .. coName(cid)
-								.. (cid == D.coMine and "  (mine)" or "") .. (locked[cid] and "  [password]" or "")
+							local who = {}
+							for l in tostring(played[cid] or ""):gmatch("%a+") do who[#who + 1] = CM.playerNameOf(l) end
+							local label = coName(cid) .. (cid == D.coMine and "  (mine)" or "") .. (locked[cid] and "  [password]" or "")
+								.. (#who == 0 and "  (empty)" or (#who > 1 and ("  (" .. table.concat(who, ", ") .. ")") or ""))
 							items[#items + 1] = { cid = cid, label = label }
 						end
 						table.sort(items, function(p, q) if p.label:lower() == q.label:lower() then return p.cid < q.cid end return p.label:lower() < q.label:lower() end)
@@ -1963,26 +1918,11 @@ function data()
 							if at then pcall(function() cb:setSelected(at, false) end) end
 							D.coRebuilding = false
 						end
-						local sel = D.coSel or D.coMine
-						local selWho = sel and played[sel]
-						-- the swatches follow the ids (see D.coSwMine)
+						-- the swatch follows the id (see D.coSwMine); the name follows the registry
 						local mineCls = "mpCo" .. tostring(math.max(1, math.min(200, D.coMine or 1)))
-						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, sel or D.coMine or 1)))
 						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
-						if D.coSwSel and D.coSwSelCls ~= selCls then D.coSwSelCls = selCls; pcall(function() D.coSwSel:setStyleClassList({ selCls }) end) end
-						local mineWho = D.coMine and whoNames(D.coMine) or {}
-						local others = {}
-						for _, l in ipairs(mineWho) do if l ~= CM.playerNameOf(K.INSTANCE or "?") then others[#others + 1] = l end end
-						D.coText:setText(string.format("You play %s (#%s)%s   %d compan%s in the session",
-							D.coMine and coName(D.coMine) or "?", tostring(D.coMine or "?"),
-							#others > 0 and (" with " .. table.concat(others, ", ")) or "",
-							#roster, #roster == 1 and "y" or "ies"))
-						if D.coJoinLbl then
-							local label
-							if not sel or sel == D.coMine then label = "  (this is yours)  "
-							else label = "  Join " .. coName(sel) .. (locked[sel] and "  [password]" or "") .. (selWho and "" or "  (empty)") .. "  " end
-							if D.coJoinLblText ~= label then D.coJoinLblText = label; pcall(function() D.coJoinLbl:setText(label) end) end
-						end
+						local mineName = D.coMine and coName(D.coMine) or "-"
+						if mineName ~= D.coNameShown then D.coNameShown = mineName; D.coNameText:setText(" " .. mineName .. "   ") end
 						local note = mine.conote or ""
 						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
 						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end
