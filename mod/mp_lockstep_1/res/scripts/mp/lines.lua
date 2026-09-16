@@ -44,10 +44,22 @@ local function allLines()
 	return ids
 end
 
+-- origin -> the highest key seq seen under that letter; rides in the save
+-- (CM.lineKeysSaveState) and is never lowered
+CM.lineKeyNext = {}
+local lineKeysGen = 0
+local function noteLineKeySeq(key)
+	local o, s = tostring(key):match("^(.+):(%d+)$")
+	s = tonumber(s)
+	if o and s and s > (CM.lineKeyNext[o] or 0) then CM.lineKeyNext[o] = s end
+end
+
 local function registerLineKey(key, lid)
 	CM.lineKeyOf[lid] = key
 	lineIdOf[key] = lid
 	knownLines[lid] = true
+	noteLineKeySeq(key)
+	lineKeysGen = lineKeysGen + 1
 	log(string.format("line: %s <-> local line %d", key, lid))
 end
 
@@ -68,12 +80,73 @@ end
 
 function CM.forgetLine(lid)
 	local key = CM.lineKeyOf[lid]
-	if key then lineIdOf[key] = nil end
+	if key then lineIdOf[key] = nil; lineKeysGen = lineKeysGen + 1 end
 	CM.lineKeyOf[lid] = nil
 	-- ids get reused: a deleted line's id must not stay 'known', or the next
 	-- line to reuse it is invisible to pairing and never replicates.
 	knownLines[lid] = nil
 	CM.primedLines[lid] = nil
+end
+
+-- ---------- line keys in the save ----------
+--
+-- The same hole as vehicles.lua's (2026-09-16): a line the host created as
+-- a:N was s:<id> on a joiner that loaded the host's save, so a host LUPDATE /
+-- LDELETE / VLINE naming a:N found "unknown line key" there. Line ids of
+-- save-loaded lines are identical on every instance, so lineId -> key rides
+-- in the save with the highest seq minted per origin. Same echo rules as the
+-- vehicle state: keys rebuilt only when the registry changed, the first load
+-- stashed and adopted on the first tick, later echoes ignored.
+local lineKeysSaved = nil
+local lineKeysAdopted = false
+local lineKeysCache, lineKeysCacheGen = nil, -1
+function CM.lineKeysSaveState()
+	if not lineKeysCache or lineKeysCacheGen ~= lineKeysGen then
+		lineKeysCache = {}
+		for lid, key in pairs(CM.lineKeyOf) do lineKeysCache[tostring(lid)] = key end
+		lineKeysCacheGen = lineKeysGen
+	end
+	local nxt = {}
+	for o, s in pairs(CM.lineKeyNext) do nxt[o] = s end
+	if (CM.seqNo or 0) > (nxt[K.INSTANCE] or 0) then nxt[K.INSTANCE] = CM.seqNo end
+	return { v = 1, keys = lineKeysCache, next = nxt }
+end
+function CM.lineKeysLoadState(st)
+	if type(st) ~= "table" or lineKeysSaved or lineKeysAdopted then return end
+	lineKeysSaved = st
+end
+local function adoptSavedLineKeys()
+	local st = lineKeysSaved
+	lineKeysSaved = nil
+	lineKeysAdopted = true
+	local n, gone, held = 0, 0, 0
+	for sid, key in pairs(type(st.keys) == "table" and st.keys or {}) do
+		local lid = tonumber(sid)
+		if lid and type(key) == "string" then
+			local alive = false
+			pcall(function() alive = api.engine.entityExists(lid) end)
+			if not alive then gone = gone + 1
+			elseif CM.lineKeyOf[lid] or lineIdOf[key] then held = held + 1
+			else
+				CM.lineKeyOf[lid] = key
+				lineIdOf[key] = lid
+				knownLines[lid] = true
+				noteLineKeySeq(key)
+				n = n + 1
+			end
+		end
+	end
+	if n > 0 then lineKeysGen = lineKeysGen + 1 end
+	for o, s in pairs(type(st.next) == "table" and st.next or {}) do
+		s = tonumber(s)
+		if type(o) == "string" and s and s > (CM.lineKeyNext[o] or 0) then CM.lineKeyNext[o] = s end
+	end
+	local mine = CM.lineKeyNext[K.INSTANCE]
+	if mine and mine > (CM.seqNo or 0) then
+		log(string.format("line: seq %d -> %d, past every %s: key the save holds", CM.seqNo or 0, mine, K.INSTANCE))
+		CM.seqNo = mine
+	end
+	log(string.format("line: adopted %d key(s) from the save, %d for lines no longer there, %d already bound here", n, gone, held))
 end
 
 function CM.stationGroupPos(sg)
@@ -386,6 +459,7 @@ function CM.lineSentDone(key, stops)
 end
 
 function CM.primeLineKeys()
+	if lineKeysSaved then adoptSavedLineKeys() end   -- the save's keys first; priming keys the rest s:<id>
 	if linesPrimed then return end
 	linesPrimed = true
 	local n = 0

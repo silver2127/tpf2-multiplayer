@@ -1279,8 +1279,10 @@ function data()
 			end
 		end,
 
-		-- the company state, the drift check's off switch and the hash grid ride in the
-		-- save (companies.lua cmSaveState, hash.lua vposSaveState / hashGridSave)
+		-- the company state, the drift check's off switch, the hash grid and the
+		-- vehicle / line key registries ride in the save (companies.lua cmSaveState,
+		-- hash.lua vposSaveState / hashGridSave, vehicles.lua vehKeysSaveState,
+		-- lines.lua lineKeysSaveState)
 		save = function()
 			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
 			local ok, st = pcall(CM.cmSaveState)
@@ -1291,6 +1293,8 @@ function data()
 			-- early would replay commands the save already holds (a double build).
 			return { cm = ok and st or nil, vposOff = CM.vposSaveState and CM.vposSaveState() or nil,
 			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
+			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
+			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
 			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
@@ -1299,6 +1303,9 @@ function data()
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
 			if type(s) == "table" and s.hashGrid and CM.hashGridLoad then pcall(CM.hashGridLoad, s.hashGrid) end
+			-- a save from before 2026-09-16 has neither: every save vehicle / line primes s:<id> as before
+			if type(s) == "table" and s.vehKeys and CM.vehKeysLoadState then pcall(CM.vehKeysLoadState, s.vehKeys) end
+			if type(s) == "table" and s.lineKeys and CM.lineKeysLoadState then pcall(CM.lineKeysLoadState, s.lineKeys) end
 		end,
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------

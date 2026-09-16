@@ -65,10 +65,23 @@ local function vehPurchaseTime(vid)
 	return pt
 end
 
+-- origin -> the highest key seq this registry has seen under that letter (the
+-- save carries it; see CM.vehKeysSaveState). Never lowered: a sold vehicle's
+-- key is gone from vehKeyOf but its number stays used.
+CM.vehKeyNext = {}
+local vehKeysGen = 0     -- bumped on every registry change; the save state is rebuilt only then
+local function noteVehKeySeq(key)
+	local o, s = tostring(key):match("^(.+):(%d+)$")
+	s = tonumber(s)
+	if o and s and s > (CM.vehKeyNext[o] or 0) then CM.vehKeyNext[o] = s end
+end
+
 local function registerVehKey(key, vid)
 	CM.vehKeyOf[vid] = key
 	vehIdOf[key] = vid
 	knownVeh[vid] = true
+	noteVehKeySeq(key)
+	vehKeysGen = vehKeysGen + 1
 	log(string.format("veh: %s <-> local vehicle %d purchaseTime=%s", key, vid, tostring(vehPurchaseTime(vid))))
 end
 
@@ -92,6 +105,78 @@ local function vehIdFor(key)
 end
 function CM.vehIdForKey(key) return vehIdFor(key) end   -- the drift check names the vehicle that drifts
 
+-- ---------- vehicle keys in the save ----------
+--
+-- A bound key used to live only in the memory of the instance that bound it.
+-- A joiner that loaded the host's save primed every vehicle in it as s:<id>,
+-- so the host's a:8 was s:189156 on the joiner (measured 2026-09-16, hot join
+-- from the host's 954.6 save: both VPOS logs paired that vehicle '(nearest)',
+-- and every later host command naming a:8 -- VLINE, VSELL, VREPL, VNAME,
+-- VCOLOR, VDEPOT, VREV -- would have been "unknown vehicle key" there). The
+-- registry rides in the save: a save-loaded entity has the same id on every
+-- instance that loads the file (measured repeatedly), so entityId -> key is
+-- valid wherever the file loads. The highest seq minted per origin rides along
+-- so an instance that takes a letter the save already used never mints a key
+-- the save holds (CM.seqNo is K.INSTANCE's mint counter).
+--
+-- The save hook runs every frame in the GUI state (engine -> GUI sync): the
+-- keys table is rebuilt only when the registry changed. The load hook runs
+-- every frame there too: the first state is stashed, the first tick adopts it
+-- (before priming, so priming only hands s:<id> to what the save carried no
+-- key for), and every later echo is ignored. Ids are string keys, as
+-- companies.lua stores its pids: the save serializer keeps sparse tables that way.
+local vehKeysSaved = nil
+local vehKeysAdopted = false
+local vehKeysCache, vehKeysCacheGen = nil, -1
+function CM.vehKeysSaveState()
+	if not vehKeysCache or vehKeysCacheGen ~= vehKeysGen then
+		vehKeysCache = {}
+		for vid, key in pairs(CM.vehKeyOf) do vehKeysCache[tostring(vid)] = key end
+		vehKeysCacheGen = vehKeysGen
+	end
+	local nxt = {}
+	for o, s in pairs(CM.vehKeyNext) do nxt[o] = s end
+	if (CM.seqNo or 0) > (nxt[K.INSTANCE] or 0) then nxt[K.INSTANCE] = CM.seqNo end
+	return { v = 1, keys = vehKeysCache, next = nxt }
+end
+function CM.vehKeysLoadState(st)
+	if type(st) ~= "table" or vehKeysSaved or vehKeysAdopted then return end
+	vehKeysSaved = st
+end
+local function adoptSavedVehKeys()
+	local st = vehKeysSaved
+	vehKeysSaved = nil
+	vehKeysAdopted = true
+	local n, gone, held = 0, 0, 0
+	for sid, key in pairs(type(st.keys) == "table" and st.keys or {}) do
+		local vid = tonumber(sid)
+		if vid and type(key) == "string" then
+			local alive = false
+			pcall(function() alive = api.engine.entityExists(vid) end)
+			if not alive then gone = gone + 1
+			elseif CM.vehKeyOf[vid] or vehIdOf[key] then held = held + 1   -- bound here already; a fresh load never is
+			else
+				CM.vehKeyOf[vid] = key
+				vehIdOf[key] = vid
+				knownVeh[vid] = true
+				noteVehKeySeq(key)
+				n = n + 1
+			end
+		end
+	end
+	if n > 0 then vehKeysGen = vehKeysGen + 1 end
+	for o, s in pairs(type(st.next) == "table" and st.next or {}) do
+		s = tonumber(s)
+		if type(o) == "string" and s and s > (CM.vehKeyNext[o] or 0) then CM.vehKeyNext[o] = s end
+	end
+	local mine = CM.vehKeyNext[K.INSTANCE]
+	if mine and mine > (CM.seqNo or 0) then
+		log(string.format("veh: seq %d -> %d, past every %s: key the save holds", CM.seqNo or 0, mine, K.INSTANCE))
+		CM.seqNo = mine
+	end
+	log(string.format("veh: adopted %d key(s) from the save, %d for vehicles no longer there, %d already bound here", n, gone, held))
+end
+
 -- Prime knownVeh from every player depot once constructions are primed.
 function CM.primeVehKeys()
 	-- DEPOT-PARKED SAVE VEHICLES (2026-09-10). A vehicle parked in a depot is
@@ -103,6 +188,10 @@ function CM.primeVehKeys()
 	-- the "new" vehicle. transportVehicleSystem lists parked vehicles. The list
 	-- is taken on the FIRST call, before anything can be bought: a vehicle
 	-- bought in the seconds before priming binds to its purchase key instead.
+	--
+	-- The save's keys come first: a vehicle the save keyed keeps that key on
+	-- every instance; the passes below only hand s:<id> to the rest.
+	if vehKeysSaved then adoptSavedVehKeys() end
 	if not CM.vehParkedAtLoad then
 		CM.vehParkedAtLoad = {}
 		pcall(function()
@@ -408,7 +497,7 @@ end
 -- A sold vehicle's key must not outlive it: entity ids get reused.
 function forgetVehicle(vid)
 	local key = CM.vehKeyOf[vid]
-	if key then vehIdOf[key] = nil end
+	if key then vehIdOf[key] = nil; vehKeysGen = vehKeysGen + 1 end
 	CM.vehKeyOf[vid] = nil
 end
 
