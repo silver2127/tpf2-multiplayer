@@ -52,6 +52,11 @@ setting at its default.
 | `slot` | 0 | 0-7 | Position of the Multiplayer entry in the title menu's list (0 = top). |
 | `scale` | 0 | 0.5-3 | Panel scale; 0 = screen height / 1080. |
 | `automod` | on | a line starting `automod=0` | Stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
+| `sharedstations` | on | a line starting `sharedstations=0` | Read by the slice DLL, not the menu. Off leaves the line editor's owner check alone, so in companies mode another company's station cannot be put on your line (see SHARED_INFRA.md). |
+
+The slice DLL reads the same file — next to itself first, then in the data dir — for its own
+`<key>=0` switches (`trainorder`, `roadspace`, `shiporder`, `airorder`, `sharedstations`); each one
+turns off a single guarded patch and says so in `tpf2_slice.log` at startup.
 
 ## `tpf2mp.cfg` and plugin settings
 
