@@ -167,6 +167,7 @@ for s in install.sh uninstall.sh collect_logs.sh; do install -m 0755 "$REPO/tool
 install -m 0755 "$REPO/tools/linux/tpf2mp-launch" "$STAGE/tpf2mp-launch"
 install -m 0644 "$REPO/tools/linux/tpf2mp_paths.sh" "$STAGE/tpf2mp_paths.sh"
 install -m 0644 "$REPO/docs/linux/INSTALL.md" "$STAGE/INSTALL.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.3.md" "$STAGE/UPSTREAM_0.5.3.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 

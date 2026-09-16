@@ -21,17 +21,16 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-The source branch now includes Windows release **0.5.3** (`66da00d`). All 28
-Lua files are byte-identical to that release. The Linux transport implements
-protocol 5, per-peer streams and world/lobby epoch resets. See
-[UPSTREAM_0.5.3.md](UPSTREAM_0.5.3.md) for validation and remaining platform gaps.
-The earlier 0.4.22 native/Proton replay results do not validate this new baseline;
-published Linux packages and the currently running lab remain on that earlier
-build until a matched 0.5.3 live test is completed. Supported
-native player actions use cancellation and scheduled replay; uncovered known
-player actions are blocked in multiplayer. Names/colors, vehicle stop/maintenance,
-loans and distinguishing other Lua commands from synchronized replay remain gaps
-in complete strict-only coverage. Multiplayer startup refuses failed required hooks.
+This experimental Linux release follows **0.5.3**. Use matching 0.5.3 peers.
+All 28 shared Lua files match the Windows release byte for byte. See
+[UPSTREAM_0.5.3.md](UPSTREAM_0.5.3.md) for technical validation details.
+
+**Known limits:** automatic resync, the new separate-company/shared-ownership
+operations, and automatic Workshop registration still need native Linux support.
+Some player actions, including names/colors, vehicle stop/maintenance and loans,
+remain blocked in multiplayer. A completed cross-platform gameplay test for
+0.5.3 has not yet been recorded; the passing 0.4.22 replay does not establish
+0.5.3 compatibility.
 
 Download the `.run` installer, then run:
 
