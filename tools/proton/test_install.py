@@ -218,6 +218,7 @@ def main():
             assert install.lobby_state((game / "netpunch/netpunch.exe").read_bytes())[0] == "repaired"
             assert install.lobby_state(cached.read_bytes())[0] == "repaired"
             assert "PASS" in run(*env_root, "--verify")
+            assert "nothing to do" in run(*env_root, "--files-zip", real_zip)   # the repaired lobby counts as current
             # --repair-lobby on a file
             tool_copy = td / "netpunch.exe"
             tool_copy.write_bytes(data)

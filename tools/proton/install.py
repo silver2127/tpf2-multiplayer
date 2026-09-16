@@ -556,15 +556,30 @@ def check_alut(game):
     return "rename", live
 
 
+def warn_unknown_lobby(path, state):
+    if state == "unknown-broken":
+        say(f"WARNING: {path}: its miniupnpc DLL has duplicate relocations but is not the analysed one; "
+            "hosting from Proton may crash. Please report this.")
+
+
 def plan_install(game, steam, prefix, files, repair):
-    plan = {"copy": [], "remove": [], "links": [], "lobby": [], "alut": None}
+    plan = {"copy": [], "remove": [], "links": [], "lobby": [], "alut": None, "lobby_bytes": None}
     plan["alut"] = check_alut(game)[0]
+    # The lobby is compared and installed in its repaired form, so a rerun finds it current.
+    shipped = files["netpunch/netpunch.exe"].read_bytes()
+    if repair:
+        state = lobby_state(shipped)[0]
+        warn_unknown_lobby(files["netpunch/netpunch.exe"], state)
+        plan["lobby_bytes"] = repair_lobby(shipped) if state == "broken" else shipped
+    else:
+        plan["lobby_bytes"] = shipped
     for relative, source in files.items():
         target = game / relative
         if relative in KEEP_IF_PRESENT and target.exists():
             continue
         require(not target.is_symlink() and (not target.exists() or target.is_file()), f"{target} is not an ordinary file")
-        if not (target.is_file() and digest(target) == digest(source)):
+        wanted = sha256(plan["lobby_bytes"]) if relative == "netpunch/netpunch.exe" else digest(source)
+        if not (target.is_file() and digest(target) == wanted):
             plan["copy"].append(relative)
     if (game / MOD).is_dir():
         for p in sorted((game / MOD).rglob("*")):
@@ -577,15 +592,11 @@ def plan_install(game, steam, prefix, files, repair):
         if not link.is_symlink():
             plan["links"].append(link)
     if repair:
-        candidates = [files["netpunch/netpunch.exe"] if "netpunch/netpunch.exe" in plan["copy"] else game / "netpunch/netpunch.exe"]
-        candidates += cached_lobbies(prefix)
-        for c in candidates:
-            state = lobby_state(c.read_bytes())[0]
+        for cached in cached_lobbies(prefix):          # copies the in-game updater left in the prefix
+            state = lobby_state(cached.read_bytes())[0]
+            warn_unknown_lobby(cached, state)
             if state == "broken":
-                plan["lobby"].append(c if c != candidates[0] else game / "netpunch/netpunch.exe")
-            elif state == "unknown-broken":
-                say(f"WARNING: {c}: its miniupnpc DLL has duplicate relocations but is not the analysed one; "
-                    "hosting from Proton may crash. Please report this.")
+                plan["lobby"].append(cached)
     # the proxy last: only after everything it loads is in place
     plan["copy"].sort(key=lambda r: (r == "alut.dll", r))
     return plan
@@ -618,10 +629,11 @@ def apply_install(game, steam, prefix, files, version, plan, tag):
         (game / relative).unlink()
     for relative in plan["copy"]:
         backup_of(relative)
-        atomic_copy(files[relative], game / relative)
+        if relative == "netpunch/netpunch.exe":
+            atomic_write(game / relative, plan["lobby_bytes"], mode=files[relative].stat().st_mode & 0o777)
+        else:
+            atomic_copy(files[relative], game / relative)
     for path in plan["lobby"]:
-        if path.is_relative_to(game):
-            backup_of(path.relative_to(game).as_posix())
         repair_lobby_file(path)
     for link in plan["links"]:
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -749,8 +761,10 @@ def main(argv=None):
         files, version = load_payload(root)
         say(f"Payload: TpF2 Multiplayer {version}" + (f" (release {tag})" if tag else ""))
         plan = plan_install(game, steam, prefix, files, repair=not args.no_lobby_repair)
-        say(f"Plan: {len(plan['copy'])} files to install, {len(plan['remove'])} old mod files to remove, "
-            f"{len(plan['links'])} prefix links to create, {len(plan['lobby'])} lobby executable(s) to repair"
+        repaired_now = "netpunch/netpunch.exe" in plan["copy"] and plan["lobby_bytes"] != files["netpunch/netpunch.exe"].read_bytes()
+        say(f"Plan: {len(plan['copy'])} files to install" + (" (the lobby repaired for Wine)" if repaired_now else "")
+            + f", {len(plan['remove'])} old mod files to remove, {len(plan['links'])} prefix links to create, "
+            f"{len(plan['lobby'])} cached update lobby(ies) to repair"
             + ("; the game's alut.dll is kept as alut_real.dll" if plan["alut"] == "rename" else ""))
         if args.dry_run:
             for relative in plan["copy"]:
