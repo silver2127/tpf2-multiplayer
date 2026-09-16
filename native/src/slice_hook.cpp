@@ -234,6 +234,15 @@ static float       g_conxpT[16];
 // was the next cap. Now whatever the engine holds ships whole, or the walk
 // refuses loudly and the placement runs natively with the notice.
 static std::string g_conxpParams;
+// Placement serial: one counter per process, stamped on a placement's ROADC
+// (ps=) and on its CONXP (ps= rc=), so the Lua pairs the two by IDENTITY and
+// not by which record happened to be read before which (cons.lua
+// CM.flushConPairs). g_conxpSerial / g_conxpHadRoadc ride with the stash: the
+// serial of the placement whose params are stashed, and whether a ROADC
+// companion was written for it (rc=0: free-standing, no payload to wait for).
+static long g_placeSerial   = 0;
+static long g_conxpSerial   = 0;
+static int  g_conxpHadRoadc = 0;
 // Stop/signal/waypoint cancel. Decoded off the proposal's
 // edgeObjectsToAdd record at the factory, written as STOPX from the Add hook
 // only once the cancel landed (else dropped: the poll captures the native
@@ -994,9 +1003,12 @@ static bool WriteBulldozeInject(uint64_t nb, int rn, uint64_t eb, int re)
 // never needed for that classification.
 //   ROADC <n> <etype> <stype> <ttype> <cat> <m> <re>
 //         n x (id x y z)   m x (a1 a2 t0 t1)   re x (a1 a2 t0 t1)
+//         m x (btype bidx)   ps=<placement serial>
+// ps= is the same serial the placement's CONXP carries: the Lua pairs the two
+// by it (cons.lua CM.flushConPairs), never by arrival order or distance.
 static long g_conroad = 0;
 static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int m,
-                               const Edge* rme, int re, const EdgeType& et)
+                               const Edge* rme, int re, const EdgeType& et, long ps)
 {
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return; }
@@ -1020,7 +1032,7 @@ static void WriteInjectConRoad(const Node* nodes, int n, const Edge* edges, int 
                 rme[i].t1[0], rme[i].t1[1], rme[i].t1[2]);
     // Bridge/tunnel tail (see WriteInject): <type idx> per ADDED edge.
     for (int i = 0; i < m; i++) fprintf(f, " %d %d", edges[i].btype, edges[i].bidx);
-    fprintf(f, "\n");
+    fprintf(f, " ps=%ld\n", ps);
     fclose(f);
 }
 
@@ -2517,9 +2529,11 @@ static bool StashConxpFromProposal(uint64_t r8)
     return true;
 }
 
-// CONXP <file> t=<16 floats> params=<lua literal>: the construction half of a
-// CANCELLED placement, for the Lua to seat in pendingCons where the entity poll
-// would have (there is no entity). Written from the Add hook, cancel confirmed.
+// CONXP <file> t=<16 floats> ps=<serial> rc=<0|1> params=<lua literal>: the
+// construction half of a CANCELLED placement, for the Lua to seat in pendingCons
+// where the entity poll would have (there is no entity). Written from the Add
+// hook, cancel confirmed. ps= is the placement serial its ROADC carries, rc=
+// whether one was written for it (0: free-standing, no payload to wait for).
 static void WriteInjectConxp()
 {
     ReadInstance();
@@ -2530,11 +2544,12 @@ static void WriteInjectConxp()
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
     fprintf(f, "CONXP %s t=", g_conxpFile.c_str());
     for (int i = 0; i < 16; i++) fprintf(f, "%s%.4f", i ? "," : "", g_conxpT[i]);
-    fputs(" params=", f);
+    fprintf(f, " ps=%ld rc=%d params=", g_conxpSerial, g_conxpHadRoadc);
     fwrite(g_conxpParams.data(), 1, g_conxpParams.size(), f);
     fputc('\n', f);
     fclose(f);
-    Log("[slice] CONXP shipped: %s (%zu B params)\n", g_conxpFile.c_str(), g_conxpParams.size());
+    Log("[slice] CONXP shipped: %s ps=%ld rc=%d (%zu B params)\n", g_conxpFile.c_str(),
+        g_conxpSerial, g_conxpHadRoadc, g_conxpParams.size());
     g_conxpFile.clear();
 }
 
@@ -3937,6 +3952,11 @@ static void ZeroAddResult(uint64_t rdx)
 // bigger placement to 64 records, so ROADC shipped a partial street.
 static void ConstructionPlacementAtFactory(uint64_t rcx, uint64_t r8)
 {
+    // One serial per placement capture, stamped on both records this writes:
+    // the ROADC companion (ps=) and the CONXP (ps= rc=). The Lua pairs the two
+    // by it, so however many polls, stalls or other placements lie between the
+    // two reads they still find each other (cons.lua CM.flushConPairs).
+    const long ps = ++g_placeSerial;
     const std::vector<Node> cn  = DecodeNodes(r8);
     const std::vector<Edge> ce  = DecodeEdges(r8);
     const std::vector<Edge> crm = DecodeEdges(r8 + 0x30);
@@ -3945,10 +3965,10 @@ static void ConstructionPlacementAtFactory(uint64_t rcx, uint64_t r8)
     if (m >= 1 && cet.ok) {
         g_conroad++;
         Log("[slice] #%ld construction placement: %d street node(s) %d "
-            "edge(s) %d removal(s), type=%s streetType=%d -- shipping ROADC\n",
+            "edge(s) %d removal(s), type=%s streetType=%d -- shipping ROADC ps=%ld\n",
             g_conroad, n, m, re, cet.type == 1 ? "TRACK" : "street",
-            cet.streetType);
-        WriteInjectConRoad(cn.data(), n, ce.data(), m, crm.data(), re, cet);
+            cet.streetType, ps);
+        WriteInjectConRoad(cn.data(), n, ce.data(), m, crm.data(), re, cet, ps);
         // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF. Walk the params off
         // THIS proposal and stash them; if the Add hook then cancels the
         // native build it ships them as CONXP and the Lua builds the
@@ -3957,12 +3977,15 @@ static void ConstructionPlacementAtFactory(uint64_t rcx, uint64_t r8)
         // g_pendingNoCb stays 0: the placement is a TOOL and waits on its
         // callback.
         bool stashed = StashConxpFromProposal(r8);
+        // rc=1: this placement's street payload IS on the wire, so the Lua
+        // waits for it by serial instead of shipping the construction alone.
+        if (stashed) { g_conxpSerial = ps; g_conxpHadRoadc = 1; }
         if (stashed && SessionLive()) {
             InterlockedExchange(&g_pendingIsConx, 1);
             InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
             InterlockedExchange(&g_pendingNoCb, 0);
-            Log("[slice] armed cancel: construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                (unsigned long long)rcx);
+            Log("[slice] armed cancel: construction placement cmd=%llx ps=%ld -- CONXP ships if the cancel lands\n",
+                (unsigned long long)rcx, ps);
         } else if (!stashed) {
             Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
             if (SessionLive()) WriteNativeNotice("construction");
@@ -3981,14 +4004,17 @@ static void ConstructionPlacementAtFactory(uint64_t rcx, uint64_t r8)
         // strict path then bulldozed and rebuilt the station, which is the
         // rebuild that asserted the engine on a modular_station.
         Log("[slice] construction placement carries no street edges "
-            "(n=%d) -- free-standing\n", n);
+            "(n=%d) -- free-standing, ps=%ld\n", n, ps);
         bool stashed = StashConxpFromProposal(r8);
+        // rc=0: no payload is coming for this one, so the Lua ships it as CONP
+        // at once rather than waiting for a ROADC that will never be parked.
+        if (stashed) { g_conxpSerial = ps; g_conxpHadRoadc = 0; }
         if (stashed && SessionLive()) {
             InterlockedExchange(&g_pendingIsConx, 1);
             InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
             InterlockedExchange(&g_pendingNoCb, 0);
-            Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                (unsigned long long)rcx);
+            Log("[slice] armed cancel: free-standing construction placement cmd=%llx ps=%ld -- CONXP ships if the cancel lands\n",
+                (unsigned long long)rcx, ps);
         } else if (!stashed) {
             Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
             if (SessionLive()) WriteNativeNotice("construction");

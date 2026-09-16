@@ -41,7 +41,7 @@ settings files say ([CONFIGURATION.md](CONFIGURATION.md)).
 | upgrade: street/track type, catenary, bus lane, tram track | strict | `ROADP` | The removed edges travel as positions so the replay replaces instead of stacking a second edge. |
 | level crossing | strict (part of the track build) | `ROADP` | A track vertex within 4.0 m of a road node shares that node, taking the road's height when they differ by more than 0.25 m (moving the road node instead asserts the engine). Otherwise the road under the vertex is split. Crossings in the middle of a track segment are found analytically; routing through an existing node requires it to be touched (0.75 m) and straight-through. A crossing the engine refuses ("Too much slope") is refused on every instance. |
 | demolish road or track | strict | `EDEMO` | Edges are matched by their end nodes (same kind, within 1 m). An edge that carries stops or signals is refused. Orphaned nodes are removed. |
-| station, depot, asset, harbour, airport | strict | `CONX` / `CONP` | The slice reads the construction's file, placement and parameters off the proposal and cancels the build; the street pieces travel as `ROADC` and are paired by position. Every instance builds the same scripted proposal at the stamp. |
+| station, depot, asset, harbour, airport | strict | `CONX` / `CONP` | The slice reads the construction's file, placement and parameters off the proposal and cancels the build; the street pieces travel as `ROADC` and are paired by identity (one placement serial on both records). Every instance builds the same scripted proposal at the stamp. |
 | same, when the parameters cannot be read | replay on peers, then corrected | `CONX` / `CONP` | The native build stands and is captured by polling. With other players connected, the originator then bulldozes its own copy and rebuilds the scripted one with the peers (money reconciled); alone it keeps the native build. |
 | module edit, station upgrade | strict | `CONU` (`diff=1 strict=1`) | The old construction and the new parameters come off the proposal; every instance upgrades the construction (same file within 10 m) at the stamp. If the cancel does not land, the edit scan ships it instead (every 30 ticks, originator skips). |
 | demolish construction | strict | `DEMOLISH` (`strict=1`) | Every instance requires the same file within 2 m. When the slice leaves a bulldoze to run natively, a tracked construction missing for two polls ships a `DEMOLISH` and peers remove the nearest one within 30 m. |
@@ -56,8 +56,17 @@ Replay details for constructions:
   from the payload (the template regenerates them).
 - A cancelled placement builds with `gatherBuildings=true`, so the engine demolishes the
   footprint's town buildings identically everywhere. For the non-cancelled path the originator
-  ships the town buildings it still has nearby ("survivors"), and the replay removes others
-  within 190 m.
+  ships the town buildings it still has nearby ("survivors") together with the radius it gathered
+  them in (`srad`: the construction's bounding box + its street payload + 100 m), and the replay
+  removes the others 10 m inside that radius. No fixed radius and no cap on the removal count: a
+  list whose survivors mostly do not exist on the peer is refused as a `DIVERGENCE`, loudly. The
+  street payload pairs with its construction by identity (the entity's frozen nodes, or for a
+  cancelled placement the placement serial the slice stamps on both records), never by
+  distance or arrival order; a cancelled placement whose payload is missing is refused
+  loudly, and an unclaimed payload is logged as a `DIVERGENCE`. The slice's own side has no
+  size of its own either: the params walk has no depth or entry cap (a misread pointer fails
+  it loudly and the build runs natively behind a `NATIVE` notice) and the street vectors are
+  decoded in full.
 - On failure the replay retries once after clearing the footprint, then asks the originator to
   roll back (`CONFAIL`: it bulldozes its own copy, same file within 1 m).
 - The construction gets a name in the proposal (the shipped one, or "`<town> <type>`"), which
