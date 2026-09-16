@@ -1186,7 +1186,7 @@ static void RenderPanelLayer(int w, int h)
             std::wstring wn = wideOf(g_players[i].c_str());
             bool isYou = g_players[i] == g_you, isHost = g_players[i] == g_host;
             int ry = cy + S(30) + i * S(26);
-            // company chip: colour + number; click your own (the host: anyone's) to cycle 1..16
+            // company chip: colour + number; left/right-click your own (the host: anyone's) to cycle
             int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
             layerRect(pad, ry + S(4), S(22), S(16), coColor(cid), 220);
             wchar_t wc[4]; _snwprintf_s(wc, _TRUNCATE, L"%d", cid);
@@ -1207,7 +1207,7 @@ static void RenderPanelLayer(int w, int h)
               layerText(pad + S(30), cy + S(30) + ROSTER_ROWS * S(26), listW, S(20), more, fl, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); }
           int legendY = cy + S(30) + (shown < 8 ? 8 : shown) * S(26) + S(6) + (n > ROSTER_ROWS ? S(22) : 0);
           if (legendY > bottom - S(44)) legendY = bottom - S(44);
-          layerText(pad, legendY, listW, S(40), L"Same number = one company together. Different numbers = separate companies. Click a chip to change.",
+          layerText(pad, legendY, listW, S(40), L"Same number = one company together. Different numbers = separate companies. Left-click a chip for the next company, right-click for the previous.",
                     fl, MW_DIM, DT_LEFT | DT_TOP | DT_WORDBREAK, 170); DeleteObject(fl); }
         DeleteObject(fr); DeleteObject(fs);
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
@@ -1561,7 +1561,7 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
 // In-frame click: the button is not a window, so poll the cursor + left button
 // against the button rect (converted to the game window's client area). One-shot
 // per press, 1s debounce.
-static void OnHit(int id);
+static void OnHit(int id, int button = 1);
 // True only when the foreground window belongs to THIS game process. GetAsyncKeyState
 // reads GLOBAL input, so without this gate the overlay would steal the user's mouse
 // and keyboard while they are alt-tabbed to another app (e.g. typing in a terminal).
@@ -1574,13 +1574,16 @@ static bool gameHasFocus()
 }
 
 static volatile LONG g_pendingPanelClick=0, g_mouseInstalled=0;
+static volatile LONG g_panelClickButton=1;   // 1 = left, 2 = right (chips cycle backwards)
 static volatile LONG64 g_panelClickPoint=0;
 static void PollClick()
 {
-    static bool prevDown = false;
+    static bool prevDown = false, prevRDown = false;
     static ULONGLONG lastFire = 0;
     bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    bool rdown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool clicked=InterlockedExchange(&g_pendingPanelClick,0)!=0;
+    int button = clicked ? (int)InterlockedCompareExchange(&g_panelClickButton, 0, 0) : (down && !prevDown ? 1 : 2);
     // hover / pressed tracking for the native-look overlay (Button:hover / :active)
     {
         int hv = 0;
@@ -1594,7 +1597,7 @@ static void PollClick()
         }
         g_hover = hv; g_active = (hv && down) ? hv : 0;
     }
-    if ((clicked || (!g_mouseInstalled && down && !prevDown)) && gameHasFocus()) {
+    if ((clicked || (!g_mouseInstalled && ((down && !prevDown) || (rdown && !prevRDown)))) && gameHasFocus()) {
         POINT pt; GetCursorPos(&pt);
         if(clicked) { const auto packed=InterlockedCompareExchange64(&g_panelClickPoint,0,0);
             pt.x=(LONG)(packed&0xffffffff); pt.y=(LONG)((unsigned long long)packed>>32); }
@@ -1610,12 +1613,12 @@ static void PollClick()
             for (int i = 0; i < g_hitCount; i++) {
                 const Hit& hh = g_hits[i];
                 if (lx >= hh.x && lx < hh.x + hh.w && ly >= hh.y && ly < hh.y + hh.h) {
-                    lastFire = now; OnHit(hh.id); break;
+                    lastFire = now; OnHit(hh.id, button); break;
                 }
             }
         }
     }
-    prevDown = down;
+    prevDown = down; prevRDown = rdown;
 }
 
 // OPEN LOGS remains a worker operation; it must not block presentation.
@@ -1673,8 +1676,9 @@ static DWORD WINAPI CollectLogsThread(LPVOID)
     return 0;
 }
 
-static void OnHit(int id)
+static void OnHit(int id, int button)
 {
+    if (button == 2 && !(id >= 20 && id <= 35)) return;   // right-click: company chips only
     Log("[menu] hit id=%d\n", id);
     switch (id) {
     case 19:
@@ -1797,12 +1801,23 @@ static void OnHit(int id)
     case 28: case 29: case 30: case 31: case 32: case 33: case 34: case 35: {   // company chip
         int i = id - 20; std::string name; int cur = 1;
         if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < playerCount()) { name = g_players[i]; cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
-        // cycle: the next company id somebody already uses, then one brand-new id, then back to 1
+        // Left click increases: the next company id somebody already uses, then
+        // one brand-new id (which is then in use, so the next click makes another).
+        // Right click (2026-09-16) decreases: the previous used id, and from the
+        // lowest round to the highest in use. Only a left click creates a company.
         bool used[MAX_COMPANIES + 2] = {}; int maxUsed = 0;
         if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); for (int k = 0; k < playerCount(); k++) { int c2 = g_companies[k]; if (c2 >= 1 && c2 <= MAX_COMPANIES) { used[c2] = true; if (c2 > maxUsed) maxUsed = c2; } } LeaveCriticalSection(&g_modelCs); }
         int next = 0;
-        for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[c2]) { next = c2; break; }
-        if (!next) next = (cur <= maxUsed && maxUsed < MAX_COMPANIES) ? maxUsed + 1 : 1;
+        bool fresh = maxUsed < MAX_COMPANIES;   // a brand-new id (maxUsed + 1) is on the ring
+        if (button == 2) {
+            for (int c2 = cur - 1; c2 >= 1; c2--) if (used[c2]) { next = c2; break; }
+            if (!next) next = maxUsed;
+            if (next == cur) break;   // the only company there is
+        } else {
+            for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[c2]) { next = c2; break; }
+            if (!next) next = (cur <= maxUsed && fresh) ? maxUsed + 1 : 1;
+        }
+        if (next < 1) next = 1;
         if (!name.empty()) { std::string line = "{\"cmd\":\"company\",\"player\":\"" + jsonEscape(name.c_str()) + "\",\"id\":" + std::to_string(next) + "}"; LobbySend(line.c_str()); }
     } break;
     case 8: {   // code field: a click on a code CLEARS it (2026-09-16), a click on the empty field pastes the clipboard
@@ -1920,7 +1935,7 @@ static PrepFn    g_prep = nullptr;
 static volatile LONG g_inMainBuild = 0;
 static void* g_mainList = nullptr;
 static int   g_mainListAdds = 0;
-static void OnHit(int id);
+static void OnHit(int id, int button);   // default on the first declaration
 
 struct FuncBase { const void* const* vptr; void* capture; };
 static FuncBase* __fastcall MpCopy(const FuncBase* self, void* dest) { FuncBase* d = (FuncBase*)dest; d->vptr = self->vptr; d->capture = self->capture; return d; }
@@ -3596,8 +3611,9 @@ static HHOOK g_kbHook = nullptr;
 static HHOOK g_mouseHook = nullptr;
 static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
 {
-    static bool captured=false;
+    static bool captured=false, capturedR=false;
     if(code==HC_ACTION && wp==WM_LBUTTONUP && captured) { captured=false; return 1; }
+    if(code==HC_ACTION && wp==WM_RBUTTONUP && capturedR) { capturedR=false; return 1; }
     // g_ingameOverlay belongs here just as much as g_showOverlay: the title-menu
     // detour sets g_showOverlay (page 2 only), while the panel opened from inside a
     // loaded game sets g_ingameOverlay (PollLobbyOpen). Without the second flag this
@@ -3606,7 +3622,10 @@ static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
     // panel button worked -- including the "x" that closes it, which is the only way
     // out in game (LEAVE is drawn only when no world is loaded). The present gate and
     // the keyboard hook already test both flags; this one was the odd man out.
-    if(code==HC_ACTION && wp==WM_LBUTTONDOWN && gameHasFocus() && g_uiState!=0
+    // A right click on the panel is a panel click too (company chips cycle
+    // backwards) and is swallowed like a left one: behind the panel it would
+    // cancel or rotate a construction tool.
+    if(code==HC_ACTION && (wp==WM_LBUTTONDOWN || wp==WM_RBUTTONDOWN) && gameHasFocus() && g_uiState!=0
        && (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0
            || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) != 0
            || g_recoveryPresent)
@@ -3616,8 +3635,9 @@ static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
         const int x=data->pt.x-origin.x-g_panelX, y=data->pt.y-origin.y-g_panelY;
         if(x>=0 && y>=0 && x<g_copyW && y<g_copyH) {
             InterlockedExchange64(&g_panelClickPoint,(LONG64)((unsigned long long)(DWORD)data->pt.y<<32 | (DWORD)data->pt.x));
+            InterlockedExchange(&g_panelClickButton, wp==WM_RBUTTONDOWN ? 2 : 1);
             InterlockedExchange(&g_pendingPanelClick,1);
-            captured=true;
+            if (wp==WM_RBUTTONDOWN) capturedR=true; else captured=true;
             return 1; // panel clicks never reach a construction tool behind it
         }
     }
