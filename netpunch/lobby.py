@@ -155,6 +155,7 @@ import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
 import collections
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -644,14 +645,121 @@ def _pack_data(payload, bulk=False):
     return _pack(TYPE_DATA, payload)
 
 
-def _send_data(sock, addr, msg):
-    """Wrap a lobby message dict in an ``NP1:`` DATA frame and fire it at addr."""
-    try:
-        sock.sendto(_pack_data(json.dumps(msg).encode("utf-8")), addr)
-    except OSError:
-        # Windows spits ICMP-port-unreachable back as an exception when a peer
-        # has gone away; the drop-timer will evict it. Ignore.
-        pass
+# --------------------------------------------------------------------------- #
+# Control-message fragmentation: a lobby message is as big as the lobby
+# --------------------------------------------------------------------------- #
+# A control message (roster, welcome, fbegin, sync_state, chat, log) used to be
+# ONE datagram. The roster carries every player, every profile and every
+# peer's link list -- N^2 -- and crossed 64 KB at 60-70 players, far below
+# CAP: sendto raised WSAEMSGSIZE, _send_data swallowed it, and nobody got a
+# roster again (2026-09-16). Anything over FRAG_DATA now goes out as
+# MTU-sized fragments and is put back together on receipt. Each fragment is a
+# complete NP1 frame on its own (sealed on its own in a sealed session), so
+# nothing below this layer changes: the relay and the mesh carry fragments
+# exactly as they carry any other DATA frame. A message that fits in one
+# fragment is sent exactly as before: plain JSON.
+#
+#   fragment = FRAG_MAGIC(1) 'F' | id u32 | index u32 | count u32 | bytes
+#
+# Loss handling is the sender's, as before: the roster is re-sent every
+# ROSTER_HEAL, chat and start go out CHAT_BURST times, fbegin repeats until
+# acked, sync_state every 0.25 s. Nothing here retransmits.
+FRAG_MAGIC = b"F"           # '{' JSON, 'N' chunk, 'g' game, 'r' relay envelope, 'F' fragment
+FRAG_HEADER = struct.Struct("!III")
+FRAG_DATA = 1300            # payload bytes per fragment: 1300 + 13 + seal 24 + NP1 5
+                            # = 1342, under the 1400 B VPN MTU (see CHUNK_DATA)
+FRAG_TTL = 15.0             # a message none of whose fragments arrived for this long is abandoned
+FRAG_PENDING_PER_ADDR = 64  # partial messages kept per sender: a garbage guard, not a
+                            # message limit (a sender's fragments go out back to back,
+                            # so a real peer never has more than a handful open)
+_frag_ids = itertools.count(int.from_bytes(os.urandom(4), "big"))   # next() is atomic: any thread may send
+
+
+def _fragments(payload, limit=FRAG_DATA):
+    """The frames to send for one control payload: [payload] when it fits,
+    else its fragments in order."""
+    if len(payload) <= limit:
+        return [payload]
+    fid = next(_frag_ids) & 0xFFFFFFFF
+    count = (len(payload) + limit - 1) // limit
+    return [FRAG_MAGIC + FRAG_HEADER.pack(fid, i, count) + payload[i * limit:(i + 1) * limit]
+            for i in range(count)]
+
+
+class _Reassembler:
+    """Puts fragments back together per sender address. ``feed`` returns the
+    whole payload once its last piece arrives, else None."""
+
+    def __init__(self, log=None):
+        self.pending = {}           # (addr, id) -> [count, {index: bytes}, last-seen]
+        self.log = log or (lambda s: None)
+        self.warned = 0.0
+
+    def feed(self, addr, frame, now=None):
+        now = time.time() if now is None else now
+        if len(frame) < 1 + FRAG_HEADER.size:
+            return None
+        fid, index, count = FRAG_HEADER.unpack_from(frame, 1)
+        if count == 0 or index >= count:
+            return None
+        key = (addr, fid)
+        entry = self.pending.get(key)
+        if entry is None:
+            mine = [k for k in self.pending if k[0] == addr]
+            if len(mine) >= FRAG_PENDING_PER_ADDR:
+                oldest = min(mine, key=lambda k: self.pending[k][2])
+                del self.pending[oldest]
+                if now - self.warned >= 5.0:
+                    self.warned = now
+                    self.log(f"[frag] {addr} has {FRAG_PENDING_PER_ADDR} unfinished messages -- "
+                             f"dropped the oldest (id {oldest[1]})")
+            entry = self.pending[key] = [count, {}, now]
+        elif entry[0] != count:
+            return None                 # a different message reusing the id: ignore the stray
+        entry[1][index] = frame[1 + FRAG_HEADER.size:]
+        entry[2] = now
+        if len(entry[1]) < count:
+            return None
+        del self.pending[key]
+        return b"".join(entry[1][i] for i in range(count))
+
+    def expire(self, now=None):
+        now = time.time() if now is None else now
+        for key in [k for k, e in self.pending.items() if now - e[2] > FRAG_TTL]:
+            del self.pending[key]
+
+    def forget(self, addr):
+        for key in [k for k in self.pending if k[0] == addr]:
+            del self.pending[key]
+
+
+_send_failures = {}         # addr -> when a send failure was last logged for it
+
+
+def _log_send_failure(addr, size, err, log=_log):
+    """Every failed send is worth a line -- one swallowed WSAEMSGSIZE hid the
+    roster cap for months -- but a peer that has gone away raises on every
+    datagram (Windows turns ICMP port-unreachable into an exception), so the
+    line is rate-limited per address."""
+    now = time.time()
+    if now - _send_failures.get(addr, 0.0) < 5.0:
+        return
+    _send_failures[addr] = now
+    log(f"[net] send of {size} B to {addr} failed: {err!r}")
+
+
+def _send_data(sock, addr, msg, log=_log):
+    """Wrap a lobby message dict in ``NP1:`` DATA frame(s) and fire it at addr."""
+    payload = json.dumps(msg).encode("utf-8")
+    for piece in _fragments(payload):
+        try:
+            sock.sendto(_pack_data(piece), addr)
+        except OSError as e:
+            # A peer that has gone away raises here; the drop-timer evicts it.
+            # Logged (rate-limited), never silent: a message size the socket
+            # refuses must show up, not vanish.
+            _log_send_failure(addr, len(payload), e, log)
+            return
 
 
 # --------------------------------------------------------------------------- #
@@ -979,6 +1087,19 @@ def _read_save_files(save_path):
     return blob, files_meta
 
 
+def _mid_transfer(addr, *transfers):
+    """True while ``addr`` is an ACTIVE target of any of the given
+    _HostSaveTransfer objects (None entries are skipped). The host's keepalive
+    eviction defers to this: such a peer is judged by PEER_XFER_TIMEOUT."""
+    for t in transfers:
+        if t is None:
+            continue
+        p = getattr(t, "peers", {}).get(addr)
+        if p is not None and p.get("state") == "active":
+            return True
+    return False
+
+
 class _HostSaveTransfer:
     """Reliable host -> all-joiners file push, PUMPED from the host's main loop.
 
@@ -1034,7 +1155,14 @@ class _HostSaveTransfer:
     def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save"):
         self.sock = sock
         self.kind = kind                      # "save" or "mods" (the round after it)
-        self.mods = mods or []                # [(id, ver)] the save needs, told in fbegin
+        # [(id, ver)] the save needs, told in fbegin. None means the host could
+        # not READ the list (modshare.save_mod_list failed): the save still
+        # goes out, but every receiver is told the list is unknown rather than
+        # empty -- "or []" here used to advertise such a save as needing
+        # nothing (2026-09-16).
+        self.mods_unknown = mods is None
+        self.mods = list(mods or [])
+        self.progress_at = time.time()        # last sign of a receiver working (base advance, verify heartbeat, done)
         self.sid = sid
         self.blob = blob
         self.total_bytes = len(blob)
@@ -1049,7 +1177,8 @@ class _HostSaveTransfer:
                           "total_bytes": self.total_bytes, "chunk": self.chunk,
                           "total_chunks": self.total_chunks,
                           "files": files_meta, "sha256": self.overall_sha,
-                          "kind": kind, "mods": [[m, v] for m, v in self.mods]}
+                          "kind": kind, "mods": [[m, v] for m, v in self.mods],
+                          "mods_unknown": self.mods_unknown}
         now = time.time()
         self.peers = {}          # addr -> per-peer send state
         for addr, name in targets:
@@ -1117,8 +1246,18 @@ class _HostSaveTransfer:
         if base > p["base"]:
             p["base"] = base
             p["last_advance"] = now
+            self.progress_at = now
             if p["next"] < base:
                 p["next"] = base
+        elif base >= self.total_chunks:
+            # Everything is delivered and the receiver is verifying and
+            # writing it (a 1 GB save on an HDD, then a mod unzip). Its facks
+            # keep coming while it works (base = total, "verifying": true),
+            # and that IS progress: the 30 s no-advance timeout used to fail
+            # exactly the peers that had the whole file and were busiest with
+            # it (2026-09-16). Silence -- no facks at all -- still times out.
+            p["last_advance"] = now
+            self.progress_at = now
         elif base < p["base"]:
             # REWIND: the receiver restarted from scratch (hash mismatch ->
             # whole-file re-request). Without this the host would filter every
@@ -1146,6 +1285,7 @@ class _HostSaveTransfer:
         if msg.get("ok"):
             if p["state"] == "active":
                 p["state"] = "done"
+                self.progress_at = time.time()
                 self.io.emit({"type": "transfer", "role": "send",
                               "peer": p["name"], "state": "done"})
                 self.log(f"[host] {p['name']} verified save transfer")
@@ -1322,17 +1462,40 @@ class _ClientSaveReceiver:
         self.manifest_key = None
         self.preflight = False
         self.save_done = False     # the save round before a mods round verified here
+        self.finalizing = False    # a worker thread is verifying/writing the completed transfer
+        self._worker = None
+        self._results = queue.Queue()
+        self.deferred_begin = None # sid of an fbegin held back while finalizing (logged once)
+        self.manifest_unknown = False
 
-    def on_manifest(self, entries):
-        if not isinstance(entries,list) or len(entries)>128:
+    def _manifest_unknown(self):
+        """The host could not READ its save's mod list. Not "no mods": the
+        player is told, nothing is offered, and the save is still taken --
+        the game itself decides whether it can load it here."""
+        if self.manifest_unknown:
+            return
+        self.manifest_unknown = True
+        self.log("[client] the host cannot read which mods its save needs -- no download will be offered")
+        self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                      "text": "The host could not read which mods its save needs, so none can be offered to you. "
+                              "If your game refuses the save, install the host's mods by hand."})
+
+    def on_manifest(self, entries, unknown=False):
+        if entries is None or unknown:
+            self._manifest_unknown()
+            return
+        if not isinstance(entries,list):
+            self.log(f"[client] the host's mod list is not a list ({type(entries).__name__}) -- leaving the lobby")
             self.cancelled=True
             return
         mods=[]
-        for entry in entries:
+        for entry in entries:              # as many entries as the save has (a 128 cap until 2026-09-16)
             if not isinstance(entry,(list,tuple)) or len(entry)!=2 or not modshare.valid_mod(entry[0],entry[1]):
+                self.log(f"[client] mod list entry {entry!r} is not a (folder name, version) pair -- leaving the lobby")
                 self.cancelled=True
                 return
             mods.append(tuple(entry))
+        self.manifest_unknown = False
         key=tuple(mods)
         if self.manifest_key==key:
             return
@@ -1413,10 +1576,12 @@ class _ClientSaveReceiver:
         return self.sid is not None and not self.complete and not self.failed
 
     def _send(self, msg):
+        payload = json.dumps(msg).encode("utf-8")
         try:
-            self.conn.send(json.dumps(msg).encode("utf-8"))
-        except (RuntimeError, OSError):
-            pass
+            for piece in _fragments(payload):
+                self.conn.send(piece)
+        except (RuntimeError, OSError) as e:
+            _log_send_failure(getattr(self.conn, "peer", None), len(payload), e, self.log)
 
     def _fail(self, detail):
         """Give up on this session: tell the menu AND the host (fdone ok:false
@@ -1444,6 +1609,14 @@ class _ClientSaveReceiver:
                             "final": True})
             else:
                 self._send({"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask})  # duplicate -> re-ack
+            return
+        if self.finalizing:
+            # The previous round is still being verified/written by the worker.
+            # Not acked: the sender repeats fbegin every BEGIN_INTERVAL until it
+            # is, and this one is taken as soon as the worker is done.
+            if self.deferred_begin != sid:
+                self.deferred_begin = sid
+                self.log(f"[client] fbegin sid={sid} while still writing sid={self.sid} -- answered once that is done")
             return
         # A brand-new session (first ever, or a later transfer): (re)allocate.
         kind = "mods" if msg.get("kind") == "mods" else "save"
@@ -1497,6 +1670,8 @@ class _ClientSaveReceiver:
                         return
                 if not present:
                     self.need.append(modshare.mod_folder_name(m, v))
+            if msg.get("mods_unknown"):
+                self._manifest_unknown()             # the list is unknown, not empty: say so, take the save
             # a new save round asks afresh: an earlier yes does not carry over
             self.offered = list(self.need)
             self.approved = previous_approval.intersection(self.offered)
@@ -1547,6 +1722,8 @@ class _ClientSaveReceiver:
         if self.complete:
             self._maybe_send_done(force=True)   # nudge host to stop resending
             return
+        if self.finalizing:
+            return                               # all in hand; the worker is on it
         if self.failed or seq < 0 or seq >= self.total_chunks:
             return
         if self.have[seq]:
@@ -1579,6 +1756,7 @@ class _ClientSaveReceiver:
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
+        self._poll_worker()                      # a finished verify/write lands here, on the loop thread
         if self.cancelled:
             return
         if self.preflight and self.approved and not self.active() and not self.catalogue_token and now-self.last_mod_request>1:
@@ -1620,7 +1798,7 @@ class _ClientSaveReceiver:
                 nack.append(s)
             s += 1
         self._send({"t": "fack", "sid": self.sid, "base": self.base,
-                    "nack": nack})
+                    "nack": nack, "verifying": self.finalizing})
 
     def _maybe_send_done(self, now=None, force=False):
         # After completion the host may not have heard our fdone (it can be
@@ -1634,32 +1812,108 @@ class _ClientSaveReceiver:
 
     # -- assemble + verify + write ----------------------------------------- #
     def _finalize(self):
-        # ZERO-COPY. This used to do bytes(self.buf[off:off+size]) per file and
-        # bytes(self.buf) for the overall hash -- three full copies of the whole
-        # save. On a 642 MB map that is ~1.9 GB of allocation and memcpy on top
-        # of the two SHA-256 passes, all of it AFTER the progress bar has
-        # reported 100%, which is exactly what "it hangs at the end" was.
-        # bytearray and memoryview both support the buffer protocol, so hashlib
-        # and file.write take them directly and none of those copies are needed.
+        """Every chunk is in hand: verify and write it OFF the lobby loop.
+
+        The hashing and the writes used to run inline here, and for that long
+        the joiner sent nothing -- no ping to the host, no fack -- so a 1 GB
+        save on an HDD (two SHA-256 passes, the write, then a mod unzip) went
+        past the host's DROP_AFTER and the joiner was evicted mid-transfer
+        (2026-09-16). Now a worker thread does the work while the loop keeps
+        pinging and keeps sending facks (base = total, "verifying": true),
+        which the host counts as progress. The outcome comes back through a
+        queue and is applied by _poll_worker on the loop thread, so every
+        state change, emit and reply still happens where it always did.
+
+        ZERO-COPY, as before: bytearray and memoryview both support the
+        buffer protocol, so hashlib and file.write take them directly.
+        """
+        if self.finalizing:
+            return
+        self.finalizing = True
+        approved = None
+        if self.kind == "mods":
+            approved, self.approved = self.approved, set()   # the yes is used up by this round
+        job = {"sid": self.sid, "buf": self.buf, "files": list(self.files),
+               "overall_sha": self.overall_sha, "kind": self.kind,
+               "approved": approved, "total_bytes": self.total_bytes}
+        self._worker = threading.Thread(target=self._finalize_work, args=(job,),
+                                        name=f"{threading.current_thread().name}/save-finalize", daemon=True)
+        self._worker.start()
+
+    def _finalize_work(self, job):
+        """WORKER THREAD: hash, then write the save or unpack the mods. Touches
+        no receiver state; everything it learns goes into the result."""
+        res = {"sid": job["sid"], "ok": True, "seconds": 0.0}
         t0 = time.time()
-        ok = True
-        off = 0
-        parts = {}
-        view = memoryview(self.buf)
-        for meta in self.files:
-            size = int(meta.get("size", 0))
-            part = view[off:off + size]                  # a window, not a copy
-            off += size
-            if hashlib.sha256(part).hexdigest() != meta.get("sha256"):
-                ok = False
-                break
-            parts[meta.get("name")] = part
-        if ok and self.overall_sha:
-            if hashlib.sha256(self.buf).hexdigest() != self.overall_sha:
-                ok = False
+        try:
+            view = memoryview(job["buf"])
+            off = 0
+            parts = {}
+            for meta in job["files"]:
+                size = int(meta.get("size", 0))
+                part = view[off:off + size]                  # a window, not a copy
+                off += size
+                if hashlib.sha256(part).hexdigest() != meta.get("sha256"):
+                    res["ok"] = False
+                    break
+                parts[meta.get("name")] = part
+            if res["ok"] and job["overall_sha"]:
+                if hashlib.sha256(job["buf"]).hexdigest() != job["overall_sha"]:
+                    res["ok"] = False
+            res["seconds"] = time.time() - t0
+            if res["ok"]:
+                if job["kind"] == "mods":
+                    res["install"] = self._install_files(parts, job["approved"])
+                else:
+                    written = []
+                    try:
+                        for meta in job["files"]:
+                            name = meta.get("name")
+                            if not _safe_incoming_name(name):
+                                res["error"] = f"refused: unexpected filename {name!r}"
+                                break
+                            with open(os.path.join(self.io.dir, name), "wb") as f:
+                                f.write(parts[name])                 # memoryview: no copy
+                            written.append(name)
+                    except OSError as e:
+                        res["error"] = f"write error: {e}"
+                    res["written"] = written
+            # Release the memoryviews before the bytearray they borrow from can
+            # be dropped; a lingering export would keep the whole save alive.
+            for v in parts.values():
+                v.release()
+            view.release()
+        except Exception as e:                               # noqa: BLE001 -- the loop must hear it
+            res["error"] = f"verify/write crashed: {e!r}"
+        self._results.put(res)
+
+    def _poll_worker(self):
+        """LOOP THREAD: apply a finished verify/write, if there is one."""
+        try:
+            res = self._results.get_nowait()
+        except queue.Empty:
+            return
+        self._worker = None
+        self.finalizing = False
+        if self.cancelled or res.get("sid") != self.sid:
+            return                                           # a round abandoned meanwhile
+        self._finish(res)
+
+    def settle(self, timeout=120.0):
+        """Block until a running verify/write has finished and its outcome is
+        applied. For tests and shutdown; the lobby loop never waits."""
+        w = self._worker
+        if w is not None:
+            w.join(timeout)
+        self._poll_worker()
+
+    def _finish(self, res):
         self.log(f"[client] save verify: {self.total_bytes}B in "
-                 f"{time.time() - t0:.1f}s ({'ok' if ok else 'MISMATCH'})")
-        if not ok:
+                 f"{res['seconds']:.1f}s ({'ok' if res['ok'] else 'MISMATCH'})")
+        if res.get("error"):
+            self._fail(res["error"])
+            return
+        if not res["ok"]:
             self.retries += 1
             if self.retries <= MAX_FILE_RETRIES:
                 self.log(f"[client] save hash mismatch -- re-request "
@@ -1673,10 +1927,7 @@ class _ClientSaveReceiver:
             self._fail("hash mismatch")
             return
         if self.kind == "mods":
-            self._install_mods(parts)
-            for v in parts.values():
-                v.release()
-            view.release()
+            self._mods_installed(res["install"])
             if self.failed:
                 self.cancelled=True
                 return
@@ -1694,24 +1945,7 @@ class _ClientSaveReceiver:
             self.catalogue_since=time.time()
             self.io.emit({"type":"mods_refresh"})
             return
-        written = []
-        try:
-            for meta in self.files:
-                name = meta.get("name")
-                if not _safe_incoming_name(name):
-                    self._fail(f"refused: unexpected filename {name!r}")
-                    return
-                with open(os.path.join(self.io.dir, name), "wb") as f:
-                    f.write(parts[name])                 # memoryview: no copy
-                written.append(name)
-        except OSError as e:
-            self._fail(f"write error: {e}")
-            return
-        # Release the memoryviews before the bytearray they borrow from can be
-        # dropped; a lingering export would keep the whole save alive.
-        for v in parts.values():
-            v.release()
-        view.release()
+        written = res.get("written", [])
         self.complete = True
         self.save_done = True                    # a mods round may follow (still needs the player's yes)
         self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
@@ -1726,13 +1960,12 @@ class _ClientSaveReceiver:
         self._maybe_send_done(force=True)
 
 
-    def _install_mods(self, parts):
-        """A mods round: unpack each incoming_mod_<id>_<ver>.zip into the game's
-        mods folder (never over an existing one) and tell the player. Only the
-        mods this player said yes to are installed; the host sends one zip set
-        to everyone who lacked something, so the rest are left alone. The yes is
-        used up by this round."""
-        approved, self.approved = self.approved, set()
+    def _install_files(self, parts, approved):
+        """WORKER THREAD half of a mods round: unpack each
+        incoming_mod_<id>_<ver>.zip into the game's mods folder (never over an
+        existing one). Only the mods this player said yes to are installed; the
+        host sends one zip set to everyone who lacked something, so the rest
+        are left alone. Returns what happened; _mods_installed tells the player."""
         done, kept, bad, skipped = [], [], [], []
         for name, part in parts.items():
             idv = modshare.parse_mod_zip_name(name)
@@ -1761,6 +1994,13 @@ class _ClientSaveReceiver:
                 st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
             (done if st == "installed" else kept if st == "present" else bad).append(label)
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
+        return {"done": done, "kept": kept, "bad": bad, "skipped": skipped, "approved": sorted(approved)}
+
+    def _mods_installed(self, r):
+        """LOOP THREAD half of a mods round: tell the player, and fail the
+        round if anything agreed to did not land. The yes was used up when the
+        round began."""
+        done, kept, bad, skipped = r["done"], r["kept"], r["bad"], r["skipped"]
         text = []
         if done: text.append("Installed from the host: " + ", ".join(done) + " (they show in the load screen's Mods panel)")
         if kept: text.append("already installed: " + ", ".join(kept))
@@ -1769,7 +2009,7 @@ class _ClientSaveReceiver:
         if text:
             self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": "; ".join(text)})
         self.install_result={"installed":done,"present":kept,"failed":bad}
-        absent=approved-set(done)-set(kept)
+        absent=set(r["approved"])-set(done)-set(kept)
         if bad or absent:
             self._fail("required mod installation failed: " + ", ".join(sorted(set(bad)|absent)))
 
@@ -2061,7 +2301,8 @@ class _PeerConn:
     def __init__(self, sock, addr):
         self.sock, self.addr = sock, addr
     def send(self, payload):
-        self.sock.sendto(_pack_data(payload), self.addr)
+        for piece in _fragments(payload):
+            self.sock.sendto(_pack_data(piece), self.addr)
 
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
@@ -2224,6 +2465,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return "A player is receiving the save. Wait for that transfer to finish, then try again."
         return "Resync is not ready yet."
 
+    frags = _Reassembler(log)                 # big control messages from joiners, per address
+
     def recovery_send(name, message):
         for address, peer in peers.items():
             if peer["name"] == name:
@@ -2274,6 +2517,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "transport_lobby": transport_lobby, "players": players, "recovery": 4 if recovery_supported() else 0,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only, "mods": advertised[1],
+                                 "mods_unknown": advertised[1] is None,
                                  "stored_age": stored_age() if relay_only else -1,
                                  "stored_max": int(HOTJOIN_STORED_MAX) if relay_only else -1,
                                  "letters": {p2["name"]: letter_for(p2["name"]) for p2 in peers.values()} if relay_only else None,
@@ -2318,8 +2562,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if relay_only:
             path=os.path.join(io.dir,"mod_cache",modshare.cache_name(m,v))
             try:
-                with open(path,"rb") as f: data=f.read(modshare.MAX_MOD_ZIP+1)
-                return data if len(data)<=modshare.MAX_MOD_ZIP else None
+                with open(path,"rb") as f: return f.read()     # whole: a cached mod is as big as it is
             except OSError: return None
         return modshare.package_mod(m,v)
 
@@ -2333,8 +2576,22 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 _send_data(sock, a, msg)
         io.emit({"type": "chat", "from": frm, "text": text, "ts": ts})
 
+    def mod_list_note(path, where):
+        """The save's mod list could not be READ. Say so everywhere it matters
+        -- the log, the host's panel, the lobby chat -- and advertise the list
+        as UNKNOWN (None). It must never become "no mods": that told every
+        joiner the save needed nothing, and the game then refused to load it
+        on any machine that lacked a mod (2026-09-16)."""
+        log(f"[host] the mod list of {path} is UNKNOWN ({where}); players are told so, and "
+            "nobody is offered the mods it needs -- if the game refuses to load it, install the host's mods by hand")
+        io.emit({"type": "chat", "from": "MULTIPLAYER",
+                 "text": f"Could not read which mods {os.path.basename(str(path))} needs; players who lack them "
+                         "will not be offered a download. If their game refuses the save, they must install your mods by hand."})
+
     cached_world = stored_save()[0] if relay_only else None
-    advertised = [cached_world, (modshare.save_mod_list(cached_world) or []) if cached_world else []]
+    advertised = [cached_world, modshare.save_mod_list(cached_world, log) if cached_world else []]
+    if cached_world and advertised[1] is None:
+        mod_list_note(cached_world, "stored world")
     preflight_requests = {}
     mod_preflight = [False]
     pending_start = [None]
@@ -2413,7 +2670,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "recovery": 4 if recovery_supported() else 0,
-                                "lobby": lobby_name, "relay": relay_only, "mods": advertised[1]})
+                                "lobby": lobby_name, "relay": relay_only, "mods": advertised[1],
+                                "mods_unknown": advertised[1] is None})
         if relay_only and started[0] and addr != leader_addr() and not peers[addr].get("started"):
             age = stored_age()
             if 0 <= age <= HOTJOIN_STORED_MAX:
@@ -2524,6 +2782,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 sid, seq = struct.unpack("!II", payload[4:12])
                 upload[0].on_chunk(sid, seq, payload[12:])
             return
+        if payload[:1] == FRAG_MAGIC:
+            # a piece of a big control message (a joiner's log batch, a long
+            # mods_request, a resync ack): whole once the last piece lands
+            if addr in peers:
+                peers[addr]["last"] = time.time()
+            payload = frags.feed(addr, payload)
+            if payload is None:
+                return
         try:
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -2666,10 +2932,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if pr and pr.get("ask"):
                     transfer[0].on_mods_answer(addr, {"sid": transfer[0].sid, "accept": True})
                 return
-            allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in advertised[1]}
+            allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in (advertised[1] or [])}
             requested=msg.get("need",[])
-            if isinstance(requested,list) and len(requested)<=128:
+            if isinstance(requested,list):          # as many as the save needs (a 128 cap until 2026-09-16)
                 preflight_requests[addr]=[allowed[n] for n in requested if isinstance(n,str) and n in allowed]
+            else:
+                log(f"[host] mods_request from {peers[addr]['name']!r} carries no list -- ignored")
         elif t == "mods_answer":
             if transfer[0] is not None:
                 transfer[0].on_mods_answer(addr, msg)
@@ -2729,10 +2997,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
-        mods = modshare.save_mod_list(save_path) or []
+        mods = modshare.save_mod_list(save_path, log)        # None = could not read it (NOT "none")
         advertised[:]=[save_path,mods]
         for a,_ in targets: preflight_requests.pop(a,None)
-        if mods:
+        if mods is None:
+            mod_list_note(save_path, "START GAME")
+            broadcast_chat("MULTIPLAYER", f"The host could not read which mods {os.path.basename(save_path)} needs: "
+                                          "you will not be offered a download. If your game refuses the save, install the host's mods by hand.")
+        elif mods:
             log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
                 + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
@@ -2748,11 +3020,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         c = cmd.get("cmd")
         if c == "advertise_mods":
             path=str(cmd.get("save", ""))
-            mods=modshare.save_mod_list(path)
-            if mods is not None:
-                advertised[:]=[path,mods]
-                for a in list(peers): _send_data(sock,a,{"t":"mods_manifest","mods":mods})
-                io.emit({"type":"mods_manifest","mods":mods})
+            mods=modshare.save_mod_list(path, log)            # None = could not read it (NOT "none")
+            if mods is None:
+                mod_list_note(path, "advertise_mods")
+            advertised[:]=[path,mods]
+            for a in list(peers): _send_data(sock,a,{"t":"mods_manifest","mods":mods,"mods_unknown":mods is None})
+            io.emit({"type":"mods_manifest","mods":mods,"mods_unknown":mods is None})
             return
 
         if c == "chat":
@@ -2926,11 +3199,29 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             if now - last_drop >= 1.0:
                 last_drop = now
-                dead = [a for a, p in peers.items()
-                        if now - p["last"] > drop_after]
+                frags.expire(now)
+                dead = []
+                for a, p in peers.items():
+                    if now - p["last"] <= drop_after:
+                        p.pop("drop_deferred", None)
+                        continue
+                    if _mid_transfer(a, transfer[0], recovery.transfer if recovery else None):
+                        # A peer that is receiving a save is judged by the
+                        # transfer's own PEER_XFER_TIMEOUT, never by the lobby
+                        # keepalive: a joiner verifying and writing a 1 GB save
+                        # on an HDD (plus a mod unzip) went quiet for longer
+                        # than DROP_AFTER and was evicted mid-transfer, which
+                        # failed the transfer for everyone (2026-09-16).
+                        if not p.get("drop_deferred"):
+                            p["drop_deferred"] = True
+                            log(f"[host] {p['name']} silent for {now - p['last']:.0f} s but mid-transfer "
+                                "-- not dropped (the transfer's own timeout decides)")
+                        continue
+                    dead.append(a)
                 for a in dead:
                     log(f"[host] DROP {a} ({peers[a]['name']}) -- silent")
                     del peers[a]
+                    frags.forget(a)
                     if transfer[0] is not None:
                         transfer[0].on_peer_dropped(a)     # skip it, keep going
                 if dead:
@@ -3206,11 +3497,15 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
              "detail": "checking multiplayer version..."})
     io.write_state(state="connecting", you=desired[0], started=False)
 
+    frags = _Reassembler(log)               # big control messages from the host (roster, fbegin, sync_state)
+
     def send(msg):
+        payload = json.dumps(msg).encode("utf-8")
         try:
-            conn.send(json.dumps(msg).encode("utf-8"))
-        except (RuntimeError, OSError):
-            pass
+            for piece in _fragments(payload):
+                conn.send(piece)
+        except (RuntimeError, OSError) as e:
+            _log_send_failure(getattr(conn, "peer", None), len(payload), e, log)
 
     recovery = ClientRecovery(sync_runtime, io, send, receiver) if sync_runtime is not None else None
 
@@ -3341,6 +3636,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             if ln is not None and ln.connected and relay is not None:
                 relay.deliver(payload)
             return
+        if payload[:1] == FRAG_MAGIC:
+            payload = frags.feed(addr, payload)
+            if payload is None:
+                return
         try:
             m = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -3362,6 +3661,12 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     def handle_msg(raw):
         if stop.is_set():
             return
+        if raw[:1] == FRAG_MAGIC:
+            # a piece of a big control message (the roster of a big lobby is
+            # N^2 and passes 64 KB at 60-70 players): whole once the last lands
+            raw = frags.feed(conn.peer, raw)
+            if raw is None:
+                return
         if not version_checked[0]:
             try:
                 greeting = json.loads(raw.decode("utf-8"))
@@ -3409,7 +3714,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             return
         t = m.get("t")
         if t == "mods_manifest":
-            receiver.on_manifest(m.get("mods"))
+            receiver.on_manifest(m.get("mods"), m.get("mods_unknown"))
             return
         if recovery and recovery.message(m):
             return
@@ -3433,7 +3738,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 seen_nonces.add(lobby_epoch)
                 io.emit(dict(type='transport_lobby', epoch=lobby_epoch))
         if t == "welcome":
-            receiver.on_manifest(m.get("mods", []))
+            receiver.on_manifest(m.get("mods", []), m.get("mods_unknown"))
             assigned[0] = m.get("you", desired[0])
             host_name[0] = m.get("host")
             is_relay[0] = bool(m.get("relay"))
@@ -3442,7 +3747,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             io.write_state(you=assigned[0], host=m.get("host"))
             log(f"[client] host named us {assigned[0]!r}")
         elif t == "roster":
-            receiver.on_manifest(m.get("mods", []))
+            receiver.on_manifest(m.get("mods", []), m.get("mods_unknown"))
             players = m.get("players", [])
             host_name[0] = m.get("host", host_name[0])
             is_relay[0] = bool(m.get("relay", is_relay[0]))
@@ -3538,8 +3843,14 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                     log(f"[client] save read failed: {e}")
                     return
                 sid = int(time.time() * 1000) & 0xFFFFFFFF
+                mods = modshare.save_mod_list(str(cmd.get("save")), log)   # None = could not read it (NOT "none")
+                if mods is None:
+                    log(f"[client] the mod list of {cmd.get('save')} is UNKNOWN -- the relay is told so; nobody is offered its mods")
+                    io.emit({"type": "chat", "from": "MULTIPLAYER",
+                             "text": f"Could not read which mods {os.path.basename(str(cmd.get('save')))} needs; players who lack them "
+                                     "will not be offered a download. If their game refuses the save, they must install your mods by hand."})
                 uploader[0] = _HostSaveTransfer(conn.sock, sid, blob, files_meta,
-                                                [(conn.peer, "relay")], io, log, mods=modshare.save_mod_list(str(cmd.get("save"))) or [])
+                                                [(conn.peer, "relay")], io, log, mods=mods)
                 io.emit({"type": "status", "state": "connected",
                          "detail": "uploading the save to the relay..."})
                 log(f"[client] uploading {cmd.get('save')} ({len(blob)} B) to the relay")
@@ -4486,10 +4797,11 @@ def _run_transfer_mods(tag):
     modshare.catalogue=lambda: ("test-catalogue",{("mod_zz","1"),("mod_have","1")})
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
     share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
-    modshare.save_mod_list = lambda p: [("mod_zz", 1), ("mod_have", 1)]
+    modshare.save_mod_list = lambda p, log=None: [("mod_zz", 1), ("mod_have", 1)]
     modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
     modshare.installed_mod = lambda m, v: src.get(m) if m == "mod_have" else None   # joiners lack mod_zz
-    modshare.install_target = lambda m, v: os.path.join(dest, threading.current_thread().name, f"{m}_{v}")
+    # a joiner is its loop thread; its verify/write worker is "<joiner>/save-finalize"
+    modshare.install_target = lambda m, v: os.path.join(dest, threading.current_thread().name.split("/")[0], f"{m}_{v}")
     ok = True
     t0 = time.time()
     try:
@@ -4668,6 +4980,7 @@ def _run_mods_gate(tag):
         r.on_begin(msg)
         for seq in range(total):
             r.on_chunk(sid, seq, blob[seq * CHUNK_LOCAL:(seq + 1) * CHUNK_LOCAL])
+        r.settle()                      # the verify/write runs on a worker thread; apply its outcome
 
     def installed(mid):
         return os.path.isfile(os.path.join(dest, f"{mid}_1", "mod.lua"))

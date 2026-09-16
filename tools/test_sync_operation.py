@@ -4,7 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'netpunch'))
-from sync_operation import SyncOperation, SyncReplica, snapshot_digest
+from sync_operation import SyncOperation, SyncReplica, snapshot_digest, SILENCE
 
 FILES = [{'suffix': s, 'size': 100, 'sha256': 'a' * 64} for s in ('.sav', '.sav.lua')]
 
@@ -93,6 +93,77 @@ class OperationTests(unittest.TestCase):
         self.op.tick(['host', 'client'])
         self.assertEqual(self.op.phase, 'error')
         self.assertEqual(self.op.error['step'], 'holding')
+
+    def progress(self, sender, token):
+        data = {k: getattr(self.op, k) for k in ('operation', 'revision', 'epoch', 'phase')}
+        data['progress'] = token
+        return self.op.progress(sender, data)
+
+    def test_transfer_lasts_as_long_as_bytes_keep_moving(self):
+        # A 1 GB save to a slow uplink used to hit the 300 s total limit and
+        # leave everyone held (2026-09-16). The phase now ends only after
+        # SILENCE seconds without progress, however long the whole takes.
+        self.transfer()
+        for step in range(20):                          # 20 x 250 s = 83 min of transfer
+            self.now += 250
+            self.assertTrue(self.progress('client', f'recv={step}'))
+            self.op.tick(self.op.members)
+            self.assertEqual(self.op.phase, 'transferring', step)
+        self.now += SILENCE['transferring'] - 1
+        self.op.tick(self.op.members)
+        self.assertEqual(self.op.phase, 'transferring')
+        self.now += 1
+        self.op.tick(self.op.members)
+        self.assertEqual(self.op.phase, 'error')
+        self.assertEqual(self.op.error['step'], 'transferring')
+        self.assertIn('No progress for 300 s', self.op.error['detail'])
+
+    def test_repeated_token_is_not_progress(self):
+        self.transfer()
+        self.assertTrue(self.progress('client', 'recv=5'))
+        self.now += 200
+        self.assertFalse(self.progress('client', 'recv=5'))   # same token: nothing advanced
+        self.now += 100
+        self.op.tick(self.op.members)
+        self.assertEqual(self.op.phase, 'error')
+
+    def test_progress_needs_the_current_phase_and_a_member(self):
+        self.transfer()
+        self.assertFalse(self.progress('stranger', 'x'))
+        data = {k: getattr(self.op, k) for k in ('operation', 'revision', 'epoch', 'phase')}
+        self.assertFalse(self.op.progress('client', dict(data, phase='loading', progress='x')))
+        self.assertFalse(self.op.progress('client', dict(data, revision=data['revision'] - 1, progress='x')))
+        self.assertFalse(self.op.progress('client', dict(data, progress='')))
+        self.assertFalse(self.op.progress('client', dict(data, progress=7)))
+        self.assertFalse(self.op.progress('client', 'not a dict'))
+        self.op.phase = 'holding'                      # a fixed-wait phase never extends
+        self.assertFalse(self.progress('client', 'x'))
+
+    def test_saving_and_loading_extend_on_engine_heartbeat(self):
+        self.both()                                     # -> saving
+        self.assertEqual(self.op.phase, 'saving')
+        for beat in range(10):
+            self.now += 100
+            self.assertTrue(self.progress('host', f'saving:busy@{beat}'))
+            self.op.tick(self.op.members)
+            self.assertEqual(self.op.phase, 'saving')
+        self.ack('host')                                # -> transferring
+        self.both()                                     # -> loading
+        self.assertEqual(self.op.phase, 'loading')
+        for beat in range(10):
+            self.now += 250
+            self.assertTrue(self.progress('client', f'loading:busy@{beat}'))
+            self.op.tick(self.op.members)
+            self.assertEqual(self.op.phase, 'loading')
+        self.now += 300
+        self.op.tick(self.op.members)
+        self.assertEqual(self.op.error['step'], 'loading')
+
+    def test_progress_tokens_reset_on_every_phase(self):
+        self.transfer()
+        self.assertTrue(self.progress('client', 'same'))
+        self.both()                                     # -> loading
+        self.assertTrue(self.progress('client', 'same'))   # a fresh phase: the token counts again
 
     def test_corrupt_file_sets_rejected(self):
         for files in (FILES[:1], FILES + FILES[:1], [{'suffix': '.sav', 'size': 0, 'sha256': 'z'*64}]):

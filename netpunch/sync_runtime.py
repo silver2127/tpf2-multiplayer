@@ -132,6 +132,34 @@ class SyncParticipant:
         self.ack.update(success=True, **fields)
         return self.ack
 
+    def progress(self):
+        """A token that changes while this member's part of the current phase
+        advances, for the host barrier's silence timeout (sync_operation.SILENCE):
+        the control stage (which native/epoch commands were issued and answered),
+        the engine's native busy heartbeat (native_control.cpp rewrites the status
+        file every 100 ms from its own thread while the game thread saves or
+        loads), the save file's size while the host's engine writes it, and the
+        Lua ack's world/held/paused. A dead or hung process stops changing it;
+        a slow one never does."""
+        if not self.state:
+            return None
+        phase = self.state['phase']
+        parts = [phase, ','.join(f'{k}={int(bool(v))}' for k, v in sorted(self.commands.items()))]
+        status = self._read('tpf2_native_status.txt')
+        if status.get('busy') == '1':
+            try:
+                parts.append('busy@%d' % os.stat(self.directory / 'tpf2_native_status.txt').st_mtime_ns)
+            except OSError:
+                pass
+        if phase == 'saving' and self.player == self.state.get('host'):
+            try:
+                parts.append('save=%d' % (self.save_directory / ('mp_' + self.state['epoch'][:12] + '.sav')).stat().st_size)
+            except OSError:
+                pass
+        lua = self._lua()
+        parts.append('lua=%s/%s/%s' % (lua.get('world', ''), lua.get('held', ''), lua.get('paused', '')))
+        return ':'.join(parts)
+
     def receive_snapshot(self, blob):
         if not self.state or self.state['phase'] != 'transferring':
             return False

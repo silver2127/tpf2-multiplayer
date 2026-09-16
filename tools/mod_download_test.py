@@ -32,6 +32,7 @@ def push(r,sid,kind,files,mods=None):
     chunk=lobby.CHUNK_LOCAL
     r.on_begin(dict(sid=sid,kind=kind,files=metadata,total_bytes=len(blob),total_chunks=(len(blob)+chunk-1)//chunk,chunk=chunk,sha256=hashlib.sha256(blob).hexdigest(),mods=mods or []))
     for seq in range((len(blob)+chunk-1)//chunk): r.on_chunk(sid,seq,blob[seq*chunk:(seq+1)*chunk])
+    r.settle()   # the verify/write runs on a worker thread; apply its outcome before asserting
 
 class Downloads(unittest.TestCase):
     def setUp(self):
