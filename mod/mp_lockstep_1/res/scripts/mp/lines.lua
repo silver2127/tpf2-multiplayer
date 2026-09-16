@@ -8,6 +8,17 @@
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
 require("mp.waypoints")(CM)
+
+-- A wait time as the wire carries it: the engine's float, "inf" for the cargo
+-- slider's unlimited wait (string.format("%.9g", math.huge) prints inf and
+-- tonumber("inf") is nil on 5.2). d is the value for a missing field.
+CM.waitNum = CM.waitNum or function(s, d)
+	if s == nil then return d end
+	if s == "inf" or s == "+inf" then return math.huge end
+	if s == "-inf" then return -math.huge end
+	if type(s) == "number" then return s end
+	return tonumber(s) or d
+end
 -- ---------- lines: cross-peer identity + Create / Update / Delete ----------
 --
 -- Same shape as vehicles: a created line gets the key origin:seq, each peer
@@ -157,7 +168,7 @@ function CM.lineSnapshot(lid)
 			local x, y = CM.stationGroupPos(s.stationGroup)
 			if not x then return end
 			local sx, sy = CM.stationPosInGroup(s.stationGroup, s.station)
-			stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y,
+			stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y,
 				tonumber(s.station) or 0, tonumber(s.terminal) or 0, tonumber(s.loadMode) or 0,
 				tonumber(s.minWaitingTime) or 0, tonumber(s.maxWaitingTime) or 180)
 				.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
@@ -395,9 +406,23 @@ function CM.pollLineKeys()
 	end
 end
 
+-- A line edit the slice could not decode ran natively here; this reads the line
+-- back once the engine has applied it (queued 3 steps after the capture) and
+-- ships it event-only (armed 0: the peers apply it, we already have it).
+function CM.execLineReadback(c)
+	local snap = CM.lineSnapshot(tonumber(c.lid))
+	if snap then
+		log(string.format("LUPDATE: %s '%s' read back after the native edit -- shipping to the peers", tostring(c.key), CM.unescName(snap.name)))
+		CM.scheduleLocal("LUPDATE", { key = c.key, name = snap.name, color = snap.color, wait = snap.wait,
+		                           stops = snap.stops, alts = snap.alts, armed = 0 })
+	else
+		log("LUPDATE: line " .. tostring(c.lid) .. " could not be read back -- not replicated")
+	end
+end
+
 local function buildLineObject(c)
 	local lineObj = api.type.Line.new()
-	lineObj.waitingTime = tonumber(c.wait) or 180
+	lineObj.waitingTime = CM.waitNum(c.wait, 180)
 	local n = 0
 	local altList = nil
 	if c.alts and c.alts ~= "" then
@@ -407,7 +432,7 @@ local function buildLineObject(c)
 	end
 	for rec in tostring(c.stops or ""):gmatch("[^;]+") do
 		local f = {}
-		for v in (rec:match("^[^~]+") or rec):gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+		for v in (rec:match("^[^~]+") or rec):gmatch("[^,]+") do f[#f + 1] = CM.waitNum(v) end
 		if #f < 7 then error("bad stop record " .. rec) end
 		local sg = findStationGroupNear(f[1], f[2])
 		if not sg then error(string.format("no station group within 20 m of %.1f,%.1f", f[1], f[2])) end

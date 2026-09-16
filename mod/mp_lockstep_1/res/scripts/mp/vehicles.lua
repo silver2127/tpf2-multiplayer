@@ -229,6 +229,35 @@ function CM.drainVehCap()
 end
 
 -- Resolve pending purchase keys: the depot's vehicle that is not yet known.
+-- Which STEP each keyed vehicle leaves its depot on, logged on every instance:
+-- two clones bought 0.8 s apart onto one line left the same depot in opposite
+-- order on the two games (a:58/a:59, 2026-09-16) with every command of ours on
+-- the same step on both, so the order was decided inside the engine. This
+-- names the step so the next pair says whether the departures themselves
+-- differ. One transportVehicleSystem query per tick.
+function CM.watchDepartures()
+	local parked = {}
+	local ok = pcall(function()
+		local st = api.type.enum.TransportVehicleState.IN_DEPOT
+		if st == nil then return end
+		local list = api.engine.system.transportVehicleSystem.getVehiclesWithState(st)
+		for i = 1, #list do parked[list[i]] = true end
+	end)
+	if not ok then return end
+	local step = CM.stepOf(CM.gameTime() or 0)
+	CM.depotSince = CM.depotSince or {}
+	for vid, since in pairs(CM.depotSince) do
+		if not parked[vid] then
+			local key = CM.vehKeyOf[vid] or (CM.primedVeh[vid] and ("s:" .. tostring(vid))) or ("id " .. tostring(vid))
+			log(string.format("veh: %s left its depot at step %d (parked since step %d)", key, step, since))
+			CM.depotSince[vid] = nil
+		end
+	end
+	for vid in pairs(parked) do
+		if not CM.depotSince[vid] then CM.depotSince[vid] = step end
+	end
+end
+
 function CM.pollVehKeys()
 	if #pendingVehKeys == 0 then return end
 	local now = CM.gameTime()

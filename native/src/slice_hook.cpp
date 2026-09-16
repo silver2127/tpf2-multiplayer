@@ -1308,11 +1308,13 @@ struct LineAlt  { int32_t station, terminal; };                   // StationTerm
 // only has to be non-negative, and every refusal names its check in
 // g_lineDecodeWhy.
 struct LineWp   { int32_t entity, index; };                        // transport::SignalId
-struct LineStop { int32_t sg, station, terminal, loadMode, minWait, maxWait; int nAlt; std::vector<LineAlt> alt; int nWp; std::vector<LineWp> wp; };
+// waits are the engine's floats, any value it holds (the cargo-wait slider goes
+// past the 36000 s this once refused, natively on the host only -- 2026-09-16)
+struct LineStop { int32_t sg, station, terminal, loadMode; float minWait, maxWait; int nAlt; std::vector<LineAlt> alt; int nWp; std::vector<LineWp> wp; };
 static const uint64_t LINE_ANY_SPAN = ~0ull;   // ReadVec's cap, not used as one
 static char g_lineDecodeWhy[200] = "";
 #define LINE_REFUSE(...) do { _snprintf_s(g_lineDecodeWhy, sizeof(g_lineDecodeWhy), _TRUNCATE, __VA_ARGS__); return false; } while (0)
-struct LineDecode { int32_t wait; int n; std::vector<LineStop> st; };
+struct LineDecode { float wait; int n; std::vector<LineStop> st; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
 
@@ -1362,11 +1364,11 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
         memcpy(&t.loadMode, b + 0x28, 4);
         memcpy(&f2c,        b + 0x2c, 4);
         memcpy(&f30,        b + 0x30, 4);
-        // floats (see the layout note); NaN fails every comparison below
-        if (!(f2c >= 0.f && f2c <= 36000.f) || !(f30 >= 0.f && f30 <= 36000.f)) LINE_REFUSE("stop %d waits %.1f/%.1f", i + 1, f2c, f30);
-        int32_t w2c = (int32_t)(f2c + 0.5f), w30 = (int32_t)(f30 + 0.5f);
+        // floats (see the layout note); only NaN is refused -- a huge or infinite
+        // wait is the slider's "unlimited", shipped as %.9g ("inf" round-trips)
+        if (f2c != f2c || f30 != f30) LINE_REFUSE("stop %d waits %g/%g", i + 1, f2c, f30);
         // which of +0x2c/+0x30 is min is unpinned; min <= max always holds
-        if (w2c <= w30) { t.minWait = w2c; t.maxWait = w30; } else { t.minWait = w30; t.maxWait = w2c; }
+        if (f2c <= f30) { t.minWait = f2c; t.maxWait = f30; } else { t.minWait = f30; t.maxWait = f2c; }
         if (t.sg <= 0 || t.station < 0 || t.terminal < 0
             || t.loadMode < 0 || t.loadMode > 3)
             LINE_REFUSE("stop %d sg=%d station=%d terminal=%d loadMode=%d", i + 1, t.sg, t.station, t.terminal, t.loadMode);
@@ -1405,15 +1407,13 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
 {
     g_lineDecodeWhy[0] = 0;
     if (!IsHeapPtr(line) || !Readable((void*)line, 0x24)) LINE_REFUSE("line struct unreadable");
-    // waitingTime's type was never recorded (t11 matched the value, not the
-    // width). Take whichever interpretation is a sane number of seconds.
+    // waitingTime is a FLOAT at +0x18 (every live capture said so); any value
+    // but NaN is the game's own
     {
-        int32_t wi = 0; float wf = 0.f;
-        memcpy(&wi, (void*)(line + 0x18), 4);
+        float wf = 0.f;
         memcpy(&wf, (void*)(line + 0x18), 4);
-        if (wi >= 0 && wi <= 36000) out->wait = wi;
-        else if (wf >= 0.f && wf <= 36000.f) { out->wait = (int32_t)(wf + 0.5f); Log("[slice] LUPDATE: waitingTime is a FLOAT at +0x18 (%.1f) -- note it\n", wf); }
-        else LINE_REFUSE("waitingTime %d / %.1f", wi, wf);
+        if (wf != wf) LINE_REFUSE("waitingTime NaN");
+        out->wait = wf;
     }
     if (DecodeLineAt(line, 0x00, out)) return true;
     if (DecodeLineAt(line, 0x18, out)) { Log("[slice] LUPDATE: stops vector found at +0x18, not +0x00 -- update the layout note\n"); return true; }
@@ -1664,9 +1664,9 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             // %.4f, 127/255 came back as 0.4980, matched no palette entry, and every new
             // line was the same orange (2026-09-12).
             const LineDecode& d = g_lcDecode.line;
-            fprintf(f, "LCREATEX %.9g %.9g %.9g %d %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
+            fprintf(f, "LCREATEX %.9g %.9g %.9g %.9g %d", g_lcDecode.rgb[0], g_lcDecode.rgb[1], g_lcDecode.rgb[2], d.wait, d.n);
             for (int i = 0; i < d.n; i++) {
-                fprintf(f, " %d %d %d %d %d %d %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
+                fprintf(f, " %d %d %d %d %.9g %.9g %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
                         d.st[i].loadMode, d.st[i].minWait, d.st[i].maxWait, d.st[i].nAlt);
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
@@ -1684,9 +1684,9 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
         if (g_lineDecodeOk) {
             // LUPDATE <line> <wait> <n> {<sg> <station> <terminal> <loadMode> <min> <max> <nAlt> {<st> <term>}*nAlt}*n
             const LineDecode& d = g_lineDecode;
-            fprintf(f, "LUPDATE %d %d %d", (int)(int32_t)r8, d.wait, d.n);
+            fprintf(f, "LUPDATE %d %.9g %d", (int)(int32_t)r8, d.wait, d.n);
             for (int i = 0; i < d.n; i++) {
-                fprintf(f, " %d %d %d %d %d %d %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
+                fprintf(f, " %d %d %d %d %.9g %.9g %d", d.st[i].sg, d.st[i].station, d.st[i].terminal,
                         d.st[i].loadMode, d.st[i].minWait, d.st[i].maxWait, d.st[i].nAlt);
                 for (int a = 0; a < d.st[i].nAlt; a++)
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
@@ -1694,11 +1694,11 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
             WriteLineWaypoints(f, d);
             fprintf(f, "\n");
             if (d.n > 0)
-                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%d..%d)\n",
+                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%g stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%g..%g)\n",
                     (int)(int32_t)r8, d.wait, d.n, d.st[0].sg, d.st[0].station, d.st[0].terminal,
                     d.st[0].loadMode, d.st[0].minWait, d.st[0].maxWait);
             else
-                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%d stops=0 (last stop removed)\n",
+                Log("[slice] LUPDATE shipped DECODED: line=%d wait=%g stops=0 (last stop removed)\n",
                     (int)(int32_t)r8, d.wait);
         } else {
             fprintf(f, "LUPDATE %d\n", (int)(int32_t)r8);

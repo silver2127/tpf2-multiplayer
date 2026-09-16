@@ -7,6 +7,15 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+-- A wait time as the wire carries it (also defined in lines.lua; whichever loads
+-- first wins): the engine's float, "inf" for the cargo slider's unlimited wait.
+CM.waitNum = CM.waitNum or function(s, d)
+	if s == nil then return d end
+	if s == "inf" or s == "+inf" then return math.huge end
+	if s == "-inf" then return -math.huge end
+	if type(s) == "number" then return s end
+	return tonumber(s) or d
+end
 -- SOLO IS SOLO. The slice leaves a build alone when no peer is playing (see
 -- SessionLive in slice_hook.cpp), so the engine has already built it -- replaying
 -- it here would build it a second time. Reading the file and dropping the lines
@@ -1202,13 +1211,13 @@ function CM.pollInject()
 				-- read it back once it exists, as the event-only LCREATE always did.
 				local armed = CM.lastArmed or 0
 				local r, g, b = tonumber(w[2]), tonumber(w[3]), tonumber(w[4])
-				local wait, nstops = tonumber(w[5]) or 180, tonumber(w[6]) or 0
+				local wait, nstops = CM.waitNum(w[5], 180), tonumber(w[6]) or 0
 				local nameTok = line:match(" name=(%S+)%s*$")
 				local stops, alts, bad = {}, {}, nil
 				local pos = 7
 				for i = 1, nstops do
 					local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
-					local lm, mn, mx = tonumber(w[pos + 3]) or 0, tonumber(w[pos + 4]) or 0, tonumber(w[pos + 5]) or 180
+					local lm, mn, mx = tonumber(w[pos + 3]) or 0, CM.waitNum(w[pos + 4], 0), CM.waitNum(w[pos + 5], 180)
 					local na = tonumber(w[pos + 6]) or 0
 					pos = pos + 7
 					local al = {}
@@ -1220,7 +1229,7 @@ function CM.pollInject()
 					if sg then x, y = CM.stationGroupPos(sg) end
 					if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
 					local sx, sy = CM.stationPosInGroup(sg, st)
-					stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y, st, term, lm, mn, mx)
+					stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y, st, term, lm, mn, mx)
 						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 					alts[#alts + 1] = table.concat(al, "/")
 				end
@@ -1263,12 +1272,12 @@ function CM.pollInject()
 					-- whole line back as before and ship it to the peers only.
 					local nstops = tonumber(w[4])
 					if #w >= 4 and nstops and #w >= 4 + nstops * 7 then
-						local wait = tonumber(w[3]) or 180
+						local wait = CM.waitNum(w[3], 180)
 						local stops, alts, bad = {}, {}, nil
 						local pos = 5   -- sequential: each stop carries a variable alternatives tail
 						for i = 1, nstops do
 							local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
-							local lm, mn, mx = tonumber(w[pos + 3]) or 0, tonumber(w[pos + 4]) or 0, tonumber(w[pos + 5]) or 180
+							local lm, mn, mx = tonumber(w[pos + 3]) or 0, CM.waitNum(w[pos + 4], 0), CM.waitNum(w[pos + 5], 180)
 							local na = tonumber(w[pos + 6]) or 0
 							pos = pos + 7
 							local al = {}
@@ -1284,7 +1293,7 @@ function CM.pollInject()
 							if sg then x, y = CM.stationGroupPos(sg) end
 							if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
 							local sx, sy = CM.stationPosInGroup(sg, st)
-							stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y, st, term, lm, mn, mx)
+							stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y, st, term, lm, mn, mx)
 								.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 							alts[#alts + 1] = table.concat(al, "/")
 						end
@@ -1320,7 +1329,7 @@ function CM.pollInject()
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
 								end
 							end
-							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %d%s", lk, #stops, wait,
+							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %g%s", lk, #stops, wait,
 								armed == 1 and " (strict)" or ""))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
 							                           wait = wait, stops = newStops,
@@ -1328,14 +1337,17 @@ function CM.pollInject()
 							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts) end
 						end
 					else
-						local snap = CM.lineSnapshot(lid)
-						if snap then
-							log(string.format("LUPDATE: %s '%s'", lk, CM.unescName(snap.name)))
-							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name, color = snap.color, wait = snap.wait,
-							                           stops = snap.stops, alts = snap.alts, armed = 0 })
-						else
-							log("LUPDATE: line " .. tostring(lid) .. " could not be read back -- not replicated")
-						end
+						-- The update ran natively here and the engine applies it on a later
+						-- step: read back NOW and the peers get the line as it was BEFORE the
+						-- edit (2026-09-16: two such read-backs were byte-identical to the
+						-- previous edit; the host's trains and the joiner's then routed
+						-- differently). Read it back a few steps from now instead.
+						CM.readbackSeq = (CM.readbackSeq or 0) + 1
+						CM.retryQueue = CM.retryQueue or {}
+						CM.retryQueue[#CM.retryQueue + 1] = { op = "LREADBACK", at = CM.gameTime() or 0, origin = K.INSTANCE,
+						                                     seq = 1000000 + CM.readbackSeq, key = lk, lid = lid,
+						                                     notBeforeStep = CM.stepOf(CM.gameTime() or 0) + 3 }
+						log(string.format("LUPDATE: %s ran natively (not decoded) -- reading it back in 3 steps", lk))
 					end
 				end
 
