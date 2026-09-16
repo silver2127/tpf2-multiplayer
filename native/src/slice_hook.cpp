@@ -143,13 +143,19 @@ static bool IsScriptCaller(uint64_t caller)
 static const int ID_BUILDPROPOSAL = 0;
 static const int ID_CMDADD        = 1;
 // SetGameSpeed (make_cmd 0x9de9e0, steal 21) is acted on for the clock
-// widget's speed controls only: UI::Clock::TogglePause and the clock's two
-// other calls, identified by the factory's return address (docs/re/COMMANDS.md).
+// widget's speed controls only, identified by the factory's return address
+// (docs/re/COMMANDS.md): the speed buttons (0x4f0097, in 0x4eff50) and the pause
+// toggle, whose two bodies are both UI::Clock::TogglePause (0x4efb8f in
+// 0x4efab0, 0x4f26ef in 0x4f2640). The mod counts a speed button as the player's
+// vote for the session speed and a toggle only as a pause or a resume -- a
+// toggle's speed is just what the lever read before the pause -- so the inject
+// line says which control it was.
 // Every other caller (the menu switching to the game, CGameUI::GameStep, the
 // camera-path tool, a debug view, and the Lua maker that pacing's own speed
 // changes go through, which returns to 0xc17eff) is left alone.
 static const int ID_SETGAMESPEED = 15;
 static const uintptr_t CALLER_SPEED_BUTTONS[] = { 0x4efb8f, 0x4f0097, 0x4f26ef };
+static const uintptr_t CALLER_PAUSE_TOGGLE[]  = { 0x4efb8f, 0x4f26ef };
 // SetDate (make_cmd 0x9de9b0) and SetCalendarSpeed (0x9de870), steal 21 each:
 // the same shape as SetGameSpeed, no Engine, the value in the low 32 bits of rdx.
 // SetDate carries boost::gregorian's day number (the Julian Day Number: the
@@ -1745,11 +1751,12 @@ static bool VehiclePayloadReadable(int fid, uint64_t r8, uint64_t r9, uint64_t s
 
 // A click on the clock's speed controls while a session is live: cancelled
 // fire-and-forget (the clock reads the speed back every frame; nothing waits on
-// the command) and written as SPEEDBTN <speed>. The leader's mod makes it the
-// session speed and a follower's ignores it, so a lever only moves through
-// pacing. Not live, not a clock caller, or a value out of range: the click runs
-// natively, as in a stock game.
-static bool WriteInjectSpeedButton(int speed)
+// the command) and written as SPEEDBTN <speed> <toggle|button>. The mod makes a
+// speed button this player's vote for the session speed, which every instance
+// counts at its stamp, and the host's pause toggle a pause or a resume, so a
+// lever only moves through pacing. Not live, not a clock caller, or a value out
+// of range: the click runs natively, as in a stock game.
+static bool WriteInjectSpeedButton(int speed, const char* kind)
 {
     ReadInstance();   // NOT cached: the lobby can rename this peer after attach
     if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
@@ -1757,7 +1764,7 @@ static bool WriteInjectSpeedButton(int speed)
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return false; }
-    fprintf(f, "SPEEDBTN %d\n", speed);
+    fprintf(f, "SPEEDBTN %d %s\n", speed, kind);
     fclose(f);
     return true;
 }
@@ -1765,8 +1772,9 @@ static bool WriteInjectSpeedButton(int speed)
 static void CaptureSpeedButton(uint64_t rcx, uint64_t rdx, uint64_t caller)
 {
     const int speed = (int)(int32_t)(uint32_t)rdx;   // no Engine argument: the speed is the low 32 bits of rdx
-    bool button = false;
+    bool button = false, toggle = false;
     for (uintptr_t c : CALLER_SPEED_BUTTONS) if (caller == c) button = true;
+    for (uintptr_t c : CALLER_PAUSE_TOGGLE) if (caller == c) toggle = true;
     if (!button) {
         static uint64_t seen[8] = {};
         for (int i = 0; i < 8; i++) {
@@ -1788,15 +1796,16 @@ static void CaptureSpeedButton(uint64_t rcx, uint64_t rdx, uint64_t caller)
         Log("[slice] speed button %d: no live session -- left alone\n", speed);
         return;
     }
-    if (!WriteInjectSpeedButton(speed)) {
+    const char* kind = toggle ? "toggle" : "button";
+    if (!WriteInjectSpeedButton(speed, kind)) {
         Log("[slice] speed button %d: not shipped -- left alone\n", speed);
         return;
     }
     InterlockedExchange(&g_pendingNoCb, 1);
     InterlockedExchange(&g_pendingHonour, 0);
     InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-    Log("[slice] armed cancel: speed button %d (caller_rva=%llx) -- the mod applies it\n",
-        speed, (unsigned long long)caller);
+    Log("[slice] armed cancel: speed %s %d (caller_rva=%llx) -- the mod applies it\n",
+        kind, speed, (unsigned long long)caller);
 }
 
 // The editor's date picker and date speed slider while a session is live:

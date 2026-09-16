@@ -5,8 +5,11 @@ lockstep.lua for several instances in one Lua 5.1 runtime (lupa), against a toy
 engine: the speed lever, the fractional-speed dither clamped to 0.25-2x of the
 lever as native/src/speedhook.cpp does, a 4x hardware cap, one tick of command
 latency and one tick of network latency. The leader answers LSNEED; nobody
-answers the leader's own. Not modelled: the load gate, commands, real frame
-timing (ticks are a fixed 1/5.4 s, 1x is 1 game unit per second).
+answers the leader's own. Commands are modelled only as far as a speed vote
+needs them: stamped past the fastest clock, applied at the stamp by every
+instance, the originator included. Not modelled: the load gate, NACK and
+resend, real frame timing (ticks are a fixed 1/5.4 s, 1x is 1 game unit per
+second).
 
 Each scenario runs on the working tree (checked) and on a git ref (printed for
 comparison, default HEAD). Built 2026-09-10 to reproduce the live failure where
@@ -109,6 +112,21 @@ function newInst(spec)
   CM.gameTime = function() return I.T end
   CM.stepOf = function(t) return math.floor((t or 0) / K.SIM_STEP + 0.5) end
   CM.clearFile = function(path) SIM.fs[path] = nil end   -- io.lua in the game empties; absent and empty read alike
+  -- the command stream, as far as a speed vote needs it (net.lua scheduleLocal): stamped
+  -- EXEC_DELAY past the fastest clock on the step grid, queued here for the stamp like every
+  -- command, and delivered to the others one tick later
+  CM.queue = {}
+  CM.scheduleLocal = function(op, args)
+    CM.seqNo = CM.seqNo + 1
+    local base = I.T
+    local fp = CM.peerFastPrecise and CM.peerFastPrecise()
+    if fp and fp + K.SIM_STEP > base then base = fp + K.SIM_STEP end
+    local at = tonumber(string.format("%.4f", math.ceil((base + K.EXEC_DELAY) / K.SIM_STEP - 1e-6) * K.SIM_STEP))
+    local c = { op = op, at = at, origin = spec.letter, seq = CM.seqNo }
+    for k, v in pairs(args) do c[k] = v end
+    CM.queue[#CM.queue + 1] = c
+    SIM.outbox[#SIM.outbox + 1] = { from = spec.letter, cmd = c }
+  end
   local function log(msg) SIM.logs[#SIM.logs + 1] = string.format("%5d %s: %s", SIM.tick, spec.letter, tostring(msg)) end
   HELPERS(CM, K)
   if not CM.heartbeatCu then
@@ -149,6 +167,16 @@ local function advance(I, dt)
 end
 
 local function deliver(msg, insts, tick)
+  if msg.cmd then
+    for _, R in ipairs(insts) do
+      if R.letter ~= msg.from and tick >= R.startTick then
+        local c = {}
+        for k, v in pairs(msg.cmd) do c[k] = v end
+        R.CM.queue[#R.CM.queue + 1] = c
+      end
+    end
+    return
+  end
   local op = msg.line:match("^(%u+)")
   for _, R in ipairs(insts) do
     if R.letter ~= msg.from and tick >= R.startTick then
@@ -162,6 +190,7 @@ local function deliver(msg, insts, tick)
         pr.cu = (msg.line:find(" cu=1", 1, true) ~= nil)
         CM.peerSeen = true
       elseif op == "LSEFF" then
+        CM.voteCounted = msg.line:match(" vt=(%S+)") or ""
         if not CM.lgHolding then
           local v = tonumber(msg.line:match("v=([%d%.]+)"))
           if v then
@@ -208,7 +237,9 @@ function SIM.run(sc)
       if act.tick == tick then
         local I = SIM.byLetter[act.who]
         if act.kind == "lever" then I.lever = act.value
-        elseif act.kind == "button" then SIM.cur = I; if I.CM.speedButton then I.CM.speedButton(act.value) end
+        -- ctl: the control the slice names on SPEEDBTN ("toggle" or "button"); absent = an older slice
+        elseif act.kind == "button" then SIM.cur = I; if I.CM.speedButton then I.CM.speedButton(act.value, act.ctl) end
+        elseif act.kind == "dash" then SIM.cur = I; if I.CM.guiSpeedSet then I.CM.guiSpeedSet(act.value) end
         elseif act.kind == "req" then SIM.fs["mem://" .. act.who .. "/tpf2_bridge_ctl.txt"] = "speed=" .. tostring(act.value) .. "\n" end
       end
     end
@@ -225,6 +256,16 @@ function SIM.run(sc)
             CM.myCeiling or 4, CM.heartbeatCu(now) and " cu=1" or ""))
         end
         CM.lgHolding = false
+        -- commands due by our clock, in stamp order, then origin, then seq
+        table.sort(CM.queue, function(x, y)
+          if x.at ~= y.at then return x.at < y.at end
+          if x.origin ~= y.origin then return x.origin < y.origin end
+          return x.seq < y.seq
+        end)
+        while CM.queue[1] and CM.queue[1].at <= now + 1e-9 do
+          local c = table.remove(CM.queue, 1)
+          if c.op == "SPEEDVOTE" and CM.execSpeedVote then CM.execSpeedVote(c) end
+        end
         local paceTick = CM.paceTick or CM.applyBarrier   -- applyBarrier in builds before remove-legacy
         paceTick(now)
       end
@@ -246,6 +287,14 @@ function SIM.run(sc)
     end
   end
   for _, l in ipairs(SIM.logs) do if l:find(" a: CATCHUP", 1, true) then M.aCatchup = M.aCatchup + 1 end end
+  -- each game's vote table at the end, "a:2,b:4"
+  M.votes = {}
+  for _, I in ipairs(insts) do
+    local parts = {}
+    for letter, vote in pairs(I.CM.speedVotes or {}) do parts[#parts + 1] = letter .. ":" .. tostring(vote.v) end
+    table.sort(parts)
+    M.votes[I.letter] = table.concat(parts, ",")
+  end
   return M
 end
 '''
@@ -279,12 +328,23 @@ SCENARIOS = {
     'pause_during_catchup': '''{ ticks = 900,
         insts = { {letter="a", T0=1000, lever=1, ceil=1, start=1}, {letter="b", T0=900, lever=1, start=1} },
         actions = { {tick=60, who="a", kind="lever", value=0}, {tick=300, who="a", kind="lever", value=1} } }''',
-    # the host's speed buttons drive the session (clicks the slice cancelled); a joiner's is ignored
+    # speed buttons are clicks the slice cancelled: the host's and a joiner's are votes, the host's pause pauses
     'host_buttons': '''{ ticks = 900,
         insts = { {letter="a", T0=2000, lever=4, start=1, native=true}, {letter="b", T0=2000, lever=4, start=1},
                   {letter="c", T0=2000, lever=4, start=1} },
-        actions = { {tick=150, who="a", kind="button", value=1}, {tick=300, who="b", kind="button", value=4},
-                    {tick=450, who="a", kind="button", value=0}, {tick=600, who="a", kind="button", value=2} } }''',
+        actions = { {tick=150, who="a", kind="button", value=1, ctl="button"}, {tick=300, who="b", kind="button", value=4, ctl="button"},
+                    {tick=450, who="a", kind="button", value=0, ctl="toggle"}, {tick=600, who="a", kind="button", value=2, ctl="button"} } }''',
+    # SPEED VOTES (2026-09-15): the session runs at the mean of the players' votes. b votes 1 against the
+    # host's own 4, c votes 2 from the window, the host votes 2; the host pauses, b votes 4 during the
+    # pause, the host's toggle resumes; a joiner's pause and toggle do nothing; b leaves at tick 800
+    'speed_votes': '''{ ticks = 1100,
+        insts = { {letter="a", T0=2000, lever=4, start=1, native=true}, {letter="b", T0=2000, lever=4, start=1},
+                  {letter="c", T0=2000, lever=4, start=1} },
+        actions = { {tick=100, who="b", kind="button", value=1, ctl="button"}, {tick=250, who="c", kind="dash", value=2},
+                    {tick=400, who="a", kind="button", value=2, ctl="button"}, {tick=500, who="a", kind="button", value=0, ctl="toggle"},
+                    {tick=560, who="b", kind="button", value=4, ctl="button"}, {tick=620, who="a", kind="button", value=2, ctl="toggle"},
+                    {tick=700, who="b", kind="button", value=0, ctl="toggle"}, {tick=720, who="c", kind="button", value=1, ctl="toggle"} },
+        stalls = { {who="b", tick=800, ticks=100000} } }''',
     # PAUSE AT 4x WITH THREE GAMES (2026-09-12 live: the pause never held -- every game ran to the fastest
     # peer, each stop overshot at 4x, and a, b and c leapfrogged "running 0.4 unit(s)" dozens of times)
     'pause_4x_three': '''{ ticks = 700,
@@ -381,7 +441,7 @@ def main():
                 print('       %s: max ahead %+.1f  max behind %.1f  end %+.2f  last tick off by 1.5+ = %d'
                       % (letter, st['max_ahead'], st['max_behind'], st['end'], st['last_out']))
         m, series, logs = res['work']
-        if name.startswith('pause') or name == 'host_buttons':   # the host's own pause is supposed to hold it at 0
+        if name.startswith('pause') or name in ('host_buttons', 'speed_votes'):   # the host's own pause is supposed to hold it at 0
             checks = [('the leader never enters catch-up', m['aCatchup'] == 0)]
         else:
             checks = [('the leader never holds', m['leaderZero'] == 0 and m['aCatchup'] == 0)]
@@ -415,11 +475,40 @@ def main():
                 return ts[0] if ts else None
             st = summarize(m, series, 700)
             checks += [("the host's 1x becomes the session speed", first(' a: SPEED2: session speed -> 1 ', 150) is not None),
-                       ("a joiner's speed button is ignored", first(' b: SPEED2: speed button 4 ignored', 300) is not None
-                        and first(' a: SPEED2: session speed -> 4 ', 300) is None),
+                       ("a joiner's speed button is its vote: the session runs at the mean, 2.5",
+                        first(' b: SPEED2: speed button 4 -- voting 4x', 300) is not None
+                        and first(' a: SPEED2: session speed -> 2.5 ', 300) is not None),
                        ("the host's pause pauses the session", first(' a: SPEED2: session speed -> 0 ', 450) is not None),
-                       ("the host's 2x resumes it", first(' a: SPEED2: host unpaused the session at 2', 600) is not None),
+                       ("the host's 2x resumes it at the mean with its new vote, 3", first(' a: SPEED2: host unpaused the session at 3', 600) is not None),
                        ('everyone within 1.5 of the leader from tick 700', all(v['max_ahead'] < 1.5 and v['max_behind'] < 1.5 for v in st.values()))]
+        elif name == 'speed_votes':
+            def first(txt, after, before=10 ** 9):
+                ts = [int(l.split()[0]) for l in logs if txt in l and after <= int(l.split()[0]) < before]
+                return ts[0] if ts else None
+            def within(txt, after, n):
+                t = first(txt, after)
+                return t is not None and t < after + n
+            gone = first(' a: SPEED2: session speed -> 2 ', 801)
+            print('       work     votes at the end: %s' % ', '.join('%s={%s}' % kv for kv in sorted(m['votes'].items())))
+            checks += [("b's vote against the host's own speed: the session runs at their mean, 2.5", within(' a: SPEED2: session speed -> 2.5 ', 100, 10)),
+                       ("every game counts b's vote at its stamp, b's own included",
+                        all(first(' %s: EXEC SPEEDVOTE seq=1 origin=b: B votes 1x' % x, 100, 110) is not None for x in 'abc')),
+                       ("b's own lever did not move for its click (it follows the session)", first(' b: PACE: speed -> 1 ', 100, 250) is None),
+                       ("c's vote from the Multiplayer window counts: 2.35", within(' a: SPEED2: session speed -> 2.35 ', 250, 10)),
+                       ("the host's vote counts like anyone's: 1.65", within(' a: SPEED2: session speed -> 1.65 ', 400, 10)),
+                       ("the host's pause pauses the session", within(' a: SPEED2: session speed -> 0 ', 500, 10)),
+                       ("b's vote during the pause does not resume it", m['leaderZero'] >= 110),
+                       ("the host's toggle resumes it with b's vote counted: 2.65",
+                        within(' a: SPEED2: host unpaused the session at 2.65', 620, 1) or within(' a: SPEED2: session speed -> 2.65 ', 620, 20)),
+                       ("the host's toggle is no vote", first(' a: SPEED2: host pause toggle', 620, 621) is not None
+                        and first(' -- voting ', 620, 800) is None),
+                       ("a joiner's pause does nothing", first(' b: SPEED2: pause ignored', 700, 701) is not None
+                        and first(' a: SPEED2: session speed -> 0 ', 700) is None),
+                       ("a joiner's pause toggle does nothing", first(' c: SPEED2: pause toggle (1) ignored', 720, 721) is not None),
+                       ("every game holds the same votes", len(set(m['votes'].values())) == 1 and m['votes']['a'] == 'a:2,b:4,c:2'),
+                       ("b's vote still counts while b is briefly silent, and stops ~30 s after b left: 2",
+                        gone is not None and 950 <= gone <= 980 and first(' a: SPEED2: session speed -> ', 801, 950) is None),
+                       ('c stays within 1.5 of the host from tick 700', all(abs(e) < 1.5 for t, e in series['c'].items() if t >= 700))]
         elif name == 'pause_4x_three':
             def runs(letter, lo, hi):
                 return len([l for l in logs if (' %s: SPEED2: session paused -- running' % letter) in l and lo <= int(l.split()[0]) < hi])

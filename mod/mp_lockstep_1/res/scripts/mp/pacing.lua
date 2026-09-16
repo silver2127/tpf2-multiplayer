@@ -101,82 +101,244 @@ function CM.setSpeed(v, why)
 	log(string.format("PACE: speed -> %s (%s)", tostring(v), why))
 end
 
--- HOST UNPAUSE: the host's play press resumes the session at once, LSEFF
--- carrying the new speed without waiting for the next controller pass.
-function CM.hostUnpause(s)
-	local v = math.min(s, CM.MAX_SPEED or 4)
-	if v < 1 then v = 1 end
-	CM.effSpeed = v
-	CM.broadcast(string.format("LSEFF v=%d", v))
-	log(string.format("SPEED2: host unpaused the session at %d", v))
+-- THE SESSION SPEED IS THE PLAYERS' VOTE (2026-09-15). Every player's speed
+-- choice counts, and none moves the lever of the game it was made on:
+--   * a click on the game's speed buttons is cancelled by the slice (SPEEDBTN),
+--     a press on the Multiplayer window's speed row writes SPEEDSET, and either
+--     becomes that player's VOTE: a SPEEDVOTE command through CM.scheduleLocal,
+--     which every instance, the voter's included, records at the stamp
+--     (CM.execSpeedVote). So every game holds the same votes from the same sim
+--     step on, and a vote reaches everyone through the command stream's NACK
+--     and resend (a hot joiner: through the history ring)
+--   * the LEADER runs the session at the mean of the votes it counts, rounded
+--     to 0.05 (CM.voteSpeed), and LSEFF carries that speed, with the votes it
+--     counted (vt=), to everyone, as it always carried the host's speed
+--   * counted: the vote of every player the leader has heard within
+--     K.VOTE_PRESENT_TICKS (an autosave's freeze is far shorter), and its own.
+--     A player who has not voted has no say, but the leader always has one: its
+--     own speed (CM.myCeiling) until it votes, and from then its latest click,
+--     a stamp before the other games count it (CM.myVoteCast)
+--   * PAUSE IS NOT A VOTE. The host's pause pauses the session and its resume
+--     resumes it, at the votes' speed; anyone else's pause does nothing
+--   * "/speed x" in the chat overrides the votes until the next vote lands
+K.VOTE_PRESENT_TICKS = 160   -- ~30 s without a heartbeat: that player's vote stops counting
+K.VOTE_MIN, K.VOTE_MAX = 0.25, 8
+CM.speedVotes = {}           -- letter -> { v =, ct = (game time of the click), seq =, at = (the stamp) }
+
+-- A speed as a vote: the speed row's quarter grid, 0.25..8.
+function CM.voteValue(v)
+	v = tonumber(v)
+	if not v then return nil end
+	v = math.floor(v * 4 + 0.5) / 4
+	if v < K.VOTE_MIN then v = K.VOTE_MIN elseif v > K.VOTE_MAX then v = K.VOTE_MAX end
+	return v
 end
 
--- A speed button clicked on THIS game: SPEEDBTN <v> from the slice, which
--- cancelled the click, so no lever moved. The leader's click becomes the
--- session speed; a follower's is ignored, its lever following the session.
+-- Newer by the CLICK, not by the stamp. Two quick clicks can be stamped out of
+-- order (the second pays a smaller peer lead in CM.scheduleLocal), and the older
+-- click must not win. The click's game time orders them; the origin's seq breaks
+-- a tie inside one tick. A restarted game counts seq from 1 again, but its clicks
+-- come later in game time.
+function CM.voteIsNewer(old, ct, seq)
+	if not old then return true end
+	if ct ~= old.ct then return ct > old.ct end
+	return (tonumber(seq) or 0) > (tonumber(old.seq) or 0)
+end
+
+-- SPEEDVOTE at its stamp, on every instance.
+function CM.execSpeedVote(c)
+	local v, ct, who = CM.voteValue(c.v), tonumber(c.ct), c.origin
+	if not (v and ct and who) then
+		log(string.format("EXEC SPEEDVOTE seq=%s origin=%s: bad vote v=%s ct=%s -- not counted",
+			tostring(c.seq), tostring(who), tostring(c.v), tostring(c.ct)))
+		return
+	end
+	local old = CM.speedVotes[who]
+	if not CM.voteIsNewer(old, ct, c.seq) then
+		log(string.format("EXEC SPEEDVOTE seq=%s origin=%s: %gx was clicked before its vote of %gx -- that one stands",
+			tostring(c.seq), who, v, old.v))
+		return
+	end
+	CM.speedVotes[who] = { v = v, ct = ct, seq = tonumber(c.seq) or 0, at = tonumber(c.at) }
+	-- the newest speed choice: a /speed request older than it stops overriding the votes
+	CM.btnAt = CM.ticks
+	log(string.format("EXEC SPEEDVOTE seq=%s origin=%s: %s votes %gx%s", tostring(c.seq), who, string.upper(who), v,
+		old and string.format(" (was %gx)", old.v) or ""))
+end
+
+-- OUR vote, scheduled like any command: this game counts it at the stamp too.
+function CM.castSpeedVote(v, why)
+	v = CM.voteValue(v)
+	local now = CM.gameTime()
+	if not (v and now) or CM.resyncHold then
+		log(string.format("SPEED2: %s -- no vote cast (%s)", why, CM.resyncHold and "a resync holds the game" or "no game clock yet"))
+		return false
+	end
+	local ct = tonumber(string.format("%.4f", now))   -- the wire's precision: every game compares the same number
+	CM.myVoteCast = { v = v, ct = ct }
+	CM.scheduleLocal("SPEEDVOTE", { v = v, ct = ct })
+	log(string.format("SPEED2: %s -- voting %gx for the session speed", why, v))
+	return true
+end
+
+-- The votes the leader counts, by letter: its own, and every other player's
+-- whose game it has heard within K.VOTE_PRESENT_TICKS. Its own is its latest
+-- click (CM.myVoteCast, which the stamp then confirms) or, before it ever voted,
+-- its own speed, marked own=true.
+function CM.votesCounted()
+	local list, me = {}, K.INSTANCE
+	local mine, cast = CM.speedVotes[me], CM.myVoteCast
+	if cast and (not mine or cast.ct > mine.ct) then mine = cast end
+	if mine then
+		list[#list + 1] = { letter = me, v = mine.v }
+	else
+		local own = ((CM.myCeiling or 0) > 0) and CM.myCeiling or CM.ceilBeforePause
+		if own and own > 0 then list[#list + 1] = { letter = me, v = CM.voteValue(own), own = true } end
+	end
+	for letter, vote in pairs(CM.speedVotes) do
+		local pr = CM.peers[letter]
+		if letter ~= me and pr and pr.at and (CM.ticks - pr.at) <= K.VOTE_PRESENT_TICKS then
+			list[#list + 1] = { letter = letter, v = vote.v }
+		end
+	end
+	table.sort(list, function(x, y) return x.letter < y.letter end)
+	return list
+end
+
+-- The session speed the votes make: their mean, rounded to 0.05 (the pacing
+-- grid; an integer over 20 is the same double a joiner parses back from LSEFF),
+-- the wire form of what was counted ("a:4*,b:1", * = the leader's own speed, not
+-- a vote), and how many. nil when nothing counts.
+function CM.voteSpeed()
+	local list = CM.votesCounted()
+	if #list == 0 then return nil, "", 0 end
+	local sum, parts = 0, {}
+	for i, e in ipairs(list) do
+		sum = sum + e.v
+		parts[i] = string.format("%s:%g%s", e.letter, e.v, e.own and "*" or "")
+	end
+	local avg = math.floor(sum / #list * 20 + 0.5) / 20
+	if avg < K.VOTE_MIN then avg = K.VOTE_MIN elseif avg > K.VOTE_MAX then avg = K.VOTE_MAX end
+	return avg, table.concat(parts, ","), #list
+end
+
+-- "a:4*,b:1" -> "A 4x (own speed), B 1x"
+function CM.voteWords(vt)
+	local out = {}
+	for letter, v, own in tostring(vt or ""):gmatch("(%a+):([%d%.]+)(%*?)") do
+		out[#out + 1] = string.format("%s %gx%s", string.upper(letter), tonumber(v) or 0, own == "*" and " (own speed)" or "")
+	end
+	return table.concat(out, ", ")
+end
+
+function CM.lseffLine(v, vt)
+	return string.format("LSEFF v=%g%s", v, (vt and vt ~= "") and (" vt=" .. vt) or "")
+end
+
+-- HOST UNPAUSE: the host's play press resumes the session at once, at the
+-- votes' speed, LSEFF carrying it without waiting for the next controller pass.
+function CM.hostUnpause(s)
+	local v, vt = CM.voteSpeed()
+	if not v then v, vt = math.max(1, math.min(tonumber(s) or 1, CM.MAX_SPEED or 4)), "" end
+	CM.effSpeed, CM.voteCounted = v, vt
+	CM.broadcast(CM.lseffLine(v, vt))
+	log(string.format("SPEED2: host unpaused the session at %g", v))
+end
+
+-- A speed control clicked on THIS game: SPEEDBTN <v> <kind> from the slice,
+-- which cancelled the click, so no lever moved. kind is "toggle" (the clock's
+-- pause toggle: 0 while the game runs, the last speed while it stands) or
+-- "button" (a speed button); an older slice sends none.
+--   * 0 pauses: the host's pauses the session, anyone else's does nothing
+--   * the toggle back from a pause is no vote -- its speed is only what the
+--     lever read before the pause: the host's resumes the session, anyone
+--     else's does nothing
+--   * a speed button is this player's vote; the host's also resumes a pause
 -- While the load gate holds, a play press is the player's override
 -- (CM.ensureRunning reads CM.lgPress).
-function CM.speedButton(v)
+function CM.speedButton(v, kind)
 	v = tonumber(v)
 	if not v then return end
-	v = math.max(0, math.min(CM.MAX_SPEED or 4, math.floor(v)))
+	v = math.max(0, math.floor(v))
 	if CM.lgHolding then
-		CM.lgPress = v
+		CM.lgPress = math.min(v, CM.MAX_SPEED or 4)
 		return
 	end
 	if not CM.peerSeen then
 		-- nobody to pace with (the slice saw a session a moment ago): apply it here
-		CM.setSpeed(v, "speed button, nobody else in the session")
+		CM.setSpeed(math.min(v, CM.MAX_SPEED or 4), "speed button, nobody else in the session")
 		return
 	end
-	if not CM.isLeader() then
-		log(string.format("SPEED2: speed button %d ignored -- the host's speed buttons set the session speed", v))
+	if kind ~= "toggle" and kind ~= "button" then
+		-- An older slice does not say. A speed sent while this game stands at 0 (a
+		-- pause, a catch-up or gap hold) may be the toggle coming back, which must
+		-- not become a vote; while the game runs, the toggle can only send 0.
+		local s
+		pcall(function() s = game.interface.getGameSpeed() end)
+		kind = (v > 0 and s == 0) and "toggle" or "button"
+	end
+	local leader = CM.isLeader()
+	local paused = leader and (CM.myCeiling == 0 or CM.effSpeed == 0)
+	if v == 0 then
+		if not leader then
+			log("SPEED2: pause ignored -- only the host pauses the session")
+			return
+		end
+		if (CM.myCeiling or 0) > 0 then CM.ceilBeforePause = CM.myCeiling end
+		CM.myCeiling = 0
+		CM.spd2ZeroSince = nil
+		CM.btnAt, CM.ceilByButton = CM.ticks, true
+		log("SPEED2: host speed button -> 0")
 		return
 	end
-	local wasPaused = (CM.effSpeed == 0)
-	CM.myCeiling = v
-	CM.spd2ZeroSince = nil
-	CM.btnAt, CM.ceilByButton = CM.ticks, true
-	log(string.format("SPEED2: host speed button -> %d", v))
-	if v > 0 and wasPaused then CM.hostUnpause(v) end
+	if kind == "toggle" then
+		if not paused then
+			log(string.format("SPEED2: pause toggle (%d) ignored -- %s", v,
+				leader and "the session is not paused" or "only the host resumes the session"))
+			return
+		end
+		-- the host's own speed from before the pause, not the lever's
+		CM.myCeiling = CM.ceilBeforePause or math.min(v, CM.MAX_SPEED or 4)
+		CM.spd2ZeroSince = nil
+		CM.btnAt, CM.ceilByButton = CM.ticks, true
+		log("SPEED2: host pause toggle -- resuming the session (not a vote)")
+		CM.hostUnpause(CM.myCeiling)
+		return
+	end
+	if leader then
+		CM.myCeiling = math.min(v, CM.MAX_SPEED or 4)   -- the host's own speed, which the lever detector compares against
+		CM.spd2ZeroSince = nil
+		CM.btnAt, CM.ceilByButton = CM.ticks, true
+		log(string.format("SPEED2: host speed button -> %d", v))
+	end
+	CM.castSpeedVote(v, string.format("speed button %d", v))
+	if paused then CM.hostUnpause(v) end
 end
 
--- THE HOST'S DASHBOARD SPEED BUTTONS (2026-09-12): 1, 1.5 ... 4.5 and -/+0.25.
--- The GUI state appends SPEEDSET <v> to our inject file. On the leader it
--- becomes the session speed like a /speed request, but as its own request
--- (CM.guiReq): pressing the same value again after the game's speed buttons
--- still takes, which a repeated /speed could not (the ctl value never changed).
--- A newer /speed in chat replaces it (CM.speedRequest); a newer press of the
--- game's own speed buttons wins over both, as before. A press while the session
--- is paused also unpauses it.
+-- THE MULTIPLAYER WINDOW'S SPEED ROW (2026-09-12, the host's; every player's
+-- since 2026-09-15): 1, 1.5 ... 4.5 and -/+0.25. The GUI state appends
+-- SPEEDSET <v> to our inject file: this player's vote, fractions included. The
+-- host's press also resumes a paused session.
 function CM.guiSpeedSet(v)
-	v = tonumber(v)
+	v = CM.voteValue(v)
 	if not v then return end
-	v = math.max(0.25, math.min(8, math.floor(v * 4 + 0.5) / 4))
 	if CM.lgHolding then
 		log(string.format("SPEED2: dashboard speed %gx ignored -- the game is still loading", v))
 		return
 	end
 	if not CM.peerSeen then
-		CM.guiReq, CM.guiReqAt, CM.spdReqChangedAt = v, CM.ticks, CM.ticks
 		CM.effSpeed = v
 		CM.setSpeed(v, "dashboard speed button, nobody else in the session")
 		return
 	end
-	if not CM.isLeader() then
-		log(string.format("SPEED2: dashboard speed %gx ignored -- only the host sets the session speed", v))
-		return
-	end
-	CM.guiReq, CM.guiReqAt = v, CM.ticks
-	if CM.effSpeed == 0 or CM.myCeiling == 0 then
-		local lever = math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v)))
-		CM.myCeiling = lever
+	local paused = CM.isLeader() and (CM.myCeiling == 0 or CM.effSpeed == 0)
+	CM.castSpeedVote(v, string.format("dashboard speed %gx", v))
+	if paused then
+		CM.myCeiling = math.max(1, math.min(CM.MAX_SPEED or 4, math.floor(v)))
 		CM.spd2ZeroSince = nil
 		CM.btnAt, CM.ceilByButton = CM.ticks, true
-		CM.hostUnpause(lever)
+		CM.hostUnpause(CM.myCeiling)
 	end
-	CM.spdReqChangedAt = CM.ticks   -- not older than any speed-button press: in force from the next pass
-	log(string.format("SPEED2: host dashboard speed -> %gx", v))
 end
 
 -- How fast a joiner's pacing may run to keep up. Up to the engine's top lever
@@ -258,15 +420,15 @@ function CM.execCalendar(c)
 		tostring(t0), tostring(t1)))
 end
 
--- SPEED V2 controller -- THE HOST'S SPEED BUTTONS (2026-09-10):
---   * the session speed is what the leader's player picks with the game's own
---     speed buttons. While a session is live the slice DLL cancels a click on
---     the clock's controls (the speed buttons and the pause toggle) and writes
---     SPEEDBTN <v> to the inject file, so a click moves no lever by itself:
---     CM.speedButton makes the leader's click the session speed, which LSEFF
---     carries to everyone, and ignores a follower's. A lever change the slice
---     did not cancel (a game without hooks, the menu setting the speed as it
---     switches to the game) still reaches the leader's detector in CM.paceV2.
+-- SPEED V2 controller (2026-09-10; the session speed a vote since 2026-09-15):
+--   * the session speed is the mean of the players' speed votes (THE SESSION
+--     SPEED IS THE PLAYERS' VOTE, above). While a session is live the slice DLL
+--     cancels a click on the clock's controls (the speed buttons and the pause
+--     toggle) and writes SPEEDBTN <v> <kind> to the inject file, so a click moves
+--     no lever by itself (CM.speedButton). A lever change the slice did not
+--     cancel (a game without hooks, the menu setting the speed as it switches to
+--     the game) still reaches the leader's detector in CM.paceV2, and a new
+--     speed there is the leader's vote.
 --   * a PAUSE IS A SYNC POINT: when the session speed is 0 the leader stops
 --     at once and everyone behind keeps running until they reach the
 --     leader's clock, then stops there. So "pause to let people catch up"
@@ -280,12 +442,12 @@ end
 -- past the fastest clock (net.lua), so a gap costs the slow player latency,
 -- never a fork.
 -- "/speed 2.5" typed in the lobby chat: the panel (menu DLL) writes speed=2.5
--- into tpf2_bridge_ctl.txt; the HOST reads it here as the session speed
--- request. Read every ~2 s, not per tick. "/speed off" (or 0) clears it. The
--- newer of the two wins: a speed button pressed after a /speed request
--- overrides it until the request next changes.
+-- into tpf2_bridge_ctl.txt; the HOST reads it here as a session speed that
+-- overrides the votes. Read every ~2 s, not per tick. "/speed off" (or 0) clears
+-- it. The newer of the two wins: a vote that lands after a /speed request hands
+-- the session back to the votes until the request next changes.
 function CM.speedRequest()
-	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.guiReq or CM.spdReq end
+	if CM.spdReqAt and CM.ticks - CM.spdReqAt < 10 then return CM.spdReq end
 	CM.spdReqAt = CM.ticks
 	local req, syncN, players
 	pcall(function()
@@ -309,8 +471,7 @@ function CM.speedRequest()
 	if req and (req <= 0 or req >= 64) then req = nil end
 	if req ~= CM.spdReq then
 		CM.spdReqChangedAt = CM.ticks
-		CM.guiReq = nil   -- a newer /speed in chat replaces the dashboard's speed
-		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (the host's speed buttons)"))
+		log(string.format("SPEED2: session speed request -> %s", req and string.format("%.2f", req) or "none (the players' votes)"))
 	end
 	CM.spdReq = req
 	if players then CM.rosterPlayers = players end
@@ -318,7 +479,7 @@ function CM.speedRequest()
 		CM.syncSeen = syncN
 		if syncN > 0 then CM.syncBegin() else CM.syncEnd("cancelled (/sync off)") end
 	end
-	return CM.guiReq or req
+	return req
 end
 
 -- HOT JOIN = a SYNC POINT (2026-09-09). A player arriving mid-session needs
@@ -659,6 +820,7 @@ function CM.paceV2(now)
 			if s == 0 then
 				CM.spd2ZeroSince = CM.spd2ZeroSince or CM.ticks
 				if CM.ticks - CM.spd2ZeroSince >= CM.SPD2_PAUSE_TICKS then
+					if (CM.myCeiling or 0) > 0 then CM.ceilBeforePause = CM.myCeiling end
 					CM.myCeiling = 0                   -- the player paused everyone
 					CM.btnAt, CM.ceilByButton = CM.ticks, false
 					log(string.format("SPEED2: player ceiling -> 0 (paused %d ticks)", CM.ticks - CM.spd2ZeroSince))
@@ -668,6 +830,8 @@ function CM.paceV2(now)
 				CM.myCeiling = s                       -- the player set the speed
 				CM.btnAt, CM.ceilByButton = CM.ticks, false
 				log(string.format("SPEED2: player ceiling -> %d", s))
+				-- a new speed is the host's vote; play after a pause only resumes (below)
+				if not (prevS == 0 or CM.effSpeed == 0) then CM.castSpeedVote(s, string.format("the host's lever moved to %d", s)) end
 			end
 		elseif s ~= 0 then
 			CM.spd2ZeroSince = nil
@@ -699,19 +863,26 @@ function CM.paceV2(now)
 	-- ahead. Joiners pace against the leader's clock alone (CM.pidPace,
 	-- CM.catchUpTick).
 	if CM.isLeader() then
-		-- the host's speed buttons, or a /speed request newer than the last press
-		local eff = CM.myCeiling
-		if eff < 0 then eff = 0 end
+		-- the mean of the players' votes, the host's pause, or a /speed request newer than the last vote
+		local avg, vt, n = CM.voteSpeed()
+		local eff, why
+		if CM.myCeiling <= 0 then
+			eff, why = 0, "the host paused the session"
+		elseif avg then
+			eff, why = avg, string.format("the mean of %d: %s", n, CM.voteWords(vt))
+		else
+			eff, why = CM.myCeiling, "host's speed"
+		end
 		local req = CM.speedRequest()
-		local why = "host's speed buttons"
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
-		if CM.spdReqInForce then eff = req; why = CM.guiReq and "host's dashboard speed buttons" or "/speed request" end
+		if CM.spdReqInForce then eff = req; why = "/speed request" end
 		CM.syncTick(now, s)
 		local changed = (eff ~= CM.effSpeed)
-		CM.effSpeed = eff
-		if not changed and (CM.ticks % 25) == 0 then CM.broadcast(string.format("LSEFF v=%g", eff)) end   -- a newcomer needs it at load
+		local recounted = (vt ~= CM.voteCounted)
+		CM.effSpeed, CM.voteCounted = eff, vt
+		-- and every 25 ticks: a newcomer needs it at load
+		if changed or recounted or (CM.ticks % 25) == 0 then CM.broadcast(CM.lseffLine(eff, vt)) end
 		if changed then
-			CM.broadcast(string.format("LSEFF v=%g", eff))
 			log(string.format("SPEED2: session speed -> %g (%s)", eff, why))
 		end
 	end
