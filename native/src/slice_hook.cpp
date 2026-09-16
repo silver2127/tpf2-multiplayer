@@ -225,13 +225,15 @@ static volatile LONG g_pendingIsConx = 0;
 static volatile LONG g_pendingIsConu = 0;
 static int32_t       g_conupOldId    = 0;
 static bool StashConupFromProposal(uint64_t r8);   // defined with the CONUP writer below
-static char  g_conxpFile[512];
-static float g_conxpT[16];
-// 64 KB: a modular station with a dozen modules is ~9 KB of params, and at
-// 8 KB the walk truncated, the upgrade ran natively on the host only, and the
-// peer rebuilt the station from a coalesced full-params edit -- 4 edges, the
-// track heights and the price differed (desync 2026-09-16).
-static char  g_conxpParams[65536];
+static std::string g_conxpFile;
+static float       g_conxpT[16];
+// Growable, no cap (2026-09-16). A modular station with a dozen modules is
+// ~9 KB of params; at the old 8 KB the walk truncated, the upgrade ran natively
+// on the host only, and the peer rebuilt the station from a coalesced
+// full-params edit -- 4 edges, the track heights and the price differed. 64 KB
+// was the next cap. Now whatever the engine holds ships whole, or the walk
+// refuses loudly and the placement runs natively with the notice.
+static std::string g_conxpParams;
 // Stop/signal/waypoint cancel. Decoded off the proposal's
 // edgeObjectsToAdd record at the factory, written as STOPX from the Add hook
 // only once the cancel landed (else dropped: the poll captures the native
@@ -262,7 +264,7 @@ static volatile LONG g_pendingIsAssets = 0;
 static char*    g_assetB64 = nullptr;
 static uint64_t g_assetBlobLen = 0;
 static long     g_assetStashSeq = 0;
-static char     g_assetRemoveIds[4096] = "";
+static std::string g_assetRemoveIds;          // "id,id,...": as long as the stroke needs
 static int      g_assetRemoveCount = 0;
 // THE STROKE WAITS FOR THE REPLAY (docs/re/PROPOSALS.md, Commit and apply).
 // The terrain modifier commits mid-stroke (30 entries / 300k cells) and applies
@@ -637,6 +639,20 @@ struct Node { float x, y, z; int32_t id; };
 // embankment ("game infers landscape instead of a bridge", 2026-08-29).
 struct Edge { int32_t node0, node1; float t0[3], t1[3]; int32_t btype, bidx; };
 
+// A vector span past this is a misread pointer, not a command. The engine keeps
+// a proposal's records in memory and nothing a player can do -- a road drag, a
+// station with every module, a brush stroke -- comes anywhere near 1 GiB of
+// them. It is not a content limit; tripping it is logged with the size so a
+// refusal is never mistaken for one.
+static const uint64_t PROPOSAL_SANITY_BYTES = 1ull << 30;
+
+static void LogBadSpan(const char* what, uint64_t at, uint64_t span, uint64_t rec)
+{
+    Log("[slice] %s vector at %llx spans %llu B -- %s, not decoded\n", what,
+        (unsigned long long)at, (unsigned long long)span,
+        span % rec ? "not whole records" : "past the misread-pointer bound");
+}
+
 // Every edge record the vector holds, however many: a long road drag or a
 // station upgrade re-adding all its internal track is one proposal, and the
 // 0x20000-byte span (1,092 edges) plus the callers' fixed arrays this once had
@@ -694,33 +710,21 @@ static int DecodeNodesVec(uint64_t a2, std::vector<Node>* out, const char* tag)
     return n;
 }
 
-// Fixed-buffer readers, kept for the construction placement's ROADC companion
-// (its buffers are that caller's own). They no longer cap the DECODE: a vector
-// longer than the buffer is logged as truncated so it can never pass silently.
-static int DecodeEdges(uint64_t a2, Edge* out, int maxOut)
+// Vector-returning readers for the construction placement's ROADC companion
+// (its caller keeps whole vectors too). Empty when the vector does not read or
+// is empty; the -1 case is already logged by the *Vec reader.
+static std::vector<Edge> DecodeEdges(uint64_t a2)
 {
     std::vector<Edge> v;
-    int n = DecodeEdgesVec(a2, &v, "edges");
-    if (n <= 0) return 0;
-    if (n > maxOut) {
-        Log("[slice] edges: %d records but this caller's buffer holds %d -- TRUNCATED, the tail does not ship\n", n, maxOut);
-        n = maxOut;
-    }
-    memcpy(out, v.data(), (size_t)n * sizeof(Edge));
-    return n;
+    DecodeEdgesVec(a2, &v, "edges");
+    return v;
 }
 
-static int DecodeNodes(uint64_t a2, Node* out, int maxOut)
+static std::vector<Node> DecodeNodes(uint64_t a2)
 {
     std::vector<Node> v;
-    int n = DecodeNodesVec(a2, &v, "nodes");
-    if (n <= 0) return 0;
-    if (n > maxOut) {
-        Log("[slice] nodes: %d records but this caller's buffer holds %d -- TRUNCATED, the tail does not ship\n", n, maxOut);
-        n = maxOut;
-    }
-    memcpy(out, v.data(), (size_t)n * sizeof(Node));
-    return n;
+    DecodeNodesVec(a2, &v, "nodes");
+    return v;
 }
 
 // Edge type fields, decoded by diffing three builds: two roads of different
@@ -1052,6 +1056,22 @@ static uint64_t ReadVec(uint64_t vecAddr, uint64_t* pbegin, uint64_t maxSpan)
     if (span > maxSpan) return 0;
     if (!Readable((void*)b, (size_t)span)) return 0;
     *pbegin = b;
+    return span;
+}
+
+// ReadVec against the misread bound, saying so when it trips: the size has to
+// reach the log, or the refusal passes for a shape decision ("not a stroke").
+static uint64_t ReadVecLoud(uint64_t vecAddr, uint64_t* pbegin, const char* what)
+{
+    const uint64_t span = ReadVec(vecAddr, pbegin, PROPOSAL_SANITY_BYTES);
+    if (!span && Readable((void*)vecAddr, 16)) {
+        uint64_t b = 0, e = 0;
+        memcpy(&b, (void*)vecAddr, 8);
+        memcpy(&e, (void*)(vecAddr + 8), 8);
+        if (b >= 0x10000 && e > b && e - b > PROPOSAL_SANITY_BYTES)
+            Log("[slice] %s vector at %llx spans %llu B -- past the misread-pointer bound, not read\n",
+                what, (unsigned long long)vecAddr, (unsigned long long)(e - b));
+    }
     return span;
 }
 
@@ -2236,26 +2256,39 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
 //   4 = nested map @0. Recursive, so a station's modules map is just a tag-4
 //   value and one walker covers every construction.
 // Emitted as the text lockstep.lua ser() makes (lockstep.lua:2684): [k]=v pairs,
-// %.14g numbers (Lua tostring: "1" not "1.0"), %q strings, nested {}, depth cap
-// 8. In-order tree traversal is ser()'s own order (the map compares tag then
+// %.14g numbers (Lua tostring: "1" not "1.0"), %q strings, nested {} to any
+// depth. In-order tree traversal is ser()'s own order (the map compares tag then
 // value: numbers before strings, each ascending) -- and byte-equality is not
 // load-bearing anyway: the peer only load()s the string (deserParams), and the
 // edit tracker re-derives its baseline locally from the built entity (8220).
 // Tags not yet observed (bool/nil) are logged RAW and omitted, exactly as ser()
 // omits what it cannot serialise; the live dump names them.
-static const int CONXP_MAX_DEPTH = 8;      // == K.MAX_SER_DEPTH
-static const int CONXP_MAX_NODES = 2048;   // whole-tree cap, all levels
+// Nothing here is a content limit (2026-09-16). The old walker had a depth cap
+// of 8 (a deeper table silently became {}), a 2048-node cap on the whole tree,
+// a 4096-byte string cap and 256/1024-byte key/value buffers that CUT a longer
+// string without a word. Now: strings of any length, tables of any size and
+// depth, and every refusal is loud and refuses the WHOLE params -- the
+// placement then runs natively with the notice, never with a partial literal.
+// The two bounds that remain are misread-pointer guards: a string past 256 MiB
+// or a map past 16M entries is not a params table but garbage.
+static const uint64_t SSO_SANITY_LEN        = 256ull << 20;
+static const uint64_t CONXP_SANITY_ENTRIES  = 1ull << 24;
 
 // MSVC std::string (len @+0x10, cap @+0x18, chars inline iff cap < 16 else heap
-// ptr @+0x00) -> out. False on anything unreadable or absurd.
-static bool ReadSsoString(uint64_t sa, char* out, size_t cap)
+// ptr @+0x00) -> out, whole. False on anything unreadable.
+static bool ReadSsoString(uint64_t sa, std::string* out)
 {
-    out[0] = 0;
+    out->clear();
     if (!Readable((void*)sa, 0x20)) return false;
     uint64_t len = 0, scap = 0;
     memcpy(&len, (void*)(sa + 0x10), 8);
     memcpy(&scap, (void*)(sa + 0x18), 8);
-    if (len > 4096 || scap < len) return false;
+    if (scap < len) return false;
+    if (len > SSO_SANITY_LEN) {
+        Log("[sso] string at %llx claims len=%llu cap=%llu -- a misread pointer, refused\n",
+            (unsigned long long)sa, (unsigned long long)len, (unsigned long long)scap);
+        return false;
+    }
     const char* chars = nullptr;
     if (scap < 16) chars = (const char*)sa;
     else {
@@ -2264,68 +2297,118 @@ static bool ReadSsoString(uint64_t sa, char* out, size_t cap)
         if (IsHeapPtr(hp) && Readable((void*)hp, (size_t)len)) chars = (const char*)hp;
     }
     if (!chars) return false;
-    size_t take = (size_t)len < cap - 1 ? (size_t)len : cap - 1;
-    memcpy(out, chars, take);
+    out->assign(chars, (size_t)len);
+    return true;
+}
+// The fixed-buffer form for a reader that keeps a char array (the stop name):
+// cut to cap-1 there, which is that reader's own bound, not the reader's.
+static bool ReadSsoString(uint64_t sa, char* out, size_t cap)
+{
+    out[0] = 0;
+    std::string s;
+    if (!ReadSsoString(sa, &s)) return false;
+    const size_t take = s.size() < cap - 1 ? s.size() : cap - 1;
+    memcpy(out, s.data(), take);
     out[take] = 0;
     return true;
 }
 
-struct ConxpOut { char* p; size_t cap; size_t n; bool trunc; };
-static void CoPut(ConxpOut* o, const char* t)
+struct ConxpOut { std::string s; };
+static void CoPut(ConxpOut* o, const char* t) { o->s.append(t); }
+// Lua %q: double-quoted, " \ and control characters escaped so load() takes it
+// back. Length-aware: an embedded NUL is escaped like any other control byte.
+static void CoPutQ(ConxpOut* o, const std::string& t)
 {
-    size_t l = strlen(t);
-    if (o->n + l + 1 >= o->cap) { o->trunc = true; return; }
-    memcpy(o->p + o->n, t, l); o->n += l; o->p[o->n] = 0;
-}
-// Lua %q: double-quoted, " \ and control characters escaped so load() takes it back.
-static void CoPutQ(ConxpOut* o, const char* t)
-{
-    CoPut(o, "\"");
+    o->s.push_back('"');
     char tmp[8];
-    for (const unsigned char* c = (const unsigned char*)t; *c; c++) {
-        if (*c == '"' || *c == '\\') { tmp[0] = '\\'; tmp[1] = (char)*c; tmp[2] = 0; CoPut(o, tmp); }
-        else if (*c == '\n') CoPut(o, "\\n");
-        else if (*c == '\r') CoPut(o, "\\r");
-        else if (*c < 32 || *c == 127) { snprintf(tmp, sizeof(tmp), "\\%03u", (unsigned)*c); CoPut(o, tmp); }
-        else { tmp[0] = (char)*c; tmp[1] = 0; CoPut(o, tmp); }
+    for (size_t i = 0; i < t.size(); i++) {
+        const unsigned char c = (unsigned char)t[i];
+        if (c == '"' || c == '\\') { o->s.push_back('\\'); o->s.push_back((char)c); }
+        else if (c == '\n') o->s.append("\\n");
+        else if (c == '\r') o->s.append("\\r");
+        else if (c < 32 || c == 127) { snprintf(tmp, sizeof(tmp), "\\%03u", (unsigned)c); o->s.append(tmp); }
+        else o->s.push_back((char)c);
     }
-    CoPut(o, "\"");
+    o->s.push_back('"');
 }
 static void CoPutNum(ConxpOut* o, double d)
 {
     char tmp[64];
     snprintf(tmp, sizeof(tmp), "%.14g", d);
-    CoPut(o, tmp);
+    o->s.append(tmp);
 }
 
-static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes);
+// Walk state: the entry count, and the maps on the current descent -- the cycle
+// guard that took the depth cap's place (see SerLuaTable).
+struct ConxpWalk { int nodes; std::vector<uint64_t> open; };
+
+// 1 = emitted, 0 = omitted (a tag ser() cannot serialise either, logged),
+// -1 = the params are unusable (unreadable, cyclic, absurd): refuse them all.
+static int SerLuaValue(ConxpOut* o, uint64_t var, int depth, ConxpWalk* w);
 
 // One lua::Table (an MSVC _Tree), walked in order and emitted as a Lua literal.
-static bool SerLuaTable(ConxpOut* o, uint64_t map, int depth, int* nodes)
+// False = refuse the whole params; the output is rolled back to where it was.
+static bool SerLuaTable(ConxpOut* o, uint64_t map, int depth, ConxpWalk* w)
 {
-    if (depth >= CONXP_MAX_DEPTH) { CoPut(o, "{}"); return true; }
+    // A lua::Table owns its nested tables by value, so no map can contain an
+    // ancestor: meeting one again on the way down means the walk is reading
+    // garbage. Engine tables never trip this; it replaces the old depth cap.
+    for (uint64_t a : w->open)
+        if (a == map) {
+            Log("[conxp] table %llx met again at depth %d -- a cycle, refusing the params\n",
+                (unsigned long long)map, depth);
+            return false;
+        }
     if (!Readable((void*)map, 0x10)) return false;
     uint64_t head = 0, size = 0;
     memcpy(&head, (void*)map, 8);
     memcpy(&size, (void*)(map + 8), 8);
-    if (!IsHeapPtr(head) || size > (uint64_t)CONXP_MAX_NODES || !Readable((void*)head, 0x70)) return false;
+    if (!IsHeapPtr(head) || !Readable((void*)head, 0x70)) return false;
+    if (size > CONXP_SANITY_ENTRIES) {
+        Log("[conxp] table %llx claims %llu entries at depth %d -- a misread pointer, refusing the params\n",
+            (unsigned long long)map, (unsigned long long)size, depth);
+        return false;
+    }
+    w->open.push_back(map);
+    const size_t mark0 = o->s.size();
+    auto refuse = [&](const char* why, uint64_t seen) {
+        Log("[conxp] table %llx: %s at entry %llu of %llu (depth %d) -- refusing the params\n",
+            (unsigned long long)map, why, (unsigned long long)seen, (unsigned long long)size, depth);
+        o->s.resize(mark0);
+        w->open.pop_back();
+        return false;
+    };
     CoPut(o, "{");
     bool first = true;
+    uint64_t seen = 0;
     uint64_t node = 0;
     memcpy(&node, (void*)head, 8);                      // _Myhead->_Left = begin()
-    while (node && node != head && *nodes < CONXP_MAX_NODES) {
-        if (!Readable((void*)node, 0x70)) break;
-        (*nodes)++;
+    while (node && node != head) {
+        // The tree holds exactly `size` nodes: walking past that is a corrupt
+        // tree, and an unreadable node used to END the walk with a partial
+        // literal on the wire. Both refuse.
+        if (++seen > size) return refuse("walked past its own size", seen);
+        if (!Readable((void*)node, 0x70)) return refuse("unreadable node", seen);
+        w->nodes++;
         uint8_t ktag = *(const uint8_t*)(node + 0x40);
-        size_t mark = o->n;
+        size_t mark = o->s.size();
         bool ok = false;
         if (!first) CoPut(o, ",");
         CoPut(o, "[");
         if (ktag == 2) { double k = 0; memcpy(&k, (void*)(node + 0x20), 8); CoPutNum(o, k); ok = true; }
-        else if (ktag == 3) { char ks[256]; if (ReadSsoString(node + 0x20, ks, sizeof(ks))) { CoPutQ(o, ks); ok = true; } }
+        else if (ktag == 3) {
+            std::string ks;
+            if (!ReadSsoString(node + 0x20, &ks)) return refuse("unreadable string key", seen);
+            CoPutQ(o, ks); ok = true;
+        }
         else Log("[conxp]   key tag %u unknown (depth %d) -- entry skipped\n", (unsigned)ktag, depth);
-        if (ok) { CoPut(o, "]="); ok = SerLuaValue(o, node + 0x48, depth + 1, nodes); }
-        if (ok) first = false; else { o->n = mark; o->p[o->n] = 0; }
+        if (ok) {
+            CoPut(o, "]=");
+            const int r = SerLuaValue(o, node + 0x48, depth + 1, w);
+            if (r < 0) return refuse("unusable value", seen);
+            ok = r == 1;
+        }
+        if (ok) first = false; else o->s.resize(mark);
         // in-order successor (MSVC _Tree): leftmost of the right subtree, else
         // climb while we are our parent's right child; the sentinel ends it.
         uint64_t nx = 0;
@@ -2354,28 +2437,30 @@ static bool SerLuaTable(ConxpOut* o, uint64_t map, int depth, int* nodes)
             node = cur;
         }
     }
+    if (seen != size) return refuse("ended short of its own size", seen);
     CoPut(o, "}");
+    w->open.pop_back();
     return true;
 }
 
-static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes)
+static int SerLuaValue(ConxpOut* o, uint64_t var, int depth, ConxpWalk* w)
 {
-    if (!Readable((void*)var, 0x28)) return false;
+    if (!Readable((void*)var, 0x28)) return -1;
     uint8_t tag = *(const uint8_t*)(var + 0x20);
     // tag 1 = boolean, value in payload byte 0 (Lua type order: nil, boolean,
     // number, string, table). A modular station carries ~20 of these in its
     // modules metadata; omitting them made the rebuilt proposal an
     // "internal error" (2026-09-08, the first modular station placed with the
     // construction cancel).
-    if (tag == 1) { uint8_t b = 0; memcpy(&b, (void*)var, 1); CoPut(o, b ? "true" : "false"); return true; }
-    if (tag == 2) { double d = 0; memcpy(&d, (void*)var, 8); CoPutNum(o, d); return true; }
-    if (tag == 3) { char t[1024]; if (!ReadSsoString(var, t, sizeof(t))) return false; CoPutQ(o, t); return true; }
-    if (tag == 4) return SerLuaTable(o, var, depth, nodes);
+    if (tag == 1) { uint8_t b = 0; memcpy(&b, (void*)var, 1); CoPut(o, b ? "true" : "false"); return 1; }
+    if (tag == 2) { double d = 0; memcpy(&d, (void*)var, 8); CoPutNum(o, d); return 1; }
+    if (tag == 3) { std::string t; if (!ReadSsoString(var, &t)) return -1; CoPutQ(o, t); return 1; }
+    if (tag == 4) return SerLuaTable(o, var, depth, w) ? 1 : -1;
     uint64_t q0 = 0;
     memcpy(&q0, (void*)var, 8);
     Log("[conxp]   value tag %u unknown (depth %d) payload0=%016llx -- omitted\n",
         (unsigned)tag, depth, (unsigned long long)q0);
-    return false;
+    return 0;
 }
 
 // Serialise the FIRST toAdd ConstructionEntity of the factory's Proposal (r8)
@@ -2383,25 +2468,28 @@ static bool SerLuaValue(ConxpOut* o, uint64_t var, int depth, int* nodes)
 // and today's capture path takes over): never cancel on data we cannot replay.
 static bool StashConxpFromProposal(uint64_t r8)
 {
-    g_conxpFile[0] = 0; g_conxpParams[0] = 0;
+    g_conxpFile.clear(); g_conxpParams.clear();
     if (!Readable((void*)(r8 + 0x1f8), 16)) return false;
     uint64_t cb = 0, ce = 0;
     memcpy(&cb, (void*)(r8 + 0x1f8), 8);
     memcpy(&ce, (void*)(r8 + 0x200), 8);
     if (!IsHeapPtr(cb) || ce < cb + 0x8e0 || !Readable((void*)cb, 0x8e0)) return false;
-    if (!ReadSsoString(cb, g_conxpFile, sizeof(g_conxpFile)) || !g_conxpFile[0]) return false;
+    if (!ReadSsoString(cb, &g_conxpFile) || g_conxpFile.empty()) return false;
     memcpy(g_conxpT, (void*)(cb + 0x728), sizeof(g_conxpT));
-    ConxpOut o = { g_conxpParams, sizeof(g_conxpParams), 0, false };
-    int nodes = 0;
-    bool ok = SerLuaTable(&o, cb + 0x460, 0, &nodes);
-    if (!ok || o.trunc || nodes == 0) {
+    ConxpOut o;
+    ConxpWalk w = { 0, {} };
+    bool ok = SerLuaTable(&o, cb + 0x460, 0, &w);
+    if (!ok || w.nodes == 0) {
         Log("[conxp] params walk %s (nodes=%d) -- not shipped\n",
-            !ok ? "failed" : (o.trunc ? "truncated" : "found no entries"), nodes);
-        g_conxpParams[0] = 0;
+            !ok ? "failed" : "found no entries", w.nodes);
+        g_conxpParams.clear();
         return false;
     }
-    Log("[conxp] %s pos=(%.1f,%.1f,%.1f) params(%d node(s))=%s\n", g_conxpFile,
-        g_conxpT[12], g_conxpT[13], g_conxpT[14], nodes, g_conxpParams);
+    g_conxpParams.swap(o.s);
+    const int nodes = w.nodes;
+    Log("[conxp] %s pos=(%.1f,%.1f,%.1f) params(%d node(s), %zu B)=%.600s%s\n", g_conxpFile.c_str(),
+        g_conxpT[12], g_conxpT[13], g_conxpT[14], nodes, g_conxpParams.size(), g_conxpParams.c_str(),
+        g_conxpParams.size() > 600 ? "..." : "");
     // PROBE (2026-09-08): does a construction placement carry the footprint
     // buildings the engine is about to demolish, in the proposal's toRemove
     // vector<int> at r8+0x1e0? If it does, the cancel flow can ship that exact
@@ -2435,17 +2523,19 @@ static bool StashConxpFromProposal(uint64_t r8)
 static void WriteInjectConxp()
 {
     ReadInstance();
-    if (!g_instance[0] || !g_conxpFile[0]) return;
+    if (!g_instance[0] || g_conxpFile.empty()) return;
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    fprintf(f, "CONXP %s t=", g_conxpFile);
+    fprintf(f, "CONXP %s t=", g_conxpFile.c_str());
     for (int i = 0; i < 16; i++) fprintf(f, "%s%.4f", i ? "," : "", g_conxpT[i]);
-    fprintf(f, " params=%s\n", g_conxpParams);
+    fputs(" params=", f);
+    fwrite(g_conxpParams.data(), 1, g_conxpParams.size(), f);
+    fputc('\n', f);
     fclose(f);
-    Log("[slice] CONXP shipped: %s\n", g_conxpFile);
-    g_conxpFile[0] = 0;
+    Log("[slice] CONXP shipped: %s (%zu B params)\n", g_conxpFile.c_str(), g_conxpParams.size());
+    g_conxpFile.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -2637,17 +2727,19 @@ static bool StashConupFromProposal(uint64_t r8)
 static void WriteInjectConup()
 {
     ReadInstance();
-    if (!g_instance[0] || !g_conxpFile[0] || g_conupOldId <= 0) return;
+    if (!g_instance[0] || g_conxpFile.empty() || g_conupOldId <= 0) return;
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
     FILE* f = _fsopen(p, "a", _SH_DENYNO);
     if (!f) { Log("[slice] cannot open %s\n", p); return; }
-    fprintf(f, "CONUP %d %s t=", g_conupOldId, g_conxpFile);
+    fprintf(f, "CONUP %d %s t=", g_conupOldId, g_conxpFile.c_str());
     for (int i = 0; i < 16; i++) fprintf(f, "%s%.4f", i ? "," : "", g_conxpT[i]);
-    fprintf(f, " params=%s\n", g_conxpParams);
+    fputs(" params=", f);
+    fwrite(g_conxpParams.data(), 1, g_conxpParams.size(), f);
+    fputc('\n', f);
     fclose(f);
-    Log("[slice] CONUP shipped: old=%d %s\n", g_conupOldId, g_conxpFile);
-    g_conxpFile[0] = 0; g_conupOldId = 0;
+    Log("[slice] CONUP shipped: old=%d %s (%zu B params)\n", g_conupOldId, g_conxpFile.c_str(), g_conxpParams.size());
+    g_conxpFile.clear(); g_conupOldId = 0;
 }
 
 // Shape test for an upgrade proposal: something removed, a CE added, no new
@@ -2777,8 +2869,17 @@ static bool MergeTemplateStreet(uint64_t r8)
     memcpy(&cb, (void*)(r8 + 0x1f8), 8); memcpy(&ce, (void*)(r8 + 0x200), 8);
     if (!IsHeapPtr(cb) || ce <= cb) return false;          // no construction: not ours
     if (!IsHeapPtr(nb) || ne <= nb || !IsHeapPtr(sb) || se <= sb) return false;
+    // Whole records only, any count. The old 64-node / 64-segment cap made this
+    // and the station weld answer "not ours" to a bigger placement on every
+    // instance, so the raw apron was built beside ours. The span bound is the
+    // misread-pointer guard (PROPOSAL_SANITY_BYTES), logged when it trips.
+    if ((ne - nb) % 24 || (se - sb) % 120 || ne - nb > PROPOSAL_SANITY_BYTES || se - sb > PROPOSAL_SANITY_BYTES) {
+        Log("[merge] node/segment vectors span %llu/%llu B -- not whole records or past the misread bound, not ours\n",
+            (unsigned long long)(ne - nb), (unsigned long long)(se - sb));
+        return false;
+    }
     int n = (int)((ne - nb) / 24), m = (int)((se - sb) / 120);
-    if (n < 2 || n > 64 || m < 1 || m > 64) return false;
+    if (n < 2 || m < 1) return false;
     if (!Readable((void*)nb, (size_t)(ne - nb)) || !Readable((void*)sb, (size_t)(se - sb))) return false;
     uint8_t* N = (uint8_t*)nb;
     uint8_t* S = (uint8_t*)sb;
@@ -2789,7 +2890,7 @@ static bool MergeTemplateStreet(uint64_t r8)
     // conversion stamps 0x7f00 on OUR node as well (rail depot dump 2026-08-30:
     // our -1 at index 0 already 0x7f00), so "first 0x7f00 node" saw no nodes of
     // ours and every rail depot replayed with the raw apron beside ours.
-    bool isT[64] = {}; int nT = 0;
+    std::vector<uint8_t> isT(n, 0); int nT = 0;
     for (int s = 0; s < m; s++) {
         uint32_t owned; memcpy(&owned, S + s * 120 + 0x74, 4);
         if (owned != 1) continue;
@@ -3068,7 +3169,7 @@ static void AppendTerrainBlob(uint8_t* buf, uint64_t* p, const TerrainGrid& g)
     *p += g.bytes;
 }
 
-static bool ReadSsoString(uint64_t sa, char* out, size_t cap);   // the CONXP walker's reader
+static bool ReadSsoString(uint64_t sa, std::string* out);   // the CONXP walker's reader
 static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
 {
     if (!Readable((void*)r8, 0x2f8)) { Log("[terrain] proposal unreadable\n"); return false; }
@@ -3485,45 +3586,39 @@ static const uintptr_t RVA_VEC_48_GROW   = 0x3c8b40;  // vector<0x48 record>::_E
 static const uintptr_t RVA_VEC_TM_ASSIGN = 0x3c7780;  // vector<TransformedModel>::assign(vec, first, last)
 static const uintptr_t RVA_VEC_INT_GROW  = 0x0e8060;  // vector<int>::_Emplace_reallocate(vec, where, const int&)
 static const int32_t   ASSET_GROUP_TYPE  = 0xb;
-static const uint32_t  ASSET_MAX_MODELS  = 20000;     // per record
-static const uint32_t  ASSET_MAX_RECORDS = 4096;
-static const size_t    ASSET_MAX_STRING  = 511;
+// Wire version 2 (2026-09-16): string lengths are u32 and no count has a cap.
+// v1 capped a stroke at 4096 groups of 20000 models with 511-byte strings, and
+// an over-cap stroke ran on the originator only -- the town-growth desync the
+// asset brush was known for. Both ends of the wire are this DLL (the lobby
+// gates on the exact version), so v1 is simply refused.
+static const uint32_t  ASSET_WIRE_VERSION = 2;
 
-struct AssetBlob { uint8_t* p; uint64_t n, cap; bool bad; };
-static void AbPut(AssetBlob* b, const void* d, uint64_t len)
+// The stroke blob, in memory, as big as the stroke.
+static void AbPut(std::vector<uint8_t>* b, const void* d, uint64_t len)
 {
-    if (b->bad || !len) return;
-    if (b->n + len > b->cap) {
-        uint64_t nc = b->cap ? b->cap * 2 : 65536;
-        while (nc < b->n + len) nc *= 2;
-        if (nc > TERRAIN_MAX_BYTES) { b->bad = true; return; }
-        uint8_t* np = (uint8_t*)realloc(b->p, (size_t)nc);
-        if (!np) { b->bad = true; return; }
-        b->p = np; b->cap = nc;
-    }
-    memcpy(b->p + b->n, d, (size_t)len);
-    b->n += len;
+    const uint8_t* p = (const uint8_t*)d;
+    b->insert(b->end(), p, p + (size_t)len);
 }
 
-// An asset-brush stroke off the ProposalAction commit: "TPAS", u32 version 1,
+// An asset-brush stroke off the ProposalAction commit: "TPAS", u32 version 2,
 // u32 records, u32 removals, then per record u32 models and per model
-// u16 + model path, u16 + second string, 64 bytes of Mat4f. Stashed as base64
+// u32 + model path, u32 + second string, 64 bytes of Mat4f. Stashed as base64
 // with the removed group ids; false (and nothing stashed) for anything that is
 // not purely an asset stroke or does not read cleanly -- never ship bad data.
 static bool StashAssetsFromProposal(uint64_t r8, long seq)
 {
     if (!Readable((void*)r8, 0x2f8)) return false;
     uint64_t ab = 0, rb = 0, b = 0;
-    const uint64_t toAddB = ReadVec(r8 + 0x1f8, &ab, TERRAIN_MAX_BYTES);
-    const uint64_t toRmB  = ReadVec(r8 + 0x1e0, &rb, TERRAIN_MAX_BYTES);
+    const uint64_t toAddB = ReadVecLoud(r8 + 0x1f8, &ab, "asset toAdd");
+    const uint64_t toRmB  = ReadVecLoud(r8 + 0x1e0, &rb, "asset toRemove");
     if (!toAddB && !toRmB) return false;
     // a stroke touches nothing else: no street half, no grids
-    if (ReadVec(r8 + 0x00, &b, TERRAIN_MAX_BYTES) || ReadVec(r8 + 0x18, &b, TERRAIN_MAX_BYTES) ||
-        ReadVec(r8 + 0x30, &b, TERRAIN_MAX_BYTES) || ReadVec(r8 + 0x48, &b, TERRAIN_MAX_BYTES) ||
-        ReadVec(r8 + 0x288, &b, TERRAIN_MAX_BYTES) || ReadVec(r8 + 0x2b0, &b, TERRAIN_MAX_BYTES) ||
-        ReadVec(r8 + 0x2d8, &b, TERRAIN_MAX_BYTES))
+    if (ReadVec(r8 + 0x00, &b, PROPOSAL_SANITY_BYTES) || ReadVec(r8 + 0x18, &b, PROPOSAL_SANITY_BYTES) ||
+        ReadVec(r8 + 0x30, &b, PROPOSAL_SANITY_BYTES) || ReadVec(r8 + 0x48, &b, PROPOSAL_SANITY_BYTES) ||
+        ReadVec(r8 + 0x288, &b, PROPOSAL_SANITY_BYTES) || ReadVec(r8 + 0x2b0, &b, PROPOSAL_SANITY_BYTES) ||
+        ReadVec(r8 + 0x2d8, &b, PROPOSAL_SANITY_BYTES))
         return false;
-    if (toAddB % 0x8e0 || toRmB % 4 || toAddB / 0x8e0 > ASSET_MAX_RECORDS) {
+    if (toAddB % 0x8e0 || toRmB % 4) {
         Log("[asset] #%ld toAdd %lluB / toRemove %lluB do not divide into records -- not an asset stroke\n",
             seq, (unsigned long long)toAddB, (unsigned long long)toRmB);
         return false;
@@ -3531,74 +3626,70 @@ static bool StashAssetsFromProposal(uint64_t r8, long seq)
     const uint32_t nrec = (uint32_t)(toAddB / 0x8e0);
     const uint32_t nrm  = (uint32_t)(toRmB / 4);
 
-    // the removed ids, as text for the mod (it turns them into positions)
-    char ids[sizeof(g_assetRemoveIds)] = "";
-    size_t io = 0;
-    for (uint32_t i = 0; i < nrm; i++) {
-        int32_t id = 0;
-        memcpy(&id, (void*)(rb + (uint64_t)i * 4), 4);
-        int w = snprintf(ids + io, sizeof(ids) - io, "%s%d", i ? "," : "", id);
-        if (w < 0 || (size_t)w >= sizeof(ids) - io) {
-            Log("[asset] #%ld %u removals do not fit the inject line -- not replicated\n", seq, nrm);
-            return false;
-        }
-        io += (size_t)w;
-    }
-
-    AssetBlob out = { nullptr, 0, 0, false };
-    const uint32_t ver = 1;
-    AbPut(&out, "TPAS", 4); AbPut(&out, &ver, 4); AbPut(&out, &nrec, 4); AbPut(&out, &nrm, 4);
+    std::vector<uint8_t> out;
+    std::string ids, first;
     uint64_t models = 0;
-    char first[ASSET_MAX_STRING + 1] = "";
     float fx = 0, fy = 0, fz = 0;
     const char* why = nullptr;
-    for (uint32_t i = 0; i < nrec && !why && !out.bad; i++) {
-        const uint64_t ce = ab + (uint64_t)i * 0x8e0;
-        if (!Readable((void*)ce, 0x8e0)) { why = "a record is unreadable"; break; }
-        int32_t type = 0;
-        memcpy(&type, (void*)(ce + 0x20), 4);
-        if (type != ASSET_GROUP_TYPE) { why = "a record is not an asset group (type != 0xb)"; break; }
-        uint64_t mb = 0, me = 0;
-        memcpy(&mb, (void*)(ce + 0x470), 8);
-        memcpy(&me, (void*)(ce + 0x478), 8);
-        if (me < mb || (me - mb) % 0x80 || (me - mb) / 0x80 > ASSET_MAX_MODELS || me == mb ||
-            !Readable((void*)mb, (size_t)(me - mb))) { why = "a record's model list does not read"; break; }
-        const uint32_t nm = (uint32_t)((me - mb) / 0x80);
-        AbPut(&out, &nm, 4);
-        for (uint32_t k = 0; k < nm; k++) {
-            const uint64_t tm = mb + (uint64_t)k * 0x80;
-            char s1[ASSET_MAX_STRING + 1], s2[ASSET_MAX_STRING + 1];
-            uint64_t l1 = 0, l2 = 0;
-            memcpy(&l1, (void*)(tm + 0x10), 8);
-            memcpy(&l2, (void*)(tm + 0x30), 8);
-            if (l1 == 0 || l1 > ASSET_MAX_STRING || l2 > ASSET_MAX_STRING ||
-                !ReadSsoString(tm, s1, sizeof(s1)) || !ReadSsoString(tm + 0x20, s2, sizeof(s2)) ||
-                strlen(s1) != l1 || strlen(s2) != l2) { why = "a model's strings do not read"; break; }
-            const uint16_t w1 = (uint16_t)l1, w2 = (uint16_t)l2;
-            AbPut(&out, &w1, 2); AbPut(&out, s1, l1);
-            AbPut(&out, &w2, 2); AbPut(&out, s2, l2);
-            AbPut(&out, (void*)(tm + 0x40), 0x40);
-            if (models == 0) {
-                strcpy_s(first, s1);
-                memcpy(&fx, (void*)(tm + 0x70), 4); memcpy(&fy, (void*)(tm + 0x74), 4); memcpy(&fz, (void*)(tm + 0x78), 4);
-            }
-            models++;
+    try {
+        // the removed ids, as text for the mod (it turns them into positions)
+        for (uint32_t i = 0; i < nrm; i++) {
+            int32_t id = 0;
+            memcpy(&id, (void*)(rb + (uint64_t)i * 4), 4);
+            if (i) ids.push_back(',');
+            ids.append(std::to_string(id));
         }
+        AbPut(&out, "TPAS", 4); AbPut(&out, &ASSET_WIRE_VERSION, 4); AbPut(&out, &nrec, 4); AbPut(&out, &nrm, 4);
+        std::string s1, s2;
+        for (uint32_t i = 0; i < nrec && !why; i++) {
+            const uint64_t ce = ab + (uint64_t)i * 0x8e0;
+            if (!Readable((void*)ce, 0x8e0)) { why = "a record is unreadable"; break; }
+            int32_t type = 0;
+            memcpy(&type, (void*)(ce + 0x20), 4);
+            if (type != ASSET_GROUP_TYPE) { why = "a record is not an asset group (type != 0xb)"; break; }
+            uint64_t mb = 0, me = 0;
+            memcpy(&mb, (void*)(ce + 0x470), 8);
+            memcpy(&me, (void*)(ce + 0x478), 8);
+            if (me > mb && me - mb > PROPOSAL_SANITY_BYTES) {
+                Log("[asset] #%ld record %u: model vector spans %llu B -- past the misread-pointer bound\n",
+                    seq, i, (unsigned long long)(me - mb));
+                why = "a record's model list is a misread pointer"; break;
+            }
+            if (me < mb || (me - mb) % 0x80 || me == mb ||
+                !Readable((void*)mb, (size_t)(me - mb))) { why = "a record's model list does not read"; break; }
+            const uint32_t nm = (uint32_t)((me - mb) / 0x80);
+            AbPut(&out, &nm, 4);
+            for (uint32_t k = 0; k < nm; k++) {
+                const uint64_t tm = mb + (uint64_t)k * 0x80;
+                if (!ReadSsoString(tm, &s1) || s1.empty() || !ReadSsoString(tm + 0x20, &s2)) {
+                    why = "a model's strings do not read"; break;
+                }
+                const uint32_t w1 = (uint32_t)s1.size(), w2 = (uint32_t)s2.size();
+                AbPut(&out, &w1, 4); AbPut(&out, s1.data(), w1);
+                AbPut(&out, &w2, 4); AbPut(&out, s2.data(), w2);
+                AbPut(&out, (void*)(tm + 0x40), 0x40);
+                if (models == 0) {
+                    first = s1;
+                    memcpy(&fx, (void*)(tm + 0x70), 4); memcpy(&fy, (void*)(tm + 0x74), 4); memcpy(&fz, (void*)(tm + 0x78), 4);
+                }
+                models++;
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        why = "out of memory stashing the stroke";
     }
-    if (why || out.bad) {
-        Log("[asset] #%ld %s -- the stroke runs here only, NOT replicated\n", seq, why ? why : "the stroke is too big to ship");
-        free(out.p);
+    if (why) {
+        Log("[asset] #%ld %s -- the stroke runs here only, NOT replicated\n", seq, why);
         return false;
     }
-    char* b64 = Base64Encode(out.p, out.n);
-    if (!b64) { free(out.p); Log("[asset] #%ld base64 encode failed -- NOT replicated\n", seq); return false; }
+    char* b64 = Base64Encode(out.data(), out.size());
+    if (!b64) { Log("[asset] #%ld base64 encode failed -- NOT replicated\n", seq); return false; }
     free(g_assetB64);
-    g_assetB64 = b64; g_assetBlobLen = out.n; g_assetStashSeq = seq;
-    strcpy_s(g_assetRemoveIds, ids);
+    g_assetB64 = b64; g_assetBlobLen = out.size(); g_assetStashSeq = seq;
+    g_assetRemoveIds.swap(ids);
     g_assetRemoveCount = (int)nrm;
-    Log("[asset] #%ld stashed: %u group(s), %llu model(s), %u removal(s); first '%s' at (%.1f,%.1f,%.1f); %lluB\n",
-        seq, nrec, (unsigned long long)models, nrm, first, fx, fy, fz, (unsigned long long)out.n);
-    free(out.p);
+    Log("[asset] #%ld stashed: %u group(s), %llu model(s), %u removal(s); first '%.200s' at (%.1f,%.1f,%.1f); %lluB\n",
+        seq, nrec, (unsigned long long)models, nrm, first.c_str(), fx, fy, fz, (unsigned long long)out.size());
     return true;
 }
 
@@ -3616,7 +3707,7 @@ static void WriteInjectAssets(bool armed)
     if (f) {
         fprintf(f, "ASSETCAP %llu ", (unsigned long long)g_assetBlobLen);
         fwrite(b64, 1, strlen(b64), f);
-        fprintf(f, " %d %s\n", g_assetRemoveCount, g_assetRemoveCount ? g_assetRemoveIds : "-");
+        fprintf(f, " %d %s\n", g_assetRemoveCount, g_assetRemoveCount ? g_assetRemoveIds.c_str() : "-");
         fclose(f);
         Log("[asset] #%ld shipped: %lluB stroke, %d removal(s) (%s)\n", g_assetStashSeq,
             (unsigned long long)g_assetBlobLen, g_assetRemoveCount,
@@ -3669,7 +3760,7 @@ static const char* ParseAssetStroke(const std::string& text, std::vector<int32_t
         while (*s) {
             char* e = nullptr;
             const long v = strtol(s, &e, 10);
-            if (e == s || v <= 0 || rm->size() >= 4096) return "bad removal list";
+            if (e == s || v <= 0) return "bad removal list";
             rm->push_back((int32_t)v);
             if (*e == ',') s = e + 1;
             else if (*e == 0) s = e;
@@ -3691,17 +3782,22 @@ static const char* ParseAssetStroke(const std::string& text, std::vector<int32_t
     uint32_t ver = 0, nrec = 0, nrm = 0;
     char magic[4];
     if (!take(magic, 4) || memcmp(magic, "TPAS", 4) != 0) bad = "not a TPAS stroke";
-    else if (!take(&ver, 4) || ver != 1 || !take(&nrec, 4) || !take(&nrm, 4) || nrec > ASSET_MAX_RECORDS) bad = "bad header";
+    // A count is bounded by the bytes behind it, never by a constant: a model
+    // record is at least 4 + 4 + 64 bytes (an empty path then fails as "bad
+    // model path", its own refusal), a group at least 4 + one model.
+    const uint64_t MODEL_MIN = 4 + 4 + 0x40;
+    if (!bad && (!take(&ver, 4) || ver != ASSET_WIRE_VERSION || !take(&nrec, 4) || !take(&nrm, 4) ||
+                 nrec > (rawLen - p) / (4 + MODEL_MIN))) bad = "bad header";
     for (uint32_t i = 0; i < nrec && !bad; i++) {
         uint32_t nm = 0;
-        if (!take(&nm, 4) || nm == 0 || nm > ASSET_MAX_MODELS) { bad = "bad model count"; break; }
+        if (!take(&nm, 4) || nm == 0 || nm > (rawLen - p) / MODEL_MIN) { bad = "bad model count"; break; }
         std::vector<AssetModelSrc> models(nm);
         for (uint32_t k = 0; k < nm && !bad; k++) {
-            uint16_t l1 = 0, l2 = 0;
-            if (!take(&l1, 2) || l1 == 0 || l1 > ASSET_MAX_STRING || l1 > rawLen - p) { bad = "bad model path"; break; }
+            uint32_t l1 = 0, l2 = 0;
+            if (!take(&l1, 4) || l1 == 0 || l1 > rawLen - p) { bad = "bad model path"; break; }
             models[k].model.assign((const char*)raw + p, l1);
             p += l1;
-            if (!take(&l2, 2) || l2 > ASSET_MAX_STRING || l2 > rawLen - p) { bad = "bad second string"; break; }
+            if (!take(&l2, 4) || l2 > rawLen - p) { bad = "bad second string"; break; }
             models[k].extra.assign((const char*)raw + p, l2);
             p += l2;
             if (!take(models[k].m, 0x40)) { bad = "truncated matrix"; break; }
@@ -3730,11 +3826,11 @@ static bool InjectAssetsFromFile(uint64_t r8)
     }
     FILE* f = _fsopen(path, "rb", _SH_DENYNO);
     if (!f) { Log("[asset-inject] inject file present but not readable\n"); return false; }
-    fseek(f, 0, SEEK_END);
-    const long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    _fseeki64(f, 0, SEEK_END);
+    const long long len = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
     std::string text;
-    if (len > 0 && (uint64_t)len <= TERRAIN_MAX_BYTES) {
+    if (len > 0) {   // no size cap: the file is ours, as big as the stroke
         text.resize((size_t)len);
         if (fread(&text[0], 1, (size_t)len, f) != (size_t)len) text.clear();
     }
@@ -3744,7 +3840,7 @@ static bool InjectAssetsFromFile(uint64_t r8)
     std::vector<int32_t> rm;
     std::vector<std::vector<AssetModelSrc>> recs;
     if (const char* bad = ParseAssetStroke(text, &rm, &recs)) {
-        Log("[asset-inject] %s (%ld B) -- left alone\n", bad, len);
+        Log("[asset-inject] %s (%lld B) -- left alone\n", bad, len);
         return false;
     }
 
@@ -3831,6 +3927,72 @@ static void ZeroAddResult(uint64_t rdx)
         *(volatile uint64_t*)rdx = 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[slice] could not zero the Add out-handle at %llx\n", (unsigned long long)rdx);
+    }
+}
+
+// The construction-placement branch of DeferHandler (caller 419f62), in its own
+// function because it holds std::vectors and MSVC forbids objects with
+// destructors in a function that uses __try. Street vectors of ANY size: the
+// old 64-record node, edge and removal buffers made the decoders CLAMP a
+// bigger placement to 64 records, so ROADC shipped a partial street.
+static void ConstructionPlacementAtFactory(uint64_t rcx, uint64_t r8)
+{
+    const std::vector<Node> cn  = DecodeNodes(r8);
+    const std::vector<Edge> ce  = DecodeEdges(r8);
+    const std::vector<Edge> crm = DecodeEdges(r8 + 0x30);
+    const int n = (int)cn.size(), m = (int)ce.size(), re = (int)crm.size();
+    EdgeType cet = DecodeEdgeType(r8);
+    if (m >= 1 && cet.ok) {
+        g_conroad++;
+        Log("[slice] #%ld construction placement: %d street node(s) %d "
+            "edge(s) %d removal(s), type=%s streetType=%d -- shipping ROADC\n",
+            g_conroad, n, m, re, cet.type == 1 ? "TRACK" : "street",
+            cet.streetType);
+        WriteInjectConRoad(cn.data(), n, ce.data(), m, crm.data(), re, cet);
+        // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF. Walk the params off
+        // THIS proposal and stash them; if the Add hook then cancels the
+        // native build it ships them as CONXP and the Lua builds the
+        // scripted proposal at the stamp on EVERY instance, the originator
+        // included -- no native build, no bulldoze, no window.
+        // g_pendingNoCb stays 0: the placement is a TOOL and waits on its
+        // callback.
+        bool stashed = StashConxpFromProposal(r8);
+        if (stashed && SessionLive()) {
+            InterlockedExchange(&g_pendingIsConx, 1);
+            InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+            InterlockedExchange(&g_pendingNoCb, 0);
+            Log("[slice] armed cancel: construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
+                (unsigned long long)rcx);
+        } else if (!stashed) {
+            Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
+            if (SessionLive()) WriteNativeNotice("construction");
+        }
+    } else if (m >= 1) {
+        Log("[slice] construction placement has %d street edge(s) but the "
+            "type decode failed -- NOT shipping ROADC (peer replica will "
+            "stay unconnected)\n", m);
+    } else {
+        // FREE-STANDING (no street edges: a station away from any road, a
+        // harbour, an airport). Nothing to ship as ROADC, but the placement
+        // itself is cancelled and replayed like a road-snapped one: the
+        // Lua ships the stashed params as CONP cancelled=1 when no ROADC
+        // pairs with them, and every instance builds the scripted proposal
+        // at the stamp. Until 2026-09-09 this branch built natively and the
+        // strict path then bulldozed and rebuilt the station, which is the
+        // rebuild that asserted the engine on a modular_station.
+        Log("[slice] construction placement carries no street edges "
+            "(n=%d) -- free-standing\n", n);
+        bool stashed = StashConxpFromProposal(r8);
+        if (stashed && SessionLive()) {
+            InterlockedExchange(&g_pendingIsConx, 1);
+            InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+            InterlockedExchange(&g_pendingNoCb, 0);
+            Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
+                (unsigned long long)rcx);
+        } else if (!stashed) {
+            Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
+            if (SessionLive()) WriteNativeNotice("construction");
+        }
     }
 }
 
@@ -4494,65 +4656,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     // the params do not walk or no session is live, the native build stands.
     if (caller == 0x419f62) {
         __try {
-            Node cn[64];
-            Edge ce[64];
-            Edge crm[64];
-            int n  = DecodeNodes(r8, cn, 64);
-            int m  = DecodeEdges(r8, ce, 64);
-            int re = DecodeEdges(r8 + 0x30, crm, 64);
-            EdgeType cet = DecodeEdgeType(r8);
-            if (m >= 1 && cet.ok) {
-                g_conroad++;
-                Log("[slice] #%ld construction placement: %d street node(s) %d "
-                    "edge(s) %d removal(s), type=%s streetType=%d -- shipping ROADC\n",
-                    g_conroad, n, m, re, cet.type == 1 ? "TRACK" : "street",
-                    cet.streetType);
-                WriteInjectConRoad(cn, n, ce, m, crm, re, cet);
-                // STRICT LOCKSTEP FOR THE PLACEMENT ITSELF. Walk the params off
-                // THIS proposal and stash them; if the Add hook then cancels the
-                // native build it ships them as CONXP and the Lua builds the
-                // scripted proposal at the stamp on EVERY instance, the originator
-                // included -- no native build, no bulldoze, no window.
-                // g_pendingNoCb stays 0: the placement is a TOOL and waits on its
-                // callback.
-                bool stashed = StashConxpFromProposal(r8);
-                if (stashed && SessionLive()) {
-                    InterlockedExchange(&g_pendingIsConx, 1);
-                    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-                    InterlockedExchange(&g_pendingNoCb, 0);
-                    Log("[slice] armed cancel: construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                        (unsigned long long)rcx);
-                } else if (!stashed) {
-                    Log("[slice] construction placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
-                    if (SessionLive()) WriteNativeNotice("construction");
-                }
-            } else if (m >= 1) {
-                Log("[slice] construction placement has %d street edge(s) but the "
-                    "type decode failed -- NOT shipping ROADC (peer replica will "
-                    "stay unconnected)\n", m);
-            } else {
-                // FREE-STANDING (no street edges: a station away from any road, a
-                // harbour, an airport). Nothing to ship as ROADC, but the placement
-                // itself is cancelled and replayed like a road-snapped one: the
-                // Lua ships the stashed params as CONP cancelled=1 when no ROADC
-                // pairs with them, and every instance builds the scripted proposal
-                // at the stamp. Until 2026-09-09 this branch built natively and the
-                // strict path then bulldozed and rebuilt the station, which is the
-                // rebuild that asserted the engine on a modular_station.
-                Log("[slice] construction placement carries no street edges "
-                    "(n=%d) -- free-standing\n", n);
-                bool stashed = StashConxpFromProposal(r8);
-                if (stashed && SessionLive()) {
-                    InterlockedExchange(&g_pendingIsConx, 1);
-                    InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
-                    InterlockedExchange(&g_pendingNoCb, 0);
-                    Log("[slice] armed cancel: free-standing construction placement cmd=%llx -- CONXP ships if the cancel lands\n",
-                        (unsigned long long)rcx);
-                } else if (!stashed) {
-                    Log("[slice] free-standing placement: params not readable -- NOT cancelled, builds natively (safe fallback)\n");
-                    if (SessionLive()) WriteNativeNotice("construction");
-                }
-            }
+            ConstructionPlacementAtFactory(rcx, r8);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             Log("[slice] ROADC decode fault -- placement proceeds, nothing shipped\n");
         }
@@ -4623,7 +4727,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 const bool live = SessionLive();
                 Log("[slice] construction UPGRADE from caller_rva=%llx -- runs natively (params %s)%s\n",
                     (unsigned long long)caller,
-                    g_conxpParams[0] ? "readable" : "not readable",
+                    !g_conxpParams.empty() ? "readable" : "not readable",
                     live ? "; the mod's edit scan or catch-up scan ships it" : "");
                 if (live) WriteNativeNotice("upgrade");
             }
