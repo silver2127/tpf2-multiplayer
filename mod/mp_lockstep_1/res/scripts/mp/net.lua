@@ -418,6 +418,24 @@ function CM.histPump()
 	end
 end
 
+-- Once per tick (lockstep.lua): the extra copies of recently issued commands
+-- (scheduleLocal, K.CMD_REPEATS), one per tick, each with its LSHI.
+function CM.txRepeatTick()
+	local q = CM.txRepeat
+	if not q or #q == 0 then return end
+	local keep = {}
+	for _, e in ipairs(q) do
+		if CM.ticks >= e.due then
+			CM.broadcast(e.wire)
+			if e.hi then CM.broadcast(e.hi) end
+			e.left = e.left - 1
+			e.due = CM.ticks + 1
+		end
+		if e.left > 0 then keep[#keep + 1] = e end
+	end
+	CM.txRepeat = keep
+end
+
 function CM.onNack(o, seq)
 	if o ~= K.INSTANCE then
 		-- the host also answers for OTHER origins from its history: a
@@ -561,16 +579,34 @@ function CM.scheduleLocal(op, args)
 	local wire = encodeCmd(c)
 	CM.recordSent(CM.seqNo, wire)
 	CM.histPush(wire, at)
+	local hi = string.format("LSHI o=%s s=%d at=%.4f", K.INSTANCE, CM.seqNo, at)
 	if CM.dropNextCmd then
 		-- DROPNEXT test hook (inject.lua): kept for resend, announced below, not sent
 		CM.dropNextCmd = nil
 		log(string.format("DROPNEXT: %s seq=%d NOT sent -- peers should hold for it and NACK", op, CM.seqNo))
 	else
-		CM.broadcast(wire)
+		-- SENT MORE THAN ONCE (2026-09-16). Every earlier fix for a lost command
+		-- (NACK, hi= on the heartbeat, the LSHI, the hold, the live catch-up
+		-- write-off) repaired the RECOVERY of a loss, and recovery cannot win at
+		-- 4x: the stamp is about a unit out, a lost packet costs a grace period
+		-- plus a round trip, and the sim has stepped past the stamp long before
+		-- the resend lands -- a's log, 19:03: b's VBUY seq=15 (stamp 2374.8) lost,
+		-- held for 2 ticks, applied at 2385.6, the bus 22 m apart. So the command
+		-- is not sent once: K.CMD_SEND_COPIES copies now, back to back, and one
+		-- more (with its LSHI) on each of the next K.CMD_REPEATS ticks
+		-- (CM.txRepeatTick). Arrival deduplicates (executed[cmdKey] at apply;
+		-- rxNote is idempotent), so a copy that was not needed costs a few
+		-- bytes. Commands are rare; the wire is UDP through a relay.
+		for _ = 1, math.max(1, tonumber(K.CMD_SEND_COPIES) or 1) do CM.broadcast(wire) end
+		local more = tonumber(K.CMD_REPEATS) or 0
+		if more > 0 then
+			CM.txRepeat = CM.txRepeat or {}
+			CM.txRepeat[#CM.txRepeat + 1] = { wire = wire, hi = hi, left = more, due = CM.ticks + 1 }
+		end
 	end
 	-- announce it separately too (a small line, lost independently of the command):
 	-- a peer that misses the LSCMD learns it exists and its stamp, and holds for it
-	CM.broadcast(string.format("LSHI o=%s s=%d at=%.4f", K.INSTANCE, CM.seqNo, at))
+	CM.broadcast(hi)
 	CM.lastSchedAt = at
 	log(string.format("SCHED %s seq=%d at=%.4f (now=%.4f)", op, CM.seqNo, at, now))
 end
@@ -932,7 +968,10 @@ function CM.execDelayTick()
 	end
 	local want, raw = K.EXEC_DELAY, nil
 	if worstMs then
-		raw = worstMs / 1000 * rate
+		-- plus K.DELAY_REPEAT_TICKS ticks (2026-09-16): a command's next-tick copy
+		-- (scheduleLocal) is what survives a burst loss, and it must also land
+		-- before the stamp, so the stamp is one tick further out than one transit
+		raw = (worstMs / 1000 + (tonumber(K.DELAY_REPEAT_TICKS) or 0) * (CM.tickSec or 0.19)) * rate
 		want = math.ceil(raw / K.SIM_STEP - 1e-6) * K.SIM_STEP
 		if want < K.EXEC_DELAY_MIN then want = K.EXEC_DELAY_MIN end
 		if want > K.EXEC_DELAY_MAX then want = K.EXEC_DELAY_MAX end
@@ -1055,7 +1094,18 @@ function CM.gapHoldNeed(now)
 			local top = math.max(r.maxSeq or 0, r.advMax or 0)
 			local topAt = r.stamp and r.stamp[top]
 			for g = (r.firstSeq or 0) + 1, top do
+				local at = r.stamp and r.stamp[g]
+				-- the command this game is holding for right now
+				local held = CM.gapHold ~= nil and CM.gapHold.o == o and CM.gapHold.seq == g
 				local pastGrace = CM.ticks - (r.missSince[g] or CM.ticks) >= K.GAP_HOLD_GRACE_TICKS
+				if not pastGrace and not r.seen[g] and at and at - now <= engage then
+					-- ITS OWN STAMP IS WITHIN REACH (2026-09-16): the LSHI said when it
+					-- is due and that is inside the engage window, so a grace tick spent
+					-- waiting for a reordered packet is a tick the sim keeps stepping
+					-- towards the stamp -- at 4x one batch is four steps. Stop now; if
+					-- the packet was merely reordered it lands and the hold releases.
+					pastGrace = true
+				end
 				if not pastGrace and not r.seen[g] then
 					-- NO GRACE WHEN IT IS DUE NOW. The grace lets a reordered packet land
 					-- without a stop, but the sim keeps stepping meanwhile. Relay session
@@ -1073,10 +1123,16 @@ function CM.gapHoldNeed(now)
 					end
 				end
 				if not r.seen[g] and (r.nackN[g] or 0) < K.NACK_MAX and not (r.holdDone and r.holdDone[g])
-				   and pastGrace then
-					local at = r.stamp and r.stamp[g]
+				   and (pastGrace or held) then
 					if at then
-						if CM.stepOf(at) >= nowStep and at - now <= engage then
+						-- ONCE HELD, HELD (2026-09-16): a stamp that fell behind while we
+						-- were holding (the batch in flight ran past it) used to release
+						-- the hold as "cannot be helped by stopping" -- and the command
+						-- then applied 11 s late when the resend came. Late by two steps
+						-- is a small divergence; late by a NACK round trip is a bus 22 m
+						-- off. Keep holding until it arrives, K.GAP_HOLD_MAX_TICKS or the
+						-- NACKs run out.
+						if held or (CM.stepOf(at) >= nowStep and at - now <= engage) then
 							if not best or not best.at or at < best.at then best = { o = o, seq = g, at = at } end
 						end
 					elseif not (topAt and CM.stepOf(topAt) < nowStep) then
@@ -1112,6 +1168,24 @@ function CM.gapHoldTick(now)
 			need.o, need.seq, need.at and string.format(" (stamp %.1f, now %.1f)", need.at, now) or " (stamp unknown)", K.GAP_HOLD_MAX_TICKS))
 	end
 	CM.gapHold.o, CM.gapHold.seq, CM.gapHold.at = need.o, need.seq, need.at
+	-- ASK AT ONCE, AND KEEP ASKING (2026-09-16): the NACK scan runs every 10th
+	-- tick and waits K.NACK_GRACE (15 ticks) first -- 3 to 5 s before the first
+	-- NACK, while the game stands still for exactly this command. A held command
+	-- is NACKed the tick the hold engages and every K.HOLD_NACK_EVERY ticks
+	-- after (the origin answers at most every K.RESEND_MIN_GAP). Only the first
+	-- one counts against K.NACK_MAX: the hold's own cap is K.GAP_HOLD_MAX_TICKS.
+	local r = need.o and CM.rx[need.o]
+	if r and need.seq and not r.seen[need.seq] then
+		local last = r.nackAt[need.seq]
+		if not last or CM.ticks - last >= (tonumber(K.HOLD_NACK_EVERY) or 3) then
+			CM.broadcast(string.format("LSNACK o=%s seq=%d by=%s", need.o, need.seq, K.INSTANCE))
+			r.nackAt[need.seq] = CM.ticks
+			if (r.nackN[need.seq] or 0) == 0 then r.nackN[need.seq] = 1 end
+			CM.nackSent = (CM.nackSent or 0) + 1
+			CM.holdNacks = (CM.holdNacks or 0) + 1
+			log(string.format("NACK %s seq=%d (holding for it)", need.o, need.seq))
+		end
+	end
 	if CM.ticks - CM.gapHold.since > K.GAP_HOLD_MAX_TICKS then
 		-- give up on everything holding us now; those commands apply late if they arrive
 		local n = 0

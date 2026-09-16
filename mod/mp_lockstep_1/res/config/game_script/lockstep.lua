@@ -204,6 +204,14 @@ K.RTT_MIN_SAMPLES = 8
 K.GAP_HOLD_GRACE_TICKS = 1     -- ordinary reordering never stutters the game
 K.GAP_HOLD_ENGAGE_TICKS = 3    -- engage this many ticks of sim progress ahead of the stamp
 K.GAP_HOLD_MAX_TICKS = 55      -- ~10 s: then give up on that command (it applies late if it comes)
+K.HOLD_NACK_EVERY = 3          -- ticks between NACKs for the command a hold is waiting for (net.lua gapHoldTick)
+-- A LOST COMMAND IS NOT RECOVERED, IT IS NOT LOST (2026-09-16). Every command goes out
+-- CMD_SEND_COPIES times back to back and once more on each of the next CMD_REPEATS
+-- ticks (net.lua scheduleLocal / txRepeatTick); the delay pays DELAY_REPEAT_TICKS
+-- ticks for the repeat (execDelayTick). Recovery (NACK + resend) stays as the backstop.
+K.CMD_SEND_COPIES = 2
+K.CMD_REPEATS = 1
+K.DELAY_REPEAT_TICKS = 1
 
 -- The most peer lead a command's stamp will pay for: a live session was seen
 -- 9.2 units apart (net.lua scheduleLocal).
@@ -932,6 +940,7 @@ function data()
 					if f then f:write(CM.statusLine(CM.gameTime() or 0)); f:close() end
 				end)
 			end
+			if CM.txRepeatTick then CM.txRepeatTick() end   -- the extra copies of our recent commands
 			if CM.ticks % 10 == 5 then CM.nackScan() end
 			CM.flushConPairs()
 			CM.primeConstructions()
