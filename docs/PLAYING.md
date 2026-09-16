@@ -153,7 +153,8 @@ In game, the **companies** section of the Multiplayer window shows your company'
 name. Pick a company from the dropdown and **switch to it** to play that company instead of yours,
 **new company** to start a fresh one, and use the **company password** field with **set on mine**
 to lock yours (switching into a locked company needs its password). A company is named in the
-game's own company window; until then it is "<player>'s company".
+game's own company window; until then it is named after the player who founded it: "<player>'s
+company", then "<player>'s 2nd company" and so on, whoever plays it now.
 
 ## Ports and firewalls
 

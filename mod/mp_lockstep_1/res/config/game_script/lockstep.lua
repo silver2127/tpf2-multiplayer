@@ -1178,7 +1178,7 @@ function data()
 							-- names, percent-escaped ("3:Acme%20Co 4:...")
 							local names = {}
 							for _, cid in ipairs(CM.cmRoster or {}) do
-								local n = CM.cmName and CM.cmName[cid]
+								local n = CM.cmNameOf and CM.cmNameOf(cid) or (CM.cmName and CM.cmName[cid])
 								if n and n ~= "" then names[#names + 1] = cid .. ":" .. CM.escName(n) end
 							end
 							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " ")))
@@ -1881,12 +1881,12 @@ function data()
 						for id, n in tostring(mine.conames or ""):gmatch("(%d+):(%S+)") do names[tonumber(id)] = CM.unescName(n) end
 						D.coRoster, D.coPlayed, D.coMine, D.coLocked, D.coNames = roster, played, tonumber(mine.company), locked, names
 						if (guiTick % 30) == 0 or not D.coNamesRead then D.coNamesRead = true; pcall(CM.readPlayerNames) end
-						-- a company's name: the one given in the game's company window, else
-						-- "<player>'s company" (the same rule the sim applies to the entities)
+						-- a company's name as the sim decided it (companies.lua CM.cmNameOf: the
+						-- name given in the game's company window, else the founder's)
 						local function coName(cid)
-							local letters = {}
-							for l in tostring(played[cid] or ""):gmatch("%a+") do letters[#letters + 1] = l end
-							return CM.cmDisplayName(cid, names[cid], letters)
+							local n = names[cid]
+							if n and n ~= "" then return n end
+							return "Company " .. tostring(cid)
 						end
 						if not D.coSel then D.coSel = D.coMine end
 						-- the dropdown: every company by name, alphabetical; a company with more
