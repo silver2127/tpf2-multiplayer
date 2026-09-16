@@ -71,6 +71,10 @@ function CM.cmReadConfig()
 	end
 	CM.cmMode = (mode and mode:gsub("%s", "")) or "coop"
 	CM.cmMyCompany = mine and tonumber(mine)
+	-- the lobby's map as it was handed out: a company's founder when no CMNEW made it
+	CM.cmLobbyOrigin = {}
+	for o, cid in pairs(CM.cmOriginCompany) do CM.cmLobbyOrigin[o] = cid end
+	if CM.cmMyCompany then CM.cmLobbyOrigin[K.INSTANCE] = CM.cmMyCompany end
 	CM.cmRoster = nil
 	if roster then
 		CM.cmRoster = {}
@@ -456,25 +460,62 @@ end
 function CM.playerNameOf(letter)
 	return CM.playerNames[letter] or letter
 end
--- An unnamed company is "<player>'s company" after its first player (the
--- lowest letter, so every instance agrees), or "Company N" while nobody plays
--- it or no player name is known. `given` is the registry name, `letters` the
--- players: the GUI passes what the dash file says, the sim what it holds.
-function CM.cmDisplayName(cid, given, letters)
-	if given and given ~= "" then return given end
-	for _, l in ipairs(letters or {}) do
-		local n = CM.playerNames[l]
-		if n and n ~= "" and n ~= l then return n .. "'s company" end
+-- Founders (2026-09-16). An unnamed company is named after the player who
+-- FOUNDED it, not whoever plays it now: a player who created a second company
+-- and moved into it saw the first fall back to "Company N". CMNEW records the
+-- founder and the ordinal among that founder's companies ("bob's company",
+-- "bob's 2nd company", ...); the ordinal counter never reuses a number, so a
+-- dissolve renames nothing. A company the lobby handed out was founded by the
+-- lowest letter the lobby put on it. Founders ride in the save state. Without
+-- a founder name, "Company N".
+CM.cmFounded = {}        -- cid -> { o = letter, n = ordinal }
+CM.cmFoundedCount = {}   -- letter -> companies founded so far (the lobby's counts as the first)
+CM.cmLobbyOrigin = nil   -- letter -> company, as the lobby handed them out
+function CM.cmFounderOf(cid)
+	local f = type(CM.cmFounded) == "table" and CM.cmFounded[cid]
+	if f then return f.o, f.n end
+	local lowest
+	if type(CM.cmLobbyOrigin) == "table" then
+		for o, c in pairs(CM.cmLobbyOrigin) do if c == cid and (not lowest or o < lowest) then lowest = o end end
 	end
+	if lowest then return lowest, 1 end
+	return nil, nil
+end
+function CM.cmRecordFounder(cid, o)
+	if type(CM.cmFoundedCount) ~= "table" then CM.cmFoundedCount = {} end
+	if type(CM.cmFounded) ~= "table" then CM.cmFounded = {} end
+	local count = CM.cmFoundedCount[o]
+	if not count then
+		-- the lobby's company counts as this founder's first
+		count = 0
+		if type(CM.cmLobbyOrigin) == "table" then
+			local first = CM.cmLobbyOrigin[o]
+			if first and CM.cmFounderOf(first) == o then count = 1 end
+		end
+	end
+	count = count + 1
+	CM.cmFoundedCount[o] = count
+	CM.cmFounded[cid] = { o = o, n = count }
+end
+function CM.cmOrdinal(n)
+	n = tonumber(n) or 1
+	if n <= 1 then return "" end
+	local last, tens = n % 10, n % 100
+	local suffix = (tens >= 11 and tens <= 13) and "th" or (last == 1 and "st" or last == 2 and "nd" or last == 3 and "rd" or "th")
+	return tostring(n) .. suffix .. " "
+end
+function CM.cmDisplayName(cid, given, founderName, ordinal)
+	if given and given ~= "" then return given end
+	if founderName and founderName ~= "" then return founderName .. "'s " .. CM.cmOrdinal(ordinal) .. "company" end
 	return "Company " .. tostring(cid)
 end
 function CM.cmNameOf(cid)
 	if not CM.cmName[cid] then
 		if CM.playerNamesRead ~= true then CM.playerNamesRead = true; pcall(CM.readPlayerNames) end
 	end
-	local letters = {}
-	pcall(function() letters = CM.cmPlayersOf(cid) or {} end)   -- never let a name lookup throw
-	return CM.cmDisplayName(cid, CM.cmName[cid], letters)
+	local o, n = CM.cmFounderOf(cid)
+	local founderName = o and type(CM.playerNames) == "table" and CM.playerNames[o] or nil
+	return CM.cmDisplayName(cid, CM.cmName[cid], founderName, n)
 end
 -- The game's finances / company windows show the player ENTITY's NAME. Keep
 -- every company's entity named after the company, here on every instance
@@ -557,6 +598,10 @@ function CM.cmGoLive()
 		CM.cmRoster = { CM.cmMyCompany }
 		CM.cmOriginCompany = CM.cmOriginCompany or {}
 		for o in pairs(CM.peers or {}) do CM.cmOriginCompany[o] = CM.cmOriginCompany[o] or CM.cmMyCompany end
+		if type(CM.cmLobbyOrigin) ~= "table" then
+			CM.cmLobbyOrigin = { [K.INSTANCE] = CM.cmMyCompany }
+			for o in pairs(CM.peers or {}) do CM.cmLobbyOrigin[o] = CM.cmMyCompany end
+		end
 		pcall(function() CM.cmCompanyPid[CM.cmMyCompany] = api.engine.util.getPlayer() end)
 		CM.cmReady = CM.cmCompanyPid[CM.cmMyCompany] ~= nil
 		CM.cmLog("CM: session moved from coop to companies mode by an in-game company command")
@@ -704,6 +749,12 @@ function CM.cmSaveState()
 	for cid, pid in pairs(CM.cmCompanyPid or {}) do st.pid[tostring(cid)] = pid end
 	st.names = {}
 	for cid, n in pairs(CM.cmName or {}) do st.names[tostring(cid)] = n end
+	st.founded, st.foundedCount = {}, {}
+	for _, cid in ipairs(CM.cmRoster or {}) do
+		local o, n = CM.cmFounderOf(cid)
+		if o then st.founded[tostring(cid)] = { o = o, n = n } end
+	end
+	for o, n in pairs(CM.cmFoundedCount or {}) do st.foundedCount[o] = n end
 	return st
 end
 function CM.cmLoadState(st)
@@ -728,6 +779,11 @@ function CM.cmApplySaved()
 	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid end
 	CM.cmName = {}
 	for k, n in pairs(sv.names or {}) do if type(n) == "string" and n ~= "" then CM.cmName[tonumber(k)] = n end end
+	CM.cmFounded, CM.cmFoundedCount = {}, {}
+	for k, f in pairs(sv.founded or {}) do
+		if type(f) == "table" and type(f.o) == "string" then CM.cmFounded[tonumber(k)] = { o = f.o, n = tonumber(f.n) or 1 } end
+	end
+	for o, n in pairs(sv.foundedCount or {}) do CM.cmFoundedCount[o] = tonumber(n) or 0 end
 	local want = CM.cmMyCompany   -- the lobby's chip for us (may be nil in coop)
 	if sv.origin and sv.origin[K.INSTANCE] then want = tonumber(sv.origin[K.INSTANCE]) end
 	if not want or not CM.cmRosterHas(want) then want = tonumber(sv.mine) end
@@ -758,6 +814,7 @@ function CM.execCompanyCmd(c)
 			table.sort(CM.cmRoster)
 			local h = c.pw; if h == nil or h == "" or h == "-" or h == 0 then h = nil end
 			CM.cmPw[cid] = h and tostring(h) or nil
+			CM.cmRecordFounder(cid, o)
 			CM.cmEnsurePlayers()   -- creates the AI entity for it here (we are not playing it yet)
 			CM.cmNote(string.format("%s created company %d%s (roster now %d)", tostring(o), cid, CM.cmPw[cid] and " [password]" or "", #CM.cmRoster))
 		end
@@ -791,6 +848,7 @@ function CM.execCompanyCmd(c)
 		CM.cmCompanyPid[cid] = nil
 		CM.cmPw[cid] = nil
 		CM.cmName[cid] = nil
+		CM.cmFounded[cid] = nil
 		CM.cmNote(string.format("%s dissolved company %d into %d (%d entities, balance %s, loan %s)", tostring(o), cid, intoCid, n, tostring(bf), tostring(lf)))
 	elseif c.op == "CMNAME" then
 		-- name / unname a company: only someone playing it may (like CMPW)

@@ -3,8 +3,9 @@
 A company's name is replicated company state, not the player entity's NAME
 component (a switch swaps the entities, so a NAME would follow the wrong
 company). This loads the real companies.lua and checks:
-  - an unnamed company reads as "<player>'s company" after its first player,
-    or "Company N" while nobody plays it or no player name is known
+  - an unnamed company reads as "<founder>'s company", "<founder>'s 2nd
+    company", ... after the player who founded it (the lobby's assignment, or
+    CMNEW), whoever plays it now; "Company N" without a founder name
   - the game's own company window is the rename: a SetName captured on our
     company's player entity becomes CMNAME (inject.lua); the dashboard has no
     name field
@@ -83,12 +84,30 @@ end
 function T.name(origin, cid, name) CM.execCompanyCmd({ op = "CMNAME", cid = cid, origin = origin, name = CM.escName(name) }) return notes[#notes] end
 function T.raw(cid) return CM.cmName[cid] end
 function T.defaults()
+  -- the lobby handed out 1 to a, 2 to b, 3 to c; only a and b have names
   CM.playerNames = { a = "Ada", b = "bob" }
-  local saved = CM.cmPlayersOf
-  CM.cmPlayersOf = function(cid) return ({ [1] = { "a" }, [2] = { "b", "c" }, [3] = {} })[cid] or {} end
-  local r = { CM.cmNameOf(1), CM.cmNameOf(2), CM.cmNameOf(3), CM.cmDisplayName(2, "Acme", { "b" }), CM.cmDisplayName(4, nil, { "c" }) }
-  CM.cmPlayersOf = saved
-  CM.playerNames = {}
+  CM.cmLobbyOrigin = { a = 1, b = 2, c = 3 }
+  local r = { CM.cmNameOf(1), CM.cmNameOf(2), CM.cmNameOf(3), CM.cmDisplayName(2, "Acme", "bob", 1), CM.cmDisplayName(4, nil, nil, 1) }
+  return table.concat(r, "|")
+end
+function T.found(origin, cid) CM.execCompanyCmd({ op = "CMNEW", cid = cid, origin = origin, sw = 0 }); CM.cmCompanyPid[cid] = 100 + cid; return CM.cmNameOf(cid) end
+function T.founders()
+  -- a founds 4 and 5, b founds 6; a switch changes nothing; a dissolve keeps the numbering
+  local r = { T.found("a", 4), T.found("a", 5), T.found("b", 6) }
+  CM.cmOriginCompany.b = 4          -- b now plays Ada's 2nd company
+  r[#r + 1] = CM.cmNameOf(4) .. "/" .. CM.cmNameOf(2)
+  CM.cmOriginCompany.b = 2
+  T.dissolve(5)
+  r[#r + 1] = T.found("a", 7)
+  r[#r + 1] = CM.cmOrdinal(11) .. CM.cmOrdinal(12) .. CM.cmOrdinal(13) .. CM.cmOrdinal(21) .. CM.cmOrdinal(22) .. CM.cmOrdinal(23) .. CM.cmOrdinal(24)
+  local st = CM.cmSaveState()
+  local f = {}
+  for k, v in pairs(st.founded or {}) do f[#f + 1] = k .. "=" .. v.o .. v.n end
+  table.sort(f)
+  r[#r + 1] = table.concat(f, ",")
+  for _, cid in ipairs({ 4, 6, 7 }) do CM.execCompanyCmd({ op = "CMDEL", cid = cid, origin = "a" }) end
+  CM.cmFounded, CM.cmFoundedCount = {}, {}
+  CM.playerNames, CM.cmLobbyOrigin = {}, nil
   return table.concat(r, "|")
 end
 function T.dissolve(cid) CM.peers = {}; CM.cmPlayersOf = function() return {} end; CM.cmMoveAssets = function() return 0 end; CM.cmWallet = function() return 0, 0 end; CM.cmSetWallet = function() end; CM.cmPwOk = function() return true end
@@ -113,8 +132,11 @@ return T
 
 check("unnamed reads as Company N with no player names", T.nameOf(2) == "Company 2", T.nameOf(2))
 d = T.defaults()
-check("unnamed reads as <player>'s company; a given name wins; an unknown player name falls back",
+check("unnamed reads as <founder>'s company; a given name wins; an unknown founder name falls back",
       d == "Ada's company|bob's company|Company 3|Acme|Company 4", d)
+d = T.founders()
+check("a founder's later companies are their 2nd, 3rd...; a switch renames nothing; a dissolve keeps the numbering; founders ride in the save",
+      d == "Ada's 2nd company|Ada's 3rd company|bob's 2nd company|Ada's 2nd company/bob's company|Ada's 4th company|11th 12th 13th 21st 22nd 23rd 24th |1=a1,2=b1,3=c1,4=a2,6=b2,7=a4", d)
 n = T.name("b", 2, "  Acme & Sons  ")
 check("the origin playing it names it (trimmed, unescaped)", T.raw(2) == "Acme & Sons", repr(T.raw(2)))
 check("the note says who named what", "b named company 2" in n and "Acme & Sons" in n, n)
