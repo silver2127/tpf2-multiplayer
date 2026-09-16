@@ -1410,9 +1410,31 @@ function data()
 						b:onClick(fn)
 						return b
 					end
-					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
-					CM.dashShowChat = (CM.dashShowChat ~= false)
-					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
+					-- Sections as tabs (2026-09-16): lobby, stats, chat, companies and speed
+					-- show one at a time. A section's button opens it and closes the
+					-- others; the open section's button closes it. CM.dashTab survives a
+					-- rebuild of the window (false = every section closed).
+					local TABS = { { "lobby", "dashShowLobby" }, { "stats", "dashShowStats" }, { "chat", "dashShowChat" },
+					               { "companies", "dashShowCompanies" }, { "speed", "dashShowSpeed" } }
+					if CM.dashTab == nil then CM.dashTab = "chat" end   -- the chat was the section open by default
+					local function applyTabs()
+						for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+						-- a chat input left open behind a hidden chat would keep taking keys
+						if not CM.dashShowChat and D.chatOpen and CM.chatCloseInput then pcall(CM.chatCloseInput) end
+						pcall(function() D.lobbyBox:setVisible(CM.dashShowLobby, false) end)
+						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
+						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
+						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
+						D.speedShown = nil   -- the GUI tick re-applies the speed row
+						for name, label in pairs(D.tabLabels or {}) do
+							pcall(function() label:setText(CM.dashTab == name and ("[ " .. name .. " ]") or ("  " .. name .. "  ")) end)
+						end
+					end
+					local function selectTab(name)
+						CM.dashTab = (CM.dashTab ~= name) and name or false
+						applyTabs()
+					end
+					for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", function()
 						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
@@ -1422,28 +1444,14 @@ function data()
 							D.win:setVisible(false, false)
 						end
 					end))
-					tog:addItem(toggleBtn("  lobby  ", function()
-						CM.dashShowLobby = not CM.dashShowLobby
-						D.lobbyBox:setVisible(CM.dashShowLobby, false)
-					end))
-					tog:addItem(toggleBtn("  stats  ", function()
-						CM.dashShowStats = not CM.dashShowStats
-						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
-					end))
-					tog:addItem(toggleBtn("  chat  ", function()
-						CM.dashShowChat = not CM.dashShowChat
-						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
-					end))
-					tog:addItem(toggleBtn("  companies  ", function()
-						CM.dashShowCompanies = not CM.dashShowCompanies
-						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
-					end))
-					-- the speed vote row: shown by default, this toggle hides it
-					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)
-					tog:addItem(toggleBtn("  speed  ", function()
-						CM.dashShowSpeed = not CM.dashShowSpeed
-						D.speedShown = nil   -- the GUI tick re-applies the row's visibility
-					end))
+					D.tabLabels = {}
+					for _, t in ipairs(TABS) do
+						local name = t[1]
+						D.tabLabels[name] = api.gui.comp.TextView.new("  " .. name .. "  ")
+						local b = api.gui.comp.Button.new(D.tabLabels[name], true)
+						b:onClick(function() selectTab(name) end)
+						tog:addItem(b)
+					end
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					-- far behind the other games, the player's actions are off: said at the very
@@ -1472,7 +1480,6 @@ function data()
 					lobbyL:addItem(D.lobbyNav)
 					D.lobbyBox = api.gui.comp.Component.new("mpLobby")
 					D.lobbyBox:setLayout(lobbyL)
-					D.lobbyBox:setVisible(CM.dashShowLobby == true, false)
 					box:addItem(D.lobbyBox)
 					-- ---- speed votes (2026-09-12 as the host's speed buttons; every player's since 2026-09-15) ----
 					-- A press appends SPEEDSET <v> to our inject file: our vote for the
@@ -1682,12 +1689,8 @@ function data()
 					D.chatBox = api.gui.comp.Component.new("mpChat")
 					D.chatBox:setLayout(chatL)
 					box:addItem(D.chatBox)
-					pcall(function()
-						D.statsBox:setVisible(CM.dashShowStats, false)
-						D.rawBox:setVisible(CM.dashShowNumbers, false)
-						D.chatBox:setVisible(CM.dashShowChat, false)
-						D.coBox:setVisible(CM.dashShowCompanies, false)
-					end)
+					pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					applyTabs()
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
