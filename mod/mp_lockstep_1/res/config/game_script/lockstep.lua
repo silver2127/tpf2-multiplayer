@@ -387,11 +387,15 @@ function CM.statusLine(now)
 	if not CM.peerSeen then stage = "starting"
 	elseif CM.catchingUp2 then stage = string.format("catchup:%s:%.1f", tostring(CM.cuPhase or "run"), CM.behindBy or 0)
 	elseif (CM.behindBy or 0) > 2 then stage = string.format("behind:%.1f", CM.behindBy or 0) end
-	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s",
+	-- cm= (2026-09-16): companies mode as the SIM knows it. The lobby's
+	-- mp_company_cfg.txt says what the roster was at START; a company created
+	-- in game never reaches that file, so the slice's shared-stations gate read
+	-- "coop" on both machines and opened nothing (foreignAsked=2344 opened=0).
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s  cm=%s",
 		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
 		pt and string.format("%+.1f", now - pt) or "?",
 		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage)
+		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage, CM.cmMode == "companies" and "companies" or "coop")
 end
 -- Letter -> 0..7, for anything that needs a per-origin namespace.
 function CM.originIdx(o)
@@ -1503,9 +1507,31 @@ function data()
 						b:onClick(fn)
 						return b
 					end
-					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
-					CM.dashShowChat = (CM.dashShowChat ~= false)
-					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
+					-- Sections as tabs (2026-09-16): lobby, stats, chat, companies and speed
+					-- show one at a time. A section's button opens it and closes the
+					-- others; the open section's button closes it. CM.dashTab survives a
+					-- rebuild of the window (false = every section closed).
+					local TABS = { { "lobby", "dashShowLobby" }, { "stats", "dashShowStats" }, { "chat", "dashShowChat" },
+					               { "companies", "dashShowCompanies" }, { "speed", "dashShowSpeed" } }
+					if CM.dashTab == nil then CM.dashTab = "chat" end   -- the chat was the section open by default
+					local function applyTabs()
+						for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+						-- a chat input left open behind a hidden chat would keep taking keys
+						if not CM.dashShowChat and D.chatOpen and CM.chatCloseInput then pcall(CM.chatCloseInput) end
+						pcall(function() D.lobbyBox:setVisible(CM.dashShowLobby, false) end)
+						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
+						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
+						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
+						D.speedShown = nil   -- the GUI tick re-applies the speed row
+						for name, label in pairs(D.tabLabels or {}) do
+							pcall(function() label:setText(CM.dashTab == name and ("[ " .. name .. " ]") or ("  " .. name .. "  ")) end)
+						end
+					end
+					local function selectTab(name)
+						CM.dashTab = (CM.dashTab ~= name) and name or false
+						applyTabs()
+					end
+					for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
 					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					-- Hiding is one thing done from two places: this button and the
 					-- window's own title-bar "x" (below). Both write the flag the
@@ -1518,28 +1544,14 @@ function data()
 					end
 					D.hideDash = hideDash
 					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", hideDash))
-					tog:addItem(toggleBtn("  lobby  ", function()
-						CM.dashShowLobby = not CM.dashShowLobby
-						D.lobbyBox:setVisible(CM.dashShowLobby, false)
-					end))
-					tog:addItem(toggleBtn("  stats  ", function()
-						CM.dashShowStats = not CM.dashShowStats
-						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
-					end))
-					tog:addItem(toggleBtn("  chat  ", function()
-						CM.dashShowChat = not CM.dashShowChat
-						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
-					end))
-					tog:addItem(toggleBtn("  companies  ", function()
-						CM.dashShowCompanies = not CM.dashShowCompanies
-						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
-					end))
-					-- the speed vote row: shown by default, this toggle hides it
-					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)
-					tog:addItem(toggleBtn("  speed  ", function()
-						CM.dashShowSpeed = not CM.dashShowSpeed
-						D.speedShown = nil   -- the GUI tick re-applies the row's visibility
-					end))
+					D.tabLabels = {}
+					for _, t in ipairs(TABS) do
+						local name = t[1]
+						D.tabLabels[name] = api.gui.comp.TextView.new("  " .. name .. "  ")
+						local b = api.gui.comp.Button.new(D.tabLabels[name], true)
+						b:onClick(function() selectTab(name) end)
+						tog:addItem(b)
+					end
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					-- far behind the other games, the player's actions are off: said at the very
@@ -1568,7 +1580,6 @@ function data()
 					lobbyL:addItem(D.lobbyNav)
 					D.lobbyBox = api.gui.comp.Component.new("mpLobby")
 					D.lobbyBox:setLayout(lobbyL)
-					D.lobbyBox:setVisible(CM.dashShowLobby == true, false)
 					box:addItem(D.lobbyBox)
 					-- ---- speed votes (2026-09-12 as the host's speed buttons; every player's since 2026-09-15) ----
 					-- A press appends SPEEDSET <v> to our inject file: our vote for the
@@ -1814,12 +1825,8 @@ function data()
 					D.chatBox = api.gui.comp.Component.new("mpChat")
 					D.chatBox:setLayout(chatL)
 					box:addItem(D.chatBox)
-					pcall(function()
-						D.statsBox:setVisible(CM.dashShowStats, false)
-						D.rawBox:setVisible(CM.dashShowNumbers, false)
-						D.chatBox:setVisible(CM.dashShowChat, false)
-						D.coBox:setVisible(CM.dashShowCompanies, false)
-					end)
+					pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					applyTabs()
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
