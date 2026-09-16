@@ -160,30 +160,53 @@ static bool steamPath(wchar_t* out, int cch)
     return false;
 }
 
-// <steam>\userdata\<accountid>\1066780\local\save -- enumerate accounts, pick the
-// one that actually has a 1066780 save dir (newest wins). 1066780 = TF2 appid.
+static void Log(const char* fmt, ...);
+
+// <steam>\userdata\<accountid>\1066780\local\save -- enumerate accounts and pick the
+// best one. A game that has NEVER SAVED has no local\save yet: on 2026-09-15 a first-time
+// tester's DLL found no account with one, fell through to the userdata\0 fallback and
+// every shared save failed to place with ERROR_PATH_NOT_FOUND -- "can't load the save".
+// So rank: an account with local\save (newest wins), else one with the 1066780 folder
+// Steam makes on first launch, else any numeric account dir. placeSaveNewest creates
+// whatever folder it is handed. 1066780 = TF2 appid.
 static void resolveSaveDir(wchar_t* out, int cch)
 {
     wchar_t steam[MAX_PATH];
     if (steamPath(steam, MAX_PATH)) {
         wchar_t pat[MAX_PATH]; _snwprintf_s(pat, _TRUNCATE, L"%s\\userdata\\*", steam);
         WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
-        wchar_t best[MAX_PATH] = L""; ULONGLONG bestT = 0;
+        wchar_t best[MAX_PATH] = L""; ULONGLONG bestT = 0; int bestTier = 0;
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
-                wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%s\\userdata\\%s\\1066780\\local\\save", steam, fd.cFileName);
-                DWORD a = GetFileAttributesW(cand);
+                bool numeric = fd.cFileName[0] != 0;
+                for (const wchar_t* c = fd.cFileName; *c; c++) if (*c < L'0' || *c > L'9') { numeric = false; break; }
+                if (!numeric) continue;
+                wchar_t app[MAX_PATH], save[MAX_PATH];
+                _snwprintf_s(app, _TRUNCATE, L"%s\\userdata\\%s\\1066780", steam, fd.cFileName);
+                _snwprintf_s(save, _TRUNCATE, L"%s\\local\\save", app);
+                int tier = 1;
+                DWORD a = GetFileAttributesW(app);
                 if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
-                    ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
-                    if (t >= bestT) { bestT = t; wcscpy_s(best, cand); }
+                    tier = 2;
+                    a = GetFileAttributesW(save);
+                    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) tier = 3;
                 }
+                ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+                if (tier > bestTier || (tier == bestTier && t >= bestT)) { bestTier = tier; bestT = t; wcscpy_s(best, save); }
             } while (FindNextFileW(h, &fd));
             FindClose(h);
         }
-        if (best[0]) { wcscpy_s(out, cch, best); return; }
+        if (best[0]) {
+            if (bestTier < 3) Log("[menu] save folder %ls does not exist yet (%s) -- it is created when a shared save is placed\n",
+                                  best, bestTier == 2 ? "this game has never saved" : "no 1066780 folder in the account yet");
+            wcscpy_s(out, cch, best); return;
+        }
+        Log("[menu] no Steam account folder under %ls\\userdata -- a shared save cannot be placed\n", steam);
+    } else {
+        Log("[menu] Steam not found in the registry -- a shared save cannot be placed\n");
     }
-    // no Steam install found: a generic path that CopyFileW will simply fail on (logged)
+    // no usable path at all: a generic one that CopyFileW will fail on, logged with dst by the placer
     wcscpy_s(out, cch, L"C:\\Program Files (x86)\\Steam\\userdata\\0\\1066780\\local\\save");
 }
 
@@ -2437,6 +2460,17 @@ static void stampNow(const wchar_t* path)
 // stamp them NEWEST, so the game's Continue (loads most-recent save) loads it.
 // Returns false if the .sav itself could not be placed (the caller must NOT click
 // Continue then -- it would load whatever unrelated save happens to be newest).
+// CreateDirectoryW for every component (no shell32 dependency): the save folder of
+// a game that has never saved does not exist until a shared save is placed in it.
+static void ensureDir(const wchar_t* path)
+{
+    wchar_t buf[700]; wcscpy_s(buf, path);
+    for (wchar_t* c = buf + 3; *c; c++) {          // past "C:\"
+        if (*c == L'\\') { *c = 0; CreateDirectoryW(buf, nullptr); *c = L'\\'; }
+    }
+    CreateDirectoryW(buf, nullptr);
+}
+
 static bool placeSaveNewest(const wchar_t* srcSav)
 {
     wchar_t dst[700]; _snwprintf_s(dst, _TRUNCATE, L"%s\\mp_shared.sav", SAVE_DIR);
@@ -2453,10 +2487,11 @@ static bool placeSaveNewest(const wchar_t* srcSav)
     wchar_t fs[700], fdst[700]; bool same = false;
     if (GetFullPathNameW(srcSav, 700, fs, nullptr) && GetFullPathNameW(dst, 700, fdst, nullptr)) same = _wcsicmp(fs, fdst) == 0;
     else same = _wcsicmp(srcSav, dst) == 0;
+    if (!same) ensureDir(SAVE_DIR);
     if (!same && !CopyFileW(srcSav, dst, FALSE)) {
         DWORD e = GetLastError();
         if (e == ERROR_SHARING_VIOLATION && _wcsicmp(srcSav, dst) == 0) same = true;
-        else { Log("[menu] placeSave copy failed err=%lu src=%ls\n", e, srcSav); return false; }
+        else { Log("[menu] placeSave copy failed err=%lu src=%ls dst=%ls\n", e, srcSav, dst); return false; }
     }
     if (same) {   // already in place: just make sure it (and its sidecars) are newest
         stampNow(dst);
