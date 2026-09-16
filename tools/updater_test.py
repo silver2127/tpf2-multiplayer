@@ -40,6 +40,15 @@ def test_msi():
     there (no native build, no PyInstaller). None -> the case is skipped."""
     msi = REPO / "installer/out/TpF2Multiplayer.msi"
     if msi.exists():
+        # a fixture older than what it must match is a stale build, not a defect:
+        # the outputs and the mod sources it packages move on between releases
+        newest = 0.0
+        for d, pat in ((REPO / "native/out", "*.dll"), (REPO / "netpunch/dist", "netpunch.exe"),
+                       (REPO / "mod/mp_lockstep_1", "**/*.lua")):
+            for f in d.glob(pat):
+                newest = max(newest, f.stat().st_mtime)
+        if msi.stat().st_mtime < newest:
+            return None
         return msi
     outputs = [REPO / "native/out" / n for n in (
         "alut.dll", "tpf2_pluginhost.dll", "tpf2_bridge_mp.dll", "tpf2_menu.dll", "tpf2_slice.dll",
@@ -167,6 +176,9 @@ class Updates(unittest.TestCase):
         if os.name != "nt":
             self.skipTest("msiexec: Windows only")
         msi = test_msi()
+        if msi is None:
+            self.skipTest("installer/out/TpF2Multiplayer.msi is missing or predates the build outputs / mod sources; "
+                          "rebuild it (installer\build_msi.ps1) to run the conversion case")
         sys.path.insert(0, str(REPO / "tools"))
         import build_update
         version = (REPO / "installer/VERSION").read_text(encoding="utf-8").strip()
