@@ -633,6 +633,26 @@ function CM.compareOne(stamp, origin, theirs, dt)
 	local mine = CM.myHashes[stamp]
 	if not mine or not theirs then return end
 	local pr = CM.peerFor(origin)
+	-- TWO SAMPLES OF ONE STAMP, TAKEN AT DIFFERENT SIM TIMES, ARE NOT COMPARABLE
+	-- (2026-09-16). Every lane below describes the world at the moment its hash
+	-- was taken, and the sample time rides in the detail (the p lane's @). A game
+	-- that entered the interval part way through -- a fresh load, or a peer on an
+	-- older build that published such a sample -- is a different sim time, and
+	-- comparing it is comparing two moments of the SAME world: on the rig of
+	-- 2026-09-16 the host's stamp-0 sample at 1.8 against a joiner's at 31.6 gave
+	-- "t: 8899 vs 8975", "!! DESYNC t=0" and an edge lane one edge apart, with
+	-- nothing wrong on either side. The p lane already refused such a pair; the
+	-- verdict, the town streak and the money/people gaps compared it anyway.
+	do
+		local dm = CM.myDetails[stamp]
+		local sm = dm and dm:match("p%d+@([%-%d%.]+):")
+		local sp = dt and dt:match("p%d+@([%-%d%.]+):")
+		if sm and sp and sm ~= sp then
+			log(string.format("~~ t=%d vs %s: the two samples are from different sim times (%s vs %s) -- not comparable, skipped",
+				stamp, origin, sm, sp))
+			return
+		end
+	end
 	-- MONEY / LOAN ride in the DETAIL, not the verdict: balances can diverge with
 	-- no geometry difference at all (a stop that cost the originator its native
 	-- price but a peer only its cheaper edge-rebuild, a delivery timed slightly
