@@ -196,7 +196,7 @@ Line::*, ..., float Line::*, ..., LineVehicleInfo Line::*>`.
 | +0x28 | loadMode | `Line::LoadMode` (int), 0..3 | +0x28 | PROVEN: member pointer 0x28; values and use below |
 | +0x2c | minWaitingTime | float | "+0x2c or +0x30" | PROVEN: member pointer 0x2c, `float Stop::*`; copied with `movss` (`0xb8326c`/`0xb83286`) |
 | +0x30 | maxWaitingTime | float | "+0x2c or +0x30" | PROVEN: member pointer 0x30, `float Stop::*`; `movss` (`0xb8328b`/`0xb8329c`) |
-| +0x38 | waypoints | `std::vector<transport::SignalId>`, 8 B each | +0x38 | PROVEN: member pointer 0x38; not shipped |
+| +0x38 | waypoints | `std::vector<transport::SignalId>`, 8 B each | +0x38 | PROVEN: member pointer 0x38; shipped as the 0.5.3 `wp=` suffix |
 | +0x50 | stopConfig | `Line::StopConfig` (two bit vectors +0x50/+0x78, a vector +0xa0) | | PROVEN: member pointer 0x50; not shipped |
 
 Stride 0xb8 (PROVEN, four independent sites):

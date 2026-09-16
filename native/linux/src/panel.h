@@ -27,7 +27,8 @@ bool Visible();
 // Render thread, once per presented frame while Visible(). Lays the panel out
 // for a screen of screenW x screenH, re-renders layer:: when it changed (or the
 // caret is due to blink), and returns the panel's rect on the screen.
-bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h);
+// `changed` reports a layer redraw so the overlay can reuse its composition.
+bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* changed);
 
 // The largest panel for this screen height, for sizing the overlay's images.
 void MaxSize(int screenW, int screenH, int* w, int* h);

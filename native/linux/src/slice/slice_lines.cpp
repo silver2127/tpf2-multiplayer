@@ -49,6 +49,20 @@ static bool DecodeBody(SliceRecord* rec, uintptr_t line)
             SliceRecordPrintf(rec, " %d %d", idsAlt[0], idsAlt[1]);
         }
     }
+    // Stop::waypoints is a libstdc++ vector<SignalId> at +0x38 (see
+    // SLICE_LINES.md). Keep the Windows wire format, including 1-based stops.
+    bool first = true;
+    for (size_t i = 0; i < stops.count; ++i) {
+        SliceVec points;
+        if (!SliceReadStdVector(stops.begin + i * 0xb8 + 0x38, 8, 64, &points)) return false;
+        for (size_t j = 0; j < points.count; ++j) {
+            int32_t id[2];
+            if (!SliceRead(points.begin + j * 8, id, sizeof(id)) ||
+                id[0] <= 0 || id[1] < 0 || id[1] > 64) return false;
+            SliceRecordPrintf(rec, "%s%zu:%d:%d", first ? " wp=" : ",", i + 1, id[0], id[1]);
+            first = false;
+        }
+    }
     return !rec->failed;
 }
 

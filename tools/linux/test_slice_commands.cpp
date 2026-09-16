@@ -220,9 +220,31 @@ static void TestLines()
     Line line{};line.wait=180.4f;
     auto c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(armed && writes[0]=="ARMED 1\nLUPDATE 42 180 0\n");Add();
-    line.stops.resize(1);auto& s=line.stops[0];s.group=98;s.station=1;s.terminal=2;s.loadMode=3;s.min=20.4f;s.max=10.7f;
+    line.stops.reserve(2);line.stops.resize(1);auto& s=line.stops[0];s.group=98;s.station=1;s.terminal=2;s.loadMode=3;s.min=20.4f;s.max=10.7f;
     s.alternatives={{2,3},{4,5}};c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(writes[0]=="ARMED 1\nLUPDATE 42 180 1 98 1 2 3 20 11 2 2 3 4 5\n");Add();
+    // Preserve waypoint order and 1-based stop positions in both wire records.
+    s.waypoints={uint64_t(123) | (uint64_t(2)<<32),uint64_t(456)};
+    SliceRecord rec{};
+    assert(slice_lines::Decode(&rec,42,uintptr_t(&line)));
+    assert(std::string(rec.data).find(" wp=1:123:2,1:456:0")!=std::string::npos);
+    SliceRecordFree(&rec);
+    std::string waypointName="Route"; const float rgb[]={1,0,0};
+    assert(slice_lines::DecodeCreate(&rec,uintptr_t(&waypointName),rgb,uintptr_t(&line)));
+    assert(std::string(rec.data).find(" wp=1:123:2,1:456:0 name=Route\n")!=std::string::npos);
+    SliceRecordFree(&rec);
+    line.stops.push_back(s);
+    assert(slice_lines::Decode(&rec,42,uintptr_t(&line)));
+    assert(std::string(rec.data).find(",2:123:2,2:456:0")!=std::string::npos);
+    SliceRecordFree(&rec);
+    line.stops.pop_back();
+    for (uint64_t invalid : {uint64_t(0),uint64_t(123)|(uint64_t(65)<<32)}) {
+        line.stops[0].waypoints={invalid};
+        assert(!slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
+    }
+    line.stops[0].waypoints.assign(65,123);
+    assert(!slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
+    line.stops[0].waypoints.clear();
     s.min=-1;c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(!armed && writes.empty());s.min=0;
     c=Call(slice_lines::kUpdate,0x132c513);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
@@ -339,6 +361,8 @@ static void TestTime()
 {
     auto c=Call(slice_time::kCalendar,slice_time::kSlider);c.rsi=0;Capture(c);assert(armed && writes.empty());
     assert(Add());assert(writes[0]=="CALSPEED 0\n");
+    c=Call(slice_time::kSpeed,slice_time::kToggle);c.rsi=4;Capture(c);assert(Add());
+    assert(writes[0]=="SPEEDBTN 4 toggle\n");
     c=Call(slice_time::kSpeed,slice_time::kToggle);c.rsi=65;Capture(c);assert(!armed && writes.empty());
     c=Call(slice_time::kSpeed,slice_time::kToggle);c.rsi=4;Capture(c);writeFails=true;assert(!Add());writeFails=false;
     c=Call(slice_time::kSpeed,slice_time::kButtons);c.rsi=4;Capture(c);assert(!armed); // no installed DoStep
@@ -347,7 +371,7 @@ static void TestTime()
     c=Call(slice_time::kSpeed,slice_time::kButtons);c.rsi=4;Capture(c);assert(!armed);
     stepInstalled=true;
     c=Call(slice_time::kSpeed,slice_time::kButtons);c.rsi=4;Capture(c);assert(Add(ClockFunction()));
-    assert(writes[0]=="SPEEDBTN 4\n");assert(Count()==0);++Count();
+    assert(writes[0]=="SPEEDBTN 4 button\n");assert(Count()==0);++Count();
     slice_time::DoStep(clockObject,1,2);assert(Count()==0);assert(!slice_time::InStep());
     // A failed append is blocked just like a cancelled Add: the UI still
     // increments its count after Add, so the reserved compensation must survive.
@@ -367,7 +391,7 @@ static void TestTime()
     stepMode=1;try {slice_time::DoStep(clockObject,1,2);assert(false);} catch(const std::runtime_error&) {}
     assert(!slice_time::InStep());
     stepMode=0;c=Call(slice_time::kSpeed,slice_time::kButtons);c.rsi=3;Capture(c);assert(Add(ClockFunction()));
-    assert(writes[0]=="SPEEDBTN 3\n");++Count();slice_time::DoStep(clockObject,1,2);assert(Count()==0);
+    assert(writes[0]=="SPEEDBTN 3 button\n");++Count();slice_time::DoStep(clockObject,1,2);assert(Count()==0);
 }
 
 int main(int argc, char** argv)

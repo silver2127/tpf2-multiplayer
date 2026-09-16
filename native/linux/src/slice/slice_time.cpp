@@ -173,7 +173,11 @@ static void OnFactory(const SliceFactoryCall& c, void*)
     char letter[8];
     if (!SliceInstance(letter, sizeof(letter))) return;
     SliceRecord rec{};
-    if (!clamp) SliceRecordPrintf(&rec, "%s %d\n", op, value);
+    if (!clamp) {
+        if (c.factory->rva == kSpeed)
+            SliceRecordPrintf(&rec, "%s %d %s\n", op, value, c.retRva == kToggle ? "toggle" : "button");
+        else SliceRecordPrintf(&rec, "%s %d\n", op, value);
+    }
     if (!rec.failed && SliceArmCancel(c, {clamp ? "clock clamp" : op, SliceDone::Never, true, nullptr, Landed, nullptr, PrepareTime})) {
         t_pending = {true, counter, date, clamp, -1, c, rec};
         return;

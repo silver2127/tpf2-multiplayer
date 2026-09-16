@@ -984,7 +984,7 @@ void MaxSize(int screenW, int screenH, int* w, int* h)
     *h = S(560) < screenH ? S(560) : screenH;
 }
 
-bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h)
+bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* changed)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
     if (!VisibleLocked()) return false;
@@ -996,7 +996,8 @@ bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h)
     if (g_uiState == 1) lobby::PublicPoll();
     const uint64_t now = NowMs();
     const bool async = g_asyncDirty.exchange(false);
-    if (g_dirty || async || layer::Width() != pw || layer::Height() != ph || now - g_lastRenderMs > 500) {
+    *changed = g_dirty || async || layer::Width() != pw || layer::Height() != ph || now - g_lastRenderMs > 500;
+    if (*changed) {
         if (g_uiState == 2) lobby::Snapshot(&P().view);
         else lobby::PublicSnapshot(&P().pubRows, &P().pubNote);
         RenderLocked(pw, ph);

@@ -50,3 +50,33 @@ not advertise those missing capabilities. Upstream Lua remains unchanged and
 rejects operations requiring unavailable native ownership support.
 A matched Windows/native 0.5.3 installation and replay are required before
 claiming the same live-game guarantees as the prior baseline.
+
+## Follow-up: menu performance and command capture
+
+The first parity follow-up ports these Windows changes to native Linux:
+
+- Opaque multiplayer panel, using the Windows RGB(5,25,40) background.
+  Removed the game-frame GPU readback, its fence wait, CPU blur and backdrop
+  allocation. The composed image is reused until the layer, hover/press state,
+  dimensions or swapchain changes. The panel's existing 500 ms refresh still
+  updates lobby state and the caret. One panel-to-frame copy remains per frame.
+- `SPEEDBTN` now explicitly carries `button` or `toggle`, using the verified
+  Linux caller addresses; Lua no longer has to infer the action type.
+- Line creation and update capture now include ordered per-stop waypoints in
+  the upstream `wp=` wire format. The Linux Stop vector offset is documented in
+  `docs/re/linux/SLICE_LINES.md`; invalid IDs, indices and oversized vectors are
+  rejected using the same limits as Windows.
+
+Validation: Soldier build and all 36 native CTests pass. Command tests cover
+creation/update waypoint records, multiple stops, invalid data and explicit
+speed-button kinds. A mock Vulkan test exercises the real compositor and draw
+path: opaque BGRA/RGBA output, row pitch, cached frames, dirty layers, hover and
+press transitions, with only one outgoing image copy per presented frame.
+The upstream Lua 5.2 waypoint test passes, including per-peer entity remapping,
+queued edits, waypoint removal and missing-target rejection.
+
+These checks do not constitute a live cross-platform gameplay or FPS test.
+The running lab and published linux-dev.1 assets have not been replaced by this
+follow-up. The larger native features listed above remain outstanding, along
+with in-game lobby reopening, bridge-model replacement, the newer modular
+station connection handling and Linux in-app updates.

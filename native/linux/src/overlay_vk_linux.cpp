@@ -17,9 +17,7 @@
 // slot is compared with a fresh vkGetDeviceProcAddr lookup before anything is
 // swapped: a wrong offset leaves the game untouched and says so.
 //
-// DRAWING is menu_hook.cpp's: copy the region under the panel out of the
-// swapchain image, blur it on the CPU, blend the panel layer over it and copy
-// it back, all before the game's own present.
+// DRAWING uses a cached opaque panel, with no game-frame readback or blur.
 #define VK_NO_PROTOTYPES
 #include "../../third_party/vk/vulkan_core.h"
 #include "near_alloc.h"
@@ -76,7 +74,7 @@ static PFN_vkGetImageSubresourceLayout pImgSubLayout = nullptr;
 static PFN_vkCmdCopyImage       pCmdCopyImage = nullptr;
 static PFN_vkCmdPipelineBarrier pCmdBarrier = nullptr;
 static PFN_vkFlushMappedMemoryRanges pFlush = nullptr;
-static PFN_vkInvalidateMappedMemoryRanges pInvalidate = nullptr;
+
 
 // render resources, rebuilt for each swapchain
 static bool g_rInit = false, g_rFail = false;
@@ -87,11 +85,12 @@ static VkImage       g_scImages[8] = {};
 static VkCommandBuffer g_cmd[8] = {};
 static uint32_t      g_scImgCount = 0;
 
-// panel image (layer composited, copied onto the frame) and backdrop (the frame region, read back)
-static VkImage g_panelImg = VK_NULL_HANDLE, g_bdImg = VK_NULL_HANDLE;
-static VkDeviceMemory g_panelMem = VK_NULL_HANDLE, g_bdMem = VK_NULL_HANDLE;
-static void* g_panelPtr = nullptr, *g_bdPtr = nullptr;
-static size_t g_panelPitch = 0, g_bdPitch = 0;
+// Cached opaque panel copied onto the frame.
+static VkImage g_panelImg = VK_NULL_HANDLE;
+static VkDeviceMemory g_panelMem = VK_NULL_HANDLE;
+static void* g_panelPtr = nullptr;
+static size_t g_panelPitch = 0;
+static bool g_composed = false;
 static int g_imgW = 0, g_imgH = 0;
 static bool g_imagesBuilt = false, g_imagesFail = false;
 
@@ -128,7 +127,7 @@ static bool InitRender(VkSwapchainKHR sc, VkQueue q)
     pCmdCopyImage= rget<PFN_vkCmdCopyImage>("vkCmdCopyImage");
     pCmdBarrier  = rget<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier");
     pFlush       = rget<PFN_vkFlushMappedMemoryRanges>("vkFlushMappedMemoryRanges");
-    pInvalidate  = rget<PFN_vkInvalidateMappedMemoryRanges>("vkInvalidateMappedMemoryRanges");
+
     const bool need[] = { !!pGetImages, !!pCreatePool, !!pAllocCB, !!pBeginCB, !!pEndCB, !!pSubmit, !!pCreateFence,
                           !!pWaitFences, !!pResetFences, !!pResetCB, !!pCreateImage, !!pImgMemReq, !!pAllocMem,
                           !!pBindImgMem, !!pMapMem, !!pImgSubLayout, !!pCmdCopyImage, !!pCmdBarrier };
@@ -221,109 +220,41 @@ static bool BuildImages(VkQueue q)
 {
     if (g_imagesBuilt) return true;
     if (g_imagesFail) return false;
-    if (g_scUsage && !(g_scUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+    if (g_scUsage && !(g_scUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         g_imagesFail = true;
-        g_log("[overlay] vk: the swapchain has no TRANSFER_SRC (usage 0x%x) -- no panel\n", g_scUsage);
+        g_log("[overlay] vk: the swapchain has no TRANSFER_DST (usage 0x%x) -- no panel\n", g_scUsage);
         return false;
     }
     panel::MaxSize((int)g_scExtent.width, (int)g_scExtent.height, &g_imgW, &g_imgH);
+    g_panelImg = VK_NULL_HANDLE; g_panelMem = VK_NULL_HANDLE; g_panelPtr = nullptr;
+    g_composed = false;
     if (!MakeHostImage(q, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
-                       &g_panelImg, &g_panelMem, &g_panelPtr, &g_panelPitch) ||
-        !MakeHostImage(q, VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                       &g_bdImg, &g_bdMem, &g_bdPtr, &g_bdPitch)) {
+                       &g_panelImg, &g_panelMem, &g_panelPtr, &g_panelPitch)) {
         g_imagesFail = true;
         g_log("[overlay] vk: no host-visible image memory -- no panel\n");
         return false;
     }
     g_imagesBuilt = true;
-    g_log("[overlay] vk: panel images ready %dx%d (pitch %zu/%zu)\n", g_imgW, g_imgH, g_panelPitch, g_bdPitch);
+    g_log("[overlay] vk: panel image ready %dx%d (pitch %zu)\n", g_imgW, g_imgH, g_panelPitch);
     return true;
 }
 
-// ---- CPU compositing (menu_hook.cpp: BlurStage, ComposeLayer) -------------------
-static unsigned char* g_stage = nullptr; static size_t g_stageSz = 0;
-static unsigned char* g_blurA = nullptr, *g_blurB = nullptr; static size_t g_blurSz = 0;
+// ---- Cached opaque compositing ------------------------------------------------
+struct HoverState { int x = 0, y = 0, w = 0, h = 0; bool pressed = false; };
+static HoverState g_lastHover;
+static int g_composedW = 0, g_composedH = 0;
 
-static void BoxBlurH(const unsigned char* src, unsigned char* dst, int w, int h, int r)
+static void Compose(int w, int h, const HoverState& hover)
 {
-    for (int y = 0; y < h; y++) {
-        const unsigned char* s = src + (size_t)y * w * 4; unsigned char* d = dst + (size_t)y * w * 4;
-        for (int c = 0; c < 3; c++) {
-            int sum = 0, n = 0;
-            for (int x = 0; x <= r && x < w; x++) { sum += s[x * 4 + c]; n++; }
-            for (int x = 0; x < w; x++) {
-                d[x * 4 + c] = (unsigned char)(sum / n);
-                int add = x + r + 1, sub = x - r;
-                if (add < w) { sum += s[add * 4 + c]; n++; }
-                if (sub >= 0) { sum -= s[sub * 4 + c]; n--; }
+    for (int y = 0; y < h; ++y) {
+        auto* d = static_cast<unsigned char*>(g_panelPtr) + y * g_panelPitch;
+        for (int x = 0; x < w; ++x, d += 4) {
+            d[0] = g_rgbaOrder ? 5 : 40; d[1] = 25;
+            d[2] = g_rgbaOrder ? 40 : 5; d[3] = 255;
+            if (x >= hover.x && x < hover.x + hover.w && y >= hover.y && y < hover.y + hover.h) {
+                const int fill = hover.pressed ? 100 : 50;
+                for (int c = 0; c < 3; ++c) d[c] += (255 - d[c]) * fill / 255;
             }
-        }
-    }
-}
-static void BoxBlurV(const unsigned char* src, unsigned char* dst, int w, int h, int r)
-{
-    for (int x = 0; x < w; x++) {
-        for (int c = 0; c < 3; c++) {
-            int sum = 0, n = 0;
-            for (int y = 0; y <= r && y < h; y++) { sum += src[((size_t)y * w + x) * 4 + c]; n++; }
-            for (int y = 0; y < h; y++) {
-                dst[((size_t)y * w + x) * 4 + c] = (unsigned char)(sum / n);
-                int add = y + r + 1, sub = y - r;
-                if (add < h) { sum += src[((size_t)add * w + x) * 4 + c]; n++; }
-                if (sub >= 0) { sum -= src[((size_t)sub * w + x) * 4 + c]; n--; }
-            }
-        }
-    }
-}
-// MenuWindow's blurRadius 64, cheaply: 4x down, two box-blur passes, bilinear up.
-static void BlurStage(int w, int h, float scale)
-{
-    const int D = 4; int sw = w / D, sh = h / D;
-    if (sw < 2 || sh < 2) return;
-    size_t need = (size_t)sw * sh * 4;
-    if (g_blurSz < need) { free(g_blurA); free(g_blurB); g_blurA = (unsigned char*)malloc(need); g_blurB = (unsigned char*)malloc(need); g_blurSz = need; }
-    for (int y = 0; y < sh; y++) for (int x = 0; x < sw; x++) {
-        int acc[3] = { 0, 0, 0 };
-        for (int yy = 0; yy < D; yy++) {
-            const unsigned char* s = g_stage + (((size_t)(y * D + yy)) * w + x * D) * 4;
-            for (int xx = 0; xx < D; xx++, s += 4) { acc[0] += s[0]; acc[1] += s[1]; acc[2] += s[2]; }
-        }
-        unsigned char* d = g_blurA + ((size_t)y * sw + x) * 4;
-        d[0] = (unsigned char)(acc[0] / 16); d[1] = (unsigned char)(acc[1] / 16); d[2] = (unsigned char)(acc[2] / 16);
-    }
-    int r = (int)(16 * scale / 2 + 0.5f); if (r < 4) r = 4;
-    BoxBlurH(g_blurA, g_blurB, sw, sh, r); BoxBlurV(g_blurB, g_blurA, sw, sh, r);
-    BoxBlurH(g_blurA, g_blurB, sw, sh, r); BoxBlurV(g_blurB, g_blurA, sw, sh, r);
-    for (int y = 0; y < h; y++) {
-        float fy = ((y + 0.5f) / D) - 0.5f; int y0 = (int)fy; if (y0 < 0) { y0 = 0; fy = 0; }
-        int y1 = y0 + 1 < sh ? y0 + 1 : y0; float ty = fy - y0; if (ty < 0) ty = 0;
-        unsigned char* d = g_stage + (size_t)y * w * 4;
-        for (int x = 0; x < w; x++, d += 4) {
-            float fx = ((x + 0.5f) / D) - 0.5f; int x0 = (int)fx; if (x0 < 0) { x0 = 0; fx = 0; }
-            int x1 = x0 + 1 < sw ? x0 + 1 : x0; float tx = fx - x0; if (tx < 0) tx = 0;
-            const unsigned char* a = g_blurA + ((size_t)y0 * sw + x0) * 4, *b = g_blurA + ((size_t)y0 * sw + x1) * 4;
-            const unsigned char* c2 = g_blurA + ((size_t)y1 * sw + x0) * 4, *e = g_blurA + ((size_t)y1 * sw + x1) * 4;
-            for (int c = 0; c < 3; c++) {
-                float top = a[c] + (b[c] - a[c]) * tx, bot = c2[c] + (e[c] - c2[c]) * tx;
-                d[c] = (unsigned char)(top + (bot - top) * ty + 0.5f);
-            }
-        }
-    }
-}
-
-static void Compose(int w, int h, float scale)
-{
-    size_t need = (size_t)w * 4 * h;
-    if (g_stageSz < need) { free(g_stage); g_stage = (unsigned char*)malloc(need); g_stageSz = need; }
-    for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, (const unsigned char*)g_bdPtr + y * g_bdPitch, (size_t)w * 4);
-    BlurStage(w, h, scale);
-    int hx, hy, hw, hh; bool pressed = false;
-    if (panel::Hover(&hx, &hy, &hw, &hh, &pressed)) {
-        const int fill = pressed ? 100 : 50;
-        int x0 = hx < 0 ? 0 : hx, y0 = hy < 0 ? 0 : hy, x1 = hx + hw > w ? w : hx + hw, y1 = hy + hh > h ? h : hy + hh;
-        for (int y = y0; y < y1; y++) {
-            unsigned char* d = g_stage + ((size_t)y * w + x0) * 4;
-            for (int x = x0; x < x1; x++, d += 4) for (int c = 0; c < 3; c++) d[c] = (unsigned char)(d[c] + (255 - d[c]) * fill / 255);
         }
     }
     // the layer is B,G,R,A; an R,G,B,A swapchain takes it swapped
@@ -331,7 +262,7 @@ static void Compose(int w, int h, float scale)
     const unsigned char* lp = layer::Pixels();
     if (layer::Width() == w && layer::Height() == h) {
         for (int y = 0; y < h; y++) {
-            unsigned char* d = g_stage + (size_t)y * w * 4; const unsigned char* l = lp + (size_t)y * w * 4;
+            unsigned char* d = static_cast<unsigned char*>(g_panelPtr) + (size_t)y * g_panelPitch; const unsigned char* l = lp + (size_t)y * w * 4;
             for (int x = 0; x < w; x++, d += 4, l += 4) {
                 const int a = l[3];
                 if (!a) continue;
@@ -341,14 +272,14 @@ static void Compose(int w, int h, float scale)
             }
         }
     }
-    for (int y = 0; y < h; y++) memcpy((unsigned char*)g_panelPtr + y * g_panelPitch, g_stage + (size_t)y * w * 4, (size_t)w * 4);
 }
 
 static void DrawPanel(VkQueue q, uint32_t imgIndex)
 {
     if (imgIndex >= g_scImgCount) return;
     int px, py, pw, ph;
-    if (!panel::Frame((int)g_scExtent.width, (int)g_scExtent.height, &px, &py, &pw, &ph)) return;
+    bool changed = false;
+    if (!panel::Frame((int)g_scExtent.width, (int)g_scExtent.height, &px, &py, &pw, &ph, &changed)) return;
     if (!BuildImages(q)) return;
     if (pw > g_imgW) pw = g_imgW;
     if (ph > g_imgH) ph = g_imgH;
@@ -362,22 +293,17 @@ static void DrawPanel(VkQueue q, uint32_t imgIndex)
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VkCommandBuffer cb = g_cmd[imgIndex];
 
-    // 1. the frame region under the panel -> backdrop
-    pResetCB(cb, 0);
-    pBeginCB(cb, &bi);
-    Barrier(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT);
-    region.srcOffset = { px, py, 0 }; region.dstOffset = { 0, 0, 0 };
-    pCmdCopyImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_bdImg, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    Barrier(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0);
-    pEndCB(cb);
-    SubmitAndWait(q, cb);
-    if (pInvalidate) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_bdMem; r.size = VK_WHOLE_SIZE; pInvalidate(g_dev, 1, &r); }
+    HoverState hover;
+    panel::Hover(&hover.x, &hover.y, &hover.w, &hover.h, &hover.pressed);
+    if (!g_composed || changed || pw != g_composedW || ph != g_composedH ||
+        hover.x != g_lastHover.x || hover.y != g_lastHover.y ||
+        hover.w != g_lastHover.w || hover.h != g_lastHover.h || hover.pressed != g_lastHover.pressed) {
+        Compose(pw, ph, hover);
+        if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
+        g_composed = true; g_composedW = pw; g_composedH = ph; g_lastHover = hover;
+    }
 
-    // 2. blur + blend on the CPU
-    Compose(pw, ph, g_scExtent.height ? g_scExtent.height / 1080.f : 1.f);
-    if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
-
-    // 3. the result -> the frame
+    // Copy the cached panel onto this frame.
     pResetCB(cb, 0);
     pBeginCB(cb, &bi);
     Barrier(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
