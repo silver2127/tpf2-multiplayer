@@ -2334,6 +2334,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     preflight_requests = {}
     mod_preflight = [False]
     pending_start = [None]
+    serve_hold = [0.0]        # until when the serve-again waits for the host's hot-join save
     mod_round = [None]        # the addrs to start once a mods round resolves
 
     def broadcast_start(save, only=None):
@@ -2770,8 +2771,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[host] public listing {'ON' if publisher.on else 'OFF'}")
             else:
                 log("[host] publish requested but no --publish URL was given")
+        elif c == "sync_taking":
+            # The host's menu is taking a hot-join save for the newcomer(s). The
+            # serve-again below must not push the save START GAME shared meanwhile
+            # -- it did, within a second of the join, and the fresh autosave then
+            # arrived to "a save transfer is in progress" (2026-09-16). Its start
+            # lifts the hold; if the save never appears the hold expires.
+            serve_hold[0] = time.time() + 120
+            log("[host] the host is saving for a hot join -- holding the serve-again")
         elif c == "start":
             save = cmd.get("save")
+            serve_hold[0] = 0.0
             if relay_only:
                 log("[relay] 'start' from the local panel ignored -- the leader starts")
             elif transfer[0] is not None:
@@ -2779,6 +2789,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     pending_start[0] = dict(cmd)
                     io.emit({"type": "status", "state": "connected",
                              "detail": "Waiting for mod downloads before starting the game."})
+                elif save:
+                    # never drop the host's save: it is the world the game is in NOW
+                    pending_start[0] = dict(cmd)
+                    log("[host] start queued until the running save transfer ends")
                 else:
                     log("[host] start ignored -- a save transfer is in progress")
             elif save and not _mod_check(save, io, log):
@@ -2968,7 +2982,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # Anyone who joined during a transfer is still unstarted: serve them
             # from the same save now that the pipe is free (relay: its stored
             # world; host: the file START GAME shared). One push per batch.
-            if not (recovery and recovery.held) and started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0:
+            if not (recovery and recovery.held) and started[0] and transfer[0] is None and upload[0] is None and last_shared[0] and now - last_serve_check[0] >= 1.0 and now >= serve_hold[0]:
                 last_serve_check[0] = now
                 waiting = [a for a in peers if not peers[a].get("started")]
                 fresh = (not relay_only) or (0 <= stored_age() <= HOTJOIN_STORED_MAX)

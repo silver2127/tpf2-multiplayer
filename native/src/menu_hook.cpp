@@ -2140,6 +2140,10 @@ static void SyncStart(const char* why)
         Log("[sync] %s -> taking the save\n", why);
         if (ForceAutosave()) {
             g_syncAskedAt = GetTickCount64(); SetStatus("Hot join: saving\xE2\x80\xA6");
+            // Our lobby would otherwise push the save START GAME shared to the
+            // newcomer within a second, and this fresh one arrived to "start
+            // ignored -- a save transfer is in progress" (2026-09-16). Hold it.
+            LobbySend("{\"cmd\":\"sync_taking\"}");
             // tell the newcomer's panel what is going on (a marked chat line;
             // a panel still at the title menu shows it as its status, not as chat)
             // ...but only for a real hot join. The relay's periodic upload
