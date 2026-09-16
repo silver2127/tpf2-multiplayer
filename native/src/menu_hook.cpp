@@ -1014,8 +1014,12 @@ static void RenderPanelLayer(int w, int h)
         if(!requested) {
             if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
             else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
-            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted")))
+            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted"))) {
                 mwButton(pad,h-S(76),S(210),S(30),g_playerCount>2 ? L"Request readiness" : L"Resync now",84);
+                // The host declines: the panel closes on every game and stays
+                // closed for this world (a later resync, or a new lobby, lifts it).
+                if(detected) mwButton(pad+S(222),h-S(76),S(150),S(30),L"Keep playing",88);
+            }
             else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
                 mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
         }
@@ -1568,6 +1572,20 @@ static void OnHit(int id)
             if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
         }
         break;
+    case 88: { // The host keeps playing: every game's panel closes and stays closed for this world.
+        if(!InterlockedCompareExchange(&g_isHost,0,0)) break;
+        static LONG declineNo = 0;
+        char line[160]; snprintf(line,sizeof(line),"{\"cmd\":\"sync_decline\",\"id\":\"decline-%lu-%llu-%ld\"}",
+            GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&declineNo));
+        LobbySend(line);
+        EnterCriticalSection(&g_modelCs);
+        if(!strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual")) {
+            g_recoveryPhase[0]=0;
+            InterlockedExchange(&g_uiState,0); InterlockedExchange(&g_recoveryPresent,0);
+            InterlockedExchange(&g_panelDirty,1);
+        }
+        LeaveCriticalSection(&g_modelCs);
+    } break;
     case 85: // Dismiss a preflight notice; never hide a held operation.
         EnterCriticalSection(&g_modelCs);
         if(!strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual") || !strcmp(g_recoveryPhase,"detected")) {

@@ -26,6 +26,14 @@ def publish_prompt(runtime, io, available, now):
     except (KeyError, ValueError):
         return
     key = (world, count, bool(available))
+    # The host declined a resync: no prompt for the rest of this world. A
+    # resync that completes afterwards (a fresh epoch) or a new lobby lifts it.
+    if getattr(runtime, 'prompt_muted', False):
+        if runtime.state and runtime.state['phase'] == 'complete' and runtime.state['epoch'] != getattr(runtime, 'prompt_muted_epoch', None):
+            runtime.prompt_muted = False
+        else:
+            runtime.prompt_seen = key
+            return
     if notice.get('held') != '0' or (runtime.state and runtime.state['phase'] != 'complete'):
         # Consume observations of the old world while recovering so completion
         # cannot reopen its prompt before the new GUI publishes its dashboard.
@@ -42,6 +50,13 @@ def ui_state(state):
     error = state.get('error') or {}
     return dict(state, type='sync_state', step=error.get('step', ''),
                 detail=error.get('detail', ''))
+
+
+def mute_prompt(runtime, io):
+    """Close this game's resync prompt and keep it closed for the current world."""
+    runtime.prompt_muted = True
+    runtime.prompt_muted_epoch = runtime.state['epoch'] if runtime.state else None
+    io.emit(dict(type='sync_prompt', phase='clear'))
 
 
 def make_runtime(args):
@@ -123,7 +138,7 @@ class HostRecovery:
 
     def command(self, sender, message):
         kind = message.get('cmd', message.get('t'))
-        if kind not in ('sync_request', 'sync_retry', 'sync_abort', 'sync_ack', 'sync_ready'):
+        if kind not in ('sync_request', 'sync_retry', 'sync_abort', 'sync_ack', 'sync_ready', 'sync_decline'):
             return False
         if sender not in self.members():
             return True
@@ -150,6 +165,14 @@ class HostRecovery:
         # Enforce authority on the authenticated sender, not a UI flag or a
         # claimed identity inside the command. Clients may only confirm ready.
         if sender != self.barrier.host:
+            return True
+        if kind == 'sync_decline':
+            # the host keeps playing: every game's panel closes and stays closed
+            # for this world (a completed resync or a new lobby lifts it)
+            mute_prompt(self.runtime, self.io)
+            for member in self.members():
+                if member != self.barrier.host:
+                    self.send(member, {'t': 'sync_declined'})
             return True
         if self.readiness and self.readiness['phase'] == 'waiting':
             self.ready_state()
@@ -297,6 +320,9 @@ class ClientRecovery:
             return True
         if kind == 'sync_command_ack':
             self.pending.pop(message.get('id'), None)
+            return True
+        if kind == 'sync_declined':
+            mute_prompt(self.runtime, self.io)
             return True
         if kind != 'sync_state':
             return False
