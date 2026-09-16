@@ -174,3 +174,47 @@ ticks = {name: p.eval("script.save().__tpf2mp_deterministic_v1.lastUpdate")
 assert len(set(ticks.values())) == 1, ticks
 print(f'PASS: 1x, 4x, 16x and jittery pacing all grow towns identically '
       f'({len(base)} writes, last tick {list(ticks.values())[0]})')
+
+
+# THE ENGINE ECHOES load EVERY FRAME (2026-09-16). During play the engine syncs
+# script state between its Lua states by calling save and then load with what
+# save returned, once per frame -- 1,360 times in one session on the host. The
+# wrapper used to re-apply every echo (RNG seed and grid anchor snapped back,
+# the script's state table replaced with the saved copy), so what an update on
+# the grid had done was undone or re-run depending on the FRAME the echo landed
+# on. Frames are not sim-aligned, so two peers grew towns differently with every
+# seed-related path deterministic. A game frame here is: update, then the echo
+# (save+load) on some frames and not others, in a per-peer pattern.
+def run_echoing(wall, start, sims, echo_every, phase):
+    p = peer(wall)
+    p.execute('load_identical(200,%d,%d)' % (start, start))
+    for i, sim in enumerate(sims):
+        p.globals().sim = sim
+        p.execute('script.update()')
+        if (i + phase) % echo_every == 0:
+            p.execute('script.load(script.save())')      # the engine's per-frame echo
+    return p
+
+
+quiet = run_sims(1000, START, evenly(0.2, START, STOP))
+echo_a = run_echoing(1000, START, evenly(0.2, START, STOP), 3, 0)   # echo on every 3rd frame
+echo_b = run_echoing(5555, START, evenly(0.2, START, STOP), 7, 2)   # a different frame pattern
+echo_c = run_echoing(31337, START, evenly(0.8, START, STOP), 2, 1)  # 4x catch-up, echo every other frame
+base = capacities(quiet)
+for name, p in (('echo every 3rd frame', echo_a), ('echo every 7th frame', echo_b), ('4x with echoes', echo_c)):
+    got = capacities(p)
+    assert got == base, (f'{name}: the engine echoing load changed the growth: {len(got)} writes vs {len(base)}; '
+                         f'first difference at '
+                         f'{next((i for i, (x, y) in enumerate(zip(got, base)) if x != y), min(len(got), len(base)))}')
+ticks = {n: p.eval("script.save().__tpf2mp_deterministic_v1.lastUpdate") for n, p in (('quiet', quiet), ('a', echo_a), ('b', echo_b), ('c', echo_c))}
+assert len(set(ticks.values())) == 1, ticks
+# a REAL load (different metadata) is still applied: a fresh peer given echo_a's save lands on its tick and seed
+fresh = peer(4242)
+# carried across runtimes as a Lua literal (the mod's own serializer does exactly this for saves)
+literal = echo_a.eval("(function() local s = require('natural_town_growth/serialization'); return s.stringify(script.save()) end)()")
+fresh.globals().saved_literal = literal
+fresh.globals().sim = STOP
+fresh.execute('script.load(assert(load("return " .. saved_literal))())')
+assert fresh.eval("script.save().__tpf2mp_deterministic_v1.lastUpdate") == ticks['a']
+assert fresh.eval("script.save().__tpf2mp_deterministic_v1.seed") == echo_a.eval("script.save().__tpf2mp_deterministic_v1.seed")
+print(f'PASS: the engine echoing load every frame no longer changes the growth ({len(base)} writes); a real load still applies')

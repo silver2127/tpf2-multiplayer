@@ -169,18 +169,48 @@ function M.wrap(script, id, options)
 			if result then return unpackRange(result, 1, result.n) end
 		end
 	end
+	-- THE ENGINE CALLS load EVERY FRAME (2026-09-16). save/load are not only the
+	-- world's save and load: the engine syncs script state between its Lua
+	-- states through them, so during play load arrives once per frame with the
+	-- state the previous save returned (1,360 calls in one session on the host,
+	-- 499 on the joiner, interleaved with the sim's own clock samples). This
+	-- wrapper re-applied every one of them: the RNG seed and the update-grid
+	-- anchor were rewritten from the saved values and the script's own load
+	-- put its state table back to the saved copy, once per frame. Harmless as
+	-- long as the echo carries exactly what the last save returned (it does),
+	-- but a needless per-frame rewrite of live state, and a trap the moment
+	-- save and load stop being back to back. (The town-lane desyncs this was
+	-- first suspected of were the running autosave: the joiner loaded a world
+	-- the host had already left -- see the hot-join held save.)
+	--
+	-- A load is applied only when its metadata is not what this wrapper handed
+	-- out in a save since the last real load: a world load brings a different
+	-- seed/anchor pair (or none), an echo brings ours back. The multiplayer
+	-- script's own load handlers work the same way (take a value only when we
+	-- have none yet).
+	local echoed = nil   -- {seed, lastUpdate} of the last save we returned
 	out.save = function(...)
 		local payload = script.save and invoke(script.save, ...) or nil
 		assert(payload == nil or type(payload) == "table", "deterministic script requires table save state")
 		local saved = payload and copy(payload) or {}
 		assert(saved[KEY] == nil, "deterministic save metadata collision")
 		saved[KEY] = {version = 1, id = id, seed = seed, lastUpdate = lastUpdate, empty = payload == nil}
+		echoed = {seed = seed, lastUpdate = lastUpdate}
 		return saved
 	end
+	local echoes = 0
 	out.load = function(saved, ...)
+		local meta = type(saved) == "table" and saved[KEY]
+		if meta and echoed and meta.seed == echoed.seed and meta.lastUpdate == echoed.lastUpdate then
+			echoes = echoes + 1
+			if echoes == 1 or echoes % 1000 == 0 then
+				print("[mpdet] " .. id .. ": load is the engine echoing our own state (x" .. echoes .. ") -- ignored")
+			end
+			return
+		end
+		echoed, echoes = nil, 0
 		seed, lastUpdate = hash(id), anchorTick()
 		local payload = saved
-		local meta = type(saved) == "table" and saved[KEY]
 		if meta then
 			assert(meta.version == 1 and meta.id == id and integer(meta.seed) and meta.seed > 0 and meta.seed < MOD,
 				"invalid deterministic script save state")
