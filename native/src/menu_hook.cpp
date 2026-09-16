@@ -592,7 +592,7 @@ static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSecti
 
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
 static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
-struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field 11=PUBLIC 12=REFRESH 30..37=public game rows; btn = hover wash
+struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field 11=PUBLIC 12=REFRESH 50=SEPARATE COMPANIES 30..37=public game rows; btn = hover wash
 static const int MAX_COMPANIES = 200;   // lobby.py MAX_COMPANIES (one addPlayer() entity each on every peer); the roster itself has no cap here -- origins a..z then aa, ab, ...
 static const int ROSTER_ROWS = 16;                        // rows the lobby page can show; the rest is a "+N more" line
 static Hit g_hits[64]; static int g_hitCount = 0;
@@ -919,6 +919,11 @@ static void SteamNameTick()
     Log("[menu] username follows Steam: %s\n", g_username);
 }
 static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itself to the master server
+// SEPARATE COMPANIES ticked (2026-09-16): the lobby gives every player their own
+// company; unticked, everyone shares company 1 (co-op). The lobby assigns the
+// chips from it, on a change and for each joiner; the roster carries the mode
+// back, so a joiner's panel shows it (and the host's stays in step).
+static volatile LONG g_sepCompanies = 0;
 
 // ---------------- the public game list (server browser) ----------------
 // GET <master>/list on a background thread every PUB_EVERY ms while the
@@ -1207,7 +1212,9 @@ static void RenderPanelLayer(int w, int h)
               layerText(pad + S(30), cy + S(30) + ROSTER_ROWS * S(26), listW, S(20), more, fl, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); }
           int legendY = cy + S(30) + (shown < 8 ? 8 : shown) * S(26) + S(6) + (n > ROSTER_ROWS ? S(22) : 0);
           if (legendY > bottom - S(44)) legendY = bottom - S(44);
-          layerText(pad, legendY, listW, S(40), L"Same number = one company together. Different numbers = separate companies. Left-click a chip for the next company, right-click for the previous.",
+          layerText(pad, legendY, listW, S(40), InterlockedCompareExchange(&g_sepCompanies, 0, 0)
+                    ? L"Separate companies: each player runs their own. Left-click a chip for the next company, right-click for the previous."
+                    : L"Co-op: everyone runs company 1 together. Left-click a chip for the next company, right-click for the previous.",
                     fl, MW_DIM, DT_LEFT | DT_TOP | DT_WORDBREAK, 170); DeleteObject(fl); }
         DeleteObject(fr); DeleteObject(fs);
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
@@ -1229,7 +1236,9 @@ static void RenderPanelLayer(int w, int h)
         int bw1 = 0;
         if (!WorldLoaded()) { bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5); }
         if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
-            if (g_flagMaster[0]) mwCheck(w - pad - bw2 - S(110), bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
+            int px2 = w - pad - bw2 - S(110);
+            if (g_flagMaster[0]) mwCheck(px2, bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
+            mwCheck(px2 - S(230), bottom, L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
         if(WorldLoaded() && g_isHost) {
             bw1=mwButtonW(L"RESYNC...");
             mwButton(pad,bottom,bw1,S(30),L"RESYNC...",87);
@@ -1274,7 +1283,8 @@ static void RenderPanelLayer(int w, int h)
           wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
           mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
         { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
-          if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
+          if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
+          mwCheck(lx, cy + S(130), L"SEPARATE COMPANIES (each player their own; off = one company together)", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
         mwHeader(rx, cy, colW, L"JOIN A GAME");
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
@@ -1791,6 +1801,14 @@ static void OnHit(int id, int button)
         } else SetStatus(on ? "Your game will be listed publicly when you host." : "Your game will not be listed.");
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game list…"); break;
+    case 50: {   // SEPARATE COMPANIES checkbox; while hosting the lobby re-assigns every chip at once
+        LONG on = InterlockedCompareExchange(&g_sepCompanies, 0, 0) ? 0 : 1; InterlockedExchange(&g_sepCompanies, on);
+        if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && InterlockedCompareExchange(&g_isHost, 0, 0)) {
+            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) SetStatus("Lobby is starting…");
+            else { LobbySend(on ? "{\"cmd\":\"mode\",\"mode\":\"companies\"}" : "{\"cmd\":\"mode\",\"mode\":\"coop\"}");
+                   SetStatus(on ? "Separate companies: every player gets their own company." : "Co-op: everyone plays company 1 together."); }
+        } else SetStatus(on ? "Players will each get their own company." : "Players will share one company.");
+        InterlockedExchange(&g_panelDirty, 1); } break;
     case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
         int i = id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
@@ -2732,6 +2750,9 @@ static void applyRoster(const char* s)
         const char* k = strstr(co, keyq.c_str());
         if (k) { k += keyq.size(); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
     }
+    // "mode":"coop"|"companies" -> the checkbox (a joiner sees the host's choice)
+    { char md[16] = ""; jsonStr(s, "mode", md, sizeof(md));
+      if (md[0]) InterlockedExchange(&g_sepCompanies, strcmp(md, "companies") == 0 ? 1 : 0); }
     // "stages":{"name":"text",...} -> g_stages[i]: what each joiner is doing
     g_stages.assign(g_players.size(), std::string());
     { const char* sg = strstr(s, "\"stages\"");
@@ -3120,7 +3141,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; char lobby[NAME_MAX]; };
+struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; int sep; char lobby[NAME_MAX]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -3169,6 +3190,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
+        if (a->sep) wcscat_s(wpub, L" --companies");                    // SEPARATE COMPANIES: the lobby assigns a company per player
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name \"%s\" --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
@@ -3547,6 +3569,7 @@ static void StartLobby(int join)
     LobbyArg* a = (LobbyArg*)calloc(1, sizeof(LobbyArg)); if (!a) return;
     a->join = join; strcpy_s(a->name, g_username); strcpy_s(a->password, g_passCode);
     a->pub = InterlockedCompareExchange(&g_public, 0, 0) ? 1 : 0;
+    a->sep = InterlockedCompareExchange(&g_sepCompanies, 0, 0) ? 1 : 0;
     InterlockedExchange(&g_joinFocus, 0); SaveNames();
     if (g_lobbyName[0]) strcpy_s(a->lobby, g_lobbyName); else snprintf(a->lobby, sizeof(a->lobby), "%s's game", g_username);
     if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); g_lobbyTitle.clear(); LeaveCriticalSection(&g_modelCs); }
