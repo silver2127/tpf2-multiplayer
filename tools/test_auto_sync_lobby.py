@@ -204,10 +204,40 @@ with tempfile.TemporaryDirectory() as temporary:
             wait_for(lambda: lagger.blocked_seen)
             assert all(r.state['phase'] == 'checking' and not r.finished for r in runtimes.values())
             command(last, cmd='quit')
-            wait_for(lambda: all(runtimes[n].state['phase'] == 'error' for n in names[:-1]))
-            assert runtimes['host'].state['error']['step'] == 'checking'
-            assert 'disconnected' in runtimes['host'].state['error']['detail']
-            assert all(not r.finished for r in runtimes.values())
+            # A client that leaves mid-round is dropped and the others carry on
+            # (2026-09-16): the round completes for them; the leaver's own copy
+            # stays where it was, unreleased.
+            wait_for(lambda: all(runtimes[n].finished for n in names[:-1]))
+            assert runtimes['host'].state['phase'] == 'complete'
+            assert set(runtimes['host'].state['members']) == set(names[:-1])
+            assert lagger.state['phase'] == 'checking' and not lagger.finished
+        if players == 2:
+            # A FROZEN JOIN (2026-09-16): a player arriving in the running session
+            # is brought in through a round the host lobby starts by itself --
+            # mode 'join', no button, no readiness -- and everyone, host included,
+            # loads the snapshot; the newcomer never gets a START GAME push.
+            ios['late'] = lobby.LobbyIO(str(root / 'late'))
+            runtimes['late'] = EngineStandIn(root / 'late', root / 'late', 123, 'late')
+            before = (runtimes['host'].saves, {n: r.loads for n, r in runtimes.items()})
+            late_conn = lobby._dial_loopback(0, host.getsockname()[1], 5)
+            assert late_conn is not None
+            connections.append(late_conn)
+            workers.append(threading.Thread(target=lobby.run_client,
+                args=(late_conn, 'late', ios['late']), kwargs=dict(stop=stop, log=lambda _: None,
+                                                                 sync_runtime=runtimes['late'])))
+            workers[-1].start()
+            wait_for(lambda: all(r.finished and r.state['mode'] == 'join' for r in runtimes.values()))
+            nonce_follows_world()
+            assert runtimes['host'].saves == before[0] + 1
+            assert runtimes['late'].loads == 1
+            assert all(runtimes[n].loads == before[1][n] + 1 for n in before[1]), 'everyone loads, the host too'
+            assert set(runtimes['host'].state['members']) == {'host', 'client', 'late'}
+            rosters = [json.loads(line) for line in Path(ios['host'].out_path).read_text(encoding='utf-8').splitlines()]
+            assert any(e.get('type') == 'roster' and e.get('join_freeze') is True for e in rosters), 'the menu is told to stand down its hot-join save'
+            # the newcomer is started by the round, not by a save push: no start event for it
+            assert not lobby._has_start(ios['late'].out_path)
+            command('late', cmd='chat', text='late is in')
+            wait_for(lambda: lobby._has_chat(ios['host'].out_path, 'late is in'))
 
     finally:
         stop.set()
@@ -217,4 +247,5 @@ with tempfile.TemporaryDirectory() as temporary:
         for connection in connections:
             connection.close()
         assert all(not worker.is_alive() for worker in workers)
-print(f'PASS ({players} players): host-only resync/retry, all-player readiness, stale confirmation rejected, lost control/ACK recovery, snapshot, pause, mismatch/retry and disconnect; engine simulated')
+print(f'PASS ({players} players): host-only resync/retry, all-player readiness, stale confirmation rejected, lost control/ACK recovery, snapshot, pause, mismatch/retry, a leaver dropped mid-round'
+      + (' and a frozen join (everyone reloads, the newcomer included)' if players == 2 else '') + '; engine simulated')

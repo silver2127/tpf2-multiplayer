@@ -46,6 +46,7 @@
 //     behind a mutex. A cancel arm is per thread by design.
 #pragma once
 #include <cstddef>
+#include <string>
 #include <cstdint>
 #include <xmmintrin.h>
 
@@ -124,7 +125,20 @@ template <class T> inline bool SliceReadT(uintptr_t addr, T* out) { return Slice
 // into out (cap >= len + 1). Refuses an implausible object: len > maxLen, a short
 // string longer than 15, a heap string whose capacity is below len, or text not
 // NUL-terminated where libstdc++ always terminates it.
+constexpr size_t SliceSanityBytes = size_t(1) << 30; // corrupt span guard, not a content count
 bool SliceReadStdString(uintptr_t obj, char* out, size_t cap, size_t* lenOut, size_t maxLen = 1 << 20);
+inline bool SliceReadStdString(uintptr_t obj, std::string* out)
+{
+    uint64_t h[3];
+    if (!SliceRead(obj, h, sizeof(h)) || h[1] >= SliceSanityBytes) return false;
+    std::string value(size_t(h[1]) + 1, '\0');
+    size_t len;
+    if (!SliceReadStdString(obj, &value[0], value.size(), &len, SliceSanityBytes)) return false;
+    value.resize(len);
+    *out = std::move(value);
+    return true;
+}
+
 // std::vector<T> {begin, end, cap}: checks begin <= end <= cap, both spans a whole
 // number of `stride`, count <= maxCount and the element range readable.
 struct SliceVec { uintptr_t begin; size_t count; };

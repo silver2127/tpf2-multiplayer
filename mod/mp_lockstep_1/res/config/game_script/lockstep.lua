@@ -204,6 +204,14 @@ K.RTT_MIN_SAMPLES = 8
 K.GAP_HOLD_GRACE_TICKS = 1     -- ordinary reordering never stutters the game
 K.GAP_HOLD_ENGAGE_TICKS = 3    -- engage this many ticks of sim progress ahead of the stamp
 K.GAP_HOLD_MAX_TICKS = 55      -- ~10 s: then give up on that command (it applies late if it comes)
+K.HOLD_NACK_EVERY = 3          -- ticks between NACKs for the command a hold is waiting for (net.lua gapHoldTick)
+-- A LOST COMMAND IS NOT RECOVERED, IT IS NOT LOST (2026-09-16). Every command goes out
+-- CMD_SEND_COPIES times back to back and once more on each of the next CMD_REPEATS
+-- ticks (net.lua scheduleLocal / txRepeatTick); the delay pays DELAY_REPEAT_TICKS
+-- ticks for the repeat (execDelayTick). Recovery (NACK + resend) stays as the backstop.
+K.CMD_SEND_COPIES = 2
+K.CMD_REPEATS = 1
+K.DELAY_REPEAT_TICKS = 1
 
 -- The most peer lead a command's stamp will pay for: a live session was seen
 -- 9.2 units apart (net.lua scheduleLocal).
@@ -219,6 +227,7 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
+K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
 -- ~400 ms, and at the base cadence that is ~10% of wall time spent inside our
 -- own bookkeeping -- which is what "it feels laggy" actually was.
@@ -330,11 +339,15 @@ end
 
 -- cu=1 on our heartbeat: catching up, or far behind the leader, so nobody
 -- paces against our clock. Never on the leader: it IS the clock.
+-- Also from the FIRST heartbeat after a load until the load gate has the
+-- command history since our save (CM.lgFetch, pacing.lua): the leader prunes
+-- its history only while nobody is catching up, and a game that has just
+-- loaded is about to ask for it.
 function CM.heartbeatCu(now)
 	if CM.isLeader() then CM.farBehind = false; return false end
 	local ref = CM.leaderPrecise() or CM.peerFastPrecise()
 	CM.farBehind = (ref ~= nil) and (ref - now) > K.CATCHUP_MIN
-	return (CM.catchingUp2 or CM.farBehind) and true or false
+	return (CM.catchingUp2 or CM.farBehind or (CM.lgFetch ~= nil and CM.lgFetch ~= "done")) and true or false
 end
 
 function CM.peerBounds()
@@ -375,11 +388,23 @@ function CM.statusLine(now)
 	-- reads it so a build in that window is cancelled and replayed like any other,
 	-- instead of running natively on one instance only (2026-09-11: two tracks laid
 	-- 2 s after loading existed on A and nowhere else).
-	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d",
+	-- stage= (2026-09-16): what a hot joiner is doing, for the lobby roster
+	-- (the menu DLL reads it and tells the host): starting until a peer is
+	-- heard, catchup:<fetch|run>:<behind> while the catch-up runs, behind:<n>
+	-- while more than 2 units back, live otherwise.
+	local stage = "live"
+	if not CM.peerSeen then stage = "starting"
+	elseif CM.catchingUp2 then stage = string.format("catchup:%s:%.1f", tostring(CM.cuPhase or "run"), CM.behindBy or 0)
+	elseif (CM.behindBy or 0) > 2 then stage = string.format("behind:%.1f", CM.behindBy or 0) end
+	-- cm= (2026-09-16): companies mode as the SIM knows it. The lobby's
+	-- mp_company_cfg.txt says what the roster was at START; a company created
+	-- in game never reaches that file, so the slice's shared-stations gate read
+	-- "coop" on both machines and opened nothing (foreignAsked=2344 opened=0).
+	return string.format("t=%d  peer=%s  skew=%s  desyncs=%d  late=%d  applylag=%.1f/%d of %d  queued=%d  mp=%d  stage=%s  cm=%s",
 		math.floor(now), tostring(pt and math.max(1, math.floor(pt)) or "?"),
 		pt and string.format("%+.1f", now - pt) or "?",
 		CM.desyncs, CM.lateCount, CM.applyLagMax or 0, CM.applyLate or 0, CM.applyCount or 0,
-		#CM.queue, tonumber(CM.rosterPlayers) or 0)
+		#CM.queue, tonumber(CM.rosterPlayers) or 0, stage, CM.cmMode == "companies" and "companies" or "coop")
 end
 -- Letter -> 0..7, for anything that needs a per-origin namespace.
 function CM.originIdx(o)
@@ -535,8 +560,12 @@ K.SIM_STEP = 0.2
 -- which is what drifted departures -- review, 2026-09-01).
 K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
 K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
+K.VCOLOR_RETRY_MAX = 50      -- a company paint waits up to 50 of those for its vehicle's key (vehicles.lua execSetColor)
+K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
 K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
-K.CMD_RING = 256          -- own commands kept for resend
+-- Own commands are kept for resend until every live peer has acknowledged them
+-- (ak= on the heartbeat, net.lua CM.sentPrune) -- no count (K.CMD_RING, 256,
+-- until 2026-09-16), and the history answers what the ring no longer holds.
 K.NACK_GRACE = 15         -- ticks a gap must persist before NACKing (UDP reorder)
 K.NACK_EVERY = 30         -- ticks between re-NACKs of the same seq
 -- How close a peer's node must be to a shipped demolish endpoint to be
@@ -617,6 +646,7 @@ local function execute(c)
 	elseif c.op == "CON" then CM.execCon(c)
 	elseif c.op == "DEMOLISH" then CM.execDemolish(c)
 	elseif c.op == "HEALCHK" then CM.execHealCheck(c)
+	elseif c.op == "LREADBACK" then CM.execLineReadback(c)
 	elseif c.op == "EDEMO" then CM.execEdgeDemolish(c)
 	elseif c.op == "CONFAIL" then CM.execConFail(c)
 	elseif c.op == "VBUY" then CM.execVBuy(c)
@@ -640,7 +670,7 @@ local function execute(c)
 	elseif c.op == "SPEEDVOTE" then CM.execSpeedVote(c)
 	elseif c.op == "TERRAIN" then CM.execTerrain(c)
 	elseif c.op == "ASSETS" then CM.execAssets(c)
-	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" then CM.execCompanyCmd(c)
+	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" or c.op == "CMNAME" or c.op == "CMOPEN" then CM.execCompanyCmd(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
 
@@ -706,7 +736,7 @@ function CM.vposShip(stamp)
 	for i = 1, m do
 		local seg = {}
 		for j = (i - 1) * K.VPOS_PER_PART + 1, math.min(i * K.VPOS_PER_PART, #pts) do
-			seg[#seg + 1] = string.format("%.1f,%.1f", pts[j][1], pts[j][2])
+			seg[#seg + 1] = string.format("%.1f,%.1f,%s", pts[j][1], pts[j][2], pts[j][3] or "-")
 		end
 		CM.broadcast(string.format("LSVPOS t=%d s=%.1f o=%s i=%d m=%d n=%d d=%s",
 			stamp, st, K.INSTANCE, i, m, #pts, #seg > 0 and table.concat(seg, ";") or "-"))
@@ -735,6 +765,20 @@ local function checkHash(now)
 	-- the first hash (the same on every instance: same save; the base interval
 	-- until then), then whatever the leader's HASHEVERY moved every instance to.
 	local stamp = CM.hashStampOf(now)
+	-- A HASH IS A SAMPLE AT A SIM TIME, not a property of the stamp (2026-09-16).
+	-- The stamp only says which interval the sample fell in; the world it describes
+	-- is the world at `now`. A game that ENTERS an interval part way through --
+	-- every game does, on the first update after a load -- would publish a sample
+	-- from the middle of it under the same stamp as a game that crossed its start,
+	-- and the two are not the same world: the hot join of 2026-09-16 had the host
+	-- sample stamp 0 at 1.8 and the joiner (which loaded a save taken at 31.4) at
+	-- 31.6, 30 game units of town growth apart, and it read as a desync at the very
+	-- first stamp. So a stamp is published only when this game watched its clock
+	-- CROSS it. The hash is still taken (the first one sets the cadence from the
+	-- edge count, hash.lua) and still shown on the dash; it is simply nobody
+	-- else's to compare.
+	local sawCrossing = CM.hashPrevNow ~= nil and CM.hashPrevNow < stamp
+	CM.hashPrevNow = now
 	if lastHashAt == stamp then return end
 	lastHashAt = stamp
 	local ph0 = os.clock()
@@ -746,6 +790,11 @@ local function checkHash(now)
 		local pf = CM.perfHash or { n = 0, sum = 0, max = 0 }
 		pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
 		CM.perfHash = pf
+	end
+	if not sawCrossing then
+		CM.dashLastDetail = detail
+		log(string.format("hash t=%d: this game entered that interval at %.1f rather than crossing its start (a load) -- the sample is not comparable with anyone else's and is not published", stamp, now))
+		return
 	end
 	CM.myHashes[stamp] = h
 	CM.myDetails[stamp] = detail
@@ -782,6 +831,33 @@ function data()
 		update = function()
 			CM.ticks = CM.ticks + 1
 			if not K.INSTANCE and not CM.detectInstance() then return end
+			-- WORLD TOKEN: which world this game is in, one line, rewritten on
+			-- the first sim tick of every load. The menu DLL cannot see a NEW
+			-- GAME (it never reaches the engine's StartSavegame) and a CONTINUE
+			-- carries no name it could recognise, so the host's menu reads a
+			-- CHANGE here as "this game has moved to another world" and pushes
+			-- it to everyone. The pid addresses the file to THIS game: a second
+			-- instance sharing the data dir must not be taken for us. Written
+			-- from the sim side only -- the dashboard's guiUpdate runs this same
+			-- chunk in its own Lua state, and a second value per load would read
+			-- as a second switch -- and BEFORE the recovery hold below, so a
+			-- resync's own load is stamped while the menu knows it is busy.
+			if not CM.worldGenWritten then
+				CM.worldGenWritten = true
+				pcall(function()
+					local f = io.open(K.BASE .. "tpf2mp_world_gen.txt", "w")
+					if not f then return end
+					-- the wall clock, this process's own clock, the address of a
+					-- fresh table and a draw: two loads cannot land on one value,
+					-- not even two in the same second of a run that never reseeded
+					local uniq = tostring({}):gsub("%W", "")
+					f:write("pid=" .. tostring(K.PROCESS_ID or "") .. "\n")
+					f:write("gen=" .. os.time() .. "-"
+						.. math.floor((os.clock() or 0) * 1000) % 1000000 .. "-"
+						.. uniq .. "-" .. math.random(0, 999999) .. "\n")
+					f:close()
+				end)
+			end
 			-- Recovery is checked before every command producer, including deferred
 			-- company repairs. Recovery control uses the separate lobby connection.
 			if CM.autoSyncPump(CM.gameTime() or 0) then return end
@@ -866,12 +942,15 @@ function data()
 					if f then f:write(CM.statusLine(CM.gameTime() or 0)); f:close() end
 				end)
 			end
+			if CM.txRepeatTick then CM.txRepeatTick() end   -- the extra copies of our recent commands
 			if CM.ticks % 10 == 5 then CM.nackScan() end
 			CM.flushConPairs()
 			CM.primeConstructions()
 			CM.primeVehKeys()
 			CM.shipParkedBuys()
 			CM.pollVehKeys()
+			CM.watchDepartures()
+			CM.watchTrains()
 			CM.drainVehCap()
 			CM.primeLineKeys()
 			CM.pollLineKeys()
@@ -898,10 +977,12 @@ function data()
 				-- ms= our clock and e= the peers' clocks echoed back (round trips, CM.rttNote);
 				-- ha= the stamp of our highest command, hi= (the gap hold, CM.gapHoldNeed)
 				-- hc= our world hash's cost in ms, which the leader sets the hash cadence by
-				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
+				-- ak= what we hold of each origin, contiguously (its sent ring prunes by this)
+				CM.broadcast(string.format("LSTICK t=%d o=%s s=%d hi=%d%s ms=%d%s%s%s%s r=%s", math.floor(now), K.INSTANCE, CM.stepOf(now), CM.seqNo,
 					CM.heartbeatCu(now) and " cu=1" or "", math.floor(os.clock() * 1000),
 					CM.lastSchedAt and string.format(" ha=%.4f", CM.lastSchedAt) or "",
-					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.hashCostReport and CM.hashCostReport() or "", CM.resyncToken))
+					CM.heartbeatEcho and CM.heartbeatEcho() or "", CM.hashCostReport and CM.hashCostReport() or "",
+					CM.ackReport and CM.ackReport() or "", CM.resyncToken))
 			end
 
 			CM.paceTick(now)
@@ -915,6 +996,8 @@ function data()
 			if CM.retryQueue and #CM.retryQueue > 0 then
 				for _, rc in ipairs(CM.retryQueue) do
 					executed[CM.cmdKey(rc)] = nil
+					CM.queuedKeys = CM.queuedKeys or {}
+					CM.queuedKeys[CM.cmdKey(rc)] = true   -- a copy arriving during the retry is not queued beside it
 					CM.queue[#CM.queue + 1] = rc
 				end
 				CM.retryQueue = {}
@@ -985,6 +1068,19 @@ function data()
 										if lg > st and (not c.notBeforeStep or c.notBeforeStep < lg) then c.notBeforeStep = lg end
 									end
 								end
+								-- Line assignments land on a step GRID. Depot departures are dispatched
+								-- with frame granularity: two assignments a few steps apart fell into one
+								-- engine batch on the slower-rendering game and into two on the other,
+								-- and two long trains left the same depot in opposite order (a:58/a:59,
+								-- 2026-09-16), while ten trucks assigned on one step never drifted -- on
+								-- one step the engine orders them the same everywhere. So assignments
+								-- due within a grid cell are issued together, on its last step, on
+								-- every instance; a hold above only ever moves this later.
+								if c.op == "VLINE" then
+									local due = c.notBeforeStep or st
+									if due % K.VLINE_GRID_STEPS ~= 0 then due = due + (K.VLINE_GRID_STEPS - due % K.VLINE_GRID_STEPS) end
+									c.notBeforeStep = due
+								end
 							end
 						end
 					end
@@ -1002,6 +1098,7 @@ function data()
 							keep[#keep + 1] = c
 						else
 						local k = CM.cmdKey(c)
+						if CM.queuedKeys then CM.queuedKeys[k] = nil end   -- the queue's copy is done with (net.lua: one copy queued per key)
 						if not executed[k] then
 							executed[k] = true
 							-- remember insertion order so this cannot grow for the life of
@@ -1068,6 +1165,7 @@ function data()
 						f:write(string.format("eff=%s\nspeedreq=%s\nvotes=%s\nmyvote=%s\nsync=%s\npace=%s\nxfer=%s\n", CM.effSpeed and string.format("%g", CM.effSpeed) or "-",
 							CM.spdReqInForce and CM.spdReq and string.format("%g", CM.spdReq) or "-", CM.voteWords(CM.voteCounted),
 							myVote and string.format("%g", myVote.v) or "-", CM.syncState or "-", CM.paceInfo or "-", CM.xferInfo or "-"))
+						f:write("gov=" .. ((CM.govFactor and CM.govFactor < 1) and string.format("x%.2f (%s %.1f behind)", CM.govFactor, tostring(CM.govWho or "?"), CM.govWorst or 0) or "-") .. "\n")
 						-- companies: mine, the roster, and who plays what ("3:a,b 4:c")
 						pcall(function()
 							local ids, who = {}, {}
@@ -1078,7 +1176,18 @@ function data()
 							local locked = {}
 							for cid in pairs(CM.cmPw or {}) do locked[#locked + 1] = tostring(cid) end
 							table.sort(locked)
-							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ",")))
+							-- names, percent-escaped ("3:Acme%20Co 4:...")
+							local names = {}
+							for _, cid in ipairs(CM.cmRoster or {}) do
+								local n = CM.cmNameOf and CM.cmNameOf(cid) or (CM.cmName and CM.cmName[cid])
+								if n and n ~= "" then names[#names + 1] = cid .. ":" .. CM.escName(n) end
+							end
+							-- station permissions ("1:* 2:1,3 3:-"), and the slice's file (companies.lua)
+							local open = {}
+							for _, cid in ipairs(CM.cmRoster or {}) do open[#open + 1] = cid .. ":" .. (CM.cmOpenCode and CM.cmOpenCode(cid) or "*") end
+							if CM.cmWritePerms then pcall(CM.cmWritePerms) end
+							if CM.cmWriteCompanyMap then pcall(CM.cmWriteCompanyMap) end
+							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\ncoopen=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " "), table.concat(open, " ")))
 						end)
 						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
@@ -1189,19 +1298,33 @@ function data()
 			end
 		end,
 
-		-- the company state, the drift check's off switch and the hash grid ride in the
-		-- save (companies.lua cmSaveState, hash.lua vposSaveState / hashGridSave)
+		-- the company state, the drift check's off switch, the hash grid and the
+		-- vehicle / line key registries ride in the save (companies.lua cmSaveState,
+		-- hash.lua vposSaveState / hashGridSave, vehicles.lua vehKeysSaveState,
+		-- lines.lua lineKeysSaveState)
 		save = function()
 			-- called every frame in the GUI state too (engine -> GUI sync): keep it cheap, no log
 			local ok, st = pcall(CM.cmSaveState)
+			-- savedAt: the sim time this save was taken at, EXACTLY. A game that loads
+			-- it asks the host for every command stamped after it (the load gate's
+			-- LSNEED ... save=1, pacing.lua): a clock read after a few ticks of play
+			-- would skip the commands stamped in between (a hole), a clock read too
+			-- early would replay commands the save already holds (a double build).
 			return { cm = ok and st or nil, vposOff = CM.vposSaveState and CM.vposSaveState() or nil,
-			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil }
+			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
+			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
+			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
+			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
 			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and tonumber(s.savedAt) and CM.savedAt == nil then CM.savedAt = tonumber(s.savedAt) end
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
 			if type(s) == "table" and s.hashGrid and CM.hashGridLoad then pcall(CM.hashGridLoad, s.hashGrid) end
+			-- a save from before 2026-09-16 has neither: every save vehicle / line primes s:<id> as before
+			if type(s) == "table" and s.vehKeys and CM.vehKeysLoadState then pcall(CM.vehKeysLoadState, s.vehKeys) end
+			if type(s) == "table" and s.lineKeys and CM.lineKeysLoadState then pcall(CM.lineKeysLoadState, s.lineKeys) end
 		end,
 
 		-- ---------- multiplayer status panel (GUI Lua state) ----------
@@ -1410,40 +1533,51 @@ function data()
 						b:onClick(fn)
 						return b
 					end
-					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
-					CM.dashShowChat = (CM.dashShowChat ~= false)
-					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
-					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", function()
-						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
-						if f then
-							f:write("0\n"); f:close()
-							D.shown = false
-							D.win:setVisible(false, false)
-						end
-					end))
-					tog:addItem(toggleBtn("  lobby  ", function()
-						CM.dashShowLobby = not CM.dashShowLobby
-						D.lobbyBox:setVisible(CM.dashShowLobby, false)
-					end))
-					tog:addItem(toggleBtn("  stats  ", function()
-						CM.dashShowStats = not CM.dashShowStats
+					-- Sections as tabs (2026-09-16): lobby, stats, chat, companies and speed
+					-- show one at a time. A section's button opens it and closes the
+					-- others; the open section's button closes it. CM.dashTab survives a
+					-- rebuild of the window (false = every section closed).
+					local TABS = { { "lobby", "dashShowLobby" }, { "stats", "dashShowStats" }, { "chat", "dashShowChat" },
+					               { "companies", "dashShowCompanies" }, { "speed", "dashShowSpeed" } }
+					if CM.dashTab == nil then CM.dashTab = "chat" end   -- the chat was the section open by default
+					local function applyTabs()
+						for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+						-- a chat input left open behind a hidden chat would keep taking keys
+						if not CM.dashShowChat and D.chatOpen and CM.chatCloseInput then pcall(CM.chatCloseInput) end
+						pcall(function() D.lobbyBox:setVisible(CM.dashShowLobby, false) end)
 						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
-					end))
-					tog:addItem(toggleBtn("  chat  ", function()
-						CM.dashShowChat = not CM.dashShowChat
 						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
-					end))
-					tog:addItem(toggleBtn("  companies  ", function()
-						CM.dashShowCompanies = not CM.dashShowCompanies
 						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
-					end))
-					-- the speed vote row: shown by default, this toggle hides it
-					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)
-					tog:addItem(toggleBtn("  speed  ", function()
-						CM.dashShowSpeed = not CM.dashShowSpeed
-						D.speedShown = nil   -- the GUI tick re-applies the row's visibility
-					end))
+						D.speedShown = nil   -- the GUI tick re-applies the speed row
+						for name, label in pairs(D.tabLabels or {}) do
+							pcall(function() label:setText(CM.dashTab == name and ("[ " .. name .. " ]") or ("  " .. name .. "  ")) end)
+						end
+					end
+					local function selectTab(name)
+						CM.dashTab = (CM.dashTab ~= name) and name or false
+						applyTabs()
+					end
+					for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+					local tog = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					-- Hiding is one thing done from two places: this button and the
+					-- window's own title-bar "x" (below). Both write the flag the
+					-- menu DLL's Ctrl+Shift+D reads, so the next chord SHOWS it.
+					local function hideDash()
+						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
+						if f then f:write("0\n"); f:close() end
+						D.shown = false
+						if D.win then D.win:setVisible(false, false) end
+					end
+					D.hideDash = hideDash
+					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", hideDash))
+					D.tabLabels = {}
+					for _, t in ipairs(TABS) do
+						local name = t[1]
+						D.tabLabels[name] = api.gui.comp.TextView.new("  " .. name .. "  ")
+						local b = api.gui.comp.Button.new(D.tabLabels[name], true)
+						b:onClick(function() selectTab(name) end)
+						tog:addItem(b)
+					end
 					local togC = api.gui.comp.Component.new("mpToggles")
 					togC:setLayout(tog)
 					-- far behind the other games, the player's actions are off: said at the very
@@ -1472,7 +1606,6 @@ function data()
 					lobbyL:addItem(D.lobbyNav)
 					D.lobbyBox = api.gui.comp.Component.new("mpLobby")
 					D.lobbyBox:setLayout(lobbyL)
-					D.lobbyBox:setVisible(CM.dashShowLobby == true, false)
 					box:addItem(D.lobbyBox)
 					-- ---- speed votes (2026-09-12 as the host's speed buttons; every player's since 2026-09-15) ----
 					-- A press appends SPEEDSET <v> to our inject file: our vote for the
@@ -1559,7 +1692,6 @@ function data()
 					-- The GUI state cannot reach the lockstep queue, so a button
 					-- appends "CMSWITCH 3" to the inject file; inject.lua schedules
 					-- the command and every peer applies it on the same step.
-					D.coText = api.gui.comp.TextView.new("company: -")
 					D.coSel = nil
 					local function coPw()
 						local t = ""
@@ -1567,29 +1699,37 @@ function data()
 						return (t or ""):gsub("[%c]", "")
 					end
 					local function coRequest(op, cid)
+						-- company changes wait for everyone to load in (the sim refuses them too)
+						local loading = CM.cmLoadingPlayers and CM.cmLoadingPlayers() or {}
+						if #loading > 0 then D.coHint = CM.cmLoadingNote(loading); return end
 						local pw = coPw()
 						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
 						if f then f:write(op .. (cid and (" " .. cid) or "") .. (pw ~= "" and (" " .. pw) or "") .. string.char(10)); f:close() end
 					end
-					local function coStep(dir)
-						local r = D.coRoster or {}
-						if #r == 0 then return end
-						local i = 1
-						for k, v in ipairs(r) do if v == D.coSel then i = k end end
-						i = ((i - 1 + dir) % #r) + 1
-						D.coSel = r[i]
-					end
-					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					-- company colour swatches (2026-09-10): the chip colour the lobby roster shows
-					-- (style classes !mpCo1..!mpCo200 in res/config/style_sheet/mp_lockstep.lua),
-					-- for our company before the text and for the selected one after it
+					-- Your company (2026-09-16): its colour swatch (the lobby chip colour: style
+					-- classes !mpCo1..!mpCo200 in res/config/style_sheet/mp_lockstep.lua) and its
+					-- name. A company is named in the game's own company window; that rename
+					-- reaches every player through CMNAME (inject.lua). Unnamed, it is
+					-- "<player>'s company" (companies.lua CM.cmNameOf).
+					local mrow = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					D.coSwMine = api.gui.comp.TextView.new("  ##  ")
+					D.coNameText = api.gui.comp.TextView.new("")
+					mrow:addItem(D.coSwMine)
+					mrow:addItem(D.coNameText)
+					local mrowC = api.gui.comp.Component.new("mpCompanyMine")
+					mrowC:setLayout(mrow)
+					-- The picker: a dropdown of every company by name, alphabetical. Rebuilt
+					-- only when its labels change (see D.coItemsSig below), so a click is
+					-- never lost to a refresh; the box sits in its own component so a
+					-- rebuild swaps it in place.
+					local crow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					D.coPickL = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					D.coPick = api.gui.comp.Component.new("mpCompanyPick")
+					D.coPick:setLayout(D.coPickL)
+					crow:addItem(D.coPick)
+					-- the selected company's colour, beside the dropdown (2026-09-16)
 					D.coSwSel = api.gui.comp.TextView.new("  ##  ")
-					crow:addItem(D.coSwMine)
-					crow:addItem(D.coText)
 					crow:addItem(D.coSwSel)
-					crow:addItem(speedBtn("  <  ", function() coStep(-1) end))
-					crow:addItem(speedBtn("  >  ", function() coStep(1) end))
 					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
 					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
 					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
@@ -1612,8 +1752,26 @@ function data()
 					prowC:setLayout(prow)
 					local crowC = api.gui.comp.Component.new("mpCompanyRow")
 					crowC:setLayout(crow)
+					-- STATION PERMISSIONS (2026-09-16): who may stop at your stations. The
+					-- selected company (the dropdown above) is allowed or denied; everyone /
+					-- nobody set the whole list. "CMOPEN who on" goes through the inject
+					-- file like the other company commands (companies.lua CMOPEN).
+					local function coOpen(who, on)
+						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						if f then f:write("CMOPEN " .. tostring(who) .. " " .. tostring(on) .. string.char(10)); f:close() end
+					end
+					local orow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					D.coOpenText = api.gui.comp.TextView.new("your stations are open to: -")
+					orow:addItem(D.coOpenText)
+					orow:addItem(api.gui.comp.TextView.new("   "))
+					orow:addItem(speedBtn("  allow selected  ", function() if D.coSel and D.coSel ~= D.coMine then coOpen(D.coSel, 1) end end))
+					orow:addItem(speedBtn("  deny selected  ", function() if D.coSel and D.coSel ~= D.coMine then coOpen(D.coSel, 0) end end))
+					orow:addItem(speedBtn("  everyone  ", function() coOpen("*", 1) end))
+					orow:addItem(speedBtn("  nobody  ", function() coOpen("*", 0) end))
+					local orowC = api.gui.comp.Component.new("mpCompanyOpenRow")
+					orowC:setLayout(orow)
 					local coL = api.gui.layout.BoxLayout.new("VERTICAL")
-					coL:addItem(crowC); coL:addItem(prowC); coL:addItem(D.coNote)
+					coL:addItem(mrowC); coL:addItem(crowC); coL:addItem(prowC); coL:addItem(orowC); coL:addItem(D.coNote)
 					D.coBox = api.gui.comp.Component.new("mpCompanies")
 					D.coBox:setLayout(coL)
 					box:addItem(D.coBox)
@@ -1682,16 +1840,19 @@ function data()
 					D.chatBox = api.gui.comp.Component.new("mpChat")
 					D.chatBox:setLayout(chatL)
 					box:addItem(D.chatBox)
-					pcall(function()
-						D.statsBox:setVisible(CM.dashShowStats, false)
-						D.rawBox:setVisible(CM.dashShowNumbers, false)
-						D.chatBox:setVisible(CM.dashShowChat, false)
-						D.coBox:setVisible(CM.dashShowCompanies, false)
-					end)
+					pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					applyTabs()
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
 					D.win = api.gui.comp.Window.new("Multiplayer", body)
 					D.win:setPosition(20, 120)
+					-- The title-bar "x" (2026-09-16): a Window has no close behaviour
+					-- of its own, so the button did nothing. Closing is hiding (the
+					-- window is rebuilt from D on every refresh and must survive),
+					-- and it goes through the same flag as the hide button, or the
+					-- poll below would put it straight back.
+					pcall(function() D.win:addHideOnCloseHandler() end)
+					pcall(function() D.win:onClose(function() D.hideDash() end) end)
 				end
 				-- A column with a fresh local file shows everything. A peer known only
 				-- over the wire shows what we know of it: its game time, our skew to
@@ -1739,28 +1900,91 @@ function data()
 					if not okW and not D.statsErrLogged then D.statsErrLogged = true; print("[ls-gui] stats in words: " .. tostring(errW)) end
 				end
 				pcall(function()
-					if D.coText and mine then
+					if D.coNameText and mine then
 						local roster = {}
 						for id in tostring(mine.roster or ""):gmatch("%d+") do roster[#roster + 1] = tonumber(id) end
 						local played = {}
 						for id, who in tostring(mine.played or ""):gmatch("(%d+):([%a,]+)") do played[tonumber(id)] = who end
 						local locked = {}
 						for id in tostring(mine.colocked or ""):gmatch("%d+") do locked[tonumber(id)] = true end
-						D.coRoster, D.coPlayed, D.coMine, D.coLocked = roster, played, tonumber(mine.company), locked
+						local names = {}
+						for id, n in tostring(mine.conames or ""):gmatch("(%d+):(%S+)") do names[tonumber(id)] = CM.unescName(n) end
+						D.coRoster, D.coPlayed, D.coMine, D.coLocked, D.coNames = roster, played, tonumber(mine.company), locked, names
+						if (guiTick % 30) == 0 or not D.coNamesRead then D.coNamesRead = true; pcall(CM.readPlayerNames) end
+						-- a company's name as the sim decided it (companies.lua CM.cmNameOf: the
+						-- name given in the game's company window, else the founder's)
+						local function coName(cid)
+							local n = names[cid]
+							if n and n ~= "" then return n end
+							return "Company " .. tostring(cid)
+						end
 						if not D.coSel then D.coSel = D.coMine end
-						local sel = D.coSel or D.coMine
-						local selWho = sel and played[sel]
-						-- the swatches follow the ids (see D.coSwMine)
+						-- the dropdown: every company by name, alphabetical; a company with more
+						-- than one player also lists the others
+						local items = {}
+						for _, cid in ipairs(roster) do
+							local who = {}
+							for l in tostring(played[cid] or ""):gmatch("%a+") do who[#who + 1] = CM.playerNameOf(l) end
+							local label = coName(cid) .. (cid == D.coMine and "  (mine)" or "") .. (locked[cid] and "  [password]" or "")
+								.. (#who == 0 and "  (empty)" or (#who > 1 and ("  (" .. table.concat(who, ", ") .. ")") or ""))
+							items[#items + 1] = { cid = cid, label = label }
+						end
+						table.sort(items, function(p, q) if p.label:lower() == q.label:lower() then return p.cid < q.cid end return p.label:lower() < q.label:lower() end)
+						local sig = {}
+						for _, it in ipairs(items) do sig[#sig + 1] = it.cid .. "=" .. it.label end
+						sig = table.concat(sig, "|")
+						if sig ~= D.coItemsSig and D.coPickL then
+							D.coItemsSig, D.coItems = sig, items
+							local old = D.coCombo
+							local cb = api.gui.comp.ComboBox.new()
+							for _, it in ipairs(items) do cb:addItem(it.label) end
+							D.coRebuilding = true
+							cb:onIndexChanged(function(i)
+								if D.coRebuilding then return end
+								local it = D.coItems and D.coItems[(tonumber(i) or -1) + 1]
+								if it then D.coSel = it.cid end
+							end)
+							if old then
+								local okR = pcall(function() D.coPickL:removeItem(old) end)
+								if not okR then pcall(function() old:setVisible(false, false) end) end
+							end
+							D.coPickL:addItem(cb)
+							D.coCombo = cb
+							local at = nil
+							for i, it in ipairs(items) do if it.cid == D.coSel then at = i - 1 end end
+							if not at and #items > 0 then at = 0; D.coSel = items[1].cid end
+							if at then pcall(function() cb:setSelected(at, false) end) end
+							D.coRebuilding = false
+						end
+						-- the swatches follow the ids (see D.coSwMine); the name follows the registry
 						local mineCls = "mpCo" .. tostring(math.max(1, math.min(200, D.coMine or 1)))
-						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, sel or D.coMine or 1)))
 						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
+						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, D.coSel or D.coMine or 1)))
 						if D.coSwSel and D.coSwSelCls ~= selCls then D.coSwSelCls = selCls; pcall(function() D.coSwSel:setStyleClassList({ selCls }) end) end
-						D.coText:setText(string.format("company: mine %s   |  %d in session   |  selected: %s%s%s   ",
-							tostring(D.coMine or "?"), #roster, tostring(sel or "-"),
-							(sel == D.coMine and " (mine)" or "") .. (sel and locked[sel] and " [password]" or ""), selWho and (" played by " .. selWho) or (sel and " (empty)" or "")))
+						local mineName = D.coMine and coName(D.coMine) or "-"
+						if mineName ~= D.coNameShown then D.coNameShown = mineName; D.coNameText:setText(" " .. mineName .. "   ") end
+						-- what our stations are open to, from the sim's coopen= ("1:* 2:1,3 3:-")
+						if D.coOpenText and D.coMine then
+							local code = tostring(mine.coopen or ""):match("%f[%d]" .. D.coMine .. ":(%S+)") or "*"
+							local text
+							if code == "*" then text = "everyone"
+							elseif code == "-" then text = "nobody"
+							else
+								local ns = {}
+								for v in code:gmatch("%d+") do ns[#ns + 1] = coName(tonumber(v)) end
+								text = table.concat(ns, ", ")
+							end
+							local line = "your stations are open to: " .. text
+							if line ~= D.coOpenShown then D.coOpenShown = line; pcall(function() D.coOpenText:setText(line) end) end
+						end
 						local note = mine.conote or ""
 						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
-						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end
+						-- while somebody loads in, say so in place of the last note
+						if (guiTick % 30) == 0 and CM.cmLoadingPlayers then
+							local loading = CM.cmLoadingPlayers()
+							D.coLoadingNote = (#loading > 0) and CM.cmLoadingNote(loading) or nil
+						end
+						if D.coNote then D.coNote:setText("   " .. (D.coHint or D.coLoadingNote or note)) end
 					end
 					if D.chatText and (guiTick % 30) == 0 then
 						local lines = CM.chatTail(8)

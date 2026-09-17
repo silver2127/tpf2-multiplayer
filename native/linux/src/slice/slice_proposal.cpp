@@ -2,6 +2,7 @@
 // Only PROVEN build-35924 fields from SLICE_PROPOSAL.md are read. No Windows STL
 // layout, game allocator, or unverified construction/template mutation is used.
 #include "slice_proposal.h"
+#include <vector>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -12,9 +13,9 @@ constexpr uintptr_t kStreetBuilder = 0xe86452;
 constexpr uintptr_t kTrackModifier = 0xed6da9;
 constexpr uintptr_t kStopBuilder = 0xeaaf79;
 constexpr uintptr_t kBulldozer = 0xdd4e99;
-constexpr size_t kMaxNodes = 4096;
-constexpr size_t kMaxEdges = 2048;
-constexpr size_t kMaxObjects = 128;
+constexpr size_t kMaxNodes = SIZE_MAX;
+constexpr size_t kMaxEdges = SIZE_MAX;
+constexpr size_t kMaxObjects = SIZE_MAX;
 // Preserve the shipped Windows replacement decision in mixed-platform lobbies:
 // the threshold is bytes, not objects (SLICE_PROPOSAL.md section 6).
 constexpr size_t kStopReplaceRefusalBytes = 0x100;
@@ -255,7 +256,7 @@ void OnBuildProposal(const SliceFactoryCall& call, void*)
         if (SliceProposalBuildStopRecord(call.rdx, &record)) kind = SliceProposalKind::Stop;
     } else if (call.retRva == kBulldozer) {
         SliceVec constructions{};
-        if (SliceReadStdVector(call.rdx + 0x2a0, 0x8f0, 256, &constructions) && constructions.count)
+        if (SliceReadStdVector(call.rdx + 0x2a0, 0x8f0, SIZE_MAX, &constructions) && constructions.count)
             return; // CONUP (module removal) is owned by slice-construction.
         kind = SliceProposalBuildBulldozeRecord(call.rdx, &record);
     } else {
@@ -290,7 +291,7 @@ bool SliceProposalBuildRoadRecord(uintptr_t proposal, bool construction, bool up
     const int32_t streetType = kind == 0 ? Field<int32_t>(first, 0x4c) : -1;
     const int32_t trackType = kind == 1 ? Field<int32_t>(first, 0x60) : 1;
     const unsigned catenary = kind == 1 ? first[0x64] : 0;
-    bool shipRemoval[kMaxEdges]{};
+    std::vector<bool> shipRemoval(removed.count);
     size_t removalCount = 0;
     for (size_t i = 0; i < removed.count; ++i) {
         bool ship = construction || upgrade;
@@ -338,18 +339,17 @@ bool SliceProposalBuildStopRecord(uintptr_t proposal, SliceRecord* out)
     const int32_t player = Field<int32_t>(object, 0xf8);
     if (edge < 0 || (kind != 0 && kind != 2) || model <= 0 || player < 0 ||
         !Finite3(object, 0x44) || object[0xd0] > 1 || object[0xd1] > 1) return false;
-    char name[4097];
-    size_t nameLen = 0;
+    std::string name;
     // A libstdc++ short string's pointer refers to the original game's object,
     // not the snapshot. Never reinterpret a copied string as a C++ object.
-    if (!SliceReadStdString(objects.begin + 0xd8, name, sizeof(name), &nameLen, sizeof(name) - 1)) return false;
-    for (size_t i = 0; i < nameLen; ++i) {
+    if (!SliceReadStdString(objects.begin + 0xd8, &name)) return false;
+    for (size_t i = 0; i < name.size(); ++i) {
         if (!name[i]) return false;
         if (name[i] == '\r' || name[i] == '\n') name[i] = ' ';
     }
     SliceRecordPrintf(out, "STOPX %d %d %d %.4f %.4f %.4f %u %u %d name=%s\n",
                       edge, kind, model, Field<float>(object, 0x44), Field<float>(object, 0x48),
-                      Field<float>(object, 0x4c), object[0xd1], object[0xd0], player, name);
+                      Field<float>(object, 0x4c), object[0xd1], object[0xd0], player, name.c_str());
     return !out->failed;
 }
 
@@ -357,8 +357,8 @@ SliceProposalKind SliceProposalBuildBulldozeRecord(uintptr_t proposal, SliceReco
 {
     if (!proposal || !out || out->failed) return SliceProposalKind::None;
     Snapshot addedCon, removedCon, added, removed, nodes;
-    if (!ReadVector(proposal + 0x2a0, 0x8f0, 256, &addedCon) ||
-        !ReadVector(proposal + 0x288, 4, 256, &removedCon) || addedCon.count ||
+    if (!ReadVector(proposal + 0x2a0, 0x8f0, SIZE_MAX, &addedCon) ||
+        !ReadVector(proposal + 0x288, 4, SIZE_MAX, &removedCon) || addedCon.count ||
         !ReadVector(proposal + 0x18, 0x78, kMaxEdges, &added) ||
         !ReadVector(proposal + 0x48, 0x78, kMaxEdges, &removed) ||
         !ReadVector(proposal + 0x30, 0x18, kMaxNodes, &nodes)) return SliceProposalKind::None;

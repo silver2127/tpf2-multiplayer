@@ -1,4 +1,114 @@
+## Latest Windows integration: dev 23419163, release 0.6 (2026-09-17)
+
+See [UPSTREAM_dev_23419163.md](UPSTREAM_dev_23419163.md). Ported the Windows
+road-edge entry order (`roadentries`) to the Linux ELF with byte-verified
+guards ([DEV_23419163.md](../re/linux/DEV_23419163.md)) and the roster's
+`join_freeze` flag. Shared Lua/Python (hash ownership, companies map, frozen
+joins) merged; Lua verification targets 23419163. Station-icon refinements
+and the resync title-menu exception remain unported (no native tint path, no
+native resync controller). Native build 45/45 CTests. No live validation.
+
+## Previous Windows integration: dev 66c870cf (2026-09-16)
+
+See [UPSTREAM_dev_66c870cf.md](UPSTREAM_dev_66c870cf.md). Shared HUD styling
+now colours only the glyph using a second image layer; 32 upstream TGA assets
+are included unchanged. Lua and glyph release verification target this commit.
+No native hook or ABI changed. Visible native company tinting remains unavailable
+because the inherited entity/owner-to-widget class tagging is unported; cumulative
+native integration remains partial. No live rendering test is claimed.
+
+## Previous Windows integration: dev 50d7588b (2026-09-16)
+
+See [UPSTREAM_dev_50d7588b.md](UPSTREAM_dev_50d7588b.md). Windows tint
+classes now use `mpWinCoN`/`mpCoN`, without the selector `!`. Linux has no
+company-tint class application path; the correction remains unported there.
+Fresh ELF checks and the remaining owner/relay prerequisites are recorded in
+[DEV_50D7588B.md](../re/linux/DEV_50D7588B.md). Lua is unchanged and exact
+against the new target; release provenance is updated. Integration is partial.
+
+## Previous Windows integration: dev d6db920f (2026-09-16)
+
+See [UPSTREAM_dev_d6db920f.md](UPSTREAM_dev_d6db920f.md). Shared station/depot
+icon-element company styles are merged exactly. Native glyph tagging remains
+unported after a fresh ELF investigation: carrier class call sites and icon
+pointers are identified, but complete entity/owner and engine lifetime contracts
+are missing. Existing native tinting stays unavailable. Lua verification and
+release provenance target d6db920f; this integration is partial.
+
+## Previous Windows integration: dev be3b86ae (2026-09-16)
+
+See [UPSTREAM_dev_be3b86ae.md](UPSTREAM_dev_be3b86ae.md). The native lobby
+exports loading players atomically on every roster update. Shared Lua blocks
+company creation, switching and dissolution until other players finish loading,
+while allowing password changes. All 28 Lua files match Windows exactly;
+verification and release provenance target be3b86ae. This commit is fully
+ported; inherited tint, ownership, recovery and Workshop gaps remain.
+No live gameplay validation is claimed.
+
+## Previous Windows integration: dev 61578d27 (2026-09-16)
+
+See [UPSTREAM_dev_61578d27.md](UPSTREAM_dev_61578d27.md). The shared Lua
+stylesheet adds company colours to station/depot icon descendants, darker
+hover colours and a translucent window title bar. All 28 Lua files match
+Windows exactly; verification and release provenance target 61578d27.
+Native root-class tagging remains unavailable, so these selectors alone do
+not enable Linux HUD/window tinting. No native patch changed. This remains
+a partial native integration; earlier gaps and runtime validation limits apply.
+
+## Previous Windows integration: dev 8e31f1e0 (2026-09-16)
+
+See [UPSTREAM_dev_8e31f1e0.md](UPSTREAM_dev_8e31f1e0.md). Windows label
+counters, first-six window-bind logs and staged no-owner station diagnostics
+are merged intact. Their native tint prerequisites remain unavailable after
+fresh static investigation; see [DEV_8E31F1E0.md](../re/linux/DEV_8E31F1E0.md).
+Lua/release provenance targets 8e31f1e0. No new native patch is enabled;
+this integration is partial and earlier gaps remain.
+
+## Previous Windows integration: dev db8a4776 (2026-09-16)
+
+See [UPSTREAM_dev_db8a4776.md](UPSTREAM_dev_db8a4776.md). The Windows
+station-icon crash fix, button-root hook, class read-back, tint-class override
+and counters are merged intact. Native station/window tinting remains
+unavailable after a fresh ELF investigation; see
+[DEV_DB8A4776.md](../re/linux/DEV_DB8A4776.md). No new game patch is enabled.
+Lua/release provenance now targets db8a4776. Earlier gaps remain unchanged.
+
+## Previous Windows integration: dev 5fb7aea2 (2026-09-16)
+
+See [UPSTREAM_dev_5fb7aea2.md](UPSTREAM_dev_5fb7aea2.md). The Windows HUD
+station/depot company wash is merged but remains unported after static Linux
+investigation; missing hook/owner/style contracts are recorded in
+[DEV_5FB7AEA2.md](../re/linux/DEV_5FB7AEA2.md). The preceding 20-colour
+palette integration is retained. All 28 Lua files match the new target.
+Native soldier build and 45/45 CTests pass. Merge remains uncommitted;
+no live gameplay compatibility is claimed. Earlier gaps below remain.
+
+## Previous Windows integration: dev d3135a59 (2026-09-16)
+
+See [UPSTREAM_dev_d3135a59.md](UPSTREAM_dev_d3135a59.md). The uncommitted merge
+includes native station permissions, four icon-owner branch patches and the
+foreign-window eligibility patch, plus 28 exact upstream Lua files. Soldier
+build and 44/44 CTests pass. Vehicle-icon, station-label and window tinting
+remain unported; attempted mappings and missing evidence are recorded in
+[DEV_D3135A59.md](../re/linux/DEV_D3135A59.md). Earlier gaps below remain.
+No game or Steam execution and no live compatibility claim.
+
+## Previous Windows integration: dev 38432b5f (2026-09-16)
+
+See [UPSTREAM_dev_38432b5f.md](UPSTREAM_dev_38432b5f.md) for the staged merge,
+paused-counter patch, load percentages, automatic lobby leave, live companies
+gate, exact Lua provenance and verification. Native build: 44/44 tests passed.
+Windows MSI in-app updates remain unsupported on native Linux; earlier gaps
+below remain. No live gameplay validation was performed for this integration.
+
 # Linux port checkpoint — 2026-09-15
+
+## Current integration — 2026-09-16
+
+Windows dev through `1d0ca473` (0.5.7 plus later changes) is staged, uncommitted,
+and partially ported. See [UPSTREAM_dev_1d0ca473.md](UPSTREAM_dev_1d0ca473.md)
+for current coverage, tests and native recovery/in-world-load gaps. Historical
+checkpoints below describe their own revisions, not current live validation.
 
 ## Upstream update — 0.5.3
 

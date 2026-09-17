@@ -14,8 +14,23 @@ import time
 PHASES = ('holding', 'waiting', 'saving', 'transferring', 'loading', 'checking',
           'releasing', 'complete', 'error', 'aborted')
 ACTIVE = frozenset(PHASES[:-3])
-TIMEOUT = {'holding': 45, 'saving': 120, 'transferring': 300,
-           'loading': 300, 'checking': 60, 'releasing': 30}
+# Phases whose length does not depend on the world: a fixed wait from entry.
+TIMEOUT = {'holding': 45, 'checking': 60, 'releasing': 30}
+# Phases whose length DOES depend on the world -- the engine writing the save,
+# the bytes crossing the wire, every engine loading it -- have no total limit.
+# A 1 GB save to a slow uplink is however long it is. What ends them early is
+# SILENCE: no member reported any progress for this long (the same numbers
+# that were the total limits until 2026-09-16, now measured from the last
+# progress report, not from entry). Progress is anything that advances, by a
+# member that has not finished its part: bytes acknowledged by a receiver
+# (and its verify/write work once it has them all), the engine's own work --
+# CPU time of the thread saving or loading, bytes through the disk -- a save
+# file growing, a member's control stage changing (see SyncParticipant.progress,
+# sync_runtime.engine_work, HostRecovery.tick, ClientRecovery.tick). Never a
+# heartbeat that ticks regardless of the engine, and never a member that has
+# already acknowledged the phase: what that member's engine does afterwards
+# (rendering, idling) says nothing about the members still working.
+SILENCE = {'saving': 120, 'transferring': 300, 'loading': 300}
 
 
 def snapshot_digest(files):
@@ -57,20 +72,65 @@ class SyncOperation:
         self.resume_speed = None
         self.error = None
         self.deadline = None
+        self.progress_seen = {}     # member -> its last progress token in this phase
         self.effects = []
         self.confirmed = True
+        # THE ROSTER MAY CHANGE UNDER AN OPERATION (2026-09-16). A join is a
+        # frozen sync point now: the whole session holds while everyone, the
+        # host included, loads one save, so a player who arrives while a round
+        # is running must be admitted, never refused -- and NOBODY is released
+        # until every member is in. A newcomer during holding/waiting simply
+        # joins the phase (it has to acknowledge it like everyone else); one
+        # arriving later is `pending`: when the round would complete, the same
+        # snapshot goes round again under a fresh epoch with the newcomer as a
+        # member. A client that leaves is dropped and the rest carry on; only
+        # the host's departure fails the operation.
+        self.pending = ()
 
     def _enter(self, phase):
         self.phase = phase
         self.revision += 1
         self.acks = {}
-        self.deadline = self.clock() + TIMEOUT[phase] if phase in TIMEOUT else None
+        self.progress_seen = {}
+        if phase in TIMEOUT:
+            self.deadline = self.clock() + TIMEOUT[phase]
+        elif phase in SILENCE:
+            self.deadline = self.clock() + SILENCE[phase]
+        else:
+            self.deadline = None
         self.effects.append(self.view())
+
+    def progress(self, sender, message):
+        """A member reports that its part of the current phase is advancing.
+
+        ``message`` names the operation, revision, epoch and phase like an
+        acknowledgement and carries a ``progress`` token; a token that differs
+        from the member's previous one moves the silence deadline out again. A
+        repeated token is not progress, and neither is anything from a member
+        that has already acknowledged this phase: its part is done, so nothing
+        it reports can stand for the members still working (a host rendering
+        away after its own quick install kept a hung joiner's load 'alive').
+        Returns True when the deadline moved."""
+        if self.phase not in SILENCE or sender not in self.members or sender in self.acks:
+            return False
+        if not isinstance(message, dict):
+            return False
+        if any(message.get(k) != getattr(self, k) for k in ('operation', 'revision', 'epoch', 'phase')):
+            return False
+        token = message.get('progress')
+        if not isinstance(token, str) or not token:
+            return False
+        if self.progress_seen.get(sender) == token:
+            return False
+        self.progress_seen[sender] = token
+        self.deadline = self.clock() + SILENCE[self.phase]
+        return True
 
     def view(self):
         return {'operation': self.operation, 'revision': self.revision,
                 'epoch': self.epoch, 'phase': self.phase, 'mode': self.mode,
                 'members': list(self.members), 'host': self.host,
+                'pending': list(self.pending),
                 'snapshot': copy.deepcopy(self.snapshot), 'resume_speed': self.resume_speed,
                 'error': copy.deepcopy(self.error)}
 
@@ -82,7 +142,10 @@ class SyncOperation:
         members = tuple(sorted(set(members)))
         if sender not in members or self.host not in members or len(members) < 2:
             return False
-        if mode not in ('start', 'resync') or (mode == 'start' and sender != self.host):
+        # 'join': a player arrived in a running session. The same round as a
+        # resync (the host saves, everyone loads), started by the host lobby
+        # itself, no button and no readiness dance.
+        if mode not in ('start', 'resync', 'join') or (mode in ('start', 'join') and sender != self.host):
             return False
         if self.phase in ACTIVE or self.phase == 'error':
             # A second player requesting recovery joins the current operation.
@@ -94,6 +157,7 @@ class SyncOperation:
         self.operation = self.token()
         self.epoch = self.token()
         self.members, self.mode = members, mode
+        self.pending = ()
         self.confirmed = confirmed
         self.snapshot = self.resume_speed = self.error = None
         self._enter('holding')
@@ -106,19 +170,54 @@ class SyncOperation:
         self._enter('error')
         return True
 
+    def _admit(self, members):
+        """The lobby roster against the operation's members: a departed client
+        is dropped (its part of the phase is no longer awaited), a newcomer is
+        admitted -- into the phase itself while nothing world-bound has begun
+        (holding/waiting), else as pending for one more round. Returns False
+        when the host is gone, which is the one change that ends a round."""
+        roster = set(members)
+        if self.host not in roster:
+            return False
+        gone = [m for m in self.members if m not in roster]
+        for m in gone:
+            self.acks.pop(m, None)
+            self.progress_seen.pop(m, None)
+        if gone:
+            self.members = tuple(m for m in self.members if m in roster)
+        self.pending = tuple(m for m in self.pending if m in roster)
+        new = sorted(m for m in roster if m not in self.members and m not in self.pending)
+        if new:
+            if self.phase in ('holding', 'waiting'):
+                self.members = tuple(sorted(set(self.members) | set(new)))
+                if self.phase == 'holding':
+                    self.deadline = self.clock() + TIMEOUT['holding']   # the newcomer's own hold
+            else:
+                self.pending = tuple(sorted(set(self.pending) | set(new)))
+        return True
+
     def tick(self, members):
         if self.phase not in ACTIVE:
             return
-        if set(members) != set(self.members):
-            self.fail('Player disconnected or roster changed')
+        if not self._admit(members):
+            self.fail('Host disconnected')
+        elif self._advance():
+            return                        # a departed client was the last one awaited
         elif self.deadline is not None and self.clock() >= self.deadline:
-            self.fail('Timed out waiting for all players')
+            if self.phase in SILENCE:
+                self.fail(f'No progress for {SILENCE[self.phase]} s while {self.phase}')
+            else:
+                self.fail('Timed out waiting for all players')
 
     def retry(self, sender, operation, members):
         if sender not in self.members or operation != self.operation or self.phase != 'error':
             return False
-        if set(members) != set(self.members):
+        members = tuple(sorted(set(members)))
+        if self.host not in members or len(members) < 2:
             return False
+        # whoever is on the roster now is the round: a member that left is
+        # not awaited, one that arrived meanwhile is in
+        self.members, self.pending = members, ()
         self.epoch = self.token()
         self.error = None
         self.confirmed = True
@@ -179,10 +278,20 @@ class SyncOperation:
                 if not isinstance(fingerprint, str) or not 1 <= len(fingerprint) <= 8192:
                     return False
         self.acks[sender] = dict(message)
+        self._advance()
+        return True
+
+    def _advance(self):
+        """Every member has acknowledged the phase: the next one. Returns True
+        when the phase moved."""
+        if self.phase not in ACTIVE or self.phase == 'waiting' or not self.members:
+            return False
         if set(self.acks) != set(self.members):
-            return True
+            return False
         if self.phase == 'holding':
             self._enter(('transferring' if self.snapshot else 'saving') if self.confirmed else 'waiting')
+        elif self.phase == 'saving':
+            return False                  # the host's snapshot ack enters transferring itself
         elif self.phase == 'transferring':
             self._enter('loading')
         elif self.phase == 'loading':
@@ -193,7 +302,17 @@ class SyncOperation:
             else:
                 self._enter('releasing')
         elif self.phase == 'releasing':
-            self._enter('complete')
+            if self.pending:
+                # somebody arrived during this round: nobody is released until
+                # they are in. The snapshot is the world every member holds, so
+                # it goes round once more under a fresh epoch, newcomers included.
+                self.members = tuple(sorted(set(self.members) | set(self.pending)))
+                self.pending = ()
+                self.epoch = self.token()
+                self.confirmed = True
+                self._enter('holding')
+            else:
+                self._enter('complete')
         return True
 
 

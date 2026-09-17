@@ -159,8 +159,10 @@ from __future__ import annotations
 
 import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
+from player_stats import PlayerStats       # relay-only: who plays, how much, how many at once (player_stats.json)
 import collections
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -248,6 +250,9 @@ BEGIN_INTERVAL = 0.2        # host re-sends 'fbegin' this often until a peer is 
 RESEND_AFTER = 0.5          # if a peer's facks go silent this long, rewind its send
                             # cursor and re-stream the window (recovers lost facks).
 PEER_XFER_TIMEOUT = 30.0    # no forward progress for this long -> skip that peer.
+FINALIZE_SLICE = 8 << 20    # a receiver hashes and writes its completed save in these steps,
+                            # reporting each in its facks; a slow disk moves one in well under a second
+_UNSET = object()           # "no verify progress reported yet" (a reported None must differ from it)
 MAX_NACK = 128              # holes a receiver reports per fack (rest next round).
 DRAIN_CAP = 2048            # inbound datagrams a joiner drains per loop iteration.
 HOST_DRAIN = 128            # inbound datagrams the host drains per ready cycle.
@@ -445,8 +450,16 @@ class PeersLog:
     def __init__(self, directory):
         self.path = os.path.join(directory, PEERS_LOG_NAME)
         self._lock = threading.Lock()
-        with open(self.path, "w", encoding="utf-8") as f:
-            f.write("# merged lobby log, started " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+        # KEEP LOGS: with <io dir>/tpf2mp_keep_logs.txt present the previous run's
+        # merged log is kept and this run appends after its banner.
+        keep = os.path.isfile(os.path.join(directory, "tpf2mp_keep_logs.txt"))
+        if sys.platform != "win32":
+            import linuxpaths
+            data = linuxpaths.data_dir()
+            keep = keep or bool(data and os.path.isfile(os.path.join(data, "tpf2mp_keep_logs.txt")))
+        with open(self.path, "a" if keep else "w", encoding="utf-8") as f:
+            f.write(("\n" if keep else "") + "# merged lobby log, started " + time.strftime("%Y-%m-%d %H:%M:%S")
+                    + (" (tpf2mp_keep_logs.txt present: appending)" if keep else "") + "\n")
 
     def write(self, who, lines):
         stamp = time.strftime("%H:%M:%S")
@@ -665,14 +678,121 @@ def _pack_data(payload, bulk=False):
     return _pack(TYPE_DATA, payload)
 
 
-def _send_data(sock, addr, msg):
-    """Wrap a lobby message dict in an ``NP1:`` DATA frame and fire it at addr."""
-    try:
-        sock.sendto(_pack_data(json.dumps(msg).encode("utf-8")), addr)
-    except OSError:
-        # Windows spits ICMP-port-unreachable back as an exception when a peer
-        # has gone away; the drop-timer will evict it. Ignore.
-        pass
+# --------------------------------------------------------------------------- #
+# Control-message fragmentation: a lobby message is as big as the lobby
+# --------------------------------------------------------------------------- #
+# A control message (roster, welcome, fbegin, sync_state, chat, log) used to be
+# ONE datagram. The roster carries every player, every profile and every
+# peer's link list -- N^2 -- and crossed 64 KB at 60-70 players, far below
+# CAP: sendto raised WSAEMSGSIZE, _send_data swallowed it, and nobody got a
+# roster again (2026-09-16). Anything over FRAG_DATA now goes out as
+# MTU-sized fragments and is put back together on receipt. Each fragment is a
+# complete NP1 frame on its own (sealed on its own in a sealed session), so
+# nothing below this layer changes: the relay and the mesh carry fragments
+# exactly as they carry any other DATA frame. A message that fits in one
+# fragment is sent exactly as before: plain JSON.
+#
+#   fragment = FRAG_MAGIC(1) 'F' | id u32 | index u32 | count u32 | bytes
+#
+# Loss handling is the sender's, as before: the roster is re-sent every
+# ROSTER_HEAL, chat and start go out CHAT_BURST times, fbegin repeats until
+# acked, sync_state every 0.25 s. Nothing here retransmits.
+FRAG_MAGIC = b"F"           # '{' JSON, 'N' chunk, 'g' game, 'r' relay envelope, 'F' fragment
+FRAG_HEADER = struct.Struct("!III")
+FRAG_DATA = 1300            # payload bytes per fragment: 1300 + 13 + seal 24 + NP1 5
+                            # = 1342, under the 1400 B VPN MTU (see CHUNK_DATA)
+FRAG_TTL = 15.0             # a message none of whose fragments arrived for this long is abandoned
+FRAG_PENDING_PER_ADDR = 64  # partial messages kept per sender: a garbage guard, not a
+                            # message limit (a sender's fragments go out back to back,
+                            # so a real peer never has more than a handful open)
+_frag_ids = itertools.count(int.from_bytes(os.urandom(4), "big"))   # next() is atomic: any thread may send
+
+
+def _fragments(payload, limit=FRAG_DATA):
+    """The frames to send for one control payload: [payload] when it fits,
+    else its fragments in order."""
+    if len(payload) <= limit:
+        return [payload]
+    fid = next(_frag_ids) & 0xFFFFFFFF
+    count = (len(payload) + limit - 1) // limit
+    return [FRAG_MAGIC + FRAG_HEADER.pack(fid, i, count) + payload[i * limit:(i + 1) * limit]
+            for i in range(count)]
+
+
+class _Reassembler:
+    """Puts fragments back together per sender address. ``feed`` returns the
+    whole payload once its last piece arrives, else None."""
+
+    def __init__(self, log=None):
+        self.pending = {}           # (addr, id) -> [count, {index: bytes}, last-seen]
+        self.log = log or (lambda s: None)
+        self.warned = 0.0
+
+    def feed(self, addr, frame, now=None):
+        now = time.time() if now is None else now
+        if len(frame) < 1 + FRAG_HEADER.size:
+            return None
+        fid, index, count = FRAG_HEADER.unpack_from(frame, 1)
+        if count == 0 or index >= count:
+            return None
+        key = (addr, fid)
+        entry = self.pending.get(key)
+        if entry is None:
+            mine = [k for k in self.pending if k[0] == addr]
+            if len(mine) >= FRAG_PENDING_PER_ADDR:
+                oldest = min(mine, key=lambda k: self.pending[k][2])
+                del self.pending[oldest]
+                if now - self.warned >= 5.0:
+                    self.warned = now
+                    self.log(f"[frag] {addr} has {FRAG_PENDING_PER_ADDR} unfinished messages -- "
+                             f"dropped the oldest (id {oldest[1]})")
+            entry = self.pending[key] = [count, {}, now]
+        elif entry[0] != count:
+            return None                 # a different message reusing the id: ignore the stray
+        entry[1][index] = frame[1 + FRAG_HEADER.size:]
+        entry[2] = now
+        if len(entry[1]) < count:
+            return None
+        del self.pending[key]
+        return b"".join(entry[1][i] for i in range(count))
+
+    def expire(self, now=None):
+        now = time.time() if now is None else now
+        for key in [k for k, e in self.pending.items() if now - e[2] > FRAG_TTL]:
+            del self.pending[key]
+
+    def forget(self, addr):
+        for key in [k for k in self.pending if k[0] == addr]:
+            del self.pending[key]
+
+
+_send_failures = {}         # addr -> when a send failure was last logged for it
+
+
+def _log_send_failure(addr, size, err, log=_log):
+    """Every failed send is worth a line -- one swallowed WSAEMSGSIZE hid the
+    roster cap for months -- but a peer that has gone away raises on every
+    datagram (Windows turns ICMP port-unreachable into an exception), so the
+    line is rate-limited per address."""
+    now = time.time()
+    if now - _send_failures.get(addr, 0.0) < 5.0:
+        return
+    _send_failures[addr] = now
+    log(f"[net] send of {size} B to {addr} failed: {err!r}")
+
+
+def _send_data(sock, addr, msg, log=_log):
+    """Wrap a lobby message dict in ``NP1:`` DATA frame(s) and fire it at addr."""
+    payload = json.dumps(msg).encode("utf-8")
+    for piece in _fragments(payload):
+        try:
+            sock.sendto(_pack_data(piece), addr)
+        except OSError as e:
+            # A peer that has gone away raises here; the drop-timer evicts it.
+            # Logged (rate-limited), never silent: a message size the socket
+            # refuses must show up, not vanish.
+            _log_send_failure(addr, len(payload), e, log)
+            return
 
 
 # --------------------------------------------------------------------------- #
@@ -1000,6 +1120,64 @@ def _read_save_files(save_path):
     return blob, files_meta
 
 
+def _keepalive_sweep(peers, now, drop_after, transfers, log):
+    """The host's keepalive eviction: the addresses of the peers to drop --
+    silent for longer than ``drop_after`` and NOT mid-transfer. A peer that
+    is receiving a save is judged by the transfer's own PEER_XFER_TIMEOUT,
+    never by the lobby keepalive: a joiner verifying and writing a 1 GB save
+    on an HDD (plus a mod unzip) went quiet for longer than DROP_AFTER and
+    was evicted mid-transfer, which failed the transfer for everyone
+    (2026-09-16). Such a peer is logged once (drop_deferred) until it is
+    heard from again."""
+    dead = []
+    for a, p in peers.items():
+        if now - p["last"] <= drop_after:
+            p.pop("drop_deferred", None)
+            continue
+        if _mid_transfer(a, *transfers):
+            if not p.get("drop_deferred"):
+                p["drop_deferred"] = True
+                log(f"[host] {p['name']} silent for {now - p['last']:.0f} s but mid-transfer "
+                    "-- not dropped (the transfer's own timeout decides)")
+            continue
+        dead.append(a)
+    return dead
+
+
+def _mid_transfer(addr, *transfers):
+    """True while ``addr`` is an ACTIVE target of any of the given
+    _HostSaveTransfer objects (None entries are skipped). The host's keepalive
+    eviction defers to this: such a peer is judged by PEER_XFER_TIMEOUT."""
+    for t in transfers:
+        if t is None:
+            continue
+        p = getattr(t, "peers", {}).get(addr)
+        if p is not None and p.get("state") == "active":
+            return True
+    return False
+
+
+def _merge_sender_stage(current, text, pct):
+    """What the roster should say for a peer when the host's own SAVE SENDER
+    reports ``text`` (pct = the send progress, None = the transfer is done),
+    given the peer's current stage: the new text, or None to leave it.
+
+    The joiner's own "receiving save M%" wins while it is at least as far
+    along (its report is the newer one); anything else the peer said is older
+    than a transfer that is running now, except a load already under way
+    ("loading world ..."), which only the peer's own DLL can see (2026-09-16).
+    """
+    current = current or ""
+    if current.startswith("loading world"):
+        return None
+    if pct is None:
+        return text
+    m = re.match(r"receiving save (\d+)%$", current)
+    if m and int(m.group(1)) >= pct:
+        return None
+    return text
+
+
 class _HostSaveTransfer:
     """Reliable host -> all-joiners file push, PUMPED from the host's main loop.
 
@@ -1052,10 +1230,23 @@ class _HostSaveTransfer:
         """
         return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
 
-    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save"):
+    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save", stage_cb=None):
         self.sock = sock
         self.kind = kind                      # "save" or "mods" (the round after it)
-        self.mods = mods or []                # [(id, ver)] the save needs, told in fbegin
+        # The host loop's view of how far each peer's SAVE is, as this sender
+        # sees it, so the roster shows "receiving save N%" before the joiner
+        # itself reports it (2026-09-16): stage_cb(name, text, pct), pct None
+        # once the peer verified the file. Only the save round: a mods round
+        # is the player's own download, reported by the receiver.
+        self.stage_cb = stage_cb if kind == "save" else None
+        # [(id, ver)] the save needs, told in fbegin. None means the host could
+        # not READ the list (modshare.save_mod_list failed): the save still
+        # goes out, but every receiver is told the list is unknown rather than
+        # empty -- "or []" here used to advertise such a save as needing
+        # nothing (2026-09-16).
+        self.mods_unknown = mods is None
+        self.mods = list(mods or [])
+        self.progress_at = time.time()        # last sign of a receiver working (base advance, verify heartbeat, done)
         self.sid = sid
         self.blob = blob
         self.total_bytes = len(blob)
@@ -1070,7 +1261,8 @@ class _HostSaveTransfer:
                           "total_bytes": self.total_bytes, "chunk": self.chunk,
                           "total_chunks": self.total_chunks,
                           "files": files_meta, "sha256": self.overall_sha,
-                          "kind": kind, "mods": [[m, v] for m, v in self.mods]}
+                          "kind": kind, "mods": [[m, v] for m, v in self.mods],
+                          "mods_unknown": self.mods_unknown}
         now = time.time()
         self.peers = {}          # addr -> per-peer send state
         for addr, name in targets:
@@ -1096,6 +1288,8 @@ class _HostSaveTransfer:
             p["last_pct"] = pct
             self.io.emit({"type": "transfer", "role": "send",
                           "peer": p["name"], "pct": pct})
+            if self.stage_cb:
+                self.stage_cb(p["name"], f"receiving save {pct}%", pct)
 
     # -- outbound chunk ---------------------------------------------------- #
     def _send_chunk(self, addr, seq):
@@ -1138,8 +1332,24 @@ class _HostSaveTransfer:
         if base > p["base"]:
             p["base"] = base
             p["last_advance"] = now
+            self.progress_at = now
             if p["next"] < base:
                 p["next"] = base
+        elif base >= self.total_chunks:
+            # Everything is delivered and the receiver is verifying and
+            # writing it (a 1 GB save on an HDD, then a mod unzip). Its facks
+            # keep coming while it works (base = total, "verifying": true,
+            # "progress": bytes hashed/written/unpacked so far), and a MOVED
+            # progress count is progress: the 30 s no-advance timeout used to
+            # fail exactly the peers that had the whole file and were busiest
+            # with it (2026-09-16). A fack whose count has not moved is not:
+            # a worker stuck in a disk hang or a wedged unzip would otherwise
+            # hold transfer[0] (and every resync) open for ever.
+            mark = msg.get("progress")
+            if mark != p.get("verify_progress", _UNSET):
+                p["verify_progress"] = mark
+                p["last_advance"] = now
+                self.progress_at = now
         elif base < p["base"]:
             # REWIND: the receiver restarted from scratch (hash mismatch ->
             # whole-file re-request). Without this the host would filter every
@@ -1160,6 +1370,14 @@ class _HostSaveTransfer:
         p["nack"] = sorted(holes)
         self._emit_pct(p)
 
+    def progress_tokens(self):
+        """(member name, token) per receiver, the token changing whenever that
+        receiver's part of the transfer moved: its chunk cursor, its
+        verify/write count, its final state. The host feeds these to the
+        resync barrier per member (sync_lobby.HostRecovery.tick)."""
+        return [(p["name"], "transfer:%s/%s/%s" % (p["base"], p.get("verify_progress", ""), p["state"]))
+                for p in self.peers.values()]
+
     def on_fdone(self, addr, msg):
         p = self.peers.get(addr)
         if not p or msg.get("sid") != self.sid:
@@ -1167,9 +1385,12 @@ class _HostSaveTransfer:
         if msg.get("ok"):
             if p["state"] == "active":
                 p["state"] = "done"
+                self.progress_at = time.time()
                 self.io.emit({"type": "transfer", "role": "send",
                               "peer": p["name"], "state": "done"})
                 self.log(f"[host] {p['name']} verified save transfer")
+                if self.stage_cb:
+                    self.stage_cb(p["name"], "save received, loading", None)
         elif msg.get("final"):
             if p["state"] == "active":
                 p["state"] = "failed"
@@ -1343,17 +1564,41 @@ class _ClientSaveReceiver:
         self.manifest_key = None
         self.preflight = False
         self.save_done = False     # the save round before a mods round verified here
+        self.finalizing = False    # a worker thread is verifying/writing the completed transfer
+        self.finalize_progress = 0 # bytes that worker has hashed, written or unpacked so far (read by the loop)
+        self._worker = None
+        self._results = queue.Queue()
+        self.deferred_begin = None # sid of an fbegin held back while finalizing (logged once)
+        self.manifest_unknown = False
 
-    def on_manifest(self, entries):
-        if not isinstance(entries,list) or len(entries)>128:
+    def _manifest_unknown(self):
+        """The host could not READ its save's mod list. Not "no mods": the
+        player is told, nothing is offered, and the save is still taken --
+        the game itself decides whether it can load it here."""
+        if self.manifest_unknown:
+            return
+        self.manifest_unknown = True
+        self.log("[client] the host cannot read which mods its save needs -- no download will be offered")
+        self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                      "text": "The host could not read which mods its save needs, so none can be offered to you. "
+                              "If your game refuses the save, install the host's mods by hand."})
+
+    def on_manifest(self, entries, unknown=False):
+        if entries is None or unknown:
+            self._manifest_unknown()
+            return
+        if not isinstance(entries,list):
+            self.log(f"[client] the host's mod list is not a list ({type(entries).__name__}) -- leaving the lobby")
             self.cancelled=True
             return
         mods=[]
-        for entry in entries:
+        for entry in entries:              # as many entries as the save has (a 128 cap until 2026-09-16)
             if not isinstance(entry,(list,tuple)) or len(entry)!=2 or not modshare.valid_mod(entry[0],entry[1]):
+                self.log(f"[client] mod list entry {entry!r} is not a (folder name, version) pair -- leaving the lobby")
                 self.cancelled=True
                 return
             mods.append(tuple(entry))
+        self.manifest_unknown = False
         key=tuple(mods)
         if self.manifest_key==key:
             return
@@ -1434,10 +1679,12 @@ class _ClientSaveReceiver:
         return self.sid is not None and not self.complete and not self.failed
 
     def _send(self, msg):
+        payload = json.dumps(msg).encode("utf-8")
         try:
-            self.conn.send(json.dumps(msg).encode("utf-8"))
-        except (RuntimeError, OSError):
-            pass
+            for piece in _fragments(payload):
+                self.conn.send(piece)
+        except (RuntimeError, OSError) as e:
+            _log_send_failure(getattr(self.conn, "peer", None), len(payload), e, self.log)
 
     def _fail(self, detail):
         """Give up on this session: tell the menu AND the host (fdone ok:false
@@ -1465,6 +1712,14 @@ class _ClientSaveReceiver:
                             "final": True})
             else:
                 self._send({"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask})  # duplicate -> re-ack
+            return
+        if self.finalizing:
+            # The previous round is still being verified/written by the worker.
+            # Not acked: the sender repeats fbegin every BEGIN_INTERVAL until it
+            # is, and this one is taken as soon as the worker is done.
+            if self.deferred_begin != sid:
+                self.deferred_begin = sid
+                self.log(f"[client] fbegin sid={sid} while still writing sid={self.sid} -- answered once that is done")
             return
         # A brand-new session (first ever, or a later transfer): (re)allocate.
         kind = "mods" if msg.get("kind") == "mods" else "save"
@@ -1518,6 +1773,8 @@ class _ClientSaveReceiver:
                         return
                 if not present:
                     self.need.append(modshare.mod_folder_name(m, v))
+            if msg.get("mods_unknown"):
+                self._manifest_unknown()             # the list is unknown, not empty: say so, take the save
             # a new save round asks afresh: an earlier yes does not carry over
             self.offered = list(self.need)
             self.approved = previous_approval.intersection(self.offered)
@@ -1568,6 +1825,8 @@ class _ClientSaveReceiver:
         if self.complete:
             self._maybe_send_done(force=True)   # nudge host to stop resending
             return
+        if self.finalizing:
+            return                               # all in hand; the worker is on it
         if self.failed or seq < 0 or seq >= self.total_chunks:
             return
         if self.have[seq]:
@@ -1597,9 +1856,11 @@ class _ClientSaveReceiver:
         if pct // 10 > self.last_pct // 10:
             self.last_pct = pct
             self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
+            self._send({"t": "stage", "text": f"receiving save {pct}%"})
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
+        self._poll_worker()                      # a finished verify/write lands here, on the loop thread
         if self.cancelled:
             return
         if self.preflight and self.approved and not self.active() and not self.catalogue_token and now-self.last_mod_request>1:
@@ -1640,8 +1901,10 @@ class _ClientSaveReceiver:
             if not self.have[s]:
                 nack.append(s)
             s += 1
-        self._send({"t": "fack", "sid": self.sid, "base": self.base,
-                    "nack": nack})
+        msg = {"t": "fack", "sid": self.sid, "base": self.base, "nack": nack, "verifying": self.finalizing}
+        if self.finalizing:
+            msg["progress"] = self.finalize_progress    # the host times out a count that stops moving
+        self._send(msg)
 
     def _maybe_send_done(self, now=None, force=False):
         # After completion the host may not have heard our fdone (it can be
@@ -1655,32 +1918,129 @@ class _ClientSaveReceiver:
 
     # -- assemble + verify + write ----------------------------------------- #
     def _finalize(self):
-        # ZERO-COPY. This used to do bytes(self.buf[off:off+size]) per file and
-        # bytes(self.buf) for the overall hash -- three full copies of the whole
-        # save. On a 642 MB map that is ~1.9 GB of allocation and memcpy on top
-        # of the two SHA-256 passes, all of it AFTER the progress bar has
-        # reported 100%, which is exactly what "it hangs at the end" was.
-        # bytearray and memoryview both support the buffer protocol, so hashlib
-        # and file.write take them directly and none of those copies are needed.
+        """Every chunk is in hand: verify and write it OFF the lobby loop.
+
+        The hashing and the writes used to run inline here, and for that long
+        the joiner sent nothing -- no ping to the host, no fack -- so a 1 GB
+        save on an HDD (two SHA-256 passes, the write, then a mod unzip) went
+        past the host's DROP_AFTER and the joiner was evicted mid-transfer
+        (2026-09-16). Now a worker thread does the work while the loop keeps
+        pinging and keeps sending facks (base = total, "verifying": true),
+        which the host counts as progress. The outcome comes back through a
+        queue and is applied by _poll_worker on the loop thread, so every
+        state change, emit and reply still happens where it always did.
+
+        ZERO-COPY, as before: bytearray and memoryview both support the
+        buffer protocol, so hashlib and file.write take them directly.
+        """
+        if self.finalizing:
+            return
+        self.finalizing = True
+        self.finalize_progress = 0
+        approved = None
+        if self.kind == "mods":
+            approved, self.approved = self.approved, set()   # the yes is used up by this round
+        job = {"sid": self.sid, "buf": self.buf, "files": list(self.files),
+               "overall_sha": self.overall_sha, "kind": self.kind,
+               "approved": approved, "total_bytes": self.total_bytes}
+        self._worker = threading.Thread(target=self._finalize_work, args=(job,),
+                                        name=f"{threading.current_thread().name}/save-finalize", daemon=True)
+        self._worker.start()
+
+    def _advance(self, count):
+        """WORKER THREAD: another ``count`` bytes hashed, written or unpacked.
+        The loop reads the total into every fack while verifying (an int
+        assignment is atomic; nothing else writes it while the worker runs)."""
+        self.finalize_progress += count
+
+    def _sha256(self, data):
+        """A SHA-256 hex digest computed in FINALIZE_SLICE windows so the
+        count moves while a 1 GB buffer is hashed."""
+        h = hashlib.sha256()
+        for i in range(0, len(data), FINALIZE_SLICE):
+            piece = data[i:i + FINALIZE_SLICE]
+            h.update(piece)
+            self._advance(len(piece))
+        return h.hexdigest()
+
+    def _finalize_work(self, job):
+        """WORKER THREAD: hash, then write the save or unpack the mods. Touches
+        no receiver state but finalize_progress; everything it learns goes
+        into the result."""
+        res = {"sid": job["sid"], "ok": True, "seconds": 0.0}
         t0 = time.time()
-        ok = True
-        off = 0
-        parts = {}
-        view = memoryview(self.buf)
-        for meta in self.files:
-            size = int(meta.get("size", 0))
-            part = view[off:off + size]                  # a window, not a copy
-            off += size
-            if hashlib.sha256(part).hexdigest() != meta.get("sha256"):
-                ok = False
-                break
-            parts[meta.get("name")] = part
-        if ok and self.overall_sha:
-            if hashlib.sha256(self.buf).hexdigest() != self.overall_sha:
-                ok = False
+        try:
+            view = memoryview(job["buf"])
+            off = 0
+            parts = {}
+            for meta in job["files"]:
+                size = int(meta.get("size", 0))
+                part = view[off:off + size]                  # a window, not a copy
+                off += size
+                if self._sha256(part) != meta.get("sha256"):
+                    res["ok"] = False
+                    break
+                parts[meta.get("name")] = part
+            if res["ok"] and job["overall_sha"]:
+                if self._sha256(view) != job["overall_sha"]:
+                    res["ok"] = False
+            res["seconds"] = time.time() - t0
+            if res["ok"]:
+                if job["kind"] == "mods":
+                    res["install"] = self._install_files(parts, job["approved"])
+                else:
+                    written = []
+                    try:
+                        for meta in job["files"]:
+                            name = meta.get("name")
+                            if not _safe_incoming_name(name):
+                                res["error"] = f"refused: unexpected filename {name!r}"
+                                break
+                            part = parts[name]
+                            with open(os.path.join(self.io.dir, name), "wb") as f:
+                                for i in range(0, len(part), FINALIZE_SLICE):
+                                    f.write(part[i:i + FINALIZE_SLICE])   # memoryview: no copy
+                                    self._advance(min(FINALIZE_SLICE, len(part) - i))
+                            written.append(name)
+                    except OSError as e:
+                        res["error"] = f"write error: {e}"
+                    res["written"] = written
+            # Release the memoryviews before the bytearray they borrow from can
+            # be dropped; a lingering export would keep the whole save alive.
+            for v in parts.values():
+                v.release()
+            view.release()
+        except Exception as e:                               # noqa: BLE001 -- the loop must hear it
+            res["error"] = f"verify/write crashed: {e!r}"
+        self._results.put(res)
+
+    def _poll_worker(self):
+        """LOOP THREAD: apply a finished verify/write, if there is one."""
+        try:
+            res = self._results.get_nowait()
+        except queue.Empty:
+            return
+        self._worker = None
+        self.finalizing = False
+        if self.cancelled or res.get("sid") != self.sid:
+            return                                           # a round abandoned meanwhile
+        self._finish(res)
+
+    def settle(self, timeout=120.0):
+        """Block until a running verify/write has finished and its outcome is
+        applied. For tests and shutdown; the lobby loop never waits."""
+        w = self._worker
+        if w is not None:
+            w.join(timeout)
+        self._poll_worker()
+
+    def _finish(self, res):
         self.log(f"[client] save verify: {self.total_bytes}B in "
-                 f"{time.time() - t0:.1f}s ({'ok' if ok else 'MISMATCH'})")
-        if not ok:
+                 f"{res['seconds']:.1f}s ({'ok' if res['ok'] else 'MISMATCH'})")
+        if res.get("error"):
+            self._fail(res["error"])
+            return
+        if not res["ok"]:
             self.retries += 1
             if self.retries <= MAX_FILE_RETRIES:
                 self.log(f"[client] save hash mismatch -- re-request "
@@ -1694,10 +2054,7 @@ class _ClientSaveReceiver:
             self._fail("hash mismatch")
             return
         if self.kind == "mods":
-            self._install_mods(parts)
-            for v in parts.values():
-                v.release()
-            view.release()
+            self._mods_installed(res["install"])
             if self.failed:
                 self.cancelled=True
                 return
@@ -1715,24 +2072,7 @@ class _ClientSaveReceiver:
             self.catalogue_since=time.time()
             self.io.emit({"type":"mods_refresh"})
             return
-        written = []
-        try:
-            for meta in self.files:
-                name = meta.get("name")
-                if not _safe_incoming_name(name):
-                    self._fail(f"refused: unexpected filename {name!r}")
-                    return
-                with open(os.path.join(self.io.dir, name), "wb") as f:
-                    f.write(parts[name])                 # memoryview: no copy
-                written.append(name)
-        except OSError as e:
-            self._fail(f"write error: {e}")
-            return
-        # Release the memoryviews before the bytearray they borrow from can be
-        # dropped; a lingering export would keep the whole save alive.
-        for v in parts.values():
-            v.release()
-        view.release()
+        written = res.get("written", [])
         self.complete = True
         self.save_done = True                    # a mods round may follow (still needs the player's yes)
         self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
@@ -1747,13 +2087,12 @@ class _ClientSaveReceiver:
         self._maybe_send_done(force=True)
 
 
-    def _install_mods(self, parts):
-        """A mods round: unpack each incoming_mod_<id>_<ver>.zip into the game's
-        mods folder (never over an existing one) and tell the player. Only the
-        mods this player said yes to are installed; the host sends one zip set
-        to everyone who lacked something, so the rest are left alone. The yes is
-        used up by this round."""
-        approved, self.approved = self.approved, set()
+    def _install_files(self, parts, approved):
+        """WORKER THREAD half of a mods round: unpack each
+        incoming_mod_<id>_<ver>.zip into the game's mods folder (never over an
+        existing one). Only the mods this player said yes to are installed; the
+        host sends one zip set to everyone who lacked something, so the rest
+        are left alone. Returns what happened; _mods_installed tells the player."""
         done, kept, bad, skipped = [], [], [], []
         for name, part in parts.items():
             idv = modshare.parse_mod_zip_name(name)
@@ -1779,9 +2118,16 @@ class _ClientSaveReceiver:
                     bad.append(label)
                     continue
             else:
-                st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log)
+                st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log, progress=self._advance)
             (done if st == "installed" else kept if st == "present" else bad).append(label)
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
+        return {"done": done, "kept": kept, "bad": bad, "skipped": skipped, "approved": sorted(approved)}
+
+    def _mods_installed(self, r):
+        """LOOP THREAD half of a mods round: tell the player, and fail the
+        round if anything agreed to did not land. The yes was used up when the
+        round began."""
+        done, kept, bad, skipped = r["done"], r["kept"], r["bad"], r["skipped"]
         text = []
         if done: text.append("Installed from the host: " + ", ".join(done) + " (they show in the load screen's Mods panel)")
         if kept: text.append("already installed: " + ", ".join(kept))
@@ -1790,7 +2136,7 @@ class _ClientSaveReceiver:
         if text:
             self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": "; ".join(text)})
         self.install_result={"installed":done,"present":kept,"failed":bad}
-        absent=approved-set(done)-set(kept)
+        absent=set(r["approved"])-set(done)-set(kept)
         if bad or absent:
             self._fail("required mod installation failed: " + ", ".join(sorted(set(bad)|absent)))
 
@@ -1816,7 +2162,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.6"
+LOBBY_VERSION = "0.6"
 
 
 def version_rejection(remote):
@@ -2088,12 +2434,13 @@ class _PeerConn:
     def __init__(self, sock, addr):
         self.sock, self.addr = sock, addr
     def send(self, payload):
-        self.sock.sendto(_pack_data(payload), self.addr)
+        for piece in _fragments(payload):
+            self.sock.sendto(_pack_data(piece), self.addr)
 
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False, punch_q=None, sync_runtime=None):
+             relay_only=False, punch_q=None, sync_runtime=None, companies_mode=False):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
@@ -2117,6 +2464,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                             #          "links":[names],
                                             #          "company":1..200}
     host_company = [1]                      # the host's own company id
+    host_stage = [""]                       # what the host itself is doing (its own load / a world switch), "" = nothing (2026-09-16)
+    # The lobby's mode (2026-09-16): "coop" puts everyone in company 1; "companies"
+    # gives every player their own. It sets the chips automatically, on a change
+    # and for each joiner; a chip click still overrides one player.
+    mode = ["companies" if companies_mode else "coop"]
     cid_counter = [0]                       # host-authoritative chat id
     started = [False]
     start_save = [False]                    # save flag of the last broadcast start
@@ -2144,6 +2496,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 chips.update({str(k): int(v) for k, v in json.load(f).items()})
         except (OSError, ValueError):
             pass
+    # PLAYER STATISTICS (2026-09-17), relay-only: joins, time connected, starts,
+    # frames relayed, per player (by profile code, else name) and in total, with
+    # the peak of players at once. player_stats.json in the io dir; a summary
+    # line in the log every ten minutes while somebody is connected.
+    stats = PlayerStats(os.path.join(io.dir, "player_stats.json"), log) if relay_only else None
+    if stats:
+        log("[stats] " + stats.summary())
 
     def remember_chip(name, cid):
         if not relay_only:
@@ -2235,10 +2594,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return sorted(p["name"] for p in peers.values())
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
+    def host_has_world():
+        """The host's game is in a world: the native adapter's status file
+        (written by the game itself, PID-scoped) says has_world=1. `started`
+        only latches after a START GAME or a save share, so a host that loaded
+        its world on its own and then got a joiner read as "not started" -- the
+        joiner was not late, no frozen join ran, and the menu's autosave path
+        served it while the world kept ticking (2026-09-17 00:05)."""
+        return sync_runtime is not None and sync_runtime._read('tpf2_native_status.txt').get('has_world') == '1'
+
     def recovery_supported():
         return (sync_runtime is not None and not relay_only and len(peers) >= 1
                 and all(p.get("recovery") == 4 for p in peers.values())
-                and started[0] and transfer[0] is None)
+                and (started[0] or host_has_world()) and transfer[0] is None)
 
     def recovery_unavailable_reason():
         if not peers:
@@ -2250,6 +2618,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if transfer[0] is not None:
             return "A player is receiving the save. Wait for that transfer to finish, then try again."
         return "Resync is not ready yet."
+
+    frags = _Reassembler(log)                 # big control messages from joiners, per address
 
     def recovery_send(name, message):
         for address, peer in peers.items():
@@ -2270,6 +2640,51 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             m[p["name"]] = int(p.get("company", 1))
         return m
 
+    def free_company(taken):
+        """the lowest company id nobody in `taken` uses"""
+        for cid in range(1, MAX_COMPANIES + 1):
+            if cid not in taken:
+                return cid
+        return MAX_COMPANIES
+
+    def assign_by_mode():
+        """coop: everyone on 1. companies: the host (relay: the leader) keeps 1,
+        the others get the lowest free id in join order."""
+        changed = False
+        if mode[0] == "coop":
+            if not relay_only and host_company[0] != 1:
+                host_company[0] = 1
+                changed = True
+            for p in peers.values():
+                if int(p.get("company", 1)) != 1:
+                    p["company"] = 1
+                    remember_chip(p["name"], 1)
+                    changed = True
+            return changed
+        taken = set() if relay_only else {1}
+        if not relay_only and host_company[0] != 1:
+            host_company[0] = 1
+            changed = True
+        seen = set()
+        for p in peers.values():                     # join order: the leader first on a relay
+            cid = int(p.get("company", 1))
+            if cid in taken or cid in seen:
+                cid = free_company(taken | seen)
+            if int(p.get("company", 1)) != cid:
+                p["company"] = cid
+                remember_chip(p["name"], cid)
+                changed = True
+            seen.add(cid)
+        return changed
+
+    def set_mode(value):
+        value = "companies" if value == "companies" else "coop"
+        if value == mode[0]:
+            return False
+        mode[0] = value
+        assign_by_mode()
+        return True
+
     def set_company(name, cid):
         try:
             cid = int(cid)
@@ -2287,6 +2702,30 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return True
         return False
 
+    def roster_stages():
+        # what each joiner is doing right now ("receiving save 40%", "loading
+        # world", "catching up (12 s behind)"): shown beside the name in every
+        # panel while a hot join runs; empty once in sync (2026-09-16)
+        stages = {p["name"]: p["stage"] for p in peers.values() if p.get("stage")}
+        if host_stage[0] and not relay_only:
+            stages[host_name] = host_stage[0]
+        return stages
+
+    def sender_stage(name, text, pct=None):
+        # The host's own save sender knows how far a joiner's save is before the
+        # joiner says so: put it in the roster right away (2026-09-16). The
+        # joiner's own report still overrides -- see _merge_sender_stage.
+        for p in peers.values():
+            if p["name"] != name:
+                continue
+            new = _merge_sender_stage(p.get("stage", ""), text, pct)
+            if new is not None and new != p.get("stage", ""):
+                p["stage"] = new
+                log(f"[host] {name} stage <- sender: {new}")
+                send_roster_packets()
+                emit_roster()
+            return
+
     def send_roster_packets():
         # Doubles as the start self-heal: a joiner that lost the whole start
         # burst sees started:true here (~2 s later) and starts. The flag is
@@ -2301,24 +2740,32 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "transport_lobby": transport_lobby, "players": players, "recovery": 4 if recovery_supported() else 0,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only, "mods": advertised[1],
+                                 "mods_unknown": advertised[1] is None,
                                  "stored_age": stored_age() if relay_only else -1,
                                  "stored_max": int(HOTJOIN_STORED_MAX) if relay_only else -1,
                                  "letters": {p2["name"]: letter_for(p2["name"]) for p2 in peers.values()} if relay_only else None,
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
                                  "profiles": profiles, "links": links,
-                                 "companies": companies})
+                                 "companies": companies, "stages": roster_stages(),
+                                 "mode": mode[0]})
 
     def emit_roster():
         if publisher is not None:
             publisher.update(lobby_name or host_name, len(peers) + (0 if relay_only else 1))
         players = roster_players()
+        # join_freeze: the menu must NOT take its own hot-join save when the
+        # roster grows -- the lobby brings the newcomer in through a recovery
+        # round (do_join). Off when recovery cannot run (an old client, a
+        # transfer in flight, a relay), so the menu's save still serves then.
+        freeze = bool(recovery is not None and not relay_only and (recovery.held or recovery_supported()))
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
-                 "relay": relay_only, "companies": roster_companies()})
+                 "relay": relay_only, "companies": roster_companies(), "stages": roster_stages(),
+                 "mode": mode[0], "join_freeze": freeze})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=leader_name(), started=started[0],
-                       lobby=lobby_name, companies=roster_companies())
+                       lobby=lobby_name, companies=roster_companies(), mode=mode[0])
 
     def roster_changed(broadcast=True):
         """Push the roster to peers, and emit an event only if it changed."""
@@ -2335,7 +2782,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago -- the next player continues it" if spath else ""))
         if broadcast:
             send_roster_packets()
-        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())))
+        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())), mode[0])
         if last_emitted_roster[0] != key:
             last_emitted_roster[0] = key
             emit_roster()
@@ -2345,8 +2792,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if relay_only:
             path=os.path.join(io.dir,"mod_cache",modshare.cache_name(m,v))
             try:
-                with open(path,"rb") as f: data=f.read(modshare.MAX_MOD_ZIP+1)
-                return data if len(data)<=modshare.MAX_MOD_ZIP else None
+                with open(path,"rb") as f: return f.read()     # whole: a cached mod is as big as it is
             except OSError: return None
         return modshare.package_mod(m,v)
 
@@ -2360,8 +2806,22 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 _send_data(sock, a, msg)
         io.emit({"type": "chat", "from": frm, "text": text, "ts": ts})
 
+    def mod_list_note(path, where):
+        """The save's mod list could not be READ. Say so everywhere it matters
+        -- the log, the host's panel, the lobby chat -- and advertise the list
+        as UNKNOWN (None). It must never become "no mods": that told every
+        joiner the save needed nothing, and the game then refused to load it
+        on any machine that lacked a mod (2026-09-16)."""
+        log(f"[host] the mod list of {path} is UNKNOWN ({where}); players are told so, and "
+            "nobody is offered the mods it needs -- if the game refuses to load it, install the host's mods by hand")
+        io.emit({"type": "chat", "from": "MULTIPLAYER",
+                 "text": f"Could not read which mods {os.path.basename(str(path))} needs; players who lack them "
+                         "will not be offered a download. If their game refuses the save, they must install your mods by hand."})
+
     cached_world = stored_save()[0] if relay_only else None
-    advertised = [cached_world, (modshare.save_mod_list(cached_world) or []) if cached_world else []]
+    advertised = [cached_world, modshare.save_mod_list(cached_world, log) if cached_world else []]
+    if cached_world and advertised[1] is None:
+        mod_list_note(cached_world, "stored world")
     preflight_requests = {}
     mod_preflight = [False]
     pending_start = [None]
@@ -2377,18 +2837,33 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         unstarted and get the next push (serve loop below)."""
         started[0] = True
         start_save[0] = bool(save)
-        msg = {"t": "start", "save": start_save[0]}
         targets = [a for a in list(peers) if only is None or a in only]
+        # A WORLD SWITCH is flagged PER PEER. The peers that were playing have
+        # to be told they are leaving that world (their menu loads the new save
+        # in place, without going back to the title screen); a peer that joined
+        # while the switch was being pushed is an ordinary newcomer and gets an
+        # ordinary start. A peer marked for the switch that this round did not
+        # reach keeps its flag for the round that finally serves it.
+        switching = {a for a in targets if peers[a].pop("switch", False)}
         for a in targets:
+            if stats and not peers[a].get("started"):
+                stats.started(peers[a]["name"], peers[a].get("profile"))
             peers[a]["started"] = True      # heal roster carries started:true
         if relay_only and upload[0] is not None and getattr(upload[0], "complete", False):
             upload[0] = None                # this upload has been distributed
         for _ in range(CHAT_BURST):
             for a in targets:
+                msg = {"t": "start", "save": start_save[0]}
+                if a in switching:
+                    msg["switch"] = True
                 _send_data(sock, a, msg)
-        io.emit({"type": "start", "save": start_save[0]})
+        event = {"type": "start", "save": start_save[0]}
+        if switching:
+            event["switch"] = True
+        io.emit(event)
         io.write_state(started=True)
-        log(f"[host] START broadcast (save={start_save[0]}) to "
+        log(f"[host] START broadcast (save={start_save[0]}"
+            f"{', world switch' if switching else ''}) to "
             f"{len(targets)} of {len(peers)} peer(s)")
 
     # ---- inbound lobby messages -------------------------------------------- #
@@ -2411,8 +2886,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # Testing the bare operation token here kept rejecting every new joiner
         # after the first resync, for as long as this lobby process lived --
         # including in the next NEW game, since the lobby outlives the world.
-        if recovery and recovery.roster_locked and addr not in peers:
-            _send_data(sock, addr, {"t": "reject", "reason": "A world recovery is in progress and the player list is fixed until it finishes. Try again in a moment."})
+        # A recovery in flight no longer fixes the player list (2026-09-16): a
+        # join IS a recovery round now, and a player arriving during one is
+        # admitted by the barrier (SyncOperation._admit) -- unless its version
+        # cannot take part, which would strand the round.
+        if recovery and recovery.roster_locked and addr not in peers and recovery_protocol != 4:
+            _send_data(sock, addr, {"t": "reject", "reason": "A world sync is in progress and your version cannot take part in it. Update the mod, or try again in a moment."})
             return
         late = False
         if addr in peers:                                   # rename in place
@@ -2426,21 +2905,46 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[host] rejected {addr} (lobby full)")
                 return
             assigned = _dedupe(name, all_names())
+            # coop: company 1. companies: a returning name gets its chip back when
+            # nobody took it, anyone else the lowest free id.
+            if mode[0] == "companies":
+                taken = set(roster_companies().values())
+                company = chips.get(assigned) if chips.get(assigned) not in taken else None
+                company = company or free_company(taken)
+            else:
+                company = 1
             peers[addr] = {"name": assigned, "last": time.time(),
                            "started": False, "profile": profile,
                            "links": [], "mesh": bool(is_mesh),
-                           "company": chips.get(assigned, 1)}   # a returning name gets its chip back
-            late = started[0]
+                           "company": company}
+            remember_chip(assigned, company)
+            if stats:
+                stats.join(assigned, profile)
+            late = started[0] or host_has_world()
             log(f"[host] JOIN {addr} as {assigned!r}"
-                + (" (late -- game already started)" if late else ""))
+                + (" (late -- game already started)" if started[0] else " (late -- the host is in a world)" if late else ""))
         peers[addr]["last"] = time.time()
         peers[addr]["recovery"] = recovery_protocol
+        # FROZEN JOIN (2026-09-16): a late joiner in a player-hosted session is
+        # brought in through a recovery round -- the session holds, the host
+        # saves, everyone (host included) loads that save -- instead of the
+        # running host sharing an autosave for the newcomer to catch up on.
+        # The menu's own hot-join save stands down when the roster says
+        # join_freeze (emit_roster). Falls back to that path when recovery is
+        # not available (an old client, a transfer in flight): logged.
+        if late and recovery and not relay_only:
+            if recovery_protocol == 4 and recovery.join(peers[addr]["name"]):
+                log(f"[host] frozen join for {peers[addr]['name']!r}: holding the session, everyone loads the shared world")
+            else:
+                log(f"[host] frozen join NOT possible for {peers[addr]['name']!r} "
+                    f"({'its version has no resync' if recovery_protocol != 4 else recovery_unavailable_reason()}) -- the menu's hot-join save serves it")
         if relay_only:
             letter_for(peers[addr]["name"])
         _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "recovery": 4 if recovery_supported() else 0,
-                                "lobby": lobby_name, "relay": relay_only, "mods": advertised[1]})
+                                "lobby": lobby_name, "relay": relay_only, "mods": advertised[1],
+                                "mods_unknown": advertised[1] is None})
         if relay_only and started[0] and addr != leader_addr() and not peers[addr].get("started"):
             age = stored_age()
             if 0 <= age <= HOTJOIN_STORED_MAX:
@@ -2508,6 +3012,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return
             for a, p in peers.items():
                 if p["name"] == to:
+                    if stats and GameRelay.is_game(inner):
+                        stats.frame(peers[addr]["name"], len(inner), peers[addr].get("profile"))
                     # a mesh joiner unwraps envelopes itself; a legacy (star)
                     # joiner only understands plain frames
                     out = payload if p.get("mesh") else inner
@@ -2522,6 +3028,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # bridge. Only from a peer that has joined -- strays are dropped.
             if addr in peers:
                 peers[addr]["last"] = time.time()
+                if stats:
+                    stats.frame(peers[addr]["name"], len(payload), peers[addr].get("profile"))
                 if relay is not None:
                     relay.deliver(payload)
                 if relay_only and peers[addr].get("mesh"):
@@ -2551,6 +3059,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 sid, seq = struct.unpack("!II", payload[4:12])
                 upload[0].on_chunk(sid, seq, payload[12:])
             return
+        if payload[:1] == FRAG_MAGIC:
+            # a piece of a big control message (a joiner's log batch, a long
+            # mods_request, a resync ack): whole once the last piece lands
+            if addr in peers:
+                peers[addr]["last"] = time.time()
+            payload = frags.feed(addr, payload)
+            if payload is None:
+                return
         try:
             msg = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -2596,6 +3112,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if new != peers[addr].get("links"):
                     peers[addr]["links"] = new
                     send_roster_packets()          # let everyone re-plan relays
+        elif t == "stage":
+            # a joiner says what it is doing (hot-join progress); "" clears it
+            if addr in peers:
+                text = str(msg.get("text", ""))[:80]
+                if peers[addr].get("stage", "") != text:
+                    peers[addr]["stage"] = text
+                    send_roster_packets()
+                    emit_roster()
         elif t == "company":
             # a joiner may set ITS OWN company; the host sets anyone's -- and on
             # a relay the leader stands in for the host
@@ -2607,6 +3131,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     roster_changed()
                 elif not allowed:
                     log(f"[host] {peers[addr]['name']} tried to set {target}'s company -- only the leader may")
+        elif t == "mode":
+            # the lobby's mode: on a relay the leader sets it; a host sets it locally (below)
+            if addr in peers and relay_only and addr == leader_addr():
+                if set_mode(str(msg.get("mode", ""))):
+                    log(f"[host] mode -> {mode[0]} (set by the leader {peers[addr]['name']}); companies {roster_companies()}")
+                    roster_changed()
         elif t == "mesh_hi":
             pass                                    # names are host-assigned
         elif t == "log":
@@ -2665,6 +3195,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "leave":
             if addr in peers:
                 log(f"[host] LEAVE {addr} ({peers[addr]['name']})")
+                if stats:
+                    stats.leave(peers[addr]["name"], peers[addr].get("profile"))
                 del peers[addr]
                 if transfer[0] is not None:
                     transfer[0].on_peer_dropped(addr)
@@ -2693,10 +3225,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if pr and pr.get("ask"):
                     transfer[0].on_mods_answer(addr, {"sid": transfer[0].sid, "accept": True})
                 return
-            allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in advertised[1]}
+            allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in (advertised[1] or [])}
             requested=msg.get("need",[])
-            if isinstance(requested,list) and len(requested)<=128:
+            if isinstance(requested,list):          # as many as the save needs (a 128 cap until 2026-09-16)
                 preflight_requests[addr]=[allowed[n] for n in requested if isinstance(n,str) and n in allowed]
+            else:
+                log(f"[host] mods_request from {peers[addr]['name']!r} carries no list -- ignored")
         elif t == "mods_answer":
             if transfer[0] is not None:
                 transfer[0].on_mods_answer(addr, msg)
@@ -2756,14 +3290,42 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
-        mods = modshare.save_mod_list(save_path) or []
+        mods = modshare.save_mod_list(save_path, log)        # None = could not read it (NOT "none")
         advertised[:]=[save_path,mods]
         for a,_ in targets: preflight_requests.pop(a,None)
-        if mods:
+        if mods is None:
+            mod_list_note(save_path, "START GAME")
+            broadcast_chat("MULTIPLAYER", f"The host could not read which mods {os.path.basename(save_path)} needs: "
+                                          "you will not be offered a download. If your game refuses the save, install the host's mods by hand.")
+        elif mods:
             log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
                 + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
-                                        io, log, mods=mods)
+                                        io, log, mods=mods, stage_cb=sender_stage)
+
+    def begin_world_switch(save_path):
+        """A WORLD SWITCH: the host loaded a different world while the session
+        was running, so everybody has to leave the world they are in and load
+        this one.
+
+        Every peer goes back to 'unstarted' -- that is what makes
+        begin_save_transfer push to ALL of them rather than only to the ones
+        still waiting for a first save -- and is marked so broadcast_start
+        tells it this is a switch. ``last_shared`` is pointed at the new file
+        BEFORE any peer is unstarted: the serve-again loop fires on 'a peer is
+        unstarted', so if it runs between here and the transfer it can only
+        ever push THIS world, never the one everyone is leaving."""
+        last_shared[0] = save_path
+        playing = sum(1 for p in peers.values() if p.get("started"))
+        for p in peers.values():
+            p["started"] = False
+            p["switch"] = True
+        name = os.path.basename(save_path)
+        log(f"[host] world switch: pushing {name} to {len(peers)} player(s)"
+            f" ({playing} of them already playing)")
+        io.emit({"type": "status", "state": "connected",
+                 "detail": f"Switching everyone to {name}\u2026"})
+        begin_save_transfer(save_path)
 
     # ---- local (host's own menu) commands ---------------------------------- #
     def handle_command(cmd):
@@ -2775,11 +3337,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         c = cmd.get("cmd")
         if c == "advertise_mods":
             path=str(cmd.get("save", ""))
-            mods=modshare.save_mod_list(path)
-            if mods is not None:
-                advertised[:]=[path,mods]
-                for a in list(peers): _send_data(sock,a,{"t":"mods_manifest","mods":mods})
-                io.emit({"type":"mods_manifest","mods":mods})
+            mods=modshare.save_mod_list(path, log)            # None = could not read it (NOT "none")
+            if mods is None:
+                mod_list_note(path, "advertise_mods")
+            advertised[:]=[path,mods]
+            for a in list(peers): _send_data(sock,a,{"t":"mods_manifest","mods":mods,"mods_unknown":mods is None})
+            io.emit({"type":"mods_manifest","mods":mods,"mods_unknown":mods is None})
             return
 
         if c == "chat":
@@ -2795,6 +3358,18 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             target = str(cmd.get("player") or host_name)
             if set_company(target, cmd.get("id")):
                 log(f"[host] {target} -> company {cmd.get('id')} (set by host)")
+                roster_changed()
+        elif c == "stage":
+            # the host's own menu says what it is doing (loading the world it
+            # picked, a world switch); "" clears it (2026-09-16)
+            text = str(cmd.get("text", ""))[:80]
+            if text != host_stage[0]:
+                host_stage[0] = text
+                send_roster_packets()
+                emit_roster()
+        elif c == "mode":
+            if set_mode(str(cmd.get("mode", ""))):
+                log(f"[host] mode -> {mode[0]} (set by host); companies {roster_companies()}")
                 roster_changed()
         elif c == "publish":
             if publisher is not None:
@@ -2812,6 +3387,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log("[host] the host is saving for a hot join -- holding the serve-again")
         elif c == "start":
             save = cmd.get("save")
+            # "switch":true -- the host's menu saw it load ANOTHER world while
+            # this session was running (see begin_world_switch). The flag rides
+            # in the queued command, so a switch that has to wait for a running
+            # transfer is still a switch when it runs.
+            switch = bool(cmd.get("switch"))
             serve_hold[0] = 0.0
             if relay_only:
                 log("[relay] 'start' from the local panel ignored -- the leader starts")
@@ -2823,11 +3403,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 elif save:
                     # never drop the host's save: it is the world the game is in NOW
                     pending_start[0] = dict(cmd)
-                    log("[host] start queued until the running save transfer ends")
+                    log("[host] start queued until the running save transfer ends"
+                        + (" (world switch)" if switch else ""))
                 else:
                     log("[host] start ignored -- a save transfer is in progress")
             elif save and not _mod_check(save, io, log):
                 pass                              # refused: made without the mod (status + chat say so)
+            elif save and switch and started[0] and peers:
+                begin_world_switch(save)          # everyone leaves the world they are in
             elif save:
                 begin_save_transfer(save)         # start(save=True) when done
             else:
@@ -2954,11 +3537,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             if now - last_drop >= 1.0:
                 last_drop = now
-                dead = [a for a, p in peers.items()
-                        if now - p["last"] > drop_after]
+                frags.expire(now)
+                dead = _keepalive_sweep(peers, now, drop_after,
+                                        (transfer[0], recovery.transfer if recovery else None), log)
                 for a in dead:
                     log(f"[host] DROP {a} ({peers[a]['name']}) -- silent")
+                    if stats:
+                        stats.leave(peers[a]["name"], peers[a].get("profile"))
                     del peers[a]
+                    frags.forget(a)
                     if transfer[0] is not None:
                         transfer[0].on_peer_dropped(a)     # skip it, keep going
                 if dead:
@@ -2982,6 +3569,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     if snapshot.is_file():
                         last_shared[0] = str(snapshot)
                     log(f"[host] transport lobby follows the completed resync ({world[:8]}..); late joiners get {os.path.basename(last_shared[0] or '')}")
+                    # every member loaded that world: a newcomer brought in by a
+                    # frozen join is started now (no START GAME push for it)
+                    for p in peers.values():
+                        if stats and not p.get("started"):
+                            stats.started(p["name"], p.get("profile"))
+                        p["started"] = True
+                    started[0] = True
                     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
                     send_roster_packets()
 
@@ -2996,6 +3590,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
+            if stats:
+                stats.tick()                                # minute flush, 10 min summary
 
             own_fwd.poll_tails()
             own_lines = own_fwd.drain(now)
@@ -3172,6 +3768,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             _log_sinks.remove(own_fwd.add)
         except ValueError:
             pass
+        if stats:
+            for p in peers.values():
+                stats.leave(p["name"], p.get("profile"))
+            stats.flush(force=True)
         for a in list(peers):
             _send_data(sock, a, {"t": "bye"})
         io.emit({"type": "status", "state": "failed",
@@ -3214,6 +3814,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     last_links_report = [0.0]
     reported_links = [None]
     last_ignored_start = [None]     # (save, sid) of the last start we refused
+    last_switch = [None]            # ("applied"/"ignored", receiver sid) of the last world switch
     is_relay = [False]              # the host is a relay-only server (roster/welcome say so)
     uploader = [None]               # our save going UP to the relay (we are the leader)
     uploaded = [False]              # an upload completed this session -> a start(save) is ours
@@ -3235,20 +3836,36 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
              "detail": "checking multiplayer version..."})
     io.write_state(state="connecting", you=desired[0], started=False)
 
+    frags = _Reassembler(log)               # big control messages from the host (roster, fbegin, sync_state)
+
     def send(msg):
+        payload = json.dumps(msg).encode("utf-8")
         try:
-            conn.send(json.dumps(msg).encode("utf-8"))
-        except (RuntimeError, OSError):
-            pass
+            for piece in _fragments(payload):
+                conn.send(piece)
+        except (RuntimeError, OSError) as e:
+            _log_send_failure(getattr(conn, "peer", None), len(payload), e, log)
 
     recovery = ClientRecovery(sync_runtime, io, send, receiver) if sync_runtime is not None else None
 
-    def apply_start(save, via):
+    def apply_start(save, via, switch=False):
         """The save-flag rule: emit start only if save==false, or save==true
         AND our receiver completed this session (it emitted save_ready). An
         unsatisfiable start is ignored WITHOUT latching started, so a retried
-        START GAME (after the host re-sends the save) still works."""
+        START GAME (after the host re-sends the save) still works.
+
+        ``switch`` marks a WORLD SWITCH -- apply_switch_start has already
+        cleared ``started`` for it, and the menu needs to know this start
+        replaces a world it is playing rather than starting a first one."""
         if started[0] or (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask or receiver.catalogue_token or not receiver.mods_satisfied:
+            return
+        if recovery and recovery.completed:
+            # a frozen join: this game loaded the shared world through the
+            # recovery round and is playing it -- the roster's started:true is
+            # already true of us, not a save to load
+            started[0] = True
+            io.write_state(started=True)
+            log(f"[client] START via {via} taken as already started -- this game joined through a world sync")
             return
         if receiver.need and not receiver.complete:
             return
@@ -3262,9 +3879,36 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                     f"{'failed' if receiver.failed else 'incomplete'})")
             return
         started[0] = True
-        io.emit({"type": "start", "save": save})
+        event = {"type": "start", "save": save}
+        if switch:
+            event["switch"] = True
+        io.emit(event)
         io.write_state(started=True)
-        log(f"[client] START (save={save}) via {via}")
+        log(f"[client] START (save={save}{', world switch' if switch else ''}) via {via}")
+
+    def apply_switch_start(save):
+        """A WORLD SWITCH start: the host loaded another world and pushed it
+        here. This is the one start that is taken although we already started --
+        we are leaving the world we are playing for the save that just arrived.
+
+        Guarded by the receiver's session id, because the host sends the start
+        CHAT_BURST times: without it every copy would emit another load. A
+        switch for which nothing was received is ignored, logged once."""
+        sid = receiver.sid
+        if (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask \
+                or receiver.catalogue_token or not receiver.mods_satisfied:
+            return
+        if not bool(save) or not receiver.complete or sid is None:
+            if last_switch[0] != ("ignored", sid):
+                last_switch[0] = ("ignored", sid)
+                log("[client] start(switch) ignored -- no verified save arrived this session")
+            return
+        if last_switch[0] == ("applied", sid):
+            return                                  # another copy of the start burst
+        last_switch[0] = ("applied", sid)
+        started[0] = False                          # this start replaces the world we are in
+        send({"t": "stage", "text": "loading the host's new world"})
+        apply_start(True, via="start (world switch)", switch=True)
 
     # ---- mesh: direct links to the other joiners, relay for the rest -------- #
     def mesh_plan_dials():
@@ -3370,6 +4014,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             if ln is not None and ln.connected and relay is not None:
                 relay.deliver(payload)
             return
+        if payload[:1] == FRAG_MAGIC:
+            payload = frags.feed(addr, payload)
+            if payload is None:
+                return
         try:
             m = json.loads(payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
@@ -3391,6 +4039,12 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     def handle_msg(raw):
         if stop.is_set():
             return
+        if raw[:1] == FRAG_MAGIC:
+            # a piece of a big control message (the roster of a big lobby is
+            # N^2 and passes 64 KB at 60-70 players): whole once the last lands
+            raw = frags.feed(conn.peer, raw)
+            if raw is None:
+                return
         if not version_checked[0]:
             try:
                 greeting = json.loads(raw.decode("utf-8"))
@@ -3438,7 +4092,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             return
         t = m.get("t")
         if t == "mods_manifest":
-            receiver.on_manifest(m.get("mods"))
+            receiver.on_manifest(m.get("mods"), m.get("mods_unknown"))
             return
         if recovery and recovery.message(m):
             return
@@ -3462,7 +4116,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 seen_nonces.add(lobby_epoch)
                 io.emit(dict(type='transport_lobby', epoch=lobby_epoch))
         if t == "welcome":
-            receiver.on_manifest(m.get("mods", []))
+            receiver.on_manifest(m.get("mods", []), m.get("mods_unknown"))
             assigned[0] = m.get("you", desired[0])
             host_name[0] = m.get("host")
             is_relay[0] = bool(m.get("relay"))
@@ -3471,7 +4125,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             io.write_state(you=assigned[0], host=m.get("host"))
             log(f"[client] host named us {assigned[0]!r}")
         elif t == "roster":
-            receiver.on_manifest(m.get("mods", []))
+            receiver.on_manifest(m.get("mods", []), m.get("mods_unknown"))
             players = m.get("players", [])
             host_name[0] = m.get("host", host_name[0])
             is_relay[0] = bool(m.get("relay", is_relay[0]))
@@ -3482,17 +4136,20 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             roster_profiles[0] = m.get("profiles", {}) or {}
             mesh_plan_dials()
             companies = m.get("companies", {}) or {}
-            key = (tuple(players), tuple(sorted(companies.items())))
+            stages = m.get("stages") or {}
+            lobby_mode = m.get("mode") or "coop"
+            key = (tuple(players), tuple(sorted(companies.items())), tuple(sorted(stages.items())), lobby_mode)
             if key != last_roster[0]:
                 last_roster[0] = key
                 io.emit({"type": "roster", "players": players,
                          "you": assigned[0], "host": m.get("host"),
-                         "lobby": m.get("lobby", ""), "companies": companies,
+                         "lobby": m.get("lobby", ""), "companies": companies, "stages": stages,
                          "relay": is_relay[0], "letters": m.get("letters") or {},
-                         "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1)})
+                         "stored_age": m.get("stored_age", -1), "stored_max": m.get("stored_max", -1),
+                         "mode": lobby_mode})
                 io.write_state(state="connected", players=players,
                                you=assigned[0], host=m.get("host"),
-                               started=started[0], lobby=m.get("lobby", ""), companies=companies)
+                               started=started[0], lobby=m.get("lobby", ""), companies=companies, mode=lobby_mode)
             # Start self-heal: the host's roster carries started:true for us
             # once we were included in a start -- catches a lost start burst.
             if m.get("started") is True:
@@ -3508,7 +4165,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             io.emit({"type": "chat", "from": m.get("from"),
                      "text": m.get("text"), "ts": m.get("ts")})
         elif t == "start":
-            apply_start(m.get("save", False), via="start")
+            if m.get("switch"):
+                apply_switch_start(m.get("save", False))
+            else:
+                apply_start(m.get("save", False), via="start")
         elif t == "status":
             # Advisory from the host (e.g. late joiner: game already started).
             io.emit({"type": "status",
@@ -3537,11 +4197,16 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "chat", "text": str(cmd.get("text", ""))})
         elif c == "mods":
             receiver.answer_mods(bool(cmd.get("accept")),cmd.get("offer"))
+        elif c == "stage":
+            send({"t": "stage", "text": str(cmd.get("text", ""))[:80]})
         elif c == "company":
             # the panel names a player when the leader of a relay lobby clicks
             # someone else's chip; this used to be overwritten with our own
             # name, so the leader could only ever change its own (2026-09-10)
             send({"t": "company", "player": str(cmd.get("player") or assigned[0]), "id": cmd.get("id")})
+        elif c == "mode":
+            # the relay leader's SEPARATE COMPANIES checkbox; the relay accepts it from the leader only
+            send({"t": "mode", "mode": str(cmd.get("mode", ""))})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
             m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
@@ -3567,8 +4232,14 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                     log(f"[client] save read failed: {e}")
                     return
                 sid = int(time.time() * 1000) & 0xFFFFFFFF
+                mods = modshare.save_mod_list(str(cmd.get("save")), log)   # None = could not read it (NOT "none")
+                if mods is None:
+                    log(f"[client] the mod list of {cmd.get('save')} is UNKNOWN -- the relay is told so; nobody is offered its mods")
+                    io.emit({"type": "chat", "from": "MULTIPLAYER",
+                             "text": f"Could not read which mods {os.path.basename(str(cmd.get('save')))} needs; players who lack them "
+                                     "will not be offered a download. If their game refuses the save, they must install your mods by hand."})
                 uploader[0] = _HostSaveTransfer(conn.sock, sid, blob, files_meta,
-                                                [(conn.peer, "relay")], io, log, mods=modshare.save_mod_list(str(cmd.get("save"))) or [])
+                                                [(conn.peer, "relay")], io, log, mods=mods)
                 io.emit({"type": "status", "state": "connected",
                          "detail": "uploading the save to the relay..."})
                 log(f"[client] uploading {cmd.get('save')} ({len(blob)} B) to the relay")
@@ -3829,7 +4500,8 @@ def cmd_host(args):
                  forward_logs=args.forward_log or (), publisher=publisher,
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
                  punch_q=rendezvous.queue if rendezvous is not None else None,
-                 sync_runtime=make_runtime(args) if not args.relay_only else None)
+                 sync_runtime=make_runtime(args) if not args.relay_only else None,
+                 companies_mode=bool(args.companies))
     finally:
         _STOPPING[0] = True
         if rendezvous is not None:
@@ -4534,10 +5206,11 @@ def _run_transfer_mods(tag):
     modshare.catalogue=lambda: ("test-catalogue",{("mod_zz","1"),("mod_have","1")})
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
     share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
-    modshare.save_mod_list = lambda p: [("mod_zz", 1), ("mod_have", 1)]
+    modshare.save_mod_list = lambda p, log=None: [("mod_zz", 1), ("mod_have", 1)]
     modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
     modshare.installed_mod = lambda m, v: src.get(m) if m == "mod_have" else None   # joiners lack mod_zz
-    modshare.install_target = lambda m, v: os.path.join(dest, threading.current_thread().name, f"{m}_{v}")
+    # a joiner is its loop thread; its verify/write worker is "<joiner>/save-finalize"
+    modshare.install_target = lambda m, v: os.path.join(dest, threading.current_thread().name.split("/")[0], f"{m}_{v}")
     ok = True
     t0 = time.time()
     try:
@@ -4716,6 +5389,7 @@ def _run_mods_gate(tag):
         r.on_begin(msg)
         for seq in range(total):
             r.on_chunk(sid, seq, blob[seq * CHUNK_LOCAL:(seq + 1) * CHUNK_LOCAL])
+        r.settle()                      # the verify/write runs on a worker thread; apply its outcome
 
     def installed(mid):
         return os.path.isfile(os.path.join(dest, f"{mid}_1", "mod.lua"))
@@ -5322,6 +5996,8 @@ def main(argv=None):
     ap.add_argument("--publish", default="",
                     help="master server base URL; the lobby is listed there while "
                          "public (see --public and the 'publish' command)")
+    ap.add_argument("--companies", action="store_true",
+                    help="start in separate-companies mode: every player gets their own company (default: co-op, one company)")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
     ap.add_argument("--rendezvous", default="",

@@ -137,6 +137,43 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(h.barrier.phase, 'aborted')
         self.assertFalse(h.roster_locked)
 
+    def test_host_decline_closes_and_mutes_every_prompt_until_a_later_resync(self):
+        # The host clicks "Keep playing": its own panel clears, every member is
+        # told, and the desync notices that keep coming for this world raise no
+        # prompt -- until a resync completes (a fresh epoch) or the lobby restarts.
+        from sync_lobby import publish_prompt, mute_prompt
+        h = self.make_host(3)
+        send = h.send
+        h.command('host', dict(cmd='sync_decline', id='keep-1'))
+        self.io.emit.assert_called_with(dict(type='sync_prompt', phase='clear'))
+        self.assertTrue(self.runtime.prompt_muted)
+        told = sorted(c.args[0] for c in send.call_args_list if c.args[1] == {'t': 'sync_declined'})
+        self.assertEqual(told, ['p1', 'p2'])
+        # a client may not decline for the host
+        send.reset_mock()
+        h.command('p1', dict(cmd='sync_decline', id='keep-2'))
+        self.assertEqual([c for c in send.call_args_list if c.args[1] == {'t': 'sync_declined'}], [])
+        # the notices keep coming; muted, they raise nothing
+        self.io.reset_mock()
+        self.runtime._read.return_value = dict(wall='100', world='w1', desyncs='3', held='0')
+        self.runtime.state = None
+        publish_prompt(self.runtime, self.io, True, 101)
+        self.io.emit.assert_not_called()
+        # a completed resync under a new epoch lifts the mute
+        self.runtime.state = dict(phase='complete', epoch='e2')
+        self.runtime._read.return_value = dict(wall='200', world='w2', desyncs='1', held='0')
+        publish_prompt(self.runtime, self.io, True, 201)
+        self.assertFalse(self.runtime.prompt_muted)
+        self.io.emit.assert_called_with(dict(type='sync_prompt', phase='detected'))
+        # and the client side of it
+        runtime = Mock(state=None); runtime._read.return_value = {}
+        io = Mock()
+        client = ClientRecovery(runtime, io, Mock(), Mock())
+        self.assertTrue(client.message(dict(t='sync_declined')))
+        io.emit.assert_called_with(dict(type='sync_prompt', phase='clear'))
+        self.assertTrue(runtime.prompt_muted)
+        mute_prompt(runtime, io)   # idempotent
+
     def test_transport_lobby_follows_a_completed_resync_only(self):
         # After a resync every member's bridge runs in the operation's epoch. A
         # player who joins later takes the lobby nonce from welcome/roster, so that

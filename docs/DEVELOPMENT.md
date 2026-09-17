@@ -109,6 +109,12 @@ Lines worth searching for: `EXEC <op> ... success=`, `!! DESYNC`, `~~ LAG`, `DIV
 `CANCEL fire-and-forget`, `callback NOT fired`, `stays local`, `UNREPLICATED BuildProposal` in
 `tpf2_slice.log`.
 
+**Keep the previous run's logs.** Create `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_keep_logs.txt` (any content).
+While it exists `tpf2_slice.log`, `lobby_proc.log` and `lobby_peers.log` are appended to after a
+`==== session ... ====` banner instead of starting afresh (`tpf2_bridge.log`, `tpf2_menu.log` and the
+company log always append). A boxed instance reads the flag from the host's data folder. The game's
+own `stdout.txt` is still truncated by the game -- snapshot it.
+
 **Snapshot before restarting a game.** `powershell -File tools\snapshot_logs.ps1 [-Tag name]` copies stdout,
 the data-folder files and the game folder's `egeo_*.txt` and `tpf2_slice.cfg` from the native instance and
 the `GameAgent`, `GameAgent2` and `GameAgent3` boxes into `%LOCALAPPDATA%\tpf2mp\runs\<timestamp>[-tag]\`. It does not
@@ -166,11 +172,26 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 
 ## Releasing
 
+Version numbers (2026-09-16): `0.x` is a major feature, `0.x.y` a minor feature, `0.x.y.z` a bugfix or
+the like. The lobby gate is an exact string match, so every release -- a bugfix included -- needs every
+player and the relay on it. The updater orders versions part by part (`0.5.7 < 0.5.7.1 < 0.5.8 < 0.6`); it
+accepts two to four parts from 0.5.7 on (exactly three before), so a two- or four-part release can only
+follow a release that carries that updater. Windows Installer wants at least three parts (`build_msi.ps1`
+pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compares versions;
+`AllowSameVersionUpgrades` in `Package.wxs` is what lets `0.5.7.1` install over `0.5.7`.
+
 1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
    game list).
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
-3. Tag the commit `v<version>` and publish `installer\out\TpF2Multiplayer.msi` as a GitHub release asset,
-   with its SHA-256 in the notes.
+3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
+   `TpF2Multiplayer.msi`, `TpF2Multiplayer-update.zip` (the in-game updater's payload),
+   `TpF2Multiplayer-files.zip` (the MSI's files as an archive: Proton and manual installs), a
+   `SHA256SUMS.txt` listing them, `tools/proton/install.py` uploaded as `install_proton.py` with its
+   `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release page
+   installs that release), and `tools/proton/install_proton.sh` uploaded as `install_proton.sh` with its
+   `DEFAULT_VERSION=""` line set the same way (the no-Python installer; `tools/proton/test_install_sh.py`
+   tests it offline). `build_msi.ps1` repairs the lobby for Wine before packaging
+   ([proton/INSTALL.md](proton/INSTALL.md)).
 4. If the lobby changed, redeploy the relay with `sh tools/relay_deploy.sh` (it refuses while players are
    connected) and the master server with `sh tools/masterserver_deploy.sh`
    ([NETWORKING.md](NETWORKING.md#dedicated-relay)).

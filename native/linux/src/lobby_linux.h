@@ -52,6 +52,7 @@ struct StartRequest {
     std::string name;        // --name
     std::string password;    // --password, when not empty
     std::string lobbyName;   // host: --lobby-name
+    bool separateCompanies = false; // host: --companies
     bool pub = false;        // host: --public
 };
 
@@ -66,9 +67,10 @@ void Leave();                                    // quit; after 1.5 s SIGTERM; a
 // ...", so the panel keeps the typed text and the status says why.
 std::string SendChat(const std::string& text);
 std::string StartGame();                         // host: share the newest save, then start
+std::string SetSeparateCompanies(bool on);
 std::string SetPublic(bool on);                  // host: list or delist the running lobby
 std::string AnswerMods(bool yes);                // YES / NO to the mods question
-void CycleCompany(int rosterIndex);              // a company chip was clicked
+void CycleCompany(int rosterIndex, bool previous = false);              // a company chip was clicked
 
 // The room code for the clipboard. The panel copies it on the UI thread; the
 // code is never drawn (menu_hook.cpp, "ROOM CODE, DELIBERATELY NOT RENDERED").
@@ -78,11 +80,12 @@ bool TakeAutoCopy(std::string* code);
 bool CapturesTyping();                           // lock-free: false once the shared save is placed
 
 struct Player {
-    std::string name;
+    std::string name, stage;
     int company = 1;
     bool you = false, host = false;
 };
 struct View {
+    bool separateCompanies = false;
     bool haveCode = false;
     bool isHost = false;          // START GAME: the host, or a relay lobby's leader
     bool youAreHost = false;      // chips: the host may set anyone's company

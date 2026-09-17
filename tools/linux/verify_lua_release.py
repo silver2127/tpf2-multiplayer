@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify that Linux ships the exact Lua sources from Windows release 0.5.6."""
+"""Verify the cumulative Linux Lua integration: dev b141b123 (release 0.6)."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,8 +7,12 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "e4702669ab99ae05074dc5b5540dbc1115e66129"
+REFERENCE = "b141b1238e4559aed4ec1ed97a51e963e455923d"
+INCOMING = REFERENCE
+INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"
+# Earlier dashboard changes have converged with upstream; all Lua is exact.
+MERGED_SHA256 = {}
 
 
 def main():
@@ -22,19 +26,36 @@ def main():
         paths = git("ls-tree", "-r", "--name-only", commit, "--", PREFIX).decode().splitlines()
         expected = {p[len(PREFIX):]: git("show", commit + ":" + p)
                     for p in paths if p.endswith(".lua")}
+        for p in INCOMING_FILES:
+            expected[p] = git("show", INCOMING + ":" + PREFIX + p)
         actual = {p.relative_to(args.mod_dir).as_posix(): p.read_bytes()
                   for p in args.mod_dir.rglob("*.lua")}
         missing = sorted(expected.keys() - actual.keys())
         extra = sorted(actual.keys() - expected.keys())
-        different = sorted(p for p in expected.keys() & actual.keys() if expected[p] != actual[p])
+        different = sorted(p for p in expected.keys() & actual.keys() if (hashlib.sha256(actual[p]).hexdigest() != MERGED_SHA256[p]
+                            if p in MERGED_SHA256 else expected[p] != actual[p]))
         for title, names in (("missing", missing), ("extra", extra), ("changed", different)):
             for name in names:
                 print(f"FAIL: {title} Lua file: {name}", file=sys.stderr)
         if missing or extra or different:
             return 1
-        manifest = "".join(f"{hashlib.sha256(expected[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files match Windows 0.5.6 ({commit}) byte for byte")
+        manifest = "".join(f"{hashlib.sha256(actual[p]).hexdigest()}  {p}\n" for p in sorted(expected))
+        print(f"PASS: {len(expected)} Lua files: exact dev b141b123 (release 0.6) except {len(MERGED_SHA256)} pinned cumulative merges")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
+        # The glyph overlays are runtime dependencies of the shared stylesheet.
+        # Check packaged copies too: Lua equality alone cannot catch omitted assets.
+        glyph_prefix = "res/textures/ui/hud/mp_glyph_"
+        expected_glyphs = {p[len(PREFIX):]: git("show", commit + ":" + p)
+                           for p in paths if p.startswith(PREFIX + glyph_prefix) and p.endswith(".tga")}
+        actual_glyphs = {p.relative_to(args.mod_dir).as_posix(): p.read_bytes()
+                         for p in (args.mod_dir / "res/textures/ui/hud").glob("mp_glyph_*.tga")}
+        bad_glyphs = sorted(p for p in expected_glyphs.keys() | actual_glyphs.keys()
+                            if expected_glyphs.get(p) != actual_glyphs.get(p))
+        for p in bad_glyphs:
+            print(f"FAIL: missing, extra or changed HUD glyph: {p}", file=sys.stderr)
+        if bad_glyphs:
+            return 1
+        print(f"PASS: {len(expected_glyphs)} HUD glyph textures exact dev b141b123 (release 0.6)")
         return 0
     except (OSError, subprocess.CalledProcessError) as error:
         print(f"Cannot verify Windows Lua baseline: {error}", file=sys.stderr)

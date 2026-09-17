@@ -1,5 +1,7 @@
 // Linux build 35924: layouts/callback policies from docs/re/linux/SLICE_LINES.md.
 #include "slice_core.h"
+#include "ecs_linux.h"
+#include <vector>
 #include <cmath>
 #include <cerrno>
 #include <initializer_list>
@@ -18,52 +20,73 @@ namespace slice_lines {
 constexpr uintptr_t kSet = 0x15ed550, kCreate = 0x15efda0, kUpdate = 0x15f0050;
 constexpr uintptr_t kDelete = 0x15ebd00, kColor = 0x15ecb40, kName = 0x15ee6d0;
 
-static bool Wait(uintptr_t address, int* value)
+// Byte-for-byte native/src/slice_hook.cpp's encoder: the wire splits records on
+// whitespace, and a company is called "Ferrovie dello Stato". '%' and '=' are
+// escaped too, so the encoding round-trips and never collides with a key=value.
+std::string PercentEncode(const std::string& s)
 {
-    float f;
-    if (!SliceReadT(address, &f) || !(f >= 0 && f <= 36000)) return false;
-    *value = int(f + .5f);
-    return true;
+    std::string enc;
+    enc.reserve(s.size() * 3);
+    for (size_t i = 0; i < s.size(); i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') enc.push_back((char)ch);
+        else { char h[4]; snprintf(h, sizeof(h), "%%%02X", ch); enc.append(h, 3); }
+    }
+    return enc;
+}
+
+// Layouts rechecked against build 35924; see SLICE_LINES.md. No game-size
+// policy limits: only vector structure/readability, valid IDs/mode and non-NaN waits.
+static bool Refuse(const char* check, size_t stop = 0)
+{
+    SliceLog("[slice-lines] decode refused: %s (stop %zu)\n", check, stop);
+    return false;
+}
+static bool Wait(uintptr_t address, float* value)
+{
+    return SliceReadT(address, value) && !std::isnan(*value);
 }
 
 static bool DecodeBody(SliceRecord* rec, uintptr_t line)
 {
-    int wait;
+    float wait;
     SliceVec stops;
-    if (!Wait(line + 0x18, &wait) || !SliceReadStdVector(line, 0xb8, 64, &stops)) return false;
-    SliceRecordPrintf(rec, "%d %zu", wait, stops.count);
+    if (!Wait(line + 0x18, &wait)) return Refuse("waitingTime unreadable or NaN");
+    if (!SliceReadStdVector(line, 0xb8, SIZE_MAX, &stops)) return Refuse("stops vector");
+    SliceRecordPrintf(rec, "%.9g %zu", wait, stops.count);
     for (size_t i = 0; i < stops.count; ++i) {
         const uintptr_t s = stops.begin + i * 0xb8;
         int32_t ids[3], mode;
-        int min, max;
+        float min, max;
         SliceVec alts;
-        if (!SliceRead(s, ids, sizeof(ids)) || ids[0] <= 0 || ids[1] < 0 || ids[1] > 64 || ids[2] < 0 || ids[2] > 64 ||
-            !SliceReadT(s + 0x28, &mode) || mode < 0 || mode > 3 ||
-            !Wait(s + 0x2c, &min) || !Wait(s + 0x30, &max) ||
-            !SliceReadStdVector(s + 0x10, 8, 8, &alts)) return false;
-        SliceRecordPrintf(rec, " %d %d %d %d %d %d %zu", ids[0], ids[1], ids[2], mode, min, max, alts.count);
+        if (!SliceRead(s, ids, sizeof(ids)) || ids[0] <= 0 || ids[1] < 0 || ids[2] < 0)
+            return Refuse("station group/station/terminal", i + 1);
+        if (!SliceReadT(s + 0x28, &mode) || mode < 0 || mode > 3) return Refuse("loadMode", i + 1);
+        if (!Wait(s + 0x2c, &min) || !Wait(s + 0x30, &max)) return Refuse("stop waits unreadable or NaN", i + 1);
+        if (!SliceReadStdVector(s + 0x10, 8, SIZE_MAX, &alts)) return Refuse("alternative terminals vector", i + 1);
+        SliceRecordPrintf(rec, " %d %d %d %d %.9g %.9g %zu", ids[0], ids[1], ids[2], mode, min, max, alts.count);
         for (size_t a = 0; a < alts.count; ++a) {
             int32_t idsAlt[2];
-            if (!SliceRead(alts.begin + a * 8, idsAlt, sizeof(idsAlt)) ||
-                idsAlt[0] < 0 || idsAlt[0] > 64 || idsAlt[1] < 0 || idsAlt[1] > 64) return false;
+            if (!SliceRead(alts.begin + a * 8, idsAlt, sizeof(idsAlt)) || idsAlt[0] < 0 || idsAlt[1] < 0)
+                return Refuse("alternative station/terminal", i + 1);
             SliceRecordPrintf(rec, " %d %d", idsAlt[0], idsAlt[1]);
+            if (rec->failed) return Refuse("record allocation", i + 1);
         }
     }
-    // Stop::waypoints is a libstdc++ vector<SignalId> at +0x38 (see
-    // SLICE_LINES.md). Keep the Windows wire format, including 1-based stops.
     bool first = true;
     for (size_t i = 0; i < stops.count; ++i) {
         SliceVec points;
-        if (!SliceReadStdVector(stops.begin + i * 0xb8 + 0x38, 8, 64, &points)) return false;
+        if (!SliceReadStdVector(stops.begin + i * 0xb8 + 0x38, 8, SIZE_MAX, &points)) return Refuse("waypoints vector", i + 1);
         for (size_t j = 0; j < points.count; ++j) {
             int32_t id[2];
-            if (!SliceRead(points.begin + j * 8, id, sizeof(id)) ||
-                id[0] <= 0 || id[1] < 0 || id[1] > 64) return false;
+            if (!SliceRead(points.begin + j * 8, id, sizeof(id)) || id[0] <= 0 || id[1] < 0)
+                return Refuse("waypoint entity/index", i + 1);
             SliceRecordPrintf(rec, "%s%zu:%d:%d", first ? " wp=" : ",", i + 1, id[0], id[1]);
             first = false;
+            if (rec->failed) return Refuse("record allocation", i + 1);
         }
     }
-    return !rec->failed;
+    return !rec->failed || Refuse("record allocation");
 }
 
 static bool Decode(SliceRecord* rec, int32_t entity, uintptr_t line)
@@ -74,11 +97,12 @@ static bool Decode(SliceRecord* rec, int32_t entity, uintptr_t line)
 
 static bool EncodeName(SliceRecord* rec, uintptr_t address)
 {
-    char name[256]; size_t len;
-    if (!SliceReadStdString(address, name, sizeof(name), &len, 255) || !len) return false;
+    std::string name;
+    if (!SliceReadStdString(address, &name) || name.empty()) return false;
+    const size_t len = name.size();
     for (size_t i = 0; i < len; ++i) {
         const unsigned char ch = name[i];
-        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') SliceRecordAppend(rec, name + i, 1);
+        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') SliceRecordAppend(rec, name.data() + i, 1);
         else SliceRecordPrintf(rec, "%%%02X", unsigned(ch));
     }
     return !rec->failed;
@@ -104,7 +128,7 @@ struct HeldCreate {
     SliceRecord identity;
     bool inflight;
 };
-static HeldCreate* g_creates[8]{};
+static std::vector<HeldCreate*> g_creates;
 static pthread_mutex_t g_createMutex = PTHREAD_MUTEX_INITIALIZER;
 static std::atomic<uint32_t> g_createSequence{0};
 static uint64_t g_claimSeen = 0;
@@ -136,14 +160,15 @@ static void ReleaseCreate(void*, void* context)
 
 static void ExpireCreates()
 {
-    HeldCreate* expired[8]{}; size_t count=0;
+    std::vector<HeldCreate*> expired;
     const uint64_t now=SliceNowMs();
     pthread_mutex_lock(&g_createMutex);
+    try { expired.reserve(g_creates.size()); } catch (...) { pthread_mutex_unlock(&g_createMutex); throw; }
     for (auto& slot:g_creates) if (slot && !slot->inflight && now-slot->at>60000) {
-        expired[count++]=slot;slot=nullptr;
+        expired.push_back(slot);slot=nullptr;
     }
     pthread_mutex_unlock(&g_createMutex);
-    for (size_t i=0;i<count;++i) ReleaseCreate(nullptr,expired[i]);
+    for (auto* h : expired) ReleaseCreate(nullptr,h);
 }
 
 static bool FreshClaim(uint64_t* nonce, char* letter)
@@ -236,6 +261,10 @@ static HeldCreate* TakeCarrier(uintptr_t commandAddress)
     return found;
 }
 
+// Windows dev 1d0ca473 converges on this existing Linux scheme: sendCommand
+// rebuilds the maker's Command. The two verified script callers plus the
+// thread-local claim identify the replay; TakeCarrier also checks its payload.
+// See docs/re/linux/DEV_1D0CA473.md for the rechecked ELF/ABI evidence.
 static void ReplayAdd(const SliceAddCall& add, void*)
 {
     if (!t_carrier.id || (add.retRva != 0xa2f5c2 && add.retRva != 0x11225a9)) return;
@@ -275,13 +304,15 @@ static bool PrepareCreate(const SliceAddCall& add, void*)
     std::memcpy(h->fn,fn,sizeof(fn)); h->id=t_create.id; h->at=SliceNowMs(); std::strcpy(h->instance,instance);
     char claimInstance[8]; uint64_t priorClaim;
     if (FreshClaim(&priorClaim,claimInstance) && !std::strcmp(claimInstance,instance)) h->claimBefore=priorClaim;
-    int slot=-1;
+    size_t slot=0;
     // A simulation-thread replay can observe the append immediately. Publish
     // the moved callback and its identity in the same critical section as the
     // append, so that replay cannot claim a half-committed holder.
     pthread_mutex_lock(&g_createMutex);
-    for (int i=0;i<8;++i) if (!g_creates[i]) { g_creates[i]=h; slot=i; break; }
-    if (slot<0) {pthread_mutex_unlock(&g_createMutex);std::free(h);return false;}
+    for (;slot<g_creates.size();++slot) if (!g_creates[slot]) break;
+    try { if (slot == g_creates.size()) g_creates.push_back(nullptr); }
+    catch (...) { pthread_mutex_unlock(&g_createMutex); std::free(h); throw; }
+    g_creates[slot]=h;
     const uintptr_t zero=0;
     if (!WriteMemory(uintptr_t(add.done)+0x10,&zero,sizeof(zero))) {
         g_creates[slot]=nullptr;pthread_mutex_unlock(&g_createMutex);
@@ -376,13 +407,37 @@ static void OnFactory(const SliceFactoryCall& c, void*)
             what = "LDELETE"; cancel = true;
             SliceRecordPrintf(&rec, "LDELETE %d", entity);
             break;
-        case kColor: case kName:
+        case kName: {
+            // THE COMPANY WINDOW'S RENAME (Windows 2a87bb4's Linux half).
+            // A VNAME whose entity is a company -- an entity with a Player
+            // component -- is turned into CMNAME by the shared inject.lua, and
+            // CMNAME renames the company on EVERY peer, the originator
+            // included. So a cancelled click is not lost here the way a
+            // vehicle's or a line's rename would be, and the barrier's replay
+            // adapter is not needed. Everything else keeps the old refusal.
+            // rsi = the engine and rdx = the entity at this factory: watched
+            // under gdb in the lab (entity 19427, Player yes, PlayerOwned no).
+            if (!SliceEcsIsCompany(c.rsi, entity)) {
+                SliceLog("[slice-lines] VNAME blocked for entity %d: not a company, and unchanged "
+                         "0.4.22 Lua skips origin replay\n", entity);
+                return;
+            }
+            std::string name;
+            if (!SliceReadStdString(c.rcx, &name) || name.empty()) {
+                SliceLog("[slice-lines] VNAME for company %d: the name did not read, or is "
+                         "empty -- not shipped\n", entity);
+                return;
+            }
+            what = "VNAME"; cancel = true;
+            SliceRecordPrintf(&rec, "VNAME %d %s", entity, PercentEncode(name).c_str());
+            break;
+        }
+        case kColor:
             // Unchanged Windows 0.4.22 Lua unconditionally sets skipOrigin=1
             // for these records. Shipping a cancelled click would apply only
             // on peers. The central player barrier blocks it until a native
             // origin replay adapter is available; script replays pass above.
-            SliceLog("[slice-lines] %s blocked: unchanged 0.4.22 Lua skips origin replay\n",
-                     c.factory->rva == kColor ? "VCOLOR" : "VNAME");
+            SliceLog("[slice-lines] VCOLOR blocked: unchanged 0.4.22 Lua skips origin replay\n");
             return;
         default: return;
     }

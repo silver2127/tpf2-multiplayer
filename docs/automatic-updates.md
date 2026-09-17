@@ -9,14 +9,31 @@ retries a check; DOWNLOAD UPDATE downloads the latest stable release after the
 player clicks. Checks/downloads run in a separate hidden process. Network failure
 does not prevent hosting or joining the currently installed version.
 
-Publish `TpF2Multiplayer-update.zip` beside `TpF2Multiplayer.msi` in each GitHub
-release. `installer/build_msi.ps1` builds both; `tools/build_update.py` can rebuild
-the ZIP from the native and frozen Python outputs. Publish only after those
-outputs have been rebuilt for the release. GitHub's release asset SHA-256 digest
-is required. Old releases without the ZIP require the MSI. Drafts, prereleases,
-equal versions, and older versions are not offered.
+A GitHub release publishes one asset, `TpF2Multiplayer.msi` (since 2026-09-16).
+The updater takes its payload from that MSI: after the download is verified it
+runs an administrative install (`msiexec /a <msi> /qn TARGETDIR=<temp>`) into a
+folder under the user's temp directory, which lays the package's file tree out
+without installing anything and without elevation, finds the game folder in it
+by its `tpf2_menu.dll`, maps the DLLs, the plugins, `netpunch\netpunch.exe` and
+the mod's `res/scripts/mp/*.lua` into the bundle layout, derives `entry.lua` and
+`mod_data.lua` from the mod's `lockstep.lua` and `mod.lua` (`updater.derive_mod_scripts`,
+the one function `tools/build_update.py` also uses), checks that the MSI's
+`tpf2mp_version.txt` stamp is the release version, hashes every file into a
+manifest and installs the result as a bundle. The temp folder is removed
+afterwards; a failing `msiexec` is reported with its exit code. Nothing in the
+bundle layout or the native bootstrap changed for this.
 
-Downloads are checked against the HTTPS GitHub asset metadata. ZIP paths, total
+`installer/build_msi.ps1` still builds `TpF2Multiplayer-update.zip` beside the
+MSI, from the same outputs: it is the offline test fixture and a fallback asset.
+`tools/updater_test.py` checks that the MSI conversion and the zip agree hash
+for hash. Releases before 2026-09-16 published that zip; a release whose only
+asset is the zip is still accepted, and the MSI wins when both are attached.
+Publish only after the native and frozen Python outputs have been rebuilt for
+the release. GitHub's release asset SHA-256 digest is required, for the MSI as
+for the zip. A release with neither asset requires installing by hand. Drafts,
+prereleases, equal versions, and older versions are not offered.
+
+Downloads are checked against the HTTPS GitHub asset metadata. Bundle paths, total
 sizes, the bootstrap ABI, required files, and every manifest hash are validated
 before extraction. A process lock serializes activation. Payloads live under
 `%LOCALAPPDATA%\tpf2mp\updates\releases\<version>`. `active.txt` is replaced
@@ -38,7 +55,7 @@ Big Maps and other existing plugins. The selected release takes precedence for
 the multiplayer previews plugin. A newer MSI overrides an older cached release;
 removing the MSI's version marker disables cached multiplayer release selection.
 Loader, shared host, system registry, or new game-resource entry-point changes
-require an MSI/ABI update. The ZIP currently updates MP Lua scripts, not arbitrary
+require an MSI/ABI update. The bundle currently updates MP Lua scripts, not arbitrary
 game resources or third-party mods. Dedicated relay servers still use their
 normal deployment process.
 

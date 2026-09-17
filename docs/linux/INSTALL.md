@@ -21,14 +21,67 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This experimental Linux release follows **0.5.6**. Use matching 0.5.6 peers.
-All 28 shared Lua files match the Windows release byte for byte. See
-[UPSTREAM_0.5.6.md](UPSTREAM_0.5.6.md) for technical validation details.
+This development tree combines **Windows release 0.6 (dev through `b141b123`)**.
+It includes native road-space summation, road-edge vehicle entry order, ship/aircraft order diagnostics,
+shared-station line selection, host world-switch sharing, bidirectional company
+chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). Lobby
+chips, shared dashboard swatches and vehicle paint use the new 20-colour palette,
+with generated colours starting at company 21. All Lua files
+exactly match that Windows revision. See
+[UPSTREAM_dev_b141b123.md](UPSTREAM_dev_b141b123.md) for provenance, tests and
+remaining gaps. This is not a claim of live cross-platform compatibility.
+`trainorder=0`, `roadspace=0`, `roadentries=0`, `shiporder=0`, `airorder=0` and
+`sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt` disable the respective
+hooks at startup; peers need matching arithmetic/ordering settings.
 
-**Known limits:** automatic resync, the new separate-company/shared-ownership
+Native station selection now honors company permissions. Foreign station and
+vehicle icons are visible and their info windows can open read-only; `showicons=0`
+and `foreignwindows=0` disable these features. Company tinting of icons, station
+labels and native windows is not ported (`iconcolor`/`windowcolor`/`stationicon` have no native
+implementation), including the own-company icon/label colours added in
+earlier Windows revisions. Founder names, buy-time paint scheduling and the optional
+`tpf2mp_hash_every.txt` cadence override are included through the shared Lua.
+
+The HUD station/depot company wash added in `5fb7aea2` remains unavailable,
+including the earlier button-root correction, non-asserting owner lookup,
+class read-back and alive counters. The `8e31f1e0` label counters, first-six
+window-bind logs and staged no-owner station diagnostics are also unavailable. `stationicon=0` and `tintclass=mpCo`
+currently affect only Windows. See the integration record for the fresh Linux
+investigation and missing evidence. The `61578d27` shared stylesheet now targets
+the station/depot icon and window title bar, but requires the same unavailable
+native root-class tagging. The d6db920f selectors additionally target the icon
+element itself, but the corresponding native entity/owner relay remains
+unavailable; stylesheet presence does not enable company tinting on Linux. The 50d7588b
+fix removes the selector bang from Windows class names (`mpWinCoN`/`mpCoN`);
+Linux still lacks the native tint-class application path. The 66c870cf stylesheet
+now colours a second glyph image layer, preserving the blue box, and includes
+32 glyph textures at 1x/2x resolution. These shared assets are included unchanged;
+visible company tinting still requires the missing native class tagging.
+The 0.6 station-icon refinements (constructor entity, post-attach restyle)
+are not ported for the same reason. Frozen joins need the native resync
+controller, which Linux lacks: a Linux host keeps the hot-join save.
+
+Company creation, switching and dissolution now wait for other players to finish
+receiving the save, loading and catching up. The dashboard names those players;
+company password changes remain available.
+
+The roster now shows verified engine load percentages while a world loads.
+Returning from a world to the title menu leaves the lobby. The paused GameTime
+counter fix is enabled by default; peers need matching `pausedtick` settings.
+Creating `tpf2mp_governor_off.txt` in the runtime data folder disables the Lua
+speed governor. Native in-app updates remain unsupported; use the Linux installer.
+
+When the host changes worlds, an already-playing Linux client receives the
+new save but must open **LOAD GAME → mp_shared**. Automatic in-world loading
+still needs the native recovery controller. Installation also removes the
+obsolete `mods/m3_determinism_1` probe, with removal shown in `--dry-run`.
+
+**Known limits:** automatic resync, the wider separate-company/shared-ownership
 operations, and automatic Workshop registration still need native Linux support.
 Some player actions, including names/colors, vehicle stop/maintenance and loans,
-remain blocked in multiplayer. A completed cross-platform gameplay test for
+remain blocked in multiplayer. In particular, the shared dashboard now uses the
+game company window for renaming, but native Linux cannot yet capture that
+rename; the player-based default names and existing saved names still display. A completed cross-platform gameplay test for
 0.5.6 has not yet been recorded; the passing 0.4.22 replay does not establish
 0.5.6 compatibility.
 
@@ -149,6 +202,8 @@ the script fallback. Logs are in `<data home>/tpf2mp/data/tpf2mp_host.log`.
 
   This also works after a crash: just start the game again. The last 2 are kept. `about.txt` in each
   folder lists what is there, with sizes.
+  Create `tpf2mp_keep_logs.txt` in the runtime data folder to keep every archive
+  and append mod/lobby logs across starts. Remove it to restore normal retention.
 - **`./collect_logs.sh`** packs everything a bug report needs into
   `tpf2mp-logs-<computer>-<time>.zip` in your Downloads folder, without uploading anything:
   - the data folder and the saved runs;
@@ -219,3 +274,14 @@ The script:
 The lobby builder uses pinned Python and manylinux wheels, checks every bundled ELF dependency against glibc 2.31, and supports `--test` for its five local network/transfer tests. Native build provenance, source commit, included libraries and lobby checksum are recorded in `BUILDINFO`.
 
 The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the source tree for implementation coverage and remaining runtime validation; packaging success alone does not establish multiplayer parity.
+
+### Optional Big Maps worktree in development packages
+
+Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`
+or `tools/linux/auto_install.py` to build and ship that checkout's native
+plugin and configuration. Source is mounted read-only; outputs go in the
+multiplayer build directory. Plugin-only source changes trigger a rebuild
+and installation after all games close. The selected checkout must contain
+`linux/CMakeLists.txt` and `linux/tpf2_bigmap.cfg`. This option never launches
+the game. Automatic recovery and Workshop registration remain unsupported as
+recorded in the integration notes.

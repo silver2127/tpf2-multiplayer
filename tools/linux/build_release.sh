@@ -3,6 +3,7 @@
 #
 #   tools/linux/build_release.sh [--build-dir DIR] [--out DIR] [--version V]
 #                                [--netpunch PATH | --no-netpunch] [--without LIB]...
+#                                [--bigmap-repo CHECKOUT_OR_WORKTREE]
 #
 # 1. Configures and builds native/linux in a build folder of its own (default
 #    native/linux/out-release; native/linux/out is the developers' folder and is
@@ -31,12 +32,13 @@ set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BUILD=$REPO/native/linux/out-release
 OUT=$REPO/dist/linux
-VERSION="" NETPUNCH="" NO_NETPUNCH=0 HOST_BUILD=0
+VERSION="" NETPUNCH="" NO_NETPUNCH=0 HOST_BUILD=0 BIGMAP_REPO=""
 WITHOUT=()
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 while [ $# -gt 0 ]; do
   case "$1" in
+    --bigmap-repo) BIGMAP_REPO=$(realpath "${2:?}"); shift 2 ;;
     --build-dir) BUILD=${2:?}; shift 2 ;;
     --out) OUT=${2:?}; shift 2 ;;
     --version) VERSION=${2:?}; shift 2 ;;
@@ -113,6 +115,13 @@ case " ${LEFT_OUT[*]:-} " in
     PLUGINS+=(tpf2_previews.so)
     ;;
 esac
+if [ -n "$BIGMAP_REPO" ]; then
+  case " ${LEFT_OUT[*]:-} " in *" tpf2_pluginhost.so "*) die "Big Maps requires tpf2_pluginhost.so" ;; esac
+  case "$BIGMAP_REPO/" in "$STAGE/"*) die "Big Maps source must be outside staging" ;; esac
+  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap"
+  install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+  PLUGINS+=(tpf2_bigmap.so)
+fi
 # A symbol the loader exports wins over the game's own for the whole process
 # (it is in LD_PRELOAD); a library the loader dlopens needs to export nothing.
 if command -v nm >/dev/null 2>&1; then
@@ -154,6 +163,9 @@ if [ ${#PLUGINS[@]} -gt 0 ]; then
   mkdir -p "$STAGE/lib/plugins"
   for l in "${PLUGINS[@]}"; do install -m 0755 "$BUILD/$l" "$STAGE/lib/plugins/$l"; done
 fi
+if [ -n "$BIGMAP_REPO" ]; then
+  install -m 0644 "$BIGMAP_REPO/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
+fi
 cp -R "$REPO/mod/mp_lockstep_1" "$STAGE/mod/"
 python3 "$REPO/tools/linux/verify_lua_release.py" --mod-dir "$STAGE/mod/mp_lockstep_1"
 NP_BIN=""   # the lobby executable taken, for its date in BUILDINFO
@@ -168,6 +180,22 @@ install -m 0755 "$REPO/tools/linux/tpf2mp-launch" "$STAGE/tpf2mp-launch"
 install -m 0644 "$REPO/tools/linux/tpf2mp_paths.sh" "$STAGE/tpf2mp_paths.sh"
 install -m 0644 "$REPO/docs/linux/INSTALL.md" "$STAGE/INSTALL.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.6.md" "$STAGE/UPSTREAM_0.5.6.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_55e97a48.md" "$STAGE/UPSTREAM_dev_55e97a48.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_3edfbccd.md" "$STAGE/UPSTREAM_dev_3edfbccd.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_cae5d370.md" "$STAGE/UPSTREAM_dev_cae5d370.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6cb03915.md" "$STAGE/UPSTREAM_dev_6cb03915.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_38432b5f.md" "$STAGE/UPSTREAM_dev_38432b5f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d3135a59.md" "$STAGE/UPSTREAM_dev_d3135a59.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_59bb258a.md" "$STAGE/UPSTREAM_dev_59bb258a.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a658fc11.md" "$STAGE/UPSTREAM_dev_a658fc11.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5fb7aea2.md" "$STAGE/UPSTREAM_dev_5fb7aea2.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8e31f1e0.md" "$STAGE/UPSTREAM_dev_8e31f1e0.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_61578d27.md" "$STAGE/UPSTREAM_dev_61578d27.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_be3b86ae.md" "$STAGE/UPSTREAM_dev_be3b86ae.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d6db920f.md" "$STAGE/UPSTREAM_dev_d6db920f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_50d7588b.md" "$STAGE/UPSTREAM_dev_50d7588b.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_66c870cf.md" "$STAGE/UPSTREAM_dev_66c870cf.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b141b123.md" "$STAGE/UPSTREAM_dev_b141b123.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
@@ -183,7 +211,8 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows release 0.5.6 (e470266), verified byte-identical"
+  echo "Lua: dev b141b1238e4559aed4ec1ed97a51e963e455923d (release 0.6); all 28 files exact"
+  if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"
   if [ "$HOST_BUILD" = 1 ]; then echo "native runtime: host build (development only)"

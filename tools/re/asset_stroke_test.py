@@ -20,11 +20,10 @@ def cut(start, end):
     return SRC[a:b]
 
 
-# the pieces ParseAssetStroke needs: base64, the limits, the struct and the parser
+# the pieces ParseAssetStroke needs: base64, the wire version, the struct and the parser
 code = "\n".join([
     cut("static const char B64_ALPHABET", "static void AppendTerrainBlob"),
-    "static const uint64_t TERRAIN_MAX_BYTES = 64ull << 20;",
-    cut("static const uint32_t  ASSET_MAX_MODELS", "struct AssetBlob"),
+    cut("static const uint32_t  ASSET_WIRE_VERSION", "// The stroke blob"),
     cut("struct AssetModelSrc", "// The replay: asset_inject_"),
 ])
 main = r'''
@@ -66,12 +65,13 @@ if not os.path.exists(exe):
     print("compile failed"); sys.exit(1)
 
 
-def stroke(groups, nrm):
-    out = b"TPAS" + struct.pack("<III", 1, len(groups), nrm)
+def stroke(groups, nrm, version=2):
+    # wire v2: u32 string lengths, no cap on any count or length
+    out = b"TPAS" + struct.pack("<III", version, len(groups), nrm)
     for g in groups:
         out += struct.pack("<I", len(g))
         for model, extra, mat in g:
-            out += struct.pack("<H", len(model)) + model.encode() + struct.pack("<H", len(extra)) + extra.encode()
+            out += struct.pack("<I", len(model)) + model.encode() + struct.pack("<I", len(extra)) + extra.encode()
             out += struct.pack("<16f", *mat)
     return out
 
@@ -113,6 +113,28 @@ out = run(b"rm -\n" + base64.b64encode(stroke(groups[:1], 0)))
 check("no removals ('-')", out.startswith("OK 0\n1\n2\n"), out[:40])
 check("CRLF after the removal line is accepted", run(b"rm 5\r\n" + base64.b64encode(blob)).startswith("OK 1 5"))
 check("removal-only stroke (erase that empties groups)", run(b"rm 9,10\n" + base64.b64encode(stroke([], 2))).startswith("OK 2 9 10\n0"))
+
+# The removed limits (2026-09-16): v1 refused a string over 511 bytes, more than
+# 20000 models in a group, more than 4096 groups or removal ids. None of these
+# is a bound any more; only the bytes behind a count bound it.
+long_model = "vegetation/" + "x" * 3000 + ".mdl"
+long_extra = "y" * 700
+out = run(b"rm -\n" + base64.b64encode(stroke([[(long_model, long_extra, mat(1, 2, 3))]], 0)))
+lines = out.splitlines()
+check("a 3 KB model path and a 700 B second string ship whole",
+      len(lines) >= 4 and lines[3].startswith(long_model + "\t" + long_extra + "\t"), out[:60])
+big = [[("tree/t.mdl", "", mat(i, 0, 0)) for i in range(25000)]]
+out = run(b"rm -\n" + base64.b64encode(stroke(big, 0)))
+check("a group of 25000 models (v1 capped at 20000) parses", out.startswith("OK 0\n1\n25000\n"), out[:30])
+many = [[("tree/t.mdl", "", mat(i, 0, 0))] for i in range(5000)]
+out = run(b"rm -\n" + base64.b64encode(stroke(many, 0)))
+check("5000 groups (v1 capped at 4096) parse", out.startswith("OK 0\n5000\n"), out[:30])
+ids = ",".join(str(i) for i in range(1, 6001)).encode()
+out = run(b"rm " + ids + b"\n" + base64.b64encode(stroke([], 6000)))
+check("6000 removal ids (v1 capped at 4096) parse", out.startswith("OK 6000 1 2 3 ") and out.split("\n")[0].endswith(" 6000"), out[:40])
+check("a v1 stroke is refused as a bad header", run(b"rm -\n" + base64.b64encode(stroke(groups, 0, version=1))).strip() == "BAD bad header")
+check("a model count past the bytes behind it is refused",
+      run(b"rm -\n" + base64.b64encode(b"TPAS" + struct.pack("<IIII", 2, 1, 0, 1 << 30) + b"\0" * 80)).strip() == "BAD bad model count")
 
 bads = [
     (b"nope\n" + base64.b64encode(blob), "malformed inject file"),

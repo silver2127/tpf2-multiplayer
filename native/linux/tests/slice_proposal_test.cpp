@@ -185,7 +185,9 @@ static void RoadRejections()
     CHECK(strstr(r.data, "ROADE 0 0 25 1 0 600 0 0"));
     SliceRecordFree(&r);
     f.edges.resize(2049, f.edges[0]);
-    CHECK(!SliceProposalBuildRoadRecord(f.bind(), false, false, &r));
+    CHECK(SliceProposalBuildRoadRecord(f.bind(), false, false, &r));
+    CHECK(strstr(r.data, " 2049 0 0"));
+    SliceRecordFree(&r);
     f.edges.resize(1); f.bind();
     Put(f.p, 0x20, reinterpret_cast<uintptr_t>(f.edges.data()) + 1); // fractional stride
     CHECK(!SliceProposalBuildRoadRecord(Address(f.p), false, false, &r));
@@ -214,7 +216,7 @@ static void StopGoldens()
     CHECK(SliceProposalBuildStopRecord(f.bind(), &r));
     CHECK(std::string(r.data) == "STOPX 500 2 17 1.0000 2.0000 3.0000 1 0 4 name=Station East\n");
     SliceRecordFree(&r);
-    *name = std::string(200, 'x'); // exercise the heap-string layout too
+    *name = std::string(10000, 'x'); // exercise the heap-string layout too
     CHECK(SliceProposalBuildStopRecord(f.bind(), &r));
     CHECK(strstr(r.data, name->c_str()));
     SliceRecordFree(&r);

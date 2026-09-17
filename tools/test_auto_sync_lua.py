@@ -64,6 +64,28 @@ with TemporaryDirectory() as temporary:
     end=main.index('pcall(CM.sampleSimRate)',begin)
     lua.execute('function worker() '+main[begin:end]+" error('producer reached') end")
     lua.execute('worker()')
+    # WORLD TOKEN: the first sim tick of every world stamps which world this
+    # game is in, addressed to this game's own pid. The host's menu reads a
+    # CHANGE as "it loaded another world" and pushes that world to everyone
+    # (a NEW GAME reaches no other hook), so one load must write exactly one
+    # value and two loads must never write the same one. It is written before
+    # the recovery hold above, so a resync's own load is stamped while the menu
+    # still knows it is busy and does not mistake it for the player's doing.
+    token=directory/'tpf2mp_world_gen.txt'
+    first=token.read_text()
+    assert first.startswith('pid=123\ngen=') and first.endswith('\n') and len(first.split('\n')[1])>8, first
+    lua.execute('worker()')                       # same world, same tick loop: one value per load
+    assert token.read_text()==first
+    reboot=LuaRuntime(unpack_returned_tuples=True)   # another world = another Lua state
+    reboot.globals().base=str(directory).replace('\\','/')+'/'
+    reboot.execute('CM={ticks=0}; K={BASE=base,PROCESS_ID="123",INSTANCE="a"}\n'
+                   'CM.detectInstance=function() return true end\n'
+                   'CM.gameTime=function() return 100 end\n'
+                   'CM.autoSyncPump=function() return true end')
+    reboot.execute('function worker() '+main[begin:end]+' end')
+    reboot.execute('worker()')
+    second=token.read_text()
+    assert second.startswith('pid=123\ngen=') and second!=first, (first, second)
     available=directory/'tpf2_sync_available.txt'
     available.write_text('pid=999\nprotocol=4\nwall='+str(int(time.time()))+'\n')
     lua.execute('assert(not CM.syncRequest("sync_request"))')
@@ -91,4 +113,5 @@ with TemporaryDirectory() as temporary:
     assert notice.read_text() == previous
     lua.execute("CM.resyncGuiTick(dash({desyncs='0'}))")
     assert 'desyncs=0\nheld=0\n' in notice.read_text()
-print('PASS: real Lua 5.2 producer hold, fresh paused comparison, stale/partial IPC, PID guard, pause preservation and native-panel notices; engine simulated')
+print('PASS: real Lua 5.2 producer hold, fresh paused comparison, stale/partial IPC, PID guard, pause preservation, '
+      'one fresh world token per load and native-panel notices; engine simulated')

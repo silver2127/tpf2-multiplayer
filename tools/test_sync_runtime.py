@@ -68,6 +68,50 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(request['cmd'], cmd)
         self.write('native_event', id=request['id'], step=step, success=success)
 
+    def test_engine_progress_is_its_work_not_the_mailbox_heartbeat(self):
+        import time
+        from sync_runtime import engine_work, ENGINE_CPU_STEP_MS, ENGINE_IO_STEP
+        self.phase('loading')
+        fields = dict(supported=1, has_world=0, busy=1, cpu_ui=5000, cpu_command=0,
+                      io_read=10 * ENGINE_IO_STEP, io_write=0)
+        self.write('native_status', **fields)
+        token = self.runtime.progress()
+        self.assertIn('engine:cpu_ui=5,io_read=10', token)
+        # The mailbox rewriting the same numbers every 100 ms is not progress:
+        # that heartbeat ticked while a hung game thread sat in a save, and
+        # the barrier's silence timeout never fired (2026-09-16).
+        for _ in range(3):
+            time.sleep(0.01)
+            self.write('native_status', **fields)
+            self.assertEqual(self.runtime.progress(), token)
+        # Sub-step noise is not progress either: a dialog-blocked thread
+        # burning milliseconds, a log line written.
+        self.write('native_status', **dict(fields, cpu_ui=5000 + ENGINE_CPU_STEP_MS - 1,
+                                           io_read=fields['io_read'] + ENGINE_IO_STEP - 1))
+        self.assertEqual(self.runtime.progress(), token)
+        # A CPU second burnt by the loading thread, or 16 MB read, is.
+        self.write('native_status', **dict(fields, cpu_ui=5000 + ENGINE_CPU_STEP_MS))
+        self.assertNotEqual(self.runtime.progress(), token)
+        self.write('native_status', **dict(fields, io_read=fields['io_read'] + ENGINE_IO_STEP))
+        self.assertNotEqual(self.runtime.progress(), token)
+        # Loading is the UI thread reading; the command thread and the writes
+        # are the engine SAVING, and mean nothing here.
+        self.write('native_status', **dict(fields, cpu_command=99000, io_write=99 * ENGINE_IO_STEP))
+        self.assertEqual(self.runtime.progress(), token)
+        self.assertEqual(engine_work('saving', {'cpu_command': '2500', 'io_write': str(3 * ENGINE_IO_STEP + 5)}),
+                         'cpu_command=2,io_write=3')
+        self.assertEqual(engine_work('loading', {'cpu_ui': 'garbage', 'io_read': '1'}), 'io_read=0')
+        # An idle engine reports no engine part at all.
+        self.write('native_status', **dict(fields, busy=0))
+        self.assertNotIn('engine:', self.runtime.progress())
+        # A status without the counters (an older DLL) is static while busy:
+        # silence, never a heartbeat.
+        self.write('native_status', supported=1, has_world=0, busy=1)
+        older = self.runtime.progress()
+        time.sleep(0.01)
+        self.write('native_status', supported=1, has_world=0, busy=1)
+        self.assertEqual(self.runtime.progress(), older)
+
     def test_hold_waits_for_lua_before_drain_and_repeats_no_commands(self):
         self.phase('holding')
         self.assertIsNone(self.runtime.tick())
@@ -82,7 +126,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(ack['speed'], 0)
         self.assertEqual(self.runtime.tick(), ack)
 
+    def test_host_loads_the_snapshot_in_every_mode(self):
+        # resync and join alike: the host took the snapshot from the world it is
+        # holding, and still LOADS it -- a world kept running from memory holds
+        # its entities in creation order, a loaded one in save order, and the
+        # person sim consumes that order (measured 2026-09-16: a catch-up joiner
+        # split within ~35 game units). Both peers loading the file agree.
+        for mode in ('resync', 'join', 'start'):
+            self.runtime = SyncParticipant(self.root, self.root, 123, 'host')
+            self.state.update(mode=mode, revision=self.state['revision'] + 1, phase='transferring')
+            self.assertTrue(self.runtime.accept(self.state))
+            self.runtime.snapshot = self.snapshot
+            self.lua()
+            self.runtime.tick()
+            self.phase('loading')
+            self.write('bridge_ctl', instance='a', peer='127.0.0.1:7773')
+            self.assertIsNone(self.runtime.tick())
+            self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
+            self.runtime.tick()
+            request = read_fields(self.root / 'tpf2_native_request.txt')
+            self.assertEqual(request['cmd'], 'load', mode)
+            (self.root / 'tpf2_native_request.txt').unlink()
+
     def test_load_requires_bridge_epoch_native_ready_and_new_lua_world(self):
+        self.runtime = SyncParticipant(self.root, self.root, 123, 'client')
         self.phase('transferring')
         self.runtime.snapshot = self.snapshot
         self.lua()

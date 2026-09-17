@@ -91,6 +91,7 @@
 // game's threads still call in.
 #include "menu_game_linux.h"
 #include "near_alloc.h"
+#include "hook.h"
 #include <cxxabi.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -803,6 +804,41 @@ using StepFn   = void (*)(void* component, int64_t t, int64_t dt);
 using UpdateFn = void (*)(void* self, int64_t t, int64_t dt);
 
 static uintptr_t g_base = 0;
+#include "progress_checks_linux.h"
+#include <sys/uio.h>
+static std::atomic<uintptr_t> g_progressMenu{0};
+static std::atomic<bool> g_progressReady{false};
+static bool ProgressRead(uintptr_t address, void* out, size_t size)
+{
+    if (!address || address+size<address) return false;
+    iovec local{out,size}, remote{reinterpret_cast<void*>(address),size};
+    return process_vm_readv(getpid(),&local,1,&remote,1,0)==ssize_t(size);
+}
+void MenuGame_ObserveMenu(void* menu) { g_progressMenu=uintptr_t(menu); }
+int MenuGame_LoadPercent()
+{
+    if (!g_progressReady.load()) return -1;
+    const uintptr_t menu=g_progressMenu.load();
+    uintptr_t bar=0, monitor=0, vtable=0;
+    float value=0;
+    if (!menu || !ProgressRead(menu+0x498,&bar,sizeof(bar)) || !bar ||
+        !ProgressRead(bar+0x440,&monitor,sizeof(monitor)) || !monitor ||
+        !ProgressRead(monitor,&vtable,sizeof(vtable)) || vtable!=g_base+0x59d8c60 ||
+        !ProgressRead(monitor+8,&value,sizeof(value)) || !(value>=0 && value<=1)) return -1;
+    return int(value*100);
+}
+static bool CheckProgress(uintptr_t base)
+{
+    for (const auto& check:kProgressChecks) {
+        uint8_t bytes[64];
+        if (!ProgressRead(base+check.rva,bytes,check.size) || memcmp(bytes,check.bytes,check.size)) return false;
+    }
+    uintptr_t slots[4];
+    if (!ProgressRead(base+0x59d8c60,slots,sizeof(slots))) return false;
+    return slots[0]==base+0x30ebcd0 && slots[1]==base+0x30ebe00 &&
+           slots[2]==base+0x30ebd30 && slots[3]==base+0x30ebd10;
+}
+
 static std::atomic<bool> g_gateOk{false};
 
 // The Step wrappers a thread is inside, by frame address. The stack grows down,
@@ -936,6 +972,25 @@ static const int kAlWatchdogMs = 15000;
 // game took it (checked on the next gated frame).
 static thread_local uint64_t t_alInFlight = 0;
 static thread_local char     t_alInFlightName[256];
+
+static std::atomic<MenuGameLoadObserver> g_loadObserver{nullptr};
+static void* g_originalStartSavegame;
+static uint8_t StartSavegameDetour(void* menu, void* params, void* info)
+{
+    // No C++ cleanup/catch encloses the foreign engine call.
+    const uint8_t accepted = reinterpret_cast<uint8_t (*)(void*,void*,void*)>(g_originalStartSavegame)(menu,params,info);
+    if (!accepted || t_alInFlight) return accepted;
+    const GStr* name = static_cast<const GStr*>(params); // libstdc++ string +0
+    if (!name || !name->p || !name->len || name->len > 200) return accepted;
+    char text[201]; memcpy(text,name->p,name->len); text[name->len]=0;
+    if (strlen(text)!=name->len || text[0]=='.' || strpbrk(text,"/\\")) return accepted;
+    if (const auto observer=g_loadObserver.load()) {
+        try { observer(text); }
+        catch (...) { Log("[menu] accepted load could not be queued for sharing\n"); }
+    }
+    return accepted;
+}
+void MenuGame_ObserveLoads(MenuGameLoadObserver observer) { g_loadObserver.store(observer); }
 
 struct AlState {
     SpinLock lock;
@@ -1662,6 +1717,8 @@ static bool Install(uintptr_t base)
         return false;
     }
     g_base = base;
+    g_progressReady=CheckProgress(base);
+    Log("[menugame] load percentage %s\n",g_progressReady ? "verified" : "OFF (byte/vtable check failed)");
     const bool guard = ResolveGameRuntime();
     const uint8_t bad = CheckBytes(base);
     const bool menuVt = VtableIs(base, "CMenuUI", RVA_MENUUI_VTABLE, RVA_MENUUI_TYPEINFO, RVA_MENUUI_TYPENAME,
@@ -1681,6 +1738,10 @@ static bool Install(uintptr_t base)
         return false;
     }
     if (wantAutoload) {
+        // CheckBytes includes the exact 16-byte, relocation-free prologue.
+        const bool observed = InstallHook(base+RVA_START_SAVEGAME,
+            reinterpret_cast<void*>(&StartSavegameDetour),16,&g_originalStartSavegame);
+        Log("[menu] accepted vanilla load observer %s\n", observed ? "ON" : "OFF (hook refused)");
         g_menuUpdate = (UpdateFn)(base + RVA_MENUUI_UPDATE);
         g_autoloadOn = StoreSlot(base + RVA_MENUUI_VTABLE + SLOT_UPDATE * sizeof(uintptr_t), base + RVA_MENUUI_UPDATE,
                                  (uintptr_t)&MenuUpdateDetour, "CMenuUI");

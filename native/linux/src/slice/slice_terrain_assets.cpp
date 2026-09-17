@@ -162,8 +162,8 @@ bool ReadAssets(uintptr_t proposal, Assets* out)
     if (!SliceReadT(proposal + 0x398, &start) || !SliceReadT(proposal + 0x3a8, &finish) ||
         !SliceReadT(proposal + 0x3a0, &a) || !SliceReadT(proposal + 0x3b0, &b) || start != finish || a != b) return false;
     SliceVec add, remove;
-    if (!SliceReadStdVector(proposal + 0x2a0, 0x8f0, 4096, &add) ||
-        !SliceReadStdVector(proposal + 0x288, 4, 4096, &remove) || (!add.count && !remove.count)) return false;
+    if (!SliceReadStdVector(proposal + 0x2a0, 0x8f0, UINT32_MAX, &add) ||
+        !SliceReadStdVector(proposal + 0x288, 4, UINT32_MAX, &remove) || (!add.count && !remove.count)) return false;
     out->originalRemovals = uint32_t(remove.count);
     out->removals.resize(remove.count);
     if (remove.count && !SliceRead(remove.begin, out->removals.data(), remove.count * 4)) return false;
@@ -179,12 +179,12 @@ bool ReadAssets(uintptr_t proposal, Assets* out)
         std::vector<Model> group(models.count);
         for (size_t j = 0; j < models.count; ++j) {
             const uintptr_t model = models.begin + j * 0x80;
-            char path[MaxAssetString + 1], extra[MaxAssetString + 1]; size_t pathLen, extraLen;
-            if (!SliceReadStdString(model, path, sizeof(path), &pathLen, MaxAssetString) || !pathLen ||
-                !SliceReadStdString(model + 0x20, extra, sizeof(extra), &extraLen, MaxAssetString) ||
-                std::strlen(path) != pathLen || std::strlen(extra) != extraLen ||
+            std::string path, extra;
+            if (!SliceReadStdString(model, &path) || path.empty() ||
+                !SliceReadStdString(model + 0x20, &extra) ||
+                path.find('\0') != std::string::npos || extra.find('\0') != std::string::npos ||
                 !SliceRead(model + 0x40, group[j].matrix.data(), 64)) return false;
-            group[j].model.assign(path, pathLen); group[j].extra.assign(extra, extraLen);
+            group[j].model = std::move(path); group[j].extra = std::move(extra);
         }
         out->groups.push_back(std::move(group));
     }
@@ -396,7 +396,7 @@ int ReadFile(const char* prefix, const char* suffix, std::string* data, std::str
     int fd = open(path->c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return errno == ENOENT ? 0 : -1;
     struct stat st{};
-    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 1 || uint64_t(st.st_size) > (MaxBytes + 512) * 4 / 3 + 45080) {
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size < 1) {
         close(fd); return -1;
     }
     try { data->resize(st.st_size); } catch (...) { close(fd); throw; }

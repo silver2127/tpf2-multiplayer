@@ -7,6 +7,15 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+-- A wait time as the wire carries it (also defined in lines.lua; whichever loads
+-- first wins): the engine's float, "inf" for the cargo slider's unlimited wait.
+CM.waitNum = CM.waitNum or function(s, d)
+	if s == nil then return d end
+	if s == "inf" or s == "+inf" then return math.huge end
+	if s == "-inf" then return -math.huge end
+	if type(s) == "number" then return s end
+	return tonumber(s) or d
+end
 -- SOLO IS SOLO. The slice leaves a build alone when no peer is playing (see
 -- SessionLive in slice_hook.cpp), so the engine has already built it -- replaying
 -- it here would build it a second time. Reading the file and dropping the lines
@@ -46,7 +55,7 @@ end
 K.ACTIONS_OFF_BEHIND = CM.MAX_LEAD or 15
 K.ACTIONS_ON_BEHIND = 2
 K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
-                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true }
+                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true }
 K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
                         VREV = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
                         STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true }
@@ -67,6 +76,28 @@ function CM.actionsBlockTick(now)
 		log(string.format("ACTIONS ON: %.1f game units behind -- the player's actions replicate again%s", behind,
 			#CM.actionsHeld > 0 and string.format("; %d held line creation(s) go out now", #CM.actionsHeld) or ""))
 	end
+end
+
+-- READ-ONLY FOREIGN WINDOWS EDIT GUARD (2026-09-16). The slice's `foreignwindows`
+-- patch lets a player OPEN another company's station/vehicle window. The depot and
+-- construction windows self-suppress their edit blocks for a foreign owner, but the
+-- vehicle and station-group windows have NO native owner gate: their rename / line /
+-- sell / send-to-depot / reverse / colour controls are live for any owner. So on the
+-- ORIGINATOR, before a captured edit is replicated, refuse it when its target entity
+-- is another company's -- the control becomes a harmless no-op that never ships, so
+-- the window is genuinely read-only and nothing can desync. Own entities (and coop)
+-- pass (cmForeignOwner is false there). Logged once per (op, entity).
+function CM.injForeignEdit(o, id)
+	if not id or not CM.cmForeignOwner then return false end
+	local foreign, cid = CM.cmForeignOwner(id)
+	if not foreign then return false end
+	CM.injForeignSaid = CM.injForeignSaid or {}
+	local k = tostring(o) .. ":" .. tostring(id)
+	if not CM.injForeignSaid[k] then
+		CM.injForeignSaid[k] = true
+		log(string.format("%s: entity %s belongs to company %s -- foreign window is read-only, not shipped", tostring(o), tostring(id), tostring(cid)))
+	end
+	return true
 end
 
 function CM.pollInject()
@@ -149,6 +180,12 @@ function CM.pollInject()
 				end
 				if K.ACTIONS_OFF_ALWAYS[o] or (K.ACTIONS_OFF_ARMED[o] and (CM.lastArmed or 0) == 1) then
 					if o == "ROADE" then CM.lastStreetBus, CM.lastStreetTram = nil, nil end
+					if o == "CONXP" then
+						-- its ROADC (parked already: it precedes the CONXP in this
+						-- file) is released by serial instead of hunted for
+						local ps = tonumber((line:match("^(.-)%s+params=") or line):match("%sps=(%d+)"))
+						if ps then CM.droppedConxp = CM.droppedConxp or {}; CM.droppedConxp[ps] = true end
+					end
 					log(string.format("ACTIONS OFF: %s dropped -- this game is %.1f game units behind, so it happens on no game", o, CM.behindBy or 0))
 					return
 				end
@@ -156,7 +193,7 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" and o ~= "CMOPEN" then
 				CM.soloDrop(line)
 				return
 			end
@@ -170,9 +207,30 @@ function CM.pollInject()
 				local cid, pwAt = tonumber(w[2]), 3
 				if o == "CMNEW" then cid = CM.cmNextId(); pwAt = 2 end
 				local pw = table.concat(w, " ", pwAt)
-				if cid then
+				-- not while somebody is still loading in (companies.lua CM.cmLoadingPlayers)
+				local loading = (o ~= "CMPW" and CM.cmLoadingPlayers) and CM.cmLoadingPlayers() or {}
+				if #loading > 0 then
+					CM.cmNote(CM.cmLoadingNote(loading))
+					log("company: " .. o .. " refused -- " .. CM.cmLoadingNote(loading))
+				elseif cid then
 					CM.scheduleLocal(o, { cid = cid, sw = (o == "CMNEW") and 1 or nil, pw = CM.cmHashPw(cid, pw) or "-" })
 					log("company: requested " .. o .. " " .. cid .. (pw ~= "" and " [with password]" or ""))
+				end
+			elseif o == "CMOPEN" then
+				-- CMOPEN who on   -- who = * or a company id; on = 1/0: who may stop at MY stations
+				local who, on = tostring(w[2] or "*"), tonumber(w[3]) == 1 and 1 or 0
+				CM.cmEnsure()
+				if CM.cmMyCompany and (who == "*" or tonumber(who)) then
+					CM.scheduleLocal("CMOPEN", { cid = CM.cmMyCompany, who = who, on = on })
+					log(string.format("company: requested CMOPEN %s %d (company %d's stations)", who, on, CM.cmMyCompany))
+				end
+			elseif o == "CMNAME" then
+				-- CMNAME cid the company's name...   (spaces allowed; travels percent-escaped)
+				local cid = tonumber(w[2])
+				local name = table.concat(w, " ", 3)
+				if cid then
+					CM.scheduleLocal("CMNAME", { cid = cid, name = CM.escName(name) })
+					log(string.format("company: requested CMNAME %d %q", cid, name))
 				end
 			elseif o == "HEAL" then
 				-- Manual repair: rejoin a road at x,y if a scar from a replayed
@@ -791,6 +849,12 @@ function CM.pollInject()
 				local cfile = w[2]
 				local tstr = tostring(w[3] or ""):match("^t=(.*)$")
 				local pstr = line:match("params=(.*)$") or "{}"
+				-- ps=<serial> rc=<0|1> sit between t= and params=: the placement
+				-- serial its ROADC carries (identity, cons.lua CM.flushConPairs) and
+				-- whether the slice wrote a ROADC for it at all
+				local head = line:match("^(.-)%s+params=") or line
+				local ps = tonumber(head:match("%sps=(%d+)"))
+				local hadRoadc = tonumber(head:match("%src=(%d)"))
 				local ct = {}
 				for tok in tostring(tstr or ""):gmatch("[^,]+") do ct[#ct + 1] = tonumber(tok) end
 				if cfile and #ct == 16 then
@@ -802,9 +866,10 @@ function CM.pollInject()
 					local base = cfile:match("([^/]+)%.con$") or "construction"
 					CM.pendingCons[#CM.pendingCons + 1] = { at = CM.gameTime() or 0, file = cfile, t = tstr, params = pstr,
 						name = CM.escName(base), x = ct[13], y = ct[14], id = nil,
-						survivors = CM.gatherSurvivors(ct[13], ct[14], nil), cancelled = 1 }
-					log(string.format("CONXP: cancelled placement %s at (%.1f,%.1f) params=%s -- parked for pairing",
-						cfile, ct[13], ct[14], pstr:sub(1, 100)))
+						survivors = CM.gatherSurvivors(ct[13], ct[14], nil), cancelled = 1,
+						ps = ps, hadRoadc = hadRoadc }
+					log(string.format("CONXP: cancelled placement %s at (%.1f,%.1f) ps=%s rc=%s params=%s -- parked for pairing",
+						cfile, ct[13], ct[14], tostring(ps), tostring(hadRoadc), pstr:sub(1, 100)))
 				else
 					log("inject: bad CONXP line: " .. line:sub(1, 70))
 				end
@@ -877,6 +942,13 @@ function CM.pollInject()
 						end
 					end
 				end
+				-- Placement serial, ps=<n> after the tail: the identity the CONXP of
+				-- the same placement carries. Absent from a slice older than 2026-09-16.
+				local ps
+				for i = 9, #w do
+					local v = tostring(w[i]):match("^ps=(%d+)$")
+					if v then ps = tonumber(v) end
+				end
 				if ok then
 					-- No classification here any more: the whole street payload
 					-- replays natively on the peer (CONX). Positive ids that still
@@ -900,11 +972,12 @@ function CM.pollInject()
 					end
 					CM.pendingRoadc[#CM.pendingRoadc + 1] = { at = CM.gameTime() or 0, posOf = posOf,
 						adds = adds, rms = rms, spos = spos, etype = etype, stype = stype,
-						ttype = ttype, cat = cat, bal0 = CM.balPrevConPoll }
-					log(string.format("ROADC: parked street payload (%d nodes, %d edges, %d removals) for pairing",
-						n, #adds, #rms))
+						ttype = ttype, cat = cat, bal0 = CM.balPrevConPoll, ps = ps }
+					log(string.format("ROADC: parked street payload (%d nodes, %d edges, %d removals, ps=%s) for pairing",
+						n, #adds, #rms, tostring(ps)))
 				else
-					log("inject: bad ROADC line: " .. line:sub(1, 70))
+					-- its CONXP (same ps) will be REFUSED for want of this payload: say which
+					log("inject: bad ROADC line (ps=" .. tostring(ps) .. "): " .. line:sub(1, 70))
 				end
 
 			elseif (o == "VBUY" or o == "VREPL") and #w >= 3 then
@@ -1077,6 +1150,10 @@ function CM.pollInject()
 								-- strict buys went in).
 								CM.scheduleLocal("VBUY", bargs)
 								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp (key binds on replay)")
+								-- COMPANY PAINT (2026-09-16): the buy's key is ours, so the paint
+								-- goes out right behind it, as the parked path has done since
+								-- 0.4.12 -- this strict path, the one every buy takes, never did.
+								pcall(CM.cmColorNewVehicle, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 							else
 								-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
 								CM.parkedBuys[#CM.parkedBuys + 1] = {
@@ -1092,7 +1169,7 @@ function CM.pollInject()
 			elseif o == "VSELL" and #w >= 2 then
 				local n = tonumber(w[2]) or 0
 				local ids = {}
-				for i = 1, n do local id = tonumber(w[2 + i]); if id then ids[#ids + 1] = id end end
+				for i = 1, n do local id = tonumber(w[2 + i]); if id and not CM.injForeignEdit("VSELL", id) then ids[#ids + 1] = id end end
 				-- Same key-binding race as VLINE: a sell right after a batch buy
 				-- finds the keys unbound and shipped NOTHING ("none shippable").
 				-- Defer and retry. STRICT (ARMED 1): the sale was
@@ -1139,8 +1216,24 @@ function CM.pollInject()
 						key = CM.vehKeyFor(id); if key then kind = "veh" end
 					end
 				end
+				-- A rename of our own company's player entity (the game's company
+				-- window) is the company's name: it travels as CMNAME (companies.lua)
+				-- and every instance names its own entity for that company. The
+				-- instance that renamed it has the new name already; CMNAME then
+				-- finds nothing to change there. (cmApplyNames renames through
+				-- make.setName, which the slice does not ship, so nothing echoes.)
+				local myCompanyPid = nil
+				if o == "VNAME" and id and not key and CM.cmMode == "companies" and CM.cmMyCompany then
+					myCompanyPid = CM.cmCompanyPid and CM.cmCompanyPid[CM.cmMyCompany]
+					if not myCompanyPid then pcall(function() myCompanyPid = api.engine.util.getPlayer() end) end
+				end
 				if echo then
 					log(string.format("VCOLOR: entity %s is our own replay coming back -- not shipped", tostring(w[2])))
+				elseif o == "VNAME" and id and id == myCompanyPid then
+					log(string.format("VNAME: entity %s is company %d's player -> CMNAME %s", tostring(id), CM.cmMyCompany, tostring(w[3])))
+					CM.scheduleLocal("CMNAME", { cid = CM.cmMyCompany, name = w[3] })
+				elseif key and CM.injForeignEdit(o, id) then
+					-- foreign vehicle: the read-only window's rename/colour control is inert
 				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
@@ -1164,6 +1257,7 @@ function CM.pollInject()
 			elseif o == "VREV" and #w >= 2 then
 				local id = tonumber(w[2])
 				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VREV", id) then k = nil end
 				if k then
 					log("VREV: " .. k)
 					CM.scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
@@ -1172,6 +1266,7 @@ function CM.pollInject()
 			elseif o == "VDEPOT" and #w >= 3 then
 				local id, sell = tonumber(w[2]), tonumber(w[3]) or 0
 				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VDEPOT", id) then k = nil end
 				if k then
 					local armed = CM.lastArmed or 0
 					log(string.format("VDEPOT: %s sell=%d%s", k, sell, armed == 1 and " (strict)" or ""))
@@ -1180,6 +1275,8 @@ function CM.pollInject()
 					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
 				end
 
+			elseif o == "VLINE" and #w >= 4 and CM.injForeignEdit("VLINE", tonumber(w[2])) then
+				-- foreign vehicle: the read-only window's line control is inert
 			elseif o == "VLINE" and #w >= 4 then
 				local id, line, stop = tonumber(w[2]), tonumber(w[3]), tonumber(w[4]) or 0
 				-- A batch buy binds its vehicle keys over the next few ticks
@@ -1202,13 +1299,13 @@ function CM.pollInject()
 				-- read it back once it exists, as the event-only LCREATE always did.
 				local armed = CM.lastArmed or 0
 				local r, g, b = tonumber(w[2]), tonumber(w[3]), tonumber(w[4])
-				local wait, nstops = tonumber(w[5]) or 180, tonumber(w[6]) or 0
+				local wait, nstops = CM.waitNum(w[5], 180), tonumber(w[6]) or 0
 				local nameTok = line:match(" name=(%S+)%s*$")
 				local stops, alts, bad = {}, {}, nil
 				local pos = 7
 				for i = 1, nstops do
 					local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
-					local lm, mn, mx = tonumber(w[pos + 3]) or 0, tonumber(w[pos + 4]) or 0, tonumber(w[pos + 5]) or 180
+					local lm, mn, mx = tonumber(w[pos + 3]) or 0, CM.waitNum(w[pos + 4], 0), CM.waitNum(w[pos + 5], 180)
 					local na = tonumber(w[pos + 6]) or 0
 					pos = pos + 7
 					local al = {}
@@ -1220,7 +1317,7 @@ function CM.pollInject()
 					if sg then x, y = CM.stationGroupPos(sg) end
 					if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
 					local sx, sy = CM.stationPosInGroup(sg, st)
-					stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y, st, term, lm, mn, mx)
+					stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y, st, term, lm, mn, mx)
 						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 					alts[#alts + 1] = table.concat(al, "/")
 				end
@@ -1252,6 +1349,7 @@ function CM.pollInject()
 				-- Key it now so the first stops are not dropped.
 				if lid and not CM.lineKeyOf[lid] and not CM.primedLines[lid] then CM.pollLineKeys() end
 				local lk = lid and CM.lineKeyFor(lid)
+				if lk and CM.injForeignEdit("LUPDATE", lid) then lk = nil end
 				if lk then
 					-- Two shapes. DECODED: the NEW stop list
 					-- came off the command itself -- the cancel means the entity
@@ -1263,12 +1361,12 @@ function CM.pollInject()
 					-- whole line back as before and ship it to the peers only.
 					local nstops = tonumber(w[4])
 					if #w >= 4 and nstops and #w >= 4 + nstops * 7 then
-						local wait = tonumber(w[3]) or 180
+						local wait = CM.waitNum(w[3], 180)
 						local stops, alts, bad = {}, {}, nil
 						local pos = 5   -- sequential: each stop carries a variable alternatives tail
 						for i = 1, nstops do
 							local sg, st, term = tonumber(w[pos]), tonumber(w[pos + 1]) or 0, tonumber(w[pos + 2]) or 0
-							local lm, mn, mx = tonumber(w[pos + 3]) or 0, tonumber(w[pos + 4]) or 0, tonumber(w[pos + 5]) or 180
+							local lm, mn, mx = tonumber(w[pos + 3]) or 0, CM.waitNum(w[pos + 4], 0), CM.waitNum(w[pos + 5], 180)
 							local na = tonumber(w[pos + 6]) or 0
 							pos = pos + 7
 							local al = {}
@@ -1284,7 +1382,7 @@ function CM.pollInject()
 							if sg then x, y = CM.stationGroupPos(sg) end
 							if not x then bad = string.format("stop %d: entity %s is not a station group", i, tostring(sg)); break end
 							local sx, sy = CM.stationPosInGroup(sg, st)
-							stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%d,%d", x, y, st, term, lm, mn, mx)
+							stops[#stops + 1] = string.format("%.2f,%.2f,%d,%d,%d,%.9g,%.9g", x, y, st, term, lm, mn, mx)
 								.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 							alts[#alts + 1] = table.concat(al, "/")
 						end
@@ -1320,7 +1418,7 @@ function CM.pollInject()
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
 								end
 							end
-							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %d%s", lk, #stops, wait,
+							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %g%s", lk, #stops, wait,
 								armed == 1 and " (strict)" or ""))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
 							                           wait = wait, stops = newStops,
@@ -1328,14 +1426,17 @@ function CM.pollInject()
 							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts) end
 						end
 					else
-						local snap = CM.lineSnapshot(lid)
-						if snap then
-							log(string.format("LUPDATE: %s '%s'", lk, CM.unescName(snap.name)))
-							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name, color = snap.color, wait = snap.wait,
-							                           stops = snap.stops, alts = snap.alts, armed = 0 })
-						else
-							log("LUPDATE: line " .. tostring(lid) .. " could not be read back -- not replicated")
-						end
+						-- The update ran natively here and the engine applies it on a later
+						-- step: read back NOW and the peers get the line as it was BEFORE the
+						-- edit (2026-09-16: two such read-backs were byte-identical to the
+						-- previous edit; the host's trains and the joiner's then routed
+						-- differently). Read it back a few steps from now instead.
+						CM.readbackSeq = (CM.readbackSeq or 0) + 1
+						CM.retryQueue = CM.retryQueue or {}
+						CM.retryQueue[#CM.retryQueue + 1] = { op = "LREADBACK", at = CM.gameTime() or 0, origin = K.INSTANCE,
+						                                     seq = 1000000 + CM.readbackSeq, key = lk, lid = lid,
+						                                     notBeforeStep = CM.stepOf(CM.gameTime() or 0) + 3 }
+						log(string.format("LUPDATE: %s ran natively (not decoded) -- reading it back in 3 steps", lk))
 					end
 				end
 

@@ -73,8 +73,12 @@ foreach ($c in "tpf2_slice.cfg", "tpf2mp.cfg") {
 $PluginDir = Join-Path $Game 'plugins'
 New-Item -ItemType Directory -Force $PluginDir | Out-Null
 Put "$Repo\native\out\tpf2_workshop_register.dll" (Join-Path $PluginDir 'tpf2_workshop_register.dll')
+# A worktree (<main>\.claude\worktrees\<name>) has its siblings next to the main
+# checkout, not next to itself: from a worktree the plugins were silently skipped.
+$SiblingRoot = Split-Path -Parent $Repo
+if ($Repo -match '^(.*)\\\.claude\\worktrees\\[^\\]+$') { $SiblingRoot = Split-Path -Parent $Matches[1] }
 foreach ($p in @(@{repo='tpf2-bigmap'; dll='out\tpf2_bigmap.dll'})) {
-    $src = Join-Path (Split-Path -Parent $Repo) (Join-Path $p.repo $p.dll)
+    $src = Join-Path $SiblingRoot (Join-Path $p.repo $p.dll)
     if (Test-Path $src) { Put $src (Join-Path $PluginDir (Split-Path $p.dll -Leaf)) }
     else { Write-Host ("[ship]   plugin {0}: not built (looked in {1}) -- skipped" -f $p.repo, $src) }
 }

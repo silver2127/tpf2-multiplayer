@@ -15,17 +15,12 @@ It is unofficial, reverse-engineered without the engine's source, and **experime
 four players have been run, on one PC and between PCs on different networks. Read
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
-This branch also contains a **native Linux build-35924 port**, based on Windows release **0.4.22**.
-Build/install instructions are in [docs/linux/INSTALL.md](docs/linux/INSTALL.md), and tested coverage
-and remaining gaps are in [docs/linux/RESUME_STATUS.md](docs/linux/RESUME_STATUS.md).
-The `.desync.5` candidate passed six complete native/Proton person-state and movement
-checkpoints through simulation time 1800, including the first town-growth and resident-birth
-event, with 21 passing SDK checks. This was a controlled test on one computer: fast-forward
-previous-frame histories still differed at two checkpoints, newborn travel was not exercised,
-and complete action/replay coverage remains unfinished. All 24 Lua files are unchanged from
-Windows 0.4.22; newer Windows 0.5.x releases are outside this baseline. Linux release tags
-identify the Windows baseline, with the uncommitted Linux implementation supplied in the
-accompanying curated source overlay.
+This branch also contains a **native Linux build-35924 port**. Its current
+integration is Windows **release 0.6, dev through `b141b123`** (partial native integration). See [Linux installation](docs/linux/INSTALL.md),
+[the integration record](docs/linux/UPSTREAM_dev_b141b123.md), and
+[existing port coverage and gaps](docs/linux/RESUME_STATUS.md).
+Historical native/Proton tests in those records do not establish live gameplay
+compatibility for this development snapshot.
 The Windows MSI instructions below apply to the Windows version.
 
 ## How it works
@@ -50,6 +45,11 @@ switches the game to the Windows Segment Heap, which makes very large maps load 
 to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
 [installer/README.md](installer/README.md).
+
+**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.sh` from the same release and run
+`sh install_proton.sh` (no Python needed; `install_proton.py` is the Python equivalent); it installs the same files into the Proton game. Details, including the lobby
+repair Wine needs: [docs/proton/INSTALL.md](docs/proton/INSTALL.md). The native Linux game has its own
+build on the `linux-native` branch.
 
 To uninstall, use **Apps → TpF2 Multiplayer → Uninstall**, or run the MSI again and choose **Remove**; the
 game's own `alut.dll` is put back. Steam's "Verify integrity of game files" also restores it, which removes the
@@ -83,6 +83,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | [docs/TESTING.md](docs/TESTING.md) | the manual test plan: what to check before pushing, and before a release |
 | [docs/re/](docs/re/README.md) | the engine reference for build 35924 that the hooks rest on |
 | [installer/README.md](installer/README.md) | the MSI: what it changes, upgrades, building it |
+| [docs/proton/INSTALL.md](docs/proton/INSTALL.md) | Linux and Steam Deck: installing into the Windows game under Proton |
 | [netpunch/README.md](netpunch/README.md) | the lobby's source |
 
 ## Repository layout

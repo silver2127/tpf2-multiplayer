@@ -41,7 +41,7 @@ settings files say ([CONFIGURATION.md](CONFIGURATION.md)).
 | upgrade: street/track type, catenary, bus lane, tram track | strict | `ROADP` | The removed edges travel as positions so the replay replaces instead of stacking a second edge. |
 | level crossing | strict (part of the track build) | `ROADP` | A track vertex within 4.0 m of a road node shares that node, taking the road's height when they differ by more than 0.25 m (moving the road node instead asserts the engine). Otherwise the road under the vertex is split. Crossings in the middle of a track segment are found analytically; routing through an existing node requires it to be touched (0.75 m) and straight-through. A crossing the engine refuses ("Too much slope") is refused on every instance. |
 | demolish road or track | strict | `EDEMO` | Edges are matched by their end nodes (same kind, within 1 m). An edge that carries stops or signals is refused. Orphaned nodes are removed. |
-| station, depot, asset, harbour, airport | strict | `CONX` / `CONP` | The slice reads the construction's file, placement and parameters off the proposal and cancels the build; the street pieces travel as `ROADC` and are paired by position. Every instance builds the same scripted proposal at the stamp. |
+| station, depot, asset, harbour, airport | strict | `CONX` / `CONP` | The slice reads the construction's file, placement and parameters off the proposal and cancels the build; the street pieces travel as `ROADC` and are paired by identity (one placement serial on both records). Every instance builds the same scripted proposal at the stamp. |
 | same, when the parameters cannot be read | replay on peers, then corrected | `CONX` / `CONP` | The native build stands and is captured by polling. With other players connected, the originator then bulldozes its own copy and rebuilds the scripted one with the peers (money reconciled); alone it keeps the native build. |
 | module edit, station upgrade | strict | `CONU` (`diff=1 strict=1`) | The old construction and the new parameters come off the proposal; every instance upgrades the construction (same file within 10 m) at the stamp. If the cancel does not land, the edit scan ships it instead (every 30 ticks, originator skips). |
 | demolish construction | strict | `DEMOLISH` (`strict=1`) | Every instance requires the same file within 2 m. When the slice leaves a bulldoze to run natively, a tracked construction missing for two polls ships a `DEMOLISH` and peers remove the nearest one within 30 m. |
@@ -56,8 +56,17 @@ Replay details for constructions:
   from the payload (the template regenerates them).
 - A cancelled placement builds with `gatherBuildings=true`, so the engine demolishes the
   footprint's town buildings identically everywhere. For the non-cancelled path the originator
-  ships the town buildings it still has nearby ("survivors"), and the replay removes others
-  within 190 m.
+  ships the town buildings it still has nearby ("survivors") together with the radius it gathered
+  them in (`srad`: the construction's bounding box + its street payload + 100 m), and the replay
+  removes the others 10 m inside that radius. No fixed radius and no cap on the removal count: a
+  list whose survivors mostly do not exist on the peer is refused as a `DIVERGENCE`, loudly. The
+  street payload pairs with its construction by identity (the entity's frozen nodes, or for a
+  cancelled placement the placement serial the slice stamps on both records), never by
+  distance or arrival order; a cancelled placement whose payload is missing is refused
+  loudly, and an unclaimed payload is logged as a `DIVERGENCE`. The slice's own side has no
+  size of its own either: the params walk has no depth or entry cap (a misread pointer fails
+  it loudly and the build runs natively behind a `NATIVE` notice) and the street vectors are
+  decoded in full.
 - On failure the replay retries once after clearing the footprint, then asks the originator to
   roll back (`CONFAIL`: it bulldozes its own copy, same file within 1 m).
 - The construction gets a name in the proposal (the shipped one, or "`<town> <type>`"), which
@@ -142,6 +151,21 @@ never by entity id, and compares with the others at common stamps.
   every instance reads from the same save, so no instance hashes on a grid another never reaches.
 - **Verdict.** A match logs `SYNC`. A mismatch logs `~~ LAG n/3` twice (a late hash is not a
   desync), then `!! DESYNC` with the differing lanes named.
+- **A hash is a sample at a sim time, not a property of the stamp** (2026-09-16). The stamp only
+  says which interval the sample fell in; what it describes is the world at the moment it was
+  taken. So a game that ENTERS an interval part way through -- every game does, on the first
+  update after a load, because the clock resumes at the save's own step -- takes its hash (the
+  first one still sets the cadence from the edge count) but does not publish it, and two samples
+  of one stamp taken at different sim times are not compared at all: no verdict, no town streak,
+  no `$$` gaps, logged as `not comparable, skipped`. Until then they were compared, and every hot
+  join reported a desync at its first stamp that was nothing of the kind: on the rig of
+  2026-09-16 the joiner loaded a save taken at sim time 31.4 and published its stamp-0 sample at
+  31.6 against the host's at 1.8, so 30 game units of ordinary town growth showed up as `t: 8899
+  vs 8975`, an edge lane one edge apart and `!! DESYNC t=0`, with both worlds correct. A save is
+  taken from a world that is not simulating (the engine's save blocks the game loop for its whole
+  duration -- "Saving...: 8319 ms", during which `update()` is not called at all and the saving
+  game loses exactly that much game time to its peers), so `savedAt` is the step the file's world
+  is at, and a hot joiner starts from the step it says.
 - **Vehicle drift.** Instances also exchange sampled vehicle positions; a maximum drift over
   10 m between samples taken at the same sim time counts as a desync. The check pairs every
   vehicle with every other, once per player, so it turns off for good the first time a world

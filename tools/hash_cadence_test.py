@@ -156,6 +156,20 @@ bad = G.newGame('q', 'q')
 bad.CM.execHashEvery(L.eval('{ op = "HASHEVERY", every = 100, prev = 60, at = 5000, origin = "q", seq = 1 }'))
 bad.CM.execHashEvery(L.eval('{ op = "HASHEVERY", every = 6, prev = 60, at = 5000, origin = "q", seq = 2 }'))
 check('a HASHEVERY off the 12-unit grid is refused', bad.CM.hashGrid is None and G.logged(bad, 'bad interval every=100'))
+bad.K.HASH_EVERY_MIN = 4
+bad.CM.execHashEvery(L.eval('{ op = "HASHEVERY", every = 4, prev = 12, at = 5000, origin = "q", seq = 3 }'))
+check('a forced 4-unit interval (K.HASH_EVERY_MIN) is accepted', bad.CM.hashGrid is not None and bad.CM.hashGrid.every == 4)
+# the forced cadence: the leader stamps the file's interval whatever the cost says
+fz = G.newGame('z', 'z')
+fz.K.HASH_EVERY_MIN = 4
+fz.CM.hashEveryForced = lambda: 4
+for ms in (2000, 2000):
+    fz.CM.hashCostNote(ms)
+fz.CM.hashCadenceTick(1000)
+forcedCmds = [G.BUS[i] for i in range(1, len(G.BUS) + 1) if G.BUS[i].op == 'HASHEVERY' and G.BUS[i].origin == 'z']
+check('tpf2mp_hash_every.txt forces the interval regardless of cost', len(forcedCmds) == 1 and forcedCmds[0].every == 4 and forcedCmds[0].prev == 12,
+      str([(c.every, c.prev) for c in forcedCmds]))
+L.execute('for k in pairs(BUS) do BUS[k] = nil end')   # the forced command is not part of the three-game story below
 
 print('== three games through three switches')
 a, b, c = G.newGame('a', 'a', 0), G.newGame('b', 'a', 0.2), G.newGame('c', 'a', 0.4)
