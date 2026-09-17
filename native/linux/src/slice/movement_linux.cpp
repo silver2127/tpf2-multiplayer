@@ -264,7 +264,7 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
         ok &= ready;
     }
     // No guessed render ABI or MSVC string crosses into the Linux engine.
-    SliceLog("[company-ui] iconcolor/windowcolor unavailable: Linux tint ABI not established\n");
+    SliceLog("[company-ui] iconcolor/windowcolor/stationicon unavailable: Linux tint ABI not established\n");
     return ok;
 }
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)

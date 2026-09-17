@@ -21,14 +21,14 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **0.5.7 plus Windows dev through `a658fc11`**.
+This development tree combines **0.5.7 plus Windows dev through `5fb7aea2`**.
 It includes native road-space summation, ship/aircraft order diagnostics,
 shared-station line selection, host world-switch sharing, bidirectional company
 chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). Lobby
 chips, shared dashboard swatches and vehicle paint use the new 20-colour palette,
 with generated colours starting at company 21. All Lua files
 exactly match that Windows revision. See
-[UPSTREAM_dev_a658fc11.md](UPSTREAM_dev_a658fc11.md) for provenance, tests and
+[UPSTREAM_dev_5fb7aea2.md](UPSTREAM_dev_5fb7aea2.md) for provenance, tests and
 remaining gaps. This is not a claim of live cross-platform compatibility.
 `trainorder=0`, `roadspace=0`, `shiporder=0`, `airorder=0` and
 `sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt` disable the respective
@@ -37,10 +37,14 @@ hooks at startup; peers need matching arithmetic/ordering settings.
 Native station selection now honors company permissions. Foreign station and
 vehicle icons are visible and their info windows can open read-only; `showicons=0`
 and `foreignwindows=0` disable these features. Company tinting of icons, station
-labels and native windows is not ported (`iconcolor`/`windowcolor` have no native
-implementation), including the own-company icon/label colours added in this
+labels and native windows is not ported (`iconcolor`/`windowcolor`/`stationicon` have no native
+implementation), including the own-company icon/label colours added in
 earlier Windows revisions. Founder names, buy-time paint scheduling and the optional
 `tpf2mp_hash_every.txt` cadence override are included through the shared Lua.
+
+The HUD station/depot company wash added in `5fb7aea2` is also unavailable;
+`stationicon=0` currently affects only Windows. See the integration record for
+the attempted Linux mappings and missing evidence.
 
 The roster now shows verified engine load percentages while a world loads.
 Returning from a world to the title menu leaves the lobby. The paused GameTime

@@ -1,4 +1,14 @@
-## Latest Windows integration: dev d3135a59 (2026-09-16)
+## Latest Windows integration: dev 5fb7aea2 (2026-09-16)
+
+See [UPSTREAM_dev_5fb7aea2.md](UPSTREAM_dev_5fb7aea2.md). The Windows HUD
+station/depot company wash is merged but remains unported after static Linux
+investigation; missing hook/owner/style contracts are recorded in
+[DEV_5FB7AEA2.md](../re/linux/DEV_5FB7AEA2.md). The preceding 20-colour
+palette integration is retained. All 28 Lua files match the new target.
+Native soldier build and 45/45 CTests pass. Merge remains uncommitted;
+no live gameplay compatibility is claimed. Earlier gaps below remain.
+
+## Previous Windows integration: dev d3135a59 (2026-09-16)
 
 See [UPSTREAM_dev_d3135a59.md](UPSTREAM_dev_d3135a59.md). The uncommitted merge
 includes native station permissions, four icon-owner branch patches and the

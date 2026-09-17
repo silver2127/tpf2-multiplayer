@@ -63,9 +63,10 @@ for rva, name in ((target, "icon draw 0x8088f0"), (getpo, "GetComponentPtr<Playe
 
 # the colour formula matches coColor (menu_hook.cpp) and cmCompanyColor (companies.lua)
 menu = (repo / "native/src/menu_hook.cpp").read_text(encoding="utf-8")
-for pal in ("220,80,80", "80,140,230", "90,190,110", "230,180,60", "180,100,220", "80,200,200"):
-    assert pal.replace(",", ", ") in source or pal in source.replace(" ", ""), f"palette {pal} missing from the icon colour"
-assert "137.508" in source, "the golden-angle hue walk is missing"
+# the palette itself (and its match with coColor / companies.lua / the style sheet)
+# is checked by tools/palette_sync_test.py; here just confirm IconCompanyColor still
+# has a fixed table and the golden-angle overflow.
+assert "static const int first[" in source and "137.508" in source, "IconCompanyColor palette/overflow missing"
 assert "0.62" in source and "0.85" in source, "sat/val differ from coColor"
 
 print(f"iconcolor bytes: ok -- call at {call:x} -> draw {target:x} (kept as CALL), "
