@@ -1,4 +1,13 @@
-## Latest Windows integration: dev d6db920f (2026-09-16)
+## Latest Windows integration: dev 50d7588b (2026-09-16)
+
+See [UPSTREAM_dev_50d7588b.md](UPSTREAM_dev_50d7588b.md). Windows tint
+classes now use `mpWinCoN`/`mpCoN`, without the selector `!`. Linux has no
+company-tint class application path; the correction remains unported there.
+Fresh ELF checks and the remaining owner/relay prerequisites are recorded in
+[DEV_50D7588B.md](../re/linux/DEV_50D7588B.md). Lua is unchanged and exact
+against the new target; release provenance is updated. Integration is partial.
+
+## Previous Windows integration: dev d6db920f (2026-09-16)
 
 See [UPSTREAM_dev_d6db920f.md](UPSTREAM_dev_d6db920f.md). Shared station/depot
 icon-element company styles are merged exactly. Native glyph tagging remains

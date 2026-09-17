@@ -16,8 +16,8 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration is Windows **0.5.7 plus dev through `d6db920f`** (partial native integration). See [Linux installation](docs/linux/INSTALL.md),
-[the integration record](docs/linux/UPSTREAM_dev_d6db920f.md), and
+integration is Windows **0.5.7 plus dev through `50d7588b`** (partial native integration). See [Linux installation](docs/linux/INSTALL.md),
+[the integration record](docs/linux/UPSTREAM_dev_50d7588b.md), and
 [existing port coverage and gaps](docs/linux/RESUME_STATUS.md).
 Historical native/Proton tests in those records do not establish live gameplay
 compatibility for this development snapshot.

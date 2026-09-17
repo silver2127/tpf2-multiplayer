@@ -6502,8 +6502,8 @@ static const uint8_t WINDOW_BIND_EXPECT[9] = {
 };
 static bool g_windowColorOn = false;
 
-// Which class the washes append: "!mpWinCo" (translucent background, the
-// default) or "!mpCo" (the opaque chip class) -- `tintclass=mpCo` in
+// Which class the washes append: "mpWinCo" (translucent background, the
+// default) or "mpCo" (the opaque chip class) -- `tintclass=mpCo` in
 // tpf2_menu_flags.txt picks the opaque one, so the next run can try the other
 // without a rebuild if a translucent root background turns out not to paint.
 static const char* TintClassPrefix()
@@ -6524,7 +6524,11 @@ static const char* TintClassPrefix()
             break;
         }
     }
-    return which == 1 ? "!mpCo" : "!mpWinCo";
+    // NO BANG (2026-09-16, the reason three builds painted nothing): in the sheet
+    // "StationItem::StationIcon!train" the '!' is selector syntax; the class the
+    // game stores on the element is "train" (read back: "train !mpWinCo4" -- ours
+    // never matched a rule). The dashboard swatches set "mpCo3" the same way.
+    return which == 1 ? "mpCo" : "mpWinCo";
 }
 
 // The component's style-class list, as the game keeps it: std::string records

@@ -193,6 +193,7 @@ install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8e31f1e0.md" "$STAGE/UPSTREAM_dev
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_61578d27.md" "$STAGE/UPSTREAM_dev_61578d27.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_be3b86ae.md" "$STAGE/UPSTREAM_dev_be3b86ae.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d6db920f.md" "$STAGE/UPSTREAM_dev_d6db920f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_50d7588b.md" "$STAGE/UPSTREAM_dev_50d7588b.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
@@ -208,7 +209,7 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: dev d6db920fa7c5689711c7f250daca170e1dd40db2; all 28 files exact"
+  echo "Lua: dev 50d7588beb4a8689dd1d790a1095607afc507c1f; all 28 files exact"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"
