@@ -3902,7 +3902,15 @@ static void MyCreatePage(uint64_t thisp, int page)
         // "start while in game" and was ignored (relay resume, 2026-09-10).
         // A pointer still set here means the player just left a world: with a
         // lobby running, that leaves the lobby too (g_leaveOnMenu, myPresent).
-        if (g_gameUi != 0 && LobbyRunning()) InterlockedExchange(&g_leaveOnMenu, 1);
+        // Not when the load is ours: a resync loads the host's snapshot through
+        // the engine's own load path, which builds this page between the old
+        // world and the loading screen. Reading that as "left the world" made
+        // every joiner LEAVE mid-resync, and the host's barrier failed with
+        // "Player disconnected or roster changed" (2026-09-16).
+        if (g_gameUi != 0 && LobbyRunning()) {
+            if (NativeIo::Loading()) Log("[menu] the title menu was built by our own load (resync) -- staying in the lobby\n");
+            else InterlockedExchange(&g_leaveOnMenu, 1);
+        }
         g_gameUi = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
         // Keep recovery reachable at the title menu after a failed load.
