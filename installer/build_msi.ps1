@@ -60,7 +60,8 @@ param(
     [switch]$SkipFreeze,
     [switch]$Validate,
     [switch]$AcceptWixEula,
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    # two to four parts (the body checks the same); a two-part version is padded for the package below
+    [ValidatePattern('^\d+\.\d+(\.\d+){0,2}$')]
     [string]$Version
 )
 
