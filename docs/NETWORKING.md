@@ -129,10 +129,12 @@ later by p50/p90/max`. `tcp_only` is a UDP datagram that never arrived but whose
 `udp_only` a TCP copy that never came within 3 s. The bridge's own ARQ still recovers what both
 paths lose. `python lobby.py --selftest-dual` runs a joiner losing 30% of its UDP sends: every
 frame still reaches the host with the link, 70% without it. Off with `tpf2mp_tcp_backup.txt`
-containing `0` in the lobby's data folder; off in an unsealed session (no nonce to dedup on).
+containing `0` in the lobby's folder (`<game folder>
+etpunch\`); off in an unsealed session (no nonce to dedup on).
 
-**Impairing one instance** (`netpunch/netsim.py`): `tpf2mp_netsim.txt` in an instance's data
-folder, `loss=0.05`, `delay=0.100`, `jitter=0.010`, drops that fraction of the datagrams the
+**Impairing one instance** (`netpunch/netsim.py`): `tpf2mp_netsim.txt` in the lobby's own folder
+(`<game folder>
+etpunch\`, where `lobby_state.json` lives; a box has its own copy under its overlay), `loss=0.05`, `delay=0.100`, `jitter=0.010`, drops that fraction of the datagrams the
 instance sends and delays the rest (the TCP link's frames wait the same, but are never dropped:
 TCP's loss is the OS's). Read once at the lobby's start; the log says `[netsim] impairing what
 this instance sends: ...`. Outbound only, so a two-sided setup is two files.
