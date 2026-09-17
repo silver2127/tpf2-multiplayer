@@ -5891,6 +5891,7 @@ static const uint8_t SHAREDSTATIONS_EXPECT[46] = {
 static bool  g_ssOn = false;
 static long  g_ssCalls = 0;     // foreign owners this filter was asked about
 static long  g_ssOpened = 0;    // ...of which were let through
+static long  g_ssRefused = 0;   // ...refused by the station permissions (mp_company_perms.txt)
 static bool  g_ssSaidOnce = false;
 
 // Companies mode, from the file both sides already share: line 1 of
@@ -5938,6 +5939,64 @@ static bool SharedStationsCompaniesLive()
 
 // The engine's comparison, with one extra answer. Returns 1 = accept (the line
 // editor may add this stop), 0 = reject (what the engine would have said).
+// STATION PERMISSIONS (2026-09-16): mp_company_perms.txt, written by the mod
+// (companies.lua CM.cmWritePerms) from lockstep state:
+//   pid <playerEntity> <companyId>      one per company
+//   open <companyId> *|-|<id>,<id>,...  what that company's stations are open to
+// Answers: is the owner's company open to ours? Unknown entities or a missing
+// file answer yes (the behaviour before the file existed); a stale file is at
+// most 2 s old, and every instance re-checks the line update it applies with
+// the same lockstep state (lines.lua), so a race here cannot split the worlds.
+static bool SharedStationsPermitted(int owner, int mine)
+{
+    static ULONGLONG last = 0;
+    static int pidN = 0;
+    static int pids[256], cids[256];
+    static char open[256][96];      // per company id 1..255: "*", "-" or a list
+    const ULONGLONG now = GetTickCount64();
+    if (!last || now - last >= 2000) {
+        last = now;
+        pidN = 0;
+        memset(open, 0, sizeof(open));
+        if (g_dataDir[0]) {
+            char p[MAX_PATH];
+            snprintf(p, sizeof(p), "%smp_company_perms.txt", g_dataDir);
+            FILE* f = _fsopen(p, "r", _SH_DENYNO);
+            if (f) {
+                char line[160];
+                while (fgets(line, sizeof(line), f)) {
+                    int a = 0, b = 0; char code[96] = {0};
+                    if (sscanf(line, "pid %d %d", &a, &b) == 2) {
+                        if (pidN < 256) { pids[pidN] = a; cids[pidN] = b; pidN++; }
+                    } else if (sscanf(line, "open %d %95s", &a, code) == 2) {
+                        if (a >= 1 && a < 256) { strncpy(open[a], code, 95); open[a][95] = 0; }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+    int ownerCid = 0, mineCid = 0;
+    for (int i = 0; i < pidN; i++) {
+        if (pids[i] == owner) ownerCid = cids[i];
+        if (pids[i] == mine) mineCid = cids[i];
+    }
+    if (!ownerCid || !mineCid || ownerCid == mineCid) return true;
+    if (ownerCid < 1 || ownerCid >= 256 || !open[ownerCid][0]) return true;
+    const char* code = open[ownerCid];
+    if (!strcmp(code, "*")) return true;
+    if (!strcmp(code, "-")) return false;
+    // a comma list of company ids
+    const char* s = code;
+    while (*s) {
+        int v = atoi(s);
+        if (v == mineCid) return true;
+        while (*s && *s != ',') s++;
+        if (*s == ',') s++;
+    }
+    return false;
+}
+
 extern "C" int SharedStationsAllow(int owner, int mine)
 {
     if (owner == mine) return 1;
@@ -5946,6 +6005,19 @@ extern "C" int SharedStationsAllow(int owner, int mine)
     __try { live = SharedStationsCompaniesLive() ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
     if (!live) return 0;
+    int permitted = 1;
+    __try { permitted = SharedStationsPermitted(owner, mine) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { permitted = 1; }
+    if (!permitted) {
+        static bool saidRefuse = false;
+        InterlockedIncrement(&g_ssRefused);
+        if (!saidRefuse) {
+            saidRefuse = true;
+            Log("[sharedstations] line editor refused a stop owned by player %d (we are %d): its company's "
+                "stations are not open to ours (mp_company_perms.txt)\n", owner, mine);
+        }
+        return 0;
+    }
     InterlockedIncrement(&g_ssOpened);
     if (!g_ssSaidOnce) {
         g_ssSaidOnce = true;
@@ -6562,8 +6634,8 @@ static DWORD WINAPI Init(LPVOID)
                 g_toCalls, g_toReorders, g_toRefusals,
                 (unsigned long)(ULONG)g_toLastSeed, (long long)g_toLastN, g_toMaxUs);
         if (g_ssOn && g_ssCalls)
-            Log("[sharedstations] alive: foreignAsked=%ld opened=%ld\n",
-                g_ssCalls, g_ssOpened);
+            Log("[sharedstations] alive: foreignAsked=%ld opened=%ld refused=%ld\n",
+                g_ssCalls, g_ssOpened, g_ssRefused);
         if (g_rsOn)
             Log("[roadspace] alive: calls=%ld filtered=%ld changed=%ld handed=%ld faults=%ld maxN=%ld\n",
                 g_rsCallsA, g_rsCallsB, g_rsDiffs, g_rsHanded, g_rsFaults, g_rsMaxN);

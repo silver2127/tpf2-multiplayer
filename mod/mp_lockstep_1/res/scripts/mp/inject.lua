@@ -55,7 +55,7 @@ end
 K.ACTIONS_OFF_BEHIND = CM.MAX_LEAD or 15
 K.ACTIONS_ON_BEHIND = 2
 K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
-                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true }
+                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true }
 K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
                         VREV = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
                         STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true }
@@ -171,7 +171,7 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" and o ~= "CMOPEN" then
 				CM.soloDrop(line)
 				return
 			end
@@ -188,6 +188,14 @@ function CM.pollInject()
 				if cid then
 					CM.scheduleLocal(o, { cid = cid, sw = (o == "CMNEW") and 1 or nil, pw = CM.cmHashPw(cid, pw) or "-" })
 					log("company: requested " .. o .. " " .. cid .. (pw ~= "" and " [with password]" or ""))
+				end
+			elseif o == "CMOPEN" then
+				-- CMOPEN who on   -- who = * or a company id; on = 1/0: who may stop at MY stations
+				local who, on = tostring(w[2] or "*"), tonumber(w[3]) == 1 and 1 or 0
+				CM.cmEnsure()
+				if CM.cmMyCompany and (who == "*" or tonumber(who)) then
+					CM.scheduleLocal("CMOPEN", { cid = CM.cmMyCompany, who = who, on = on })
+					log(string.format("company: requested CMOPEN %s %d (company %d's stations)", who, on, CM.cmMyCompany))
 				end
 			elseif o == "CMNAME" then
 				-- CMNAME cid the company's name...   (spaces allowed; travels percent-escaped)

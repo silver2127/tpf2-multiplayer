@@ -105,6 +105,7 @@ function CM.cmEnsure()
 		CM.cmReady = true
 		CM.cmLog(string.format("CM: companies mode ready, me=co%d players=%d", CM.cmMyCompany, #CM.cmRoster))
 		CM.cmApplyNames()
+		pcall(CM.cmWritePerms)
 	end
 end
 
@@ -119,6 +120,103 @@ function CM.cmOwnerOf(eid)
 	end)
 	if ok and comp then return comp.player end
 	return nil
+end
+
+-- ---------- STATION PERMISSIONS (2026-09-16) ----------
+-- Which companies' vehicles may stop at a company's stations. Lockstep state
+-- (CMOPEN, below), so every instance answers alike; it travels in the save.
+-- CM.cmOpen[cid] is nil (open to everyone, the default), {} (nobody) or a set
+-- of company ids. The originator's line editor asks the slice (the SHARED
+-- STATIONS gate), which reads mp_company_perms.txt written here; every
+-- instance then re-checks the LCREATE / LUPDATE it applies (lines.lua) with
+-- the same answer, so a race between a click and a revoke cannot split the
+-- worlds.
+if type(rawget(CM, "cmOpen")) ~= "table" then CM.cmOpen = {} end   -- rawget: a test stub CM answers every field
+function CM.cmStationOpen(ownerCid, userCid)
+	ownerCid, userCid = tonumber(ownerCid), tonumber(userCid)
+	if not ownerCid or not userCid or ownerCid == userCid then return true end
+	local set = CM.cmOpen[ownerCid]
+	if set == nil then return true end
+	return set[userCid] == true
+end
+-- the company that plays a player entity, from the cid -> pid map
+function CM.cmCompanyOfPid(pid)
+	if pid == nil then return nil end
+	for cid, p in pairs(CM.cmCompanyPid or {}) do if p == pid then return cid end end
+	return nil
+end
+-- "everyone", "nobody" or the names of the companies a company's stations are open to
+function CM.cmOpenText(cid)
+	local set = CM.cmOpen[tonumber(cid)]
+	if set == nil then return "everyone" end
+	local names = {}
+	for _, other in ipairs(CM.cmRoster or {}) do
+		if other ~= tonumber(cid) and set[other] then names[#names + 1] = CM.cmNameOf and CM.cmNameOf(other) or ("company " .. other) end
+	end
+	if #names == 0 then return "nobody" end
+	return table.concat(names, ", ")
+end
+-- the wire / dash / file form of one company's permission: "*", "-" or "1,3"
+function CM.cmOpenCode(cid)
+	local set = CM.cmOpen[tonumber(cid)]
+	if set == nil then return "*" end
+	local ids = {}
+	for other in pairs(set) do ids[#ids + 1] = other end
+	table.sort(ids)
+	if #ids == 0 then return "-" end
+	local t = {}
+	for i, v in ipairs(ids) do t[i] = tostring(v) end
+	return table.concat(t, ",")
+end
+function CM.cmOpenFromCode(cid, code)
+	code = tostring(code or "*")
+	if code == "*" then CM.cmOpen[cid] = nil
+	elseif code == "-" then CM.cmOpen[cid] = {}
+	else
+		local set = {}
+		for v in code:gmatch("%d+") do set[tonumber(v)] = true end
+		CM.cmOpen[cid] = set
+	end
+end
+-- mp_company_perms.txt, for the slice's line-editor gate: the player entity of
+-- every company and what each company's stations are open to. Rewritten only
+-- when its text changes (called from the dash writer every few ticks, and
+-- after every company command).
+function CM.cmWritePerms()
+	if CM.cmMode ~= "companies" then return end
+	local lines = {}
+	local cids = {}
+	for cid in pairs(CM.cmCompanyPid or {}) do cids[#cids + 1] = cid end
+	table.sort(cids)
+	for _, cid in ipairs(cids) do lines[#lines + 1] = string.format("pid %s %d", tostring(CM.cmCompanyPid[cid]), cid) end
+	for _, cid in ipairs(CM.cmRoster or {}) do lines[#lines + 1] = string.format("open %d %s", cid, CM.cmOpenCode(cid)) end
+	local text = table.concat(lines, string.char(10)) .. string.char(10)
+	if text == CM.cmPermsWritten then return end
+	local f = io.open(K.BASE .. "mp_company_perms.txt", "w")
+	if f then f:write(text); f:close(); CM.cmPermsWritten = text end
+end
+-- Every instance checks a line's stops against the permissions before it
+-- applies the create / update (lines.lua): the stations' owners' companies
+-- must be open to the line's company. Returns true, or false and why.
+function CM.cmLineStopsPermitted(userCid, stationGroups)
+	userCid = tonumber(userCid)
+	if CM.cmMode ~= "companies" or not userCid then return true end
+	for _, sg in ipairs(stationGroups or {}) do
+		local owner = CM.cmOwnerOf(sg)
+		if owner == nil then
+			pcall(function()
+				local gc = api.engine.getComponent(sg, api.type.ComponentType.STATION_GROUP)
+				if gc and gc.stations and gc.stations[1] then owner = CM.cmOwnerOf(gc.stations[1]) end
+			end)
+		end
+		local ownerCid = CM.cmCompanyOfPid(owner)
+		if ownerCid and not CM.cmStationOpen(ownerCid, userCid) then
+			return false, string.format("%s's stations are not open to %s",
+				CM.cmNameOf and CM.cmNameOf(ownerCid) or ("company " .. ownerCid),
+				CM.cmNameOf and CM.cmNameOf(userCid) or ("company " .. userCid))
+		end
+	end
+	return true
 end
 
 -- ROADSIDE STOPS BELONG TO THEIR COMPANY (2026-09-11). Companies mode only: is
@@ -749,6 +847,8 @@ function CM.cmSaveState()
 	for cid, pid in pairs(CM.cmCompanyPid or {}) do st.pid[tostring(cid)] = pid end
 	st.names = {}
 	for cid, n in pairs(CM.cmName or {}) do st.names[tostring(cid)] = n end
+	st.open = {}
+	for cid in pairs(CM.cmOpen or {}) do st.open[tostring(cid)] = CM.cmOpenCode(cid) end
 	st.founded, st.foundedCount = {}, {}
 	for _, cid in ipairs(CM.cmRoster or {}) do
 		local o, n = CM.cmFounderOf(cid)
@@ -779,6 +879,8 @@ function CM.cmApplySaved()
 	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid end
 	CM.cmName = {}
 	for k, n in pairs(sv.names or {}) do if type(n) == "string" and n ~= "" then CM.cmName[tonumber(k)] = n end end
+	CM.cmOpen = {}
+	for k, code in pairs(sv.open or {}) do if tonumber(k) then CM.cmOpenFromCode(tonumber(k), code) end end
 	CM.cmFounded, CM.cmFoundedCount = {}, {}
 	for k, f in pairs(sv.founded or {}) do
 		if type(f) == "table" and type(f.o) == "string" then CM.cmFounded[tonumber(k)] = { o = f.o, n = tonumber(f.n) or 1 } end
@@ -849,6 +951,9 @@ function CM.execCompanyCmd(c)
 		CM.cmPw[cid] = nil
 		CM.cmName[cid] = nil
 		CM.cmFounded[cid] = nil
+		CM.cmOpen[cid] = nil
+		for _, other in pairs(CM.cmOpen) do other[cid] = nil end
+		CM.cmWritePerms()
 		CM.cmNote(string.format("%s dissolved company %d into %d (%d entities, balance %s, loan %s)", tostring(o), cid, intoCid, n, tostring(bf), tostring(lf)))
 	elseif c.op == "CMNAME" then
 		-- name / unname a company: only someone playing it may (like CMPW)
@@ -859,8 +964,35 @@ function CM.execCompanyCmd(c)
 		CM.cmName[cid] = (name ~= "") and name or nil
 		CM.cmNote(string.format("%s named company %d %s", tostring(o), cid, name ~= "" and ('"' .. name .. '"') or "(unnamed)"))
 		CM.cmApplyNames()
+	elseif c.op == "CMOPEN" then
+		-- who may stop at my stations: only someone playing the company may.
+		-- who="*" on=1 everyone; who="*" on=0 nobody; who=<cid> on=1/0 one company
+		if not CM.cmRosterHas(cid) then CM.cmNote("cannot set permissions: no company " .. cid); return end
+		local mineCid = (o == K.INSTANCE) and CM.cmMyCompany or CM.cmOriginCompany[o]
+		if mineCid ~= cid then CM.cmNote(string.format("%s cannot set company %d's permissions (plays %s)", tostring(o), cid, tostring(mineCid))); return end
+		local who, on = tostring(c.who or "*"), tonumber(c.on or 1) == 1
+		if who == "*" then
+			if on then CM.cmOpen[cid] = nil else CM.cmOpen[cid] = {} end
+		else
+			local other = tonumber(who)
+			if not other or not CM.cmRosterHas(other) or other == cid then CM.cmNote("cannot set permissions: no company " .. who); return end
+			local set = CM.cmOpen[cid]
+			if set == nil then
+				-- open to everyone so far: an explicit set of everyone else, then edit it
+				set = {}
+				for _, r in ipairs(CM.cmRoster) do if r ~= cid then set[r] = true end end
+			end
+			set[other] = on and true or nil
+			-- back to "everyone" when it names every other company
+			local all = true
+			for _, r in ipairs(CM.cmRoster) do if r ~= cid and not set[r] then all = false end end
+			if all then CM.cmOpen[cid] = nil else CM.cmOpen[cid] = set end
+		end
+		CM.cmNote(string.format("%s's stations are now open to %s", CM.cmNameOf and CM.cmNameOf(cid) or ("company " .. cid), CM.cmOpenText(cid)))
+		CM.cmWritePerms()
 	elseif c.op == "CMPW" then
 		-- set / clear a company's password: only someone playing it may
+
 		if not CM.cmRosterHas(cid) then CM.cmNote("cannot set a password: no company " .. cid); return end
 		local mineCid = (o == K.INSTANCE) and CM.cmMyCompany or CM.cmOriginCompany[o]
 		if mineCid ~= cid then CM.cmNote(string.format("%s cannot set company %d's password (plays %s)", tostring(o), cid, tostring(mineCid))); return end
