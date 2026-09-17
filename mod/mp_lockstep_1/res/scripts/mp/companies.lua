@@ -558,6 +558,29 @@ end
 function CM.playerNameOf(letter)
 	return CM.playerNames[letter] or letter
 end
+-- Players still loading in (2026-09-16): the menu DLL writes mp_loading.txt
+-- ("letter=name=stage" per player receiving the save, loading the world or
+-- catching up; empty once everyone is in). A company switch, creation or
+-- dissolve while somebody is loading is refused on the requesting game, before
+-- anything ships: the joiner takes its companies from the save and the lobby's
+-- map, and a switch in between would land it in the wrong company. Read fresh
+-- each time it is asked (a few times a second at most).
+function CM.cmLoadingPlayers()
+	local out = {}
+	local f = io.open(K.BASE .. "mp_loading.txt", "r")
+	if not f then return out end
+	for line in f:lines() do
+		local l, n, stage = line:match("^(%a+)=([^=]*)=?(.*)$")
+		if l and l ~= K.INSTANCE then out[#out + 1] = { letter = l, name = (n ~= "" and n or l):gsub("[%c]", ""), stage = (stage or ""):gsub("[%c]", "") } end
+	end
+	f:close()
+	return out
+end
+function CM.cmLoadingNote(who)
+	local names = {}
+	for _, p in ipairs(who) do names[#names + 1] = p.name end
+	return string.format("company changes wait until %s %s loaded in", table.concat(names, ", "), #names == 1 and "has" or "have")
+end
 -- Founders (2026-09-16). An unnamed company is named after the player who
 -- FOUNDED it, not whoever plays it now: a player who created a second company
 -- and moved into it saw the first fall back to "Company N". CMNEW records the

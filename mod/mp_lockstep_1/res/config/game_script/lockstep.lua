@@ -1698,6 +1698,9 @@ function data()
 						return (t or ""):gsub("[%c]", "")
 					end
 					local function coRequest(op, cid)
+						-- company changes wait for everyone to load in (the sim refuses them too)
+						local loading = CM.cmLoadingPlayers and CM.cmLoadingPlayers() or {}
+						if #loading > 0 then D.coHint = CM.cmLoadingNote(loading); return end
 						local pw = coPw()
 						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
 						if f then f:write(op .. (cid and (" " .. cid) or "") .. (pw ~= "" and (" " .. pw) or "") .. string.char(10)); f:close() end
@@ -1970,7 +1973,12 @@ function data()
 						end
 						local note = mine.conote or ""
 						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
-						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end
+						-- while somebody loads in, say so in place of the last note
+						if (guiTick % 30) == 0 and CM.cmLoadingPlayers then
+							local loading = CM.cmLoadingPlayers()
+							D.coLoadingNote = (#loading > 0) and CM.cmLoadingNote(loading) or nil
+						end
+						if D.coNote then D.coNote:setText("   " .. (D.coHint or D.coLoadingNote or note)) end
 					end
 					if D.chatText and (guiTick % 30) == 0 then
 						local lines = CM.chatTail(8)

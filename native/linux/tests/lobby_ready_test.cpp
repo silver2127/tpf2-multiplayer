@@ -106,6 +106,28 @@ int main()
     assert(readNames() == "ac=Joiner with spaces\nz=" + model.host + "\n");
     model.players.resize(1); lobby::WritePlayerNames();
     assert(readNames() == "ac=Joiner with spaces\n");
+    auto readLoading = [&] {
+        std::string content;
+        assert(lobby::ReadSmallFile(dir + "mp_loading.txt", &content));
+        return content;
+    };
+    assert(readLoading().empty()); // Missing stages are safe, including short vectors.
+    // Exercise real roster parsing/export, stable relay letters and stage-only updates.
+    auto rosterLoading = [&](const std::string& stages) {
+        lobby::Json roster;
+        assert(lobby::ParseJson(R"({"players":["host","joiner","third"],"host":"host","you":"joiner","relay":true,"letters":{"host":"z","joiner":"ac","third":"b"},"stages":)"
+                               + stages + "}", &roster));
+        lobby::ApplyRoster(roster);
+    };
+    rosterLoading(R"({"host":"","joiner":"receiving save 40%","third":"loading world"})");
+    assert(readLoading() == "ac=joiner=receiving save 40%\nb=third=loading world\n");
+    rosterLoading(R"json({"third":"catching up (12 s behind)"})json");
+    assert(readLoading() == "b=third=catching up (12 s behind)\n");
+    rosterLoading("{}"); assert(readLoading().empty());
+    rosterLoading(R"({"third":"loading world"})");
+    lobby::Json departed;
+    assert(lobby::ParseJson(R"({"players":["host","joiner"]})", &departed));
+    lobby::ApplyRoster(departed); assert(readLoading().empty());
     // A complete roster over 1 MiB survives the mailbox tail and parser.
     lobby::S().lobbyDir=dir; lobby::S().child.gen=model.gen;
     std::string event="{\"type\":\"roster\",\"players\":[";
@@ -211,6 +233,7 @@ int main()
     unlink((dir+"lockstep_dash_"+letter+".txt").c_str());
     unlink((dir+"lockstep_status_"+letter+".txt").c_str());
     assert(unlink((dir + "mp_players.txt").c_str()) == 0);
+    assert(unlink((dir + "mp_loading.txt").c_str()) == 0);
     assert(unlink(path.c_str())==0 && rmdir(temporary)==0);
     puts("lobby readiness: current-process hooks required for host, join and start; no external effects");
 }

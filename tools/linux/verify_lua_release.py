@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the cumulative Linux Lua integration: dev 61578d27."""
+"""Verify the cumulative Linux Lua integration: dev be3b86ae."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "61578d278c2e975bfbed7227cf09a7d272228884"
+REFERENCE = "be3b86ae11ec67f7e337e11093875c83ee3b04a0"
 INCOMING = REFERENCE
 INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"
@@ -40,7 +40,7 @@ def main():
         if missing or extra or different:
             return 1
         manifest = "".join(f"{hashlib.sha256(actual[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files: exact dev 61578d27 except {len(MERGED_SHA256)} pinned cumulative merges")
+        print(f"PASS: {len(expected)} Lua files: exact dev be3b86ae except {len(MERGED_SHA256)} pinned cumulative merges")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
         return 0
     except (OSError, subprocess.CalledProcessError) as error:

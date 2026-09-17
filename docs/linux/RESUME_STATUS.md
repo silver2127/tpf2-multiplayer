@@ -1,4 +1,14 @@
-## Latest Windows integration: dev 61578d27 (2026-09-16)
+## Latest Windows integration: dev be3b86ae (2026-09-16)
+
+See [UPSTREAM_dev_be3b86ae.md](UPSTREAM_dev_be3b86ae.md). The native lobby
+exports loading players atomically on every roster update. Shared Lua blocks
+company creation, switching and dissolution until other players finish loading,
+while allowing password changes. All 28 Lua files match Windows exactly;
+verification and release provenance target be3b86ae. This commit is fully
+ported; inherited tint, ownership, recovery and Workshop gaps remain.
+No live gameplay validation is claimed.
+
+## Previous Windows integration: dev 61578d27 (2026-09-16)
 
 See [UPSTREAM_dev_61578d27.md](UPSTREAM_dev_61578d27.md). The shared Lua
 stylesheet adds company colours to station/depot icon descendants, darker

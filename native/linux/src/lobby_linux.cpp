@@ -1016,16 +1016,25 @@ static void WriteCompanyCfg()
 
 static void WritePlayerNames()
 {
-    std::string content;
+    std::string content, loading;
     {
         std::lock_guard<std::mutex> lk(S().mtx);
         const Model& m = S().m;
         for (const auto& name : m.players)
             content += OriginLetterFor(m, name) + "=" + OneLine(name) + "\n";
+        // Same roster snapshot for the shared Lua company-loading gate.
+        for (size_t i = 0; i < m.players.size() && i < m.stages.size(); ++i) {
+            if (m.stages[i].empty()) continue;
+            loading += OriginLetterFor(m, m.players[i]) + "=" + OneLine(m.players[i])
+                     + "=" + OneLine(m.stages[i]) + "\n";
+        }
     }
     std::string err;
     if (!WriteFileAtomic(S().cfg.dataDir + "mp_players.txt", content, &err))
         Log("[lobby] player names: %s\n", err.c_str());
+    // Replace even when empty so completed/departed players stop blocking changes.
+    if (!WriteFileAtomic(S().cfg.dataDir + "mp_loading.txt", loading, &err))
+        Log("[lobby] loading players: %s\n", err.c_str());
 }
 
 // ---- commands to the lobby ----------------------------------------------------------------------
