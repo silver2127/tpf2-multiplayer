@@ -21,14 +21,14 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **Windows release 0.6 (dev through `d129fab7`)**.
+This development tree combines **Windows release 0.6 (dev through `b141b123`)**.
 It includes native road-space summation, road-edge vehicle entry order, ship/aircraft order diagnostics,
 shared-station line selection, host world-switch sharing, bidirectional company
 chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). Lobby
 chips, shared dashboard swatches and vehicle paint use the new 20-colour palette,
 with generated colours starting at company 21. All Lua files
 exactly match that Windows revision. See
-[UPSTREAM_dev_d129fab7.md](UPSTREAM_dev_d129fab7.md) for provenance, tests and
+[UPSTREAM_dev_b141b123.md](UPSTREAM_dev_b141b123.md) for provenance, tests and
 remaining gaps. This is not a claim of live cross-platform compatibility.
 `trainorder=0`, `roadspace=0`, `roadentries=0`, `shiporder=0`, `airorder=0` and
 `sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt` disable the respective

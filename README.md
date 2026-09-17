@@ -16,8 +16,8 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration is Windows **release 0.6, dev through `d129fab7`** (partial native integration). See [Linux installation](docs/linux/INSTALL.md),
-[the integration record](docs/linux/UPSTREAM_dev_d129fab7.md), and
+integration is Windows **release 0.6, dev through `b141b123`** (partial native integration). See [Linux installation](docs/linux/INSTALL.md),
+[the integration record](docs/linux/UPSTREAM_dev_b141b123.md), and
 [existing port coverage and gaps](docs/linux/RESUME_STATUS.md).
 Historical native/Proton tests in those records do not establish live gameplay
 compatibility for this development snapshot.
@@ -46,8 +46,8 @@ to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
 [installer/README.md](installer/README.md).
 
-**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.py` from the same release and run
-`python3 install_proton.py`; it installs the same files into the Proton game. Details, including the lobby
+**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.sh` from the same release and run
+`sh install_proton.sh` (no Python needed; `install_proton.py` is the Python equivalent); it installs the same files into the Proton game. Details, including the lobby
 repair Wine needs: [docs/proton/INSTALL.md](docs/proton/INSTALL.md). The native Linux game has its own
 build on the `linux-native` branch.
 
