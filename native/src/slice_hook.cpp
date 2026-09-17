@@ -5715,6 +5715,154 @@ extern "C" float RoadSpaceDetourB(void* self, const void* edgeId, void* fnObj)
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// ROAD ENTRY ORDER -- the per-edge `entries` vector in a canonical order.
+//
+// THE FINDING (RE, 2026-09-16, after a hot join drifted buses ~300 m at equal
+// sim time while the world hash stayed locked). EdgeUseManager's per-edge
+// `entries` are not serialized: they are rebuilt on load (EntityAdded 0xa64be0
+// -> AddToEdgeUseManager 0xa64390 -> Add 0x2115f80, a push_back) in the order
+// the loaded save registers vehicles, while the host's vector holds the order
+// they ARRIVED on the edge over the whole game. Same vehicles, different order.
+// GetUsedSpace's float sum over that order is already neutralised (ROAD FREE
+// SPACE above). The other order-sensitive consumer is the lead-vehicle search
+// in GetNext (0x2116990/0x2116e10/0x2116160/0x21164d0): an exact-float min
+// search that keeps the FIRST entry on a tie, so two vehicles at bit-identical
+// positions (queued at a stop) pick a different leader on the two peers, the
+// brake point differs, and car-following amplifies it down the line.
+//
+// THE PATCH. A post-call hook right after AddToEdgeUseManager's call to Add
+// (0xa64473, the 8-byte `mov rbx,[rsp+0x80]` that follows it) re-sorts that
+// edge's entries by vehicle NAME (the train-order rule: ASCII-case-insensitive
+// byte-wise, then entity id), which is replicated state on every peer. Add is
+// the only writer that appends (Remove is an order-preserving erase), so the
+// vector is canonical after every mutation. At the hook, rsi is still the
+// EdgeUseManager, rbx the ecs world (AddToEdgeUseManager uses it for the type
+// index map at +0x48) and the EdgeId Add was given is still at [rsp+0x30]. The
+// EdgeData is found the engine's way (GetEdgeDataPtr 0x2116330), and a vector
+// we cannot make sense of (bad span, more than ROADENTRIES_MAX vehicles on one
+// edge, a fault) is left exactly as the engine built it and counted.
+//
+// Kill switch: roadentries=0 in tpf2_menu_flags.txt.
+static const uintptr_t RVA_ROADENTRIES_HOOK = 0xa64473;   // right after `call 0x2115f80` in AddToEdgeUseManager
+static const uint8_t ROADENTRIES_EXPECT[8] = { 0x48, 0x8B, 0x9C, 0x24, 0x80, 0x00, 0x00, 0x00 };   // mov rbx,[rsp+0x80]
+static const uint32_t ROADENTRIES_EDGEID_OFF = 0x30;      // [rsp+0x30] at the hook = the EdgeId passed to Add
+static const int      ROADENTRIES_MAX = 512;
+static bool g_reOn = false;
+static volatile LONG g_reCalls = 0, g_reSorted = 0, g_reRefused = 0, g_reFaults = 0, g_reMaxN = 0, g_reShown = 0;
+
+struct RoadEntryKey { TrainOrderKey k; int32_t pos; };
+
+static bool RoadEntriesLess(const RoadEntryKey& a, const RoadEntryKey& b)
+{
+    const int c = TrainOrderNameCmp(a.k, b.k);
+    if (c) return c < 0;
+    return a.k.id < b.k.id;
+}
+
+static void RoadEntriesSortImpl(uint8_t* world, uint8_t* mgr, const void* edgeId)
+{
+    typedef uint8_t* (*GetEdgeData)(void*, const void*);
+    uint8_t* ed = ((GetEdgeData)(g_base + RVA_EDGEUSE_DATA))(mgr, edgeId);
+    if (!ed || !Readable(ed, 0x20)) return;
+    uint8_t* begin = *(uint8_t**)(ed + 8);
+    uint8_t* end = *(uint8_t**)(ed + 0x10);
+    if (!begin || end < begin || (size_t)(end - begin) % sizeof(RoadUseEntry)) { InterlockedIncrement(&g_reRefused); return; }
+    const int64_t n = (int64_t)((end - begin) / sizeof(RoadUseEntry));
+    if (n > g_reMaxN) g_reMaxN = (LONG)n;
+    if (n < 2) return;
+    if (n > ROADENTRIES_MAX || !Readable(begin, (size_t)(end - begin))) { InterlockedIncrement(&g_reRefused); return; }
+    RoadEntryKey keys[ROADENTRIES_MAX];
+    RoadUseEntry rec[ROADENTRIES_MAX];
+    memcpy(rec, begin, (size_t)n * sizeof(RoadUseEntry));
+    const int typeIdx = TrainOrderNameType(world);
+    for (int64_t i = 0; i < n; i++) {
+        keys[i].k.name = ""; keys[i].k.len = 0; keys[i].k.id = rec[i].entity; keys[i].pos = (int32_t)i;
+        if (typeIdx >= 0) {
+            const int slot = TrainOrderSlot(world, rec[i].entity, typeIdx);
+            const uint8_t* comp = slot >= 0 ? TrainOrderComponent(world, typeIdx, slot) : nullptr;
+            if (comp) TrainOrderNameText(comp, &keys[i].k.name, &keys[i].k.len);
+        }
+    }
+    // insertion sort (n is a handful of vehicles per edge; stable, no allocation)
+    for (int64_t i = 1; i < n; i++) {
+        RoadEntryKey t = keys[i];
+        int64_t j = i - 1;
+        while (j >= 0 && RoadEntriesLess(t, keys[j])) { keys[j + 1] = keys[j]; j--; }
+        keys[j + 1] = t;
+    }
+    bool changed = false;
+    for (int64_t i = 0; i < n; i++) if (keys[i].pos != i) { changed = true; break; }
+    if (!changed) return;
+    for (int64_t i = 0; i < n; i++) memcpy(begin + i * sizeof(RoadUseEntry), &rec[keys[i].pos], sizeof(RoadUseEntry));
+    InterlockedIncrement(&g_reSorted);
+    if (InterlockedIncrement(&g_reShown) <= 4)
+        Log("[roadentries] edge with %lld vehicles re-ordered by name (first now entity %d)\n", (long long)n, rec[keys[0].pos].entity);
+}
+
+extern "C" void RoadEntriesSort(uint8_t* world, uint8_t* mgr, const void* edgeId)
+{
+    InterlockedIncrement(&g_reCalls);
+    __try { if (world && mgr && edgeId) RoadEntriesSortImpl(world, mgr, edgeId); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_reFaults); }
+}
+
+static void InstallRoadEntries()
+{
+    if (FlagsSayOff("roadentries")) {
+        Log("[roadentries] OFF (roadentries=0 in tpf2_menu_flags.txt) -- a road edge's vehicle "
+            "entries keep the engine's arrival/load order\n");
+        return;
+    }
+    if (!BytesAre(RVA_ROADENTRIES_HOOK, ROADENTRIES_EXPECT, sizeof(ROADENTRIES_EXPECT), "roadentries")) return;
+    // the call right before the hook must be EdgeUseManager::Add
+    {
+        uint8_t pre[5] = { 0 };
+        memcpy(pre, (const void*)(g_base + RVA_ROADENTRIES_HOOK - 5), 5);
+        int32_t rel = 0; memcpy(&rel, pre + 1, 4);
+        if (pre[0] != 0xE8 || (uintptr_t)((int64_t)(RVA_ROADENTRIES_HOOK - 5) + 5 + rel) != 0x2115f80) {
+            Log("[roadentries] NOT installed: the call before rva=%llx is not EdgeUseManager::Add\n", (unsigned long long)RVA_ROADENTRIES_HOOK);
+            return;
+        }
+    }
+    uint8_t* stub = NearAlloc(96);
+    if (!stub) { Log("[roadentries] NOT installed: no page for the stub\n"); return; }
+    const uintptr_t helper = (uintptr_t)&RoadEntriesSort;
+    size_t k = 0;
+    // r8 = &EdgeId (rsp+0x30 at the hook, BEFORE anything is pushed), rcx = world (rbx), rdx = manager (rsi)
+    stub[k++] = 0x4C; stub[k++] = 0x8D; stub[k++] = 0x44; stub[k++] = 0x24; stub[k++] = (uint8_t)ROADENTRIES_EDGEID_OFF; // lea r8,[rsp+0x30]
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xCB;                    // mov rcx, rbx
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xD6;                    // mov rdx, rsi
+    stub[k++] = 0x55;                                                        // push rbp
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xEC;                    // mov rbp, rsp
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xE4; stub[k++] = 0xF0;  // and rsp, -16
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xEC; stub[k++] = 0x20;  // sub rsp, 0x20
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &helper, 8); k += 8;// mov rax, RoadEntriesSort
+    stub[k++] = 0xFF; stub[k++] = 0xD0;                                      // call rax
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xE5;                    // mov rsp, rbp
+    stub[k++] = 0x5D;                                                        // pop rbp
+    memcpy(stub + k, ROADENTRIES_EXPECT, sizeof(ROADENTRIES_EXPECT)); k += sizeof(ROADENTRIES_EXPECT);   // mov rbx,[rsp+0x80] (stolen)
+    const uintptr_t resume = g_base + RVA_ROADENTRIES_HOOK + sizeof(ROADENTRIES_EXPECT);
+    stub[k++] = 0xE9;
+    const int32_t rel = (int32_t)((int64_t)resume - (int64_t)((uintptr_t)stub + k + 4));
+    memcpy(stub + k, &rel, 4); k += 4;
+    FlushInstructionCache(GetCurrentProcess(), stub, k);
+    const uintptr_t at = g_base + RVA_ROADENTRIES_HOOK;
+    const int64_t nrel = (int64_t)(uintptr_t)stub - (int64_t)(at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) { Log("[roadentries] NOT installed: stub out of reach\n"); return; }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)at, 8, PAGE_EXECUTE_READWRITE, &old)) { Log("[roadentries] NOT installed: could not unprotect\n"); return; }
+    uint8_t patch[8] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+    const int32_t r32 = (int32_t)nrel;
+    memcpy(patch + 1, &r32, 4);
+    memcpy((void*)at, patch, 8);
+    VirtualProtect((void*)at, 8, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 8);
+    g_reOn = true;
+    Log("[roadentries] installed: a road edge's vehicle entries are kept in name order on every peer (hook at rva=%llx)\n",
+        (unsigned long long)RVA_ROADENTRIES_HOOK);
+}
+
 static void InstallRoadSpace()
 {
     if (FlagsSayOff("roadspace")) {
@@ -7563,6 +7711,7 @@ static DWORD WINAPI Init(LPVOID)
     // ORDER"): the first bus to reach a junction must get the same float on
     // every peer from the first step.
     InstallRoadSpace();
+    InstallRoadEntries();
     InstallMoveOrder(g_shipChan, "shiporder", RVA_SHIP_UPDATE2, MOVEORDER_EXPECT_SHIP,
                      sizeof(MOVEORDER_EXPECT_SHIP), (void*)&ShipOrderRelay,
                      &g_shipOrderResume, "ship");
@@ -7606,6 +7755,9 @@ static DWORD WINAPI Init(LPVOID)
         if (g_rsOn)
             Log("[roadspace] alive: calls=%ld filtered=%ld changed=%ld handed=%ld faults=%ld maxN=%ld\n",
                 g_rsCallsA, g_rsCallsB, g_rsDiffs, g_rsHanded, g_rsFaults, g_rsMaxN);
+        if (g_reOn)
+            Log("[roadentries] alive: adds=%ld sorted=%ld refused=%ld faults=%ld maxN=%ld\n",
+                g_reCalls, g_reSorted, g_reRefused, g_reFaults, g_reMaxN);
         if (g_stnIconColorOn && g_siAsked)
             Log("[stationicon] alive: asked=%ld direct=%ld walked=%ld tinted=%ld glyphs=%ld noOwner=%ld faults=%ld\n",
                 g_siAsked, g_siDirect, g_siWalked, g_siTinted, g_icApplied, g_siNoOwner, g_siFaults);
