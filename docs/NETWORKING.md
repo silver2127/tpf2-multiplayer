@@ -110,6 +110,33 @@ every 250 ms; with more than 512 pending the backlog is dropped; a peer is consi
 10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
 other directly.
 
+## TCP backup link
+
+Since 2026-09-17 (`netpunch/dual_tcp.py`) every sealed frame between a joiner and the host --
+control messages and game frames alike, never save chunks -- goes out twice: on the punched UDP
+socket as before, and on a TCP connection between the two. The joiner connects to the host's
+(or relay's) lobby port over TCP once its UDP punch has landed, and both sides also try a TCP
+simultaneous open toward the address the other punched from, bound to their own lobby port,
+for a NAT that preserves ports; whichever lands first is the link (`[dual] TCP link with ... up
+(joiner connected | host connected)`). A frame read from the link is written into the process's
+own UDP socket over loopback with the original sender's address in front, so every consumer sees
+it as an ordinary datagram from the peer, and the seal layer's per-sender replay window drops
+whichever copy comes second. Nothing above the socket changed.
+
+What it is for is written in the log every 10 s per peer: `[dual] bob: udp_first=.. tcp_first=..
+tcp_only=.. (udp lost, tcp covered) udp_only=.. (tcp lost/late); tcp later by p50/p90/max, udp
+later by p50/p90/max`. `tcp_only` is a UDP datagram that never arrived but whose TCP copy did;
+`udp_only` a TCP copy that never came within 3 s. The bridge's own ARQ still recovers what both
+paths lose. `python lobby.py --selftest-dual` runs a joiner losing 30% of its UDP sends: every
+frame still reaches the host with the link, 70% without it. Off with `tpf2mp_tcp_backup.txt`
+containing `0` in the lobby's data folder; off in an unsealed session (no nonce to dedup on).
+
+**Impairing one instance** (`netpunch/netsim.py`): `tpf2mp_netsim.txt` in an instance's data
+folder, `loss=0.05`, `delay=0.100`, `jitter=0.010`, drops that fraction of the datagrams the
+instance sends and delays the rest (the TCP link's frames wait the same, but are never dropped:
+TCP's loss is the OS's). Read once at the lobby's start; the log says `[netsim] impairing what
+this instance sends: ...`. Outbound only, so a two-sided setup is two files.
+
 ## Lobby protocol
 
 Every packet is `NP1:` + a one-byte type + payload; anything else is ignored.

@@ -49,6 +49,7 @@ class BulkListener:
         self._stop = threading.Event()
         self._pending = 0
         self.accepted = self.refused = 0
+        self.link_handler = None   # dual_tcp: a "TPF2LINK1 ..." hello is a peer's TCP link, not a transfer
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((bind, self.port))
@@ -111,6 +112,12 @@ class BulkListener:
                 if not piece:
                     break
                 line += piece
+            if line.startswith(b"TPF2LINK1 ") and self.link_handler is not None:
+                c.settimeout(None)
+                with self._lock:
+                    self._pending -= 1
+                self.link_handler(c, addr, line)
+                return
             parts = line.strip().split(b" ", 4)
             if len(parts) < 4 or parts[0] != BULK_MAGIC:
                 raise ValueError("bad hello")

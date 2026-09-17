@@ -155,6 +155,8 @@ import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
 from player_stats import PlayerStats       # relay-only: who plays, how much, how many at once (player_stats.json)
 import bulk_tcp                            # the TCP side channel the save/mod transfers stream over (2026-09-17)
+import dual_tcp                            # every sealed frame a second time over a TCP link, first copy wins (2026-09-17)
+import netsim                              # tpf2mp_netsim.txt: loss and delay for one instance, for the rig (2026-09-17)
 import collections
 import hashlib
 import itertools
@@ -242,6 +244,71 @@ CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
 # feedback, verify and start messages are the same as over UDP.
 BULK = [None]
 BULK_TCP = [True]
+# THE TCP BACKUP LINK (dual_tcp.py): DUAL[0] is the host's DualSocket (the joiner's
+# is conn.sock); off with tpf2mp_tcp_backup.txt = 0 in the io dir or in an
+# unsealed session.
+DUAL = [None]
+
+
+def _tcp_backup_on(io_dir):
+    try:
+        with open(os.path.join(io_dir, "tpf2mp_tcp_backup.txt"), "r", encoding="utf-8") as f:
+            return f.read().strip() not in ("0", "off", "no")
+    except OSError:
+        return True
+
+
+def _dual_hello(name):
+    """The hello a peer proves itself with: its name, sealed with the session key."""
+    return dual_tcp.hello_bytes(name, SEAL[0].seal(name.encode("utf-8", "replace")))
+
+
+def _dual_hello_ok(line, cipher):
+    """(name) from a peer's hello when the sealed name opens and matches, else None."""
+    name, sealed = dual_tcp.parse_hello(line)
+    if name is None or cipher is None:
+        return None
+    plain = cipher.open(sealed)
+    return name if plain is not None and plain.decode("utf-8", "replace") == name else None
+
+
+def _impair_client(conn, io_dir, log):
+    """tpf2mp_netsim.txt on a joiner: wrap its punched socket before anything
+    else does (the dual socket's TCP copies are delayed the same, never dropped)."""
+    sim = netsim.read_config(io_dir)
+    if not sim:
+        return None
+    conn.sock = netsim.ImpairedSocket(conn.sock, sim, log)
+    log(f"[netsim] impairing what this instance sends: {netsim.describe(sim)}")
+    return sim
+
+
+def _start_dual_client(conn, name, log, sim=None):
+    """A joiner's TCP backup link to the host: wrap the punched socket and run
+    the simultaneous open on a thread (the host is reachable through the relay,
+    a UPnP TCP mapping or a port forward; a NAT that preserves ports lets the
+    host's own attempt land on our listener)."""
+    dsock = dual_tcp.DualSocket(conn.sock, log)
+    if sim:
+        dsock.link_delay = sim["delay"]
+    conn.sock = dsock                    # the reader thread and the mesh pick it up on their next turn
+    host_addr = conn.peer
+    local_port = dsock.getsockname()[1]
+    hello = _dual_hello(name)
+
+    def work():
+        c, how = dual_tcp.dial(host_addr, local_port, hello, log, listen_too=True)
+        if c is None:
+            log(f"[dual] no TCP link to the host on tcp/{host_addr[1]} within {dual_tcp.DIAL_FOR:.0f} s -- UDP only")
+            return
+        if how == "accepted":
+            if _dual_hello_ok(dual_tcp.read_hello(c) or b"", conn.cipher) is None:
+                log("[dual] the host's TCP attempt did not prove itself -- closed")
+                c.close()
+                return
+        dsock.attach(c, host_addr, "joiner connected" if how == "connected" else "host connected")
+    threading.Thread(target=work, name="dual-dial", daemon=True).start()
+    return dsock
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
 SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds the
@@ -2590,6 +2657,21 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     stop = stop or threading.Event()
     sock.setblocking(False)
     _boost_socket_buffers(sock)             # help bursty save-transfer traffic
+    # NETWORK IMPAIRMENT for this instance (netsim.py, tpf2mp_netsim.txt in the io dir)
+    sim = netsim.read_config(io.dir)
+    if sim:
+        sock = netsim.ImpairedSocket(sock, sim, log)
+        log(f"[netsim] impairing what this instance sends: {netsim.describe(sim)}")
+    # THE TCP BACKUP LINK: every sealed frame to a joiner goes out on its TCP link
+    # too, and its TCP copies come in through this same socket (dual_tcp.py)
+    dual = None
+    if _tcp_backup_on(io.dir) and SEAL[0] is not None:
+        sock = dual_tcp.DualSocket(sock, log)
+        dual = sock
+        if sim:
+            dual.link_delay = sim["delay"]
+    DUAL[0] = dual
+    last_dual_tick = [0.0]
 
     transport_lobby = os.urandom(16).hex()
     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
@@ -3056,6 +3138,18 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             remember_chip(assigned, company)
             if stats:
                 stats.join(assigned, profile)
+            if dual is not None and isinstance(addr, tuple) and not dual.has_link(addr):
+                # our half of the TCP simultaneous open toward the joiner (a NAT that
+                # preserves ports lets it land on the joiner's listener); the joiner's
+                # own connect to our listener is the usual way in
+                def host_dial(a=addr, n=assigned):
+                    c, how = dual_tcp.dial(a, sock.getsockname()[1], _dual_hello(host_name), log, listen_too=False)
+                    if c is not None:
+                        if dual.has_link(a):
+                            c.close()
+                        else:
+                            dual.attach(c, a, "host connected")
+                threading.Thread(target=host_dial, name="dual-host-dial", daemon=True).start()
             late = started[0] or host_has_world()
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if started[0] else " (late -- the host is in a world)" if late else ""))
@@ -3563,6 +3657,24 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     log(f"[host] serving as {host_name!r} on udp/{sock.getsockname()[1]}")
     # the TCP listener the save/mod transfers stream over (bulk_tcp.py); one per process
     BULK[0] = bulk_tcp.BulkListener.open(sock.getsockname()[1], log) if BULK_TCP[0] else None
+    if BULK[0] is not None and dual is not None:
+        # a joiner's TCP backup link arrives on the same listener ("TPF2LINK1 <name> <sealed>")
+        def link_hello(c, addr, line):
+            name = _dual_hello_ok(line, SEAL[0])
+            # the joiner dials the moment its UDP punch lands, often before its
+            # `join` has been processed here: give the roster a few seconds
+            found = []
+            deadline = time.time() + 10.0
+            while name and not found and time.time() < deadline:
+                found = [a for a, p in peers.items() if p["name"] == name]
+                if not found:
+                    time.sleep(0.1)
+            if not found:
+                log(f"[dual] TCP link hello from {addr[0]} ({name!r}) matches no joiner -- closed")
+                c.close()
+                return
+            dual.attach(c, found[0], "joiner connected")
+        BULK[0].link_handler = link_hello
 
     last_heal = last_drop = 0.0
     last_serve_check = [0.0]
@@ -3729,6 +3841,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 relay.tick(now)                             # 10 s stats line
             if stats:
                 stats.tick()                                # minute flush, 10 min summary
+            if dual is not None and now - last_dual_tick[0] >= 0.5:
+                last_dual_tick[0] = now
+                dual.tick({a: p["name"] for a, p in peers.items()})
 
             own_fwd.poll_tails()
             own_lines = own_fwd.drain(now)
@@ -3907,6 +4022,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if BULK[0] is not None:
             BULK[0].close()
             BULK[0] = None
+        if dual is not None:
+            dual.close_links()
+            DUAL[0] = None
         if stats:
             for p in peers.values():
                 stats.leave(p["name"], p.get("profile"))
@@ -4416,6 +4534,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         join_msg["profile"] = profile_code
     send(join_msg)                                          # announce ourselves
     last_ping = 0.0
+    last_dual_tick = [0.0]
     join_sent_at = time.time()
     welcomed = [False]
     try:
@@ -4454,6 +4573,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                 break
             now = time.time()
             mesh_housekeeping(now)
+            ds = getattr(conn, "sock", None)
+            if isinstance(ds, dual_tcp.DualSocket) and now - last_dual_tick[0] >= 0.5:
+                last_dual_tick[0] = now
+                ds.tick({conn.peer: "host"})              # the TCP backup link's counters, every 10 s
             receiver.tick(now)                              # facks / fdone cadence
             if receiver.cancelled:
                 send({"t":"leave"})
@@ -4692,6 +4815,9 @@ def cmd_join(args):
         return 1
     _log(f"[join] connected to host {conn.peer_str}")
     conn.cipher = SEAL[0]
+    sim = _impair_client(conn, io.dir, _log)
+    if _tcp_backup_on(io.dir) and SEAL[0] is not None:
+        _start_dual_client(conn, args.name, _log, sim)
     mesh = None
     if not getattr(args, "no_mesh", False):
         mesh, conn = _mesh_from_conn(conn)
@@ -5624,6 +5750,157 @@ def selftest_transfer():
 # --------------------------------------------------------------------------- #
 # Self-test: GAME RELAY -- two stand-in bridges exchange frames via host+joiner
 # --------------------------------------------------------------------------- #
+def _run_dual_round(tag, loss, delay, dual_on, n_frames=300):
+    """Host + joiner on loopback with game relays, SEALED; the joiner's UDP
+    sends impaired (netsim) once the lobby has formed; ``n_frames`` frames each
+    way. With the TCP backup link every frame the joiner sends must reach the
+    host (UDP loses ~loss of them, the TCP copies cover); with it off the loss
+    shows. Prints the dual counters. Returns (ok, delivered fraction joiner->host)."""
+    HP, P1 = 29540, 29541
+    RELAY_HOST, RELAY_JOIN = 7793, 7794
+    LOCAL_HOST, LOCAL_JOIN = 7791, 7792
+    names = {"host": "alice", "j1": "bob"}
+    base = tempfile.mkdtemp(prefix="lobby_dual_")
+    ios = {k: LobbyIO(os.path.join(base, k)) for k in names}
+    if not dual_on:
+        for k in names:
+            with open(os.path.join(ios[k].dir, "tpf2mp_tcp_backup.txt"), "w") as f:
+                f.write("0\n")
+    stop = threading.Event()
+    conns, relays, standins = [], [], []
+    ok = True
+    KEY = derive_key(b"selftest-secret!"[:SECRET_LEN], "pw")
+    SEAL[0] = Sealer(KEY)
+
+    def frame(t, i):
+        head = t + struct.pack("!I", i)
+        return head + bytes((i * 7 + j) & 0xFF for j in range(900 - len(head)))
+
+    delivered = 0.0
+    try:
+        bridge_a = _open_loopback_udp(LOCAL_HOST)
+        bridge_b = _open_loopback_udp(LOCAL_JOIN)
+        standins += [bridge_a, bridge_b]
+        relay_h = GameRelay(RELAY_HOST, LOCAL_HOST, log=lambda _: None)
+        relay_j = GameRelay(RELAY_JOIN, LOCAL_JOIN, log=lambda _: None)
+        relays += [relay_h, relay_j]
+        hsock = open_socket(HP, socket.AF_INET)
+        threading.Thread(target=run_host, name="dual-host", args=(hsock, names["host"], ios["host"]),
+                         kwargs={"code": "DUALCODE", "stop": stop, "relay": relay_h}, daemon=True).start()
+        time.sleep(0.4)
+        conn = _dial_loopback(P1, HP, 10)
+        if not conn:
+            print(f"[dual:{tag}] FAIL: joiner could not connect")
+            return False, 0.0
+        conns.append(conn)
+        conn.cipher = Sealer(KEY)
+        sim = {"loss": 0.0, "delay": 0.0, "jitter": 0.0}      # impaired only once the lobby has formed
+        conn.sock = netsim.ImpairedSocket(conn.sock, sim)
+        impaired = conn.sock
+        dsock = _start_dual_client(conn, names["j1"], lambda _: None, sim) if dual_on else None
+        threading.Thread(target=run_client, name="dual-j1", args=(conn, names["j1"], ios["j1"]),
+                         kwargs={"stop": stop, "relay": relay_j}, daemon=True).start()
+
+        def both_joined():
+            for k in names:
+                r = _latest_roster(ios[k].out_path)
+                if not r or sorted(r.get("players", [])) != sorted(names.values()):
+                    return False
+            return True
+        if not _wait_until(both_joined, timeout=12):
+            print(f"[dual:{tag}] FAIL: lobby did not form")
+            return False, 0.0
+        if dual_on:
+            if not _wait_until(lambda: dsock.has_link(conn.peer) and DUAL[0] is not None and len(DUAL[0].links) > 0, timeout=15):
+                print(f"[dual:{tag}] FAIL: the TCP link did not come up (joiner {dsock.has_link(conn.peer)}, host {DUAL[0] and list(DUAL[0].links)})")
+                return False, 0.0
+        impaired.loss, impaired.delay = loss, delay
+        if delay and not impaired._pump_started:
+            impaired.start_pump()
+        if dsock is not None:
+            dsock.set_link_delay(delay)          # the TCP copies wait the same as the UDP ones
+        for i in range(n_frames):
+            bridge_a.sendto(frame(b"A", i), ("127.0.0.1", RELAY_HOST))
+            bridge_b.sendto(frame(b"B", i), ("127.0.0.1", RELAY_JOIN))
+            if i % 10 == 9:
+                time.sleep(0.005)
+        got = {b"A": set(), b"B": set()}
+        deadline = time.time() + 8.0
+        while time.time() < deadline and (len(got[b"A"]) < n_frames or len(got[b"B"]) < n_frames):
+            try:
+                ready, _, _ = select.select([bridge_a, bridge_b], [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            for s in ready:
+                for _ in range(GAME_RELAY_DRAIN):
+                    try:
+                        data, _src = s.recvfrom(65535)
+                    except (BlockingIOError, ConnectionResetError, OSError):
+                        break
+                    t = data[:1]
+                    if t in got and len(data) >= 5 and data == frame(t, struct.unpack("!I", data[1:5])[0]):
+                        got[t].add(struct.unpack("!I", data[1:5])[0])
+        delivered = len(got[b"B"]) / n_frames
+        print(f"[dual:{tag}] host->joiner {len(got[b'A'])}/{n_frames}, joiner->host {len(got[b'B'])}/{n_frames} "
+              f"(joiner sends: {impaired.dropped} dropped, {impaired.delayed} delayed)")
+        if len(got[b"A"]) != n_frames:
+            ok = False
+            print(f"[dual:{tag}] FAIL: host->joiner frames missing")
+        if dual_on:
+            host_dual = DUAL[0]
+            time.sleep(dual_tcp.AGE_OUT + 0.5)   # a copy that never came is counted after the age-out
+            host_dual.stats._last_log = 0.0
+            host_dual.tick({a: "bob" for a in host_dual.links})
+            for _a, p in host_dual.stats.peers.items():
+                print(f"[dual:{tag}] host counters: udp_first={p['udp_first']} tcp_first={p['tcp_first']} "
+                      f"tcp_only={p['tcp_only']} udp_only={p['udp_only']}; tcp later by {host_dual.stats._q(p['tcp_late'])}, "
+                      f"udp later by {host_dual.stats._q(p['udp_late'])}")
+            covered = sum(p["tcp_only"] for p in host_dual.stats.peers.values())
+            if len(got[b"B"]) != n_frames:
+                ok = False
+                print(f"[dual:{tag}] FAIL: with the TCP link every joiner frame must arrive")
+            if loss and covered < n_frames * loss * 0.5:
+                ok = False
+                print(f"[dual:{tag}] FAIL: expected the TCP copies to cover ~{loss:.0%} of {n_frames} frames, tcp_only={covered}")
+        elif loss and delivered > 1.0 - loss * 0.5:
+            ok = False
+            print(f"[dual:{tag}] FAIL: with the link off, {loss:.0%} loss should show; delivered {delivered:.0%}")
+    finally:
+        stop.set()
+        time.sleep(0.3)
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        for r in relays:
+            try:
+                r.close()
+            except Exception:
+                pass
+        for s in standins:
+            try:
+                s.close()
+            except Exception:
+                pass
+        SEAL[0] = None
+        shutil.rmtree(base, ignore_errors=True)
+    return ok, delivered
+
+
+def selftest_dual():
+    """The TCP backup link: a joiner losing 30% of its UDP sends (50 ms delay)
+    still gets every lockstep frame to the host; with the link off the loss shows."""
+    print("[selftest-dual] every sealed frame on UDP and a TCP link; first copy wins")
+    ok1, d1 = _run_dual_round("link-on-30pct-loss", 0.30, 0.05, True)
+    time.sleep(0.5)
+    ok2, d2 = _run_dual_round("link-off-30pct-loss", 0.30, 0.05, False)
+    print(f"[selftest-dual] joiner->host delivered: link on {d1:.0%}, link off {d2:.0%}")
+    allok = ok1 and ok2
+    print(f"[selftest-dual] {'PASS' if allok else 'FAIL'}")
+    return allok
+
+
 def selftest_relay():
     """1 host + 1 joiner on loopback, each with a game relay; two plain UDP
     sockets stand in for the two bridges (bound to the --game-local-ports).
@@ -6029,6 +6306,9 @@ def main(argv=None):
     ap.add_argument("--selftest-mesh", action="store_true",
                     help="run the mesh self-test (host + 3 joiners, two of "
                          "them directly linked, one relay-only) and exit")
+    ap.add_argument("--selftest-dual", action="store_true",
+                    help="run the TCP backup-link self-test (a joiner losing 30%% of its UDP "
+                         "sends still delivers every frame; the link off shows the loss)")
     ap.add_argument("--selftest-relay", action="store_true",
                     help="run the game-relay self-test (host + joiner, two "
                          "stand-in bridges, frames both ways) and exit")
@@ -6052,6 +6332,8 @@ def main(argv=None):
         return 0 if selftest_mods() else 1
     if args.selftest_relay:
         return 0 if selftest_relay() else 1
+    if args.selftest_dual:
+        return 0 if selftest_dual() else 1
     if args.selftest_mesh:
         return 0 if selftest_mesh() else 1
     if args.mode == "host":
