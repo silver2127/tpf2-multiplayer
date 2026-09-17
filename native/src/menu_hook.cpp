@@ -850,6 +850,7 @@ static char g_lobbyName[NAME_MAX] = ""; static int g_lobbyNameLen = 0;   // what
 static int  g_userLen = 0;
 static void ensureUsername();
 static void SaveNames();
+static bool IsGeneratedName(const char* n);   // one of ensureUsername's Adjective+Noun defaults
 // The player name follows the STEAM persona name (2026-09-16) unless the
 // player typed one. g_userAuto says which: auto names are re-read from Steam
 // every launch (the persona can change), a typed one is kept as typed. Clearing
@@ -898,6 +899,15 @@ static void LoadNames()
     fclose(f);
     // a file from before auto= existed holds a name the player kept: treat it as typed
     if (!sawAuto) g_userAuto = !sawPlayer;
+    // ...unless it is one of OUR random defaults (HappyDingo, DaringOcelot): nobody
+    // typed that. The first run of the Steam-name build found such a name in the
+    // file, called it typed, wrote auto=0, and the persona ("steam persona:
+    // ComradeSilver" in every log since) never replaced it on either rig
+    // instance (2026-09-17). A generated name is never a typed one.
+    if (sawPlayer && !g_userAuto && IsGeneratedName(g_username)) {
+        g_userAuto = true;
+        Log("[menu] names: %s is one of our random defaults, not a typed name -- following Steam\n", g_username);
+    }
     g_userLen = (int)strlen(g_username); g_lobbyNameLen = (int)strlen(g_lobbyName);
     Log("[menu] names: player=%s (%s) lobby=%s\n", g_username, g_userAuto ? "follows Steam" : "typed", g_lobbyName);
 }
@@ -2183,6 +2193,20 @@ static const char* const NAME_NOUN[] = {
     "Marmot","Newt","Ocelot","Puffin","Quail","Rabbit","Salmon","Toucan","Urchin","Viper",
     "Wombat","Yak","Zebra","Engine","Signal","Depot","Tender","Boxcar","Caboose","Tram",
     "Ferry","Barge","Trolley","Wagon","Piston","Rail","Switch","Girder","Trestle","Viaduct" };
+// Is this exactly one of the names ensureUsername makes up (an adjective from
+// NAME_ADJ followed by a noun from NAME_NOUN, nothing else)? Such a name was
+// never typed by the player, so it must not be kept over the Steam persona.
+static bool IsGeneratedName(const char* n)
+{
+    if (!n || !n[0]) return false;
+    for (size_t a = 0; a < sizeof(NAME_ADJ) / sizeof(NAME_ADJ[0]); a++) {
+        const size_t la = strlen(NAME_ADJ[a]);
+        if (strncmp(n, NAME_ADJ[a], la) != 0) continue;
+        for (size_t b = 0; b < sizeof(NAME_NOUN) / sizeof(NAME_NOUN[0]); b++)
+            if (strcmp(n + la, NAME_NOUN[b]) == 0) return true;
+    }
+    return false;
+}
 static void ensureUsername()
 {
     if (g_username[0]) return;
@@ -3849,7 +3873,8 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
                         g_userAuto = true;
                         if (g_steamName[0]) { strcpy_s(g_username, g_steamName); g_userLen = (int)strlen(g_username); } else ensureUsername();
                         Log("[menu] username cleared -> follows Steam (%s)\n", g_username);
-                    } else g_userAuto = strcmp(g_username, g_steamName) == 0;   // typed back exactly the Steam name: still follows it
+                    } else g_userAuto = strcmp(g_username, g_steamName) == 0    // typed back exactly the Steam name: still follows it
+                                        || IsGeneratedName(g_username);          // Enter on an untouched random default: not a typed name either
                 }
                 InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
             else { char c = vkToChar((int)vk, shift);
