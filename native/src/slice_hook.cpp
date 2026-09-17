@@ -6226,17 +6226,17 @@ static int IconCompanyOfPid(int pid)
     return 0;
 }
 
-// The company's colour, 0..1 RGB -- the six fixed lobby-chip colours and the
+// The company's colour, 0..1 RGB -- the 20 distinct lobby-chip colours (Trubetskoy) and the
 // golden-angle hue walk, byte-for-byte the menu's coColor / companies.lua
 // CM.cmCompanyColor, so an icon matches its roster chip.
 static void IconCompanyColor(int cid, float out[3])
 {
-    static const int first[6][3] = { {220,80,80}, {80,140,230}, {90,190,110}, {230,180,60}, {180,100,220}, {80,200,200} };
-    if (cid >= 1 && cid <= 6) {
+    static const int first[20][3] = { {230,25,75}, {0,130,200}, {60,180,75}, {245,130,48}, {145,30,180}, {70,240,240}, {240,50,230}, {255,225,25}, {0,128,128}, {170,110,40}, {210,245,60}, {128,0,0}, {0,0,128}, {128,128,0}, {250,190,212}, {220,190,255}, {170,255,195}, {255,215,180}, {128,128,128}, {255,250,200} };
+    if (cid >= 1 && cid <= 20) {
         out[0] = first[cid - 1][0] / 255.0f; out[1] = first[cid - 1][1] / 255.0f; out[2] = first[cid - 1][2] / 255.0f;
         return;
     }
-    double hd = ((cid - 7) * 137.508);
+    double hd = ((cid - 21) * 137.508);
     float h = (float)(hd - (int)(hd / 360.0) * 360.0);
     if (h < 0) h += 360.0f;
     const float sat = 0.62f, val = 0.85f, c = val * sat;

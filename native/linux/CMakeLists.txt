@@ -196,6 +196,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_boot_format_passthrough PRIVATE ${CMAKE_DL_LIBS})
   find_package(Python3 COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME palette_sync COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/palette_sync_test.py")
     add_test(NAME boot_format_passthrough COMMAND "${Python3_EXECUTABLE}"
              "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/linux/test_boot_format.py"
              --boot $<TARGET_FILE:tpf2mp_boot> --probe $<TARGET_FILE:test_boot_format_passthrough>)

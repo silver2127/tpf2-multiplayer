@@ -351,12 +351,12 @@ static void MwStatus(int w, int h)
     layer::Text(S(25), h - S(34), w - S(50), S(24), P().status.c_str(), S(12), MW_DIM, layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
 }
 
-// Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
+// Company chips: 20 Trubetskoy colours, then the shared golden-angle hue walk.
 static Rgb CoColor(int cid)
 {
-    static const Rgb first[6] = { rgb(220, 80, 80), rgb(80, 140, 230), rgb(90, 190, 110), rgb(230, 180, 60), rgb(180, 100, 220), rgb(80, 200, 200) };
-    if (cid >= 1 && cid <= 6) return first[cid - 1];
-    const float h = (float)(((cid - 7) * 137.508) - (int)(((cid - 7) * 137.508) / 360.0) * 360.0);
+    static const Rgb first[20] = { rgb(230,25,75), rgb(0,130,200), rgb(60,180,75), rgb(245,130,48), rgb(145,30,180), rgb(70,240,240), rgb(240,50,230), rgb(255,225,25), rgb(0,128,128), rgb(170,110,40), rgb(210,245,60), rgb(128,0,0), rgb(0,0,128), rgb(128,128,0), rgb(250,190,212), rgb(220,190,255), rgb(170,255,195), rgb(255,215,180), rgb(128,128,128), rgb(255,250,200) };
+    if (cid >= 1 && cid <= 20) return first[cid - 1];
+    const float h = (float)(((cid - 21) * 137.508) - (int)(((cid - 21) * 137.508) / 360.0) * 360.0);
     const float sat = 0.62f, val = 0.85f, c = val * sat, x = c * (1.f - std::fabs(std::fmod(h / 60.f, 2.f) - 1.f)), m = val - c;
     float r, g, b;
     if (h < 60) { r = c; g = x; b = 0; } else if (h < 120) { r = x; g = c; b = 0; } else if (h < 180) { r = 0; g = c; b = x; }
