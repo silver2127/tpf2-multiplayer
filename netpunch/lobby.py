@@ -2551,10 +2551,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return sorted(p["name"] for p in peers.values())
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
+    def host_has_world():
+        """The host's game is in a world: the native adapter's status file
+        (written by the game itself, PID-scoped) says has_world=1. `started`
+        only latches after a START GAME or a save share, so a host that loaded
+        its world on its own and then got a joiner read as "not started" -- the
+        joiner was not late, no frozen join ran, and the menu's autosave path
+        served it while the world kept ticking (2026-09-17 00:05)."""
+        return sync_runtime is not None and sync_runtime._read('tpf2_native_status.txt').get('has_world') == '1'
+
     def recovery_supported():
         return (sync_runtime is not None and not relay_only and len(peers) >= 1
                 and all(p.get("recovery") == 4 for p in peers.values())
-                and started[0] and transfer[0] is None)
+                and (started[0] or host_has_world()) and transfer[0] is None)
 
     def recovery_unavailable_reason():
         if not peers:
@@ -2864,9 +2873,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                            "links": [], "mesh": bool(is_mesh),
                            "company": company}
             remember_chip(assigned, company)
-            late = started[0]
+            late = started[0] or host_has_world()
             log(f"[host] JOIN {addr} as {assigned!r}"
-                + (" (late -- game already started)" if late else ""))
+                + (" (late -- game already started)" if started[0] else " (late -- the host is in a world)" if late else ""))
         peers[addr]["last"] = time.time()
         peers[addr]["recovery"] = recovery_protocol
         # FROZEN JOIN (2026-09-16): a late joiner in a player-hosted session is
