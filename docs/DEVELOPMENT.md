@@ -186,9 +186,11 @@ pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compare
 3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
    `TpF2Multiplayer.msi`, `TpF2Multiplayer-update.zip` (the in-game updater's payload),
    `TpF2Multiplayer-files.zip` (the MSI's files as an archive: Proton and manual installs), a
-   `SHA256SUMS.txt` listing them, and `tools/proton/install.py` uploaded as `install_proton.py` with its
+   `SHA256SUMS.txt` listing them, `tools/proton/install.py` uploaded as `install_proton.py` with its
    `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release page
-   installs that release). `build_msi.ps1` repairs the lobby for Wine before packaging
+   installs that release), and `tools/proton/install_proton.sh` uploaded as `install_proton.sh` with its
+   `DEFAULT_VERSION=""` line set the same way (the no-Python installer; `tools/proton/test_install_sh.py`
+   tests it offline). `build_msi.ps1` repairs the lobby for Wine before packaging
    ([proton/INSTALL.md](proton/INSTALL.md)).
 4. If the lobby changed, redeploy the relay with `sh tools/relay_deploy.sh` (it refuses while players are
    connected) and the master server with `sh tools/masterserver_deploy.sh`

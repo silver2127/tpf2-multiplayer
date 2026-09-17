@@ -11,7 +11,7 @@ Windows (Steam, game build 35924)
 
 Linux and Steam Deck (the Windows game under Proton)
 1. In Steam, set Transport Fever 2 to run with Proton (Properties → Compatibility; Proton 9 or newer), start it once and quit.
-2. Download `install_proton.py` below, close the game, and run `python3 install_proton.py` (Python 3.9 or newer). It finds Steam, the game and the Proton prefix, downloads `TpF2Multiplayer-files.zip` from this release, checks it against `SHA256SUMS.txt` and installs. `--dry-run` shows the plan first.
+2. Download `install_proton.sh` below, close the game, and run `sh install_proton.sh`. It finds Steam, the game and the Proton prefix, downloads `TpF2Multiplayer-files.zip` from this release, checks it against `SHA256SUMS.txt` and installs; `--dry-run` shows the plan first. It needs only bash, curl, sha256sum and unzip. (`install_proton.py` does the same with Python 3.9 or newer: `python3 install_proton.py`.)
 3. Start the game: Main menu → Multiplayer. Full guide: docs/proton/INSTALL.md.
 
 Manual install (any platform): `TpF2Multiplayer-files.zip` holds the files in the game-folder layout.

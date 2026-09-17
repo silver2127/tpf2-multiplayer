@@ -1,9 +1,10 @@
 # Linux and Steam Deck: the Windows game under Proton
 
-`tools/proton/install.py` installs TpF2 Multiplayer into Transport Fever 2 when
-Steam runs the Windows game through Proton. It installs the same files as the
-Windows MSI and needs only Python 3.9 or newer. Every release page carries a
-copy of it as `install_proton.py`.
+`tools/proton/install_proton.sh` (a shell script: bash, curl, sha256sum, unzip)
+and `tools/proton/install.py` (Python 3.9 or newer) install TpF2 Multiplayer into
+Transport Fever 2 when Steam runs the Windows game through Proton. Both install
+the same files as the Windows MSI. Every release page carries copies of them as
+`install_proton.sh` and `install_proton.py`.
 
 The multiplayer mod is Windows code; under Proton it runs unchanged. The
 separate native Linux build (branch `linux-native`, releases tagged
@@ -16,13 +17,19 @@ separate native Linux build (branch `linux-native`, releases tagged
    newer; Proton 11 is what this was tested with), and let Steam download the
    Windows game.
 2. Start the game once and quit, so Proton creates its prefix.
-3. Download `install_proton.py` from the
+3. Download `install_proton.sh` from the
    [release](https://github.com/silver2127/tpf2-multiplayer/releases) you want,
    close the game, and run:
 
    ```sh
-   python3 install_proton.py
+   sh install_proton.sh
    ```
+
+   It needs only bash, curl, sha256sum and unzip (or bsdtar), which every Linux
+   desktop and the Steam Deck have. `install_proton.py` on the same release page
+   does the same with Python 3.9 or newer (`python3 install_proton.py`), and can
+   additionally repair a lobby executable from a release before 0.6 and check an
+   installation (`--verify`). Both take the options below.
 
    It finds Steam, the game and the Proton prefix (native, Snap and Flatpak
    Steam, every library in `libraryfolders.vdf`, SD cards included), downloads that

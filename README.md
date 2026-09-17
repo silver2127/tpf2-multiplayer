@@ -38,8 +38,8 @@ to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
 [installer/README.md](installer/README.md).
 
-**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.py` from the same release and run
-`python3 install_proton.py`; it installs the same files into the Proton game. Details, including the lobby
+**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.sh` from the same release and run
+`sh install_proton.sh` (no Python needed; `install_proton.py` is the Python equivalent); it installs the same files into the Proton game. Details, including the lobby
 repair Wine needs: [docs/proton/INSTALL.md](docs/proton/INSTALL.md). The native Linux game has its own
 build on the `linux-native` branch.
 
