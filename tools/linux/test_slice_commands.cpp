@@ -14,8 +14,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include "../../native/linux/src/slice/ecs_checks_linux.h"
 #include "../../native/linux/src/slice/slice_vehicles.cpp"
 #include "../../native/linux/src/slice/slice_lines.cpp"
 #include "../../native/linux/src/slice/slice_time.cpp"
@@ -125,6 +127,59 @@ bool SliceShipAndArm(const SliceFactoryCall& c,const SliceArm& a,const SliceReco
     }
     return false;
 }
+
+
+// A minimal ecs engine for the company-rename branch: the type-index lookup the
+// walk calls lives at its own RVA, so the image is a private reservation with
+// just that page executable. Layout as gdb found it in the running game
+// (docs/re/linux/DEV_D6DB920F.md): engine+0x80 pools, engine+0x98 records.
+static uint8_t* fakeImage;
+static uint64_t fakePlayerNode[4];
+static uintptr_t FakeTypeFind(void*, const uintptr_t* ti)
+{
+    return *ti == uintptr_t(fakeImage) + SLICE_TI_PLAYER ? uintptr_t(fakePlayerNode) : 0;
+}
+struct FakeCompanyEngine {
+    static constexpr int kPlayerType = 18;
+    uint8_t engine[0x200]{};
+    uintptr_t pools[64]{};
+    struct Record { uintptr_t begin, end, cap; } records[16]{};
+    int32_t pairs[2];
+    uintptr_t address;
+    explicit FakeCompanyEngine(int32_t company)
+    {
+        const size_t span = 0x6000000;
+        fakeImage = static_cast<uint8_t*>(mmap(nullptr, span, PROT_NONE,
+            MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0));
+        assert(fakeImage != MAP_FAILED);
+        uint8_t* at = fakeImage + (SLICE_RVA_TYPE_FIND & ~uintptr_t(0xfff));
+        assert(mprotect(at, 0x2000, PROT_READ|PROT_WRITE) == 0);
+        uint8_t code[12]={0x48,0xB8,0,0,0,0,0,0,0,0,0xFF,0xE0};   // mov rax,imm64; jmp rax
+        const uintptr_t target = uintptr_t(&FakeTypeFind);
+        std::memcpy(code+2,&target,8);
+        std::memcpy(fakeImage+SLICE_RVA_TYPE_FIND,code,sizeof(code));
+        assert(mprotect(at, 0x2000, PROT_READ|PROT_EXEC) == 0);
+        at = fakeImage + (SLICE_TI_PLAYER & ~uintptr_t(0xfff));
+        assert(mprotect(at, 0x1000, PROT_READ|PROT_WRITE) == 0);
+        fakePlayerNode[2] = kPlayerType + 1;      // node+0x10 = index + 1
+        pairs[0] = kPlayerType; pairs[1] = 0;
+        assert(company >= 0 && company < 16);
+        records[company] = {uintptr_t(pairs), uintptr_t(pairs)+sizeof(pairs), uintptr_t(pairs)+sizeof(pairs)};
+        const uintptr_t p = uintptr_t(pools), r = uintptr_t(records);
+        std::memcpy(engine+0x80,&p,8);
+        std::memcpy(engine+0x98,&r,8);
+        address = uintptr_t(engine);
+        for (const auto& check : kEcsChecks) {
+            uint8_t* page = fakeImage + (check.rva & ~uintptr_t(0xfff));
+            assert(mprotect(page, ((check.rva & 0xfff) + check.size + 0xfff) & ~size_t(0xfff),
+                            PROT_READ|PROT_WRITE) == 0);
+            std::memcpy(fakeImage + check.rva, check.bytes, check.size);
+        }
+        SliceEcsSetBase(uintptr_t(fakeImage));
+        assert(SliceEcsAnchored(uintptr_t(fakeImage)));
+    }
+    void Release() { SliceEcsSetBase(0); munmap(fakeImage, 0x6000000); fakeImage=nullptr; }
+};
 
 static SliceFactoryCall Call(uintptr_t rva, uintptr_t ret = 1)
 {
@@ -282,8 +337,34 @@ static void TestLines()
     c=Call(slice_lines::kUpdate,0x132c513);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);fn[3]=0;
     assert(!Add(fn));assert(writes.empty());
     std::string name="Coal 50%=\xc3\xa9";
+    // A plain entity: no Player component, so the rename still has no origin
+    // replay and stays blocked (no engine is set up yet either).
     c=Call(slice_lines::kName);c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
     assert(!armed && writes.empty());
+    // The game's company window: entity 7 carries a Player component, so the
+    // rename ships as VNAME and the shared Lua turns it into CMNAME.
+    FakeCompanyEngine engine(7);
+    c=Call(slice_lines::kName);c.rdx=7;c.rsi=engine.address;c.rcx=uintptr_t(&name);Capture(c);
+    assert(armed && arm.done==SliceDone::Never);
+    assert(Add());
+    // the cancelled click is shipped as one armed record, percent-encoded so the
+    // space, the '%' and the '=' survive the whitespace-split wire
+    // one armed record, percent-encoded so the space, the '%' and the '=' all
+    // survive a wire that splits on whitespace
+    assert(writes.size()==1 && writes[0].rfind("ARMED ",0)==0);
+    {
+        const std::string tail="VNAME 7 Coal%2050%25%3D%C3%A9\n";
+        assert(writes[0].size()>=tail.size() &&
+               writes[0].compare(writes[0].size()-tail.size(),tail.size(),tail)==0);
+    }
+    // A different entity in the same world has no Player component.
+    c=Call(slice_lines::kName);c.rdx=9;c.rsi=engine.address;c.rcx=uintptr_t(&name);Capture(c);
+    assert(!armed && writes.empty());
+    // An empty name cannot travel: the Lua's VNAME parser needs a third token.
+    std::string empty;
+    c=Call(slice_lines::kName);c.rdx=7;c.rsi=engine.address;c.rcx=uintptr_t(&empty);Capture(c);
+    assert(!armed && writes.empty());
+    engine.Release();
     c=Call(slice_lines::kColor);c.rdx=7;c.xmm[0]=_mm_setr_ps(.25f,.5f,99,99);c.xmm[1]=_mm_setr_ps(.75f,99,99,99);Capture(c);
     assert(!armed && writes.empty());
     c=Call(slice_lines::kCreate);Capture(c);assert(!armed && writes.empty());

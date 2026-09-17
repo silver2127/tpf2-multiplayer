@@ -18,6 +18,7 @@
 // being UI and script code).
 #include "slice_core_internal.h"
 #include "train_order_linux.h"
+#include "company_tint_linux.h"
 #include "movement_linux.h"
 #include "../datadir_linux.h"
 #include "../game_image.h"
@@ -115,6 +116,7 @@ static void InitThread()
         sleep(15);
         SliceCoreLogAlive();
         SliceTrainOrderLogAlive();
+        SliceCompanyTintLogAlive();
     }
 }
 

@@ -68,3 +68,179 @@ instructions). A global Windows-style entity cache is not justified by this
 inlined/looped Linux structure. No guessed address, offset, ABI or patch is
 introduced. Native tinting and glyph counters remain unavailable; shared
 selectors cannot apply themselves. Existing visibility hooks stay intact.
+
+---
+
+# 2026-09-17 revisit: settled in the running game
+
+The sections above are the static-only record. This one supersedes their
+"Decision and missing evidence": the open contracts were closed in the lab
+game with gdb, and the tint now ships
+(`native/linux/src/slice/company_tint_linux.cpp`).
+
+## How the game was driven
+
+There is no input automation on this desktop, so the game was steered through
+the mod's own autoload. First `MenuGame_RequestAutoload` was called through
+gdb; that worked twice and then crashed the game twice (crash dumps 16:26:47
+and 16:35:08), because gdb runs an inferior call on whichever thread it
+stopped, and a save name longer than a `std::string`'s local buffer makes that
+call allocate. It was replaced by pure memory writes into the mod's own
+`AL()` state and `g_alPending`
+(`meta/live/request_load.py` in the job directory): no code runs while the
+game is stopped, and the load then happens on the game's own menu frame.
+Save: "Ordering desync Sep15", copied to the short name "Stations".
+
+## The engine and the entity (0x1090250)
+
+Breakpoint at the `StationItem` constructor entry, before the prologue:
+
+```
+CTOR #1 entity=28301 enginePtr=0x5730bf82ef80 ret=0x5730af4c70ba
+ENGINE: EnginePtr=0x5730bf82ef80 -> engine=0x74138b5cc760
+```
+
+`rsi` is the `UI::EnginePtr` and `r9d` the entity, exactly as the prologue's
+`mov [rbp-0xa8],rsi` / `mov [rbp-0xc4],r9d` suggested. The engine came from
+calling the game's own `0x146f0a0(&EnginePtr)` (`0x1477120(ptr)` then
+`[rax+0x28]`) on the saved slot.
+
+## Type indices (0x9e3d50)
+
+`0x9e3d50(engine+0x48, &type_info*)` returns a node whose `+0x10` holds
+index+1. Live, against the typeinfo objects located by their RTTI name
+strings:
+
+| component | typeinfo | index |
+| --- | --- | --- |
+| `ecs::component::Name` | 0x5a02600 | 19 |
+| `ecs::component::Player` | 0x5a025f0 | 18 |
+| `ecs::component::PlayerOwned` | 0x5a01c18 | 52 |
+| `ecs::component::Station` | 0x5a03488 | 53 |
+| `ecs::component::StationGroup` | 0x5a01b98 | 55 |
+| `ecs::component::Town` | 0x5a01b88 | 22 |
+
+0x5a02600 is the one `train_order_linux.cpp` already uses for Name, so the
+whole table is anchored on a value the port had verified before.
+
+## The owner: no StationGroup walk needed on Linux
+
+The icon entity's own component record (`engine+0x98`, 24 bytes per entity, a
+`std::vector` of 8-byte (type, slot) pairs) read:
+
+```
+entity 28301 components: [(55, 1), (19, 1344), (52, 7), (0, 23979), (9, 305)]
+```
+
+That is StationGroup **and** PlayerOwned on the same entity -- the thing the
+Windows note said was absent there (`0x472900` returns null for a group on
+Windows, which is why `db8a477` added the group -> stations[0] walk). Reading
+PlayerOwned slot 7:
+
+```
+  PlayerOwned slot=7
+    stride 4 -> comp 0x7412f8e6ae8c  first int32 = 19427
+    ALL PlayerOwned int32 entries (stride 4): [19427 x 14]
+    owner candidate entity 19427: Player=True name='ComradeSilver Transport'
+  StationGroup slot=1 comp=0x7412f91abdb8 vector 0x7412f91e07c0..0x7412f91e07c4 -> stations [28300]
+    station 28300 PlayerOwned slot=6 value=19427
+  station-group name: "Dinnington St John's Modular terminal #2"
+```
+
+So both routes agree on owner 19427, and that entity carries a `Player`
+component and the company's name. The group walk is kept as a fallback only.
+
+## The pool layout and the strides
+
+Live, per component pool (`engine+0x80` is the pool table):
+
+```
+  Name          ti=19  count@0xb0=1979  data=0x7412f8d00a80..0x7412f8d0b700  pages=0
+  PlayerOwned   ti=52  count@0xb0=14    data=0x7412f8e6ae70..0x7412f8e6aea8  pages=0
+  StationGroup  ti=55  count@0xb0=2     data=0x7412f91abda0..0x7412f91abdd0  pages=0
+  Player        ti=18  count@0xb0=1     data=0x7412f8d12290..0x7412f8d122b8  pages=0
+```
+
+`+0xb8`/`+0xc0` are the component vector's begin/end and `+0xd0` the page
+table -- the same fields `NameComponent` already used, plus the end pointer,
+which the tint uses as a bound so a stale slot cannot read past the vector.
+`+0xb0` is *not* a reliable element count (for Name it moved by 22 while the
+vector grew by one 32-byte element between two probe runs), so nothing derives
+a stride from it.
+
+The strides are fixed statically instead, by the engine's own PlayerOwned read
+inside the function the port already patches for `showicons`
+(0x138ba89..0x138bacd):
+
+```
+138baa1: call 9e5590                 ; GetComponentDataIndex(engine, &entity, type)
+138baa6: mov rdx,[r14+0x80]          ; pools
+138baad: movsxd rcx,r13d             ; the PlayerOwned type index, cached at [rbx+0x190]
+138bab0: mov rcx,[rdx+rcx*8]         ; pool
+138bab4: cmp eax,0x3fffffff ; jg     ; paged?
+138babb: mov rdx,[rcx+0xb8]          ; flat data
+138bac4: lea rax,[rdx+rax*4]         ; STRIDE 4
+138bac8: mov eax,[rax]               ; the owner
+  paged: sub eax,0x40000000 ; and eax,0x1f ; sar edx,5 ; shl rdx,4
+         add rdx,[rcx+0xd0] ; mov rdx,[rdx] ; lea rax,[rdx+rax*4]   ; STRIDE 4
+```
+
+`StationGroup` is one `std::vector<ecs::Entity>`; 24 matches both the type and
+the live slot-1 address (`data + 24`).
+
+## Where the class goes
+
+`addStyleClass` 0x30550d0 disassembled in full: `rdi` = widget, `rsi` =
+`std::string*`; an empty string returns at 0x30550f7; the class list is
+`[widget+0xb0, widget+0xb8)` with capacity at `+0xc0`, 0x20 per string; a
+duplicate is dropped (`cmp rax,[rbx+0xb8] ; jne` at 0x305513c); otherwise the
+string is **moved** into the slot (local-buffer source handled at 0x30551d0),
+`+0xb8` advanced by 0x20 and the source cleared at 0x305519d. A class name
+`mpWinCo1..mpWinCo200` is at most 10 characters, so the string the tint passes
+is always local: nothing crosses between the game's allocator and ours.
+
+The entity for the element being styled is taken from the component lookup each
+path already performs:
+
+* stations: `call 0x109a8f0` at **0x10902e4** inside the constructor
+  (`rdi`=engine, `rsi`=&entity, `edx`=type), which covers the DoStep build and
+  the cargo-state rebuild alike, because both run this constructor;
+* depots: `call 0x9e5590` at **0x1095525** in `HudIconManager::DoStep`, where
+  0x1095505 copies the entity to `[rbp-0xe9c]` and 0x1095516 takes its address.
+
+Both are redirected with `Tpf2mpRedirectCall`, which refuses anything that is
+not that exact call. `tools/linux/verify_company_tint_elf.py` re-checks all
+eighteen sites against the ELF and proves no branch inside either icon function
+lands inside a redirected five-byte call.
+
+## Re-checking it
+
+`tools/linux/verify_company_tint_elf.py <TransportFever2>` re-derives all of
+the above from the shipped ELF: the build-id, every byte anchor as a whole
+number of instructions, the 11+5 `addStyleClass` calls and the two context
+calls resolved by disassembly, that no branch inside either icon function lands
+inside a redirected five-byte call, and the RTTI names behind the three
+typeinfo pointers.
+
+## Installed, live
+
+```
+[stationicon] installed: 11 of 11 station and 5 of 5 depot carrier-class calls
+              redirected; class prefix mpWinCo
+```
+
+## Lab note
+
+Two host problems had to be worked around, neither in the port:
+
+* AppArmor `apparmor_restrict_unprivileged_userns=1` lets only profiled
+  `/usr/bin/bwrap` create a user namespace, and a nested one is refused
+  (`bwrap//&unpriv_bwrap` has no `allow userns`), so the lab's inner
+  pressure-vessel layer cannot start. The job's copy of `tpf2mp-lab` runs the
+  native game directly inside the outer bwrap, which is the layer that provides
+  the isolation. No host policy was changed.
+* Part-way through the session the NVIDIA modeset device stopped accepting new
+  clients: every launch blocked forever in `nvkms_open_common` opening
+  `/dev/nvidia-modeset`, with `dmesg` repeating "GPU:0: Error while waiting for
+  GPU progress" (which had started before this session). Restricting the Vulkan
+  loader to Mesa's lavapipe got the game running again.

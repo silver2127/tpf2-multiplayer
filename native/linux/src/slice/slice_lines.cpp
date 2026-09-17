@@ -1,5 +1,6 @@
 // Linux build 35924: layouts/callback policies from docs/re/linux/SLICE_LINES.md.
 #include "slice_core.h"
+#include "ecs_linux.h"
 #include <vector>
 #include <cmath>
 #include <cerrno>
@@ -18,6 +19,21 @@
 namespace slice_lines {
 constexpr uintptr_t kSet = 0x15ed550, kCreate = 0x15efda0, kUpdate = 0x15f0050;
 constexpr uintptr_t kDelete = 0x15ebd00, kColor = 0x15ecb40, kName = 0x15ee6d0;
+
+// Byte-for-byte native/src/slice_hook.cpp's encoder: the wire splits records on
+// whitespace, and a company is called "Ferrovie dello Stato". '%' and '=' are
+// escaped too, so the encoding round-trips and never collides with a key=value.
+std::string PercentEncode(const std::string& s)
+{
+    std::string enc;
+    enc.reserve(s.size() * 3);
+    for (size_t i = 0; i < s.size(); i++) {
+        const unsigned char ch = (unsigned char)s[i];
+        if (ch > 32 && ch < 127 && ch != '%' && ch != '=') enc.push_back((char)ch);
+        else { char h[4]; snprintf(h, sizeof(h), "%%%02X", ch); enc.append(h, 3); }
+    }
+    return enc;
+}
 
 // Layouts rechecked against build 35924; see SLICE_LINES.md. No game-size
 // policy limits: only vector structure/readability, valid IDs/mode and non-NaN waits.
@@ -391,13 +407,37 @@ static void OnFactory(const SliceFactoryCall& c, void*)
             what = "LDELETE"; cancel = true;
             SliceRecordPrintf(&rec, "LDELETE %d", entity);
             break;
-        case kColor: case kName:
+        case kName: {
+            // THE COMPANY WINDOW'S RENAME (Windows 2a87bb4's Linux half).
+            // A VNAME whose entity is a company -- an entity with a Player
+            // component -- is turned into CMNAME by the shared inject.lua, and
+            // CMNAME renames the company on EVERY peer, the originator
+            // included. So a cancelled click is not lost here the way a
+            // vehicle's or a line's rename would be, and the barrier's replay
+            // adapter is not needed. Everything else keeps the old refusal.
+            // rsi = the engine and rdx = the entity at this factory: watched
+            // under gdb in the lab (entity 19427, Player yes, PlayerOwned no).
+            if (!SliceEcsIsCompany(c.rsi, entity)) {
+                SliceLog("[slice-lines] VNAME blocked for entity %d: not a company, and unchanged "
+                         "0.4.22 Lua skips origin replay\n", entity);
+                return;
+            }
+            std::string name;
+            if (!SliceReadStdString(c.rcx, &name) || name.empty()) {
+                SliceLog("[slice-lines] VNAME for company %d: the name did not read, or is "
+                         "empty -- not shipped\n", entity);
+                return;
+            }
+            what = "VNAME"; cancel = true;
+            SliceRecordPrintf(&rec, "VNAME %d %s", entity, PercentEncode(name).c_str());
+            break;
+        }
+        case kColor:
             // Unchanged Windows 0.4.22 Lua unconditionally sets skipOrigin=1
             // for these records. Shipping a cancelled click would apply only
             // on peers. The central player barrier blocks it until a native
             // origin replay adapter is available; script replays pass above.
-            SliceLog("[slice-lines] %s blocked: unchanged 0.4.22 Lua skips origin replay\n",
-                     c.factory->rva == kColor ? "VCOLOR" : "VNAME");
+            SliceLog("[slice-lines] VCOLOR blocked: unchanged 0.4.22 Lua skips origin replay\n");
             return;
         default: return;
     }

@@ -7,6 +7,8 @@
 #include "../codewrite_linux.h"
 #include "train_order_checks.h"
 #include "train_order_linux.h"
+#include "company_tint_linux.h"
+#include "ecs_linux.h"
 #include "slice_core.h"
 #include "hook.h"
 #include "../near_alloc.h"
@@ -336,6 +338,12 @@ template<size_t N> bool ApplyUiPatches(uintptr_t base,const UiPatch (&patches)[N
 bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
 {
     bool ok=true;
+    // The engine walk first, and unconditionally: slice-lines needs it for the
+    // company rename even when the icon tint is switched off.
+    SliceEcsSetBase(base);
+    if (!SliceEcsAnchored(base))
+        SliceLog("[company-ui] the engine's component walk is unavailable on this image: "
+                 "the icon tint and the company rename stay off\n");
     if (!FlagOff(root,data,"showicons")) {
         const bool ready=Check(base,kIconChecks) && ApplyUiPatches(base,iconPatches);
         SliceLog("[showicons] %s: four Linux owner branches\n",ready ? "installed" : "OFF");
@@ -346,8 +354,15 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
         SliceLog("[foreignwindows] %s: native command barrier and Lua foreign edit guard retained\n",ready ? "installed" : "OFF");
         ok &= ready;
     }
-    // No guessed render ABI or MSVC string crosses into the Linux engine.
-    SliceLog("[company-ui] iconcolor/windowcolor/stationicon unavailable: Linux tint ABI not established\n");
+    // The HUD icon tint is native: the Linux addStyleClass contract and the
+    // non-asserting owner walk were settled in the running game (see
+    // company_tint_linux.cpp and docs/re/linux/DEV_D6DB920F.md).
+    // Not folded into `ok`: the tint is cosmetic, and a refusal here must not
+    // take multiplayer startup with it the way a failed permission patch does.
+    SliceInstallCompanyTint(base, root, data);
+    // Still unavailable: the vehicle-icon RGBA draw (iconcolor) and the entity
+    // window wash (windowcolor) -- neither Linux ABI is established.
+    SliceLog("[company-ui] iconcolor/windowcolor unavailable: Linux tint ABI not established\n");
     return ok;
 }
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)

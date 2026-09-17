@@ -62,7 +62,8 @@ add_library(tpf2_slice SHARED src/slice/slice_core.cpp src/slice/slice_install.c
             src/slice/slice_core_main.cpp src/hook_posix.cpp src/slice/slice_vehicles.cpp
             src/slice/slice_lines.cpp src/slice/slice_time.cpp src/slice/slice_proposal.cpp
             src/slice/slice_construction.cpp src/slice/slice_construction_merge.cpp src/slice/slice_terrain_assets.cpp
-            src/slice/slice_terrain_codec.cpp src/slice/train_order_linux.cpp src/slice/movement_linux.cpp)
+            src/slice/slice_terrain_codec.cpp src/slice/train_order_linux.cpp src/slice/movement_linux.cpp
+            src/slice/company_tint_linux.cpp src/slice/ecs_linux.cpp)
 set_target_properties(tpf2_slice PROPERTIES PREFIX "")
 target_include_directories(tpf2_slice PRIVATE ../src src)
 # The recursion guard in slice_install.cpp compares frame addresses.
@@ -269,8 +270,10 @@ if(BUILD_TESTING)
   target_compile_options(test_ordering_foreign_unwind PRIVATE -UNDEBUG -Werror -fno-omit-frame-pointer)
   target_link_libraries(test_ordering_foreign_unwind PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME ordering_foreign_unwind COMMAND test_ordering_foreign_unwind $<TARGET_FILE:person_map_foreign_game>)
-  add_executable(test_slice_commands ../../tools/linux/test_slice_commands.cpp)
+  add_executable(test_slice_commands ../../tools/linux/test_slice_commands.cpp
+                 src/slice/ecs_linux.cpp)
   target_compile_options(test_slice_commands PRIVATE -UNDEBUG -Werror -fno-omit-frame-pointer)
+  target_include_directories(test_slice_commands PRIVATE ../src src)
   target_link_libraries(test_slice_commands PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/slice-command-data")
   add_test(NAME slice_commands COMMAND test_slice_commands $<TARGET_FILE:slice_test_foreign>
@@ -318,6 +321,13 @@ if(BUILD_TESTING)
   add_executable(test_train_order ../../tools/trainorder_test.cpp)
   target_compile_options(test_train_order PRIVATE -UNDEBUG)
   add_test(NAME train_order COMMAND test_train_order)
+  add_executable(test_company_tint tests/company_tint_test.cpp src/slice/slice_core.cpp
+                 src/slice/ecs_linux.cpp src/hook_posix.cpp)
+  target_include_directories(test_company_tint PRIVATE ../src src)
+  target_compile_options(test_company_tint PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+  target_link_options(test_company_tint PRIVATE -Wl,--gc-sections)
+  target_link_libraries(test_company_tint PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME company_tint COMMAND test_company_tint)
   add_executable(test_train_order_linux tests/train_order_linux_test.cpp src/slice/slice_core.cpp)
   target_include_directories(test_train_order_linux PRIVATE ../src src)
   target_compile_options(test_train_order_linux PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
