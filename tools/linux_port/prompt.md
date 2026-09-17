@@ -65,10 +65,21 @@ You may run the game -- only through the test lab, which has its own copies of t
   `~/.local/share/tpf2mp-lab/native/game/mods/mp_lockstep_1/`. Back both up first
   (`cp -a DIR DIR.before-port`) and restore them before you finish, whatever happened.
 - The desktop session is available (`DISPLAY`, `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` are set); the windows
-  appear on the laptop's screen. There is no input automation (no xdotool; Wayland), so drive the game through
-  what exists: the menu flags file (`autoload=1`; `docs/linux/MENU_LOBBY.md`), the profile's last game, the
-  lobby programs (`netpunch/lobby.py host|join`), the mod's file-driven controls and its status files under
-  the actor's `share/tpf2mp/data/`, and saves you prepare in the actor's userdata.
+  appear on the laptop's screen. Drive the game through what exists first: the menu flags file (`autoload=1`;
+  `docs/linux/MENU_LOBBY.md`), the profile's last game, the lobby programs (`netpunch/lobby.py host|join`),
+  the mod's file-driven controls and its status files under the actor's `share/tpf2mp/data/`, and saves you
+  prepare in the actor's userdata.
+- **Clicking and typing are allowed (user, 2026-09-17): XTEST.** `libXtst` is installed; the game is an
+  XWayland window, so `XTestFakeMotionEvent` / `XTestFakeButtonEvent` / `XTestFakeKeyEvent` (ctypes, or
+  python-xlib if you install it under `~/.local`) drive it. It takes over the laptop's REAL pointer and
+  keyboard, so: check the desktop is idle first (`gdbus call --session --dest org.gnome.Mutter.IdleMonitor
+  --object-path /org/gnome/Mutter/IdleMonitor/Core --method org.gnome.Mutter.IdleMonitor.GetIdletime` >=
+  60000 ms) and abort a sequence the moment the pointer moves where you did not put it; raise and focus the
+  game window and verify the focus (`_NET_ACTIVE_WINDOW`) before every sequence; keep sequences short and
+  scripted (open a window, click a button, type a name, Escape) and grab the window before and after to see
+  what happened; never type outside the game window; put the pointer back where it was. With this you can
+  open entity windows (window wash), read station labels, rename a company in its window, buy vehicles,
+  build and play -- do, and observe the result on screen.
 - Live reverse engineering: `sudo gdb -p <pid>` on the lab game process (sudo is passwordless; ptrace_scope is
   1, so attaching needs it) -- breakpoints at the sites you located statically, registers, memory, backtraces
   -- to settle what the static work left open: entity/owner lookups, component presence, lifetimes, the ABI

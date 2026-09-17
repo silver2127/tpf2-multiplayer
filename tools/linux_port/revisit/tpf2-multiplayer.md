@@ -19,6 +19,10 @@ depot icons, vehicle icons, station labels and window washes on the Windows side
 world hash and vehicle positions staying locked; the dashboard's companies tab; names and colours. Every
 difference between the two windows on the same save is a porting gap; make the native side match.
 
+XTEST input is allowed since 2026-09-17 17:45 (see the prompt's Live testing): the window wash, the
+station-label tint and the click half of the rename are no longer blocked on "cannot click". The Proton
+actor accepts the same XTEST input, so a real two-player action (build on one, watch the other) is possible.
+
 ## The items
 
 Every item below was left unported by the static-only runs of 2026-09-16/17. Each has an integration record
