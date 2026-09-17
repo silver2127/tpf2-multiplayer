@@ -172,5 +172,23 @@ assert [(i.mnemonic, i.op_str) for i in vins[:3]] == [("mov", "rcx, qword ptr [r
 ds = list(md.disasm(code[0x5e2dc0 - base:0x5e4270 - base], 0x5e2dc0))
 assert any(i.mnemonic == "call" and i.op_str == "0x8b9e60" for i in ds), "DoStep no longer uses the EnginePtr accessor"
 
+# ---- the VehicleDepotItem constructor pre-hook: rcx is its EnginePtr (it hands &rcx-home to 0x8b9e60) ----
+dctor = const("RVA_DEPOTITEM_CTOR")
+dpro = byte_array("DEPOTITEM_CTOR_PROLOGUE")
+assert len(dpro) == 9 and pe.get_data(dctor, 9) == dpro, f"depot ctor prologue changed: {pe.get_data(dctor, 9).hex(' ')}"
+dins = list(md.disasm(dpro, dctor))
+assert [(i.mnemonic, i.op_str) for i in dins] == [("mov", "dword ptr [rsp + 0x10], edx"), ("mov", "qword ptr [rsp + 8], rcx")], [(i.mnemonic, i.op_str) for i in dins]
+head = list(md.disasm(pe.get_data(dctor, 0x48), dctor))
+ops = [(i.mnemonic, i.op_str) for i in head]
+assert ("lea", "rcx, [rbp + 0x67]") in ops and ("call", "0x8b9e60") in ops, "the depot ctor no longer resolves its engine from the rcx home slot"
+for i in range(len(code) - 5):
+    if code[i] in (0xE8, 0xE9):
+        t = base + i + 5 + struct.unpack_from("<i", code, i + 1)[0]
+        assert not (dctor < t < dctor + 9), f"rel32 at {base + i:x} into the depot ctor steal"
+for d in md.disasm(code[dctor - base:0x5e2dc0 - base], dctor):
+    if d.mnemonic.startswith("j") and d.operands and d.operands[0].type == X86_OP_IMM:
+        assert not (dctor < d.operands[0].imm < dctor + 9), f"branch into the depot ctor steal at {d.address:x}"
+assert "IconEngineNow()" in source and "g_uiEngine)" not in source.split("static int IconOwnerForEntity")[1].split("}")[0], "the owner lookup must not fall back to the cached engine"
+
 print(f"stationicon bytes: ok -- hook {hook:x} (mov rdi,rax/xor r12d), wrap-call -> 2251620, "
-      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites + post-attach hook + engine accessor ok")
+      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites + post-attach hook + engine accessor + depot ctor prologue ok")

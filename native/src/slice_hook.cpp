@@ -6412,11 +6412,13 @@ static void IconCompanyColor(int cid, float out[3])
 // value just yields no tint (the lookups are SEH-guarded).
 static volatile void*  g_uiEngine = nullptr;
 static volatile LONG   g_uiLocalPlayer = -1;
+static void IconEngineSeen(void* engine);   // STATION ICON COLOUR below: the engine of the item being built, with its time
+static uint8_t* IconEngineRecent(unsigned maxAgeMs);   // ...and that engine, if seen within maxAgeMs (never a dead world's)
 
 extern "C" const float* IconTintForEntity(void* engine, const int* entity, int local)
 {
     static float rgba[4];
-    if (engine) { g_uiEngine = engine; InterlockedExchange(&g_uiLocalPlayer, local); }
+    if (engine) { g_uiEngine = engine; IconEngineSeen(engine); InterlockedExchange(&g_uiLocalPlayer, local); }
     __try {
         typedef void* (*GetPlayerOwned)(void*, const int*);
         void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, entity);
@@ -6729,7 +6731,7 @@ extern "C" void WindowTint(void* window, int entity)
     InterlockedIncrement(&g_wcAsked);
     if (InterlockedIncrement(&g_wcSeen) <= 6) Log("[windowcolor] window bind for entity %d\n", entity);
     __try {
-        void* engine = (void*)g_uiEngine;
+        void* engine = IconEngineRecent(5000);
         if (!engine || !window) return;
         const int local = (int)InterlockedCompareExchange(&g_uiLocalPlayer, 0, 0);
         int ent = entity;
@@ -6848,20 +6850,42 @@ static const uint8_t* EcsComponentAt(uint8_t* world, int typeIdx, int slot, size
 // receives the UI::EnginePtr as its 2nd argument; the entry pre-hook records it
 // and the game's own accessor 0x8b9e60(&ptr) ((*ptr)->vslot1()->+0x28, what DoStep
 // itself uses before GetComponentDataIndex) yields the ecs engine from it.
-static void* volatile g_curIconEnginePtr = nullptr;          // set at the StationItem ctor entry (rdx)
+static void* volatile g_curIconEnginePtr = nullptr;          // set at the StationItem / VehicleDepotItem ctor entry (rdx / rcx)
 static const uintptr_t RVA_ENGINE_FROM_PTR = 0x8b9e60;       // engine* EngineFromPtr(const EnginePtr*)
-static int IconOwnerForEntity(int entity)
+// NEVER A CACHE ACROSS WORLDS (2026-09-17). A frozen join reloads the world in
+// place; the engine of the world before it is freed. g_uiEngine, cached by the
+// vehicle-icon draw, outlived it: the first HUD build of the new world walked
+// the dead engine (asked=60 direct=0 noOwner=0 in the crashed run) and on the
+// third reload both games crashed at the same second, in the load. So the
+// engine is derived from the constructor's OWN EnginePtr, inside that
+// constructor while the pointer is live (IconEngineNow), and remembered only
+// as "the engine of the item being built", with the time it was seen.
+static void* volatile g_curIconEngine = nullptr;
+static volatile LONGLONG g_curIconEngineAt = 0;
+static void IconEngineSeen(void* engine)
 {
-    uint8_t* engine = (uint8_t*)g_uiEngine;
-    if (!engine) {
-        void* ep = g_curIconEnginePtr;
-        if (ep) {
-            typedef void* (*EngineFromPtr)(void*);
-            engine = (uint8_t*)((EngineFromPtr)(g_base + RVA_ENGINE_FROM_PTR))(&ep);
-            if (engine) g_uiEngine = engine;
-        }
-        if (!engine) return -1;
-    }
+    if (!engine) return;
+    g_curIconEngine = engine;
+    g_curIconEngineAt = (LONGLONG)GetTickCount64();
+}
+static uint8_t* IconEngineNow()   // inside a constructor: its EnginePtr is live
+{
+    void* ep = g_curIconEnginePtr;
+    if (!ep) return nullptr;
+    typedef void* (*EngineFromPtr)(void*);
+    void* engine = ((EngineFromPtr)(g_base + RVA_ENGINE_FROM_PTR))(&ep);
+    IconEngineSeen(engine);
+    return (uint8_t*)engine;
+}
+static uint8_t* IconEngineRecent(unsigned maxAgeMs)   // the last engine seen, if seen recently enough
+{
+    void* e = g_curIconEngine;
+    if (!e || (LONGLONG)GetTickCount64() - g_curIconEngineAt > (LONGLONG)maxAgeMs) return nullptr;
+    return (uint8_t*)e;
+}
+static int IconOwnerForEntity(uint8_t* engine, int entity)
+{
+    if (!engine) return -1;
     int ent = entity;
     typedef void* (*GetPlayerOwned)(void*, const int*);
     void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &ent);
@@ -6902,7 +6926,7 @@ extern "C" void StationIconTint(void* component, int entity)
     InterlockedIncrement(&g_siAsked);
     __try {
         if (!component) return;
-        const int owner = IconOwnerForEntity(entity);
+        const int owner = IconOwnerForEntity(IconEngineRecent(2000), entity);   // this build's constructor derived it
         if (owner < 0) return;
         const int cid = IconCompanyOfPid(owner);
         if (cid <= 0) return;
@@ -6950,6 +6974,13 @@ static const uint8_t STNITEM_CTOR_PROLOGUE[15] = {
     0x48, 0x89, 0x50, 0x10               // mov [rax+0x10], rdx
 };
 static const uint32_t STNITEM_CTOR_ENTITY_ARG = 0x30;        // [rsp+0x30] at entry = the 6th argument, ecs::Entity
+// VehicleDepotItem(EnginePtr rcx, entity edx, int r8d, ...): it hands &rcx-home to
+// EngineFromPtr itself (lea rcx,[rbp+0x67]; call 0x8b9e60), so rcx IS the EnginePtr.
+static const uintptr_t RVA_DEPOTITEM_CTOR = 0x5e2b70;
+static const uint8_t DEPOTITEM_CTOR_PROLOGUE[9] = {
+    0x89, 0x54, 0x24, 0x10,              // mov [rsp+0x10], edx
+    0x48, 0x89, 0x4C, 0x24, 0x08         // mov [rsp+8], rcx
+};
 static const uintptr_t RVA_STNICON_CLASS_CALL  = 0x5e07f9;  // call 0x227a1e0 in StationItem (rcx = ::StationIcon)
 static const uintptr_t RVA_DEPOTICON_CLASS_CALL = 0x5e2d13; // call 0x227a1e0 in VehicleDepotItem (rcx = ::Icon)
 static const uint8_t STNICON_CLASS_EXPECT[5]   = { 0xE8, 0xE2, 0x99, 0xC9, 0x01 };
@@ -7014,7 +7045,7 @@ extern "C" void IconClassApply(void* comp, const void* cls)
     __try {
         const int entity = (int)InterlockedCompareExchange(&g_curIconEntity, 0, 0);
         if (entity < 0 || !comp) return;
-        const int owner = IconOwnerForEntity(entity);
+        const int owner = IconOwnerForEntity(IconEngineNow(), entity);      // the constructor's own EnginePtr, live now
         if (owner < 0) return;
         const int cid = IconCompanyOfPid(owner);
         if (cid <= 0) return;
@@ -7150,8 +7181,37 @@ static void InstallIconClassApply()
             }
         }
     }
-    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationItem ctor entry %s; post-attach restyle %s; StationIcon call %s, depot Icon call %s\n",
+    // the depot item constructor: rcx = EnginePtr, edx = entity (steal 9, no relative operands)
+    bool s5 = false;
+    if (BytesAre(RVA_DEPOTITEM_CTOR, DEPOTITEM_CTOR_PROLOGUE, sizeof(DEPOTITEM_CTOR_PROLOGUE), "stationicon")) {
+        uint8_t* ds = NearAlloc(64);
+        void* dtramp = nullptr;
+        if (ds) {
+            size_t j = 0;
+            ds[j++] = 0x49; ds[j++] = 0xBA; memcpy(ds + j, &slot, 8); j += 8;              // mov r10, &g_curIconEntity
+            ds[j++] = 0x41; ds[j++] = 0x89; ds[j++] = 0x12;                                // mov [r10], edx
+            const uintptr_t eslot2 = (uintptr_t)&g_curIconEnginePtr;
+            ds[j++] = 0x49; ds[j++] = 0xBB; memcpy(ds + j, &eslot2, 8); j += 8;            // mov r11, &g_curIconEnginePtr
+            ds[j++] = 0x49; ds[j++] = 0x89; ds[j++] = 0x0B;                                // mov [r11], rcx  (the EnginePtr)
+            const size_t dj = j;
+            ds[j++] = 0x48; ds[j++] = 0xB8; memset(ds + j, 0, 8); j += 8;                  // mov rax, <tramp>
+            ds[j++] = 0xFF; ds[j++] = 0xE0;                                                // jmp rax
+            if (PatchJumpNear(g_base + RVA_DEPOTITEM_CTOR, ds, sizeof(DEPOTITEM_CTOR_PROLOGUE), &dtramp) && dtramp) {
+                const uintptr_t dtp = (uintptr_t)dtramp;
+                DWORD o4 = 0;
+                VirtualProtect(ds, 64, PAGE_EXECUTE_READWRITE, &o4);
+                memcpy(ds + dj + 2, &dtp, 8);
+                VirtualProtect(ds, 64, o4, &o4);
+                FlushInstructionCache(GetCurrentProcess(), ds, 64);
+                s5 = true;
+            } else {
+                Log("[stationicon] NOT installed: could not detour the VehicleDepotItem constructor at rva=%llx\n", (unsigned long long)RVA_DEPOTITEM_CTOR);
+            }
+        }
+    }
+    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationItem ctor entry %s; depot ctor entry %s; post-attach restyle %s; StationIcon call %s, depot Icon call %s\n",
         (unsigned long long)RVA_ICON_CONTENT_FN, s3 ? "hooked (rebuild path covered)" : "NOT hooked (cargo rebuilds keep a stale entity)",
+        s5 ? "hooked (its own EnginePtr)" : "NOT hooked (depots take the last station's engine)",
         s4 ? "hooked" : "NOT hooked (fresh icons colour only after a restyle)",
         s1 ? "redirected" : "NOT redirected", s2 ? "redirected" : "NOT redirected");
 }
