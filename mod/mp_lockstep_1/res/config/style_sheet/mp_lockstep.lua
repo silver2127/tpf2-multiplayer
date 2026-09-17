@@ -61,6 +61,15 @@ function data()
 		a("Window!mpWinCo" .. cid .. " Window::Title-bar", {
 			backgroundColor = { r, g, b, 0.85 },
 		})
+		-- The class on the icon ELEMENT (the slice appends it right after the game's
+		-- own carrier class, StationItem::StationIcon!train and friends): the form the
+		-- game itself uses, so it resolves when the icon is styled.
+		a("StationItem::StationIcon!mpWinCo" .. cid .. ", VehicleDepotItem::Icon!mpWinCo" .. cid, {
+			backgroundColor1 = { r, g, b, 1.0 },
+		})
+		a("StationItem::StationIcon!mpWinCo" .. cid .. "!hover, VehicleDepotItem::Icon!mpWinCo" .. cid .. "!hover", {
+			backgroundColor1 = { r * 0.8, g * 0.8, b * 0.8, 1.0 },
+		})
 	end
 	return result
 end

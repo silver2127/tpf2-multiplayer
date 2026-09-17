@@ -6679,63 +6679,169 @@ static const uint8_t* EcsComponentAt(uint8_t* world, int typeIdx, int slot, size
     return page ? page + (size_t)(e % 32) * stride : nullptr;
 }
 
-// The owner comes from the entity's PlayerOwned or, for a station group, its
-// first station's. engine is g_uiEngine (cached from the icon path).
+// The owner of a HUD icon's entity: its PlayerOwned or, for a station group,
+// its first station's. -1 when there is none (a town, an industry). engine is
+// g_uiEngine (cached from the icon path).
 //
 // NEVER the engine's GetComponentPtr for the group (0x149290 -> 0xd0920): that
-// one ASSERTS when the entity lacks the component, and this hook sees every HUD
+// one ASSERTS when the entity lacks the component, and this path sees every HUD
 // icon entity -- towns and industries have no PlayerOwned and no StationGroup,
 // so each of them wrote a crash dump (Engine.h:291 `it != components.end()`),
 // which is the 24 s freeze the first build of this caused (2026-09-16). The
 // slot scan (TrainOrderSlot) returns -1 on a miss instead.
+static int IconOwnerForEntity(int entity)
+{
+    uint8_t* engine = (uint8_t*)g_uiEngine;
+    if (!engine) return -1;
+    int ent = entity;
+    typedef void* (*GetPlayerOwned)(void*, const int*);
+    void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &ent);
+    if (po) { InterlockedIncrement(&g_siDirect); return *(const int*)po; }
+    const void* desc = (const void*)(g_base + RVA_TI_STATIONGROUP);
+    typedef int (*GetTypeIndex)(void*, const void**);
+    const int ti = ((GetTypeIndex)(g_base + RVA_GET_TYPEINDEX))(engine + 0x48, &desc);
+    if (ti < 0) return -1;
+    const int slot = TrainOrderSlot(engine, entity, ti);   // -1 = not a station group (a town, an industry)
+    if (slot < 0) {
+        InterlockedIncrement(&g_siNoOwner);
+        if (InterlockedIncrement(&g_siNoOwnerShown) <= 6)
+            Log("[stationicon] entity %d: no PlayerOwned and no StationGroup (ti=%d) -- a town/industry/building, untinted\n", entity, ti);
+        return -1;
+    }
+    const uint8_t* comp = EcsComponentAt(engine, ti, slot, STATIONGROUP_STRIDE);
+    if (!comp || !Readable(comp, 16)) return -1;
+    const int* begin = *(const int* const*)(comp + 0);
+    const int* end = *(const int* const*)(comp + 8);
+    if (!begin || end <= begin || !Readable(begin, 4)) return -1;   // no stations yet
+    int station0 = begin[0];
+    void* po2 = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &station0);
+    if (!po2) {
+        InterlockedIncrement(&g_siNoOwner);
+        if (InterlockedIncrement(&g_siNoOwnerShown) <= 6)
+            Log("[stationicon] entity %d is a StationGroup (ti=%d slot=%d) but its first station %d has no PlayerOwned\n", entity, ti, slot, station0);
+        return -1;
+    }
+    InterlockedIncrement(&g_siWalked);
+    return *(const int*)po2;
+}
+
+// The ROOT tag (button root, 0x5e38e1). Kept -- it is what the ancestor-selector
+// rules key on -- but measured not to restyle children created before it, so the
+// visible tint comes from IconClassApply below.
 extern "C" void StationIconTint(void* component, int entity)
 {
     InterlockedIncrement(&g_siAsked);
     __try {
-        uint8_t* engine = (uint8_t*)g_uiEngine;
-        if (!engine || !component) return;
-        int ent = entity;
-        typedef void* (*GetPlayerOwned)(void*, const int*);
-        void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &ent);
-        int owner = -1;
-        if (po) {
-            owner = *(const int*)po;
-            InterlockedIncrement(&g_siDirect);
-        } else {
-            const void* desc = (const void*)(g_base + RVA_TI_STATIONGROUP);
-            typedef int (*GetTypeIndex)(void*, const void**);
-            const int ti = ((GetTypeIndex)(g_base + RVA_GET_TYPEINDEX))(engine + 0x48, &desc);
-            if (ti < 0) return;
-            const int slot = TrainOrderSlot(engine, entity, ti);   // -1 = not a station group (a town, an industry)
-            if (slot < 0) {
-                InterlockedIncrement(&g_siNoOwner);
-                if (InterlockedIncrement(&g_siNoOwnerShown) <= 6)
-                    Log("[stationicon] entity %d: no PlayerOwned and no StationGroup (ti=%d) -- a town/industry/building, untinted\n", entity, ti);
-                return;
-            }
-            const uint8_t* comp = EcsComponentAt(engine, ti, slot, STATIONGROUP_STRIDE);
-            if (!comp || !Readable(comp, 16)) return;
-            const int* begin = *(const int* const*)(comp + 0);
-            const int* end = *(const int* const*)(comp + 8);
-            if (!begin || end <= begin || !Readable(begin, 4)) return;   // no stations yet
-            int station0 = begin[0];
-            void* po2 = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &station0);
-            if (!po2) {
-                InterlockedIncrement(&g_siNoOwner);
-                if (InterlockedIncrement(&g_siNoOwnerShown) <= 6)
-                    Log("[stationicon] entity %d is a StationGroup (ti=%d slot=%d) but its first station %d has no PlayerOwned\n", entity, ti, slot, station0);
-                return;
-            }
-            owner = *(const int*)po2;
-            InterlockedIncrement(&g_siWalked);
-        }
-        if (owner < 0) { InterlockedIncrement(&g_siNoOwner); return; }
+        if (!component) return;
+        const int owner = IconOwnerForEntity(entity);
+        if (owner < 0) return;
         const int cid = IconCompanyOfPid(owner);
         if (cid <= 0) return;
         TintApplyClass(component, cid, "stationicon", entity, owner, &g_siShown);
         InterlockedIncrement(&g_siTinted);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_siFaults); }
+}
+
+// ---- THE CLASS ON THE ICON ITSELF (2026-09-16, third try) ----
+// Tagging the root landed (read back) but painted nothing: the game styles a
+// component when it is created, and StationItem's ::StationIcon child (the
+// box-and-glyph image, hud.lua) is created inside the content build -- BEFORE
+// the root gets our class -- so an ancestor rule never re-resolves it. The
+// game's own variants put the class on the icon element itself
+// (StationItem::StationIcon!train, !hover), applied by addStyleClass 0x227a1e0
+// at 0x5e07f9 (StationItem) and 0x5e2d13 (VehicleDepotItem), rcx = the icon
+// component, rdx = the carrier class string. Those two calls now go through
+// IconClassApply: the original, then "!mpWinCoN" on the SAME component, whose
+// entity the content-builder entry hook (0x5e45d0, pre-hook) recorded. Rule:
+// "StationItem::StationIcon!mpWinCoN" { backgroundColor1 = colour } in the mod
+// sheet, the same grammar as !train.
+static volatile LONG g_curIconEntity = -1;   // set at 0x5e45d0 entry (edx), main thread, serial
+static const uintptr_t RVA_ICON_CONTENT_FN   = 0x5e45d0;   // FUN_5e45d0(context, entity): builds the item content
+static const uint8_t ICON_CONTENT_PROLOGUE[15] = {
+    0x89, 0x54, 0x24, 0x10,              // mov [rsp+0x10], edx
+    0x53, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57,   // push rbx/rsi/rdi/r14/r15
+    0x48, 0x83, 0xEC, 0x70               // sub rsp, 0x70
+};
+static const uintptr_t RVA_STNICON_CLASS_CALL  = 0x5e07f9;  // call 0x227a1e0 in StationItem (rcx = ::StationIcon)
+static const uintptr_t RVA_DEPOTICON_CLASS_CALL = 0x5e2d13; // call 0x227a1e0 in VehicleDepotItem (rcx = ::Icon)
+static const uint8_t STNICON_CLASS_EXPECT[5]   = { 0xE8, 0xE2, 0x99, 0xC9, 0x01 };
+static const uint8_t DEPOTICON_CLASS_EXPECT[5] = { 0xE8, 0xC8, 0x74, 0xC9, 0x01 };
+static volatile LONG g_icApplied = 0, g_icShown = 0;
+
+extern "C" void IconClassApply(void* comp, const void* cls)
+{
+    typedef void (*AddClass)(void*, const void*);
+    ((AddClass)(g_base + RVA_ADD_STYLE_CLASS))(comp, cls);      // the game's own carrier class first
+    __try {
+        const int entity = (int)InterlockedCompareExchange(&g_curIconEntity, 0, 0);
+        if (entity < 0 || !comp) return;
+        const int owner = IconOwnerForEntity(entity);
+        if (owner < 0) return;
+        const int cid = IconCompanyOfPid(owner);
+        if (cid <= 0) return;
+        TintApplyClass(comp, cid, "stationicon-glyph", entity, owner, &g_icShown);
+        InterlockedIncrement(&g_icApplied);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_siFaults); }
+}
+
+// Rewrites one `call 0x227a1e0` to call IconClassApply through a near jmp-stub
+// (the DLL may sit beyond rel32 reach); the caller's return address is untouched.
+static bool RedirectClassCall(uintptr_t siteRva, const uint8_t* expect, const char* what)
+{
+    if (!BytesAre(siteRva, expect, 5, "stationicon")) return false;
+    int32_t rel = 0; memcpy(&rel, expect + 1, 4);
+    if ((uintptr_t)((int64_t)siteRva + 5 + rel) != RVA_ADD_STYLE_CLASS) {
+        Log("[stationicon] NOT installed: %s call at rva=%llx does not resolve to addStyleClass\n", what, (unsigned long long)siteRva);
+        return false;
+    }
+    uint8_t* stub = NearAlloc(16);
+    if (!stub) return false;
+    const uintptr_t fn = (uintptr_t)&IconClassApply;
+    stub[0] = 0xFF; stub[1] = 0x25; memset(stub + 2, 0, 4); memcpy(stub + 6, &fn, 8);   // jmp [rip+0] -> IconClassApply
+    FlushInstructionCache(GetCurrentProcess(), stub, 14);
+    const uintptr_t at = g_base + siteRva;
+    const int64_t nrel = (int64_t)(uintptr_t)stub - (int64_t)(at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) return false;
+    DWORD old = 0;
+    if (!VirtualProtect((void*)(at + 1), 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+    const int32_t r32 = (int32_t)nrel;
+    memcpy((void*)(at + 1), &r32, 4);
+    VirtualProtect((void*)(at + 1), 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 5);
+    return true;
+}
+
+static void InstallIconClassApply()
+{
+    if (FlagsSayOff("stationicon")) return;
+    if (!BytesAre(RVA_ICON_CONTENT_FN, ICON_CONTENT_PROLOGUE, sizeof(ICON_CONTENT_PROLOGUE), "stationicon")) return;
+    // the entry pre-hook: record edx (the entity), run the stolen prologue, continue
+    uint8_t* stub = NearAlloc(32);
+    if (!stub) return;
+    void* tramp = nullptr;
+    const uintptr_t slot = (uintptr_t)&g_curIconEntity;
+    size_t k = 0;
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &slot, 8); k += 8;   // mov rax, &g_curIconEntity
+    stub[k++] = 0x89; stub[k++] = 0x10;                                       // mov [rax], edx
+    const size_t jmpAt = k;
+    stub[k++] = 0x48; stub[k++] = 0xB8; memset(stub + k, 0, 8); k += 8;       // mov rax, <tramp>
+    stub[k++] = 0xFF; stub[k++] = 0xE0;                                       // jmp rax
+    if (!PatchJumpNear(g_base + RVA_ICON_CONTENT_FN, stub, sizeof(ICON_CONTENT_PROLOGUE), &tramp) || !tramp) {
+        Log("[stationicon] NOT installed: could not detour the content builder at rva=%llx\n", (unsigned long long)RVA_ICON_CONTENT_FN);
+        return;
+    }
+    const uintptr_t tp = (uintptr_t)tramp;
+    DWORD old = 0;
+    VirtualProtect(stub, 32, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(stub + jmpAt + 2, &tp, 8);
+    VirtualProtect(stub, 32, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), stub, 32);
+    const bool s1 = RedirectClassCall(RVA_STNICON_CLASS_CALL, STNICON_CLASS_EXPECT, "StationItem::StationIcon");
+    const bool s2 = RedirectClassCall(RVA_DEPOTICON_CLASS_CALL, DEPOTICON_CLASS_EXPECT, "VehicleDepotItem::Icon");
+    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationIcon call %s, depot Icon call %s\n",
+        (unsigned long long)RVA_ICON_CONTENT_FN, s1 ? "redirected" : "NOT redirected", s2 ? "redirected" : "NOT redirected");
 }
 
 static void InstallStationIconColor()
@@ -7317,8 +7423,10 @@ static DWORD WINAPI Init(LPVOID)
     InstallForeignWindows();
     // A foreign entity's window, washed its owner's company colour.
     InstallWindowColor();
-    // The HUD station/depot icon, washed its owner's company colour.
+    // The HUD station/depot icon, washed its owner's company colour: the root tag,
+    // and the class on the icon element itself (what actually paints).
     InstallStationIconColor();
+    InstallIconClassApply();
 
     for (;;) {
         Sleep(15000);
@@ -7335,8 +7443,8 @@ static DWORD WINAPI Init(LPVOID)
             Log("[roadspace] alive: calls=%ld filtered=%ld changed=%ld handed=%ld faults=%ld maxN=%ld\n",
                 g_rsCallsA, g_rsCallsB, g_rsDiffs, g_rsHanded, g_rsFaults, g_rsMaxN);
         if (g_stnIconColorOn && g_siAsked)
-            Log("[stationicon] alive: asked=%ld direct=%ld walked=%ld tinted=%ld noOwner=%ld faults=%ld\n",
-                g_siAsked, g_siDirect, g_siWalked, g_siTinted, g_siNoOwner, g_siFaults);
+            Log("[stationicon] alive: asked=%ld direct=%ld walked=%ld tinted=%ld glyphs=%ld noOwner=%ld faults=%ld\n",
+                g_siAsked, g_siDirect, g_siWalked, g_siTinted, g_icApplied, g_siNoOwner, g_siFaults);
         if (g_windowColorOn && g_wcAsked)
             Log("[windowcolor] alive: asked=%ld tinted=%ld faults=%ld\n", g_wcAsked, g_wcTinted, g_wcFaults);
         if (g_stnLabelColorOn && g_slAsked)

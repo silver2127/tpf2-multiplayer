@@ -1,4 +1,13 @@
-## Latest Windows integration: dev be3b86ae (2026-09-16)
+## Latest Windows integration: dev d6db920f (2026-09-16)
+
+See [UPSTREAM_dev_d6db920f.md](UPSTREAM_dev_d6db920f.md). Shared station/depot
+icon-element company styles are merged exactly. Native glyph tagging remains
+unported after a fresh ELF investigation: carrier class call sites and icon
+pointers are identified, but complete entity/owner and engine lifetime contracts
+are missing. Existing native tinting stays unavailable. Lua verification and
+release provenance target d6db920f; this integration is partial.
+
+## Previous Windows integration: dev be3b86ae (2026-09-16)
 
 See [UPSTREAM_dev_be3b86ae.md](UPSTREAM_dev_be3b86ae.md). The native lobby
 exports loading players atomically on every roster update. Shared Lua blocks
