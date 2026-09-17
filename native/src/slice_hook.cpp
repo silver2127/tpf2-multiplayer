@@ -6790,6 +6790,52 @@ static const uintptr_t RVA_DEPOTICON_CLASS_CALL = 0x5e2d13; // call 0x227a1e0 in
 static const uint8_t STNICON_CLASS_EXPECT[5]   = { 0xE8, 0xE2, 0x99, 0xC9, 0x01 };
 static const uint8_t DEPOTICON_CLASS_EXPECT[5] = { 0xE8, 0xC8, 0x74, 0xC9, 0x01 };
 static volatile LONG g_icApplied = 0, g_icShown = 0;
+// THE POST-ATTACH RESTYLE (2026-09-16, fifth try). Measured: an icon tagged in
+// its constructor shows the colour when the 1000 ms cargo rebuild swaps it into
+// the already-attached ContentView, but NOT when DoStep builds it fresh -- the
+// tag lands before the button is attached to the HUD layer and the engine only
+// honours it at a restyle after that (hover, zoom). So the icon component
+// tagged during THIS build is remembered and, right after DoStep hands the
+// button to the layer (call 0x224a920 at 0x5e3add), the class is added again on
+// the now-attached element: the same post-attach addStyleClass hover does.
+// Same thread, same DoStep iteration, so the pointer is live; the entity check
+// keeps a rebuild-path tag (no attach hook) from being replayed on a later build.
+static void* volatile g_lastIconComp = nullptr;
+static volatile LONG g_lastIconEntity = -1, g_lastIconCid = 0;
+static volatile LONG g_iaApplied = 0, g_iaShown = 0;
+static const uintptr_t RVA_ICON_ATTACH_HOOK = 0x5e3ae2;   // right after `call 0x224a920` (the layer takes the button)
+static const uint8_t ICON_ATTACH_EXPECT[8] = {
+    0x48, 0x8B, 0x45, 0x80,        // mov rax, [rbp-0x80]
+    0x48, 0x8B, 0x58, 0x18         // mov rbx, [rax+0x18]
+};
+
+static void IconAttachedApply(void* comp, int cid, int entity)   // the std::string lives here, outside __try (C2712)
+{
+    std::string cls = std::string(TintClassPrefix()) + std::to_string(cid);
+    typedef void (*AddClass)(void*, const void*);
+    ((AddClass)(g_base + RVA_ADD_STYLE_CLASS))(comp, &cls);
+    InterlockedIncrement(&g_iaApplied);
+    if (InterlockedIncrement(&g_iaShown) <= 4) {
+        char list[512];
+        TintClassList(comp, list, sizeof(list));
+        Log("[stationicon-attach] entity %d: re-added %s after the HUD layer took the button; classes now: %s\n", entity, cls.c_str(), list);
+    }
+}
+
+extern "C" void IconAttached()
+{
+    __try {
+        void* comp = g_lastIconComp;
+        if (!comp) return;
+        const int entity = (int)InterlockedCompareExchange(&g_lastIconEntity, 0, 0);
+        if (entity != (int)InterlockedCompareExchange(&g_curIconEntity, 0, 0)) return;
+        g_lastIconComp = nullptr;
+        const int cid = (int)InterlockedCompareExchange(&g_lastIconCid, 0, 0);
+        if (cid <= 0) return;
+        IconAttachedApply(comp, cid, entity);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_siFaults); }
+}
 
 extern "C" void IconClassApply(void* comp, const void* cls)
 {
@@ -6804,6 +6850,9 @@ extern "C" void IconClassApply(void* comp, const void* cls)
         if (cid <= 0) return;
         TintApplyClass(comp, cid, "stationicon-glyph", entity, owner, &g_icShown);
         InterlockedIncrement(&g_icApplied);
+        g_lastIconCid = cid;
+        g_lastIconEntity = entity;
+        g_lastIconComp = comp;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_siFaults); }
 }
@@ -6889,8 +6938,48 @@ static void InstallIconClassApply()
             }
         }
     }
-    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationItem ctor entry %s; StationIcon call %s, depot Icon call %s\n",
+    // the post-attach restyle: after `call 0x224a920` in DoStep. rax/rcx/rdx/r8-r11
+    // are dead there (rax is reloaded by the first stolen instruction); align, call,
+    // re-run the two stolen loads, resume at hook+8.
+    bool s4 = false;
+    if (BytesAre(RVA_ICON_ATTACH_HOOK, ICON_ATTACH_EXPECT, sizeof(ICON_ATTACH_EXPECT), "stationicon")) {
+        uint8_t* as = NearAlloc(64);
+        if (as) {
+            const uintptr_t helper = (uintptr_t)&IconAttached;
+            size_t j = 0;
+            as[j++] = 0x55;                                                        // push rbp
+            as[j++] = 0x48; as[j++] = 0x8B; as[j++] = 0xEC;                        // mov rbp, rsp
+            as[j++] = 0x48; as[j++] = 0x83; as[j++] = 0xE4; as[j++] = 0xF0;        // and rsp, -16
+            as[j++] = 0x48; as[j++] = 0x83; as[j++] = 0xEC; as[j++] = 0x20;        // sub rsp, 0x20
+            as[j++] = 0x48; as[j++] = 0xB8; memcpy(as + j, &helper, 8); j += 8;    // mov rax, IconAttached
+            as[j++] = 0xFF; as[j++] = 0xD0;                                        // call rax
+            as[j++] = 0x48; as[j++] = 0x8B; as[j++] = 0xE5;                        // mov rsp, rbp
+            as[j++] = 0x5D;                                                        // pop rbp
+            memcpy(as + j, ICON_ATTACH_EXPECT, sizeof(ICON_ATTACH_EXPECT)); j += sizeof(ICON_ATTACH_EXPECT);   // the stolen loads
+            const uintptr_t resume = g_base + RVA_ICON_ATTACH_HOOK + sizeof(ICON_ATTACH_EXPECT);
+            as[j++] = 0xE9;
+            const int32_t rel = (int32_t)((int64_t)resume - (int64_t)((uintptr_t)as + j + 4));
+            memcpy(as + j, &rel, 4); j += 4;
+            FlushInstructionCache(GetCurrentProcess(), as, j);
+            const uintptr_t at = g_base + RVA_ICON_ATTACH_HOOK;
+            const int64_t nrel = (int64_t)(uintptr_t)as - (int64_t)(at + 5);
+            DWORD o3 = 0;
+            if (nrel >= INT32_MIN && nrel <= INT32_MAX && VirtualProtect((void*)at, 8, PAGE_EXECUTE_READWRITE, &o3)) {
+                uint8_t patch[8] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+                const int32_t r32 = (int32_t)nrel;
+                memcpy(patch + 1, &r32, 4);
+                memcpy((void*)at, patch, 8);
+                VirtualProtect((void*)at, 8, o3, &o3);
+                FlushInstructionCache(GetCurrentProcess(), (void*)at, 8);
+                s4 = true;
+            } else {
+                Log("[stationicon] NOT installed: could not patch the attach site at rva=%llx\n", (unsigned long long)RVA_ICON_ATTACH_HOOK);
+            }
+        }
+    }
+    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationItem ctor entry %s; post-attach restyle %s; StationIcon call %s, depot Icon call %s\n",
         (unsigned long long)RVA_ICON_CONTENT_FN, s3 ? "hooked (rebuild path covered)" : "NOT hooked (cargo rebuilds keep a stale entity)",
+        s4 ? "hooked" : "NOT hooked (fresh icons colour only after a restyle)",
         s1 ? "redirected" : "NOT redirected", s2 ? "redirected" : "NOT redirected");
 }
 
@@ -7497,6 +7586,8 @@ static DWORD WINAPI Init(LPVOID)
                 g_siAsked, g_siDirect, g_siWalked, g_siTinted, g_icApplied, g_siNoOwner, g_siFaults);
         if (g_windowColorOn && g_wcAsked)
             Log("[windowcolor] alive: asked=%ld tinted=%ld faults=%ld\n", g_wcAsked, g_wcTinted, g_wcFaults);
+        if (g_iaApplied)
+            Log("[stationicon-attach] alive: restyled=%ld\n", g_iaApplied);
         if (g_stnLabelColorOn && g_slAsked)
             Log("[stationlabelcolor] alive: labels=%ld tinted=%ld\n", g_slAsked, g_slTinted);
         for (int c = 0; c < 2; c++) {

@@ -144,5 +144,23 @@ for site, src in ((0x5dfeeb, "r14d"), (0x5e5a48, "eax")):
 after = list(md.disasm(pe.get_data(0x5e5a4d, 0x10), 0x5e5a4d))
 assert after[2].mnemonic == "call" and int(after[2].op_str, 16) == 0x2286020, "rebuild path no longer calls setContent 0x2286020 after the ctor"
 
+# ---- the post-attach restyle hook: right after DoStep hands the button to the HUD layer ----
+att = const("RVA_ICON_ATTACH_HOOK")
+aexp = byte_array("ICON_ATTACH_EXPECT")
+assert len(aexp) == 8 and pe.get_data(att, 8) == aexp, f"attach site changed: {pe.get_data(att, 8).hex(' ')}"
+ains = list(md.disasm(aexp, att))
+assert [(i.mnemonic, i.op_str) for i in ains] == [("mov", "rax, qword ptr [rbp - 0x80]"), ("mov", "rbx, qword ptr [rax + 0x18]")], [(i.mnemonic, i.op_str) for i in ains]
+pre = pe.get_data(att - 5, 5)
+assert pre[0] == 0xE8 and (att - 5) + 5 + struct.unpack("<i", pre[1:5])[0] == 0x224a920, "the call before the attach hook is not the HUD layer add 0x224a920"
+assert pe.get_data(att - 12, 3) == bytes([0x48, 0x8B, 0xD7]), "rdx is no longer the button (mov rdx, rdi) before the layer add"
+assert 0x5e2dc0 <= att < 0x5e4270, "attach hook outside DoStep"
+for d in md.disasm(code[0x5e2dc0 - base:0x5e4270 - base], 0x5e2dc0):
+    if d.mnemonic.startswith("j") and d.operands and d.operands[0].type == X86_OP_IMM:
+        assert not (att < d.operands[0].imm < att + 8), f"branch into the attach steal at {d.address:x}"
+for i in range(len(code) - 5):
+    if code[i] in (0xE8, 0xE9):
+        t = base + i + 5 + struct.unpack_from("<i", code, i + 1)[0]
+        assert not (att < t < att + 8), f"rel32 at {base + i:x} into the attach steal"
+
 print(f"stationicon bytes: ok -- hook {hook:x} (mov rdi,rax/xor r12d), wrap-call -> 2251620, "
-      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites ok")
+      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites + post-attach hook ok")
