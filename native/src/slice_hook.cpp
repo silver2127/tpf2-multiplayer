@@ -6274,7 +6274,14 @@ extern "C" const float* IconTintForEntity(void* engine, const int* entity, int l
         void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, entity);
         if (!po) return nullptr;
         const int owner = *(const int*)po;
-        if (owner == local || owner < 0) return nullptr;   // own or unowned: as before
+        // ICONS SHOW EVERY COMPANY'S COLOUR, OWN INCLUDED (2026-09-16): the icon
+        // and station-label tints colour your OWN vehicles/stations your company's
+        // colour too, not just other companies'. Only unowned entities (owner < 0,
+        // towns/industries) and coop (no company for the pid -> cid 0 below) stay
+        // untinted. The read-only WINDOW wash stays foreign-only (WindowTint keeps
+        // its owner == local skip). `local` is still cached above for WindowTint.
+        (void)local;
+        if (owner < 0) return nullptr;
         const int cid = IconCompanyOfPid(owner);
         if (cid <= 0) return nullptr;
         IconCompanyColor(cid, rgba);
