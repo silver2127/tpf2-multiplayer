@@ -41,6 +41,26 @@ function data()
 		a("!mpWinCo" .. cid, {
 			backgroundColor = { r, g, b, 0.30 },
 		})
+		-- WHERE THE COLOUR ACTUALLY PAINTS (2026-09-16). The slice tags a ROOT --
+		-- the HUD item button, the entity window -- with !mpWinCoN; that root is
+		-- a bare container and draws nothing itself (measured: its class list was
+		-- empty before ours). The game's own sheets paint the parts, by name:
+		--   * hud.lua: StationItem::StationIcon / VehicleDepotItem::Icon are the
+		--     box-and-glyph image, MODULATED by backgroundColor1 (white; hover =
+		--     grey). Setting it to the company colour tints the icon.
+		--   * window.lua: Window::Title-bar is left transparent; a backgroundColor
+		--     there colours the title bar without hiding the content.
+		-- The game combines an ancestor's !class with descendant names itself
+		-- ("!ui-couch BuildControlComp::CostsLabel"), so these are the same grammar.
+		a("!mpWinCo" .. cid .. " StationItem::StationIcon, !mpWinCo" .. cid .. " VehicleDepotItem::Icon", {
+			backgroundColor1 = { r, g, b, 1.0 },
+		})
+		a("!mpWinCo" .. cid .. " StationItem::StationIcon!hover, !mpWinCo" .. cid .. " VehicleDepotItem::Icon!hover", {
+			backgroundColor1 = { r * 0.8, g * 0.8, b * 0.8, 1.0 },
+		})
+		a("Window!mpWinCo" .. cid .. " Window::Title-bar", {
+			backgroundColor = { r, g, b, 0.85 },
+		})
 	end
 	return result
 end
