@@ -162,5 +162,15 @@ for i in range(len(code) - 5):
         t = base + i + 5 + struct.unpack_from("<i", code, i + 1)[0]
         assert not (att < t < att + 8), f"rel32 at {base + i:x} into the attach steal"
 
+# ---- the engine accessor the ctor pre-hook's EnginePtr goes through ----
+efp = const("RVA_ENGINE_FROM_PTR")
+eins = list(md.disasm(pe.get_data(efp, 0x12), efp))
+assert [(i.mnemonic, i.op_str) for i in eins[:4]] == [("sub", "rsp, 0x28"), ("call", "0x8bb7f0"), ("mov", "rax, qword ptr [rax + 0x28]"), ("add", "rsp, 0x28")], [(i.mnemonic, i.op_str) for i in eins[:4]]
+vins = list(md.disasm(pe.get_data(0x8bb7f0, 0xa), 0x8bb7f0))
+assert [(i.mnemonic, i.op_str) for i in vins[:3]] == [("mov", "rcx, qword ptr [rcx]"), ("mov", "rax, qword ptr [rcx]"), ("jmp", "qword ptr [rax + 8]")], "the EnginePtr virtual accessor changed"
+# DoStep itself resolves the engine this way (call 0x8b9e60 then GetComponentDataIndex 0xd0920)
+ds = list(md.disasm(code[0x5e2dc0 - base:0x5e4270 - base], 0x5e2dc0))
+assert any(i.mnemonic == "call" and i.op_str == "0x8b9e60" for i in ds), "DoStep no longer uses the EnginePtr accessor"
+
 print(f"stationicon bytes: ok -- hook {hook:x} (mov rdi,rax/xor r12d), wrap-call -> 2251620, "
-      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites + post-attach hook ok")
+      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites + post-attach hook + engine accessor ok")

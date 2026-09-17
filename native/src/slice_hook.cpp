@@ -6693,10 +6693,27 @@ static const uint8_t* EcsComponentAt(uint8_t* world, int typeIdx, int slot, size
 // so each of them wrote a crash dump (Engine.h:291 `it != components.end()`),
 // which is the 24 s freeze the first build of this caused (2026-09-16). The
 // slot scan (TrainOrderSlot) returns -1 on a miss instead.
+// THE ENGINE AT LOAD (2026-09-16, sixth build). g_uiEngine is cached by the
+// vehicle-icon draw hook, so a HUD built before any vehicle icon drew (a fresh
+// load: asked=18 direct=0 glyphs=0) found no engine and tagged nothing -- the
+// icons stayed vanilla until something rebuilt them. The StationItem constructor
+// receives the UI::EnginePtr as its 2nd argument; the entry pre-hook records it
+// and the game's own accessor 0x8b9e60(&ptr) ((*ptr)->vslot1()->+0x28, what DoStep
+// itself uses before GetComponentDataIndex) yields the ecs engine from it.
+static void* volatile g_curIconEnginePtr = nullptr;          // set at the StationItem ctor entry (rdx)
+static const uintptr_t RVA_ENGINE_FROM_PTR = 0x8b9e60;       // engine* EngineFromPtr(const EnginePtr*)
 static int IconOwnerForEntity(int entity)
 {
     uint8_t* engine = (uint8_t*)g_uiEngine;
-    if (!engine) return -1;
+    if (!engine) {
+        void* ep = g_curIconEnginePtr;
+        if (ep) {
+            typedef void* (*EngineFromPtr)(void*);
+            engine = (uint8_t*)((EngineFromPtr)(g_base + RVA_ENGINE_FROM_PTR))(&ep);
+            if (engine) g_uiEngine = engine;
+        }
+        if (!engine) return -1;
+    }
     int ent = entity;
     typedef void* (*GetPlayerOwned)(void*, const int*);
     void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &ent);
@@ -6920,23 +6937,26 @@ static void InstallIconClassApply()
     // 1000 ms cargo-state rebuild, which never passes the content builder)
     bool s3 = false;
     if (BytesAre(RVA_STNITEM_CTOR, STNITEM_CTOR_PROLOGUE, sizeof(STNITEM_CTOR_PROLOGUE), "stationicon")) {
-        uint8_t* cs = NearAlloc(32);
+        uint8_t* cs = NearAlloc(64);
         void* ctramp = nullptr;
         if (cs) {
             size_t j = 0;
             cs[j++] = 0x49; cs[j++] = 0xBA; memcpy(cs + j, &slot, 8); j += 8;              // mov r10, &g_curIconEntity
             cs[j++] = 0x8B; cs[j++] = 0x44; cs[j++] = 0x24; cs[j++] = (uint8_t)STNITEM_CTOR_ENTITY_ARG; // mov eax, [rsp+0x30]
             cs[j++] = 0x41; cs[j++] = 0x89; cs[j++] = 0x02;                                // mov [r10], eax
+            const uintptr_t eslot = (uintptr_t)&g_curIconEnginePtr;
+            cs[j++] = 0x49; cs[j++] = 0xBB; memcpy(cs + j, &eslot, 8); j += 8;             // mov r11, &g_curIconEnginePtr
+            cs[j++] = 0x49; cs[j++] = 0x89; cs[j++] = 0x13;                                // mov [r11], rdx  (the EnginePtr)
             const size_t cj = j;
             cs[j++] = 0x48; cs[j++] = 0xB8; memset(cs + j, 0, 8); j += 8;                  // mov rax, <tramp>
             cs[j++] = 0xFF; cs[j++] = 0xE0;                                                // jmp rax
             if (PatchJumpNear(g_base + RVA_STNITEM_CTOR, cs, sizeof(STNITEM_CTOR_PROLOGUE), &ctramp) && ctramp) {
                 const uintptr_t ctp = (uintptr_t)ctramp;
                 DWORD o2 = 0;
-                VirtualProtect(cs, 32, PAGE_EXECUTE_READWRITE, &o2);
+                VirtualProtect(cs, 64, PAGE_EXECUTE_READWRITE, &o2);
                 memcpy(cs + cj + 2, &ctp, 8);
-                VirtualProtect(cs, 32, o2, &o2);
-                FlushInstructionCache(GetCurrentProcess(), cs, 32);
+                VirtualProtect(cs, 64, o2, &o2);
+                FlushInstructionCache(GetCurrentProcess(), cs, 64);
                 s3 = true;
             } else {
                 Log("[stationicon] NOT installed: could not detour the StationItem constructor at rva=%llx\n", (unsigned long long)RVA_STNITEM_CTOR);
