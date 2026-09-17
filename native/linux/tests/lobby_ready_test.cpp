@@ -167,6 +167,23 @@ int main()
     Write(dir+"tpf2mp_world_gen.txt", "gen=three\n");
     lobby::PollWorldGen(); assert(lobby::S().sharedSave.empty()); // never reuse across worlds
     unlink((dir+"tpf2mp_world_gen.txt").c_str()); unlink((dir+"snapshot.sav").c_str());
+    // FROZEN JOIN: with join_freeze the host takes no hot-join save (the stubbed
+    // autosave asserts) and sends no start; the flag clears on the next roster.
+    lobby::g_gameUiSeen=true; lobby::g_titleMenu=false; model.isHost=true; model.lastCount=2;
+    {
+        const lobby::Model saved=model;
+        std::string before; lobby::ReadSmallFile(dir+"lobby_in.jsonl", &before);
+        lobby::Json frozen;
+        assert(lobby::ParseJson(R"({"players":["host","joiner","late"],"host":"host","you":"host","join_freeze":true})", &frozen));
+        lobby::ApplyRoster(frozen);
+        assert(model.joinFreeze && model.lastCount==3);
+        std::string after; lobby::ReadSmallFile(dir+"lobby_in.jsonl", &after);
+        assert(after==before);
+        lobby::Json same;
+        assert(lobby::ParseJson(R"({"players":["host","joiner","late"],"host":"host","you":"host"})", &same));
+        lobby::ApplyRoster(same); assert(!model.joinFreeze);
+        model=saved;   // the later stage checks use the earlier roster's letter
+    }
     // Stage updates are sent once and cleared when the script reports live.
     lobby::g_gameUiSeen=true; lobby::g_titleMenu=false; lobby::S().stageWatch=true;
     Write(dir+"lockstep_status_"+letter+".txt", "stage=catchup:fetch:25\n");

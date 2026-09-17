@@ -1186,6 +1186,7 @@ function data()
 							local open = {}
 							for _, cid in ipairs(CM.cmRoster or {}) do open[#open + 1] = cid .. ":" .. (CM.cmOpenCode and CM.cmOpenCode(cid) or "*") end
 							if CM.cmWritePerms then pcall(CM.cmWritePerms) end
+							if CM.cmWriteCompanyMap then pcall(CM.cmWriteCompanyMap) end
 							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\ncoopen=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " "), table.concat(open, " ")))
 						end)
 						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
@@ -1726,6 +1727,9 @@ function data()
 					D.coPick = api.gui.comp.Component.new("mpCompanyPick")
 					D.coPick:setLayout(D.coPickL)
 					crow:addItem(D.coPick)
+					-- the selected company's colour, beside the dropdown (2026-09-16)
+					D.coSwSel = api.gui.comp.TextView.new("  ##  ")
+					crow:addItem(D.coSwSel)
 					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
 					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
 					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
@@ -1952,9 +1956,11 @@ function data()
 							if at then pcall(function() cb:setSelected(at, false) end) end
 							D.coRebuilding = false
 						end
-						-- the swatch follows the id (see D.coSwMine); the name follows the registry
+						-- the swatches follow the ids (see D.coSwMine); the name follows the registry
 						local mineCls = "mpCo" .. tostring(math.max(1, math.min(200, D.coMine or 1)))
 						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
+						local selCls = "mpCo" .. tostring(math.max(1, math.min(200, D.coSel or D.coMine or 1)))
+						if D.coSwSel and D.coSwSelCls ~= selCls then D.coSwSelCls = selCls; pcall(function() D.coSwSel:setStyleClassList({ selCls }) end) end
 						local mineName = D.coMine and coName(D.coMine) or "-"
 						if mineName ~= D.coNameShown then D.coNameShown = mineName; D.coNameText:setText(" " .. mineName .. "   ") end
 						-- what our stations are open to, from the sim's coopen= ("1:* 2:1,3 3:-")

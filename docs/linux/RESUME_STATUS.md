@@ -1,4 +1,14 @@
-## Latest Windows integration: dev 66c870cf (2026-09-16)
+## Latest Windows integration: dev 23419163, release 0.6 (2026-09-17)
+
+See [UPSTREAM_dev_23419163.md](UPSTREAM_dev_23419163.md). Ported the Windows
+road-edge entry order (`roadentries`) to the Linux ELF with byte-verified
+guards ([DEV_23419163.md](../re/linux/DEV_23419163.md)) and the roster's
+`join_freeze` flag. Shared Lua/Python (hash ownership, companies map, frozen
+joins) merged; Lua verification targets 23419163. Station-icon refinements
+and the resync title-menu exception remain unported (no native tint path, no
+native resync controller). Native build 45/45 CTests. No live validation.
+
+## Previous Windows integration: dev 66c870cf (2026-09-16)
 
 See [UPSTREAM_dev_66c870cf.md](UPSTREAM_dev_66c870cf.md). Shared HUD styling
 now colours only the glyph using a second image layer; 32 upstream TGA assets

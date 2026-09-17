@@ -2161,7 +2161,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.5.7"
+LOBBY_VERSION = "0.6"
 
 
 def version_rejection(remote):
@@ -2586,10 +2586,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return sorted(p["name"] for p in peers.values())
         return sorted([host_name] + [p["name"] for p in peers.values()])
 
+    def host_has_world():
+        """The host's game is in a world: the native adapter's status file
+        (written by the game itself, PID-scoped) says has_world=1. `started`
+        only latches after a START GAME or a save share, so a host that loaded
+        its world on its own and then got a joiner read as "not started" -- the
+        joiner was not late, no frozen join ran, and the menu's autosave path
+        served it while the world kept ticking (2026-09-17 00:05)."""
+        return sync_runtime is not None and sync_runtime._read('tpf2_native_status.txt').get('has_world') == '1'
+
     def recovery_supported():
         return (sync_runtime is not None and not relay_only and len(peers) >= 1
                 and all(p.get("recovery") == 4 for p in peers.values())
-                and started[0] and transfer[0] is None)
+                and (started[0] or host_has_world()) and transfer[0] is None)
 
     def recovery_unavailable_reason():
         if not peers:
@@ -2737,10 +2746,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if publisher is not None:
             publisher.update(lobby_name or host_name, len(peers) + (0 if relay_only else 1))
         players = roster_players()
+        # join_freeze: the menu must NOT take its own hot-join save when the
+        # roster grows -- the lobby brings the newcomer in through a recovery
+        # round (do_join). Off when recovery cannot run (an old client, a
+        # transfer in flight, a relay), so the menu's save still serves then.
+        freeze = bool(recovery is not None and not relay_only and (recovery.held or recovery_supported()))
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
                  "relay": relay_only, "companies": roster_companies(), "stages": roster_stages(),
-                 "mode": mode[0]})
+                 "mode": mode[0], "join_freeze": freeze})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=leader_name(), started=started[0],
                        lobby=lobby_name, companies=roster_companies(), mode=mode[0])
@@ -2862,8 +2876,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # Testing the bare operation token here kept rejecting every new joiner
         # after the first resync, for as long as this lobby process lived --
         # including in the next NEW game, since the lobby outlives the world.
-        if recovery and recovery.roster_locked and addr not in peers:
-            _send_data(sock, addr, {"t": "reject", "reason": "A world recovery is in progress and the player list is fixed until it finishes. Try again in a moment."})
+        # A recovery in flight no longer fixes the player list (2026-09-16): a
+        # join IS a recovery round now, and a player arriving during one is
+        # admitted by the barrier (SyncOperation._admit) -- unless its version
+        # cannot take part, which would strand the round.
+        if recovery and recovery.roster_locked and addr not in peers and recovery_protocol != 4:
+            _send_data(sock, addr, {"t": "reject", "reason": "A world sync is in progress and your version cannot take part in it. Update the mod, or try again in a moment."})
             return
         late = False
         if addr in peers:                                   # rename in place
@@ -2890,11 +2908,24 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                            "links": [], "mesh": bool(is_mesh),
                            "company": company}
             remember_chip(assigned, company)
-            late = started[0]
+            late = started[0] or host_has_world()
             log(f"[host] JOIN {addr} as {assigned!r}"
-                + (" (late -- game already started)" if late else ""))
+                + (" (late -- game already started)" if started[0] else " (late -- the host is in a world)" if late else ""))
         peers[addr]["last"] = time.time()
         peers[addr]["recovery"] = recovery_protocol
+        # FROZEN JOIN (2026-09-16): a late joiner in a player-hosted session is
+        # brought in through a recovery round -- the session holds, the host
+        # saves, everyone (host included) loads that save -- instead of the
+        # running host sharing an autosave for the newcomer to catch up on.
+        # The menu's own hot-join save stands down when the roster says
+        # join_freeze (emit_roster). Falls back to that path when recovery is
+        # not available (an old client, a transfer in flight): logged.
+        if late and recovery and not relay_only:
+            if recovery_protocol == 4 and recovery.join(peers[addr]["name"]):
+                log(f"[host] frozen join for {peers[addr]['name']!r}: holding the session, everyone loads the shared world")
+            else:
+                log(f"[host] frozen join NOT possible for {peers[addr]['name']!r} "
+                    f"({'its version has no resync' if recovery_protocol != 4 else recovery_unavailable_reason()}) -- the menu's hot-join save serves it")
         if relay_only:
             letter_for(peers[addr]["name"])
         _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
@@ -3518,6 +3549,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     if snapshot.is_file():
                         last_shared[0] = str(snapshot)
                     log(f"[host] transport lobby follows the completed resync ({world[:8]}..); late joiners get {os.path.basename(last_shared[0] or '')}")
+                    # every member loaded that world: a newcomer brought in by a
+                    # frozen join is started now (no START GAME push for it)
+                    for p in peers.values():
+                        p["started"] = True
+                    started[0] = True
                     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
                     send_roster_packets()
 
@@ -3794,6 +3830,14 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         cleared ``started`` for it, and the menu needs to know this start
         replaces a world it is playing rather than starting a first one."""
         if started[0] or (recovery and recovery.held) or receiver.cancelled or receiver.failed or receiver.ask or receiver.catalogue_token or not receiver.mods_satisfied:
+            return
+        if recovery and recovery.completed:
+            # a frozen join: this game loaded the shared world through the
+            # recovery round and is playing it -- the roster's started:true is
+            # already true of us, not a save to load
+            started[0] = True
+            io.write_state(started=True)
+            log(f"[client] START via {via} taken as already started -- this game joined through a world sync")
             return
         if receiver.need and not receiver.complete:
             return

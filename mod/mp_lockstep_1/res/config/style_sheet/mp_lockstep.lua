@@ -69,9 +69,10 @@ function data()
 			backgroundColor = { r, g, b, 1.0 },
 			color = { r, g, b, 1.0 },
 		})
-		-- a translucent wash of the company colour for a whole window root / any
-		-- container the slice tags with !mpWinCoN (the read-only foreign windows).
-		a("!mpWinCo" .. cid, {
+		-- a translucent wash for a foreign entity WINDOW only (Window-scoped, so it
+		-- does NOT paint the HUD icon button root, which the slice also tags with
+		-- !mpWinCoN -- that produced a tinted box larger than the icon, 2026-09-16).
+		a("Window!mpWinCo" .. cid, {
 			backgroundColor = { r, g, b, 0.30 },
 		})
 		-- 2. the glyph colour (color2) when the icon carries this company's class.

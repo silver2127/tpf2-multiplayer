@@ -41,6 +41,16 @@ static float FakeFiltered(uintptr_t mode,uintptr_t,uintptr_t)
     TermFixture(reinterpret_cast<void*>(&SliceFilteredRelayA),1.0f);
     return 16777216.0f;
 }
+extern "C" void RoadRelayFixture(uintptr_t,uint64_t,uint32_t,int32_t,int32_t,uintptr_t,RoadBounds);
+// Engine calling AddToEdgeUseManager's Add: the engine sits in r12, r9 is junk.
+asm(".text\n.type RoadRelayFixture,@function\nRoadRelayFixture:\n"
+    "push %r12\nmov %r9,%r12\nmov $0x5a5a5a5a,%r9\ncall SliceRoadEntriesRelay\npop %r12\nret\n");
+struct AddSeen { uintptr_t mgr; uint64_t edge; uint32_t forward; int32_t entity, comp; RoadBounds bounds; int calls; } addSeen;
+static void FakeAdd(uintptr_t mgr,uint64_t edge,uint32_t forward,int32_t entity,int32_t comp,RoadBounds bounds)
+{ addSeen={mgr,edge,forward,entity,comp,bounds,addSeen.calls+1}; }
+static uintptr_t fakeTypeNode[3];
+static uintptr_t FakeTypeFind(uintptr_t,const uintptr_t*) { return uintptr_t(fakeTypeNode); }
+struct RoadEntry { int32_t entity, comp; float back, front; uint8_t forward, pad[3]; };
 static void (*foreignThrow)();
 static float ForeignFiltered(uintptr_t,uintptr_t,uintptr_t) { foreignThrow(); return 0; }
 static void ForeignCallback() { FilteredHook(0,0,0); }
@@ -121,6 +131,80 @@ int main(int argc,char** argv)
     assert(FilteredHook(3,0,0)==123.0f && !FilterContext::active); // cap: original answer
     try { FilteredHook(2,0,0); assert(false); } catch (int n) { assert(n==42); }
     assert(!FilterContext::active);
+    // ROAD ENTRY ORDER: synthetic manager in Add's layout, names in the Linux Name layout.
+    {
+        assert(sizeof(RoadEntry)==ROADENTRY_SIZE);
+        std::vector<RoadEntry> entries{{30,1,0,4,1,{}},{10,2,0,4,0,{}},{20,3,0,4,1,{}}};
+        uint8_t edgeData[32]{}; float len=50; memcpy(edgeData,&len,4);
+        auto vec=[](uint8_t* at,uintptr_t b,uintptr_t e){ memcpy(at,&b,8); memcpy(at+8,&e,8); memcpy(at+16,&e,8); };
+        vec(edgeData+8,uintptr_t(entries.data()),uintptr_t(entries.data()+3));
+        std::vector<uint8_t> groups(2*72);
+        vec(groups.data()+72,uintptr_t(edgeData)-32,uintptr_t(edgeData)+32);   // group 1: datas[1] is edgeData
+        std::vector<int32_t> indices{-1,1};
+        std::vector<uint8_t> mgr(0x80);
+        vec(mgr.data()+0x30,uintptr_t(indices.data()),uintptr_t(indices.data()+2));
+        vec(mgr.data()+0x48,uintptr_t(groups.data()),uintptr_t(groups.data()+groups.size()));
+        const uint64_t edge=(uint64_t(1)<<32)|1;
+        assert(RoadEdgeData(uintptr_t(mgr.data()),edge)==uintptr_t(edgeData));
+        assert(!RoadEdgeData(uintptr_t(mgr.data()),(uint64_t(1)<<32)|0));   // index -1
+        assert(!RoadEdgeData(uintptr_t(mgr.data()),(uint64_t(2)<<32)|1));   // past datas
+        assert(!RoadEdgeData(uintptr_t(mgr.data()),2));                     // past indices
+        assert(!RoadEdgeData(uintptr_t(mgr.data()),uint64_t(0xffffffffu)));
+        // world: entity slots at +98 (24-byte vectors of {type,slot}), pools at +80, flat data at pool+b8
+        const int type=2;
+        std::string names[2]={"bus a","Bus B"};
+        std::vector<uint8_t> pool(0xc0); uintptr_t data=uintptr_t(names); memcpy(pool.data()+0xb8,&data,8);
+        uintptr_t pools[3]={0,0,uintptr_t(pool.data())};
+        std::vector<uint8_t> slots(31*24);
+        int32_t slot30[2]={type,0}, slot10[2]={type,1}, other20[2]={type+1,0};
+        vec(slots.data()+30*24,uintptr_t(slot30),uintptr_t(slot30)+8);
+        vec(slots.data()+10*24,uintptr_t(slot10),uintptr_t(slot10)+8);
+        vec(slots.data()+20*24,uintptr_t(other20),uintptr_t(other20)+8);
+        std::vector<uint8_t> world(0xa0);
+        uintptr_t sp=uintptr_t(slots.data()), pp=uintptr_t(pools);
+        memcpy(world.data()+0x98,&sp,8); memcpy(world.data()+0x80,&pp,8);
+        const auto original=entries;
+        // no names: ids decide
+        assert(RoadEntriesSortAt(0,uintptr_t(mgr.data()),edge,-1)==RoadSorted);
+        assert(entries[0].entity==10 && entries[1].entity==20 && entries[2].entity==30);
+        assert(entries[0].comp==2 && entries[0].forward==0 && entries[2].comp==1 && entries[2].forward==1);
+        assert(RoadEntriesSortAt(0,uintptr_t(mgr.data()),edge,-1)==RoadUnchanged);
+        entries=original;
+        vec(edgeData+8,uintptr_t(entries.data()),uintptr_t(entries.data()+3));
+        // names, case-insensitive; the unnamed entity sorts first
+        fakeTypeNode[2]=type+1;
+        movementBase=uintptr_t(&FakeTypeFind)-0x9e3d50;
+        roadEntriesOriginal=&FakeAdd;
+        const RoadBounds b{1.5f,7.25f};
+        RoadRelayFixture(uintptr_t(mgr.data()),edge,1,30,77,uintptr_t(world.data()),b);
+        assert(addSeen.calls==1 && addSeen.mgr==uintptr_t(mgr.data()) && addSeen.edge==edge && addSeen.forward==1 &&
+               addSeen.entity==30 && addSeen.comp==77 && addSeen.bounds.back==1.5f && addSeen.bounds.front==7.25f);
+        assert(entries[0].entity==20 && entries[1].entity==30 && entries[2].entity==10);
+        assert(reSorted.load()==1 && reRefused.load()==0);
+        // a span that is not whole 20-byte entries is refused and left alone
+        const auto sorted=entries;
+        uintptr_t oddEnd=uintptr_t(entries.data())+50; memcpy(edgeData+0x10,&oddEnd,8);
+        assert(RoadEntriesSortAt(uintptr_t(world.data()),uintptr_t(mgr.data()),edge,type)==RoadRefused);
+        assert(!memcmp(entries.data(),sorted.data(),3*ROADENTRY_SIZE));
+        // more than ROADENTRIES_MAX vehicles on one edge: refused, untouched
+        std::vector<RoadEntry> many(ROADENTRIES_MAX+1);
+        for (size_t i=0;i<many.size();++i) many[i].entity=int32_t(many.size()-i);
+        const auto manyBefore=many;
+        vec(edgeData+8,uintptr_t(many.data()),uintptr_t(many.data()+many.size()));
+        assert(RoadEntriesSortAt(0,uintptr_t(mgr.data()),edge,-1)==RoadRefused);
+        assert(!memcmp(many.data(),manyBefore.data(),many.size()*ROADENTRY_SIZE));
+        movementBase=0;
+        // byte guard: mutated evidence refuses
+        const size_t isize=0x2e5a000;
+        auto* img=static_cast<uint8_t*>(mmap(nullptr,isize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+        assert(img!=MAP_FAILED);
+        for (const auto& c:kRoadEntriesChecks) memcpy(img+c.rva,c.bytes,c.size);
+        assert(Check(uintptr_t(img),kRoadEntriesChecks));
+        assert(img[0x16c484a]==0xe8);
+        int32_t rel=0; memcpy(&rel,img+0x16c484b,4); assert(0x16c484f+rel==0x2e58f70);
+        img[0x2e59441+20]^=1; assert(!Check(uintptr_t(img),kRoadEntriesChecks));
+        munmap(img,isize);
+    }
     assert(argc==2);
     void* library=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL); assert(library);
     foreignThrow=reinterpret_cast<void(*)()>(dlsym(library,"SliceTestForeignThrow"));
@@ -129,5 +213,5 @@ int main(int argc,char** argv)
     filteredOriginal=reinterpret_cast<void*>(&ForeignFiltered);
     assert(foreignCatch(&ForeignCallback)); assert(!FilterContext::active);
     dlclose(library);
-    puts("Linux movement: original term sums, immutable diagnostics, byte refusal, SysV station relay PASS");
+    puts("Linux movement: original term sums, immutable diagnostics, byte refusal, SysV station relay, road entry order PASS");
 }

@@ -114,5 +114,63 @@ for cname, ename, fn_lo, fn_hi in (("RVA_STNICON_CLASS_CALL", "STNICON_CLASS_EXP
         if code[j - base] == 0xE8 and j + 5 + struct.unpack_from("<i", code, j - base + 1)[0] == addclass: n += 1
     assert n == 1, f"{cname}: {n} addStyleClass calls in the function, expected 1"
 
+# ---- the StationItem constructor pre-hook (the 1000 ms cargo-state rebuild path) ----
+ctor = const("RVA_STNITEM_CTOR")
+cpro = byte_array("STNITEM_CTOR_PROLOGUE")
+arg = const("STNITEM_CTOR_ENTITY_ARG")
+assert len(cpro) == 15 and pe.get_data(ctor, 15) == cpro, f"StationItem ctor prologue changed: {pe.get_data(ctor, 15).hex(' ')}"
+cins = list(md.disasm(cpro, ctor))
+assert sum(i.size for i in cins) == 15 and [i.mnemonic for i in cins] == ["mov"] * 4, [(i.mnemonic, i.op_str) for i in cins]
+assert not any("rip" in i.op_str for i in cins), "a rip-relative operand in the stolen ctor prologue"
+for i in range(len(code) - 5):
+    if code[i] in (0xE8, 0xE9):
+        t = base + i + 5 + struct.unpack_from("<i", code, i + 1)[0]
+        assert not (ctor < t < ctor + 15), f"rel32 at {base + i:x} into the ctor steal"
+for d in md.disasm(code[ctor - base:0x5e0b70 - base], ctor):
+    if d.mnemonic.startswith("j") and d.operands and d.operands[0].type == X86_OP_IMM:
+        assert not (ctor < d.operands[0].imm < ctor + 15), f"branch into the ctor steal at {d.address:x}"
+# both callers pass the entity as the 6th argument: [rsp+0x28] at the call = [rsp+0x30] at entry
+assert arg == 0x30
+callers = {}
+for i in range(len(code) - 5):
+    if code[i] == 0xE8 and base + i + 5 + struct.unpack_from("<i", code, i + 1)[0] == ctor:
+        callers[base + i] = None
+assert set(callers) == {0x5dfeeb, 0x5e5a48}, f"StationItem ctor callers moved: {[hex(c) for c in callers]}"
+for site, src in ((0x5dfeeb, "r14d"), (0x5e5a48, "eax")):
+    window = list(md.disasm(pe.get_data(site - 0x40, 0x40), site - 0x40))
+    stores = [i for i in window if i.mnemonic == "mov" and i.op_str == f"dword ptr [rsp + 0x28], {src}"]
+    assert stores, f"caller {site:x}: no entity store to [rsp+0x28] from {src} before the call"
+# the rebuild callback constructs the item and swaps it into the ContentView right after
+after = list(md.disasm(pe.get_data(0x5e5a4d, 0x10), 0x5e5a4d))
+assert after[2].mnemonic == "call" and int(after[2].op_str, 16) == 0x2286020, "rebuild path no longer calls setContent 0x2286020 after the ctor"
+
+# ---- the post-attach restyle hook: right after DoStep hands the button to the HUD layer ----
+att = const("RVA_ICON_ATTACH_HOOK")
+aexp = byte_array("ICON_ATTACH_EXPECT")
+assert len(aexp) == 8 and pe.get_data(att, 8) == aexp, f"attach site changed: {pe.get_data(att, 8).hex(' ')}"
+ains = list(md.disasm(aexp, att))
+assert [(i.mnemonic, i.op_str) for i in ains] == [("mov", "rax, qword ptr [rbp - 0x80]"), ("mov", "rbx, qword ptr [rax + 0x18]")], [(i.mnemonic, i.op_str) for i in ains]
+pre = pe.get_data(att - 5, 5)
+assert pre[0] == 0xE8 and (att - 5) + 5 + struct.unpack("<i", pre[1:5])[0] == 0x224a920, "the call before the attach hook is not the HUD layer add 0x224a920"
+assert pe.get_data(att - 12, 3) == bytes([0x48, 0x8B, 0xD7]), "rdx is no longer the button (mov rdx, rdi) before the layer add"
+assert 0x5e2dc0 <= att < 0x5e4270, "attach hook outside DoStep"
+for d in md.disasm(code[0x5e2dc0 - base:0x5e4270 - base], 0x5e2dc0):
+    if d.mnemonic.startswith("j") and d.operands and d.operands[0].type == X86_OP_IMM:
+        assert not (att < d.operands[0].imm < att + 8), f"branch into the attach steal at {d.address:x}"
+for i in range(len(code) - 5):
+    if code[i] in (0xE8, 0xE9):
+        t = base + i + 5 + struct.unpack_from("<i", code, i + 1)[0]
+        assert not (att < t < att + 8), f"rel32 at {base + i:x} into the attach steal"
+
+# ---- the engine accessor the ctor pre-hook's EnginePtr goes through ----
+efp = const("RVA_ENGINE_FROM_PTR")
+eins = list(md.disasm(pe.get_data(efp, 0x12), efp))
+assert [(i.mnemonic, i.op_str) for i in eins[:4]] == [("sub", "rsp, 0x28"), ("call", "0x8bb7f0"), ("mov", "rax, qword ptr [rax + 0x28]"), ("add", "rsp, 0x28")], [(i.mnemonic, i.op_str) for i in eins[:4]]
+vins = list(md.disasm(pe.get_data(0x8bb7f0, 0xa), 0x8bb7f0))
+assert [(i.mnemonic, i.op_str) for i in vins[:3]] == [("mov", "rcx, qword ptr [rcx]"), ("mov", "rax, qword ptr [rcx]"), ("jmp", "qword ptr [rax + 8]")], "the EnginePtr virtual accessor changed"
+# DoStep itself resolves the engine this way (call 0x8b9e60 then GetComponentDataIndex 0xd0920)
+ds = list(md.disasm(code[0x5e2dc0 - base:0x5e4270 - base], 0x5e2dc0))
+assert any(i.mnemonic == "call" and i.op_str == "0x8b9e60" for i in ds), "DoStep no longer uses the EnginePtr accessor"
+
 print(f"stationicon bytes: ok -- hook {hook:x} (mov rdi,rax/xor r12d), wrap-call -> 2251620, "
-      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + 2 addStyleClass sites ok")
+      f"StationGroup ti at {ti_sg:x}, accessors present; glyph class: content-builder prologue + ctor prologue (2 callers) + 2 addStyleClass sites + post-attach hook + engine accessor ok")

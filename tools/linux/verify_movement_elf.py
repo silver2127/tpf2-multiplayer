@@ -19,7 +19,7 @@ with open(sys.argv[1], 'rb') as stream:
         return stream.read(size)
     source = (root/'native/linux/src/slice/movement_checks.h').read_text()
     checks = re.findall(r'\{(0x[0-9a-f]+),\s*((?:"[^"\n]+"\s*)+), (\d+)\}', source)
-    assert len(checks) == 7
+    assert len(checks) == 11
     for addr, data, size in checks:
         expected = bytes(int(x,16) for x in re.findall(r'\\x([0-9a-f]{2})', data))
         assert len(expected) == int(size)
@@ -50,4 +50,11 @@ with open(sys.argv[1], 'rb') as stream:
     additions = [i.address for i in insns if i.mnemonic == 'addss' and 'rbp - 0x44' in i.op_str]
     assert additions == [0x2e55db5,0x2e56014]
     assert read(0x2e55db5,10) == read(0x2e56014,10) == bytes.fromhex('f3 0f 58 45 bc f3 0f 11 45 bc')
-    print('PASS: build-id, 7 movement byte spans and menu prologue, all stolen boundaries, no interior branches, both filtered sums')
+    # roadentries (f6195dd): the only call in AddToEdgeUseManager is Add, and the
+    # three Add callers are PersonMoveSystem, AddToEdgeUseManager and TramMoveSystem.
+    insns = list(md.disasm(read(0x16c4780,302),0x16c4780))
+    calls = [(i.address,i.operands[0].imm) for i in insns if i.mnemonic == 'call' and i.operands[0].type == X86_OP_IMM]
+    assert (0x16c484a,0x2e58f70) in calls and read(0x16c484a,1) == b'\xe8'
+    body = list(md.disasm(read(0x2e58f70,2911),0x2e58f70))
+    assert any(i.address == 0x2e59454 and i.op_str == 'rsi, 0x14' for i in body)   # 20-byte push_back
+    print('PASS: build-id, 11 movement byte spans (incl. roadentries), roadentries Add call, menu prologue, all stolen boundaries, no interior branches, both filtered sums')

@@ -251,21 +251,17 @@ class SyncParticipant:
                 return None
             if ready.get('ok') != '1':
                 raise RuntimeError('Bridge could not clear the previous world')
-            if self.player == self.state['host'] and self.state['mode'] != 'start':
-                # THE HOST KEEPS ITS WORLD (2026-09-16). The snapshot was taken
-                # from this very world while it was held, so reloading it here
-                # only cost the host a full load for nothing. The clients load
-                # the file; the host stays held at the same step -- the shape a
-                # hot join already has (the joiner loads, the host does not) --
-                # and the checking phase still compares its fingerprint with the
-                # freshly loaded ones. Start mode (the host picked a save to load
-                # for everyone) still loads on the host too.
-                lua = self._lua()
-                if lua.get('held') != '1':
-                    return None
-                if self._native('pause', 'paused'):
-                    return self._ack(paused=True, digest=self.snapshot.digest)
-                return None
+            # THE HOST LOADS TOO, in every mode (2026-09-16, evening). For a few
+            # hours the host kept the world it took the snapshot from, to spare
+            # it a load. Measured the same evening: a joiner that loads a save
+            # the host keeps RUNNING FROM MEMORY diverges within ~35 game units
+            # (the simulated-people count splits, then the buses at the next
+            # stop), because a loaded world registers its entities in save
+            # order while the host's are in the order they were created --
+            # order the person and town systems consume. Two peers that both
+            # load the same file agree on it, and a session that started that
+            # way stayed locked for nine minutes. So every member, the host
+            # included, loads the snapshot: the load is the point.
             if not self._native('load', 'world_ready', basename):
                 return None
             lua = self._lua()

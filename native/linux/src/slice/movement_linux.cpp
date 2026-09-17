@@ -1,4 +1,5 @@
-// Linux SysV counterparts of 3217497/a64e4ea. No engine-owned order is changed.
+// Linux SysV counterparts of 3217497/a64e4ea and f6195dd. Only roadentries
+// changes an engine-owned order (a road edge's entries, as Windows does).
 #include "movement_linux.h"
 #include "movement_checks.h"
 #include "../paused_checks_linux.h"
@@ -8,6 +9,7 @@
 #include "train_order_linux.h"
 #include "slice_core.h"
 #include "hook.h"
+#include "../near_alloc.h"
 #include <cstring>
 #include "roadspace.h"
 #include "trainorder.h"
@@ -111,16 +113,22 @@ bool Measure(uintptr_t self, uintptr_t world, int n, int type, MoveSample* sampl
 }
 using UpdateFn = void (*)(uintptr_t,uintptr_t,int,float);
 void* moveOriginal[2];
-void Observe(int kind, uintptr_t self, uintptr_t world, int n)
+// The Name component's type index, or -1. TypeFind is an engine call, outside
+// all allocation catches.
+int NameType(uintptr_t world)
 {
-    static thread_local bool busy=false;
-    if (busy) return;
-    // TypeFind is an engine call, outside all allocation catches.
     const uintptr_t ti=movementBase+0x5a02600;
     using Find=uintptr_t (*)(uintptr_t,const uintptr_t*);
     int type=-1,stored=0;
     const uintptr_t node=reinterpret_cast<Find>(movementBase+0x9e3d50)(world+0x48,&ti);
     if (node && SliceReadT(node+0x10,&stored) && stored>0 && stored<=4097) type=stored-1;
+    return type;
+}
+void Observe(int kind, uintptr_t self, uintptr_t world, int n)
+{
+    static thread_local bool busy=false;
+    if (busy) return;
+    const int type=NameType(world);
     busy=true;
     MoveSample sample{};
     const bool ok=Measure(self,world,n,type,&sample);
@@ -138,6 +146,81 @@ void ShipHook(uintptr_t self,uintptr_t world,int n,float dt)
 { Observe(0,self,world,n); reinterpret_cast<UpdateFn>(moveOriginal[0])(self,world,n,dt); }
 void AirHook(uintptr_t self,uintptr_t world,int n,float dt)
 { Observe(1,self,world,n); reinterpret_cast<UpdateFn>(moveOriginal[1])(self,world,n,dt); }
+
+// ROAD ENTRY ORDER (Windows f6195dd). EdgeUseManager's per-edge entries are
+// rebuilt on load in save order, while a running world holds arrival order; the
+// lead-vehicle search keeps the first entry on an exact tie. After every Add from
+// AddToEdgeUseManager the edge's entries are put in name order (the train-order
+// rule: ASCII-case-insensitive bytes, then entity id), as Windows does. The edge
+// is found through the layout Add's own inlined lookup uses (2e59028..2e590a4):
+// indices vector<int> at +30, 72-byte groups at +48..+50 whose vector<EdgeData>
+// has 32-byte elements, entries (20 bytes) at EdgeData+8. Anything that does not
+// read back as that shape is left exactly as the engine built it.
+struct RoadBounds { float back, front; };   // CVec2f: one SSE eightbyte, xmm0
+using EdgeAddFn=void (*)(uintptr_t,uint64_t,uint32_t,int32_t,int32_t,RoadBounds);
+EdgeAddFn roadEntriesOriginal;
+constexpr size_t ROADENTRIES_MAX=512, ROADENTRY_SIZE=20;
+std::atomic<uint64_t> reCalls{0}, reSorted{0}, reRefused{0}, reShown{0};
+uintptr_t RoadEdgeData(uintptr_t mgr, uint64_t edge)
+{
+    const int32_t id0=int32_t(uint32_t(edge)), id1=int32_t(uint32_t(edge>>32));
+    if (!mgr || id0<0 || id1<0) return 0;
+    SliceVec indices{}, groups{}, datas{};
+    int32_t group=-1;
+    if (!SliceReadStdVector(mgr+0x30,4,1u<<26,&indices) || size_t(id0)>=indices.count ||
+        !SliceReadT(indices.begin+size_t(id0)*4,&group) || group<0) return 0;
+    if (!SliceReadStdVector(mgr+0x48,72,1u<<24,&groups) || size_t(group)>=groups.count) return 0;
+    if (!SliceReadStdVector(groups.begin+size_t(group)*72,32,1u<<24,&datas) || size_t(id1)>=datas.count) return 0;
+    return datas.begin+size_t(id1)*32;
+}
+enum RoadSortResult { RoadUnchanged, RoadSorted, RoadRefused };
+RoadSortResult RoadEntriesSortAt(uintptr_t world, uintptr_t mgr, uint64_t edge, int type) noexcept
+{
+    const uintptr_t ed=RoadEdgeData(mgr,edge);
+    if (!ed) return RoadUnchanged;
+    SliceVec entries{};
+    if (!SliceReadStdVector(ed+8,ROADENTRY_SIZE,1u<<24,&entries)) return RoadRefused;
+    const size_t n=entries.count;
+    if (n<2) return RoadUnchanged;
+    if (n>ROADENTRIES_MAX) return RoadRefused;
+    try {
+        thread_local std::vector<uint8_t> recs;
+        thread_local std::vector<TrainOrderKey> keys;
+        thread_local std::vector<std::string> names;
+        thread_local std::vector<int32_t> order;
+        recs.resize(n*ROADENTRY_SIZE); keys.resize(n); names.resize(n); order.resize(n);
+        if (!SliceRead(entries.begin,recs.data(),recs.size())) return RoadRefused;
+        for (size_t i=0;i<n;++i) {
+            int32_t id=0; memcpy(&id,recs.data()+i*ROADENTRY_SIZE,4);
+            char text[TRAINORDER_NAME_MAX+1]; size_t len=0;
+            const uintptr_t comp=world ? SliceNameComponent(world,id,type) : 0;
+            if (comp && SliceReadStdString(comp,text,sizeof(text),&len,TRAINORDER_NAME_MAX)) names[i].assign(text,len);
+            else names[i].clear();
+            keys[i]={names[i].data(),uint32_t(names[i].size()),id,0}; order[i]=int32_t(i);
+        }
+        // insertion sort, as Windows: stable, the same order for the same keys
+        for (size_t i=1;i<n;++i) {
+            const int32_t t=order[i]; size_t j=i;
+            for (; j>0; --j) {
+                const int c=TrainOrderNameCmp(keys[t],keys[order[j-1]]);
+                if (!(c<0 || (c==0 && keys[t].id<keys[order[j-1]].id))) break;
+                order[j]=order[j-1];
+            }
+            order[j]=t;
+        }
+        bool changed=false;
+        for (size_t i=0;i<n;++i) if (order[i]!=int32_t(i)) { changed=true; break; }
+        if (!changed) return RoadUnchanged;
+        // The engine's own allocation, just read back whole, inside its Add caller.
+        uint8_t* out=reinterpret_cast<uint8_t*>(entries.begin);
+        for (size_t i=0;i<n;++i) memcpy(out+i*ROADENTRY_SIZE,recs.data()+size_t(order[i])*ROADENTRY_SIZE,ROADENTRY_SIZE);
+        if (++reShown<=4) {
+            int32_t first=0; memcpy(&first,out,4);
+            SliceLog("[roadentries] edge with %zu vehicles re-ordered by name (first now entity %d)\n",n,first);
+        }
+        return RoadSorted;
+    } catch (...) { return RoadRefused; } // private allocations only
+}
 
 bool ReadCompanies(const std::string& data, const char* letter)
 {
@@ -296,6 +379,24 @@ extern "C" { __attribute__((visibility("hidden"))) uintptr_t SliceStationResume=
 extern "C" __attribute__((visibility("hidden")))
 int SliceStationAllow(int owner,int local) { return owner==local || (Companies() && StationsPermitted(owner,local)); }
 extern "C" void SliceStationRelay();
+// Replaces `call Add` at 16c484a (rdi=manager, rsi=EdgeId, edx=forward,
+// ecx=entity, r8d=component, xmm0=bounds; r12 holds AddToEdgeUseManager's
+// engine). Add takes no r9, so the relay hands the engine over in it and
+// tail-jumps: the C++ side returns straight to AddToEdgeUseManager.
+extern "C" __attribute__((visibility("hidden")))
+void SliceRoadEntriesAdd(uintptr_t mgr,uint64_t edge,uint32_t forward,int32_t entity,int32_t comp,uintptr_t world,RoadBounds bounds)
+{
+    roadEntriesOriginal(mgr,edge,forward,entity,comp,bounds);
+    ++reCalls;
+    if (!world || !mgr) return;
+    const RoadSortResult r=RoadEntriesSortAt(world,mgr,edge,NameType(world));
+    if (r==RoadSorted) ++reSorted;
+    else if (r==RoadRefused) ++reRefused;
+}
+extern "C" void SliceRoadEntriesRelay();
+asm(".text\n.hidden SliceRoadEntriesRelay\n.type SliceRoadEntriesRelay,@function\n"
+    "SliceRoadEntriesRelay:\nendbr64\nmov %r12,%r9\njmp SliceRoadEntriesAdd\n"
+    ".size SliceRoadEntriesRelay,.-SliceRoadEntriesRelay\n");
 // Entered via JMP with the engine's stack already aligned for CALL. The next
 // instruction after the stolen cmp/sete/movzx is the engine's epilogue jump.
 asm(".text\n.hidden SliceStationRelay\n.type SliceStationRelay,@function\n"
@@ -336,6 +437,16 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
     }
     uintptr_t name=0; char text[sizeof("N3ecs9component4NameE")];
     namesOk &= SliceReadT(base+0x5a02608,&name) && SliceRead(name,text,sizeof(text)) && !memcmp(text,"N3ecs9component4NameE",sizeof(text));
+    if (FlagOff(root,data,"roadentries")) {
+        SliceLog("[roadentries] OFF (roadentries=0 in tpf2_menu_flags.txt) -- a road edge's vehicle entries keep the engine's arrival/load order\n");
+    } else {
+        roadEntriesOriginal=reinterpret_cast<EdgeAddFn>(base+0x2e58f70);
+        const bool ready=namesOk && Check(base,kRoadEntriesChecks) &&
+            Tpf2mpRedirectCall(base+0x16c484a,base+0x2e58f70,reinterpret_cast<void*>(&SliceRoadEntriesRelay));
+        SliceLog("[roadentries] %s: a road edge's vehicle entries are kept in name order (AddToEdgeUseManager call at 16c484a)\n",
+            ready ? "installed" : "OFF");
+        ok &= ready;
+    }
     if (!FlagOff(root,data,"shiporder")) {
         const bool ready=namesOk && Check(base,kShipChecks) && InstallHook(base+0x16d75c0,reinterpret_cast<void*>(&ShipHook),8,&moveOriginal[0]);
         SliceLog("[shiporder] %s (measurement only)\n",ready ? "installed" : "OFF"); ok &= ready;

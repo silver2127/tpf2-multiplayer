@@ -14,6 +14,8 @@ company). This loads the real companies.lua and checks:
   - an origin playing another company may not name it
   - an empty name clears it; a dissolved company loses its name
   - the names ride in the save state and come back from it
+  - mp_company_map.txt (for the Big Maps minimap) lists me= and cid=pid=name,
+    percent-escaped, rewritten only on change, emptied outside companies mode
   - the GUI's inject line and the dispatcher carry CMNAME (text anchors, as
     actions_off_test does for the dash file)
 
@@ -83,6 +85,18 @@ function T.swapSwitch()
 end
 function T.name(origin, cid, name) CM.execCompanyCmd({ op = "CMNAME", cid = cid, origin = origin, name = CM.escName(name) }) return notes[#notes] end
 function T.raw(cid) return CM.cmName[cid] end
+function T.map(dir)
+  K.BASE = dir
+  CM.cmWriteCompanyMap()
+  local f = io.open(dir .. "mp_company_map.txt", "r"); local s = f and f:read("*a") or "?"; if f then f:close() end
+  local stamp = CM.cmMapWritten
+  CM.cmWriteCompanyMap()                      -- unchanged content: no rewrite
+  local same = CM.cmMapWritten == stamp
+  local mode = CM.cmMode; CM.cmMode = "coop"; CM.cmWriteCompanyMap(); CM.cmMode = mode
+  local f2 = io.open(dir .. "mp_company_map.txt", "r"); local empty = f2 and f2:read("*a") or "?"; if f2 then f2:close() end
+  K.BASE = ""
+  return s, same, empty
+end
 function T.defaults()
   -- the lobby handed out 1 to a, 2 to b, 3 to c; only a and b have names
   CM.playerNames = { a = "Ada", b = "bob" }
@@ -145,6 +159,12 @@ check("an origin playing another company may not", T.raw(2) == "Acme & Sons" and
 T.name("a", 1, "Host Rail")
 check("the host names its own", T.nameOf(1) == "Host Rail", T.nameOf(1))
 check("every company's entity carries its name (finances window)", T.entityNames() == "Host Rail|Acme & Sons|Company 3", T.entityNames())
+import tempfile as _tf
+with _tf.TemporaryDirectory() as _td:
+    _s, _same, _empty = T.map(_td.replace("\\", "/") + "/")
+    check("mp_company_map.txt: me= and cid=pid=name, percent-escaped",
+          _s == "me=1\n1=7=Host%20Rail\n2=8=Acme%20%26%20Sons\n3=9=Company%203\n", repr(_s))
+    check("the map is rewritten only on change and emptied outside companies mode", _same and _empty == "", (_same, repr(_empty)))
 T.sets()
 T.name("a", 1, "Host Rail")
 check("an unchanged name issues no setName", T.sets() == 0)

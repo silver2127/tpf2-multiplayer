@@ -139,6 +139,7 @@ struct Model {
     std::vector<std::string> letters;   // relay lobbies: the relay's origin letter per player
     std::deque<std::string> chat;
     long storedAge = -1, storedMax = -1;
+    bool joinFreeze = false;   // roster join_freeze: the lobby brings a late joiner in through a world sync; no hot-join save here
     int relayPort = 0;         // this lobby's --game-relay-port
     int lastCount = 0;         // hot join: the previous roster's size
 };
@@ -1286,6 +1287,7 @@ static void ApplyRoster(const Json& ev)
     bool roleKnown, isHost, relay, relayRoleChanged = false;
     int count, prevCount;
     long age, mx;
+    bool freeze;
     {
         std::lock_guard<std::mutex> lk(S().mtx);
         Model& m = S().m;
@@ -1313,6 +1315,9 @@ static void ApplyRoster(const Json& ev)
         m.relay = JBool(ev, "relay", false);
         m.storedAge = JInt(ev, "stored_age", -1);
         m.storedMax = JInt(ev, "stored_max", -1);
+        // "join_freeze":true -> the lobby freezes the session for a late joiner and
+        // reloads everyone (a recovery round); absent or false -> the hot-join save
+        m.joinFreeze = JBool(ev, "join_freeze", false);
         m.letters.assign(m.players.size(), std::string());
         if (const Json* lm = ev.Get("letters"))
             if (m.relay)
@@ -1332,6 +1337,7 @@ static void ApplyRoster(const Json& ev)
         count = (int)m.players.size();
         age = m.storedAge;
         mx = m.storedMax;
+        freeze = m.joinFreeze;
         prevCount = m.lastCount;
         m.lastCount = count;
     }
@@ -1351,7 +1357,12 @@ static void ApplyRoster(const Json& ev)
         if (InGame()) {
             if (relay && age >= 0 && mx > 0 && age <= mx)
                 Log("[lobby] hot join: roster %d -> %d -- the relay serves its %ld s old world, no sync taken\n", prevCount, count, age);
-            else
+            else if (freeze) {
+                // FROZEN JOIN (Windows f94d8c0): the lobby holds the session and
+                // everyone, this game included, loads the host's save. No autosave here.
+                Log("[lobby] hot join: roster %d -> %d -- the lobby freezes the session and reloads everyone; no hot-join save taken here\n", prevCount, count);
+                Status("A player joined: holding the game while everyone loads the shared world\xE2\x80\xA6");
+            } else
                 SyncStart("hot join: roster " + std::to_string(prevCount) + " -> " + std::to_string(count));
         } else if (!g_titleMenu.load() && !g_gameUiSeen.load() && !S().loggedNoGameUi) {
             S().loggedNoGameUi = true;

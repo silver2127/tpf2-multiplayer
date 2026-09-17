@@ -894,17 +894,17 @@ function CM.isPlayerConstruction(id, fileName)
 	pcall(function()
 		local po = api.engine.getComponent(id, api.type.ComponentType.PLAYER_OWNED)
 		if po ~= nil then
-			local me = api.engine.util.getPlayer()
-			owned = (po.player == me)
-			-- companies mode: a REMOTE company's copy sits on that company's AI
-			-- player, not on me. It is still a player construction we must keep
-			-- tracking (consByKey) -- otherwise the very act of reassigning it
-			-- evicts it, and the owner's later demolish/edit finds nothing.
-			if not owned and CM.cmMode == "companies" then
-				for _, pid in pairs(CM.cmCompanyPid) do
-					if po.player == pid then owned = true; break end
-				end
-			end
+			-- Any owner is a player: the human, or a company's AI player entity
+			-- (companies mode puts a remote company's copy on that company's entity,
+			-- and it must stay tracked -- consByKey -- or reassigning it evicts it
+			-- and the owner's later demolish/edit finds nothing). Town buildings and
+			-- industries carry no PLAYER_OWNED at all. This used to accept only the
+			-- human plus the pids in CM.cmCompanyPid, which the save's state fills in
+			-- lazily: a joiner's first hash samples after the load gate ran BEFORE that
+			-- (2026-09-16, t=6668/6672: c1 t:696 against the host's c13 t:684), the
+			-- town lane counted the other companies' 12 stations as town buildings
+			-- for two stamps, and a false "DESYNC town +12" was declared.
+			owned = po.player ~= nil and po.player ~= -1
 		else
 			owned = false
 		end

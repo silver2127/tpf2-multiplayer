@@ -621,6 +621,7 @@ static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // m
 static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
 static int   g_flagAutoLoad = 1;            // START loads the shared save in-process (autoload=0: the player opens LOAD GAME)
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
+static volatile LONG g_joinFreeze = 0;   // roster join_freeze: the lobby brings a late joiner in through a world sync (everyone reloads); this DLL takes no hot-join save (2026-09-16)
 static bool  g_latoLoaded = false;
 static void ReadFlags()
 {
@@ -2856,6 +2857,10 @@ static void applyRoster(const char* s)
     // "mode":"coop"|"companies" -> the checkbox (a joiner sees the host's choice)
     { char md[16] = ""; jsonStr(s, "mode", md, sizeof(md));
       if (md[0]) InterlockedExchange(&g_sepCompanies, strcmp(md, "companies") == 0 ? 1 : 0); }
+    // "join_freeze":true -> the lobby freezes the session for a late joiner and
+    // reloads everyone (a recovery round); absent or false -> the hot-join save below
+    { const char* jf = strstr(s, "\"join_freeze\"");
+      InterlockedExchange(&g_joinFreeze, (jf && strstr(jf, "true") && strstr(jf, "true") < jf + 24) ? 1 : 0); }
     // "stages":{"name":"text",...} -> g_stages[i]: what each joiner is doing
     g_stages.assign(g_players.size(), std::string());
     { const char* sg = strstr(s, "\"stages\"");
@@ -2914,6 +2919,14 @@ static void applyRoster(const char* s)
             // the relay holds a copy fresh enough to serve the newcomer itself
             // (the periodic upload keeps it that way): no autosave, no upload here
             Log("[menu] hot join: roster %d -> %d -- the relay serves its %ld s old world, no sync taken\n", lastCount, count, age);
+        } else if (InterlockedCompareExchange(&g_joinFreeze, 0, 0)) {
+            // FROZEN JOIN (2026-09-16): the lobby holds the session and runs a
+            // recovery round -- the host saves, EVERYONE (this game included)
+            // loads that save -- so the newcomer's world registers its entities
+            // in the same order as ours. A catch-up joiner never did, and its
+            // person sim split within ~35 game units. No autosave from here.
+            Log("[menu] hot join: roster %d -> %d -- the lobby freezes the session and reloads everyone; no hot-join save taken here\n", lastCount, count);
+            SetStatus("A player joined: holding the game while everyone loads the shared world\xE2\x80\xA6");
         } else {
             char why[96]; snprintf(why, sizeof(why), "hot join: roster %d -> %d", lastCount, count);
             SyncStart(why);
@@ -3902,7 +3915,15 @@ static void MyCreatePage(uint64_t thisp, int page)
         // "start while in game" and was ignored (relay resume, 2026-09-10).
         // A pointer still set here means the player just left a world: with a
         // lobby running, that leaves the lobby too (g_leaveOnMenu, myPresent).
-        if (g_gameUi != 0 && LobbyRunning()) InterlockedExchange(&g_leaveOnMenu, 1);
+        // Not when the load is ours: a resync loads the host's snapshot through
+        // the engine's own load path, which builds this page between the old
+        // world and the loading screen. Reading that as "left the world" made
+        // every joiner LEAVE mid-resync, and the host's barrier failed with
+        // "Player disconnected or roster changed" (2026-09-16).
+        if (g_gameUi != 0 && LobbyRunning()) {
+            if (NativeIo::Loading()) Log("[menu] the title menu was built by our own load (resync) -- staying in the lobby\n");
+            else InterlockedExchange(&g_leaveOnMenu, 1);
+        }
         g_gameUi = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
         // Keep recovery reachable at the title menu after a failed load.
