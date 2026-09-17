@@ -6767,6 +6767,24 @@ static const uint8_t ICON_CONTENT_PROLOGUE[15] = {
     0x53, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57,   // push rbx/rsi/rdi/r14/r15
     0x48, 0x83, 0xEC, 0x70               // sub rsp, 0x70
 };
+// THE REBUILD PATH (2026-09-16, fourth try). CreateStationGroupItem2 (0x5dfcf0,
+// called by the content builder) wraps the StationItem in a ContentView and arms
+// a 1000 ms re-evaluation (0x227ca40) whose callback (0x5e5970, no static
+// caller) constructs a FRESH StationItem (0x5e0070) and swaps it in
+// (setContent 0x2286020) whenever the waiting-cargo state changes. That path
+// never enters the content builder, so g_curIconEntity was whatever the LAST
+// DoStep build recorded: the rebuilt icon got another entity's owner (a town ->
+// vanilla, another station -> the wrong colour, "two colours"). The constructor
+// is common to both paths and takes the entity as its 6th argument ([rsp+0x30]
+// at entry), so its entry pre-hook records the right entity every time.
+static const uintptr_t RVA_STNITEM_CTOR = 0x5e0070;          // StationItem(ctx, a, b, c, sys, entity, i, i, i, cfg)
+static const uint8_t STNITEM_CTOR_PROLOGUE[15] = {
+    0x48, 0x8B, 0xC4,                    // mov rax, rsp
+    0x4C, 0x89, 0x48, 0x20,              // mov [rax+0x20], r9
+    0x4C, 0x89, 0x40, 0x18,              // mov [rax+0x18], r8
+    0x48, 0x89, 0x50, 0x10               // mov [rax+0x10], rdx
+};
+static const uint32_t STNITEM_CTOR_ENTITY_ARG = 0x30;        // [rsp+0x30] at entry = the 6th argument, ecs::Entity
 static const uintptr_t RVA_STNICON_CLASS_CALL  = 0x5e07f9;  // call 0x227a1e0 in StationItem (rcx = ::StationIcon)
 static const uintptr_t RVA_DEPOTICON_CLASS_CALL = 0x5e2d13; // call 0x227a1e0 in VehicleDepotItem (rcx = ::Icon)
 static const uint8_t STNICON_CLASS_EXPECT[5]   = { 0xE8, 0xE2, 0x99, 0xC9, 0x01 };
@@ -6844,8 +6862,36 @@ static void InstallIconClassApply()
     FlushInstructionCache(GetCurrentProcess(), stub, 32);
     const bool s1 = RedirectClassCall(RVA_STNICON_CLASS_CALL, STNICON_CLASS_EXPECT, "StationItem::StationIcon");
     const bool s2 = RedirectClassCall(RVA_DEPOTICON_CLASS_CALL, DEPOTICON_CLASS_EXPECT, "VehicleDepotItem::Icon");
-    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationIcon call %s, depot Icon call %s\n",
-        (unsigned long long)RVA_ICON_CONTENT_FN, s1 ? "redirected" : "NOT redirected", s2 ? "redirected" : "NOT redirected");
+    // the StationItem constructor entry: record its entity argument (covers the
+    // 1000 ms cargo-state rebuild, which never passes the content builder)
+    bool s3 = false;
+    if (BytesAre(RVA_STNITEM_CTOR, STNITEM_CTOR_PROLOGUE, sizeof(STNITEM_CTOR_PROLOGUE), "stationicon")) {
+        uint8_t* cs = NearAlloc(32);
+        void* ctramp = nullptr;
+        if (cs) {
+            size_t j = 0;
+            cs[j++] = 0x49; cs[j++] = 0xBA; memcpy(cs + j, &slot, 8); j += 8;              // mov r10, &g_curIconEntity
+            cs[j++] = 0x8B; cs[j++] = 0x44; cs[j++] = 0x24; cs[j++] = (uint8_t)STNITEM_CTOR_ENTITY_ARG; // mov eax, [rsp+0x30]
+            cs[j++] = 0x41; cs[j++] = 0x89; cs[j++] = 0x02;                                // mov [r10], eax
+            const size_t cj = j;
+            cs[j++] = 0x48; cs[j++] = 0xB8; memset(cs + j, 0, 8); j += 8;                  // mov rax, <tramp>
+            cs[j++] = 0xFF; cs[j++] = 0xE0;                                                // jmp rax
+            if (PatchJumpNear(g_base + RVA_STNITEM_CTOR, cs, sizeof(STNITEM_CTOR_PROLOGUE), &ctramp) && ctramp) {
+                const uintptr_t ctp = (uintptr_t)ctramp;
+                DWORD o2 = 0;
+                VirtualProtect(cs, 32, PAGE_EXECUTE_READWRITE, &o2);
+                memcpy(cs + cj + 2, &ctp, 8);
+                VirtualProtect(cs, 32, o2, &o2);
+                FlushInstructionCache(GetCurrentProcess(), cs, 32);
+                s3 = true;
+            } else {
+                Log("[stationicon] NOT installed: could not detour the StationItem constructor at rva=%llx\n", (unsigned long long)RVA_STNITEM_CTOR);
+            }
+        }
+    }
+    Log("[stationicon] glyph class: content-builder entry hooked at rva=%llx; StationItem ctor entry %s; StationIcon call %s, depot Icon call %s\n",
+        (unsigned long long)RVA_ICON_CONTENT_FN, s3 ? "hooked (rebuild path covered)" : "NOT hooked (cargo rebuilds keep a stale entity)",
+        s1 ? "redirected" : "NOT redirected", s2 ? "redirected" : "NOT redirected");
 }
 
 static void InstallStationIconColor()
