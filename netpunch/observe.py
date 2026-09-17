@@ -220,6 +220,15 @@ def upnp_map(game_port, keep=False):
                 ok = u.addportmapping(game_port, "UDP", u.lanaddr, game_port,
                                       "netpunch", "")
                 result["open"] = bool(ok)
+                # the same port on TCP: the save transfers stream over a TCP
+                # connection to the host when it is reachable (bulk_tcp.py);
+                # best effort, a router that refuses it just costs the joiner
+                # one failed connect and the transfer runs over UDP
+                if ok and keep:
+                    try:
+                        u.addportmapping(game_port, "TCP", u.lanaddr, game_port, "netpunch save transfer", "")
+                    except Exception:                    # noqa: BLE001
+                        pass
                 if ok and not keep:
                     # We only needed to prove it works; connect.py re-adds it.
                     try:
@@ -274,6 +283,10 @@ def upnp_unmap(game_port):
         u.discoverdelay = 1000
         if u.discover() > 0:
             u.selectigd()
+            try:
+                u.deleteportmapping(game_port, "TCP")    # the save-transfer mapping, if the router took it
+            except Exception:                            # noqa: BLE001
+                pass
             try:
                 u.deleteportmapping(game_port, "UDP")
                 return True

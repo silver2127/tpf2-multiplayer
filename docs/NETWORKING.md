@@ -25,6 +25,7 @@ own lobby process over loopback; the lobbies carry the frames between machines.
 | STUN | outbound UDP 19302 / 3478 | `stun.l.google.com`, `stun.nextcloud.com`, `stun.cloudflare.com`, `stun.services.mozilla.com`. |
 | master server | outbound HTTPS | The public game list, and the rendezvous for hole punching (`/knock`); see [Master server](#master-server). |
 | dedicated relay | UDP 29471 on the server | Same protocol as a host. |
+| save transfers | TCP 29471 on the host or relay | The bulk channel the save and mod transfers stream over ([Save transfer](#save-transfer)). A host maps it with UPnP beside the UDP port; when it is not reachable the transfer uses the UDP path. The relay opens it in ufw. |
 
 ## Join codes
 
@@ -203,11 +204,27 @@ status message.
 2. The lobby reads the `.sav`, its `.sav.lua` and `.jpg` sidecars, and sends them as one
    stream named `incoming_save.sav`, `incoming_save.sav.lua`, `incoming_save.jpg`, with a
    SHA-256 per file and overall in the (sealed) `fbegin`.
-3. Chunks are 1,350 bytes (8,192 when every receiver is on loopback), sent as plaintext
-   `NPF1` frames inside a 2,048-chunk window (16,384 on loopback). Receivers write each
-   chunk at its offset, report `{base, nack}` every 50 ms, and the sender resends NACKed
-   chunks first. It rewinds after 0.5 s without feedback and gives up on a peer after 30 s
-   without progress.
+3. **Over TCP when it can** (2026-09-17, `netpunch/bulk_tcp.py`). The host and the relay
+   listen on the lobby port over TCP as well. `fbegin` carries the listener's port and a
+   16-byte token; each receiver connects, says `TPF2BULK1 recv <sid> <token> <name>`, and
+   the file streams down that connection from offset 0, in order, nothing else. A leader
+   uploading to the relay does the same the other way round: the relay's `fbegin_ack`
+   names its port and the leader connects with role `send`. The side behind NAT always
+   connects, so no TCP hole punching is attempted; a host not reachable on TCP (no UPnP
+   TCP mapping, a firewall) costs the joiner one failed connect and the transfer runs over
+   UDP as below. A stream that breaks half way leaves the receiver's feedback naming the
+   holes and the UDP path fills them. Measured on loopback: ~10 MB/s per peer over the UDP
+   scheme, ~450 MB/s over TCP; over the internet TCP reaches the link's speed, which the
+   2.76 MB UDP window (window / round trip: ~15 MB/s at 185 ms) does not. `BULK_TCP` in
+   lobby.py turns it off for a diagnosis. A Windows host gets the firewall's one-time
+   prompt for `netpunch.exe` the first time it listens; refusing it only means joiners use
+   the UDP path.
+4. Over UDP otherwise: chunks are 1,350 bytes (8,192 when every receiver is on loopback),
+   sent as plaintext `NPF1` frames inside a 2,048-chunk window (16,384 on loopback).
+   Receivers write each chunk at its offset, report `{base, nack}` every 50 ms, and the
+   sender resends NACKed chunks first. It rewinds after 0.5 s without feedback and gives up
+   on a peer after 30 s without progress. The feedback runs on this path during a TCP
+   stream too, so progress, stages and timeouts are one mechanism.
 4. The receiver checks the proposed filenames against a whitelist before allocating, refuses
    writes past the end, verifies every hash (retrying the whole transfer up to three
    times), writes the files and emits `save_ready`.

@@ -154,6 +154,7 @@ from __future__ import annotations
 import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
 from player_stats import PlayerStats       # relay-only: who plays, how much, how many at once (player_stats.json)
+import bulk_tcp                            # the TCP side channel the save/mod transfers stream over (2026-09-17)
 import collections
 import hashlib
 import itertools
@@ -233,6 +234,14 @@ CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
 # The remote value is bounded by the receive buffer: 2048 x 1200 B = 2.4 MB sits
 # inside the 4 MB buffer with room for reordering, and is the value every
 # internet transfer before this ran on.
+# THE TCP BULK CHANNEL (2026-09-17, bulk_tcp.py). BULK[0] is this process's
+# listener (the host's / relay's, on the lobby port; None on a joiner and when
+# the port cannot be bound); BULK_TCP[0] False keeps every transfer on UDP
+# (the self-test's lossy rounds, a diagnosis). A host transfer advertises the
+# listener in its fbegin, a receiver connects and the file streams; the
+# feedback, verify and start messages are the same as over UDP.
+BULK = [None]
+BULK_TCP = [True]
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
 SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds the
@@ -1234,6 +1243,19 @@ class _HostSaveTransfer:
                           "files": files_meta, "sha256": self.overall_sha,
                           "kind": kind, "mods": [[m, v] for m, v in self.mods],
                           "mods_unknown": self.mods_unknown}
+        # THE TCP CHANNEL. A per-transfer token rides in the (sealed) fbegin; a
+        # receiver that can reach our listener connects with it and the file
+        # streams (_tcp_serve). With no listener here (a joiner uploading to the
+        # relay) the RELAY's fbegin_ack names its listener and we connect to it
+        # instead (_tcp_push, on_begin_ack). A peer on the stream is skipped by
+        # the UDP pump; its feedback still drives base, stage and timeouts.
+        self.tcp_token = os.urandom(16).hex() if BULK_TCP[0] else None
+        self.tcp_bytes = 0
+        if self.tcp_token and BULK[0] is not None:
+            self.begin_msg["tcp"] = {"port": BULK[0].port, "token": self.tcp_token}
+            BULK[0].expect(sid, "recv", self.tcp_token, self._tcp_serve)
+        elif self.tcp_token:
+            self.begin_msg["tcp"] = {"token": self.tcp_token}     # no listener: the other side may offer one
         now = time.time()
         self.peers = {}          # addr -> per-peer send state
         for addr, name in targets:
@@ -1242,11 +1264,60 @@ class _HostSaveTransfer:
                 "nack": [], "last_fack": now, "last_begin": 0.0,
                 "last_resend": 0.0, "last_advance": now,
                 "state": "active", "last_pct": -1, "need": [], "ask": False, "ask_since": 0.0, "ask_logged": False,
+                "tcp": False, "tcp_tried": False,
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
                  f"{self.total_chunks} chunks of {self.chunk}B "
                  f"({'local' if self.chunk == CHUNK_LOCAL else 'internet-safe'}) "
                  f"-> {len(self.peers)} peer(s)")
+
+    # -- the TCP channel --------------------------------------------------- #
+    def _peer_for_stream(self, addr, name):
+        """The peer record a connection is for: by the name it said, else the
+        one peer at that address (a NAT shows the UDP and TCP sides alike)."""
+        for a, p in self.peers.items():
+            if p["state"] == "active" and not p["tcp"] and name and p["name"] == name:
+                return a, p
+        same = [(a, p) for a, p in self.peers.items()
+                if p["state"] == "active" and not p["tcp"] and isinstance(a, tuple) and a[0] == addr[0]]
+        return same[0] if len(same) == 1 else (None, None)
+
+    def _tcp_serve(self, sock, addr, name):
+        """ACCEPT THREAD HELPER: a receiver connected to our listener."""
+        _, p = self._peer_for_stream(addr, name)
+        if p is None:
+            self.log(f"[host] a TCP stream from {addr[0]} ({name!r}) matches no waiting receiver -- closed")
+            sock.close()
+            return
+        self._tcp_stream(sock, p)
+
+    def _tcp_push(self, ip, port, p):
+        """A thread: WE connect (a joiner's upload to the relay's listener)."""
+        sock = bulk_tcp.bulk_connect(ip, port, "send", self.sid, self.tcp_token, p["name"])
+        if sock is None:
+            self.log(f"[host] {p['name']}: no TCP stream to {ip}:{port} -- the upload runs over UDP")
+            return
+        self._tcp_stream(sock, p)
+
+    def _tcp_stream(self, sock, p):
+        p["tcp"] = True
+        p["ready"] = True
+        p["tcp_done"] = 0.0
+        self.log(f"[host] {p['name']} takes the {self.kind} over TCP")
+        self.io.emit({"type": "transfer", "role": "send", "peer": p["name"], "state": "tcp"})
+        t0 = time.time()
+        ok = bulk_tcp.stream_send(sock, self.blob, lambda n: p.__setitem__("tcp_sent", n))
+        self.tcp_bytes += p.get("tcp_sent", 0)
+        if ok:
+            # the receiver may still be feeding the last blocks to its buffer:
+            # stay off the UDP pump until its feedback says so (on_fack clears
+            # the flag if the base stops short of the end for a while)
+            p["tcp_done"] = time.time()
+            self.log(f"[host] {p['name']}: sent over TCP, {bulk_tcp.rate_text(self.total_bytes, time.time() - t0)}")
+        else:
+            # the receiver's feedback names what is missing; the UDP pump resumes from its base
+            p["tcp"] = False
+            self.log(f"[host] {p['name']}: the TCP stream broke after {p.get('tcp_sent', 0)} B -- UDP takes over")
 
     # -- progress ---------------------------------------------------------- #
     def _emit_pct(self, p):
@@ -1280,6 +1351,12 @@ class _HostSaveTransfer:
         if not p["ready"]:
             p["ready"] = True
             self.log(f"[host] {p['name']} ready for {self.kind}")
+        # the receiver has a listener (the relay, for our upload): connect and stream
+        port = msg.get("tcp_port")
+        if self.tcp_token and isinstance(port, int) and 0 < port < 65536 and not p["tcp"] and not p["tcp_tried"] \
+                and isinstance(addr, tuple):
+            p["tcp_tried"] = True
+            threading.Thread(target=self._tcp_push, args=(addr[0], port, p), name="bulk-push", daemon=True).start()
         need = msg.get("need")
         if isinstance(need, list):
             # the ids this joiner does not have installed, out of self.mods
@@ -1300,6 +1377,12 @@ class _HostSaveTransfer:
         p["ready"] = True
         p["last_fack"] = now
         base = int(msg.get("base", 0))
+        if p["tcp"] and p.get("tcp_done") and base < self.total_chunks and now - p["tcp_done"] > 5.0 \
+                and now - p["last_advance"] > 2.0:
+            # the stream ended but the receiver's base stopped short: whatever
+            # is missing comes over UDP from here
+            p["tcp"] = False
+            self.log(f"[host] {p['name']}: base {base}/{self.total_chunks} after the TCP stream -- UDP fills the rest")
         if base > p["base"]:
             p["base"] = base
             p["last_advance"] = now
@@ -1400,6 +1483,8 @@ class _HostSaveTransfer:
                     _send_data(self.sock, addr, self.begin_msg)
                     p["last_begin"] = now
                 continue
+            if p["tcp"]:
+                continue                        # streaming over TCP: nothing to send here
             # Receiver silent for too long? Its facks were lost -- rewind and
             # re-stream the window so it (and its facks) can catch up.
             if (now - p["last_fack"] > RESEND_AFTER
@@ -1541,6 +1626,19 @@ class _ClientSaveReceiver:
         self._results = queue.Queue()
         self.deferred_begin = None # sid of an fbegin held back while finalizing (logged once)
         self.manifest_unknown = False
+        # THE TCP CHANNEL (bulk_tcp.py). A joiner connects to the sender's listener
+        # (the host's or relay's, named in fbegin) and a reader thread queues the
+        # stream; the relay, which listens itself, accepts the leader's upload the
+        # same way and tells the leader its port in fbegin_ack. tick() feeds the
+        # queued bytes to on_chunk in chunk-sized pieces, so every receive-side
+        # rule (holes, hashes, finalize, feedback) is the one the UDP path uses.
+        self.my_name = ""          # said in the hello so the host matches the stream to us
+        self.tcp_active = False
+        self.tcp_bytes = 0
+        self._tcp_q = queue.Queue()
+        self._tcp_buf = bytearray()
+        self._tcp_off = 0
+        self._tcp_started = 0.0
 
     def _manifest_unknown(self):
         """The host could not READ its save's mod list. Not "no mods": the
@@ -1785,10 +1883,81 @@ class _ClientSaveReceiver:
         self.done_sends = 0
         self.log(f"[client] save incoming sid={sid} {self.total_bytes}B "
                  f"{self.total_chunks} chunks")
-        self._send({"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask})
+        ack = {"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask}
+        self._tcp_buf, self._tcp_off, self.tcp_bytes = bytearray(), 0, 0
+        while not self._tcp_q.empty():
+            self._tcp_q.get_nowait()
+        tcp = msg.get("tcp") if BULK_TCP[0] and self.total_bytes > 0 else None
+        if isinstance(tcp, dict) and isinstance(tcp.get("token"), str) and tcp["token"]:
+            if isinstance(self.conn, _PeerConn):
+                # we are the relay taking the leader's upload: WE listen, it connects
+                if BULK[0] is not None:
+                    BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
+                    ack["tcp_port"] = BULK[0].port
+            elif isinstance(tcp.get("port"), int) and getattr(self.conn, "peer", None):
+                threading.Thread(target=self._tcp_pull, args=(self.conn.peer[0], tcp["port"], tcp["token"], sid),
+                                 name="bulk-pull", daemon=True).start()
+        self._send(ack)
         self.io.emit({"type": "transfer", "role": "recv", "pct": 0})
         if self.total_chunks == 0:
             self._finalize()
+
+    # -- the TCP channel --------------------------------------------------- #
+    def _tcp_pull(self, ip, port, token, sid):
+        """A thread: connect to the sender's listener and read the file."""
+        sock = bulk_tcp.bulk_connect(ip, port, "recv", sid, token, self.my_name)
+        if sock is None:
+            self.log(f"[client] no TCP stream from {ip}:{port} -- receiving over UDP")
+            return
+        self._tcp_read(sock, sid)
+
+    def _tcp_accepted(self, sock, addr, name):
+        """ACCEPT THREAD HELPER (the relay): the leader connected to push its upload."""
+        self._tcp_read(sock, self.sid)
+
+    def _tcp_read(self, sock, sid):
+        self.tcp_active, self._tcp_started = True, time.time()
+        self.log(f"[client] taking the {self.kind} over TCP")
+        self.io.emit({"type": "transfer", "role": "recv", "state": "tcp"})
+        q = self._tcp_q
+
+        def sink(data):
+            while q.qsize() > 16:            # ~64 MB queued: let the loop thread catch up
+                time.sleep(0.005)
+            q.put((sid, bytes(data)))
+        ok = bulk_tcp.stream_recv(sock, self.total_bytes, sink)
+        q.put((sid, None if ok else b""))
+        if not ok:
+            self.log("[client] the TCP stream broke -- the rest comes over UDP")
+
+    def _drain_tcp(self):
+        """LOOP THREAD: feed queued stream bytes to on_chunk, chunk by chunk.
+        Bounded per call so the feedback timer keeps running during a fast stream."""
+        fed = 0
+        while fed < 8 * bulk_tcp.RECV_BLOCK:
+            try:
+                sid, data = self._tcp_q.get_nowait()
+            except queue.Empty:
+                break
+            if sid != self.sid:
+                continue
+            if data is None or data == b"":
+                self.tcp_active = False
+                if data is None:
+                    self.tcp_bytes = self._tcp_off
+                    self.log(f"[client] received over TCP, {bulk_tcp.rate_text(self._tcp_off, time.time() - self._tcp_started)}")
+                break
+            fed += len(data)
+            self._tcp_buf += data
+            while self.sid == sid and not self.failed and not self.complete:
+                remaining = self.total_bytes - self._tcp_off
+                take = min(self.chunk, remaining)
+                if take <= 0 or len(self._tcp_buf) < take:
+                    break
+                piece = bytes(self._tcp_buf[:take])
+                del self._tcp_buf[:take]
+                self.on_chunk(sid, self._tcp_off // self.chunk, piece)
+                self._tcp_off += take
 
     def on_chunk(self, sid, seq, data):
         if self.sid is None or sid != self.sid:
@@ -1832,6 +2001,8 @@ class _ClientSaveReceiver:
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
         self._poll_worker()                      # a finished verify/write lands here, on the loop thread
+        if not self._tcp_q.empty():
+            self._drain_tcp()
         if self.cancelled:
             return
         if self.preflight and self.approved and not self.active() and not self.catalogue_token and now-self.last_mod_request>1:
@@ -3390,6 +3561,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              "detail": f"lobby ready on {sock.getsockname()[1]}"})
     emit_roster()                                           # initial: just host
     log(f"[host] serving as {host_name!r} on udp/{sock.getsockname()[1]}")
+    # the TCP listener the save/mod transfers stream over (bulk_tcp.py); one per process
+    BULK[0] = bulk_tcp.BulkListener.open(sock.getsockname()[1], log) if BULK_TCP[0] else None
 
     last_heal = last_drop = 0.0
     last_serve_check = [0.0]
@@ -3731,6 +3904,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             _log_sinks.remove(own_fwd.add)
         except ValueError:
             pass
+        if BULK[0] is not None:
+            BULK[0].close()
+            BULK[0] = None
         if stats:
             for p in peers.values():
                 stats.leave(p["name"], p.get("profile"))
@@ -3790,6 +3966,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         pass
     _clear_stale_incoming(io.dir, log)      # never trust a previous session's save
     receiver = receiver_cls(conn, io, log)  # save-transfer receive side
+    receiver.my_name = my_name              # said in the TCP hello so the host matches the stream
     fwd = LogForwarder(forward_logs)        # our log lines -> the host's merged log
     _log_sinks.append(fwd.add)
 
@@ -4801,14 +4978,21 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
-def _run_transfer_once(loss, size_bytes, tag):
+def _run_transfer_once(loss, size_bytes, tag, tcp=False, tcp_unreachable=False):
     """One full host + 2-joiner save transfer over loopback. Returns True/False.
 
     Asserts: each joiner's incoming_save.* is byte-identical (SHA-256) to the
     source, each joiner emitted save_ready + start, the host emitted a per-peer
     state:"done", and the host's {"type":"start"} came AFTER both done events.
+    ``tcp`` runs the round with the TCP bulk channel (bulk_tcp.py) and asserts
+    both joiners took it; ``tcp_unreachable`` makes every connect fail, so the
+    round must complete over UDP with nobody on TCP.
     """
     HP, P1, P2 = 29520, 29521, 29522
+    BULK_TCP[0] = bool(tcp)
+    real_connect = bulk_tcp.bulk_connect
+    if tcp_unreachable:
+        bulk_tcp.bulk_connect = lambda *a, **k: None
     names = {"host": "alice", "j1": "bob", "j2": "carol"}
     base = tempfile.mkdtemp(prefix="lobby_xfer_")
     dirs = {k: os.path.join(base, k) for k in names}
@@ -4947,6 +5131,18 @@ def _run_transfer_once(loss, size_bytes, tag):
             if not _has_start(ios[k].out_path, save=True):
                 print(f"[xfer:{tag}] FAIL: {k} never received start(save=true)")
                 ok = False
+
+        # (5) the path: with TCP on and reachable both joiners streamed (and the
+        # host served two streams); otherwise nobody touched TCP
+        via_tcp = [k for k in ("j1", "j2") if any(e.get("type") == "transfer" and e.get("state") == "tcp"
+                                                   for e in _read_events(ios[k].out_path))]
+        served = sum(1 for e in hev if e.get("type") == "transfer" and e.get("role") == "send" and e.get("state") == "tcp")
+        if tcp and not tcp_unreachable and (len(via_tcp) != 2 or served != 2):
+            print(f"[xfer:{tag}] FAIL: expected both joiners on TCP, got {via_tcp} (host served {served})")
+            ok = False
+        if (not tcp or tcp_unreachable) and (via_tcp or served):
+            print(f"[xfer:{tag}] FAIL: TCP was used ({via_tcp}, host served {served}) although it was off/unreachable")
+            ok = False
     finally:
         stop.set()
         time.sleep(0.5)                           # let the host release its port
@@ -4956,6 +5152,8 @@ def _run_transfer_once(loss, size_bytes, tag):
             except Exception:
                 pass
         shutil.rmtree(base, ignore_errors=True)
+        bulk_tcp.bulk_connect = real_connect
+        BULK_TCP[0] = True
 
     dt = time.time() - t0
     mb = size_bytes / (1024 * 1024)
@@ -5406,14 +5604,18 @@ def selftest_transfer():
     then the failure + retry case."""
     print("[selftest-transfer] reliable host -> 2-joiner save transfer")
     runs = [
-        ("clean-1", 0.00, 20 * 1024 * 1024),
-        ("clean-2", 0.00, 16 * 1024 * 1024),
-        ("lossy-8pct", 0.08, 12 * 1024 * 1024),
-        ("lossy-15pct", 0.15, 10 * 1024 * 1024),
+        ("clean-1", 0.00, 20 * 1024 * 1024, False, False),
+        ("clean-2", 0.00, 16 * 1024 * 1024, False, False),
+        ("lossy-8pct", 0.08, 12 * 1024 * 1024, False, False),
+        ("lossy-15pct", 0.15, 10 * 1024 * 1024, False, False),
+        # the TCP bulk channel: a bigger file so the rate means something, then the
+        # same with every connect refused, which must fall back to UDP unnoticed
+        ("tcp-64MB", 0.00, 64 * 1024 * 1024, True, False),
+        ("tcp-unreachable-udp-fallback", 0.00, 8 * 1024 * 1024, True, True),
     ]
     allok = True
-    for tag, loss, size in runs:
-        allok = _run_transfer_once(loss, size, tag) and allok
+    for tag, loss, size, tcp, unreachable in runs:
+        allok = _run_transfer_once(loss, size, tag, tcp=tcp, tcp_unreachable=unreachable) and allok
     allok = _run_transfer_failure("fail-retry") and allok
     print(f"[selftest-transfer] {'PASS' if allok else 'FAIL'}")
     return allok
