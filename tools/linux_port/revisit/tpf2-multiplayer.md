@@ -1,3 +1,26 @@
+## The test world
+
+The user's newest multiplayer save is in both actors' save directories as `mp_multi_company`
+(`~/.local/share/tpf2mp-lab/{native,proton}/userdata/125253817/1066780/local/save/mp_multi_company.sav`;
+pristine copy in `~/tpf2-port/saves/`, restore it from there after a test has changed it). Saved on Windows
+0.5.7/dev on 2026-09-17 (game year 1959): four companies (player a founded company 1; player b founded
+2, 3 and 4 -- a 2nd and 3rd company with the "<player>'s 2nd company" names), stations and lines of several
+companies, vehicles moving. It needs the stock mods `urbangames_legacy_vehicle_pack_1`,
+`_urbangames_deluxe_pack_1`, `_urbangames_preorder_pack_1`, `urbangames_vehicles_no_end_year_1`,
+`urbangames_sandbox_1`, `urbangames_no_costs_1` besides ours; Legacy Vehicles was re-enabled on both actors
+on 2026-09-17 for it (its 2026-09-14 removal only served to match the two actors' catalogues, which the
+launcher's bind mounts now do).
+
+Use it as the world for every item below: load it in the native instance (the profile's last game or the
+menu's LOAD GAME via autoload), and for cross-platform checks host it from one actor and join from the other
+so the Proton (Windows build) instance and the native one show the same world side by side. That pair is the
+oracle for the PASSIVE functionality -- what the player sees without clicking: company-coloured station and
+depot icons, vehicle icons, station labels and window washes on the Windows side versus the native side; the
+world hash and vehicle positions staying locked; the dashboard's companies tab; names and colours. Every
+difference between the two windows on the same save is a porting gap; make the native side match.
+
+## The items
+
 Every item below was left unported by the static-only runs of 2026-09-16/17. Each has an integration record
 (`docs/linux/UPSTREAM_dev_<sha>.md`) and most an RE note (`docs/re/linux/DEV_<SHA>.md`) with the addresses
 already located and the exact contract still unproven. Do not redo the static work: read the note, then

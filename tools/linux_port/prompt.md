@@ -77,6 +77,9 @@ You may run the game -- only through the test lab, which has its own copies of t
   only processes you started (the lab's `logs/latest-launch.log` names them; `pkill -f tpf2mp-lab/native/game`
   is acceptable); leave no game running and the actor restored when you finish; copy the logs you relied on
   (the actor's `logs/`, `share/tpf2mp/data/`, gdb transcripts) into `{{META}}/live/`.
+- Saves the user provides for testing are in `~/tpf2-port/saves/` (pristine copies; each actor's save
+  directory already holds a copy). Prefer them over new games: they hold real stations, vehicles and several
+  companies. Restore an actor's copy from the pristine one after a test has changed it.
 - A crash you caused is information, not a failure: note it, restore, continue. Never claim a live result you
   did not observe.
 
