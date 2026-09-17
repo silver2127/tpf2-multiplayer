@@ -167,7 +167,7 @@ PYTHONDONTWRITEBYTECODE=1 "$vpy" -m PyInstaller --noconfirm --clean --log-level 
 listing=$("$venv/bin/pyi-archive_viewer" --list --recursive --brief "$exe" 2>/dev/null) \
     || die "pyi-archive_viewer could not read $exe"
 missing=""
-for m in lobby punch connect observe mesh seal modshare desynclogs linuxpaths stun zstandard; do
+for m in lobby punch connect observe mesh seal modshare desynclogs linuxpaths player_stats stun zstandard; do
     grep -q -E "(^|[[:space:]'/])$m([.'[:space:]]|$)" <<<"$listing" || missing="$missing $m"
 done
 [ -n "$(find "$out/_internal" -path '*/zstandard/backend_c*.so' -print -quit)" ] || missing="$missing zstandard.backend_c"

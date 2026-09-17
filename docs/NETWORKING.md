@@ -270,6 +270,14 @@ accept inbound connections, and for an always-on public server.
 - **Persistence.** Letters (`relay_letters.json`), company chips (`relay_companies.json`) and
   the secret survive restarts. When the last player leaves, the session is closed but the
   world is kept.
+- **Player statistics** (`player_stats.json` in the data folder, relay code from 2026-09-17): per player --
+  by profile code when the client sends one, else by name -- first and last seen, joins,
+  starts into a world, time connected, frames and bytes relayed; in total the unique players,
+  joins, sessions (each time the relay goes from nobody to somebody), the peak of players at
+  once and when, and player-hours. Written at most once a minute and at shutdown; a summary
+  line goes to the relay log every ten minutes while somebody is connected.
+  `python3 /opt/tpf2mp/netpunch/player_stats.py /var/lib/tpf2mp/relay/player_stats.json`
+  prints the summary and the top players by time.
 - **It does not simulate.** The world only advances while players are connected.
 
 Operating one (all scripts take the SSH target as their first argument):

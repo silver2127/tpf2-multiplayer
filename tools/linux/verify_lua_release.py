@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the cumulative Linux Lua integration: dev 23419163 (release 0.6)."""
+"""Verify the cumulative Linux Lua integration: dev d129fab7 (release 0.6)."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "23419163881f81188559362401f62da091da4956"
+REFERENCE = "d129fab7ac343b62f0c6fcda2f5b2a5a25af312c"
 INCOMING = REFERENCE
 INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"
@@ -40,7 +40,7 @@ def main():
         if missing or extra or different:
             return 1
         manifest = "".join(f"{hashlib.sha256(actual[p]).hexdigest()}  {p}\n" for p in sorted(expected))
-        print(f"PASS: {len(expected)} Lua files: exact dev 23419163 (release 0.6) except {len(MERGED_SHA256)} pinned cumulative merges")
+        print(f"PASS: {len(expected)} Lua files: exact dev d129fab7 (release 0.6) except {len(MERGED_SHA256)} pinned cumulative merges")
         print("Lua manifest sha256: " + hashlib.sha256(manifest.encode()).hexdigest())
         # The glyph overlays are runtime dependencies of the shared stylesheet.
         # Check packaged copies too: Lua equality alone cannot catch omitted assets.
@@ -55,7 +55,7 @@ def main():
             print(f"FAIL: missing, extra or changed HUD glyph: {p}", file=sys.stderr)
         if bad_glyphs:
             return 1
-        print(f"PASS: {len(expected_glyphs)} HUD glyph textures exact dev 23419163 (release 0.6)")
+        print(f"PASS: {len(expected_glyphs)} HUD glyph textures exact dev d129fab7 (release 0.6)")
         return 0
     except (OSError, subprocess.CalledProcessError) as error:
         print(f"Cannot verify Windows Lua baseline: {error}", file=sys.stderr)
