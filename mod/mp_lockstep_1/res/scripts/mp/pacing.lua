@@ -1119,6 +1119,15 @@ function CM.paceTick(now)
 	-- ...and while the governor still holds the speed down after the last peer
 	-- left, so it can climb back to the votes (the controller is what raises it).
 	if slowT == nil and not (CM.isLeader() and (CM.livePeers() > 0 or (CM.govFactor or 1) < 1)) then return end
+	-- ALONE AGAIN (2026-09-17): once the last other player is gone (roster 1, no
+	-- peer heard) the controller has nothing to pace against and must not keep a
+	-- governed or fractional speed on the player's lever: clear the fraction
+	-- once and leave the lever to the engine until somebody joins.
+	if CM.othersPresent and not CM.othersPresent() then
+		if CM.ditherCur ~= "" and CM.ditherCur ~= nil then CM.setDither(0); log("PACE: alone -- the fractional speed is cleared, the lever is the player's") end
+		CM.govFactor = 1
+		return
+	end
 	CM.paceV2(now)
 end
 

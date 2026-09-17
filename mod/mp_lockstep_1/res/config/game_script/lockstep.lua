@@ -226,6 +226,7 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
+K.SOLO_RELEASE_TICKS = 75  -- ~15 s alone (roster 1, no peer heard) before a world-operation hold is abandoned (resync.lua)
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
 K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
@@ -761,6 +762,16 @@ end
 -- A 224-tile map starts at 12 * 14 = 168 units and settles near the 576 rung at
 -- 3.5 s a stamp: one hitch roughly every ten minutes at 1x, against none before.
 local function checkHash(now)
+	-- ALONE, NO HASH (2026-09-17, user): with nobody to compare against, the walk
+	-- over every vehicle, construction and edge is a hitch for nothing. The clock
+	-- is still tracked so the first stamp after a peer arrives is judged by a
+	-- real crossing below, never by the solo stretch before it.
+	if not CM.hashPeersPresent() then
+		CM.hashPrevNow = now
+		if not CM.hashSoloNoted then CM.hashSoloNoted = true; log("hash: no other player in this game -- the world hash is off until one joins") end
+		return
+	end
+	if CM.hashSoloNoted then CM.hashSoloNoted = nil; log("hash: another player is in -- the world hash is on") end
 	-- THE AGREED GRID (hash.lua CM.hashStampOf): CM.hashEvery from the map size on
 	-- the first hash (the same on every instance: same save; the base interval
 	-- until then), then whatever the leader's HASHEVERY moved every instance to.

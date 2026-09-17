@@ -54,7 +54,8 @@ function CM.autoSyncPump(now)
 		and #incoming.epoch == 32 and not incoming.epoch:find("[^0-9a-f]")
 		and tonumber(incoming.revision) and tonumber(incoming.revision) >= 1
 		and ({holding=true, waiting=true, saving=true, transferring=true, loading=true,
-			checking=true, releasing=true, complete=true, error=true, aborted=true})[incoming.phase] then
+			checking=true, releasing=true, complete=true, error=true, aborted=true})[incoming.phase]
+		and incoming.operation ~= CM.autoAbandoned then     -- an operation abandoned alone (below) stays abandoned
 		local old = CM.autoSync
 		if (old or incoming.phase ~= "complete") and (not old or tonumber(incoming.revision) > tonumber(old.revision)) then
 			CM.autoSync = incoming
@@ -80,7 +81,30 @@ function CM.autoSyncPump(now)
 		end
 		return false
 	end
-	-- Missing/partial control or an error NEVER releases an existing hold.
+	-- Missing/partial control or an error NEVER releases an existing hold --
+	-- while there is a session to protect. ALONE (2026-09-17, user: "with only
+	-- 1 person in game I cannot increase game speed"): the lobby's roster back
+	-- at one and no peer heard for K.SOLO_RELEASE_TICKS means the other players
+	-- are gone and nobody will ever advance this operation; the hold would pin
+	-- the speed at 0 for the rest of the game. Abandon it and give the lever back.
+	if CM.othersPresent and not CM.othersPresent() then
+		CM.autoAloneSince = CM.autoAloneSince or CM.ticks
+		if CM.ticks - CM.autoAloneSince >= (K.SOLO_RELEASE_TICKS or 75) then
+			local speed = tonumber(CM.autoResumeSpeed) or 0
+			if speed < 1 or speed > 4 then speed = 1 end
+			log(string.format("RESYNC: %s left in phase %s with nobody else in the game -- abandoned, speed back to %d",
+				tostring(state.operation), tostring(state.phase), speed))
+			CM.autoAbandoned = state.operation
+			CM.autoSync, CM.autoFingerprint, CM.autoAloneSince = nil, nil, nil
+			CM.recoveryReleasePacing(speed)
+			CM.lgHolding, CM.resyncHold = false, false
+			CM.baseSpeed = speed
+			CM.setSpeed(speed, "the other players are gone; the world operation is abandoned")
+			return false
+		end
+	else
+		CM.autoAloneSince = nil
+	end
 	CM.resyncHold = true
 	local speed; pcall(function() speed = game.interface.getGameSpeed() end)
 	if state.phase == "checking" and speed == 0 and not CM.autoFingerprint then

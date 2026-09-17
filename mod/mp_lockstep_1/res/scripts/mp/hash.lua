@@ -389,6 +389,22 @@ CM.hashCostSamples = {}          -- ms per stamp, newest last
 CM.hashCostMs = nil              -- their median
 CM.hashGrid = nil                -- { every =, prev =, from = }: from a HASHEVERY, or the save
 
+-- SOMEBODY TO COMPARE WITH (2026-09-17, user): the lobby's roster says two or
+-- more players, or a peer was heard within K.PEER_STALE_TICKS. Alone, the
+-- world hash is an O(world) hitch for nothing -- seconds of it on a big map --
+-- so checkHash takes no sample at all. The roster counts from the first ticks
+-- of a session, before the peer's first heartbeat, so a host resumes hashing
+-- while its joiner is still loading and the joiner's first stamps have a
+-- partner.
+function CM.othersPresent()
+	if (tonumber(CM.rosterPlayers) or 0) >= 2 then return true end
+	for _, pr in pairs(CM.peers or {}) do
+		if pr.at and (CM.ticks - pr.at) <= (K.PEER_STALE_TICKS or 25) then return true end
+	end
+	return false
+end
+CM.hashPeersPresent = CM.othersPresent
+
 -- The stamp for `now` on the agreed grid, and the interval it lies on.
 function CM.hashStampOf(now)
 	local g, every = CM.hashGrid, nil
