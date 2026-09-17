@@ -227,6 +227,7 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
+K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
 -- ~400 ms, and at the base cadence that is ~10% of wall time spent inside our
 -- own bookkeeping -- which is what "it feels laggy" actually was.
