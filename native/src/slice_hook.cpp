@@ -6558,6 +6558,123 @@ static void InstallWindowColor()
         "colour (bind at rva=%llx)\n", (unsigned long long)RVA_WINDOW_BIND);
 }
 
+// ---------------------------------------------------------------------------
+// STATION ICON COLOUR (2026-09-16) -- the clickable HUD station/depot icon is
+// washed its owner's company colour. HudIconManager::DoStep builds the button
+// content with FUN_5e45d0(context, entityId) and, right after that call at
+// 0x5e38d0, rax = the item content component and ebx = the entity id (main
+// thread, once per icon). The glyph is style-driven (no native RGBA); a company
+// class appended via addStyleClass 0x227a1e0 tints it, the same as the window
+// wash. Owner resolution: 0x472900 works on depots directly; a StationGroup's
+// icon entity has no PlayerOwned, so walk group -> stations[0] -> PlayerOwned
+// (StationGroup is a vector<Entity> at component +0; type index via 0xd0a40 on
+// engine+0x48 with the StationGroup type_info; component via GetComponentPtr
+// 0x149290). Own included (icons show every company; only unowned entities and
+// coop stay untinted). KILL SWITCH: `stationicon=0`.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_ICON_STN_HOOK      = 0x5e38d0;   // right after the FUN_5e45d0 call in DoStep
+static const uintptr_t RVA_TI_STATIONGROUP    = 0x41d1438;  // .?AUStationGroup@component@ecs@@ descriptor
+static const uintptr_t RVA_GET_TYPEINDEX      = 0x0d0a40;   // int(componentMgr = engine+0x48, type_info**)
+static const uintptr_t RVA_GET_COMPONENT_SG   = 0x149290;   // GetComponentPtr<StationGroup>(engine, &ent, ti)
+static const uint8_t ICON_STN_EXPECT[6] = { 0x45, 0x33, 0xC9, 0x41, 0xB0, 0x01 };  // xor r9d,r9d ; mov r8b,1
+static bool g_stnIconColorOn = false;
+
+// engine+0x214 holds nothing here; the owner comes from the entity's PlayerOwned
+// (or, for a station group, its first station's). engine is g_uiEngine (cached).
+extern "C" void StationIconTint(void* component, int entity)
+{
+    __try {
+        void* engine = (void*)g_uiEngine;
+        if (!engine || !component) return;
+        int ent = entity;
+        typedef void* (*GetPlayerOwned)(void*, const int*);
+        void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &ent);
+        int owner = -1;
+        if (po) {
+            owner = *(const int*)po;
+        } else {
+            // a station group: type index (re-fetched, a type index belongs to a
+            // world), then the StationGroup component, then its first station's owner
+            const void* desc = (const void*)(g_base + RVA_TI_STATIONGROUP);
+            typedef int (*GetTypeIndex)(void*, const void**);
+            const int ti = ((GetTypeIndex)(g_base + RVA_GET_TYPEINDEX))((uint8_t*)engine + 0x48, &desc);
+            if (ti < 0) return;
+            typedef void* (*GetComp)(void*, const int*, int);
+            void* comp = ((GetComp)(g_base + RVA_GET_COMPONENT_SG))(engine, &ent, ti);
+            if (!comp) return;
+            const int* begin = *(const int**)((const uint8_t*)comp + 0);
+            const int* end = *(const int**)((const uint8_t*)comp + 8);
+            if (!begin || begin == end) return;               // no stations yet
+            int station0 = begin[0];
+            void* po2 = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &station0);
+            if (!po2) return;
+            owner = *(const int*)po2;
+        }
+        if (owner < 0) return;
+        const int cid = IconCompanyOfPid(owner);
+        if (cid <= 0) return;
+        WindowTintApply(component, cid);   // append !mpWinCoN (the translucent company wash)
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void InstallStationIconColor()
+{
+    if (FlagsSayOff("stationicon")) {
+        Log("[stationicon] OFF (stationicon=0 in tpf2_menu_flags.txt) -- HUD station/depot icons "
+            "are not washed with the owner's colour\n");
+        return;
+    }
+    if (!BytesAre(RVA_ICON_STN_HOOK, ICON_STN_EXPECT, sizeof(ICON_STN_EXPECT), "stationicon")) return;
+    // Post-call hook: rax = item component, ebx = entity. Preserve rax across the
+    // tint call (the body at hook+6 reads it), align rsp, then re-run the two
+    // stolen instructions and resume at hook+6. ebx is nonvolatile (kept by the C fn).
+    uint8_t* stub = NearAlloc(96);
+    if (!stub) { Log("[stationicon] NOT installed: no page for the stub\n"); return; }
+    const uintptr_t helper = (uintptr_t)&StationIconTint;
+    size_t k = 0;
+    stub[k++] = 0x56;                                                        // push rsi (save DoStep's)
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xF0;                    // mov rsi, rax  (component, survives call)
+    stub[k++] = 0x55;                                                        // push rbp
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xEC;                    // mov rbp, rsp
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xE4; stub[k++] = 0xF0;  // and rsp, -16
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xEC; stub[k++] = 0x20;  // sub rsp, 0x20
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xCE;                    // mov rcx, rsi  (component)
+    stub[k++] = 0x8B; stub[k++] = 0xD3;                                      // mov edx, ebx  (entity)
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &helper, 8); k += 8;// mov rax, StationIconTint
+    stub[k++] = 0xFF; stub[k++] = 0xD0;                                      // call rax
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xE5;                    // mov rsp, rbp
+    stub[k++] = 0x5D;                                                        // pop rbp
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xC6;                    // mov rax, rsi  (component back)
+    stub[k++] = 0x5E;                                                        // pop rsi
+    stub[k++] = 0x45; stub[k++] = 0x33; stub[k++] = 0xC9;                    // xor r9d, r9d  (stolen)
+    stub[k++] = 0x41; stub[k++] = 0xB0; stub[k++] = 0x01;                    // mov r8b, 1    (stolen)
+    // jmp hook+6 (rel32; keeps rax = component)
+    const uintptr_t resume = g_base + RVA_ICON_STN_HOOK + 6;
+    stub[k++] = 0xE9;
+    const int32_t rel = (int32_t)((int64_t)resume - (int64_t)((uintptr_t)stub + k + 4));
+    memcpy(stub + k, &rel, 4); k += 4;
+    FlushInstructionCache(GetCurrentProcess(), stub, k);
+    // write E9 rel32 at the hook -> stub (steal 6, pad 1 with nop)
+    const uintptr_t at = g_base + RVA_ICON_STN_HOOK;
+    const int64_t nrel = (int64_t)(uintptr_t)stub - (int64_t)(at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) { Log("[stationicon] NOT installed: stub out of reach\n"); return; }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)at, 6, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[stationicon] NOT installed: could not unprotect rva=%llx\n", (unsigned long long)RVA_ICON_STN_HOOK);
+        return;
+    }
+    uint8_t patch[6] = { 0xE9, 0, 0, 0, 0, 0x90 };
+    const int32_t r32 = (int32_t)nrel;
+    memcpy(patch + 1, &r32, 4);
+    memcpy((void*)at, patch, 6);
+    VirtualProtect((void*)at, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 6);
+    g_stnIconColorOn = true;
+    Log("[stationicon] installed: HUD station/depot icons washed the owner's company colour "
+        "(hook at rva=%llx)\n", (unsigned long long)RVA_ICON_STN_HOOK);
+}
+
 static void InstallSharedStations()
 {
     if (FlagsSayOff("sharedstations")) {
@@ -7079,6 +7196,8 @@ static DWORD WINAPI Init(LPVOID)
     InstallForeignWindows();
     // A foreign entity's window, washed its owner's company colour.
     InstallWindowColor();
+    // The HUD station/depot icon, washed its owner's company colour.
+    InstallStationIconColor();
 
     for (;;) {
         Sleep(15000);
