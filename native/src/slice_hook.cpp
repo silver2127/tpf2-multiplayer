@@ -6113,6 +6113,68 @@ static void InstallPausedTick()
         (unsigned long long)RVA_PAUSED_TICK_CALL);
 }
 
+// ---------------------------------------------------------------------------
+// SHOW ALL ICONS (2026-09-16) -- the world icons over stations and vehicles are
+// drawn only for the local player's entities. Three owner tests gate them, one
+// per icon system, each a plain cmp/jne (RE pass on build 35924):
+//   * ItemCreator::Visit 0x808478 -- vehicles (road/rail/water/air), station
+//     name labels, signals, dead ends: cmp eax,[rbx+0x20] ; jne 0x8088de
+//   * ItemCreator::End 0x80c569 -- the second gate, trains only:
+//     mov eax,[r15+0x20] ; cmp [rdx],eax ; jne 0x80c640
+//   * HudIconManager::DoStep lambda 0x5de526 -- the clickable station/depot
+//     buttons: cmp [rdx],r15d ; jne 0x5de603
+// Opening a gate = NOP its jne, so the accept path runs for every owner. In
+// co-op there is one player entity, so the compare always succeeded and the NOP
+// changes nothing; only in companies mode do foreign entities now get icons.
+// Widening these does not open the entity WINDOWS (UI::ViewCreator 0x8b3020
+// still refuses a foreign entity, so a click does nothing) nor the list windows
+// (GetEntitiesForPlayer, untouched). The company-colour TINT of a foreign icon
+// is a separate render-path detour (0x80b613), done after this is proven live.
+// KILL SWITCH: `showicons=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+struct IconGate { uintptr_t jne; uint8_t before[8]; int beforeLen; uint8_t jbytes[6]; const char* what; };
+static const IconGate ICON_GATES[3] = {
+    // the two bytes before each jne are the cmp it depends on: a byte match that
+    // landed elsewhere cannot pass. Visit: cmp eax,[rbx+0x20]. End: cmp [rdx],eax.
+    // DoStep: cmp [rdx],r15d.
+    { 0x80847b, { 0x3B, 0x43, 0x20 }, 3, { 0x0F, 0x85, 0x5D, 0x04, 0x00, 0x00 }, "vehicles, station labels, signals (Visit)" },
+    { 0x80c56b, { 0x39, 0x02 },       2, { 0x0F, 0x85, 0xCF, 0x00, 0x00, 0x00 }, "trains (End)" },
+    { 0x5de529, { 0x44, 0x39, 0x3A }, 3, { 0x0F, 0x85, 0xD4, 0x00, 0x00, 0x00 }, "station/depot buttons (DoStep)" },
+};
+
+static void InstallShowAllIcons()
+{
+    if (FlagsSayOff("showicons")) {
+        Log("[showicons] OFF (showicons=0 in tpf2_menu_flags.txt) -- icons only over your own "
+            "stations and vehicles\n");
+        return;
+    }
+    // Verify every gate before touching any: a partial patch (one system opened,
+    // two not) is worse than none.
+    for (int i = 0; i < 3; i++) {
+        const IconGate& g = ICON_GATES[i];
+        if (!BytesAre(g.jne - g.beforeLen, g.before, g.beforeLen, "showicons")) return;
+        if (!BytesAre(g.jne, g.jbytes, sizeof(g.jbytes), "showicons")) return;
+    }
+    static const uint8_t NOP6[6] = { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+    int done = 0;
+    for (int i = 0; i < 3; i++) {
+        const uintptr_t at = g_base + ICON_GATES[i].jne;
+        DWORD old = 0;
+        if (!VirtualProtect((void*)at, 6, PAGE_EXECUTE_READWRITE, &old)) {
+            Log("[showicons] NOT installed: could not unprotect rva=%llx (%s)\n",
+                (unsigned long long)ICON_GATES[i].jne, ICON_GATES[i].what);
+            continue;
+        }
+        memcpy((void*)at, NOP6, 6);
+        VirtualProtect((void*)at, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void*)at, 6);
+        done++;
+    }
+    Log("[showicons] installed: %d/3 owner gates opened -- every player's stations and vehicles "
+        "get icons (company-colour tint is a later, separate patch)\n", done);
+}
+
 static void InstallSharedStations()
 {
     if (FlagsSayOff("sharedstations")) {
@@ -6624,6 +6686,8 @@ static DWORD WINAPI Init(LPVOID)
     // the town developer stamps it into every building it proposes, and the
     // account and train systems pick and seed by it.
     InstallPausedTick();
+    // Icons over every player's stations and vehicles ("SHOW ALL ICONS").
+    InstallShowAllIcons();
 
     for (;;) {
         Sleep(15000);
