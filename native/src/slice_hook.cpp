@@ -6368,6 +6368,22 @@ static const uintptr_t RVA_STNLABEL_CALL   = 0x80a0ee;   // call 0x8090f0 (label
 static const uintptr_t RVA_STNLABEL_TARGET = 0x8090f0;   // AddRect(buffer, tex, colour*, rect)
 static const uint8_t STNLABEL_EXPECT[5] = { 0xE8, 0xFD, 0xEF, 0xFF, 0xFF };
 static bool g_stnLabelColorOn = false;
+static volatile LONG g_slAsked = 0, g_slTinted = 0, g_slShown = 0;
+
+// The label site's own counted wrapper around the vehicle-icon helper, so the log
+// can say whether the station-label draw is reached at all and what it decides.
+extern "C" const float* StationLabelTint(void* engine, const int* entity, int local)
+{
+    InterlockedIncrement(&g_slAsked);
+    const float* c = IconTintForEntity(engine, entity, local);
+    if (c) InterlockedIncrement(&g_slTinted);
+    if (InterlockedIncrement(&g_slShown) <= 6) {
+        int ent = -1; __try { if (entity) ent = *entity; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        Log("[stationlabelcolor] label for entity %d (local %d): %s\n", ent, local,
+            c ? "company colour" : "no colour (no owner / coop / own-and-off)");
+    }
+    return c;
+}
 
 static void InstallStationLabelColor()
 {
@@ -6382,7 +6398,7 @@ static void InstallStationLabelColor()
     }
     uint8_t* stub = NearAlloc(96);
     if (!stub) { Log("[stationlabelcolor] NOT installed: no page for the stub\n"); return; }
-    const uintptr_t helper = (uintptr_t)&IconTintForEntity;
+    const uintptr_t helper = (uintptr_t)&StationLabelTint;
     const uintptr_t target = g_base + RVA_STNLABEL_TARGET;
     size_t k = 0;
     stub[k++] = 0x51;                                                        // push rcx (buffer)
@@ -6554,11 +6570,12 @@ static void TintApplyClass(void* comp, int cid, const char* tag, int entity, int
             tag, entity, owner, cid, cls.c_str(), list);
     }
 }
-static volatile LONG g_wcShown = 0, g_siShown = 0;
+static volatile LONG g_wcShown = 0, g_siShown = 0, g_siNoOwnerShown = 0, g_wcSeen = 0;
 
 extern "C" void WindowTint(void* window, int entity)
 {
     InterlockedIncrement(&g_wcAsked);
+    if (InterlockedIncrement(&g_wcSeen) <= 6) Log("[windowcolor] window bind for entity %d\n", entity);
     __try {
         void* engine = (void*)g_uiEngine;
         if (!engine || !window) return;
@@ -6690,7 +6707,12 @@ extern "C" void StationIconTint(void* component, int entity)
             const int ti = ((GetTypeIndex)(g_base + RVA_GET_TYPEINDEX))(engine + 0x48, &desc);
             if (ti < 0) return;
             const int slot = TrainOrderSlot(engine, entity, ti);   // -1 = not a station group (a town, an industry)
-            if (slot < 0) { InterlockedIncrement(&g_siNoOwner); return; }
+            if (slot < 0) {
+                InterlockedIncrement(&g_siNoOwner);
+                if (InterlockedIncrement(&g_siNoOwnerShown) <= 6)
+                    Log("[stationicon] entity %d: no PlayerOwned and no StationGroup (ti=%d) -- a town/industry/building, untinted\n", entity, ti);
+                return;
+            }
             const uint8_t* comp = EcsComponentAt(engine, ti, slot, STATIONGROUP_STRIDE);
             if (!comp || !Readable(comp, 16)) return;
             const int* begin = *(const int* const*)(comp + 0);
@@ -6698,7 +6720,12 @@ extern "C" void StationIconTint(void* component, int entity)
             if (!begin || end <= begin || !Readable(begin, 4)) return;   // no stations yet
             int station0 = begin[0];
             void* po2 = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &station0);
-            if (!po2) { InterlockedIncrement(&g_siNoOwner); return; }
+            if (!po2) {
+                InterlockedIncrement(&g_siNoOwner);
+                if (InterlockedIncrement(&g_siNoOwnerShown) <= 6)
+                    Log("[stationicon] entity %d is a StationGroup (ti=%d slot=%d) but its first station %d has no PlayerOwned\n", entity, ti, slot, station0);
+                return;
+            }
             owner = *(const int*)po2;
             InterlockedIncrement(&g_siWalked);
         }
@@ -7312,6 +7339,8 @@ static DWORD WINAPI Init(LPVOID)
                 g_siAsked, g_siDirect, g_siWalked, g_siTinted, g_siNoOwner, g_siFaults);
         if (g_windowColorOn && g_wcAsked)
             Log("[windowcolor] alive: asked=%ld tinted=%ld faults=%ld\n", g_wcAsked, g_wcTinted, g_wcFaults);
+        if (g_stnLabelColorOn && g_slAsked)
+            Log("[stationlabelcolor] alive: labels=%ld tinted=%ld\n", g_slAsked, g_slTinted);
         for (int c = 0; c < 2; c++) {
             const MoveOrderChan& ch = c == 0 ? g_shipChan : g_airChan;
             if (ch.on)

@@ -1,4 +1,13 @@
-## Latest Windows integration: dev db8a4776 (2026-09-16)
+## Latest Windows integration: dev 8e31f1e0 (2026-09-16)
+
+See [UPSTREAM_dev_8e31f1e0.md](UPSTREAM_dev_8e31f1e0.md). Windows label
+counters, first-six window-bind logs and staged no-owner station diagnostics
+are merged intact. Their native tint prerequisites remain unavailable after
+fresh static investigation; see [DEV_8E31F1E0.md](../re/linux/DEV_8E31F1E0.md).
+Lua/release provenance targets 8e31f1e0. No new native patch is enabled;
+this integration is partial and earlier gaps remain.
+
+## Previous Windows integration: dev db8a4776 (2026-09-16)
 
 See [UPSTREAM_dev_db8a4776.md](UPSTREAM_dev_db8a4776.md). The Windows
 station-icon crash fix, button-root hook, class read-back, tint-class override
