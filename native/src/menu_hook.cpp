@@ -2811,6 +2811,20 @@ static void writePlayerNames()
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return;
     DWORD w = 0; WriteFile(h, content.c_str(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
+    // mp_loading.txt (2026-09-16): "letter=name=stage" for every player still loading in
+    // (receiving the save, loading the world, catching up); empty once everyone is in.
+    // The mod refuses company switches while it is not empty (companies.lua).
+    std::string loading;
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    for (int i = 0; i < playerCount() && i < (int)g_stages.size(); i++) {
+        if (g_stages[i].empty()) continue;
+        loading += originLetterFor(g_players[i]); loading += '='; loading += g_players[i]; loading += '='; loading += g_stages[i]; loading += '\n';
+    }
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    _snwprintf_s(path, _TRUNCATE, L"%smp_loading.txt", g_dataDirW);
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, loading.c_str(), (DWORD)loading.size(), &w, nullptr); CloseHandle(h);
 }
 
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
