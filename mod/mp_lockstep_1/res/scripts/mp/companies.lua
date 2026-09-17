@@ -576,6 +576,34 @@ function CM.cmLoadingPlayers()
 	f:close()
 	return out
 end
+-- mp_company_map.txt (2026-09-16): this instance's company -> player entity ->
+-- name, for other mods that colour or label things by company (the Big Maps
+-- minimap guessed the mapping from creation order and got colours and names
+-- wrong after a switch, a load or an in-game company). Entity ids are this
+-- instance's own. Rewritten only when the content changes.
+--   me=<my company id>
+--   <cid>=<pid>=<name, percent-escaped>
+function CM.cmWriteCompanyMap()
+	if CM.cmMode ~= "companies" then
+		if CM.cmMapWritten ~= "" then
+			CM.cmMapWritten = ""
+			local f = io.open(K.BASE .. "mp_company_map.txt", "w")
+			if f then f:close() end
+		end
+		return
+	end
+	local lines = { "me=" .. tostring(CM.cmMyCompany or 1) }
+	for _, cid in ipairs(CM.cmRoster or {}) do
+		local pid = CM.cmCompanyPid and CM.cmCompanyPid[cid]
+		if pid then lines[#lines + 1] = cid .. "=" .. tostring(pid) .. "=" .. CM.escName(CM.cmNameOf(cid)) end
+	end
+	local text = table.concat(lines, "\n") .. "\n"
+	if text == CM.cmMapWritten then return end
+	local f = io.open(K.BASE .. "mp_company_map.txt", "w")
+	if not f then return end
+	f:write(text); f:close()
+	CM.cmMapWritten = text
+end
 function CM.cmLoadingNote(who)
 	local names = {}
 	for _, p in ipairs(who) do names[#names + 1] = p.name end
