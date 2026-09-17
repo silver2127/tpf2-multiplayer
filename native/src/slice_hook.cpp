@@ -6336,6 +6336,49 @@ static void InstallIconColor()
         "(call at rva=%llx -> stub)\n", (unsigned long long)RVA_ICON_DRAW_CALL);
 }
 
+// ---------------------------------------------------------------------------
+// FOREIGN WINDOWS (2026-09-16) -- clicking a foreign station/vehicle/depot icon
+// opens its info window (read-only). UI::ViewCreator::CanCreateView (0x8b3020)
+// is a PURE predicate: it reads GetComponentPtr<PlayerOwned> and, for a foreign
+// owner, returns 0 (no window) before the type cascade -- the gate at 0x8b3060.
+// Opening it (NOP the jne) lets a foreign entity's window build; building only
+// READS components, so no write, no command, no sim/lockstep effect, and the
+// clicked entity is null-checked by 0x472900. The depot and construction windows
+// already suppress their edit blocks for a foreign owner; the vehicle and
+// station-group windows do NOT, so their edit controls are made inert on the
+// originator by the mod's capture guard (inject.lua CM.injForeignEdit). Together
+// that is a genuinely read-only foreign window that cannot desync.
+// KILL SWITCH: `foreignwindows=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_FOREIGNWIN_JNE = 0x8b3060;   // cmp [rax],edx ; jne 0x8b3388 (reject: return 0)
+// the two bytes before are the owner compare it depends on: cmp dword [rax],edx
+static const uint8_t FOREIGNWIN_BEFORE[2] = { 0x39, 0x10 };
+static const uint8_t FOREIGNWIN_JNE_BYTES[6] = { 0x0F, 0x85, 0x22, 0x03, 0x00, 0x00 };
+
+static void InstallForeignWindows()
+{
+    if (FlagsSayOff("foreignwindows")) {
+        Log("[foreignwindows] OFF (foreignwindows=0 in tpf2_menu_flags.txt) -- a foreign entity's "
+            "window cannot be opened\n");
+        return;
+    }
+    if (!BytesAre(RVA_FOREIGNWIN_JNE - 2, FOREIGNWIN_BEFORE, sizeof(FOREIGNWIN_BEFORE), "foreignwindows")) return;
+    if (!BytesAre(RVA_FOREIGNWIN_JNE, FOREIGNWIN_JNE_BYTES, sizeof(FOREIGNWIN_JNE_BYTES), "foreignwindows")) return;
+    static const uint8_t NOP6[6] = { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+    const uintptr_t at = g_base + RVA_FOREIGNWIN_JNE;
+    DWORD old = 0;
+    if (!VirtualProtect((void*)at, 6, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[foreignwindows] NOT installed: could not unprotect rva=%llx\n",
+            (unsigned long long)RVA_FOREIGNWIN_JNE);
+        return;
+    }
+    memcpy((void*)at, NOP6, 6);
+    VirtualProtect((void*)at, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 6);
+    Log("[foreignwindows] installed: a foreign entity's info window opens read-only (the mod's "
+        "capture guard keeps its edit controls inert)\n");
+}
+
 static void InstallSharedStations()
 {
     if (FlagsSayOff("sharedstations")) {
@@ -6851,6 +6894,8 @@ static DWORD WINAPI Init(LPVOID)
     // the company-colour tint of a foreign vehicle icon ("ICON COLOUR").
     InstallShowAllIcons();
     InstallIconColor();
+    // A foreign entity's window opens read-only ("FOREIGN WINDOWS").
+    InstallForeignWindows();
 
     for (;;) {
         Sleep(15000);

@@ -78,6 +78,28 @@ function CM.actionsBlockTick(now)
 	end
 end
 
+-- READ-ONLY FOREIGN WINDOWS EDIT GUARD (2026-09-16). The slice's `foreignwindows`
+-- patch lets a player OPEN another company's station/vehicle window. The depot and
+-- construction windows self-suppress their edit blocks for a foreign owner, but the
+-- vehicle and station-group windows have NO native owner gate: their rename / line /
+-- sell / send-to-depot / reverse / colour controls are live for any owner. So on the
+-- ORIGINATOR, before a captured edit is replicated, refuse it when its target entity
+-- is another company's -- the control becomes a harmless no-op that never ships, so
+-- the window is genuinely read-only and nothing can desync. Own entities (and coop)
+-- pass (cmForeignOwner is false there). Logged once per (op, entity).
+function CM.injForeignEdit(o, id)
+	if not id or not CM.cmForeignOwner then return false end
+	local foreign, cid = CM.cmForeignOwner(id)
+	if not foreign then return false end
+	CM.injForeignSaid = CM.injForeignSaid or {}
+	local k = tostring(o) .. ":" .. tostring(id)
+	if not CM.injForeignSaid[k] then
+		CM.injForeignSaid[k] = true
+		log(string.format("%s: entity %s belongs to company %s -- foreign window is read-only, not shipped", tostring(o), tostring(id), tostring(cid)))
+	end
+	return true
+end
+
 function CM.pollInject()
 	if not K.INJECT_FILE then return end
 	local data, newOff = CM.readFrom(K.INJECT_FILE, CM.injectOffset)
@@ -1142,7 +1164,7 @@ function CM.pollInject()
 			elseif o == "VSELL" and #w >= 2 then
 				local n = tonumber(w[2]) or 0
 				local ids = {}
-				for i = 1, n do local id = tonumber(w[2 + i]); if id then ids[#ids + 1] = id end end
+				for i = 1, n do local id = tonumber(w[2 + i]); if id and not CM.injForeignEdit("VSELL", id) then ids[#ids + 1] = id end end
 				-- Same key-binding race as VLINE: a sell right after a batch buy
 				-- finds the keys unbound and shipped NOTHING ("none shippable").
 				-- Defer and retry. STRICT (ARMED 1): the sale was
@@ -1205,6 +1227,8 @@ function CM.pollInject()
 				elseif o == "VNAME" and id and id == myCompanyPid then
 					log(string.format("VNAME: entity %s is company %d's player -> CMNAME %s", tostring(id), CM.cmMyCompany, tostring(w[3])))
 					CM.scheduleLocal("CMNAME", { cid = CM.cmMyCompany, name = w[3] })
+				elseif key and CM.injForeignEdit(o, id) then
+					-- foreign vehicle: the read-only window's rename/colour control is inert
 				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
@@ -1228,6 +1252,7 @@ function CM.pollInject()
 			elseif o == "VREV" and #w >= 2 then
 				local id = tonumber(w[2])
 				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VREV", id) then k = nil end
 				if k then
 					log("VREV: " .. k)
 					CM.scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
@@ -1236,6 +1261,7 @@ function CM.pollInject()
 			elseif o == "VDEPOT" and #w >= 3 then
 				local id, sell = tonumber(w[2]), tonumber(w[3]) or 0
 				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VDEPOT", id) then k = nil end
 				if k then
 					local armed = CM.lastArmed or 0
 					log(string.format("VDEPOT: %s sell=%d%s", k, sell, armed == 1 and " (strict)" or ""))
@@ -1244,6 +1270,8 @@ function CM.pollInject()
 					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
 				end
 
+			elseif o == "VLINE" and #w >= 4 and CM.injForeignEdit("VLINE", tonumber(w[2])) then
+				-- foreign vehicle: the read-only window's line control is inert
 			elseif o == "VLINE" and #w >= 4 then
 				local id, line, stop = tonumber(w[2]), tonumber(w[3]), tonumber(w[4]) or 0
 				-- A batch buy binds its vehicle keys over the next few ticks
@@ -1316,6 +1344,7 @@ function CM.pollInject()
 				-- Key it now so the first stops are not dropped.
 				if lid and not CM.lineKeyOf[lid] and not CM.primedLines[lid] then CM.pollLineKeys() end
 				local lk = lid and CM.lineKeyFor(lid)
+				if lk and CM.injForeignEdit("LUPDATE", lid) then lk = nil end
 				if lk then
 					-- Two shapes. DECODED: the NEW stop list
 					-- came off the command itself -- the cancel means the entity
