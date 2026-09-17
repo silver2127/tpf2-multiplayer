@@ -110,6 +110,29 @@ class HostRecovery:
     def held(self):
         return self.barrier.operation is not None and self.barrier.phase != 'complete'
 
+    def join(self, newcomer):
+        """A player arrived in the running session: a FROZEN JOIN (2026-09-16).
+
+        The session holds, the host saves, everyone -- host included -- loads
+        that save, the paused worlds are compared, and only then does anyone
+        play again. The old shape (the host keeps running, the newcomer loads
+        an autosave and catches up on the command history) diverged the
+        person sim within ~35 game units and the buses followed; see
+        sync_runtime. Returns True when the newcomer is covered: a round
+        started for it, or a round already running that admits it (the
+        barrier's tick reads the roster). False when recovery is unavailable
+        (an old client version, a transfer in flight): the caller falls back."""
+        if self.held:
+            return True                   # admitted by the barrier on its next tick
+        if not self.is_available():
+            return False
+        if self.barrier.request(self.barrier.host, self.members(), 'join'):
+            self.io.emit(ui_state(self.barrier.view()))
+            self.io.emit(dict(type='sync_feedback',
+                              detail=f'{newcomer} joined: holding the session while everyone loads the shared world.'))
+            return True
+        return False
+
     def world_epoch(self):
         """The epoch every member's bridge runs in after a COMPLETED resync, else None.
 
@@ -306,6 +329,13 @@ class ClientRecovery:
     @property
     def held(self):
         return self.runtime.state is not None and self.runtime.state['phase'] != 'complete'
+
+    @property
+    def completed(self):
+        """This game finished a recovery round: it is IN the shared world. A
+        newcomer that joined through a frozen join never received START
+        GAME's save, and the roster's started:true must not make it load one."""
+        return self.runtime.finished
 
     def identify(self, player, host, supported):
         self.supported = supported

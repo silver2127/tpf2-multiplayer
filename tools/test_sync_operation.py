@@ -194,12 +194,93 @@ class OperationTests(unittest.TestCase):
         self.ack('host')
         self.assertEqual(self.op.phase, 'transferring')
 
-    def test_missing_player_fails_in_every_phase(self):
+    def test_missing_host_fails_in_every_phase(self):
         for phase in ('holding', 'saving', 'transferring', 'loading', 'checking', 'releasing'):
             self.op.phase = phase
-            self.op.tick(['host'])
+            self.op.tick(['client'])
             self.assertEqual(self.op.phase, 'error')
             self.assertEqual(self.op.error['step'], phase)
+
+    def test_departed_client_is_dropped_and_the_rest_carry_on(self):
+        # three members, the third leaves while loading: the round is not lost --
+        # it continues with the two that remain, and if the leaver was the last
+        # one awaited the phase moves on the tick that drops it
+        self.op.abort('host', self.op.operation)
+        self.op.request('host', ['host', 'client', 'third'], 'resync')
+        self.ack('host'); self.ack('client'); self.ack('third')
+        self.ack('host')
+        self.assertEqual(self.op.phase, 'transferring')
+        self.ack('host'); self.ack('client'); self.ack('third')
+        self.assertEqual(self.op.phase, 'loading')
+        self.ack('host'); self.ack('client')
+        self.assertEqual(self.op.phase, 'loading')             # third still loading
+        self.op.tick(['host', 'client'])                        # third quit
+        self.assertEqual(self.op.phase, 'checking')             # it was the last one awaited
+        self.assertEqual(self.op.members, ('client', 'host'))
+        self.assertNotIn('third', self.op.acks)
+        self.both(); self.both()
+        self.assertEqual(self.op.phase, 'complete')
+
+    def test_newcomer_during_holding_joins_the_phase(self):
+        # a player arriving while everyone is still pausing is simply one more
+        # member to hear from before the save is taken
+        self.ack('client')
+        self.op.tick(['host', 'client', 'late'])
+        self.assertEqual(self.op.members, ('client', 'host', 'late'))
+        self.assertEqual(self.op.phase, 'holding')
+        self.ack('host')
+        self.assertEqual(self.op.phase, 'holding')             # late has not paused yet
+        self.ack('late')
+        self.assertEqual(self.op.phase, 'saving')
+
+    def test_newcomer_during_a_round_gets_one_more_round_before_anyone_is_released(self):
+        # a player arriving once the world is being moved is pending: the round
+        # finishes for the members it had, and instead of releasing them the
+        # same snapshot goes round again, newcomer included, under a new epoch
+        self.transfer()
+        self.op.tick(['host', 'client', 'late'])
+        self.assertEqual(self.op.members, ('client', 'host'))
+        self.assertEqual(self.op.pending, ('late',))
+        self.assertEqual(self.op.view()['pending'], ['late'])
+        epoch, snapshot = self.op.epoch, self.op.snapshot
+        self.both()                                             # transferring -> loading
+        self.both()                                             # loading -> checking
+        self.both()                                             # checking -> releasing
+        self.assertEqual(self.op.phase, 'releasing')
+        self.both()
+        self.assertEqual(self.op.phase, 'holding')             # not complete: late is in now
+        self.assertEqual(self.op.members, ('client', 'host', 'late'))
+        self.assertEqual(self.op.pending, ())
+        self.assertNotEqual(self.op.epoch, epoch)
+        self.assertEqual(self.op.snapshot, snapshot)            # the world everyone holds
+        self.ack('host'); self.ack('client'); self.ack('late')
+        self.assertEqual(self.op.phase, 'transferring')         # no second save
+        for _ in range(4):
+            self.ack('host'); self.ack('client'); self.ack('late')
+        self.assertEqual(self.op.phase, 'complete')
+
+    def test_join_mode_is_the_hosts_and_a_pending_leaver_is_forgotten(self):
+        self.op.abort('host', self.op.operation)
+        self.assertFalse(self.op.request('client', ['host', 'client'], 'join'))
+        self.assertTrue(self.op.request('host', ['host', 'client'], 'join'))
+        self.assertEqual(self.op.mode, 'join')
+        self.transfer()
+        self.op.tick(['host', 'client', 'late'])
+        self.assertEqual(self.op.pending, ('late',))
+        self.op.tick(['host', 'client'])                        # late gave up before its round
+        self.assertEqual(self.op.pending, ())
+        for _ in range(4):
+            self.both()
+        self.assertEqual(self.op.phase, 'complete')
+
+    def test_retry_takes_the_roster_as_it_is_now(self):
+        self.op.abort('host', self.op.operation)
+        self.op.request('host', ['host', 'client', 'third'], 'resync')
+        self.assertEqual(self.op.members, ('client', 'host', 'third'))
+        self.op.fail('save failed')
+        self.assertTrue(self.op.retry('host', self.op.operation, ['host', 'client']))
+        self.assertEqual(self.op.members, ('client', 'host'))
+        self.assertFalse(self.op.retry('host', self.op.operation, ['host']))
 
     def test_retry_reuses_only_complete_snapshot_and_changes_epoch(self):
         self.both()
