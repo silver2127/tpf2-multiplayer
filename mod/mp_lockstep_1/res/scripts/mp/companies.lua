@@ -501,15 +501,15 @@ function CM.cmSwapWallets(p1, p2)
 	return true, b1, l1, b2, l2
 end
 function CM.cmNote(s) CM.cmLastNote = s; log("company: " .. s) end
--- The company's colour, 0..1 RGB: the same six fixed colours and golden-angle
+-- The company's colour, 0..1 RGB: 20 distinct colours (Trubetskoy) then a golden-angle
 -- hue walk the lobby chips use (menu_hook.cpp coColor), so a vehicle's paint
 -- matches the chip its owner shows in the roster.
-CM.CM_COLORS = { {220,80,80}, {80,140,230}, {90,190,110}, {230,180,60}, {180,100,220}, {80,200,200} }
+CM.CM_COLORS = { {230,25,75}, {0,130,200}, {60,180,75}, {245,130,48}, {145,30,180}, {70,240,240}, {240,50,230}, {255,225,25}, {0,128,128}, {170,110,40}, {210,245,60}, {128,0,0}, {0,0,128}, {128,128,0}, {250,190,212}, {220,190,255}, {170,255,195}, {255,215,180}, {128,128,128}, {255,250,200} }
 function CM.cmCompanyColor(cid)
 	cid = tonumber(cid) or 1
 	local c = CM.CM_COLORS[cid]
 	if c then return c[1] / 255, c[2] / 255, c[3] / 255 end
-	local h = ((cid - 7) * 137.508) % 360
+	local h = ((cid - 21) * 137.508) % 360
 	local sat, val = 0.62, 0.85
 	local C = val * sat
 	local X = C * (1 - math.abs((h / 60) % 2 - 1))

@@ -1,19 +1,20 @@
 -- Transport Fever 2 Multiplayer: company colour classes for the in-game
 -- Multiplayer window (config/game_script/lockstep.lua, the companies row swatches).
 --
--- !mpCo1 .. !mpCo200 carry the company chip colour: the same six fixed colours
--- and golden-angle hue walk as the lobby chips (native/src/menu_hook.cpp coColor)
--- and the vehicle paint (scripts/mp/companies.lua CM.cmCompanyColor). Keep the
--- three in step. Text and background get the colour, so a swatch reads as a solid
+-- !mpCo1 .. !mpCo200 carry the company chip colour: the 20 distinct colours
+-- (Trubetskoy) then a golden-angle hue walk, the same as the lobby chips
+-- (native/src/menu_hook.cpp coColor), the icon/window tints (slice_hook.cpp
+-- IconCompanyColor) and the vehicle paint (companies.lua CM.cmCompanyColor).
+-- Keep all FOUR in step (tools/palette_sync_test.py checks it). Text and background get the colour, so a swatch reads as a solid
 -- block where the background is drawn and as coloured "##" where it is not.
 local ssu = require "stylesheetutil"
 
-local FIRST = { { 220, 80, 80 }, { 80, 140, 230 }, { 90, 190, 110 }, { 230, 180, 60 }, { 180, 100, 220 }, { 80, 200, 200 } }
+local FIRST = { { 230, 25, 75 }, { 0, 130, 200 }, { 60, 180, 75 }, { 245, 130, 48 }, { 145, 30, 180 }, { 70, 240, 240 }, { 240, 50, 230 }, { 255, 225, 25 }, { 0, 128, 128 }, { 170, 110, 40 }, { 210, 245, 60 }, { 128, 0, 0 }, { 0, 0, 128 }, { 128, 128, 0 }, { 250, 190, 212 }, { 220, 190, 255 }, { 170, 255, 195 }, { 255, 215, 180 }, { 128, 128, 128 }, { 255, 250, 200 } }
 
 local function companyColor(cid)
 	local c = FIRST[cid]
 	if c then return c[1] / 255, c[2] / 255, c[3] / 255 end
-	local h = ((cid - 7) * 137.508) % 360
+	local h = ((cid - 21) * 137.508) % 360
 	local sat, val = 0.62, 0.85
 	local C = val * sat
 	local X = C * (1 - math.abs((h / 60) % 2 - 1))
