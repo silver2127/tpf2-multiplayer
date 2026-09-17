@@ -1186,6 +1186,7 @@ function data()
 							local open = {}
 							for _, cid in ipairs(CM.cmRoster or {}) do open[#open + 1] = cid .. ":" .. (CM.cmOpenCode and CM.cmOpenCode(cid) or "*") end
 							if CM.cmWritePerms then pcall(CM.cmWritePerms) end
+							if CM.cmWriteCompanyMap then pcall(CM.cmWriteCompanyMap) end
 							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\ncoopen=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " "), table.concat(open, " ")))
 						end)
 						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
