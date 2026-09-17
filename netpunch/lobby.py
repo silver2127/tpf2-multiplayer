@@ -153,6 +153,7 @@ from __future__ import annotations
 
 import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
+from player_stats import PlayerStats       # relay-only: who plays, how much, how many at once (player_stats.json)
 import collections
 import hashlib
 import itertools
@@ -2460,6 +2461,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 chips.update({str(k): int(v) for k, v in json.load(f).items()})
         except (OSError, ValueError):
             pass
+    # PLAYER STATISTICS (2026-09-17), relay-only: joins, time connected, starts,
+    # frames relayed, per player (by profile code, else name) and in total, with
+    # the peak of players at once. player_stats.json in the io dir; a summary
+    # line in the log every ten minutes while somebody is connected.
+    stats = PlayerStats(os.path.join(io.dir, "player_stats.json"), log) if relay_only else None
+    if stats:
+        log("[stats] " + stats.summary())
 
     def remember_chip(name, cid):
         if not relay_only:
@@ -2803,6 +2811,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # reach keeps its flag for the round that finally serves it.
         switching = {a for a in targets if peers[a].pop("switch", False)}
         for a in targets:
+            if stats and not peers[a].get("started"):
+                stats.started(peers[a]["name"], peers[a].get("profile"))
             peers[a]["started"] = True      # heal roster carries started:true
         if relay_only and upload[0] is not None and getattr(upload[0], "complete", False):
             upload[0] = None                # this upload has been distributed
@@ -2873,6 +2883,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                            "links": [], "mesh": bool(is_mesh),
                            "company": company}
             remember_chip(assigned, company)
+            if stats:
+                stats.join(assigned, profile)
             late = started[0] or host_has_world()
             log(f"[host] JOIN {addr} as {assigned!r}"
                 + (" (late -- game already started)" if started[0] else " (late -- the host is in a world)" if late else ""))
@@ -2965,6 +2977,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return
             for a, p in peers.items():
                 if p["name"] == to:
+                    if stats and GameRelay.is_game(inner):
+                        stats.frame(peers[addr]["name"], len(inner), peers[addr].get("profile"))
                     # a mesh joiner unwraps envelopes itself; a legacy (star)
                     # joiner only understands plain frames
                     out = payload if p.get("mesh") else inner
@@ -2979,6 +2993,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # bridge. Only from a peer that has joined -- strays are dropped.
             if addr in peers:
                 peers[addr]["last"] = time.time()
+                if stats:
+                    stats.frame(peers[addr]["name"], len(payload), peers[addr].get("profile"))
                 if relay is not None:
                     relay.deliver(payload)
                 if relay_only and peers[addr].get("mesh"):
@@ -3144,6 +3160,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "leave":
             if addr in peers:
                 log(f"[host] LEAVE {addr} ({peers[addr]['name']})")
+                if stats:
+                    stats.leave(peers[addr]["name"], peers[addr].get("profile"))
                 del peers[addr]
                 if transfer[0] is not None:
                     transfer[0].on_peer_dropped(addr)
@@ -3488,6 +3506,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                         (transfer[0], recovery.transfer if recovery else None), log)
                 for a in dead:
                     log(f"[host] DROP {a} ({peers[a]['name']}) -- silent")
+                    if stats:
+                        stats.leave(peers[a]["name"], peers[a].get("profile"))
                     del peers[a]
                     frags.forget(a)
                     if transfer[0] is not None:
@@ -3516,6 +3536,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     # every member loaded that world: a newcomer brought in by a
                     # frozen join is started now (no START GAME push for it)
                     for p in peers.values():
+                        if stats and not p.get("started"):
+                            stats.started(p["name"], p.get("profile"))
                         p["started"] = True
                     started[0] = True
                     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
@@ -3532,6 +3554,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
+            if stats:
+                stats.tick()                                # minute flush, 10 min summary
 
             own_fwd.poll_tails()
             own_lines = own_fwd.drain(now)
@@ -3707,6 +3731,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             _log_sinks.remove(own_fwd.add)
         except ValueError:
             pass
+        if stats:
+            for p in peers.values():
+                stats.leave(p["name"], p.get("profile"))
+            stats.flush(force=True)
         for a in list(peers):
             _send_data(sock, a, {"t": "bye"})
         io.emit({"type": "status", "state": "failed",
