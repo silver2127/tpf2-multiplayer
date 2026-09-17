@@ -530,6 +530,12 @@ function CM.hashGridLoad(t)
 end
 
 local function worldHash(now)
+	-- The companies state (mode, the company entities, the saved origin map) is
+	-- applied lazily; the m/l lanes and the construction classification read it.
+	-- Apply it before sampling, so a joiner's first samples after the load gate
+	-- describe the same world as the host's (2026-09-16: two coop-mode samples
+	-- against a companies-mode host declared a false town-lane desync).
+	if CM.cmEnsure then pcall(CM.cmEnsure) end
 	-- Where the ~0.5 s per hash goes (2026-09-11): each lane is timed and the
 	-- split rides on the PERF line (CM.hashPartsMs), so the next session says
 	-- which part to make cheaper instead of guessing.
