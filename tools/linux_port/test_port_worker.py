@@ -40,6 +40,15 @@ printf '## Merged\nall\n## Ported\nported.txt\n## Not ported\nnothing\n## Tests\
 echo DONE > "$meta/STATUS"
 '''
 DEAD = '#!/bin/sh\necho "quota exhausted" >&2\nexit 3\n'
+REVISITOR = r'''#!/bin/sh
+# a backlog run: nothing to merge; the prompt (stdin) names the items; "ports" one and keeps verification green
+meta="$1"
+cat > "$meta/prompt-seen.md"
+echo ok > ported.txt
+echo backlog > backlog.txt
+printf '## Merged\nnone (revisit)\n## Ported\nbacklog.txt\n## Not ported\nrest\n## Live testing\nran the lab\n## Tests\nverify\n' > "$meta/REPORT.md"
+echo PARTIAL > "$meta/STATUS"
+'''
 WRONG = '#!/bin/sh\necho broken > ported.txt\necho DONE > "$1/STATUS"\n'
 
 
@@ -51,7 +60,7 @@ def main():
         # GIT_DIR=. is what the inbox's post-receive hook hands the worker (2026-09-16: every
         # job clone then failed with "not a git repository: '.'").
         env = dict(os.environ, TPF2_PORT_HOME=str(home), GIT_DIR='.', GIT_QUARANTINE_PATH=str(td / 'quarantine'))
-        for name, text in (('fixer', FIXER), ('dead', DEAD), ('wrong', WRONG)):
+        for name, text in (('fixer', FIXER), ('dead', DEAD), ('wrong', WRONG), ('revisitor', REVISITOR)):
             p = td / name
             p.write_text(text)
             p.chmod(0o755)
@@ -269,12 +278,30 @@ def main():
         before = len(published())
         worker()
         assert [e['head'] for e in published()[before:]] == ['port/main'], published()[before:]
+
+        # 8. A revisit: no new Windows commits; the agents work on the backlog of the existing port branch,
+        #    the prompt carries the focus list, the run lands on the same pull request as an update.
+        config(['revisitor'], include=['main'])
+        focus = td / 'focus.md'
+        focus.write_text('- **native tinting**: owner lookup unproven\n')
+        assert worker('--plan') == ''                   # nothing pending, and a revisit needs nothing pending
+        before = len(published())
+        out = worker('--revisit', 'demo', '--branch', 'main', '--focus', str(focus))
+        assert 'revisit of the backlog' in out and 'port passed (revisitor)' in out, out
+        ev = published()[before:]
+        assert [(e['head'], e['action'], e['draft']) for e in ev] == [('port/main', 'update', False)], ev
+        assert 'revisit of the backlog on top of' in ev[0]['body'] and '(revisit)' in ev[0]['body'], ev[0]['body']
+        assert github_file('port/main', 'backlog.txt') == 'backlog\n' and github_file('port/main', 'm.txt') == 'm\n'
+        seen = next((home / 'jobs').glob('demo-main-revisit-*')) / 'meta' / 'prompt-seen.md'
+        seen = seen.read_text()
+        assert 'REVISIT run' in seen and 'native tinting' in seen and 'Live testing' in seen and '{{' not in seen, seen
+        assert worker('--plan') == ''                   # the revisit commit did not create pending work
         print('PASS: tpf2-port worker: baseline on first push; new branches ported with agent fallback; conflicts '
               'resolved and the single pull request description rewritten (a comment only on failure or recovery); a failed port lands as a draft and is not retried; long branches '
               'split by max_commits; one worker at a time (a second exits at the lock, the queue runs after); excluded '
               'and baseline branches untouched; a saved session is resumed by id when its lock is free and skipped for '
               'the next agent while held; a fresh session per job with follow-up rounds resuming that job\'s own session; '
-              'include limits porting to main')
+              'include limits porting to main; a --revisit run works the backlog on the existing port branch')
 
 
 if __name__ == '__main__':
