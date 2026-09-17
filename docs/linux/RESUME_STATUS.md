@@ -1,4 +1,13 @@
-## Latest Windows integration: dev 50d7588b (2026-09-16)
+## Latest Windows integration: dev 66c870cf (2026-09-16)
+
+See [UPSTREAM_dev_66c870cf.md](UPSTREAM_dev_66c870cf.md). Shared HUD styling
+now colours only the glyph using a second image layer; 32 upstream TGA assets
+are included unchanged. Lua and glyph release verification target this commit.
+No native hook or ABI changed. Visible native company tinting remains unavailable
+because the inherited entity/owner-to-widget class tagging is unported; cumulative
+native integration remains partial. No live rendering test is claimed.
+
+## Previous Windows integration: dev 50d7588b (2026-09-16)
 
 See [UPSTREAM_dev_50d7588b.md](UPSTREAM_dev_50d7588b.md). Windows tint
 classes now use `mpWinCoN`/`mpCoN`, without the selector `!`. Linux has no

@@ -21,14 +21,14 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **0.5.7 plus Windows dev through `50d7588b`**.
+This development tree combines **0.5.7 plus Windows dev through `66c870cf`**.
 It includes native road-space summation, ship/aircraft order diagnostics,
 shared-station line selection, host world-switch sharing, bidirectional company
 chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). Lobby
 chips, shared dashboard swatches and vehicle paint use the new 20-colour palette,
 with generated colours starting at company 21. All Lua files
 exactly match that Windows revision. See
-[UPSTREAM_dev_50d7588b.md](UPSTREAM_dev_50d7588b.md) for provenance, tests and
+[UPSTREAM_dev_66c870cf.md](UPSTREAM_dev_66c870cf.md) for provenance, tests and
 remaining gaps. This is not a claim of live cross-platform compatibility.
 `trainorder=0`, `roadspace=0`, `shiporder=0`, `airorder=0` and
 `sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt` disable the respective
@@ -53,7 +53,10 @@ native root-class tagging. The d6db920f selectors additionally target the icon
 element itself, but the corresponding native entity/owner relay remains
 unavailable; stylesheet presence does not enable company tinting on Linux. The 50d7588b
 fix removes the selector bang from Windows class names (`mpWinCoN`/`mpCoN`);
-Linux still lacks the native tint-class application path.
+Linux still lacks the native tint-class application path. The 66c870cf stylesheet
+now colours a second glyph image layer, preserving the blue box, and includes
+32 glyph textures at 1x/2x resolution. These shared assets are included unchanged;
+visible company tinting still requires the missing native class tagging.
 
 Company creation, switching and dissolution now wait for other players to finish
 receiving the save, loading and catching up. The dashboard names those players;
