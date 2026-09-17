@@ -6811,14 +6811,19 @@ static const uint8_t ICON_ATTACH_EXPECT[8] = {
 
 static void IconAttachedApply(void* comp, int cid, int entity)   // the std::string lives here, outside __try (C2712)
 {
-    std::string cls = std::string(TintClassPrefix()) + std::to_string(cid);
+    // NOT the company class again: addStyleClass drops a duplicate (read back: the list
+    // stays "road mpWinCo2") and a dropped duplicate restyles nothing. A class the
+    // element does not have yet is a real change, and the restyle it triggers
+    // re-resolves the whole list, company class included (what !hover does).
+    (void)cid;
+    std::string cls = "mpAttached";
     typedef void (*AddClass)(void*, const void*);
     ((AddClass)(g_base + RVA_ADD_STYLE_CLASS))(comp, &cls);
     InterlockedIncrement(&g_iaApplied);
     if (InterlockedIncrement(&g_iaShown) <= 4) {
         char list[512];
         TintClassList(comp, list, sizeof(list));
-        Log("[stationicon-attach] entity %d: re-added %s after the HUD layer took the button; classes now: %s\n", entity, cls.c_str(), list);
+        Log("[stationicon-attach] entity %d: added mpAttached after the HUD layer took the button; classes now: %s\n", entity, list);
     }
 }
 
