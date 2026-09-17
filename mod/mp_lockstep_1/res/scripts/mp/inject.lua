@@ -207,7 +207,12 @@ function CM.pollInject()
 				local cid, pwAt = tonumber(w[2]), 3
 				if o == "CMNEW" then cid = CM.cmNextId(); pwAt = 2 end
 				local pw = table.concat(w, " ", pwAt)
-				if cid then
+				-- not while somebody is still loading in (companies.lua CM.cmLoadingPlayers)
+				local loading = (o ~= "CMPW" and CM.cmLoadingPlayers) and CM.cmLoadingPlayers() or {}
+				if #loading > 0 then
+					CM.cmNote(CM.cmLoadingNote(loading))
+					log("company: " .. o .. " refused -- " .. CM.cmLoadingNote(loading))
+				elseif cid then
 					CM.scheduleLocal(o, { cid = cid, sw = (o == "CMNEW") and 1 or nil, pw = CM.cmHashPw(cid, pw) or "-" })
 					log("company: requested " .. o .. " " .. cid .. (pw ~= "" and " [with password]" or ""))
 				end
