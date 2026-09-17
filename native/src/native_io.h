@@ -29,6 +29,11 @@ bool PauseAndDrain(const std::string& operation);
 bool Poll(Event& event);
 bool HasWorld();
 bool Busy();
+// A load queued by Load() is in flight: from the request until the new world's
+// CGameUI constructs, or the engine refused it. The engine builds the title
+// menu (CreatePage 2) on the way from the old world to the loading screen, so
+// the menu hook asks this before it reads a title menu as "the player left".
+bool Loading();
 // The threads that do the engine's work, so the lobby can read whether a
 // save or load is ALIVE (native_control.cpp reports their CPU time next to
 // busy): the observed UI thread, and the world's command thread -- the one

@@ -351,6 +351,7 @@ bool PauseAndDrain(const std::string& id) {
 bool Poll(Event& event) { std::lock_guard<std::mutex> lock(mutex); if(events.empty()) return false; event=events.front(); events.pop_front(); return true; }
 bool HasWorld() { std::lock_guard<std::mutex> lock(mutex); return ui!=0; }
 bool Busy() { std::lock_guard<std::mutex> lock(mutex); return state!=State::Idle; }
+bool Loading() { std::lock_guard<std::mutex> lock(mutex); return state==State::QueuedLoad || state==State::Loading; }
 void WorkThreads(DWORD& uiThread,DWORD& command) { std::lock_guard<std::mutex> lock(mutex); uiThread=owner; command=commandThread; }
 bool SetActionsHeld(bool held) {
     std::lock_guard<std::mutex> lock(mutex);
