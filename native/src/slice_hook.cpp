@@ -6172,7 +6172,168 @@ static void InstallShowAllIcons()
         done++;
     }
     Log("[showicons] installed: %d/3 owner gates opened -- every player's stations and vehicles "
-        "get icons (company-colour tint is a later, separate patch)\n", done);
+        "get icons\n", done);
+}
+
+// ---------------------------------------------------------------------------
+// ICON COLOUR (2026-09-16) -- a foreign vehicle icon is tinted its owner's
+// company colour, so you can tell whose it is. The icon quad is drawn by
+// AddVehicle (0x80b410) with `call 0x8088f0` at 0x80b613, r9 = colour pointer,
+// currently NULL (untinted). A non-null r9 -> CVec4f (4 floats, copied into the
+// vertex buffer during the call) modulates the texture. The call site is a
+// clean 5-byte `e8 rel32`; we keep it a CALL (so 0x8088f0 returns to 0x80b618)
+// and point its rel32 at a stub that fills r9 for a foreign owner. The owner is
+// read fault-safely via the game's own GetComponentPtr<PlayerOwned> (0x472900,
+// returns NULL on a missing/edge entity rather than faulting). pid -> company
+// comes from mp_company_perms.txt (the mod writes it, companies.lua); the colour
+// per company is the lobby chip colour. Tints vehicle icons of all four carrier
+// types and nothing else (0x8088f0's only AddVehicle caller is this site).
+// KILL SWITCH: `iconcolor=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_ICON_DRAW_CALL   = 0x80b613;   // call 0x8088f0 in AddVehicle
+static const uintptr_t RVA_ICON_DRAW_TARGET = 0x8088f0;   // AddQuad(rect, buffer, tex, colour*, ...)
+static const uintptr_t RVA_GET_PLAYEROWNED  = 0x472900;   // GetComponentPtr<PlayerOwned>(engine, &entity)
+static const uint8_t ICON_DRAW_EXPECT[5] = { 0xE8, 0xD8, 0xD2, 0xFF, 0xFF };
+static bool g_iconColorOn = false;
+
+// pid -> company id, from mp_company_perms.txt ("pid <playerEntity> <companyId>"),
+// cached 2 s. 0 = unknown (coop, or a pid with no company). Its own cache, so it
+// never disturbs SharedStationsPermitted's.
+static int IconCompanyOfPid(int pid)
+{
+    static ULONGLONG last = 0;
+    static int n = 0;
+    static int pids[256], cids[256];
+    const ULONGLONG now = GetTickCount64();
+    if (!last || now - last >= 2000) {
+        last = now;
+        n = 0;
+        if (g_dataDir[0]) {
+            char p[MAX_PATH];
+            snprintf(p, sizeof(p), "%smp_company_perms.txt", g_dataDir);
+            FILE* f = _fsopen(p, "r", _SH_DENYNO);
+            if (f) {
+                char line[160];
+                while (fgets(line, sizeof(line), f)) {
+                    int a = 0, b = 0;
+                    if (sscanf(line, "pid %d %d", &a, &b) == 2 && n < 256) { pids[n] = a; cids[n] = b; n++; }
+                }
+                fclose(f);
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) if (pids[i] == pid) return cids[i];
+    return 0;
+}
+
+// The company's colour, 0..1 RGB -- the six fixed lobby-chip colours and the
+// golden-angle hue walk, byte-for-byte the menu's coColor / companies.lua
+// CM.cmCompanyColor, so an icon matches its roster chip.
+static void IconCompanyColor(int cid, float out[3])
+{
+    static const int first[6][3] = { {220,80,80}, {80,140,230}, {90,190,110}, {230,180,60}, {180,100,220}, {80,200,200} };
+    if (cid >= 1 && cid <= 6) {
+        out[0] = first[cid - 1][0] / 255.0f; out[1] = first[cid - 1][1] / 255.0f; out[2] = first[cid - 1][2] / 255.0f;
+        return;
+    }
+    double hd = ((cid - 7) * 137.508);
+    float h = (float)(hd - (int)(hd / 360.0) * 360.0);
+    if (h < 0) h += 360.0f;
+    const float sat = 0.62f, val = 0.85f, c = val * sat;
+    const float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f)), m = val - c;
+    float r, g, b;
+    if (h < 60)      { r = c; g = x; b = 0; }
+    else if (h < 120){ r = x; g = c; b = 0; }
+    else if (h < 180){ r = 0; g = c; b = x; }
+    else if (h < 240){ r = 0; g = x; b = c; }
+    else if (h < 300){ r = x; g = 0; b = c; }
+    else             { r = c; g = 0; b = x; }
+    out[0] = r + m; out[1] = g + m; out[2] = b + m;
+}
+
+// Called by the stub for every vehicle icon. Returns a pointer to 4 floats
+// (RGBA, alpha 1) to tint a FOREIGN owner's icon, or NULL to leave it untinted
+// (no owner, own vehicle, or coop). A fault reading the component is swallowed:
+// an untinted icon is never worth a render-thread crash. The buffer is a single
+// static -- one render thread, and 0x8088f0 copies it before it returns.
+extern "C" const float* IconTintForEntity(void* engine, const int* entity, int local)
+{
+    static float rgba[4];
+    __try {
+        typedef void* (*GetPlayerOwned)(void*, const int*);
+        void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, entity);
+        if (!po) return nullptr;
+        const int owner = *(const int*)po;
+        if (owner == local || owner < 0) return nullptr;   // own or unowned: as before
+        const int cid = IconCompanyOfPid(owner);
+        if (cid <= 0) return nullptr;
+        IconCompanyColor(cid, rgba);
+        rgba[3] = 1.0f;
+        return rgba;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static void InstallIconColor()
+{
+    if (FlagsSayOff("iconcolor")) {
+        Log("[iconcolor] OFF (iconcolor=0 in tpf2_menu_flags.txt) -- foreign vehicle icons are "
+            "not tinted\n");
+        return;
+    }
+    if (!BytesAre(RVA_ICON_DRAW_CALL, ICON_DRAW_EXPECT, sizeof(ICON_DRAW_EXPECT), "iconcolor")) return;
+    int32_t rel = 0;
+    memcpy(&rel, ICON_DRAW_EXPECT + 1, 4);
+    if ((uintptr_t)((int64_t)RVA_ICON_DRAW_CALL + 5 + rel) != RVA_ICON_DRAW_TARGET) {
+        Log("[iconcolor] NOT installed: the call at rva=%llx does not resolve to the icon quad "
+            "draw %llx\n", (unsigned long long)RVA_ICON_DRAW_CALL, (unsigned long long)RVA_ICON_DRAW_TARGET);
+        return;
+    }
+    // The stub: fill r9 with the owner's company colour, then jmp the real draw.
+    // Entered by CALL (rel32 rewritten below), so [rsp] = 0x80b618 and the draw's
+    // ret lands back in AddVehicle. rcx/rdx/r8 are the draw's live args -> saved.
+    uint8_t* stub = NearAlloc(96);
+    if (!stub) { Log("[iconcolor] NOT installed: no page within reach for the stub\n"); return; }
+    const uintptr_t helper = (uintptr_t)&IconTintForEntity;
+    const uintptr_t target = g_base + RVA_ICON_DRAW_TARGET;
+    size_t k = 0;
+    stub[k++] = 0x51;                                                        // push rcx
+    stub[k++] = 0x52;                                                        // push rdx
+    stub[k++] = 0x41; stub[k++] = 0x50;                                      // push r8
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xEC; stub[k++] = 0x20;  // sub rsp, 0x20
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0x4E; stub[k++] = 0x28;  // mov rcx, [rsi+0x28]  (engine)
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xD5;                    // mov rdx, rbp         (&entity)
+    stub[k++] = 0x44; stub[k++] = 0x8B; stub[k++] = 0x46; stub[k++] = 0x20;  // mov r8d, [rsi+0x20]  (local player)
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &helper, 8); k += 8;// mov rax, IconTintForEntity
+    stub[k++] = 0xFF; stub[k++] = 0xD0;                                      // call rax
+    stub[k++] = 0x49; stub[k++] = 0x89; stub[k++] = 0xC1;                    // mov r9, rax
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xC4; stub[k++] = 0x20;  // add rsp, 0x20
+    stub[k++] = 0x41; stub[k++] = 0x58;                                      // pop r8
+    stub[k++] = 0x5A;                                                        // pop rdx
+    stub[k++] = 0x59;                                                        // pop rcx
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &target, 8); k += 8;// mov rax, 0x8088f0
+    stub[k++] = 0xFF; stub[k++] = 0xE0;                                      // jmp rax
+    FlushInstructionCache(GetCurrentProcess(), stub, k);
+    // Rewrite the call's rel32 to the stub; keep the 0xE8 (still a CALL).
+    const uintptr_t at = g_base + RVA_ICON_DRAW_CALL;
+    const int64_t nrel = (int64_t)(uintptr_t)stub - (int64_t)(at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) {
+        Log("[iconcolor] NOT installed: the stub is out of rel32 reach of the call site\n");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)(at + 1), 4, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[iconcolor] NOT installed: could not unprotect the call at rva=%llx\n",
+            (unsigned long long)RVA_ICON_DRAW_CALL);
+        return;
+    }
+    const int32_t r32 = (int32_t)nrel;
+    memcpy((void*)(at + 1), &r32, 4);
+    VirtualProtect((void*)(at + 1), 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 5);
+    g_iconColorOn = true;
+    Log("[iconcolor] installed: foreign vehicle icons tinted their owner's company colour "
+        "(call at rva=%llx -> stub)\n", (unsigned long long)RVA_ICON_DRAW_CALL);
 }
 
 static void InstallSharedStations()
@@ -6686,8 +6847,10 @@ static DWORD WINAPI Init(LPVOID)
     // the town developer stamps it into every building it proposes, and the
     // account and train systems pick and seed by it.
     InstallPausedTick();
-    // Icons over every player's stations and vehicles ("SHOW ALL ICONS").
+    // Icons over every player's stations and vehicles ("SHOW ALL ICONS"), and
+    // the company-colour tint of a foreign vehicle icon ("ICON COLOUR").
     InstallShowAllIcons();
+    InstallIconColor();
 
     for (;;) {
         Sleep(15000);
