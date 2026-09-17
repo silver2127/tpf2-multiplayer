@@ -440,6 +440,34 @@ function CM.hashCostSlowest()
 	return worst, who
 end
 
+-- FORCED CADENCE (2026-09-16): tpf2mp_hash_every.txt in the data dir, holding a
+-- number of game units (a multiple of K.HASH_EVERY_MIN, 4, below the 12-unit
+-- ladder; a rung of the ladder above it), makes the leader stamp that interval
+-- to every instance regardless of cost -- for chasing a divergence to the step
+-- it starts on. An empty or missing file hands the cadence back to the cost
+-- ladder. Read by the leader only, every 15 ticks.
+function CM.hashEveryForced()
+	if CM.hashForcedAt and CM.ticks - CM.hashForcedAt < 15 then return CM.hashForced end
+	CM.hashForcedAt = CM.ticks
+	local v = nil
+	local f = io.open(K.BASE .. "tpf2mp_hash_every.txt", "r")
+	if f then
+		v = tonumber((f:read("*l") or ""):match("%d+"))
+		f:close()
+	end
+	local minU = K.HASH_EVERY_MIN or K.HASH_EVERY_GAMETIME
+	if v and (v < minU or v % minU ~= 0 or (v > K.HASH_EVERY_GAMETIME and v % K.HASH_EVERY_GAMETIME ~= 0)) then
+		if CM.hashForcedBad ~= v then CM.hashForcedBad = v; log(string.format("HASH CADENCE: tpf2mp_hash_every.txt says %d -- not a multiple of %d (or of %d above it), ignored", v, minU, K.HASH_EVERY_GAMETIME)) end
+		v = nil
+	end
+	if v ~= CM.hashForced then
+		log(v and string.format("HASH CADENCE: forced to every %d game units by tpf2mp_hash_every.txt", v)
+		      or "HASH CADENCE: tpf2mp_hash_every.txt gone -- back to the cost ladder")
+	end
+	CM.hashForced = v
+	return v
+end
+
 -- THE LEADER, after each of its own stamps: move every instance's interval when
 -- the slowest cost calls for it.
 function CM.hashCadenceTick(now)
@@ -447,6 +475,16 @@ function CM.hashCadenceTick(now)
 	local g = CM.hashGrid
 	if g and g.prev and now < g.from then return end   -- the last switch has not started yet
 	if CM.hashCadenceAt and CM.ticks - CM.hashCadenceAt < K.HASH_CADENCE_MIN_TICKS then return end
+	local forced = CM.hashEveryForced()
+	if forced then
+		local _, curF = CM.hashStampOf(now)
+		if forced ~= curF then
+			CM.hashCadenceAt = CM.ticks
+			CM.scheduleLocal("HASHEVERY", { every = forced, prev = curF })
+			log(string.format("HASH CADENCE: every %d game units instead of %d (forced by tpf2mp_hash_every.txt)", forced, curF))
+		end
+		return
+	end
 	local cost, who = CM.hashCostSlowest()
 	if not cost then return end
 	local _, cur = CM.hashStampOf(now)
@@ -465,7 +503,9 @@ end
 function CM.execHashEvery(c)
 	local every, prev, at = tonumber(c.every), tonumber(c.prev), tonumber(c.at)
 	local base = K.HASH_EVERY_GAMETIME
-	local function onGrid(v) return v ~= nil and v >= base and v % base == 0 end
+	local minU = K.HASH_EVERY_MIN or base
+	-- a rung of the ladder, or a forced interval below it (a multiple of K.HASH_EVERY_MIN)
+	local function onGrid(v) return v ~= nil and v >= minU and ((v % base == 0) or (v < base and v % minU == 0)) end
 	if not (onGrid(every) and onGrid(prev) and at) then
 		log(string.format("EXEC HASHEVERY seq=%s origin=%s: bad interval every=%s prev=%s -- not applied",
 			tostring(c.seq), tostring(c.origin), tostring(c.every), tostring(c.prev)))

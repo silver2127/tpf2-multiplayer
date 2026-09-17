@@ -69,7 +69,8 @@ local K = setmetatable({ INSTANCE = "a", PEER = "b", INJECT_FILE = INJECT, STRIC
 local CM = { peerSeen = true, injectOffset = 0, consByKey = { d = { id = 900 } }, seqNo = 0, ticks = 0 }
 function CM.gameTime() return 100 end
 function CM.stepOf(t) return math.floor((t or 0) / 0.2 + 0.5) end
-function CM.scheduleLocal(op, args) sched[#sched + 1] = { op = op, args = args } end
+function CM.scheduleLocal(op, args) CM.seqNo = CM.seqNo + 1; sched[#sched + 1] = { op = op, args = args, seq = CM.seqNo } end
+-- companies.lua's paint, as the strict buy calls it (2026-09-16): records the key it was given
 local keys = { [170607] = "a:87" }
 function CM.lineKeyFor(lid) return keys[lid] end
 local ids = { ["a:87"] = 170607 }
@@ -96,6 +97,12 @@ function H.poll() CM.pollInject() end
 function H.nsched() return #sched end
 function H.cline(i) local s = sched[i]; return s and s.args.cline end
 function H.op(i) local s = sched[i]; return s and s.op end
+local paints = {}
+function CM.cmColorNewVehicle(key) paints[#paints + 1] = key end
+function H.paints() local t = {}; for i, k in ipairs(paints) do t[i] = k end; return t end
+function H.clearPaints() paints = {} end
+function H.arg(i, k) local s = sched[i]; return s and s.args and s.args[k] end
+function H.seq(i) local s = sched[i]; return s and s.seq end
 function H.clearSched() sched = {} end
 function H.nsent() return #sent end
 function H.sentAt(i) local c = sent[i]; return c and string.format("%s %s %s %s", c.what, c.v, c.l, c.s) end
@@ -145,6 +152,15 @@ def main():
     check("split read: scheduled on the next poll", H.nsched() == 1)
     check("split read: still carries the clone line", H.cline(1) == "a:87", str(H.cline(1)))
     H.clearSched()
+
+    # 2b. the strict buy paints its vehicle: a VCOLOR keyed by the buy's own key follows (2026-09-16)
+    H.clearPaints()
+    write("ARMED 1", VBUY, "VBUYLINE -1")
+    H.poll()
+    paints = [H.paints()[i] for i in range(1, len(H.paints()) + 1)]
+    check("strict buy: the company paint is asked for once, right behind the VBUY", H.nsched() == 1 and len(paints) == 1, str(paints))
+    check("strict buy: the paint names the buy's own key", paints and paints[0] == "a:" + str(H.seq(1)), str(paints))
+    H.clearSched(); H.clearPaints()
 
     # 3. no VBUYLINE ever: a plain buy, one poll late
     write("ARMED 1", VBUY)

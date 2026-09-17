@@ -1,4 +1,14 @@
-## Latest Windows integration: dev 38432b5f (2026-09-16)
+## Latest Windows integration: dev d3135a59 (2026-09-16)
+
+See [UPSTREAM_dev_d3135a59.md](UPSTREAM_dev_d3135a59.md). The uncommitted merge
+includes native station permissions, four icon-owner branch patches and the
+foreign-window eligibility patch, plus 28 exact upstream Lua files. Soldier
+build and 44/44 CTests pass. Vehicle-icon, station-label and window tinting
+remain unported; attempted mappings and missing evidence are recorded in
+[DEV_D3135A59.md](../re/linux/DEV_D3135A59.md). Earlier gaps below remain.
+No game or Steam execution and no live compatibility claim.
+
+## Previous Windows integration: dev 38432b5f (2026-09-16)
 
 See [UPSTREAM_dev_38432b5f.md](UPSTREAM_dev_38432b5f.md) for the staged merge,
 paused-counter patch, load percentages, automatic lobby leave, live companies

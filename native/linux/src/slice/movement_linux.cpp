@@ -2,6 +2,7 @@
 #include "movement_linux.h"
 #include "movement_checks.h"
 #include "../paused_checks_linux.h"
+#include "../company_ui_checks_linux.h"
 #include "../codewrite_linux.h"
 #include "train_order_checks.h"
 #include "train_order_linux.h"
@@ -168,6 +169,104 @@ bool Companies()
     SliceInstance(letter,sizeof(letter));
     return cached=ReadCompanies(movementData,letter);
 }
+// Same bounded wire format and permissive missing-file fallback as Windows.
+// File IO stays behind a mutex and a two-second cache, off the hover hot path.
+struct StationPermissions {
+    int count=0, pids[256]{}, cids[256]{};
+    char codes[256][96]{};
+    void Read(const std::string& data) {
+        *this=StationPermissions{};
+        if (data.empty()) return;
+        FILE* f=fopen((data+"/mp_company_perms.txt").c_str(),"r");
+        if (!f) return;
+        char line[160];
+        while (fgets(line,sizeof(line),f)) {
+            int a=0,b=0; char code[96]{};
+            if (sscanf(line,"pid %d %d",&a,&b)==2) {
+                if (count<256) { pids[count]=a; cids[count++]=b; }
+            } else if (sscanf(line,"open %d %95s",&a,code)==2 && a>=1 && a<256) {
+                memcpy(codes[a],code,sizeof(code));
+            }
+        }
+        fclose(f);
+    }
+    bool Allows(int owner,int mine) const {
+        int oc=0,mc=0;
+        for (int i=0;i<count;++i) {
+            if (pids[i]==owner) oc=cids[i];
+            if (pids[i]==mine) mc=cids[i];
+        }
+        if (!oc || !mc || oc==mc || oc<1 || oc>=256 || !codes[oc][0]) return true;
+        const char* code=codes[oc];
+        if (!strcmp(code,"*")) return true;
+        if (!strcmp(code,"-")) return false;
+        while (*code) {
+            if (atoi(code)==mc) return true;
+            while (*code && *code!=',') ++code;
+            if (*code) ++code;
+        }
+        return false;
+    }
+};
+bool StationsPermitted(int owner,int mine)
+{
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    static StationPermissions cached;
+    static std::chrono::steady_clock::time_point last;
+    const auto now=std::chrono::steady_clock::now();
+    if (last.time_since_epoch().count()==0 || now-last>=std::chrono::seconds(2)) {
+        cached.Read(movementData); last=now;
+    }
+    return cached.Allows(owner,mine);
+}
+struct UiPatch { uintptr_t rva; const char* before; const char* after; size_t size; };
+static const UiPatch iconPatches[] = {
+    {0x1383b78, "\x75\x86", "\x90\x90", 2},
+    {0x138ba6f, "\x74\x5e", "\xeb\x5e", 2}, // paged owner storage
+    {0x138bacd, "\x75\xa2", "\x90\x90", 2}, // contiguous owner storage
+    {0x1090cb5, "\x0f\x84\x5d\x01\x00\x00", "\xe9\x5e\x01\x00\x00\x90", 6},
+};
+static const UiPatch foreignWindowPatches[] = {
+    {0x1446d54, "\x0f\x85\xb0\x00\x00\x00", "\x66\x0f\x1f\x44\x00\x00", 6},
+};
+template<size_t N> bool ApplyUiPatches(uintptr_t base,const UiPatch (&patches)[N])
+{
+    // Check the whole group before writing, and roll back if a write fails.
+    for (const auto& p:patches) {
+        char actual[6];
+        if (!SliceRead(base+p.rva,actual,p.size) || memcmp(actual,p.before,p.size)) return false;
+    }
+    for (size_t i=0;i<N;++i) {
+        const auto& p=patches[i]; int error=0;
+        if (Tpf2mpCodeWriteSelf(base+p.rva,reinterpret_cast<const uint8_t*>(p.after),p.size,&error)!=TPF2MP_CW_OK) {
+            for (size_t j=0;j<=i;++j) {
+                const auto& undo=patches[j];
+                if (Tpf2mpCodeWriteSelf(base+undo.rva,reinterpret_cast<const uint8_t*>(undo.before),undo.size,&error)!=TPF2MP_CW_OK)
+                    SliceLog("[company-ui] rollback failed at %lx errno=%d\n",(unsigned long)undo.rva,error);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
+{
+    bool ok=true;
+    if (!FlagOff(root,data,"showicons")) {
+        const bool ready=Check(base,kIconChecks) && ApplyUiPatches(base,iconPatches);
+        SliceLog("[showicons] %s: four Linux owner branches\n",ready ? "installed" : "OFF");
+        ok &= ready;
+    }
+    if (!FlagOff(root,data,"foreignwindows")) {
+        const bool ready=Check(base,kForeignWindowChecks) && ApplyUiPatches(base,foreignWindowPatches);
+        SliceLog("[foreignwindows] %s: native command barrier and Lua foreign edit guard retained\n",ready ? "installed" : "OFF");
+        ok &= ready;
+    }
+    // No guessed render ABI or MSVC string crosses into the Linux engine.
+    SliceLog("[company-ui] iconcolor/windowcolor unavailable: Linux tint ABI not established\n");
+    return ok;
+}
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)
 {
     if (FlagOff(root,data,"pausedtick")) {
@@ -195,7 +294,7 @@ extern "C" void SliceFilteredRelayB();
 #include "filtered_relays_linux.h"
 extern "C" { __attribute__((visibility("hidden"))) uintptr_t SliceStationResume=0; }
 extern "C" __attribute__((visibility("hidden")))
-int SliceStationAllow(int owner,int local) { return owner==local || Companies(); }
+int SliceStationAllow(int owner,int local) { return owner==local || (Companies() && StationsPermitted(owner,local)); }
 extern "C" void SliceStationRelay();
 // Entered via JMP with the engine's stack already aligned for CALL. The next
 // instruction after the stolen cmp/sete/movzx is the engine's epilogue jump.
@@ -208,6 +307,7 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
 {
     movementBase=base; movementData=data ? data : "";
     bool ok=InstallPausedTick(base,root,data);
+    ok &= InstallCompanyUi(base,root,data);
     if (!FlagOff(root,data,"roadspace")) {
         void* unusedPlainA=nullptr; void* unusedPlainB=nullptr;
         SliceRoadResumeA=base+0x2e558eb; SliceRoadResumeB=base+0x2e55988;

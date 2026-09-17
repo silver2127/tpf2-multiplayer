@@ -484,14 +484,14 @@ static void RenderHostJoinLocked(int w, int h)
         const int hb = MwButtonW("HOST GAME");
         MwButton(lx, cy + S(96), hb, S(30), "HOST GAME", 2);
         if (master) MwCheck(lx + hb + S(16), cy + S(96), "PUBLIC (listed in the browser)", g_public, 11);
-        MwCheck(lx, cy + S(130), "SEPARATE COMPANIES (off = co-op)", g_separateCompanies, 50);
+        MwCheck(lx, cy + S(128), "SEPARATE COMPANIES (off = co-op)", g_separateCompanies, 50);
     }
     MwHeader(rx, cy, colW, "JOIN A GAME");
     MwBody(rx, cy + S(28), colW, S(24), "Paste or type the code from your host.");
     MwField(rx, cy + S(58), colW, S(30), P().joinCode, g_focus == 1, "Click to paste the code", 8);
     MwButton(rx, cy + S(96), MwButtonW("JOIN GAME"), S(30), "JOIN GAME", 3);
-    MwBody(pad, cy + S(166), w - 2 * pad, S(20),
-           "Everyone needs the Transport Fever 2 Multiplayer mod, and the shared save must have it enabled.");
+    MwBody(rx, cy + S(134), colW, S(20),
+           "The shared save must have the Multiplayer mod enabled.");
     MwHeader(pad, cy + S(192), S(260), "YOUR NAME");
     MwField(pad, cy + S(216), S(260), S(30), P().username, g_focus == 3, "Steam name (click to type your own)", 13);
     MwHeader(pad + S(290), cy + S(192), w - 2 * pad - S(290),
@@ -503,7 +503,7 @@ static void RenderHostJoinLocked(int w, int h)
         // PUBLIC GAMES: the server browser. A click drops the row's code into the join field.
         int ly = cy + S(260);
         const int lw = w - 2 * pad;
-        MwHeader(pad, ly, lw - S(120), "PUBLIC GAMES  --  click a row to fill in its code, then JOIN GAME");
+        MwHeader(pad, ly, lw - S(120), "PUBLIC GAMES  --  click a row, then JOIN GAME");
         { const int rb = MwButtonW("REFRESH"); MwButton(w - pad - rb, ly - S(4), rb, S(30), "REFRESH", 12); }
         ly += S(26);
         const int cName = pad + S(10), cType = pad + S(395), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);

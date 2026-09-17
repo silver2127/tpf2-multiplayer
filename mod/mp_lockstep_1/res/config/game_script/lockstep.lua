@@ -227,6 +227,7 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
+K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
 -- ~400 ms, and at the base cadence that is ~10% of wall time spent inside our
 -- own bookkeeping -- which is what "it feels laggy" actually was.
@@ -559,6 +560,7 @@ K.SIM_STEP = 0.2
 -- which is what drifted departures -- review, 2026-09-01).
 K.BIND_GUARD_STEPS = 10      -- 2 game-units after the last buy of a batch
 K.VLINE_RETRY_STEPS = 5      -- 1 game-unit per key-not-bound retry
+K.VCOLOR_RETRY_MAX = 50      -- a company paint waits up to 50 of those for its vehicle's key (vehicles.lua execSetColor)
 K.VLINE_GRID_STEPS = 10      -- line assignments land on a 2 game-unit step grid (see the dispatcher)
 K.LINE_MATERIALIZE_STEPS = 5 -- hold a batch's line ops/assigns this many steps after the LCREATE that makes their line (createLine binds its key async)
 -- Own commands are kept for resend until every live peer has acknowledged them
@@ -668,7 +670,7 @@ local function execute(c)
 	elseif c.op == "SPEEDVOTE" then CM.execSpeedVote(c)
 	elseif c.op == "TERRAIN" then CM.execTerrain(c)
 	elseif c.op == "ASSETS" then CM.execAssets(c)
-	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" or c.op == "CMNAME" then CM.execCompanyCmd(c)
+	elseif c.op == "CMNEW" or c.op == "CMSWITCH" or c.op == "CMDEL" or c.op == "CMPW" or c.op == "CMNAME" or c.op == "CMOPEN" then CM.execCompanyCmd(c)
 	else log("unknown op: " .. tostring(c.op)) end
 end
 
@@ -1177,10 +1179,14 @@ function data()
 							-- names, percent-escaped ("3:Acme%20Co 4:...")
 							local names = {}
 							for _, cid in ipairs(CM.cmRoster or {}) do
-								local n = CM.cmName and CM.cmName[cid]
+								local n = CM.cmNameOf and CM.cmNameOf(cid) or (CM.cmName and CM.cmName[cid])
 								if n and n ~= "" then names[#names + 1] = cid .. ":" .. CM.escName(n) end
 							end
-							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " ")))
+							-- station permissions ("1:* 2:1,3 3:-"), and the slice's file (companies.lua)
+							local open = {}
+							for _, cid in ipairs(CM.cmRoster or {}) do open[#open + 1] = cid .. ":" .. (CM.cmOpenCode and CM.cmOpenCode(cid) or "*") end
+							if CM.cmWritePerms then pcall(CM.cmWritePerms) end
+							f:write(string.format("company=%s\nroster=%s\nplayed=%s\nconote=%s\ncolocked=%s\nconames=%s\ncoopen=%s\n", tostring(CM.cmMyCompany or 1), table.concat(ids, ","), table.concat(who, " "), tostring(CM.cmLastNote or ""), table.concat(locked, ","), table.concat(names, " "), table.concat(open, " ")))
 						end)
 						-- paused=yes: the speed lever reads 0 (a pause, the load gate, a catch-up hold)
 						f:write(string.format("t=%d\npeer=%s\nskew=%s\ndesyncs=%d\nlate=%d\napplylag=%.1f\napplylate=%d\napplied=%d\nqueued=%d\npaused=%s\nspeed=%s\nverdict=%s\ndetail=%s\n",
@@ -1739,8 +1745,26 @@ function data()
 					prowC:setLayout(prow)
 					local crowC = api.gui.comp.Component.new("mpCompanyRow")
 					crowC:setLayout(crow)
+					-- STATION PERMISSIONS (2026-09-16): who may stop at your stations. The
+					-- selected company (the dropdown above) is allowed or denied; everyone /
+					-- nobody set the whole list. "CMOPEN who on" goes through the inject
+					-- file like the other company commands (companies.lua CMOPEN).
+					local function coOpen(who, on)
+						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						if f then f:write("CMOPEN " .. tostring(who) .. " " .. tostring(on) .. string.char(10)); f:close() end
+					end
+					local orow = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					D.coOpenText = api.gui.comp.TextView.new("your stations are open to: -")
+					orow:addItem(D.coOpenText)
+					orow:addItem(api.gui.comp.TextView.new("   "))
+					orow:addItem(speedBtn("  allow selected  ", function() if D.coSel and D.coSel ~= D.coMine then coOpen(D.coSel, 1) end end))
+					orow:addItem(speedBtn("  deny selected  ", function() if D.coSel and D.coSel ~= D.coMine then coOpen(D.coSel, 0) end end))
+					orow:addItem(speedBtn("  everyone  ", function() coOpen("*", 1) end))
+					orow:addItem(speedBtn("  nobody  ", function() coOpen("*", 0) end))
+					local orowC = api.gui.comp.Component.new("mpCompanyOpenRow")
+					orowC:setLayout(orow)
 					local coL = api.gui.layout.BoxLayout.new("VERTICAL")
-					coL:addItem(mrowC); coL:addItem(crowC); coL:addItem(prowC); coL:addItem(D.coNote)
+					coL:addItem(mrowC); coL:addItem(crowC); coL:addItem(prowC); coL:addItem(orowC); coL:addItem(D.coNote)
 					D.coBox = api.gui.comp.Component.new("mpCompanies")
 					D.coBox:setLayout(coL)
 					box:addItem(D.coBox)
@@ -1880,12 +1904,12 @@ function data()
 						for id, n in tostring(mine.conames or ""):gmatch("(%d+):(%S+)") do names[tonumber(id)] = CM.unescName(n) end
 						D.coRoster, D.coPlayed, D.coMine, D.coLocked, D.coNames = roster, played, tonumber(mine.company), locked, names
 						if (guiTick % 30) == 0 or not D.coNamesRead then D.coNamesRead = true; pcall(CM.readPlayerNames) end
-						-- a company's name: the one given in the game's company window, else
-						-- "<player>'s company" (the same rule the sim applies to the entities)
+						-- a company's name as the sim decided it (companies.lua CM.cmNameOf: the
+						-- name given in the game's company window, else the founder's)
 						local function coName(cid)
-							local letters = {}
-							for l in tostring(played[cid] or ""):gmatch("%a+") do letters[#letters + 1] = l end
-							return CM.cmDisplayName(cid, names[cid], letters)
+							local n = names[cid]
+							if n and n ~= "" then return n end
+							return "Company " .. tostring(cid)
 						end
 						if not D.coSel then D.coSel = D.coMine end
 						-- the dropdown: every company by name, alphabetical; a company with more
@@ -1930,6 +1954,20 @@ function data()
 						if D.coSwMine and D.coSwMineCls ~= mineCls then D.coSwMineCls = mineCls; pcall(function() D.coSwMine:setStyleClassList({ mineCls }) end) end
 						local mineName = D.coMine and coName(D.coMine) or "-"
 						if mineName ~= D.coNameShown then D.coNameShown = mineName; D.coNameText:setText(" " .. mineName .. "   ") end
+						-- what our stations are open to, from the sim's coopen= ("1:* 2:1,3 3:-")
+						if D.coOpenText and D.coMine then
+							local code = tostring(mine.coopen or ""):match("%f[%d]" .. D.coMine .. ":(%S+)") or "*"
+							local text
+							if code == "*" then text = "everyone"
+							elseif code == "-" then text = "nobody"
+							else
+								local ns = {}
+								for v in code:gmatch("%d+") do ns[#ns + 1] = coName(tonumber(v)) end
+								text = table.concat(ns, ", ")
+							end
+							local line = "your stations are open to: " .. text
+							if line ~= D.coOpenShown then D.coOpenShown = line; pcall(function() D.coOpenText:setText(line) end) end
+						end
 						local note = mine.conote or ""
 						if note ~= "" and note ~= D.coNoteSeen then D.coNoteSeen = note; D.coHint = nil end
 						if D.coNote then D.coNote:setText("   " .. (D.coHint or note)) end

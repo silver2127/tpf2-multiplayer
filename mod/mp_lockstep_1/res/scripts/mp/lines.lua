@@ -542,6 +542,7 @@ local function buildLineObject(c)
 	local lineObj = api.type.Line.new()
 	lineObj.waitingTime = CM.waitNum(c.wait, 180)
 	local n = 0
+	local groups = {}   -- the station group of every stop, for the permission check
 	local altList = nil
 	if c.alts and c.alts ~= "" then
 		altList = {}
@@ -573,6 +574,7 @@ local function buildLineObject(c)
 				if best then idx = best end
 			end
 		end
+		groups[#groups + 1] = sg
 		local s = api.type.Line.Stop.new()
 		s.stationGroup = sg
 		s.station = idx
@@ -604,7 +606,7 @@ local function buildLineObject(c)
 		end
 		lineObj.stops[n] = s
 	end
-	return lineObj, n
+	return lineObj, n, groups
 end
 
 -- A line op replayed on a peer can share a batch with the LCREATE that makes
@@ -646,8 +648,22 @@ function CM.execLine(c)
 		log(string.format("%s seq=%s: STRICT -- originator replaying at stamp (local was cancelled)", c.op, tostring(c.seq)))
 	end
 	local ok, err = pcall(function()
+		-- STATION PERMISSIONS (2026-09-16): every instance refuses a line whose
+		-- stops include a station of a company not open to the line's company
+		-- (companies.lua CM.cmLineStopsPermitted, lockstep state). The originator's
+		-- line editor was already told no by the slice's gate; this is the same
+		-- answer on every instance if a click and a revoke ever race.
+		local function permitted(lineObj, groups)
+			if not CM.cmLineStopsPermitted then return true end
+			local okP, why = CM.cmLineStopsPermitted(c.company, groups)
+			if okP then return true end
+			log(string.format("%s seq=%s origin=%s REFUSED on every instance: %s", c.op, tostring(c.seq), tostring(c.origin), tostring(why)))
+			if c.origin == K.INSTANCE and CM.cmNote then CM.cmNote("line not changed: " .. tostring(why)) end
+			return false
+		end
 		if c.op == "LCREATE" then
-			local lineObj, n = buildLineObject(c)
+			local lineObj, n, groups = buildLineObject(c)
+			if not permitted(lineObj, groups) then return end
 			local r, g, b = tostring(c.color or ""):match("^([^,]+),([^,]+),([^,]+)$")
 			local color = api.type.Vec3f.new(tonumber(r) or 0.9, tonumber(g) or 0.2, tonumber(b) or 0.2)
 			local name = CM.unescName(c.name)
@@ -683,7 +699,11 @@ function CM.execLine(c)
 		elseif c.op == "LUPDATE" then
 			local lid = CM.lineIdFor(c.key)
 			if not lid then retryLineDep(c); return end
-			local lineObj, n = buildLineObject(c)
+			local lineObj, n, groups = buildLineObject(c)
+			if not permitted(lineObj, groups) then
+				if c.origin == K.INSTANCE then CM.lineSentDone(c.key, c.stops) end
+				return
+			end
 			-- the lists the line editor may still be showing (CM.lineBaseFor)
 			pcall(function()
 				local pre = CM.lineSnapshot(lid)

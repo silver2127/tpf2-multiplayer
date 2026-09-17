@@ -33,6 +33,13 @@ function data()
 			backgroundColor = { r, g, b, 1.0 },
 			color = { r, g, b, 1.0 },
 		})
+		-- !mpWinCoN: a TRANSLUCENT wash of the company colour for a whole window
+		-- root (the slice tags a foreign entity's window with this, ICON COLOUR /
+		-- FOREIGN WINDOWS). A low alpha so the company is obvious at a glance while
+		-- the window's own content stays readable; no text-colour override.
+		a("!mpWinCo" .. cid, {
+			backgroundColor = { r, g, b, 0.30 },
+		})
 	end
 	return result
 end

@@ -55,7 +55,7 @@ end
 K.ACTIONS_OFF_BEHIND = CM.MAX_LEAD or 15
 K.ACTIONS_ON_BEHIND = 2
 K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
-                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true }
+                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true }
 K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
                         VREV = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
                         STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true }
@@ -76,6 +76,28 @@ function CM.actionsBlockTick(now)
 		log(string.format("ACTIONS ON: %.1f game units behind -- the player's actions replicate again%s", behind,
 			#CM.actionsHeld > 0 and string.format("; %d held line creation(s) go out now", #CM.actionsHeld) or ""))
 	end
+end
+
+-- READ-ONLY FOREIGN WINDOWS EDIT GUARD (2026-09-16). The slice's `foreignwindows`
+-- patch lets a player OPEN another company's station/vehicle window. The depot and
+-- construction windows self-suppress their edit blocks for a foreign owner, but the
+-- vehicle and station-group windows have NO native owner gate: their rename / line /
+-- sell / send-to-depot / reverse / colour controls are live for any owner. So on the
+-- ORIGINATOR, before a captured edit is replicated, refuse it when its target entity
+-- is another company's -- the control becomes a harmless no-op that never ships, so
+-- the window is genuinely read-only and nothing can desync. Own entities (and coop)
+-- pass (cmForeignOwner is false there). Logged once per (op, entity).
+function CM.injForeignEdit(o, id)
+	if not id or not CM.cmForeignOwner then return false end
+	local foreign, cid = CM.cmForeignOwner(id)
+	if not foreign then return false end
+	CM.injForeignSaid = CM.injForeignSaid or {}
+	local k = tostring(o) .. ":" .. tostring(id)
+	if not CM.injForeignSaid[k] then
+		CM.injForeignSaid[k] = true
+		log(string.format("%s: entity %s belongs to company %s -- foreign window is read-only, not shipped", tostring(o), tostring(id), tostring(cid)))
+	end
+	return true
 end
 
 function CM.pollInject()
@@ -171,7 +193,7 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" and o ~= "CMOPEN" then
 				CM.soloDrop(line)
 				return
 			end
@@ -188,6 +210,14 @@ function CM.pollInject()
 				if cid then
 					CM.scheduleLocal(o, { cid = cid, sw = (o == "CMNEW") and 1 or nil, pw = CM.cmHashPw(cid, pw) or "-" })
 					log("company: requested " .. o .. " " .. cid .. (pw ~= "" and " [with password]" or ""))
+				end
+			elseif o == "CMOPEN" then
+				-- CMOPEN who on   -- who = * or a company id; on = 1/0: who may stop at MY stations
+				local who, on = tostring(w[2] or "*"), tonumber(w[3]) == 1 and 1 or 0
+				CM.cmEnsure()
+				if CM.cmMyCompany and (who == "*" or tonumber(who)) then
+					CM.scheduleLocal("CMOPEN", { cid = CM.cmMyCompany, who = who, on = on })
+					log(string.format("company: requested CMOPEN %s %d (company %d's stations)", who, on, CM.cmMyCompany))
 				end
 			elseif o == "CMNAME" then
 				-- CMNAME cid the company's name...   (spaces allowed; travels percent-escaped)
@@ -1115,6 +1145,10 @@ function CM.pollInject()
 								-- strict buys went in).
 								CM.scheduleLocal("VBUY", bargs)
 								log("VBUY: STRICT -- cancelled locally, shipped at once; every instance creates it at the stamp (key binds on replay)")
+								-- COMPANY PAINT (2026-09-16): the buy's key is ours, so the paint
+								-- goes out right behind it, as the parked path has done since
+								-- 0.4.12 -- this strict path, the one every buy takes, never did.
+								pcall(CM.cmColorNewVehicle, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 							else
 								-- shipped by CM.shipParkedBuys once the vehicle exists (purchaseTime)
 								CM.parkedBuys[#CM.parkedBuys + 1] = {
@@ -1130,7 +1164,7 @@ function CM.pollInject()
 			elseif o == "VSELL" and #w >= 2 then
 				local n = tonumber(w[2]) or 0
 				local ids = {}
-				for i = 1, n do local id = tonumber(w[2 + i]); if id then ids[#ids + 1] = id end end
+				for i = 1, n do local id = tonumber(w[2 + i]); if id and not CM.injForeignEdit("VSELL", id) then ids[#ids + 1] = id end end
 				-- Same key-binding race as VLINE: a sell right after a batch buy
 				-- finds the keys unbound and shipped NOTHING ("none shippable").
 				-- Defer and retry. STRICT (ARMED 1): the sale was
@@ -1193,6 +1227,8 @@ function CM.pollInject()
 				elseif o == "VNAME" and id and id == myCompanyPid then
 					log(string.format("VNAME: entity %s is company %d's player -> CMNAME %s", tostring(id), CM.cmMyCompany, tostring(w[3])))
 					CM.scheduleLocal("CMNAME", { cid = CM.cmMyCompany, name = w[3] })
+				elseif key and CM.injForeignEdit(o, id) then
+					-- foreign vehicle: the read-only window's rename/colour control is inert
 				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
@@ -1216,6 +1252,7 @@ function CM.pollInject()
 			elseif o == "VREV" and #w >= 2 then
 				local id = tonumber(w[2])
 				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VREV", id) then k = nil end
 				if k then
 					log("VREV: " .. k)
 					CM.scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
@@ -1224,6 +1261,7 @@ function CM.pollInject()
 			elseif o == "VDEPOT" and #w >= 3 then
 				local id, sell = tonumber(w[2]), tonumber(w[3]) or 0
 				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VDEPOT", id) then k = nil end
 				if k then
 					local armed = CM.lastArmed or 0
 					log(string.format("VDEPOT: %s sell=%d%s", k, sell, armed == 1 and " (strict)" or ""))
@@ -1232,6 +1270,8 @@ function CM.pollInject()
 					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
 				end
 
+			elseif o == "VLINE" and #w >= 4 and CM.injForeignEdit("VLINE", tonumber(w[2])) then
+				-- foreign vehicle: the read-only window's line control is inert
 			elseif o == "VLINE" and #w >= 4 then
 				local id, line, stop = tonumber(w[2]), tonumber(w[3]), tonumber(w[4]) or 0
 				-- A batch buy binds its vehicle keys over the next few ticks
@@ -1304,6 +1344,7 @@ function CM.pollInject()
 				-- Key it now so the first stops are not dropped.
 				if lid and not CM.lineKeyOf[lid] and not CM.primedLines[lid] then CM.pollLineKeys() end
 				local lk = lid and CM.lineKeyFor(lid)
+				if lk and CM.injForeignEdit("LUPDATE", lid) then lk = nil end
 				if lk then
 					-- Two shapes. DECODED: the NEW stop list
 					-- came off the command itself -- the cancel means the entity

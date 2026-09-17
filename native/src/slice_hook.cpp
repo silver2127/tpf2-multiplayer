@@ -5891,6 +5891,7 @@ static const uint8_t SHAREDSTATIONS_EXPECT[46] = {
 static bool  g_ssOn = false;
 static long  g_ssCalls = 0;     // foreign owners this filter was asked about
 static long  g_ssOpened = 0;    // ...of which were let through
+static long  g_ssRefused = 0;   // ...refused by the station permissions (mp_company_perms.txt)
 static bool  g_ssSaidOnce = false;
 
 // Companies mode, from the file both sides already share: line 1 of
@@ -5938,6 +5939,64 @@ static bool SharedStationsCompaniesLive()
 
 // The engine's comparison, with one extra answer. Returns 1 = accept (the line
 // editor may add this stop), 0 = reject (what the engine would have said).
+// STATION PERMISSIONS (2026-09-16): mp_company_perms.txt, written by the mod
+// (companies.lua CM.cmWritePerms) from lockstep state:
+//   pid <playerEntity> <companyId>      one per company
+//   open <companyId> *|-|<id>,<id>,...  what that company's stations are open to
+// Answers: is the owner's company open to ours? Unknown entities or a missing
+// file answer yes (the behaviour before the file existed); a stale file is at
+// most 2 s old, and every instance re-checks the line update it applies with
+// the same lockstep state (lines.lua), so a race here cannot split the worlds.
+static bool SharedStationsPermitted(int owner, int mine)
+{
+    static ULONGLONG last = 0;
+    static int pidN = 0;
+    static int pids[256], cids[256];
+    static char open[256][96];      // per company id 1..255: "*", "-" or a list
+    const ULONGLONG now = GetTickCount64();
+    if (!last || now - last >= 2000) {
+        last = now;
+        pidN = 0;
+        memset(open, 0, sizeof(open));
+        if (g_dataDir[0]) {
+            char p[MAX_PATH];
+            snprintf(p, sizeof(p), "%smp_company_perms.txt", g_dataDir);
+            FILE* f = _fsopen(p, "r", _SH_DENYNO);
+            if (f) {
+                char line[160];
+                while (fgets(line, sizeof(line), f)) {
+                    int a = 0, b = 0; char code[96] = {0};
+                    if (sscanf(line, "pid %d %d", &a, &b) == 2) {
+                        if (pidN < 256) { pids[pidN] = a; cids[pidN] = b; pidN++; }
+                    } else if (sscanf(line, "open %d %95s", &a, code) == 2) {
+                        if (a >= 1 && a < 256) { strncpy(open[a], code, 95); open[a][95] = 0; }
+                    }
+                }
+                fclose(f);
+            }
+        }
+    }
+    int ownerCid = 0, mineCid = 0;
+    for (int i = 0; i < pidN; i++) {
+        if (pids[i] == owner) ownerCid = cids[i];
+        if (pids[i] == mine) mineCid = cids[i];
+    }
+    if (!ownerCid || !mineCid || ownerCid == mineCid) return true;
+    if (ownerCid < 1 || ownerCid >= 256 || !open[ownerCid][0]) return true;
+    const char* code = open[ownerCid];
+    if (!strcmp(code, "*")) return true;
+    if (!strcmp(code, "-")) return false;
+    // a comma list of company ids
+    const char* s = code;
+    while (*s) {
+        int v = atoi(s);
+        if (v == mineCid) return true;
+        while (*s && *s != ',') s++;
+        if (*s == ',') s++;
+    }
+    return false;
+}
+
 extern "C" int SharedStationsAllow(int owner, int mine)
 {
     if (owner == mine) return 1;
@@ -5946,6 +6005,19 @@ extern "C" int SharedStationsAllow(int owner, int mine)
     __try { live = SharedStationsCompaniesLive() ? 1 : 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
     if (!live) return 0;
+    int permitted = 1;
+    __try { permitted = SharedStationsPermitted(owner, mine) ? 1 : 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { permitted = 1; }
+    if (!permitted) {
+        static bool saidRefuse = false;
+        InterlockedIncrement(&g_ssRefused);
+        if (!saidRefuse) {
+            saidRefuse = true;
+            Log("[sharedstations] line editor refused a stop owned by player %d (we are %d): its company's "
+                "stations are not open to ours (mp_company_perms.txt)\n", owner, mine);
+        }
+        return 0;
+    }
     InterlockedIncrement(&g_ssOpened);
     if (!g_ssSaidOnce) {
         g_ssSaidOnce = true;
@@ -6039,6 +6111,444 @@ static void InstallPausedTick()
     Log("[pausedtick] installed: the paused branch of GameSim::Step (rva=%llx) no longer "
         "advances GameTime+0x30 per render batch; it moves only with the step count\n",
         (unsigned long long)RVA_PAUSED_TICK_CALL);
+}
+
+// ---------------------------------------------------------------------------
+// SHOW ALL ICONS (2026-09-16) -- the world icons over stations and vehicles are
+// drawn only for the local player's entities. Three owner tests gate them, one
+// per icon system, each a plain cmp/jne (RE pass on build 35924):
+//   * ItemCreator::Visit 0x808478 -- vehicles (road/rail/water/air), station
+//     name labels, signals, dead ends: cmp eax,[rbx+0x20] ; jne 0x8088de
+//   * ItemCreator::End 0x80c569 -- the second gate, trains only:
+//     mov eax,[r15+0x20] ; cmp [rdx],eax ; jne 0x80c640
+//   * HudIconManager::DoStep lambda 0x5de526 -- the clickable station/depot
+//     buttons: cmp [rdx],r15d ; jne 0x5de603
+// Opening a gate = NOP its jne, so the accept path runs for every owner. In
+// co-op there is one player entity, so the compare always succeeded and the NOP
+// changes nothing; only in companies mode do foreign entities now get icons.
+// Widening these does not open the entity WINDOWS (UI::ViewCreator 0x8b3020
+// still refuses a foreign entity, so a click does nothing) nor the list windows
+// (GetEntitiesForPlayer, untouched). The company-colour TINT of a foreign icon
+// is a separate render-path detour (0x80b613), done after this is proven live.
+// KILL SWITCH: `showicons=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+struct IconGate { uintptr_t jne; uint8_t before[8]; int beforeLen; uint8_t jbytes[6]; const char* what; };
+static const IconGate ICON_GATES[3] = {
+    // the two bytes before each jne are the cmp it depends on: a byte match that
+    // landed elsewhere cannot pass. Visit: cmp eax,[rbx+0x20]. End: cmp [rdx],eax.
+    // DoStep: cmp [rdx],r15d.
+    { 0x80847b, { 0x3B, 0x43, 0x20 }, 3, { 0x0F, 0x85, 0x5D, 0x04, 0x00, 0x00 }, "vehicles, station labels, signals (Visit)" },
+    { 0x80c56b, { 0x39, 0x02 },       2, { 0x0F, 0x85, 0xCF, 0x00, 0x00, 0x00 }, "trains (End)" },
+    { 0x5de529, { 0x44, 0x39, 0x3A }, 3, { 0x0F, 0x85, 0xD4, 0x00, 0x00, 0x00 }, "station/depot buttons (DoStep)" },
+};
+
+static void InstallShowAllIcons()
+{
+    if (FlagsSayOff("showicons")) {
+        Log("[showicons] OFF (showicons=0 in tpf2_menu_flags.txt) -- icons only over your own "
+            "stations and vehicles\n");
+        return;
+    }
+    // Verify every gate before touching any: a partial patch (one system opened,
+    // two not) is worse than none.
+    for (int i = 0; i < 3; i++) {
+        const IconGate& g = ICON_GATES[i];
+        if (!BytesAre(g.jne - g.beforeLen, g.before, g.beforeLen, "showicons")) return;
+        if (!BytesAre(g.jne, g.jbytes, sizeof(g.jbytes), "showicons")) return;
+    }
+    static const uint8_t NOP6[6] = { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+    int done = 0;
+    for (int i = 0; i < 3; i++) {
+        const uintptr_t at = g_base + ICON_GATES[i].jne;
+        DWORD old = 0;
+        if (!VirtualProtect((void*)at, 6, PAGE_EXECUTE_READWRITE, &old)) {
+            Log("[showicons] NOT installed: could not unprotect rva=%llx (%s)\n",
+                (unsigned long long)ICON_GATES[i].jne, ICON_GATES[i].what);
+            continue;
+        }
+        memcpy((void*)at, NOP6, 6);
+        VirtualProtect((void*)at, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void*)at, 6);
+        done++;
+    }
+    Log("[showicons] installed: %d/3 owner gates opened -- every player's stations and vehicles "
+        "get icons\n", done);
+}
+
+// ---------------------------------------------------------------------------
+// ICON COLOUR (2026-09-16) -- a foreign vehicle icon is tinted its owner's
+// company colour, so you can tell whose it is. The icon quad is drawn by
+// AddVehicle (0x80b410) with `call 0x8088f0` at 0x80b613, r9 = colour pointer,
+// currently NULL (untinted). A non-null r9 -> CVec4f (4 floats, copied into the
+// vertex buffer during the call) modulates the texture. The call site is a
+// clean 5-byte `e8 rel32`; we keep it a CALL (so 0x8088f0 returns to 0x80b618)
+// and point its rel32 at a stub that fills r9 for a foreign owner. The owner is
+// read fault-safely via the game's own GetComponentPtr<PlayerOwned> (0x472900,
+// returns NULL on a missing/edge entity rather than faulting). pid -> company
+// comes from mp_company_perms.txt (the mod writes it, companies.lua); the colour
+// per company is the lobby chip colour. Tints vehicle icons of all four carrier
+// types and nothing else (0x8088f0's only AddVehicle caller is this site).
+// KILL SWITCH: `iconcolor=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_ICON_DRAW_CALL   = 0x80b613;   // call 0x8088f0 in AddVehicle
+static const uintptr_t RVA_ICON_DRAW_TARGET = 0x8088f0;   // AddQuad(rect, buffer, tex, colour*, ...)
+static const uintptr_t RVA_GET_PLAYEROWNED  = 0x472900;   // GetComponentPtr<PlayerOwned>(engine, &entity)
+static const uint8_t ICON_DRAW_EXPECT[5] = { 0xE8, 0xD8, 0xD2, 0xFF, 0xFF };
+static bool g_iconColorOn = false;
+
+// pid -> company id, from mp_company_perms.txt ("pid <playerEntity> <companyId>"),
+// cached 2 s. 0 = unknown (coop, or a pid with no company). Its own cache, so it
+// never disturbs SharedStationsPermitted's.
+static int IconCompanyOfPid(int pid)
+{
+    static ULONGLONG last = 0;
+    static int n = 0;
+    static int pids[256], cids[256];
+    const ULONGLONG now = GetTickCount64();
+    if (!last || now - last >= 2000) {
+        last = now;
+        n = 0;
+        if (g_dataDir[0]) {
+            char p[MAX_PATH];
+            snprintf(p, sizeof(p), "%smp_company_perms.txt", g_dataDir);
+            FILE* f = _fsopen(p, "r", _SH_DENYNO);
+            if (f) {
+                char line[160];
+                while (fgets(line, sizeof(line), f)) {
+                    int a = 0, b = 0;
+                    if (sscanf(line, "pid %d %d", &a, &b) == 2 && n < 256) { pids[n] = a; cids[n] = b; n++; }
+                }
+                fclose(f);
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) if (pids[i] == pid) return cids[i];
+    return 0;
+}
+
+// The company's colour, 0..1 RGB -- the six fixed lobby-chip colours and the
+// golden-angle hue walk, byte-for-byte the menu's coColor / companies.lua
+// CM.cmCompanyColor, so an icon matches its roster chip.
+static void IconCompanyColor(int cid, float out[3])
+{
+    static const int first[6][3] = { {220,80,80}, {80,140,230}, {90,190,110}, {230,180,60}, {180,100,220}, {80,200,200} };
+    if (cid >= 1 && cid <= 6) {
+        out[0] = first[cid - 1][0] / 255.0f; out[1] = first[cid - 1][1] / 255.0f; out[2] = first[cid - 1][2] / 255.0f;
+        return;
+    }
+    double hd = ((cid - 7) * 137.508);
+    float h = (float)(hd - (int)(hd / 360.0) * 360.0);
+    if (h < 0) h += 360.0f;
+    const float sat = 0.62f, val = 0.85f, c = val * sat;
+    const float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f)), m = val - c;
+    float r, g, b;
+    if (h < 60)      { r = c; g = x; b = 0; }
+    else if (h < 120){ r = x; g = c; b = 0; }
+    else if (h < 180){ r = 0; g = c; b = x; }
+    else if (h < 240){ r = 0; g = x; b = c; }
+    else if (h < 300){ r = x; g = 0; b = c; }
+    else             { r = c; g = 0; b = x; }
+    out[0] = r + m; out[1] = g + m; out[2] = b + m;
+}
+
+// Called by the stub for every vehicle icon. Returns a pointer to 4 floats
+// (RGBA, alpha 1) to tint a FOREIGN owner's icon, or NULL to leave it untinted
+// (no owner, own vehicle, or coop). A fault reading the component is swallowed:
+// an untinted icon is never worth a render-thread crash. The buffer is a single
+// static -- one render thread, and 0x8088f0 copies it before it returns.
+// The ecs engine and the local player, cached from the icon path (which has them
+// reliably every frame at ItemCreatorImpl+0x28/+0x20). The window tint (0x8b2390)
+// and the station-label tint have no engine in hand at their sites; they read
+// these. A per-world pointer that only changes on a new game / load, and windows
+// and labels only render while the icon path is running, so it is fresh; a stale
+// value just yields no tint (the lookups are SEH-guarded).
+static volatile void*  g_uiEngine = nullptr;
+static volatile LONG   g_uiLocalPlayer = -1;
+
+extern "C" const float* IconTintForEntity(void* engine, const int* entity, int local)
+{
+    static float rgba[4];
+    if (engine) { g_uiEngine = engine; InterlockedExchange(&g_uiLocalPlayer, local); }
+    __try {
+        typedef void* (*GetPlayerOwned)(void*, const int*);
+        void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, entity);
+        if (!po) return nullptr;
+        const int owner = *(const int*)po;
+        if (owner == local || owner < 0) return nullptr;   // own or unowned: as before
+        const int cid = IconCompanyOfPid(owner);
+        if (cid <= 0) return nullptr;
+        IconCompanyColor(cid, rgba);
+        rgba[3] = 1.0f;
+        return rgba;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+
+static void InstallIconColor()
+{
+    if (FlagsSayOff("iconcolor")) {
+        Log("[iconcolor] OFF (iconcolor=0 in tpf2_menu_flags.txt) -- foreign vehicle icons are "
+            "not tinted\n");
+        return;
+    }
+    if (!BytesAre(RVA_ICON_DRAW_CALL, ICON_DRAW_EXPECT, sizeof(ICON_DRAW_EXPECT), "iconcolor")) return;
+    int32_t rel = 0;
+    memcpy(&rel, ICON_DRAW_EXPECT + 1, 4);
+    if ((uintptr_t)((int64_t)RVA_ICON_DRAW_CALL + 5 + rel) != RVA_ICON_DRAW_TARGET) {
+        Log("[iconcolor] NOT installed: the call at rva=%llx does not resolve to the icon quad "
+            "draw %llx\n", (unsigned long long)RVA_ICON_DRAW_CALL, (unsigned long long)RVA_ICON_DRAW_TARGET);
+        return;
+    }
+    // The stub: fill r9 with the owner's company colour, then jmp the real draw.
+    // Entered by CALL (rel32 rewritten below), so [rsp] = 0x80b618 and the draw's
+    // ret lands back in AddVehicle. rcx/rdx/r8 are the draw's live args -> saved.
+    uint8_t* stub = NearAlloc(96);
+    if (!stub) { Log("[iconcolor] NOT installed: no page within reach for the stub\n"); return; }
+    const uintptr_t helper = (uintptr_t)&IconTintForEntity;
+    const uintptr_t target = g_base + RVA_ICON_DRAW_TARGET;
+    size_t k = 0;
+    stub[k++] = 0x51;                                                        // push rcx
+    stub[k++] = 0x52;                                                        // push rdx
+    stub[k++] = 0x41; stub[k++] = 0x50;                                      // push r8
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xEC; stub[k++] = 0x20;  // sub rsp, 0x20
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0x4E; stub[k++] = 0x28;  // mov rcx, [rsi+0x28]  (engine)
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xD5;                    // mov rdx, rbp         (&entity)
+    stub[k++] = 0x44; stub[k++] = 0x8B; stub[k++] = 0x46; stub[k++] = 0x20;  // mov r8d, [rsi+0x20]  (local player)
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &helper, 8); k += 8;// mov rax, IconTintForEntity
+    stub[k++] = 0xFF; stub[k++] = 0xD0;                                      // call rax
+    stub[k++] = 0x49; stub[k++] = 0x89; stub[k++] = 0xC1;                    // mov r9, rax
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xC4; stub[k++] = 0x20;  // add rsp, 0x20
+    stub[k++] = 0x41; stub[k++] = 0x58;                                      // pop r8
+    stub[k++] = 0x5A;                                                        // pop rdx
+    stub[k++] = 0x59;                                                        // pop rcx
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &target, 8); k += 8;// mov rax, 0x8088f0
+    stub[k++] = 0xFF; stub[k++] = 0xE0;                                      // jmp rax
+    FlushInstructionCache(GetCurrentProcess(), stub, k);
+    // Rewrite the call's rel32 to the stub; keep the 0xE8 (still a CALL).
+    const uintptr_t at = g_base + RVA_ICON_DRAW_CALL;
+    const int64_t nrel = (int64_t)(uintptr_t)stub - (int64_t)(at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) {
+        Log("[iconcolor] NOT installed: the stub is out of rel32 reach of the call site\n");
+        return;
+    }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)(at + 1), 4, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[iconcolor] NOT installed: could not unprotect the call at rva=%llx\n",
+            (unsigned long long)RVA_ICON_DRAW_CALL);
+        return;
+    }
+    const int32_t r32 = (int32_t)nrel;
+    memcpy((void*)(at + 1), &r32, 4);
+    VirtualProtect((void*)(at + 1), 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 5);
+    g_iconColorOn = true;
+    Log("[iconcolor] installed: foreign vehicle icons tinted their owner's company colour "
+        "(call at rva=%llx -> stub)\n", (unsigned long long)RVA_ICON_DRAW_CALL);
+}
+
+// ---------------------------------------------------------------------------
+// STATION LABEL COLOUR (2026-09-16) -- a foreign station's world name-label
+// background is washed the owner's company colour, the station counterpart of
+// the vehicle-icon tint. The label background is drawn at 0x80a0ee (call 0x8090f0,
+// r8 = colour pointer, chosen by cmove between grey [rbp+0x98] and the blue
+// highlight [rbp+0xa8]). At that call r13 = ItemCreatorImpl (engine [r13+0x28],
+// local [r13+0x20]) and r12 = &entity (the station id, the same pointer handed to
+// the click-rect register at 0x80a0fc). For a foreign owner the stub overrides r8
+// with the company colour (IconTintForEntity, the vehicle-icon helper); own/coop
+// keep the grey/blue. Same fault-safe lookup, same `iconcolor` kill switch.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_STNLABEL_CALL   = 0x80a0ee;   // call 0x8090f0 (label bg) in the label builder
+static const uintptr_t RVA_STNLABEL_TARGET = 0x8090f0;   // AddRect(buffer, tex, colour*, rect)
+static const uint8_t STNLABEL_EXPECT[5] = { 0xE8, 0xFD, 0xEF, 0xFF, 0xFF };
+static bool g_stnLabelColorOn = false;
+
+static void InstallStationLabelColor()
+{
+    if (FlagsSayOff("iconcolor")) return;   // same switch as the vehicle-icon tint
+    if (!BytesAre(RVA_STNLABEL_CALL, STNLABEL_EXPECT, sizeof(STNLABEL_EXPECT), "stationlabelcolor")) return;
+    int32_t rel = 0;
+    memcpy(&rel, STNLABEL_EXPECT + 1, 4);
+    if ((uintptr_t)((int64_t)RVA_STNLABEL_CALL + 5 + rel) != RVA_STNLABEL_TARGET) {
+        Log("[stationlabelcolor] NOT installed: the call at rva=%llx does not resolve to the label "
+            "draw %llx\n", (unsigned long long)RVA_STNLABEL_CALL, (unsigned long long)RVA_STNLABEL_TARGET);
+        return;
+    }
+    uint8_t* stub = NearAlloc(96);
+    if (!stub) { Log("[stationlabelcolor] NOT installed: no page for the stub\n"); return; }
+    const uintptr_t helper = (uintptr_t)&IconTintForEntity;
+    const uintptr_t target = g_base + RVA_STNLABEL_TARGET;
+    size_t k = 0;
+    stub[k++] = 0x51;                                                        // push rcx (buffer)
+    stub[k++] = 0x52;                                                        // push rdx (tex)
+    stub[k++] = 0x41; stub[k++] = 0x50;                                      // push r8  (default colour)
+    stub[k++] = 0x41; stub[k++] = 0x51;                                      // push r9  (rect)
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xEC; stub[k++] = 0x28;  // sub rsp, 0x28
+    stub[k++] = 0x49; stub[k++] = 0x8B; stub[k++] = 0x4D; stub[k++] = 0x28;  // mov rcx, [r13+0x28]  (engine)
+    stub[k++] = 0x4C; stub[k++] = 0x89; stub[k++] = 0xE2;                    // mov rdx, r12         (&entity)
+    stub[k++] = 0x45; stub[k++] = 0x8B; stub[k++] = 0x45; stub[k++] = 0x20;  // mov r8d, [r13+0x20]  (local)
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &helper, 8); k += 8;// mov rax, IconTintForEntity
+    stub[k++] = 0xFF; stub[k++] = 0xD0;                                      // call rax
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xC4; stub[k++] = 0x28;  // add rsp, 0x28
+    stub[k++] = 0x41; stub[k++] = 0x59;                                      // pop r9
+    stub[k++] = 0x41; stub[k++] = 0x58;                                      // pop r8
+    stub[k++] = 0x5A;                                                        // pop rdx
+    stub[k++] = 0x59;                                                        // pop rcx
+    stub[k++] = 0x48; stub[k++] = 0x85; stub[k++] = 0xC0;                    // test rax, rax
+    stub[k++] = 0x74; stub[k++] = 0x03;                                      // je +3 (keep default r8)
+    stub[k++] = 0x49; stub[k++] = 0x89; stub[k++] = 0xC0;                    // mov r8, rax  (company colour)
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &target, 8); k += 8;// mov rax, 0x8090f0
+    stub[k++] = 0xFF; stub[k++] = 0xE0;                                      // jmp rax
+    FlushInstructionCache(GetCurrentProcess(), stub, k);
+    const uintptr_t at = g_base + RVA_STNLABEL_CALL;
+    const int64_t nrel = (int64_t)(uintptr_t)stub - (int64_t)(at + 5);
+    if (nrel < INT32_MIN || nrel > INT32_MAX) { Log("[stationlabelcolor] NOT installed: stub out of reach\n"); return; }
+    DWORD old = 0;
+    if (!VirtualProtect((void*)(at + 1), 4, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[stationlabelcolor] NOT installed: could not unprotect rva=%llx\n", (unsigned long long)RVA_STNLABEL_CALL);
+        return;
+    }
+    const int32_t r32 = (int32_t)nrel;
+    memcpy((void*)(at + 1), &r32, 4);
+    VirtualProtect((void*)(at + 1), 4, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 5);
+    g_stnLabelColorOn = true;
+    Log("[stationlabelcolor] installed: a foreign station's name-label background is washed the "
+        "owner's company colour (call at rva=%llx)\n", (unsigned long long)RVA_STNLABEL_CALL);
+}
+
+// ---------------------------------------------------------------------------
+// FOREIGN WINDOWS (2026-09-16) -- clicking a foreign station/vehicle/depot icon
+// opens its info window (read-only). UI::ViewCreator::CanCreateView (0x8b3020)
+// is a PURE predicate: it reads GetComponentPtr<PlayerOwned> and, for a foreign
+// owner, returns 0 (no window) before the type cascade -- the gate at 0x8b3060.
+// Opening it (NOP the jne) lets a foreign entity's window build; building only
+// READS components, so no write, no command, no sim/lockstep effect, and the
+// clicked entity is null-checked by 0x472900. The depot and construction windows
+// already suppress their edit blocks for a foreign owner; the vehicle and
+// station-group windows do NOT, so their edit controls are made inert on the
+// originator by the mod's capture guard (inject.lua CM.injForeignEdit). Together
+// that is a genuinely read-only foreign window that cannot desync.
+// KILL SWITCH: `foreignwindows=0` in tpf2_menu_flags.txt.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_FOREIGNWIN_JNE = 0x8b3060;   // cmp [rax],edx ; jne 0x8b3388 (reject: return 0)
+// the two bytes before are the owner compare it depends on: cmp dword [rax],edx
+static const uint8_t FOREIGNWIN_BEFORE[2] = { 0x39, 0x10 };
+static const uint8_t FOREIGNWIN_JNE_BYTES[6] = { 0x0F, 0x85, 0x22, 0x03, 0x00, 0x00 };
+
+static void InstallForeignWindows()
+{
+    if (FlagsSayOff("foreignwindows")) {
+        Log("[foreignwindows] OFF (foreignwindows=0 in tpf2_menu_flags.txt) -- a foreign entity's "
+            "window cannot be opened\n");
+        return;
+    }
+    if (!BytesAre(RVA_FOREIGNWIN_JNE - 2, FOREIGNWIN_BEFORE, sizeof(FOREIGNWIN_BEFORE), "foreignwindows")) return;
+    if (!BytesAre(RVA_FOREIGNWIN_JNE, FOREIGNWIN_JNE_BYTES, sizeof(FOREIGNWIN_JNE_BYTES), "foreignwindows")) return;
+    static const uint8_t NOP6[6] = { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 };
+    const uintptr_t at = g_base + RVA_FOREIGNWIN_JNE;
+    DWORD old = 0;
+    if (!VirtualProtect((void*)at, 6, PAGE_EXECUTE_READWRITE, &old)) {
+        Log("[foreignwindows] NOT installed: could not unprotect rva=%llx\n",
+            (unsigned long long)RVA_FOREIGNWIN_JNE);
+        return;
+    }
+    memcpy((void*)at, NOP6, 6);
+    VirtualProtect((void*)at, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)at, 6);
+    Log("[foreignwindows] installed: a foreign entity's info window opens read-only (the mod's "
+        "capture guard keeps its edit controls inert)\n");
+}
+
+// ---------------------------------------------------------------------------
+// WINDOW COLOUR (2026-09-16) -- a foreign entity's (read-only) info window is
+// washed with its owner's company colour, so it's obvious whose it is. All 14
+// entity-view creators funnel through the bind helper 0x8b2390(window, entityId)
+// once when a window opens. Windows are 100% style-sheet driven (no native RGBA
+// write); a window tags itself with classes via addStyleClass 0x227a1e0(window,
+// std::string*), which appends only if absent. So for a foreign entity we append
+// "!mpWinCoN" (a translucent company wash defined in res/config/style_sheet/
+// mp_lockstep.lua). Once per window open, rendering-only, cannot desync; the
+// owner is read via 0x472900 (null-safe) with the engine/local cached from the
+// icon path (g_uiEngine/g_uiLocalPlayer). KILL SWITCH: `windowcolor=0`.
+// ---------------------------------------------------------------------------
+static const uintptr_t RVA_ADD_STYLE_CLASS = 0x227a1e0;   // CComponent::addStyleClass(this, std::string*)
+static const uintptr_t RVA_WINDOW_BIND     = 0x8b2390;     // bind entity to window (all view creators)
+static const uint8_t WINDOW_BIND_EXPECT[9] = {
+    0x40, 0x53,                                 // push rbx
+    0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00    // sub rsp, 0x80
+};
+static bool g_windowColorOn = false;
+
+// no SEH in this scope (it constructs a std::string with a destructor): the
+// caller wraps the call in __try.
+static void WindowTintApply(void* window, int cid)
+{
+    std::string cls = "!mpWinCo" + std::to_string(cid);
+    typedef void (*AddClass)(void*, const void*);
+    ((AddClass)(g_base + RVA_ADD_STYLE_CLASS))(window, &cls);
+}
+
+extern "C" void WindowTint(void* window, int entity)
+{
+    __try {
+        void* engine = (void*)g_uiEngine;
+        if (!engine || !window) return;
+        const int local = (int)InterlockedCompareExchange(&g_uiLocalPlayer, 0, 0);
+        int ent = entity;
+        typedef void* (*GetPlayerOwned)(void*, const int*);
+        void* po = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &ent);
+        if (!po) return;
+        const int owner = *(const int*)po;
+        if (owner < 0 || owner == local) return;   // unowned or ours: no wash
+        const int cid = IconCompanyOfPid(owner);
+        if (cid <= 0) return;
+        WindowTintApply(window, cid);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static void InstallWindowColor()
+{
+    if (FlagsSayOff("windowcolor")) {
+        Log("[windowcolor] OFF (windowcolor=0 in tpf2_menu_flags.txt) -- foreign windows are not "
+            "washed with the owner's colour\n");
+        return;
+    }
+    if (!BytesAre(RVA_WINDOW_BIND, WINDOW_BIND_EXPECT, sizeof(WINDOW_BIND_EXPECT), "windowcolor")) return;
+    // A stub that tints (rcx=window, edx=entity), then the trampoline runs the two
+    // stolen instructions and jumps to bind+9. Keep rcx/rdx across the call: the
+    // window body after bind+9 reads rcx (mov rbx,rcx) and edx (the entity).
+    void* tramp = nullptr;
+    uint8_t* stub = NearAlloc(64);
+    if (!stub) { Log("[windowcolor] NOT installed: no page within reach for the stub\n"); return; }
+    const uintptr_t helper = (uintptr_t)&WindowTint;
+    size_t k = 0;
+    stub[k++] = 0x51;                                                        // push rcx  (window)
+    stub[k++] = 0x52;                                                        // push rdx  (entity in edx)
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xEC; stub[k++] = 0x28;  // sub rsp, 0x28
+    stub[k++] = 0x48; stub[k++] = 0xB8; memcpy(stub + k, &helper, 8); k += 8;// mov rax, WindowTint
+    stub[k++] = 0xFF; stub[k++] = 0xD0;                                      // call rax  (rcx,edx already set)
+    stub[k++] = 0x48; stub[k++] = 0x83; stub[k++] = 0xC4; stub[k++] = 0x28;  // add rsp, 0x28
+    stub[k++] = 0x5A;                                                        // pop rdx
+    stub[k++] = 0x59;                                                        // pop rcx
+    // jmp trampoline (filled after PatchJumpNear gives its address)
+    const size_t jmpAt = k;
+    stub[k++] = 0x48; stub[k++] = 0xB8; memset(stub + k, 0, 8); k += 8;      // mov rax, <tramp>
+    stub[k++] = 0xFF; stub[k++] = 0xE0;                                      // jmp rax
+    if (!PatchJumpNear(g_base + RVA_WINDOW_BIND, stub, sizeof(WINDOW_BIND_EXPECT), &tramp) || !tramp) {
+        Log("[windowcolor] NOT installed: could not write the detour at rva=%llx\n",
+            (unsigned long long)RVA_WINDOW_BIND);
+        return;
+    }
+    const uintptr_t tp = (uintptr_t)tramp;
+    DWORD old = 0;
+    VirtualProtect(stub, 64, PAGE_EXECUTE_READWRITE, &old);
+    memcpy(stub + jmpAt + 2, &tp, 8);
+    VirtualProtect(stub, 64, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), stub, 64);
+    g_windowColorOn = true;
+    Log("[windowcolor] installed: a foreign entity's window is washed with the owner's company "
+        "colour (bind at rva=%llx)\n", (unsigned long long)RVA_WINDOW_BIND);
 }
 
 static void InstallSharedStations()
@@ -6552,6 +7062,16 @@ static DWORD WINAPI Init(LPVOID)
     // the town developer stamps it into every building it proposes, and the
     // account and train systems pick and seed by it.
     InstallPausedTick();
+    // Icons over every player's stations and vehicles ("SHOW ALL ICONS"), and
+    // the company-colour tint of a foreign vehicle icon ("ICON COLOUR").
+    InstallShowAllIcons();
+    InstallIconColor();
+    // A foreign station's name-label background, washed its owner's colour.
+    InstallStationLabelColor();
+    // A foreign entity's window opens read-only ("FOREIGN WINDOWS").
+    InstallForeignWindows();
+    // A foreign entity's window, washed its owner's company colour.
+    InstallWindowColor();
 
     for (;;) {
         Sleep(15000);
@@ -6562,8 +7082,8 @@ static DWORD WINAPI Init(LPVOID)
                 g_toCalls, g_toReorders, g_toRefusals,
                 (unsigned long)(ULONG)g_toLastSeed, (long long)g_toLastN, g_toMaxUs);
         if (g_ssOn && g_ssCalls)
-            Log("[sharedstations] alive: foreignAsked=%ld opened=%ld\n",
-                g_ssCalls, g_ssOpened);
+            Log("[sharedstations] alive: foreignAsked=%ld opened=%ld refused=%ld\n",
+                g_ssCalls, g_ssOpened, g_ssRefused);
         if (g_rsOn)
             Log("[roadspace] alive: calls=%ld filtered=%ld changed=%ld handed=%ld faults=%ld maxN=%ld\n",
                 g_rsCallsA, g_rsCallsB, g_rsDiffs, g_rsHanded, g_rsFaults, g_rsMaxN);

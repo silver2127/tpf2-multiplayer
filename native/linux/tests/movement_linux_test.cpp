@@ -70,6 +70,22 @@ int main(int argc,char** argv)
     assert(InstallPausedTick(uintptr_t(image),"",""));
     assert(!memcmp(image+0xa61860,"\x0f\x1f\x44\x00\x00",5));
     assert(!memcmp(image+0xa617c3,kPausedChecks[2].bytes,kPausedChecks[2].size));
+    for (const auto& c:kIconChecks) memcpy(image+c.rva,c.bytes,c.size);
+    for (const auto& c:kForeignWindowChecks) memcpy(image+c.rva,c.bytes,c.size);
+    image[kIconChecks[0].rva]^=1;
+    assert(!Check(uintptr_t(image),kIconChecks));
+    for (const auto& p:iconPatches) assert(!memcmp(image+p.rva,p.before,p.size));
+    image[kIconChecks[0].rva]^=1;
+    assert(Check(uintptr_t(image),kIconChecks));
+    image[iconPatches[3].rva]^=1;
+    assert(!ApplyUiPatches(uintptr_t(image),iconPatches));
+    assert(!memcmp(image+iconPatches[0].rva,iconPatches[0].before,2));
+    image[iconPatches[3].rva]^=1;
+    assert(ApplyUiPatches(uintptr_t(image),iconPatches));
+    for (const auto& p:iconPatches) assert(!memcmp(image+p.rva,p.after,p.size));
+    assert(Check(uintptr_t(image),kForeignWindowChecks));
+    assert(ApplyUiPatches(uintptr_t(image),foreignWindowPatches));
+    assert(!memcmp(image+0x1446d54,foreignWindowPatches[0].after,6));
     munmap(image,size);
     char dir[]="/tmp/tpf2mp-companies.XXXXXX"; assert(mkdtemp(dir));
     const std::string cfg=std::string(dir)+"/mp_company_cfg.txt";
@@ -79,6 +95,18 @@ int main(int argc,char** argv)
     write(status,"t=1 cm=companies\n"); assert(ReadCompanies(dir,"a")); assert(!ReadCompanies(dir,"b"));
     write(status,"t=2 cm=coop\n"); assert(!ReadCompanies(dir,"a"));
     write(cfg,"companies\n"); assert(ReadCompanies(dir,"a")); assert(ReadCompanies(dir,""));
+    const std::string perms=std::string(dir)+"/mp_company_perms.txt";
+    StationPermissions rules; rules.Read(dir); assert(rules.Allows(101,102));
+    write(perms,"pid 101 1\npid 102 2\npid 103 3\nopen 1 -\nopen 2 *\nopen 3 2,11\n");
+    rules.Read(dir);
+    assert(!rules.Allows(101,102) && rules.Allows(102,101));
+    assert(rules.Allows(103,102) && !rules.Allows(103,101));
+    assert(rules.Allows(101,101) && rules.Allows(999,101) && rules.Allows(101,999));
+    write(perms,"pid 101 1\npid 102 2\nopen 1 12,21\nopen 999 -\n");
+    rules.Read(dir); assert(!rules.Allows(101,102)); // IDs are whole tokens
+    write(perms,"pid 101 1\npid 102 2\n");
+    rules.Read(dir); assert(rules.Allows(101,102)); // absent rule defaults open
+    unlink(perms.c_str()); rules.Read(dir); assert(rules.Allows(101,102));
     unlink(cfg.c_str()); unlink(status.c_str()); rmdir(dir);
     // Execute only the handwritten relay and synthetic frame, no ELF code.
     SliceStationResume=uintptr_t(&StationReturn);
