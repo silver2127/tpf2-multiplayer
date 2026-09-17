@@ -1,36 +1,28 @@
-Frozen joins, separate companies with permissions and colours, and the road-vehicle drift closed
+Frozen joins, separate companies, and the road-vehicle drift closed
 
-Every player in a session must run this version (the lobby version gate is exact) and the dedicated relay must run it too. Installs of 0.5.7 or newer are offered this update in game; older ones install the MSI by hand.
+Everyone in a session needs this version, and the dedicated relay runs it.
 
-Joining
-- A player joining a running game now freezes the session: the host saves, everyone (the host included) loads that save, the paused worlds are compared, and play resumes at the host's previous speed. Until now the host kept running and the newcomer caught up on the command history; that newcomer's world registered its entities in a different order from the host's, its simulated people split within about 35 game units and the buses on a line drifted at the next stop, on two identical replays, while a session whose members had loaded together stayed locked (2026-09-16). A join is a resync now; on the rig the joined session ran 830 game units with matching hashes, 0.0 m vehicle drift and no people gap.
-- Nobody is released until everyone is in: a player who arrives while a round is running is admitted (into the pause directly, or as pending, in which case the same snapshot goes round once more with them before anyone plays); a player who leaves mid-round is dropped and the rest carry on. Only the host leaving ends a round.
-- Resync reloads the host's world too, for the same reason.
-- A resync's own snapshot load no longer makes a joiner leave the lobby.
+How to install
 
-Companies
-- Separate companies: a lobby setting assigns each player a company (co-op stays the default). Left- or right-click a company chip in the lobby to change it; no switch, new company or dissolve while somebody is still loading in.
-- Station permissions: a company decides which companies' vehicles may stop at its stations (the Multiplayer dashboard, companies tab). A line may use another company's stations when permitted.
-- Companies have names (default: the founder's, with an ordinal); the dashboard shows your colour and name, renaming is the game's company window; the company -> player -> name map is published for other mods.
-- Every player's stations, depots and vehicles show HUD icons, coloured with the owner's company colour: the vehicle icon, the station icon glyph (the blue box stays), the station name label. Another company's vehicle or station window is washed in that company's colour and is read-only.
-- A 20-colour palette (distinct, easy to tell apart) shared by the lobby chips, the icons, the windows and the vehicle paint; company paint follows every vehicle buy.
+Windows (Steam, game build 35924)
+1. Download `TpF2Multiplayer.msi` below.
+2. Close the game and run the MSI. It installs into the game folder and the mod into the game's mods.
+3. Start the game: Main menu → Multiplayer. Installs of 0.5.7 or newer get this update offered in game; older ones install the MSI by hand.
 
-Desync fixes
-- Road vehicles: the free-space sum a bus checks before a junction is summed in an order-independent way, and each road edge's vehicle list is kept in name order on every peer, so an exact tie picks the same lead vehicle everywhere.
-- A lost command is no longer recovered late: every command is sent three times, a gap holds the queue at once and asks for the missing piece immediately; a command that arrives more than once is queued once.
-- The paused branch of the engine's step no longer advances a game-time counter per render batch (a paused host drifted from a paused joiner).
-- The line editor gets its new line again (the replay's add is matched by call site); vehicle and line keys travel in the save, so a joiner adopts the host's.
-- The world hash samples the sim at a sim time, treats any owned construction as a player construction, and applies the companies state before sampling (a false "town" desync seconds after the load gate). A flag file (tpf2mp_hash_every.txt) forces the hash cadence down to 4 game units for diagnosis.
+Linux and Steam Deck (the Windows game under Proton)
+1. In Steam, set Transport Fever 2 to run with Proton (Properties → Compatibility; Proton 9 or newer), start it once and quit.
+2. Download `install_proton.py` below, close the game, and run `python3 install_proton.py` (Python 3.9 or newer). It finds Steam, the game and the Proton prefix, downloads `TpF2Multiplayer-files.zip` from this release, checks it against `SHA256SUMS.txt` and installs. `--dry-run` shows the plan first.
+3. Start the game: Main menu → Multiplayer. Full guide: docs/proton/INSTALL.md.
 
-Lobby and menu
-- A host that loads another save mid-session pushes it to every client, who load it in place; the roster shows each joiner's world-load percentage and the host's transfer progress.
-- Leaving the world leaves the lobby.
-- The in-game updater's payload is the MSI itself; a governor kill switch (tpf2mp_governor_off.txt).
+Manual install (any platform): `TpF2Multiplayer-files.zip` holds the files in the game-folder layout.
 
-Proton and Linux
-- install_proton.py installs this release into the Windows game under Steam Proton (finds Steam, the game and the prefix; verifies the build; repairs the lobby executable for Wine). The lobby executable in this release is shipped in its repaired form. TpF2Multiplayer-files.zip is the MSI's files as an archive for that script and for manual installs.
+What's new
+- Joining a running game freezes the session: the host saves, everyone (host included) loads that save, the worlds are compared, and play resumes. Nobody is released until every player is in; a player who leaves mid-way is dropped and the rest continue.
+- Separate companies: a lobby setting assigns one per player; station permissions decide whose vehicles may stop where; companies have names and a 20-colour palette; every player's stations, depots and vehicles show colour-coded icons, and another company's windows are read-only.
+- A host that loads another save mid-session pushes it to every client; the roster shows each joiner's loading progress.
+- Linux and Steam Deck: `install_proton.py` installs the Windows game's multiplayer under Proton.
 
-Tooling
-- tools/auto_install.ps1 builds while the games run and installs the moment they close; the relay deploy installs zstandard.
-
-Validation: offline, the full Python suite (sync barrier, runtime and lobby scenarios with two and three simulated engines including a frozen join and a leaver dropped mid-round, the Lua recovery test, the palette, station-icon, road-entries and other byte tests), luacheck and five native targets; on the two-instance rig the previous build reproduced the join drift twice, and this build's frozen join ran 830 game units clean.
+Fixes
+- Road vehicles no longer drift apart after a join (the cause was the join itself; see above) and the free-space check before a junction is order-independent.
+- A lost or duplicated command is handled at once instead of recovered late; a paused host no longer drifts from a paused joiner.
+- False "town" desync seconds after loading; the line editor losing a new line; a joiner not adopting the host's vehicle and line keys.
