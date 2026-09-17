@@ -1,4 +1,14 @@
-## Latest Windows integration: dev 8e31f1e0 (2026-09-16)
+## Latest Windows integration: dev 61578d27 (2026-09-16)
+
+See [UPSTREAM_dev_61578d27.md](UPSTREAM_dev_61578d27.md). The shared Lua
+stylesheet adds company colours to station/depot icon descendants, darker
+hover colours and a translucent window title bar. All 28 Lua files match
+Windows exactly; verification and release provenance target 61578d27.
+Native root-class tagging remains unavailable, so these selectors alone do
+not enable Linux HUD/window tinting. No native patch changed. This remains
+a partial native integration; earlier gaps and runtime validation limits apply.
+
+## Previous Windows integration: dev 8e31f1e0 (2026-09-16)
 
 See [UPSTREAM_dev_8e31f1e0.md](UPSTREAM_dev_8e31f1e0.md). Windows label
 counters, first-six window-bind logs and staged no-owner station diagnostics

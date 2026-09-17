@@ -21,14 +21,14 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **0.5.7 plus Windows dev through `8e31f1e0`**.
+This development tree combines **0.5.7 plus Windows dev through `61578d27`**.
 It includes native road-space summation, ship/aircraft order diagnostics,
 shared-station line selection, host world-switch sharing, bidirectional company
 chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). Lobby
 chips, shared dashboard swatches and vehicle paint use the new 20-colour palette,
 with generated colours starting at company 21. All Lua files
 exactly match that Windows revision. See
-[UPSTREAM_dev_8e31f1e0.md](UPSTREAM_dev_8e31f1e0.md) for provenance, tests and
+[UPSTREAM_dev_61578d27.md](UPSTREAM_dev_61578d27.md) for provenance, tests and
 remaining gaps. This is not a claim of live cross-platform compatibility.
 `trainorder=0`, `roadspace=0`, `shiporder=0`, `airorder=0` and
 `sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt` disable the respective
@@ -47,7 +47,9 @@ including the earlier button-root correction, non-asserting owner lookup,
 class read-back and alive counters. The `8e31f1e0` label counters, first-six
 window-bind logs and staged no-owner station diagnostics are also unavailable. `stationicon=0` and `tintclass=mpCo`
 currently affect only Windows. See the integration record for the fresh Linux
-investigation and missing evidence.
+investigation and missing evidence. The `61578d27` shared stylesheet now targets
+the station/depot icon and window title bar, but requires the same unavailable
+native root-class tagging; its presence does not enable company tinting on Linux.
 
 The roster now shows verified engine load percentages while a world loads.
 Returning from a world to the title menu leaves the lobby. The paused GameTime
