@@ -67,3 +67,12 @@ settle the open contract in the running lab game with gdb, and build on it. Most
    segment-tag ownership across compaction. Lower priority.
 
 Out of scope: the MSI in-app updater (Windows only by nature) and anything under `installer/`.
+
+## Scope and rendering (2026-09-17 17:55, user)
+
+- Skip the entity-window wash (coloured windows) for now. Order: native-vs-Proton parity on mp_multi_company,
+  the company-window rename, real play through XTEST (build/buy on one, watch the other), then the native
+  resync controller.
+- Render on the AMD Radeon 890M through radv (VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json), not
+  lavapipe: the NVIDIA GPU on this laptop is wedged until a reboot. If radv fails, lavapipe at a 1280x720
+  window (settings.lua windowSize), never at 3322x2022. Detach gdb between probes.

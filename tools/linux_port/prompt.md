@@ -93,6 +93,10 @@ You may run the game -- only through the test lab, which has its own copies of t
   companies. Restore an actor's copy from the pristine one after a test has changed it.
 - A crash you caused is information, not a failure: note it, restore, continue. Never claim a live result you
   did not observe.
+- Rendering: know which Vulkan device the game got (its log names it). A software rasteriser (lavapipe) at
+  the full window is unplayable and is what the user sees on the laptop screen; prefer a real GPU (this laptop:
+  the AMD Radeon 890M through radv when the NVIDIA one is unavailable), else a 1280x720 window. Detach gdb
+  between probes: a breakpoint in a hot path stops every thread.
 
 ## Rules
 
