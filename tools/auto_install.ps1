@@ -138,7 +138,14 @@ function InstallStale {
             $src = Join-Path $Game $f; if (Test-Path $src) { Copy-Item $src (Join-Path $ov $f) -Force }
         }
         New-Item -ItemType Directory -Force (Join-Path $ov 'netpunch'), (Join-Path $ov 'plugins') | Out-Null
-        Copy-Item (Join-Path $Game 'netpunch\netpunch.exe') (Join-Path $ov 'netpunch\netpunch.exe') -Force
+        # the box's lobby helper can outlive the game by a few seconds and hold its exe open;
+        # a locked copy must not abort the mod/plugin refresh and the relaunch (2026-09-16)
+        $lobbyOk = $false
+        for ($try = 0; $try -lt 6 -and -not $lobbyOk; $try++) {
+            try { Copy-Item (Join-Path $Game 'netpunch\netpunch.exe') (Join-Path $ov 'netpunch\netpunch.exe') -Force -EA Stop; $lobbyOk = $true }
+            catch { Start-Sleep -Seconds 2 }
+        }
+        if (-not $lobbyOk) { Say "the $b overlay's netpunch.exe is still locked (a lingering boxed lobby?) -- lobby NOT refreshed in the box" DarkYellow }
         foreach ($f in (Get-ChildItem (Join-Path $Game 'plugins') -File | Where-Object { $_.Extension -in '.dll', '.cfg' })) {
             Copy-Item $f.FullName (Join-Path $ov ('plugins\' + $f.Name)) -Force
         }
