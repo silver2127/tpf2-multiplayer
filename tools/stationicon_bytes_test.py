@@ -1,16 +1,16 @@
 """Verify the STATION ICON COLOUR hook in the supported binary.
 
-A post-call detour at 0x5e38d0 (right after DoStep's FUN_5e45d0 call) tags the HUD
-station/depot icon with a company style class. Checks, against the exe:
+A post-call detour at 0x5e38e1 (right after DoStep wraps the item content into its
+ItemButton, call 0x2251620) tags the button root with a company style class. Checks, against the exe:
 
-  * the hook site's 6 bytes are `xor r9d,r9d ; mov r8b,1` as the source records, so a
+  * the hook site's 6 bytes are `mov rdi,rax ; xor r12d,r12d` as the source records, so a
     5-byte jmp + 1 NOP replaces them and the two instructions are re-run in the stub;
-  * the immediately preceding call resolves to FUN_5e45d0 (so rax at the hook is that
-    call's return, the item component);
+  * the immediately preceding call is the ItemButton wrap 0x2251620 (so rax at the hook
+    is the button root), and the call before that (0x5e38cb) is FUN_5e45d0;
   * nothing branches into the 6 stolen bytes;
   * the StationGroup type_info string is at RVA_TI_STATIONGROUP + 0x10;
-  * the accessors (type index, GetComponentPtr<StationGroup>, GetComponentPtr<PlayerOwned>)
-    are real function starts.
+  * the accessors (type index, GetComponentPtr<PlayerOwned>) are real function starts, and
+    the asserting GetComponentPtr<StationGroup> is NOT used (it crash-dumped on towns).
 
     python tools/stationicon_bytes_test.py
 """
@@ -39,10 +39,11 @@ hook = const("RVA_ICON_STN_HOOK")
 expect = byte_array("ICON_STN_EXPECT")
 ti_sg = const("RVA_TI_STATIONGROUP")
 get_ti = const("RVA_GET_TYPEINDEX")
-get_sg = const("RVA_GET_COMPONENT_SG")
 get_po = const("RVA_GET_PLAYEROWNED")
 
 assert 'FlagsSayOff("stationicon")' in source and "InstallStationIconColor();" in source
+assert "RVA_GET_COMPONENT_SG" not in source and "(GetComp)" not in source, "the asserting GetComponentPtr<StationGroup> (0x149290 -> 0xd0920) is back: it crash-dumps on towns/industries"
+assert "TrainOrderSlot(engine, entity, ti)" in source, "the station-group walk must use the non-asserting slot scan"
 assert len(expect) == 6
 
 game = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\TransportFever2.exe")
@@ -55,13 +56,17 @@ md = Cs(CS_ARCH_X86, CS_MODE_64); md.detail = True
 got = pe.get_data(hook, 6)
 assert got == expect, f"hook site changed: {got.hex(' ')} != {expect.hex(' ')}"
 ins = list(md.disasm(got, hook))
-assert [i.mnemonic for i in ins] == ["xor", "mov"], [(i.mnemonic, i.op_str) for i in ins]
+assert [(i.mnemonic, i.op_str) for i in ins] == [("mov", "rdi, rax"), ("xor", "r12d, r12d")], [(i.mnemonic, i.op_str) for i in ins]
 
-# the call right before the hook must resolve to FUN_5e45d0 (rax = its return = component)
+# the call right before the hook is the ItemButton wrap (rax = the button root), and the
+# item-content build FUN_5e45d0 is the call at 0x5e38cb just above it
 pre = pe.get_data(hook - 5, 5)
 assert pre[0] == 0xE8, f"no call right before the hook: {pre.hex(' ')}"
 callee = (hook - 5) + 5 + struct.unpack("<i", pre[1:5])[0]
-assert callee == 0x5e45d0, f"pre-call resolves to {callee:x}, not FUN_5e45d0"
+assert callee == 0x2251620, f"pre-call resolves to {callee:x}, not the ItemButton wrap 0x2251620"
+c2 = pe.get_data(0x5e38cb, 5)
+assert c2[0] == 0xE8 and 0x5e38cb + 5 + struct.unpack("<i", c2[1:5])[0] == 0x5e45d0, "FUN_5e45d0 call moved"
+# the je at 0x5e38c0 lands at 0x5e38e9, past the stolen bytes (checked by the scan below)
 
 # nothing branches into the 6 stolen bytes (whole DoStep + a wide rel32 scan)
 for d in md.disasm(code[0x5e2dc0 - base:0x5e4000 - base], 0x5e2dc0):
@@ -77,10 +82,9 @@ s = pe.get_data(ti_sg + 0x10, 40).split(b"\0")[0]
 assert s == b".?AUStationGroup@component@ecs@@", f"RVA_TI_STATIONGROUP is {s!r}"
 
 # accessors are real function prologues
-for rva, name in ((get_ti, "GetTypeIndex 0xd0a40"), (get_sg, "GetComponentPtr<StationGroup> 0x149290"),
-                  (get_po, "GetComponentPtr<PlayerOwned> 0x472900")):
+for rva, name in ((get_ti, "GetTypeIndex 0xd0a40"), (get_po, "GetComponentPtr<PlayerOwned> 0x472900")):
     p = pe.get_data(rva, 4)
     assert p[0] in (0x48, 0x4c, 0x40, 0x53, 0x55, 0x56, 0x57), f"{name} prologue {p.hex(' ')}"
 
-print(f"stationicon bytes: ok -- hook {hook:x} (xor r9d/mov r8b), pre-call -> 5e45d0, "
+print(f"stationicon bytes: ok -- hook {hook:x} (mov rdi,rax/xor r12d), wrap-call -> 2251620, "
       f"StationGroup ti at {ti_sg:x}, accessors present")

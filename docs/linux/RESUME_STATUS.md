@@ -1,4 +1,13 @@
-## Latest Windows integration: dev 5fb7aea2 (2026-09-16)
+## Latest Windows integration: dev db8a4776 (2026-09-16)
+
+See [UPSTREAM_dev_db8a4776.md](UPSTREAM_dev_db8a4776.md). The Windows
+station-icon crash fix, button-root hook, class read-back, tint-class override
+and counters are merged intact. Native station/window tinting remains
+unavailable after a fresh ELF investigation; see
+[DEV_DB8A4776.md](../re/linux/DEV_DB8A4776.md). No new game patch is enabled.
+Lua/release provenance now targets db8a4776. Earlier gaps remain unchanged.
+
+## Previous Windows integration: dev 5fb7aea2 (2026-09-16)
 
 See [UPSTREAM_dev_5fb7aea2.md](UPSTREAM_dev_5fb7aea2.md). The Windows HUD
 station/depot company wash is merged but remains unported after static Linux

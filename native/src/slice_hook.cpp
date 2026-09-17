@@ -6486,17 +6486,79 @@ static const uint8_t WINDOW_BIND_EXPECT[9] = {
 };
 static bool g_windowColorOn = false;
 
-// no SEH in this scope (it constructs a std::string with a destructor): the
-// caller wraps the call in __try.
-static void WindowTintApply(void* window, int cid)
+// Which class the washes append: "!mpWinCo" (translucent background, the
+// default) or "!mpCo" (the opaque chip class) -- `tintclass=mpCo` in
+// tpf2_menu_flags.txt picks the opaque one, so the next run can try the other
+// without a rebuild if a translucent root background turns out not to paint.
+static const char* TintClassPrefix()
 {
-    std::string cls = "!mpWinCo" + std::to_string(cid);
-    typedef void (*AddClass)(void*, const void*);
-    ((AddClass)(g_base + RVA_ADD_STYLE_CLASS))(window, &cls);
+    static int which = -1;
+    if (which < 0) {
+        which = 0;
+        for (int i = 0; i < 2; i++) {
+            const char* dir = i == 0 ? g_dllDir : g_dataDir;
+            if (!dir[0]) continue;
+            char p[MAX_PATH];
+            snprintf(p, sizeof(p), "%stpf2_menu_flags.txt", dir);
+            FILE* f = _fsopen(p, "r", _SH_DENYNO);
+            if (!f) continue;
+            char line[256];
+            while (fgets(line, sizeof(line), f)) if (!strncmp(line, "tintclass=mpCo", 14)) which = 1;
+            fclose(f);
+            break;
+        }
+    }
+    return which == 1 ? "!mpCo" : "!mpWinCo";
 }
+
+// The component's style-class list, as the game keeps it: std::string records
+// (MSVC, 0x20 bytes) between [comp+0xb0] and [comp+0xb8]. Read back after an
+// append so the log says whether the class really landed (the mechanism was
+// inferred from bytes; this is the check). Writes "a b c" into out.
+static void TintClassList(const void* comp, char* out, size_t cap)
+{
+    out[0] = 0;
+    const uint8_t* c = (const uint8_t*)comp;
+    if (!Readable(c + 0xb0, 16)) { snprintf(out, cap, "(unreadable)"); return; }
+    const uint8_t* b = *(const uint8_t* const*)(c + 0xb0);
+    const uint8_t* e = *(const uint8_t* const*)(c + 0xb8);
+    if (!b || e < b || (size_t)(e - b) % 0x20 || (size_t)(e - b) > 0x20 * 64) { snprintf(out, cap, "(odd list %p..%p)", b, e); return; }
+    size_t n = 0;
+    for (const uint8_t* r = b; r < e && n + 2 < cap; r += 0x20) {
+        if (!Readable(r, 0x20)) break;
+        uint64_t sz = 0, cp = 0; memcpy(&sz, r + 0x10, 8); memcpy(&cp, r + 0x18, 8);
+        const char* s = (const char*)r;
+        if (cp >= 16) { uint64_t ptr = 0; memcpy(&ptr, r, 8); s = (const char*)ptr; }
+        if (sz > 64 || !s || !Readable(s, (size_t)sz)) break;
+        if (n) out[n++] = ' ';
+        size_t take = (size_t)sz; if (n + take + 1 >= cap) take = cap - n - 1;
+        memcpy(out + n, s, take); n += take; out[n] = 0;
+    }
+}
+
+static volatile LONG g_wcAsked = 0, g_wcTinted = 0, g_wcFaults = 0;
+static volatile LONG g_siAsked = 0, g_siDirect = 0, g_siWalked = 0, g_siTinted = 0, g_siFaults = 0, g_siNoOwner = 0;
+
+// no SEH in this scope (it constructs a std::string with a destructor): the
+// callers wrap the call in __try. Logs the first few per tag with the class
+// list read back, so a run says whether the class landed on the component.
+static void TintApplyClass(void* comp, int cid, const char* tag, int entity, int owner, volatile LONG* shown)
+{
+    std::string cls = std::string(TintClassPrefix()) + std::to_string(cid);
+    typedef void (*AddClass)(void*, const void*);
+    ((AddClass)(g_base + RVA_ADD_STYLE_CLASS))(comp, &cls);
+    if (InterlockedIncrement(shown) <= 4) {
+        char list[512];
+        TintClassList(comp, list, sizeof(list));
+        Log("[%s] entity %d owner %d -> company %d: appended %s; the component's classes now: %s\n",
+            tag, entity, owner, cid, cls.c_str(), list);
+    }
+}
+static volatile LONG g_wcShown = 0, g_siShown = 0;
 
 extern "C" void WindowTint(void* window, int entity)
 {
+    InterlockedIncrement(&g_wcAsked);
     __try {
         void* engine = (void*)g_uiEngine;
         if (!engine || !window) return;
@@ -6509,9 +6571,10 @@ extern "C" void WindowTint(void* window, int entity)
         if (owner < 0 || owner == local) return;   // unowned or ours: no wash
         const int cid = IconCompanyOfPid(owner);
         if (cid <= 0) return;
-        WindowTintApply(window, cid);
+        TintApplyClass(window, cid, "windowcolor", entity, owner, &g_wcShown);
+        InterlockedIncrement(&g_wcTinted);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_wcFaults); }
 }
 
 static void InstallWindowColor()
@@ -6572,19 +6635,47 @@ static void InstallWindowColor()
 // 0x149290). Own included (icons show every company; only unowned entities and
 // coop stay untinted). KILL SWITCH: `stationicon=0`.
 // ---------------------------------------------------------------------------
-static const uintptr_t RVA_ICON_STN_HOOK      = 0x5e38d0;   // right after the FUN_5e45d0 call in DoStep
+static const uintptr_t RVA_ICON_STN_HOOK      = 0x5e38e1;   // right after the ItemButton wrap (call 0x2251620) in DoStep
 static const uintptr_t RVA_TI_STATIONGROUP    = 0x41d1438;  // .?AUStationGroup@component@ecs@@ descriptor
 static const uintptr_t RVA_GET_TYPEINDEX      = 0x0d0a40;   // int(componentMgr = engine+0x48, type_info**)
-static const uintptr_t RVA_GET_COMPONENT_SG   = 0x149290;   // GetComponentPtr<StationGroup>(engine, &ent, ti)
-static const uint8_t ICON_STN_EXPECT[6] = { 0x45, 0x33, 0xC9, 0x41, 0xB0, 0x01 };  // xor r9d,r9d ; mov r8b,1
+static const size_t    STATIONGROUP_STRIDE    = 0x18;       // the component is one vector<Entity>: begin/end/cap
+static const uint8_t ICON_STN_EXPECT[6] = { 0x48, 0x8B, 0xF8, 0x45, 0x33, 0xE4 };  // mov rdi,rax ; xor r12d,r12d
 static bool g_stnIconColorOn = false;
 
-// engine+0x214 holds nothing here; the owner comes from the entity's PlayerOwned
-// (or, for a station group, its first station's). engine is g_uiEngine (cached).
+// A component of any stride, the way TrainOrderComponent reads a Name (stride
+// 0x20): the flat array at pool+0x68, or the paged table past 0x40000000.
+static const uint8_t* EcsComponentAt(uint8_t* world, int typeIdx, int slot, size_t stride)
+{
+    if (typeIdx < 0 || typeIdx > 4096 || slot < 0) return nullptr;
+    uint8_t* pools = *(uint8_t**)(world + 0x88);
+    if (!pools) return nullptr;
+    uint8_t* pool = *(uint8_t**)(pools + (size_t)typeIdx * 8);
+    if (!pool) return nullptr;
+    if (slot < 0x40000000) {
+        uint8_t* data = *(uint8_t**)(pool + 0x68);
+        return data ? data + (size_t)slot * stride : nullptr;
+    }
+    const int32_t e = slot - 0x40000000;
+    uint8_t* pages = *(uint8_t**)(pool + 0x80);
+    if (!pages) return nullptr;
+    uint8_t* page = *(uint8_t**)(pages + (size_t)(e / 32) * 2 * 8);
+    return page ? page + (size_t)(e % 32) * stride : nullptr;
+}
+
+// The owner comes from the entity's PlayerOwned or, for a station group, its
+// first station's. engine is g_uiEngine (cached from the icon path).
+//
+// NEVER the engine's GetComponentPtr for the group (0x149290 -> 0xd0920): that
+// one ASSERTS when the entity lacks the component, and this hook sees every HUD
+// icon entity -- towns and industries have no PlayerOwned and no StationGroup,
+// so each of them wrote a crash dump (Engine.h:291 `it != components.end()`),
+// which is the 24 s freeze the first build of this caused (2026-09-16). The
+// slot scan (TrainOrderSlot) returns -1 on a miss instead.
 extern "C" void StationIconTint(void* component, int entity)
 {
+    InterlockedIncrement(&g_siAsked);
     __try {
-        void* engine = (void*)g_uiEngine;
+        uint8_t* engine = (uint8_t*)g_uiEngine;
         if (!engine || !component) return;
         int ent = entity;
         typedef void* (*GetPlayerOwned)(void*, const int*);
@@ -6592,30 +6683,32 @@ extern "C" void StationIconTint(void* component, int entity)
         int owner = -1;
         if (po) {
             owner = *(const int*)po;
+            InterlockedIncrement(&g_siDirect);
         } else {
-            // a station group: type index (re-fetched, a type index belongs to a
-            // world), then the StationGroup component, then its first station's owner
             const void* desc = (const void*)(g_base + RVA_TI_STATIONGROUP);
             typedef int (*GetTypeIndex)(void*, const void**);
-            const int ti = ((GetTypeIndex)(g_base + RVA_GET_TYPEINDEX))((uint8_t*)engine + 0x48, &desc);
+            const int ti = ((GetTypeIndex)(g_base + RVA_GET_TYPEINDEX))(engine + 0x48, &desc);
             if (ti < 0) return;
-            typedef void* (*GetComp)(void*, const int*, int);
-            void* comp = ((GetComp)(g_base + RVA_GET_COMPONENT_SG))(engine, &ent, ti);
-            if (!comp) return;
-            const int* begin = *(const int**)((const uint8_t*)comp + 0);
-            const int* end = *(const int**)((const uint8_t*)comp + 8);
-            if (!begin || begin == end) return;               // no stations yet
+            const int slot = TrainOrderSlot(engine, entity, ti);   // -1 = not a station group (a town, an industry)
+            if (slot < 0) { InterlockedIncrement(&g_siNoOwner); return; }
+            const uint8_t* comp = EcsComponentAt(engine, ti, slot, STATIONGROUP_STRIDE);
+            if (!comp || !Readable(comp, 16)) return;
+            const int* begin = *(const int* const*)(comp + 0);
+            const int* end = *(const int* const*)(comp + 8);
+            if (!begin || end <= begin || !Readable(begin, 4)) return;   // no stations yet
             int station0 = begin[0];
             void* po2 = ((GetPlayerOwned)(g_base + RVA_GET_PLAYEROWNED))(engine, &station0);
-            if (!po2) return;
+            if (!po2) { InterlockedIncrement(&g_siNoOwner); return; }
             owner = *(const int*)po2;
+            InterlockedIncrement(&g_siWalked);
         }
-        if (owner < 0) return;
+        if (owner < 0) { InterlockedIncrement(&g_siNoOwner); return; }
         const int cid = IconCompanyOfPid(owner);
         if (cid <= 0) return;
-        WindowTintApply(component, cid);   // append !mpWinCoN (the translucent company wash)
+        TintApplyClass(component, cid, "stationicon", entity, owner, &g_siShown);
+        InterlockedIncrement(&g_siTinted);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement(&g_siFaults); }
 }
 
 static void InstallStationIconColor()
@@ -6626,8 +6719,9 @@ static void InstallStationIconColor()
         return;
     }
     if (!BytesAre(RVA_ICON_STN_HOOK, ICON_STN_EXPECT, sizeof(ICON_STN_EXPECT), "stationicon")) return;
-    // Post-call hook: rax = item component, ebx = entity. Preserve rax across the
-    // tint call (the body at hook+6 reads it), align rsp, then re-run the two
+    // Post-call hook, right after the ItemButton wrap: rax = the button ROOT (the
+    // component the HUD places and paints), ebx = entity. Preserve rax across the
+    // tint call (the stolen `mov rdi,rax` needs it), align rsp, then re-run the two
     // stolen instructions and resume at hook+6. ebx is nonvolatile (kept by the C fn).
     uint8_t* stub = NearAlloc(96);
     if (!stub) { Log("[stationicon] NOT installed: no page for the stub\n"); return; }
@@ -6647,8 +6741,8 @@ static void InstallStationIconColor()
     stub[k++] = 0x5D;                                                        // pop rbp
     stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xC6;                    // mov rax, rsi  (component back)
     stub[k++] = 0x5E;                                                        // pop rsi
-    stub[k++] = 0x45; stub[k++] = 0x33; stub[k++] = 0xC9;                    // xor r9d, r9d  (stolen)
-    stub[k++] = 0x41; stub[k++] = 0xB0; stub[k++] = 0x01;                    // mov r8b, 1    (stolen)
+    stub[k++] = 0x48; stub[k++] = 0x8B; stub[k++] = 0xF8;                    // mov rdi, rax     (stolen)
+    stub[k++] = 0x45; stub[k++] = 0x33; stub[k++] = 0xE4;                    // xor r12d, r12d   (stolen)
     // jmp hook+6 (rel32; keeps rax = component)
     const uintptr_t resume = g_base + RVA_ICON_STN_HOOK + 6;
     stub[k++] = 0xE9;
@@ -7213,6 +7307,11 @@ static DWORD WINAPI Init(LPVOID)
         if (g_rsOn)
             Log("[roadspace] alive: calls=%ld filtered=%ld changed=%ld handed=%ld faults=%ld maxN=%ld\n",
                 g_rsCallsA, g_rsCallsB, g_rsDiffs, g_rsHanded, g_rsFaults, g_rsMaxN);
+        if (g_stnIconColorOn && g_siAsked)
+            Log("[stationicon] alive: asked=%ld direct=%ld walked=%ld tinted=%ld noOwner=%ld faults=%ld\n",
+                g_siAsked, g_siDirect, g_siWalked, g_siTinted, g_siNoOwner, g_siFaults);
+        if (g_windowColorOn && g_wcAsked)
+            Log("[windowcolor] alive: asked=%ld tinted=%ld faults=%ld\n", g_wcAsked, g_wcTinted, g_wcFaults);
         for (int c = 0; c < 2; c++) {
             const MoveOrderChan& ch = c == 0 ? g_shipChan : g_airChan;
             if (ch.on)
