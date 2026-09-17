@@ -107,7 +107,7 @@ for cname, ename, fn_lo, fn_hi in (("RVA_STNICON_CLASS_CALL", "STNICON_CLASS_EXP
     assert fn_lo <= site < fn_hi, f"{cname} outside its function"
     # rcx = rbx (the icon component) right before the call
     prev = pe.get_data(site - 3, 3)
-    assert prev == b"HË", f"{cname}: expected mov rcx,rbx before the call, got {prev.hex(' ')}"
+    assert prev == bytes([0x48, 0x8B, 0xCB]), f"{cname}: expected mov rcx,rbx before the call, got {prev.hex(' ')}"
     # only one addStyleClass call in that function, so the class lands on the icon and nothing else
     n = 0
     for j in range(fn_lo, fn_hi - 5):
