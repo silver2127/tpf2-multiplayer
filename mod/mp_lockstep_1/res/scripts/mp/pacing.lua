@@ -198,12 +198,14 @@ function CM.votesCounted()
 	local list, me = {}, K.INSTANCE
 	local mine, cast = CM.speedVotes[me], CM.myVoteCast
 	if cast and (not mine or cast.ct > mine.ct) then mine = cast end
-	if mine then
+	if mine and not CM.dedicated then
 		list[#list + 1] = { letter = me, v = mine.v }
-	else
+	elseif not CM.dedicated then
 		local own = ((CM.myCeiling or 0) > 0) and CM.myCeiling or CM.ceilBeforePause
 		if own and own > 0 then list[#list + 1] = { letter = me, v = CM.voteValue(own), own = true } end
 	end
+	-- A DEDICATED SERVER (2026-09-18, user) has no vote and no own speed in the
+	-- mean: the players' votes are the session speed; with none cast yet, 1x.
 	for letter, vote in pairs(CM.speedVotes) do
 		local pr = CM.peers[letter]
 		if letter ~= me and pr and pr.at and (CM.ticks - pr.at) <= K.VOTE_PRESENT_TICKS then
@@ -220,7 +222,10 @@ end
 -- a vote), and how many. nil when nothing counts.
 function CM.voteSpeed()
 	local list = CM.votesCounted()
-	if #list == 0 then return nil, "", 0 end
+	if #list == 0 then
+		if CM.dedicated and CM.othersPresent and CM.othersPresent() then return 1, "", 0 end   -- players in, nobody voted yet
+		return nil, "", 0
+	end
 	local sum, parts = 0, {}
 	for i, e in ipairs(list) do
 		sum = sum + e.v
@@ -918,7 +923,9 @@ function CM.paceV2(now)
 	-- this and hid the host's play-click. A 0 we set ourselves is `ours`.
 	local prevS = CM.spd2LastS
 	CM.spd2LastS = s
-	if CM.isLeader() then
+	-- a DEDICATED SERVER has no hand at its lever: nothing it reads is a player's
+	-- pause or speed (its 0s are the load gate, a hold, the empty-world pause)
+	if CM.isLeader() and not CM.dedicated then
 		-- A lever that has not moved is not the player's choice while the ceiling
 		-- came from a speed button: the button's speed reaches the lever only when
 		-- pacing applies it. A host whose lever pacing had never set read its old
@@ -974,10 +981,15 @@ function CM.paceV2(now)
 		-- the mean of the players' votes, the host's pause, or a /speed request newer than the last vote
 		local avg, vt, n = CM.voteSpeed()
 		local eff, why
-		if CM.myCeiling <= 0 then
+		if CM.myCeiling <= 0 and not CM.dedicated then
 			eff, why = 0, "the host paused the session"
 		elseif avg then
 			eff, why = avg, string.format("the mean of %d: %s", n, CM.voteWords(vt))
+		elseif CM.dedicated then
+			-- nobody at the server's controls: the players' votes run the session
+			-- (voteSpeed gives 1 while players are in and none has voted); with
+			-- nobody in, the world's own speed (the empty-world pause owns that)
+			eff, why = math.max(1, CM.myCeiling), "dedicated server, no votes"
 		else
 			eff, why = CM.myCeiling, "host's speed"
 		end
@@ -1138,9 +1150,22 @@ function CM.dedicatedTick()
 	end
 	if CM.dedPaused then
 		CM.dedPaused = false
-		CM.setSpeed(CM.dedResume or 1, "dedicated server: a player is in")
+		CM.setSpeed((CM.voteSpeed and CM.voteSpeed()) or CM.dedResume or 1, "dedicated server: a player is in")
 	end
 	return false
+end
+
+-- The speed a dedicated server resumes a world operation at: the players' vote,
+-- else the speed it paused from, never 0 (a freshly loaded server sits at 0 --
+-- the load gate, then the empty-server pause -- and the first frozen join of
+-- 2026-09-18 17:12 handed that 0 to everyone as the resume speed).
+function CM.dedicatedResumeSpeed(found)
+	if not CM.dedicated then return found end
+	if (tonumber(found) or 0) > 0 then return found end
+	local v = CM.voteSpeed and CM.voteSpeed()
+	v = v or CM.dedResume or 1
+	if v < 1 then v = 1 end
+	return math.floor(v + 0.5)
 end
 
 function CM.paceTick(now)

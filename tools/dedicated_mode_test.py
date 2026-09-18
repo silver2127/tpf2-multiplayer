@@ -72,13 +72,21 @@ m = re.search(r"^function CM\.dedicatedPauseEmpty\(\)\n.*?\n^end\n", PACING, re.
 m2 = re.search(r"^function CM\.dedicatedTick\(\)\n.*?\n^end\n", PACING, re.S | re.M)
 check("pacing.lua defines CM.dedicatedPauseEmpty and CM.dedicatedTick", bool(m and m2))
 check("paceTick asks the dedicated rule first", "\tif CM.dedicatedTick() then return end" in PACING)
-m3 = re.search(r"if CM\.dedPaused and \(speed or 0\) == 0 and CM\.dedResume then speed = CM\.dedResume", RESYNC)
-check("resync.lua resumes a paused-because-empty server at the remembered speed", bool(m3))
+check("resync.lua resumes a dedicated server at the players' vote, never 0 (CM.dedicatedResumeSpeed)",
+      "speed = CM.dedicatedResumeSpeed(speed)" in RESYNC and RESYNC.count("dedicatedResumeSpeed") >= 2)
+check("a dedicated server casts no vote and adds no own speed to the mean",
+      "if mine and not CM.dedicated then" in PACING and "elseif not CM.dedicated then" in PACING)
+check("players in, nobody voted yet: 1x", 'if CM.dedicated and CM.othersPresent and CM.othersPresent() then return 1, "", 0 end' in PACING)
+m4 = re.search(r"^function CM\.dedicatedResumeSpeed\(found\)\n.*?\n^end\n", PACING, re.S | re.M)
+check("pacing.lua defines CM.dedicatedResumeSpeed", bool(m4))
+check("the leader's lever detector is off on a dedicated server (no hand at its lever)", "if CM.isLeader() and not CM.dedicated then" in PACING)
+check("a dedicated server's 0 ceiling never pauses the session; the votes run it",
+      "if CM.myCeiling <= 0 and not CM.dedicated then" in PACING and '"dedicated server, no votes"' in PACING)
 
 with tempfile.TemporaryDirectory() as td:
     base = td.replace("\\", "/") + "/"
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
-    L.globals().SRC = (m.group(0) if m else "") + (m2.group(0) if m2 else "")
+    L.globals().SRC = (m.group(0) if m else "") + (m2.group(0) if m2 else "") + (m4.group(0) if m4 else "")
     L.globals().BASE = base
     T = L.execute(r'''
 local K = { BASE = BASE, LOADGATE_MIN_TICKS = 100 }
@@ -134,6 +142,16 @@ return T
     n = len(T.speeds)
     held, s = T.tick(400, False, False)
     check("pause_empty=0: the server keeps simulating while empty", s == 3 and len(T.speeds) == n)
+    # the resume speed: a found 0 becomes the vote, else the remembered speed, else 1; a found speed stands
+    T.CM.dedicated = True; T.CM.voteSpeed = L.eval("function() return nil end"); T.CM.dedResume = None
+    check("no vote, nothing remembered: 1", T.CM.dedicatedResumeSpeed(0) == 1)
+    T.CM.dedResume = 3
+    check("no vote, remembered 3: 3", T.CM.dedicatedResumeSpeed(0) == 3)
+    T.CM.voteSpeed = L.eval("function() return 2.5 end")
+    check("a vote of 2.5: 3 (whole lever)", T.CM.dedicatedResumeSpeed(0) == 3)
+    check("a found speed 2 stands", T.CM.dedicatedResumeSpeed(2) == 2)
+    T.CM.dedicated = False
+    check("not dedicated: whatever was found, 0 included", T.CM.dedicatedResumeSpeed(0) == 0)
 
 if fails:
     raise SystemExit("FAIL: " + ", ".join(fails))
