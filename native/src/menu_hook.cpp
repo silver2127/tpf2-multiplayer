@@ -3659,7 +3659,15 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             if(!strcmp(phase,"complete")) {
                                 InterlockedExchange(&g_recoveryPresent,0);
                                 InterlockedExchange(&g_lobbyDone,1);
-                                if(InterlockedCompareExchange(&g_uiState,0,0)==3) InterlockedExchange(&g_uiState,0);
+                                // Back to the LOBBY VIEW when the panel is open (2026-09-18, user:
+                                // "keep the lobby view up after we load into the game"): the loading
+                                // screen hands the panel over to the game open on the roster, then the
+                                // frozen join's phases took it to this recovery view and its completion
+                                // collapsed it to nothing. Collapsed only when nothing had it open.
+                                if(InterlockedCompareExchange(&g_uiState,0,0)==3) {
+                                    const bool open = InterlockedCompareExchange(&g_ingameOverlay,0,0) || InterlockedCompareExchange(&g_showOverlay,0,0);
+                                    InterlockedExchange(&g_uiState, open ? 2 : 0);
+                                }
                             } else {
                                 InterlockedExchange(&g_uiState,3);
                             }

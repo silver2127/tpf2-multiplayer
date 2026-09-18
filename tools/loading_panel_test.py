@@ -48,6 +48,9 @@ check("the world coming up hands the loading view over to the in-game panel, ope
 check("quiet = no recovery world I/O and no native I/O", "const bool quiet = !g_recoveryWorldIo && !NativeIo::Busy();" in gate)
 check("the panel is drawn when quiet OR while the loading view is up", "(quiet || loadingPanel)" in gate)
 check("clicks are taken only when quiet", "DrawButton(q, idx); if (quiet) PollClick();" in gate)
+done = MENU[MENU.index('Back to the LOBBY VIEW when the panel is open'):][:900]
+check("a completed world operation returns an open panel to the lobby view (2), collapses only a closed one",
+      "InterlockedExchange(&g_uiState, open ? 2 : 0);" in done and "InterlockedCompareExchange(&g_ingameOverlay,0,0) || InterlockedCompareExchange(&g_showOverlay,0,0)" in done)
 
 if fails:
     print("FAIL:", len(fails), "check(s):", "; ".join(fails))
