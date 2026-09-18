@@ -3836,6 +3836,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 handle_command(cmd)
             if recovery:
                 recovery.tick(now)
+                # DEDICATED HOST (2026-09-18): a member who joined BEFORE the host's world
+                # was up sat in the lobby for ever -- nobody presses START GAME on a
+                # dedicated server. Once the world is up, each such member is brought in
+                # through the frozen-join round exactly as a late joiner would be.
+                if not relay_only and not started[0] and transfer[0] is None and host_has_world():
+                    for a, p in list(peers.items()):
+                        if not p.get("started") and not p.get("frozen_join") and p.get("recovery") == 4:
+                            if recovery.join(p["name"]):
+                                p["frozen_join"] = True
+                                log(f"[host] frozen join for {p['name']!r} (it was waiting for the host's world): "
+                                    "holding the session, everyone loads the shared world")
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
