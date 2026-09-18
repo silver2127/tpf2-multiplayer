@@ -142,7 +142,7 @@ with TemporaryDirectory() as temporary:
     (directory / 'tpf2_sync_available.txt').write_text('protocol=4\nwall=%d\npid=123\n' % int(time.time()))
     lua.execute("CM.syncLobbyAt=nil; assert(CM.syncLobbyAlive()); CM.rosterPlayers=nil; assert(not CM.syncAlone())")
     (directory / 'tpf2_sync_available.txt').write_text('protocol=4\nwall=%d\npid=123\n' % (int(time.time()) - 60))
-    lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); assert(CM.syncAlone())")
+    lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=nil; assert(not CM.syncAlone())")  # stale heartbeat: not alone
     (directory / 'tpf2_sync_available.txt').unlink()
     lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=3; assert(not CM.syncAlone())")  # a stale heartbeat is NOT alone (16:38)
     lua.execute("CM.rosterPlayers=nil; assert(not CM.syncAlone()); CM.rosterPlayers=1; assert(CM.syncAlone())")
