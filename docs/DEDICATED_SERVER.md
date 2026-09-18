@@ -23,8 +23,15 @@ then kept in **offline mode**, which lets the same account play online elsewhere
 A crash to the title menu leaves the lobby (as for any player) and the first row hosts
 again. The mod's half (`mp/pacing.lua`, told through `mp_dedicated.txt`): with
 `dedicated_pause_empty=1` the world pauses when the last other player leaves and
-resumes at that speed when one arrives; the frozen join that brings a newcomer in
-resumes at the remembered speed, not the 0 it finds.
+resumes when one arrives.
+
+**Speed.** Nobody stands at the server's controls, so the server has no vote and
+its own lever is never read as a player's pause. The players' speed votes (the
+speed buttons and the multiplayer window's speed row) set the session speed, as
+in any session; with players in and no vote cast yet the world runs at 1x. A
+frozen join or a resync resumes at the votes' speed (else the speed the server
+paused from, never 0). Nobody can pause a dedicated server's session -- a
+player's pause press does nothing there, as it does for any joiner.
 
 Flags (all in `tpf2_menu_flags.txt` next to `tpf2_menu.dll`; see
 [CONFIGURATION.md](CONFIGURATION.md)):
