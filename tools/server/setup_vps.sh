@@ -32,6 +32,7 @@ mkdir -p $DEST
 install -m 755 "$HERE/tpf2server" /usr/local/bin/tpf2server
 install -m 755 "$HERE/steam_login.sh" $DEST/steam_login.sh
 install -m 755 "$HERE/steam_bootstrap.sh" $DEST/steam_bootstrap.sh
+install -m 644 "$HERE/steam_compat.py" $DEST/steam_compat.py
 install -m 755 "$HERE/game_watchdog.sh" $DEST/game_watchdog.sh
 install -m 644 "$HERE/server.env.example" $DEST/server.env.example
 [ -f /etc/tpf2mp/server.env ] || { mkdir -p /etc/tpf2mp; install -m 644 "$HERE/server.env.example" /etc/tpf2mp/server.env; }
