@@ -263,6 +263,19 @@ static CreatePageFn g_origCreatePage = nullptr;
 // resolves them, then draw a clear-attachment button rect each frame.
 static PFN_vkGetDeviceProcAddr g_origGdpa    = nullptr;
 static PFN_vkQueuePresentKHR   g_realPresent = nullptr;
+// NO RENDERING (2026-09-18, user: "can we disable the renderer"): a dedicated
+// server has no GPU; its Vulkan is lavapipe, which rasterizes on the CPU at
+// vkQueueSubmit -- six llvmpipe threads at 180% for a town nobody looks at, and
+// the sim, which advances per frame, crawled. With dedicated_render=0 (the
+// default in dedicated mode) every submit goes through EMPTY: the same fences
+// and semaphores are signalled, no command buffer runs; query results read as
+// zero so nothing waits on a query that never executed; the panel is not drawn.
+// The engine's frame loop, the swapchain and the present are untouched.
+static PFN_vkQueueSubmit        g_origSubmit  = nullptr;
+static PFN_vkGetQueryPoolResults g_origQueryResults = nullptr;
+static volatile LONG g_noRender = 0;
+static volatile LONG g_noRenderSubmits = 0, g_noRenderCmdBufs = 0;
+static bool NoRender() { return InterlockedCompareExchange(&g_noRender, 0, 0) != 0; }
 static PFN_vkGetDeviceQueue    g_origGetQueue = nullptr;
 static PFN_vkCreateSwapchainKHR g_origCreateSc = nullptr;
 static VkDevice   g_dev   = VK_NULL_HANDLE;
@@ -648,6 +661,7 @@ static int   g_flagDedCompanies = 0;        // dedicated_companies=0|1: SEPARATE
 static int   g_flagDedAutosaveMin = 10;     // dedicated_autosave_min=<n>, 0-600: the game's own autosave this often (0 = never)
 static int   g_flagDedEmptySpeed = 1;       // dedicated_empty_speed=0..4: the world's speed while nobody else is in (0 = paused); dedicated_pause_empty=1 is 0
 static int   g_flagDedPort = 0;             // dedicated_port=<udp/tcp port> for the lobby (0 = the default 29471); a box that also runs the relay needs another
+static int   g_flagDedRender = 0;           // dedicated_render=0|1: 0 (default) submits no command buffers -- a software renderer then costs nothing; 1 draws (screenshots)
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
 static volatile LONG g_joinFreeze = 0;   // roster join_freeze: the lobby brings a late joiner in through a world sync (everyone reloads); this DLL takes no hot-join save (2026-09-16)
 static bool  g_latoLoaded = false;
@@ -697,6 +711,8 @@ static void ReadFlags()
         } else if (!strcmp(line, "dedicated_pause_empty")) {
             // the older flag: 1 = paused while empty; 0 = the (old) "keep simulating" = 1x
             if (!strcmp(v, "0")) g_flagDedEmptySpeed = 1; else if (!strcmp(v, "1")) g_flagDedEmptySpeed = 0;
+        } else if (!strcmp(line, "dedicated_render")) {
+            if (!strcmp(v, "0")) g_flagDedRender = 0; else if (!strcmp(v, "1")) g_flagDedRender = 1;
         } else if (!strcmp(line, "dedicated_port")) {
             int pt = atoi(v);
             if (digit && pt >= 1024 && pt <= 65535) g_flagDedPort = pt;
@@ -714,9 +730,10 @@ static void ReadFlags()
     fclose(f);
     Log("[menu] flags: slot=%d scale=%.2f autoload=%d relay_autosave_min=%d\n", g_flagSlot, g_flagScale, g_flagAutoLoad, g_flagRelayAutosaveMin);
     if (g_flagDedicated)
-        Log("[dedicated] on: save='%s' lobby='%s' name='%s' password=%s public=%d companies=%d autosave_min=%d empty_speed=%d port=%d\n",
+        Log("[dedicated] on: save='%s' lobby='%s' name='%s' password=%s public=%d companies=%d autosave_min=%d empty_speed=%d port=%d render=%d\n",
             g_flagDedSave, g_flagDedLobby, g_flagDedName, g_flagDedPassword[0] ? "yes" : "no", g_flagDedPublic,
-            g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedEmptySpeed, g_flagDedPort);
+            g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedEmptySpeed, g_flagDedPort, g_flagDedRender);
+    if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -1983,7 +2000,7 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
             InterlockedExchange(&g_panelDirty, 1);
         }
         const bool quiet = !g_recoveryWorldIo && !NativeIo::Busy();
-        if ((InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && (quiet || loadingPanel) && pi->swapchainCount >= 1) {
+        if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && (quiet || loadingPanel) && pi->swapchainCount >= 1) {
             VkSwapchainKHR sc = pi->pSwapchains[0];
             uint32_t idx = pi->pImageIndices[0];
             if ((!g_rInit || sc != g_theSc) && !g_rFail) InitRender(sc);
@@ -2025,10 +2042,47 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
     return r;
 }
 
+// vkQueueSubmit with the command buffers taken out: the fence and the semaphores
+// are signalled as the engine expects, nothing is rasterized. Our own overlay
+// submits go through pSubmit (the real one) and are skipped anyway (myPresent).
+static VkResult VKAPI_CALL mySubmit(VkQueue q, uint32_t n, const VkSubmitInfo* pSubmits, VkFence fence)
+{
+    if (!InterlockedCompareExchange(&g_noRender, 0, 0) || n == 0 || !pSubmits) return g_origSubmit(q, n, pSubmits, fence);
+    VkSubmitInfo local[8];
+    VkSubmitInfo* copy = (n <= 8) ? local : (VkSubmitInfo*)_alloca(sizeof(VkSubmitInfo) * n);
+    LONG dropped = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        copy[i] = pSubmits[i];
+        dropped += (LONG)copy[i].commandBufferCount;
+        copy[i].commandBufferCount = 0;
+        copy[i].pCommandBuffers = nullptr;
+    }
+    InterlockedIncrement(&g_noRenderSubmits);
+    InterlockedAdd(&g_noRenderCmdBufs, dropped);
+    return g_origSubmit(q, n, copy, fence);
+}
+// a query that never ran has no result: zeros, available now (a WAIT would never return)
+static VkResult VKAPI_CALL myQueryResults(VkDevice dev, VkQueryPool pool, uint32_t first, uint32_t count,
+                                          size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags)
+{
+    if (!InterlockedCompareExchange(&g_noRender, 0, 0)) return g_origQueryResults(dev, pool, first, count, dataSize, pData, stride, flags);
+    if (pData && dataSize) memset(pData, 0, dataSize);
+    return VK_SUCCESS;
+}
 static PFN_vkVoidFunction myGdpa(VkDevice dev, const char* name)
 {
     PFN_vkVoidFunction real = g_origGdpa(dev, name);
     if (!name || !real) return real;
+    if (strcmp(name, "vkQueueSubmit") == 0) {
+        g_origSubmit = (PFN_vkQueueSubmit)real;
+        if (NoRender()) Log("[menu] intercepted vkQueueSubmit dev=%p -- dedicated_render=0: no command buffer will run\n", dev);
+        return (PFN_vkVoidFunction)mySubmit;
+    }
+    if (strcmp(name, "vkGetQueryPoolResults") == 0) {
+        g_origQueryResults = (PFN_vkGetQueryPoolResults)real; return (PFN_vkVoidFunction)myQueryResults;
+    }
+    if (NoRender() && (strcmp(name, "vkQueueSubmit2") == 0 || strcmp(name, "vkQueueSubmit2KHR") == 0))
+        Log("[menu] the game resolves %s -- not intercepted, rendering may still run\n", name);
     if (strcmp(name, "vkQueuePresentKHR") == 0) {
         g_realPresent = (PFN_vkQueuePresentKHR)real; g_dev = dev;
         Log("[menu] intercepted vkQueuePresentKHR dev=%p real=%p\n", dev, real);
@@ -3937,6 +3991,14 @@ static void DedicatedTick()
         return;
     }
     if (!g_dedWorldUpSince) g_dedWorldUpSince = now;
+    if (NoRender()) {
+        static ULONGLONG lastCount = 0;
+        if (now - lastCount >= 60000) {
+            lastCount = now;
+            Log("[dedicated] no-render: %ld submits, %ld command buffers dropped so far\n",
+                InterlockedCompareExchange(&g_noRenderSubmits, 0, 0), InterlockedCompareExchange(&g_noRenderCmdBufs, 0, 0));
+        }
+    }
     if (g_flagDedAutosaveMin > 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
         && now - g_dedLastSave > (ULONGLONG)g_flagDedAutosaveMin * 60000ULL) {
         g_dedLastSave = now;

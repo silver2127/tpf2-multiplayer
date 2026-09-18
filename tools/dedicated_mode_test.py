@@ -34,7 +34,7 @@ def check(name, cond, extra=""):
 
 # ---- the menu DLL
 for key in ("dedicated", "dedicated_save", "dedicated_lobby", "dedicated_name", "dedicated_password", "dedicated_public",
-            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port"):
+            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render"):
     check(f"ReadFlags parses {key}=", f'!strcmp(line, "{key}")' in MENU)
 check("dedicated_save refuses path parts and quotes", 'strpbrk(v, "\\\\/:*?\\"<>|")' in MENU)
 check("dedicated_password refuses blanks and quotes (it is an argument)",
@@ -53,6 +53,15 @@ check("world up -> the game's own autosave every dedicated_autosave_min, never d
       "ForceAutosave()" in tick and "g_flagDedAutosaveMin * 60000ULL" in tick and "!NativeIo::Busy()" in tick)
 check("the mod is told (mp_dedicated.txt: dedicated=1, empty_speed=)", 'L"%smp_dedicated.txt"' in tick and 'empty_speed=%d' in tick)
 check("the tick runs by the clock, not per present", "if (now - lastTick < 1000) return;" in tick and "% 60" not in tick)
+sub = re.search(r"static VkResult VKAPI_CALL mySubmit\(.*?\n\}\n", MENU, re.S)
+check("dedicated_render=0: vkQueueSubmit is intercepted and its command buffers taken out", bool(sub)
+      and "copy[i].commandBufferCount = 0;" in sub.group(0) and "return g_origSubmit(q, n, copy, fence);" in sub.group(0))
+check("  ... the fence and semaphores still reach the real submit (a straight copy of each VkSubmitInfo)", bool(sub) and "copy[i] = pSubmits[i];" in sub.group(0))
+check("  ... hooked through the device proc-addr interceptor", 'if (strcmp(name, "vkQueueSubmit") == 0) {' in MENU and "return (PFN_vkVoidFunction)mySubmit;" in MENU)
+check("  ... query results read as zero, available at once", "static VkResult VKAPI_CALL myQueryResults(" in MENU and 'strcmp(name, "vkGetQueryPoolResults") == 0' in MENU)
+check("  ... the panel is not drawn while not rendering", "if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0)" in MENU)
+check("  ... on by default in dedicated mode, dedicated_render=1 turns drawing back on",
+      "static int   g_flagDedRender = 0;" in MENU and "if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);" in MENU)
 check("the host command line carries --dedicated", 'if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");' in MENU)
 check("and --local-port from dedicated_port (a box that also runs the relay)", 'L" --local-port %d", g_flagDedPort' in MENU)
 check("the public list labels a dedicated game a dedicated server",
