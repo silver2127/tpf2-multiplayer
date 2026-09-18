@@ -7,6 +7,9 @@
 # update the code or the settings; the service restarts and keeps its code (the
 # relay keeps its secret in its io dir). It announces to the master server on the
 # same machine; set MASTER_URL for one elsewhere.
+# Loopback ports 7783 -> 7781 (not the defaults 7773 -> 7771): the dedicated game
+# server on the same box (tools/server) uses the defaults for its own bridge, and the
+# two must not exchange frames (2026-09-18).
 set -e
 HOST="${1:-root@76.13.109.115}"
 LOBBY="${2:-Dedicated Test Server All Welcome}"
@@ -44,6 +47,7 @@ User=tpf2mp
 EnvironmentFile=/etc/tpf2mp/relay.env
 WorkingDirectory=/var/lib/tpf2mp/relay
 ExecStart=/usr/bin/python3 /opt/tpf2mp/netpunch/lobby.py host --relay-only --name relay \\
+  --game-relay-port 7783 --game-local-port 7781 \\
   --lobby-name \"\${LOBBY_NAME}\" --local-port \${RELAY_PORT} \\
   --publish \${MASTER_URL} --public \\
   --io-dir /var/lib/tpf2mp/relay

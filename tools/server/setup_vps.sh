@@ -31,6 +31,7 @@ id -u $USER_NAME >/dev/null 2>&1 || useradd --create-home --shell /bin/bash $USE
 mkdir -p $DEST
 install -m 755 "$HERE/tpf2server" /usr/local/bin/tpf2server
 install -m 755 "$HERE/steam_login.sh" $DEST/steam_login.sh
+install -m 755 "$HERE/steam_bootstrap.sh" $DEST/steam_bootstrap.sh
 install -m 755 "$HERE/game_watchdog.sh" $DEST/game_watchdog.sh
 install -m 644 "$HERE/server.env.example" $DEST/server.env.example
 [ -f /etc/tpf2mp/server.env ] || { mkdir -p /etc/tpf2mp; install -m 644 "$HERE/server.env.example" /etc/tpf2mp/server.env; }
@@ -102,4 +103,6 @@ if command -v ufw >/dev/null 2>&1; then
   PORT=$(sed -n 's/^LOBBY_PORT=//p' /etc/tpf2mp/server.env)
   [ -n "$PORT" ] && ufw allow "$PORT"/udp >/dev/null && ufw allow "$PORT"/tcp >/dev/null && echo "ufw: $PORT udp+tcp open"
 fi
+echo "== steam client bootstrap (the wrapper's licence dialog has no place on a headless box)"
+sudo -iu $USER_NAME sh $DEST/steam_bootstrap.sh
 echo "setup done. Next: sudo -iu $USER_NAME sh $DEST/steam_login.sh"

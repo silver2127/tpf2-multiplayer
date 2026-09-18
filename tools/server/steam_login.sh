@@ -16,6 +16,8 @@ if ! xdpyinfo >/dev/null 2>&1; then echo "no X display at $DISPLAY (systemctl st
 if systemctl is-active --quiet tpf2mp-steam 2>/dev/null; then echo "stop the client first: sudo systemctl stop tpf2mp-steam"; exit 1; fi
 pkill -x steam 2>/dev/null || true
 
+if [ "${TPF2_OFFLINE_ONLY:-0}" = 1 ]; then USERNAME=$(python3 -c "import re,sys;t=open(sys.argv[1]).read();m=re.search(r'\"AccountName\"\s*\"([^\"]+)\"',t);print(m.group(1) if m else '')" "$CFG"); [ -n "$USERNAME" ] || { echo "no account in $CFG"; exit 1; }; pkill -x steam 2>/dev/null || true; sleep 3; SKIP_LOGIN=1; fi
+if [ "${SKIP_LOGIN:-0}" != 1 ]; then
 printf 'Steam account name: '; read -r USERNAME
 printf 'Password (not echoed): '; stty -echo; read -r PASSWORD; stty echo; echo
 echo "starting the client on $DISPLAY (the first start downloads the client itself, a few minutes)..."
@@ -43,6 +45,8 @@ if ! grep -q "\"AccountName\"\s*\"$USERNAME\"" "$CFG" 2>/dev/null; then
     echo "the client did not record a login for $USERNAME; see /tmp/steam_login.out and try again"; exit 1
 fi
 echo "logged in as $USERNAME"
+fi
+if [ "${TPF2_STAY_ONLINE:-0}" = 1 ]; then echo "TPF2_STAY_ONLINE=1: the client stays online (install the game now); mark offline later with: sudo systemctl stop tpf2mp-steam; TPF2_OFFLINE_ONLY=1 sh $0"; exit 0; fi
 # Let the client finish its first-run work (library, Proton listing), then stop it and
 # mark the account for offline mode: WantsOfflineMode makes the next start offline
 # without the dialog; the same account is then free to play online elsewhere.
