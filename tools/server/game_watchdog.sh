@@ -4,31 +4,38 @@
 # overlay), so the game is never our child: ask Steam to start it, then watch for
 # the process and ask again when it is gone. The mod's dedicated mode does the rest
 # (host, load, autosave). Logs go to the journal.
+#
+# A CRASHED GAME IS A STUCK GAME, not a dump file. The engine's crash reporter
+# leaves the process alive in its dialog, and it also runs for a game WE killed:
+# ~15 s after a kill it writes a .dmp and appends __CRASHDB_DUMP__ to stdout.txt --
+# the NEXT run's stdout.txt, same path. Judging by dumps or markers killed the
+# healthy new game twice over (2026-09-18 18:18 and 19:04, both self-feeding
+# loops). What a crashed game stops doing is presenting: the menu DLL writes
+# tpf2_menu.log every few seconds while it presents (title menu, loading screen,
+# world alike). A game process whose menu log has not moved for STALL_SECONDS is
+# stuck: it is killed -9 (no crash handler, no stray dump) and launched again.
 set -u
 APPID=1066780
 : "${DISPLAY:=:9}"
 export DISPLAY
 STEAM=/usr/games/steam
-DUMPS=$(ls -d "$HOME"/.steam/steam/userdata/*/1066780/local/crash_dump 2>/dev/null | head -1)
+GAME_DIR=$(ls -d "$HOME"/.steam/steam/steamapps/common/"Transport Fever 2" 2>/dev/null | head -1)
+MENU_LOG="$GAME_DIR/tpf2_menu.log"
+STALL_SECONDS=${STALL_SECONDS:-180}
 started=0
 launched_at=0
 while :; do
-    if pgrep -f 'TransportFever2.exe' >/dev/null 2>&1; then
+    if pgrep -f 'TransportFever2[.]exe' >/dev/null 2>&1; then
         started=0
-        # a crash leaves the engine's dialog up and the process alive. The game itself
-        # prints __CRASHDB_DUMP__ into ITS OWN stdout.txt at the exception, so that line
-        # in a stdout.txt newer than the launch is a crash of THIS run. A .dmp newer than
-        # the launch is not: the engine's crash reporter writes the post-mortem of a
-        # KILLED instance (tpf2server stop) 30-120 s later, after the next launch, and
-        # the watchdog used to kill the healthy new game for it, again and again
-        # (2026-09-18 18:18: a self-feeding "crash loop" after a plain update).
-        if [ -n "$DUMPS" ] && [ "$launched_at" -gt 0 ] && [ -f "$DUMPS/stdout.txt" ]            && [ -n "$(find "$DUMPS" -maxdepth 1 -name stdout.txt -newermt "@$launched_at" 2>/dev/null)" ]; then
-            newdump=$(grep -a -o '__CRASHDB_DUMP__ [0-9a-f-]*' "$DUMPS/stdout.txt" 2>/dev/null | head -1)
-            if [ -n "$newdump" ]; then
-                echo "$newdump in this run's stdout.txt; killing the game for a relaunch"
-                pkill -f '^Z:.*TransportFever2' ; pkill -f '^C:.*TransportFever2'
+        if [ "$launched_at" -gt 0 ] && [ -f "$MENU_LOG" ]; then
+            now=$(date +%s)
+            mod=$(stat -c %Y "$MENU_LOG" 2>/dev/null || echo "$now")
+            # the log must have moved since THIS launch before its silence counts (the
+            # first seconds of a launch, before the DLL loads, are not a stall)
+            if [ "$mod" -gt "$launched_at" ] && [ $((now - mod)) -ge "$STALL_SECONDS" ]; then
+                echo "the game has not presented for $((now - mod)) s (tpf2_menu.log still); killing it -9 for a relaunch"
+                pkill -9 -f '^[A-Za-z]:.*TransportFever2[.]exe'
                 sleep 5
-                pkill -9 -f '^Z:.*TransportFever2' ; pkill -9 -f '^C:.*TransportFever2'
                 launched_at=0
                 sleep 10
                 continue
