@@ -4688,9 +4688,10 @@ def cmd_host(args):
     # carries a fresh session secret: whoever has the code can talk to us,
     # nobody else can read or inject; --password layers on top of it.
     secret = None
-    if getattr(args, "relay_only", False):
-        # a dedicated relay keeps its secret: the same code stays valid across
-        # restarts (the address and port are fixed too), so nobody re-pastes
+    if getattr(args, "relay_only", False) or getattr(args, "dedicated", False):
+        # a dedicated relay -- or a dedicated game server (--dedicated) -- keeps
+        # its secret: the same code stays valid across restarts (the address and
+        # port are fixed too), so nobody re-pastes
         spath = os.path.join(io.dir, "relay_secret.bin")
         try:
             with open(spath, "rb") as f:
@@ -4721,7 +4722,7 @@ def cmd_host(args):
          + (" + password)" if args.password else ")"))
     publisher = None
     if args.publish:
-        publisher = _Publisher(args.publish, code, "relay" if args.relay_only else "host", bool(args.password), _log,
+        publisher = _Publisher(args.publish, code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
                                stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
         # systemd stops the relay with SIGTERM; without a handler Python just
         # dies and the finally: below (publisher.close -> /leave) never runs,
@@ -6290,6 +6291,9 @@ def main(argv=None):
                          "public (see --public and the 'publish' command)")
     ap.add_argument("--companies", action="store_true",
                     help="start in separate-companies mode: every player gets their own company (default: co-op, one company)")
+    ap.add_argument("--dedicated", action="store_true",
+                    help="a game that hosts by itself (tpf2_menu_flags.txt dedicated=1): keep the session secret "
+                         "across restarts so the code stays valid, and list as a dedicated server")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
     ap.add_argument("--rendezvous", default="",

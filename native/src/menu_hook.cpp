@@ -349,6 +349,7 @@ static volatile LONG g_leaveOnMenu = 0;
 static HWND g_gameWnd = nullptr;
 static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
 static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
+static void DedicatedTick();          // dedicated server mode (tpf2_menu_flags.txt dedicated=1): host, load, keep up
 static void LeaveLobby();
 static DWORD WINAPI KbHookThread(LPVOID);
 static bool LobbySend(const char* jsonLine);
@@ -624,6 +625,22 @@ static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
 static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
 static int   g_flagAutoLoad = 1;            // START loads the shared save in-process (autoload=0: the player opens LOAD GAME)
+// DEDICATED SERVER (2026-09-18): a game that hosts by itself. With dedicated=1 the
+// title menu hosts a lobby the moment it is up, loads dedicated_save (else the
+// newest save), keeps the game's own autosave going, and hosts + loads again
+// after a crash to the title menu. The world pauses while nobody else is in
+// (dedicated_pause_empty=1, mp/pacing.lua) and joiners come in through the
+// frozen-join round like on any host. DedicatedTick, once a second from myPresent.
+static int   g_flagDedicated = 0;
+static char  g_flagDedSave[64] = "";        // dedicated_save=<name without .sav>; empty = the newest save in the save folder
+static char  g_flagDedLobby[64] = "";       // dedicated_lobby=<lobby name shown in the public list>
+static char  g_flagDedName[32] = "";        // dedicated_name=<the server's player name>
+static char  g_flagDedPassword[40] = "";    // dedicated_password=<lobby password>; empty = open
+static int   g_flagDedPublic = 1;           // dedicated_public=0|1: listed on the master server
+static int   g_flagDedCompanies = 0;        // dedicated_companies=0|1: SEPARATE COMPANIES (a company per player)
+static int   g_flagDedAutosaveMin = 10;     // dedicated_autosave_min=<n>, 0-600: the game's own autosave this often (0 = never)
+static int   g_flagDedPauseEmpty = 1;       // dedicated_pause_empty=0|1: the world stands still while nobody else is in
+static int   g_flagDedPort = 0;             // dedicated_port=<udp/tcp port> for the lobby (0 = the default 29471); a box that also runs the relay needs another
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
 static volatile LONG g_joinFreeze = 0;   // roster join_freeze: the lobby brings a late joiner in through a world sync (everyone reloads); this DLL takes no hot-join save (2026-09-16)
 static bool  g_latoLoaded = false;
@@ -647,6 +664,31 @@ static void ReadFlags()
             if (!strcmp(v, "always")) g_flagShareMods = 1; else if (!strcmp(v, "never")) g_flagShareMods = 2; else g_flagShareMods = 0;
         } else if (!strcmp(line, "autoload")) {
             if (!strcmp(v, "0")) g_flagAutoLoad = 0; else if (!strcmp(v, "1")) g_flagAutoLoad = 1;
+        } else if (!strcmp(line, "dedicated")) {
+            if (!strcmp(v, "0")) g_flagDedicated = 0; else if (!strcmp(v, "1")) g_flagDedicated = 1;
+        } else if (!strcmp(line, "dedicated_save")) {
+            // a save NAME (it becomes <save dir>\<name>.sav): no path parts, no quotes
+            if (v[0] && strlen(v) < sizeof(g_flagDedSave) && !strpbrk(v, "\\/:*?\"<>|")) strcpy_s(g_flagDedSave, v);
+            else if (v[0]) Log("[menu] flags: dedicated_save ignored (a plain save name, under 64 characters)\n");
+        } else if (!strcmp(line, "dedicated_lobby")) {
+            if (v[0] && strlen(v) < sizeof(g_flagDedLobby) && !strpbrk(v, "\"")) strcpy_s(g_flagDedLobby, v);
+        } else if (!strcmp(line, "dedicated_name")) {
+            if (v[0] && strlen(v) < sizeof(g_flagDedName) && !strpbrk(v, "\" \t")) strcpy_s(g_flagDedName, v);
+        } else if (!strcmp(line, "dedicated_password")) {
+            // it becomes a netpunch.exe argument: no blanks or quotes
+            if (strlen(v) < sizeof(g_flagDedPassword) && !strpbrk(v, "\" \t")) strcpy_s(g_flagDedPassword, v);
+        } else if (!strcmp(line, "dedicated_public")) {
+            if (!strcmp(v, "0")) g_flagDedPublic = 0; else if (!strcmp(v, "1")) g_flagDedPublic = 1;
+        } else if (!strcmp(line, "dedicated_companies")) {
+            if (!strcmp(v, "0")) g_flagDedCompanies = 0; else if (!strcmp(v, "1")) g_flagDedCompanies = 1;
+        } else if (!strcmp(line, "dedicated_autosave_min")) {
+            int m = atoi(v);
+            if (digit && m >= 0 && m <= 600) g_flagDedAutosaveMin = m;
+        } else if (!strcmp(line, "dedicated_pause_empty")) {
+            if (!strcmp(v, "0")) g_flagDedPauseEmpty = 0; else if (!strcmp(v, "1")) g_flagDedPauseEmpty = 1;
+        } else if (!strcmp(line, "dedicated_port")) {
+            int pt = atoi(v);
+            if (digit && pt >= 1024 && pt <= 65535) g_flagDedPort = pt;
         } else if (!strcmp(line, "slot")) {
             // the title menu builds 8 entries (9 with CONTINUE): a slot past them never inserts ours
             int s = atoi(v);
@@ -660,6 +702,10 @@ static void ReadFlags()
     }
     fclose(f);
     Log("[menu] flags: slot=%d scale=%.2f autoload=%d relay_autosave_min=%d\n", g_flagSlot, g_flagScale, g_flagAutoLoad, g_flagRelayAutosaveMin);
+    if (g_flagDedicated)
+        Log("[dedicated] on: save='%s' lobby='%s' name='%s' password=%s public=%d companies=%d autosave_min=%d pause_empty=%d port=%d\n",
+            g_flagDedSave, g_flagDedLobby, g_flagDedName, g_flagDedPassword[0] ? "yes" : "no", g_flagDedPublic,
+            g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedPauseEmpty, g_flagDedPort);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -1368,7 +1414,7 @@ static void RenderPanelLayer(int w, int h)
                 wchar_t wn[64], wv[32], wp[32], wa[32];
                 MultiByteToWideChar(CP_UTF8, 0, r.name, -1, wn, 64); MultiByteToWideChar(CP_UTF8, 0, r.version, -1, wv, 32);
                 // a master from before the type field: the relay is known by its game string
-                const wchar_t* wt = !strcmp(r.type, "relay") ? L"dedicated server" : !strcmp(r.type, "host") ? L"player hosted"
+                const wchar_t* wt = (!strcmp(r.type, "relay") || !strcmp(r.type, "dedicated")) ? L"dedicated server" : !strcmp(r.type, "host") ? L"player hosted"
                                   : !strcmp(r.game, "dedicated relay") ? L"dedicated server" : L"player hosted";
                 if (r.locked) { wchar_t t[64]; _snwprintf_s(t, _TRUNCATE, L"%s  [locked]", wn); wcscpy_s(wn, t); }
                 _snwprintf_s(wp, _TRUNCATE, L"%d / %d", r.players, r.max);
@@ -1903,6 +1949,7 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
     SteamNameTick();
     StageTick();
     PollWorldGen();
+    DedicatedTick();
     LONG n = InterlockedIncrement(&g_presentCount);
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
@@ -3369,6 +3416,8 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
         if (a->sep) wcscat_s(wpub, L" --companies");                    // SEPARATE COMPANIES: the lobby assigns a company per player
+        if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");            // a stable code across restarts, listed as a dedicated server
+        if (g_flagDedicated && g_flagDedPort) { wchar_t t[40]; _snwprintf_s(t, _TRUNCATE, L" --local-port %d", g_flagDedPort); wcscat_s(wpub, t); }
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name \"%s\" --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
@@ -3789,6 +3838,76 @@ static void LeaveLobby()
     EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs);
     InterlockedExchange(&g_modRefreshPending, 0);
     InterlockedExchange(&g_uiState, 1); InterlockedExchange(&g_panelDirty, 1);
+}
+
+// ---------------- dedicated server ----------------
+// Runs once a second from myPresent while dedicated=1. Three states, each
+// self-healing: no lobby -> host one; lobby but no world -> load the configured
+// (else the newest) save through the ordinary shared-save autoload, so a joiner
+// arriving later reuses that save and the lobby counts the host as started;
+// world up -> force the game's own autosave every dedicated_autosave_min, so a
+// crash restarts from a fresh world (the newest save is what the next launch
+// loads). A crash to the title menu leaves the lobby (g_leaveOnMenu), and the
+// first state hosts again.
+static ULONGLONG g_dedLastHost = 0, g_dedLastLoad = 0, g_dedLastSave = 0, g_dedWorldUpSince = 0;
+static bool g_dedFileWritten = false;
+static void DedicatedTick()
+{
+    if (!g_flagDedicated) return;
+    static LONG frames = 0;
+    if ((InterlockedIncrement(&frames) % 60) != 0) return;
+    const ULONGLONG now = GetTickCount64();
+    if (!g_dedFileWritten) {
+        // the mod's half: pause while nobody else is in (mp/pacing.lua CM.dedicatedPauseEmpty)
+        g_dedFileWritten = true;
+        wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%smp_dedicated.txt", g_dataDirW);
+        FILE* f = _wfsopen(p, L"w", _SH_DENYNO);
+        if (f) { fprintf(f, "dedicated=1\npause_empty=%d\n", g_flagDedPauseEmpty); fclose(f); }
+    }
+    const bool world = WorldLoaded();
+    if (!LobbyRunning()) {
+        if (world) return;   // a world without a lobby is the moment after a crash to the menu: wait for it
+        if (now - g_dedLastHost < 15000) return;
+        g_dedLastHost = now;
+        if (g_flagDedName[0]) strcpy_s(g_username, g_flagDedName);
+        if (g_flagDedLobby[0]) strcpy_s(g_lobbyName, g_flagDedLobby);
+        strcpy_s(g_passCode, g_flagDedPassword); g_passLen = (int)strlen(g_passCode);
+        InterlockedExchange(&g_public, g_flagDedPublic ? 1 : 0);
+        InterlockedExchange(&g_sepCompanies, g_flagDedCompanies ? 1 : 0);
+        ensureUsername();
+        Log("[dedicated] hosting lobby '%s' as '%s' (%s, %s)\n", g_lobbyName[0] ? g_lobbyName : "(default)", g_username,
+            g_flagDedPublic ? "public" : "unlisted", g_flagDedPassword[0] ? "password" : "open");
+        StartLobby(0);
+        return;
+    }
+    if (!world) {
+        g_dedWorldUpSince = 0;
+        if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) return;
+        if (InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()) return;
+        if (now - g_dedLastLoad < 60000) return;   // a load takes as long as it takes: one request a minute
+        g_dedLastLoad = now;
+        wchar_t path[600] = L"";
+        if (g_flagDedSave[0]) {
+            wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagDedSave, -1, wn, 64);
+            _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
+            if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { Log("[dedicated] %ls not found -- loading the newest save instead\n", path); path[0] = 0; }
+        }
+        if (!path[0] && !newestSave(path, 600)) {
+            Log("[dedicated] no save in %ls -- nothing to load (put one there, or set dedicated_save)\n", SAVE_DIR);
+            return;
+        }
+        wcscpy_s(g_startSaveW, path);
+        MarkSaveShared();                     // a joiner arriving before the first autosave reuses this save
+        Log("[dedicated] loading %ls\n", path);
+        if (doStartLoad(path)) ArmStageWatch("loading world");
+        return;
+    }
+    if (!g_dedWorldUpSince) g_dedWorldUpSince = now;
+    if (g_flagDedAutosaveMin > 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
+        && now - g_dedLastSave > (ULONGLONG)g_flagDedAutosaveMin * 60000ULL) {
+        g_dedLastSave = now;
+        if (ForceAutosave()) Log("[dedicated] autosave forced (every %d min)\n", g_flagDedAutosaveMin);
+    }
 }
 
 // in-frame chat text input: poll key edges while in the lobby

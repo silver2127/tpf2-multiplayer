@@ -85,6 +85,9 @@ function CM.autoSyncPump(now)
 			CM.autoSync = incoming
 			if not old or old.operation ~= incoming.operation then
 				local speed; pcall(function() speed = game.interface.getGameSpeed() end)
+				-- a dedicated server pauses itself while empty (pacing.lua): the
+				-- speed to resume at is the one it paused from, not that 0
+				if CM.dedPaused and (speed or 0) == 0 and CM.dedResume then speed = CM.dedResume; CM.dedPaused = false end
 				CM.autoResumeSpeed = speed or CM.baseSpeed or 0
 				CM.setSpeed(0, "automatic world operation")
 			end

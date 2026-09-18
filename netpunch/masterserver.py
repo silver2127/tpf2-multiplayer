@@ -42,7 +42,7 @@ FIELDS = ("id", "name", "code", "players", "max", "game", "type", "version", "lo
 # The list shows what KIND of server a row is, never the host's save name
 # (2026-09-10): a save's file name ("multi Balage", "autosave 3") read as
 # nonsense and was not even the world START GAME ends up sharing.
-TYPE_LABELS = {"relay": "dedicated server", "host": "player hosted"}
+TYPE_LABELS = {"relay": "dedicated server", "dedicated": "dedicated server", "host": "player hosted"}
 
 UPLOAD_MAX = 16 << 20          # nginx's client_max_body_size for /tpf2mp/desync matches
 UPLOAD_PER_IP_HOUR = 6

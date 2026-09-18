@@ -1100,10 +1100,54 @@ end
 
 -- Once per tick: the slowest peer's clock for the status and dash files
 -- (CM.slowT), then the session speed controller.
+-- A DEDICATED SERVER (2026-09-18; mp_dedicated.txt, written by the menu DLL from
+-- tpf2_menu_flags.txt dedicated=1) with pause_empty=1 stands still while nobody
+-- else is in: a world simulating for no one only burns the server's CPU and
+-- ages the towns. Read every 300 ticks (the file is written once, at start).
+function CM.dedicatedPauseEmpty()
+	if CM.dedCfgAt and (CM.ticks or 0) - CM.dedCfgAt < 300 then return CM.dedPauseEmpty end
+	CM.dedCfgAt = CM.ticks or 0
+	CM.dedPauseEmpty = false
+	local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+	if f then
+		local body = f:read("*a") or ""
+		f:close()
+		CM.dedicated = body:find("dedicated=1", 1, true) ~= nil
+		CM.dedPauseEmpty = CM.dedicated and body:find("pause_empty=1", 1, true) ~= nil
+	end
+	return CM.dedPauseEmpty
+end
+
+-- The pause itself. Alone: stop the clock once (remembering the speed for the
+-- resume). Somebody in: give the speed back once. Never during a world
+-- operation's hold (the frozen join that brings the newcomer in owns the clock
+-- then; resync.lua hands it CM.dedResume as the speed to resume at, because the
+-- speed it finds is our 0). Returns true while it holds the world paused.
+function CM.dedicatedTick()
+	if not CM.dedicatedPauseEmpty() or CM.resyncHold then return false end
+	local others = CM.othersPresent and CM.othersPresent()
+	local s
+	pcall(function() s = game.interface.getGameSpeed() end)
+	if not others then
+		if not CM.dedPaused and s and s > 0 and (CM.ticks or 0) >= (K.LOADGATE_MIN_TICKS or 0) then
+			CM.dedResume = s
+			CM.dedPaused = true
+			CM.setSpeed(0, "dedicated server: nobody is here")
+		end
+		return CM.dedPaused == true
+	end
+	if CM.dedPaused then
+		CM.dedPaused = false
+		CM.setSpeed(CM.dedResume or 1, "dedicated server: a player is in")
+	end
+	return false
+end
+
 function CM.paceTick(now)
 	-- the stamp our world starts from: the save's own (savedAt, written by save()),
 	-- else the first clock we read -- what the load gate asks the history after
 	if CM.loadStamp == nil then CM.loadStamp = tonumber(CM.savedAt) or now end
+	if CM.dedicatedTick() then return end
 	local slowT = CM.peerBounds()
 	CM.slowT = slowT
 	if not CM.peerSeen then return end

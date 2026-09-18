@@ -1,0 +1,86 @@
+#!/bin/sh
+# tpf2server -- operate the dedicated server (installed by setup_vps.sh to /usr/local/bin).
+#
+#   tpf2server status              units, the game process, the lobby's code and roster
+#   tpf2server install             the mod: install_proton.sh from the GitHub release into the client's game
+#   tpf2server configure           write tpf2_menu_flags.txt (dedicated mode) and a headless settings.lua from /etc/tpf2mp/server.env
+#   tpf2server start|stop|restart  the game (the Steam client stays up)
+#   tpf2server logs [n]            the last n lines of the mod's menu log
+#   tpf2server say <text>          a chat line from the server
+#   tpf2server code                the join code
+#
+# Run as root (systemctl) or as tpf2server (files).
+set -eu
+ENV=/etc/tpf2mp/server.env
+[ -f "$ENV" ] && . "$ENV"
+: "${DISPLAY:=:9}" "${LOBBY_PORT:=29472}" "${LOBBY_NAME:=Dedicated Server}" "${SERVER_NAME:=Server}" "${LOBBY_PASSWORD:=}"
+: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${PAUSE_EMPTY:=1}" "${MOD_RELEASE:=}"
+: "${STEAM_ROOT:=/home/tpf2server/.steam/steam}"
+: "${GAME_DIR:=$STEAM_ROOT/steamapps/common/Transport Fever 2}"
+NETDIR="$GAME_DIR/netpunch"
+as_server() { if [ "$(id -un)" = tpf2server ]; then "$@"; else sudo -u tpf2server "$@"; fi; }
+
+cmd=${1:-status}; shift || true
+case "$cmd" in
+status)
+    for u in tpf2mp-xvfb tpf2mp-steam tpf2mp-game; do printf '%-14s %s\n' "$u" "$(systemctl is-active $u 2>/dev/null || echo unknown)"; done
+    if pgrep -f TransportFever2.exe >/dev/null 2>&1; then echo "game: running (pid $(pgrep -f TransportFever2.exe | head -1))"; else echo "game: not running"; fi
+    [ -f "$NETDIR/lobby_proc.log" ] && grep -a "^CODE=\|\[host\] JOIN\|\[host\] LEAVE\|DROP\|listed publicly" "$NETDIR/lobby_proc.log" | tail -6
+    [ -f "$GAME_DIR/tpf2_menu.log" ] && grep -a "\[dedicated\]" "$GAME_DIR/tpf2_menu.log" | tail -4
+    ;;
+install)
+    # the release's installer: it finds Steam, the game and the Proton prefix by itself
+    url="https://github.com/silver2127/tpf2-multiplayer/releases/${MOD_RELEASE:+download/v$MOD_RELEASE}${MOD_RELEASE:-latest/download}/install_proton.sh"
+    tmp=$(mktemp -d)
+    curl -fsSL "$url" -o "$tmp/install_proton.sh"
+    as_server sh "$tmp/install_proton.sh" --steam-root "$STEAM_ROOT" "$@"
+    rm -rf "$tmp"
+    echo "installed; now: tpf2server configure"
+    ;;
+configure)
+    [ -d "$GAME_DIR" ] || { echo "game dir not found: $GAME_DIR (install the game in the Steam client first)"; exit 1; }
+    flags="$GAME_DIR/tpf2_menu_flags.txt"
+    as_server sh -c "cat > '$flags'" <<EOF
+dedicated=1
+dedicated_save=$SAVE
+dedicated_lobby=$LOBBY_NAME
+dedicated_name=$SERVER_NAME
+dedicated_password=$LOBBY_PASSWORD
+dedicated_public=1
+dedicated_companies=$COMPANIES
+dedicated_autosave_min=$AUTOSAVE_MIN
+dedicated_pause_empty=$PAUSE_EMPTY
+dedicated_port=$LOBBY_PORT
+autoload=1
+EOF
+    echo "wrote $flags"
+    # a headless-sized settings.lua: the smallest window, the lowest graphics, no sound.
+    # The game writes the file on its first run; only then are the keys there to change.
+    for s in "$STEAM_ROOT"/userdata/*/1066780/local/settings.lua; do
+        [ -f "$s" ] || continue
+        as_server python3 - "$s" <<'EOF'
+import re, sys
+p = sys.argv[1]
+t = open(p, encoding="utf-8").read()
+want = {"fullscreen": "false", "windowSize": "{ 640, 480, }", "vsync": "false", "resolutionScale": "0.5",
+        "shadowQuality": "0", "textureQuality": "0", "numSamples": "1", "anisotropicFiltering": "0",
+        "masterVolume": "0", "musicVolume": "0", "soundVolume": "0"}
+for k, v in want.items():
+    t, n = re.subn(r"(?m)^(\s*%s\s*=\s*).*?,\s*$" % re.escape(k), lambda m: m.group(1) + v + ",", t)
+open(p, "w", encoding="utf-8").write(t)
+print("settings:", p)
+EOF
+    done
+    ;;
+start)   systemctl start tpf2mp-game ;;
+stop)    systemctl stop tpf2mp-game; pkill -f TransportFever2.exe 2>/dev/null || true ;;
+restart) systemctl restart tpf2mp-game; pkill -f TransportFever2.exe 2>/dev/null || true ;;
+logs)    tail -n "${1:-40}" "$GAME_DIR/tpf2_menu.log" ;;
+code)    grep -a "^CODE=" "$NETDIR/lobby_proc.log" | tail -1 ;;
+say)
+    [ $# -gt 0 ] || { echo "usage: tpf2server say <text>"; exit 2; }
+    text=$(printf '%s' "$*" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+    as_server sh -c "printf '%s\n' '{\"cmd\":\"chat\",\"text\":$text}' >> '$NETDIR/lobby_in.jsonl'"
+    ;;
+*) sed -n 2,12p "$0"; exit 2 ;;
+esac
