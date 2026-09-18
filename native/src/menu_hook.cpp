@@ -3852,6 +3852,7 @@ static void LeaveLobby()
 static ULONGLONG g_dedLastHost = 0, g_dedLastLoad = 0, g_dedLastSave = 0, g_dedWorldUpSince = 0, g_dedMenuSince = 0;
 static bool g_dedFileWritten = false;
 static const ULONGLONG DED_MENU_SETTLE_MS = 8000;   // the title menu's main page has been up this long before we act on it
+static const ULONGLONG DED_LOAD_MIN_UPTIME_MS = 45000;   // and this long before the first LOAD: two launches that loaded ~10 s in crashed mid-load (16:26, no assertion)
 static void DedicatedTick()
 {
     if (!g_flagDedicated) return;
@@ -3895,6 +3896,7 @@ static void DedicatedTick()
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) return;
         if (InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()) return;
         if (now - g_dedLastLoad < 60000) return;   // a load takes as long as it takes: one request a minute
+        if (now - g_dedMenuSince < DED_LOAD_MIN_UPTIME_MS) return;   // let the engine finish its own start-up work first
         g_dedLastLoad = now;
         wchar_t path[600] = L"";
         if (g_flagDedSave[0]) {
