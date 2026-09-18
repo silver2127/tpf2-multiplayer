@@ -603,54 +603,75 @@ function CM.governorOff()
 	end
 	return off
 end
--- HOST CAPACITY (2026-09-18). The engine hands its sim one batch of `lever`
--- iterations every 200 ms and, when a batch costs more than that, stretches
--- the interval to what it measured (speedhook.cpp): the lever still reads 4,
--- the world runs at 2. The bridge publishes that interval once a second
--- (tpf2_engine_pace.txt: base=<us> lever=<n>). The leader reads it every 25
--- ticks; three stretched readings in a row (one is a hash stamp or an
--- autosave) cap the session speed at what the host sustains, a whole number
--- (a fraction would ride the stretched interval through the dither); an
--- unstretched minute at the cap tries one step up. The dedicated server at
--- lever 4 sat at 400 ms and a joiner ran 13 units ahead before this.
-K.CAP_STRETCH_US = 210000
+-- HOST CAPACITY (2026-09-18). The engine runs 5 sim steps a second per unit
+-- of session speed (a batch of `lever` 200 ms iterations every 200 ms), and
+-- what it cannot afford it simply does not do: the lever still reads 4 while
+-- the world runs at 2 and a joiner runs ahead until it holds. Every
+-- K.CAP_WINDOW_S wall seconds the leader compares the steps it made with
+-- 5 x the session speed x the seconds; three short windows in a row (one is a
+-- hash stamp or an autosave) cap the session speed at what the host sustains,
+-- a whole number (a fraction would need the dither on top); an unstretched
+-- minute at the cap tries one step up. A pause, a hold and a speed change
+-- restart the window. The engine's own interval estimate is NOT the measure:
+-- on a VPS with CPU steal it sat at 400 ms with the sim thread half idle
+-- (a dedicated server pins it, tpf2_bridge_mp.dll); tpf2_engine_pace.txt
+-- still says what it thinks, for the log.
+K.CAP_WINDOW_S = 15
+K.CAP_LOW = 0.8
 K.CAP_SAMPLES = 3
-K.CAP_UP_TICKS = 300
+K.CAP_UP_S = 60
 function CM.hostPace()
-	if CM.paceReadAt == (CM.ticks or 0) then return CM.paceBase, CM.paceLever, true end
-	if CM.paceReadAt and (CM.ticks or 0) - CM.paceReadAt < 25 then return CM.paceBase, CM.paceLever, false end
-	CM.paceReadAt = CM.ticks or 0
-	CM.paceBase, CM.paceLever = nil, nil
+	local base, lever
 	local f = io.open(K.BASE .. "tpf2_engine_pace.txt", "r")
 	if f then
 		local body = f:read("*a") or ""
 		f:close()
-		CM.paceBase = tonumber(body:match("base=(%d+)"))
-		CM.paceLever = tonumber(body:match("lever=(%d+)"))
+		base = tonumber(body:match("base=(%d+)"))
+		lever = tonumber(body:match("lever=(%d+)"))
 	end
-	return CM.paceBase, CM.paceLever, true
+	return base, lever
 end
-function CM.hostCapacityCap(eff)
-	if not eff or eff <= 0 then return eff, nil end
-	if CM.governorOff and CM.governorOff() then CM.hostCap = nil; return eff, nil end
-	local base, lever, fresh = CM.hostPace()
-	if fresh then
-		if base and lever and lever > 0 and base > K.CAP_STRETCH_US then
+-- eff: the speed the votes (or the request) ask for now; applied: the session
+-- speed in force since the last pass (CM.effSpeed); s: the lever as read; now:
+-- the sim clock. Returns (eff to use, the cap when it bites).
+function CM.hostCapacityCap(eff, applied, s, now)
+	if not eff or eff <= 0 then CM.capWin = nil; return eff, nil end
+	if CM.governorOff and CM.governorOff() then CM.hostCap = nil; CM.capWin = nil; return eff, nil end
+	local wall = os.time()
+	local step = CM.stepOf and CM.stepOf(now) or math.floor((now or 0) / (K.SIM_STEP or 0.2) + 0.5)
+	-- a window measures ONE applied speed with the lever running: anything else restarts it
+	if not applied or applied <= 0 or (s ~= nil and s == 0) or CM.resyncHold
+		or (CM.capWin and CM.capWin.applied ~= applied) then
+		CM.capWin = (applied and applied > 0 and not (s ~= nil and s == 0) and not CM.resyncHold)
+			and { wall = wall, step = step, applied = applied } or nil
+		return CM.hostCap and CM.hostCap < eff and CM.hostCap or eff, CM.hostCap and CM.hostCap < eff and CM.hostCap or nil
+	end
+	if not CM.capWin then CM.capWin = { wall = wall, step = step, applied = applied } end
+	local dt = wall - CM.capWin.wall
+	if dt >= K.CAP_WINDOW_S then
+		local expected = 5 * applied * dt
+		local got = step - CM.capWin.step
+		local r = expected > 0 and got / expected or 1
+		CM.capWin = { wall = wall, step = step, applied = applied }
+		CM.capLast = r
+		if r < K.CAP_LOW then
 			CM.capStretched = (CM.capStretched or 0) + 1
 			CM.capOkSince = nil
 			if CM.capStretched >= K.CAP_SAMPLES then
-				local can = math.floor(lever * 200000 / base)
+				local can = math.floor(applied * r)
 				if can < 1 then can = 1 end
 				if not CM.hostCap or can < CM.hostCap then
 					CM.hostCap = can
-					log(string.format("SPEED2: the host keeps up with %dx (lever %d: a batch takes %d ms of its 200) -- the session is capped there", can, lever, math.floor(base / 1000)))
+					local base = CM.hostPace()
+					log(string.format("SPEED2: the host keeps up with %dx (%d of %d steps in %d s at %gx%s) -- the session is capped there",
+						can, got, math.floor(expected + 0.5), dt, applied, base and string.format(", the engine's interval reads %d ms", math.floor(base / 1000)) or ""))
 				end
 			end
 		else
 			CM.capStretched = 0
 			if CM.hostCap then
-				CM.capOkSince = CM.capOkSince or (CM.ticks or 0)
-				if (CM.ticks or 0) - CM.capOkSince >= K.CAP_UP_TICKS then
+				CM.capOkSince = CM.capOkSince or wall
+				if wall - CM.capOkSince >= K.CAP_UP_S then
 					CM.capOkSince = nil
 					if CM.hostCap < eff then
 						CM.hostCap = CM.hostCap + 1
@@ -1059,7 +1080,7 @@ function CM.paceV2(now)
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
 		if CM.spdReqInForce then eff = req; why = "/speed request" end
 		-- the host's own machine first: what it sustains caps the votes and the request
-		local capped, capAt = CM.hostCapacityCap(eff)
+		local capped, capAt = CM.hostCapacityCap(eff, CM.effSpeed, s, now)
 		if capAt then eff = capped; why = string.format("the host keeps up with %dx", capAt) end
 		-- the governor works under the votes (or the request): the slowest peer sets the pace
 		local governed = CM.governSpeed(now, eff)

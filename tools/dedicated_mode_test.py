@@ -34,7 +34,7 @@ def check(name, cond, extra=""):
 
 # ---- the menu DLL
 for key in ("dedicated", "dedicated_save", "dedicated_lobby", "dedicated_name", "dedicated_password", "dedicated_public",
-            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render", "dedicated_nowsi", "dedicated_fps"):
+            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render", "dedicated_nowsi", "dedicated_fps", "dedicated_pin_batch"):
     check(f"ReadFlags parses {key}=", f'!strcmp(line, "{key}")' in MENU)
 check("dedicated_save refuses path parts and quotes", 'strpbrk(v, "\\\\/:*?\\"<>|")' in MENU)
 check("dedicated_password refuses blanks and quotes (it is an argument)",
@@ -51,7 +51,7 @@ check("no load while one is pending or the native side is busy",
       "InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()" in tick)
 check("world up -> the game's own autosave every dedicated_autosave_min, never during a native operation",
       "ForceAutosave()" in tick and "g_flagDedAutosaveMin * 60000ULL" in tick and "!NativeIo::Busy()" in tick)
-check("the mod is told (mp_dedicated.txt: dedicated=1, empty_speed=)", 'L"%smp_dedicated.txt"' in tick and 'empty_speed=%d' in tick)
+check("the mod is told (mp_dedicated.txt: dedicated=1, empty_speed=, pin_batch=)", 'L"%smp_dedicated.txt"' in tick and 'empty_speed=%d' in tick and 'pin_batch=%d' in tick)
 check("the tick runs by the clock, not per present", "if (now - lastTick < 1000) return;" in tick and "% 60" not in tick)
 sub = re.search(r"static VkResult VKAPI_CALL mySubmit\(.*?\n\}\n", MENU, re.S)
 check("dedicated_render=0: vkQueueSubmit is intercepted and its command buffers taken out", bool(sub)

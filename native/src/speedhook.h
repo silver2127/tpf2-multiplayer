@@ -29,4 +29,11 @@ uint64_t SpeedHook_Frames();
 // The engine's own batch interval (microseconds; 200000 when it keeps up, longer
 // when a batch of `lever` iterations costs more than that) and the lever.
 void SpeedHook_Pace(long* engineBaseUs, int* lever);
+// Pin the batch interval (microseconds; 0 = off). The engine stretches its 200 ms
+// interval to the wall time it measured for the last batch, and on a VPS with CPU
+// steal that estimate sits at 300-400 ms while the sim thread is half idle: the
+// world then runs at half speed for nobody's benefit. Pinned, the engine is asked
+// for a batch every `us` and achieves what the CPU allows. A fractional target
+// scales the pin instead of the engine's estimate.
+void SpeedHook_SetPin(long us);
 int SpeedHook_LastCount();

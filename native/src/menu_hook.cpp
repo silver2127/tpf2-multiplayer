@@ -294,6 +294,7 @@ static const double NORENDER_FPS = 60.0;     // the frame rate the engine's per-
 // needs only 5 batches a second; every headless frame beyond that is scene
 // prep for nobody on the thread that hands the sim its batches (2026-09-18).
 static int g_flagDedFps = 30;
+static int g_flagDedPinBatch = 1;             // dedicated_pin_batch=0|1: 1 (default) pins the engine's batch interval at 200 ms (tpf2_bridge_mp.dll speedhook)
 static void NullSignal(VkQueue q, VkSemaphore signalSem, VkFence fence, uint32_t waitCount, const VkSemaphore* waitSems);
 static void NullPace(double fps);
 static volatile LONG g_noRender = 0;
@@ -740,6 +741,8 @@ static void ReadFlags()
             if (!strcmp(v, "0")) g_flagDedRender = 0; else if (!strcmp(v, "1")) g_flagDedRender = 1;
         } else if (!strcmp(line, "dedicated_nowsi")) {
             if (!strcmp(v, "0")) g_flagDedNoWsi = 0; else if (!strcmp(v, "1")) g_flagDedNoWsi = 1;
+        } else if (!strcmp(line, "dedicated_pin_batch")) {
+            if (!strcmp(v, "0")) g_flagDedPinBatch = 0; else if (!strcmp(v, "1")) g_flagDedPinBatch = 1;
         } else if (!strcmp(line, "dedicated_fps")) {
             int fv = atoi(v);
             if (digit && fv >= 5 && fv <= 240) g_flagDedFps = fv;
@@ -4050,7 +4053,7 @@ static void DedicatedTick()
         g_dedFileWritten = true;
         wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%smp_dedicated.txt", g_dataDirW);
         FILE* f = _wfsopen(p, L"w", _SH_DENYNO);
-        if (f) { fprintf(f, "dedicated=1\nempty_speed=%d\npause_empty=%d\n", g_flagDedEmptySpeed, g_flagDedEmptySpeed == 0 ? 1 : 0); fclose(f); }
+        if (f) { fprintf(f, "dedicated=1\nempty_speed=%d\npause_empty=%d\npin_batch=%d\n", g_flagDedEmptySpeed, g_flagDedEmptySpeed == 0 ? 1 : 0, g_flagDedPinBatch); fclose(f); }
     }
     const bool world = WorldLoaded();
     // At the title menu, act only once its main page (CreatePage 2 -> g_showOverlay) has

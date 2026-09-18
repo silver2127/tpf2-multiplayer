@@ -520,6 +520,23 @@ static DWORD WINAPI CtlThread(LPVOID)
     while (!g_stopping) {
         Sleep(500);
         PublishEpochReady();
+        // DATADIR\mp_dedicated.txt (the menu DLL writes it in dedicated mode): pin_batch=1
+        // pins the engine's batch interval at its nominal 200 ms (SpeedHook_SetPin)
+        {
+            static ULONGLONG lastDed = 0; static bool pinned = false;
+            const ULONGLONG nowDed = GetTickCount64();
+            if (nowDed - lastDed >= 5000) {
+                lastDed = nowDed;
+                std::string ded;
+                const bool want = ReadSmallFile(g_dataDir + L"mp_dedicated.txt", ded) && ded.find("dedicated=1") != std::string::npos && ded.find("pin_batch=1") != std::string::npos;
+                if (want != pinned) {
+                    pinned = want;
+                    SpeedHook_SetPin(want ? 200000 : 0);
+                    Log(want ? "[speed] dedicated server: the batch interval is pinned at 200 ms (the engine's estimate no longer throttles)\n"
+                             : "[speed] batch interval pin off\n");
+                }
+            }
+        }
         if (ReadSmallFile(g_dataDir + L"tpf2_epoch_request.txt", epochControl) && epochControl != lastEpoch) {
             // Recovery requests require our exact live PID, unlike legacy
             // identity recovery for a Steam sibling process.
