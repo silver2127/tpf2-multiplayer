@@ -2933,9 +2933,28 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if peer["name"] == name:
                 _send_data(sock, address, message)
 
+    def recovery_transfer(sid, blob, files, targets):
+        # The frozen join's and the resync's save carries its mod list like START
+        # GAME's does. It never did: every joiner of a dedicated server heard "the
+        # host cannot read which mods its save needs" (2026-09-18) -- the list was
+        # never asked for, not unreadable. The .sav is the part of the blob its
+        # entry names; None stays None (unknown, said so).
+        mods, off = None, 0
+        for f in files or []:
+            size = int(f.get("size") or 0)
+            if str(f.get("name", "")).endswith(".sav"):
+                mods = modshare.save_mod_list_bytes(bytes(blob[off:off + size]), log)
+                break
+            off += size
+        if mods is None:
+            log("[host] the sync save's mod list could not be read -- the joiner is told, nothing is offered")
+        elif mods:
+            log(f"[host] the sync save needs {len(mods)} mod(s) besides ours: " + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
+        return _HostSaveTransfer(sock, sid, blob, files, targets, io, log, mods=mods)
+
     recovery = HostRecovery(sync_runtime, host_name, io, recovery_send,
         roster_players, lambda: [(a, p["name"]) for a, p in peers.items()],
-        lambda sid, blob, files, targets: _HostSaveTransfer(sock, sid, blob, files, targets, io, log),
+        recovery_transfer,
         available=recovery_supported, unavailable_reason=recovery_unavailable_reason) if sync_runtime is not None and not relay_only else None
 
     def roster_companies():

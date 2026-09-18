@@ -33,6 +33,15 @@ frozen join or a resync resumes at the votes' speed (else the speed the server
 paused from, never 0). Nobody can pause a dedicated server's session -- a
 player's pause press does nothing there, as it does for any joiner.
 
+**What the server sustains.** The engine hands its simulation one batch per
+200 ms and stretches that interval when a batch of `speed` iterations costs
+more; the lever still reads 4 while the world runs at 2 and joiners run ahead.
+The bridge publishes that interval and the leader's pacing caps the session
+speed at what the host actually keeps up with (`SPEED2: the host keeps up
+with 2x ...` in its log), trying one step up after an unstretched minute. This
+applies to any host, not only a dedicated one; `tpf2mp_governor_off.txt`
+disables it with the governor.
+
 Flags (all in `tpf2_menu_flags.txt` next to `tpf2_menu.dll`; see
 [CONFIGURATION.md](CONFIGURATION.md)):
 

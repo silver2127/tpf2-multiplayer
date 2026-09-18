@@ -603,6 +603,68 @@ function CM.governorOff()
 	end
 	return off
 end
+-- HOST CAPACITY (2026-09-18). The engine hands its sim one batch of `lever`
+-- iterations every 200 ms and, when a batch costs more than that, stretches
+-- the interval to what it measured (speedhook.cpp): the lever still reads 4,
+-- the world runs at 2. The bridge publishes that interval once a second
+-- (tpf2_engine_pace.txt: base=<us> lever=<n>). The leader reads it every 25
+-- ticks; three stretched readings in a row (one is a hash stamp or an
+-- autosave) cap the session speed at what the host sustains, a whole number
+-- (a fraction would ride the stretched interval through the dither); an
+-- unstretched minute at the cap tries one step up. The dedicated server at
+-- lever 4 sat at 400 ms and a joiner ran 13 units ahead before this.
+K.CAP_STRETCH_US = 210000
+K.CAP_SAMPLES = 3
+K.CAP_UP_TICKS = 300
+function CM.hostPace()
+	if CM.paceReadAt == (CM.ticks or 0) then return CM.paceBase, CM.paceLever, true end
+	if CM.paceReadAt and (CM.ticks or 0) - CM.paceReadAt < 25 then return CM.paceBase, CM.paceLever, false end
+	CM.paceReadAt = CM.ticks or 0
+	CM.paceBase, CM.paceLever = nil, nil
+	local f = io.open(K.BASE .. "tpf2_engine_pace.txt", "r")
+	if f then
+		local body = f:read("*a") or ""
+		f:close()
+		CM.paceBase = tonumber(body:match("base=(%d+)"))
+		CM.paceLever = tonumber(body:match("lever=(%d+)"))
+	end
+	return CM.paceBase, CM.paceLever, true
+end
+function CM.hostCapacityCap(eff)
+	if not eff or eff <= 0 then return eff, nil end
+	if CM.governorOff and CM.governorOff() then CM.hostCap = nil; return eff, nil end
+	local base, lever, fresh = CM.hostPace()
+	if fresh then
+		if base and lever and lever > 0 and base > K.CAP_STRETCH_US then
+			CM.capStretched = (CM.capStretched or 0) + 1
+			CM.capOkSince = nil
+			if CM.capStretched >= K.CAP_SAMPLES then
+				local can = math.floor(lever * 200000 / base)
+				if can < 1 then can = 1 end
+				if not CM.hostCap or can < CM.hostCap then
+					CM.hostCap = can
+					log(string.format("SPEED2: the host keeps up with %dx (lever %d: a batch takes %d ms of its 200) -- the session is capped there", can, lever, math.floor(base / 1000)))
+				end
+			end
+		else
+			CM.capStretched = 0
+			if CM.hostCap then
+				CM.capOkSince = CM.capOkSince or (CM.ticks or 0)
+				if (CM.ticks or 0) - CM.capOkSince >= K.CAP_UP_TICKS then
+					CM.capOkSince = nil
+					if CM.hostCap < eff then
+						CM.hostCap = CM.hostCap + 1
+						log(string.format("SPEED2: the host kept up for a while -- trying %dx", CM.hostCap))
+					end
+					if CM.hostCap >= eff then CM.hostCap = nil end
+				end
+			end
+		end
+	end
+	if CM.hostCap and CM.hostCap < eff then return CM.hostCap, CM.hostCap end
+	return eff, nil
+end
+
 function CM.governSpeed(now, eff)
 	if not eff or eff <= 0 then CM.govPrevNow, CM.govPrevTick = nil, nil; return eff end
 	if CM.governorOff() then CM.govFactor, CM.govWorst, CM.govWho = 1, 0, nil; return eff end
@@ -996,6 +1058,9 @@ function CM.paceV2(now)
 		local req = CM.speedRequest()
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
 		if CM.spdReqInForce then eff = req; why = "/speed request" end
+		-- the host's own machine first: what it sustains caps the votes and the request
+		local capped, capAt = CM.hostCapacityCap(eff)
+		if capAt then eff = capped; why = string.format("the host keeps up with %dx", capAt) end
 		-- the governor works under the votes (or the request): the slowest peer sets the pace
 		local governed = CM.governSpeed(now, eff)
 		if governed ~= eff then eff = governed; why = string.format("governed: %s is %.1f behind", tostring(CM.govWho or "?"), CM.govWorst or 0) end

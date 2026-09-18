@@ -106,6 +106,11 @@ extern "C" void CGameStepSeen(uint64_t cgame)
     }
 }
 
+void SpeedHook_Pace(long* engineBaseUs, int* lever)
+{
+    if (engineBaseUs) *engineBaseUs = (long)g_engineBase;
+    if (lever) *lever = (int)g_lever;
+}
 // A 12-byte stub within +/-2 GB of the exe so a rel32 call can reach our
 // handler: mov rax, imm64 ; jmp rax.
 static void* AllocNear(uintptr_t anchor)

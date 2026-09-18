@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <cstdio>
+#include <share.h>
 #include <cstdarg>
 #include <cstring>
 #include <string>
@@ -527,6 +528,23 @@ static DWORD WINAPI CtlThread(LPVOID)
             if (owner != std::string::npos) sscanf_s(epochControl.c_str()+owner, "pid=%lu", &pid);
             if (pid == GetCurrentProcessId()) ApplyControl(epochControl);
             lastEpoch = epochControl;
+        }
+        // DATADIR\tpf2_engine_pace.txt, once a second: the engine's own batch interval
+        // and lever, so the leader's pacing (mp/pacing.lua CM.hostCapacityCap) can see
+        // when THIS machine no longer keeps up with the lever (the interval stretches
+        // past 200 ms: a dedicated server at lever 4 sat at 400 ms = 2x, 2026-09-18).
+        {
+            static ULONGLONG lastPace = 0;
+            const ULONGLONG nowPace = GetTickCount64();
+            if (nowPace - lastPace >= 1000) {
+                lastPace = nowPace;
+                long base = 0; int lever = 0;
+                SpeedHook_Pace(&base, &lever);
+                if (base > 0) {
+                    FILE* pf = _wfsopen((g_dataDir + L"tpf2_engine_pace.txt").c_str(), L"w", _SH_DENYNO);
+                    if (pf) { fprintf(pf, "base=%ld lever=%d\n", base, lever); fclose(pf); }
+                }
+            }
         }
         if (!ReadSmallFile(speedPath, curSpeed)) curSpeed.clear();
         if (curSpeed != lastSpeed) {

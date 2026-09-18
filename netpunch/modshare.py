@@ -304,7 +304,9 @@ def _decompress_until(path, marker, tail=64):
     out = bytearray()
     dec = zstandard.ZstdDecompressor().decompressobj()
     scanned = 0
-    with open(path, "rb") as f:
+    # the save's bytes in memory (a sync snapshot) read the same way as a file
+    opener = (lambda: io.BytesIO(path)) if isinstance(path, (bytes, bytearray, memoryview)) else (lambda: open(path, "rb"))
+    with opener() as f:
         while True:
             chunk = f.read(DECOMPRESS_CHUNK)
             if not chunk:
@@ -386,9 +388,20 @@ def save_mod_list(save_path, log=None):
     empty); None if the list could not be READ -- zstandard missing, not a
     save, layout not recognised. A None is UNKNOWN: it means "we cannot tell
     which mods this save needs", never "none". ``log`` hears why."""
+    return _save_mod_list_from(save_path, save_path, log)
+
+
+def save_mod_list_bytes(data, log=None, label="the sync save"):
+    """save_mod_list for a save held in memory (a frozen join's or resync's
+    snapshot): the same answer, the same None for unknown."""
+    return _save_mod_list_from(data, label, log)
+
+
+def _save_mod_list_from(source, label, log):
+    save_path = label
     log = log or (lambda s: None)
     try:
-        head = _decompress_until(save_path, SETTINGS_ANCHOR)
+        head = _decompress_until(source, SETTINGS_ANCHOR)
     except OSError as e:
         log(f"[mods] cannot read the mod list of {save_path}: {e}")
         return None

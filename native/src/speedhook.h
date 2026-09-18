@@ -26,4 +26,7 @@ double SpeedHook_Target();
 
 // Diagnostics: frames seen and the last value handed to the engine.
 uint64_t SpeedHook_Frames();
+// The engine's own batch interval (microseconds; 200000 when it keeps up, longer
+// when a batch of `lever` iterations costs more than that) and the lever.
+void SpeedHook_Pace(long* engineBaseUs, int* lever);
 int SpeedHook_LastCount();
