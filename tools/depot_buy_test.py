@@ -18,7 +18,7 @@ local world, nearby, all, sent, logs = {}, {}, {}, {}, {}
 local scans = 0
 local buySuccess = true
 local CM = {consByKey={}, ticks=10, cmMode="coop"}
-local K = {INSTANCE="a", STRICT_OPS={VBUY=true}}
+local K = {INSTANCE="a", STRICT_OPS={VBUY=true, VLINE=true}}
 function CM.conKey(x,y) return string.format("%.1f/%.1f",x,y) end
 function CM.gameTime() return 100 end
 function CM.stepOf(t) return math.floor(t*5+0.5) end
@@ -30,8 +30,9 @@ api = {
     util={getPlayer=function() return 1 end},
   },
   cmd = {
-    make={buyVehicle=function(who,depot,config) return {who=who,depot=depot} end},
-    sendCommand=function(cmd,cb) sent[#sent+1]=cmd; cb({resultEntity=700},buySuccess) end,
+    make={buyVehicle=function(who,depot,config) return {who=who,depot=depot} end,
+          setLine=function(v,l,s) return {vehicle=v,line=l,stop=s} end},
+    sendCommand=function(cmd,cb) sent[#sent+1]=cmd; cb({resultEntity=700},not cmd.line and buySuccess) end,
   },
 }
 game={interface={getEntities=function(area)
@@ -58,6 +59,14 @@ function H.count() return #sent end
 function H.target() return sent[#sent] and sent[#sent].depot end
 function H.scans() return scans end
 function H.logs() return table.concat(logs,"\n") end
+function H.assign(stop)
+  CM.primedVeh[700]=true
+  world[800]={stops={{},{}}}
+  K.VLINE_RETRY_STEPS=5
+  CM.lineIdFor=function(key) return key=="b:32" and 800 or nil end
+  CM.execVehCmd({op="VLINE",origin="a",armed=1,seq=4,at=100,key="s:700",line="b:32",stop=stop})
+end
+function H.stop() return sent[#sent] and sent[#sent].stop end
 return H
 ''')
 
@@ -128,10 +137,22 @@ def uncancelled():
     assert h.count() == 0 and h.scans() == 0, h.logs()
 
 
+def assignment_diagnostic():
+    for requested, actual in [(-1, 0), (1, 1)]:
+        h = runtime()
+        h.assign(requested)
+        assert h.count() == 1 and h.stop() == actual, h.logs()
+        assert f"line=b:32 stop={actual} requestedStop={requested} success=false" in h.logs(), h.logs()
+        if requested < 0:
+            assert len(h.CM.retryQueue) == 1 and h.CM.retryQueue[1].autoStop == 1
+        else:
+            assert h.CM.retryQueue is None, "explicit stop must not fall back"
+
 
 if __name__ == "__main__":
     for name, test in [("offset geometry, origin and peer, cached batch", offset),
                        ("stale/reused registry entry", stale), ("nearby order and position/type filtering", nearby_order),
                        ("missing, invalid and ambiguous depot", invalid), ("replacement invalidates cache", replacement),
-                       ("uncancelled origin never buys twice", uncancelled)]:
+                       ("uncancelled origin never buys twice", uncancelled),
+                       ("line failure records destination and preserves explicit stop", assignment_diagnostic)]:
         check(name, test)

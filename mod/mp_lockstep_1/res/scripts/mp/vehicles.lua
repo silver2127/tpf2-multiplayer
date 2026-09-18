@@ -685,11 +685,25 @@ function CM.execSetColor(c)
 	if not ok then log("exec VCOLOR error: " .. tostring(err)) end
 end
 
+local pendingLineOrders = {}
 function CM.execVehCmd(c)
-	-- Strict ops replay on the originator ONLY if the slice actually cancelled
-	-- the local command (armed=1). A Reverse left to run natively and then
-	-- replayed is a toggle applied twice.
+	-- A delayed automatic assignment must not undo a newer player order.
+	if c.op == "VLINE" and c.key then
+		if c.lineStarted then
+			if pendingLineOrders[c.key] ~= c then return end
+		else
+			c.lineStarted = true
+			pendingLineOrders[c.key] = c
+		end
+	elseif c.op == "VDEPOT" and c.key then
+		pendingLineOrders[c.key] = nil
+	elseif c.op == "VSELL" then
+		for key in tostring(c.keys or ""):gmatch("[^,]+") do pendingLineOrders[key] = nil end
+	end
+	-- Even an uncancelled local order supersedes a pending automatic search,
+	-- but it must not be applied twice (Reverse, for example, is a toggle).
 	if c.origin == K.INSTANCE and (not K.STRICT_OPS[c.op] or tonumber(c.armed or 1) == 0) then
+		if c.op == "VLINE" and c.key then pendingLineOrders[c.key] = nil end
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
 		return
 	end
@@ -779,23 +793,29 @@ function CM.execVehCmd(c)
 				return
 			end
 			if id and line then
-				-- Types, because a wrong one here surfaced as an unreadable Lua
-				-- error ("execVLINE error: function: 0000018D4AC0FF60") with
-				-- nothing to say which argument was wrong.
-				-- A stop of -1 means "engine, pick one", which is what the UI sends when a
-				-- vehicle is assigned without choosing a stop -- the normal way a TRAIN is
-				-- assigned. Replaying it verbatim had the engine refuse the command every
-				-- time (EXEC VLINE ... success=false), and because the slice has already
-				-- cancelled the player's own SetLine, the assignment was simply lost --
-				-- "I can't set a line on a train" (2026-09-03). Buses were unaffected
-				-- because the UI ships a real stop index for them. Clamp to the first stop:
-				-- deterministic, since every instance clamps identically.
+				-- The script API refused -1 in earlier tests. For automatic selection
+				-- try stops in line order, on agreed steps. Stop 0 alone is insufficient:
+				-- a real train from the Spitzkehre depot failed at 0 and succeeded at 1.
+				-- Explicit player-selected stops must never fall back to another stop.
 				local stopIx = tonumber(c.stop) or 0
-				if stopIx < 0 then stopIx = 0 end
+				if stopIx < 0 then
+					stopIx = c.autoStop or 0
+					local lc = api.engine.getComponent(line, api.type.ComponentType.LINE)
+					local count = lc and lc.stops and #lc.stops or 0
+					c.autoStopCount = math.min(c.autoStopCount or count, count)
+					if stopIx >= c.autoStopCount then
+						pendingLineOrders[c.key] = nil
+						log(string.format("VLINE seq=%s: no remaining stop on line %s -- unassigned", tostring(c.seq), tostring(c.line)))
+						return
+					end
+				end
 				local okMake, made = pcall(api.cmd.make.setLine, id, line, stopIx)
 				if okMake and made then
-					cmds[#cmds + 1] = { made, "setLine " .. tostring(c.key) }
+					cmds[#cmds + 1] = { made, "setLine " .. tostring(c.key)
+						.. " line=" .. tostring(c.line) .. " stop=" .. tostring(stopIx)
+						.. " requestedStop=" .. tostring(c.stop), nil, stopIx }
 				else
+					pendingLineOrders[c.key] = nil
 					log(string.format("VLINE seq=%s: setLine(%s:%s, %s:%s, %s) refused by the maker: %s",
 						tostring(c.seq), type(id), tostring(id), type(line), tostring(line),
 						tostring(stopIx), tostring(made)))
@@ -804,6 +824,7 @@ function CM.execVehCmd(c)
 		end
 		for _, pair in ipairs(cmds) do
 			local what, vid = pair[2], pair[3]
+			local attemptedStop = pair[4]
 			local sentTick = CM.ticks
 			api.cmd.sendCommand(pair[1], function(res, success)
 				local why = string.format(" step=%d +%d ticks", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick)
@@ -821,6 +842,21 @@ function CM.execVehCmd(c)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s %s success=%s%s",
 					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), what, tostring(success), why))
 				if success and c.op == "VSELL" and vid then forgetVehicle(vid) end
+				if success and CM.actionSoundSuccess then pcall(CM.actionSoundSuccess, c) end
+				if c.op == "VLINE" and pendingLineOrders[c.key] == c then
+					if not success and (tonumber(c.stop) or 0) < 0
+							and attemptedStop + 1 < (c.autoStopCount or 0) then
+						c.autoStop = attemptedStop + 1
+						-- Never dispatch from a callback or use local frame/game time.
+						c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+						CM.retryQueue = CM.retryQueue or {}
+						CM.retryQueue[#CM.retryQueue + 1] = c
+						log(string.format("VLINE seq=%s: trying stop %d on line %s at step %d",
+							tostring(c.seq), c.autoStop, tostring(c.line), c.notBeforeStep))
+					else
+						pendingLineOrders[c.key] = nil
+					end
+				end
 			end)
 		end
 	end)
@@ -936,11 +972,11 @@ end
 -- later in pollVehKeys), and a poll-time setLine would land on a frame-tick-dependent
 -- step. Instead every instance queues the same VLINE at the buy's stamp, due a fixed
 -- BIND_GUARD_STEPS later; VLINE already retries an unbound key on fixed steps. Its own
--- seq (+0.5) keeps it apart from the buy in the executed set. Stop 0, not the game's
--- -1: the engine refuses -1 for trains (see VLINE), and every instance clamps alike.
+-- seq (+0.5) keeps it apart from the buy in the executed set. Automatic stop
+-- selection follows the same bounded stop search as a player's VLINE.
 function CM.queueCloneAssign(c, key)
 	local vl = { op = "VLINE", at = c.at, origin = c.origin, seq = (tonumber(c.seq) or 0) + 0.5,
-	             key = key, line = tostring(c.cline), stop = 0, armed = 1,
+	             key = key, line = tostring(c.cline), stop = -1, armed = 1,
 	             notBeforeStep = CM.stepOf(c.at) + K.BIND_GUARD_STEPS }
 	if c.company then vl.company = c.company end
 	CM.retryQueue = CM.retryQueue or {}
@@ -1087,6 +1123,7 @@ function CM.execVBuy(c)
 					tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success),
 					retry and " (as our own player)" or "", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
 				if success then
+					if CM.actionSoundSuccess then pcall(CM.actionSoundSuccess, c) end
 					-- buyVehicle is entity-returning (same shape VREPL reads): bind
 					-- this key to THAT entity, not to whichever new id sorts first
 					local nid = nil
@@ -1172,6 +1209,7 @@ function CM.execVReplace(c)
 				.. "result=%s success=%s",
 				tostring(seq), tostring(origin), tostring(at), key, tostring(veh), u,
 				tostring(nid), tostring(success)))
+			if success and CM.actionSoundSuccess then pcall(CM.actionSoundSuccess, c) end
 			if success and nid and nid > 0 and nid ~= veh then
 				forgetVehicle(veh)          -- the old id is dead; ids get reused
 				registerVehKey(key, nid)

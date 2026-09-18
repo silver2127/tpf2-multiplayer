@@ -99,6 +99,43 @@ the player bulldozes it.
 
 Not replicated: stop/start a vehicle, manual departure, "depart now", maintenance targets.
 
+Cancelled local vehicle actions restore their original confirmation sounds through
+`action_sounds.lua`: buy (including clones), sell, assign line, send to depot and replace.
+Only successful replay callbacks enqueue audio; uncancelled actions retain their native
+UI feedback, and remote actions remain silent. Batch sales produce one confirmation per
+command. Engine-to-GUI save/load sync carries a bounded cosmetic event history, never
+network packets or simulation RNG. Initial audio state is deterministic and load/save
+preserves it exactly: the engine compares ScriptSave across internal game states at
+startup. A fresh GUI establishes a silent baseline, so saved confirmations do not
+play again after loading or resync. The GUI uses
+the game's [GameUI.playSoundEffect API](https://wiki.transportfever2.com/api/modules/api.gui.html)
+and sound-effect names from `soundeffectsutil.lua`; an audio error does not affect replay.
+New-line creation retains its existing native callback; ambient and vehicle-running audio
+are unchanged. Offline coverage: `tools/action_sounds_test.py`; audible verification pending.
+
+Purchase lookup validates the construction's transform position, file and depot children,
+including cached ids. On a registry/local-query miss it scans constructions globally and
+matches the same position key and file. This covers depots whose model geometry is offset
+from the construction origin (the UEP catenary terminal was missing from the old 6 m query).
+Fallback results are cached separately from construction edit state and revalidated on
+each purchase; ambiguous query results are refused. `tools/depot_buy_test.py` exercises
+the replay with mocked spatial queries, stale ids and neighboring depot types.
+
+Line replay logs the destination line key, requested stop and applied stop on both success
+and failure. Automatic stop selection (`-1`, including clones) tries the stops in line
+order until one succeeds. An engine rejection schedules the next stop via the existing
+retry queue, five simulation steps after the previous agreed target, without changing
+the command stamp or dispatching from its callback. Each stop is tried at most once;
+the initial stop count bounds the search, and a shortened line reduces that bound.
+Explicit stop selections never fall back. A newer assignment, depot order or sale
+invalidates the old search, including callbacks still outstanding.
+
+An actual train on `Holz 1` rejected stop 0 and accepted stop 1, then left its depot.
+`tools/vehicle_line_choice_test.py` reproduces this at the mocked engine boundary and
+checks host/peer target steps, exhaustion, clones, delayed callbacks and superseding
+orders. The complete automatic fallback still needs a multiplayer game test; matching
+retry targets do not repair differences in peers' route topology or engine results.
+
 ## Lines
 
 | action | mode | wire | notes |

@@ -628,6 +628,7 @@ CM.boot("mp.cons")
 -- ---------- vehicles: cross-peer identity, names/colours, vehicle commands, buy, replace ----------
 -- Lives in res/scripts/mp/vehicles.lua.
 CM.boot("mp.vehicles")
+CM.boot("mp.action_sounds")
 -- ---------- lines: cross-peer identity, create/update/delete ----------
 -- Lives in res/scripts/mp/lines.lua.
 CM.boot("mp.lines")
@@ -1326,10 +1327,12 @@ function data()
 			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
 			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
 			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
+			         actionSounds = CM.actionSoundsSave and CM.actionSoundsSave() or nil,
 			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
 			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and s.actionSounds and CM.actionSoundsLoad then pcall(CM.actionSoundsLoad, s.actionSounds) end
 			if type(s) == "table" and tonumber(s.savedAt) and CM.savedAt == nil then CM.savedAt = tonumber(s.savedAt) end
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
@@ -1366,6 +1369,7 @@ function data()
 			if CM.dedicatedGui then
 				if guiTick % 300 ~= 0 then return end
 			else
+				if CM.actionSoundsGuiTick then pcall(CM.actionSoundsGuiTick, CM.recoveryGuiHeld()) end
 				-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
 				-- the panel's own twice-a-second refresh
 				if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
