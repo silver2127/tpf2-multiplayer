@@ -64,7 +64,7 @@ has to be reachable directly when the master is unreachable, or when both ends s
 behind symmetric NAT or CGNAT. A dedicated relay does not poll: its port is open.
 
 **Joiner.** `netpunch.exe join <code>` decodes the code, observes its own socket (no
-UPnP), and sends HELLO every 100 ms to the host's candidates, LAN first, until an ACK
+UPnP), and sends HELLO every 100 ms to the host's candidates, VPN adapter first when the host has one (Hamachi 25.0.0.0/8 or Tailscale 100.64.0.0/10, or `TPF2MP_VPN_IP`; carried as a trailing field of the code, so two players on one virtual LAN connect without any NAT), then LAN, until an ACK
 echoes its token or 40 s pass. Punching is the fallback: a host whose port is open (UPnP,
 a forward) answers within a second and nothing else happens. If there is no answer after
 4 s, the joiner **knocks**: every 2 s it posts its own

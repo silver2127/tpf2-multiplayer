@@ -30,6 +30,11 @@ Code format (base32 of a compact binary blob, ~45-55 chars)
     [v6]         2-byte port + (10 bytes low-order if 6to4-derived else 16 bytes)
 The 6to4 trick: a 2002:VVVV:VVVV:... address embeds the public IPv4 in its top
 48 bits, so when public_v4 is also present we ship only the low 80 bits.
+    [vpn_v4]     4-byte IPv4 + 2-byte port, TRAILING (after every flagged field
+    [vpn2_v4]    and the secret): the host's VPN adapters (Hamachi 25/8 first,
+                 then Tailscale 100.64/10, or TPF2MP_VPN_IP). Every flag bit is
+                 taken, so these ride as a 6- or 12-byte tail; readers from
+                 before it ignore the tail.
 """
 
 from __future__ import annotations
@@ -188,6 +193,10 @@ def encode_profile(profile, secret=None, password=None):
             raise ValueError("secret must be 12 bytes")
         b0 |= _P_SEC
         body += bytes(secret)
+    for key in ("vpn_v4", "vpn2_v4"):   # trailing fields, see the module docstring
+        vpn = parse_hostport(cand.get(key))
+        if vpn:
+            body += socket.inet_aton(vpn[0]) + struct.pack("!H", vpn[1])
     ts = int(time.time())
     if password:
         blob = _lock(bytes([b0]) + body, ts, password)
@@ -245,11 +254,17 @@ def decode_code(code, password=None):
         v6 = f"[{socket.inet_ntop(socket.AF_INET6, v6bytes)}]:{port}"
 
     secret = take(SECRET_LEN) if b0 & _P_SEC else None
+    vpns = []
+    if len(blob) - off in (6, 12):      # the trailing VPN candidates
+        while len(blob) - off >= 6:
+            ip = socket.inet_ntoa(take(4))
+            vpns.append(f"{ip}:{struct.unpack('!H', take(2))[0]}")
+    vpn, vpn2 = (vpns + [None, None])[:2]
     age = int(time.time()) - ts
     return {
         "secret": secret,
         "locked": locked,
-        "candidates": {"lan_v4": lan, "public_v4": pub, "v6": v6},
+        "candidates": {"lan_v4": lan, "public_v4": pub, "v6": v6, "vpn_v4": vpn, "vpn2_v4": vpn2},
         "flags": {
             "open": bool(b0 & _F_OPEN),
             "symmetric": bool(b0 & _F_SYM),
@@ -336,7 +351,10 @@ def _targets_v4(peer, mine=None):
     peer_pub = parse_hostport(peer["candidates"].get("public_v4"))
     same_nat = bool(my_pub and peer_pub and my_pub == peer_pub[0]
                     and peer["candidates"].get("lan_v4"))
-    keys = ("lan_v4",) if same_nat else ("lan_v4", "public_v4")
+    # A VPN adapter address (Hamachi, Tailscale) goes first: when both ends
+    # are on the same virtual network it is a direct path with no NAT at all,
+    # the one that works where the punch cannot (CGNAT host, symmetric joiner).
+    keys = ("vpn_v4", "vpn2_v4", "lan_v4") if same_nat else ("vpn_v4", "vpn2_v4", "lan_v4", "public_v4")
     if same_nat:
         log("[race] peer shares our public address -> same NAT, dialling LAN only")
     out = []
@@ -501,13 +519,14 @@ def selftest():
     samples = [
         {"candidates": {"lan_v4": "192.168.1.20:29471",
                         "public_v4": "198.51.100.77:29471",
-                        "v6": "[2002:c633:644d:1::1000]:29471"},
+                        "v6": "[2002:c633:644d:1::1000]:29471",
+                        "vpn_v4": "25.37.84.221:29471", "vpn2_v4": "100.92.122.123:29471"},
          "flags": {"open": True, "symmetric": False, "cgnat": False, "v6": True}},
         {"candidates": {"lan_v4": "10.0.0.5:5000", "public_v4": None,
-                        "v6": "[2001:db8:9b::1925:45e6]:5000"},
+                        "v6": "[2001:db8:9b::1925:45e6]:5000", "vpn_v4": None, "vpn2_v4": None},
          "flags": {"open": False, "symmetric": True, "cgnat": True, "v6": True}},
         {"candidates": {"lan_v4": None, "public_v4": "203.0.113.9:1234",
-                        "v6": None},
+                        "v6": None, "vpn_v4": "100.92.122.123:1234", "vpn2_v4": None},
          "flags": {"open": True, "symmetric": False, "cgnat": False, "v6": False}},
     ]
     for i, s in enumerate(samples):
@@ -521,6 +540,23 @@ def selftest():
             ok = False
             print(f"           in ={s['candidates']} {s['flags']}")
             print(f"           out={d['candidates']} {d['flags']}")
+
+    # --- the VPN tail: with a secret, without one, and its place in the dial list ---
+    sec = bytes(range(12))
+    d = decode_code(encode_profile(samples[0], secret=sec))
+    tail_ok = d["secret"] == sec and d["candidates"]["vpn_v4"] == "25.37.84.221:29471"
+    d = decode_code(encode_profile(samples[1], secret=sec))
+    tail_ok = tail_ok and d["secret"] == sec and d["candidates"]["vpn_v4"] is None
+    # a code written without the tail (an older client) decodes as before
+    legacy = {"candidates": dict(samples[0]["candidates"], vpn_v4=None, vpn2_v4=None), "flags": samples[0]["flags"]}
+    tail_ok = tail_ok and decode_code(encode_profile(legacy))["candidates"]["vpn_v4"] is None
+    order = _targets_v4(decode_code(encode_profile(samples[0])), None)
+    tail_ok = tail_ok and order == [("25.37.84.221", 29471), ("100.92.122.123", 29471), ("192.168.1.20", 29471), ("198.51.100.77", 29471)]
+    same = {"candidates": {"public_v4": "198.51.100.77:1", "lan_v4": None, "v6": None}, "flags": {}}
+    order = _targets_v4(decode_code(encode_profile(samples[0])), same)
+    tail_ok = tail_ok and order == [("25.37.84.221", 29471), ("100.92.122.123", 29471), ("192.168.1.20", 29471)]
+    print(f"[selftest] vpn tail + dial order: {'OK' if tail_ok else 'FAIL'}")
+    ok = ok and tail_ok
 
     # --- stale detection ---
     old = encode_profile(samples[0])
