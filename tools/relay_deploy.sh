@@ -11,6 +11,10 @@
 # server on the same box (tools/server) uses the defaults for its own bridge, and the
 # two must not exchange frames (2026-09-18).
 set -e
+# RETIRED 2026-09-18: the relay-only lobby is replaced by the dedicated game server
+# (tools/server, tpf2server). The VPS unit tpf2mp-relay is stopped and disabled; this
+# script stays for a future relay and refuses to run unless RELAY_RETIRED_OK=1 is set.
+if [ "${RELAY_RETIRED_OK:-0}" != 1 ]; then echo "the relay-only lobby is retired (2026-09-18); set RELAY_RETIRED_OK=1 to deploy one anyway"; exit 3; fi
 HOST="${1:-root@76.13.109.115}"
 LOBBY="${2:-Dedicated Test Server All Welcome}"
 PORT="${3:-29471}"
