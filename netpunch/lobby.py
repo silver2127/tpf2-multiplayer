@@ -2536,8 +2536,12 @@ _SSL_CTX = [None]
 
 def _master_ssl_context():
     if _SSL_CTX[0] is None:
-        from roots import ssl_context
-        _SSL_CTX[0] = ssl_context()
+        try:
+            from roots import ssl_context
+            _SSL_CTX[0] = ssl_context()
+        except ImportError:                    # a deploy that shipped lobby.py without roots.py
+            import ssl
+            _SSL_CTX[0] = ssl.create_default_context()
     return _SSL_CTX[0]
 
 
