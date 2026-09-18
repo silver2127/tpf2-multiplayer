@@ -84,8 +84,8 @@ EOF
     done
     ;;
 start)   systemctl start tpf2mp-game ;;
-stop)    systemctl stop tpf2mp-game; pkill -f TransportFever2.exe 2>/dev/null || true ;;
-restart) systemctl restart tpf2mp-game; pkill -f TransportFever2.exe 2>/dev/null || true ;;
+stop)    systemctl stop tpf2mp-game; pkill -f "^[A-Za-z]:.*TransportFever2.exe" 2>/dev/null || true ;;
+restart) systemctl restart tpf2mp-game; pkill -f "^[A-Za-z]:.*TransportFever2.exe" 2>/dev/null || true ;;
 logs)    tail -n "${1:-40}" "$GAME_DIR/tpf2_menu.log" ;;
 code)    grep -a "^CODE=" "$NETDIR/lobby_proc.log" | tail -1 ;;
 say)
