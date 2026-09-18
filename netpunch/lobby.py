@@ -3889,10 +3889,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if u is not None and u.failed:
                     log("[relay] the leader's upload failed -- waiting for a new START")
                     upload[0] = None
-                elif u is not None and u.complete and u.mods_satisfied and transfer[0] is None and not getattr(u, "handed", False):
+                elif u is not None and u.complete and transfer[0] is None and not getattr(u, "handed", False):
+                    # The relay runs no game, so it "lacks" every mod a save
+                    # names and mods_satisfied never turns true here: the leader
+                    # is never asked for a mods round toward the relay. Waiting
+                    # for it left every completed upload unhanded, and every
+                    # joiner arriving after the leader's first periodic upload
+                    # waited for a save that never came (2026-09-18, three
+                    # players in a row). The joiners settle the mods they lack
+                    # with the leader as before; the relay hands the world on.
                     u.handed = True
                     path = os.path.join(io.dir, INCOMING_BASENAME + ".sav")
-                    log(f"[relay] upload complete -> pushing {path} to the waiting peers")
+                    log(f"[relay] upload complete -> pushing {path} to the waiting peers"
+                        + ("" if u.mods_satisfied else f" (the save names {len(u.need)} mod(s) the relay does not hold; the joiners sort those out)"))
                     begin_save_transfer(path)
             if transfer[0] is None and pending_start[0] is not None:
                 queued, pending_start[0] = pending_start[0], None
