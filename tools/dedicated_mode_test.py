@@ -34,7 +34,7 @@ def check(name, cond, extra=""):
 
 # ---- the menu DLL
 for key in ("dedicated", "dedicated_save", "dedicated_lobby", "dedicated_name", "dedicated_password", "dedicated_public",
-            "dedicated_companies", "dedicated_autosave_min", "dedicated_pause_empty", "dedicated_port"):
+            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port"):
     check(f"ReadFlags parses {key}=", f'!strcmp(line, "{key}")' in MENU)
 check("dedicated_save refuses path parts and quotes", 'strpbrk(v, "\\\\/:*?\\"<>|")' in MENU)
 check("dedicated_password refuses blanks and quotes (it is an argument)",
@@ -51,7 +51,8 @@ check("no load while one is pending or the native side is busy",
       "InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()" in tick)
 check("world up -> the game's own autosave every dedicated_autosave_min, never during a native operation",
       "ForceAutosave()" in tick and "g_flagDedAutosaveMin * 60000ULL" in tick and "!NativeIo::Busy()" in tick)
-check("the mod is told (mp_dedicated.txt: dedicated=1, pause_empty=)", 'L"%smp_dedicated.txt"' in tick and 'pause_empty=%d' in tick)
+check("the mod is told (mp_dedicated.txt: dedicated=1, empty_speed=)", 'L"%smp_dedicated.txt"' in tick and 'empty_speed=%d' in tick)
+check("the tick runs by the clock, not per present", "if (now - lastTick < 1000) return;" in tick and "% 60" not in tick)
 check("the host command line carries --dedicated", 'if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");' in MENU)
 check("and --local-port from dedicated_port (a box that also runs the relay)", 'L" --local-port %d", g_flagDedPort' in MENU)
 check("the public list labels a dedicated game a dedicated server",
@@ -112,7 +113,7 @@ return T
     # no file: an ordinary game, the rule is off
     held, s = T.tick(400, False, False)
     check("without mp_dedicated.txt nothing happens (an ordinary game)", held is False and s == 2 and len(T.speeds) == 0)
-    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\npause_empty=1\n")
+    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\nempty_speed=0\n")
     T.CM.dedCfgAt = None
     held, s = T.tick(1, False, False)
     check("alone at speed 2: paused once, the speed remembered", held is True and s == 0 and T.CM.dedResume == 2
@@ -136,12 +137,31 @@ return T
     T.CM.ticks = 0; T.CM.dedPaused = False; T.setSpeed(3)
     held, s = T.tick(50, False, False)
     check("right after a load the load gate keeps the clock (no pause below LOADGATE_MIN_TICKS)", s == 3 and held is False)
-    # pause_empty=0: never
-    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\npause_empty=0\n")
-    T.CM.dedCfgAt = None; T.CM.ticks = 1000
+    # empty_speed=1 (the default): alone, the world runs at 1x, whatever the lever read
+    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\nempty_speed=1\n")
+    T.CM.dedCfgAt = None; T.CM.ticks = 1000; T.CM.dedPaused = False
     n = len(T.speeds)
-    held, s = T.tick(400, False, False)
-    check("pause_empty=0: the server keeps simulating while empty", s == 3 and len(T.speeds) == n)
+    held, s = T.tick(1, False, False)
+    check("empty_speed=1: alone at 3, the world goes to 1x once, 3 remembered",
+          held is True and s == 1 and T.CM.dedResume == 3 and len(T.speeds) == n + 1 and T.speeds[n + 1] == "1:dedicated server: nobody is here, 1x", str(T.speeds[n + 1]))
+    held, s = T.tick(300, False, False)
+    check("and stays there without repeating the command", s == 1 and len(T.speeds) == n + 1)
+    T.setSpeed(0)   # something else moved the lever (a released hold, a load)
+    held, s = T.tick(30, False, False)
+    check("a lever moved under it goes back to 1x", s == 1 and len(T.speeds) == n + 2)
+    T.CM.voteSpeed = L.eval("function() return 2 end")
+    held, s = T.tick(1, True, False)
+    check("somebody in: the votes' speed", held is False and s == 2 and T.speeds[n + 3] == "2:dedicated server: a player is in")
+    T.CM.voteSpeed = L.eval("function() return nil end")
+    # the older DLL's file: pause_empty=1 is empty_speed 0, pause_empty=0 is 1
+    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\npause_empty=1\n")
+    T.CM.dedCfgAt = None; T.CM.dedPaused = False; T.setSpeed(3)
+    held, s = T.tick(1, False, False)
+    check("an older DLL's pause_empty=1 still pauses", s == 0 and T.CM.dedEmptySpeed == 0)
+    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\npause_empty=0\n")
+    T.CM.dedCfgAt = None; T.CM.dedPaused = False; T.setSpeed(3)
+    held, s = T.tick(1, False, False)
+    check("an older DLL's pause_empty=0 runs at 1x", s == 1 and T.CM.dedEmptySpeed == 1)
     # the resume speed: a found 0 becomes the vote, else the remembered speed, else 1; a found speed stands
     T.CM.dedicated = True; T.CM.voteSpeed = L.eval("function() return nil end"); T.CM.dedResume = None
     check("no vote, nothing remembered: 1", T.CM.dedicatedResumeSpeed(0) == 1)

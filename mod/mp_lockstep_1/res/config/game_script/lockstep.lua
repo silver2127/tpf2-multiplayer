@@ -1351,6 +1351,29 @@ function data()
 			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
 			if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
 			if guiTick % 30 ~= 0 then return end
+			-- A DEDICATED SERVER LOOKS AT THE GROUND (2026-09-18). Headless means a
+			-- software renderer (lavapipe on the VPS): it drew the whole town the save's
+			-- camera looked at, six llvmpipe threads at 180% CPU, and the sim -- which
+			-- advances per frame -- crawled (skew -3 behind a single joiner at 4x). Once
+			-- per world: the camera goes close to the ground, straight down, where it
+			-- already is; a few square metres of terrain are nothing to draw.
+			if not CM.dedCamDone and guiTick >= 60 then
+				CM.dedCamDone = true
+				local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+				local body = f and (f:read("*a") or "") or ""
+				if f then f:close() end
+				if body:find("dedicated=1", 1, true) then
+					local cam
+					local ok, err = pcall(function()
+						cam = game.gui.getCamera()
+						local x, y = tonumber(cam[1]) or 0, tonumber(cam[2]) or 0
+						game.gui.setCamera({ x, y, 20, tonumber(cam[4]) or 0, -1.5 })
+					end)
+					print(string.format("[ls-gui] dedicated: camera to the ground -- was %s,%s d=%s a=%s,%s: %s",
+						tostring(cam and cam[1]), tostring(cam and cam[2]), tostring(cam and cam[3]), tostring(cam and cam[4]), tostring(cam and cam[5]),
+						ok and "ok" or tostring(err)))
+				end
+			end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
 				-- (Window, Table, TextView, BoxLayout), so the dashboard is built

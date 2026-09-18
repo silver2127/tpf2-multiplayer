@@ -59,7 +59,7 @@ setting at its default.
 | `dedicated_public` | 1 | `0`, `1` | Listed on the master server. |
 | `dedicated_companies` | 0 | `0`, `1` | SEPARATE COMPANIES: the lobby gives each player their own company. |
 | `dedicated_autosave_min` | 10 | 0-600 | The game's own autosave this often while a world is up; 0 never. A restart loads the newest save. |
-| `dedicated_pause_empty` | 1 | `0`, `1` | The world pauses while nobody else is in and resumes at that speed when someone joins. |
+| `dedicated_empty_speed` | 1 | `0`..`4` | The world's speed while nobody else is in (0 = paused); when someone joins it resumes at the players' votes. `dedicated_pause_empty=1` is the older spelling of 0. |
 | `dedicated_port` | 0 | 1024-65535 | The lobby's UDP/TCP port (0: the default 29471). A box that also runs the dedicated relay needs another. |
 | `automod` | on | a line starting `automod=0` | Stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
 | `sharedstations` | on | a line starting `sharedstations=0` | Read by the slice DLL, not the menu. Off leaves the line editor's owner check alone, so in companies mode another company's station cannot be put on your line (see SHARED_INFRA.md). |

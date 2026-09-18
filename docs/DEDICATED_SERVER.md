@@ -22,8 +22,8 @@ then kept in **offline mode**, which lets the same account play online elsewhere
 
 A crash to the title menu leaves the lobby (as for any player) and the first row hosts
 again. The mod's half (`mp/pacing.lua`, told through `mp_dedicated.txt`): with
-`dedicated_pause_empty=1` the world pauses when the last other player leaves and
-resumes when one arrives.
+`dedicated_empty_speed=N` the world runs at N (1x by default, 0 = paused) when the
+last other player leaves, and resumes at the players' votes when one arrives.
 
 **Speed.** Nobody stands at the server's controls, so the server has no vote and
 its own lever is never read as a player's pause. The players' speed votes (the
@@ -45,7 +45,7 @@ dedicated_password=                  # empty = open
 dedicated_public=1
 dedicated_companies=1                # each player their own company
 dedicated_autosave_min=10
-dedicated_pause_empty=1
+dedicated_empty_speed=1              # while nobody else is in; 0 = paused
 ```
 
 ## A server on Linux (the Windows game under Proton)

@@ -1116,35 +1116,53 @@ end
 -- tpf2_menu_flags.txt dedicated=1) with pause_empty=1 stands still while nobody
 -- else is in: a world simulating for no one only burns the server's CPU and
 -- ages the towns. Read every 300 ticks (the file is written once, at start).
+-- Reads mp_dedicated.txt (the menu DLL writes it): CM.dedicated, and the speed
+-- the world runs at while nobody else is in (CM.dedEmptySpeed: 0 = paused;
+-- 1x by default since 2026-09-18, the user: "keep the server at speed 1 when no
+-- players are online"). An older DLL writes pause_empty= only: 1 = 0, else 1.
+-- Returns true when the rule has something to do (a dedicated server).
 function CM.dedicatedPauseEmpty()
-	if CM.dedCfgAt and (CM.ticks or 0) - CM.dedCfgAt < 300 then return CM.dedPauseEmpty end
+	if CM.dedCfgAt and (CM.ticks or 0) - CM.dedCfgAt < 300 then return CM.dedicated == true end
 	CM.dedCfgAt = CM.ticks or 0
-	CM.dedPauseEmpty = false
+	CM.dedicated, CM.dedEmptySpeed = false, 1
 	local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
 	if f then
 		local body = f:read("*a") or ""
 		f:close()
 		CM.dedicated = body:find("dedicated=1", 1, true) ~= nil
-		CM.dedPauseEmpty = CM.dedicated and body:find("pause_empty=1", 1, true) ~= nil
+		local es = tonumber(body:match("empty_speed=(%d)"))
+		if es == nil then es = body:find("pause_empty=1", 1, true) and 0 or 1 end
+		CM.dedEmptySpeed = math.max(0, math.min(4, es))
 	end
-	return CM.dedPauseEmpty
+	CM.dedPauseEmpty = CM.dedicated and CM.dedEmptySpeed == 0
+	return CM.dedicated == true
 end
 
--- The pause itself. Alone: stop the clock once (remembering the speed for the
--- resume). Somebody in: give the speed back once. Never during a world
--- operation's hold (the frozen join that brings the newcomer in owns the clock
--- then; resync.lua hands it CM.dedResume as the speed to resume at, because the
--- speed it finds is our 0). Returns true while it holds the world paused.
+-- The empty-world speed. Alone: the world runs at CM.dedEmptySpeed (put back
+-- whenever something else moved the lever -- nobody stands at the server's
+-- controls), or stands still when that is 0; the speed it left is remembered for
+-- the resume. Somebody in: give the speed back once (the votes, else the
+-- remembered speed). Never during a world operation's hold (the frozen join that
+-- brings the newcomer in owns the clock then; resync.lua asks
+-- CM.dedicatedResumeSpeed for the speed to resume at, because the speed it finds
+-- is ours). Returns true while the rule owns the lever (alone).
 function CM.dedicatedTick()
 	if not CM.dedicatedPauseEmpty() or CM.resyncHold then return false end
 	local others = CM.othersPresent and CM.othersPresent()
 	local s
 	pcall(function() s = game.interface.getGameSpeed() end)
 	if not others then
-		if not CM.dedPaused and s and s > 0 and (CM.ticks or 0) >= (K.LOADGATE_MIN_TICKS or 0) then
-			CM.dedResume = s
-			CM.dedPaused = true
-			CM.setSpeed(0, "dedicated server: nobody is here")
+		if s and (CM.ticks or 0) >= (K.LOADGATE_MIN_TICKS or 0) then
+			local want = CM.dedEmptySpeed or 1
+			if not CM.dedPaused then
+				if s > 0 then CM.dedResume = s end
+				CM.dedPaused = true
+				if s ~= want then CM.setSpeed(want, want == 0 and "dedicated server: nobody is here" or string.format("dedicated server: nobody is here, %dx", want)) end
+			elseif s ~= want and (CM.ticks or 0) - (CM.dedEmptySetAt or -1000) >= 25 then
+				-- the lever moved under us (a load, a released hold): back to the empty speed
+				CM.dedEmptySetAt = CM.ticks or 0
+				CM.setSpeed(want, string.format("dedicated server: nobody is here, %dx", want))
+			end
 		end
 		return CM.dedPaused == true
 	end

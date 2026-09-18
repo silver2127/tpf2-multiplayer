@@ -646,7 +646,7 @@ static char  g_flagDedPassword[40] = "";    // dedicated_password=<lobby passwor
 static int   g_flagDedPublic = 1;           // dedicated_public=0|1: listed on the master server
 static int   g_flagDedCompanies = 0;        // dedicated_companies=0|1: SEPARATE COMPANIES (a company per player)
 static int   g_flagDedAutosaveMin = 10;     // dedicated_autosave_min=<n>, 0-600: the game's own autosave this often (0 = never)
-static int   g_flagDedPauseEmpty = 1;       // dedicated_pause_empty=0|1: the world stands still while nobody else is in
+static int   g_flagDedEmptySpeed = 1;       // dedicated_empty_speed=0..4: the world's speed while nobody else is in (0 = paused); dedicated_pause_empty=1 is 0
 static int   g_flagDedPort = 0;             // dedicated_port=<udp/tcp port> for the lobby (0 = the default 29471); a box that also runs the relay needs another
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
 static volatile LONG g_joinFreeze = 0;   // roster join_freeze: the lobby brings a late joiner in through a world sync (everyone reloads); this DLL takes no hot-join save (2026-09-16)
@@ -691,8 +691,12 @@ static void ReadFlags()
         } else if (!strcmp(line, "dedicated_autosave_min")) {
             int m = atoi(v);
             if (digit && m >= 0 && m <= 600) g_flagDedAutosaveMin = m;
+        } else if (!strcmp(line, "dedicated_empty_speed")) {
+            int es = atoi(v);
+            if (digit && es >= 0 && es <= 4) g_flagDedEmptySpeed = es;
         } else if (!strcmp(line, "dedicated_pause_empty")) {
-            if (!strcmp(v, "0")) g_flagDedPauseEmpty = 0; else if (!strcmp(v, "1")) g_flagDedPauseEmpty = 1;
+            // the older flag: 1 = paused while empty; 0 = the (old) "keep simulating" = 1x
+            if (!strcmp(v, "0")) g_flagDedEmptySpeed = 1; else if (!strcmp(v, "1")) g_flagDedEmptySpeed = 0;
         } else if (!strcmp(line, "dedicated_port")) {
             int pt = atoi(v);
             if (digit && pt >= 1024 && pt <= 65535) g_flagDedPort = pt;
@@ -710,9 +714,9 @@ static void ReadFlags()
     fclose(f);
     Log("[menu] flags: slot=%d scale=%.2f autoload=%d relay_autosave_min=%d\n", g_flagSlot, g_flagScale, g_flagAutoLoad, g_flagRelayAutosaveMin);
     if (g_flagDedicated)
-        Log("[dedicated] on: save='%s' lobby='%s' name='%s' password=%s public=%d companies=%d autosave_min=%d pause_empty=%d port=%d\n",
+        Log("[dedicated] on: save='%s' lobby='%s' name='%s' password=%s public=%d companies=%d autosave_min=%d empty_speed=%d port=%d\n",
             g_flagDedSave, g_flagDedLobby, g_flagDedName, g_flagDedPassword[0] ? "yes" : "no", g_flagDedPublic,
-            g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedPauseEmpty, g_flagDedPort);
+            g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedEmptySpeed, g_flagDedPort);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -3873,15 +3877,16 @@ static const ULONGLONG DED_LOAD_MIN_UPTIME_MS = 45000;   // and this long before
 static void DedicatedTick()
 {
     if (!g_flagDedicated) return;
-    static LONG frames = 0;
-    if ((InterlockedIncrement(&frames) % 60) != 0) return;
     const ULONGLONG now = GetTickCount64();
+    static ULONGLONG lastTick = 0;
+    if (now - lastTick < 1000) return;   // by the clock: on a software renderer 60 presents of the title menu took minutes
+    lastTick = now;
     if (!g_dedFileWritten) {
         // the mod's half: pause while nobody else is in (mp/pacing.lua CM.dedicatedPauseEmpty)
         g_dedFileWritten = true;
         wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%smp_dedicated.txt", g_dataDirW);
         FILE* f = _wfsopen(p, L"w", _SH_DENYNO);
-        if (f) { fprintf(f, "dedicated=1\npause_empty=%d\n", g_flagDedPauseEmpty); fclose(f); }
+        if (f) { fprintf(f, "dedicated=1\nempty_speed=%d\npause_empty=%d\n", g_flagDedEmptySpeed, g_flagDedEmptySpeed == 0 ? 1 : 0); fclose(f); }
     }
     const bool world = WorldLoaded();
     // At the title menu, act only once its main page (CreatePage 2 -> g_showOverlay) has

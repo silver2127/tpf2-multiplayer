@@ -14,7 +14,9 @@ set -eu
 ENV=/etc/tpf2mp/server.env
 [ -f "$ENV" ] && . "$ENV"
 : "${DISPLAY:=:9}" "${LOBBY_PORT:=29472}" "${LOBBY_NAME:=Dedicated Server}" "${SERVER_NAME:=Server}" "${LOBBY_PASSWORD:=}"
-: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${PAUSE_EMPTY:=1}" "${MOD_RELEASE:=}" "${MASTER_URL:=}"
+: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${EMPTY_SPEED:=1}" "${MOD_RELEASE:=}" "${MASTER_URL:=}"
+# the older setting: PAUSE_EMPTY=1 is EMPTY_SPEED=0
+[ "${PAUSE_EMPTY:-}" = 1 ] && EMPTY_SPEED=0
 : "${STEAM_ROOT:=/home/tpf2server/.steam/steam}"
 : "${GAME_DIR:=$STEAM_ROOT/steamapps/common/Transport Fever 2}"
 NETDIR="$GAME_DIR/netpunch"
@@ -49,7 +51,7 @@ dedicated_password=$LOBBY_PASSWORD
 dedicated_public=1
 dedicated_companies=$COMPANIES
 dedicated_autosave_min=$AUTOSAVE_MIN
-dedicated_pause_empty=$PAUSE_EMPTY
+dedicated_empty_speed=$EMPTY_SPEED
 dedicated_port=$LOBBY_PORT
 autoload=1
 ${MASTER_URL:+master_url=$MASTER_URL}
@@ -63,9 +65,13 @@ EOF
 import re, sys
 p = sys.argv[1]
 t = open(p, encoding="utf-8").read()
-want = {"fullscreen": "false", "windowSize": "{ 640, 480, }", "vsync": "false", "resolutionScale": "0.5",
-        "shadowQuality": "0", "textureQuality": "0", "numSamples": "1", "anisotropicFiltering": "0",
-        "masterVolume": "0", "musicVolume": "0", "soundVolume": "0",
+want = {"fullscreen": "false", "screenMode": '"WINDOW"', "windowSize": "{ 640, 480, }", "fullscreenSize": "{ 640, 480, }",
+        "vsync": "false", "resolutionScale": "0.5", "viewportScale": "1",
+        "shadowQuality": "0", "textureQuality": "0", "numSamples": "1", "anisotropicFiltering": "0", "maxDegreeOfAnisotropy": "1",
+        "geometryQuality": "0", "grassQuality": "0", "bloomQuality": "0", "terrainTextureQuality": "0",
+        "terrainTesselationEnabled": "false", "useSsao": "false", "useReflection": "false", "useHdr": "false",
+        "terrainTriplanarDistance": "0",
+        "masterVolume": "0", "musicVolume": "0", "soundVolume": "0", "musicEnabled": "false", "menuMusicEnabled": "false",
         # the news popup ("DO NOT SHOW AGAIN") keeps the title page from being built until it is
         # dismissed, and the choice is written only on a clean exit -- which a server never has.
         # 7 is the Autumn 2026 update's id; the game shows the popup again for a higher one.
