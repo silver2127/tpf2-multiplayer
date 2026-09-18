@@ -477,6 +477,13 @@ static bool InitRender(VkSwapchainKHR sc)
 // ---- multiplayer panel state ----
 static volatile LONG g_recoveryPresent = 0;
 static volatile LONG g_recoveryWorldIo = 0;
+// THE PANEL STAYS UP WHILE A WORLD LOADS (2026-09-18, user): with a lobby running,
+// the loading screen (CreatePage 16) keeps the lobby view -- the roster with what
+// every player is doing (receiving the save N%, loading world N%, catching up).
+// It is drawn even during a native save/load (the frozen join is one) but takes
+// no clicks then; when the world is up it hands over to the in-game panel, open,
+// so the catch-up is visible too, until the player closes it.
+static volatile LONG g_loadingPanel = 0;
 static ULONGLONG g_recoveryRequestedAt = 0; // guarded by g_modelCs
 static char g_recoveryOperation[40] = "", g_recoveryEpoch[40] = "";
 static char g_recoveryPhase[24] = "", g_recoveryDetail[420] = "", g_recoveryFailedStep[24] = "";
@@ -1962,11 +1969,21 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         InterlockedCompareExchange(&g_showOverlay, 0, 0), pi->swapchainCount,
         (int)g_rInit, (int)g_rFail, g_dev, g_qfam, (int)g_scFormat);
     __try {
-        if ((InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && !g_recoveryWorldIo && !NativeIo::Busy() && pi->swapchainCount >= 1) {
+        const bool loadingPanel = InterlockedCompareExchange(&g_loadingPanel, 0, 0) != 0;
+        if (loadingPanel && WorldLoaded()) {
+            // the world is up: the loading view hands over to the in-game panel, open
+            InterlockedExchange(&g_loadingPanel, 0);
+            InterlockedExchange(&g_showOverlay, 0);
+            InterlockedExchange(&g_ingameOverlay, 1);
+            InterlockedExchange(&g_uiState, 2);
+            InterlockedExchange(&g_panelDirty, 1);
+        }
+        const bool quiet = !g_recoveryWorldIo && !NativeIo::Busy();
+        if ((InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && (quiet || loadingPanel) && pi->swapchainCount >= 1) {
             VkSwapchainKHR sc = pi->pSwapchains[0];
             uint32_t idx = pi->pImageIndices[0];
             if ((!g_rInit || sc != g_theSc) && !g_rFail) InitRender(sc);
-            if (g_rInit && !g_rFail && sc == g_theSc) { DrawButton(q, idx); PollClick(); }
+            if (g_rInit && !g_rFail && sc == g_theSc) { DrawButton(q, idx); if (quiet) PollClick(); }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static bool once = false;
@@ -4120,6 +4137,7 @@ static void MyCreatePage(uint64_t thisp, int page)
         }
         g_gameUi = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
+        InterlockedExchange(&g_loadingPanel, 0);
         // Keep recovery reachable at the title menu after a failed load.
         if (InterlockedCompareExchange(&g_recoveryPresent, 0, 0) && g_modelCsInit) {
             EnterCriticalSection(&g_modelCs);
@@ -4128,7 +4146,14 @@ static void MyCreatePage(uint64_t thisp, int page)
             if (open) { InterlockedExchange(&g_uiState, 3); InterlockedExchange(&g_panelDirty, 1); }
         }
     }
-    else if (page >= 3) InterlockedExchange(&g_showOverlay, 0);
+    else if (page == 16 && LobbyRunning()) {
+        InterlockedExchange(&g_showOverlay, 1);
+        InterlockedExchange(&g_loadingPanel, 1);
+        if (InterlockedCompareExchange(&g_uiState, 0, 0) != 2) InterlockedExchange(&g_uiState, 2);
+        InterlockedExchange(&g_panelDirty, 1);
+        Log("[menu] loading screen with a lobby running -- the panel stays up with the roster\n");
+    }
+    else if (page >= 3) { InterlockedExchange(&g_showOverlay, 0); InterlockedExchange(&g_loadingPanel, 0); }
     static int seen = 0;
     if (seen < 30) { seen++; Log("[menu] CreatePage page=%d show=%ld\n", page,
         InterlockedCompareExchange(&g_showOverlay, 0, 0)); }
