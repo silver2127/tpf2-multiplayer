@@ -986,21 +986,41 @@ static bool httpGet(const char* url, char* out, int n)
     uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 512;
     if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return false;
     bool ok = false; out[0] = 0;
+    // 2026-09-18: a player's browser answered "no response" 99 times out of 99
+    // while his own lobby.py published to the same host over Python: the
+    // failure was silent (no error code) and the 5 s budget covered one
+    // address family. The master has an AAAA record, so a machine whose IPv6
+    // routes nowhere spent the whole budget on the v6 connect. Now: IPv6 fast
+    // fallback (the connect races both families), a longer budget, the
+    // WinHTTP error code in the note the panel shows, and one retry.
+    // WINHTTP_OPTION_IPV6_FAST_FALLBACK is 140 (Windows 10 1709+); an older
+    // WinHTTP just refuses the option.
     HINTERNET s = WinHttpOpen(L"tpf2mp-menu/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s) return false;
-    WinHttpSetTimeouts(s, 5000, 5000, 5000, 5000);
-    HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
-    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
-    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
-        DWORD st = 0, sl = sizeof(st);
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
-        int got = 0; DWORD rd = 0;
-        while (got < n - 1 && WinHttpReadData(r, out + got, (DWORD)(n - 1 - got), &rd) && rd) got += (int)rd;
-        out[got] = 0; ok = (st == 200);
-        if (!ok) snprintf(out, n, "HTTP %lu", (unsigned long)st);
+    if (!s) { snprintf(out, n, "winhttp open error %lu", (unsigned long)GetLastError()); return false; }
+    { DWORD on = 1; WinHttpSetOption(s, 140 /* WINHTTP_OPTION_IPV6_FAST_FALLBACK */, &on, sizeof(on)); }
+    WinHttpSetTimeouts(s, 8000, 10000, 10000, 10000);   // resolve, connect, send, receive
+    DWORD err = 0; const char* stage = "";
+    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+        HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
+        HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
+        if (!c) { err = GetLastError(); stage = "connect"; }
+        else if (!r) { err = GetLastError(); stage = "request"; }
+        else if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) { err = GetLastError(); stage = "send"; }
+        else if (!WinHttpReceiveResponse(r, nullptr)) { err = GetLastError(); stage = "receive"; }
+        else {
+            DWORD st = 0, sl = sizeof(st);
+            WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
+            int got = 0; DWORD rd = 0;
+            while (got < n - 1 && WinHttpReadData(r, out + got, (DWORD)(n - 1 - got), &rd) && rd) got += (int)rd;
+            out[got] = 0; ok = (st == 200);
+            if (!ok) { snprintf(out, n, "HTTP %lu", (unsigned long)st); err = 0; stage = ""; }
+        }
+        if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c);
+        if (!ok && stage[0] && attempt == 0) Log("[menu] server browser: %s failed (winhttp %lu), retrying", stage, (unsigned long)err);
     }
-    if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+    WinHttpCloseHandle(s);
+    if (!ok && stage[0]) snprintf(out, n, "winhttp %lu at %s", (unsigned long)err, stage);   // 12002 timeout, 12007 no such host, 12029 cannot connect
     return ok;
 }
 static DWORD WINAPI PubFetchThread(LPVOID)
