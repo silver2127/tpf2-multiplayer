@@ -1,4 +1,4 @@
-# TpF2 Multiplayer
+# TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
