@@ -2284,6 +2284,7 @@ class _ClientSaveReceiver:
             return
         written = res.get("written", [])
         self.complete = True
+        self.complete_at = time.time()
         self.save_done = True                    # a mods round may follow (still needs the player's yes)
         self.io.emit({"type": "transfer", "role": "recv", "pct": 100})
         self.io.emit({"type": "save_ready", "name": INCOMING_BASENAME,
@@ -2841,6 +2842,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return letters[name]
 
     HOTJOIN_STORED_MAX = 180.0                # a late joiner is served from the stored world when it is this fresh
+    RELAY_MODS_GRACE = 8.0                    # seconds a completed upload waits for the leader's mods round before it goes out
 
     session_epoch = [0.0]                     # when the current session's world left the relay (resume push)
 
@@ -3993,15 +3995,20 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if u is not None and u.failed:
                     log("[relay] the leader's upload failed -- waiting for a new START")
                     upload[0] = None
-                elif u is not None and u.complete and transfer[0] is None and not getattr(u, "handed", False):
+                elif u is not None and u.complete and transfer[0] is None and not getattr(u, "handed", False) \
+                        and (u.mods_satisfied or now - getattr(u, "complete_at", now) >= RELAY_MODS_GRACE):
                     # The relay runs no game, so it "lacks" every mod a save
-                    # names and mods_satisfied never turns true here: the leader
-                    # is never asked for a mods round toward the relay. Waiting
-                    # for it left every completed upload unhanded, and every
-                    # joiner arriving after the leader's first periodic upload
-                    # waited for a save that never came (2026-09-18, three
-                    # players in a row). The joiners settle the mods they lack
-                    # with the leader as before; the relay hands the world on.
+                    # names; a leader that shares mods follows the save with a
+                    # mods round into the relay's cache (mods_satisfied), a leader
+                    # that cannot (share_mods=never, a mod it does not have) never
+                    # does. Waiting for the round left every such upload unhanded,
+                    # and every joiner arriving after the leader's first periodic
+                    # upload waited for a save that never came (2026-09-18, three
+                    # players in a row). Handing off at once instead raced a
+                    # leader that DOES send mods: its round hit "still pushing the
+                    # previous save" (relay_mod_download_test). So: the round gets
+                    # RELAY_MODS_GRACE seconds to begin, then the world goes out
+                    # and the joiners settle their mods with the leader.
                     u.handed = True
                     path = os.path.join(io.dir, INCOMING_BASENAME + ".sav")
                     log(f"[relay] upload complete -> pushing {path} to the waiting peers"
@@ -4013,15 +4020,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if transfer[0] is None and preflight_requests:
                 a, wanted = preflight_requests.popitem()
                 if a in peers and wanted:
-                    blob, meta = bytearray(), []
+                    blob, meta, missing = bytearray(), [], []
                     for m,v in wanted:
-                        folder=modshare.find_mod(m,v)
                         data=mod_package(m,v)
-                        if data is None: break
+                        if data is None:
+                            # say WHICH and WHY: this rejection logged nothing and named
+                            # nothing, and a host with its Workshop mods in another
+                            # Steam library looked exactly like one that refused (2026-09-18)
+                            why = ("DLC, never transferred" if modshare.is_dlc(m)
+                                   else "mod sharing is off here (share_mods=never)" if not SHARE_MODS[0]
+                                   else "not installed here; looked in " + ", ".join(
+                                       [d for d in modshare.workshop_dirs()] + [modshare.managed_workshop()]) if m.startswith("*")
+                                   else "not installed here (game mods folder, userdata mods)")
+                            missing.append((modshare.mod_folder_name(m, v), why))
+                            continue
                         meta.append({"name":modshare.mod_zip_name(m,v),"size":len(data),"sha256":hashlib.sha256(data).hexdigest()})
                         blob+=data
-                    if len(meta)!=len(wanted):
-                        _send_data(sock,a,{"t":"reject","reason":"The host cannot supply all required mods."})
+                    if missing:
+                        names = ", ".join(n for n, _ in missing)
+                        for n, why in missing:
+                            log(f"[host] cannot supply {n} to {peers[a]['name']!r}: {why}")
+                        _send_data(sock,a,{"t":"reject","reason":f"The host cannot supply {names}: {missing[0][1]}."})
                         del peers[a]
                         roster_changed()
                     else:

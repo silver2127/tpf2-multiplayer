@@ -200,9 +200,38 @@ def request_catalogue():
     return token
 
 
+def library_root():
+    """The Steam LIBRARY that holds the game (<lib>\\steamapps\\common\\Transport
+    Fever 2 -> <lib>), or None. Workshop content lives in the library of the
+    game, not in Steam's own folder: a host with the game on D:\\SteamLibrary
+    keeps its Workshop mods under D:, and looking only under C:\\...\\Steam found
+    none of them -- every joiner got "The host cannot supply all required
+    mods" (2026-09-18)."""
+    g = game_dir()
+    if not g:
+        return None
+    lib = os.path.dirname(os.path.dirname(os.path.dirname(g)))
+    return lib if os.path.isdir(os.path.join(lib, "steamapps")) else None
+
+
+def workshop_dirs():
+    """Every Workshop content folder this game's mods could be in: the game's
+    library first, then Steam's own folder (the same place when the game is
+    installed there)."""
+    out = []
+    for root in (library_root(), steam_root()):
+        if root:
+            p = os.path.join(root, "steamapps", "workshop", "content", TF2_APPID)
+            if p not in out:
+                out.append(p)
+    return out
+
+
 def workshop_dir():
-    root = steam_root()
-    return os.path.join(root, "steamapps", "workshop", "content", TF2_APPID) if root else None
+    """The Workshop content folder of the game's library (the first of
+    workshop_dirs), or None."""
+    dirs = workshop_dirs()
+    return dirs[0] if dirs else None
 
 
 def mod_folder_name(mod_id, version):
@@ -214,7 +243,7 @@ def find_mod(mod_id, version):
     if not valid_mod(mod_id, version):
         return None
     if mod_id.startswith("*"):
-        for w in (workshop_dir(), managed_workshop()):
+        for w in workshop_dirs() + [managed_workshop()]:
             p = w and os.path.join(w, mod_id[1:])
             if p and os.path.isfile(os.path.join(p, "mod.lua")):
                 return p
