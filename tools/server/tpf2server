@@ -14,7 +14,7 @@ set -eu
 ENV=/etc/tpf2mp/server.env
 [ -f "$ENV" ] && . "$ENV"
 : "${DISPLAY:=:9}" "${LOBBY_PORT:=29472}" "${LOBBY_NAME:=Dedicated Server}" "${SERVER_NAME:=Server}" "${LOBBY_PASSWORD:=}"
-: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${PAUSE_EMPTY:=1}" "${MOD_RELEASE:=}"
+: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${PAUSE_EMPTY:=1}" "${MOD_RELEASE:=}" "${MASTER_URL:=}"
 : "${STEAM_ROOT:=/home/tpf2server/.steam/steam}"
 : "${GAME_DIR:=$STEAM_ROOT/steamapps/common/Transport Fever 2}"
 NETDIR="$GAME_DIR/netpunch"
@@ -52,6 +52,7 @@ dedicated_autosave_min=$AUTOSAVE_MIN
 dedicated_pause_empty=$PAUSE_EMPTY
 dedicated_port=$LOBBY_PORT
 autoload=1
+${MASTER_URL:+master_url=$MASTER_URL}
 EOF
     echo "wrote $flags"
     # a headless-sized settings.lua: the smallest window, the lowest graphics, no sound.

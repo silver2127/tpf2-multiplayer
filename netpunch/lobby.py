@@ -2397,7 +2397,7 @@ class _Publisher:
     def __init__(self, url, code, kind, locked, log, stable_key=None):
         self.url = url.rstrip("/")
         self.code = code
-        self.kind = kind if kind in ("relay", "host") else "host"   # listed as its type, never a save name
+        self.kind = kind if kind in ("relay", "host", "dedicated") else "host"   # listed as its type, never a save name
         self.locked = bool(locked)
         self.log = log
         # A STABLE id: derived from the lobby name + port + machine, so a

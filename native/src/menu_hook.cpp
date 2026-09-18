@@ -3849,8 +3849,9 @@ static void LeaveLobby()
 // crash restarts from a fresh world (the newest save is what the next launch
 // loads). A crash to the title menu leaves the lobby (g_leaveOnMenu), and the
 // first state hosts again.
-static ULONGLONG g_dedLastHost = 0, g_dedLastLoad = 0, g_dedLastSave = 0, g_dedWorldUpSince = 0;
+static ULONGLONG g_dedLastHost = 0, g_dedLastLoad = 0, g_dedLastSave = 0, g_dedWorldUpSince = 0, g_dedMenuSince = 0;
 static bool g_dedFileWritten = false;
+static const ULONGLONG DED_MENU_SETTLE_MS = 8000;   // the title menu's main page has been up this long before we act on it
 static void DedicatedTick()
 {
     if (!g_flagDedicated) return;
@@ -3865,6 +3866,15 @@ static void DedicatedTick()
         if (f) { fprintf(f, "dedicated=1\npause_empty=%d\n", g_flagDedPauseEmpty); fclose(f); }
     }
     const bool world = WorldLoaded();
+    // At the title menu, act only once its main page (CreatePage 2 -> g_showOverlay) has
+    // been up for a while. Hosting on the first CMenuUI frame and loading a second later
+    // ran StartSavegame inside the page's own InvokeStoredFunctions and the engine
+    // asserted `!m_isInvoking` (the first run on the VPS, 2026-09-18 16:05).
+    if (!world) {
+        if (!InterlockedCompareExchange(&g_showOverlay, 0, 0)) { g_dedMenuSince = 0; return; }
+        if (!g_dedMenuSince) g_dedMenuSince = now;
+        if (now - g_dedMenuSince < DED_MENU_SETTLE_MS) return;
+    }
     if (!LobbyRunning()) {
         if (world) return;   // a world without a lobby is the moment after a crash to the menu: wait for it
         if (now - g_dedLastHost < 15000) return;

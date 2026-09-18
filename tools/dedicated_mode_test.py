@@ -64,6 +64,8 @@ check("a dedicated game keeps its secret like the relay (a stable code)",
 check("the publisher announces type dedicated",
       '"relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host")' in LOBBY)
 check("the master server labels it", '"dedicated": "dedicated server"' in MASTER)
+check("the publisher does not coerce the type back to host (it did: listed as player hosted, 2026-09-18 16:25)",
+      'kind if kind in ("relay", "host", "dedicated") else "host"' in LOBBY)
 
 # ---- the Lua rule, for real
 m = re.search(r"^function CM\.dedicatedPauseEmpty\(\)\n.*?\n^end\n", PACING, re.S | re.M)
