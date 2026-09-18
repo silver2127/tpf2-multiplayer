@@ -828,6 +828,7 @@ function CM.pollInject()
 						pcall(CM.cmNote, string.format("That side of the road holds company %s's stop -- you cannot replace it", tostring(takenCid or "?")))
 						return
 					end
+					if CM.autoSigCapture then CM.autoSigCapture(fields) end
 					CM.scheduleLocal("STOPADD", fields)
 					log(string.format("STOPX: cancelled %s '%s' on edge %d u=%.3f engine-left=%s geo-left=%s side=%d%s -> STOPADD (strict, every instance replays)",
 						model, name, eid, u, tostring(engLeft), tostring(geoLeft), wside, oneWay and " one-way" or ""))

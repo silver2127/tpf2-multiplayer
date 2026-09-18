@@ -7,6 +7,7 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+require("mp/autosig_compat").bind(CM, K, log)
 -- ---------- roadside stops (edge objects) ----------
 --
 -- A small bus or truck stop placed on a street is not a construction. It is an
@@ -541,6 +542,28 @@ function CM.nativeStopProposal(add, remove, why, onDone)
 				if m2[id] then kept = kept + 1 else lost[#lost + 1] = tostring(id) end
 			end
 		end)
+		if success and add and add.autoSig then
+			-- AutoSig plans centreline positions; the signal model stands off to
+			-- the side. Mark its actual position too, so a later catch-up scan
+			-- cannot mistake our replay for a new local placement.
+			pcall(function()
+				local original = sp.streetProposal.edgesToAdd[1].comp
+				local map = api.engine.system.streetSystem.getNode2TrackEdgeMap()
+				local old = {}; for _, id in ipairs(survivors) do old[id] = true end
+				for _, edgeId in ipairs(map[original.node0] or {}) do
+					local be = api.engine.getComponent(edgeId, api.type.ComponentType.BASE_EDGE)
+					if be and ((be.node0 == original.node0 and be.node1 == original.node1)
+						or (be.node1 == original.node0 and be.node0 == original.node1)) then
+						for _, obj in ipairs(be.objects) do
+							if not old[obj[1]] then
+								local d = describeStop(obj[1], edgeId)
+								if d and d.model == add.model then CM.expectAdd(CM.expectStop, d.x, d.y) end
+							end
+						end
+					end
+				end
+			end)
+		end
 		log(string.format("EXEC %s: %d edge(s)%s%s success=%s%s; survivors kept %d/%d%s", why, #edges,
 			add and " +add" or "", remove and (" -rm " .. tostring(remove.eo)) or "", tostring(success), msg,
 			kept, #survivors, #lost > 0 and (" LOST [" .. table.concat(lost, ",") .. "]") or ""))
@@ -623,6 +646,8 @@ function CM.execStopAdd(c)
 			log(string.format("%s: edge %d: could not read its %d object(s) -- skipped (DIVERGENCE)", tag, eid, n or -1))
 			return
 		end
+		local autoSigObjects = {}
+		for _, obj in ipairs(objs) do autoSigObjects[#autoSigObjects+1] = obj[1] end
 		-- REPLACE: the object the originator's tool removed with this placement
 		local rm = nil
 		if c.rx then
@@ -708,11 +733,15 @@ function CM.execStopAdd(c)
 		end)
 		local okB, why = CM.nativeStopProposal(
 			{ eid = eid, u = u, left = engL, side = side, model = CM.unescName(c.model), name = CM.unescName(c.name),
-			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y, player = ownerPid },
+			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y, player = ownerPid, autoSig = tonumber(c.autosigFollow) == 1 },
 			rm, string.format("%s origin=%s '%s'", tag, tostring(c.origin), CM.unescName(c.name)),
 			function(success, res)
 				CM.conxBusy = false
 				if success and ownerCid then pcall(CM.stopSettleOwner, c, res, ownerCid, ownerPid) end
+				if success and CM.autoSigAfterSeed then
+					local okAuto, whyAuto = pcall(CM.autoSigAfterSeed, c, {comp.node0, comp.node1}, autoSigObjects, engL)
+					if not okAuto then log("AutoSig planning failed: " .. tostring(whyAuto)) end
+				end
 			end)
 		if okB then sent = true else log(string.format("%s: %s -- skipped", tag, tostring(why))) end
 	end)
