@@ -1777,10 +1777,12 @@ class _ClientSaveReceiver:
             return
         if self.preflight:
             self.last_mod_request=time.time()
+            self.first_mod_request=self.last_mod_request
             self._send({"t":"mods_request", "need":list(self.offered)})
         else:
             self._send({"t":"mods_answer", "sid":self.sid, "accept":True})
-        self.log("[client] mod download accepted")
+        shown = ", ".join(self.offered[:8]) + (f", +{len(self.offered)-8} more" if len(self.offered) > 8 else "")
+        self.log(f"[client] mod download accepted -- asking the host for {len(self.offered)} mod(s): {shown}")
 
     def _refusal(self, kind, files):
         """Why this proposed transfer must not be taken, or None."""
@@ -2076,6 +2078,13 @@ class _ClientSaveReceiver:
         if self.preflight and self.approved and not self.active() and not self.catalogue_token and now-self.last_mod_request>1:
             self.last_mod_request=now
             self._send({"t":"mods_request","need":list(self.offered)})
+            first = getattr(self, "first_mod_request", 0) or now
+            if now - first > 20 and not getattr(self, "silence_logged", False):
+                self.silence_logged = True
+                self.log(f"[client] the host has not answered the mod request in {now - first:.0f} s -- still asking every second "
+                         f"(its log says whether it received it and what it is doing)")
+                self.io.emit({"type": "status", "state": "connected",
+                              "detail": "waiting for the host to send the mods (no answer yet)\u2026"})
         if self.catalogue_token:
             token, entries = modshare.catalogue()
             if token == self.catalogue_token:
@@ -3125,6 +3134,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     pending_start = [None]
     serve_hold = [0.0]        # until when the serve-again waits for the host's hot-join save
     mod_round = [None]        # the addrs to start once a mods round resolves
+    pack_job = [None]         # the worker packaging one joiner's mods (see the preflight block)
 
     def broadcast_start(save, only=None):
         """Start everyone currently in the lobby -- or, with ``only`` (a set of
@@ -3538,7 +3548,20 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in (advertised[1] or [])}
             requested=msg.get("need",[])
             if isinstance(requested,list):          # as many as the save needs (a 128 cap until 2026-09-16)
-                preflight_requests[addr]=[allowed[n] for n in requested if isinstance(n,str) and n in allowed]
+                wanted=[allowed[n] for n in requested if isinstance(n,str) and n in allowed]
+                unknown=[n for n in requested if not (isinstance(n,str) and n in allowed)]
+                if addr not in preflight_requests and pack_job[0] is None:
+                    # said once per request round (the joiner repeats it every second until answered)
+                    shown=", ".join(str(n) for n in requested[:6]) + (f", +{len(requested)-6} more" if len(requested) > 6 else "")
+                    log(f"[host] {peers[addr]['name']!r} asks for {len(requested)} mod(s), {len(wanted)} of them in this save's list of {len(allowed)}: {shown}")
+                    if unknown:
+                        log(f"[host] ... {len(unknown)} of those are not in the list this save advertised (a different save since the join?): "
+                            + ", ".join(str(n) for n in unknown[:6]))
+                if wanted:
+                    preflight_requests[addr]=wanted
+                elif requested:
+                    _send_data(sock, addr, {"t": "status", "state": "connected",
+                                            "detail": "the host's save no longer lists the mods you asked for -- rejoin to get the current list"})
             else:
                 log(f"[host] mods_request from {peers[addr]['name']!r} carries no list -- ignored")
         elif t == "mods_answer":
@@ -4017,35 +4040,70 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if transfer[0] is None and pending_start[0] is not None:
                 queued, pending_start[0] = pending_start[0], None
                 handle_command(queued)
-            if transfer[0] is None and preflight_requests:
+            # A joiner's mods are packaged on a WORKER THREAD. Zipping ran in this
+            # loop until 2026-09-18: a host with hundreds of Workshop mods sat
+            # deaf -- no keepalives, no roster, no answer to anyone -- for as
+            # long as the zips took, and nothing said why. The loop keeps
+            # serving; the joiner hears the progress; the result lands here.
+            if transfer[0] is None and pack_job[0] is None and preflight_requests:
                 a, wanted = preflight_requests.popitem()
                 if a in peers and wanted:
-                    blob, meta, missing = bytearray(), [], []
-                    for m,v in wanted:
-                        data=mod_package(m,v)
-                        if data is None:
-                            # say WHICH and WHY: this rejection logged nothing and named
-                            # nothing, and a host with its Workshop mods in another
-                            # Steam library looked exactly like one that refused (2026-09-18)
-                            why = ("DLC, never transferred" if modshare.is_dlc(m)
-                                   else "mod sharing is off here (share_mods=never)" if not SHARE_MODS[0]
-                                   else "not installed here; looked in " + ", ".join(
-                                       [d for d in modshare.workshop_dirs()] + [modshare.managed_workshop()]) if m.startswith("*")
-                                   else "not installed here (game mods folder, userdata mods)")
-                            missing.append((modshare.mod_folder_name(m, v), why))
-                            continue
-                        meta.append({"name":modshare.mod_zip_name(m,v),"size":len(data),"sha256":hashlib.sha256(data).hexdigest()})
-                        blob+=data
-                    if missing:
-                        names = ", ".join(n for n, _ in missing)
-                        for n, why in missing:
-                            log(f"[host] cannot supply {n} to {peers[a]['name']!r}: {why}")
-                        _send_data(sock,a,{"t":"reject","reason":f"The host cannot supply {names}: {missing[0][1]}."})
+                    job = {"addr": a, "name": peers[a]["name"], "wanted": wanted, "blob": bytearray(), "meta": [],
+                           "missing": [], "done": 0, "started": now, "told": 0.0, "finished": False}
+                    shown = ", ".join(modshare.mod_folder_name(m, v) for m, v in wanted[:8]) + (f", +{len(wanted)-8} more" if len(wanted) > 8 else "")
+                    log(f"[host] packaging {len(wanted)} mod(s) for {job['name']!r}: {shown}")
+
+                    def _pack_mods(job=job):
+                        for m, v in job["wanted"]:
+                            try:
+                                data = mod_package(m, v)
+                            except Exception as e:                          # noqa: BLE001
+                                log(f"[host] packaging {modshare.mod_folder_name(m, v)} failed: {e!r}")
+                                data = None
+                            if data is None:
+                                # say WHICH and WHY: this rejection logged nothing and named
+                                # nothing, and a host with its Workshop mods in another
+                                # Steam library looked exactly like one that refused (2026-09-18)
+                                why = ("DLC, never transferred" if modshare.is_dlc(m)
+                                       else "mod sharing is off here (share_mods=never)" if not SHARE_MODS[0]
+                                       else "not installed here; looked in " + ", ".join(
+                                           [d for d in modshare.workshop_dirs()] + [modshare.managed_workshop()]) if m.startswith("*")
+                                       else "not installed here (game mods folder, userdata mods)")
+                                job["missing"].append((modshare.mod_folder_name(m, v), why))
+                            else:
+                                job["meta"].append({"name": modshare.mod_zip_name(m, v), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+                                job["blob"] += data
+                            job["done"] += 1
+                        job["finished"] = True
+
+                    pack_job[0] = job
+                    threading.Thread(target=_pack_mods, name="mod-pack", daemon=True).start()
+            if pack_job[0] is not None:
+                job = pack_job[0]
+                a = job["addr"]
+                if not job["finished"]:
+                    if now - job["told"] >= 2.0 and a in peers:
+                        job["told"] = now
+                        mb = len(job["blob"]) / (1024.0 * 1024.0)
+                        _send_data(sock, a, {"t": "status", "state": "connected",
+                                             "detail": f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])} ({mb:.0f} MB so far)"})
+                else:
+                    pack_job[0] = None
+                    took = now - job["started"]
+                    if a not in peers:
+                        log(f"[host] packaged {len(job['meta'])} mod(s) for {job['name']!r} in {took:.1f} s, but they left")
+                    elif job["missing"]:
+                        names = ", ".join(n for n, _ in job["missing"])
+                        for n, why in job["missing"]:
+                            log(f"[host] cannot supply {n} to {job['name']!r}: {why}")
+                        _send_data(sock, a, {"t": "reject", "reason": f"The host cannot supply {names}: {job['missing'][0][1]}."})
                         del peers[a]
                         roster_changed()
                     else:
-                        mod_preflight[0]=True
-                        transfer[0]=_HostSaveTransfer(sock,int.from_bytes(os.urandom(4), "big"),blob,meta,[(a,peers[a]["name"])],io,log,kind="mods")
+                        mb = len(job["blob"]) / (1024.0 * 1024.0)
+                        log(f"[host] packaged {len(job['meta'])} mod(s) ({mb:.1f} MB) for {job['name']!r} in {took:.1f} s -- sending")
+                        mod_preflight[0] = True
+                        transfer[0] = _HostSaveTransfer(sock, int.from_bytes(os.urandom(4), "big"), job["blob"], job["meta"], [(a, job["name"])], io, log, kind="mods")
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
             #   any FAILED -> failed status naming them, NO start, and the
