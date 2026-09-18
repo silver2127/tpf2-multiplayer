@@ -1346,11 +1346,32 @@ function data()
 		end,
 		guiUpdate = function()
 			guiTick = guiTick + 1
-			-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
-			-- the panel's own twice-a-second refresh
-			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
-			if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
-			if guiTick % 30 ~= 0 then return end
+			-- A DEDICATED SERVER HAS NO SCREEN (2026-09-18): the other players' cursor
+			-- circles, the construction previews and the dashboard are drawn for a player
+			-- who is not there, every frame, on the thread that hands the sim its batches.
+			-- With one joiner in, the server's batch interval crept from 200 to 300 ms at
+			-- lever 1 while its own game-script update stayed under 8 ms. Read once, a
+			-- moment after the world is up; then: no per-frame work, the dashboard every
+			-- 300 ticks (the chat and the players' requests still arrive through it).
+			if CM.dedicatedGui == nil and guiTick >= 30 then
+				CM.dedicatedGui = false
+				local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+				if f then
+					local body = f:read("*a") or ""
+					f:close()
+					CM.dedicatedGui = body:find("dedicated=1", 1, true) ~= nil
+					if CM.dedicatedGui then print("[ls-gui] dedicated server: no cursors, previews or per-frame panel work") end
+				end
+			end
+			if CM.dedicatedGui then
+				if guiTick % 300 ~= 0 then return end
+			else
+				-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
+				-- the panel's own twice-a-second refresh
+				if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
+				if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
+				if guiTick % 30 ~= 0 then return end
+			end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
 				-- (Window, Table, TextView, BoxLayout), so the dashboard is built

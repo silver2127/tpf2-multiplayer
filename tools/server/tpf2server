@@ -14,7 +14,7 @@ set -eu
 ENV=/etc/tpf2mp/server.env
 [ -f "$ENV" ] && . "$ENV"
 : "${DISPLAY:=:9}" "${LOBBY_PORT:=29472}" "${LOBBY_NAME:=Dedicated Server}" "${SERVER_NAME:=Server}" "${LOBBY_PASSWORD:=}"
-: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${EMPTY_SPEED:=1}" "${RENDER:=0}" "${MOD_RELEASE:=}" "${MASTER_URL:=}"
+: "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${EMPTY_SPEED:=1}" "${RENDER:=0}" "${FPS:=30}" "${MOD_RELEASE:=}" "${MASTER_URL:=}"
 # the older setting: PAUSE_EMPTY=1 is EMPTY_SPEED=0
 [ "${PAUSE_EMPTY:-}" = 1 ] && EMPTY_SPEED=0
 : "${STEAM_ROOT:=/home/tpf2server/.steam/steam}"
@@ -53,6 +53,7 @@ dedicated_companies=$COMPANIES
 dedicated_autosave_min=$AUTOSAVE_MIN
 dedicated_empty_speed=$EMPTY_SPEED
 dedicated_render=$RENDER
+dedicated_fps=$FPS
 dedicated_port=$LOBBY_PORT
 autoload=1
 ${MASTER_URL:+master_url=$MASTER_URL}

@@ -34,7 +34,7 @@ def check(name, cond, extra=""):
 
 # ---- the menu DLL
 for key in ("dedicated", "dedicated_save", "dedicated_lobby", "dedicated_name", "dedicated_password", "dedicated_public",
-            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render", "dedicated_nowsi"):
+            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render", "dedicated_nowsi", "dedicated_fps"):
     check(f"ReadFlags parses {key}=", f'!strcmp(line, "{key}")' in MENU)
 check("dedicated_save refuses path parts and quotes", 'strpbrk(v, "\\\\/:*?\\"<>|")' in MENU)
 check("dedicated_password refuses blanks and quotes (it is an argument)",
@@ -65,8 +65,9 @@ check("  ... the swapchain is never acquired from or presented to: acquire answe
       and 'strcmp(name, "vkAcquireNextImageKHR") == 0' in MENU and 'strcmp(name, "vkAcquireNextImage2KHR") == 0' in MENU)
 check("  ... present consumes its wait semaphores and returns without the window system, paced to 60 frames/s",
       "NullSignal(q, VK_NULL_HANDLE, VK_NULL_HANDLE, pi->waitSemaphoreCount, pi->pWaitSemaphores);" in MENU
-      and "static const double NORENDER_FPS = 60.0;" in MENU and "NullPace();" in MENU
-      and MENU.index("NullPace();") < MENU.index("return g_realPresent(q, pi);"))
+      and "static const double NORENDER_FPS = 60.0;" in MENU and "NullPace(NORENDER_FPS);" in MENU
+      and MENU.index("NullPace(NORENDER_FPS);") < MENU.index("return g_realPresent(q, pi);"))
+check("  ... with the window system in place the present is paced to dedicated_fps", "if (NoRender()) NullPace((double)g_flagDedFps);" in MENU)
 check("  ... on by default in dedicated mode, dedicated_render=1 turns drawing back on",
       "static int   g_flagDedRender = 0;" in MENU and "if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);" in MENU)
 check("the host command line carries --dedicated", 'if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");' in MENU)

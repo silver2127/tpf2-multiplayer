@@ -288,9 +288,14 @@ static PFN_vkGetSwapchainImagesKHR g_origGetScImages = nullptr;
 static volatile LONG g_noWsi = 0;            // dedicated_nowsi=1 (opt-in, needs render=0): acquire/present answered here -- crashed the engine on the VPS 2026-09-18 22:42, under study
 static volatile LONG g_nullScCount = 0;      // images in the current swapchain (for the round robin)
 static volatile LONG g_nullScNext = 0;
-static const double NORENDER_FPS = 60.0;     // the frame rate the engine's per-frame stepping assumes
+static const double NORENDER_FPS = 60.0;     // the frame rate the engine's per-frame stepping assumes (the DLL-answered present)
+// dedicated_fps=<n> (default 30): with render=0 and the window system still in
+// place, the present is paced here to this many frames a second. The engine
+// needs only 5 batches a second; every headless frame beyond that is scene
+// prep for nobody on the thread that hands the sim its batches (2026-09-18).
+static int g_flagDedFps = 30;
 static void NullSignal(VkQueue q, VkSemaphore signalSem, VkFence fence, uint32_t waitCount, const VkSemaphore* waitSems);
-static void NullPace();
+static void NullPace(double fps);
 static volatile LONG g_noRender = 0;
 static volatile LONG g_noRenderSubmits = 0, g_noRenderCmdBufs = 0;
 static bool NoRender() { return InterlockedCompareExchange(&g_noRender, 0, 0) != 0; }
@@ -735,6 +740,9 @@ static void ReadFlags()
             if (!strcmp(v, "0")) g_flagDedRender = 0; else if (!strcmp(v, "1")) g_flagDedRender = 1;
         } else if (!strcmp(line, "dedicated_nowsi")) {
             if (!strcmp(v, "0")) g_flagDedNoWsi = 0; else if (!strcmp(v, "1")) g_flagDedNoWsi = 1;
+        } else if (!strcmp(line, "dedicated_fps")) {
+            int fv = atoi(v);
+            if (digit && fv >= 5 && fv <= 240) g_flagDedFps = fv;
         } else if (!strcmp(line, "dedicated_port")) {
             int pt = atoi(v);
             if (digit && pt >= 1024 && pt <= 65535) g_flagDedPort = pt;
@@ -2039,9 +2047,10 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         // report success for every swapchain, pace the loop to NORENDER_FPS
         NullSignal(q, VK_NULL_HANDLE, VK_NULL_HANDLE, pi->waitSemaphoreCount, pi->pWaitSemaphores);
         if (pi->pResults) for (uint32_t i = 0; i < pi->swapchainCount; ++i) pi->pResults[i] = VK_SUCCESS;
-        NullPace();
+        NullPace(NORENDER_FPS);
         return VK_SUCCESS;
     }
+    if (NoRender()) NullPace((double)g_flagDedFps);   // headless with the window system: dedicated_fps
     return g_realPresent(q, pi);
 }
 
@@ -2111,13 +2120,14 @@ static VkResult VKAPI_CALL myAcquire2(VkDevice dev, const VkAcquireNextImageInfo
     if (!NoWsi()) return g_origAcquire2(dev, info, pIndex);
     return NullAcquire(info ? info->semaphore : VK_NULL_HANDLE, info ? info->fence : VK_NULL_HANDLE, pIndex);
 }
-// the frame pace the window system no longer sets: NORENDER_FPS, slept here
-static void NullPace()
+// the frame pace: `fps` frames a second, slept here (the window system's pace,
+// or the lack of one, no longer decides)
+static void NullPace(double fps)
 {
     static LARGE_INTEGER freq{}, next{};
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const LONGLONG period = (LONGLONG)(freq.QuadPart / NORENDER_FPS);
+    const LONGLONG period = (LONGLONG)(freq.QuadPart / (fps > 1.0 ? fps : 1.0));
     if (!next.QuadPart || now.QuadPart > next.QuadPart + 4 * period) next.QuadPart = now.QuadPart;   // first frame, or far behind: restart the grid
     next.QuadPart += period;
     LONGLONG wait = next.QuadPart - now.QuadPart;
@@ -4099,8 +4109,9 @@ static void DedicatedTick()
             const LONG presents = InterlockedCompareExchange(&g_presentCount, 0, 0);
             const double fps = lastAt ? (presents - lastPresents) * 1000.0 / (double)(now - lastAt) : 0.0;
             lastPresents = presents; lastAt = now;
-            Log("[dedicated] no-render: %ld submits, %ld command buffers dropped so far; %.1f frames/s (paced to %.0f, no window system)\n",
-                InterlockedCompareExchange(&g_noRenderSubmits, 0, 0), InterlockedCompareExchange(&g_noRenderCmdBufs, 0, 0), fps, NORENDER_FPS);
+            Log("[dedicated] no-render: %ld submits, %ld command buffers dropped so far; %.1f frames/s (paced to %.0f)\n",
+                InterlockedCompareExchange(&g_noRenderSubmits, 0, 0), InterlockedCompareExchange(&g_noRenderCmdBufs, 0, 0), fps,
+                NoWsi() ? NORENDER_FPS : (double)g_flagDedFps);
         }
     }
     if (g_flagDedAutosaveMin > 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
