@@ -365,11 +365,13 @@ def _targets_v4(peer, mine=None):
     return out
 
 
-def race(sock_v4, peer, role, local_port, timeout, my_has_v6, mine=None):
+def race(sock_v4, peer, role, local_port, timeout, my_has_v6, mine=None, late_targets=None):
     """Fire per-family Connections at the peer's candidates; first wins.
 
     Returns the winning Connection (still live) or None. Losing families are
     closed. ``sock_v4`` is the shared game/STUN socket so the NAT mapping holds.
+    ``late_targets`` is a list the rendezvous knock appends the master's relay
+    port to once the direct dial has gone unanswered (lobby.py).
     """
     conns = []          # list of (family_label, Connection)
     listen = role == "listen"
@@ -377,7 +379,7 @@ def race(sock_v4, peer, role, local_port, timeout, my_has_v6, mine=None):
     # --- IPv4 family (always attempted; reuses the game socket) ---
     v4_targets = [] if listen else _targets_v4(peer, mine)
     v4 = Connection(sock_v4, v4_targets, name="v4", listen=listen,
-                    log=log)
+                    log=log, extra=late_targets)
     conns.append(("v4", v4))
 
     # --- IPv6 family (only if both ends have v6) ---

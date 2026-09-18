@@ -15,6 +15,10 @@ ssh "$HOST" "NAME='$NAME' sh -s" <<'REMOTE'
 set -e
 mkdir -p /opt/tpf2mp
 install -m 0644 /tmp/masterserver.py /opt/tpf2mp/masterserver.py
+# the relay fallback sends from this address (the default route's source) on udp/29600-29699
+IP=$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
+[ -n "$IP" ] || { echo "cannot find this machine's public IPv4"; exit 2; }
+if command -v ufw >/dev/null 2>&1; then ufw allow 29600:29699/udp >/dev/null && echo "ufw: udp/29600-29699 open (relay fallback)"; fi
 id -u tpf2mp >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin tpf2mp
 # desync reports (POST /tpf2mp/desync) are kept here; the service may write nowhere else
 mkdir -p /var/lib/tpf2mp/desync
@@ -27,7 +31,7 @@ After=network.target
 
 [Service]
 User=tpf2mp
-ExecStart=/usr/bin/python3 /opt/tpf2mp/masterserver.py 8471 --desync-dir /var/lib/tpf2mp/desync
+ExecStart=/usr/bin/python3 /opt/tpf2mp/masterserver.py 8471 --desync-dir /var/lib/tpf2mp/desync --relay-ip $IP --relay-ports 29600-29699
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -48,8 +52,6 @@ systemctl restart tpf2mp-master
 # public IPv4 (the default route's source address), so it joins a site already
 # listening on that address. Not getent: /etc/hosts maps the machine's own name
 # to 127.0.1.1, and a listen there serves nobody outside.
-IP=$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
-[ -n "$IP" ] || { echo "cannot find this machine's public IPv4"; exit 2; }
 SITE=/etc/nginx/sites-available/tpf2mp
 WEBROOT=/var/www/tpf2mp-acme
 mkdir -p "$WEBROOT"

@@ -159,6 +159,7 @@ import dual_tcp                            # every sealed frame a second time ov
 import netsim                              # tpf2mp_netsim.txt: loss and delay for one instance, for the rig (2026-09-17)
 import collections
 import hashlib
+import secrets
 import itertools
 import json
 import os
@@ -2486,6 +2487,18 @@ RV_KNOCK_EVERY = 2.0      # joiner: seconds between knocks while it dials
 RV_KNOCK_AFTER = 4.0
 RV_PUNCH_FOR = 15.0       # host: seconds to keep punching toward one knocked address
 RV_PUNCH_EVERY = 0.2      # host: seconds between punch bursts
+# THE RELAY FALLBACK. A host behind CGNAT cannot be punched, and a joiner behind
+# a symmetric NAT cannot be punched toward; the pair had no path at all
+# (2026-09-18). From its second knock on, a joiner still unanswered asks the
+# master for a relay port; the master binds one UDP port for that joiner and
+# tells both ends (the joiner in the reply, the host with the note). Each end
+# sends a bind packet to it, then the port swaps their datagrams verbatim: the
+# frames stay sealed, the master forwards what it cannot read. The joiner adds
+# the port to its dial as one more candidate, so a direct path that answers
+# first still wins, and the host binds every RV_PUNCH_EVERY until that peer is in.
+RV_RELAY_FROM_KNOCK = 2   # the joiner asks for the relay on this knock and after
+RELAY_MAGIC = b"TRLB"
+RELAY_ACK = b"TRLA"
 
 
 def _rv_tag(secret):
@@ -2534,6 +2547,20 @@ class _RendezvousHost:
         self._stop.set()
         self._t.join(timeout=3)
 
+    @staticmethod
+    def relay_from(k):
+        """A knock's relay allocation -> (ip, port, id bytes), or None."""
+        r = k.get("relay") if isinstance(k, dict) else None
+        if not isinstance(r, dict):
+            return None
+        try:
+            ip, port, aid = str(r.get("ip") or ""), int(r.get("port") or 0), bytes.fromhex(str(r.get("id") or ""))
+        except (TypeError, ValueError):
+            return None
+        if not ip or not (0 < port < 65536) or len(aid) != 16:
+            return None
+        return (ip, port, aid)
+
     def targets_from(self, blob_b64):
         """A knock's blob -> [(ip, port), ...], or None if it is not ours."""
         import base64
@@ -2568,6 +2595,11 @@ class _RendezvousHost:
                     t = self.targets_from(str(k.get("blob") or ""))
                     if t:
                         self.log(f"[rendezvous] a joiner knocked: punching toward {t}")
+                        r = self.relay_from(k)
+                        if r:
+                            # a 3-tuple rides in the same list: run_host binds it
+                            self.log(f"[rendezvous] the joiner asked for the master's relay at {r[0]}:{r[1]} -- binding to it")
+                            t = list(t) + [r]
                         self.queue.put(t)
                 if warned:
                     self.log("[rendezvous] master reachable again")
@@ -2585,12 +2617,18 @@ class _RendezvousKnock:
     accepts every one)."""
 
     def __init__(self, url, secret, password, profile_code, log, every=RV_KNOCK_EVERY,
-                 delay=RV_KNOCK_AFTER):
+                 delay=RV_KNOCK_AFTER, sock=None, late=None, relay_from=RV_RELAY_FROM_KNOCK):
         self.url, self.tag, self.log, self.every = url.rstrip("/"), _rv_tag(secret), log, every
         self.delay = delay
         self._sealer = _rv_sealer(secret, password)
         self._plain = profile_code.encode("ascii")
         self.sent = 0
+        # the relay fallback: ``sock`` is the game socket (the bind must come
+        # from the address the HELLOs come from), ``late`` the race's extra
+        # target list; None disables the request
+        self.sock, self.late, self.relay_from = sock, late, relay_from
+        self.nonce = secrets.token_hex(6)
+        self.relay = None                     # (ip, port, id) once the master allocated one
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True, name="knock")
         self._t.start()
@@ -2609,15 +2647,39 @@ class _RendezvousKnock:
         while not self._stop.is_set():
             try:
                 blob = base64.b64encode(self._sealer.seal(self._plain)).decode("ascii")
-                _http_json(self.url + "/knock", {"s": self.tag, "blob": blob})
+                body = {"s": self.tag, "blob": blob}
+                want_relay = self.sock is not None and self.late is not None and self.sent + 1 >= self.relay_from
+                if want_relay:
+                    body["relay"] = 1
+                    body["j"] = self.nonce
+                r = _http_json(self.url + "/knock", body)
                 self.sent += 1
                 if self.sent == 1:
                     self.log("[rendezvous] knocked at the master: the host punches toward us")
+                if want_relay:
+                    self._relay_bind(_RendezvousHost.relay_from(r))
             except Exception as e:                            # noqa: BLE001
                 if not warned:
                     self.log(f"[rendezvous] cannot knock at {self.url} ({e}) -- dialing the host directly only")
                     warned = True
             self._stop.wait(self.every)
+
+    def _relay_bind(self, r):
+        """Bind to the master's relay port and add it to the dial (once)."""
+        if r is None:
+            if self.relay is None and self.sent == self.relay_from:
+                self.log("[rendezvous] the master offers no relay -- the punch is the only fallback")
+            return
+        ip, port, aid = r
+        try:
+            self.sock.sendto(RELAY_MAGIC + aid + b"J", (ip, port))
+        except OSError:
+            return
+        if self.relay is None:
+            self.relay = r
+            if (ip, port) not in self.late:
+                self.late.append((ip, port))
+            self.log(f"[rendezvous] no direct path yet -- the master relays for us at {ip}:{port}, dialling it too")
 
 
 # --------------------------------------------------------------------------- #
@@ -3679,6 +3741,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     last_heal = last_drop = 0.0
     last_serve_check = [0.0]
     punching = {}                           # (ip, port) a joiner knocked from -> punch until
+    relay_binds = {}                        # (ip, port) of a master relay allocation -> (id, bind until)
     last_punch = [0.0]
     punch_token = os.urandom(TOKEN_LEN)     # nobody echoes it back to us; any token opens the NAT
     reject_sent = {}                        # addr -> when we last sent a plain reject
@@ -3766,10 +3829,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 try:
                     while True:
                         for t in punch_q.get_nowait():
-                            punching[(str(t[0]), int(t[1]))] = now + RV_PUNCH_FOR
+                            if len(t) >= 3:
+                                # the master's relay port for a joiner: bind to it
+                                # (TRLB|id|H) until that joiner's frames come through it
+                                relay_binds[(str(t[0]), int(t[1]))] = (bytes(t[2]), now + RV_PUNCH_FOR)
+                            else:
+                                punching[(str(t[0]), int(t[1]))] = now + RV_PUNCH_FOR
                 except queue.Empty:
                     pass
-                if punching and now - last_punch[0] >= RV_PUNCH_EVERY:
+                if (punching or relay_binds) and now - last_punch[0] >= RV_PUNCH_EVERY:
                     last_punch[0] = now
                     for a in list(punching):
                         if punching[a] < now or a in peers:
@@ -3777,6 +3845,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             continue
                         try:
                             sock.sendto(_pack(TYPE_HELLO, punch_token), a)
+                        except OSError:
+                            pass
+                    for a in list(relay_binds):
+                        aid, until = relay_binds[a]
+                        if until < now or a in peers:
+                            del relay_binds[a]
+                            continue
+                        try:
+                            sock.sendto(RELAY_MAGIC + aid + b"H", a)
                         except OSError:
                             pass
 
@@ -4818,11 +4895,13 @@ def cmd_join(args):
     # a host whose port is not really open still gets through (see RENDEZVOUS).
     knock = None
     rv_url = _rv_url(args)
+    late_targets = []                      # the master's relay port, once asked for (see RV_RELAY_FROM_KNOCK)
     if rv_url and profile_code and peer.get("secret"):
-        knock = _RendezvousKnock(rv_url, peer["secret"], args.password or "", profile_code, _log)
+        knock = _RendezvousKnock(rv_url, peer["secret"], args.password or "", profile_code, _log,
+                                 sock=sock, late=late_targets)
     try:
         conn = race(sock, peer, "dial", args.local_port, args.timeout,
-                    my_has_v6=False, mine=prof)
+                    my_has_v6=False, mine=prof, late_targets=late_targets)
     finally:
         if knock is not None:
             knock.close()
