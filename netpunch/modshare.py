@@ -424,6 +424,24 @@ def _save_mod_list_from(source, label, log):
 # ---------------------------------------------------------------------------
 # zip / unzip
 # ---------------------------------------------------------------------------
+def folder_bytes(folder):
+    """Bytes of files under ``folder`` (what zip_mod would read); 0 if unreadable."""
+    total = 0
+    try:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".")]
+            for fn in files:
+                p = os.path.join(root, fn)
+                if not os.path.islink(p):
+                    try:
+                        total += os.path.getsize(p)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    return total
+
+
 def zip_mod(folder, log=None):
     """The folder as one zip (entries relative to the folder) -- bytes. No
     size cap (512 MB until 2026-09-16: a big vehicle pack was silently "not

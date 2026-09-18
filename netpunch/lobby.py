@@ -193,6 +193,7 @@ CAP = 200               # max players in a lobby, INCLUDING the host (origins a.
 MAX_COMPANIES = 200     # company ids 1..200 (one addPlayer() entity each on every peer; measured 264 fine)
 PING_INTERVAL = 3.0     # joiner -> host lobby keepalive cadence
 DROP_AFTER = 10.0       # host drops a peer unheard-from for this long
+MODS_BATCH_BYTES = 192 * 1024 * 1024    # a mods round goes out in batches of about this much on disk (run_host start_pack_job)
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
 HOST_GONE_AFTER = 12.0  # joiner declares the host dead after this much silence
@@ -1168,7 +1169,7 @@ def _read_save_files(save_path):
     return blob, files_meta
 
 
-def _keepalive_sweep(peers, now, drop_after, transfers, log):
+def _keepalive_sweep(peers, now, drop_after, transfers, log, exempt=()):
     """The host's keepalive eviction: the addresses of the peers to drop --
     silent for longer than ``drop_after`` and NOT mid-transfer. A peer that
     is receiving a save is judged by the transfer's own PEER_XFER_TIMEOUT,
@@ -1182,7 +1183,7 @@ def _keepalive_sweep(peers, now, drop_after, transfers, log):
         if now - p["last"] <= drop_after:
             p.pop("drop_deferred", None)
             continue
-        if _mid_transfer(a, *transfers):
+        if _mid_transfer(a, *transfers) or a in exempt:
             if not p.get("drop_deferred"):
                 p["drop_deferred"] = True
                 log(f"[host] {p['name']} silent for {now - p['last']:.0f} s but mid-transfer "
@@ -1278,7 +1279,7 @@ class _HostSaveTransfer:
         """
         return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
 
-    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save", stage_cb=None):
+    def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save", stage_cb=None, extra=None):
         self.sock = sock
         self.kind = kind                      # "save" or "mods" (the round after it)
         # The host loop's view of how far each peer's SAVE is, as this sender
@@ -1311,6 +1312,8 @@ class _HostSaveTransfer:
                           "files": files_meta, "sha256": self.overall_sha,
                           "kind": kind, "mods": [[m, v] for m, v in self.mods],
                           "mods_unknown": self.mods_unknown}
+        if extra:
+            self.begin_msg.update(extra)          # "batch": [k, n] for a mods round sent in batches
         # THE TCP CHANNEL. A per-transfer token rides in the (sealed) fbegin; a
         # receiver that can reach our listener connects with it and the file
         # streams (_tcp_serve). With no listener here (a joiner uploading to the
@@ -1694,6 +1697,9 @@ class _ClientSaveReceiver:
         self._results = queue.Queue()
         self.deferred_begin = None # sid of an fbegin held back while finalizing (logged once)
         self.manifest_unknown = False
+        self.batch = None            # [k, n] of the mods batch being received (a host from 0.6.1.7 on)
+        self.batch_open = False      # a round is under way: more batches follow, do not ask again
+        self.batch_got = set()       # mods installed or present across the round's batches
         # THE TCP CHANNEL (bulk_tcp.py). A joiner connects to the sender's listener
         # (the host's or relay's, named in fbegin) and a reader thread queues the
         # stream; the relay, which listens itself, accepts the leader's upload the
@@ -1778,7 +1784,7 @@ class _ClientSaveReceiver:
         if self.preflight:
             self.last_mod_request=time.time()
             self.first_mod_request=self.last_mod_request
-            self._send({"t":"mods_request", "need":list(self.offered)})
+            self._send({"t":"mods_request", "need":list(self.offered), "batches": 1})
         else:
             self._send({"t":"mods_answer", "sid":self.sid, "accept":True})
         shown = ", ".join(self.offered[:8]) + (f", +{len(self.offered)-8} more" if len(self.offered) > 8 else "")
@@ -1833,6 +1839,7 @@ class _ClientSaveReceiver:
         if self.kind=="mods":
             self.cancelled=True
             self.cancel_reason=detail
+        self.log(f"[client] giving up this transfer: {detail}")
         self.io.emit({"type": "status", "state": "failed",
                       "detail": f"save transfer failed: {detail}"})
         self._send({"t": "fdone", "sid": self.sid, "ok": False, "final": True})
@@ -1885,6 +1892,10 @@ class _ClientSaveReceiver:
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = files
         self.kind = kind
+        b = msg.get("batch")
+        self.batch = [int(b[0]), int(b[1])] if kind == "mods" and isinstance(b, list) and len(b) == 2 else None
+        if kind == "mods" and (self.batch is None or self.batch[0] == 1):
+            self.batch_got = set()
         # the mods this save needs that are not installed here (told back in the ack)
         self.need = []
         previous_approval=set(self.approved) if self.preflight else set()
@@ -2075,9 +2086,9 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
-        if self.preflight and self.approved and not self.active() and not self.catalogue_token and now-self.last_mod_request>1:
+        if self.preflight and self.approved and not self.active() and not self.catalogue_token and not self.batch_open and now-self.last_mod_request>1:
             self.last_mod_request=now
-            self._send({"t":"mods_request","need":list(self.offered)})
+            self._send({"t":"mods_request","need":list(self.offered), "batches": 1})
             first = getattr(self, "first_mod_request", 0) or now
             if now - first > 20 and not getattr(self, "silence_logged", False):
                 self.silence_logged = True
@@ -2158,7 +2169,9 @@ class _ClientSaveReceiver:
         self.finalize_progress = 0
         approved = None
         if self.kind == "mods":
-            approved, self.approved = self.approved, set()   # the yes is used up by this round
+            approved = set(self.approved)
+            if not (self.batch and self.batch[0] < self.batch[1]):
+                self.approved = set()               # the yes is used up by this round (its LAST batch)
         job = {"sid": self.sid, "buf": self.buf, "files": list(self.files),
                "overall_sha": self.overall_sha, "kind": self.kind,
                "approved": approved, "total_bytes": self.total_bytes}
@@ -2282,6 +2295,14 @@ class _ClientSaveReceiver:
                 self.mods_satisfied=True
                 self._maybe_send_done(force=True)
                 return
+            if self.batch and self.batch[0] < self.batch[1]:
+                # one batch of a round: hand it back and wait for the next
+                self.batch_open = True
+                self.complete = False
+                self.log(f"[client] mod batch {self.batch[0]}/{self.batch[1]} installed -- waiting for the next")
+                self._maybe_send_done(force=True)
+                return
+            self.batch_open = False
             self.complete = False
             try:
                 self.catalogue_token=modshare.request_catalogue()
@@ -2348,7 +2369,11 @@ class _ClientSaveReceiver:
         round if anything agreed to did not land. The yes was used up when the
         round began."""
         done, kept, bad, skipped = r["done"], r["kept"], r["bad"], r["skipped"]
+        self.batch_got |= set(done) | set(kept)
+        self.log(f"[client] mods installed: batch={self.batch} done={done} kept={kept} bad={bad} approved={sorted(r['approved'])} got={sorted(self.batch_got)}")
         text = []
+        if self.batch:
+            text.append(f"mod batch {self.batch[0]}/{self.batch[1]}")
         if done: text.append("Installed from the host: " + ", ".join(done) + " (they show in the load screen's Mods panel)")
         if kept: text.append("already installed: " + ", ".join(kept))
         if bad: text.append("FAILED to install: " + ", ".join(bad) + " -- install it by hand")
@@ -2356,7 +2381,9 @@ class _ClientSaveReceiver:
         if text:
             self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": "; ".join(text)})
         self.install_result={"installed":done,"present":kept,"failed":bad}
-        absent=set(r["approved"])-set(done)-set(kept)
+        absent=set(r["approved"])-self.batch_got
+        if self.batch and self.batch[0] < self.batch[1]:
+            absent=set()                          # the rest of the round is still to come
         if bad or absent:
             self._fail("required mod installation failed: " + ", ".join(sorted(set(bad)|absent)))
 
@@ -3154,6 +3181,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     serve_hold = [0.0]        # until when the serve-again waits for the host's hot-join save
     mod_round = [None]        # the addrs to start once a mods round resolves
     pack_job = [None]         # the worker packaging one joiner's mods (see the preflight block)
+    pack_queue = []           # jobs waiting for the worker (a round asked for while a preflight runs)
 
     def broadcast_start(save, only=None):
         """Start everyone currently in the lobby -- or, with ``only`` (a set of
@@ -3445,6 +3473,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if t == "join":
             do_join(addr, msg.get("name", "player"), msg.get("profile"),
                     msg.get("mesh", False), msg.get("version"), msg.get("recovery", 0))
+            if addr in peers:
+                peers[addr]["batches"] = bool(msg.get("batches"))   # a client from 0.6.1.7 on takes a mods round in batches
         elif t == "links":
             if addr in peers:
                 new = [str(x) for x in msg.get("direct", [])][:CAP]
@@ -3564,12 +3594,18 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 if pr and pr.get("ask"):
                     transfer[0].on_mods_answer(addr, {"sid": transfer[0].sid, "accept": True})
                 return
+            if addr in peers:
+                peers[addr]["batches"] = bool(msg.get("batches"))   # a client from 0.6.1.7 on takes a round in batches
+            if pack_job[0] is not None and addr in pack_job[0]["addrs"]:
+                return                                  # already packaging for this joiner: it repeats every second
+            if any(addr in j["addrs"] for j in pack_queue):
+                return
             allowed={modshare.mod_folder_name(m,v):(m,v) for m,v in (advertised[1] or [])}
             requested=msg.get("need",[])
             if isinstance(requested,list):          # as many as the save needs (a 128 cap until 2026-09-16)
                 wanted=[allowed[n] for n in requested if isinstance(n,str) and n in allowed]
                 unknown=[n for n in requested if not (isinstance(n,str) and n in allowed)]
-                if addr not in preflight_requests and pack_job[0] is None:
+                if addr not in preflight_requests:
                     # said once per request round (the joiner repeats it every second until answered)
                     shown=", ".join(str(n) for n in requested[:6]) + (f", +{len(requested)-6} more" if len(requested) > 6 else "")
                     log(f"[host] {peers[addr]['name']!r} asks for {len(requested)} mod(s), {len(wanted)} of them in this save's list of {len(allowed)}: {shown}")
@@ -3925,7 +3961,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 last_drop = now
                 frags.expire(now)
                 dead = _keepalive_sweep(peers, now, drop_after,
-                                        (transfer[0], recovery.transfer if recovery else None), log)
+                                        (transfer[0], recovery.transfer if recovery else None), log,
+                                        exempt=set(pack_job[0]["addrs"]) if pack_job[0] else ())
                 for a in dead:
                     log(f"[host] DROP {a} ({peers[a]['name']}) -- silent")
                     if stats:
@@ -4059,21 +4096,58 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if transfer[0] is None and pending_start[0] is not None:
                 queued, pending_start[0] = pending_start[0], None
                 handle_command(queued)
-            # A joiner's mods are packaged on a WORKER THREAD. Zipping ran in this
-            # loop until 2026-09-18: a host with hundreds of Workshop mods sat
-            # deaf -- no keepalives, no roster, no answer to anyone -- for as
-            # long as the zips took, and nothing said why. The loop keeps
-            # serving; the joiner hears the progress; the result lands here.
-            if transfer[0] is None and pack_job[0] is None and preflight_requests:
-                a, wanted = preflight_requests.popitem()
-                if a in peers and wanted:
-                    job = {"addr": a, "name": peers[a]["name"], "wanted": wanted, "blob": bytearray(), "meta": [],
-                           "missing": [], "done": 0, "started": now, "told": 0.0, "finished": False}
-                    shown = ", ".join(modshare.mod_folder_name(m, v) for m, v in wanted[:8]) + (f", +{len(wanted)-8} more" if len(wanted) > 8 else "")
-                    log(f"[host] packaging {len(wanted)} mod(s) for {job['name']!r}: {shown}")
+            # MOD ROUNDS run on a worker thread, in BATCHES. Zipping ran in this
+            # loop until 2026-09-18, as ONE blob: a joiner asking for 314 of a
+            # save's 486 Workshop mods (~15 GB) left the host deaf for as long
+            # as the zips took, would have held every byte in RAM, and the host
+            # dropped it as silent meanwhile. A job now plans batches of about
+            # MODS_BATCH_BYTES on disk, zips them one after another (at most two
+            # ahead of the sender) and each goes out as its own mods transfer
+            # with "batch": [k, n] in its fbegin; the joiner keeps the round
+            # open until the last one lands. A joiner from before batches (no
+            # "batches" in its mods_request) gets the whole set as one blob.
+            def start_pack_job(kind, addrs, wanted, got=None):
+                addrs = [x for x in addrs if x in peers]
+                if not addrs or not wanted:
+                    return
+                batched = all(peers[x].get("batches") for x in addrs)
+                names = ", ".join(peers[x]["name"] for x in addrs)
+                job = {"kind": kind, "addrs": addrs, "names": names, "wanted": list(wanted), "got": got,
+                       "batched": batched, "plan": None, "ready": [], "taken": 0, "done": 0,
+                       "started": now, "told": 0.0, "finished": False, "abort": False, "bytes": 0}
+                if pack_job[0] is not None:
+                    pack_queue.append(job)
+                    log(f"[host] mod round for {names} queued behind the one for {pack_job[0]['names']}")
+                    return
+                shown = ", ".join(modshare.mod_folder_name(m, v) for m, v in wanted[:8]) + (f", +{len(wanted)-8} more" if len(wanted) > 8 else "")
+                log(f"[host] packaging {len(wanted)} mod(s) for {names}{'' if batched else ' as one blob (a client from before batches)'}: {shown}")
 
-                    def _pack_mods(job=job):
-                        for m, v in job["wanted"]:
+                def _pack_mods(job=job):
+                    sizes = []
+                    for m, v in job["wanted"]:
+                        f = modshare.find_mod(m, v)
+                        sizes.append(modshare.folder_bytes(f) if f else 0)
+                    job["bytes"] = sum(sizes)
+                    plan, cur, cur_bytes = [], [], 0
+                    if job["batched"]:
+                        for (m, v), sz in zip(job["wanted"], sizes):
+                            if cur and cur_bytes + sz > MODS_BATCH_BYTES:
+                                plan.append(cur)
+                                cur, cur_bytes = [], 0
+                            cur.append((m, v))
+                            cur_bytes += sz
+                        if cur:
+                            plan.append(cur)
+                    else:
+                        plan = [list(job["wanted"])]
+                    job["plan"] = plan
+                    for group in plan:
+                        while len(job["ready"]) - job["taken"] >= 2 and not job["abort"]:
+                            time.sleep(0.2)
+                        if job["abort"]:
+                            break
+                        blob, meta, missing = bytearray(), [], []
+                        for m, v in group:
                             try:
                                 data = mod_package(m, v)
                             except Exception as e:                          # noqa: BLE001
@@ -4088,41 +4162,75 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                        else "not installed here; looked in " + ", ".join(
                                            [d for d in modshare.workshop_dirs()] + [modshare.managed_workshop()]) if m.startswith("*")
                                        else "not installed here (game mods folder, userdata mods)")
-                                job["missing"].append((modshare.mod_folder_name(m, v), why))
+                                missing.append((modshare.mod_folder_name(m, v), why))
                             else:
-                                job["meta"].append({"name": modshare.mod_zip_name(m, v), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-                                job["blob"] += data
+                                meta.append({"name": modshare.mod_zip_name(m, v), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+                                blob += data
                             job["done"] += 1
-                        job["finished"] = True
+                        job["ready"].append((blob, meta, missing))
+                    job["finished"] = True
 
-                    pack_job[0] = job
-                    threading.Thread(target=_pack_mods, name="mod-pack", daemon=True).start()
+                pack_job[0] = job
+                threading.Thread(target=_pack_mods, name="mod-pack", daemon=True).start()
+
+            if pack_job[0] is None and pack_queue:
+                nxt = pack_queue.pop(0)
+                start_pack_job(nxt["kind"], nxt["addrs"], nxt["wanted"], got=nxt["got"])
+            if transfer[0] is None and pack_job[0] is None and preflight_requests:
+                a, wanted = preflight_requests.popitem()
+                if a in peers and wanted:
+                    start_pack_job("preflight", [a], wanted)
             if pack_job[0] is not None:
                 job = pack_job[0]
-                a = job["addr"]
-                if not job["finished"]:
-                    if now - job["told"] >= 2.0 and a in peers:
-                        job["told"] = now
-                        mb = len(job["blob"]) / (1024.0 * 1024.0)
-                        _send_data(sock, a, {"t": "status", "state": "connected",
-                                             "detail": f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])} ({mb:.0f} MB so far)"})
-                else:
+                live = [x for x in job["addrs"] if x in peers]
+                if not live:
+                    job["abort"] = True
                     pack_job[0] = None
-                    took = now - job["started"]
-                    if a not in peers:
-                        log(f"[host] packaged {len(job['meta'])} mod(s) for {job['name']!r} in {took:.1f} s, but they left")
-                    elif job["missing"]:
-                        names = ", ".join(n for n, _ in job["missing"])
-                        for n, why in job["missing"]:
-                            log(f"[host] cannot supply {n} to {job['name']!r}: {why}")
-                        _send_data(sock, a, {"t": "reject", "reason": f"The host cannot supply {names}: {job['missing'][0][1]}."})
-                        del peers[a]
+                    log(f"[host] mod round for {job['names']} abandoned -- they left")
+                    if job["kind"] == "round" and job["got"] is not None:
+                        rest = set(job["got"]) - set(job["addrs"])
+                        if rest:
+                            broadcast_start(save=True, only=rest)
+                elif transfer[0] is None and job["taken"] < len(job["ready"]):
+                    blob, meta, missing = job["ready"][job["taken"]]
+                    job["taken"] += 1
+                    n, k = len(job["plan"]), job["taken"]
+                    if missing:
+                        names = ", ".join(nm for nm, _ in missing)
+                        for nm, why in missing:
+                            log(f"[host] cannot supply {nm} to {job['names']}: {why}")
+                        for x in live:
+                            _send_data(sock, x, {"t": "reject", "reason": f"The host cannot supply {names}: {missing[0][1]}."})
+                            del peers[x]
                         roster_changed()
+                        job["abort"] = True
+                        pack_job[0] = None
+                        if job["kind"] == "round" and job["got"] is not None:
+                            rest = set(job["got"]) - set(job["addrs"])
+                            log(f"[host] mods round failed for {job['names']} -- starting the other {len(rest)} peer(s)")
+                            if rest:
+                                broadcast_start(save=True, only=rest)
                     else:
-                        mb = len(job["blob"]) / (1024.0 * 1024.0)
-                        log(f"[host] packaged {len(job['meta'])} mod(s) ({mb:.1f} MB) for {job['name']!r} in {took:.1f} s -- sending")
-                        mod_preflight[0] = True
-                        transfer[0] = _HostSaveTransfer(sock, int.from_bytes(os.urandom(4), "big"), job["blob"], job["meta"], [(a, job["name"])], io, log, kind="mods")
+                        mb = len(blob) / (1024.0 * 1024.0)
+                        final = k == n
+                        log(f"[host] sending mod batch {k}/{n} ({len(meta)} mod(s), {mb:.1f} MB) to {job['names']}")
+                        mod_preflight[0] = job["kind"] == "preflight"
+                        mod_round[0] = set(job["got"]) if (job["kind"] == "round" and final and job["got"] is not None) else None
+                        targets = [(x, peers[x]["name"]) for x in live]
+                        transfer[0] = _HostSaveTransfer(sock, int.from_bytes(os.urandom(4), "big"), blob, meta, targets, io, log, kind="mods",
+                                                        extra={"batch": [k, n]} if job["batched"] else None)
+                elif job["finished"] and job["taken"] >= len(job["ready"]):
+                    took = now - job["started"]
+                    gb = job["bytes"] / (1024.0 ** 3)
+                    log(f"[host] mod round for {job['names']}: {job['done']} mod(s), {gb:.2f} GB on disk, {len(job['plan'] or [])} batch(es), packaged in {took:.0f} s")
+                    pack_job[0] = None
+                elif now - job["told"] >= 2.0:
+                    job["told"] = now
+                    n = len(job["plan"]) if job["plan"] else 0
+                    for x in live:
+                        _send_data(sock, x, {"t": "status", "state": "connected",
+                                             "detail": f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}"
+                                                       + (f", batch {job['taken']}/{n} sent" if n else "")})
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
             #   any FAILED -> failed status naming them, NO start, and the
@@ -4176,43 +4284,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             waiting = [a for a in peers if a not in got and not peers[a].get("started")]
                             needs = xfer.mod_needs()
                             if needs:
-                                # MODS ROUND: zip every mod somebody lacks, send the
-                                # union to those peers, start everyone once it resolves.
-                                # A mod the host cannot find (or that is too big) is
-                                # named in chat and skipped; the rest still go.
+                                # MODS ROUND: every mod somebody lacks goes to those peers, in
+                                # batches on the worker (start_pack_job above); everyone
+                                # starts once the last batch resolves (mod_round).
                                 wanted = {}
                                 for lst in needs.values():
                                     for m, v in lst:
                                         wanted[(m, v)] = True
-                                blob2, meta2, missing = bytearray(), [], []
-                                for (m, v) in wanted:
-                                    folder = modshare.find_mod(m, v)
-                                    data = mod_package(m,v)
-                                    if not data:
-                                        missing.append(modshare.mod_folder_name(m, v))
-                                        continue
-                                    meta2.append({"name": modshare.mod_zip_name(m, v), "size": len(data),
-                                                  "sha256": hashlib.sha256(data).hexdigest()})
-                                    blob2 += data
-                                if missing:
-                                    log(f"[host] cannot share {', '.join(missing)} (not installed here, or over the size cap)")
-                                    broadcast_chat("MULTIPLAYER", "Cannot share " + ", ".join(missing)
-                                                   + " -- not found on the host; install it by hand.")
-                                if missing:
-                                    for a in needs:
-                                        _send_data(sock,a,{"t":"reject","reason":"Host cannot supply required mods."})
-                                    got -= set(needs)
-                                if meta2 and not missing:
-                                    targets2 = [(a, peers[a]["name"]) for a in needs if a in peers]
-                                    names2 = ", ".join(n for _, n in targets2)
-                                    mb = len(blob2) / (1024.0 * 1024.0)
-                                    log(f"[host] sharing {len(meta2)} mod(s) ({mb:.1f} MB) with {names2}")
-                                    broadcast_chat("MULTIPLAYER", f"Sharing {len(meta2)} mod(s) ({mb:.1f} MB) with {names2}: "
-                                                   + ", ".join(m["name"][len(modshare.INCOMING_MOD_PREFIX):-4] for m in meta2))
-                                    mod_round[0] = got
-                                    transfer[0] = _HostSaveTransfer(sock, (xfer.sid + 1) & 0xFFFFFFFF, blob2, meta2,
-                                                                    targets2, io, log, kind="mods")
-                            if transfer[0] is None:          # no mods round started: start now
+                                start_pack_job("round", list(needs.keys()), list(wanted), got=got)
+                            if transfer[0] is None and pack_job[0] is None and not pack_queue:   # no mods round started: start now
                                 log(f"[host] all save transfers resolved -- starting {len(got)} peer(s)"
                                     + (f"; {len(waiting)} joined during the transfer and will be served next" if waiting else ""))
                                 broadcast_start(save=True, only=got)
@@ -4738,7 +4818,8 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                                         daemon=True)
         relay_thread.start()
 
-    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0}
+    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0,
+                "batches": 1}          # this client takes a mods round in batches (0.6.1.7)
     if profile_code:
         join_msg["profile"] = profile_code
     send(join_msg)                                          # announce ourselves

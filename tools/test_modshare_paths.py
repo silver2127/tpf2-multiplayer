@@ -51,5 +51,10 @@ check("game in Steam's folder: one Workshop folder", modshare.workshop_dirs() ==
 modshare.game_dir = lambda: None
 check("no game: Steam's folder alone", modshare.workshop_dirs() == [os.path.join(steam, "steamapps", "workshop", "content", modshare.TF2_APPID)])
 
+open(os.path.join(ws, "big.bin"), "wb").write(b"x" * 5000)
+os.makedirs(os.path.join(ws, ".git")); open(os.path.join(ws, ".git", "junk"), "wb").write(b"y" * 9000)
+check("folder_bytes counts the mod's files and skips dot folders", modshare.folder_bytes(ws) == 5000 + len("function data() return {} end"), str(modshare.folder_bytes(ws)))
+check("folder_bytes of a missing folder is 0", modshare.folder_bytes(os.path.join(tmp, "nope")) == 0)
+
 print("FAILED: " + ", ".join(fails) if fails else "ALL OK")
 sys.exit(1 if fails else 0)
