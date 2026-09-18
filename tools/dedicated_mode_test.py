@@ -34,7 +34,7 @@ def check(name, cond, extra=""):
 
 # ---- the menu DLL
 for key in ("dedicated", "dedicated_save", "dedicated_lobby", "dedicated_name", "dedicated_password", "dedicated_public",
-            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render"):
+            "dedicated_companies", "dedicated_autosave_min", "dedicated_empty_speed", "dedicated_pause_empty", "dedicated_port", "dedicated_render", "dedicated_nowsi"):
     check(f"ReadFlags parses {key}=", f'!strcmp(line, "{key}")' in MENU)
 check("dedicated_save refuses path parts and quotes", 'strpbrk(v, "\\\\/:*?\\"<>|")' in MENU)
 check("dedicated_password refuses blanks and quotes (it is an argument)",

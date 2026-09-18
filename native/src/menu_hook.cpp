@@ -285,6 +285,7 @@ static PFN_vkGetQueryPoolResults g_origQueryResults = nullptr;
 static PFN_vkAcquireNextImageKHR g_origAcquire = nullptr;
 static PFN_vkAcquireNextImage2KHR g_origAcquire2 = nullptr;
 static PFN_vkGetSwapchainImagesKHR g_origGetScImages = nullptr;
+static volatile LONG g_noWsi = 0;            // dedicated_nowsi=1 (opt-in, needs render=0): acquire/present answered here -- crashed the engine on the VPS 2026-09-18 22:42, under study
 static volatile LONG g_nullScCount = 0;      // images in the current swapchain (for the round robin)
 static volatile LONG g_nullScNext = 0;
 static const double NORENDER_FPS = 60.0;     // the frame rate the engine's per-frame stepping assumes
@@ -293,6 +294,7 @@ static void NullPace();
 static volatile LONG g_noRender = 0;
 static volatile LONG g_noRenderSubmits = 0, g_noRenderCmdBufs = 0;
 static bool NoRender() { return InterlockedCompareExchange(&g_noRender, 0, 0) != 0; }
+static bool NoWsi() { return InterlockedCompareExchange(&g_noWsi, 0, 0) != 0; }
 static PFN_vkGetDeviceQueue    g_origGetQueue = nullptr;
 static PFN_vkCreateSwapchainKHR g_origCreateSc = nullptr;
 static VkDevice   g_dev   = VK_NULL_HANDLE;
@@ -679,6 +681,7 @@ static int   g_flagDedAutosaveMin = 10;     // dedicated_autosave_min=<n>, 0-600
 static int   g_flagDedEmptySpeed = 1;       // dedicated_empty_speed=0..4: the world's speed while nobody else is in (0 = paused); dedicated_pause_empty=1 is 0
 static int   g_flagDedPort = 0;             // dedicated_port=<udp/tcp port> for the lobby (0 = the default 29471); a box that also runs the relay needs another
 static int   g_flagDedRender = 0;           // dedicated_render=0|1: 0 (default) submits no command buffers -- a software renderer then costs nothing; 1 draws (screenshots)
+static int   g_flagDedNoWsi = 0;            // dedicated_nowsi=0|1: 1 also answers acquire/present in the DLL, paced to 60 frames/s (opt-in: it crashed the engine on the VPS)
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
 static volatile LONG g_joinFreeze = 0;   // roster join_freeze: the lobby brings a late joiner in through a world sync (everyone reloads); this DLL takes no hot-join save (2026-09-16)
 static bool  g_latoLoaded = false;
@@ -730,6 +733,8 @@ static void ReadFlags()
             if (!strcmp(v, "0")) g_flagDedEmptySpeed = 1; else if (!strcmp(v, "1")) g_flagDedEmptySpeed = 0;
         } else if (!strcmp(line, "dedicated_render")) {
             if (!strcmp(v, "0")) g_flagDedRender = 0; else if (!strcmp(v, "1")) g_flagDedRender = 1;
+        } else if (!strcmp(line, "dedicated_nowsi")) {
+            if (!strcmp(v, "0")) g_flagDedNoWsi = 0; else if (!strcmp(v, "1")) g_flagDedNoWsi = 1;
         } else if (!strcmp(line, "dedicated_port")) {
             int pt = atoi(v);
             if (digit && pt >= 1024 && pt <= 65535) g_flagDedPort = pt;
@@ -751,6 +756,7 @@ static void ReadFlags()
             g_flagDedSave, g_flagDedLobby, g_flagDedName, g_flagDedPassword[0] ? "yes" : "no", g_flagDedPublic,
             g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedEmptySpeed, g_flagDedPort, g_flagDedRender);
     if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);
+    if (g_flagDedicated && !g_flagDedRender && g_flagDedNoWsi) InterlockedExchange(&g_noWsi, 1);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -2028,7 +2034,7 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         if (!once) { once = true; Log("[menu] myPresent FAULT exc=%lx (rInit=%d rFail=%d)\n",
             GetExceptionCode(), (int)g_rInit, (int)g_rFail); }
     }
-    if (NoRender() && pi) {
+    if (NoWsi() && pi) {
         // the window system never sees this frame: consume the wait semaphores,
         // report success for every swapchain, pace the loop to NORENDER_FPS
         NullSignal(q, VK_NULL_HANDLE, VK_NULL_HANDLE, pi->waitSemaphoreCount, pi->pWaitSemaphores);
@@ -2055,7 +2061,7 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
         uint32_t cnt = 0;
         if (g_origGetScImages && sc && g_origGetScImages(dev, *sc, &cnt, nullptr) == VK_SUCCESS && cnt > 0) {
             InterlockedExchange(&g_nullScCount, (LONG)cnt); InterlockedExchange(&g_nullScNext, 0);
-            if (NoRender()) Log("[menu] no-render: swapchain of %u images -- acquire and present are answered here, never by the window system\n", cnt);
+            if (NoWsi()) Log("[menu] no-render: swapchain of %u images -- acquire and present are answered here, never by the window system\n", cnt);
         }
         g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent; g_scUsage = ci->imageUsage;
         g_rInit = false; g_rFail = false;   // rebuild on next present
@@ -2097,12 +2103,12 @@ static VkResult NullAcquire(VkSemaphore sem, VkFence fence, uint32_t* pIndex)
 }
 static VkResult VKAPI_CALL myAcquire(VkDevice dev, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence fence, uint32_t* pIndex)
 {
-    if (!NoRender()) return g_origAcquire(dev, sc, timeout, sem, fence, pIndex);
+    if (!NoWsi()) return g_origAcquire(dev, sc, timeout, sem, fence, pIndex);
     return NullAcquire(sem, fence, pIndex);
 }
 static VkResult VKAPI_CALL myAcquire2(VkDevice dev, const VkAcquireNextImageInfoKHR* info, uint32_t* pIndex)
 {
-    if (!NoRender()) return g_origAcquire2(dev, info, pIndex);
+    if (!NoWsi()) return g_origAcquire2(dev, info, pIndex);
     return NullAcquire(info ? info->semaphore : VK_NULL_HANDLE, info ? info->fence : VK_NULL_HANDLE, pIndex);
 }
 // the frame pace the window system no longer sets: NORENDER_FPS, slept here
