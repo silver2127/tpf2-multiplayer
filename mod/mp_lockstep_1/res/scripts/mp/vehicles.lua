@@ -949,6 +949,56 @@ function CM.queueCloneAssign(c, key)
 		tostring(c.seq), key, tostring(c.cline), vl.notBeforeStep))
 end
 
+-- A construction's spatial-query position need not be its transform origin.
+-- Offset mod depots (UEP catenary terminal) were captured at the transform but
+-- absent from the 6 m replay query. Search globally only on a cache/local miss,
+-- then match the SAME transform key and file, never the nearest arbitrary depot.
+-- Keep this cache separate from consByKey: adopting a purchase target must not
+-- change construction edit/parameter tracking. Validate cached ids on every buy.
+local buyDepotCache = {}
+local function findBuyDepot(x, y, want)
+	local key = CM.conKey(x, y)
+	local cacheKey = key .. "|" .. want
+	local function matches(id)
+		if type(id) ~= "number" or id < 0 then return false end
+		local ok, yes = pcall(function()
+			if not api.engine.entityExists(id) then return false end
+			local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+			return co and co.transf and co.depots and #co.depots > 0
+				and (want == "?" or tostring(co.fileName) == want)
+				and CM.conKey(co.transf[13], co.transf[14]) == key
+		end)
+		return ok and yes
+	end
+	local cached = buyDepotCache[cacheKey]
+	if matches(cached) then return cached end
+	buyDepotCache[cacheKey] = nil
+	local rec = CM.consByKey[key]
+	if rec and matches(rec.id) then return rec.id end
+	local function scan(area)
+		local found, ambiguous
+		local ok = pcall(function()
+			local list = game.interface.getEntities(area, { type = "CONSTRUCTION", includeData = false }) or {}
+			for _, id in pairs(list) do
+				if matches(id) then
+					if found and found ~= id then ambiguous = true end
+					found = id
+				end
+			end
+		end)
+		if not ok or ambiguous then return nil, true end
+		return found, false
+	end
+	local found, uncertain = scan({ pos = { x, y }, radius = 6 })
+	if not found and not uncertain then found, uncertain = scan({ radius = 999999 }) end
+	if uncertain then
+		log("VBUY: depot lookup ambiguous or unavailable at " .. key .. " -- refusing")
+		return nil
+	end
+	buyDepotCache[cacheKey] = found
+	return found
+end
+
 function CM.execVBuy(c)
 	-- The originator replays its own purchase ONLY if the buy was actually
 	-- cancelled here: VBUY is a strict op (K.STRICT_OPS) and c.armed is the
@@ -968,18 +1018,7 @@ function CM.execVBuy(c)
 	local ok, err = pcall(function()
 		local x, y = tonumber(c.x), tonumber(c.y)
 		if not (x and y) then log("VBUY: no depot position"); return end
-		local rec = CM.consByKey[CM.conKey(x, y)]
-		local depot = rec and rec.id
-		local alive = false
-		if depot then pcall(function() alive = api.engine.entityExists(depot) end) end
-		if not alive then
-			depot = nil
-			pcall(function()
-				local list = game.interface.getEntities({ pos = { x, y }, radius = 6 },
-					{ type = "CONSTRUCTION", includeData = false }) or {}
-				for _, id in pairs(list) do depot = depot or id end
-			end)
-		end
+		local depot = findBuyDepot(x, y, tostring(c.file or "?"))
 		if not depot then
 			log(string.format("EXEC VBUY seq=%s: no depot at %.1f,%.1f -- vehicle NOT bought", tostring(c.seq), x, y))
 			return
