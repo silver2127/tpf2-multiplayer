@@ -67,6 +67,12 @@ Replay details for constructions:
   size of its own either: the params walk has no depth or entry cap (a misread pointer fails
   it loudly and the build runs natively behind a `NATIVE` notice) and the street vectors are
   decoded in full.
+- Construction parameter strings and keys escape embedded newlines as `\n` in
+  their Lua literals. Lua 5.2's default `%q` emits a physical newline after a
+  backslash, which splits the line-based command stream and loses module edits.
+  Values are preserved exactly; malformed literals are still refused. Offline
+  coverage: `tools/params_line_test.py` exercises the line receiver and station
+  removal diffs on origin and peer with a mocked engine.
 - On failure the replay retries once after clearing the footprint, then asks the originator to
   roll back (`CONFAIL`: it bulldozes its own copy, same file within 1 m).
 - The construction gets a name in the proposal (the shipped one, or "`<town> <type>`"), which
