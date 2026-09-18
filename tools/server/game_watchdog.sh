@@ -15,12 +15,17 @@ launched_at=0
 while :; do
     if pgrep -f 'TransportFever2.exe' >/dev/null 2>&1; then
         started=0
-        # a crash leaves the engine's dialog up and the process alive; a minidump newer
-        # than the launch says so. Kill it: the next pass launches again.
-        if [ -n "$DUMPS" ] && [ "$launched_at" -gt 0 ]; then
-            newdump=$(find "$DUMPS" -maxdepth 1 -name '*.dmp' -newermt "@$launched_at" 2>/dev/null | head -1)
+        # a crash leaves the engine's dialog up and the process alive. The game itself
+        # prints __CRASHDB_DUMP__ into ITS OWN stdout.txt at the exception, so that line
+        # in a stdout.txt newer than the launch is a crash of THIS run. A .dmp newer than
+        # the launch is not: the engine's crash reporter writes the post-mortem of a
+        # KILLED instance (tpf2server stop) 30-120 s later, after the next launch, and
+        # the watchdog used to kill the healthy new game for it, again and again
+        # (2026-09-18 18:18: a self-feeding "crash loop" after a plain update).
+        if [ -n "$DUMPS" ] && [ "$launched_at" -gt 0 ] && [ -f "$DUMPS/stdout.txt" ]            && [ -n "$(find "$DUMPS" -maxdepth 1 -name stdout.txt -newermt "@$launched_at" 2>/dev/null)" ]; then
+            newdump=$(grep -a -o '__CRASHDB_DUMP__ [0-9a-f-]*' "$DUMPS/stdout.txt" 2>/dev/null | head -1)
             if [ -n "$newdump" ]; then
-                echo "crash dump $newdump since the launch; killing the game for a relaunch"
+                echo "$newdump in this run's stdout.txt; killing the game for a relaunch"
                 pkill -f '^Z:.*TransportFever2' ; pkill -f '^C:.*TransportFever2'
                 sleep 5
                 pkill -9 -f '^Z:.*TransportFever2' ; pkill -9 -f '^C:.*TransportFever2'
