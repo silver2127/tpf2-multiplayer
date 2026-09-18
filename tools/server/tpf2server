@@ -65,7 +65,11 @@ p = sys.argv[1]
 t = open(p, encoding="utf-8").read()
 want = {"fullscreen": "false", "windowSize": "{ 640, 480, }", "vsync": "false", "resolutionScale": "0.5",
         "shadowQuality": "0", "textureQuality": "0", "numSamples": "1", "anisotropicFiltering": "0",
-        "masterVolume": "0", "musicVolume": "0", "soundVolume": "0"}
+        "masterVolume": "0", "musicVolume": "0", "soundVolume": "0",
+        # the news popup ("DO NOT SHOW AGAIN") keeps the title page from being built until it is
+        # dismissed, and the choice is written only on a clean exit -- which a server never has.
+        # 7 is the Autumn 2026 update's id; the game shows the popup again for a higher one.
+        "updateMessageID": "7"}
 for k, v in want.items():
     t, n = re.subn(r"(?m)^(\s*%s\s*=\s*).*?,\s*$" % re.escape(k), lambda m: m.group(1) + v + ",", t)
 open(p, "w", encoding="utf-8").write(t)
