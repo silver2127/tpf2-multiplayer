@@ -381,6 +381,11 @@ function CM.pollInject()
 							raw[i][5] = tonumber(w[tb + (i - 1) * 2 + 2]) or -1
 						end
 					end
+					local ob = tb + m * 2
+					if w[ob + 1] == "OWNERS" then
+						assert(#w == ob + 1 + m, "ROADE: incomplete ownership tail")
+						for i = 1, m do raw[i][6] = CM.edgeOwnerCompany(tonumber(w[ob + 1 + i])) end
+					end
 				end
 
 				if ok then
@@ -486,6 +491,7 @@ function CM.pollInject()
 					-- it is not shipped in rm as well -- rm is matched in the command's own
 					-- network only, and two removals of one edge reject the whole proposal.
 					local companionPair = {}
+					local owners = {}
 					local function pairKey(a, b) return (a < b) and (a .. ":" .. b) or (b .. ":" .. a) end
 					local upgradeShape = #raw > 0
 					do
@@ -571,6 +577,7 @@ function CM.pollInject()
 									end
 									bts[#bts + 1] = tostring(e[4] or 0)
 									bts[#bts + 1] = tostring(e[5] or -1)
+									if e[6] ~= nil then owners[#owners + 1] = tostring(e[6]) end
 								end
 							end
 						end
@@ -665,6 +672,7 @@ function CM.pollInject()
 						if #freshV > 0 then sargs.fv = table.concat(freshV, ",") end
 						if #bridges > 0 then sargs.br = table.concat(bridges, ";") end
 						if #sameBridges > 0 then sargs.bs = table.concat(sameBridges, ";") end
+						if #owners > 0 then sargs.own = table.concat(owners, ",") end
 						-- carry the bus lane / tram track the slice just decoded, so an
 						-- upgrade that ADDS either one actually reaches the peers (and the
 						-- originator, whose own upgrade was cancelled)
