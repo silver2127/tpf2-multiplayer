@@ -115,7 +115,7 @@ with TemporaryDirectory() as temporary:
     assert 'desyncs=0\nheld=0\n' in notice.read_text()
     # ALONE (2026-09-17): a hold whose other players are gone (roster 1, no peer heard) is abandoned
     # after K.SOLO_RELEASE_TICKS and the lever comes back; with others present it is held for good.
-    lua.execute("alone=false; CM.syncAlone=function() return alone end; CM.rosterPlayers=nil; K.SOLO_RELEASE_TICKS=75; "
+    lua.execute("alone=false; CM.syncAlone=function() return alone or tonumber(CM.rosterPlayers) == 1 end; CM.rosterPlayers=nil; K.SOLO_RELEASE_TICKS=75; "
                 "CM.ticks=1000; speed=3; changes=0; CM.autoSync=nil; CM.autoReleased=nil; CM.resyncHold=false")
     control(20, 'loading')
     lua.execute("assert(CM.autoSyncPump(100) and speed==0 and CM.resyncHold and CM.autoResumeSpeed==3)")
