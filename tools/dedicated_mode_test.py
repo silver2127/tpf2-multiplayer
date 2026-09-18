@@ -60,6 +60,13 @@ check("  ... the fence and semaphores still reach the real submit (a straight co
 check("  ... hooked through the device proc-addr interceptor", 'if (strcmp(name, "vkQueueSubmit") == 0) {' in MENU and "return (PFN_vkVoidFunction)mySubmit;" in MENU)
 check("  ... query results read as zero, available at once", "static VkResult VKAPI_CALL myQueryResults(" in MENU and 'strcmp(name, "vkGetQueryPoolResults") == 0' in MENU)
 check("  ... the panel is not drawn while not rendering", "if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0)" in MENU)
+check("  ... the swapchain is never acquired from or presented to: acquire answered here (round robin + empty signal submit)",
+      "static VkResult NullAcquire(VkSemaphore sem, VkFence fence, uint32_t* pIndex)" in MENU
+      and 'strcmp(name, "vkAcquireNextImageKHR") == 0' in MENU and 'strcmp(name, "vkAcquireNextImage2KHR") == 0' in MENU)
+check("  ... present consumes its wait semaphores and returns without the window system, paced to 60 frames/s",
+      "NullSignal(q, VK_NULL_HANDLE, VK_NULL_HANDLE, pi->waitSemaphoreCount, pi->pWaitSemaphores);" in MENU
+      and "static const double NORENDER_FPS = 60.0;" in MENU and "NullPace();" in MENU
+      and MENU.index("NullPace();") < MENU.index("return g_realPresent(q, pi);"))
 check("  ... on by default in dedicated mode, dedicated_render=1 turns drawing back on",
       "static int   g_flagDedRender = 0;" in MENU and "if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);" in MENU)
 check("the host command line carries --dedicated", 'if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");' in MENU)

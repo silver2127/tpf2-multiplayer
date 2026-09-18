@@ -273,6 +273,23 @@ static PFN_vkQueuePresentKHR   g_realPresent = nullptr;
 // The engine's frame loop, the swapchain and the present are untouched.
 static PFN_vkQueueSubmit        g_origSubmit  = nullptr;
 static PFN_vkGetQueryPoolResults g_origQueryResults = nullptr;
+// ... and NO WINDOW SYSTEM either (same evening): with the command buffers gone
+// the server still presented through lavapipe's X11 swapchain at 30 frames a
+// second, and the engine steps the simulation per frame as if there were 60 --
+// the world ran at exactly half of every speed asked (0.45 units/s at 1x, 0.9 at
+// 2x; a PC does 0.9 at 1x). With dedicated_render=0 the swapchain is never
+// acquired from or presented to: acquire hands out image indices in turn and
+// signals the semaphore/fence through an empty submit, present consumes its
+// wait semaphores the same way and returns, and the frame loop is paced here to
+// NORENDER_FPS instead of by the X server.
+static PFN_vkAcquireNextImageKHR g_origAcquire = nullptr;
+static PFN_vkAcquireNextImage2KHR g_origAcquire2 = nullptr;
+static PFN_vkGetSwapchainImagesKHR g_origGetScImages = nullptr;
+static volatile LONG g_nullScCount = 0;      // images in the current swapchain (for the round robin)
+static volatile LONG g_nullScNext = 0;
+static const double NORENDER_FPS = 60.0;     // the frame rate the engine's per-frame stepping assumes
+static void NullSignal(VkQueue q, VkSemaphore signalSem, VkFence fence, uint32_t waitCount, const VkSemaphore* waitSems);
+static void NullPace();
 static volatile LONG g_noRender = 0;
 static volatile LONG g_noRenderSubmits = 0, g_noRenderCmdBufs = 0;
 static bool NoRender() { return InterlockedCompareExchange(&g_noRender, 0, 0) != 0; }
@@ -2011,6 +2028,14 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         if (!once) { once = true; Log("[menu] myPresent FAULT exc=%lx (rInit=%d rFail=%d)\n",
             GetExceptionCode(), (int)g_rInit, (int)g_rFail); }
     }
+    if (NoRender() && pi) {
+        // the window system never sees this frame: consume the wait semaphores,
+        // report success for every swapchain, pace the loop to NORENDER_FPS
+        NullSignal(q, VK_NULL_HANDLE, VK_NULL_HANDLE, pi->waitSemaphoreCount, pi->pWaitSemaphores);
+        if (pi->pResults) for (uint32_t i = 0; i < pi->swapchainCount; ++i) pi->pResults[i] = VK_SUCCESS;
+        NullPace();
+        return VK_SUCCESS;
+    }
     return g_realPresent(q, pi);
 }
 
@@ -2026,6 +2051,12 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
 {
     VkResult r = g_origCreateSc(dev, ci, a, sc);
     if (r == VK_SUCCESS && ci) {
+        if (!g_origGetScImages && g_origGdpa) g_origGetScImages = (PFN_vkGetSwapchainImagesKHR)g_origGdpa(dev, "vkGetSwapchainImagesKHR");
+        uint32_t cnt = 0;
+        if (g_origGetScImages && sc && g_origGetScImages(dev, *sc, &cnt, nullptr) == VK_SUCCESS && cnt > 0) {
+            InterlockedExchange(&g_nullScCount, (LONG)cnt); InterlockedExchange(&g_nullScNext, 0);
+            if (NoRender()) Log("[menu] no-render: swapchain of %u images -- acquire and present are answered here, never by the window system\n", cnt);
+        }
         g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent; g_scUsage = ci->imageUsage;
         g_rInit = false; g_rFail = false;   // rebuild on next present
         // The panel and backdrop images were created against the OLD format and
@@ -2040,6 +2071,55 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
             ci->imageUsage, (ci->imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ? 1 : 0);
     }
     return r;
+}
+
+// an empty submit that only signals (acquire) or only waits (present): what the
+// window system would have done to those semaphores and that fence
+static void NullSignal(VkQueue q, VkSemaphore signalSem, VkFence fence, uint32_t waitCount, const VkSemaphore* waitSems)
+{
+    if (!g_origSubmit || q == VK_NULL_HANDLE) return;
+    VkPipelineStageFlags stages[16];
+    if (waitCount > 16) waitCount = 16;
+    for (uint32_t i = 0; i < waitCount; ++i) stages[i] = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = waitCount; si.pWaitSemaphores = waitCount ? waitSems : nullptr; si.pWaitDstStageMask = waitCount ? stages : nullptr;
+    si.signalSemaphoreCount = signalSem != VK_NULL_HANDLE ? 1 : 0; si.pSignalSemaphores = signalSem != VK_NULL_HANDLE ? &signalSem : nullptr;
+    g_origSubmit(q, 1, &si, fence);
+}
+static VkResult NullAcquire(VkSemaphore sem, VkFence fence, uint32_t* pIndex)
+{
+    LONG cnt = InterlockedCompareExchange(&g_nullScCount, 0, 0);
+    if (cnt <= 0) cnt = 3;
+    LONG i = InterlockedIncrement(&g_nullScNext) - 1;
+    if (pIndex) *pIndex = (uint32_t)(i % cnt);
+    NullSignal(g_qFromFam, sem, fence, 0, nullptr);
+    return VK_SUCCESS;
+}
+static VkResult VKAPI_CALL myAcquire(VkDevice dev, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence fence, uint32_t* pIndex)
+{
+    if (!NoRender()) return g_origAcquire(dev, sc, timeout, sem, fence, pIndex);
+    return NullAcquire(sem, fence, pIndex);
+}
+static VkResult VKAPI_CALL myAcquire2(VkDevice dev, const VkAcquireNextImageInfoKHR* info, uint32_t* pIndex)
+{
+    if (!NoRender()) return g_origAcquire2(dev, info, pIndex);
+    return NullAcquire(info ? info->semaphore : VK_NULL_HANDLE, info ? info->fence : VK_NULL_HANDLE, pIndex);
+}
+// the frame pace the window system no longer sets: NORENDER_FPS, slept here
+static void NullPace()
+{
+    static LARGE_INTEGER freq{}, next{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const LONGLONG period = (LONGLONG)(freq.QuadPart / NORENDER_FPS);
+    if (!next.QuadPart || now.QuadPart > next.QuadPart + 4 * period) next.QuadPart = now.QuadPart;   // first frame, or far behind: restart the grid
+    next.QuadPart += period;
+    LONGLONG wait = next.QuadPart - now.QuadPart;
+    if (wait > 0) {
+        DWORD ms = (DWORD)(wait * 1000 / freq.QuadPart);
+        if (ms > 1) Sleep(ms - 1);
+        do { QueryPerformanceCounter(&now); } while (now.QuadPart < next.QuadPart);
+    }
 }
 
 // vkQueueSubmit with the command buffers taken out: the fence and the semaphores
@@ -2080,6 +2160,12 @@ static PFN_vkVoidFunction myGdpa(VkDevice dev, const char* name)
     }
     if (strcmp(name, "vkGetQueryPoolResults") == 0) {
         g_origQueryResults = (PFN_vkGetQueryPoolResults)real; return (PFN_vkVoidFunction)myQueryResults;
+    }
+    if (strcmp(name, "vkAcquireNextImageKHR") == 0) {
+        g_origAcquire = (PFN_vkAcquireNextImageKHR)real; return (PFN_vkVoidFunction)myAcquire;
+    }
+    if (strcmp(name, "vkAcquireNextImage2KHR") == 0) {
+        g_origAcquire2 = (PFN_vkAcquireNextImage2KHR)real; return (PFN_vkVoidFunction)myAcquire2;
     }
     if (NoRender() && (strcmp(name, "vkQueueSubmit2") == 0 || strcmp(name, "vkQueueSubmit2KHR") == 0))
         Log("[menu] the game resolves %s -- not intercepted, rendering may still run\n", name);
@@ -4003,8 +4089,12 @@ static void DedicatedTick()
         static ULONGLONG lastCount = 0;
         if (now - lastCount >= 60000) {
             lastCount = now;
-            Log("[dedicated] no-render: %ld submits, %ld command buffers dropped so far\n",
-                InterlockedCompareExchange(&g_noRenderSubmits, 0, 0), InterlockedCompareExchange(&g_noRenderCmdBufs, 0, 0));
+            static LONG lastPresents = 0; static ULONGLONG lastAt = 0;
+            const LONG presents = InterlockedCompareExchange(&g_presentCount, 0, 0);
+            const double fps = lastAt ? (presents - lastPresents) * 1000.0 / (double)(now - lastAt) : 0.0;
+            lastPresents = presents; lastAt = now;
+            Log("[dedicated] no-render: %ld submits, %ld command buffers dropped so far; %.1f frames/s (paced to %.0f, no window system)\n",
+                InterlockedCompareExchange(&g_noRenderSubmits, 0, 0), InterlockedCompareExchange(&g_noRenderCmdBufs, 0, 0), fps, NORENDER_FPS);
         }
     }
     if (g_flagDedAutosaveMin > 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
