@@ -115,8 +115,8 @@ with TemporaryDirectory() as temporary:
     assert 'desyncs=0\nheld=0\n' in notice.read_text()
     # ALONE (2026-09-17): a hold whose other players are gone (roster 1, no peer heard) is abandoned
     # after K.SOLO_RELEASE_TICKS and the lever comes back; with others present it is held for good.
-    lua.execute("alone=false; CM.othersPresent=function() return not alone end; K.SOLO_RELEASE_TICKS=75; CM.ticks=1000; "
-                "speed=3; changes=0; CM.autoSync=nil; CM.autoReleased=nil; CM.resyncHold=false")
+    lua.execute("alone=false; CM.syncLobbyAlive=function() return not alone end; CM.rosterPlayers=nil; K.SOLO_RELEASE_TICKS=75; "
+                "CM.ticks=1000; speed=3; changes=0; CM.autoSync=nil; CM.autoReleased=nil; CM.resyncHold=false")
     control(20, 'loading')
     lua.execute("assert(CM.autoSyncPump(100) and speed==0 and CM.resyncHold and CM.autoResumeSpeed==3)")
     lua.execute("for i=1,200 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0 and CM.resyncHold)")
@@ -129,5 +129,21 @@ with TemporaryDirectory() as temporary:
     lua.execute("assert(CM.autoSyncPump(100) and speed==0)")            # a fresh operation with others present holds again
     lua.execute("alone=true; for i=1,40 do CM.ticks=CM.ticks+1 end; alone=false; assert(CM.autoSyncPump(100)); "
                 "alone=true; for i=1,74 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0)")  # the alone clock restarts
+    # THE FROZEN JOIN OF 21:51 (2026-09-17): a freshly loaded Lua state hears no peer and knows no roster yet,
+    # but the lobby is alive -- that is not alone, however long it lasts
+    lua.execute("alone=false; CM.autoAloneSince=nil; CM.rosterPlayers=nil; CM.peers={}; "
+                "for i=1,600 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0 and CM.resyncHold)")
+    # a roster the lobby says is one player, lobby still alive: that IS alone (the other player left)
+    lua.execute("CM.rosterPlayers=1; for i=1,75 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; "
+                "CM.ticks=CM.ticks+1; assert(not CM.autoSyncPump(100)); assert(speed==3)")
+    # the real liveness reader: a fresh wall is alive, a stale one is not, a missing file is not
+    lua.execute("CM.syncLobbyAlive=nil")
+    lua.execute(source)(lua.globals().CM, lua.globals().K, lambda _: None)   # reload the module's functions
+    (directory / 'tpf2_sync_available.txt').write_text('protocol=4\nwall=%d\npid=123\n' % int(time.time()))
+    lua.execute("CM.syncLobbyAt=nil; assert(CM.syncLobbyAlive()); CM.rosterPlayers=nil; assert(not CM.syncAlone())")
+    (directory / 'tpf2_sync_available.txt').write_text('protocol=4\nwall=%d\npid=123\n' % (int(time.time()) - 60))
+    lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); assert(CM.syncAlone())")
+    (directory / 'tpf2_sync_available.txt').unlink()
+    lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=3; assert(CM.syncAlone())")
 print('PASS: real Lua 5.2 producer hold, fresh paused comparison, stale/partial IPC, PID guard, pause preservation, '
       'one fresh world token per load and native-panel notices, a hold abandoned once alone; engine simulated')

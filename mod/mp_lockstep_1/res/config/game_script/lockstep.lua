@@ -226,7 +226,8 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
-K.SOLO_RELEASE_TICKS = 75  -- ~15 s alone (roster 1, no peer heard) before a world-operation hold is abandoned (resync.lua)
+K.SOLO_RELEASE_TICKS = 75  -- ~15 s alone (lobby gone or roster 1) before a world-operation hold is abandoned (resync.lua)
+K.SOLO_RELEASE_SECONDS = 15 -- how stale tpf2_sync_available.txt may be before the lobby counts as gone (resync.lua)
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
 K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs

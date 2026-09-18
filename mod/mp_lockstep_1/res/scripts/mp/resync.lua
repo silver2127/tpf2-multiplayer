@@ -47,6 +47,30 @@ function CM.recoveryGuiHeld()
 	return CM.recoveryGuiHold
 end
 
+-- The lobby that runs a world operation refreshes tpf2_sync_available.txt (wall=)
+-- every second or two while it lives. Read every 15 ticks.
+function CM.syncLobbyAlive()
+	if CM.syncLobbyAt and (CM.ticks or 0) - CM.syncLobbyAt < 15 then return CM.syncLobbyAliveCached end
+	CM.syncLobbyAt = CM.ticks or 0
+	local a = CM.syncRead("tpf2_sync_available.txt")
+	local wall = a and tonumber(a.wall)
+	CM.syncLobbyAliveCached = wall ~= nil and math.abs(os.time() - wall) <= (K.SOLO_RELEASE_SECONDS or 15)
+	return CM.syncLobbyAliveCached
+end
+
+-- ALONE, for a hold: the lobby that drives the operation is gone, or its
+-- roster is KNOWN to be one player. Never "no peer heard": right after the
+-- load every member is deaf for a while (fresh Lua state, peers still loading),
+-- and the first frozen join with three players abandoned its hold on every
+-- machine 15 s after the load for exactly that reason (2026-09-17 21:51):
+-- each unpaused itself, the pause fence could not drain, no fingerprint was
+-- taken and the round timed out in "checking".
+function CM.syncAlone()
+	local roster = tonumber(CM.rosterPlayers)
+	if roster ~= nil and roster <= 1 then return true end
+	return not CM.syncLobbyAlive()
+end
+
 function CM.autoSyncPump(now)
 	local incoming = CM.syncRead("tpf2_sync_lua.txt")
 	if incoming and incoming.pid == K.PROCESS_ID and incoming.operation and incoming.epoch
@@ -83,13 +107,14 @@ function CM.autoSyncPump(now)
 	end
 	-- Missing/partial control or an error NEVER releases an existing hold --
 	-- while there is a session to protect. ALONE (2026-09-17, user: "with only
-	-- 1 person in game I cannot increase game speed"): the lobby's roster back
-	-- at one and no peer heard for K.SOLO_RELEASE_TICKS means the other players
-	-- are gone and nobody will ever advance this operation; the hold would pin
-	-- the speed at 0 for the rest of the game. Abandon it and give the lever back.
-	if CM.othersPresent and not CM.othersPresent() then
-		CM.autoAloneSince = CM.autoAloneSince or CM.ticks
-		if CM.ticks - CM.autoAloneSince >= (K.SOLO_RELEASE_TICKS or 75) then
+	-- 1 person in game I cannot increase game speed"): the lobby gone, or its
+	-- roster known to be one, for K.SOLO_RELEASE_TICKS means nobody will ever
+	-- advance this operation; the hold would pin the speed at 0 for the rest of
+	-- the game. Abandon it and give the lever back. (CM.syncAlone: not by
+	-- unheard peers -- see there.)
+	if CM.syncAlone() then
+		CM.autoAloneSince = CM.autoAloneSince or (CM.ticks or 0)
+		if (CM.ticks or 0) - CM.autoAloneSince >= (K.SOLO_RELEASE_TICKS or 75) then
 			local speed = tonumber(CM.autoResumeSpeed) or 0
 			if speed < 1 or speed > 4 then speed = 1 end
 			log(string.format("RESYNC: %s left in phase %s with nobody else in the game -- abandoned, speed back to %d",
