@@ -379,6 +379,10 @@ static volatile LONG g_saveReady  = 0;
 //  g_worldGenHold     -- absorb the next change: it is a load WE caused
 //  g_switchShare      -- the save SyncPoll is about to share is a world switch
 static volatile LONG g_selfLoad = 0, g_hostLoadedItself = 0, g_lastPage = -1;
+//  g_hostMenuLoad -- the host's own mid-session LOAD GAME is in flight (a world
+//  switch it shared); the title page the engine builds on the way is not a
+//  "left the world" (consumed by MyCreatePage, one shot).
+static volatile LONG g_hostMenuLoad = 0;
 static volatile LONG g_sessionStarted = 0;
 static volatile LONG g_worldGenHold = 0, g_switchShare = 0;
 static char g_worldGen[160] = "";
@@ -2320,7 +2324,10 @@ extern "C" {
     void* g_gameUiTramp = nullptr;
     void  GameUiRelay();
     volatile uint64_t g_gameUi = 0;                 // UI::CGameUI 'this', per frame
-    void GameUiSeen(uint64_t rcx) { g_gameUi = rcx; }
+    void GameUiSeen(uint64_t rcx) {
+        if (!g_gameUi && rcx) InterlockedExchange(&g_hostMenuLoad, 0);   // a NEW world is up: a switch in flight is over
+        g_gameUi = rcx;
+    }
 }
 static const uintptr_t RVA_GAMEUI_UPDATE = 0x5741d0;
 static const int       STEAL_GAMEUI      = 21;
@@ -3119,7 +3126,12 @@ static void OnStartSavegame(const void* params, bool accepted, bool ours)
     Log("[menu] menu load of '%s' from page %ld (hosting=%d players=%d)\n",
         name, InterlockedCompareExchange(&g_lastPage, 0, 0), hosting ? 1 : 0, players);
     if (!hosting || !name[0]) return;
-    if (players < 2) { Log("[menu] menu load while hosting with nobody in the lobby -- not shared\n"); return; }
+    // On a relay lobby the relay keeps the world for the next player, so the
+    // leader's load is uploaded even with nobody else in (2026-09-18: a swap
+    // taken alone was "not shared", the relay kept the old save, and the
+    // leader's next join got the old world back).
+    const bool relay = InterlockedCompareExchange(&g_lobbyRelay, 0, 0) != 0;
+    if (players < 2 && !relay) { Log("[menu] menu load while hosting with nobody in the lobby -- not shared\n"); return; }
     wchar_t wn[300]; MultiByteToWideChar(CP_UTF8, 0, name, -1, wn, 300);
     wchar_t path[600]; _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
@@ -3140,10 +3152,15 @@ static void OnStartSavegame(const void* params, bool accepted, bool ours)
     line += "}";
     LobbySend(line.c_str());
     MarkSaveShared();     // a joiner arriving right after reuses this save
+    // The engine builds the title page between the old world and the loading
+    // screen of THIS load; MyCreatePage must not read that as "left the world"
+    // (it did: the host's every mid-session load LEFT the lobby, 2026-09-18).
+    if (switching) InterlockedExchange(&g_hostMenuLoad, 1);
     char st[240];
     if (switching) {
-        snprintf(st, sizeof(st), "Switching everyone to '%s'\xE2\x80\xA6", name);
-        Log("[menu] world switch: the host loaded %ls mid-session -- pushing it to %d player(s)\n", path, players - 1);
+        if (relay && players < 2) snprintf(st, sizeof(st), "Uploading '%s' to the server\xE2\x80\xA6", name);
+        else snprintf(st, sizeof(st), "Switching everyone to '%s'\xE2\x80\xA6", name);
+        Log("[menu] world switch: the host loaded %ls mid-session -- pushing it to %d player(s)%s\n", path, players - 1, relay ? " and the relay" : "");
     } else {
         InterlockedExchange(&g_hostLoadedItself, 1);
         snprintf(st, sizeof(st), "Sharing '%s' with %d player(s)\xE2\x80\xA6", name, players - 1);
@@ -3967,6 +3984,7 @@ static void MyCreatePage(uint64_t thisp, int page)
         // "Player disconnected or roster changed" (2026-09-16).
         if (g_gameUi != 0 && LobbyRunning()) {
             if (NativeIo::Loading()) Log("[menu] the title menu was built by our own load (resync) -- staying in the lobby\n");
+            else if (InterlockedExchange(&g_hostMenuLoad, 0)) Log("[menu] the title menu was built by the host's own world switch -- staying in the lobby\n");
             else InterlockedExchange(&g_leaveOnMenu, 1);
         }
         g_gameUi = 0;
