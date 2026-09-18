@@ -644,6 +644,7 @@ CM.boot("mp.assets")
 local function execute(c)
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
+	elseif c.op == "FENCE" then CM.execFence(c)
 	elseif c.op == "ROADP" then CM.execPolyline(c)
 	elseif c.op == "ROAD" or c.op == "RAIL" then CM.execEdge(c)
 	elseif c.op == "CON" then CM.execCon(c)
@@ -699,6 +700,7 @@ CM.boot("mp.pacing")
 -- Lives in res/scripts/mp/cursors.lua.
 CM.boot("mp.cursors")
 CM.boot("mp.previews")
+require("mp/fences_compat").bind(CM, K, log)
 -- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
 -- Lives in res/scripts/mp/stats.lua.
 CM.boot("mp.stats")

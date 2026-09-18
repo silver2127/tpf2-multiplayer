@@ -934,6 +934,16 @@ local function noteCon(id, fn, key, pstr)
 	return prev
 end
 
+-- The additive Fences replay knows its result id; register that exact entity
+-- before a catch-up scan can mistake it for an unsynchronized native build.
+function CM.registerFenceReplay(id, file, params)
+	if type(id) ~= "number" or id < 0 or not api.engine.entityExists(id) then return end
+	local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+	if not co or tostring(co.fileName) ~= file or not co.transf then return end
+	knownCons[id] = true
+	noteCon(id, file, CM.conKey(co.transf[13], co.transf[14]), params)
+end
+
 -- The live player construction of `file` nearest (x, y) within maxDist, looked up in
 -- the WORLD rather than consByKey, and registered. The edit replay's fallback for a
 -- station the table lost -- a reused entity id the poll skipped, or an upgrade whose

@@ -866,6 +866,7 @@ function CM.pollInject()
 				local ct = {}
 				for tok in tostring(tstr or ""):gmatch("[^,]+") do ct[#ct + 1] = tonumber(tok) end
 				if cfile and #ct == 16 then
+					if CM.fencesCapture and CM.fencesCapture(cfile,ct,pstr,hadRoadc) then return end
 					-- Name is generated at BUILD time (execConX -> CM.depotName): the
 					-- engine auto-names a native placement "<town> Road depot", which
 					-- a script buildProposal does not, so we reproduce it from the
