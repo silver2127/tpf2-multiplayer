@@ -31,9 +31,9 @@ status)
 install)
     # the release's installer: it finds Steam, the game and the Proton prefix by itself
     url="https://github.com/silver2127/tpf2-multiplayer/releases/${MOD_RELEASE:+download/v$MOD_RELEASE}${MOD_RELEASE:-latest/download}/install_proton.sh"
-    tmp=$(mktemp -d)
-    curl -fsSL "$url" -o "$tmp/install_proton.sh"
-    as_server sh "$tmp/install_proton.sh" --steam-root "$STEAM_ROOT" "$@"
+    tmp=$(mktemp -d); chmod 755 "$tmp"          # readable by the tpf2server user the installer runs as
+    curl -fsSL "$url" -o "$tmp/install_proton.sh"; chmod 644 "$tmp/install_proton.sh"
+    as_server bash "$tmp/install_proton.sh" --steam-root "$STEAM_ROOT" "$@"   # a bash script (arrays); sh is dash here
     rm -rf "$tmp"
     echo "installed; now: tpf2server configure"
     ;;

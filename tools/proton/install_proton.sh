@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Run under bash even when started as `sh install_proton.sh` (dash on Debian/Ubuntu has no
+# arrays and no pipefail; the release notes say `sh`, and that broke at line 174 on 2026-09-18).
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 # TpF2 Multiplayer -- install into the Windows game under Steam Proton (Linux, Steam Deck).
 #
 # The same install as tools/proton/install.py, without Python: finds Steam, the game
