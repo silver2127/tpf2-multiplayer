@@ -2433,7 +2433,7 @@ class _Publisher:
         req = urllib.request.Request(self.url + path, data=data,
                                      headers={"Content-Type": "application/json",
                                               "User-Agent": "tpf2mp-lobby/" + LOBBY_VERSION})
-        with urllib.request.urlopen(req, timeout=6) as r:
+        with urllib.request.urlopen(req, timeout=6, context=_master_ssl_context()) as r:
             return r.status
 
     def _run(self):
@@ -2525,8 +2525,20 @@ def _http_json(url, body=None, timeout=6):
     req = urllib.request.Request(url, data=data,
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": "tpf2mp-lobby/" + LOBBY_VERSION})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    # roots.ssl_context: the system store plus the ISRG roots, so a Windows
+    # without ISRG Root X2 does not fail the master's chain as "expired"
+    with urllib.request.urlopen(req, timeout=timeout, context=_master_ssl_context()) as r:
         return json.loads(r.read().decode("utf-8") or "{}")
+
+
+_SSL_CTX = [None]
+
+
+def _master_ssl_context():
+    if _SSL_CTX[0] is None:
+        from roots import ssl_context
+        _SSL_CTX[0] = ssl_context()
+    return _SSL_CTX[0]
 
 
 class _RendezvousHost:

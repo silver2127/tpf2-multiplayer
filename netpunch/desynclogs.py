@@ -231,7 +231,12 @@ def post(url, blob, meta, version, timeout=60):
         "X-Tpf2mp-Meta": json.dumps(meta)[:1800],
         "User-Agent": f"tpf2mp-lobby/{version}",
     })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    try:
+        from roots import ssl_context
+        ctx = ssl_context()
+    except Exception:  # noqa: BLE001
+        ctx = None
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
         return json.loads(r.read(4096) or b"{}")
 
 
