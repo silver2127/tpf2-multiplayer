@@ -245,6 +245,39 @@ function test_fresh_parallel()
   local sp=execute({etype=1,pts='-20,1,0,0,1,0,20,1,0',links='1,2,2,3',fv='1,2,3'})
   assert(#sp.nodesToAdd==3 and #sp.edgesToAdd==2 and #sp.edgesToRemove==0,'fresh parallel track snapped to existing one')
 end
+-- The second track of a double track sits 5 m from the first. Bulge the
+-- existing track toward the new one so the closest approach is mid-segment
+-- (a straight pair meets first at the rail's end, which the endpoint case
+-- already skips): 2.9 m apart, parallel -> not a crossing, nothing split.
+function test_parallel_neighbour()
+  reset()
+  node(101,-20,0,0);node(102,20,0,0);edge(201,101,102,1)
+  edges[201].comp.tangent0=vec(40,8,0);edges[201].comp.tangent1=vec(40,-8,0)
+  local sp=execute({etype=1,pts='-20,4.9,0,20,4.9,0',links='1,2',fv='1,2'})
+  assert(#sp.edgesToRemove==0,'a parallel track 2.9 m away was split as a crossing')
+  assert(#sp.nodesToAdd==2 and #sp.edgesToAdd==1,'parallel track changed the build shape')
+  local said=false
+  for _,l in ipairs(logs) do if l:find('parallel, not a crossing',1,true) then said=true end end
+  assert(said,'parallel guard did not fire: '..table.concat(logs,'\n'))
+end
+-- The upgrade tool replaces an edge between its own two nodes (rm= names it).
+-- Whatever stands beside that edge -- here another track brushing it at 20
+-- degrees, 1 m away, a shape the engine itself would never have allowed to
+-- cross -- the segment takes the old edge's place and the crossing pass is
+-- skipped: one removal (the replaced edge), one edge, no new node.
+function test_in_place_upgrade()
+  reset()
+  node(101,-20,0,0);node(102,20,0,0);edge(201,101,102,1)
+  node(103,-20,15,0);node(104,20,1,0);edge(202,103,104,1)
+  local sp=execute({etype=1,pts='-20,0,0,20,0,0',links='1,2',rm='-20,0,20,0'})
+  assert(#sp.edgesToRemove==1 and sp.edgesToRemove[1]==201,'in-place upgrade removed '..#sp.edgesToRemove..' edge(s)')
+  assert(#sp.nodesToAdd==0 and #sp.edgesToAdd==1,'in-place upgrade changed shape: nodes '..#sp.nodesToAdd..' edges '..#sp.edgesToAdd)
+  local e=sp.edgesToAdd[1]
+  assert((e.comp.node0==101 and e.comp.node1==102) or (e.comp.node0==102 and e.comp.node1==101),'replacement not between the old nodes')
+  local said=false
+  for _,l in ipairs(logs) do if l:find('in place) -- no crossings',1,true) then said=true end end
+  assert(said,'in-place guard did not fire: '..table.concat(logs,'\n'))
+end
 function test_bridge_companion(reverse,isTrack)
   reset()
   node(101,0,-20,20);node(102,0,20,20)
@@ -310,7 +343,9 @@ if __name__ == "__main__":
                     lua.globals().test_no_crossing(is_track, bridge, planned)
             lua.globals().test_existing_crossing(is_track)
         lua.globals().test_fresh_parallel()
-        print("PASS: both bridge/height guards, existing crossing nodes, and fresh parallel tracks")
+        lua.globals().test_parallel_neighbour()
+        lua.globals().test_in_place_upgrade()
+        print("PASS: both bridge/height guards, existing crossing nodes, fresh parallel tracks, a parallel neighbour and an in-place upgrade")
     if "companions" in cases:
         for reverse in (False, True):
             for is_track in (False, True):
