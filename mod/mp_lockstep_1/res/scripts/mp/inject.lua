@@ -1451,12 +1451,19 @@ function CM.pollInject()
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
 								end
 							end
+							-- a line no vehicle runs: applied here now, everyone else at the stamp
+							-- (lines.lua CM.lineApplyNow); armed 0 = "ran natively here" to execLine
+							local free = armed == 1 and (K.LINE_EDIT_FREE or 1) == 1 and CM.lineHasVehicles and not CM.lineHasVehicles(lid)
 							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %g%s", lk, #stops, wait,
-								armed == 1 and " (strict)" or ""))
+								free and " (no vehicles: applied here now, the others at the stamp)" or (armed == 1 and " (strict)" or "")))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
 							                           wait = wait, stops = newStops,
-							                           alts = newAlts, armed = armed })
+							                           alts = newAlts, armed = free and 0 or armed })
 							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts) end
+							if free then
+								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts })
+								if not okA then log("LUPDATE: applying here now failed (" .. tostring(errA) .. ") -- it lands at the stamp with the others") end
+							end
 						end
 					else
 						-- The update ran natively here and the engine applies it on a later

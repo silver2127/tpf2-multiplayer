@@ -1811,55 +1811,67 @@ static int32_t ReadAndConsumeSpareLine()
     if (w) fclose(w);
     return (int32_t)id;
 }
-// FIRING THE EDITOR'S CALLBACK ON THE SPARE (2026-09-19, second attempt). Fired at
-// the create's own Add it failed every time: both callbacks look the result up in
-// THEIR OWN list of lines first (0x1423e27d0 over a vector of 16-byte entries,
-// entity at +0; not found = assert), and that list holds the player's lines only.
-// The spare is the pool company's until the game script re-owns it a tick later,
-// and the manager lists it a frame after that. So the callback is HELD as before,
-// and fired from a later CommandList::Add on the same (UI) thread -- the GUI
-// state's rename of the spare, sent every few frames while lockstep_lfire.txt
-// names it -- once the callback's own list holds the spare:
-//   line manager: _Do_call thunk 0x618d70 = `add rcx,8; jmp 0x6154a0`, the lambda
-//                 at impl+8 captures the manager, whose list is at +0x448
-//   line list:    _Do_call 0x610490 reads the LineList at [impl+8], list at +0x440
-// The command handed to the callback is a stand-in: they read only the tag at
-// +0xb18 (3 = CreateLine) and the result entity at +0x58 of the impl.
+// FIRING THE EDITOR'S CALLBACK ON THE SPARE (2026-09-19, third attempt). Fired at
+// the create's own Add it failed every time, and the reason was not the line
+// manager's list: both callbacks (0x6154a0 line manager, 0x610490 line list) hand
+// 0x1423e27d0 the COMMAND RESULT's own vector -- begin/end at +8/+0x10 of the
+// argument they get, entries of 16 bytes { int32 entity; double gen; int32 x } --
+// and require the created entity in it with a generation that still matches the
+// registry's (0x1423df380: alive = the slot at [reg+0xa0]+id*24 holds one non-
+// negative int, gen = the 12 bytes at [reg+0xb8]+id*12); a miss is an assert. The
+// registry is what 0x8b9e60(owner+0x448 | +0x440) returns, owner = the lambda's
+// captured manager/list at [impl+8] (thunk 0x618d70 = `add rcx,8; jmp 0x6154a0`;
+// 0x610490 is its own _Do_call). After that they open the editor on the entity
+// through the registry alone. So the callback is HELD as before and fired from a
+// later CommandList::Add on the same (UI) thread -- the GUI state's rename of the
+// spare, sent every third frame once the UI's copy of the engine shows the spare
+// as the player's, with lockstep_lfire.txt naming it -- with a stand-in result:
+// { impl (tag 3 at +0xb18, the spare at +0x58), one entry of the spare with the
+// registry's current generation }.
 static const uintptr_t RVA_LINEMGR_CB_THUNK = 0x618d70;
 static const uintptr_t RVA_LINELIST_CB      = 0x610490;
-static const ULONGLONG LSPARE_FIRE_MAX_MS   = 5000;
+static const uintptr_t RVA_REGISTRY_OF      = 0x8b9e60;
+static const ULONGLONG LSPARE_FIRE_MAX_MS   = 6000;
 static volatile LONG g_lcSpareWaitId = 0;      // the spare the held callback should open, 0 = none
 static ULONGLONG     g_lcSpareWaitAt = 0;
 static DWORD         g_lcUiTid       = 0;      // the thread the create's Add ran on
-static void BlankSpareFireFile()
+static void BlankSpareFireFiles()
+{
+    for (const char* n : { "lockstep_lfire.txt", "lockstep_lfire_req.txt" }) {
+        char p[MAX_PATH];
+        snprintf(p, sizeof(p), "%s%s", g_dataDir, n);
+        FILE* w = _fsopen(p, "w", _SH_DENYNO);
+        if (w) fclose(w);
+    }
+}
+static int32_t SpareFireGo()
 {
     char p[MAX_PATH];
     snprintf(p, sizeof(p), "%slockstep_lfire.txt", g_dataDir);
-    FILE* w = _fsopen(p, "w", _SH_DENYNO);
-    if (w) fclose(w);
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return 0;
+    long id = 0;
+    if (fscanf(f, "%ld", &id) != 1) id = 0;
+    fclose(f);
+    return (int32_t)id;
 }
-static bool LineListHas(uint64_t vecAt, int32_t ent)
-{
-    if (!Readable((void*)vecAt, 16)) return false;
-    uint64_t b = 0, e = 0;
-    memcpy(&b, (void*)vecAt, 8); memcpy(&e, (void*)(vecAt + 8), 8);
-    if (!b || e < b || e - b > 16ULL * 200000ULL || !Readable((void*)b, (size_t)(e - b))) return false;
-    for (uint64_t q = b; q + 16 <= e; q += 16) {
-        int32_t v = 0;
-        memcpy(&v, (void*)q, 4);
-        if (v == ent) return true;
-    }
-    return false;
-}
+#pragma pack(push, 1)
+struct SpareResultEntry { int32_t entity; double gen; int32_t x; };
+#pragma pack(pop)
 static void TryFireSpareLine()
 {
     const int32_t id = (int32_t)InterlockedCompareExchange(&g_lcSpareWaitId, 0, 0);
     if (!id || GetCurrentThreadId() != g_lcUiTid) return;
+    const bool late = GetTickCount64() - g_lcSpareWaitAt > LSPARE_FIRE_MAX_MS;
+    if (SpareFireGo() != id) {
+        if (late) { InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFiles(); Log("[slice] CreateLine: the GUI never saw spare line %d as the player's -- giving up (the held callback expires)\n", id); }
+        return;
+    }
     uint8_t* buf = nullptr;
     AcquireSRWLockExclusive(&g_lcLock);
     if (!g_lcStash.empty()) buf = g_lcStash.front().fn;
     ReleaseSRWLockExclusive(&g_lcLock);
-    if (!buf) { InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFile(); Log("[slice] CreateLine: no held callback for spare line %d -- the editor keeps what it shows\n", id); return; }
+    if (!buf) { InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFiles(); Log("[slice] CreateLine: no held callback for spare line %d -- the editor keeps what it shows\n", id); return; }
     uint64_t impl = 0, vft = 0, doCall = 0, owner = 0;
     memcpy(&impl, buf + 0x38, 8);
     if (!impl || !Readable((void*)impl, 16)) return;
@@ -1867,38 +1879,60 @@ static void TryFireSpareLine()
     memcpy(&owner, (void*)(impl + 8), 8);
     if (!vft || !Readable((void*)vft, 8 * 3)) return;
     memcpy(&doCall, (void*)(vft + 0x10), 8);
-    size_t listOff = 0;
-    if (doCall == (uint64_t)g_base + RVA_LINEMGR_CB_THUNK) listOff = 0x448;
-    else if (doCall == (uint64_t)g_base + RVA_LINELIST_CB) listOff = 0x440;
+    size_t regOff = 0;
+    if (doCall == (uint64_t)g_base + RVA_LINEMGR_CB_THUNK) regOff = 0x448;
+    else if (doCall == (uint64_t)g_base + RVA_LINELIST_CB) regOff = 0x440;
     else {
-        InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFile();
+        InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFiles();
         Log("[slice] CreateLine: held callback %llx is neither the line manager's nor the line list's -- spare line %d stays unselected\n", (unsigned long long)(doCall - (uint64_t)g_base), id);
         return;
     }
-    if (!owner || !LineListHas(owner + listOff, id)) {
-        if (GetTickCount64() - g_lcSpareWaitAt > LSPARE_FIRE_MAX_MS) {
-            InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFile();
-            Log("[slice] CreateLine: spare line %d never appeared in the editor's list -- giving up (the held callback expires)\n", id);
+    // the registry, and the spare's generation in it (alive, or nothing fires)
+    SpareResultEntry entry{ id, 0.0, 0 };
+    bool alive = false;
+    __try {
+        const uint64_t reg = owner ? ((uint64_t (*)(uint64_t))((uint64_t)g_base + RVA_REGISTRY_OF))(owner + regOff) : 0;
+        if (reg && Readable((void*)(reg + 0xa0), 0x20)) {
+            uint64_t sb = 0, se = 0, gens = 0;
+            memcpy(&sb, (void*)(reg + 0xa0), 8); memcpy(&se, (void*)(reg + 0xa8), 8); memcpy(&gens, (void*)(reg + 0xb8), 8);
+            const uint64_t count = (se > sb) ? (se - sb) / 24 : 0;
+            if ((uint64_t)id < count && Readable((void*)(sb + (uint64_t)id * 24), 16) && gens && Readable((void*)(gens + (uint64_t)id * 12), 12)) {
+                uint64_t vb = 0, ve = 0;
+                memcpy(&vb, (void*)(sb + (uint64_t)id * 24), 8); memcpy(&ve, (void*)(sb + (uint64_t)id * 24 + 8), 8);
+                int32_t first = -1;
+                if (ve - vb == 8 && Readable((void*)vb, 4)) memcpy(&first, (void*)vb, 4);
+                if (ve - vb != 8 || first >= 0) {
+                    memcpy(&entry.gen, (void*)(gens + (uint64_t)id * 12), 8);
+                    memcpy(&entry.x, (void*)(gens + (uint64_t)id * 12 + 8), 4);
+                    alive = true;
+                }
+            }
         }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { alive = false; }
+    if (!alive) {
+        if (late) { InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFiles(); Log("[slice] CreateLine: spare line %d is not alive in the editor's registry -- giving up (the held callback expires)\n", id); }
         return;
     }
     AcquireSRWLockExclusive(&g_lcLock);
     if (!g_lcStash.empty() && g_lcStash.front().fn == buf) g_lcStash.erase(g_lcStash.begin());
     ReleaseSRWLockExclusive(&g_lcLock);
     InterlockedExchange(&g_lcSpareWaitId, 0);
-    uint8_t* fake = (uint8_t*)calloc(1, 0xb20);
+    uint8_t* fakeImpl = (uint8_t*)calloc(1, 0xb20);
+    uint64_t* result = (uint64_t*)calloc(8, 8);   // { impl, begin, end, ... }
     bool fired = false;
-    if (fake) {
-        fake[0xb18] = 3;
-        memcpy(fake + 0x58, &id, 4);
-        uint64_t holder = (uint64_t)fake;
-        __try { ((void (*)(uint64_t, uint64_t))doCall)(impl, (uint64_t)&holder); fired = true; }
+    if (fakeImpl && result) {
+        fakeImpl[0xb18] = 3;
+        memcpy(fakeImpl + 0x58, &id, 4);
+        result[0] = (uint64_t)fakeImpl;
+        result[1] = (uint64_t)&entry;
+        result[2] = (uint64_t)&entry + sizeof(entry);
+        __try { ((void (*)(uint64_t, uint64_t))doCall)(impl, (uint64_t)result); fired = true; }
         __except (EXCEPTION_EXECUTE_HANDLER) { fired = false; }
-        free(fake);
     }
+    free(fakeImpl); free(result);
     if (g_lcSpentFn) free(g_lcSpentFn);
     g_lcSpentFn = buf;
-    BlankSpareFireFile();
+    BlankSpareFireFiles();
     Log(fired ? "[slice] CreateLine: the line editor opened spare line %d (%llu ms after the click)\n"
               : "[slice] CreateLine: firing the held callback on spare line %d faulted -- the editor keeps what it shows\n",
         id, (unsigned long long)(GetTickCount64() - g_lcSpareWaitAt));

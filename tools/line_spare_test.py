@@ -217,7 +217,7 @@ def main():
     seq = H.arg(1, "seq")
     check("re-keyed here to origin:seq", H.keyOf(500) == f"a:{seq}" and H.idFor(f"a:{seq}") == 500 and H.idFor("spare:a") is None, str(H.keyOf(500)))
     check("the slice's file is blank again", H.spareFile() == "", repr(H.spareFile()))
-    fire = open(os.path.join(tmp, "lockstep_lfire.txt"), encoding="utf-8").read()
+    fire = open(os.path.join(tmp, "lockstep_lfire_req.txt"), encoding="utf-8").read()
     check("the GUI thread is asked to rename it (and so open the editor on it)", fire == "500 Bus%20Line%201", repr(fire))
     check("its colour is set here at once", H.nsent() >= 1 and H.sent(1, "what") == "setColor" and H.sentColor(1, 1) == 0.1, str(H.sent(1, "what")))
     check("the read-back path is not used", len(list(H.CM.pendingLineCreates.values())) == 0)

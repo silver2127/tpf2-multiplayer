@@ -577,7 +577,7 @@ function CM.spareLid() return CM.lineIdFor(CM.spareKey()) end
 -- manager's own list (slice_hook.cpp TryFireSpareLine): the GUI state reads this
 -- file and sends the rename from that thread until the slice blanks it.
 function CM.spareFireWrite(lid, nameEsc)
-	local f = io.open((K.BASE or "") .. "lockstep_lfire.txt", "w")
+	local f = io.open((K.BASE or "") .. "lockstep_lfire_req.txt", "w")
 	if not f then return end
 	if lid then f:write(tostring(lid) .. " " .. tostring(nameEsc or "")) end
 	f:close()
@@ -627,6 +627,22 @@ local function spareCreate(origin, why)
 				pendingLineKeys[#pendingLineKeys + 1] = { key = key, sig = "", name = CM.escName(name), since = CM.gameTime() or 0, pool = true }
 			end
 		end)
+end
+-- OPTIMISTIC EDIT OF A LINE WITH NO VEHICLES (2026-09-19). A strict update lands
+-- at its stamp, so every stop click showed up 1-2.6 s later. A line no vehicle
+-- runs carries nothing the simulation reads (nobody waits for it, nothing routes
+-- over it) and an update allocates no entity, so the originator applies the
+-- decoded click here at once and the others apply it at the stamp; the moment a
+-- vehicle is on the line, its edits are strict again. The rig's hash lanes are
+-- the judge of the premise: K.LINE_EDIT_FREE = 0 turns it off.
+K.LINE_EDIT_FREE = K.LINE_EDIT_FREE or 1
+function CM.lineHasVehicles(lid)
+	local n = 1   -- unreadable = assume vehicles: the strict path is always right
+	pcall(function()
+		local v = api.engine.system.transportVehicleSystem.getLineVehicles(lid)
+		n = v and #v or 0
+	end)
+	return n > 0
 end
 -- every tick: keep the slice's file fresh, ask for a spare when we have none
 CM.spareAskedAt = nil
@@ -739,6 +755,21 @@ local function buildLineObject(c)
 	return lineObj, n, groups
 end
 
+-- the click, applied here now (c: key, wait, stops, alts); the history and the
+-- sent-list bookkeeping as execLine's own apply would keep them
+function CM.lineApplyNow(lid, c)
+	local lineObj, n = buildLineObject(c)
+	pcall(function()
+		local pre = CM.lineSnapshot(lid)
+		if pre and pre.stops then CM.lineHistNote(c.key, pre.stops, pre.alts) end
+		CM.lineHistNote(c.key, c.stops or "", c.alts or "")
+	end)
+	api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
+		log(string.format("LUPDATE %s: applied here at once (no vehicles) stops=%d success=%s", tostring(c.key), n, tostring(success)))
+		CM.lineSentDone(c.key, c.stops)
+	end)
+	return n
+end
 -- A line op replayed on a peer can share a batch with the LCREATE that makes
 -- its line, and createLine materializes its entity (and binds its key) only on
 -- a LATER sim step -- so lineIdFor is nil for a few steps. Dropping the op there

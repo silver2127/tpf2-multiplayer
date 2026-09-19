@@ -1367,16 +1367,18 @@ function data()
 			if CM.dedicatedGui then
 				if guiTick % 300 ~= 0 then return end
 			else
-				-- THE SPARE LINE'S RENAME, FROM THIS THREAD (lines.lua CM.spareFireWrite,
+				-- THE SPARE LINE'S EDITOR, FROM THIS THREAD (lines.lua CM.spareFireWrite,
 				-- 2026-09-19). A New line click opens the editor on a pre-made line the
-				-- game script has just re-owned to the player. The editor's callback
-				-- must run on the UI thread, once the line manager lists the line: the
-				-- slice fires it from a CommandList::Add on this thread, and this
-				-- rename IS that Add -- sent every few frames until the slice blanks the
-				-- file (fired, or gave up after five seconds), or four seconds pass.
+				-- game script re-owns to the player on its next tick. The editor's
+				-- callback must run on the UI thread, and its result must name a line
+				-- the player owns: once this state (the UI's own copy of the engine)
+				-- sees the spare as ours, lockstep_lfire.txt tells the slice to fire
+				-- the held callback from the next CommandList::Add on this thread --
+				-- and this rename IS that Add, sent every third frame until the slice
+				-- blanks the file, or four seconds pass.
 				if guiTick % 3 == 0 then
 					pcall(function()
-						local f = io.open(K.BASE .. "lockstep_lfire.txt", "r")
+						local f = io.open(K.BASE .. "lockstep_lfire_req.txt", "r")
 						if not f then return end
 						local body = f:read("*a") or ""
 						f:close()
@@ -1384,13 +1386,40 @@ function data()
 						lid = tonumber(lid)
 						if not lid then CM.guiFireSince = nil; return end
 						local nowC = os.clock()
-						if not CM.guiFireSince or CM.guiFireLid ~= lid then CM.guiFireSince, CM.guiFireLid = nowC, lid end
-						if nowC - CM.guiFireSince > 4 then
-							local w = io.open(K.BASE .. "lockstep_lfire.txt", "w")
+						if not CM.guiFireSince or CM.guiFireLid ~= lid then CM.guiFireSince, CM.guiFireLid, CM.guiFireOwned = nowC, lid, nil end
+						local function blank(name)
+							local w = io.open(K.BASE .. name, "w")
 							if w then w:close() end
+						end
+						if nowC - CM.guiFireSince > 4 then
+							blank("lockstep_lfire_req.txt"); blank("lockstep_lfire.txt")
 							print(string.format("[ls-gui] spare line %d: the slice never opened the editor on it -- giving up", lid))
 							CM.guiFireSince = nil
 							return
+						end
+						if not CM.guiFireOwned then
+							local mine = false
+							pcall(function()
+								local po = api.engine.getComponent(lid, api.type.ComponentType.PLAYER_OWNED)
+								mine = po and po.player == api.engine.util.getPlayer()
+							end)
+							if not mine then return end
+							CM.guiFireOwned = guiTick
+							return   -- one more frame for the UI's tables to follow the ownership
+						end
+						local g = io.open(K.BASE .. "lockstep_lfire.txt", "r")
+						local go = g and (g:read("*a") or "") or ""
+						if g then g:close() end
+						if go == "" and CM.guiFireGone then
+							-- the slice blanked it: fired (or gave up); done
+							blank("lockstep_lfire_req.txt")
+							CM.guiFireSince, CM.guiFireGone = nil, nil
+							return
+						end
+						if go == "" then
+							local w = io.open(K.BASE .. "lockstep_lfire.txt", "w")
+							if w then w:write(tostring(lid)); w:close() end
+							CM.guiFireGone = true
 						end
 						local name = (tostring(nameEsc or ""):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
 						if name == "" then name = "Line" end
