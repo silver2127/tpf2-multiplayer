@@ -3967,6 +3967,11 @@ static void TeardownLobby(int waitMs, bool joinThread)
     if (g_lobbyCsInit) EnterCriticalSection(&g_lobbyCs);
     QuitLobbyProc(g_lobbyProc, waitMs);
     if (g_lobbyCsInit) LeaveCriticalSection(&g_lobbyCs);
+    // The lobby's company assignment dies with the lobby. Left behind, the file
+    // made a single-player load read as a two-company lobby session and the
+    // save's own companies record was the loser (2026-09-18); with no file the
+    // game script keeps whatever companies the save carries.
+    { wchar_t cfg[MAX_PATH]; _snwprintf_s(cfg, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW); DeleteFileW(cfg); }
     if (joinThread && g_lobbyThread) {
         if (WaitForSingleObject(g_lobbyThread, 3000) != WAIT_OBJECT_0) Log("[menu] lobby tail thread did not exit in time\n");
         CloseHandle(g_lobbyThread); g_lobbyThread = nullptr;
