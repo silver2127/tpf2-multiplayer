@@ -193,7 +193,16 @@ CAP = 200               # max players in a lobby, INCLUDING the host (origins a.
 MAX_COMPANIES = 200     # company ids 1..200 (one addPlayer() entity each on every peer; measured 264 fine)
 PING_INTERVAL = 3.0     # joiner -> host lobby keepalive cadence
 DROP_AFTER = 10.0       # host drops a peer unheard-from for this long
-MODS_BATCH_BYTES = 192 * 1024 * 1024    # a mods round goes out in batches of about this much on disk (run_host start_pack_job)
+# A mods round goes out in batches of about this much ON DISK (run_host
+# start_pack_job). 192 MB until 2026-09-19: a save with 556 Workshop mods went
+# out as 359 batches, most of them one mod, each a full round trip (zip, send,
+# unzip, done) at about 15 s -- an hour and a half on loopback. Workshop
+# vehicle packs zip 5:1, so this is ~150-200 MB on the wire per batch. The
+# mods are packed smallest first, so the small ones fill a batch together
+# and the big ones go alone.
+MODS_BATCH_BYTES = 768 * 1024 * 1024
+MODS_PACK_THREADS = 3                      # batches zipped at once; zlib releases the GIL (3 threads: 21.7 s -> 11.3 s for three 1 GB mods)
+MODS_ZIP_LEVEL = 3                         # deflate level for a mods round (modshare.zip_mod)
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
 HOST_GONE_AFTER = 12.0  # joiner declares the host dead after this much silence
@@ -3148,7 +3157,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             try:
                 with open(path,"rb") as f: return f.read()     # whole: a cached mod is as big as it is
             except OSError: return None
-        return modshare.package_mod(m,v)
+        return modshare.package_mod(m,v, level=MODS_ZIP_LEVEL)
 
     def broadcast_chat(frm, text):
         cid_counter[0] += 1
@@ -4117,11 +4126,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # save's 486 Workshop mods (~15 GB) left the host deaf for as long
             # as the zips took, would have held every byte in RAM, and the host
             # dropped it as silent meanwhile. A job now plans batches of about
-            # MODS_BATCH_BYTES on disk, zips them one after another (at most two
-            # ahead of the sender) and each goes out as its own mods transfer
-            # with "batch": [k, n] in its fbegin; the joiner keeps the round
-            # open until the last one lands. A joiner from before batches (no
-            # "batches" in its mods_request) gets the whole set as one blob.
+            # MODS_BATCH_BYTES on disk, zips them MODS_PACK_THREADS at a time (at
+            # most two finished ones waiting for the sender) and each goes out as
+            # its own mods transfer with "batch": [k, n] in its fbegin; the joiner
+            # keeps the round open until the last one lands. A joiner from before
+            # batches (no "batches" in its mods_request) gets the whole set as one
+            # blob. The batches go out in plan order whatever thread finishes first.
             def start_pack_job(kind, addrs, wanted, got=None):
                 addrs = [x for x in addrs if x in peers]
                 if not addrs or not wanted:
@@ -4146,7 +4156,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     job["bytes"] = sum(sizes)
                     plan, cur, cur_bytes = [], [], 0
                     if job["batched"]:
-                        for (m, v), sz in zip(job["wanted"], sizes):
+                        # smallest first: the small mods fill a batch together, the big ones go alone
+                        for (m, v), sz in sorted(zip(job["wanted"], sizes), key=lambda t: t[1]):
                             if cur and cur_bytes + sz > MODS_BATCH_BYTES:
                                 plan.append(cur)
                                 cur, cur_bytes = [], 0
@@ -4157,13 +4168,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     else:
                         plan = [list(job["wanted"])]
                     job["plan"] = plan
-                    for group in plan:
-                        while len(job["ready"]) - job["taken"] >= 2 and not job["abort"]:
-                            time.sleep(0.2)
-                        if job["abort"]:
-                            break
+                    log(f"[host] mod round for {job['names']}: {len(job['wanted'])} mod(s), {job['bytes'] / (1024.0 ** 3):.2f} GB on disk, "
+                        f"{len(plan)} batch(es), {MODS_PACK_THREADS} packer(s) at deflate level {MODS_ZIP_LEVEL}")
+
+                    def pack_group(group):
                         blob, meta, missing = bytearray(), [], []
                         for m, v in group:
+                            if job["abort"]:
+                                break
                             try:
                                 data = mod_package(m, v)
                             except Exception as e:                          # noqa: BLE001
@@ -4183,7 +4195,41 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                 meta.append({"name": modshare.mod_zip_name(m, v), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
                                 blob += data
                             job["done"] += 1
-                        job["ready"].append((blob, meta, missing))
+                        return blob, meta, missing
+
+                    # MODS_PACK_THREADS packers take the plan's groups in order; a finished
+                    # group waits in `slots` until every earlier one is done, then moves to
+                    # `ready` -- the sender only ever sees the plan order. A packer starts a
+                    # new group only while fewer than two finished batches wait for the sender.
+                    lock = threading.Lock()
+                    slots, next_group, moved = {}, [0], [0]
+
+                    def packer():
+                        while not job["abort"]:
+                            with lock:
+                                gi = next_group[0]
+                                if gi >= len(plan):
+                                    return
+                                waiting = len(job["ready"]) - job["taken"] + len(slots)
+                                if waiting >= 2:
+                                    gi = None
+                                else:
+                                    next_group[0] = gi + 1
+                            if gi is None:
+                                time.sleep(0.2)
+                                continue
+                            result = pack_group(plan[gi])
+                            with lock:
+                                slots[gi] = result
+                                while moved[0] in slots:
+                                    job["ready"].append(slots.pop(moved[0]))
+                                    moved[0] += 1
+
+                    threads = [threading.Thread(target=packer, name=f"mod-pack-{i}", daemon=True) for i in range(max(1, MODS_PACK_THREADS))]
+                    for t in threads:
+                        t.start()
+                    for t in threads:
+                        t.join()
                     job["finished"] = True
 
                 pack_job[0] = job

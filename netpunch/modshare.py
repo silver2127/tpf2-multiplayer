@@ -147,11 +147,11 @@ def is_dlc(m):
     return m.startswith("_") or m in ("urbangames_deluxe_pack", "urbangames_preorder_pack")
 
 
-def package_mod(m, v):
+def package_mod(m, v, level=None):
     if is_dlc(m) or not valid_mod(m,v):
         return None
     folder=find_mod(m,v)
-    return zip_mod(folder) if folder else None
+    return zip_mod(folder, level=level) if folder else None
 
 
 def valid_mod(m, v):
@@ -442,14 +442,17 @@ def folder_bytes(folder):
     return total
 
 
-def zip_mod(folder, log=None):
+def zip_mod(folder, log=None, level=None):
     """The folder as one zip (entries relative to the folder) -- bytes. No
     size cap (512 MB until 2026-09-16: a big vehicle pack was silently "not
     found on the host"); a mod is as big as it is, and the transfer holds it
-    in memory like it holds the save. ``log`` hears the size."""
+    in memory like it holds the save. ``log`` hears the size. ``level`` is
+    the deflate level (None = zlib's default, 6): a mods round packs at 3 --
+    measured on a 1.2 GB Workshop vehicle pack (2026-09-19): level 6 took
+    16.0 s for 213 MB, level 3 10.3 s for 229 MB, level 1 8.5 s for 236 MB."""
     buf = io.BytesIO()
     total = 0
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True, compresslevel=level) as z:
         for root, dirs, files in os.walk(folder):
             dirs[:] = [d for d in dirs if not d.startswith(".")]
             for fn in files:
