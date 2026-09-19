@@ -151,12 +151,26 @@ function M.bind(cm,k,logger)
 		sp.constructionsToAdd[1].playerEntity=ctx.player
 		-- An additive proposal only: no clearing buildings or replacing an
 		-- existing construction at the same coordinate, even on repeated clicks.
-		api.cmd.sendCommand(api.cmd.make.buildProposal(sp,ctx,false),function(res,success)
+		-- ignoreErrors=true, as the mod's own game.interface.buildConstruction
+		-- builds: a segment touches the segment before it, and with false the
+		-- engine refused every segment after a drag's first with "Kollision" --
+		-- on every instance alike, so each drag left one segment (2026-09-19).
+		api.cmd.sendCommand(api.cmd.make.buildProposal(sp,ctx,true),function(res,success)
 			local id=res and res.resultEntities and res.resultEntities[1]
 			if success and type(id)=="number" and id>=0 and api.engine.entityExists(id) then
 				CM.registerFenceReplay(id,c.file,c.params)
 			end
-			log(string.format("EXEC FENCE seq=%s origin=%s success=%s",tostring(c.seq),tostring(c.origin),tostring(success)))
+			local extra=""
+			if not success then
+				pcall(function()
+					local es=res.resultProposalData and res.resultProposalData.errorState
+					if es then
+						extra=" critical="..tostring(es.critical)
+						for i=1,#es.messages do extra=extra.." '"..tostring(es.messages[i]).."'" end
+					end
+				end)
+			end
+			log(string.format("EXEC FENCE seq=%s origin=%s success=%s%s",tostring(c.seq),tostring(c.origin),tostring(success),extra))
 		end)
 	end
 	function CM.fencesPreviewRead()

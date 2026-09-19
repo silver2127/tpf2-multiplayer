@@ -39,7 +39,7 @@ api={type={ComponentType=CT,Context={new=function() return {} end},
     ConstructionEntity={new=function() return {} end}}},
   engine={util={getPlayer=function() return 99 end},entityExists=function(id) assert(id);return objects[id]~=nil end,
     getComponent=function(id) assert(id);return objects[id] end},
-  cmd={make={buildProposal=function(sp,ctx,ignore) assert(not ignore);return {sp=sp,ctx=ctx} end},
+  cmd={make={buildProposal=function(sp,ctx,ignore) assert(ignore==true,'a segment touches its predecessor: build like buildConstruction does');return {sp=sp,ctx=ctx} end},
     sendCommand=function(cmd,cb) submitted[#submitted+1]={cmd=cmd,cb=cb} end}}
 local script
 if REAL then

@@ -205,6 +205,24 @@ CM.consByKey    = {}   -- conKey -> { id=, file=, params=<ser string> }
 local expectedEdit = {}   -- conKey -> true: our own replayed edit is about to replace the entity
 CM.primeQueue   = {}   -- ids from the first poll, classified a few per tick
 
+-- Is the entity the table names still THAT construction? Entity ids are
+-- recycled: after a fence segment was bulldozed its id came back as something
+-- else while its record was still in consByKey (the segment next to it, 4 m
+-- away, had passed the "something is still there" check). entityExists then
+-- said yes, getEntity().params read {} and the edit scan shipped a CONU with
+-- empty params -- upgradeConstruction on a non-construction id is a fatal
+-- GetComponentDataIndex assert on every instance (live log, 2026-09-19).
+-- Only an entity with a CONSTRUCTION component of the record's file counts.
+local function conStillThere(rec)
+	local ok = false
+	pcall(function()
+		if not api.engine.entityExists(rec.id) then return end
+		local co = api.engine.getComponent(rec.id, api.type.ComponentType.CONSTRUCTION)
+		ok = co ~= nil and (rec.file == nil or tostring(co.fileName or "") == tostring(rec.file))
+	end)
+	return ok
+end
+
 local function findConNear(file, x, y, maxDist)
 	local best, bestD
 	for key, rec in pairs(CM.consByKey) do
@@ -234,8 +252,7 @@ function CM.execConU(c)
 	local ok, err = pcall(function()
 		local x, y = tonumber(c.x), tonumber(c.y)
 		local rec = findConNear(c.file, x, y, 10)
-		local alive = false
-		if rec then pcall(function() alive = api.engine.entityExists(rec.id) end) end
+		local alive = rec ~= nil and conStillThere(rec)
 		if not (rec and alive) then
 			-- the table lost it (a reused entity id): find it in the world instead
 			local found = CM.adoptConAt(tostring(c.file), x, y, 10)
@@ -1667,10 +1684,10 @@ K.REMOVAL_POLL_EVERY = 3
 -- player constructions to the joiner's 7, seq 1..51 arrived from the joiner with
 -- no gaps and not one DEMOLISH among them -- nothing was lost in flight, the
 -- detector simply never fired.
-function CM.constructionAt(x, y)
+function CM.constructionAt(x, y, maxDist)
 	local found
 	pcall(function()
-		local list = game.interface.getEntities({ pos = { x, y }, radius = 6 },
+		local list = game.interface.getEntities({ pos = { x, y }, radius = maxDist or 6 },
 			{ type = "CONSTRUCTION", includeData = false }) or {}
 		for _, id in pairs(list) do
 			if not found then
@@ -1686,14 +1703,15 @@ end
 function CM.pollConstructionRemovals()
 	local ok, err = pcall(function()
 		for key, rec in pairs(CM.consByKey) do
-			local alive = false
-			pcall(function() alive = api.engine.entityExists(rec.id) end)
-			if alive then
+			if conStillThere(rec) then
 				demolishMiss[key] = nil
 			else
 				local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
 				local x, y = tonumber(kx), tonumber(ky)
-				if x and CM.constructionAt(x, y) then
+				-- An upgrade replacement stands ON the spot (the key is rounded to
+				-- 0.1 m); a neighbour 6 m away is not it -- a bulldozed fence
+				-- segment's record lived on because the next segment was in reach.
+				if x and CM.constructionAt(x, y, 1) then
 					-- something is still there: an upgrade replacement; let
 					-- pollNewConstructions re-adopt it. Not a demolish.
 					demolishMiss[key] = nil
@@ -1734,9 +1752,7 @@ end
 function CM.scanConstructionEdits()
 	local ok, err = pcall(function()
 		for key, rec in pairs(CM.consByKey) do
-			local alive = false
-			pcall(function() alive = api.engine.entityExists(rec.id) end)
-			if alive then
+			if conStillThere(rec) then
 				local e = game.interface.getEntity(rec.id)
 				local pstr = (e and e.params) and CM.ser(e.params) or "{}"
 				if pstr ~= rec.params then

@@ -60,7 +60,9 @@ for _,instance in ipairs({'b','a'}) do
   K.INSTANCE=instance
   local state=before()
   local calls=0
-  api={engine={entityExists=function(id) assert(id==42); return true end}}
+  -- the engine boundary: the record's id still carries the construction of that file
+  api={type={ComponentType={CONSTRUCTION=1}},engine={entityExists=function(id) assert(id==42); return true end,
+    getComponent=function(id,t) assert(id==42 and t==1); return {fileName=command.file} end}}
   game={interface={getEntity=function(id) assert(id==42); return {params=state} end,
     upgradeConstruction=function(id,file,params)
       assert(id==42 and file==command.file); state=params; calls=calls+1
