@@ -129,6 +129,7 @@ function H.sent(i, k) local c = sent[i]; return c and c[k] end
 function H.sentColor(i, j) local c = sent[i]; return c and c.color and c.color[j] end
 function H.clearSent() sent = {} end
 function H.completeNext(ok) local cb = table.remove(nextCb, 1); if cb then cb({}, ok) end end
+function H.completeAll(ok) while #nextCb > 0 do table.remove(nextCb, 1)({}, ok) end end
 function H.appear(lid, name) lines[#lines + 1] = lid; snaps[lid] = { name = CM.escName(name), color = "0.5,0.5,0.5", wait = 180, stops = "", alts = "" }; owners[lid] = owners[lid] or CM.poolPid end
 function H.vanish(lid) snaps[lid] = nil; for i = #lines, 1, -1 do if lines[i] == lid then table.remove(lines, i) end end end
 function H.keyOf(lid) return CM.lineKeyOf[lid] end
@@ -195,9 +196,9 @@ def main():
     check("pool company made once", H.addPlayers() == 1 and H.pool() == 901, str(H.pool()))
     check("a grey empty line for the pool", H.nsent() == 1 and H.sent(1, "what") == "createLine" and H.sent(1, "player") == 901
           and H.sent(1, "n") == 0 and H.sentColor(1, 1) == 0.5, str(H.sent(1, "what")))
-    check("named for its origin", H.sent(1, "name") == "spare a", str(H.sent(1, "name")))
+    check("named like a new line, minus the number", H.sent(1, "name") == "Line", str(H.sent(1, "name")))
     H.completeNext(True)
-    H.appear(500, "spare a")
+    H.appear(500, "Line")
     H.pollKeys()
     check("the new line is keyed spare:a", H.keyOf(500) == "spare:a" and H.idFor("spare:a") == 500, str(H.keyOf(500)))
     check("our spare is handed to the slice", H.spareFile() == "500", str(H.spareFile()))
@@ -216,6 +217,9 @@ def main():
     seq = H.arg(1, "seq")
     check("re-keyed here to origin:seq", H.keyOf(500) == f"a:{seq}" and H.idFor(f"a:{seq}") == 500 and H.idFor("spare:a") is None, str(H.keyOf(500)))
     check("the slice's file is blank again", H.spareFile() == "", repr(H.spareFile()))
+    fire = open(os.path.join(tmp, "lockstep_lfire.txt"), encoding="utf-8").read()
+    check("the GUI thread is asked to rename it (and so open the editor on it)", fire == "500 Bus%20Line%201", repr(fire))
+    check("its colour is set here at once", H.nsent() >= 1 and H.sent(1, "what") == "setColor" and H.sentColor(1, 1) == 0.1, str(H.sent(1, "what")))
     check("the read-back path is not used", len(list(H.CM.pendingLineCreates.values())) == 0)
 
     print("== the claim replays on the originator too")
@@ -226,9 +230,9 @@ def main():
           H.nplayers() == 2 and H.sent(1, "what") == "setName" and H.sent(1, "name") == "Bus Line 1"
           and H.sent(2, "what") == "setColor" and H.sentColor(2, 1) == 0.1 and H.sent(3, "what") == "createLine",
           " ".join(str(H.sent(i, "what")) for i in range(1, H.nsent() + 1)))
-    check("the next spare is created on the same step, for the pool", H.sent(3, "player") == 901 and H.sent(3, "name") == "spare a")
-    H.completeNext(True); H.completeNext(True); H.completeNext(True)
-    H.appear(501, "spare a")
+    check("the next spare is created on the same step, for the pool", H.sent(3, "player") == 901 and H.sent(3, "name") == "Line")
+    H.completeAll(True)
+    H.appear(501, "Line")
     H.pollKeys()
     check("the successor is keyed spare:a and handed to the slice", H.keyOf(501) == "spare:a" and H.spareFile() == "501", str(H.spareFile()))
     check("the claimed line keeps its key", H.keyOf(500) == f"a:{seq}")
@@ -257,7 +261,7 @@ def main():
     B = runtime(injb, tmpb, "b")
     B.exec({"op": "LSPARE", "origin": "a", "seq": 9, "at": 100.8})
     B.completeNext(True)
-    B.appear(500, "spare a")
+    B.appear(500, "Line")
     B.pollKeys()
     check("b binds a's spare without touching its own file", B.keyOf(500) == "spare:a" and not B.spareFile())
     B.clearSent()
@@ -267,7 +271,7 @@ def main():
     check("re-keyed to a:11", B.keyOf(500) == "a:11" and B.idFor("spare:a") is None, str(B.keyOf(500)))
     what = [B.sent(i, "what") for i in range(1, B.nsent() + 1)]
     check("renamed, recoloured, the changed wait applied, successor created", what == ["setName", "setColor", "updateLine", "createLine"], str(what))
-    check("the successor is the origin's, for the pool", B.sent(4, "name") == "spare a" and B.sent(4, "player") == 901)
+    check("the successor is the origin's, for the pool", B.sent(4, "name") == "Line" and B.sent(4, "player") == 901)
 
     print("== the claim before the spare is bound")
     B.clearSent()

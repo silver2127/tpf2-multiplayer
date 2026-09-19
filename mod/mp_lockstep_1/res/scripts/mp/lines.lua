@@ -573,6 +573,15 @@ function CM.spareWrite(lid)
 	spareFileHas, spareTouchedTick = lid, CM.ticks or 0
 end
 function CM.spareLid() return CM.lineIdFor(CM.spareKey()) end
+-- The editor's callback fires from the UI thread once the spare is in the line
+-- manager's own list (slice_hook.cpp TryFireSpareLine): the GUI state reads this
+-- file and sends the rename from that thread until the slice blanks it.
+function CM.spareFireWrite(lid, nameEsc)
+	local f = io.open((K.BASE or "") .. "lockstep_lfire.txt", "w")
+	if not f then return end
+	if lid then f:write(tostring(lid) .. " " .. tostring(nameEsc or "")) end
+	f:close()
+end
 -- pollLineKeys bound a pool-owned create: hand the slice ours
 function CM.spareBound(key, lid)
 	if CM.poolPid and CM.cmOwnerOf and CM.cmOwnerOf(lid) ~= CM.poolPid then
@@ -603,7 +612,10 @@ local function spareCreate(origin, why)
 	end
 	local key = CM.spareKey(origin)
 	if CM.lineIdFor(key) then log(string.format("LSPARE: %s already has a spare (line %d)", key, CM.lineIdFor(key))); return end
-	local name = "spare " .. tostring(origin)
+	-- named as the engine names a new line, minus the number: the moment it is
+	-- opened it is renamed to the create's own name (the GUI does that, and the
+	-- claim at the stamp), so a glimpse of it reads as an ordinary new line
+	local name = "Line"
 	local lineObj = api.type.Line.new()
 	lineObj.waitingTime = 180
 	-- grey off the editor's palette: the next new line's colour is chosen by

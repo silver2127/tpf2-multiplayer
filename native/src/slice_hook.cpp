@@ -1811,33 +1811,97 @@ static int32_t ReadAndConsumeSpareLine()
     if (w) fclose(w);
     return (int32_t)id;
 }
-// At the cancelled create's Add: the result is the spare, and the editor hears
-// "done" now. Same shape as the build tools' fire below (impl via r9+0x38, _Do_call
-// at vftable+0x10, rdx = the Command). false = nothing fired (the caller stashes).
-static bool FireLineCreateWithSpare(uint64_t r8, uint64_t r9, int32_t spare)
+// FIRING THE EDITOR'S CALLBACK ON THE SPARE (2026-09-19, second attempt). Fired at
+// the create's own Add it failed every time: both callbacks look the result up in
+// THEIR OWN list of lines first (0x1423e27d0 over a vector of 16-byte entries,
+// entity at +0; not found = assert), and that list holds the player's lines only.
+// The spare is the pool company's until the game script re-owns it a tick later,
+// and the manager lists it a frame after that. So the callback is HELD as before,
+// and fired from a later CommandList::Add on the same (UI) thread -- the GUI
+// state's rename of the spare, sent every few frames while lockstep_lfire.txt
+// names it -- once the callback's own list holds the spare:
+//   line manager: _Do_call thunk 0x618d70 = `add rcx,8; jmp 0x6154a0`, the lambda
+//                 at impl+8 captures the manager, whose list is at +0x448
+//   line list:    _Do_call 0x610490 reads the LineList at [impl+8], list at +0x440
+// The command handed to the callback is a stand-in: they read only the tag at
+// +0xb18 (3 = CreateLine) and the result entity at +0x58 of the impl.
+static const uintptr_t RVA_LINEMGR_CB_THUNK = 0x618d70;
+static const uintptr_t RVA_LINELIST_CB      = 0x610490;
+static const ULONGLONG LSPARE_FIRE_MAX_MS   = 5000;
+static volatile LONG g_lcSpareWaitId = 0;      // the spare the held callback should open, 0 = none
+static ULONGLONG     g_lcSpareWaitAt = 0;
+static DWORD         g_lcUiTid       = 0;      // the thread the create's Add ran on
+static void BlankSpareFireFile()
 {
-    uint64_t impl = r9;
-    if (Readable((void*)(r9 + 0x38), 8)) {
-        uint64_t p = 0;
-        memcpy(&p, (void*)(r9 + 0x38), 8);
-        if (p && Readable((void*)p, 8)) impl = p;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_lfire.txt", g_dataDir);
+    FILE* w = _fsopen(p, "w", _SH_DENYNO);
+    if (w) fclose(w);
+}
+static bool LineListHas(uint64_t vecAt, int32_t ent)
+{
+    if (!Readable((void*)vecAt, 16)) return false;
+    uint64_t b = 0, e = 0;
+    memcpy(&b, (void*)vecAt, 8); memcpy(&e, (void*)(vecAt + 8), 8);
+    if (!b || e < b || e - b > 16ULL * 200000ULL || !Readable((void*)b, (size_t)(e - b))) return false;
+    for (uint64_t q = b; q + 16 <= e; q += 16) {
+        int32_t v = 0;
+        memcpy(&v, (void*)q, 4);
+        if (v == ent) return true;
     }
-    uint64_t cimpl = 0;
-    if (!Readable((void*)r8, 8)) return false;
-    memcpy(&cimpl, (void*)r8, 8);
-    if (!cimpl || !Readable((void*)(cimpl + 0xb18), 1) || !Readable((void*)(cimpl + 0x58), 4)) return false;
-    uint8_t tag = 0;
-    memcpy(&tag, (void*)(cimpl + 0xb18), 1);
-    if (tag != 3) { Log("[slice] CreateLine: command impl tag is %d, not 3 -- the spare is not used\n", (int)tag); return false; }
-    uint64_t vft = 0, doCall = 0;
-    if (!Readable((void*)impl, 8)) return false;
+    return false;
+}
+static void TryFireSpareLine()
+{
+    const int32_t id = (int32_t)InterlockedCompareExchange(&g_lcSpareWaitId, 0, 0);
+    if (!id || GetCurrentThreadId() != g_lcUiTid) return;
+    uint8_t* buf = nullptr;
+    AcquireSRWLockExclusive(&g_lcLock);
+    if (!g_lcStash.empty()) buf = g_lcStash.front().fn;
+    ReleaseSRWLockExclusive(&g_lcLock);
+    if (!buf) { InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFile(); Log("[slice] CreateLine: no held callback for spare line %d -- the editor keeps what it shows\n", id); return; }
+    uint64_t impl = 0, vft = 0, doCall = 0, owner = 0;
+    memcpy(&impl, buf + 0x38, 8);
+    if (!impl || !Readable((void*)impl, 16)) return;
     memcpy(&vft, (void*)impl, 8);
-    if (!vft || !Readable((void*)vft, 8 * 3)) return false;
+    memcpy(&owner, (void*)(impl + 8), 8);
+    if (!vft || !Readable((void*)vft, 8 * 3)) return;
     memcpy(&doCall, (void*)(vft + 0x10), 8);
-    if (!doCall) return false;
-    memcpy((void*)(cimpl + 0x58), &spare, 4);
-    ((void (*)(uint64_t, uint64_t))doCall)(impl, r8);
-    return true;
+    size_t listOff = 0;
+    if (doCall == (uint64_t)g_base + RVA_LINEMGR_CB_THUNK) listOff = 0x448;
+    else if (doCall == (uint64_t)g_base + RVA_LINELIST_CB) listOff = 0x440;
+    else {
+        InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFile();
+        Log("[slice] CreateLine: held callback %llx is neither the line manager's nor the line list's -- spare line %d stays unselected\n", (unsigned long long)(doCall - (uint64_t)g_base), id);
+        return;
+    }
+    if (!owner || !LineListHas(owner + listOff, id)) {
+        if (GetTickCount64() - g_lcSpareWaitAt > LSPARE_FIRE_MAX_MS) {
+            InterlockedExchange(&g_lcSpareWaitId, 0); BlankSpareFireFile();
+            Log("[slice] CreateLine: spare line %d never appeared in the editor's list -- giving up (the held callback expires)\n", id);
+        }
+        return;
+    }
+    AcquireSRWLockExclusive(&g_lcLock);
+    if (!g_lcStash.empty() && g_lcStash.front().fn == buf) g_lcStash.erase(g_lcStash.begin());
+    ReleaseSRWLockExclusive(&g_lcLock);
+    InterlockedExchange(&g_lcSpareWaitId, 0);
+    uint8_t* fake = (uint8_t*)calloc(1, 0xb20);
+    bool fired = false;
+    if (fake) {
+        fake[0xb18] = 3;
+        memcpy(fake + 0x58, &id, 4);
+        uint64_t holder = (uint64_t)fake;
+        __try { ((void (*)(uint64_t, uint64_t))doCall)(impl, (uint64_t)&holder); fired = true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { fired = false; }
+        free(fake);
+    }
+    if (g_lcSpentFn) free(g_lcSpentFn);
+    g_lcSpentFn = buf;
+    BlankSpareFireFile();
+    Log(fired ? "[slice] CreateLine: the line editor opened spare line %d (%llu ms after the click)\n"
+              : "[slice] CreateLine: firing the held callback on spare line %d faulted -- the editor keeps what it shows\n",
+        id, (unsigned long long)(GetTickCount64() - g_lcSpareWaitAt));
 }
 
 // Our Lua is about to create a line: if it wrote a fresh claim, this createLine is
@@ -4341,6 +4405,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
     uint64_t caller = retAddr - g_base;
 
     if (id == ID_CMDADD) {
+        TryFireSpareLine();   // a held create callback waiting for the editor to list its spare line
         if (g_terrainHeldTool) {
             uint64_t carrier = (uint64_t)InterlockedCompareExchange64(&g_terrainCarrierCmd, 0, 0);
             if (carrier && r8 == carrier) {
@@ -4406,17 +4471,16 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 InterlockedExchange(&g_pendingHonour, 0);
                 if (InterlockedExchange(&g_pendingStashCb, 0)) {
                     const int32_t spare = (int32_t)InterlockedExchange(&g_lcSpareId, 0);
-                    bool fired = false;
-                    if (spare) {
-                        __try { fired = FireLineCreateWithSpare(r8, r9, spare); }
-                        __except (EXCEPTION_EXECUTE_HANDLER) { fired = false; }
-                        Log(fired ? "[slice] CreateLine: the line editor opens spare line %d now; the Lua claims it at the stamp\n"
-                                  : "[slice] CreateLine: spare line %d could not be handed to the editor -- callback held instead (the Lua still claims the spare; the editor will not select it)\n", spare);
-                    }
-                    if (!fired) {
-                        bool held = false;
-                        __try { held = StashLineCreateCallback(r9); }
-                        __except (EXCEPTION_EXECUTE_HANDLER) { held = false; }
+                    bool held = false;
+                    __try { held = StashLineCreateCallback(r9); }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { held = false; }
+                    if (held && spare) {
+                        // fired from a later Add on this thread, once the editor lists the spare (TryFireSpareLine)
+                        g_lcUiTid = GetCurrentThreadId();
+                        g_lcSpareWaitAt = GetTickCount64();
+                        InterlockedExchange(&g_lcSpareWaitId, spare);
+                        Log("[slice] CreateLine: the line editor's callback is held to open spare line %d as soon as the editor lists it\n", spare);
+                    } else {
                         Log(held ? "[slice] CreateLine: the line editor's callback is held for our replay at the stamp\n"
                                  : "[slice] CreateLine: callback could not be held -- cancelled anyway (ARMED 1 promised the replay); the editor will not select the new line\n");
                     }

@@ -1341,6 +1341,15 @@ function CM.pollInject()
 					if CM.seqNo ~= seqBefore then
 						CM.lineRekey(spareId, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 						CM.spareWrite(nil)
+						-- its colour now, here (cosmetic; the claim sets it everywhere at the
+						-- stamp; the slice echo of this replay is expected, not a click)
+						pcall(function()
+							if CM.expectColorEcho then CM.expectColorEcho(spareId, r, g, b) end
+							api.cmd.sendCommand(api.cmd.make.setColor(spareId, api.type.Vec3f.new(r, g, b)), function() end)
+						end)
+						-- the GUI thread renames it and, through that, lets the slice open
+						-- the editor on it once the line manager lists it
+						if CM.spareFireWrite then CM.spareFireWrite(spareId, nameTok) end
 						log(string.format("LCREATE: '%s' is spare line %d (%s), the editor has it already -- ours now (ok=%s%s), everyone's at the stamp as %s:%d",
 							CM.unescName(nameTok), spareId, spareKey, tostring(okO), okO and "" or " " .. tostring(errO), K.INSTANCE, CM.seqNo))
 					else

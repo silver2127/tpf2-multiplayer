@@ -1367,6 +1367,36 @@ function data()
 			if CM.dedicatedGui then
 				if guiTick % 300 ~= 0 then return end
 			else
+				-- THE SPARE LINE'S RENAME, FROM THIS THREAD (lines.lua CM.spareFireWrite,
+				-- 2026-09-19). A New line click opens the editor on a pre-made line the
+				-- game script has just re-owned to the player. The editor's callback
+				-- must run on the UI thread, once the line manager lists the line: the
+				-- slice fires it from a CommandList::Add on this thread, and this
+				-- rename IS that Add -- sent every few frames until the slice blanks the
+				-- file (fired, or gave up after five seconds), or four seconds pass.
+				if guiTick % 3 == 0 then
+					pcall(function()
+						local f = io.open(K.BASE .. "lockstep_lfire.txt", "r")
+						if not f then return end
+						local body = f:read("*a") or ""
+						f:close()
+						local lid, nameEsc = body:match("^(%d+)%s*(%S*)")
+						lid = tonumber(lid)
+						if not lid then CM.guiFireSince = nil; return end
+						local nowC = os.clock()
+						if not CM.guiFireSince or CM.guiFireLid ~= lid then CM.guiFireSince, CM.guiFireLid = nowC, lid end
+						if nowC - CM.guiFireSince > 4 then
+							local w = io.open(K.BASE .. "lockstep_lfire.txt", "w")
+							if w then w:close() end
+							print(string.format("[ls-gui] spare line %d: the slice never opened the editor on it -- giving up", lid))
+							CM.guiFireSince = nil
+							return
+						end
+						local name = (tostring(nameEsc or ""):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+						if name == "" then name = "Line" end
+						api.cmd.sendCommand(api.cmd.make.setName(lid, name), function() end)
+					end)
+				end
 				-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
 				-- the panel's own twice-a-second refresh
 				if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
