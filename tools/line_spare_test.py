@@ -279,6 +279,13 @@ def main():
             "name": "L9", "color": "0.1,0.2,0.3", "wait": 180, "stops": "", "alts": ""})
     check("retried on the step grid, nothing sent", B.nretry() == 1 and B.nsent() == 0, B.logs()[-160:])
 
+    print("== a stop whose platform the engine re-resolved is the same stop")
+    A0, A1, Bs = "-535.82,4152.30,0,0,0,0,180,-541.5,4154.6", "-535.82,4152.30,1,0,0,0,180,-530.1,4150.0", "-491.65,4223.18,1,0,0,0,180,-486.8,4219.5"
+    check("platform 0 and platform 1 of one group are one change apart from nothing", H.CM.lineDistance(A0, A1) == 0)
+    merged, _, adds, dels, sets = H.CM.mergeLineEdit(A0, "", A1 + ";" + Bs, ";", A0, "")
+    check("the click's new stop goes onto the sent list once, the re-resolved platform as a re-set",
+          merged == A1 + ";" + Bs and adds == 1 and dels == 0 and sets == 1, f"{merged!r} +{adds} -{dels} ~{sets}")
+
     print("== the pool company in the save state")
     st = B.saveState()
     check("pool pid saved", st["pool"] == 901, str(st["pool"]))

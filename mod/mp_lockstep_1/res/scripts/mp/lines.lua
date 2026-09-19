@@ -303,15 +303,21 @@ local function lineSplit(str, n)
 	while #t > n do t[#t] = nil end
 	return t
 end
+-- A stop's identity is its station GROUP (the position the wire carries), not the
+-- platform inside it: the engine re-resolves a stop's station index as it applies
+-- the update (a:19, 2026-09-19: the click after an update applied here at once
+-- carried the same group as platform 1 where the sent list said 0, the merge took
+-- them for two stops, and the line held that station twice). A changed platform or
+-- terminal is a re-set of the same stop.
 local function stopKey(entry)
-	local a, b, c, d = tostring(entry):match("^([^,]*),([^,]*),([^,]*),([^,]*)")
-	return table.concat({ a or "", b or "", c or "", d or "" }, ",")
+	local a, b = tostring(entry):match("^([^,]*),([^,]*)")
+	return (a or "") .. "," .. (b or "")
 end
 CM.lineCount = lineCount
 
 -- base = the engine's list, click = what the editor built from it, pending = the
 -- list still on its way. Returns the merged stops, alts and the counts of stops
--- added, removed and re-set. Stop identity is position + station + terminal.
+-- added, removed and re-set. Stop identity is the station group's position (stopKey).
 function CM.mergeLineEdit(baseS, baseA, clickS, clickA, pendS, pendA)
 	local nb, nc, np = lineCount(baseS), lineCount(clickS), lineCount(pendS)
 	local B, C, P = lineSplit(baseS, nb), lineSplit(clickS, nc), lineSplit(pendS, np)
@@ -354,7 +360,7 @@ function CM.mergeLineEdit(baseS, baseA, clickS, clickA, pendS, pendA)
 end
 
 -- How many single-stop changes turn one list into the other (stop identity as in
--- mergeLineEdit: position + station + terminal): additions plus removals.
+-- mergeLineEdit: the station group's position): additions plus removals.
 local function lineDistance(aS, bS)
 	local na, nb = lineCount(aS), lineCount(bS)
 	local A, B = lineSplit(aS, na), lineSplit(bS, nb)
