@@ -7,6 +7,10 @@ transfers, no game. What a WORLD SWITCH has to do, and what this checks:
      back to unstarted, pushes the new save to ALL of them (a plain start would
      push to nobody -- they all have a save already) and broadcasts a start
      flagged as a switch;
+  a2) the switch is a new world for the bridges: the host mints a fresh
+     transport-lobby nonce, hands it to its own menu and to every client
+     through the roster (the old world's heartbeats otherwise keep feeding
+     the host's new world: "5,000 game units behind", 2026-09-19);
   b) a client takes that start although it had started, emits
      ``{"type":"start","save":true,"switch":true}`` for its menu and tells the
      roster it is loading the host's new world;
@@ -118,6 +122,7 @@ with tempfile.TemporaryDirectory() as temporary:
               all(incoming(n) == contents['world1'] for n in ('client1', 'client2')))
 
         # -- a) the host loads another world while everyone is playing ------- #
+        nonce_before = events(ios['host'], 'transport_lobby')[-1]['epoch']
         command('host', cmd='start', save=worlds['world2'], switch=True)
         assert wait_for(lambda: all(len(starts(n)) >= 2 for n in ('client1', 'client2')), 'the switch start')
         check('the host unstarted every peer and pushed the new world to all of them',
@@ -128,6 +133,15 @@ with tempfile.TemporaryDirectory() as temporary:
         check('the host broadcast the start as a switch', host_said('START broadcast (save=True, world switch)'))
         check('the host menu is told its own start is a switch',
               any(e.get('switch') is True for e in events(ios['host'], 'start')))
+
+        # -- a2) the switch is a new world for every bridge ------------------- #
+        nonces = [e['epoch'] for e in events(ios['host'], 'transport_lobby')]
+        check('the host minted a fresh transport-lobby nonce for the switch',
+              len(nonces) >= 2 and nonces[-1] != nonce_before and len(nonces[-1]) == 32, ','.join(n[:8] for n in nonces))
+        assert wait_for(lambda: all(any(e.get('epoch') == nonces[-1] for e in events(ios[n], 'transport_lobby'))
+                                    for n in ('client1', 'client2')), 'the clients taking the new nonce'), 'no client took the switch nonce'
+        check('every client handed the new nonce to its menu',
+              all(events(ios[n], 'transport_lobby')[-1].get('epoch') == nonces[-1] for n in ('client1', 'client2')))
 
         # -- b) the client takes it although it had started ------------------ #
         check('every client emitted a switch start for its menu',

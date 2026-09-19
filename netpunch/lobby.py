@@ -2790,6 +2790,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
     transport_lobby = os.urandom(16).hex()
     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
+    resync_world = [None]                   # the completed resync's epoch the nonce last followed (a world switch mints its own)
     host_name = _dedupe(my_name, set())     # reassigned by the 'name' command
     peers = collections.OrderedDict()       # addr -> {"name":str, "last":float,
                                             #          "started":bool,
@@ -3702,7 +3703,20 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         tells it this is a switch. ``last_shared`` is pointed at the new file
         BEFORE any peer is unstarted: the serve-again loop fires on 'a peer is
         unstarted', so if it runs between here and the transfer it can only
-        ever push THIS world, never the one everyone is leaving."""
+        ever push THIS world, never the one everyone is leaving.
+
+        The switch is a NEW WORLD for the bridges too (2026-09-19). Only a
+        resync used to mint a world epoch; a switch kept the lobby's nonce, so
+        the players still in the old world went on feeding their heartbeats
+        into the host's new one: the host loaded an earlier save and read
+        itself as 5,000 game units behind (actions off, every build dropped),
+        and its load gate took the old-world heartbeats as "everyone is in".
+        A fresh nonce goes to our own menu now and rides the next roster to
+        every player: each bridge starts a new cohort and drops the old
+        world's datagrams until their sender has moved too."""
+        nonlocal transport_lobby
+        transport_lobby = os.urandom(16).hex()
+        io.emit(dict(type='transport_lobby', epoch=transport_lobby))
         last_shared[0] = save_path
         playing = sum(1 for p in peers.values() if p.get("started"))
         for p in peers.values():
@@ -3713,6 +3727,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             f" ({playing} of them already playing)")
         io.emit({"type": "status", "state": "connected",
                  "detail": f"Switching everyone to {name}\u2026"})
+        send_roster_packets()                 # carries the new nonce: the players' bridges leave the old world now
         begin_save_transfer(save_path)
 
     # ---- local (host's own menu) commands ---------------------------------- #
@@ -3985,7 +4000,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # not the save START GAME shared: that world was left behind.
             if recovery:
                 world = recovery.world_epoch()
-                if world and world != transport_lobby:
+                if world and world != resync_world[0]:   # not transport_lobby: a world switch after the resync minted its own nonce
+                    resync_world[0] = world
                     transport_lobby = world
                     last_heal = now
                     snapshot = recovery.runtime.save_directory / ('mp_' + world[:12] + '.sav')
