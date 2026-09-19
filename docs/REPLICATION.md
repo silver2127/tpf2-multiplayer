@@ -96,7 +96,7 @@ Not replicated: stop/start a vehicle, manual departure, "depart now", maintenanc
 
 | action | mode | wire | notes |
 |---|---|---|---|
-| create | replay on peers | `LCREATE` | Never cancelled (the line editor needs the new line). Peers read the line back from the originator's data and bind the new line by its stop signature. |
+| create | strict, from a spare | `LSPARE`, `LCREATE spare=` | Every player owns one empty SPARE line, created in lockstep (same step, same id everywhere) and owned by a hidden pool company, so no line list shows it. A click on New line is cancelled like any strict command, but the slice opens the line editor on the spare at once; at the stamp every instance re-owns, renames, recolours and re-keys that line to `origin:seq` and creates the player's next spare on the same step. Without a spare (one still in flight, or an older build) the editor's callback is held and rides on the replay at the stamp, as before. Why not create natively at the click: an entity allocated off-step shifts every id allocated after it on that game, and the worlds split (rig, 2026-09-12). |
 | edit stops | strict | `LUPDATE` | The new stop list is decoded off the command. If decoding fails the edit applies natively and peers read the line back. |
 | delete | strict | `LDELETE` | |
 

@@ -537,7 +537,7 @@ K.JOURNAL_LOAN = 0
 -- a 30,000,000 loan is several ticks of settling.
 K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
-K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
 -- read from the proposal); the originator instead deletes its native copy and
 -- replays, gated by c.cancelled rather than ARMED. See execConX.
@@ -657,7 +657,7 @@ local function execute(c)
 	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
 	elseif c.op == "VNAME" then CM.execSetName(c)
 	elseif c.op == "VCOLOR" then CM.execSetColor(c)
-	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then
+	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" or c.op == "LSPARE" then
 		-- behind any stop / construction replay still in flight: a line update
 		-- that re-adds a replaced stop must find that stop already there
 		if CM.conxBusy or #CM.conxQueue > 0 then
@@ -966,6 +966,7 @@ function data()
 			CM.drainVehCap()
 			CM.primeLineKeys()
 			CM.pollLineKeys()
+			if CM.spareTick then CM.spareTick() end   -- the pre-made "New line" (lines.lua)
 			if not CM.conxBusy and #CM.conxQueue > 0 then
 				local nowG = CM.gameTime() or 0
 				local head = CM.conxQueue[1]

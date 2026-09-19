@@ -78,6 +78,15 @@ function CM.lineIdFor(key)
 	return nil
 end
 
+-- the line keeps its id, its key changes (a claimed spare, below): the old
+-- key stops naming it so a later spare can take that key
+function CM.lineRekey(lid, key)
+	local old = CM.lineKeyOf[lid]
+	if old == key then return end
+	if old then lineIdOf[old] = nil end
+	registerLineKey(key, lid)
+end
+
 function CM.forgetLine(lid)
 	local key = CM.lineKeyOf[lid]
 	if key then lineIdOf[key] = nil; lineKeysGen = lineKeysGen + 1 end
@@ -109,7 +118,7 @@ function CM.lineKeysSaveState()
 	local nxt = {}
 	for o, s in pairs(CM.lineKeyNext) do nxt[o] = s end
 	if (CM.seqNo or 0) > (nxt[K.INSTANCE] or 0) then nxt[K.INSTANCE] = CM.seqNo end
-	return { v = 1, keys = lineKeysCache, next = nxt }
+	return { v = 1, keys = lineKeysCache, next = nxt, pool = CM.poolPid }
 end
 function CM.lineKeysLoadState(st)
 	if type(st) ~= "table" or lineKeysSaved or lineKeysAdopted then return end
@@ -119,6 +128,8 @@ local function adoptSavedLineKeys()
 	local st = lineKeysSaved
 	lineKeysSaved = nil
 	lineKeysAdopted = true
+	-- the pool company (CM.spareTick) is in the save like any player entity
+	if tonumber(st.pool) and not CM.poolPid then CM.poolPid = tonumber(st.pool) end
 	local n, gone, held = 0, 0, 0
 	for sid, key in pairs(type(st.keys) == "table" and st.keys or {}) do
 		local lid = tonumber(sid)
@@ -483,11 +494,15 @@ function CM.pollLineKeys()
 		local hit
 		for fi = 1, #fresh do
 			local snap = CM.lineSnapshot(fresh[fi])
-			if snap and (not p.sig or CM.stopsSigEqual(snap.stops, p.sig)) then hit = fi; break end
+			-- two empty lines can land on one step (a claimed spare's successor
+			-- beside another player's create): the name tells them apart
+			if snap and (not p.sig or CM.stopsSigEqual(snap.stops, p.sig))
+			   and (not p.name or p.name == snap.name) then hit = fi; break end
 		end
 		if hit then
 			registerLineKey(p.key, fresh[hit])
 			if p.company then CM.cmReassignEntity(fresh[hit], p.company, "line") end   -- companies mode
+			if p.pool then CM.spareBound(p.key, fresh[hit]) end
 			table.remove(fresh, hit)
 			table.remove(pendingLineKeys, pk)
 		end
@@ -522,6 +537,109 @@ function CM.pollLineKeys()
 	for i = #pendingLineKeys, 1, -1 do
 		if now - pendingLineKeys[i].since > 6 then log("line: key " .. pendingLineKeys[i].key .. " never produced a line -- dropped"); table.remove(pendingLineKeys, i) end
 	end
+end
+
+-- ---------- the spare line: an instant "New line" (2026-09-19) ----------
+--
+-- A strict create lands at its stamp, so the line editor opened the new line
+-- 1-2.6 s after the click. Creating it natively at the click is not an option:
+-- an entity allocated off-step shifts every id allocated after it on that game
+-- (3-game rig, 2026-09-12: people split at the very next hash). So the entity
+-- is allocated AHEAD of the click, in lockstep: every player owns one SPARE
+-- line, created at an agreed stamp on every instance (same step, same id),
+-- keyed spare:<origin>. It belongs to a hidden POOL company (an addPlayer
+-- entity nobody plays, made at the first spare's stamp), so no line list shows
+-- it. The slice reads this instance's spare id from lockstep_lspare_<x>.txt
+-- and, when the player clicks New line, fires the editor's callback with the
+-- spare at once instead of holding it; the LCREATEX then carries spare=<id>.
+-- inject.lua re-owns the spare to the player here and now (ownership touches
+-- no simulated state) and ships the create with spare=<key>; at the stamp
+-- every instance re-owns, renames, recolours and re-keys that line to
+-- origin:seq -- and creates the origin's next spare, on that same step.
+-- A missing spare (consumed by a click still in flight, deleted, absent on
+-- this build) simply means the slice holds the callback as before.
+K.LINE_SPARE = K.LINE_SPARE or 1
+K.LINE_SPARE_RETRY = 30           -- game units before this instance asks for a spare again
+K.LINE_SPARE_TOUCH_TICKS = 25     -- the slice takes the file only while it is fresh (30 s)
+CM.poolPid = nil
+local spareFileHas, spareTouchedTick = nil, 0
+function CM.spareKey(origin) return "spare:" .. tostring(origin or K.INSTANCE) end
+function CM.spareFile() return (K.BASE or "") .. "lockstep_lspare_" .. K.INSTANCE .. ".txt" end
+function CM.spareWrite(lid)
+	local f = io.open(CM.spareFile(), "w")
+	if not f then return end
+	if lid then f:write(tostring(lid)) end
+	f:close()
+	spareFileHas, spareTouchedTick = lid, CM.ticks or 0
+end
+function CM.spareLid() return CM.lineIdFor(CM.spareKey()) end
+-- pollLineKeys bound a pool-owned create: hand the slice ours
+function CM.spareBound(key, lid)
+	if CM.poolPid and CM.cmOwnerOf and CM.cmOwnerOf(lid) ~= CM.poolPid then
+		local ok, err = pcall(CM.cmSetPlayer, lid, CM.poolPid)
+		log(string.format("line: spare %s (line %d) was not the pool's -- re-owned to pid %s ok=%s %s",
+			key, lid, tostring(CM.poolPid), tostring(ok), ok and "" or tostring(err)))
+	end
+	if key == CM.spareKey() then CM.spareWrite(lid) end
+end
+-- the origin's player on THIS instance (companies mode: its company's entity)
+local function playerForOrigin(c)
+	if CM.cmMode == "companies" and c.company and CM.cmCompanyPid then
+		local cid = tonumber(c.company)
+		if cid and cid ~= CM.cmMyCompany and CM.cmCompanyPid[cid] then return CM.cmCompanyPid[cid] end
+	end
+	return api.engine.util.getPlayer()
+end
+-- a spare for `origin`, created at the stamp on every instance; nil = done or refused
+local function spareCreate(origin, why)
+	if (K.LINE_SPARE or 1) == 0 then return end
+	if not CM.poolPid then
+		local pid
+		pcall(function() pid = game.interface.addPlayer() end)
+		if not pid then log("LSPARE: addPlayer failed -- no pool company, no spare lines"); return end
+		CM.poolPid = pid
+		pcall(function() game.interface.setMaximumLoan(pid, 0) end)
+		log(string.format("LSPARE: pool company created (pid %s, %s)", tostring(pid), why))
+	end
+	local key = CM.spareKey(origin)
+	if CM.lineIdFor(key) then log(string.format("LSPARE: %s already has a spare (line %d)", key, CM.lineIdFor(key))); return end
+	local name = "spare " .. tostring(origin)
+	local lineObj = api.type.Line.new()
+	lineObj.waitingTime = 180
+	-- grey off the editor's palette: the next new line's colour is chosen by
+	-- counting existing lines' colours exactly, and this one must count for nothing
+	api.cmd.sendCommand(api.cmd.make.createLine(name, api.type.Vec3f.new(0.5, 0.5, 0.5), CM.poolPid, lineObj),
+		function(res, success)
+			log(string.format("EXEC LSPARE %s success=%s (%s)", key, tostring(success), why))
+			if success then
+				pendingLineKeys[#pendingLineKeys + 1] = { key = key, sig = "", name = CM.escName(name), since = CM.gameTime() or 0, pool = true }
+			end
+		end)
+end
+-- every tick: keep the slice's file fresh, ask for a spare when we have none
+CM.spareAskedAt = nil
+function CM.spareTick()
+	if (K.LINE_SPARE or 1) == 0 or not CM.peerSeen or CM.resyncHold or CM.actionsOff or CM.dedicatedGui then return end
+	local now = CM.gameTime()
+	if not now then return end
+	local lid = CM.spareLid()
+	if lid then
+		local alive = false
+		pcall(function() alive = api.engine.entityExists(lid) end)
+		if not alive then
+			log(string.format("line: spare line %d is gone -- forgotten, a new one will be asked for", lid))
+			CM.forgetLine(lid)
+			CM.spareWrite(nil)
+			return
+		end
+		if spareFileHas ~= lid or (CM.ticks or 0) - spareTouchedTick >= K.LINE_SPARE_TOUCH_TICKS then CM.spareWrite(lid) end
+		return
+	end
+	if spareFileHas then CM.spareWrite(nil) end
+	if CM.spareAskedAt and now - CM.spareAskedAt < K.LINE_SPARE_RETRY then return end
+	CM.spareAskedAt = now
+	CM.scheduleLocal("LSPARE", {})
+	log(string.format("line: no spare line for %s -- asking for one (LSPARE)", K.INSTANCE))
 end
 
 -- A line edit the slice could not decode ran natively here; this reads the line
@@ -660,6 +778,40 @@ function CM.execLine(c)
 			log(string.format("%s seq=%s origin=%s REFUSED on every instance: %s", c.op, tostring(c.seq), tostring(c.origin), tostring(why)))
 			if c.origin == K.INSTANCE and CM.cmNote then CM.cmNote("line not changed: " .. tostring(why)) end
 			return false
+		end
+		if c.op == "LSPARE" then
+			spareCreate(c.origin, "asked for")
+			return
+		end
+		if c.op == "LCREATE" and c.spare then
+			-- CLAIM: the create's line is the origin's spare, already open in the
+			-- originator's editor. Same entity on every instance; from this
+			-- step it is the player's, named and coloured as the create says.
+			local key = tostring(c.origin) .. ":" .. tostring(c.seq)
+			local lid = CM.lineIdFor(key) or CM.lineIdFor(tostring(c.spare))
+			if not lid then c.key = c.key or c.spare; retryLineDep(c); return end
+			local lineObj, n, groups = buildLineObject(c)
+			if not permitted(lineObj, groups) then return end
+			local pid = playerForOrigin(c)
+			local okO, errO = pcall(CM.cmSetPlayer, lid, pid)
+			CM.lineRekey(lid, key)
+			local name = CM.unescName(c.name)
+			pcall(function() api.cmd.sendCommand(api.cmd.make.setName(lid, name), function() end) end)
+			local r, g, b = tostring(c.color or ""):match("^([^,]+),([^,]+),([^,]+)$")
+			r, g, b = tonumber(r) or 0.9, tonumber(g) or 0.2, tonumber(b) or 0.2
+			pcall(function()
+				if CM.expectColorEcho then CM.expectColorEcho(lid, r, g, b) end
+				api.cmd.sendCommand(api.cmd.make.setColor(lid, api.type.Vec3f.new(r, g, b)), function() end)
+			end)
+			if n > 0 or math.abs(CM.waitNum(c.wait, 180) - 180) > 1e-6 then
+				api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
+					log(string.format("EXEC LCREATE seq=%s: the claimed spare's stops applied success=%s", tostring(c.seq), tostring(success)))
+				end)
+			end
+			log(string.format("EXEC LCREATE seq=%s origin=%s at=%s '%s' claimed spare %s -> line %d (owner pid %s ok=%s%s)",
+				tostring(c.seq), tostring(c.origin), tostring(c.at), name, tostring(c.spare), lid, tostring(pid), tostring(okO), okO and "" or " " .. tostring(errO)))
+			spareCreate(c.origin, "the previous one was claimed")
+			return
 		end
 		if c.op == "LCREATE" then
 			local lineObj, n, groups = buildLineObject(c)

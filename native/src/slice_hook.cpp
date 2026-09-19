@@ -1773,6 +1773,73 @@ static bool StashLineCreateCallback(uint64_t r9)
     return true;
 }
 
+// THE SPARE LINE (2026-09-19, lines.lua CM.spareTick). Holding the callback showed
+// the new line 1-2.6 s after the click. The Lua keeps one empty line per player
+// pre-made in lockstep (same step, same id everywhere, owned by a hidden pool
+// company) and names ours in lockstep_lspare_<x>.txt. A create that is cancelled
+// then fires the editor's callback AT ONCE with that line as its result: the
+// callbacks (0x6154a0 line manager, 0x610490 line list) only check the command's
+// tag (+0xb18 == 3, still true) and read the entity at +0x58 of the command impl,
+// then select it. The LCREATEX carries spare=<id>, so the Lua re-owns and re-keys
+// that line instead of creating one. The file is consumed here so a second click
+// before the Lua provides the next spare falls back to the held callback, and it
+// is trusted only while fresh (the Lua rewrites it every few seconds and blanks
+// it at boot: a stale id from another world would select a line that is not there).
+static const uint64_t LSPARE_MAX_AGE_100NS = 30ULL * 10000000ULL;
+static volatile LONG g_lcSpareId = 0;   // the spare this capture will open, 0 = none
+static int32_t ReadAndConsumeSpareLine()
+{
+    ReadInstance();
+    if (!g_instance[0]) return 0;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_lspare_%s.txt", g_dataDir, g_instance);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return 0;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const uint64_t wrote = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    const uint64_t now = ((uint64_t)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
+    if (now > wrote && now - wrote > LSPARE_MAX_AGE_100NS) { Log("[slice] CreateLine: the spare file is stale -- not used\n"); return 0; }
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return 0;
+    long id = 0;
+    if (fscanf(f, "%ld", &id) != 1) id = 0;
+    fclose(f);
+    if (id <= 0) return 0;
+    // consumed: the Lua writes the next one once it is bound
+    FILE* w = _fsopen(p, "w", _SH_DENYNO);
+    if (w) fclose(w);
+    return (int32_t)id;
+}
+// At the cancelled create's Add: the result is the spare, and the editor hears
+// "done" now. Same shape as the build tools' fire below (impl via r9+0x38, _Do_call
+// at vftable+0x10, rdx = the Command). false = nothing fired (the caller stashes).
+static bool FireLineCreateWithSpare(uint64_t r8, uint64_t r9, int32_t spare)
+{
+    uint64_t impl = r9;
+    if (Readable((void*)(r9 + 0x38), 8)) {
+        uint64_t p = 0;
+        memcpy(&p, (void*)(r9 + 0x38), 8);
+        if (p && Readable((void*)p, 8)) impl = p;
+    }
+    uint64_t cimpl = 0;
+    if (!Readable((void*)r8, 8)) return false;
+    memcpy(&cimpl, (void*)r8, 8);
+    if (!cimpl || !Readable((void*)(cimpl + 0xb18), 1) || !Readable((void*)(cimpl + 0x58), 4)) return false;
+    uint8_t tag = 0;
+    memcpy(&tag, (void*)(cimpl + 0xb18), 1);
+    if (tag != 3) { Log("[slice] CreateLine: command impl tag is %d, not 3 -- the spare is not used\n", (int)tag); return false; }
+    uint64_t vft = 0, doCall = 0;
+    if (!Readable((void*)impl, 8)) return false;
+    memcpy(&vft, (void*)impl, 8);
+    if (!vft || !Readable((void*)vft, 8 * 3)) return false;
+    memcpy(&doCall, (void*)(vft + 0x10), 8);
+    if (!doCall) return false;
+    memcpy((void*)(cimpl + 0x58), &spare, 4);
+    ((void (*)(uint64_t, uint64_t))doCall)(impl, r8);
+    return true;
+}
+
 // Our Lua is about to create a line: if it wrote a fresh claim, this createLine is
 // the originator's own replay, and the oldest stashed UI callback rides on its Add.
 static void ClaimLineCreateCarrier(uint64_t rcx)
@@ -1915,8 +1982,10 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
+            const int32_t spare = (int32_t)InterlockedCompareExchange(&g_lcSpareId, 0, 0);
+            if (spare) fprintf(f, " spare=%d", spare);
             fprintf(f, " name=%s\n", g_lcDecode.nameEnc.c_str());
-            Log("[slice] LCREATEX shipped: name=%.200s stops=%d\n", g_lcDecode.nameEnc.c_str(), d.n);
+            Log("[slice] LCREATEX shipped: name=%.200s stops=%d%s\n", g_lcDecode.nameEnc.c_str(), d.n, spare ? " (the spare line opens the editor)" : "");
         } else {
             // not decoded: the new line's content is read back from the entity by
             // the Lua side once it exists; only the EVENT ships from here.
@@ -2179,6 +2248,10 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
             } else {
                 const bool armed = cancel && SessionLive();
                 WriteArmed(armed);
+                // the spare line (ReadAndConsumeSpareLine): only for a create that IS
+                // cancelled and decoded, so the Lua sees spare= exactly when the editor
+                // was given that line
+                InterlockedExchange(&g_lcSpareId, (f.id == 7 && armed && g_lcDecodeOk) ? ReadAndConsumeSpareLine() : 0);
                 bool shipped = false;
                 __try { shipped = WriteInjectVehicleCmd(f.id, r8, r9, st[0]); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] %s decode fault -- not shipped\n", f.name); }
@@ -4332,11 +4405,21 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
                 InterlockedExchange(&g_pendingNoCb, 0);
                 InterlockedExchange(&g_pendingHonour, 0);
                 if (InterlockedExchange(&g_pendingStashCb, 0)) {
-                    bool held = false;
-                    __try { held = StashLineCreateCallback(r9); }
-                    __except (EXCEPTION_EXECUTE_HANDLER) { held = false; }
-                    Log(held ? "[slice] CreateLine: the line editor's callback is held for our replay at the stamp\n"
-                             : "[slice] CreateLine: callback could not be held -- cancelled anyway (ARMED 1 promised the replay); the editor will not select the new line\n");
+                    const int32_t spare = (int32_t)InterlockedExchange(&g_lcSpareId, 0);
+                    bool fired = false;
+                    if (spare) {
+                        __try { fired = FireLineCreateWithSpare(r8, r9, spare); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { fired = false; }
+                        Log(fired ? "[slice] CreateLine: the line editor opens spare line %d now; the Lua claims it at the stamp\n"
+                                  : "[slice] CreateLine: spare line %d could not be handed to the editor -- callback held instead (the Lua still claims the spare; the editor will not select it)\n", spare);
+                    }
+                    if (!fired) {
+                        bool held = false;
+                        __try { held = StashLineCreateCallback(r9); }
+                        __except (EXCEPTION_EXECUTE_HANDLER) { held = false; }
+                        Log(held ? "[slice] CreateLine: the line editor's callback is held for our replay at the stamp\n"
+                                 : "[slice] CreateLine: callback could not be held -- cancelled anyway (ARMED 1 promised the replay); the editor will not select the new line\n");
+                    }
                 }
                 g_suppressed++;
                 ZeroAddResult(rdx);
