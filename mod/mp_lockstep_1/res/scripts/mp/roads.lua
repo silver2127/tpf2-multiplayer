@@ -554,6 +554,13 @@ function CM.execPolyline(c, planOnly)
 
 		local np = math.floor(#pts / 3)
 		local ne = math.floor(#links / 2)
+		local owners = {}
+		if c.own ~= nil then
+			local text = tostring(c.own)
+			assert(text:match("^%d[%d,]*$") and not text:find(",,") and text:sub(-1) ~= ",", "ROADP: invalid ownership list")
+			for value in text:gmatch("[^,]+") do owners[#owners + 1] = tonumber(value) end
+			assert(#owners == ne, "ROADP: ownership count does not match links")
+		end
 		local welds = {}
 		for tok in tostring(c.weld or ""):gmatch("[^,]+") do welds[#welds + 1] = tonumber(tok) end
 		local nw = math.floor(#welds / 3)
@@ -1352,6 +1359,7 @@ function CM.execPolyline(c, planOnly)
 						e.trackEdge.catenary = (tonumber(c.cat) or 0) == 1
 						e.streetEdge = api.type.BaseEdgeStreet.new()
 						e.streetEdge.streetType = stype or 16
+						CM.applyEdgeOwner(e, owners[k])
 						addEdges[#addEdges + 1] = e
 					end
 					log(string.format("ROADP: segment %d routed through %d crossing node(s)", k, #hits))
@@ -1394,6 +1402,7 @@ function CM.execPolyline(c, planOnly)
 					e.streetEdge.hasBus, e.streetEdge.tramTrackType =
 						CM.streetProps(c, x0, y0, x1, y1)
 				end
+				CM.applyEdgeOwner(e, owners[k])
 				addEdges[#addEdges + 1] = e
 				end   -- (no crossings: the original single-edge build)
 			end

@@ -37,10 +37,16 @@ return function(CM, K, log)
 -- (CM.deserParams) is a plain load() of the literal: no depth of ours there
 -- either, and its one failure (the game parser's own nesting limit) is loud.
 CM.serCycles = 0
+local function quoteParam(s)
+	-- Lua 5.2 %q represents LF as a backslash followed by a physical newline.
+	-- Our IPC/network records are lines: use the equivalent Lua escape so a
+	-- module's text (including table keys) cannot split a construction command.
+	return (string.format("%q", s):gsub("\\\n", "\\n"))
+end
 local function serValue(v, onPath, path)
 	local t = type(v)
 	if t == "number" or t == "boolean" then return tostring(v) end
-	if t == "string" then return string.format("%q", v) end
+	if t == "string" then return quoteParam(v) end
 	if t == "table" then
 		if onPath[v] then
 			CM.serCycles = CM.serCycles + 1
@@ -60,7 +66,7 @@ local function serValue(v, onPath, path)
 		local parts = {}
 		for _, k in ipairs(keys) do
 			local key = (type(k) == "number") and ("[" .. k .. "]")
-			                                   or ("[" .. string.format("%q", k) .. "]")
+			                                   or ("[" .. quoteParam(k) .. "]")
 			local inner = serValue(v[k], onPath, path .. key)
 			if inner then parts[#parts + 1] = key .. "=" .. inner end
 		end
@@ -926,6 +932,16 @@ local function noteCon(id, fn, key, pstr)
 	local prev = CM.consByKey[key]
 	CM.consByKey[key] = { id = id, file = fn, params = pstr }
 	return prev
+end
+
+-- The additive Fences replay knows its result id; register that exact entity
+-- before a catch-up scan can mistake it for an unsynchronized native build.
+function CM.registerFenceReplay(id, file, params)
+	if type(id) ~= "number" or id < 0 or not api.engine.entityExists(id) then return end
+	local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+	if not co or tostring(co.fileName) ~= file or not co.transf then return end
+	knownCons[id] = true
+	noteCon(id, file, CM.conKey(co.transf[13], co.transf[14]), params)
 end
 
 -- The live player construction of `file` nearest (x, y) within maxDist, looked up in

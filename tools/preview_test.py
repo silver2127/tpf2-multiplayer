@@ -349,5 +349,23 @@ T=T+0.5; SENT={}; BG.previewGuiTick(); BS.previewTick()
 for _,line in ipairs(SENT) do PS.previewRecv(line) end
 PS.previewTick(); PG.previewGuiTick()
 check('building cancellation without apply clears peer marker',ZONES.mppreview_e_1==nil and ZONES.mppreview_e_4==nil)
+local FG=side('g','G/')
+local fp={fence=true,details=true,x=100,y=200,params={result={models={
+ {transf={1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1}},
+ {transf={1,0,0,0,0,1,0,0,0,0,1,0,10,0,0,1}}}}}}
+FG.fencesPreviewRead=function() return fp,'fence-preview' end
+FG.previewNativeUpdate=function() return false end
+FG.previewGuiTick()
+check('local Fences uses cosmetic outline without native renderer',ZONES.mpfences~=nil and #FG.queue==0 and FG.seqNo==0)
+FG.previewControlsVisible=function() return false end
+T=T+0.5;FG.previewGuiTick()
+check('Fences outline clears when build controls close',ZONES.mpfences==nil)
+FG.previewControlsVisible=function() return true end
+FG.previewNativeUpdate=function(o,p) return o=='g' and p==fp end
+T=T+0.5;FG.previewGuiTick()
+check('Fences native preview does not also draw fallback',ZONES.mpfences==nil)
+FG.fencesPreviewRead=function() return nil end
+T=T+0.5;FG.previewGuiTick()
+check('absent Fences preview leaves no outline',ZONES.mpfences==nil)
 realPrint(string.format('%d preview checks passed', count))
 ''')
