@@ -2689,6 +2689,7 @@ def version_rejection(remote):
 
 
 PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
+PING_EVERY = 60.0           # the anonymous session heartbeat (/ping), listed or not; --no-ping turns it off
 
 
 class _Publisher:
@@ -2699,7 +2700,7 @@ class _Publisher:
     the code (host address + session secret) and a name -- so it is opt-in,
     and a password-locked code shows as locked (useless without the password)."""
 
-    def __init__(self, url, code, kind, locked, log, stable_key=None):
+    def __init__(self, url, code, kind, locked, log, stable_key=None, ping=True):
         self.url = url.rstrip("/")
         self.code = code
         self.kind = kind if kind in ("relay", "host", "dedicated") else "host"   # listed as its type, never a save name
@@ -2715,6 +2716,12 @@ class _Publisher:
         self.name = "host"
         self.players = 1
         self.on = False
+        # the anonymous session count: a random id for this run, never the code,
+        # the name or the stable id -- a private lobby is counted, not found
+        self.ping = bool(ping)
+        self.ping_id = os.urandom(8).hex()
+        self._last_ping = 0.0
+        self._ping_said = False
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True, name="publish")
@@ -2732,7 +2739,7 @@ class _Publisher:
         self._t.join(timeout=6)
 
     def _post(self, path, body):
-        import urllib.request
+        import urllib.request, urllib.error   # noqa: F401 -- HTTPError is caught by the caller
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(self.url + path, data=data,
                                      headers={"Content-Type": "application/json",
@@ -2741,9 +2748,24 @@ class _Publisher:
             return r.status
 
     def _run(self):
+        import urllib.error
         announced = False
         while not self._stop.is_set():
             try:
+                if self.ping and time.time() - self._last_ping >= PING_EVERY:
+                    self._last_ping = time.time()
+                    try:
+                        self._post("/ping", {"sid": self.ping_id, "players": self.players, "max": CAP,
+                                             "type": self.kind, "version": LOBBY_VERSION, "public": self.on})
+                    except urllib.error.HTTPError as e:
+                        if e.code != 404:
+                            raise
+                        self.ping = False          # a master from before the session count: never again this run
+                        self.log(f"[publish] {self.url} keeps no session count (404) -- not sent again")
+                    if self.ping and not self._ping_said:
+                        self._ping_said = True
+                        self.log(f"[publish] session counted anonymously at {self.url} (players, version, public or not; "
+                                 "no name, no code; report_sessions=0 turns it off)")
                 if self.on:
                     self._post("/announce", {"id": self.id, "name": self.name, "code": self.code,
                                              "players": self.players, "max": CAP, "type": self.kind,
@@ -5356,7 +5378,8 @@ def cmd_host(args):
     publisher = None
     if args.publish:
         publisher = _Publisher(args.publish, code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
-                               stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
+                               stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None,
+                               ping=not getattr(args, "no_ping", False))
         # systemd stops the relay with SIGTERM; without a handler Python just
         # dies and the finally: below (publisher.close -> /leave) never runs,
         # so the public list kept the dead row for a full TTL
@@ -7019,6 +7042,8 @@ def main(argv=None):
                          "across restarts so the code stays valid, and list as a dedicated server")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
+    ap.add_argument("--no-ping", action="store_true",
+                    help="do not send the anonymous session heartbeat to the master (tpf2_menu_flags.txt report_sessions=0)")
     ap.add_argument("--rendezvous", default="",
                     help="master server used for hole punching to the host (default: "
                          "--publish, else " + DEFAULT_MASTER + "; 'off' disables)")

@@ -12,6 +12,12 @@ shows as locked (its code alone does not get anyone in).
     POST /leave      {"id"}
     GET  /list       {"servers":[{... , "age": seconds since last announce}], "now": unix}
     GET  /health     "ok"
+    POST /ping       {"sid", "players", "max", "type", "version", "public"}
+                     -- a session heartbeat every PING_EVERY s from EVERY lobby, listed
+                     or not: an anonymous count (a random per-run id; no name, no code,
+                     no address kept). report_sessions=0 / --no-ping turns it off.
+    GET  /stats      {"sessions", "players", "public", "private", "by_version",
+                     "by_type", "listed", "hours": [...]} -- aggregates only
     POST /desync     a zip of a player's scrubbed logs (netpunch/desynclogs.py), metadata
                      as JSON in the X-Tpf2mp-Meta header -> {"ok":true,"id":...}
     POST /knock      {"s": session tag, "blob": base64[, "relay": 1, "j": nonce]}
@@ -49,6 +55,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 TTL = 30.0           # seconds an entry lives without a fresh announce (lobbies announce every 10 s)
 MAX_BODY = 4096
 MAX_ENTRIES = 500
+SESSION_TTL = 180.0  # seconds a session counts without a fresh ping (lobbies ping every 60 s)
+PING_EVERY = 60
+STATS_FILE = None    # --stats-file: one JSON line per finished hour
+_sessions = {}       # sid -> {"players","max","type","version","public","at","first"}
+_hours = {}          # hour (unix // 3600) -> {"sids": set, "peak_sessions", "peak_players", "versions": {}}
+_SID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 FIELDS = ("id", "name", "code", "players", "max", "game", "type", "version", "locked")
 # The list shows what KIND of server a row is, never the host's save name
 # (2026-09-10): a save's file name ("multi Balage", "autosave 3") read as
@@ -86,6 +98,44 @@ _knock_by_ip = {}    # ip -> [unix times of posts in the last minute]
 _up_lock = threading.Lock()
 _up_by_ip = {}       # ip -> [unix times of accepted uploads in the last hour]
 _up_all = []         # unix times of accepted uploads in the last day
+
+
+def _clean_sessions(now):
+    dead = [k for k, v in _sessions.items() if now - v["at"] > SESSION_TTL]
+    for k in dead:
+        del _sessions[k]
+    # finished hours go to the stats file once, and stay in memory for a day
+    h = int(now // 3600)
+    for k in [k for k in _hours if k < h and not _hours[k].get("flushed")]:
+        row = _hours[k]
+        row["flushed"] = True
+        if STATS_FILE:
+            try:
+                with open(STATS_FILE, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"hour": k * 3600, "sessions": len(row["sids"]), "peak_sessions": row["peak_sessions"],
+                                        "peak_players": row["peak_players"], "by_version": row["versions"]}) + "\n")
+            except OSError as e:
+                sys.stderr.write("stats file: %s\n" % e)
+    for k in [k for k in _hours if k < h - 24]:
+        del _hours[k]
+
+
+def _stats(now):
+    """Aggregates only: how many sessions and players right now, split public/private,
+    by version and type, and the last 24 finished hours."""
+    _clean_sessions(now)
+    by_version, by_type = {}, {}
+    players = public = 0
+    for s in _sessions.values():
+        players += s["players"]
+        public += 1 if s["public"] else 0
+        by_version[s["version"]] = by_version.get(s["version"], 0) + 1
+        by_type[s["type"]] = by_type.get(s["type"], 0) + 1
+    hours = [{"hour": k * 3600, "sessions": len(v["sids"]), "peak_sessions": v["peak_sessions"], "peak_players": v["peak_players"]}
+             for k, v in sorted(_hours.items())]
+    return {"now": int(now), "sessions": len(_sessions), "players": players, "public": public,
+            "private": len(_sessions) - public, "by_version": by_version, "by_type": by_type,
+            "listed": len(_servers), "hours": hours, "ttl": int(SESSION_TTL)}
 
 
 def _clean(now):
@@ -339,6 +389,9 @@ class H(BaseHTTPRequestHandler):
                 since = 0.0
             now = time.time()
             return self._send(200, {"knocks": _knock_get(tag, since, now), "now": now})
+        if path.endswith("/stats"):
+            with _lock:
+                return self._send(200, _stats(time.time()))
         if path.endswith("/list") or path == "/":
             now = time.time()
             with _lock:
@@ -431,6 +484,38 @@ class H(BaseHTTPRequestHandler):
             if relay:
                 reply["relay"] = relay
             return self._send(200, reply)
+        if path.endswith("/ping"):
+            if not isinstance(d, dict):
+                return self._send(400, {"error": "bad request"})
+            now = time.time()
+            # the anonymous session count: nothing here identifies a lobby or a
+            # player, and the address is deliberately not kept
+            psid = _s(d.get("sid"), 32)
+            if not _SID_RE.match(psid):
+                return self._send(400, {"error": "bad sid"})
+            kind = _s(d.get("type"), 16)
+            if kind not in TYPE_LABELS:
+                kind = "host"
+            try:
+                players = max(0, min(int(d.get("players") or 0), 1000))
+            except (TypeError, ValueError):
+                players = 0
+            with _lock:
+                _clean_sessions(now)
+                if psid not in _sessions and len(_sessions) >= MAX_ENTRIES:
+                    return self._send(503, {"error": "full"})
+                prev = _sessions.get(psid)
+                _sessions[psid] = {"players": players, "max": int(d.get("max") or 0), "type": kind,
+                                   "version": _s(d.get("version"), 20), "public": bool(d.get("public")),
+                                   "at": now, "first": prev["first"] if prev else now}
+                h = _hours.setdefault(int(now // 3600), {"sids": set(), "peak_sessions": 0, "peak_players": 0, "versions": {}})
+                if psid not in h["sids"]:
+                    h["sids"].add(psid)
+                    v = _sessions[psid]["version"]
+                    h["versions"][v] = h["versions"].get(v, 0) + 1
+                h["peak_sessions"] = max(h["peak_sessions"], len(_sessions))
+                h["peak_players"] = max(h["peak_players"], sum(s["players"] for s in _sessions.values()))
+            return self._send(200, {"ok": True, "every": PING_EVERY})
         if not isinstance(d, dict) or not _s(d.get("id"), 64):
             return self._send(400, {"error": "bad request"})
         sid = _s(d.get("id"), 64)
@@ -476,10 +561,11 @@ class H(BaseHTTPRequestHandler):
 
 
 def main(argv=None):
-    global DESYNC_DIR, RELAY_IP, RELAY_PORTS, RELAY_BIND
+    global DESYNC_DIR, RELAY_IP, RELAY_PORTS, RELAY_BIND, STATS_FILE
     ap = argparse.ArgumentParser(description="tpf2mp master server")
     ap.add_argument("port", nargs="?", type=int, default=8471)
     ap.add_argument("--desync-dir", default=None, help="accept desync reports and keep them here")
+    ap.add_argument("--stats-file", default=None, help="append one JSON line per finished hour of session counts")
     ap.add_argument("--bind", default="127.0.0.1",
                     help="listen address (default 127.0.0.1, behind nginx; tools/nat_lab binds 0.0.0.0)")
     ap.add_argument("--relay-ip", default=None,
@@ -494,6 +580,7 @@ def main(argv=None):
         lo, hi = (int(x) for x in a.relay_ports.split("-", 1))
         RELAY_IP, RELAY_PORTS, RELAY_BIND = a.relay_ip, (lo, hi), a.relay_bind
         start_relay()
+    STATS_FILE = a.stats_file
     srv = ThreadingHTTPServer((a.bind, a.port), H)
     sys.stderr.write("tpf2mp master server on %s:%d (ttl %ds, desync reports %s, relay %s)\n"
                      % (a.bind, a.port, TTL, DESYNC_DIR or "off",

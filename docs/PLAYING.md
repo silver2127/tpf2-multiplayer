@@ -210,6 +210,11 @@ names and chat can remain. The lobby's own logs and crash dumps are not sent. A 
 MULTIPLAYER says when they arrived. Type `/desynclogs always`, `/desynclogs ask` or `/desynclogs never`
 in the in-game chat to change your choice; it is kept in `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_prefs.txt`.
 
+While you host, the lobby also tells the master server once a minute that a session exists, listed
+or not: a random id for that run, the player count, the mod version and whether the lobby is
+public. It carries no name, no code and the server keeps no address; only totals are published.
+`report_sessions=0` in `tpf2_menu_flags.txt` turns it off.
+
 For a bug report, send the logs of **every** player. The mod gathers them in one folder,
 `%LOCALAPPDATA%\tpf2mp\logs\`:
 

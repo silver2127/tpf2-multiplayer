@@ -45,6 +45,7 @@ setting at its default.
 
 | key | default | accepted | effect |
 |---|---|---|---|
+| `report_sessions` | `1` | `0` or `1` | While you host, the lobby tells the master server once a minute that a session exists: a random id for that run, the player count, the version and whether it is listed. No name, no code, no address is kept; the server publishes only totals (`/stats`). `0` sends nothing. |
 | `master_url` | `https://srv1306562.hstgr.cloud/tpf2mp` (the project's master server) | empty, or an `http://` or `https://` URL without blanks or quotes (a trailing `/` is dropped) | Base URL of the public game list. The panel reads `<url>/list`, and a host with PUBLIC ticked announces to it. Empty hides the list and the PUBLIC checkbox. |
 | `relay_autosave_min` | 2 | 0-60 | How often, in minutes, a relay lobby's leader uploads a fresh save while playing; `0` never. |
 | `autoload` | 1 | `0`, `1` | `1`: the shared save loads by itself after START GAME. `0`: the player loads it with LOAD GAME. |
