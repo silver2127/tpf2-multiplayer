@@ -458,7 +458,7 @@ end
 -- confirming it -- one click merged onto a list the player never made, and the
 -- entry pinned every base of the line (review 2026-09-16). The queue's newest
 -- entry is the one just scheduled, or the send did not happen.
-function CM.noteLineSent(key, stops, alts)
+function CM.noteLineSent(key, stops, alts, asg)
 	CM.lineSent = CM.lineSent or {}
 	local q = CM.queue and CM.queue[#CM.queue]
 	local queued = q and q.op == "LUPDATE" and q.key == key and q.stops == stops and (q.origin == nil or q.origin == K.INSTANCE)
@@ -466,7 +466,34 @@ function CM.noteLineSent(key, stops, alts)
 		log(string.format("LUPDATE: %s was not queued (a resync hold, or no clock yet) -- not on its way; the next click builds on the entity", tostring(key)))
 		return
 	end
-	CM.lineSent[key] = { stops = stops, alts = alts, t = CM.gameTime() or 0 }
+	CM.lineSent[key] = { stops = stops, alts = alts, asg = asg, t = CM.gameTime() or 0 }
+end
+
+-- PLATFORMS AT THE STAMP (2026-09-20). A station clicked into a line gets its
+-- platform from the editor's assignment pass, run over the ENGINE's list at the
+-- click; under lockstep that list lacks the stop of any click still on its way,
+-- so the platform was chosen against the wrong predecessor and every instance
+-- applied it. An update that came out of that pass carries asg=<0|1> (the bool
+-- the editor gave the pass); right before the replay's updateLine is MADE, the
+-- file names the line for the slice, whose factory hook re-runs the game's own
+-- assignment on the rebuilt list, in place, on every instance at the same step.
+-- The seq keeps a stale file from serving a later update of the same line.
+CM.lassignSeq = nil
+function CM.lineAssignRequest(lid, c)
+	if not (c and c.asg) then return false end
+	CM.lassignSeq = (CM.lassignSeq or (os.time() % 100000000) * 10) + 1
+	local ok = false
+	pcall(function()
+		local f = io.open(K.BASE .. "lockstep_lassign_" .. K.INSTANCE .. ".txt", "w")
+		if f then f:write(string.format("%d %d %d", lid, tonumber(c.asg) or 1, CM.lassignSeq)); f:close(); ok = true end
+	end)
+	return ok
+end
+function CM.lineAssignDone()
+	pcall(function()
+		local f = io.open(K.BASE .. "lockstep_lassign_" .. K.INSTANCE .. ".txt", "w")
+		if f then f:close() end
+	end)
 end
 -- the engine answered our own update (success or not): that list is no longer
 -- on its way; a failed one is lost and the next click builds on the entity
@@ -770,8 +797,12 @@ function CM.lineApplyNow(lid, c)
 		if pre and pre.stops then CM.lineHistNote(c.key, pre.stops, pre.alts) end
 		CM.lineHistNote(c.key, c.stops or "", c.alts or "")
 	end)
-	api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
-		log(string.format("LUPDATE %s: applied here at once (no vehicles) stops=%d success=%s", tostring(c.key), n, tostring(success)))
+	local asked = CM.lineAssignRequest(lid, c)
+	local cmd = api.cmd.make.updateLine(lid, lineObj)
+	if asked then CM.lineAssignDone() end
+	api.cmd.sendCommand(cmd, function(res, success)
+		log(string.format("LUPDATE %s: applied here at once (no vehicles) stops=%d success=%s%s", tostring(c.key), n, tostring(success),
+			asked and " (platforms assigned here)" or ""))
 		CM.lineSentDone(c.key, c.stops)
 	end)
 	return n
@@ -912,10 +943,13 @@ function CM.execLine(c)
 				CM.lineHistNote(c.key, c.stops or "", c.alts or "")
 			end)
 			local sentTick = CM.ticks
-			api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
-				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s step=%d +%d ticks",
+			local asked = CM.lineAssignRequest(lid, c)
+			local cmd = api.cmd.make.updateLine(lid, lineObj)
+			if asked then CM.lineAssignDone() end
+			api.cmd.sendCommand(cmd, function(res, success)
+				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s step=%d +%d ticks%s",
 					tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.key), n, tostring(success),
-					CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
+					CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick, asked and " (platforms assigned at the stamp)" or ""))
 				if c.origin == K.INSTANCE then CM.lineSentDone(c.key, c.stops) end
 			end)
 		elseif c.op == "LDELETE" then

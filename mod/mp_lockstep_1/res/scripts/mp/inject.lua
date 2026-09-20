@@ -1429,6 +1429,11 @@ function CM.pollInject()
 							alts[#alts + 1] = table.concat(al, "/")
 						end
 						if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
+						-- asg=<0|1>: this click ran the editor's platform assignment (a station or
+						-- waypoint added); every instance re-runs it on the replayed list at the
+						-- stamp (slice: LINE PLATFORM ASSIGNMENT AT REPLAY). Absent for a manual
+						-- terminal pick, a stop setting or a removal, which replay verbatim.
+						local asg = tonumber(line:match(" asg=(%d)"))
 						local armed = CM.lastArmed or 0
 						if bad then
 							-- The DLL's +0x00 stationGroup slot is INFERRED; this is
@@ -1456,6 +1461,9 @@ function CM.pollInject()
 										lk, (pend and pend.seq) and ("seq " .. tostring(pend.seq)) or (pend and "the last edit" or "the list it was built from"),
 										adds, dels, sets, CM.lineCount(mS)))
 									newStops, newAlts = mS, mA
+									-- the merged list lands after the one it was put onto: it must not undo
+									-- that one's platform assignment with the click's stale platforms
+									if not asg and pend and pend.asg then asg = tonumber(pend.asg) end
 								else
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
 								end
@@ -1467,10 +1475,10 @@ function CM.pollInject()
 								free and " (no vehicles: applied here now, the others at the stamp)" or (armed == 1 and " (strict)" or "")))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
 							                           wait = wait, stops = newStops,
-							                           alts = newAlts, armed = free and 0 or armed })
-							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts) end
+							                           alts = newAlts, armed = free and 0 or armed, asg = asg })
+							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts, asg) end
 							if free then
-								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts })
+								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts, asg = asg })
 								if not okA then log("LUPDATE: applying here now failed (" .. tostring(errA) .. ") -- it lands at the stamp with the others") end
 							end
 						end

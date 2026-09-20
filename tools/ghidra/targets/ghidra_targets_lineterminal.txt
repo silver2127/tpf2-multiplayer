@@ -1,0 +1,21 @@
+# Targets for DecompileTargets.java. RVAs; image base is 0x140000000.
+#
+# ONE question (2026-09-20): how does the line editor pick a stop's terminal
+# ("the best platform") when a station is added, and what state does it read,
+# so cancel-and-replay of UpdateLine reproduces the same choice.
+# Provenance: call_edges.csv callers of make_cmd::UpdateLine 0x9df4e0 inside
+# game\ui\components\lineeditor.cpp (func2src), plus the assignment helper
+# they share.
+
+# UI::`anonymous-namespace'::UpdateLineAssignment(engine, MovePathUtilContext, entity, Line&, bool*, bool)
+5fe260  lineed_UpdateLineAssignment
+
+# lineeditor.cpp callers of make_cmd::UpdateLine
+5fe9e0  lineed_update_5fe9e0
+6033c0  lineed_update_6033c0
+603a00  lineed_update_603a00
+603fa0  lineed_update_603fa0
+60b970  lineed_update_60b970
+
+# line_util::GetBestLineAssignment
+215d660  line_util_GetBestLineAssignment

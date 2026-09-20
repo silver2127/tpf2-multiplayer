@@ -2579,6 +2579,10 @@ extern "C" {
         g_gameUi = rcx;
     }
 }
+// tpf2_slice.dll reads the CGameUI through this (its game-state provider at
+// +0x450 is how the slice builds a MovePathUtilContext for the line platform
+// assignment at replay). 0 between worlds.
+extern "C" __declspec(dllexport) uint64_t Tpf2mpGameUi() { return g_gameUi; }
 static const uintptr_t RVA_GAMEUI_UPDATE = 0x5741d0;
 static const int       STEAL_GAMEUI      = 21;
 static const uint8_t   GAMEUI_EXPECTED[STEAL_GAMEUI] = {

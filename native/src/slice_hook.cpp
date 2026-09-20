@@ -1680,6 +1680,236 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
 }
 
 // ---------------------------------------------------------------------------
+// LINE PLATFORM ASSIGNMENT AT REPLAY (2026-09-20).
+//
+// When a station is clicked into a line, the line editor (0x603fa0, and the
+// waypoint click 0x603a00) copies the ENGINE's current component::Line, inserts
+// the stop, and runs UI::UpdateLineAssignment (0x60a5a0) over every stop:
+// line_util::GetBestLineAssignment path-searches from each stop to the next
+// through the transport network and picks the terminal that fits the approach
+// -- "the best platform". The command carries the result. Under lockstep the
+// click's UpdateLine is cancelled and replayed at the stamp, so the engine's
+// Line stays stale for the length of the delay; a click inside that window is
+// built from a list that lacks the previous stop (the Lua merges the lists
+// back, CM.mergeLineEdit) and its platform was chosen against the wrong
+// predecessor, or none: the station on a double-track main line came out on
+// the wrong side, on every instance alike, and players fixed it by hand.
+//
+// So the assignment runs AT THE REPLAY instead, on every instance, on the list
+// the Lua rebuilt: same step, same network, same input -> same platforms.
+//   - 0x60a5a0 is hooked (15-byte prologue steal). The detour records the
+//     click it ran for -- entity, the bool it was given, the thread -- and a
+//     copy of the MovePathUtilContext the editor built (14 system pointers).
+//   - CaptureFactory tags the LUPDATE that follows on the same thread with
+//     " asg=<bool>" (LineAssignTagForCapture). The tag is shipped only after
+//     the context this DLL builds from the game state (GameStateNow +
+//     BuildMovePathCtx) has been compared byte for byte with the editor's copy
+//     ONCE on this machine: a layout that does not match is logged and the
+//     feature stays off, on every instance alike (nobody assigns).
+//   - At the replay the Lua writes lockstep_lassign_<x>.txt ("<line> <bool>
+//     <seq>") right before api.cmd.make.updateLine; the factory hook on the Lua
+//     path (ApplyLineAssignAtReplay) reads it and runs the game's own routine
+//     on the Line the Lua passed, in place, before the command is built.
+// The game state: UI::CGameUI+0x450 holds the UI's state provider (CreateUI,
+// 0x56a000 `mov rax,[rsi+0x450]`, copied into every component's ptr); its
+// vftable slot 1 returns the GameState (0x8bb7f0: `mov rcx,[rcx]; mov
+// rax,[rcx]; jmp [rax+8]`); GameState+0x28 is the engine (0x8b9e60), which is
+// the check against the factory's own engine argument. The CGameUI pointer
+// comes from tpf2_menu.dll's per-frame capture (export Tpf2mpGameUi).
+// Manual terminal picks (the combo box 0x7b43b0), alternative terminals, stop
+// settings and stop removal never ran the assignment, carry no tag, and
+// replay verbatim as before.
+static const uintptr_t RVA_LINE_ASSIGN         = 0x60a5a0;
+static const uintptr_t OFF_GAMEUI_STATE_PROVIDER = 0x450;
+static const uintptr_t OFF_GAMESTATE_ENGINE    = 0x28;
+static const int       LINE_ASSIGN_STEAL       = 15;
+static const uint8_t   LINE_ASSIGN_EXPECT[LINE_ASSIGN_STEAL] = {
+    0x40, 0x53,                                            // push rbx
+    0x48, 0x83, 0xEC, 0x60,                                // sub  rsp, 0x60
+    0x48, 0xC7, 0x44, 0x24, 0x40, 0xFE, 0xFF, 0xFF, 0xFF,  // mov  qword [rsp+0x40], -2
+};
+typedef void (*LineAssignFn)(void* engine, void* ctx, const int32_t* entity, void* line, bool* ok, uint8_t flag);
+static LineAssignFn    g_lineAssignTramp = nullptr;
+struct MovePathCtx { uint64_t f[14]; };
+static volatile LONG   g_asgTid = 0;          // the editor's last assignment: thread,
+static volatile LONG   g_asgEntity = 0;       //   line entity,
+static volatile LONG   g_asgFlag = 0;         //   the bool it passed,
+static volatile LONG64 g_asgAt = 0;           //   when (ms)
+static MovePathCtx     g_asgCtx;              //   and the context it built
+static volatile LONG   g_asgCtxValid = 0;
+static volatile LONG   g_asgLayout = 0;       // 0 unchecked, 1 our context matched the editor's, -1 it did not
+static int             g_lineAsgTag = -1;     // the tag for the LUPDATE being written (-1 none)
+static long            g_lasgSeen = 0;        // the last lockstep_lassign seq applied
+static uint64_t (*g_menuGameUi)() = nullptr;
+static bool            g_menuGameUiTried = false;
+
+static void LineAssignDetour(void* engine, void* ctx, const int32_t* entity, void* line, bool* ok, uint8_t flag)
+{
+    int32_t e = 0;
+    __try {
+        if (entity) e = *entity;
+        if (ctx) { memcpy(&g_asgCtx, ctx, sizeof(g_asgCtx)); InterlockedExchange(&g_asgCtxValid, 1); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { e = 0; }
+    InterlockedExchange(&g_asgEntity, e);
+    InterlockedExchange(&g_asgFlag, flag ? 1 : 0);
+    InterlockedExchange(&g_asgTid, (LONG)GetCurrentThreadId());
+    InterlockedExchange64(&g_asgAt, (LONG64)GetTickCount64());
+    g_lineAssignTramp(engine, ctx, entity, line, ok, flag);
+}
+
+static uint64_t GameStateNow(uint64_t engine)
+{
+    if (!g_menuGameUi && !g_menuGameUiTried) {
+        g_menuGameUiTried = true;
+        HMODULE m = GetModuleHandleA("tpf2_menu.dll");
+        if (m) g_menuGameUi = (uint64_t (*)())GetProcAddress(m, "Tpf2mpGameUi");
+        if (!g_menuGameUi) Log("[lineassign] tpf2_menu.dll's Tpf2mpGameUi export not found -- no game state, platforms replay as shipped\n");
+    }
+    if (!g_menuGameUi) return 0;
+    const uint64_t ui = g_menuGameUi();
+    if (!ui || !Readable((void*)(ui + OFF_GAMEUI_STATE_PROVIDER), 8)) return 0;
+    const uint64_t prov = *(uint64_t*)(ui + OFF_GAMEUI_STATE_PROVIDER);
+    if (!prov || !Readable((void*)prov, 8)) return 0;
+    const uint64_t vt = *(uint64_t*)prov;
+    if (!vt || !Readable((void*)(vt + 8), 8)) return 0;
+    const uint64_t fn = *(uint64_t*)(vt + 8);
+    if (fn < g_base || fn > g_base + 0x4000000ULL) return 0;   // the provider's getter lives in the exe
+    const uint64_t gs = ((uint64_t (*)(uint64_t))fn)(prov);
+    if (!gs || !Readable((void*)(gs + OFF_GAMESTATE_ENGINE), 8)) return 0;
+    if (*(uint64_t*)(gs + OFF_GAMESTATE_ENGINE) != engine) {
+        Log("[lineassign] game state %llx holds engine %llx, the command's is %llx -- not used\n",
+            (unsigned long long)gs, (unsigned long long)*(uint64_t*)(gs + OFF_GAMESTATE_ENGINE), (unsigned long long)engine);
+        return 0;
+    }
+    return gs;
+}
+
+// The 14 pointers UI::LineEditor copies out of the game state into a
+// vehicle_util::MovePathUtilContext (0x603fa0, 0x5fe260: the same list, the
+// same order). Verified against the editor's own copy before first use.
+static bool BuildMovePathCtx(uint64_t gs, MovePathCtx* c)
+{
+    if (!Readable((void*)gs, 0x208)) return false;
+    const uint64_t h8 = *(uint64_t*)(gs + 0x08);
+    if (!h8 || !Readable((void*)h8, 0x98)) return false;
+    c->f[0]  = *(uint64_t*)(gs + 0x38);
+    c->f[1]  = *(uint64_t*)(h8 + 0x18);
+    c->f[2]  = *(uint64_t*)(h8 + 0x90);
+    c->f[3]  = *(uint64_t*)(gs + 0x20);
+    c->f[4]  = *(uint64_t*)(gs + 0x28);
+    c->f[5]  = *(uint64_t*)(gs + 0x138);
+    c->f[6]  = *(uint64_t*)(gs + 0x150);
+    c->f[7]  = *(uint64_t*)(gs + 0x1a0);
+    c->f[8]  = *(uint64_t*)(gs + 0x158);
+    c->f[9]  = *(uint64_t*)(gs + 0x160);
+    c->f[10] = *(uint64_t*)(gs + 0xb0);
+    c->f[11] = *(uint64_t*)(gs + 0x170);
+    c->f[12] = *(uint64_t*)(gs + 0x180);
+    c->f[13] = *(uint64_t*)(gs + 0x200);
+    return true;
+}
+
+// The tag for a captured editor UpdateLine: the bool the editor's assignment
+// ran with, or -1 when this update did not come out of an assignment (a manual
+// terminal pick, a stop setting, a removal) or the feature is off.
+static int LineAssignTagForCapture(uint64_t engine, int32_t entity)
+{
+    if (!g_lineAssignTramp) return -1;
+    if ((LONG)GetCurrentThreadId() != g_asgTid || g_asgEntity != entity) return -1;
+    const LONG64 age = (LONG64)GetTickCount64() - g_asgAt;
+    if (age < 0 || age > 2000) return -1;
+    if (g_asgLayout == 0) {
+        MovePathCtx mine;
+        memset(&mine, 0, sizeof(mine));
+        const uint64_t gs = GameStateNow(engine);
+        if (gs && g_asgCtxValid && BuildMovePathCtx(gs, &mine) && memcmp(&mine, &g_asgCtx, sizeof(mine)) == 0) {
+            InterlockedExchange(&g_asgLayout, 1);
+            Log("[lineassign] context verified: the 14 pointers built from game state %llx match the line editor's -- platforms are assigned at the replay from now on\n",
+                (unsigned long long)gs);
+        } else {
+            InterlockedExchange(&g_asgLayout, -1);
+            Log("[lineassign] CONTEXT MISMATCH (gs=%llx ctxValid=%ld): built %llx %llx %llx %llx .. editor %llx %llx %llx %llx -- "
+                "platform assignment at replay stays OFF (as before this build); report this line\n",
+                (unsigned long long)gs, (long)g_asgCtxValid,
+                (unsigned long long)mine.f[0], (unsigned long long)mine.f[1], (unsigned long long)mine.f[2], (unsigned long long)mine.f[3],
+                (unsigned long long)g_asgCtx.f[0], (unsigned long long)g_asgCtx.f[1], (unsigned long long)g_asgCtx.f[2], (unsigned long long)g_asgCtx.f[3]);
+        }
+    }
+    if (g_asgLayout != 1) return -1;
+    return g_asgFlag ? 1 : 0;
+}
+
+// The Lua path's make_cmd::UpdateLine: if the Lua asked for it (a fresh
+// lockstep_lassign_<x>.txt naming this line), run the game's assignment on the
+// Line it passed (r9), in place, before the factory copies it into the command.
+static void ApplyLineAssignAtReplay(uint64_t engine, int32_t entity, uint64_t line)
+{
+    if (!g_lineAssignTramp) return;
+    ReadInstance();
+    if (!g_instance[0]) return;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_lassign_%s.txt", g_dataDir, g_instance);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return;
+    if (fa.nFileSizeLow == 0) return;
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const uint64_t wrote = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    const uint64_t now = ((uint64_t)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
+    if (now > wrote && now - wrote > 5ULL * 10000000ULL) return;
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return;
+    long lid = 0, flag = 0, seq = 0;
+    const int got = fscanf(f, "%ld %ld %ld", &lid, &flag, &seq);
+    fclose(f);
+    if (got != 3 || lid != (long)entity || seq == g_lasgSeen) return;
+    g_lasgSeen = seq;
+    const uint64_t gs = GameStateNow(engine);
+    MovePathCtx ctx;
+    if (!gs || !BuildMovePathCtx(gs, &ctx)) {
+        Log("[lineassign] LUPDATE replay line=%d: no game state -- the list is applied as shipped. LOCKSTEP AT RISK if the others assign\n", (int)lid);
+        return;
+    }
+    LineDecode before, after;
+    const bool okB = DecodeLine(line, &before);
+    int32_t ent = entity;
+    g_lineAssignTramp((void*)engine, &ctx, &ent, (void*)line, nullptr, (uint8_t)(flag ? 1 : 0));
+    const bool okA = DecodeLine(line, &after);
+    char summary[512]; summary[0] = 0; int o = 0;
+    if (okB && okA && before.n == after.n) {
+        for (int i = 0; i < after.n && o < (int)sizeof(summary) - 24; i++) {
+            if (before.st[i].station != after.st[i].station || before.st[i].terminal != after.st[i].terminal)
+                o += snprintf(summary + o, sizeof(summary) - o, " %d:%d/%d->%d/%d", i + 1,
+                              before.st[i].station, before.st[i].terminal, after.st[i].station, after.st[i].terminal);
+        }
+    }
+    Log("[lineassign] LUPDATE replay line=%d flag=%ld seq=%ld: platforms assigned at the stamp, %d stop(s), changed:%s\n",
+        (int)lid, flag, seq, okA ? after.n : -1, summary[0] ? summary : " none");
+}
+
+static void InstallLineAssign()
+{
+    const uint8_t* code = (const uint8_t*)(g_base + RVA_LINE_ASSIGN);
+    if (memcmp(code, LINE_ASSIGN_EXPECT, LINE_ASSIGN_STEAL) != 0) {
+        Log("[lineassign] NOT installed: prologue at rva=%llx differs from build 35924 -- platforms replay as shipped\n",
+            (unsigned long long)RVA_LINE_ASSIGN);
+        return;
+    }
+    if (PrologueSteal(code, 14) != LINE_ASSIGN_STEAL) {
+        Log("[lineassign] NOT installed: steal would not land on an instruction boundary\n");
+        return;
+    }
+    void* tramp = nullptr;
+    if (!InstallHook(g_base + RVA_LINE_ASSIGN, (void*)&LineAssignDetour, LINE_ASSIGN_STEAL, &tramp)) {
+        Log("[lineassign] NOT installed: could not write the detour at rva=%llx\n", (unsigned long long)RVA_LINE_ASSIGN);
+        return;
+    }
+    g_lineAssignTramp = (LineAssignFn)tramp;
+    Log("[lineassign] installed rva=%llx steal=%d -- a station clicked into a line gets its platform assigned at the replay, on every instance\n",
+        (unsigned long long)RVA_LINE_ASSIGN, LINE_ASSIGN_STEAL);
+}
+
+// ---------------------------------------------------------------------------
 // STRICT LINE CREATION (2026-09-12).
 //
 // A line the player creates used to exist on their own game one command delay
@@ -2115,6 +2345,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
+            if (g_lineAsgTag >= 0) fprintf(f, " asg=%d", g_lineAsgTag);
             fprintf(f, "\n");
             if (d.n > 0)
                 Log("[slice] LUPDATE shipped DECODED: line=%d wait=%g stops=%d (first: sg=%d st=%d term=%d lm=%d wait=%g..%g)\n",
@@ -2326,6 +2557,11 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                 __try { ClaimLineCreateCarrier(rcx); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] CreateLine: claim fault -- ignored\n"); }
             }
+            if (f.id == 8) {
+                // the platform assignment the click ran, re-run here on the rebuilt list (LINE PLATFORM ASSIGNMENT AT REPLAY)
+                __try { ApplyLineAssignAtReplay(rdx, (int32_t)r8, r9); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[lineassign] LUPDATE replay: fault in the assignment -- the list is applied as shipped\n"); }
+            }
         } else {
             // UpdateLine: decode the Line FIRST. A cancel is only honest when
             // the whole new stop list is on the wire; otherwise ship the event
@@ -2339,6 +2575,7 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                         "LOCKSTEP AT RISK: this edit runs on this game first and the read-back may not carry it\n", g_lineDecodeWhy);
                     cancel = false;
                 }
+                g_lineAsgTag = (g_lineDecodeOk && cancel) ? LineAssignTagForCapture(rdx, (int32_t)r8) : -1;
             }
             if (f.id == 7) {
                 // CreateLine: strict only when the whole create -- name, colour, line --
@@ -7960,6 +8197,7 @@ static DWORD WINAPI Init(LPVOID)
     // session being live -- two peers have to rank trains the same way from
     // the first sim step, long before anybody clicks anything.
     InstallTrainOrder();
+    InstallLineAssign();
     // The same independence from the session applies to the road sum and the
     // two claim-order observers ("ROAD FREE SPACE", "SHIP AND AIRCRAFT CLAIM
     // ORDER"): the first bus to reach a junction must get the same float on

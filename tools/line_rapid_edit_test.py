@@ -136,6 +136,12 @@ function H.logs() return table.concat(logs, "\n") end
 function H.holdResync(on) CM.resyncHold = on or nil end
 function H.sentStops() local s = CM.lineSent and CM.lineSent["b:6"]; return s and s.stops end
 function H.pendingStops() local p = CM.linePending("b:6"); return p and p.stops end
+function H.lastSched() return sched[#sched] end
+H.CM, H.K = CM, K
+function H.lua(src)
+  local env = setmetatable({ CM = CM, K = K }, { __index = _G, __newindex = _G })
+  return assert(load(src, "@test", "t", env))()
+end
 return H
 ''')
 
