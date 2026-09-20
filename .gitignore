@@ -38,3 +38,6 @@ backup/
 .claude/
 *.orig
 docs/audit.md
+
+# per-machine test artifacts (tools/edge_owner_decode_test.py compiles here)
+.local-test/
