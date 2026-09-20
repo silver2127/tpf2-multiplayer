@@ -327,6 +327,8 @@ SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds t
                             # for OTHER peers keep being serviced during a send.
 FEEDBACK_INTERVAL = 0.05    # receiver 'fack' (base + NACKs) cadence.
 BEGIN_INTERVAL = 0.2        # host re-sends 'fbegin' this often until a peer is ready.
+DONE_NUDGE_INTERVAL = 1.0   # a peer that holds every chunk but has not said done gets
+                            # the last chunk again this often (it answers with done)
 RESEND_AFTER = 0.5          # if a peer's facks go silent this long, rewind its send
                             # cursor and re-stream the window (recovers lost facks).
 PEER_XFER_TIMEOUT = 30.0    # no forward progress for this long -> skip that peer.
@@ -1576,6 +1578,16 @@ class _HostSaveTransfer:
                     _send_data(self.sock, addr, self.begin_msg)
                     p["last_begin"] = now
                 continue
+            if p["base"] >= self.total_chunks and not p.get("verifying"):
+                # Every chunk is delivered and the peer is past its verify, yet no
+                # done has arrived: its announcement was lost. Re-send the last
+                # chunk now and then (a chunk to a finished receiver is answered
+                # with done) so recovery does not rest on the peer's timer alone.
+                # This is the ONLY path for a TCP peer, which no chunk otherwise reaches.
+                if now - p.get("last_nudge", 0.0) >= DONE_NUDGE_INTERVAL:
+                    p["last_nudge"] = now
+                    self._send_chunk(addr, self.total_chunks - 1)
+                continue
             if p["tcp"]:
                 continue                        # streaming over TCP: nothing to send here
             # Receiver silent for too long? Its facks were lost -- rewind and
@@ -1721,6 +1733,7 @@ class _ClientSaveReceiver:
         self.manifest_unknown = False
         self.batch = None            # [k, n] of the mods batch being received (a host from 0.6.1.7 on)
         self.batch_open = False      # a round is under way: more batches follow, do not ask again
+        self.batch_done = False      # this batch is installed and its done is being announced (cleared by the next fbegin)
         self.batch_got = set()       # mods installed or present across the round's batches
         # THE TCP CHANNEL (bulk_tcp.py). A joiner connects to the sender's listener
         # (the host's or relay's, named in fbegin) and a reader thread queues the
@@ -1984,6 +1997,7 @@ class _ClientSaveReceiver:
         self.retries = 0
         self.last_pct = -1
         self.done_sends = 0
+        self.batch_done = False
         self.log(f"[client] save incoming sid={sid} {self.total_bytes}B "
                  f"{self.total_chunks} chunks")
         ack = {"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask}
@@ -2065,7 +2079,7 @@ class _ClientSaveReceiver:
     def on_chunk(self, sid, seq, data):
         if self.sid is None or sid != self.sid:
             return
-        if self.complete:
+        if self.complete or self.batch_done:
             self._maybe_send_done(force=True)   # nudge host to stop resending
             return
         if self.finalizing:
@@ -2138,7 +2152,12 @@ class _ClientSaveReceiver:
             return
         if self.sid is None or self.failed:
             return
-        if self.complete:
+        if self.complete or self.batch_done:
+            # A batch that is not the last of its round leaves `complete` false
+            # (the round is still open), and until 2026-09-20 that meant its done
+            # went out exactly ONCE: one lost datagram and the host, with every
+            # chunk already delivered and nothing to retransmit, timed the peer
+            # out 30 s later and failed the round (batch 18/359, 2026-09-20 01:14).
             self._maybe_send_done(now=now)
             return
         if now - self.last_fack >= FEEDBACK_INTERVAL:
@@ -2323,6 +2342,7 @@ class _ClientSaveReceiver:
                 # one batch of a round: hand it back and wait for the next
                 self.batch_open = True
                 self.complete = False
+                self.batch_done = True
                 self.log(f"[client] mod batch {self.batch[0]}/{self.batch[1]} installed -- waiting for the next")
                 self._maybe_send_done(force=True)
                 return

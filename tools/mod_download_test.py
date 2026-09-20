@@ -26,11 +26,19 @@ def archive():
     with zipfile.ZipFile(out,'w') as z: z.writestr('mod.lua','function data() return {} end')
     return out.getvalue()
 
-def push(r,sid,kind,files,mods=None):
+def begin(r,sid,kind,files,mods=None,batch=None):
+    """The host's fbegin for ``files`` (a mods batch when ``batch`` is [k, n]); returns the blob."""
     blob=b''.join(data for _,data in files)
     metadata=[dict(name=name,size=len(data),sha256=hashlib.sha256(data).hexdigest()) for name,data in files]
     chunk=lobby.CHUNK_LOCAL
-    r.on_begin(dict(sid=sid,kind=kind,files=metadata,total_bytes=len(blob),total_chunks=(len(blob)+chunk-1)//chunk,chunk=chunk,sha256=hashlib.sha256(blob).hexdigest(),mods=mods or []))
+    msg=dict(sid=sid,kind=kind,files=metadata,total_bytes=len(blob),total_chunks=(len(blob)+chunk-1)//chunk,chunk=chunk,sha256=hashlib.sha256(blob).hexdigest(),mods=mods or [])
+    if batch: msg['batch']=batch
+    r.on_begin(msg)
+    return blob
+
+def push(r,sid,kind,files,mods=None,batch=None):
+    blob=begin(r,sid,kind,files,mods,batch)
+    chunk=lobby.CHUNK_LOCAL
     for seq in range((len(blob)+chunk-1)//chunk): r.on_chunk(sid,seq,blob[seq*chunk:(seq+1)*chunk])
     r.settle()   # the verify/write runs on a worker thread; apply its outcome before asserting
 
@@ -57,6 +65,30 @@ class Downloads(unittest.TestCase):
         self.r.tick(time.time());self.assertFalse(self.r.complete)
         (self.root/'mods_catalogue.txt').write_text(self.r.catalogue_token+'\n*9876543210\t1\n')
         self.r.tick(time.time());self.assertTrue(self.r.complete and self.r.mods_satisfied)
+    def test_mid_round_batch_keeps_announcing_done(self):
+        """A batch that is not the last of its round leaves the round open (complete
+        stays false) -- and until 2026-09-20 its done went out exactly once, so one
+        lost datagram had the host time the peer out and fail the round (batch
+        18/359 of a 556-mod round, unpacked in 0 s). The done is re-announced on
+        the tick and in answer to a resent chunk, until the next batch begins."""
+        self.offer();self.r.answer_mods(True)
+        files=[(modshare.mod_zip_name('*9876543210',1),archive())]
+        push(self.r,10,'mods',files,batch=[1,2])
+        self.assertFalse(self.r.complete);self.assertTrue(self.r.batch_open);self.assertTrue(self.r.batch_done)
+        dones=lambda sid:[m for m in self.conn.sent if m.get('t')=='fdone' and m.get('ok') and m.get('sid')==sid]
+        self.assertEqual(len(dones(10)),1)
+        now=time.time()
+        self.r.tick(now+1);self.r.tick(now+2)
+        self.assertEqual(len(dones(10)),3,'re-announced on the tick')
+        self.r.on_chunk(10,0,b'x')
+        self.assertEqual(len(dones(10)),4,'a resent chunk is answered with done')
+        self.assertTrue((self.root/'workshop/9876543210/mod.lua').exists())
+        # the next batch's fbegin ends the announcement: no done for either sid while it is incoming
+        self.conn.sent.clear()
+        begin(self.r,11,'mods',files,batch=[2,2])
+        self.assertFalse(self.r.batch_done)
+        self.r.tick(now+3);self.r.on_chunk(10,0,b'x')
+        self.assertFalse(dones(10));self.assertFalse(dones(11))
     def test_receipt_missing_required_mod_disconnects(self):
         self.accept_and_install();(self.root/'mods_catalogue.txt').write_text(self.r.catalogue_token+'\n')
         self.r.tick(time.time());self.assertTrue(self.r.cancelled)

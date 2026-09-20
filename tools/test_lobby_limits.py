@@ -300,6 +300,33 @@ class MidTransfer(unittest.TestCase):
         t = lobby._HostSaveTransfer(self.Sock(), 5, blob, meta, [(addr, "joiner")], self.IO(), lambda s: None)
         return t, addr
 
+    def test_host_nudges_a_finished_peer_that_has_not_said_done(self):
+        """A peer whose base covers every chunk and that is past its verify
+        gets the last chunk again once a second (a finished receiver answers
+        a chunk with done), so a lost done does not end in a timeout. Not
+        while it is still verifying, and not once it is done."""
+        t, addr = self.transfer()
+        p = t.peers[addr]
+        p["ready"] = True
+        p["base"] = p["next"] = t.total_chunks
+        p["verifying"] = True
+        t.pump(100.0)
+        self.assertEqual(t.sock.sent, 0, "verifying: nothing to nudge")
+        p["verifying"] = False
+        t.pump(100.0)
+        self.assertEqual(t.sock.sent, 1)
+        t.pump(100.0 + lobby.DONE_NUDGE_INTERVAL / 2)
+        self.assertEqual(t.sock.sent, 1, "not before the interval")
+        t.pump(100.0 + lobby.DONE_NUDGE_INTERVAL)
+        self.assertEqual(t.sock.sent, 2)
+        p["tcp"] = True                       # a TCP peer is reached the same way
+        t.pump(100.0 + 2 * lobby.DONE_NUDGE_INTERVAL)
+        self.assertEqual(t.sock.sent, 3)
+        t.on_fdone(addr, {"sid": t.sid, "ok": True})
+        t.pump(100.0 + 3 * lobby.DONE_NUDGE_INTERVAL)
+        self.assertEqual(t.sock.sent, 3, "done: nothing more")
+        self.assertEqual(p["state"], "done")
+
     def test_host_drop_defers_to_the_transfer(self):
         t, addr = self.transfer()
         self.assertTrue(lobby._mid_transfer(addr, t))
@@ -352,14 +379,14 @@ class MidTransfer(unittest.TestCase):
         fack(t, addr, 0)
         fack(t, addr, 8 << 20)
         self.assertEqual(p["verify_progress"], 8 << 20)
-        p["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+        p["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5
         fack(t, addr, 8 << 20)                            # the worker stopped moving
         t.pump(time.time())
         self.assertEqual(p["state"], "failed")
         t2, addr2 = self.transfer()
         p2 = t2.peers[addr2]
         for i in range(4):                                # a moving count: alive past the timeout, every time
-            p2["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+            p2["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5
             fack(t2, addr2, i * 4096)
             t2.pump(time.time())
             self.assertEqual(p2["state"], "active")
@@ -373,7 +400,7 @@ class MidTransfer(unittest.TestCase):
     def test_verifying_facks_are_progress_for_the_transfer_timeout(self):
         t, addr = self.transfer()
         p = t.peers[addr]
-        p["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5      # would time out now
+        p["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5      # would time out now
         t.on_fack(addr, {"t": "fack", "sid": 5, "base": t.total_chunks, "nack": [], "verifying": True})
         self.assertGreater(p["last_advance"], time.time() - 1)
         before = t.progress_at
@@ -386,7 +413,7 @@ class MidTransfer(unittest.TestCase):
         t2, addr2 = self.transfer()
         p2 = t2.peers[addr2]
         t2.on_fack(addr2, {"t": "fack", "sid": 5, "base": 1, "nack": [2]})
-        p2["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+        p2["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5
         t2.on_fack(addr2, {"t": "fack", "sid": 5, "base": 1, "nack": [2]})   # same base: no progress
         t2.pump(time.time())
         self.assertEqual(p2["state"], "failed")
