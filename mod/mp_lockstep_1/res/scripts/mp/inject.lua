@@ -1310,6 +1310,7 @@ function CM.pollInject()
 				local r, g, b = tonumber(w[2]), tonumber(w[3]), tonumber(w[4])
 				local wait, nstops = CM.waitNum(w[5], 180), tonumber(w[6]) or 0
 				local nameTok = line:match(" name=(%S+)%s*$")
+				local vi = line:match(" vi=(%x+)")   -- the line's transport modes (see LUPDATE)
 				local stops, alts, bad = {}, {}, nil
 				local pos = 7
 				for i = 1, nstops do
@@ -1346,7 +1347,7 @@ function CM.pollInject()
 					local seqBefore = CM.seqNo
 					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.9g,%.9g,%.9g", r, g, b),
 					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
-					                           armed = 1, spare = spareKey })
+					                           armed = 1, spare = spareKey, vi = vi })
 					if CM.seqNo ~= seqBefore then
 						CM.lineRekey(spareId, K.INSTANCE .. ":" .. tostring(CM.seqNo))
 						CM.spareWrite(nil)
@@ -1378,7 +1379,7 @@ function CM.pollInject()
 					-- new line came out orange (slice_hook.cpp, LCREATEX)
 					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.9g,%.9g,%.9g", r, g, b),
 					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
-					                           armed = 1 })
+					                           armed = 1, vi = vi })
 				end
 
 			elseif o == "LCREATE" then
@@ -1434,6 +1435,10 @@ function CM.pollInject()
 						-- stamp (slice: LINE PLATFORM ASSIGNMENT AT REPLAY). Absent for a manual
 						-- terminal pick, a stop setting or a removal, which replay verbatim.
 						local asg = tonumber(line:match(" asg=(%d)"))
+						-- vi=<hex>: the line's transport modes (VehicleInfo), which the replay's
+						-- Line would otherwise reset to none -- and without them the platform
+						-- assignment has nothing to path-search with
+						local vi = line:match(" vi=(%x+)")
 						local armed = CM.lastArmed or 0
 						if bad then
 							-- The DLL's +0x00 stationGroup slot is INFERRED; this is
@@ -1464,6 +1469,7 @@ function CM.pollInject()
 									-- the merged list lands after the one it was put onto: it must not undo
 									-- that one's platform assignment with the click's stale platforms
 									if not asg and pend and pend.asg then asg = tonumber(pend.asg) end
+									if not vi and pend and pend.vi then vi = pend.vi end
 								else
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
 								end
@@ -1475,10 +1481,10 @@ function CM.pollInject()
 								free and " (no vehicles: applied here now, the others at the stamp)" or (armed == 1 and " (strict)" or "")))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
 							                           wait = wait, stops = newStops,
-							                           alts = newAlts, armed = free and 0 or armed, asg = asg })
-							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts, asg) end
+							                           alts = newAlts, armed = free and 0 or armed, asg = asg, vi = vi })
+							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts, asg, vi) end
 							if free then
-								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts, asg = asg })
+								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts, asg = asg, vi = vi })
 								if not okA then log("LUPDATE: applying here now failed (" .. tostring(errA) .. ") -- it lands at the stamp with the others") end
 							end
 						end

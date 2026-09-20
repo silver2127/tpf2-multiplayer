@@ -458,7 +458,7 @@ end
 -- confirming it -- one click merged onto a list the player never made, and the
 -- entry pinned every base of the line (review 2026-09-16). The queue's newest
 -- entry is the one just scheduled, or the send did not happen.
-function CM.noteLineSent(key, stops, alts, asg)
+function CM.noteLineSent(key, stops, alts, asg, vi)
 	CM.lineSent = CM.lineSent or {}
 	local q = CM.queue and CM.queue[#CM.queue]
 	local queued = q and q.op == "LUPDATE" and q.key == key and q.stops == stops and (q.origin == nil or q.origin == K.INSTANCE)
@@ -466,7 +466,7 @@ function CM.noteLineSent(key, stops, alts, asg)
 		log(string.format("LUPDATE: %s was not queued (a resync hold, or no clock yet) -- not on its way; the next click builds on the entity", tostring(key)))
 		return
 	end
-	CM.lineSent[key] = { stops = stops, alts = alts, asg = asg, t = CM.gameTime() or 0 }
+	CM.lineSent[key] = { stops = stops, alts = alts, asg = asg, vi = vi, t = CM.gameTime() or 0 }
 end
 
 -- PLATFORMS AT THE STAMP (2026-09-20). A station clicked into a line gets its
@@ -492,6 +492,28 @@ end
 function CM.lineAssignDone()
 	pcall(function()
 		local f = io.open(K.BASE .. "lockstep_lassign_" .. K.INSTANCE .. ".txt", "w")
+		if f then f:close() end
+	end)
+end
+-- THE LINE'S TRANSPORT MODES (2026-09-20). api.type.Line.new() has none, so every
+-- replayed create or edit reset the line's VehicleInfo -- and the platform
+-- assignment's path search, with no mode to search, left every platform at 0.
+-- The slice ships the 8 bytes as vi=<hex>; named here (lid 0 for a create) right
+-- before the command is MADE, the slice's factory hook writes them into the Line.
+CM.lviSeq = nil
+function CM.lineVehicleInfoRequest(lid, c)
+	if not (c and c.vi) then return false end
+	CM.lviSeq = (CM.lviSeq or (os.time() % 100000000) * 10) + 1
+	local ok = false
+	pcall(function()
+		local f = io.open(K.BASE .. "lockstep_lvi_" .. K.INSTANCE .. ".txt", "w")
+		if f then f:write(string.format("%d %s %d", lid or 0, tostring(c.vi), CM.lviSeq)); f:close(); ok = true end
+	end)
+	return ok
+end
+function CM.lineVehicleInfoDone()
+	pcall(function()
+		local f = io.open(K.BASE .. "lockstep_lvi_" .. K.INSTANCE .. ".txt", "w")
 		if f then f:close() end
 	end)
 end
@@ -798,8 +820,10 @@ function CM.lineApplyNow(lid, c)
 		CM.lineHistNote(c.key, c.stops or "", c.alts or "")
 	end)
 	local asked = CM.lineAssignRequest(lid, c)
+	local viAsked = CM.lineVehicleInfoRequest(lid, c)
 	local cmd = api.cmd.make.updateLine(lid, lineObj)
 	if asked then CM.lineAssignDone() end
+	if viAsked then CM.lineVehicleInfoDone() end
 	api.cmd.sendCommand(cmd, function(res, success)
 		log(string.format("LUPDATE %s: applied here at once (no vehicles) stops=%d success=%s%s", tostring(c.key), n, tostring(success),
 			asked and " (platforms assigned here)" or ""))
@@ -883,9 +907,14 @@ function CM.execLine(c)
 				if CM.expectColorEcho then CM.expectColorEcho(lid, r, g, b) end
 				api.cmd.sendCommand(api.cmd.make.setColor(lid, api.type.Vec3f.new(r, g, b)), function() end)
 			end)
-			if n > 0 or math.abs(CM.waitNum(c.wait, 180) - 180) > 1e-6 then
-				api.cmd.sendCommand(api.cmd.make.updateLine(lid, lineObj), function(res, success)
-					log(string.format("EXEC LCREATE seq=%s: the claimed spare's stops applied success=%s", tostring(c.seq), tostring(success)))
+			if n > 0 or math.abs(CM.waitNum(c.wait, 180) - 180) > 1e-6 or c.vi then
+				-- the transport modes too: the spare was made with none
+				local viAsked = CM.lineVehicleInfoRequest(lid, c)
+				local cmd = api.cmd.make.updateLine(lid, lineObj)
+				if viAsked then CM.lineVehicleInfoDone() end
+				api.cmd.sendCommand(cmd, function(res, success)
+					log(string.format("EXEC LCREATE seq=%s: the claimed spare's stops applied success=%s%s", tostring(c.seq), tostring(success),
+						viAsked and " (with its transport modes)" or ""))
 				end)
 			end
 			log(string.format("EXEC LCREATE seq=%s origin=%s at=%s '%s' claimed spare %s -> line %d (owner pid %s ok=%s%s)",
@@ -922,7 +951,10 @@ function CM.execLine(c)
 				log(string.format("EXEC LCREATE seq=%s origin=%s at=%s '%s' stops=%d -- created at the stamp here too (the line editor's callback takes the result)",
 					tostring(c.seq), tostring(c.origin), tostring(c.at), name, n))
 			end
-			api.cmd.sendCommand(api.cmd.make.createLine(name, color, api.engine.util.getPlayer(), lineObj),
+			local viAsked = CM.lineVehicleInfoRequest(0, c)
+			local createCmd = api.cmd.make.createLine(name, color, api.engine.util.getPlayer(), lineObj)
+			if viAsked then CM.lineVehicleInfoDone() end
+			api.cmd.sendCommand(createCmd,
 				function(res, success)
 					log(string.format("EXEC LCREATE seq=%s origin=%s at=%s '%s' stops=%d success=%s",
 						tostring(c.seq), tostring(c.origin), tostring(c.at), name, n, tostring(success)))
@@ -944,8 +976,10 @@ function CM.execLine(c)
 			end)
 			local sentTick = CM.ticks
 			local asked = CM.lineAssignRequest(lid, c)
+			local viAsked = CM.lineVehicleInfoRequest(lid, c)
 			local cmd = api.cmd.make.updateLine(lid, lineObj)
 			if asked then CM.lineAssignDone() end
+			if viAsked then CM.lineVehicleInfoDone() end
 			api.cmd.sendCommand(cmd, function(res, success)
 				log(string.format("EXEC LUPDATE seq=%s origin=%s at=%s %s stops=%d success=%s step=%d +%d ticks%s",
 					tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.key), n, tostring(success),

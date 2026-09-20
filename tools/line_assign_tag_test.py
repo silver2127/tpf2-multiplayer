@@ -43,16 +43,18 @@ def main():
     a, b = 107158, 107161
 
     # 1. the tag off the record, onto the command and the sent note
-    click(R.click_line([a]) + " asg=1")
+    click(R.click_line([a]) + " vi=180 asg=1")
     s = H.lastSched()
     check("a tagged click schedules asg=1", s is not None and s.asg == 1, str(s and s.asg))
     check("...and the sent-list note keeps it", H.CM.lineSent["b:6"].asg == 1)
+    check("the line's transport modes ride along (vi=180)", s.vi == "180" and H.CM.lineSent["b:6"].vi == "180", str(s.vi))
 
     # 2. a click without the tag, merged onto the waiting tagged one, inherits it
     click(R.click_line([b]))                         # built from the stale empty list, no tag of its own
     s = H.lastSched()
     check("an untagged click merged onto a tagged update inherits asg=1", s.asg == 1, str(s.asg))
     check("...with both stops", s.stops == f"{R.stop_str(a)};{R.stop_str(b)}", str(s.stops))
+    check("...and the modes of the update it was put onto", s.vi == "180", str(s.vi))
 
     # 3. everything applied and confirmed: a plain click ships no tag
     while H.applyNext():
@@ -70,20 +72,29 @@ def main():
     H.lua(r'''
       CM.lineReadWaypoints = function() return {} end
       api.type = { Line = { new = function() return { stops = {} } end, Stop = { new = function() return {} end } },
-                   StationTerminal = { new = function() return {} end } }
+                   StationTerminal = { new = function() return {} end }, Vec3f = { new = function(...) return { ... } end } }
       game.interface = { getEntities = function() return { 107158, 107161 } end }
       api.cmd = { make = {}, sendCommand = function(cmd, cb) end }
-      SEEN = {}
+      SEEN, VI = {}, {}
+      local function readf(name) local f = io.open(name, "r"); local s = f and f:read("*a") or "(no file)"; if f then f:close() end; return s end
       api.cmd.make.updateLine = function(lid, obj)
-        local f = io.open("lockstep_lassign_b.txt", "r")
-        SEEN[#SEEN + 1] = f and f:read("*a") or "(no file)"
-        if f then f:close() end
+        SEEN[#SEEN + 1] = readf("lockstep_lassign_b.txt")
+        VI[#VI + 1] = readf("lockstep_lvi_b.txt")
         return {}
       end
+      api.cmd.make.createLine = function(name, color, player, obj)
+        VI[#VI + 1] = "create:" .. readf("lockstep_lvi_b.txt")
+        return {}
+      end
+      api.engine = { util = { getPlayer = function() return 7 end } }
     ''')
     stop = R.stop_str(a)
     H.lua(f'CM.execLine({{ op = "LUPDATE", key = "b:6", origin = "a", seq = 77, at = 100.8, armed = 1, '
-          f'wait = 180, stops = "{stop}", alts = "", asg = 1 }})')
+          f'wait = 180, stops = "{stop}", alts = "", asg = 1, vi = "180" }})')
+    vi = list(H.lua("return VI").values())
+    check("the replay named the line's modes for the slice while the command was made",
+          len(vi) == 1 and vi[0].startswith(f"{LID} 180 "), str(vi))
+    check("...and blanked that file after", open(os.path.join(d, "lockstep_lvi_b.txt")).read() == "")
     seen = list(H.lua("return SEEN").values())
     check("the replay named the line for the slice while the command was made",
           len(seen) == 1 and seen[0].startswith(f"{LID} 1 "), str(seen) + " | log: " + H.logs()[-700:])
@@ -95,6 +106,12 @@ def main():
     seen = list(H.lua("return SEEN").values())
     check("an update without the tag makes its command with the file still blank",
           len(seen) == 2 and seen[1] == "", str(seen))
+
+    # 5. a create names the modes with line 0
+    H.lua(f'CM.execLine({{ op = "LCREATE", name = "Line%201", color = "0.9,0.2,0.2", origin = "a", seq = 79, at = 101.2, '
+          f'armed = 1, wait = 180, stops = "{stop}", alts = "", vi = "180" }})')
+    vi = list(H.lua("return VI").values())
+    check("a create names the modes with line 0", len(vi) == 3 and vi[2].startswith("create:0 180 "), str(vi))
 
     print("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")
     return 0 if not fails else 1
