@@ -13,7 +13,7 @@ hook the game.
 
 ## Publishing (the game's own uploader, from the publisher's Steam account)
 
-1. Copy `tpf2_multiplayer_link_1` (mod.lua and image_00.tga) into the account's
+1. Copy `tpf2_multiplayer_link_1` (mod.lua, image_00.tga and workshop_preview.jpg -- the uploader refuses a folder without the jpg) into the account's
    **staging area**: `<Steam>\userdata\<account>\1066780\local\staging_area\`.
    The uploader lists only that folder (a copy under `local\mods` shows in the
    mod list as `!tpf2_multiplayer_link` but cannot be published; 2026-09-20).
