@@ -1568,14 +1568,7 @@ struct LineStop { int32_t sg, station, terminal, loadMode; float minWait, maxWai
 static const uint64_t LINE_ANY_SPAN = ~0ull;   // ReadVec's cap, not used as one
 static char g_lineDecodeWhy[200] = "";
 #define LINE_REFUSE(...) do { _snprintf_s(g_lineDecodeWhy, sizeof(g_lineDecodeWhy), _TRUNCATE, __VA_ARGS__); return false; } while (0)
-// vi: the 8 bytes at Line+0x1c -- VehicleInfo, the line's transport modes
-// (`std::bitset<16> CreateVehicleTransportModes`, 0x219edd0) plus 4 bytes. The
-// path search behind the platform assignment (line_util::GetBestLineAssignment
-// copies Line+0x18..+0x24 into its own Line) has no mode to search with when it
-// is zero, and a Line built by api.type.Line.new() is zero: every replayed line
-// edit reset it and every later platform stayed 0 (live, 2026-09-20). Shipped
-// as vi=<hex> and written back into the replay's Line by the factory hook.
-struct LineDecode { float wait; int n; std::vector<LineStop> st; uint64_t vi = 0; };
+struct LineDecode { float wait; int n; std::vector<LineStop> st; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
 
@@ -1680,7 +1673,6 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
         memcpy(&wf, (void*)(line + 0x18), 4);
         if (wf != wf) LINE_REFUSE("waitingTime NaN");
         out->wait = wf;
-        memcpy(&out->vi, (void*)(line + 0x1c), 8);
     }
     if (DecodeLineAt(line, 0x00, out)) return true;
     if (DecodeLineAt(line, 0x18, out)) { Log("[slice] LUPDATE: stops vector found at +0x18, not +0x00 -- update the layout note\n"); return true; }
@@ -1917,42 +1909,8 @@ static void ApplyLineAssignAtReplay(uint64_t engine, int32_t entity, uint64_t li
                               before.st[i].station, before.st[i].terminal, after.st[i].station, after.st[i].terminal);
         }
     }
-    Log("[lineassign] LUPDATE replay line=%d flag=%ld seq=%ld vi=%llx: platforms assigned at the stamp, %d stop(s), changed:%s\n",
-        (int)lid, flag, seq, (unsigned long long)(okA ? after.vi : 0), okA ? after.n : -1, summary[0] ? summary : " none");
-}
-
-// The Lua path's make_cmd::CreateLine / UpdateLine: if the Lua named this line
-// (0 for a create) in a fresh lockstep_lvi_<x>.txt, write the shipped
-// VehicleInfo into the Line it passed -- before the assignment, which needs it.
-static long g_lviSeen = 0;
-static void ApplyLineVehicleInfoAtReplay(int32_t entity, uint64_t line, bool create)
-{
-    ReadInstance();
-    if (!g_instance[0]) return;
-    char p[MAX_PATH];
-    snprintf(p, sizeof(p), "%slockstep_lvi_%s.txt", g_dataDir, g_instance);
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return;
-    if (fa.nFileSizeLow == 0) return;
-    FILETIME nowFt;
-    GetSystemTimeAsFileTime(&nowFt);
-    const uint64_t wrote = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
-    const uint64_t now = ((uint64_t)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
-    if (now > wrote && now - wrote > 5ULL * 10000000ULL) return;
-    FILE* f = _fsopen(p, "r", _SH_DENYNO);
-    if (!f) return;
-    long lid = 0, seq = 0; unsigned long long vi = 0;
-    const int got = fscanf(f, "%ld %llx %ld", &lid, &vi, &seq);
-    fclose(f);
-    if (got != 3 || seq == g_lviSeen) return;
-    if (create ? lid != 0 : lid != (long)entity) return;
-    g_lviSeen = seq;
-    if (!Readable((void*)line, 0x24)) { Log("[lineassign] %s replay: Line unreadable -- vehicle info not written\n", create ? "LCREATE" : "LUPDATE"); return; }
-    uint64_t had = 0;
-    memcpy(&had, (void*)(line + 0x1c), 8);
-    memcpy((void*)(line + 0x1c), &vi, 8);
-    Log("[lineassign] %s replay line=%ld: vehicle info %llx written (the Lua's Line had %llx)\n",
-        create ? "LCREATE" : "LUPDATE", lid, vi, (unsigned long long)had);
+    Log("[lineassign] LUPDATE replay line=%d flag=%ld seq=%ld: platforms assigned at the stamp, %d stop(s), changed:%s\n",
+        (int)lid, flag, seq, okA ? after.n : -1, summary[0] ? summary : " none");
 }
 
 static void InstallLineAssign()
@@ -2391,7 +2349,6 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
-            fprintf(f, " vi=%llx", (unsigned long long)d.vi);
             const int32_t spare = (int32_t)InterlockedCompareExchange(&g_lcSpareId, 0, 0);
             if (spare) fprintf(f, " spare=%d", spare);
             fprintf(f, " name=%s\n", g_lcDecode.nameEnc.c_str());
@@ -2414,7 +2371,6 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
-            fprintf(f, " vi=%llx", (unsigned long long)d.vi);
             if (g_lineAsgTag >= 0) fprintf(f, " asg=%d", g_lineAsgTag);
             fprintf(f, "\n");
             if (d.n > 0)
@@ -2627,16 +2583,8 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                 __try { ClaimLineCreateCarrier(rcx); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("[slice] CreateLine: claim fault -- ignored\n"); }
             }
-            if (f.id == 7) {
-                // the create's transport modes, which api.type.Line.new() leaves zero
-                __try { ApplyLineVehicleInfoAtReplay(0, st[0], true); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[lineassign] LCREATE replay: fault writing the vehicle info -- created as the Lua built it\n"); }
-            }
             if (f.id == 8) {
-                // the line's transport modes first (the assignment's path search needs them), then
                 // the platform assignment the click ran, re-run here on the rebuilt list (LINE PLATFORM ASSIGNMENT AT REPLAY)
-                __try { ApplyLineVehicleInfoAtReplay((int32_t)r8, r9, false); }
-                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[lineassign] LUPDATE replay: fault writing the vehicle info -- applied as the Lua built it\n"); }
                 __try { ApplyLineAssignAtReplay(rdx, (int32_t)r8, r9); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("[lineassign] LUPDATE replay: fault in the assignment -- the list is applied as shipped\n"); }
             }
