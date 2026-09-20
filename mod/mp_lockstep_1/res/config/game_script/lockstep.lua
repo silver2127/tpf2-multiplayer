@@ -628,6 +628,7 @@ CM.boot("mp.cons")
 -- ---------- vehicles: cross-peer identity, names/colours, vehicle commands, buy, replace ----------
 -- Lives in res/scripts/mp/vehicles.lua.
 CM.boot("mp.vehicles")
+CM.boot("mp.action_sounds")
 -- ---------- lines: cross-peer identity, create/update/delete ----------
 -- Lives in res/scripts/mp/lines.lua.
 CM.boot("mp.lines")
@@ -643,6 +644,7 @@ CM.boot("mp.assets")
 local function execute(c)
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
+	elseif c.op == "FENCE" then CM.execFence(c)
 	elseif c.op == "ROADP" then CM.execPolyline(c)
 	elseif c.op == "ROAD" or c.op == "RAIL" then CM.execEdge(c)
 	elseif c.op == "CON" then CM.execCon(c)
@@ -698,6 +700,7 @@ CM.boot("mp.pacing")
 -- Lives in res/scripts/mp/cursors.lua.
 CM.boot("mp.cursors")
 CM.boot("mp.previews")
+require("mp/fences_compat").bind(CM, K, log)
 -- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
 -- Lives in res/scripts/mp/stats.lua.
 CM.boot("mp.stats")
@@ -1327,10 +1330,12 @@ function data()
 			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
 			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
 			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
+			         actionSounds = CM.actionSoundsSave and CM.actionSoundsSave() or nil,
 			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
 			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and s.actionSounds and CM.actionSoundsLoad then pcall(CM.actionSoundsLoad, s.actionSounds) end
 			if type(s) == "table" and tonumber(s.savedAt) and CM.savedAt == nil then CM.savedAt = tonumber(s.savedAt) end
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
@@ -1367,6 +1372,7 @@ function data()
 			if CM.dedicatedGui then
 				if guiTick % 300 ~= 0 then return end
 			else
+				if CM.actionSoundsGuiTick then pcall(CM.actionSoundsGuiTick, CM.recoveryGuiHeld()) end
 				-- THE SPARE LINE'S EDITOR, FROM THIS THREAD (lines.lua CM.spareFireWrite,
 				-- 2026-09-19). A New line click opens the editor on a pre-made line the
 				-- game script re-owns to the player on its next tick. The editor's

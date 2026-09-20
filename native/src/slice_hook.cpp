@@ -646,7 +646,7 @@ struct Node { float x, y, z; int32_t id; };
 // objects vector +0x30..0x47, and the +0x48 street/track flag DecodeEdgeType
 // reads. Without these two ints every replicated bridge came out as an
 // embankment ("game infers landscape instead of a bridge", 2026-08-29).
-struct Edge { int32_t node0, node1; float t0[3], t1[3]; int32_t btype, bidx; };
+struct Edge { int32_t node0, node1; float t0[3], t1[3]; int32_t btype, bidx; int32_t owner = -1; };
 
 // A vector span past this is a misread pointer, not a command. The engine keeps
 // a proposal's records in memory and nothing a player can do -- a road drag, a
@@ -689,6 +689,15 @@ static int DecodeEdgesVec(uint64_t a2, std::vector<Edge>* out, const char* tag)
         memcpy(e.t1,     b + (size_t)i * 120 + 0x1c, 12);
         memcpy(&e.btype, b + (size_t)i * 120 + 0x28, 4);
         memcpy(&e.bidx,  b + (size_t)i * 120 + 0x2c, 4);
+        // Optional PlayerOwned: paired ownership-tool capture, 2026-09-18.
+        // The replaced records have flag 0; otherwise identical new records
+        // have flag 1 and the local player at +0x70. Never read an absent optional.
+        const uint8_t owned = b[(size_t)i * 120 + 0x74];
+        if (owned > 1) return -1;
+        if (owned) {
+            memcpy(&e.owner, b + (size_t)i * 120 + 0x70, 4);
+            if (e.owner < 0) return -1;
+        }
     }
     return n;
 }
@@ -876,6 +885,10 @@ static void WriteInject(const Node* nodes, int n, const Edge* edges, int m,
     // whole legacy payload: the Lua length checks are ">=", so an old parser
     // ignores it and the new one reads it at the offset it computes itself.
     for (int i = 0; i < m; i++) fprintf(f, " %d %d", edges[i].btype, edges[i].bidx);
+    // Local IPC only: inject.lua converts player entities to company numbers
+    // before networking. Keep one entry per captured edge, including split halves.
+    fprintf(f, " OWNERS");
+    for (int i = 0; i < m; i++) fprintf(f, " %d", edges[i].owner);
     fprintf(f, "\n");
     fclose(f);
 }

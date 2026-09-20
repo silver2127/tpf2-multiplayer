@@ -51,8 +51,11 @@ function runCase(mode)
   local wire='ARMED 1\nROADE 2 '..(primaryTrack and '1 -1 0 1' or '0 25 1 0')..' 2 0 '..(removed and '1' or '0')
     ..' -1 6.5205 -446.5256 13.8915 -2 -85.9093 -442.9310 6.8005'
     ..' -1 -2 -92.4298 3.5946 -7.0910 -92.4298 3.5946 -7.0910 '..e
-    ..(removed and (' '..e) or '')..' 0 -1 1 4\n'
+    ..(removed and (' '..e) or '')..' 0 -1 1 4 OWNERS -1 3921\n'
   local CM={peerSeen=true,injectOffset=0,seqNo=0,ticks=0}
+  CM.cmMode='companies';CM.cmEnsure=function() end
+  CM.cmCompanyOfPid=function(pid) return pid==3921 and 2 or nil end
+  assert(load(GEOM))()(CM,{},function() end)
   local K={INSTANCE='a',INJECT_FILE='mock'}
   local scheduled,planned,logs={},{},{}
   CM.gameTime=function() return 100 end
@@ -71,6 +74,7 @@ function runCase(mode)
   local other=(key=='br') and 'bs' or 'br'
   assert(c.links==(drop and '1,2' or '1,2,3,4'),mode..': wrong edges: '..c.links)
   assert(c.bt==(drop and '0,-1' or '0,-1,1,4'),mode..': bridge type tail misaligned')
+  assert(c.own==(drop and '0' or '0,2'),mode..': ownership tail misaligned')
   assert(c.fv=='1,2',mode..': fresh-node hints changed')
   assert(planned[1].links==c.links and planned[1].bt==c.bt,'plan differs from wire')
   assert(planned[1].br==c.br and planned[1].bs==c.bs,'bridge companion missing from planning pass')
@@ -89,7 +93,7 @@ end
 
 -- The upgrade tool: every edge replaces a removal between the same two existing nodes.
 -- Its own network's span is the upgrade itself and stays an explicit edge + removal.
-function runUpgradeShape()
+function runUpgradeShape(owner)
   local CT={BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_TRACK=3,BASE_EDGE_STREET=4}
   local p0,p1={-48.4622,-474.1883,22.1595},{-38.1558,-392.8513,21.8020}
   local t={x=10.3065,y=81.3370,z=-0.3575}
@@ -105,7 +109,11 @@ function runUpgradeShape()
   game={}
   local e='33254 27347 10.3065 81.3370 -0.3575 10.3065 81.3370 -0.3575'
   local wire='ARMED 1\nROADE 0 0 25 1 0 1 0 1 '..e..' '..e..' 1 4\n'
+  if owner then wire=wire:sub(1,-2)..' OWNERS '..owner..'\n' end
   local CM={peerSeen=true,injectOffset=0,seqNo=0,ticks=0}
+  CM.cmMode='companies';CM.cmCompanyPid={[2]=3921};CM.cmEnsure=function() end
+  CM.cmCompanyOfPid=function(pid) return pid==3921 and 2 or nil end
+  assert(load(GEOM))()(CM,{},function() end)
   local K={INSTANCE='a',INJECT_FILE='mock'}
   local scheduled,logs={},{}
   CM.gameTime=function() return 100 end
@@ -122,10 +130,13 @@ function runUpgradeShape()
   assert(c.links=='1,2' and c.bt=='1,4','upgrade: the span must stay an explicit edge: '..tostring(c.links))
   assert(c.rm,'upgrade: its removal must still ship')
   assert(not c.bs and not c.br,'upgrade: moved to companions')
+  assert(c.own==(owner and (owner=='-1' and '0' or '2') or nil),'ownership missing or raw player ID sent')
+  return c
 end
 ''')
 
 if __name__ == '__main__':
+    L.globals().GEOM = (Path(__file__).resolve().parents[1] / 'mod/mp_lockstep_1/res/scripts/mp/geom.lua').read_text(encoding='utf-8')
     for case in ('normal', 'reverse', 'inverse', 'same_kind', 'removed', 'removed_changed', 'changed', 'different_model', 'missing'):
         L.globals().runCase(case)
         print('PASS:', case)
@@ -134,6 +145,11 @@ if __name__ == '__main__':
     net = (Path(__file__).resolve().parents[1] / 'mod/mp_lockstep_1/res/scripts/mp/net.lua').read_text(encoding='utf-8')
     codec = net[net.index('local function encodeCmd(c)'):net.index('function CM.scheduleLocal(op, args)')]
     encode, decode = L.execute(codec + '\nreturn encodeCmd, decodeCmd')
+    for owner in ('3921', '-1'):
+        command = L.globals().runUpgradeShape(owner)
+        command.op, command.at, command.origin, command.seq = 'ROADP', 100, 'b', 28
+        assert decode(encode(command)).own == (2 if owner == '3921' else 0)
+    print('PASS: ownership upgrade and public reversal survive capture and real wire codec without player entity IDs')
     bridges = '-48.4622,-474.1883,22.1595,-38.1558,-392.8513,21.8020,4;0,0,20,30,0,20,2'
     command = L.table_from(dict(op='ROADP', at=100, origin='b', seq=27, br=bridges, bs=bridges, links='1,2', etype=0))
     decoded = decode(encode(command))

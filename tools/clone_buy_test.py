@@ -191,8 +191,8 @@ def main():
     check("queueCloneAssign: one VLINE queued", H.nretry() == 1 and H.retry(1, "op") == "VLINE")
     check("queueCloneAssign: for the bought vehicle's key and the clone line",
           H.retry(1, "key") == "a:7" and H.retry(1, "line") == "a:87", f"{H.retry(1, 'key')} {H.retry(1, 'line')}")
-    check("queueCloneAssign: stop 0, armed, its own seq",
-          H.retry(1, "stop") == 0 and H.retry(1, "armed") == 1 and H.retry(1, "seq") == 7.5, str(H.retry(1, "seq")))
+    check("queueCloneAssign: automatic stop, armed, its own seq",
+          H.retry(1, "stop") == -1 and H.retry(1, "armed") == 1 and H.retry(1, "seq") == 7.5, str(H.retry(1, "seq")))
     check("queueCloneAssign: due BIND_GUARD_STEPS after the stamp (step 500 + 10)",
           H.retry(1, "notBeforeStep") == 510, str(H.retry(1, "notBeforeStep")))
     check("queueCloneAssign: nothing sent directly", H.nsent() == 0)

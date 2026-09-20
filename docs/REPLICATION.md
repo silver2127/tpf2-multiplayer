@@ -39,12 +39,14 @@ settings files say ([CONFIGURATION.md](CONFIGURATION.md)).
 | rail track | strict | `ROADP` | Same path with the track type and catenary. Track snaps to an edge within 2.0 m (roads 5.0 m). |
 | bridge, tunnel | strict | `ROADP` | Each link carries its BaseEdge type (1 bridge, 2 tunnel) and type index; split halves keep them. |
 | upgrade: street/track type, catenary, bus lane, tram track | strict | `ROADP` | The removed edges travel as positions so the replay replaces instead of stacking a second edge. |
+| road ownership tool | strict | `ROADP` | Each link carries `own`: 0 for public, otherwise a logical company number resolved to the receiver's player entity. The native `OWNERS` tail contains local player entities only in local IPC; they never travel over the network. Splits and unchanged bridge companions retain their original owners. Replay uses typed PlayerOwned components: the engine silently discards plain Lua tables assigned to this optional field. Captures without the optional tail retain legacy behavior. Ownership capture and replay have automated coverage; an in-game multiplayer test of this fix is still pending. |
 | level crossing | strict (part of the track build) | `ROADP` | A track vertex within 4.0 m of a road node shares that node, taking the road's height when they differ by more than 0.25 m (moving the road node instead asserts the engine). Otherwise the road under the vertex is split. Crossings in the middle of a track segment are found analytically; routing through an existing node requires it to be touched (0.75 m) and straight-through. A crossing the engine refuses ("Too much slope") is refused on every instance. |
 | demolish road or track | strict | `EDEMO` | Edges are matched by their end nodes (same kind, within 1 m). An edge that carries stops or signals is refused. Orphaned nodes are removed. |
+| Snowball Fences / hedges | strict | `FENCE` | Cancelled `CONXP` cursor placements feed the installed mod's planner through a resource wrapper. Start/finish points create no construction; confirmed segments carry model names and transforms, never entity ids. Planning virtualizes build/bulldoze and isolates decorative RNG. Replays add one construction at the command stamp, with the originating company's local player and no building/field gathering or graph cleanup. Geometry is anchored near the fence, not world zero. Cursor previews are cosmetic, using native 3D when available and an outline otherwise; Workshop files stay unchanged. Segments are built with `ignoreErrors=true`, as the mod's own `buildConstruction` does: a segment touches the one before it, and a checked build refused every segment after a drag's first ("Kollision"). Automated coverage includes the real installed Fences planner, but a multiplayer game test remains pending. All participants need the new command handler. |
 | station, depot, asset, harbour, airport | strict | `CONX` / `CONP` | The slice reads the construction's file, placement and parameters off the proposal and cancels the build; the street pieces travel as `ROADC` and are paired by identity (one placement serial on both records). Every instance builds the same scripted proposal at the stamp. |
 | same, when the parameters cannot be read | replay on peers, then corrected | `CONX` / `CONP` | The native build stands and is captured by polling. With other players connected, the originator then bulldozes its own copy and rebuilds the scripted one with the peers (money reconciled); alone it keeps the native build. |
 | module edit, station upgrade | strict | `CONU` (`diff=1 strict=1`) | The old construction and the new parameters come off the proposal; every instance upgrades the construction (same file within 10 m) at the stamp. If the cancel does not land, the edit scan ships it instead (every 30 ticks, originator skips). |
-| demolish construction | strict | `DEMOLISH` (`strict=1`) | Every instance requires the same file within 2 m. When the slice leaves a bulldoze to run natively, a tracked construction missing for two polls ships a `DEMOLISH` and peers remove the nearest one within 30 m. |
+| demolish construction | strict | `DEMOLISH` (`strict=1`) | Every instance requires the same file within 2 m. When the slice leaves a bulldoze to run natively, a tracked construction missing for two polls ships a `DEMOLISH` and peers remove the nearest one within 30 m. A record counts as present only while its entity still carries a CONSTRUCTION component of the recorded file (entity ids are recycled) or a replacement stands within 1 m of its spot; a neighbour further away does not keep it, and a recycled id never ships an edit. |
 | roadside stop, signal, waypoint: place | strict | `STOPADD` | The engine's own `left` byte and the edge tangent travel with it (a track object's `left` is not its geometric side). |
 | stop, signal, waypoint: bulldoze | strict | `STOPDEL` | |
 | stop placed on an occupied side (replace) | poll | `STOPREP` + `LUPDATE` | Not cancelled: the engine re-points the old stop's lines, which a script proposal cannot express, so the originator re-ships every affected line after the replace. |
@@ -67,6 +69,12 @@ Replay details for constructions:
   size of its own either: the params walk has no depth or entry cap (a misread pointer fails
   it loudly and the build runs natively behind a `NATIVE` notice) and the street vectors are
   decoded in full.
+- Construction parameter strings and keys escape embedded newlines as `\n` in
+  their Lua literals. Lua 5.2's default `%q` emits a physical newline after a
+  backslash, which splits the line-based command stream and loses module edits.
+  Values are preserved exactly; malformed literals are still refused. Offline
+  coverage: `tools/params_line_test.py` exercises the line receiver and station
+  removal diffs on origin and peer with a mocked engine.
 - On failure the replay retries once after clearing the footprint, then asks the originator to
   roll back (`CONFAIL`: it bulldozes its own copy, same file within 1 m).
 - The construction gets a name in the proposal (the shipped one, or "`<town> <type>`"), which
@@ -82,7 +90,7 @@ the player bulldozes it.
 
 | action | mode | wire | notes |
 |---|---|---|---|
-| buy | strict | `VBUY` | The depot window waits for its callback, which is fired. The depot is found by position and file; the vehicle goes into its first depot. At most one buy per tick, so purchases bind to keys in the same order everywhere. A buy the slice leaves to run natively ships once the vehicle exists (or after 1.5 units). If the new vehicle's configuration cannot be read, the buy is not cancelled and does not replicate. |
+| buy | strict | `VBUY` | The depot window waits for its callback, which is fired. The depot is matched by live construction, transform-position key, file and depot children; a validated cache/local miss falls back to a global construction scan for offset mod geometry, and ambiguous matches are refused; the vehicle goes into its first depot. At most one buy per tick, so purchases bind to keys in the same order everywhere. A buy the slice leaves to run natively ships once the vehicle exists (or after 1.5 units). If the new vehicle's configuration cannot be read, the buy is not cancelled and does not replicate. |
 | sell | strict | `VSELL` | Ships once every vehicle's key is bound, or the bound subset after 8 units. If the vehicle list cannot be read, the sale is not cancelled and does not replicate. |
 | send to depot | strict | `VDEPOT` | |
 | reverse | strict | `VREV` | |
@@ -91,6 +99,43 @@ the player bulldozes it.
 | rename, recolour | replay on peers | `VNAME` / `VCOLOR` | By key, or by position for constructions. |
 
 Not replicated: stop/start a vehicle, manual departure, "depart now", maintenance targets.
+
+Cancelled local vehicle actions restore their original confirmation sounds through
+`action_sounds.lua`: buy (including clones), sell, assign line, send to depot and replace.
+Only successful replay callbacks enqueue audio; uncancelled actions retain their native
+UI feedback, and remote actions remain silent. Batch sales produce one confirmation per
+command. Engine-to-GUI save/load sync carries a bounded cosmetic event history, never
+network packets or simulation RNG. Initial audio state is deterministic and load/save
+preserves it exactly: the engine compares ScriptSave across internal game states at
+startup. A fresh GUI establishes a silent baseline, so saved confirmations do not
+play again after loading or resync. The GUI uses
+the game's [GameUI.playSoundEffect API](https://wiki.transportfever2.com/api/modules/api.gui.html)
+and sound-effect names from `soundeffectsutil.lua`; an audio error does not affect replay.
+New-line creation retains its existing native callback; ambient and vehicle-running audio
+are unchanged. Offline coverage: `tools/action_sounds_test.py`; audible verification pending.
+
+Purchase lookup validates the construction's transform position, file and depot children,
+including cached ids. On a registry/local-query miss it scans constructions globally and
+matches the same position key and file. This covers depots whose model geometry is offset
+from the construction origin (the UEP catenary terminal was missing from the old 6 m query).
+Fallback results are cached separately from construction edit state and revalidated on
+each purchase; ambiguous query results are refused. `tools/depot_buy_test.py` exercises
+the replay with mocked spatial queries, stale ids and neighboring depot types.
+
+Line replay logs the destination line key, requested stop and applied stop on both success
+and failure. Automatic stop selection (`-1`, including clones) tries the stops in line
+order until one succeeds. An engine rejection schedules the next stop via the existing
+retry queue, five simulation steps after the previous agreed target, without changing
+the command stamp or dispatching from its callback. Each stop is tried at most once;
+the initial stop count bounds the search, and a shortened line reduces that bound.
+Explicit stop selections never fall back. A newer assignment, depot order or sale
+invalidates the old search, including callbacks still outstanding.
+
+An actual train on `Holz 1` rejected stop 0 and accepted stop 1, then left its depot.
+`tools/vehicle_line_choice_test.py` reproduces this at the mocked engine boundary and
+checks host/peer target steps, exhaustion, clones, delayed callbacks and superseding
+orders. The complete automatic fallback still needs a multiplayer game test; matching
+retry targets do not repair differences in peers' route topology or engine results.
 
 ## Lines
 
