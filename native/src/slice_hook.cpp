@@ -1711,11 +1711,17 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
 //     path (ApplyLineAssignAtReplay) reads it and runs the game's own routine
 //     on the Line the Lua passed, in place, before the command is built.
 // The game state: UI::CGameUI+0x450 holds the UI's state provider (CreateUI,
-// 0x56a000 `mov rax,[rsi+0x450]`, copied into every component's ptr); its
-// vftable slot 1 returns the GameState (0x8bb7f0: `mov rcx,[rcx]; mov
-// rax,[rcx]; jmp [rax+8]`); GameState+0x28 is the engine (0x8b9e60), which is
-// the check against the factory's own engine argument. The CGameUI pointer
-// comes from tpf2_menu.dll's per-frame capture (export Tpf2mpGameUi).
+// 0x56a000 `mov rax,[rsi+0x450]`, copied into every component's ptr);
+// UI::GameStateProvider's vftable slot 1 (0x8badf0) is `mov rax,[rcx+8]; mov
+// rax,[rax+0x158]`: provider+8 is the CGame, CGame+0x158 the state the game
+// calls current THIS FRAME. There are TWO: CGame::RunGameSimLoop (0x11875d)
+// keeps them at CGame+0x168 -> { GameState* [2], ..., int current at +0x20 }
+// and GameState::Replicate copies one into the other every frame, so the
+// current one alternates -- the first live test (2026-09-20 16:05) saw every
+// replay handed the state of the OTHER engine and gave up. GameState+0x28 is
+// the engine (0x8b9e60): the replay takes whichever of the pair holds the
+// command's own engine. The CGameUI pointer comes from tpf2_menu.dll's
+// per-frame capture (export Tpf2mpGameUi).
 // Manual terminal picks (the combo box 0x7b43b0), alternative terminals, stop
 // settings and stop removal never ran the assignment, carry no tag, and
 // replay verbatim as before.
@@ -1757,6 +1763,17 @@ static void LineAssignDetour(void* engine, void* ctx, const int32_t* entity, voi
     g_lineAssignTramp(engine, ctx, entity, line, ok, flag);
 }
 
+static const uintptr_t OFF_PROVIDER_GAME   = 0x08;    // UI::GameStateProvider+8: the CGame
+static const uintptr_t OFF_GAME_STATE_NOW  = 0x158;   // CGame+0x158: this frame's state
+static const uintptr_t OFF_GAME_STATE_PAIR = 0x168;   // CGame+0x168 -> { GameState* [2], ... }
+static volatile LONG   g_gsSourceLogged = 0;
+
+static bool GameStateHoldsEngine(uint64_t gs, uint64_t engine)
+{
+    return gs && Readable((void*)(gs + OFF_GAMESTATE_ENGINE), 8) && *(uint64_t*)(gs + OFF_GAMESTATE_ENGINE) == engine;
+}
+
+// The game state whose engine is `engine`: this frame's, or its twin.
 static uint64_t GameStateNow(uint64_t engine)
 {
     if (!g_menuGameUi && !g_menuGameUiTried) {
@@ -1769,19 +1786,28 @@ static uint64_t GameStateNow(uint64_t engine)
     const uint64_t ui = g_menuGameUi();
     if (!ui || !Readable((void*)(ui + OFF_GAMEUI_STATE_PROVIDER), 8)) return 0;
     const uint64_t prov = *(uint64_t*)(ui + OFF_GAMEUI_STATE_PROVIDER);
-    if (!prov || !Readable((void*)prov, 8)) return 0;
-    const uint64_t vt = *(uint64_t*)prov;
-    if (!vt || !Readable((void*)(vt + 8), 8)) return 0;
-    const uint64_t fn = *(uint64_t*)(vt + 8);
-    if (fn < g_base || fn > g_base + 0x4000000ULL) return 0;   // the provider's getter lives in the exe
-    const uint64_t gs = ((uint64_t (*)(uint64_t))fn)(prov);
-    if (!gs || !Readable((void*)(gs + OFF_GAMESTATE_ENGINE), 8)) return 0;
-    if (*(uint64_t*)(gs + OFF_GAMESTATE_ENGINE) != engine) {
-        Log("[lineassign] game state %llx holds engine %llx, the command's is %llx -- not used\n",
-            (unsigned long long)gs, (unsigned long long)*(uint64_t*)(gs + OFF_GAMESTATE_ENGINE), (unsigned long long)engine);
-        return 0;
+    if (!prov || !Readable((void*)(prov + OFF_PROVIDER_GAME), 8)) return 0;
+    const uint64_t game = *(uint64_t*)(prov + OFF_PROVIDER_GAME);
+    if (!game || !Readable((void*)(game + OFF_GAME_STATE_PAIR), 8)) return 0;
+    uint64_t cand[3] = { 0, 0, 0 };
+    const char* src[3] = { "CGame+0x158", "pair[0]", "pair[1]" };
+    cand[0] = *(uint64_t*)(game + OFF_GAME_STATE_NOW);
+    const uint64_t pair = *(uint64_t*)(game + OFF_GAME_STATE_PAIR);
+    if (pair && Readable((void*)pair, 0x28)) { cand[1] = *(uint64_t*)pair; cand[2] = *(uint64_t*)(pair + 8); }
+    for (int i = 0; i < 3; i++) {
+        if (GameStateHoldsEngine(cand[i], engine)) {
+            if (!InterlockedExchange(&g_gsSourceLogged, 1))
+                Log("[lineassign] game state for engine %llx is %llx (%s; this frame's %llx, pair %llx/%llx)\n",
+                    (unsigned long long)engine, (unsigned long long)cand[i], src[i], (unsigned long long)cand[0],
+                    (unsigned long long)cand[1], (unsigned long long)cand[2]);
+            return cand[i];
+        }
     }
-    return gs;
+    Log("[lineassign] no game state holds engine %llx (this frame's %llx -> %llx, pair %llx/%llx) -- not used\n",
+        (unsigned long long)engine, (unsigned long long)cand[0],
+        (unsigned long long)(GameStateHoldsEngine(cand[0], 0) ? 0 : (cand[0] && Readable((void*)(cand[0] + OFF_GAMESTATE_ENGINE), 8) ? *(uint64_t*)(cand[0] + OFF_GAMESTATE_ENGINE) : 0)),
+        (unsigned long long)cand[1], (unsigned long long)cand[2]);
+    return 0;
 }
 
 // The 14 pointers UI::LineEditor copies out of the game state into a
