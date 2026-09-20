@@ -1853,7 +1853,23 @@ class _ClientSaveReceiver:
             else:
                 need.append(modshare.mod_folder_name(m, v))
         self._publish_rows(mods)
+        self._say_unreadable(mods)
         return need, on_disk
+
+    def _say_unreadable(self, mods):
+        """Which required mods this game could not read (its stdout.txt said 'Mod
+        will be skipped' at startup): find_mod passed those folders over, so they
+        are fetched from the host and registered in their place -- say so."""
+        bad = [(modshare.mod_folder_name(m, v), modshare.skipped_copies.get(m)) for m, v in mods if m in modshare.skipped_copies]
+        if not bad:
+            return
+        shown = ", ".join(f"{n} ({p})" for n, p in bad[:4]) + (f", +{len(bad) - 4} more" if len(bad) > 4 else "")
+        self.log(f"[client] {len(bad)} required mod(s) have a copy here the game could not read (stdout.txt: 'Mod will be skipped') -- "
+                 f"the host's copy is fetched and registered in its place: {shown}")
+        self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                      "text": f"Your game could not read {len(bad)} mod(s) this save needs (" + ", ".join(n for n, _ in bad[:4])
+                              + (", ..." if len(bad) > 4 else "") + "); the host's copy will be fetched. "
+                                "A Workshop item that stays broken here: unsubscribe, delete its folder and subscribe again."})
 
     def _publish_rows(self, mods):
         """A registry row for EVERY Workshop mod of the save whose folder is on

@@ -125,6 +125,18 @@ class Downloads(unittest.TestCase):
             self.assertTrue(self.r.mods_satisfied)
             token,rows=modshare.read_registry()
             self.assertEqual(token,'b'*32,'no new token: nothing to wait for');self.assertEqual(rows,{'9876543210':str(folder)})
+    def test_a_copy_the_game_could_not_read_is_fetched_from_the_host(self):
+        """The game's log says it skipped a mod's mod.lua here; that folder is no copy
+        at all, so the mod is offered for download and the player is told."""
+        lib=self.root/'library';(lib/'9876543210').mkdir(parents=True);(lib/'9876543210'/'mod.lua').write_text('x')
+        log=self.root/'stdout.txt';log.write_text(f"Lua error while reading {str(lib).replace(chr(92),'/')}/9876543210/mod.lua: Unknown exception. Mod will be skipped.\n")
+        modshare.skipped_copies.clear()
+        with patch.object(modshare,'game_log_path',return_value=str(log)), patch.object(modshare,'workshop_dirs',return_value=[str(lib)]), patch.object(modshare,'catalogue',return_value=('t',set())):
+            self.assertIsNone(modshare.find_mod('*9876543210',1))
+            self.offer()
+            self.assertEqual(self.r.need,['*9876543210_1']);self.assertTrue(self.r.ask)
+            self.assertTrue(any(e['type']=='chat' and 'could not read' in e['text'] for e in self.io.events))
+        modshare.skipped_copies.clear()
     def test_registration_the_game_does_not_recognise_disconnects(self):
         with self.on_disk():
             self.offer();self.receipt();self.r.tick(time.time())

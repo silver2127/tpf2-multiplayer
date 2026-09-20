@@ -43,6 +43,7 @@ import zipfile
 import hashlib
 import uuid
 import threading
+import re
 
 TF2_APPID = "1066780"
 MP_MOD_ID = "mp_lockstep"                 # ours: shipped by the installer, never sent
@@ -115,9 +116,9 @@ def game_dir():
     return None
 
 
-def userdata_mods_dir():
-    """<steam>\\userdata\\<account>\\1066780\\local\\mods -- the account that has a
-    save folder (newest wins), like the menu DLL's resolveSaveDir."""
+def _newest_local():
+    """<steam>\\userdata\\<account>\\1066780\\local of the account that has a save
+    folder (newest wins), like the menu DLL's resolveSaveDir; None without Steam."""
     root = steam_root()
     if not root:
         return None
@@ -129,10 +130,68 @@ def userdata_mods_dir():
             if os.path.isdir(os.path.join(local, "save")):
                 t = os.path.getmtime(os.path.join(ud, acc))
                 if t > best_t:
-                    best, best_t = os.path.join(local, "mods"), t
+                    best, best_t = local, t
     except OSError:
         pass
     return best
+
+
+def userdata_mods_dir():
+    """<steam>\\userdata\\<account>\\1066780\\local\\mods of the newest account."""
+    local = _newest_local()
+    return os.path.join(local, "mods") if local else None
+
+
+def game_log_path():
+    """The game's own log (stdout.txt, the Lua print lines) of the newest account."""
+    local = _newest_local()
+    return os.path.join(local, "crash_dump", "stdout.txt") if local else None
+
+
+_UNREADABLE_CACHE = {}
+_UNREADABLE_LINE = re.compile(r"Lua error while reading (.+?)[/\\\\]mod\.lua: .*Mod will be skipped\.", re.I)
+
+
+def unreadable_mod_folders(log_path=None):
+    """Folders the running game could NOT read a mod.lua from, as its stdout.txt
+    says at startup: 'Lua error while reading <folder>/mod.lua: Unknown exception.
+    Mod will be skipped.' Such a mod is skipped at the title menu, but a shared
+    save that needs it makes the world load run that same file, and that dies
+    (a joiner at 78% of every load, the Boeing 777 Pack's mod.lua, 2026-09-20).
+    Normalised paths; cached per (path, size, mtime)."""
+    path = log_path or game_log_path()
+    if not path:
+        return set()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return set()
+    key = (path, st.st_size, st.st_mtime_ns)
+    hit = _UNREADABLE_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    found = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = _UNREADABLE_LINE.search(line)
+                if m:
+                    found.add(os.path.normcase(os.path.normpath(m.group(1))))
+    except OSError:
+        pass
+    _UNREADABLE_CACHE[path] = (key, found)
+    return found
+
+
+skipped_copies = {}     # mod id -> the folder find_mod passed over because the game could not read it
+
+
+def _readable(mod_id, folder):
+    """False for a folder the game reported unreadable (remembered in skipped_copies)."""
+    if os.path.normcase(os.path.normpath(folder)) in unreadable_mod_folders():
+        skipped_copies[mod_id] = folder
+        return False
+    return True
 
 
 def data_dir():
@@ -424,7 +483,10 @@ def find_mod(mod_id, version):
         library = [] if "ignore_steam_workshop" in test_flags() else workshop_dirs()
         for w in library + [managed_workshop()]:
             p = w and os.path.join(w, mod_id[1:])
-            if p and os.path.isfile(os.path.join(p, "mod.lua")):
+            # a copy the game could not read counts as absent: the next candidate
+            # (the managed download) or nothing, so the host's copy is fetched and
+            # registered in place of the broken one
+            if p and os.path.isfile(os.path.join(p, "mod.lua")) and _readable(mod_id, p):
                 return p
         return None
     if mod_id.startswith("_"):
@@ -444,7 +506,7 @@ def find_mod(mod_id, version):
     for base in (game_dir() and os.path.join(game_dir(), "mods"), userdata_mods_dir()):
         if base:
             p = os.path.join(base, name)
-            if os.path.isfile(os.path.join(p, "mod.lua")):
+            if os.path.isfile(os.path.join(p, "mod.lua")) and _readable(mod_id, p):
                 return p
     return None
 
@@ -987,9 +1049,36 @@ def selftest():
             assert got == expect, (got, expect)          # every byte counted once
         finally:
             install_target = real_it
+    # a folder the game's log calls unreadable is passed over: the managed copy or nothing
+    with tempfile.TemporaryDirectory() as td:
+        global game_log_path, workshop_dirs
+        real_glp, real_wd, real_dd = game_log_path, workshop_dirs, data_dir
+        lib = os.path.join(td, "library")
+        for base in (lib, os.path.join(td, "data", "workshop")):
+            os.makedirs(os.path.join(base, "555"))
+            open(os.path.join(base, "555", "mod.lua"), "w").write("x")
+        os.makedirs(os.path.join(lib, "666"))
+        open(os.path.join(lib, "666", "mod.lua"), "w").write("x")
+        log_path = os.path.join(td, "stdout.txt")
+        open(log_path, "w", encoding="utf-8").write(
+            "Found 923 mods\n"
+            f"Lua error while reading {lib.replace(chr(92), '/')}/555/mod.lua: Unknown exception. Mod will be skipped.\n"
+            f"Lua error while reading {lib.replace(chr(92), '/')}/666/mod.lua: Unknown exception. Mod will be skipped.\n")
+        game_log_path = lambda: log_path
+        workshop_dirs = lambda: [lib]
+        data_dir = lambda: os.path.join(td, "data")
+        skipped_copies.clear()
+        try:
+            assert unreadable_mod_folders(log_path) == {os.path.normcase(os.path.join(lib, "555")), os.path.normcase(os.path.join(lib, "666"))}
+            assert find_mod("*555", 1) == os.path.join(td, "data", "workshop", "555"), "the managed copy stands in"
+            assert find_mod("*666", 1) is None and skipped_copies["*666"] == os.path.join(lib, "666"), "nothing else: absent, and remembered"
+            assert unreadable_mod_folders(os.path.join(td, "nolog.txt")) == set()
+        finally:
+            game_log_path, workshop_dirs, data_dir = real_glp, real_wd, real_dd
+            skipped_copies.clear()
     # tpf2mp_modtest.txt: ignore_steam_workshop hides the library, not the managed folder
     with tempfile.TemporaryDirectory() as td:
-        global workshop_dirs                  # data_dir is already this function's global
+        # data_dir, workshop_dirs: this function's globals, declared above
         real_dd, real_wd = data_dir, workshop_dirs
         data_dir = lambda: os.path.join(td, "data")
         workshop_dirs = lambda: [os.path.join(td, "library")]
