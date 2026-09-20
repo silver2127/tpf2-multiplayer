@@ -16,8 +16,8 @@
 ## Prerequisites
 
 - Windows 10 or 11 x64, Steam, Transport Fever 2 build 35924.
-- Visual Studio 2022 Build Tools with the MSVC x64 toolchain in its default location (`build.bat` calls
-  `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`).
+- Visual Studio 2022 with the MSVC x64 toolchain, Build Tools or any edition (`build.bat` and the installer's
+  custom-action build find it through `vswhere` in `tools\msvc_env.bat`).
 - Python 3.12 with `pip install -r netpunch\requirements.txt`, plus `pyinstaller` to freeze the lobby,
   `luaparser` for `tools\luacheck.py`, `Pillow` for the logo scripts and `numpy pefile capstone` for
   `tools\re`.

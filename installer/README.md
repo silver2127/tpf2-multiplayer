@@ -191,8 +191,8 @@ value skips both checks; it exists for test rigs.
 
 Prerequisites:
 
-- Visual Studio 2022 Build Tools with the MSVC x64 toolchain, in its default location (the `.bat` scripts
-  call its `vcvars64.bat`).
+- Visual Studio 2022 with the MSVC x64 toolchain: the Build Tools or any edition. The `.bat` scripts find it
+  through `vswhere` (`tools\msvc_env.bat`), so no fixed install path is assumed.
 - Python 3.12 with `pip install pyinstaller -r netpunch\requirements.txt`.
 - WiX Toolset v7 as a .NET global tool (`dotnet tool install --global wix`). `build_msi.ps1` runs it from
   `%USERPROFILE%\.dotnet\tools\wix.exe` and adds `WixToolset.UI.wixext` if it is missing.
@@ -202,6 +202,12 @@ Prerequisites:
 ```
 powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 [-AcceptWixEula] [-Validate]
 ```
+
+GitHub Actions runs the same script (`.github/workflows/build-msi.yml`): every push to `dev` or `main` and
+every pull request builds the MSI, `TpF2Multiplayer-files.zip`, `install_proton.py` and `SHA256SUMS.txt` on a
+`windows-2022` runner and keeps them as the run's artifact; a `v*` tag also creates a draft GitHub release
+with them attached, ready to be edited and published. The workflow passes `-AcceptWixEula`, which is the
+repository owner accepting the WiX terms for those builds.
 
 | option | effect |
 |---|---|
