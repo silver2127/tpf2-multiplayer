@@ -188,6 +188,9 @@ installing the new MSI (or running the Proton installer again): there is no in-g
    engines called `netpunch.exe` "Trojan.Win64.Krypt" on 2026-09-20). A compiled stub clears the
    signature matches; the behaviour heuristics some engines still raise on a self-extracting exe only go
    away with code signing.
+   Since 0.6.1.12 the lobby is a folder build (netpunch.exe beside netpunch/_internal/): a one-file exe unpacks itself at
+   run time, which four engines called a trojan even with the compiled stub; a plain program beside its libraries is
+   what their rules treat as normal. The Proton repair patches the plain miniupnpc DLL in that folder.
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
 3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
    `TpF2Multiplayer.msi`,

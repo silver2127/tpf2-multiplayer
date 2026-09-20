@@ -34,7 +34,7 @@
   <?ifndef BridgeDll ?><?define BridgeDll = "$(BridgeOut)\tpf2_bridge_mp.dll" ?><?endif?>
   <?ifndef MenuDll ?><?define MenuDll = "$(BridgeOut)\tpf2_menu.dll" ?><?endif?>
   <?ifndef SliceDll ?><?define SliceDll = "$(BridgeOut)\tpf2_slice.dll" ?><?endif?>
-  <?ifndef NetpunchExe ?><?define NetpunchExe = "..\netpunch\dist\netpunch.exe" ?><?endif?>
+  <?ifndef NetpunchDir ?><?define NetpunchDir = "..\netpunch\dist\netpunch" ?><?endif?>
   <?ifndef ModSource ?><?define ModSource = "..\mod\mp_lockstep_1" ?><?endif?>
   <?ifndef CaDll ?><?define CaDll = "out\tpf2ca.dll" ?><?endif?>
 
@@ -108,6 +108,7 @@
            the game rather than adding files beside it. -->
       <ComponentGroupRef Id="PluginHostShared" />
       <ComponentGroupRef Id="GameFolderFiles" />
+      <ComponentGroupRef Id="NetpunchFiles" />
       <ComponentGroupRef Id="ModFiles" />
     </Feature>
 
@@ -153,9 +154,6 @@
       <Component Id="SliceCfg">
         <File Id="tpf2_slice.cfg" Name="tpf2_slice.cfg" Source="cfg\tpf2_slice.cfg" />
       </Component>
-      <Component Id="NetpunchExe" Directory="NetpunchFolder">
-        <File Id="netpunch.exe" Name="netpunch.exe" Source="$(NetpunchExe)" />
-      </Component>
       <!-- Remembered folder for upgrades/uninstall (read back by Search2RememberedInstallFolder). -->
       <Component Id="RememberInstallFolder" Guid="68615E50-B3D1-4EF1-9966-89EC1379F83A">
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Multiplayer" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
@@ -169,6 +167,13 @@
 
     <ComponentGroup Id="ModFiles" Directory="ModFolder">
       <Files Include="$(ModSource)\**" />
+    </ComponentGroup>
+
+    <!-- The lobby: a PyInstaller folder build (netpunch.exe beside _internal\), one
+         component per file. A one-file build was a self-extracting exe, which four
+         antivirus engines called a trojan (2026-09-20). -->
+    <ComponentGroup Id="NetpunchFiles" Directory="NetpunchFolder">
+      <Files Include="$(NetpunchDir)\**" />
     </ComponentGroup>
   </Fragment>
 

@@ -194,8 +194,32 @@ def main():
         # 10. the lobby repair on a real Windows netpunch.exe, when one is at hand
         candidates = [os.environ.get("TPF2MP_TEST_LOBBY"), HERE.parents[1] / "netpunch/dist/netpunch.exe"]
         lobby = next((Path(c) for c in candidates if c and Path(c).is_file() and Path(c).read_bytes()[:2] == b"MZ"), None)
+        folder = HERE.parents[1] / "netpunch/dist/netpunch"
+        folder_dll = install.lobby_dll_in(folder) if folder.is_dir() else None
+        if folder_dll is not None:
+            # 10a. the folder-form lobby (0.6.1.12+): the plain DLL is what the repair touches,
+            # in tool mode on the folder and on the DLL, and through an install
+            dll_data = folder_dll.read_bytes()
+            state = "repaired" if install.sha256(dll_data) == install.REPAIRED_DLL_SHA256 else "broken"
+            assert state == "broken" or install.sha256(dll_data) == install.REPAIRED_DLL_SHA256
+            tool_dir = td / "lobby"; (tool_dir / "_internal").mkdir(parents=True)
+            (tool_dir / "netpunch.exe").write_bytes(b"MZ not a bundle")
+            (tool_dir / "_internal" / folder_dll.name).write_bytes(dll_data)
+            out = run("--repair-lobby", tool_dir)
+            assert ("repaired (64" in out) == (state == "broken"), out
+            assert install.sha256((tool_dir / "_internal" / folder_dll.name).read_bytes()) == install.REPAIRED_DLL_SHA256
+            assert "already repaired" in run("--repair-lobby", tool_dir / "_internal" / folder_dll.name)
+            folder_zip = td / "files-folder.zip"
+            make_zip(folder_zip, dict(upgraded, **{"netpunch/netpunch.exe": b"MZ not a bundle",
+                                                  "netpunch/_internal/" + folder_dll.name: dll_data}))
+            assert "PASS" in run(*env_root, "--files-zip", folder_zip)          # step 9 left the product uninstalled
+            assert install.sha256((game / "netpunch/_internal" / folder_dll.name).read_bytes()) == install.REPAIRED_DLL_SHA256
+            assert "PASS" in run(*env_root, "--verify")
+            assert "nothing to do" in run(*env_root, "--files-zip", folder_zip)   # the repaired DLL counts as current
+            run(*env_root, "--uninstall")
+            print("note: folder-form lobby repair exercised on the real _internal DLL")
         if lobby is None:
-            print("note: no Windows netpunch.exe at hand; the lobby repair ran only on the pinned-hash paths")
+            print("note: no one-file Windows netpunch.exe at hand; its repair ran only on the pinned-hash paths")
         else:
             data = lobby.read_bytes()
             state = install.lobby_state(data)[0]

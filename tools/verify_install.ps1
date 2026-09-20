@@ -9,7 +9,7 @@ its own overlay copy of the game folder, and one stale DLL, plugin or mod file
 there runs silently and looks like a protocol bug between A and B. This lists
 every mismatch or missing file and exits 1 if there is one.
 
-Compared: native\out\*.dll (in the game folder root and plugins\), netpunch\dist\netpunch.exe,
+Compared: native\out\*.dll (in the game folder root and plugins\), netpunch\dist\netpunch\ (the exe and _internal\),
 and the whole mods\mp_lockstep_1 tree.
 
   tools\verify_install.ps1                 the game folder and every C:\Sandbox\<user>\*\ overlay of it
@@ -40,7 +40,10 @@ foreach ($d in Get-ChildItem "$src\native\out\*.dll") {
     if (Test-Path -LiteralPath (Join-Path $Game "plugins\$($d.Name)")) { $targets = @("plugins\$($d.Name)") }
     $items += ,@($d.FullName, $targets)
 }
-$items += ,@("$src\netpunch\dist\netpunch.exe", @("netpunch\netpunch.exe"))
+$items += ,@("$src\netpunch\dist\netpunch\netpunch.exe", @("netpunch\netpunch.exe"))
+foreach ($f in Get-ChildItem "$src\netpunch\dist\netpunch\_internal" -Recurse -File) {
+    $items += ,@($f.FullName, @("netpunch\" + $f.FullName.Substring("$src\netpunch\dist\netpunch\".Length)))
+}
 foreach ($f in Get-ChildItem "$src\mod\mp_lockstep_1" -Recurse -File) {
     $items += ,@($f.FullName, @("mods\" + $f.FullName.Substring("$src\mod\".Length)))
 }

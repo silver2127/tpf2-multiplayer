@@ -80,19 +80,19 @@ function BuildStale {
             Say "built $($p.name)" Green
         }
     }
-    $exe = Join-Path $Repo 'netpunch\dist\netpunch.exe'
+    $exe = Join-Path $Repo 'netpunch\dist\netpunch\netpunch.exe'
     $exeT = if (Test-Path $exe) { (Get-Item $exe).LastWriteTime } else { [datetime]0 }
     if ((Newest @('netpunch\*.py')) -gt $exeT) {
         Say 'freezing netpunch (lobby sources newer than dist\netpunch.exe)' Cyan
         Push-Location (Join-Path $Repo 'netpunch')
-        try { $log = cmd /c "python -m PyInstaller --onefile --name netpunch lobby.py --noconfirm --log-level WARN 2>&1" } finally { Pop-Location }   # via cmd: PS 5.1 turns PyInstaller's stderr INFO lines into terminating errors
+        try { $log = cmd /c "python -m PyInstaller --onedir --name netpunch lobby.py --noconfirm --log-level WARN 2>&1" } finally { Pop-Location }   # via cmd: PS 5.1 turns PyInstaller's stderr INFO lines into terminating errors
         if ((Test-Path $exe) -and ((Get-Item $exe).LastWriteTime -gt $exeT)) { Say 'froze netpunch' Green } else { Say ("freeze FAILED:`n" + ($log | Select-Object -Last 5 | Out-String)) Red }
     }
 }
 
 function InstallStale {
     # newest built output vs the game folder's copies (the mod tree too)
-    $built = Newest @('native\out\alut.dll', 'native\out\tpf2_menu.dll', 'native\out\tpf2_slice.dll', 'native\out\tpf2_pluginhost.dll', 'netpunch\dist\netpunch.exe', 'mod\mp_lockstep_1')
+    $built = Newest @('native\out\alut.dll', 'native\out\tpf2_menu.dll', 'native\out\tpf2_slice.dll', 'native\out\tpf2_pluginhost.dll', 'netpunch\dist\netpunch\netpunch.exe', 'mod\mp_lockstep_1')
     $deployed = [datetime]0
     foreach ($f in 'alut.dll', 'tpf2_menu.dll', 'tpf2_slice.dll', 'tpf2_pluginhost.dll', 'netpunch\netpunch.exe') {
         $p = Join-Path $Game $f; if (Test-Path $p) { $t = (Get-Item $p).LastWriteTime; if ($t -gt $deployed) { $deployed = $t } }
@@ -142,7 +142,8 @@ function InstallStale {
         # a locked copy must not abort the mod/plugin refresh and the relaunch (2026-09-16)
         $lobbyOk = $false
         for ($try = 0; $try -lt 6 -and -not $lobbyOk; $try++) {
-            try { Copy-Item (Join-Path $Game 'netpunch\netpunch.exe') (Join-Path $ov 'netpunch\netpunch.exe') -Force -EA Stop; $lobbyOk = $true }
+            try { Copy-Item (Join-Path $Game 'netpunch\netpunch.exe') (Join-Path $ov 'netpunch\netpunch.exe') -Force -EA Stop
+                  Copy-Item (Join-Path $Game 'netpunch\_internal') (Join-Path $ov 'netpunch\_internal') -Recurse -Force -EA Stop; $lobbyOk = $true }
             catch { Start-Sleep -Seconds 2 }
         }
         if (-not $lobbyOk) { Say "the $b overlay's netpunch.exe is still locked (a lingering boxed lobby?) -- lobby NOT refreshed in the box" DarkYellow }

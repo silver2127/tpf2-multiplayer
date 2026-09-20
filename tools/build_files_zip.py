@@ -25,7 +25,7 @@ LAYOUT = {
     "tpf2_slice.dll": "native/out/tpf2_slice.dll",
     "tpf2_slice.cfg": "installer/cfg/tpf2_slice.cfg",
     "tpf2mp_version.txt": "installer/VERSION",
-    "netpunch/netpunch.exe": "netpunch/dist/netpunch.exe",
+    "netpunch/netpunch.exe": "netpunch/dist/netpunch/netpunch.exe",
     "plugins/tpf2_previews.dll": "native/out/tpf2_previews.dll",
     "plugins/tpf2_workshop_register.dll": "native/out/tpf2_workshop_register.dll",
 }
@@ -47,6 +47,11 @@ def collect(from_msi):
         path = REPO / source
         assert path.is_file(), f"missing build output: {path} (run native\\build.bat all and freeze netpunch first)"
         files[name] = path.read_bytes()
+    # the lobby is a folder: netpunch.exe beside _internal\ (PyInstaller --onedir)
+    lobby = REPO / "netpunch/dist/netpunch"
+    for p in sorted((lobby / "_internal").rglob("*")):
+        if p.is_file():
+            files["netpunch/" + p.relative_to(lobby).as_posix()] = p.read_bytes()
     for p in sorted((REPO / MOD).rglob("*")):
         if p.is_file():
             files["mods/mp_lockstep_1/" + p.relative_to(REPO / MOD).as_posix()] = p.read_bytes()
