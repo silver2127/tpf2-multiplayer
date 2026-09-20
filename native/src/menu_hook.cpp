@@ -2016,6 +2016,23 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
     PollWorldGen();
     DedicatedTick();
     LONG n = InterlockedIncrement(&g_presentCount);
+    {   // The frame meter: frames per second and the LONGEST frame of the last
+        // 5 s, in the log. The longest frame is the stutter number (a 60 fps
+        // average hides a 200 ms hitch). An overlay's own FPS counter (NVIDIA's)
+        // hooks the same present call and does not attach beside this detour
+        // (2026-09-20); Steam's counter does. Render thread only: plain statics.
+        static LARGE_INTEGER freq{}, last{}, windowStart{}; static double longest = 0; static LONG frames = 0;
+        LARGE_INTEGER t; QueryPerformanceCounter(&t);
+        if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); last = windowStart = t; }
+        double dt = double(t.QuadPart - last.QuadPart) * 1000.0 / double(freq.QuadPart); last = t;
+        if (dt > longest) longest = dt;
+        frames++;
+        double win = double(t.QuadPart - windowStart.QuadPart) / double(freq.QuadPart);
+        if (win >= 5.0) {
+            Log("[menu] frames: %.0f/s, longest %.0f ms, over %.1f s\n", frames / win, longest, win);
+            frames = 0; longest = 0; windowStart = t;
+        }
+    }
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
         InterlockedExchange(&g_autoLoadPending, 0);
