@@ -100,9 +100,9 @@ in either order:
 - **Separate settings.** A plugin installed by another package keeps its settings in
   `plugins\<name>.cfg` beside its DLL, so neither installer edits a file the other owns.
 
-The Big Maps repository has `installer\test_coexist.ps1` (real `msiexec` transactions for both orders
-against a throwaway folder) and `tools\vendor_host.ps1` (copies the shared binaries from this repository
-and records the commit). After changing `PluginHost.wxs`, the proxy, the plugin host or the custom
+The Big Maps repository has `test_coexist.ps1` in its installer folder (real `msiexec` transactions for
+both orders against a throwaway folder) and `vendor_host.ps1` in its tools folder (copies the shared
+binaries from this repository and records the commit). After changing `PluginHost.wxs`, the proxy, the plugin host or the custom
 actions here, re-vendor there.
 
 ## Segment Heap

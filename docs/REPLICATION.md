@@ -43,6 +43,8 @@ settings files say ([CONFIGURATION.md](CONFIGURATION.md)).
 | level crossing | strict (part of the track build) | `ROADP` | A track vertex within 4.0 m of a road node shares that node, taking the road's height when they differ by more than 0.25 m (moving the road node instead asserts the engine). Otherwise the road under the vertex is split. Crossings in the middle of a track segment are found analytically; routing through an existing node requires it to be touched (0.75 m) and straight-through. A crossing the engine refuses ("Too much slope") is refused on every instance. |
 | demolish road or track | strict | `EDEMO` | Edges are matched by their end nodes (same kind, within 1 m). An edge that carries stops or signals is refused. Orphaned nodes are removed. |
 | Snowball Fences / hedges | strict | `FENCE` | Cancelled `CONXP` cursor placements feed the installed mod's planner through a resource wrapper. Start/finish points create no construction; confirmed segments carry model names and transforms, never entity ids. Planning virtualizes build/bulldoze and isolates decorative RNG. Replays add one construction at the command stamp, with the originating company's local player and no building/field gathering or graph cleanup. Geometry is anchored near the fence, not world zero. Cursor previews are cosmetic, using native 3D when available and an outline otherwise; Workshop files stay unchanged. Segments are built with `ignoreErrors=true`, as the mod's own `buildConstruction` does: a segment touches the one before it, and a checked build refused every segment after a drag's first ("Kollision"). Automated coverage includes the real installed Fences planner, but a multiplayer game test remains pending. All participants need the new command handler. |
+| terraform, terrain paint | strict | `TERRAIN` | The slice stashes the edit's grid (or paint-only blob) at the factory and cancels the commit; every instance applies it at the stamp (`ARMED 1`), or the peers alone when it had to run natively here (`ARMED 0`). The brush stroke is held until this instance's own replay has applied, so the next part of the stroke is computed against the replayed heights. |
+| asset brush | strict | `ASSETS` | The stroke travels as a blob plus the ids of the asset groups it removes; same `ARMED` rule as terrain. |
 | station, depot, asset, harbour, airport | strict | `CONX` / `CONP` | The slice reads the construction's file, placement and parameters off the proposal and cancels the build; the street pieces travel as `ROADC` and are paired by identity (one placement serial on both records). Every instance builds the same scripted proposal at the stamp. |
 | same, when the parameters cannot be read | replay on peers, then corrected | `CONX` / `CONP` | The native build stands and is captured by polling. With other players connected, the originator then bulldozes its own copy and rebuilds the scripted one with the peers (money reconciled); alone it keeps the native build. |
 | module edit, station upgrade | strict | `CONU` (`diff=1 strict=1`) | The old construction and the new parameters come off the proposal; every instance upgrades the construction (same file within 10 m) at the stamp. If the cancel does not land, the edit scan ships it instead (every 30 ticks, originator skips). |
@@ -160,11 +162,14 @@ Stops are resolved by the station group's position (within 20 m) and the station
 
 ## Not replicated
 
-- Terraforming, terrain painting, the asset brush.
 - Stop/start, manual departure, "depart now" and maintenance targets for vehicles.
 - Map editor and scenario commands (towns, industries, no-costs).
 - Town growth itself: it is not sent, it is simulated identically. Its building count is a
-  detector lane, so a town that grows differently shows up.
+  detector lane, so a town that grows differently shows up. The Natural Town Growth Workshop
+  script is wrapped so its clock and random numbers follow the simulation:
+  [DETERMINISTIC_SCRIPTS.md](DETERMINISTIC_SCRIPTS.md).
+- A stop's load settings (`stopConfig`: unload only, maximum load) are not carried by a line
+  replay yet ([KNOWN_ISSUES.md](KNOWN_ISSUES.md#replication-gaps)).
 
 ## Detecting divergence
 

@@ -55,6 +55,9 @@ about 74 characters.
 
 ## Connecting
 
+Every join request, welcome and roster carries the release version, and admission needs an
+exact match on both sides; [version-checking.md](version-checking.md) has the rule and its tests.
+
 **Host.** `netpunch.exe host` observes its own socket (STUN, plus a UPnP port mapping
 it removes on exit), prints `CODE=...`, answers every HELLO, and polls the master server
 for knocks every second. For each knock it can open, it sends HELLO to that joiner's

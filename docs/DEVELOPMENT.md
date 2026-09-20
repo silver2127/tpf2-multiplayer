@@ -130,6 +130,8 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 - **`powershell -File tools\pscheck.ps1`**: PowerShell parse errors, variables whose names differ only in
   case (PowerShell treats them as one), and array literals that flatten. To check specific files pass
   them in-process (`-Path @(...)`); with `-File`, only the first path is checked.
+- **`python tools\check_doc_links.py`** after editing documentation: dead file links, dead `#anchors`,
+  repository paths named in prose that no longer exist, and documents nothing links to.
 - **Lobby self-tests**: [NETWORKING.md](NETWORKING.md#self-tests); `python tools\relay_selftest.py` for
   the relay.
 - **Installer**: `installer\test_upgrade.ps1` ([installer/README.md](../installer/README.md#testing-an-upgrade)).

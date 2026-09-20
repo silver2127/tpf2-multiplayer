@@ -65,7 +65,7 @@ setting at its default.
 | `dedicated_fps` | 30 | 5-240 | With `dedicated_render=0`: the headless frame rate the present is paced to. The engine needs only 5 batches a second; every frame beyond is scene prep on the thread that hands the sim its batches. |
 | `dedicated_render` | 0 | `0`, `1` | 0: no command buffer reaches the GPU (fences and semaphores are still signalled), so a software Vulkan (lavapipe) costs nothing and the panel is not drawn; 1: the game renders as usual. |
 | `automod` | on | a line starting `automod=0` | Stops the panel adding the Transport Fever 2 Multiplayer mod to the game's default mod list. |
-| `sharedstations` | on | a line starting `sharedstations=0` | Read by the slice DLL, not the menu. Off leaves the line editor's owner check alone, so in companies mode another company's station cannot be put on your line (see SHARED_INFRA.md). |
+| `sharedstations` | on | a line starting `sharedstations=0` | Read by the slice DLL, not the menu. Off leaves the line editor's owner check alone, so in companies mode another company's station cannot be put on your line (see [SHARED_INFRA.md](SHARED_INFRA.md)). |
 
 The slice DLL reads the same file — next to itself first, then in the data dir — for its own
 `<key>=0` switches (`trainorder`, `roadspace`, `shiporder`, `airorder`, `sharedstations`); each one
