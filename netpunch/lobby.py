@@ -1735,6 +1735,8 @@ class _ClientSaveReceiver:
         self.batch_open = False      # a round is under way: more batches follow, do not ask again
         self.batch_done = False      # this batch is installed and its done is being announced (cleared by the next fbegin)
         self.batch_got = set()       # mods installed or present across the round's batches
+        self.registering = []        # [(id, ver, folder)] on disk here, being registered with the game (catalogue_token pending)
+        self.round_receipt = False   # the pending catalogue_token closes a download round (else it is a registration)
         # THE TCP CHANNEL (bulk_tcp.py). A joiner connects to the sender's listener
         # (the host's or relay's, named in fbegin) and a reader thread queues the
         # stream; the relay, which listens itself, accepts the leader's upload the
@@ -1793,17 +1795,65 @@ class _ClientSaveReceiver:
             self.cancel_reason="Required DLC is not installed: " + ", ".join(missing_dlc) + ". DLC is never transferred."
             self.io.emit({"type":"mods_cancelled","text":"Required DLC is not installed: " + ", ".join(missing_dlc) + ". DLC is never transferred."})
             return
-        self.need=[modshare.mod_folder_name(m,v) for m,v in mods if modshare.installed_mod(m,v) is None]
+        self.need, on_disk = self._split_missing(mods)
         self.offered=list(self.need)
         self.approved=set()
         self.preflight=True
         self.ask=bool(self.need)
-        self.mods_satisfied=not self.need
+        self.mods_satisfied=not self.need and not on_disk
+        if on_disk and not self._register(on_disk):
+            return
         if self.ask:
             self.consent_id+=1
             self.io.emit({"type":"mods_prompt", "offer":self.consent_id, "count":len(self.need), "text":", ".join(self.need)})
         else:
             self.io.emit({"type":"mods_clear"})
+
+    def _split_missing(self, mods):
+        """Of the mods a save needs, the folder names to DOWNLOAD (nowhere on
+        this machine) and the [(id, ver, folder)] to REGISTER: on disk here, but
+        not in the game's catalogue. Until 2026-09-20 both were "need": a joiner
+        whose game had not catalogued a folder -- every mod of a round that never
+        finished, since the registry was published only at a round's last batch
+        -- had it zipped, sent and found "present" on arrival (21 folders, 2 GB,
+        on 2026-09-20). The game loads what its catalogue lists, so a folder that
+        is here is registered, never fetched."""
+        need, on_disk = [], []
+        for m, v in mods:
+            if modshare.installed_mod(m, v) is not None:
+                continue
+            folder = modshare.on_disk_mod(m, v)
+            if folder:
+                on_disk.append((m, v, folder))
+            else:
+                need.append(modshare.mod_folder_name(m, v))
+        return need, on_disk
+
+    def _register(self, on_disk):
+        """Publish the registry naming these folders and ask the game to refresh
+        its catalogue; the receipt (tick) must list every one. A registration
+        already pending is folded in. False if the registry could not be
+        written (the receiver has failed)."""
+        rows = {(m, v): folder for m, v, folder in self.registering}
+        rows.update({(m, v): folder for m, v, folder in on_disk})
+        pending = [(m, v, folder) for (m, v), folder in rows.items()]
+        extra = [(m[1:], folder) for m, v, folder in pending if m.startswith("*")]
+        try:
+            self.catalogue_token = modshare.request_catalogue(extra)
+        except (OSError, ValueError) as e:
+            self._fail("cannot publish mod registry: " + str(e))
+            return False
+        self.catalogue_since = time.time()
+        self.registering = pending
+        self.round_receipt = False
+        names = [modshare.mod_folder_name(m, v) for m, v, _ in pending]
+        shown = ", ".join(names[:6]) + (f", +{len(names) - 6} more" if len(names) > 6 else "")
+        self.log(f"[client] {len(names)} mod(s) the save needs are on this PC but not in the game's catalogue -- "
+                 f"registering them, not downloading: {shown}")
+        self.io.emit({"type": "status", "state": "connected",
+                      "detail": f"registering {len(names)} mod(s) already on this PC\u2026"})
+        self.io.emit({"type": "mods_refresh"})
+        return True
 
     def answer_mods(self, accept, offer=None):
         if offer is not None and offer != self.consent_id: return
@@ -1938,6 +1988,7 @@ class _ClientSaveReceiver:
             self.preflight=False
             self.required=[]
             self.save_done = False
+            on_disk = []
             for ent in (msg.get("mods") or []):
                 try:
                     m, v = str(ent[0]), int(ent[1])
@@ -1956,8 +2007,15 @@ class _ClientSaveReceiver:
                         self.cancel_reason="Required DLC is missing. Deluxe and Early Supporter content cannot be downloaded from the host."
                         self.io.emit({"type":"mods_cancelled","text":"Required DLC is missing. Deluxe and Early Supporter content cannot be downloaded from the host."})
                         return
+                    if not present:
+                        folder = modshare.on_disk_mod(m, v)
+                        if folder:                       # here, not catalogued: register (see _split_missing)
+                            on_disk.append((m, v, folder))
+                            present = True
                 if not present:
                     self.need.append(modshare.mod_folder_name(m, v))
+            if on_disk and not (self.catalogue_token and self.round_receipt) and not self._register(on_disk):
+                return
             if msg.get("mods_unknown"):
                 self._manifest_unknown()             # the list is unknown, not empty: say so, take the save
             # a new save round asks afresh: an earlier yes does not carry over
@@ -2135,21 +2193,35 @@ class _ClientSaveReceiver:
         if self.catalogue_token:
             token, entries = modshare.catalogue()
             if token == self.catalogue_token:
-                missing=[modshare.mod_folder_name(m,v) for m,v in self.required if (m,str(v)) not in entries]
+                check = self.required if self.round_receipt else [(m, v) for m, v, _ in self.registering]
+                missing=[modshare.mod_folder_name(m,v) for m,v in check if (m,str(v)) not in entries]
                 self.catalogue_token=None
+                self.registering=[]
                 if missing:
-                    self._fail("mods not recognised by game: " + ", ".join(missing))
+                    self._fail(("mods not recognised by game: " if self.round_receipt else
+                                "mods on this PC the game does not recognise (delete the folder to download the host's copy): ")
+                               + ", ".join(missing))
                     self.cancelled=True
                     return
-                self.complete=True
-                self.mods_satisfied=True
-                self.io.emit(dict({"type":"mods_ready", "failed":[]}, **getattr(self,"install_result",{})))
-                self._maybe_send_done(force=True)
+                if self.round_receipt:
+                    self.complete=True
+                    self.mods_satisfied=True
+                    self.io.emit(dict({"type":"mods_ready", "failed":[]}, **getattr(self,"install_result",{})))
+                    self._maybe_send_done(force=True)
+                else:
+                    # a registration: the on-disk folders are catalogued; what is
+                    # not here at all is still to be downloaded (need, prompt, round)
+                    self.mods_satisfied = not self.need
+                    self.log(f"[client] the game registered the mods already on this PC"
+                             + ("" if self.mods_satisfied else f"; {len(self.need)} still to download"))
+                    if self.mods_satisfied:
+                        self.io.emit({"type": "mods_ready", "failed": [], "registered": len(check)})
             elif now-self.catalogue_since>45:
                 self._fail("game did not refresh its mod catalogue")
                 self.cancelled=True
                 self.catalogue_token=None
-            return
+            if self.round_receipt or self.cancelled or self.sid is None:
+                return                    # a registration beside a live transfer keeps feeding it
         if self.sid is None or self.failed:
             return
         if self.complete or self.batch_done:
@@ -2343,6 +2415,12 @@ class _ClientSaveReceiver:
                 self.batch_open = True
                 self.complete = False
                 self.batch_done = True
+                try:
+                    # publish what this batch installed NOW (keeping any pending token):
+                    # a round that stops here still registers its mods at the next game start
+                    modshare.write_registry()
+                except (OSError, ValueError) as e:
+                    self.log(f"[client] could not publish the mod registry after batch {self.batch[0]}: {e}")
                 self.log(f"[client] mod batch {self.batch[0]}/{self.batch[1]} installed -- waiting for the next")
                 self._maybe_send_done(force=True)
                 return
@@ -2353,6 +2431,8 @@ class _ClientSaveReceiver:
             except (OSError,ValueError) as e:
                 self._fail("cannot publish mod registry: " + str(e))
                 return
+            self.round_receipt = True
+            self.registering = []
             self.catalogue_since=time.time()
             self.io.emit({"type":"mods_refresh"})
             return
@@ -3193,7 +3273,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             try:
                 with open(path,"rb") as f: return f.read()     # whole: a cached mod is as big as it is
             except OSError: return None
-        return modshare.package_mod(m,v, level=MODS_ZIP_LEVEL)
+        return modshare.package_mod(m,v, level=MODS_ZIP_LEVEL, log=log)
 
     def broadcast_chat(frm, text):
         cid_counter[0] += 1
@@ -5132,6 +5212,8 @@ def cmd_host(args):
     try:
         if args.relay_only:
             _log("[host] RELAY-ONLY: no game here; the oldest joiner is the leader")
+        else:
+            _publish_registry_at_start(_log)
         run_host(sock, args.name, io, code=code, relay=None if args.relay_only else relay,
                  forward_logs=args.forward_log or (), publisher=publisher,
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
@@ -5220,6 +5302,7 @@ def cmd_join(args):
     if not getattr(args, "no_mesh", False):
         mesh, conn = _mesh_from_conn(conn)
         _log("[join] mesh: direct links to other joiners enabled")
+    _publish_registry_at_start(_log)
     run_client(conn, args.name, io, relay=relay, mesh=mesh,
                profile_code=profile_code, forward_logs=args.forward_log or (), sync_runtime=make_runtime(args))
     return 0
@@ -5867,10 +5950,12 @@ def _run_transfer_mods(tag):
             f.write("return " + repr(mid) + "\n")
         src[mid] = d
     dest = os.path.join(base, "joinermods")
-    registry_real=(modshare.request_catalogue,modshare.catalogue)
-    modshare.request_catalogue=lambda: "test-catalogue"
+    registry_real=(modshare.request_catalogue,modshare.catalogue,modshare.write_registry)
+    modshare.request_catalogue=lambda extra=None: "test-catalogue"
+    modshare.write_registry=lambda token=None, extra=None: "test-catalogue"
     modshare.catalogue=lambda: ("test-catalogue",{("mod_zz","1"),("mod_have","1")})
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
+    on_disk_real, modshare.on_disk_mod = modshare.on_disk_mod, lambda m, v: src.get(m) if m == "mod_have" else None
     share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
     modshare.save_mod_list = lambda p, log=None: [("mod_zz", 1), ("mod_have", 1)]
     modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
@@ -5973,10 +6058,11 @@ def _run_transfer_mods(tag):
                 ok=False
             else:
                 print("[mods] OK: hotjoin downloaded and registered required mods before start")
-        hev = _read_events(ios["host"].out_path)
-        chat = [e.get("text", "") for e in hev if e.get("type") == "chat"]
-        if not any("Sharing 1 mod(s)" in t for t in chat):
-            print(f"[mods:{tag}] FAIL: host never announced the mods round: {chat}")
+        # the round is announced per batch in the joiners' chat ("mod batch 1/1; Installed
+        # from the host: ..."); the host's "Sharing N mod(s)" chat went with batching
+        jchat = [e.get("text", "") for k in ("j1", "j2") for e in _read_events(ios[k].out_path) if e.get("type") == "chat"]
+        if not any("mod batch 1/1" in t and "Installed from the host" in t for t in jchat):
+            print(f"[mods:{tag}] FAIL: no joiner reported an installed mod batch: {jchat}")
             ok = False
     finally:
         stop.set()
@@ -5987,7 +6073,8 @@ def _run_transfer_mods(tag):
             except Exception:
                 pass
         (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target) = real
-        modshare.request_catalogue,modshare.catalogue=registry_real
+        modshare.on_disk_mod = on_disk_real
+        modshare.request_catalogue,modshare.catalogue,modshare.write_registry=registry_real
         SHARE_MODS[0] = share_was
         shutil.rmtree(base, ignore_errors=True)
     print(f"[mods:{tag}] {'OK' if ok else 'FAIL'}  ({time.time() - t0:.1f}s)")
@@ -6024,9 +6111,11 @@ def _run_mods_gate(tag):
     that skips the prompt would."""
     base = tempfile.mkdtemp(prefix="lobby_modgate_")
     dest = os.path.join(base, "mods")
-    registry_request_real=modshare.request_catalogue
-    modshare.request_catalogue=lambda: "consent-test"
+    registry_request_real=(modshare.request_catalogue, modshare.write_registry)
+    modshare.request_catalogue=lambda extra=None: "consent-test"
+    modshare.write_registry=lambda token=None, extra=None: "consent-test"
     real = (modshare.installed_mod, modshare.install_target)
+    on_disk_real, modshare.on_disk_mod = modshare.on_disk_mod, lambda m, v: None
     modshare.installed_mod = lambda m, v: None
     modshare.install_target = lambda m, v: os.path.join(dest, f"{m}_{v}")
     zips = {}
@@ -6107,8 +6196,9 @@ def _run_mods_gate(tag):
         push(r, 52, "mods", mzz + [(INCOMING_BASENAME + ".sav", b"x" * 10)])
         check("a mods round carrying a non-mod file is refused", not installed("mod_zz"))
     finally:
-        modshare.request_catalogue=registry_request_real
+        modshare.request_catalogue, modshare.write_registry=registry_request_real
         modshare.installed_mod, modshare.install_target = real
+        modshare.on_disk_mod = on_disk_real
         shutil.rmtree(base, ignore_errors=True)
     return all(results)
 
@@ -6647,6 +6737,19 @@ def selftest_mesh():
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _publish_registry_at_start(log):
+    """Rewrite the Workshop registry from what is on disk now, keeping its
+    token, so the NEXT game start registers every consented download even if
+    the round that fetched it never reached its last batch."""
+    try:
+        modshare.write_registry()
+        rows = modshare.read_registry()[1]
+        if rows:
+            log(f"[mods] registry published: {len(rows)} Workshop folder(s) for the game's next catalogue refresh")
+    except (OSError, ValueError) as e:
+        log(f"[mods] could not publish the mod registry: {e}")
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if "--update" in argv:

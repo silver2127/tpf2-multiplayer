@@ -31,7 +31,7 @@ def main(batch_bytes=None, workshop=1):
             c=l.race(s,peer,'dial',s.getsockname()[1],8,my_has_v6=False);assert c,'connect failed'
             conns.append(c)
             t=threading.Thread(target=l.run_client,name=name,args=(c,name,io),kwargs={'stop':stop},daemon=True);t.start();threads.append(t)
-        with patch.object(m,'save_mod_list',return_value=mods), patch.object(m,'find_mod',return_value=str(src)), patch.object(m,'installed_mod',side_effect=installed), patch.object(m,'install_target',side_effect=lambda mid,v:str(root/who()/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_"))), patch.object(m,'request_catalogue',side_effect=lambda:who()), patch.object(m,'catalogue',side_effect=catalogue):
+        with patch.object(m,'save_mod_list',return_value=mods), patch.object(m,'find_mod',return_value=str(src)), patch.object(m,'installed_mod',side_effect=installed), patch.object(m,'on_disk_mod',side_effect=installed), patch.object(m,'install_target',side_effect=lambda mid,v:str(root/who()/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_"))), patch.object(m,'request_catalogue',side_effect=lambda extra=None:who()), patch.object(m,'write_registry',side_effect=lambda token=None,extra=None:who()), patch.object(m,'catalogue',side_effect=catalogue):
             server=l.LobbyIO(str(root/'relay'))
             t=threading.Thread(target=l.run_host,args=(hs,'relay',server),kwargs={'relay_only':True,'stop':stop},daemon=True);t.start();threads.append(t)
             try:

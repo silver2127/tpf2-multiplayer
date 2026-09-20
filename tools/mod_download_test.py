@@ -89,6 +89,71 @@ class Downloads(unittest.TestCase):
         self.assertFalse(self.r.batch_done)
         self.r.tick(now+3);self.r.on_chunk(10,0,b'x')
         self.assertFalse(dones(10));self.assertFalse(dones(11))
+    def on_disk(self):
+        """A Workshop folder for *9876543210 that is on this PC but not in the game's catalogue."""
+        folder=self.root/'steam_ws'/'9876543210';folder.mkdir(parents=True);(folder/'mod.lua').write_text('x')
+        return patch.object(modshare,'on_disk_mod',side_effect=lambda mid,v:str(folder) if mid=='*9876543210' else None)
+    def receipt(self,*names):
+        (self.root/'mods_catalogue.txt').write_text(self.r.catalogue_token+'\n'+''.join(n.rsplit('_',1)[0]+'\t'+n.rsplit('_',1)[1]+'\n' for n in names))
+    def test_on_disk_mod_is_registered_not_downloaded(self):
+        """A required mod whose folder is here but uncatalogued is named in the
+        registry and the game is asked to refresh; nothing is offered or requested.
+        Until 2026-09-20 it was zipped, sent and found 'present' on arrival."""
+        with self.on_disk():
+            self.offer()
+            self.assertFalse(self.r.ask);self.assertEqual(self.r.need,[]);self.assertFalse(self.r.mods_satisfied)
+            self.assertTrue(self.r.catalogue_token);self.assertFalse(self.r.round_receipt)
+            self.assertEqual([m for m,v,_ in self.r.registering],['*9876543210'])
+            self.assertFalse(any(e['type']=='mods_prompt' for e in self.io.events))
+            self.assertTrue(any(e['type']=='mods_refresh' for e in self.io.events))
+            token,rows=modshare.read_registry()
+            self.assertEqual(token,self.r.catalogue_token);self.assertEqual(rows,{'9876543210':str(self.root/'steam_ws'/'9876543210')})
+            self.r.tick(time.time());self.assertFalse(self.r.mods_satisfied,'no receipt yet')
+            self.receipt('*9876543210_1');self.r.tick(time.time())
+            self.assertTrue(self.r.mods_satisfied);self.assertIsNone(self.r.catalogue_token);self.assertFalse(self.r.complete)
+            self.assertTrue(any(e['type']=='mods_ready' for e in self.io.events))
+            self.assertFalse(any(m.get('t') in ('mods_request','fdone') for m in self.conn.sent))
+    def test_registration_the_game_does_not_recognise_disconnects(self):
+        with self.on_disk():
+            self.offer();self.receipt();self.r.tick(time.time())
+        self.assertTrue(self.r.cancelled)
+    def test_on_disk_and_absent_mods_register_then_download_the_rest(self):
+        """Only what is nowhere on this PC is offered; the request for it waits for
+        the registration receipt, then goes out."""
+        with self.on_disk():
+            self.r.on_manifest([['*9876543210',1],['*1111111111',1]])
+            self.assertEqual(self.r.need,['*1111111111_1']);self.assertTrue(self.r.ask)
+            self.r.answer_mods(True)
+            self.conn.sent.clear();self.r.tick(time.time()+2)
+            self.assertFalse(any(m['t']=='mods_request' for m in self.conn.sent),'the request waits for the receipt')
+            self.receipt('*9876543210_1');self.r.tick(time.time()+3)
+            self.assertFalse(self.r.mods_satisfied);self.assertIsNone(self.r.catalogue_token)
+            self.r.tick(time.time()+5)
+            self.assertEqual([m['need'] for m in self.conn.sent if m['t']=='mods_request'],[['*1111111111_1']])
+    def test_mid_round_batch_publishes_the_registry(self):
+        """Each batch's installs reach the registry at once (token kept), so a
+        round that never finishes still registers them at the next game start."""
+        self.offer();self.r.answer_mods(True)
+        (self.root/'mods_registry.txt').write_text('a'*32+'\n')
+        push(self.r,10,'mods',[(modshare.mod_zip_name('*9876543210',1),archive())],batch=[1,2])
+        token,rows=modshare.read_registry()
+        self.assertEqual(token,'a'*32,'a mid-round publish keeps the token');self.assertEqual(list(rows),['9876543210'])
+        self.assertIsNone(self.r.catalogue_token,'no receipt is asked for mid-round')
+    def test_registration_beside_a_save_transfer_keeps_feeding_it(self):
+        """A save whose fbegin names an on-disk uncatalogued mod registers it; the
+        save keeps streaming meanwhile (facks flow) and the start waits for the receipt."""
+        with self.on_disk():
+            data=b'save'*4096
+            blob=begin(self.r,20,'save',[('incoming_save.sav',data)],mods=[['*9876543210',1]])
+            self.assertEqual(self.r.need,[]);self.assertTrue(self.r.catalogue_token);self.assertFalse(self.r.round_receipt)
+            self.conn.sent.clear();self.r.tick(time.time()+1)
+            self.assertTrue(any(m['t']=='fack' for m in self.conn.sent),'the transfer is fed during a registration')
+            chunk=lobby.CHUNK_LOCAL
+            for seq in range((len(blob)+chunk-1)//chunk): self.r.on_chunk(20,seq,blob[seq*chunk:(seq+1)*chunk])
+            self.r.settle();self.assertTrue(self.r.complete);self.assertTrue(self.r.save_done)
+            self.assertTrue(self.r.catalogue_token,'the receipt is still awaited')
+            self.receipt('*9876543210_1');self.r.tick(time.time()+2)
+            self.assertIsNone(self.r.catalogue_token);self.assertTrue(self.r.mods_satisfied and self.r.complete)
     def test_receipt_missing_required_mod_disconnects(self):
         self.accept_and_install();(self.root/'mods_catalogue.txt').write_text(self.r.catalogue_token+'\n')
         self.r.tick(time.time());self.assertTrue(self.r.cancelled)

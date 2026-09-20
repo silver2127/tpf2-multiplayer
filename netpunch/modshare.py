@@ -147,11 +147,114 @@ def is_dlc(m):
     return m.startswith("_") or m in ("urbangames_deluxe_pack", "urbangames_preorder_pack")
 
 
-def package_mod(m, v, level=None):
+# The HOST's zip cache: <data>\mod_zip_cache\<sha256 of id_version>.zip plus a
+# .sig sidecar naming the deflate level and the folder's signature (file count,
+# bytes, newest mtime). A mod is zipped once per change of its folder, not once
+# per joiner per session: the 556-mod round re-deflated 93 GB every time
+# (2026-09-20), and the zip -- not the wire -- is what paces a LAN round.
+# TPF2MP_MOD_CACHE_MB caps it (oldest-used zips go first); 0 turns it off.
+MOD_ZIP_CACHE_MB = 24 * 1024
+
+
+def mod_zip_cache_mb():
+    try:
+        return max(0, int(os.environ.get("TPF2MP_MOD_CACHE_MB", MOD_ZIP_CACHE_MB)))
+    except ValueError:
+        return MOD_ZIP_CACHE_MB
+
+
+def mod_zip_cache_dir():
+    return os.path.join(data_dir(), "mod_zip_cache")
+
+
+def folder_signature(folder):
+    """'files:bytes:newest mtime_ns' over the files zip_mod would read."""
+    files = total = newest = 0
+    for root, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fn in names:
+            p = os.path.join(root, fn)
+            if os.path.islink(p):
+                continue
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            files += 1
+            total += st.st_size
+            newest = max(newest, st.st_mtime_ns)
+    return f"{files}:{total}:{newest}"
+
+
+def prune_zip_cache(cdir, cap_bytes, keep=None):
+    """Drop the least recently used zips until the cache fits ``cap_bytes``."""
+    entries = []
+    try:
+        for fn in os.listdir(cdir):
+            if fn.endswith(".zip"):
+                p = os.path.join(cdir, fn)
+                try:
+                    st = os.stat(p)
+                    entries.append((st.st_mtime_ns, st.st_size, p))
+                except OSError:
+                    pass
+    except OSError:
+        return
+    total = sum(size for _, size, _ in entries)
+    for _, size, p in sorted(entries):
+        if total <= cap_bytes:
+            break
+        if p == keep:
+            continue
+        for victim in (p, p + ".sig"):
+            try:
+                os.remove(victim)
+            except OSError:
+                pass
+        total -= size
+
+
+def package_mod(m, v, level=None, log=None):
+    """The mod as one zip (bytes), from the zip cache when its folder has not
+    changed since it was last packaged at this level; None if it is DLC or
+    not installed here."""
     if is_dlc(m) or not valid_mod(m,v):
         return None
     folder=find_mod(m,v)
-    return zip_mod(folder, level=level) if folder else None
+    if not folder:
+        return None
+    cap = mod_zip_cache_mb() << 20
+    if not cap:
+        return zip_mod(folder, log=log, level=level)
+    sig = f"{level}|{folder_signature(folder)}"
+    cdir = mod_zip_cache_dir()
+    path = os.path.join(cdir, cache_name(m, v))
+    try:
+        with open(path + ".sig", encoding="utf-8") as f:
+            cached = f.read().strip() == sig
+        if cached:
+            with open(path, "rb") as f:
+                data = f.read()
+            os.utime(path)                       # most recently used
+            if log:
+                log(f"[mods] {mod_folder_name(m, v)} from the zip cache ({len(data)} B)")
+            return data
+    except OSError:
+        pass
+    data = zip_mod(folder, log=log, level=level)
+    try:
+        os.makedirs(cdir, exist_ok=True)
+        with open(path + ".tmp", "wb") as f:
+            f.write(data)
+        os.replace(path + ".tmp", path)
+        with open(path + ".sig.tmp", "w", encoding="utf-8") as f:
+            f.write(sig)
+        os.replace(path + ".sig.tmp", path + ".sig")
+        prune_zip_cache(cdir, cap, keep=path)
+    except OSError as e:
+        if log:
+            log(f"[mods] zip cache write for {mod_folder_name(m, v)} failed: {e}")
+    return data
 
 
 def valid_mod(m, v):
@@ -179,25 +282,82 @@ def installed_mod(m, v):
     return find_mod(m, v) if (m, str(v)) in entries else None
 
 
-def request_catalogue():
-    """Atomically publish all consented Workshop installs and a fresh receipt token."""
+def on_disk_mod(m, v):
+    """The JOINER's on-disk lookup: the folder a required mod already lives in
+    on this machine, whether or not the game has catalogued it (find_mod). A
+    mod that is here but not catalogued is REGISTERED, never downloaded: the
+    registry names its folder and the game's next catalogue refresh lists it.
+    Separate from installed_mod (catalogued) and find_mod (the host's lookup)
+    so a test can give the ends different answers."""
+    return find_mod(m, v)
+
+
+def registry_path():
+    return os.path.join(data_dir(), "mods_registry.txt")
+
+
+def read_registry():
+    """(token, {workshop id: folder}) the registry names now; ('', {}) if none."""
+    try:
+        with open(registry_path(), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return "", {}
+    token = lines[0] if lines and len(lines[0]) == 32 and all(c in "0123456789abcdef" for c in lines[0]) else ""
+    rows = {}
+    for line in lines[1:]:
+        if "\t" in line:
+            item, path = line.split("\t", 1)
+            if item.isdigit() and path:
+                rows[item] = path
+    return token, rows
+
+
+def write_registry(token=None, extra=None):
+    """Atomically publish the Workshop registry: every consented install under
+    the managed workshop folder, every row already published whose folder
+    still holds a mod, and ``extra`` [(workshop id, folder)] -- the folders a
+    save needs that are on this machine but not in the game's catalogue.
+
+    ``token`` None KEEPS the token the file carries (minting one if it has
+    none): a publish after each batch of a round, or at lobby start, must not
+    change the token a pending receipt is waiting for. request_catalogue
+    mints a fresh token, which is what a receipt is matched against.
+
+    Until 2026-09-20 the registry was written once, after a round's LAST
+    batch, so a round that never finished (359 batches; the joiner left or
+    the host failed it) published nothing: at the next game start none of
+    the folders it had installed were registered, the catalogue lacked them,
+    and every one was requested, zipped and sent again -- to be found
+    "present" on arrival."""
     root = data_dir()
     os.makedirs(root, exist_ok=True)
-    token = uuid.uuid4().hex
-    lines = [token]
+    old_token, rows = read_registry()
+    rows = {item: path for item, path in rows.items() if os.path.isfile(os.path.join(path, "mod.lua"))}
     if os.path.isdir(managed_workshop()):
         for item in sorted(os.listdir(managed_workshop())):
             path = os.path.abspath(os.path.join(managed_workshop(), item))
             if item.isdigit() and os.path.isfile(os.path.join(path, "mod.lua")):
-                lines.append(item + "\t" + path)
+                rows[item] = path
+    for item, path in (extra or []):
+        if isinstance(item, str) and item.isdigit() and path and os.path.isfile(os.path.join(path, "mod.lua")):
+            rows[item] = os.path.abspath(path)
+    token = token or old_token or uuid.uuid4().hex
     # No cap on the number of rows: the reader (native/src/workshop_register.cpp)
     # registers every row, and refusing here would leave every consented mod
     # unregistered on this peer alone.
-    target = os.path.join(root, "mods_registry.txt")
+    lines = [token] + [item + "\t" + rows[item] for item in sorted(rows)]
+    target = registry_path()
     with open(target + ".tmp", "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
     os.replace(target + ".tmp", target)
     return token
+
+
+def request_catalogue(extra=None):
+    """Publish the registry under a FRESH token and return it: the game's next
+    catalogue refresh writes a receipt carrying that token (see catalogue())."""
+    return write_registry(uuid.uuid4().hex, extra)
 
 
 def library_root():
@@ -607,6 +767,50 @@ def selftest():
             assert st == "present", st
         finally:
             install_target = real
+    # the zip cache: packaged once, then read back until the folder changes; the
+    # registry keeps its rows and token across publishes and adds extra rows
+    with tempfile.TemporaryDirectory() as td:
+        global data_dir, find_mod
+        real_dd, real_fm = data_dir, find_mod
+        src = os.path.join(td, "mod_c_2")
+        os.makedirs(src)
+        open(os.path.join(src, "mod.lua"), "w").write("function data() return {} end")
+        data_dir = lambda: os.path.join(td, "data")
+        find_mod = lambda m, v: src if m == "mod_c" else None
+        try:
+            calls = []
+            first = package_mod("mod_c", 2, level=3, log=calls.append)
+            again = package_mod("mod_c", 2, level=3, log=calls.append)
+            assert first == again and any("from the zip cache" in s for s in calls), calls
+            assert not any("from the zip cache" in s for s in calls[:1]), calls
+            assert package_mod("mod_c", 2, level=1, log=calls.append) is not None   # another level: repackaged
+            assert sum("from the zip cache" in s for s in calls) == 1, calls
+            os.utime(os.path.join(src, "mod.lua"), (2_000_000_000, 2_000_000_000))    # the folder changed
+            package_mod("mod_c", 2, level=1, log=calls.append)
+            assert sum("from the zip cache" in s for s in calls) == 1, "a changed folder is repackaged"
+            assert package_mod("mod_c", 2, level=1, log=calls.append) and sum("from the zip cache" in s for s in calls) == 2
+            os.environ["TPF2MP_MOD_CACHE_MB"] = "0"
+            try:
+                package_mod("mod_c", 2, level=1, log=calls.append)
+                assert sum("from the zip cache" in s for s in calls) == 2, "cache off"
+            finally:
+                del os.environ["TPF2MP_MOD_CACHE_MB"]
+            prune_zip_cache(mod_zip_cache_dir(), 0)
+            assert not [f for f in os.listdir(mod_zip_cache_dir()) if f.endswith(".zip")], "pruned"
+            # registry
+            ws = os.path.join(td, "ws", "555")
+            os.makedirs(ws)
+            open(os.path.join(ws, "mod.lua"), "w").write("x")
+            t1 = request_catalogue([("555", ws)])
+            assert read_registry() == (t1, {"555": os.path.abspath(ws)}), read_registry()
+            assert write_registry() == t1 and read_registry()[1] == {"555": os.path.abspath(ws)}, "kept"
+            t2 = request_catalogue()
+            assert t2 != t1 and read_registry() == (t2, {"555": os.path.abspath(ws)}), "rows survive a fresh token"
+            os.remove(os.path.join(ws, "mod.lua"))
+            write_registry()
+            assert read_registry()[1] == {}, "a row whose folder lost its mod.lua is dropped"
+        finally:
+            data_dir, find_mod = real_dd, real_fm
     print("modshare selftest: all checks passed")
 
 
