@@ -1861,12 +1861,14 @@ class _ClientSaveReceiver:
         for -- the world load's own refresh reads the registry, and the plugin
         registers each row in place of the game's own entry for that id).
 
-        Why also the catalogued ones: a subscription to a Workshop item Steam
-        has since removed still lists the id, with an EMPTY install folder. The
-        catalogue names it, the lobby calls it present, and at world load the
-        loader asserts !modDir.empty() running its mod.lua: two players, two
-        removed items (a Boeing 777 pack, Car Parks), every join, 2026-09-20.
-        With the row in place the game runs our copy of the folder instead."""
+        Why also the catalogued ones: the game's own entry for a Workshop id can
+        lack a folder (an item Steam lists but has not installed), and the
+        loader runs a listed mod's mod.lua at world load from whatever entry it
+        holds. A row names the folder this lobby verified on disk, and the
+        plugin registers it in place of the game's entry. Background: a joiner
+        whose world load died running the Boeing 777 Pack's mod file, with Car
+        Parks on the same stack, while the host loaded the same save
+        (2026-09-20); the error text of that run is still to be seen."""
         rows = _workshop_rows(mods, modshare.on_disk_mod)
         if not rows:
             return

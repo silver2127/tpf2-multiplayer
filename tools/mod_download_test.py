@@ -115,8 +115,8 @@ class Downloads(unittest.TestCase):
             self.assertFalse(any(m.get('t') in ('mods_request','fdone') for m in self.conn.sent))
     def test_catalogued_workshop_mods_still_get_a_registry_row(self):
         """A Workshop mod the game lists AND that is on disk gets its folder into the
-        registry without a refresh: the game's own entry may be a subscription to a
-        removed item with no folder, which the loader asserts on at world load."""
+        registry without a refresh: the game's own entry for the id may lack a
+        folder, and the plugin puts ours in its place at the next refresh."""
         folder=self.root/'steam_ws'/'9876543210';folder.mkdir(parents=True);(folder/'mod.lua').write_text('x')
         with patch.object(modshare,'installed_mod',return_value=str(folder)), patch.object(modshare,'on_disk_mod',return_value=str(folder)):
             (self.root/'mods_registry.txt').write_text('b'*32+'\n')
