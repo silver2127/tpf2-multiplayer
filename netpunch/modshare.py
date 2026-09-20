@@ -22,8 +22,11 @@ immediately by the game settings pairs (``u32 n``, then ``u32 len "climate"``
 Nothing in that layout bounds the count, a name's length or a version, so
 nothing here does either: the parser takes whatever the game wrote.
 
-Mod ids: a folder ``<id>_<version>`` under the game's ``mods`` or the profile's
-``local/mods``; a Steam Workshop item is ``*<workshopid>`` and lives under
+Mod ids: a folder ``<id>_<version>`` under the game's ``mods``; ``!<id>`` is the
+same folder under the profile's ``local/mods`` (Steam userdata: the game writes
+the ``!`` for mods from there, and its catalogue lists them with it -- measured
+on ``!tpf2_multiplayer_link``, 2026-09-20); ``_<id>`` is a DLC under ``dlcs``;
+a Steam Workshop item is ``*<workshopid>`` and lives under
 ``steamapps/workshop/content/1066780/<workshopid>`` or our managed workshop
 folder after a multiplayer download. An id is any name the game accepts as a
 mod folder (spaces and non-ASCII included); only what no folder can carry --
@@ -412,6 +415,15 @@ def find_mod(mod_id, version):
         g=game_dir()
         p=g and os.path.join(g,"dlcs",mod_folder_name(mod_id[1:],version))
         return p if p and os.path.isfile(os.path.join(p,"mod.lua")) else None
+    if mod_id.startswith("!"):
+        # the profile's local/mods: the save and the catalogue carry the '!', the
+        # folder does not. Until 2026-09-20 this looked for '!<id>_<ver>' under the
+        # game's mods and found nothing on either end: the joiner asked for a mod its
+        # catalogue already listed, the host could not supply it, and the join was
+        # rejected (the Workshop-registered multiplayer link mod, every session).
+        u = userdata_mods_dir()
+        p = u and os.path.join(u, mod_folder_name(mod_id[1:], version))
+        return p if p and os.path.isfile(os.path.join(p, "mod.lua")) else None
     name = mod_folder_name(mod_id, version)
     for base in (game_dir() and os.path.join(game_dir(), "mods"), userdata_mods_dir()):
         if base:
@@ -432,6 +444,9 @@ def install_target(mod_id, version):
     content folder for a workshop item."""
     if mod_id.startswith("*"):
         return os.path.join(managed_workshop(), mod_id[1:])
+    if mod_id.startswith("!"):
+        u = userdata_mods_dir()                  # where the game will list it as '!<id>' again
+        return u and os.path.join(u, mod_folder_name(mod_id[1:], version))
     name = mod_folder_name(mod_id, version)
     g = game_dir()
     if g and os.access(os.path.join(g, "mods"), os.W_OK):
@@ -811,6 +826,24 @@ def selftest():
             assert read_registry()[1] == {}, "a row whose folder lost its mod.lua is dropped"
         finally:
             data_dir, find_mod = real_dd, real_fm
+    # '!<id>': the profile's local/mods, without the '!' on the folder
+    with tempfile.TemporaryDirectory() as td:
+        global userdata_mods_dir
+        real_ud = userdata_mods_dir
+        userdata_mods_dir = lambda: os.path.join(td, "local", "mods")
+        try:
+            os.makedirs(os.path.join(td, "local", "mods", "link_1"))
+            open(os.path.join(td, "local", "mods", "link_1", "mod.lua"), "w").write("x")
+            assert find_mod("!link", 1) == os.path.join(td, "local", "mods", "link_1"), find_mod("!link", 1)
+            assert find_mod("!link", 2) is None and find_mod("!other", 1) is None
+            assert install_target("!other", 3) == os.path.join(td, "local", "mods", "other_3")
+            z = io.BytesIO()
+            with zipfile.ZipFile(z, "w") as zz:
+                zz.writestr("mod.lua", "x")
+            st, p = install_mod_zip(z.getvalue(), "!other", 3)
+            assert st == "installed" and p == install_target("!other", 3) and find_mod("!other", 3) == p, (st, p)
+        finally:
+            userdata_mods_dir = real_ud
     print("modshare selftest: all checks passed")
 
 
