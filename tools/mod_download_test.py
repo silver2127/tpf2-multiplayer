@@ -154,6 +154,14 @@ class Downloads(unittest.TestCase):
             self.assertTrue(self.r.catalogue_token,'the receipt is still awaited')
             self.receipt('*9876543210_1');self.r.tick(time.time()+2)
             self.assertIsNone(self.r.catalogue_token);self.assertTrue(self.r.mods_satisfied and self.r.complete)
+    def test_a_batch_of_several_mods_unpacks_them_all(self):
+        """Every zip of a batch lands (they unpack on MODS_UNPACK_THREADS threads)."""
+        ids=['*9876543210','*9876543211','*9876543212','*9876543213','*9876543214']
+        self.r.on_manifest([[i,1] for i in ids]);self.r.answer_mods(True)
+        push(self.r,10,'mods',[(modshare.mod_zip_name(i,1),archive()) for i in ids],batch=[1,1])
+        for i in ids: self.assertTrue((self.root/'workshop'/i[1:]/'mod.lua').exists(),i)
+        self.assertEqual(sorted(self.r.install_result['installed']),sorted(i+'_1' for i in ids))
+        self.assertTrue(self.r.catalogue_token)
     def test_receipt_missing_required_mod_disconnects(self):
         self.accept_and_install();(self.root/'mods_catalogue.txt').write_text(self.r.catalogue_token+'\n')
         self.r.tick(time.time());self.assertTrue(self.r.cancelled)

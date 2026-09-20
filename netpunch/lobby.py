@@ -203,6 +203,13 @@ DROP_AFTER = 10.0       # host drops a peer unheard-from for this long
 MODS_BATCH_BYTES = 768 * 1024 * 1024
 MODS_PACK_THREADS = 3                      # batches zipped at once; zlib releases the GIL (3 threads: 21.7 s -> 11.3 s for three 1 GB mods)
 MODS_ZIP_LEVEL = 3                         # deflate level for a mods round (modshare.zip_mod)
+# A joiner unpacks a batch's zips on this many threads. Measured 2026-09-20 on the
+# two-instance rig, 555 mods / 93 GB in 140 batches: each batch crossed loopback
+# in 0.7-1.0 s and then took 7-9 s (23 s for the 65 small mods of batch 1) to
+# unpack on one thread -- ~110 MB/s -- while the host's packers ran 300 mods
+# ahead. The round was paced by the joiner's unzip alone. zlib and file writes
+# release the GIL, and every mod is its own zip, so they unpack side by side.
+MODS_UNPACK_THREADS = 4
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
 HOST_GONE_AFTER = 12.0  # joiner declares the host dead after this much silence
@@ -1728,6 +1735,7 @@ class _ClientSaveReceiver:
         self.finalizing = False    # a worker thread is verifying/writing the completed transfer
         self.finalize_progress = 0 # bytes that worker has hashed, written or unpacked so far (read by the loop)
         self._worker = None
+        self._progress_lock = threading.Lock()   # _advance is called from the unpack threads too
         self._results = queue.Queue()
         self.deferred_begin = None # sid of an fbegin held back while finalizing (logged once)
         self.manifest_unknown = False
@@ -2296,9 +2304,10 @@ class _ClientSaveReceiver:
 
     def _advance(self, count):
         """WORKER THREAD: another ``count`` bytes hashed, written or unpacked.
-        The loop reads the total into every fack while verifying (an int
-        assignment is atomic; nothing else writes it while the worker runs)."""
-        self.finalize_progress += count
+        The loop reads the total into every fack while verifying; the unpack
+        threads of a batch all add to it, hence the lock."""
+        with self._progress_lock:
+            self.finalize_progress += count
 
     def _sha256(self, data):
         """A SHA-256 hex digest computed in FINALIZE_SLICE windows so the
@@ -2459,6 +2468,7 @@ class _ClientSaveReceiver:
         host sends one zip set to everyone who lacked something, so the rest
         are left alone. Returns what happened; _mods_installed tells the player."""
         done, kept, bad, skipped = [], [], [], []
+        jobs = []
         for name, part in parts.items():
             idv = modshare.parse_mod_zip_name(name)
             if not idv:
@@ -2469,9 +2479,13 @@ class _ClientSaveReceiver:
                     skipped.append(label)
                 self.log(f"[client] mod {label}: not agreed to here -- not installed")
                 continue
+            if self.server_cache and modshare.is_dlc(idv[0]):
+                bad.append(label); continue
+            jobs.append((idv, label, part))
+
+        def one(job):
+            idv, label, part = job
             if self.server_cache:
-                if modshare.is_dlc(idv[0]):
-                    bad.append(label); continue
                 try:
                     os.makedirs(self.server_cache,exist_ok=True)
                     path=os.path.join(self.server_cache,modshare.cache_name(*idv))
@@ -2480,12 +2494,21 @@ class _ClientSaveReceiver:
                     st="installed"
                 except OSError as e:
                     self.log(f"[relay] cannot cache {label}: {e}")
-                    bad.append(label)
-                    continue
+                    return label, "failed", None
             else:
                 st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log, progress=self._advance)
-            (done if st == "installed" else kept if st == "present" else bad).append(label)
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
+            return label, st, path
+
+        # Every mod is its own zip: unpack them side by side. The pool's threads carry
+        # this worker's name ("<player>/save-finalize") so a lookup that reads the
+        # thread name to tell players apart (the self-tests) still can.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max(1, MODS_UNPACK_THREADS),
+                                thread_name_prefix=threading.current_thread().name) as pool:
+            results = list(pool.map(one, jobs))
+        for label, st, _ in results:
+            (done if st == "installed" else kept if st == "present" else bad).append(label)
         return {"done": done, "kept": kept, "bad": bad, "skipped": skipped, "approved": sorted(approved)}
 
     def _mods_installed(self, r):
@@ -4291,6 +4314,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     else:
                         plan = [list(job["wanted"])]
                     job["plan"] = plan
+                    size_of = dict(zip(job["wanted"], sizes))
+                    job["sizes"] = [size_of.get(mv, 0) for group in plan for mv in group]   # plan order, for the status
                     log(f"[host] mod round for {job['names']}: {len(job['wanted'])} mod(s), {job['bytes'] / (1024.0 ** 3):.2f} GB on disk, "
                         f"{len(plan)} batch(es), {MODS_PACK_THREADS} packer(s) at deflate level {MODS_ZIP_LEVEL}")
 
@@ -4412,9 +4437,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 elif now - job["told"] >= 2.0:
                     job["told"] = now
                     n = len(job["plan"]) if job["plan"] else 0
+                    # bytes, not a mod count: the batches go smallest first, so "233/555"
+                    # packaged beside "7/140 sent" read as a stall when it was not
+                    gb = job["bytes"] / (1024.0 ** 3)
+                    packed_gb = sum(job["sizes"][i] for i in range(min(job["done"], len(job["sizes"])))) / (1024.0 ** 3) if job.get("sizes") else 0.0
                     for x in live:
                         _send_data(sock, x, {"t": "status", "state": "connected",
-                                             "detail": f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}"
+                                             "detail": (f"the host is packaging the mods you need\u2026 {packed_gb:.1f} of {gb:.1f} GB"
+                                                        if gb else f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}")
                                                        + (f", batch {job['taken']}/{n} sent" if n else "")})
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
