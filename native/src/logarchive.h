@@ -278,6 +278,11 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
 
     // 1. the data folder: bridge, slice, proxy, plugin host, company logs
     each(data, L"*.log", L"", L"data", previousSession);
+    // ... and the Workshop registry + the game's catalogue receipt (which mods
+    // the lobby registered and which the game listed: a joiner that crashes at
+    // the mod-file step of a world load is explained by their difference)
+    each(data, L"mods_registry.txt", L"", L"data", false);
+    each(data, L"mods_catalogue.txt", L"", L"data", false);
     // 2. the game folder: the menu and the lobby
     if (gameDir && gameDir[0]) {
         wchar_t net[MAX_PATH];
@@ -314,6 +319,12 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
         wchar_t so[MAX_PATH];
         _snwprintf_s(so, _TRUNCATE, L"%sstdout.txt", best);
         place(so, L"game_stdout.txt", L"game log (stdout.txt, includes the Lua script)", false);
+        // The game renames the previous run's log to stdout_old.txt at launch. After
+        // a crash the player restarts and presses OPEN LOGS, so THAT file holds the
+        // run that died (the Lua error, the last resource it touched); the <id>_stdout_old
+        // beside a dump is not always written (2026-09-20: four archives, none had it).
+        _snwprintf_s(so, _TRUNCATE, L"%sstdout_old.txt", best);
+        place(so, L"game_stdout_previous.txt", L"game log of the run before this one (stdout_old.txt: after a crash, the run that died)", false);
 
         // newest dumps since the last archive, each with the log the game kept beside it
         struct Dump { wchar_t name[80]; FILETIME t; ULONGLONG size; } dumps[64];
@@ -364,6 +375,25 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
                 _snwprintf_s(shown, _TRUNCATE, L"game log of that crash (%s)", base);
                 place(src, dest, shown, false);
             }
+        }
+    }
+    // 4. a "now" copy after a crash: the newest previous-run archive holds the
+    // game log of the run that died (the proxy moved it there at the restart)
+    if (!previousSession) {
+        wchar_t pat[MAX_PATH], newest[MAX_PATH] = L"";
+        _snwprintf_s(pat, _TRUNCATE, L"%s*-previous", out->root);
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(fd.cFileName, newest) > 0) wcscpy_s(newest, fd.cFileName);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        if (newest[0]) {
+            wchar_t src[MAX_PATH];
+            _snwprintf_s(src, _TRUNCATE, L"%s%s\game_stdout.txt", out->root, newest);
+            place(src, L"previous_run_game_stdout.txt", L"game log of the previous run (from the newest -previous archive)", false);
         }
     }
     if (about) fclose(about);
