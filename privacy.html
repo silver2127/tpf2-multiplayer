@@ -27,7 +27,8 @@
 <div class="page-head">
   <div class="container">
     <h1>Privacy policy</h1>
-    <p>TpF2 Multiplayer has no advertising, analytics or update checks, but it does use the network in ways you might not
+    <p>TpF2 Multiplayer has no advertising, analytics, update checks or automatic bug reports (the desync-report upload and
+    the session count of earlier versions were removed in 0.6.1.11), but it does use the network in ways you might not
     expect: opening the Multiplayer page fetches the public games list from the project's server, a host checks the
     project's connection helper throughout a session, and every player's diagnostic logs are sent to the session's host
     automatically. This page lists everything the software sends, to whom, and what is kept.</p>
@@ -41,21 +42,20 @@
       <li><a href="#responsible">Who is responsible</a></li>
       <li><a href="#playing">Playing with others</a></li>
       <li><a href="#connecting">Connection services</a></li>
-      <li><a href="#relays">Dedicated relays</a></li>
-      <li><a href="#reports">Desync reports</a></li>
+      <li><a href="#relays">Dedicated servers</a></li>
       <li><a href="#local">What stays on your PC</a></li>
       <li><a href="#choices">Your choices</a></li>
     </ol>
   </nav>
 
   <article>
-    <p><small>Last updated 12 September 2026. Every change to this page is in the
+    <p><small>Last updated 20 September 2026. Every change to this page is in the
     <a href="https://github.com/silver2127/tpf2-multiplayer/commits/gh-pages">site's commit history</a>.</small></p>
 
     <h2 id="responsible">Who is responsible</h2>
     <p>TpF2 Multiplayer is an open-source project run by an individual maintainer
     (<a href="https://github.com/silver2127">silver2127</a> on GitHub). The project runs one server, which hosts the public
-    games list, the connection helper, a dedicated relay and the desync report receiver. For questions or requests about
+    games list, the connection helper and a dedicated game server. For questions or requests about
     your data, open an issue on <a href="https://github.com/silver2127/tpf2-multiplayer/issues">GitHub</a>.</p>
 
     <h2 id="playing">Playing with others</h2>
@@ -117,44 +117,28 @@
     <p>Every web request to the project server is made over HTTPS. Like any web server, it can record the IP address of
     requests in its access logs.</p>
 
-    <h2 id="relays">Dedicated relays</h2>
-    <p>If you join a dedicated relay from the public games list, all of the session's data passes through that relay:
-    player names, chat, game commands, logs and the world save. The relay's operator holds the session key and can read
-    this data. On the project's own relay:</p>
+    <h2 id="relays">Dedicated servers</h2>
+    <p>If you join a dedicated server from the public games list, all of the session's data passes through that server:
+    player names, chat, game commands, logs and the world save. The server's operator holds the session key and can read
+    this data. On the project's own server:</p>
     <ul>
-      <li>the session's leader uploads the world save again every few minutes during the session, and the most recent
-      one is stored until the leader starts a new world (<code>/new</code>) or a newer save replaces it;</li>
+      <li>the world save is autosaved there during the session and kept until a newer save replaces it;</li>
       <li>which instance letter and company each player name had is stored, so returning players keep them;</li>
-      <li>the session log, including the logs forwarded by players, is kept until the relay restarts.</li>
+      <li>the session log, including the logs forwarded by players, is kept until the server restarts;</li>
+      <li>no statistics about players are kept (versions before 0.6.1.11 counted joins and time played on the relay; that
+      code is gone).</li>
     </ul>
-
-    <h2 id="reports">Desync reports</h2>
-    <p>When the game notices that the players' worlds no longer match, it can send a report so the bug can be fixed.
-    <strong>By default it asks first</strong>, offering <em>Always send</em>, <em>Only this once</em> and <em>Never</em>. Change
-    the choice at any time by typing <code>/desynclogs ask</code>, <code>/desynclogs always</code> or
-    <code>/desynclogs never</code> in the in-game chat. At most one report is sent per session.</p>
-    <p><strong>What a report contains:</strong> the multiplayer logs and runtime files from
-    <code>%LOCALAPPDATA%\tpf2mp\data</code>, the game's log (<code>stdout.txt</code>), the game's settings file (including your
-    list of enabled mods), a few multiplayer configuration files from the game folder, and the multiplayer version, your
-    Windows version and details of the desync.</p>
-    <p><strong>Removed before sending:</strong> your Windows user name, computer name and profile folder name, your Steam
-    account ID, all IP addresses, and join codes.</p>
-    <p><strong>Not removed:</strong> player names, lobby names, chat messages and game content. In versions up to 0.4.18, a
-    company password typed in the in-game Multiplayer window can also be included in plain text, so do not reuse a password
-    there that you use anywhere else.</p>
-    <p><strong>What the server keeps:</strong> the report archive and its details, without your IP address. Your IP address is
-    held in memory for up to an hour for rate limiting. Reports are kept for investigating bugs, and the oldest are deleted
-    automatically once they take up more than 2 GB. To have a report deleted, open an issue on GitHub with the time it was
-    sent.</p>
 
     <h2 id="local">What stays on your PC</h2>
     <p>The multiplayer logs, crash-log archives and settings in <code>%LOCALAPPDATA%\tpf2mp</code>, the lobby's logs in the
     game's <code>netpunch</code> folder, and your saved player and lobby names stay on your computer. Nothing reads them except
-    the features above, and you can delete them at any time.</p>
+    the features above, and you can delete them at any time. When the players' worlds stop matching, nothing is sent to the
+    project: the logs stay in <code>%LOCALAPPDATA%\tpf2mp\logs</code> and you attach them yourself if you report the bug.
+    (Versions before 0.6.1.11 could upload a scrubbed report to the project's server; that feature and its receiver were
+    removed.)</p>
 
     <h2 id="choices">Your choices</h2>
     <ul>
-      <li>Type <code>/desynclogs never</code> to never send desync reports.</li>
       <li>Set a lobby password so your join code does not reveal your IP address.</li>
       <li>Leave <strong>PUBLIC</strong> unticked to keep your game off the public list.</li>
       <li>Play with people you trust: players in a session see each other's IP addresses, chat and logs.</li>
