@@ -1852,7 +1852,29 @@ class _ClientSaveReceiver:
                 on_disk.append((m, v, folder))
             else:
                 need.append(modshare.mod_folder_name(m, v))
+        self._publish_rows(mods)
         return need, on_disk
+
+    def _publish_rows(self, mods):
+        """A registry row for EVERY Workshop mod of the save whose folder is on
+        this machine, catalogued or not (the token is kept; no refresh is asked
+        for -- the world load's own refresh reads the registry, and the plugin
+        registers each row in place of the game's own entry for that id).
+
+        Why also the catalogued ones: a subscription to a Workshop item Steam
+        has since removed still lists the id, with an EMPTY install folder. The
+        catalogue names it, the lobby calls it present, and at world load the
+        loader asserts !modDir.empty() running its mod.lua: two players, two
+        removed items (a Boeing 777 pack, Car Parks), every join, 2026-09-20.
+        With the row in place the game runs our copy of the folder instead."""
+        rows = _workshop_rows(mods, modshare.on_disk_mod)
+        if not rows:
+            return
+        try:
+            modshare.write_registry(None, rows)
+            self.log(f"[client] registry: {len(rows)} Workshop folder(s) of this save published for the game's next refresh")
+        except (OSError, ValueError) as e:
+            self.log(f"[client] could not publish the Workshop rows: {e}")
 
     def _register(self, on_disk):
         """Publish the registry naming these folders and ask the game to refresh
@@ -2039,6 +2061,7 @@ class _ClientSaveReceiver:
                             present = True
                 if not present:
                     self.need.append(modshare.mod_folder_name(m, v))
+            self._publish_rows(self.required)
             if on_disk and not (self.catalogue_token and self.round_receipt) and not self._register(on_disk):
                 return
             if msg.get("mods_unknown"):
@@ -3862,6 +3885,15 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return
         mods = modshare.save_mod_list(save_path, log)        # None = could not read it (NOT "none")
         advertised[:]=[save_path,mods]
+        if mods and not relay_only:
+            # the host loads this save too: its own removed-item subscriptions need the rows as much
+            rows = _workshop_rows(mods, modshare.find_mod)
+            if rows:
+                try:
+                    modshare.write_registry(None, rows)
+                    log(f"[host] registry: {len(rows)} Workshop folder(s) of this save published for the game's next refresh")
+                except (OSError, ValueError) as e:
+                    log(f"[host] could not publish the Workshop rows: {e}")
         for a,_ in targets: preflight_requests.pop(a,None)
         if mods is None:
             mod_list_note(save_path, "START GAME")
@@ -6844,6 +6876,17 @@ def _mods_progress_text(job, in_flight, now):
                 + (f", batch {job['taken']}/{n} sent" if n else ""))
     return (f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}"
             + (f", batch {job['taken']}/{n} sent" if n else ""))
+
+
+def _workshop_rows(mods, lookup):
+    """[(workshop id, folder)] for the '*' mods of ``mods`` that ``lookup`` finds on disk."""
+    rows = []
+    for m, v in mods:
+        if isinstance(m, str) and m.startswith("*") and modshare.valid_mod(m, v):
+            folder = lookup(m, v)
+            if folder:
+                rows.append((m[1:], folder))
+    return rows
 
 
 def _publish_registry_at_start(log):

@@ -48,7 +48,15 @@ prototype-2. The first attempt exposed a missing trailing path separator:
 the loader concatenates `mod.lua` directly onto the registered directory. Paths
 now retain or receive a trailing separator, covered by regression tests.
 
-This is still an opt-in, single-item prototype. Automatic file transfer is not
+Since 2026-09-20 every row is registered in REPLACE mode: the Steam backend's own
+entry for that id is dropped and ours takes its place. A subscription to an item
+Steam has since removed still lists the id with an empty install folder; the
+catalogue named it, the lobby saw it present, and the loader asserted
+`!modDir.empty()` running its mod.lua at world load (two players, two removed
+items, every join). The lobby publishes a row for every Workshop mod of the
+shared save it finds on disk, catalogued or not, on both ends.
+
+This was an opt-in, single-item prototype. Automatic file transfer is not
 enabled or validated by this test. Subsequent work must connect catalogue
 readiness to the lobby, verify transferred content, and handle dependencies and
 multiple items. Offline tests cover shadow construction, duplicate precedence,

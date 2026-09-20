@@ -40,7 +40,14 @@ static bool Hook(void* rep, const Result* source) {
                 auto folder=std::filesystem::u8path(line.substr(tab+1));
                 std::error_code ec;
                 if (!folder.is_absolute() || !std::filesystem::is_regular_file(folder/L"mod.lua",ec)) continue;
-                shadows.push_back(std::make_unique<Shadow>(*input,steam,id,folder.wstring()));
+                // REPLACE the Steam backend's own entry for this id, never sit beside it.
+                // A subscription to an item Steam has since removed still lists the
+                // id, with no install folder; the catalogue then names the mod, the
+                // lobby sees it "present", and at world load the loader asserts
+                // !modDir.empty() running its mod.lua -- two players, two removed
+                // items, every join (2026-09-20). Without replace mode a registry row
+                // for that id was dropped as a duplicate and the empty entry won.
+                shadows.push_back(std::make_unique<Shadow>(*input,steam,id,folder.wstring(),true));
                 input=&shadows.back()->result;
             }
         }

@@ -113,6 +113,18 @@ class Downloads(unittest.TestCase):
             self.assertTrue(self.r.mods_satisfied);self.assertIsNone(self.r.catalogue_token);self.assertFalse(self.r.complete)
             self.assertTrue(any(e['type']=='mods_ready' for e in self.io.events))
             self.assertFalse(any(m.get('t') in ('mods_request','fdone') for m in self.conn.sent))
+    def test_catalogued_workshop_mods_still_get_a_registry_row(self):
+        """A Workshop mod the game lists AND that is on disk gets its folder into the
+        registry without a refresh: the game's own entry may be a subscription to a
+        removed item with no folder, which the loader asserts on at world load."""
+        folder=self.root/'steam_ws'/'9876543210';folder.mkdir(parents=True);(folder/'mod.lua').write_text('x')
+        with patch.object(modshare,'installed_mod',return_value=str(folder)), patch.object(modshare,'on_disk_mod',return_value=str(folder)):
+            (self.root/'mods_registry.txt').write_text('b'*32+'\n')
+            self.offer()
+            self.assertFalse(self.r.ask);self.assertEqual(self.r.need,[]);self.assertIsNone(self.r.catalogue_token)
+            self.assertTrue(self.r.mods_satisfied)
+            token,rows=modshare.read_registry()
+            self.assertEqual(token,'b'*32,'no new token: nothing to wait for');self.assertEqual(rows,{'9876543210':str(folder)})
     def test_registration_the_game_does_not_recognise_disconnects(self):
         with self.on_disk():
             self.offer();self.receipt();self.r.tick(time.time())
