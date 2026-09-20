@@ -14,7 +14,9 @@ hook the game.
 ## Publishing (the game's own uploader, from the publisher's Steam account)
 
 1. Copy `tpf2_multiplayer_link_1` (mod.lua and image_00.tga) into the account's
-   local mods folder: `<Steam>\userdata\<account>\1066780\local\mods\`.
+   **staging area**: `<Steam>\userdata\<account>\1066780\local\staging_area\`.
+   The uploader lists only that folder (a copy under `local\mods` shows in the
+   mod list as `!tpf2_multiplayer_link` but cannot be published; 2026-09-20).
 2. Start the game. Open the Mod Browser from the title menu, find the mod under the
    local mods and press **Publish** (the game calls it "Mod publishing"; the
    button says Publish, then Start upload). Accept the Workshop terms once.
@@ -24,7 +26,7 @@ hook the game.
    plain and reads fine as it is).
 4. Note the item id from its URL and put it in this README.
 
-Updating the text later: edit `mod.lua`, copy it over the staged folder again and
-publish again from the same account; the game updates the existing item.
+Updating the text later: edit `mod.lua`, copy it over the staging-area folder again
+and publish again from the same account; the game updates the existing item.
 
 Item id: not yet published.
