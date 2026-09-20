@@ -1725,6 +1725,19 @@ static bool DecodeLine(uint64_t line, LineDecode* out)
 // Manual terminal picks (the combo box 0x7b43b0), alternative terminals, stop
 // settings and stop removal never ran the assignment, carry no tag, and
 // replay verbatim as before.
+//
+// WHAT THE ASSIGNMENT IS (live + decompiled, 2026-09-20, see
+// tools/ghidra/targets/ghidra_targets_lineterminal_notes.txt): section paths
+// between consecutive stops over every platform, then the shortest closed
+// loop; a loop found gives each stop the loop's platform, none gives platform
+// 0. There is no side-of-track preference: on plain double track the loop is
+// shortest with platform 0 in both directions, and vanilla picks 0 there too.
+// So "changed: none" in the replay log is the normal outcome on such track;
+// the pass only moves a platform where signals, one-way track or geometry
+// force it -- and there the stamp-time run on the FULL list is what the click
+// could not do while the previous stop was still on its way. The engine keeps
+// its own Line+0x1c (VehicleInfo) on every update (0x9d9fd0 restores it), so
+// nothing about the modes can or need be shipped.
 static const uintptr_t RVA_LINE_ASSIGN         = 0x60a5a0;
 static const uintptr_t OFF_GAMEUI_STATE_PROVIDER = 0x450;
 static const uintptr_t OFF_GAMESTATE_ENGINE    = 0x28;

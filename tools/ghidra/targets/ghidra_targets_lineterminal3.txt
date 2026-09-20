@@ -1,0 +1,17 @@
+# Targets for DecompileTargets.java. RVAs; image base is 0x140000000.
+#
+# Third pass (2026-09-20): the platform assignment returns terminal 0 for
+# every stop even when run at the stamp with the whole list, and the line's
+# VehicleInfo is zero on vanilla's own create. What does the path search
+# behind line_util::GetBestLineAssignment search WITH, what does the station
+# flag it is given (0x603fa0: !(station_util flags & 0x10)) mean, does the
+# sim-side UpdateLine handler fill VehicleInfo, and what are the LineSystem's
+# "terminal decision indices"?
+
+215f150  line_util_MultiGetBestLineAssignment
+2155ca0  line_util_LineData_2155ca0
+215bc30  line_util_CreateDefaultWorkItems
+218d480  station_util_flags_218d480
+264c10   engine_264c10
+9d9fd0   cmd_UpdateLine_sim_handler
+a42cb0   ecs_ComputeTerminalDecisionIndices

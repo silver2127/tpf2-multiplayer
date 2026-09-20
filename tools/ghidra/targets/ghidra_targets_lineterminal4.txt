@@ -1,0 +1,10 @@
+# Targets for DecompileTargets.java. RVAs; image base is 0x140000000.
+#
+# Fourth pass (2026-09-20): MultiGetBestLineAssignment falls back to the
+# default assignment when CalcShortestLoop finds no loop through the section
+# paths. Why is there no loop for a fresh line whose stations are connected?
+# What carrier/mode do the section paths search with, and what is the fallback?
+
+215b6b0  line_util_CalcShortestLoop
+215ed80  line_util_MultiCalcSectionPaths
+2159a10  line_util_default_assignment_2159a10
