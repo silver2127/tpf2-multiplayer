@@ -2179,7 +2179,9 @@ class _ClientSaveReceiver:
         if pct // 10 > self.last_pct // 10:
             self.last_pct = pct
             self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
-            self._send({"t": "stage", "text": f"receiving save {pct}%"})
+            what = (f"mod batch {self.batch[0]}/{self.batch[1]}" if self.batch
+                    else "mods" if self.kind == "mods" else "save")
+            self._send({"t": "stage", "text": f"receiving {what} {pct}%"})
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
@@ -4316,6 +4318,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     job["plan"] = plan
                     size_of = dict(zip(job["wanted"], sizes))
                     job["sizes"] = [size_of.get(mv, 0) for group in plan for mv in group]   # plan order, for the status
+                    job["batch_bytes"] = [sum(size_of.get(mv, 0) for mv in group) for group in plan]
                     log(f"[host] mod round for {job['names']}: {len(job['wanted'])} mod(s), {job['bytes'] / (1024.0 ** 3):.2f} GB on disk, "
                         f"{len(plan)} batch(es), {MODS_PACK_THREADS} packer(s) at deflate level {MODS_ZIP_LEVEL}")
 
@@ -4437,15 +4440,12 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 elif now - job["told"] >= 2.0:
                     job["told"] = now
                     n = len(job["plan"]) if job["plan"] else 0
-                    # bytes, not a mod count: the batches go smallest first, so "233/555"
-                    # packaged beside "7/140 sent" read as a stall when it was not
-                    gb = job["bytes"] / (1024.0 ** 3)
-                    packed_gb = sum(job["sizes"][i] for i in range(min(job["done"], len(job["sizes"])))) / (1024.0 ** 3) if job.get("sizes") else 0.0
+                    in_flight = transfer[0] is not None and transfer[0].kind == "mods"
+                    detail = _mods_progress_text(job, in_flight, now)
                     for x in live:
-                        _send_data(sock, x, {"t": "status", "state": "connected",
-                                             "detail": (f"the host is packaging the mods you need\u2026 {packed_gb:.1f} of {gb:.1f} GB"
-                                                        if gb else f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}")
-                                                       + (f", batch {job['taken']}/{n} sent" if n else "")})
+                        _send_data(sock, x, {"t": "status", "state": "connected", "detail": detail})
+                    # the host waits too: its panel shows the same pace and time left
+                    io.emit({"type": "status", "state": "connected", "detail": f"{job['names']}: {detail}"})
             # Pump the save transfer (if any). Once every peer has resolved:
             #   all done (dropped peers don't block) -> start with save=true;
             #   any FAILED -> failed status naming them, NO start, and the
@@ -6771,6 +6771,45 @@ def selftest_mesh():
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def _time_left_text(seconds):
+    """'under a minute', '7 min', '1 h 12 min' -- for a status line."""
+    if seconds is None:
+        return "?"
+    m = int(seconds // 60 + (1 if seconds % 60 >= 30 else 0))
+    if m < 1:
+        return "under a minute"
+    if m < 60:
+        return f"{m} min"
+    return f"{m // 60} h {m % 60} min"
+
+
+def _mods_progress_text(job, in_flight, now):
+    """The status line both panels show during a mods round: what the joiner
+    has (bytes of files landed), the pace since the round began, and what is
+    left at that pace. Before the first batch lands it is the packaging line
+    (bytes, not a mod count: batches go smallest first, so the count runs far
+    ahead of the batches and read as a stall). ``in_flight`` is True while a
+    batch is still crossing, so it is not counted as delivered."""
+    gb = job["bytes"] / (1024.0 ** 3)
+    n = len(job["plan"]) if job.get("plan") else 0
+    batch_bytes = job.get("batch_bytes") or []
+    landed = max(0, job["taken"] - (1 if in_flight else 0))
+    delivered = sum(batch_bytes[:landed])
+    if n and delivered:
+        elapsed = max(1e-3, now - job["started"])
+        rate = delivered / elapsed
+        left = (job["bytes"] - delivered) / rate if rate > 0 else None
+        return (f"sharing mods: {delivered / (1024.0 ** 3):.1f} of {gb:.1f} GB landed, "
+                f"{rate / (1024.0 ** 2):.0f} MB/s, {_time_left_text(left)} left (batch {landed}/{n})")
+    sizes = job.get("sizes") or []
+    packed_gb = sum(sizes[:min(job["done"], len(sizes))]) / (1024.0 ** 3)
+    if gb:
+        return (f"the host is packaging the mods you need\u2026 {packed_gb:.1f} of {gb:.1f} GB"
+                + (f", batch {job['taken']}/{n} sent" if n else ""))
+    return (f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}"
+            + (f", batch {job['taken']}/{n} sent" if n else ""))
+
+
 def _publish_registry_at_start(log):
     """Rewrite the Workshop registry from what is on disk now, keeping its
     token, so the NEXT game start registers every consented download even if

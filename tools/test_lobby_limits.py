@@ -281,6 +281,41 @@ class ModList(unittest.TestCase):
             self.assertEqual(len(lines), 301)
 
 
+class ModsProgress(unittest.TestCase):
+    """The status line of a mods round: packaging (bytes) before anything landed,
+    then landed bytes, MB/s since the round began and the time left at that pace;
+    a batch still crossing is not counted."""
+
+    def job(self, taken, done=10, started=0.0):
+        gb = 1024 ** 3
+        plan = [[("a", 1), ("b", 1)], [("c", 1)], [("d", 1)], [("e", 1)]]
+        return {"bytes": 8 * gb, "plan": plan, "wanted": [m for g in plan for m in g], "done": done,
+                "taken": taken, "started": started, "sizes": [gb, gb, 2 * gb, 2 * gb, 2 * gb],
+                "batch_bytes": [2 * gb, 2 * gb, 2 * gb, 2 * gb], "names": "bob"}
+
+    def test_time_left_text(self):
+        self.assertEqual(lobby._time_left_text(None), "?")
+        self.assertEqual(lobby._time_left_text(20), "under a minute")
+        self.assertEqual(lobby._time_left_text(7 * 60 + 10), "7 min")
+        self.assertEqual(lobby._time_left_text(72 * 60 + 40), "1 h 13 min")
+
+    def test_packaging_then_pace_and_time_left(self):
+        j = self.job(taken=0, done=2)
+        self.assertEqual(lobby._mods_progress_text(j, False, 10.0),
+                         "the host is packaging the mods you need\u2026 2.0 of 8.0 GB, batch 0/4 sent")
+        # one batch handed to the sender and still crossing: nothing landed yet
+        j = self.job(taken=1, done=3)
+        self.assertTrue(lobby._mods_progress_text(j, True, 10.0).startswith("the host is packaging"))
+        # two batches landed (2 GB each) in 40 s: 102 MB/s -> 4 GB left at that pace = 40 s, rounded up to a minute
+        j = self.job(taken=2, done=5)
+        text = lobby._mods_progress_text(j, False, 40.0)
+        self.assertEqual(text, "sharing mods: 4.0 of 8.0 GB landed, 102 MB/s, 1 min left (batch 2/4)")
+        # a third batch in flight does not count; a longer wall clock lowers the pace
+        j = self.job(taken=3, done=5)
+        text = lobby._mods_progress_text(j, True, 400.0)
+        self.assertIn("4.0 of 8.0 GB landed, 10 MB/s, 7 min left (batch 2/4)", text)
+
+
 class MidTransfer(unittest.TestCase):
     """A joiner that has every chunk and is verifying/writing is neither
     dropped by the host's keepalive nor timed out by the transfer."""
