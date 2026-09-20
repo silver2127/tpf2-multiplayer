@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Website: [silver2127.github.io/tpf2-multiplayer](https://silver2127.github.io/tpf2-multiplayer/)** ·
-[Download](https://github.com/silver2127/tpf2-multiplayer/releases/latest) ·
+[Download the installer](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) ·
 [Privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html)
 
 **Multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Several players build in one
@@ -28,7 +28,7 @@ compares them continuously. The lobby handles NAT traversal, encryption and send
 
 ## Install
 
-**Download `TpF2Multiplayer.msi` from the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases),
+**Download [`TpF2Multiplayer.msi`](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) (the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases/latest); Linux and Steam Deck: `install_proton.sh` from the same page),
 close the game, and run it.** Everyone in a session needs the same version. A new version is installed the same
 way, over the old one: there is no in-game updater.
 

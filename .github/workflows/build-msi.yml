@@ -69,7 +69,39 @@ jobs:
             ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
             Set-Content SHA256SUMS.txt -Encoding ascii
           Get-Content SHA256SUMS.txt
-          Copy-Item ..\..\tools\proton\install.py install_proton.py
+          # the Proton installers, pinned to this release when the run is a tag
+          $ver = if ('${{ github.ref }}' -like 'refs/tags/v*') { '${{ github.ref_name }}'.Substring(1) } else { '' }
+          $utf8 = New-Object Text.UTF8Encoding $false
+          $py = [IO.File]::ReadAllText((Resolve-Path ..\..\tools\proton\install.py))
+          if ($ver) { $py = $py -replace 'DEFAULT_VERSION = None', "DEFAULT_VERSION = `"$ver`"" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) install_proton.py), $py, $utf8)
+          $sh = [IO.File]::ReadAllText((Resolve-Path ..\..\tools\proton\install_proton.sh))
+          if ($ver) { $sh = $sh -replace 'DEFAULT_VERSION=""', "DEFAULT_VERSION=`"$ver`"" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) install_proton.sh), $sh.Replace("`r`n", "`n"), $utf8)
+
+      - name: Release notes (the Download table first, then installer/RELEASE-<version>.md)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $ver = $tag.Substring(1)
+          $base = 'https://github.com/${{ github.repository }}/releases/download/' + $tag
+          $body = @"
+          ## Download
+
+          | You play on | Get this one file |
+          | --- | --- |
+          | **Windows** (Steam, game build 35924) | **[TpF2Multiplayer.msi]($base/TpF2Multiplayer.msi)** -- close the game, run it, done |
+          | **Linux / Steam Deck** (the Windows game under Proton) | [install_proton.sh]($base/install_proton.sh) -- run it with sh; it fetches the rest itself ([install_proton.py]($base/install_proton.py) does the same with Python) |
+          | Manual install, any platform | [TpF2Multiplayer-files.zip]($base/TpF2Multiplayer-files.zip), checked against [SHA256SUMS.txt]($base/SHA256SUMS.txt) |
+
+          The two *Source code* archives at the bottom are the repository, not the mod. Everyone in a session needs the same version.
+
+          "@
+          $notes = "installer/RELEASE-$ver.md"
+          if (Test-Path $notes) { $body += "`n" + [IO.File]::ReadAllText((Resolve-Path $notes)) } else { Write-Host "no $notes -- the generated notes follow the table" }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) 'installer/out/release_body.md'), $body.Replace("`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+          Get-Content installer/out/release_body.md
 
       - uses: actions/upload-artifact@v4
         with:
@@ -78,6 +110,7 @@ jobs:
             installer/out/TpF2Multiplayer.msi
             installer/out/TpF2Multiplayer-files.zip
             installer/out/install_proton.py
+            installer/out/install_proton.sh
             installer/out/SHA256SUMS.txt
           if-no-files-found: error
 
@@ -89,6 +122,8 @@ jobs:
             installer/out/TpF2Multiplayer.msi
             installer/out/TpF2Multiplayer-files.zip
             installer/out/install_proton.py
+            installer/out/install_proton.sh
             installer/out/SHA256SUMS.txt
+          body_path: installer/out/release_body.md
           draft: true
           generate_release_notes: true
