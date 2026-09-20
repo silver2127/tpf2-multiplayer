@@ -1418,8 +1418,15 @@ class _HostSaveTransfer:
             p["tcp"] = False
             self.log(f"[host] {p['name']}: the TCP stream broke after {p.get('tcp_sent', 0)} B -- UDP takes over")
 
+    def _stage_word(self):
+        """'mods k/n' or 'mods' -- the roster's 120 px stage column."""
+        b = (self.begin_msg or {}).get("batch")
+        if isinstance(b, list) and len(b) == 2:
+            return f"mods {b[0]}/{b[1]}"
+        return "mods"
+
     def _what(self):
-        """'save', 'mods', or 'mod batch k/n' -- for stages and the log."""
+        """'save', 'mods', or 'mod batch k/n' -- for the log."""
         b = (self.begin_msg or {}).get("batch")
         if self.kind == "mods" and isinstance(b, list) and len(b) == 2:
             return f"mod batch {b[0]}/{b[1]}"
@@ -1442,7 +1449,8 @@ class _HostSaveTransfer:
                 self.io.emit({"type": "transfer", "role": "send",
                               "peer": p["name"], "pct": pct})
             if self.stage_cb:
-                self.stage_cb(p["name"], f"receiving {self._what()} {pct}%", pct)
+                self.stage_cb(p["name"], (f"{self._stage_word()} {pct}%" if self.kind == "mods"
+                                          else f"receiving save {pct}%"), pct)
 
     # -- outbound chunk ---------------------------------------------------- #
     def _send_chunk(self, addr, seq):
@@ -1561,7 +1569,7 @@ class _HostSaveTransfer:
                 self.log(f"[host] {p['name']} verified {self._what()} transfer")
                 if self.stage_cb:
                     self.stage_cb(p["name"], "save received, loading" if self.kind != "mods"
-                                  else f"{self._what()} installed", None)
+                                  else f"{self._stage_word()} done", None)
         elif msg.get("final"):
             if p["state"] == "active":
                 p["state"] = "failed"
@@ -2249,9 +2257,12 @@ class _ClientSaveReceiver:
             self.last_pct = pct
             if self.kind != "mods":
                 self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
-            what = (f"mod batch {self.batch[0]}/{self.batch[1]}" if self.batch
-                    else "mods" if self.kind == "mods" else "save")
-            self._send({"t": "stage", "text": f"receiving {what} {pct}%"})
+            # the roster's stage column is 120 px wide: "mods 32/140 90%", not a sentence
+            if self.kind == "mods":
+                what = f"mods {self.batch[0]}/{self.batch[1]}" if self.batch else "mods"
+                self._send({"t": "stage", "text": f"{what} {pct}%"})
+            else:
+                self._send({"t": "stage", "text": f"receiving save {pct}%"})
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
@@ -6854,12 +6865,12 @@ def selftest_mesh():
 # CLI
 # --------------------------------------------------------------------------- #
 def _time_left_text(seconds):
-    """'under a minute', '7 min', '1 h 12 min' -- for a status line."""
+    """'<1 min', '7 min', '1 h 12 min' -- for a status line."""
     if seconds is None:
         return "?"
     m = int(seconds // 60 + (1 if seconds % 60 >= 30 else 0))
     if m < 1:
-        return "under a minute"
+        return "<1 min"
     if m < 60:
         return f"{m} min"
     return f"{m // 60} h {m % 60} min"
@@ -6890,14 +6901,16 @@ def _mods_progress_text(job, in_flight, now):
         else:
             rate = delivered / max(1e-3, now - job["started"])
         left = (job["bytes"] - delivered) / rate if rate > 0 else None
-        return (f"sharing mods: {delivered / (1024.0 ** 3):.1f} of {gb:.1f} GB landed, "
-                f"{rate / (1024.0 ** 2):.0f} MB/s, {_time_left_text(left)} left (batch {landed}/{n})")
+        # short: the panel draws this beside the buttons at the bottom, ~50 characters
+        # wide on the joiner and less on the host, where the joiner's name leads
+        return (f"Mods {delivered / (1024.0 ** 3):.1f}/{gb:.1f} GB, "
+                f"{rate / (1024.0 ** 2):.0f} MB/s, {_time_left_text(left)} left, batch {landed}/{n}")
     sizes = job.get("sizes") or []
     packed_gb = sum(sizes[:min(job["done"], len(sizes))]) / (1024.0 ** 3)
     if gb:
-        return (f"the host is packaging the mods you need\u2026 {packed_gb:.1f} of {gb:.1f} GB"
+        return (f"Packaging mods {packed_gb:.1f}/{gb:.1f} GB"
                 + (f", batch {job['taken']}/{n} sent" if n else ""))
-    return (f"the host is packaging the mods you need\u2026 {job['done']}/{len(job['wanted'])}"
+    return (f"Packaging mods {job['done']}/{len(job['wanted'])}"
             + (f", batch {job['taken']}/{n} sent" if n else ""))
 
 

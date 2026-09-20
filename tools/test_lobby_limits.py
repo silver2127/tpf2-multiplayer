@@ -325,32 +325,32 @@ class ModsProgress(unittest.TestCase):
 
     def test_time_left_text(self):
         self.assertEqual(lobby._time_left_text(None), "?")
-        self.assertEqual(lobby._time_left_text(20), "under a minute")
+        self.assertEqual(lobby._time_left_text(20), "<1 min")
         self.assertEqual(lobby._time_left_text(7 * 60 + 10), "7 min")
         self.assertEqual(lobby._time_left_text(72 * 60 + 40), "1 h 13 min")
 
     def test_packaging_then_pace_and_time_left(self):
         j = self.job(taken=0, done=2)
         self.assertEqual(lobby._mods_progress_text(j, False, 10.0),
-                         "the host is packaging the mods you need\u2026 2.0 of 8.0 GB, batch 0/4 sent")
+                         "Packaging mods 2.0/8.0 GB, batch 0/4 sent")
         # one batch handed to the sender and still crossing: nothing landed yet
         j = self.job(taken=1, done=3)
-        self.assertTrue(lobby._mods_progress_text(j, True, 10.0).startswith("the host is packaging"))
+        self.assertTrue(lobby._mods_progress_text(j, True, 10.0).startswith("Packaging mods"))
         # two batches landed (2 GB each) in 40 s: 102 MB/s -> 4 GB left at that pace = 40 s, rounded up to a minute
         j = self.job(taken=2, done=5)
         text = lobby._mods_progress_text(j, False, 40.0)
-        self.assertEqual(text, "sharing mods: 4.0 of 8.0 GB landed, 102 MB/s, 1 min left (batch 2/4)")
+        self.assertEqual(text, "Mods 4.0/8.0 GB, 102 MB/s, 1 min left, batch 2/4")
         # a third batch in flight does not count; a longer wall clock lowers the pace
         j = self.job(taken=3, done=5)
         text = lobby._mods_progress_text(j, True, 400.0)
-        self.assertIn("4.0 of 8.0 GB landed, 10 MB/s, 7 min left (batch 2/4)", text)
+        self.assertIn("4.0/8.0 GB, 10 MB/s, 7 min left, batch 2/4", text)
         # with landing times the pace is over the recent batches, not the whole round:
         # a 60 s lead-in, then two 2 GB batches 10 s apart -> 205 MB/s, 20 s left
         j = self.job(taken=2, done=5)
         j["landed"] = [(70.0, 2 * 1024 ** 3), (80.0, 2 * 1024 ** 3)]
         j["started"] = 60.0
         text = lobby._mods_progress_text(j, False, 80.0)
-        self.assertEqual(text, "sharing mods: 4.0 of 8.0 GB landed, 205 MB/s, under a minute left (batch 2/4)")
+        self.assertEqual(text, "Mods 4.0/8.0 GB, 205 MB/s, <1 min left, batch 2/4")
         # more landings than the window: only the last MODS_RATE_WINDOW count, timed
         # from the landing before them
         j = self.job(taken=4, done=5)

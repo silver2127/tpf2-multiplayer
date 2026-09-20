@@ -1412,7 +1412,10 @@ static void RenderPanelLayer(int w, int h)
             mwButton(dx+dw-S(20)-bwN,dy+S(175),bwN,S(32),L"CANCEL",17);
         }
         wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), wst, fst, mp[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fst);
+        // The status sits between LEAVE and the right-hand buttons: a line longer than
+        // that space ends in an ellipsis rather than a hard cut (the mods-round line
+        // with a joiner's name in front ran to the edge, 2026-09-20).
+        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), wst, fst, mp[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS); DeleteObject(fst);
     } else {
         // ---------------- HOST / JOIN ----------------
         mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
