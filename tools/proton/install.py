@@ -785,7 +785,7 @@ def main(argv=None):
             say(f"Replaced files were kept in {backup}")
         verify(game, steam, prefix)
         say("Next: in Steam, Properties > Compatibility > force a Proton version (Proton 9 or newer), and start the game. "
-            "To update, run this script again; do not use the in-game DOWNLOAD UPDATE button under Proton.")
+            "To update, run this script again with the new release.")
         return 0
 
 

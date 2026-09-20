@@ -77,8 +77,8 @@ relocates it, applies each entry twice, and the lobby crashes the moment a game
 is hosted. Joining does not touch UPnP and was never affected. The analysis is in
 [NAT_CRASH.md](NAT_CRASH.md).
 
-The installer repairs the installed `netpunch.exe` (and any copy the in-game
-updater cached in the prefix): the second copy of each entry becomes padding, the
+The installer repairs the installed `netpunch.exe` (and any copy an older release's
+in-game updater left cached in the prefix): the second copy of each entry becomes padding, the
 PE checksum is recalculated, and every other byte of every other bundle member
 is verified unchanged. The repair is pinned to the exact DLL every release has
 shipped; a different DLL is reported, not patched. Since the build that carries
@@ -89,10 +89,9 @@ finds nothing to do). `--repair-lobby FILE` applies it to a file by hand.
 ## Updating
 
 Run the script again (a newer copy from the new release, or `--version X.Y.Z`).
-Do not use the in-game **DOWNLOAD UPDATE** button under Proton: it stores an
-update in the prefix that would take precedence over the installed files, and
-for releases before the repaired lobby it brings the crash back. The installer
-repairs such cached copies when it finds them.
+Releases before 0.6.1.11 had an in-game **DOWNLOAD UPDATE** button; a copy it cached
+in the prefix takes precedence over the installed files, and the installer repairs
+such copies when it finds them.
 
 ## Limits
 

@@ -7007,9 +7007,6 @@ def _publish_registry_at_start(log):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if "--update" in argv:
-        import updater
-        return updater.main(argv, LOBBY_VERSION)
     ap = argparse.ArgumentParser(description="netpunch N-player lobby")
     ap.add_argument("mode", nargs="?", choices=["host", "join"],
                     help="host a lobby or join one with a CODE")

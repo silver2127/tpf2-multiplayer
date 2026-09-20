@@ -174,17 +174,17 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 
 Version numbers (2026-09-16): `0.x` is a major feature, `0.x.y` a minor feature, `0.x.y.z` a bugfix or
 the like. The lobby gate is an exact string match, so every release -- a bugfix included -- needs every
-player and the relay on it. The updater orders versions part by part (`0.5.7 < 0.5.7.1 < 0.5.8 < 0.6`); it
-accepts two to four parts from 0.5.7 on (exactly three before), so a two- or four-part release can only
-follow a release that carries that updater. Windows Installer wants at least three parts (`build_msi.ps1`
+player and the relay on it. Windows Installer wants at least three parts (`build_msi.ps1`
 pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compares versions;
-`AllowSameVersionUpgrades` in `Package.wxs` is what lets `0.5.7.1` install over `0.5.7`.
+`AllowSameVersionUpgrades` in `Package.wxs` is what lets `0.5.7.1` install over `0.5.7`. Players update by
+installing the new MSI (or running the Proton installer again): there is no in-game updater since 0.6.1.11
+(removed 2026-09-20 -- mod-hosting sites do not allow a mod that downloads and installs its own updates).
 
 1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
    game list).
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
 3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
-   `TpF2Multiplayer.msi`, `TpF2Multiplayer-update.zip` (the in-game updater's payload),
+   `TpF2Multiplayer.msi`,
    `TpF2Multiplayer-files.zip` (the MSI's files as an archive: Proton and manual installs), a
    `SHA256SUMS.txt` listing them, `tools/proton/install.py` uploaded as `install_proton.py` with its
    `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release page

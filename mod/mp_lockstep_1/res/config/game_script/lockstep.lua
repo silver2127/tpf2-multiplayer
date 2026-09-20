@@ -1,9 +1,3 @@
-if os.getenv("TPF2MP_RELEASE_ROOT") then
-    require("mp/update_bootstrap").setup()
-    local path = os.getenv("TPF2MP_RELEASE_ROOT") .. "/mod/res/scripts/mp/entry.lua"
-    assert(loadfile(path, "t", _ENV))()
-    return
-end
 -- MP Lockstep -- the game-script half of TpF2 Multiplayer (docs/ARCHITECTURE.md).
 --
 -- Replicates COMMANDS, not state. Every command carries the game time at which
@@ -1446,13 +1440,9 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
-				-- Match the native lobby's process-pinned release directory. Never fall
-				-- back to an older inbox while a release lobby is still starting.
+				-- The lobby's folder: the per-user one when a lobby has run there, else the
+				-- game folder's. Never fall back to an older inbox while a lobby is still starting.
 				function CM.netDir()
-					local okRelease, release = pcall(os.getenv, "TPF2MP_RELEASE_ROOT")
-					if okRelease and release and release ~= "" then
-						return release .. "/netpunch"
-					end
 					if CM.netDirCached then return CM.netDirCached end
 					local cands = {}
 					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
