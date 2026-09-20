@@ -210,6 +210,7 @@ MODS_ZIP_LEVEL = 3                         # deflate level for a mods round (mod
 # ahead. The round was paced by the joiner's unzip alone. zlib and file writes
 # release the GIL, and every mod is its own zip, so they unpack side by side.
 MODS_UNPACK_THREADS = 4
+MODS_RATE_WINDOW = 5                       # the status line's MB/s is over this many landed batches
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
 HOST_GONE_AFTER = 12.0  # joiner declares the host dead after this much silence
@@ -1415,6 +1416,13 @@ class _HostSaveTransfer:
             p["tcp"] = False
             self.log(f"[host] {p['name']}: the TCP stream broke after {p.get('tcp_sent', 0)} B -- UDP takes over")
 
+    def _what(self):
+        """'save', 'mods', or 'mod batch k/n' -- for stages and the log."""
+        b = (self.begin_msg or {}).get("batch")
+        if self.kind == "mods" and isinstance(b, list) and len(b) == 2:
+            return f"mod batch {b[0]}/{b[1]}"
+        return self.kind
+
     # -- progress ---------------------------------------------------------- #
     def _emit_pct(self, p):
         if self.total_bytes == 0:
@@ -1424,10 +1432,15 @@ class _HostSaveTransfer:
             pct = int(done * 100 // self.total_bytes)
         if pct // 10 > p["last_pct"] // 10:
             p["last_pct"] = pct
-            self.io.emit({"type": "transfer", "role": "send",
-                          "peer": p["name"], "pct": pct})
+            if self.kind != "mods":
+                # The menu prints every transfer event over its status line
+                # ("Sending save... N%", then "Save transfer complete."). A mods
+                # batch crosses in under a second and the round's own status
+                # line (landed GB, MB/s, time left) is the one to keep in view.
+                self.io.emit({"type": "transfer", "role": "send",
+                              "peer": p["name"], "pct": pct})
             if self.stage_cb:
-                self.stage_cb(p["name"], f"receiving save {pct}%", pct)
+                self.stage_cb(p["name"], f"receiving {self._what()} {pct}%", pct)
 
     # -- outbound chunk ---------------------------------------------------- #
     def _send_chunk(self, addr, seq):
@@ -1540,11 +1553,13 @@ class _HostSaveTransfer:
             if p["state"] == "active":
                 p["state"] = "done"
                 self.progress_at = time.time()
-                self.io.emit({"type": "transfer", "role": "send",
-                              "peer": p["name"], "state": "done"})
-                self.log(f"[host] {p['name']} verified save transfer")
+                if self.kind != "mods":
+                    self.io.emit({"type": "transfer", "role": "send",
+                                  "peer": p["name"], "state": "done"})
+                self.log(f"[host] {p['name']} verified {self._what()} transfer")
                 if self.stage_cb:
-                    self.stage_cb(p["name"], "save received, loading", None)
+                    self.stage_cb(p["name"], "save received, loading" if self.kind != "mods"
+                                  else f"{self._what()} installed", None)
         elif msg.get("final"):
             if p["state"] == "active":
                 p["state"] = "failed"
@@ -2081,7 +2096,8 @@ class _ClientSaveReceiver:
                 threading.Thread(target=self._tcp_pull, args=(self.conn.peer[0], tcp["port"], tcp["token"], sid),
                                  name="bulk-pull", daemon=True).start()
         self._send(ack)
-        self.io.emit({"type": "transfer", "role": "recv", "pct": 0})
+        if kind != "mods":
+            self.io.emit({"type": "transfer", "role": "recv", "pct": 0})   # a mods batch: the round's status line stays
         if self.total_chunks == 0:
             self._finalize()
 
@@ -2178,7 +2194,8 @@ class _ClientSaveReceiver:
             pct = int(self.recv_count * 100 // self.total_chunks)
         if pct // 10 > self.last_pct // 10:
             self.last_pct = pct
-            self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
+            if self.kind != "mods":
+                self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
             what = (f"mod batch {self.batch[0]}/{self.batch[1]}" if self.batch
                     else "mods" if self.kind == "mods" else "save")
             self._send({"t": "stage", "text": f"receiving {what} {pct}%"})
@@ -4456,6 +4473,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     if transfer[0].all_resolved() and transfer[0].kind == "mods":
                         # Only recipients with a successful catalogue receipt may start.
                         xfer, transfer[0] = transfer[0], None
+                        if pack_job[0] is not None and pack_job[0].get("batch_bytes") and xfer.done_count():
+                            j = pack_job[0]
+                            j.setdefault("landed", []).append((now, j["batch_bytes"][min(j["taken"], len(j["batch_bytes"])) - 1]))
                         got = set(mod_round[0] or set())
                         was_preflight,mod_preflight[0]=mod_preflight[0],False
                         mod_round[0] = None
@@ -6796,8 +6816,17 @@ def _mods_progress_text(job, in_flight, now):
     landed = max(0, job["taken"] - (1 if in_flight else 0))
     delivered = sum(batch_bytes[:landed])
     if n and delivered:
-        elapsed = max(1e-3, now - job["started"])
-        rate = delivered / elapsed
+        # the pace over the last few landed batches (their bytes over the time
+        # since the landing before them), not since the round began: the average
+        # carried the packaging lead-in and one slow batch for minutes ("13 MB/s"
+        # while batches were landing at 50+, 2026-09-20 02:16)
+        log_ = job.get("landed") or []
+        recent = log_[-MODS_RATE_WINDOW:]
+        if recent:
+            t0 = log_[-MODS_RATE_WINDOW - 1][0] if len(log_) > MODS_RATE_WINDOW else job["started"]
+            rate = sum(b for _, b in recent) / max(1e-3, recent[-1][0] - t0)
+        else:
+            rate = delivered / max(1e-3, now - job["started"])
         left = (job["bytes"] - delivered) / rate if rate > 0 else None
         return (f"sharing mods: {delivered / (1024.0 ** 3):.1f} of {gb:.1f} GB landed, "
                 f"{rate / (1024.0 ** 2):.0f} MB/s, {_time_left_text(left)} left (batch {landed}/{n})")

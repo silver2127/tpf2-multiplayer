@@ -314,6 +314,20 @@ class ModsProgress(unittest.TestCase):
         j = self.job(taken=3, done=5)
         text = lobby._mods_progress_text(j, True, 400.0)
         self.assertIn("4.0 of 8.0 GB landed, 10 MB/s, 7 min left (batch 2/4)", text)
+        # with landing times the pace is over the recent batches, not the whole round:
+        # a 60 s lead-in, then two 2 GB batches 10 s apart -> 205 MB/s, 20 s left
+        j = self.job(taken=2, done=5)
+        j["landed"] = [(70.0, 2 * 1024 ** 3), (80.0, 2 * 1024 ** 3)]
+        j["started"] = 60.0
+        text = lobby._mods_progress_text(j, False, 80.0)
+        self.assertEqual(text, "sharing mods: 4.0 of 8.0 GB landed, 205 MB/s, under a minute left (batch 2/4)")
+        # more landings than the window: only the last MODS_RATE_WINDOW count, timed
+        # from the landing before them
+        j = self.job(taken=4, done=5)
+        j["batch_bytes"] = [1024 ** 3] * 4
+        j["landed"] = [(t, 1024 ** 3) for t in (10.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0)]
+        text = lobby._mods_progress_text(j, False, 150.0)
+        self.assertIn("102 MB/s", text)      # 5 GB over 100 -> 150 s
 
 
 class MidTransfer(unittest.TestCase):
