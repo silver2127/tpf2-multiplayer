@@ -392,7 +392,7 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
         }
         if (newest[0]) {
             wchar_t src[MAX_PATH];
-            _snwprintf_s(src, _TRUNCATE, L"%s%s\game_stdout.txt", out->root, newest);
+            _snwprintf_s(src, _TRUNCATE, L"%s%s\\game_stdout.txt", out->root, newest);
             place(src, L"previous_run_game_stdout.txt", L"game log of the previous run (from the newest -previous archive)", false);
         }
     }
