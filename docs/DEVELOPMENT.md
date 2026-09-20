@@ -182,6 +182,12 @@ installing the new MSI (or running the Proton installer again): there is no in-g
 
 1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
    game list).
+   The lobby is frozen with a PyInstaller whose bootloader was compiled on the building machine
+   (`tools/pyinstaller_from_source.py`, run by `build_msi.ps1` and the workflow): the stock stub is the
+   same bytes in every PyInstaller download and antivirus engines keep signatures for it (two VirusTotal
+   engines called `netpunch.exe` "Trojan.Win64.Krypt" on 2026-09-20). A compiled stub clears the
+   signature matches; the behaviour heuristics some engines still raise on a self-extracting exe only go
+   away with code signing.
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
 3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
    `TpF2Multiplayer.msi`,

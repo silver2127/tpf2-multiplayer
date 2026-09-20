@@ -168,6 +168,10 @@ if ($SkipBuild) {
 } elseif ($SkipFreeze -and (Test-Path $netExe)) {
     Warn "-SkipFreeze: reusing $netExe (built $((Get-Item $netExe).LastWriteTime)); lobby.py changes since then are NOT in it"
 } else {
+    # the bootloader compiled here, not the stock stub (tools\pyinstaller_from_source.py; a no-op once done)
+    Say "PyInstaller bootloader: compiled from source"
+    & python (Join-Path $Repo "tools\pyinstaller_from_source.py")
+    if ($LASTEXITCODE -ne 0) { Fail "tools\pyinstaller_from_source.py failed (exit $LASTEXITCODE): the lobby would carry the stock PyInstaller stub" }
     Say "freezing netpunch\lobby.py with PyInstaller"
     Push-Location $Netpunch
     try {

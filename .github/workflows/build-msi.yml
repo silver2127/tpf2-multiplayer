@@ -40,7 +40,11 @@ jobs:
           cache-dependency-path: netpunch/requirements.txt
 
       - name: Python packages (lobby freeze)
-        run: pip install pyinstaller -r netpunch\requirements.txt
+        # PyInstaller with its bootloader compiled here, not the stock stub every
+        # antivirus signature knows (tools/pyinstaller_from_source.py)
+        run: |
+          python tools\pyinstaller_from_source.py
+          pip install -r netpunch\requirements.txt
 
       - uses: actions/setup-dotnet@v4
         with:
