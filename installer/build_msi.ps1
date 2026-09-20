@@ -150,6 +150,11 @@ if ($SkipBuild) {
     Say "running build.bat previews"
     $rc = Run-Bat $build "previews"
     if ($rc -ne 0) { Fail "build.bat previews failed (exit $rc)" }
+    # The workshop-registration plugin ships too; a fresh checkout (CI) has no
+    # leftover copy from a manual build.bat workshop.
+    Say "running build.bat workshop"
+    $rc = Run-Bat $build "workshop"
+    if ($rc -ne 0) { Fail "build.bat workshop failed (exit $rc)" }
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
