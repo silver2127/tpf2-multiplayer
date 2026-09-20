@@ -209,7 +209,9 @@ MODS_ZIP_LEVEL = 3                         # deflate level for a mods round (mod
 # unpack on one thread -- ~110 MB/s -- while the host's packers ran 300 mods
 # ahead. The round was paced by the joiner's unzip alone. zlib and file writes
 # release the GIL, and every mod is its own zip, so they unpack side by side.
-MODS_UNPACK_THREADS = 4
+MODS_UNPACK_THREADS = 8                    # file-by-file across every zip of the batch (modshare.install_mod_zips)
+TCP_CONNECT_TRIES = 3                      # a joiner's TCP connect for a transfer, before UDP takes over
+TCP_CONNECT_RETRY = 0.5                    # seconds between those attempts
 MODS_RATE_WINDOW = 5                       # the status line's MB/s is over this many landed batches
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
@@ -2103,12 +2105,22 @@ class _ClientSaveReceiver:
 
     # -- the TCP channel --------------------------------------------------- #
     def _tcp_pull(self, ip, port, token, sid):
-        """A thread: connect to the sender's listener and read the file."""
-        sock = bulk_tcp.bulk_connect(ip, port, "recv", sid, token, self.my_name)
-        if sock is None:
-            self.log(f"[client] no TCP stream from {ip}:{port} -- receiving over UDP")
-            return
-        self._tcp_read(sock, sid)
+        """A thread: connect to the sender's listener and read the file. A
+        connect that fails is tried again (TCP_CONNECT_TRIES): the UDP fallback
+        is 20x slower than the stream, and nothing has been read yet, so a fresh
+        stream from the start is consistent with what UDP delivers meanwhile
+        (chunks already in hand are dropped as duplicates)."""
+        for attempt in range(1, TCP_CONNECT_TRIES + 1):
+            if sid != self.sid:
+                return                       # a later transfer replaced this one
+            sock = bulk_tcp.bulk_connect(ip, port, "recv", sid, token, self.my_name)
+            if sock is not None:
+                self._tcp_read(sock, sid)
+                return
+            if attempt < TCP_CONNECT_TRIES:
+                self.log(f"[client] no TCP stream from {ip}:{port} (attempt {attempt}) -- trying again")
+                time.sleep(TCP_CONNECT_RETRY)
+        self.log(f"[client] no TCP stream from {ip}:{port} after {TCP_CONNECT_TRIES} attempts -- receiving over UDP")
 
     def _tcp_accepted(self, sock, addr, name):
         """ACCEPT THREAD HELPER (the relay): the leader connected to push its upload."""
@@ -2501,32 +2513,27 @@ class _ClientSaveReceiver:
             if self.server_cache and modshare.is_dlc(idv[0]):
                 bad.append(label); continue
             jobs.append((idv, label, part))
-
-        def one(job):
-            idv, label, part = job
-            if self.server_cache:
+        results = []
+        if self.server_cache:
+            for idv, label, part in jobs:
                 try:
                     os.makedirs(self.server_cache,exist_ok=True)
                     path=os.path.join(self.server_cache,modshare.cache_name(*idv))
                     with open(path+".tmp","wb") as f: f.write(part)
                     os.replace(path+".tmp",path)
-                    st="installed"
+                    results.append((label, "installed", path))
                 except OSError as e:
                     self.log(f"[relay] cannot cache {label}: {e}")
-                    return label, "failed", None
-            else:
-                st, path = modshare.install_mod_zip(bytes(part), idv[0], idv[1], self.log, progress=self._advance)
+                    results.append((label, "failed", None))
+        else:
+            # every file of every zip in the batch over one pool: a batch of many
+            # small mods and one mod of 1,300 files both keep every thread busy
+            # (one thread per zip left a 1,330-file mod alone for 8 s, 2026-09-20)
+            outcome = modshare.install_mod_zips([(bytes(part), idv[0], idv[1]) for idv, _, part in jobs],
+                                                self.log, progress=self._advance, threads=MODS_UNPACK_THREADS)
+            results = [(label,) + outcome.get(label, ("failed", None)) for _, label, _ in jobs]
+        for label, st, path in results:
             self.log(f"[client] mod {label}: {st}" + (f" -> {path}" if path else ""))
-            return label, st, path
-
-        # Every mod is its own zip: unpack them side by side. The pool's threads carry
-        # this worker's name ("<player>/save-finalize") so a lookup that reads the
-        # thread name to tell players apart (the self-tests) still can.
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max(1, MODS_UNPACK_THREADS),
-                                thread_name_prefix=threading.current_thread().name) as pool:
-            results = list(pool.map(one, jobs))
-        for label, st, _ in results:
             (done if st == "installed" else kept if st == "present" else bad).append(label)
         return {"done": done, "kept": kept, "bad": bad, "skipped": skipped, "approved": sorted(approved)}
 

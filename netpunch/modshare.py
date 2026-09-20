@@ -42,6 +42,7 @@ import sys
 import zipfile
 import hashlib
 import uuid
+import threading
 
 TF2_APPID = "1066780"
 MP_MOD_ID = "mp_lockstep"                 # ours: shipped by the installer, never sent
@@ -736,6 +737,115 @@ def install_mod_zip(data, mod_id, version, log=None, progress=None):
         return "failed", None
 
 
+def _zip_entries_safe(z, tmp):
+    """[(info, dest, is_dir)] for every entry of ``z`` under ``tmp``; ValueError
+    on a path that would leave it."""
+    base = os.path.realpath(tmp)
+    out = []
+    for info in z.infolist():
+        n = info.filename.replace("\\", "/")
+        if n.startswith("/") or ".." in n.split("/") or ":" in n:
+            raise ValueError(f"unsafe path in zip: {n!r}")
+        dest = os.path.realpath(os.path.join(tmp, n))
+        if not dest.startswith(base + os.sep) and dest != base:
+            raise ValueError(f"path escapes the target: {n!r}")
+        out.append((info, dest, n.endswith("/")))
+    return out
+
+
+def _extract_share(data, entries, progress):
+    """POOL THREAD: one share of a zip's entries, through its own ZipFile over
+    the same bytes (a ZipFile is not shared between threads)."""
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for info, dest, is_dir in entries:
+            if is_dir:
+                os.makedirs(dest, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(info) as src, open(dest, "wb") as dst:
+                while True:
+                    b = src.read(1 << 20)
+                    if not b:
+                        break
+                    dst.write(b)
+                    progress(len(b))
+
+
+def install_mod_zips(items, log=None, progress=None, threads=4):
+    """Unpack several received mods at once: ``items`` [(zip bytes, id, version)]
+    -> {folder name: (status, path)}, statuses as install_mod_zip gives them.
+
+    Every zip's entries are split into ``threads`` shares and all shares of
+    all zips run on one pool, so a batch of many small mods and a single mod
+    of 1,300 files both keep every thread busy (one thread per zip left the
+    big mod alone for 8 s while the others idled, 2026-09-20). A mod's folder
+    still appears only whole: extraction goes to <target>.mp_incoming and the
+    rename is the last step, as install_mod_zip does one at a time."""
+    log = log or (lambda s: None)
+    progress = progress or (lambda n: None)
+    from concurrent.futures import ThreadPoolExecutor
+    results, plans = {}, []
+    with ThreadPoolExecutor(max_workers=max(1, threads),
+                            thread_name_prefix=threading.current_thread().name) as pool:
+        for data, mod_id, version in items:
+            label = mod_folder_name(mod_id, version) if valid_mod(mod_id, version) else str(mod_id)
+            if not valid_mod(mod_id, version) or is_dlc(mod_id):
+                results[label] = ("failed", None)
+                continue
+            target = install_target(mod_id, version)
+            if not target:
+                log(f"[mods] no mods folder to install {mod_id} into")
+                results[label] = ("failed", None)
+                continue
+            if os.path.isdir(target):
+                results[label] = ("present", target) if os.path.isfile(os.path.join(target, "mod.lua")) else ("failed", None)
+                continue
+            tmp = target + ".mp_incoming"
+            try:
+                if os.path.isdir(tmp):
+                    shutil.rmtree(tmp, ignore_errors=True)
+                os.makedirs(tmp, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(data)) as z:
+                    entries = _zip_entries_safe(z, tmp)
+                    declared = sum(i.file_size for i in z.infolist())
+                try:
+                    free = shutil.disk_usage(os.path.dirname(os.path.abspath(tmp))).free
+                except OSError:
+                    free = None
+                if free is not None and declared > free:
+                    raise ValueError(f"mod unpacks to {declared} B but only {free} B are free")
+                log(f"[mods] unpacking {label}: {len(entries)} entries, {declared} B")
+            except (OSError, ValueError, zipfile.BadZipFile) as e:
+                log(f"[mods] install of {label} failed: {e}")
+                shutil.rmtree(tmp, ignore_errors=True)
+                results[label] = ("failed", None)
+                continue
+            k = max(1, min(threads, len(entries)))
+            shares = [entries[i::k] for i in range(k)]
+            futures = [pool.submit(_extract_share, data, share, progress) for share in shares if share]
+            plans.append((label, tmp, target, futures))
+        for label, tmp, target, futures in plans:
+            err = None
+            for f in futures:
+                try:
+                    f.result()
+                except (OSError, ValueError, zipfile.BadZipFile) as e:
+                    err = err or e
+            if err is None and not os.path.isfile(os.path.join(tmp, "mod.lua")):
+                err = ValueError("no mod.lua at the top of the zip")
+            if err is None:
+                try:
+                    os.rename(tmp, target)
+                    results[label] = ("installed", target)
+                    continue
+                except OSError as e:
+                    err = e
+            log(f"[mods] install of {label} failed: {err}")
+            shutil.rmtree(tmp, ignore_errors=True)
+            results[label] = ("failed", None)
+    return results
+
+
 def selftest():
     """Round-trip a fake mod through zip -> install into a temp game dir, and
     parse a synthetic save head."""
@@ -841,6 +951,42 @@ def selftest():
             assert read_registry()[1] == {}, "a row whose folder lost its mod.lua is dropped"
         finally:
             data_dir, find_mod = real_dd, real_fm
+    # install_mod_zips: many files of one mod across the pool, a second small mod,
+    # an unsafe one refused, a present one kept
+    with tempfile.TemporaryDirectory() as td:
+        real_it = install_target
+        install_target = lambda mid, ver: os.path.join(td, "dest", f"{mid}_{ver}")
+        try:
+            big = io.BytesIO()
+            with zipfile.ZipFile(big, "w") as z:
+                z.writestr("mod.lua", "x")
+                for i in range(300):
+                    z.writestr(f"res/models/m{i // 20}/f{i}.txt", str(i) * 100)
+            small = io.BytesIO()
+            with zipfile.ZipFile(small, "w") as z:
+                z.writestr("mod.lua", "y")
+            bad = io.BytesIO()
+            with zipfile.ZipFile(bad, "w") as z:
+                z.writestr("../evil.lua", "x")
+                z.writestr("mod.lua", "x")
+            os.makedirs(os.path.join(td, "dest", "have_1"))
+            open(os.path.join(td, "dest", "have_1", "mod.lua"), "w").write("z")
+            got = 0
+            def count(n):
+                nonlocal got
+                got += n
+            r = install_mod_zips([(big.getvalue(), "big", 1), (small.getvalue(), "small", 2),
+                                  (bad.getvalue(), "evil", 1), (small.getvalue(), "have", 1)],
+                                 progress=count, threads=4)
+            assert r["big_1"][0] == "installed" and r["small_2"][0] == "installed", r
+            assert r["evil_1"] == ("failed", None) and r["have_1"][0] == "present", r
+            assert not os.path.exists(os.path.join(td, "dest", "evil_1")) and not os.path.exists(os.path.join(td, "dest", "evil_1.mp_incoming"))
+            files = [f for _, _, fs in os.walk(os.path.join(td, "dest", "big_1")) for f in fs]
+            assert len(files) == 301, len(files)
+            expect = sum(len(str(i)) * 100 for i in range(300)) + 2   # big's files + two mod.lua bytes
+            assert got == expect, (got, expect)          # every byte counted once
+        finally:
+            install_target = real_it
     # tpf2mp_modtest.txt: ignore_steam_workshop hides the library, not the managed folder
     with tempfile.TemporaryDirectory() as td:
         global workshop_dirs                  # data_dir is already this function's global

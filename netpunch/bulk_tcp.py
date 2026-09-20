@@ -160,13 +160,19 @@ def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT)
         c.sendall(BULK_MAGIC + b" " + role.encode() + b" " + str(int(sid)).encode() + b" " + str(token).encode()
                   + b" " + name.encode("utf-8", "replace")[:64] + b"\n")
         c.settimeout(timeout)
+        # EXACTLY the three bytes of "OK\n", never more: the sender's stream
+        # follows its OK at once, and a read of up to 8 bytes took the first
+        # payload bytes with it whenever they arrived in the same segment. The
+        # reply then was not "OK", this end closed, and the host saw "the TCP
+        # stream broke after 1048576 B -- UDP takes over": 200 MB at 1350 B a
+        # datagram, 13 s instead of 0.6 (twice in a 140-batch round, 2026-09-20).
         ok = b""
-        while not ok.endswith(b"\n") and len(ok) < 8:
-            piece = c.recv(8 - len(ok))
+        while len(ok) < 3:
+            piece = c.recv(3 - len(ok))
             if not piece:
                 break
             ok += piece
-        if ok.strip() != b"OK":
+        if ok != b"OK\n":
             c.close()
             return None
         c.settimeout(None)

@@ -281,6 +281,36 @@ class ModList(unittest.TestCase):
             self.assertEqual(len(lines), 301)
 
 
+class BulkHello(unittest.TestCase):
+    """bulk_connect reads exactly the 'OK' line: a sender whose stream follows
+    its OK in the same segment used to make the client read 'OK\\n' plus five
+    payload bytes, reject the reply and close -- the host then saw the stream
+    break at 1 MiB and fell back to UDP (2026-09-20)."""
+
+    def test_ok_coalesced_with_the_payload(self):
+        import bulk_tcp, socket, threading
+        payload = bytes(range(256)) * 64
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        hello = []
+        def serve():
+            c, _ = srv.accept()
+            line = b""
+            while not line.endswith(b"\n"):
+                line += c.recv(256)
+            hello.append(line)
+            c.sendall(b"OK\n" + payload)         # one segment: OK and the stream together
+            c.close()
+        t = threading.Thread(target=serve, daemon=True); t.start()
+        sock = bulk_tcp.bulk_connect("127.0.0.1", srv.getsockname()[1], "recv", 7, "tok", "bob")
+        self.assertIsNotNone(sock, "the OK must be recognised though the payload arrived with it")
+        got = bytearray()
+        self.assertTrue(bulk_tcp.stream_recv(sock, len(payload), got.extend))
+        self.assertEqual(bytes(got), payload, "no payload byte may be swallowed by the handshake")
+        self.assertTrue(hello[0].startswith(b"TPF2BULK1 recv 7 tok bob"))
+        t.join(2); srv.close()
+
+
 class ModsProgress(unittest.TestCase):
     """The status line of a mods round: packaging (bytes) before anything landed,
     then landed bytes, MB/s since the round began and the time left at that pace;
