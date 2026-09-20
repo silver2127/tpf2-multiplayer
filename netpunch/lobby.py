@@ -330,6 +330,13 @@ BEGIN_INTERVAL = 0.2        # host re-sends 'fbegin' this often until a peer is 
 RESEND_AFTER = 0.5          # if a peer's facks go silent this long, rewind its send
                             # cursor and re-stream the window (recovers lost facks).
 PEER_XFER_TIMEOUT = 30.0    # no forward progress for this long -> skip that peer.
+# A peer that HAS every byte and is verifying, writing or unpacking it gets this
+# long between two facks whose progress count moved (2026-09-19: a joiner
+# unpacking a 665 MB mod batch was timed out at 30 s and the whole round with
+# it; a slow disk, a virus scanner or a Sandboxie overlay can hold a count
+# still for longer than that). Its facks are logged every 10 s so a silent
+# receiver is visible as such, not as "timed out".
+PEER_XFER_VERIFY_TIMEOUT = 300.0
 FINALIZE_SLICE = 8 << 20    # a receiver hashes and writes its completed save in these steps,
                             # reporting each in its facks; a slow disk moves one in well under a second
 _UNSET = object()           # "no verify progress reported yet" (a reported None must differ from it)
@@ -1480,10 +1487,14 @@ class _HostSaveTransfer:
             # a worker stuck in a disk hang or a wedged unzip would otherwise
             # hold transfer[0] (and every resync) open for ever.
             mark = msg.get("progress")
+            p["verifying"] = bool(msg.get("verifying"))
             if mark != p.get("verify_progress", _UNSET):
                 p["verify_progress"] = mark
                 p["last_advance"] = now
                 self.progress_at = now
+            if now - p.get("verify_said", 0.0) >= 10.0:
+                p["verify_said"] = now
+                self.log(f"[host] {p['name']} has the whole {self.kind}; verifying/unpacking, {mark if mark is not None else '?'} B so far")
         elif base < p["base"]:
             # REWIND: the receiver restarted from scratch (hash mismatch ->
             # whole-file re-request). Without this the host would filter every
@@ -1551,12 +1562,14 @@ class _HostSaveTransfer:
         for addr, p in self.peers.items():
             if p["state"] != "active":
                 continue
-            if now - p["last_advance"] > PEER_XFER_TIMEOUT:
+            verifying = p.get("verifying") and p["base"] >= self.total_chunks
+            if now - p["last_advance"] > (PEER_XFER_VERIFY_TIMEOUT if verifying else PEER_XFER_TIMEOUT):
                 p["state"] = "failed"
                 self.io.emit({"type": "transfer", "role": "send",
                               "peer": p["name"], "state": "failed",
                               "detail": "timed out"})
-                self.log(f"[host] {p['name']} save transfer TIMED OUT")
+                self.log(f"[host] {p['name']} save transfer TIMED OUT ({'its verify/unpack count stopped moving' if verifying else 'no forward progress'} "
+                         f"for {now - p['last_advance']:.0f} s; last fack {now - p['last_fack']:.0f} s ago, base {p['base']}/{self.total_chunks})")
                 continue
             if not p["ready"] or self.total_chunks == 0:
                 if now - p["last_begin"] >= BEGIN_INTERVAL:
@@ -2150,7 +2163,9 @@ class _ClientSaveReceiver:
         # lost), so we keep re-announcing it on a timer AND force a reply to any
         # chunk the host retransmits -- either way the host learns we're done.
         now = now or time.time()
-        if force or (self.done_sends < 40 and now - self.last_done >= 0.2):
+        # every 0.2 s for the first 8 s, then every second for as long as the host
+        # keeps this transfer open (it stops asking once it moves on)
+        if force or now - self.last_done >= (0.2 if self.done_sends < 40 else 1.0):
             self.last_done = now
             self.done_sends += 1
             self._send({"t": "fdone", "sid": self.sid, "ok": True})
@@ -2817,6 +2832,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     start_save = [False]                    # save flag of the last broadcast start
     last_emitted_roster = [None]
     transfer = [None]                       # the active _HostSaveTransfer, or None
+    unplaced_feedback = set()               # (addr, sid) of facks/fdones the transfer could not place, logged once each
     upload = [None]                         # relay-only: the leader's save coming in
     pending_resume = [None]                 # relay-only: (leader addr, when) -- the stored world goes out then
     # A relay that holds a world loads it as soon as a leader arrives (2026-09-12: the
@@ -3584,12 +3600,19 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "fbegin_ack":
             if transfer[0] is not None:
                 transfer[0].on_begin_ack(addr, msg)
-        elif t == "fack":
-            if transfer[0] is not None:
-                transfer[0].on_fack(addr, msg)
-        elif t == "fdone":
-            if transfer[0] is not None:
-                transfer[0].on_fdone(addr, msg)
+        elif t in ("fack", "fdone"):
+            xf = transfer[0]
+            if xf is not None:
+                if addr not in xf.peers or msg.get("sid") != xf.sid:
+                    key = (addr, msg.get("sid"))
+                    if key not in unplaced_feedback:
+                        unplaced_feedback.add(key)
+                        log(f"[host] {t} from {peers.get(addr, {}).get('name', addr)} for sid {msg.get('sid')} cannot be placed: "
+                            f"the transfer is sid {xf.sid} to {', '.join(q['name'] for q in xf.peers.values())}")
+                elif t == "fack":
+                    xf.on_fack(addr, msg)
+                else:
+                    xf.on_fdone(addr, msg)
         elif t == "mods_request":
             if transfer[0] is not None and addr in transfer[0].peers:
                 # A joiner prompted BEFORE the save is in "preflight" mode, and
