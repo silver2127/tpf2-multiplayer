@@ -1,0 +1,24 @@
+# What the four line-terminal passes established (2026-09-20). Read with
+# ghidra_targets_lineterminal.txt .. _lineterminal4.txt.
+#
+# - The line editor's station click (0x603fa0) and waypoint click (0x603a00)
+#   copy the ENGINE's component::Line, insert the stop, and run
+#   UI::UpdateLineAssignment 0x60a5a0 -> line_util::GetBestLineAssignment
+#   0x215d660 -> MultiGetBestLineAssignment 0x215f150: section paths between
+#   consecutive stops over every platform (CreateDefaultWorkItems 0x215bc30,
+#   mode 1 = all terminals when the bool is true), then CalcShortestLoop
+#   0x215b6b0; a loop found -> each stop takes the loop's platform; none ->
+#   the default assignment 0x2159a10 (platform 0). The "Try to fix problem
+#   automatically" button (lambda_0e60289d -> 0x5fe260) is the same pass.
+# - There is NO side-of-track preference: on plain double track a loop
+#   A-B-C-D-C-B is shortest with platform 0 both ways, so vanilla gives 0
+#   there too (confirmed by the user, 2026-09-20). The choice only differs
+#   from 0 where signals/one-way track or geometry force it.
+# - The sim-side UpdateLine handler 0x9d9fd0 copies the command's stops and
+#   waitingTime and then RESTORES the engine's own Line+0x1c (VehicleInfo,
+#   the std::bitset<16> of transport modes): that field is engine-maintained
+#   (vehicles) and a command cannot set it. Shipping it (dev 1b116cd) was a
+#   no-op and was reverted.
+# - The game keeps two GameStates (CGame+0x168 -> {GameState*[2], .., int
+#   current}); CGame+0x158 alternates between them every frame. A command
+#   carries one engine; take the state whose +0x28 is that engine.
