@@ -5953,6 +5953,7 @@ def _run_transfer_mods(tag):
     registry_real=(modshare.request_catalogue,modshare.catalogue,modshare.write_registry)
     modshare.request_catalogue=lambda extra=None: "test-catalogue"
     modshare.write_registry=lambda token=None, extra=None: "test-catalogue"
+    cache_real, modshare.mod_zip_cache_dir = modshare.mod_zip_cache_dir, (lambda: os.path.join(base, "zipcache"))
     modshare.catalogue=lambda: ("test-catalogue",{("mod_zz","1"),("mod_have","1")})
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
     on_disk_real, modshare.on_disk_mod = modshare.on_disk_mod, lambda m, v: src.get(m) if m == "mod_have" else None
@@ -6075,6 +6076,7 @@ def _run_transfer_mods(tag):
         (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target) = real
         modshare.on_disk_mod = on_disk_real
         modshare.request_catalogue,modshare.catalogue,modshare.write_registry=registry_real
+        modshare.mod_zip_cache_dir = cache_real
         SHARE_MODS[0] = share_was
         shutil.rmtree(base, ignore_errors=True)
     print(f"[mods:{tag}] {'OK' if ok else 'FAIL'}  ({time.time() - t0:.1f}s)")
@@ -6114,6 +6116,7 @@ def _run_mods_gate(tag):
     registry_request_real=(modshare.request_catalogue, modshare.write_registry)
     modshare.request_catalogue=lambda extra=None: "consent-test"
     modshare.write_registry=lambda token=None, extra=None: "consent-test"
+    cache_real, modshare.mod_zip_cache_dir = modshare.mod_zip_cache_dir, (lambda: os.path.join(base, "zipcache"))
     real = (modshare.installed_mod, modshare.install_target)
     on_disk_real, modshare.on_disk_mod = modshare.on_disk_mod, lambda m, v: None
     modshare.installed_mod = lambda m, v: None
@@ -6197,6 +6200,7 @@ def _run_mods_gate(tag):
         check("a mods round carrying a non-mod file is refused", not installed("mod_zz"))
     finally:
         modshare.request_catalogue, modshare.write_registry=registry_request_real
+        modshare.mod_zip_cache_dir = cache_real
         modshare.installed_mod, modshare.install_target = real
         modshare.on_disk_mod = on_disk_real
         shutil.rmtree(base, ignore_errors=True)

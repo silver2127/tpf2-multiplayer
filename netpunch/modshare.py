@@ -377,6 +377,20 @@ def library_root():
     return lib if os.path.isdir(os.path.join(lib, "steamapps")) else None
 
 
+def test_flags():
+    """Rig-only switches: the lines of <data>\\tpf2mp_modtest.txt (like
+    tpf2mp_netsim.txt, one instance's data folder, never shipped).
+    ``ignore_steam_workshop``: this end treats the Steam library's Workshop
+    content as absent, so a joiner on the host's own PC -- which otherwise
+    finds and registers every mod in the host's library -- has to be sent
+    them: the mod transfer-speed test (2026-09-20)."""
+    try:
+        with open(os.path.join(data_dir(), "tpf2mp_modtest.txt"), encoding="utf-8") as f:
+            return {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
+    except OSError:
+        return set()
+
+
 def workshop_dirs():
     """Every Workshop content folder this game's mods could be in: the game's
     library first, then Steam's own folder (the same place when the game is
@@ -406,7 +420,8 @@ def find_mod(mod_id, version):
     if not valid_mod(mod_id, version):
         return None
     if mod_id.startswith("*"):
-        for w in workshop_dirs() + [managed_workshop()]:
+        library = [] if "ignore_steam_workshop" in test_flags() else workshop_dirs()
+        for w in library + [managed_workshop()]:
             p = w and os.path.join(w, mod_id[1:])
             if p and os.path.isfile(os.path.join(p, "mod.lua")):
                 return p
@@ -826,6 +841,25 @@ def selftest():
             assert read_registry()[1] == {}, "a row whose folder lost its mod.lua is dropped"
         finally:
             data_dir, find_mod = real_dd, real_fm
+    # tpf2mp_modtest.txt: ignore_steam_workshop hides the library, not the managed folder
+    with tempfile.TemporaryDirectory() as td:
+        global workshop_dirs                  # data_dir is already this function's global
+        real_dd, real_wd = data_dir, workshop_dirs
+        data_dir = lambda: os.path.join(td, "data")
+        workshop_dirs = lambda: [os.path.join(td, "library")]
+        try:
+            for base in ("library", os.path.join("data", "workshop")):
+                os.makedirs(os.path.join(td, base, "777"))
+                open(os.path.join(td, base, "777", "mod.lua"), "w").write("x")
+            os.makedirs(os.path.join(td, "library", "888"))
+            open(os.path.join(td, "library", "888", "mod.lua"), "w").write("x")
+            assert find_mod("*777", 1) == os.path.join(td, "library", "777") and find_mod("*888", 1), "library first"
+            os.makedirs(os.path.join(td, "data"), exist_ok=True)
+            open(os.path.join(td, "data", "tpf2mp_modtest.txt"), "w").write("# rig\nignore_steam_workshop\n")
+            assert find_mod("*777", 1) == os.path.join(td, "data", "workshop", "777"), "managed copy only"
+            assert find_mod("*888", 1) is None, "library hidden"
+        finally:
+            data_dir, workshop_dirs = real_dd, real_wd
     # '!<id>': the profile's local/mods, without the '!' on the folder
     with tempfile.TemporaryDirectory() as td:
         global userdata_mods_dir
