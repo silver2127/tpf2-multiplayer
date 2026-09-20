@@ -4480,6 +4480,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             broadcast_start(save=True, only=rest)
                 elif transfer[0] is None and job["taken"] < len(job["ready"]):
                     blob, meta, missing = job["ready"][job["taken"]]
+                    # the transfer owns the blob now: drop the job's reference, or the round's
+                    # every batch stays in RAM until the lobby exits (27 GB after a 140-batch
+                    # round on 2026-09-20 -- the commit charge it took pushed Big Maps'
+                    # terrain pager into a compress/expand flip-flop, and the game stuttered)
+                    job["ready"][job["taken"]] = None
                     job["taken"] += 1
                     n, k = len(job["plan"]), job["taken"]
                     if missing:
