@@ -699,8 +699,6 @@ require("mp/fences_compat").bind(CM, K, log)
 -- Lives in res/scripts/mp/stats.lua.
 CM.boot("mp.stats")
 -- ---------- the desync popup: send this game's logs to the developers? (GUI state) ----------
--- Lives in res/scripts/mp/desyncreport.lua.
-CM.boot("mp.desyncreport")
 CM.boot("mp.resync")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
@@ -1228,7 +1226,7 @@ function data()
 						-- LSTICK table, with a wall clock so a leftover file can be
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
-						-- the first desync of this game, for the popup (desyncreport.lua)
+						-- the first desync of this game, for the dashboard
 						f:write("boot=" .. tostring(CM.bootWall or 0) .. "\n")
 						f:write("resynctoken=" .. CM.resyncToken .. "\n")
 						if CM.firstDesync then
@@ -1554,10 +1552,6 @@ function data()
 				local own = K.INSTANCE or "a"
 				local ownKv = readDash(own)
 				local ownWall = ownKv and tonumber(ownKv.wall) or nil
-				if CM.desyncReportTick then
-					local okR, errR = pcall(CM.desyncReportTick, ownKv)
-					if not okR then print("[ls-gui] desync report: " .. tostring(errR)) end
-				end
 				local peerInfo = {}
 				if ownKv and ownKv.peers and ownKv.peers ~= "-" then
 					for o, pt, sk, vd in ownKv.peers:gmatch("(%a+):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
@@ -1905,10 +1899,7 @@ function data()
 						end
 						D.input:onEnter(function()
 							local t = D.input:getText()
-							if t and #t > 0 then
-								-- "/desynclogs ..." sets the desync popup's choice here and never reaches the chat
-								if not (CM.desyncLogsCommand and CM.desyncLogsCommand(t)) then CM.chatSend(t) end
-							end
+							if t and #t > 0 then CM.chatSend(t) end
 							CM.chatCloseInput()
 						end)
 						pcall(function() D.input:onCancel(function() CM.chatCloseInput() end) end)

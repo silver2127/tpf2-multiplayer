@@ -153,7 +153,6 @@ from __future__ import annotations
 
 import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
-from player_stats import PlayerStats       # relay-only: who plays, how much, how many at once (player_stats.json)
 import bulk_tcp                            # the TCP side channel the save/mod transfers stream over (2026-09-17)
 import dual_tcp                            # every sealed frame a second time over a TCP link, first copy wins (2026-09-17)
 import netsim                              # tpf2mp_netsim.txt: loss and delay for one instance, for the rig (2026-09-17)
@@ -561,21 +560,14 @@ def _dedupe(name, taken):
 # File IPC: the flat-file surface the in-game menu reads/writes
 # --------------------------------------------------------------------------- #
 def _report_command(cmd, io, log, url_base=None):
-    """The in-game desync popup's commands (mod: res/scripts/mp/desyncreport.lua).
-
-    {"cmd":"upload_logs",...} sends this game's logs to the master server
-    (netpunch/desynclogs.py, in the background); {"cmd":"note","text":...} shows
-    a chat line from MULTIPLAYER to this player only. True when cmd was one.
+    """A game script's request to the lobby: {"cmd":"note","text":...} shows a chat
+    line from MULTIPLAYER to this player only. True when cmd was one. (The desync
+    log upload that also came this way was removed on 2026-09-20: nothing leaves
+    the player's machine but what they host or join with.)
     """
     c = cmd.get("cmd")
     if c == "note":
         io.emit({"type": "chat", "from": "MULTIPLAYER", "text": str(cmd.get("text", ""))[:400]})
-        return True
-    if c == "upload_logs":
-        import desynclogs
-        url = (url_base.rstrip("/") + "/desync") if url_base else None
-        if desynclogs.start(io, log, cmd, LOBBY_VERSION, url):
-            log(f"[report] desync logs requested (instance {cmd.get('instance')!r}, {cmd.get('reason')!r})")
         return True
     return False
 
@@ -599,9 +591,7 @@ class LobbyIO:
         open(self.out_path, "w", encoding="utf-8").close()
         open(self.in_path, "w", encoding="utf-8").close()
         self._in_offset = 0
-        # A fresh id per lobby run. The in-game desync popup reads it here
-        # (desyncreport.lua) so it asks, and sends, at most once per session,
-        # even when the players reload the game to recover from the desync.
+        # A fresh id per lobby run, for anything that wants to act once per session.
         self._state = {"session": os.urandom(6).hex()}
         self._lock = threading.Lock()
         self.write_state()
@@ -2689,9 +2679,6 @@ def version_rejection(remote):
 
 
 PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
-PING_EVERY = 60.0           # the anonymous session heartbeat (/ping), listed or not; --no-ping turns it off
-
-
 class _Publisher:
     """Announces this lobby to the master server every PUBLISH_EVERY seconds
     while ``on``; a ``leave`` goes out when it is switched off or the host
@@ -2700,7 +2687,7 @@ class _Publisher:
     the code (host address + session secret) and a name -- so it is opt-in,
     and a password-locked code shows as locked (useless without the password)."""
 
-    def __init__(self, url, code, kind, locked, log, stable_key=None, ping=True):
+    def __init__(self, url, code, kind, locked, log, stable_key=None):
         self.url = url.rstrip("/")
         self.code = code
         self.kind = kind if kind in ("relay", "host", "dedicated") else "host"   # listed as its type, never a save name
@@ -2716,12 +2703,6 @@ class _Publisher:
         self.name = "host"
         self.players = 1
         self.on = False
-        # the anonymous session count: a random id for this run, never the code,
-        # the name or the stable id -- a private lobby is counted, not found
-        self.ping = bool(ping)
-        self.ping_id = os.urandom(8).hex()
-        self._last_ping = 0.0
-        self._ping_said = False
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True, name="publish")
@@ -2752,20 +2733,6 @@ class _Publisher:
         announced = False
         while not self._stop.is_set():
             try:
-                if self.ping and time.time() - self._last_ping >= PING_EVERY:
-                    self._last_ping = time.time()
-                    try:
-                        self._post("/ping", {"sid": self.ping_id, "players": self.players, "max": CAP,
-                                             "type": self.kind, "version": LOBBY_VERSION, "public": self.on})
-                    except urllib.error.HTTPError as e:
-                        if e.code != 404:
-                            raise
-                        self.ping = False          # a master from before the session count: never again this run
-                        self.log(f"[publish] {self.url} keeps no session count (404) -- not sent again")
-                    if self.ping and not self._ping_said:
-                        self._ping_said = True
-                        self.log(f"[publish] session counted anonymously at {self.url} (players, version, public or not; "
-                                 "no name, no code; report_sessions=0 turns it off)")
                 if self.on:
                     self._post("/announce", {"id": self.id, "name": self.name, "code": self.code,
                                              "players": self.players, "max": CAP, "type": self.kind,
@@ -3120,13 +3087,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 chips.update({str(k): int(v) for k, v in json.load(f).items()})
         except (OSError, ValueError):
             pass
-    # PLAYER STATISTICS (2026-09-17), relay-only: joins, time connected, starts,
-    # frames relayed, per player (by profile code, else name) and in total, with
-    # the peak of players at once. player_stats.json in the io dir; a summary
-    # line in the log every ten minutes while somebody is connected.
-    stats = PlayerStats(os.path.join(io.dir, "player_stats.json"), log) if relay_only else None
-    if stats:
-        log("[stats] " + stats.summary())
 
     def remember_chip(name, cid):
         if not relay_only:
@@ -3492,8 +3452,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # reach keeps its flag for the round that finally serves it.
         switching = {a for a in targets if peers[a].pop("switch", False)}
         for a in targets:
-            if stats and not peers[a].get("started"):
-                stats.started(peers[a]["name"], peers[a].get("profile"))
             peers[a]["started"] = True      # heal roster carries started:true
         if relay_only and upload[0] is not None and getattr(upload[0], "complete", False):
             upload[0] = None                # this upload has been distributed
@@ -3564,8 +3522,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                            "links": [], "mesh": bool(is_mesh),
                            "company": company}
             remember_chip(assigned, company)
-            if stats:
-                stats.join(assigned, profile)
             if dual is not None and isinstance(addr, tuple) and not dual.has_link(addr):
                 # our half of the TCP simultaneous open toward the joiner (a NAT that
                 # preserves ports lets it land on the joiner's listener); the joiner's
@@ -3670,8 +3626,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 return
             for a, p in peers.items():
                 if p["name"] == to:
-                    if stats and GameRelay.is_game(inner):
-                        stats.frame(peers[addr]["name"], len(inner), peers[addr].get("profile"))
                     # a mesh joiner unwraps envelopes itself; a legacy (star)
                     # joiner only understands plain frames
                     out = payload if p.get("mesh") else inner
@@ -3686,8 +3640,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # bridge. Only from a peer that has joined -- strays are dropped.
             if addr in peers:
                 peers[addr]["last"] = time.time()
-                if stats:
-                    stats.frame(peers[addr]["name"], len(payload), peers[addr].get("profile"))
                 if relay is not None:
                     relay.deliver(payload)
                 if relay_only and peers[addr].get("mesh"):
@@ -3855,8 +3807,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "leave":
             if addr in peers:
                 log(f"[host] LEAVE {addr} ({peers[addr]['name']})")
-                if stats:
-                    stats.leave(peers[addr]["name"], peers[addr].get("profile"))
                 del peers[addr]
                 if transfer[0] is not None:
                     transfer[0].on_peer_dropped(addr)
@@ -4288,8 +4238,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                         exempt=set(pack_job[0]["addrs"]) if pack_job[0] else ())
                 for a in dead:
                     log(f"[host] DROP {a} ({peers[a]['name']}) -- silent")
-                    if stats:
-                        stats.leave(peers[a]["name"], peers[a].get("profile"))
                     del peers[a]
                     frags.forget(a)
                     if transfer[0] is not None:
@@ -4319,8 +4267,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     # every member loaded that world: a newcomer brought in by a
                     # frozen join is started now (no START GAME push for it)
                     for p in peers.values():
-                        if stats and not p.get("started"):
-                            stats.started(p["name"], p.get("profile"))
                         p["started"] = True
                     started[0] = True
                     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
@@ -4348,8 +4294,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
-            if stats:
-                stats.tick()                                # minute flush, 10 min summary
             if dual is not None and now - last_dual_tick[0] >= 0.5:
                 last_dual_tick[0] = now
                 dual.tick({a: p["name"] for a, p in peers.items()})
@@ -4688,10 +4632,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         if dual is not None:
             dual.close_links()
             DUAL[0] = None
-        if stats:
-            for p in peers.values():
-                stats.leave(p["name"], p.get("profile"))
-            stats.flush(force=True)
         for a in list(peers):
             _send_data(sock, a, {"t": "bye"})
         io.emit({"type": "status", "state": "failed",
@@ -5378,8 +5318,7 @@ def cmd_host(args):
     publisher = None
     if args.publish:
         publisher = _Publisher(args.publish, code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
-                               stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None,
-                               ping=not getattr(args, "no_ping", False))
+                               stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
         # systemd stops the relay with SIGTERM; without a handler Python just
         # dies and the finally: below (publisher.close -> /leave) never runs,
         # so the public list kept the dead row for a full TTL
@@ -7039,8 +6978,6 @@ def main(argv=None):
                          "across restarts so the code stays valid, and list as a dedicated server")
     ap.add_argument("--public", action="store_true",
                     help="start listed publicly (host only)")
-    ap.add_argument("--no-ping", action="store_true",
-                    help="do not send the anonymous session heartbeat to the master (tpf2_menu_flags.txt report_sessions=0)")
     ap.add_argument("--rendezvous", default="",
                     help="master server used for hole punching to the host (default: "
                          "--publish, else " + DEFAULT_MASTER + "; 'off' disables)")

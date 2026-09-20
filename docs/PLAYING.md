@@ -190,30 +190,7 @@ In a two-player host lobby, this pauses both games, saves and transfers the host
 reloads both players and compares the fresh worlds before resuming. An intentional
 pause is preserved. Client-only changes are discarded. See [One-click recovery](RESYNC.md)
 for progress, retry and supported-session limits. `/sync` serves joining players; it does not reload
-players already in the game. The Resync section is independent of log reporting below.
-
-The first desync in a session also opens a **Desync detected** window that asks whether to send
-that game's logs to the developers:
-
-- **Always send**: send them now, and in later sessions without asking.
-- **Only this once**: send them now and ask again in the next session.
-- **Never**: send nothing, and never show the window again on this computer.
-
-A desync keeps being detected until the players reload, so the window appears, and logs are sent,
-at most once per session: not again for the same desync, and not after reloading the shared save in
-the same lobby.
-
-The logs go to the project's server (the one behind the public games list): the game's log with the
-mod's script lines, the mod's DLL logs and files, and the game's graphics settings. Windows user and
-computer names, the Steam account number, IP addresses and lobby codes are removed first; player
-names and chat can remain. The lobby's own logs and crash dumps are not sent. A chat line from
-MULTIPLAYER says when they arrived. Type `/desynclogs always`, `/desynclogs ask` or `/desynclogs never`
-in the in-game chat to change your choice; it is kept in `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_prefs.txt`.
-
-While you host, the lobby also tells the master server once a minute that a session exists, listed
-or not: a random id for that run, the player count, the mod version and whether the lobby is
-public. It carries no name, no code and the server keeps no address; only totals are published.
-`report_sessions=0` in `tpf2_menu_flags.txt` turns it off.
+players already in the game.
 
 For a bug report, send the logs of **every** player. The mod gathers them in one folder,
 `%LOCALAPPDATA%\tpf2mp\logs\`:

@@ -661,7 +661,6 @@ static const Hit* hoveredHit(){ for(int i=0;i<g_hitCount;i++) if(g_hits[i].btn &
 //   autoload=0|1            START loads the shared save in-process (0: the player opens LOAD GAME)
 static float g_flagScale = 0.f;
 static int   g_flagSlot = 0;
-static int   g_flagReportSessions = 1;   // report_sessions=0: no anonymous session heartbeat to the master (--no-ping)
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
 static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
 static int   g_flagAutoLoad = 1;            // START loads the shared save in-process (autoload=0: the player opens LOAD GAME)
@@ -748,8 +747,6 @@ static void ReadFlags()
             // the title menu builds 8 entries (9 with CONTINUE): a slot past them never inserts ours
             int s = atoi(v);
             if (digit && s >= 0 && s <= 7) g_flagSlot = s;
-        } else if (!strcmp(line, "report_sessions")) {
-            g_flagReportSessions = digit ? atoi(v) != 0 : 1;
         } else if (!strcmp(line, "master_url")) {
             while (e > v && e[-1] == '/') *--e = 0;
             // it becomes a process argument and a WinHTTP request: a space or quote breaks both
@@ -3578,7 +3575,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
         wchar_t wpub[560 + NAME_MAX] = L"";
         { wchar_t wl[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, NAME_MAX); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
-                               wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s%s", wm, a->pub ? L" --public" : L"", g_flagReportSessions ? L"" : L" --no-ping"); wcscat_s(wpub, t); }
+                               wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
         if (a->sep) wcscat_s(wpub, L" --companies");                    // SEPARATE COMPANIES: the lobby assigns a company per player
         if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");            // a stable code across restarts, listed as a dedicated server
