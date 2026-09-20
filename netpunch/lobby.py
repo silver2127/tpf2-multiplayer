@@ -1162,6 +1162,48 @@ def _mod_check(save_path, io, log):
     return False
 
 
+def _host_missing_mods(mods, lookup=None):
+    """The (id, version) pairs of ``mods`` that are nowhere on THIS PC: not in a
+    Steam Workshop folder, not a managed download, not in the game's mods or
+    dlcs folders (the host's own lookup, modshare.find_mod)."""
+    lookup = lookup or modshare.find_mod
+    return [(m, v) for m, v in mods if modshare.valid_mod(m, v) and lookup(m, v) is None]
+
+
+def _host_mods_check(save_path, mods, io, log, lookup=None):
+    """True when the host's own game can load ``save_path``: every mod the save
+    needs is on this PC. Otherwise the start is refused and the missing mods are
+    NAMED. Until 2026-09-20 the host pushed the save, every joiner loaded it, and
+    the host's own game refused it with nothing but "Couldn't start the shared
+    save by itself -- open LOAD GAME" (the host had unsubscribed from 557 Workshop
+    items between two sessions; the game found 29 mods where the save wanted
+    563). ``mods`` is the list save_mod_list read (None = unknown: nothing to
+    check, the transfer goes ahead as before)."""
+    if not mods:
+        return True
+    missing = _host_missing_mods(mods, lookup)
+    if not missing:
+        return True
+    label = os.path.basename(str(save_path))
+    if label.lower().endswith(".sav"):
+        label = label[:-4]
+    names = [modshare.mod_folder_name(m, v) for m, v in missing]
+    shown = ", ".join(names[:8]) + (f", ... ({len(names) - 8} more)" if len(names) > 8 else "")
+    log(f"[host] NOT sharing {save_path}: it needs {len(names)} mod(s) this PC does not have, "
+        f"so the host's own game could not load it: {', '.join(names)}")
+    io.emit({"type": "status", "state": "connected",
+             "detail": f"Not started: '{label}' needs {len(names)} mod(s) not installed on this PC (see chat)"})
+    now = time.time()
+    key = ("host-mods", save_path)
+    if now - _mod_refusal_notes.get(key, 0.0) > 60.0:
+        _mod_refusal_notes[key] = now
+        io.emit({"type": "chat", "from": "MULTIPLAYER",
+                 "text": f"'{label}' needs {len(names)} mod(s) that are not installed on this PC, so your own game "
+                         f"cannot load it: {shown}. Subscribe to them on the Steam Workshop (or put them in the "
+                         "game's mods folder), let Steam finish downloading, then press START GAME again."})
+    return False
+
+
 def _read_save_files(save_path):
     """Read the .sav and any sidecars; return (blob, files_meta).
 
@@ -3913,6 +3955,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
         mods = modshare.save_mod_list(save_path, log)        # None = could not read it (NOT "none")
+        if not relay_only and not _host_mods_check(save_path, mods, io, log):
+            return                                           # refused: the host's own game could not load it (status + chat name the mods)
         advertised[:]=[save_path,mods]
         if mods and not relay_only:
             # the host loads this save too: its own removed-item subscriptions need the rows as much

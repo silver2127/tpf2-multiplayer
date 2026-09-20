@@ -3509,7 +3509,7 @@ static void AutoLoadTick(void* menu)
     InterlockedExchange(&g_autoLoadPending, 0);
     int r = AutoLoadCall(menu, "mp_shared");
     Log("[menu] autoload: StartSavegame(mp_shared) -> %d\n", r);
-    if (r != 1) SetStatus("Couldn't start the shared save by itself -- open LOAD GAME and pick \"mp_shared\".");
+    if (r != 1) SetStatus("The game refused to start mp_shared (a mod it needs is not installed here?) -- open LOAD GAME and pick \"mp_shared\" to see why.");
 }
 
 static void MyMenuUpdate(void* menu, void* a2, void* a3, void* a4)
