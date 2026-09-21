@@ -16,7 +16,10 @@ The game folder is found from Steam's own uninstall entry
 (`HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780`,
 `InstallLocation`) and from the folder a previous install remembered
 (`HKLM\SOFTWARE\silver2127\TpF2 Multiplayer`, `InstallFolder`). When both exist the remembered folder
-wins. Without either, the default is `C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2`.
+wins. When neither holds `TransportFever2.exe` (a stale registration, the game moved to another
+drive), the `FindGameDir` custom action reads Steam's `libraryfolders.vdf` and takes the first library,
+on any drive, whose `steamapps\common\Transport Fever 2` holds the exe; the log says which libraries it
+probed. Only without any of those is the default `C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2`.
 The folder page refuses a folder without `TransportFever2.exe`, and a silent install fails with the
 same message.
 

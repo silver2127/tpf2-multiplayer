@@ -4,8 +4,14 @@
 // readable sentence in front of the user (an ExeCommand can only fail with
 // "a program run as part of the setup did not finish as expected"), VBScript
 // is on Microsoft's removal list, and a console window flashing during install
-// is not something a player should see. Four entry points, all tiny:
+// is not something a player should see. Five entry points, all tiny:
 //
+//   FindGameDir       immediate, after AppSearch in both sequences. When the
+//                     default INSTALLFOLDER (Steam's registration, a remembered
+//                     folder, or nothing yet) holds no TransportFever2.exe, it
+//                     reads Steam's libraryfolders.vdf and takes the first
+//                     library that has the game -- a second drive, a second
+//                     library on C:. A player never types the folder for that.
 //   CheckGameDir      immediate, UI sequence (DoAction from the folder dialog).
 //                     Sets TPF2_GAMEDIR_OK to 1/0 and shows a warning box when
 //                     INSTALLFOLDER holds no TransportFever2.exe, or one that
@@ -249,6 +255,82 @@ std::wstring SteamRoot()
     return WithSlash(s);
 }
 
+std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+bool DirExists(const std::wstring& p)
+{
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Every Steam library root: the Steam folder itself, then each folder named in
+// config\libraryfolders.vdf (2021+: a "path" per entry) or the older
+// steamapps\libraryfolders.vdf ("1" "D:\\Games"). The file is Valve's KeyValues
+// text; rather than parse the nesting, every quoted string that unescapes to an
+// existing drive-letter folder is a candidate, which covers both layouts and
+// skips the per-app sizes. `steam` carries a trailing backslash.
+std::vector<std::wstring> SteamLibraries(const std::wstring& steam)
+{
+    std::vector<std::wstring> out;
+    auto add = [&](std::wstring p) {
+        for (auto& c : p) if (c == L'/') c = L'\\';
+        p = WithSlash(p);
+        for (const auto& e : out) if (_wcsicmp(e.c_str(), p.c_str()) == 0) return;
+        if (DirExists(p)) out.push_back(p);
+    };
+    if (steam.empty()) return out;
+    add(steam);
+    const wchar_t* files[] = { L"config\\libraryfolders.vdf", L"steamapps\\libraryfolders.vdf" };
+    for (const wchar_t* rel : files) {
+        HANDLE f = CreateFileW((steam + rel).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        std::string text(1 << 20, '\0');
+        DWORD got = 0;
+        bool ok = ReadFile(f, &text[0], (DWORD)text.size(), &got, nullptr) != 0;
+        CloseHandle(f);
+        if (!ok) continue;
+        text.resize(got);
+        size_t pos = 0;
+        while (true) {
+            size_t q1 = text.find('"', pos);
+            if (q1 == std::string::npos) break;
+            size_t q2 = text.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            pos = q2 + 1;
+            std::string val;
+            for (size_t i = q1 + 1; i < q2; i++) {
+                if (text[i] == '\\' && i + 1 < q2) { val += text[++i]; } else val += text[i];
+            }
+            if (val.size() < 3 || val[1] != ':' || (val[2] != '\\' && val[2] != '/')) continue;
+            add(Utf8ToWide(val));
+        }
+    }
+    return out;
+}
+
+// The game folder (with a trailing backslash) in the first Steam library that
+// holds TransportFever2.exe, else empty. Every library probed is logged.
+std::wstring GameInLibraries(MSIHANDLE h, const std::wstring& steam, const wchar_t* who)
+{
+    std::vector<std::wstring> libs = SteamLibraries(steam);
+    if (libs.empty()) Log(h, std::wstring(who) + L": no Steam library found (Steam not registered?)");
+    for (const std::wstring& lib : libs) {
+        std::wstring dir = lib + L"steamapps\\common\\Transport Fever 2\\";
+        bool hit = FileExists(dir + L"TransportFever2.exe");
+        Log(h, std::wstring(who) + L": library " + lib + (hit ? L" -> holds the game" : L" -> no game there"));
+        if (hit) return dir;
+    }
+    return L"";
+}
+
 // The mod's display name from its mod.lua when that is a literal string. A
 // translation key ("mod_name") says nothing and is left out.
 std::wstring ModNameIn(const std::wstring& modDir)
@@ -394,6 +476,27 @@ const wchar_t* GameDirProblem(MSIHANDLE h, std::wstring* dirOut, const wchar_t* 
 }
 
 } // namespace
+
+extern "C" __declspec(dllexport) UINT __stdcall FindGameDir(MSIHANDLE h)
+{
+    // Before costing, a Directory property that no search set reads as empty;
+    // one Steam's registration or a remembered install set is a real path.
+    std::wstring cur = GetProp(h, L"INSTALLFOLDER");
+    if (!cur.empty() && FileExists(WithSlash(cur) + L"TransportFever2.exe")) {
+        Log(h, L"FindGameDir: " + cur + L" holds the game; keeping it");
+        return ERROR_SUCCESS;
+    }
+    Log(h, L"FindGameDir: default folder " + (cur.empty() ? std::wstring(L"(none)") : cur) +
+           L" holds no TransportFever2.exe; looking through the Steam libraries");
+    std::wstring found = GameInLibraries(h, SteamRoot(), L"FindGameDir");
+    if (!found.empty()) {
+        MsiSetPropertyW(h, L"INSTALLFOLDER", found.c_str());
+        Log(h, L"FindGameDir: INSTALLFOLDER = " + found);
+    } else {
+        Log(h, L"FindGameDir: no library holds the game; the folder page will ask");
+    }
+    return ERROR_SUCCESS;
+}
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckGameDir(MSIHANDLE h)
 {
@@ -582,3 +685,18 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
 {
     return TRUE;
 }
+
+#ifdef TPF2CA_HARNESS
+// tools\test_find_game_dir.py builds this file as a console program and hands it
+// a fake Steam folder: prints every library found and the game folder chosen.
+#include <cstdio>
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc < 2) { wprintf(L"usage: harness <steam root>\n"); return 2; }
+    std::wstring steam = WithSlash(argv[1]);
+    for (const std::wstring& lib : SteamLibraries(steam)) wprintf(L"library %s\n", lib.c_str());
+    std::wstring game = GameInLibraries(0, steam, L"harness");
+    wprintf(L"game %s\n", game.empty() ? L"(none)" : game.c_str());
+    return 0;
+}
+#endif

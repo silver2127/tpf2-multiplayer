@@ -13,7 +13,9 @@
 
   INSTALLFOLDER defaults to the Transport Fever 2 folder Steam registered
   (Steam App 1066780 / InstallLocation), then to the folder remembered by a
-  previous install, then to the stock Steam library path. The folder must hold
+  previous install; when neither holds TransportFever2.exe, FindGameDir
+  (PluginHost.wxs) takes the first Steam library that does, on any drive; and
+  only then the stock Steam library path. The folder must hold
   TransportFever2.exe: the folder dialog refuses to continue without it and a
   silent install fails at RequireGameDir with the same message.
 
