@@ -70,8 +70,16 @@ def write_fields(path, fields):
     # real transfer (2026-09-14, "No such file or directory: ...sync.tmp").
     temporary = path.with_name(f'{path.name}.{os.getpid()}.{next(_temporary_counter)}.sync.tmp')
     # Match the native/Lua wire format on Windows as well: no CRLF translation.
-    with temporary.open('w', encoding='utf-8', newline='\n') as stream:
-        stream.write(data)
+    try:
+        with temporary.open('w', encoding='utf-8', newline='\n') as stream:
+            stream.write(data)
+    except FileNotFoundError as exc:
+        # The folder itself is missing from THIS process's view. Seen under Proton
+        # with TPF2MP_DATADIR=/tmp/tpf2mp-data: a rootless path resolves against
+        # each process's current drive, so the game had the folder and the lobby
+        # did not (2026-09-21). Say which folder and from where, not just the file.
+        raise OSError(exc.errno, 'runtime folder missing as seen from this lobby: %s (working folder %s); '
+                      'a relative or Unix-style TPF2MP_DATADIR must be absolute' % (path.parent, os.getcwd())) from exc
     # A Lua/engine reader can briefly deny atomic replacement on Windows.
     # Retry publication only; never repeat the native save/load side effect.
     for attempt in range(21):

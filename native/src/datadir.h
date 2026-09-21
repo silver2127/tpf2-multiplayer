@@ -25,6 +25,31 @@
 #include <stdio.h>
 #include <string.h>
 
+// A pin is taken as ABSOLUTE. A relative or Unix-style one ("/tmp/tpf2mp-data" from a
+// Steam launch option under Proton, 2026-09-21) names a different folder in every
+// process: Windows resolves a rootless path against the process's CURRENT DRIVE, so
+// the game (working folder on Z:) created and used /tmp/tpf2mp-data while the lobby
+// it started from a folder on C: looked for C:\tmp\tpf2mp-data and a resync died
+// with "[Errno 2] No such file or directory". GetFullPathNameW here, in the game
+// process, resolves it once, against the game's folder; Tpf2mpPublishDataDir then
+// hands the absolute form to the Lua and every child process.
+static inline bool Tpf2mpPathIsAbsoluteW(const wchar_t* p)
+{
+    if (!p || !p[0]) return false;
+    if (p[0] == L'\\' && p[1] == L'\\') return true;                         // UNC
+    return ((p[0] >= L'A' && p[0] <= L'Z') || (p[0] >= L'a' && p[0] <= L'z'))
+        && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/');                  // X:\ or X:/
+}
+
+static inline void Tpf2mpAbsoluteW(const wchar_t* in, wchar_t* out, size_t cch)
+{
+    if (!Tpf2mpPathIsAbsoluteW(in)) {
+        DWORD n = GetFullPathNameW(in, (DWORD)cch, out, nullptr);
+        if (n > 0 && n < cch) return;
+    }
+    _snwprintf_s(out, cch, _TRUNCATE, L"%s", in);
+}
+
 // Fills `out` (MAX_PATH wide chars) with the data dir INCLUDING a trailing
 // backslash, creating it if needed. Returns false when neither TPF2MP_DATADIR
 // nor LOCALAPPDATA is set. `self` is unused; the callers still pass it.
@@ -33,7 +58,7 @@ static inline bool Tpf2mpDataDirW(wchar_t* out, size_t cch, const void* self)
     (void)self;
     wchar_t buf[MAX_PATH] = L"";
     if (GetEnvironmentVariableW(L"TPF2MP_DATADIR", buf, MAX_PATH) && buf[0]) {
-        _snwprintf_s(out, cch, _TRUNCATE, L"%s", buf);
+        Tpf2mpAbsoluteW(buf, out, cch);
     } else if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH) && buf[0]) {
         _snwprintf_s(out, cch, _TRUNCATE, L"%s\\tpf2mp", buf);
         CreateDirectoryW(out, nullptr);
@@ -66,14 +91,18 @@ static inline bool Tpf2mpIsAsciiW(const wchar_t* s)
 static inline void Tpf2mpPublishDataDir()
 {
     wchar_t pin[MAX_PATH] = L"";
-    if (GetEnvironmentVariableW(L"TPF2MP_DATADIR", pin, MAX_PATH) && pin[0]) return;
+    const bool pinned = GetEnvironmentVariableW(L"TPF2MP_DATADIR", pin, MAX_PATH) && pin[0];
+    if (pinned && Tpf2mpPathIsAbsoluteW(pin)) return;   // a harness pin is left exactly as it was
     wchar_t dir[MAX_PATH];
-    if (!Tpf2mpDataDirW(dir, MAX_PATH, nullptr)) return;   // creates the folder
-    if (Tpf2mpIsAsciiW(dir)) return;
+    if (!Tpf2mpDataDirW(dir, MAX_PATH, nullptr)) return;   // creates the folder; absolute
     wchar_t shortp[MAX_PATH] = L"";
-    DWORD n = GetShortPathNameW(dir, shortp, MAX_PATH);
-    const bool ascii = n > 0 && n < MAX_PATH && Tpf2mpIsAsciiW(shortp);
-    const wchar_t* pub = ascii ? shortp : dir;
+    bool ascii = Tpf2mpIsAsciiW(dir);
+    if (!pinned && ascii) return;                          // the shipping folder, ASCII: nothing to publish
+    if (!ascii) {
+        DWORD n = GetShortPathNameW(dir, shortp, MAX_PATH);
+        ascii = n > 0 && n < MAX_PATH && Tpf2mpIsAsciiW(shortp);
+    }
+    const wchar_t* pub = (!Tpf2mpIsAsciiW(dir) && ascii) ? shortp : dir;
     // The game's CRT keeps its own narrow copy of the environment once initialised;
     // its getenv (what Lua's os.getenv calls) reads that copy, so set it there too.
     // UTF-8 bytes for the no-short-name case, since that is what the game's io.open

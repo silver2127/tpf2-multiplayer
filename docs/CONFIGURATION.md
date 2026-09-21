@@ -94,7 +94,7 @@ the start of a line starts a comment, so values may contain them. Booleans take 
 |---|---|
 | `<data>\tpf2mp_modtest.txt` | Rig-only, one line per switch. `ignore_steam_workshop`: this instance treats the Steam library's Workshop content as absent, so a joiner on the host's own PC has to be sent the mods (transfer-speed testing). Never ship it. |
 | `TPF2MP_MOD_CACHE_MB` | The host's mod zip cache under `<data>\mod_zip_cache\`, in MB (default 24576). A mod a joiner needs is zipped once per change of its folder and served from here to every later joiner and session; the least recently used zips go first when the cap is reached. `0` turns the cache off. |
-| `TPF2MP_DATADIR` | Use this folder as the data folder instead of `%LOCALAPPDATA%\tpf2mp\data\`. The mod follows it only if the folder already holds `tpf2_instance.txt` (the bridge writes it at start). The lobby folder and the menu log are unaffected. |
+| `TPF2MP_DATADIR` | Use this folder as the data folder instead of `%LOCALAPPDATA%\tpf2mp\data\`. The mod follows it only if the folder already holds `tpf2_instance.txt` (the bridge writes it at start). The lobby folder and the menu log are unaffected. Give an absolute Windows path; a relative or Unix-style one (`/tmp/tpf2mp-data` in a Steam launch option under Proton) is made absolute against the game's folder at start, since Windows resolves such a path against each process's current drive and the lobby would otherwise look in a different folder than the game (a resync then failed with "No such file or directory"). |
 | `TPF2MP_LOG_IPS=1` | Log IP addresses unmasked (bridge and lobby). |
 
 ## Files the software writes for itself
