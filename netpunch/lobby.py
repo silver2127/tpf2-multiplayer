@@ -232,6 +232,13 @@ CHUNK_LOCAL = 8192          # bytes of file data per chunk when every target pee
                             # loopback it just multiplies the per-datagram cost.
                             # NOT used on a LAN: 8 KB fragments at 1500 MTU and one
                             # lost fragment loses the whole chunk.
+CHUNK_STEAM = 1100          # bytes of file data per chunk when a peer is reached through the
+                            # Steam tunnel (steamtunnel.is_tunnel_addr): the wire is 1100+17+28
+                            # = 1145 B, under the 1,200 B limit of Steam's UNRELIABLE P2P send.
+                            # Anything bigger the tunnel has to send reliable, and a burst of
+                            # reliable 8 KB messages stalled a real transfer at 15 of 12,781
+                            # chunks (2026-09-21): the peer looks like 127.0.0.1 and was taken
+                            # for loopback, no-loss window and all.
 CHUNK_DATA = 1350           # bytes of file data per chunk (1200 until 2026-09-10: +12% per
                             # datagram; 1350+17+28 = 1395 B stays under a 1492 PPPoE MTU and
                             # a 1400 B VPN MTU; every path measured so far is v4). Wire =
@@ -1327,11 +1334,14 @@ class _HostSaveTransfer:
         is 535k chunks at 1200 B against 78k at 8192 B, each costing a sign, a
         pack and a sendto in single-threaded Python.
         """
+        chunk = CHUNK_LOCAL
         for addr, _name in targets:
+            if steamtunnel.is_tunnel_addr(addr):
+                return CHUNK_STEAM            # the smallest wins: Steam's unreliable limit
             host = addr[0] if isinstance(addr, tuple) else str(addr)
             if not host.startswith("127."):
-                return CHUNK_DATA
-        return CHUNK_LOCAL
+                chunk = CHUNK_DATA
+        return chunk
 
     @staticmethod
     def _pick_window(chunk):
@@ -1403,7 +1413,7 @@ class _HostSaveTransfer:
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
                  f"{self.total_chunks} chunks of {self.chunk}B "
-                 f"({'local' if self.chunk == CHUNK_LOCAL else 'internet-safe'}) "
+                 f"({'local' if self.chunk == CHUNK_LOCAL else 'steam' if self.chunk == CHUNK_STEAM else 'internet-safe'}) "
                  f"-> {len(self.peers)} peer(s)")
 
     # -- the TCP channel --------------------------------------------------- #
@@ -2671,7 +2681,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.6.1.15"
+LOBBY_VERSION = "0.6.1.16"
 
 
 def version_rejection(remote):
