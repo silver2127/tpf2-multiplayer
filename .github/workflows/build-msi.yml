@@ -65,9 +65,11 @@ jobs:
         shell: pwsh
         working-directory: installer/out
         run: |
-          Get-FileHash TpF2Multiplayer.msi, TpF2Multiplayer-files.zip -Algorithm SHA256 |
-            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
-            Set-Content SHA256SUMS.txt -Encoding ascii
+          # LF line endings: sha256sum -c and the shell installer read "<hash>  <name>" lines,
+          # and a trailing \r (Set-Content's default on Windows) broke the 0.6.1.12 install
+          $sums = Get-FileHash TpF2Multiplayer.msi, TpF2Multiplayer-files.zip -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) }
+          [IO.File]::WriteAllText((Join-Path (Get-Location) SHA256SUMS.txt), ($sums -join "`n") + "`n", (New-Object Text.ASCIIEncoding))
           Get-Content SHA256SUMS.txt
           # the Proton installers, pinned to this release when the run is a tag
           $ver = if ('${{ github.ref }}' -like 'refs/tags/v*') { '${{ github.ref_name }}'.Substring(1) } else { '' }

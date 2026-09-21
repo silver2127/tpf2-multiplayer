@@ -151,7 +151,8 @@ if [ -z "$files_zip" ]; then
   curl -fsSL --retry 3 -o "$cache/$SUMS_ASSET" "$base/$SUMS_ASSET" || fail "could not download $base/$SUMS_ASSET (no such release, or no network)"
   if [ -t 1 ]; then progress="--progress-bar"; else progress="-sS"; fi     # a bar on a terminal, silence in a log
   curl -fL --retry 3 $progress -o "$cache/$FILES_ASSET" "$base/$FILES_ASSET" || fail "could not download $base/$FILES_ASSET"
-  want="$(grep " $FILES_ASSET\$" "$cache/$SUMS_ASSET" | cut -c1-64)"
+  # tr: a sums file written on Windows ends its lines in \r\n, and "name$" would never match
+  want="$(tr -d '\r' < "$cache/$SUMS_ASSET" | grep " $FILES_ASSET\$" | cut -c1-64)"
   [ -n "$want" ] || fail "$SUMS_ASSET does not list $FILES_ASSET"
   [ "$(sha "$cache/$FILES_ASSET")" = "$want" ] || fail "$FILES_ASSET does not match $SUMS_ASSET (a broken download?); delete $cache and try again"
   say "  checksum ok"
