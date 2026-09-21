@@ -97,6 +97,21 @@ check("a dedicated server casts no vote and adds no own speed to the mean",
 check("players in, nobody voted yet: 1x", 'if CM.dedicated and CM.othersPresent and CM.othersPresent() then return 1, "", 0 end' in PACING)
 m4 = re.search(r"^function CM\.dedicatedResumeSpeed\(found\)\n.*?\n^end\n", PACING, re.S | re.M)
 check("pacing.lua defines CM.dedicatedResumeSpeed", bool(m4))
+m5 = re.search(r"^function CM\.dedAutosaveTick\(s, others\)\n.*?\n^end\n", PACING, re.S | re.M)
+check("pacing.lua defines CM.dedAutosaveTick, asked first by the dedicated tick",
+      bool(m5) and "\tif CM.dedAutosaveTick(s, others) then return true end" in PACING)
+m6 = re.search(r"^function CM\.speedButton\(v, kind\)\n.*?\n^end\n", PACING, re.S | re.M)
+check("a speed button on a dedicated server is not a vote (the clock re-sends the engine's speed limit)",
+      bool(m6) and "if CM.dedicatedPauseEmpty and CM.dedicatedPauseEmpty() then" in m6.group(0)
+      and m6.group(0).index("dedicatedPauseEmpty") < m6.group(0).index("CM.lgHolding"))
+check("the DLL asks the mod to hold before a forced autosave and says so in the chat",
+      'L"%stpf2_ded_autosave.txt"' in tick and 'putMarker(req, "hold\\n")' in tick
+      and "Server autosave in a moment" in tick and "Server autosave done" in tick)
+check("  ... saves only on the ack, gives up after 15 s and tries again in a minute",
+      "if (markerSet(ack)) {" in tick and "now - g_dedSaveAt > 15000" in tick and "+ 60000ULL;   // again in a minute" in tick)
+check("  ... the done marker follows the save file (stopped growing), or 90 s",
+      "if (wcscmp(cur, g_dedSaveFile) == 0 && sz == g_dedSaveLastSize) finished = true;" in tick and "now - g_dedSaveAt > 90000" in tick)
+check("  ... markers are emptied, never deleted (the game's Lua has no remove)", "DeleteFileW(req)" not in tick and 'putMarker(req, "")' in tick)
 check("the leader's lever detector is off on a dedicated server (no hand at its lever)", "if CM.isLeader() and not CM.dedicated then" in PACING)
 check("a dedicated server's 0 ceiling never pauses the session; the votes run it",
       "if CM.myCeiling <= 0 and not CM.dedicated then" in PACING and '"dedicated server, no votes"' in PACING)
@@ -104,12 +119,17 @@ check("a dedicated server's 0 ceiling never pauses the session; the votes run it
 with tempfile.TemporaryDirectory() as td:
     base = td.replace("\\", "/") + "/"
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
-    L.globals().SRC = (m.group(0) if m else "") + (m2.group(0) if m2 else "") + (m4.group(0) if m4 else "")
+    L.globals().SRC = (m.group(0) if m else "") + (m2.group(0) if m2 else "") + (m4.group(0) if m4 else "") + (m5.group(0) if m5 else "") + (m6.group(0) if m6 else "")
     L.globals().BASE = base
     T = L.execute(r'''
-local K = { BASE = BASE, LOADGATE_MIN_TICKS = 100 }
+local K = { BASE = BASE, LOADGATE_MIN_TICKS = 100, DED_SAVE_HOLD_TICKS = 300, MAX_SPEED = 4 }
 local CM = { ticks = 0, peers = {} }
-local T = { log = {}, speeds = {} }
+local T = { log = {}, speeds = {}, sent = {}, unpaused = {}, votes = {} }
+CM.broadcast = function(line) T.sent[#T.sent + 1] = line end
+CM.lseffLine = function(v, vt) return string.format("LSEFF v=%g%s", v, (vt and vt ~= "") and (" vt=" .. vt) or "") end
+CM.hostUnpause = function(v) T.unpaused[#T.unpaused + 1] = v end
+CM.castSpeedVote = function(v, why) T.votes[#T.votes + 1] = v end
+CM.clearFile = function(path) local f = io.open(path, "w"); if f then f:close() end end
 local speed = 2
 local others = false
 game = { interface = { getGameSpeed = function() return speed end } }
@@ -189,6 +209,98 @@ return T
     check("a found speed 2 stands", T.CM.dedicatedResumeSpeed(2) == 2)
     T.CM.dedicated = False
     check("not dedicated: whatever was found, 0 included", T.CM.dedicatedResumeSpeed(0) == 0)
+
+# ---- the autosave hold (2026-09-21) and the clock's own button, on Lua 5.2
+with tempfile.TemporaryDirectory() as td:
+    base = td.replace("\\", "/") + "/"
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.globals().SRC = (m.group(0) if m else "") + (m2.group(0) if m2 else "") + (m4.group(0) if m4 else "") + (m5.group(0) if m5 else "") + (m6.group(0) if m6 else "")
+    L.globals().BASE = base
+    T = L.execute(r'''
+local K = { BASE = BASE, LOADGATE_MIN_TICKS = 100, DED_SAVE_HOLD_TICKS = 300, MAX_SPEED = 4 }
+local CM = { ticks = 1000, peers = {} }
+local T = { log = {}, speeds = {}, sent = {}, unpaused = {}, votes = {} }
+local speed = 2
+local others = true
+game = { interface = { getGameSpeed = function() return speed end } }
+CM.othersPresent = function() return others end
+CM.setSpeed = function(v, why) speed = v; T.speeds[#T.speeds + 1] = v .. ":" .. why end
+CM.broadcast = function(line) T.sent[#T.sent + 1] = line end
+CM.lseffLine = function(v, vt) return string.format("LSEFF v=%g%s", v, (vt and vt ~= "") and (" vt=" .. vt) or "") end
+CM.hostUnpause = function(v) T.unpaused[#T.unpaused + 1] = v end
+CM.castSpeedVote = function(v, why) T.votes[#T.votes + 1] = v end
+CM.clearFile = function(path) local f = io.open(path, "w"); if f then f:close() end end
+local function log(s) T.log[#T.log + 1] = s end
+assert(load("local CM, K, log = ...\n" .. SRC, "@dedicated"))(CM, K, log)
+T.CM, T.K = CM, K
+function T.tick(n, o)
+  others = o
+  local held
+  for _ = 1, n do CM.ticks = CM.ticks + 1; held = CM.dedicatedTick() end
+  return held, speed
+end
+function T.setSpeed(v) speed = v end
+function T.write(name, text) local f = io.open(BASE .. name, "w"); f:write(text); f:close() end
+function T.read(name) local f = io.open(BASE .. name, "r"); if not f then return nil end; local b = f:read("*a"); f:close(); return b end
+return T
+''')
+    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\nempty_speed=1\n")
+    held, s = T.tick(5, True)
+    check("players in, no request: the world runs on", held is False and s == 2 and len(T.speeds) == 0)
+    T.write("tpf2_ded_autosave.txt", "hold\n")
+    held, s = T.tick(1, True)
+    check("a request with players in: held at 0, the ack written, LSEFF 0 sent",
+          held is True and s == 0 and T.speeds[1] == "0:dedicated server: autosave" and T.read("tpf2_ded_autosave_ack.txt") == "held\n"
+          and T.sent[1] == "LSEFF v=0" and T.CM.effSpeed == 0 and T.read("tpf2_ded_autosave.txt") == "", str(T.speeds[1]))
+    check("the request file was emptied, not removed", T.read("tpf2_ded_autosave.txt") == "")
+    held, s = T.tick(60, True)
+    check("while the save runs the hold stays and LSEFF 0 is repeated (every 25 ticks)", held is True and s == 0 and len(T.sent) == 3, str(len(T.sent)))
+    T.setSpeed(3)   # something moved the lever under the hold
+    held, s = T.tick(1, True)
+    check("a lever moved under the hold goes back to 0", s == 0 and T.speeds[len(T.speeds)] == "0:dedicated server: autosave")
+    T.write("tpf2_ded_autosave_done.txt", "saved\n")
+    held, s = T.tick(1, True)
+    check("the done marker releases: unpaused and set to the speed it held from, the marker emptied",
+          held is False and s == 2 and T.unpaused[1] == 2 and T.speeds[len(T.speeds)] == "2:dedicated server: autosave done"
+          and T.read("tpf2_ded_autosave_done.txt") == "" and T.CM.dedSaveHold is None, str(T.speeds[len(T.speeds)]))
+    held, s = T.tick(30, True)
+    check("and the world runs on afterwards", held is False and s == 2)
+    # the votes decide the resume speed
+    T.CM.voteSpeed = L.eval("function() return 4 end")
+    T.write("tpf2_ded_autosave.txt", "hold\n")
+    T.tick(1, True); n = len(T.speeds)
+    T.write("tpf2_ded_autosave_done.txt", "saved\n")
+    held, s = T.tick(1, True)
+    check("the votes' speed comes back after the save", s == 4 and T.unpaused[len(T.unpaused)] == 4, str(s))
+    T.CM.voteSpeed = L.eval("function() return nil end")
+    # no done marker: the hold ends on its own
+    T.write("tpf2_ded_autosave.txt", "hold\n")
+    held, s = T.tick(1, True)
+    held, s = T.tick(299, True)
+    check("the hold lasts up to DED_SAVE_HOLD_TICKS without a done marker", held is True and s == 0)
+    held, s = T.tick(2, True)
+    check("then releases on its own (timed out) at the speed it held from", held is False and s == 4 and "hold timed out" in T.log[len(T.log)], T.log[len(T.log)])
+    # alone: the ack goes back, nothing pauses
+    T.setSpeed(1); T.CM.dedPaused = True; T.CM.dedResume = 1
+    T.write("tpf2_ded_autosave.txt", "hold\n")
+    n = len(T.speeds)
+    held, s = T.tick(1, False)
+    check("alone: the ack says so and nothing pauses", T.read("tpf2_ded_autosave_ack.txt") == "alone\n" and T.CM.dedSaveHold is None and s == 1)
+    # an emptied request is no request
+    T.write("tpf2_ded_autosave.txt", "")
+    held, s = T.tick(3, True)
+    check("an emptied request file starts no hold", T.CM.dedSaveHold is None and held is False)
+    # the clock's own button on a dedicated server: no vote, whatever the value
+    T.CM.speedButton(1, "button")
+    check("SPEEDBTN 1 on a dedicated server: ignored, logged, no vote cast",
+          len(T.votes) == 0 and "on a dedicated server ignored" in T.log[len(T.log)], T.log[len(T.log)])
+    T.CM.speedButton(0, "toggle")
+    check("the toggle too", len(T.votes) == 0 and "ignored" in T.log[len(T.log)])
+    # an ordinary game still takes the button (the guard sits in front of the load-gate rule, which is next)
+    os.remove(os.path.join(td, "mp_dedicated.txt"))
+    T.CM.dedCfgAt = None; T.CM.lgHolding = True
+    T.CM.speedButton(3, "button")
+    check("an ordinary game's button still reaches the load-gate rule (lgPress)", T.CM.lgPress == 3 and T.CM.dedicated is False)
 
 if fails:
     raise SystemExit("FAIL: " + ", ".join(fails))
