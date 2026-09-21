@@ -32,7 +32,11 @@ Play Transport Fever 2 together. This mod adds real multiplayer to the game: sev
 [h2]Requirements[/h2][list][*] Transport Fever 2 on Steam, build 35924 (Windows, or Linux / Steam Deck through Proton)
 [*] The same mod version on every player's PC
 [*] For a host: UDP port 29471 reachable, or use the dedicated server
-[*] The mods a session uses are sent to joiners automatically; Workshop mods are registered on the joiner's side without a second download[/list]Big maps are welcome: the mod installs alongside [url=https://github.com/silver2127/tpf2-bigmap]TpF2 Big Maps[/url], in either order.
+[*] The mods a session uses are sent to joiners automatically; Workshop mods are registered on the joiner's side without a second download[/list]
+[hr][/hr]
+[h2]Compatible Mods[/h2][b]Compatible[/b]
+[list][*] [url=https://github.com/silver2127/tpf2-bigmap]TpF2 Big Maps[/url] -- maps far beyond the game's size limit, from the same author; the two install alongside each other in either order, and a Big Maps world plays in multiplayer like any other[/list][b]Not yet compatible[/b]
+[list][*] [b]Natural Town Growth[/b] and similar mods that change how towns grow or otherwise drive the simulation from a script. Their changes run on each player's game separately and drift apart, so the worlds desync. I am working on it.[/list]Most other mods are fine: vehicles, buildings, stations, tracks, roads, assets and visual mods add content that every player loads the same way. The host's save decides which mods a session uses, and they are sent to the joiners automatically. If a mod that changes the simulation desyncs a session, please report it with the mod's name.
 [hr][/hr]
 [h2]Troubleshooting[/h2]Most problems are fixed by a [b]rejoin[/b] or a [b]resync[/b] (when the Multiplayer window shows DESYNC, a Resync section appears at its top; [b]Resync now[/b] reloads the host's save on every machine). Before reporting a bug, please try these:
 [list][*] Make sure every player runs the same mod version; the lobby refuses a different one
