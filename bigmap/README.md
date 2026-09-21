@@ -233,6 +233,10 @@ limits still apply, so the longest maps must be narrow. See
 [the implementation and test notes](docs/octree-depth12.md) for configuration,
 evidence and remaining live checks. Defaults retain depth 11.
 
+**Steam 35924 only.** Depths 12 and 13 rewrite two prologues the GOG build does
+not share, so there `octree_depth=12`/`13` fall back to the depth-11 root
+instead of refusing to load: the ceiling stays 512 tiles and the log says so.
+
 Terrain LOD at the edge was **not** traced to the same limit. The only
 terrain-side 32,768 is an asymmetric legacy vertex packer (tiles −128..895),
 which can't produce a four-edge effect. If the edge renders right with `octree=1`

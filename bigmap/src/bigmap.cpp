@@ -432,10 +432,14 @@ static int g_logEvery    = 1;
 // A rectangle's long axis may use all of it -- its
 // area (the street-raster product, handled by the raster hook / warned
 // below) is a separate limit. max_tiles stays an explicit lower cap.
+// Depths 12/13 cannot be installed on the GOG build, so the ceiling there is
+// the patched box (EffectiveOctreeDepth drops them to 11). A menu that offered
+// 2,048 tiles over a 512-tile root would hand the user a broken world.
 static int EffectiveMaxTiles()
 {
-    int octCap = g_octreeOn ? (g_octreeDepth == 13 ? 2048 :
-                              g_octreeDepth == 12 ? 1024 : OCTREE_PATCH_TILES)
+    const int depth = EffectiveOctreeDepth();
+    int octCap = g_octreeOn ? (depth == 13 ? 2048 :
+                              depth == 12 ? 1024 : OCTREE_PATCH_TILES)
                             : OCTREE_STOCK_TILES;
     return (g_maxTiles > 0 && g_maxTiles < octCap) ? g_maxTiles : octCap;
 }
@@ -477,6 +481,19 @@ void BigmapTestOctreeSize(int depth, int maxTiles, int enabled, int* tx, int* ty
     *tx = Sanitise(*tx); *ty = Sanitise(*ty);
     BoundHeightmap(tx, ty);
     g_octreeDepth = oldDepth; g_maxTiles = oldMax; g_octreeOn = oldOn;
+}
+
+extern "C" __declspec(dllexport)
+int BigmapTestOctreeCeiling(int gog, int depth, int maxTiles, int enabled)
+{
+    int oldDepth = g_octreeDepth, oldMax = g_maxTiles;
+    bool oldOn = g_octreeOn, oldGog = g_gog;
+    g_gog = gog != 0; g_octreeDepth = depth; g_maxTiles = maxTiles;
+    g_octreeOn = enabled != 0;
+    const int cap = EffectiveMaxTiles();
+    g_gog = oldGog; g_octreeDepth = oldDepth;
+    g_maxTiles = oldMax; g_octreeOn = oldOn;
+    return cap;
 }
 
 // A std::string holding `s` in its inline buffer (SSO: at most 15 chars).
@@ -1437,10 +1454,20 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host, Tpf2mpPluginInfo* out)
         }
         uintptr_t rva = g_gog ? RVA_OCTREE_GOG : RVA_OCTREE;
         const uint8_t* exp = g_gog ? EXPECTED_OCTREE_GOG : EXPECTED_OCTREE;
+        const int depth = EffectiveOctreeDepth();
+        if (g_octreeOn && depth != g_octreeDepth) {
+            // Depth 12/13 rewrite two Steam-35924 prologues this build does not
+            // have. Refusing to load only punished GOG users whose config asked
+            // for it -- the shipped cfg does -- so keep the widening that does
+            // byte-verify here and say what the shorter root costs.
+            H->log("octree: octree_depth=%d is Steam 35924 only -- this build keeps "
+                   "depth 11 and loads, so the edge ceiling stays %d tiles, not %d",
+                   g_octreeDepth, OCTREE_PATCH_TILES, g_octreeDepth == 13 ? 2048 : 1024);
+        }
         if (!g_octreeOn) {
             H->log("octree: disabled (octree=0); maps over %d tiles will grow "
                    "duplicate street nodes past +-32,768 m", OCTREE_STOCK_TILES);
-        } else if (g_octreeDepth >= 12) {
+        } else if (depth >= 12) {
             // Explicit opt-in also applies on load, even with a small menu
             // ladder: saved worlds do not pass through GetNumTilesNew.
             if (!InstallOctDepth12(rva, exp)) {

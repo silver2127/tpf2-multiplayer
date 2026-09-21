@@ -118,7 +118,25 @@ cl /nologo /O2 /MT /W3 /EHsc /c src\bigmap.cpp /Fo:out\bigmap.obj || exit /b 1
 link /nologo /DLL /MAP:out\tpf2_bigmap.map /OUT:out\tpf2_bigmap.dll out\bigmap.obj          || exit /b 1
 echo BUILD BIGMAP OK
 
+REM One install, not two. The plugin host scans the datadir FIRST, so a datadir
+REM copy silently shadows a game-folder one -- and the two drift: the datadir
+REM gets this build and the repo cfg, while the game folder keeps whatever the
+REM user edited. This MUST stay outside the `if` block below: cmd expands a
+REM parenthesised block before it runs, so a `call :find_game_dir` inside it
+REM expands %GAMEDIR% to nothing and the check passes whatever the answer is.
+call :find_game_dir
+
 if /i "%1"=="-deploy" (
+    if defined GAMEDIR if exist "%GAMEDIR%\plugins\tpf2_bigmap.dll" (
+        echo.
+        echo DEPLOY REFUSED: a game-folder install already exists:
+        echo     %GAMEDIR%\plugins\tpf2_bigmap.dll
+        echo The plugin host scans %%LOCALAPPDATA%%\tpf2mp\data\plugins FIRST, so a
+        echo datadir copy would shadow it and run against the repo cfg, not yours.
+        echo Remove one of the two installs, or pass -deploy-force to overwrite anyway.
+        echo.
+        if /i not "%2"=="-deploy-force" exit /b 1
+    )
     if not exist "%LOCALAPPDATA%\tpf2mp\data\plugins" mkdir "%LOCALAPPDATA%\tpf2mp\data\plugins"
     copy /y out\tpf2_bigmap.dll "%LOCALAPPDATA%\tpf2mp\data\plugins\" >nul ^
         && echo DEPLOYED to %LOCALAPPDATA%\tpf2mp\data\plugins ^
@@ -129,3 +147,28 @@ if /i "%1"=="-deploy" (
     if exist cfg\tpf2_bigmap.cfg copy /y cfg\tpf2_bigmap.cfg "%LOCALAPPDATA%\tpf2mp\data\plugins\" >nul
 )
 endlocal
+exit /b 0
+
+REM ---- locate the game folder, for the -deploy shadow check ----------------
+REM A subroutine, not inline: inside a parenthesised block cmd expands the whole
+REM block before it runs, so `if not defined GAMEDIR` would keep testing the
+REM pre-loop value and the last registry hit would win, not the first.
+:find_game_dir
+set "GAMEDIR="
+if defined TPF2_GAMEDIR if exist "%TPF2_GAMEDIR%\TransportFever2.exe" set "GAMEDIR=%TPF2_GAMEDIR%"
+if defined GAMEDIR goto :eof
+for /f "tokens=2,*" %%a in ('reg query "HKLM\SOFTWARE\WOW6432Node\GOG.com\Games" /s /v path 2^>nul ^| findstr /i "path"') do (
+    if not defined GAMEDIR if exist "%%b\TransportFever2.exe" set "GAMEDIR=%%b"
+)
+if defined GAMEDIR goto :eof
+for /f "tokens=2,*" %%a in ('reg query "HKLM\SOFTWARE\GOG.com\Games" /s /v path 2^>nul ^| findstr /i "path"') do (
+    if not defined GAMEDIR if exist "%%b\TransportFever2.exe" set "GAMEDIR=%%b"
+)
+if defined GAMEDIR goto :eof
+for %%d in (
+    "C:\Games\Transport Fever 2"
+    "%ProgramFiles(x86)%\Steam\steamapps\common\Transport Fever 2"
+    "%ProgramFiles%\Steam\steamapps\common\Transport Fever 2"
+    "%ProgramFiles(x86)%\GOG Galaxy\Games\Transport Fever 2"
+) do if not defined GAMEDIR if exist "%%~d\TransportFever2.exe" set "GAMEDIR=%%~d"
+goto :eof
