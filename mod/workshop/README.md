@@ -19,7 +19,9 @@ hook the game.
 
 `WORKSHOP_DESCRIPTION.bbcode` is the item's page description in Steam's BBCode
 (headers, rules, lists): paste it into the item's description box on the Workshop
-site after publishing, and keep its version line current. The in-game uploader only
+site after publishing, and keep its version line current. Steam refuses a description over
+8,000 characters ("There was a problem trying to save the title and description");
+keep the file under about 7,800. The in-game uploader only
 sends `mod.lua`'s plain-text description, which is the fallback shown until then.
 
 ## Publishing (the game's own uploader, from the publisher's Steam account)
