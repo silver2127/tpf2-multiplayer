@@ -17,6 +17,11 @@ The shipped mod (`mod/mp_lockstep_1`) stays out of the Workshop: a Workshop copy
 would sit beside the installer's copy under another folder name and both would
 hook the game.
 
+`WORKSHOP_DESCRIPTION.bbcode` is the item's page description in Steam's BBCode
+(headers, rules, lists): paste it into the item's description box on the Workshop
+site after publishing, and keep its version line current. The in-game uploader only
+sends `mod.lua`'s plain-text description, which is the fallback shown until then.
+
 ## Publishing (the game's own uploader, from the publisher's Steam account)
 
 1. Copy `tpf2_multiplayer_link_1` (mod.lua, image_00.tga and workshop_preview.jpg -- the uploader refuses a folder without the jpg) into the account's
