@@ -37,9 +37,15 @@ While the panel is open, typing goes into its fields and the game does not see i
    shows `[locked]`.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
-4. Press **START GAME**. The most recent save in your save folder (autosaves count) is sent to
-   everyone. When the panel says the save is ready, open **LOAD GAME** and pick **mp_shared**;
-   everyone else does the same.
+4. Click **SELECT SAVE** in the lobby and choose your world. The list includes autosaves,
+   shows modification dates, and puts the newest files first. Use **NEXT** / **PREVIOUS**
+   for more saves, or **REFRESH** after saving a new world. The chosen filename stays visible
+   in the lobby. The save must have the Multiplayer mod enabled.
+5. Press **START GAME** to send the selected save to everyone. If the file was removed,
+   choose another save; the lobby never silently substitutes a different world. With automatic
+   loading disabled, open **LOAD GAME** and pick **mp_shared** when the save is ready.
+
+Hosting from an already running world continues to share a fresh snapshot of that world.
 
 Games load at different speeds; each player's game holds at the start until the host's game is
 running, so nobody plays ahead.
