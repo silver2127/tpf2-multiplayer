@@ -19,13 +19,13 @@ Play Transport Fever 2 together. This mod adds real multiplayer to the game: sev
 [*] Build. Every road, station, vehicle and line appears for all players.[/olist]A new game has the multiplayer mod enabled by itself; for an existing save, enable it once in the save's Mods panel. The host's PC should have UDP port 29471 reachable (the lobby tries UPnP first). If that is not possible, play on the [b]public dedicated test server[/b] in the PUBLIC GAMES list, where nobody needs an open port. It runs all day.
 [hr][/hr]
 [h2]Features[/h2][list][*] [b]One shared world[/b]: every build, purchase, sale, line edit and demolition is applied at the same simulation step on every machine, the builder's own included
-[*] [b]Shared company or one company per player[/b], each with its own money, and station permissions between companies
+[*] [b]Shared company or one company per player[/b]: co-op in one company, or the host's SEPARATE COMPANIES option gives every player a company with its own money on the same map
 [*] [b]Hot join[/b]: a player can join a running game; the session holds while they load, then carries on
 [*] [b]Automatic save and mod transfer[/b]: the host's save and the mods it needs go to every joiner, over a fast direct channel
 [*] [b]Works through home routers[/b]: hole punching first, a relay through the project's server when the punch cannot work
 [*] [b]Public game list and join codes[/b], with an optional password
-[*] [b]Session speed voting[/b]: the players agree on the game speed; the world pauses for everyone or for no one
-[*] [b]Desync detection[/b]: the worlds are compared continuously, and a resync from the host's save is one click
+[*] [b]Session speed by vote[/b]: the session runs at the average of everyone's speed votes, and a pause is a pause for everyone
+[*] [b]Desync detection[/b]: the worlds are compared continuously, and a resync from the host's save is one click (Resync now)
 [*] [b]Dedicated server[/b]: a headless host that keeps a world up for anyone to join
 [*] [b]Nothing phones home[/b]: no telemetry, no statistics, no crash upload. The only network use is the public game list, the join rendezvous and your session ([url=https://silver2127.github.io/tpf2-multiplayer/privacy.html]privacy policy[/url])[/list]
 [hr][/hr]
@@ -34,16 +34,16 @@ Play Transport Fever 2 together. This mod adds real multiplayer to the game: sev
 [*] For a host: UDP port 29471 reachable, or use the dedicated server
 [*] The mods a session uses are sent to joiners automatically; Workshop mods are registered on the joiner's side without a second download[/list]Big maps are welcome: the mod installs alongside [url=https://github.com/silver2127/tpf2-bigmap]TpF2 Big Maps[/url], in either order.
 [hr][/hr]
-[h2]Troubleshooting[/h2]Most problems are fixed by a [b]rejoin[/b] or a [b]resync[/b] (the RESYNC button in the Multiplayer window reloads the host's save on every machine). Before reporting a bug, please try these:
+[h2]Troubleshooting[/h2]Most problems are fixed by a [b]rejoin[/b] or a [b]resync[/b] (when the Multiplayer window shows DESYNC, a Resync section appears at its top; [b]Resync now[/b] reloads the host's save on every machine). Before reporting a bug, please try these:
 [list][*] Make sure every player runs the same mod version; the lobby refuses a different one
 [*] Have the affected player leave the session and join again
-[*] If the world drifted (a DESYNC line in the window), press RESYNC on the host
+[*] If the world drifted (DESYNC in the window), press Resync now once
 [*] If nobody can connect to you, check the host's port or use the dedicated server
 [*] Steam's "Verify integrity of game files" removes the mod's hook; run the installer's Repair to bring the MULTIPLAYER button back[/list][b]Known Issues[/b]
 [list][*] [b]A player more than 15 units behind the others[/b] has their actions held until they catch up; wait, or lower the session speed
 [*] [b]A second game on the same PC[/b] does not get the hooks; one instance per Windows session
 [*] [b]A four-arm track crossing built as one piece[/b] freezes the game; build it as two straight lines
-[*] [b]Some stop and line details do not replicate yet[/b] (a stop's load settings, replacing a stop on an occupied platform); the full list is in KNOWN_ISSUES.md on GitHub[/list]If a problem persists, open an issue on GitHub with a short description and the logs from [b]%LOCALAPPDATA%\tpf2mp\logs[/b] (Proton: the same path inside the game's prefix). Logs from everyone involved speed things up enormously.
+[*] [b]Some stop and line details do not replicate yet[/b] (a stop's load settings, replacing a stop on an occupied platform); the full list is in KNOWN_ISSUES.md on GitHub[/list]If a problem persists, open an issue on GitHub with a short description and the logs from [b]%LOCALAPPDATA%\tpf2mp\logs[/b] (Proton: the same folder inside the game's Wine prefix). Logs from everyone involved speed things up enormously.
 [url=https://github.com/silver2127/tpf2-multiplayer/issues]Issue tracker[/url]
 [hr][/hr]
 [h2]Links[/h2][list][*] [url=https://silver2127.github.io/tpf2-multiplayer/]Website and download[/url]
