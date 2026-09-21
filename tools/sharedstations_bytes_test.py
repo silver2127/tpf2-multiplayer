@@ -31,9 +31,10 @@ import struct
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_REG_RIP
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
 
 repo = Path(__file__).resolve().parents[1]
-source = (repo / "native/src/slice_hook.cpp").read_text(encoding="utf-8")
+source = slice_source(repo)
 
 
 def const(name):
@@ -146,7 +147,10 @@ assert (0x609600, "cmp", "edx, 3") in cls and (0x609603, "jg", f"{BASE + reject:
 # jump over the reject arm by the right displacement, and touch no register the
 # tails read. A typo'd opcode here is a jump into the middle of an instruction
 # in a running game, which no other test would catch.
-emit = re.search(r"size_t n = 0;\s*(.*?)FlushInstructionCache", source, re.S)[1]
+# anchored on the install function: `size_t n = 0;` appears in earlier regions too (the
+# first match used to be the icon-class stub, which has no stub[n++] lines at all)
+emit = re.search(r"size_t n = 0;\s*(.*?)FlushInstructionCache",
+                 source[source.index("static void InstallSharedStations()"):], re.S)[1]
 stub = bytearray()
 for line in emit.splitlines():
     line = re.sub(r"//.*", "", line)

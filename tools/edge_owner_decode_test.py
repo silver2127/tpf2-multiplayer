@@ -6,9 +6,10 @@ The memory-vector reader is stubbed, not the decoder under test.
 """
 from pathlib import Path
 import subprocess
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
 
 ROOT = Path(__file__).resolve().parents[1]
-source = (ROOT / 'native/src/slice_hook.cpp').read_text(encoding='utf-8')
+source = slice_source(ROOT)
 edge = source[source.index('struct Edge {'):source.index('\n', source.index('struct Edge {'))]
 decoder = source[source.index('static int DecodeEdgesVec('):source.index('static int DecodeNodesVec(')]
 fixture = bytes.fromhex(

@@ -11,7 +11,9 @@ groups, strings, matrices and removal ids, and that damaged files are refused.
 import base64, os, random, struct, subprocess, sys, tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-SRC = open(os.path.join(REPO, "native", "src", "slice_hook.cpp"), encoding="utf-8").read()
+sys.path.insert(0, os.path.join(REPO, "tools"))
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
+SRC = slice_source(REPO)
 
 
 def cut(start, end):
