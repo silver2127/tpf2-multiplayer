@@ -390,3 +390,34 @@ python ..\tools\relay_selftest.py     # real processes, dedicated relay (needs i
 
 `punch.py`, `connect.py` and `observe.py` also run standalone (a two-player punch test, the
 original two-player connect CLI, and a printout of this machine's connectivity profile).
+
+## Steam's networking
+
+Since 0.6.1.15 the bridge DLL also carries the lobby's traffic over Steam's own
+P2P networking (`native/src/steam_tunnel.cpp`, the game's `steam_api64.dll`,
+`ISteamNetworking`). Steam does the NAT traversal and, when no direct path
+opens, relays through Valve's servers, for any app: nobody forwards a port,
+installs a VPN or depends on the master server's relay.
+
+- **How it appears to the lobby.** The tunnel presents every Steam peer as a
+  loopback UDP endpoint: `127.0.0.1` on a port in 62100-62199, the range that
+  tells an endpoint from a real peer. A datagram the lobby sends there goes
+  out as a P2P packet to that SteamID; a packet from that SteamID arrives at
+  the lobby's socket from that endpoint. Sealing, the roster, the save
+  transfer and the NACK/resend are unchanged; the TCP side channels (the
+  backup link, the bulk channel) are skipped for endpoints, so a transfer
+  through Steam runs on the UDP path. Packets over 1,200 bytes go through
+  Steam's reliable send (the unreliable limit), the rest unreliable.
+- **Addressing.** The host's SteamID rides in the join code as the last
+  trailing field; the joiner dials it through its tunnel as one more
+  candidate, in the same race as the LAN, public and VPN addresses (a direct
+  path still wins when it answers first). The joiner's knock at the master
+  carries its own SteamID, so the host opens the session from its side too;
+  a session request Steam delivers is accepted from anyone, the seal decides.
+- **Files.** `tpf2_steam.txt` in the data folder (`id=`, `port=`, `name=`)
+  once the tunnel is up; `tpf2mp_steam_off.txt` keeps it off. The tunnel's
+  lines in `tpf2_bridge.log` start with `[steam]`; `STATUS` on its control
+  port lists every endpoint with Steam's session state (relay in use, errors).
+- **Not there:** a dedicated server whose Steam client runs offline (the VPS),
+  a game started outside Steam, and a second instance on the same account
+  (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).

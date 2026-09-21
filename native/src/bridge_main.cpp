@@ -29,6 +29,7 @@
 #include "datadir.h"
 #include "speedhook.h"
 #include "setplayer_patch.h"
+#include "steam_tunnel.h"
 
 static FILE* g_log = nullptr;
 static void Log(const char* fmt, ...)
@@ -746,6 +747,11 @@ static DWORD WINAPI InitThread(LPVOID)
     // a company switch calls it on everything the player owns.
     g_entityOwnerReady = SetPlayerPatch_Install(Log);
     WriteIdentity(cfg.instance, false);
+
+    // Steam P2P as a lobby transport (steam_tunnel.cpp): its own thread waits
+    // for the game's Steam to come up, then presents every Steam peer to the
+    // lobby as a loopback UDP endpoint. tpf2_steam.txt in the data dir says so.
+    SteamTunnel_Start(g_dataDir, Log);
 
     // Transport health, from our own thread every 10 s. A line is written only
     // when a figure moved, so an idle bridge does not repeat itself all session.

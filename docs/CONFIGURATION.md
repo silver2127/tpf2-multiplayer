@@ -104,3 +104,7 @@ bridge and the mod: letter, loopback port, player count, session speed request, 
 `tpf2_speed.txt` (the fractional speed target), `tpf2mp_dash.txt` (window visibility),
 `mp_company_cfg.txt` (company assignment) and `tpf2_names.txt` (your player and lobby names), all in the
 data folder. [ARCHITECTURE.md](ARCHITECTURE.md#files) lists every file.
+
+## Steam transport
+
+`tpf2mp_steam_off.txt` in the data folder (any content) keeps the bridge from using Steam's networking for the lobby ([NETWORKING.md](NETWORKING.md#steams-networking)); the join code then carries no SteamID. `tpf2_steam.txt` there is written by the bridge once its Steam side is up.

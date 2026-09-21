@@ -158,6 +158,7 @@ company", then "<player>'s 2nd company" and so on, whoever plays it now.
 
 ## Ports and firewalls
 
+- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code, and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in.
 - **Most hosts need no port forwarding.** When a friend joins, both lobbies punch through
   their routers to each other with the help of the master server. The lobby also tries UPnP.
 - If friends still cannot connect, forward UDP 29471 to your PC on your router, or use a

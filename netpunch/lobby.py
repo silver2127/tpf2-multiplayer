@@ -181,6 +181,7 @@ from punch import (
 )
 from seal import Sealer, derive_key, SECRET_LEN
 import modshare                     # share the mods a save needs (mod zips ride the save transfer)
+import steamtunnel                  # Steam's own networking as a transport (native/src/steam_tunnel.cpp), 2026-09-21
 # Reuse the code exchange + the connect race + observe/announce.
 from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4, parse_hostport
 from mesh import MeshNode
@@ -313,6 +314,9 @@ def _start_dual_client(conn, name, log, sim=None):
         dsock.link_delay = sim["delay"]
     conn.sock = dsock                    # the reader thread and the mesh pick it up on their next turn
     host_addr = conn.peer
+    if steamtunnel.is_tunnel_addr(host_addr):
+        log("[dual] the host is reached through Steam's networking -- no TCP link (Steam carries the frames)")
+        return
     local_port = dsock.getsockname()[1]
     hello = _dual_hello(name)
 
@@ -1505,7 +1509,7 @@ class _HostSaveTransfer:
         # the receiver has a listener (the relay, for our upload): connect and stream
         port = msg.get("tcp_port")
         if self.tcp_token and isinstance(port, int) and 0 < port < 65536 and not p["tcp"] and not p["tcp_tried"] \
-                and isinstance(addr, tuple):
+                and isinstance(addr, tuple) and not steamtunnel.is_tunnel_addr(addr):
             p["tcp_tried"] = True
             threading.Thread(target=self._tcp_push, args=(addr[0], port, p), name="bulk-push", daemon=True).start()
         need = msg.get("need")
@@ -2175,7 +2179,8 @@ class _ClientSaveReceiver:
                 if BULK[0] is not None:
                     BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
                     ack["tcp_port"] = BULK[0].port
-            elif isinstance(tcp.get("port"), int) and getattr(self.conn, "peer", None):
+            elif isinstance(tcp.get("port"), int) and getattr(self.conn, "peer", None) \
+                    and not steamtunnel.is_tunnel_addr(self.conn.peer):   # Steam carries the chunks: no TCP there
                 threading.Thread(target=self._tcp_pull, args=(self.conn.peer[0], tcp["port"], tcp["token"], sid),
                                  name="bulk-pull", daemon=True).start()
         self._send(ack)
@@ -2803,6 +2808,17 @@ def _rv_sealer(secret, password):
     return Sealer(hashlib.sha256(derive_key(secret, password or "") + b"|rendezvous").digest())
 
 
+def _steam_tunnel(args):
+    """The Steam tunnel client for this lobby (steamtunnel.py): a no-op object
+    without a data dir, the kill switch, or a bridge whose Steam is not up."""
+    d = getattr(args, "sync_runtime_dir", None) or os.environ.get("TPF2MP_DATADIR") \
+        or os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "tpf2mp", "data")
+    t = steamtunnel.SteamTunnel(d, _log, wait=1.0)   # the bridge wrote the identity long before HOST/JOIN; 1 s covers a game still starting
+    if not t.available:
+        _log("[steam] no Steam transport (no tunnel identity in the data folder)")
+    return t
+
+
 def _rv_url(args):
     """The master used for knocks: --rendezvous, else --publish, else the default;
     '--rendezvous off' disables them."""
@@ -2842,10 +2858,11 @@ class _RendezvousHost:
     """Polls the master for joiners' sealed address notes; each valid one is put
     on ``queue`` as a list of (ip, port) punch targets for run_host."""
 
-    def __init__(self, url, secret, password, log, poll_every=RV_POLL_EVERY):
+    def __init__(self, url, secret, password, log, poll_every=RV_POLL_EVERY, tunnel=None):
         self.url, self.tag, self.log = url.rstrip("/"), _rv_tag(secret), log
         self.sealer = _rv_sealer(secret, password)
         self.poll_every = poll_every
+        self.tunnel = tunnel                  # the Steam tunnel: a knock that names a SteamID is dialled through it
         self.queue = queue.Queue()
         self._since = 0.0
         self._stop = threading.Event()
@@ -2889,6 +2906,14 @@ class _RendezvousHost:
             hp = parse_hostport(prof.get("candidates", {}).get(key))
             if hp and hp[1] and hp not in out:
                 out.append(hp)
+        # the joiner's Steam identity: open its session from our side (the OPEN
+        # implicitly accepts) and punch at the endpoint like any other address
+        sid = prof.get("candidates", {}).get("steam")
+        if sid and self.tunnel is not None and self.tunnel.available:
+            ep = self.tunnel.dial(sid)
+            if ep and ep not in out:
+                self.log(f"[steam] the joiner is {sid} on Steam -- session opened, punching at {ep[0]}:{ep[1]}")
+                out.append(ep)
         return out or None
 
     def _run(self):
@@ -5306,8 +5331,12 @@ def cmd_host(args):
     if secret is None:
         secret = os.urandom(SECRET_LEN)
     SEAL[0] = Sealer(derive_key(secret, args.password or ""))
+    tunnel = _steam_tunnel(args)
     sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
-                                                 password=args.password or None)
+                                                 password=args.password or None,
+                                                 extra_candidates={"steam": tunnel.id})
+    if tunnel.available:
+        tunnel.hello(sock.getsockname()[1])   # the code names our SteamID; joiners reach us through Steam too
     if args.password:
         _log("[host] the code is LOCKED: without the password it reveals nothing")
     else:
@@ -5336,7 +5365,7 @@ def cmd_host(args):
     rendezvous = None
     rv_url = "" if args.relay_only else _rv_url(args)
     if rv_url:
-        rendezvous = _RendezvousHost(rv_url, secret, args.password or "", _log)
+        rendezvous = _RendezvousHost(rv_url, secret, args.password or "", _log, tunnel=tunnel)
         _log(f"[rendezvous] polling {rv_url} for joiners to punch toward")
     try:
         if args.relay_only:
@@ -5354,6 +5383,7 @@ def cmd_host(args):
             rendezvous.close()
         if publisher is not None:
             publisher.close()
+        tunnel.close()
         try:
             from observe import upnp_unmap
             if upnp_unmap(args.local_port):
@@ -5391,10 +5421,15 @@ def cmd_join(args):
     # UPnP), so the host can hand the other joiners a code that punches us.
     profile_code = None
     prof = None
+    tunnel = _steam_tunnel(args)
+    if tunnel.available:
+        tunnel.hello(sock.getsockname()[1])
     if not getattr(args, "no_mesh", False):
         try:
             from observe import observe
             prof = observe(args.local_port, sock=sock, do_upnp=False)
+            if tunnel.available:
+                prof["candidates"]["steam"] = tunnel.id   # the knock tells the host to open our Steam session
             profile_code = encode_profile(prof)
             _log(f"[join] self-observed candidates={prof['candidates']} "
                  f"flags={prof['flags']}")
@@ -5405,6 +5440,20 @@ def cmd_join(args):
     knock = None
     rv_url = _rv_url(args)
     late_targets = []                      # the master's relay port, once asked for (see RV_RELAY_FROM_KNOCK)
+    # The host's Steam identity from the code: dial it through the tunnel as one
+    # more candidate. On a thread, so the direct dial starts at once; the race
+    # picks the endpoint up from late_targets. Steam punches or relays on its own,
+    # so this is the path that works where nothing else does (CGNAT, both closed).
+    host_steam = peer.get("candidates", {}).get("steam")
+    if host_steam and tunnel.available and host_steam != tunnel.id:
+        def _dial_steam():
+            ep = tunnel.dial(host_steam)
+            if ep:
+                _log(f"[steam] the host is {host_steam} on Steam -- dialling it through Steam at {ep[0]}:{ep[1]} as well")
+                late_targets.append(ep)
+        threading.Thread(target=_dial_steam, name="steam-dial", daemon=True).start()
+    elif host_steam and not tunnel.available:
+        _log("[steam] the host is on Steam but this game has no Steam transport -- direct dial and the master's punch only")
     if rv_url and profile_code and peer.get("secret"):
         knock = _RendezvousKnock(rv_url, peer["secret"], args.password or "", profile_code, _log,
                                  sock=sock, late=late_targets)
@@ -5422,7 +5471,8 @@ def cmd_join(args):
         if relay is not None:
             relay.close()
         return 1
-    _log(f"[join] connected to host {conn.peer_str}")
+    _log(f"[join] connected to host {conn.peer_str}"
+         + (" -- through Steam's networking" if steamtunnel.is_tunnel_addr(conn.peer) else ""))
     conn.cipher = SEAL[0]
     sim = _impair_client(conn, io.dir, _log)
     if _tcp_backup_on(io.dir) and SEAL[0] is not None:
