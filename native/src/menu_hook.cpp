@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <iphlpapi.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
@@ -347,6 +348,21 @@ static bool           g_panelBuilt = false;
 static char           g_code[128] = "";                   // host/own code to display
 static volatile LONG  g_haveCode = 0;
 static wchar_t        g_startSaveW[600] = L"";             // host: the .sav it chose to share
+// Picker state belongs to the presentation thread; g_startSaveW is the transfer snapshot.
+struct LobbySave { std::wstring path, name; FILETIME modified; };
+static std::vector<LobbySave> g_lobbySaves;
+static std::wstring g_selectedSave;
+static bool g_savePicker = false;
+static volatile LONG g_saveStartPending = 0;
+static void SaveStartStatus(const char* state, const char* detail)
+{
+    // A refusal permits choosing another world; ordinary progress must keep the snapshot fixed.
+    if (!strcmp(state,"failed") || strstr(detail,"no players to share with")==detail || strstr(detail,"Not shared:")==detail)
+        InterlockedExchange(&g_saveStartPending,0);
+}
+static int g_savePage = 0;
+static const int SAVE_ROWS = 8;
+static void RefreshLobbySaves();
 static volatile LONG  g_panelDirty = 1;       // re-render the GDI content
 static int            g_panelX = 0, g_panelY = 0;   // top-left on the swapchain
 
@@ -1297,6 +1313,33 @@ static void RenderPanelLayer(int w, int h)
         mwStatus(w,h);
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
+        if (g_savePicker && g_isHost && !WorldLoaded() && !g_sessionStarted) {
+            mwTitle(L"SELECT SAVE"); mwClose(w, 91);
+            mwBody(pad, cy, w-2*pad, S(40), L"Choose the world to share. Newest saves first, including autosaves.");
+            HFONT font = mkLato(S(14));
+            for (int row=0; row<SAVE_ROWS; ++row) {
+                int i=g_savePage*SAVE_ROWS+row;
+                if (i >= (int)g_lobbySaves.size()) break;
+                const auto& save=g_lobbySaves[i];
+                int y=cy+S(48)+row*S(40);
+                layerRect(pad,y,w-2*pad,S(36),save.path==g_selectedSave ? MW_YOU : RGB(0,0,0),65);
+                layerText(pad+S(10),y,w-2*pad-S(185),S(36),save.name.c_str(),font,MW_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+                FILETIME local; SYSTEMTIME date; wchar_t stamp[40]=L"";
+                if (FileTimeToLocalFileTime(&save.modified,&local) && FileTimeToSystemTime(&local,&date))
+                    _snwprintf_s(stamp,_TRUNCATE,L"%04u-%02u-%02u %02u:%02u",date.wYear,date.wMonth,date.wDay,date.wHour,date.wMinute);
+                layerText(w-pad-S(170),y,S(160),S(36),stamp,font,MW_DIM,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+                addHit(pad,y,w-2*pad,S(36),100+row,true);
+            }
+            DeleteObject(font);
+            if (g_lobbySaves.empty()) mwBody(pad,cy+S(55),w-2*pad,S(60),L"No saves found. Create and save a world with the Multiplayer mod enabled, then refresh.");
+            int y=h-S(85);
+            mwButton(pad,y,S(110),S(30),L"BACK",91);
+            mwButton(pad+S(125),y,S(110),S(30),L"REFRESH",92);
+            if (g_savePage>0) mwButton(w-pad-S(240),y,S(110),S(30),L"PREVIOUS",93);
+            if ((g_savePage+1)*SAVE_ROWS<(int)g_lobbySaves.size()) mwButton(w-pad-S(110),y,S(110),S(30),L"NEXT",94);
+            mwStatus(w,h);
+            return;
+        }
         int titleW = S(90);
         { std::wstring wt = L"LOBBY";
           if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_lobbyTitle.empty()) wt = L"LOBBY  --  " + wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
@@ -1321,6 +1364,16 @@ static void RenderPanelLayer(int w, int h)
             layerText(cx + S(10), S(11), cw, S(26), wcode, fm, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fm);
             HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy (never shown)", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
             addHit(cx, S(11), cw, S(26), 7, true);
+        }
+        if (g_isHost && !WorldLoaded() && !g_sessionStarted) {
+            int bw=mwButtonW(L"SELECT SAVE");
+            mwButton(pad,cy,bw,S(30),L"SELECT SAVE",90);
+            const wchar_t* name=g_selectedSave.empty() ? L"Choose a save before starting" : wcsrchr(g_selectedSave.c_str(),L'\\');
+            if (!g_selectedSave.empty()) name=name ? name+1 : g_selectedSave.c_str();
+            HFONT font=mkLato(S(14));
+            layerText(pad+bw+S(12),cy,w-2*pad-bw-S(12),S(30),name,font,MW_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+            DeleteObject(font);
+            cy+=S(44);
         }
         int bottom = h - S(44);
         int listW = S(220), chatX = pad + listW + S(20), chatW = w - chatX - pad;
@@ -1419,7 +1472,7 @@ static void RenderPanelLayer(int w, int h)
         mwHeader(lx, cy, colW, L"HOST A GAME");
         mwBody(lx, cy + S(24), colW, S(36), WorldLoaded()
             ? L"Opens a lobby and saves this world for everyone who joins."
-            : L"Opens a lobby and shares your newest save with everyone who joins.");
+            : L"Open a lobby, choose a save, then share it with everyone who joins.");
         // NOT ensureUsername() here: this runs every frame, so emptying the name
         // field made the next frame roll a new random name before anything could be
         // typed (2026-09-11). An empty name is filled only on HOST/JOIN or Enter.
@@ -1803,6 +1856,28 @@ static void OnHit(int id, int button)
 {
     if (button == 2 && !(id >= 20 && id <= 35)) return;   // right-click: company chips only
     Log("[menu] hit id=%d\n", id);
+    if (id>=90 && id<100+SAVE_ROWS) {
+        if (!g_isHost || WorldLoaded() || g_sessionStarted) return;
+        if (g_saveStartPending) { SetStatus("The selected save is being shared. Wait for the transfer to finish."); return; }
+        if (id==90 || id==92) { RefreshLobbySaves(); g_savePicker=true; }
+        else if (id==91) g_savePicker=false;
+        else if (id==93 && g_savePage>0) --g_savePage;
+        else if (id==94 && (g_savePage+1)*SAVE_ROWS<(int)g_lobbySaves.size()) ++g_savePage;
+        else if (id>=100 && g_savePicker) {
+            int i=g_savePage*SAVE_ROWS+id-100;
+            if (i<(int)g_lobbySaves.size()) {
+                g_selectedSave=g_lobbySaves[i].path;
+                g_savePicker=false;
+                if (g_lobbyReady) {
+                    std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+jsonEscape(utf8Of(g_selectedSave.c_str()).c_str())+"\"}";
+                    LobbySend(line.c_str());
+                }
+                SetStatus("Save selected. Press START GAME to share it.");
+            }
+        }
+        InterlockedExchange(&g_panelDirty,1);
+        return;
+    }
     switch (id) {
     case 19:
         g_flagShareMods = g_flagShareMods==1 ? 0:1;
@@ -1887,18 +1962,25 @@ static void OnHit(int id, int button)
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: if (WorldLoaded()) SetStatus("Return to the main menu to join another world."); else StartLobby(1); break;
     case 5: if (!WorldLoaded()) LeaveLobby(); break;                // title-menu LEAVE only
-    case 6: if (InterlockedCompareExchange(&g_isHost,0,0)) {   // START GAME (host): share newest save, then start
+    case 6: if (InterlockedCompareExchange(&g_isHost,0,0)) {   // START GAME (host): share the selected save
         // Hosting from a running map already starts its snapshot/hot-join flow.
         // Dismiss the panel without resending the world or waiting for loaders.
         if (WorldLoaded()) { OnHit(4); break; }
         // lobby.py truncates lobby_in.jsonl when it starts: a command appended
         // before its first event line would be lost. Wait for that first line.
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
-        if (newestSave(g_startSaveW, 600)) {
+        if (g_saveStartPending) { SetStatus("The selected save is being shared. Please wait."); break; }
+        if (g_selectedSave.empty()) { OnHit(90); SetStatus("Choose a save before starting."); break; }
+        DWORD attributes=GetFileAttributesW(g_selectedSave.c_str());
+        if (attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_DIRECTORY)) {
+            SetStatus("The selected save is no longer available. Choose another save."); break;
+        }
+        if (wcscpy_s(g_startSaveW,g_selectedSave.c_str())==0) {
             std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(g_startSaveW).c_str()) + "\"}";
-            LobbySend(line.c_str()); SetStatus("Sharing save & starting game…");
-            MarkSaveShared();
-        } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
+            InterlockedExchange(&g_saveStartPending,1);
+            if (LobbySend(line.c_str())) { SetStatus("Sharing save & starting game…"); MarkSaveShared(); }
+            else { InterlockedExchange(&g_saveStartPending,0); SetStatus("Could not send the start request. Please try again."); }
+        }
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
@@ -3202,6 +3284,25 @@ static void applyRoster(const char* s)
 static const wchar_t* SAVE_DIR =   // placeholder: resolveSaveDir() replaces it at init
     L"C:\\Program Files (x86)\\Steam\\userdata\\0\\1066780\\local\\save";
 
+static void RefreshLobbySaves()
+{
+    g_lobbySaves.clear(); g_savePage=0;
+    wchar_t pattern[700]; _snwprintf_s(pattern,_TRUNCATE,L"%s\\*.sav",SAVE_DIR);
+    WIN32_FIND_DATAW data; HANDLE find=FindFirstFileW(pattern,&data);
+    if (find==INVALID_HANDLE_VALUE) return;
+    do {
+        if (data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring path=std::wstring(SAVE_DIR)+L"\\"+data.cFileName;
+        if (path.size()>=600) continue; // the native load/transfer path uses 600 wchar_t
+        g_lobbySaves.push_back({path,data.cFileName,data.ftLastWriteTime});
+    } while (FindNextFileW(find,&data));
+    FindClose(find);
+    std::sort(g_lobbySaves.begin(),g_lobbySaves.end(),[](const LobbySave& a,const LobbySave& b) {
+        LONG order=CompareFileTime(&a.modified,&b.modified);
+        return order ? order>0 : a.name<b.name;
+    });
+}
+
 // newest *.sav in SAVE_DIR (full path). Returns false if none. mp_shared.sav is
 // OUR OWN placed copy (always stamped newest by placeSaveNewest), so it is skipped
 // unless it is the only save there -- otherwise every START would re-share the
@@ -3665,11 +3766,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) {
                             if (g_isHost) {
-                                wchar_t save[600];
                                 if (WorldLoaded()) SyncStart("host: initial world snapshot");
-                                else if (newestSave(save,600)) {
-                                    std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+jsonEscape(utf8Of(save).c_str())+"\"}"; LobbySend(line.c_str());
-                                }
                             }
                             strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
                         else if(strcmp(ty,"transport_lobby")==0) {
@@ -3769,7 +3866,11 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 if (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 && !g_gameUi) SetStatus(tx + 9);
                             } else { chatPush(fr.c_str(), tx); speedFromChat(tx); }
                         }
-                        else if (strcmp(ty, "status") == 0) { char de[200]; jsonStr(rem, "detail", de, sizeof(de)); if (de[0]) SetStatus(de); }
+                        else if (strcmp(ty, "status") == 0) {
+                            char de[200], state[24]; jsonStr(rem, "detail", de, sizeof(de)); jsonStr(rem,"state",state,sizeof(state));
+                            SaveStartStatus(state,de);
+                            if (de[0]) SetStatus(de);
+                        }
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));
                             int pct = jsonInt(rem, "pct"); char msg[96];
@@ -3803,6 +3904,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         else if (strcmp(ty, "mods_ready") == 0) { SetStatus("Mods received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "save_ready") == 0) { InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "start") == 0) {
+                            InterlockedExchange(&g_saveStartPending,0);
                             // {"type":"start","save":true|false}: save=true means a save
                             // transfer completed for this peer this session; absent => true.
                             bool withSave = jsonBool(rem, "save", true);
@@ -3995,6 +4097,8 @@ static void StartLobby(int join)
     InterlockedExchange(&g_lobbyReady, 0);
     InterlockedExchange(&g_saveReady, 0);
     InterlockedExchange(&g_sessionStarted, 0);
+    g_selectedSave.clear(); g_savePicker=false; g_lobbySaves.clear(); g_savePage=0;
+    InterlockedExchange(&g_saveStartPending,0);
     InterlockedExchange(&g_hostLoadedItself, 0);
     InterlockedExchange(&g_worldGenHold, 0);
     InterlockedExchange(&g_switchShare, 0);
