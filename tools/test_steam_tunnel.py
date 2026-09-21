@@ -143,6 +143,9 @@ check("packets over 1,200 bytes go reliable", "UNRELIABLE_MAX = 1200" in src and
 check("endpoints live on 127.0.0.1 ports 62100-62199 and the identity file is tpf2_steam.txt",
       'TUNNEL_PORT_LO = 62100, TUNNEL_PORT_HI = 62199' in src and 'L"tpf2_steam.txt"' in src and list(steamtunnel.TUNNEL_PORTS) == list(range(62100, 62200)))
 check("the kill switch", 'L"tpf2mp_steam_off.txt"' in src)
+check("Steam's send-rate cap and buffers are raised (SendRateMax 24, SendBufferSize 9, RecvBufferSize 47)",
+      '{ "SendRateMax",    24,' in src and '{ "SendBufferSize",  9,' in src and '{ "RecvBufferSize", 47,' in src
+      and '"SteamAPI_ISteamNetworkingUtils_SetConfigValue"' in src)
 check("the bridge starts it after its identity is written", "SteamTunnel_Start(g_dataDir, Log);" in bridge and bridge.index("SteamTunnel_Start") > bridge.index("SetPlayerPatch_Install(Log);"))
 check("build.bat compiles and links it into the bridge", "src\\steam_tunnel.cpp" in bat and "out\\steam_tunnel_mp.obj ||" in bat)
 lob = open(os.path.join(ROOT, "netpunch", "lobby.py"), encoding="utf-8").read()

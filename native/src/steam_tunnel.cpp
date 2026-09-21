@@ -38,6 +38,8 @@ typedef bool     (*FnSessionState)(void* net, uint64_t id, void* state);
 typedef void     (*FnRegisterCallback)(void* cb, int id);
 typedef void     (*FnUnregisterCallback)(void* cb);
 typedef const char* (*FnPersonaName)(void* friends);
+typedef bool     (*FnSetConfig)(void* utils, int value, int scope, intptr_t obj, int dataType, const void* arg);
+typedef int      (*FnGetConfig)(void* utils, int value, int scope, intptr_t obj, int* dataType, void* result, size_t* size);
 
 struct Api {
     FnAccessor networking = nullptr, user = nullptr, friends = nullptr;
@@ -51,6 +53,9 @@ struct Api {
     FnRegisterCallback registerCb = nullptr;
     FnUnregisterCallback unregisterCb = nullptr;
     FnPersonaName personaName = nullptr;
+    FnAccessor utils = nullptr;
+    FnSetConfig setConfig = nullptr;
+    FnGetConfig getConfig = nullptr;
     void* net = nullptr;
 };
 
@@ -142,6 +147,9 @@ bool ResolveApi()
     g_api.registerCb   = (FnRegisterCallback)get("SteamAPI_RegisterCallback");
     g_api.unregisterCb = (FnUnregisterCallback)get("SteamAPI_UnregisterCallback");
     g_api.personaName  = (FnPersonaName)get("SteamAPI_ISteamFriends_GetPersonaName");
+    g_api.utils        = (FnAccessor)get("SteamAPI_SteamNetworkingUtils_SteamAPI_v004");
+    g_api.setConfig    = (FnSetConfig)get("SteamAPI_ISteamNetworkingUtils_SetConfigValue");
+    g_api.getConfig    = (FnGetConfig)get("SteamAPI_ISteamNetworkingUtils_GetConfigValue");
     return g_api.networking && g_api.user && g_api.getSteamId && g_api.send && g_api.avail && g_api.read
         && g_api.accept && g_api.closeSession && g_api.allowRelay && g_api.registerCb;
 }
@@ -202,6 +210,31 @@ DWORD WINAPI TunnelThread(LPVOID)
     for (auto& c : persona) if (c == '\n' || c == '\r') c = ' ';
 
     g_api.allowRelay(g_api.net, true);
+    // THE SEND-RATE CAP (2026-09-21). In today's Steam client the legacy P2P API
+    // rides on the SteamNetworkingSockets stack, whose per-connection send rate
+    // defaults to 1 MB/s (k_ESteamNetworkingConfig_SendRateMax) with 512 KB
+    // buffers: a 104 MB save moved at 1 MB/s while the lobby offered 1.6, and the
+    // rest was dropped as over-rate. Raised globally: the lobby's own window is
+    // the pacing after that. Values from steamnetworkingtypes.h; Int32 = 1,
+    // scope Global = 1. Each set is logged with its result; a client whose
+    // legacy path ignores them loses nothing.
+    if (g_api.utils && g_api.setConfig) {
+        void* utils = g_api.utils();
+        struct { const char* name; int id; int32_t value; } cfg[] = {
+            { "SendRateMin",    23,  1 * 1024 * 1024 },
+            { "SendRateMax",    24, 16 * 1024 * 1024 },
+            { "SendBufferSize",  9,  8 * 1024 * 1024 },
+            { "RecvBufferSize", 47,  8 * 1024 * 1024 },
+        };
+        for (auto& c : cfg) {
+            int32_t before = -1; int dt = 0; size_t sz = sizeof(before);
+            if (g_api.getConfig && utils) g_api.getConfig(utils, c.id, 1, 0, &dt, &before, &sz);
+            bool ok = utils && g_api.setConfig(utils, c.id, 1, 0, 1, &c.value);
+            g_log("[steam] %s: %d -> %d (%s)\n", c.name, before, c.value, ok ? "set" : "REFUSED");
+        }
+    } else {
+        g_log("[steam] no SteamNetworkingUtils in this steam_api64.dll -- the send-rate cap stays at Steam's default\n");
+    }
     g_api.registerCb(&g_reqCb, CB_SESSION_REQUEST);
     g_api.registerCb(&g_failCb, CB_CONNECT_FAIL);
 
