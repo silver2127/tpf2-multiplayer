@@ -23,7 +23,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MP = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp")
 
 # a real record from lockstep_inject_a.txt (depot child 241897, one bus part)
-VBUY = "VBUY 241897 1 3320 1 0 -1.0000 -1.0000 -1.0000 1 1 1 1"
+VBUY = "VBUY 241897 1 3320 0 1 0 -1.0000 -1.0000 -1.0000 1 1 1 1"
 
 fails = []
 

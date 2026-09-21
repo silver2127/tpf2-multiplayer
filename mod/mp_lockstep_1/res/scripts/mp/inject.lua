@@ -995,8 +995,11 @@ function CM.pollInject()
 				-- id -> position + file, vehicle id -> cross-peer key, model ids ->
 				-- file names.
 				--
-				--   VBUY  <depotChild>    <n> <model nl loads.. r g b na autos..>*n [ng groups..]
-				--   VREPL <vehicleEntity> <n> <model nl loads.. r g b na autos..>*n [ng groups..]
+				--   VBUY  <depotChild>    <n> <model rev nl loads.. r g b na autos..>*n [ng groups..]
+				--   VREPL <vehicleEntity> <n> <model rev nl loads.. r g b na autos..>*n [ng groups..]
+				--
+				-- rev is the part's reversed flag (0/1): a turned wagon, an ICE's
+				-- tail head. It travels to the peers as the part spec's fifth field.
 				--
 				-- The config encoding is byte-identical after the first field, so
 				-- both ops share this parser: two copies of it drifted apart the
@@ -1007,9 +1010,9 @@ function CM.pollInject()
 				local parts, ok = {}, (depot ~= nil and n >= 1)
 				for k = 1, n do
 					if not ok then break end
-					local model, nl = tonumber(w[i]), tonumber(w[i + 1])
-					if not (model and nl) then ok = false; break end
-					i = i + 2
+					local model, rev, nl = tonumber(w[i]), tonumber(w[i + 1]), tonumber(w[i + 2])
+					if not (model and rev and nl) then ok = false; break end
+					i = i + 3
 					local loads = {}
 					for j = 1, nl do loads[j] = tonumber(w[i]) or 0; i = i + 1 end
 					local r, g, b = tonumber(w[i]), tonumber(w[i + 1]), tonumber(w[i + 2])
@@ -1022,7 +1025,7 @@ function CM.pollInject()
 					-- the slice copies autoLoadConfig's packed vector<bool> words; the wire
 					-- carries one 0/1 per load slot (CM.autoLoadFlags, vehicles.lua)
 					if CM.autoLoadFlags then autos = CM.autoLoadFlags(autos, nl) end
-					parts[#parts + 1] = { model = model, loads = loads, color = { r, g, b }, autos = autos }
+					parts[#parts + 1] = { model = model, rev = (rev ~= 0) and 1 or 0, loads = loads, color = { r, g, b }, autos = autos }
 				end
 				local ng = tonumber(w[i]) or 0
 				i = i + 1
@@ -1039,7 +1042,8 @@ function CM.pollInject()
 						enc[#enc + 1] = table.concat({ name,
 							table.concat(p.loads, "/"),
 							string.format("%.4f,%.4f,%.4f", p.color[1], p.color[2], p.color[3]),
-							table.concat(p.autos, "/") }, "~")
+							table.concat(p.autos, "/"),
+							tostring(p.rev or 0) }, "~")
 					end
 
 					if o == "VREPL" then

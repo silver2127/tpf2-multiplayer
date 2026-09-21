@@ -4,13 +4,19 @@
 
 // VBUY: a player's BuyVehicle, shipped for replication. The config is decoded
 // from the by-value TransportVehicleConfig on the caller's stack (st[0]):
-// parts at +0x00 (0x80 stride: modelId +0x00, loadConfig +0x08, color +0x20,
-// autoLoadConfig +0x60), vehicleGroups at +0x18 -- every offset a ground-truth
-// EXACT match (docs/re/COMMANDS.md). The depot travels as its entity id; the Lua
-// side on THIS instance turns it into a position and the model ids into file
-// names before anything crosses to the peer. Cancelled and replayed at the
-// stamp while a session is live (see the cancel decision in DeferHandler).
-//   VBUY <depot> <nParts> { <model> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <nGroups> <group..>
+// parts at +0x00 (0x80 stride: modelId +0x00, reversed +0x04, loadConfig +0x08,
+// color +0x20, autoLoadConfig +0x60), vehicleGroups at +0x18 -- every offset a
+// ground-truth EXACT match (docs/re/COMMANDS.md; reversed from the member
+// offsets RegisterUsertypesVehicle hands the VehiclePart usertype). The depot
+// travels as its entity id; the Lua side on THIS instance turns it into a
+// position and the model ids into file names before anything crosses to the
+// peer. Cancelled and replayed at the stamp while a session is live (see the
+// cancel decision in DeferHandler).
+//   VBUY <depot> <nParts> { <model> <rev> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <nGroups> <group..>
+// <rev> is the part's reversed flag (0/1): without it every replayed wagon
+// faced forward, and a train bought with a turned car (an ICE's tail head, a
+// cab car) came out wrong on every instance, the originator's included
+// (tearded's fork, 2026-09-20).
 //
 // The config half is shared with VREPL (ReplaceVehicle takes the SAME
 // TransportVehicleConfig), so validation and encoding live in these two helpers
@@ -72,7 +78,9 @@ static int WriteVehicleConfig(FILE* f, uint64_t cfg, uint64_t ub, int units)
         uint64_t u = ub + (uint64_t)k * 0x80;
         int32_t model = 0;
         memcpy(&model, (void*)(u + 0x00), 4);
-        fprintf(f, " %d", model);
+        uint8_t rev = 0;
+        memcpy(&rev, (void*)(u + 0x04), 1);      // bool reversed, right behind modelId
+        fprintf(f, " %d %d", model, rev ? 1 : 0);
         ReadIntVec(u + 0x08, &v, "loadConfig");
         fprintf(f, " %d", (int)v.size());
         for (size_t j = 0; j < v.size(); j++) fprintf(f, " %d", v[j]);

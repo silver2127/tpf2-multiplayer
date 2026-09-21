@@ -903,8 +903,8 @@ end
 
 -- The TransportVehicleConfig a command carries, rebuilt on this instance.
 --
--- VBUY and VREPL ship the SAME encoding (name~loads~colour~autoloads;... plus a
--- vehicleGroups list), so they decode it with the same code: a second copy of
+-- VBUY and VREPL ship the SAME encoding (name~loads~colour~autoloads~reversed;...
+-- plus a vehicleGroups list), so they decode it with the same code: a second copy of
 -- this would drift the moment one op learned about a new field, and a wrong
 -- config is a wrong vehicle in a depot -- an uncatchable native assert away.
 -- A global (not a `local function`): the chunk is at Lua 5.1's 200-local limit.
@@ -916,7 +916,12 @@ function buildVehConfig(c)
 	local config = api.type.TransportVehicleConfig.new()
 	local u = 0
 	for spec in tostring(c.parts or ""):gmatch("[^;]+") do
-		local name, loads, col, autos = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+		local name, loads, col, autos, rev = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+		if not name then
+			-- a four-field spec (before the reversed flag rode along): every part forward
+			name, loads, col, autos = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+			rev = "0"
+		end
 		if not name then error("bad part spec: " .. spec) end
 		local mid = tonumber(name:match("^#(%-?%d+)$") or "")
 		if not mid then pcall(function() mid = api.res.modelRep.find(name) end) end
@@ -929,7 +934,10 @@ function buildVehConfig(c)
 		-- an empty loadConfig is a native assert (`!loadConfig.empty()`), not an error
 		if n == 0 then error("part without load slots: " .. spec) end
 		part.loadConfig = lc
-		part.reversed = false     -- offset not yet decoded; TODO sweep
+		-- the originator's flag (the slice reads it at VehiclePart+0x04); a turned
+		-- wagon or an ICE's tail head used to come out facing forward on every
+		-- instance, the originator's included (its buy is replayed too)
+		part.reversed = (rev == "1")
 		local r, g, b = col:match("^([^,]+),([^,]+),([^,]+)$")
 		part.color = api.type.Vec3f.new(tonumber(r) or -1, tonumber(g) or -1, tonumber(b) or -1)
 		part.logo = ""

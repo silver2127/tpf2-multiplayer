@@ -92,7 +92,7 @@ the player bulldozes it.
 
 | action | mode | wire | notes |
 |---|---|---|---|
-| buy | strict | `VBUY` | The depot window waits for its callback, which is fired. The depot is matched by live construction, transform-position key, file and depot children; a validated cache/local miss falls back to a global construction scan for offset mod geometry, and ambiguous matches are refused; the vehicle goes into its first depot. At most one buy per tick, so purchases bind to keys in the same order everywhere. A buy the slice leaves to run natively ships once the vehicle exists (or after 1.5 units). If the new vehicle's configuration cannot be read, the buy is not cancelled and does not replicate. |
+| buy | strict | `VBUY` | The depot window waits for its callback, which is fired. The depot is matched by live construction, transform-position key, file and depot children; a validated cache/local miss falls back to a global construction scan for offset mod geometry, and ambiguous matches are refused; the vehicle goes into its first depot. At most one buy per tick, so purchases bind to keys in the same order everywhere. A buy the slice leaves to run natively ships once the vehicle exists (or after 1.5 units). If the new vehicle's configuration cannot be read, the buy is not cancelled and does not replicate. Each part's reversed flag (a turned wagon, an ICE's tail head) travels with the config and is applied on every instance. |
 | sell | strict | `VSELL` | Ships once every vehicle's key is bound, or the bound subset after 8 units. If the vehicle list cannot be read, the sale is not cancelled and does not replicate. |
 | send to depot | strict | `VDEPOT` | |
 | reverse | strict | `VREV` | |

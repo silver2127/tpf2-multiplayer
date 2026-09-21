@@ -131,10 +131,10 @@ return H
 
 
 def vehicle_config(nparts, ngroups):
-    # WriteVehicleConfig: <n> { <model> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <ng> <group..>
+    # WriteVehicleConfig: <n> { <model> <rev> <nLoad> <load..> <r> <g> <b> <nAuto> <auto..> }* <ng> <group..>
     parts = []
     for k in range(nparts):
-        parts.append(f"{3000 + k} 3 0 1 2 -1.0000 -1.0000 -1.0000 2 1 0")
+        parts.append(f"{3000 + k} 0 3 0 1 2 -1.0000 -1.0000 -1.0000 2 1 0")
     groups = " ".join(str(g) for g in range(ngroups))
     return f"{nparts} " + " ".join(parts) + f" {ngroups}" + (" " + groups if ngroups else "")
 
