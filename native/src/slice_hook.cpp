@@ -54,6 +54,7 @@
 #include <cmath>
 #include <share.h>
 #include <string>
+#include <algorithm>
 #include <utility>
 #include <vector>
 #include "hook.h"
@@ -582,4 +583,5 @@ enum VecRead { VEC_UNREADABLE, VEC_EMPTY, VEC_OK };
 #include "slice/ui_tints.inl"   // paused tick, icons for every player, company-colour tints on icons, labels and windows
 #include "slice/sharedstations_install.inl"   // InstallSharedStations (the patch of the gate above)
 #include "slice/moveorder.inl"   // SHIP AND AIRCRAFT CLAIM ORDER (moveorder.h)
+#include "slice/hotjoin_order.inl"   // HOT-JOIN ORDER: person batches in entity-id order (hotjoin_order.inl)
 #include "slice/init.inl"   // the relay blobs, hook installation, Init and DllMain

@@ -1,0 +1,160 @@
+# Hot join without a host reload: node-list order
+
+Investigation 2026-09-22, build 35924 (Windows exe and the native Linux ELF,
+GNU build-id `3a0e156390b0e6f1e372051c24802c8493ae454a`).
+
+## The question
+
+A hot join today is a recovery round in which **every** member, the host
+included, loads the snapshot (`sync_runtime.py`, "THE HOST LOADS TOO"). Skipping
+the host's load was tried on 2026-09-16 and again on 2026-09-22
+(`linux-load-perf:docs/re/linux/RETAINED_WORLD_JOIN.md`): the paused
+fingerprints matched, the main hash kept matching, and the people count split
+~100 game units later. What does a running world hold that its own save does
+not reproduce?
+
+## Measurement
+
+Private native lab pair on the VPS (`/opt/tpf2mp-linux-parity-20260921`, see
+[Lab harness](#lab-harness)): host `lab` keeps its world at the join
+(`TPF2MP_EXPERIMENT_RETAIN_HOST=1`), `peer` loads the snapshot. A Lua probe
+(EVAL) dumps every SIM_PERSON with `game.interface.getEntity` at each whole game
+unit on both sides: destinations, target, move modes, speed, travel times,
+reachability.
+
+| run | host | first differing person | paired dumps equal |
+|---|---|---|---|
+| control (host reloads too) | reloads | none | 25 / 25 |
+| retained, vanilla | keeps its world | **2-5 game units after release** | 2 / 25 |
+| retained, with the sorts below (3 sites) | keeps its world | none | 59 / 59 over ~290 game units, 55 / 55 hash stamps |
+| busy world (the dedicated server's save: 10 ships, ~130 cargo, ~2,800 people out), host alone 5 min first, live-join lobby path, 4 sites | keeps its world | none | persons, vehicles and cargo dumps and every hash stamp equal (see the run log below) |
+
+What differs first in the vanilla run is a person's **choice of destination**
+(`destinations[2]` or `[3]`, and the move mode with it), everything else equal;
+a few units later different people are out travelling (the `n:` lane counts only
+travelling people, which is why the count split showed so late). Entity ids are
+NOT the cause: new people appear with identical ids on both sides (the free-id
+deque is saved, `Engine::Load` 0x23df8f0).
+
+## Mechanism
+
+ECS node lists (`NodeList<N>::Add` 0x21d660 push_back, `Remove` 0x241030
+swap-with-last; component-group family node vectors behave the same) are not
+saved. After a load, 0x23dc1d0 collects every live entity, topologically sorts
+them (0x23e1350) and fires `EntityAdded` iterating the result backwards: mostly
+descending id order. A running world holds its lists in add / swap-remove
+history. Same contents, different order. The person sim consumes three batches
+in that order:
+
+1. **candidates** -- `destination_util::GetTargetsByLandUse` 0x9279f0 copies the
+   PersonCapacity family node list into a local `vector<Entity>`;
+   `PickTarget` 0x928370 accumulates free capacity over it in that order, draws
+   one `r` and binary-searches. Same `r`, another order: another building.
+2. **departures** -- `SimEntityAtBuildingSystem::Update2` 0xa7c920 collects the
+   people whose stay ran out in node order and signals
+   `SimPersonSystem::NoteAtBuildingPersonsLeave` 0xa93610, which draws "recompute
+   the destination?" and stay durations from one time-seeded mt19937 in batch
+   order, then seeds the destination batch (0x927877).
+3. **arrivals** -- `PersonMoveSystem::Update2` 0xa59450 collects walk arrivals for
+   `NoteWalkPersonsArrived` 0xa97820 (one tag-3 mt19937, stay durations
+   U(5,300) in batch order).
+4. **idle** -- `SimEntityIdleSystem::Update` 0xa86760 keeps its pending list
+   (system+0x18) in insertion order; `PathFactory::Compute` 0x90f320 seeds one
+   mt19937 per chunk (time + chunk start) and draws per item, so each trip's path
+   and mode depend on the person's place in that list. Not seen diverging in the
+   lab (3-site runs stayed equal), sorted anyway: it runs for every trip.
+
+## The fix
+
+Sort each batch ascending by entity id just before the engine reads it. Every
+peer of a session must run it (a draw lands on another building than vanilla's);
+the lobby's exact version gate guarantees that.
+
+| batch | Windows site (steal) | vector | native site (steal) | vector |
+|---|---|---|---|---|
+| candidates | 0x927df6 `c7 45 87 01 00 00 00` | `[rbp-0x71]` | 0x1502918 `48 c7 03 00 00 00 00` | `[rbp-0x90]` |
+| departures | 0xa7c9fd `48 8d 54 24 28` | `[rsp+0x28]` | 0x16f0bcb `48 8b 7a 08 48 85 ff` | `[rbp-0x50]` |
+| arrivals | 0xa59928 `48 8d 54 24 68` | `[rsp+0x68]` | 0x16b5dc6 `48 8b 78 08 48 85 ff` | `[rbp-0x88]` |
+| idle | 0xa867ce `49 8b 55 20 49 2b 55 18` | `[r13+0x18]` (the system's own list, sorted in place) | 0x17005cc `48 8b 8d 80 fe ff ff` | `[[rbp-0x180]+0x18]` |
+
+- Windows: `native/src/slice/hotjoin_order.inl` + `native/src/hotjoinrelay_slice.asm`,
+  verified by `tools/hotjoin_order_bytes_test.py`. Kill switch `hotjoinorder=0`.
+- Native Linux: [`hotjoin/order_canon_linux.cpp`](hotjoin/order_canon_linux.cpp)
+  / `.h`, a boot-library module in the style of `target_order_linux.cpp`
+  (installed from `boot.cpp` after the person-order modules; add the .cpp to
+  `tpf2mp_boot`'s sources). Kill switch `TPF2MP_ORDER_CANON=0`. This is what
+  the lab measured.
+
+## Live join in the lobby
+
+`sync_operation.SyncOperation` carries `retain`: in a `join` round the host and
+everyone already playing keep the world they are paused in; only the newcomers
+load (`sync_runtime`: a kept member pauses its world -- only the one the round
+found, held, paused, engine idle -- and acks `kept=True`). The paused
+fingerprints still decide: a difference empties `retain` and repeats `loading`
+once under a fresh epoch, i.e. the frozen join everyone knows; a difference after
+that is the ordinary error. A retry is always the plain round. Off unless the
+host's io dir holds `tpf2mp_live_join.txt` = `1` (read at each join), because it
+needs every peer's engine sorts. Tests: `tools/test_sync_operation.py`,
+`tools/test_sync_runtime.py` (live-join cases).
+
+## Option B: every family's node list, sorted once at the join
+
+The complete answer for node-list consumers the sorts above do not reach
+(vehicles claiming terminals, industries, stock lists, ship/aircraft
+reservations, the town stagger): at the barrier, on every member, sort each ECS
+family's node vector by entity and rewrite its entity->position index. RE
+(2026-09-22, static only):
+
+- Each peer runs TWO sim engines and alternates per batch (`RunGameSimLoop`
+  Windows 0x1184d0 / native 0xa2ddd0; the other is caught up by replaying an op
+  log, `Engine::Replicate` 0x23e0cc0) -- both must be sorted. Hook `GameSim::Step`
+  entry (Windows 0x15aa00 `40 53 41 56 48 83 ec 68`, rcx = GameSim; native
+  0xa61250 `f3 0f 1e fa 55 48 89 e5`, rdi = GameSim), engine =
+  `[[GameSim+8]+0x28]`; sort each engine the first time it reaches Step after
+  the barrier arms it (paused batches still alternate).
+- Families: Windows MSVC `unordered_map<type_index, IFamily*>` at engine+0x148
+  (list node {next, prev, type_info*, IFamily*}); native libstdc++ hashtable at
+  engine+0x160 (first node `*(engine+0x170)`, node {next, type_info*, IFamily*}).
+  GetNodeList: Windows vtable slot 1 (0xba990 `lea rax,[rcx+8]`, 0xbdff0 = none);
+  native slot 2 (0xa914c0). N from the node list's vtable (Windows 0x2f47a38 +
+  0x10*(N-1), native 0x59ac260 + 0x20*(N-1)); node stride 4 + 4N.
+- Node list: +8/+0x10/+0x18 vector; +0x20 phmap entity->position (ctrl +0,
+  slots +8 {int32 entity, int32 pos}, size +0x10, capacity +0x18): sort the nodes,
+  rewrite each full slot's pos by lower_bound, refuse on any mismatch. Read only
+  by the five `NodeList<N>::Remove` functions; systems hold the node vector only
+  during their own call.
+- Not implemented yet: the lab has not shown a consumer it would fix.
+
+## Not covered yet
+
+Order-sensitive consumers the lab world did not exercise (it has two vehicles
+and no player activity between the host's load and the join), found by RE:
+
+- **TownSystem::Update2** 0xab1d20: a town develops iff `GameTime34 % 120 ==
+  (node index % 30) * 4`, one tag-21 mt19937 shared across the processed towns in
+  node order. Matters when the Town node list differs (a world that was started
+  as a new game and never reloaded). Fix: `entity id % 30`, sort the processed
+  towns (and their parallel float vector) by id.
+- **SimEntityAtTerminalSystem::Update** 0xa81810: waiting people sit in per-terminal,
+  per-cargo deques -- arrival order while running, registration order after a
+  load; one time-seeded mt19937 draws "give up waiting" per person in deque
+  order, and boarding takes them in deque order up to capacity. Needs an arrival
+  key to canonicalise, not a sort by id.
+- Whatever else consumes a node list the same way in vehicle, cargo and industry
+  systems; see the sections added below as they are measured.
+
+The acceptance gate stays the one in `RETAINED_WORLD_JOIN.md`: a retained-host
+join must match a loaded joiner past the previously observed failure interval,
+with vehicles, cargo, construction and later joins exercised, before any
+production join skips the host's load.
+
+## Lab harness
+
+On the VPS under `/opt/tpf2mp-linux-parity-20260921/hj-lab/` (sources in
+[`hotjoin/lab/`](hotjoin/lab/)): `hj_run.py` restarts the private pair, waits for
+the host world, joins the peer through the lobby, installs the person probe on
+both, collects paired dumps and compares; `--control` makes the host reload too,
+`--save NAME` picks the host's world, `--prejoin S` lets the host run alone
+first. `hj_watch.py` follows a long run (hash lanes + dumps), `hj_long.py` /
+`hj_compare.py` compare. Production (`tpf2mp-game`) is never touched.
