@@ -198,12 +198,14 @@ function CM.votesCounted()
 	local list, me = {}, K.INSTANCE
 	local mine, cast = CM.speedVotes[me], CM.myVoteCast
 	if cast and (not mine or cast.ct > mine.ct) then mine = cast end
-	if mine then
+	if mine and not CM.dedicated then
 		list[#list + 1] = { letter = me, v = mine.v }
-	else
+	elseif not CM.dedicated then
 		local own = ((CM.myCeiling or 0) > 0) and CM.myCeiling or CM.ceilBeforePause
 		if own and own > 0 then list[#list + 1] = { letter = me, v = CM.voteValue(own), own = true } end
 	end
+	-- A DEDICATED SERVER (2026-09-18, user) has no vote and no own speed in the
+	-- mean: the players' votes are the session speed; with none cast yet, 1x.
 	for letter, vote in pairs(CM.speedVotes) do
 		local pr = CM.peers[letter]
 		if letter ~= me and pr and pr.at and (CM.ticks - pr.at) <= K.VOTE_PRESENT_TICKS then
@@ -220,7 +222,10 @@ end
 -- a vote), and how many. nil when nothing counts.
 function CM.voteSpeed()
 	local list = CM.votesCounted()
-	if #list == 0 then return nil, "", 0 end
+	if #list == 0 then
+		if CM.dedicated and CM.othersPresent and CM.othersPresent() then return 1, "", 0 end   -- players in, nobody voted yet
+		return nil, "", 0
+	end
 	local sum, parts = 0, {}
 	for i, e in ipairs(list) do
 		sum = sum + e.v
@@ -598,6 +603,89 @@ function CM.governorOff()
 	end
 	return off
 end
+-- HOST CAPACITY (2026-09-18). The engine runs 5 sim steps a second per unit
+-- of session speed (a batch of `lever` 200 ms iterations every 200 ms), and
+-- what it cannot afford it simply does not do: the lever still reads 4 while
+-- the world runs at 2 and a joiner runs ahead until it holds. Every
+-- K.CAP_WINDOW_S wall seconds the leader compares the steps it made with
+-- 5 x the session speed x the seconds; three short windows in a row (one is a
+-- hash stamp or an autosave) cap the session speed at what the host sustains,
+-- a whole number (a fraction would need the dither on top); an unstretched
+-- minute at the cap tries one step up. A pause, a hold and a speed change
+-- restart the window. The engine's own interval estimate is NOT the measure:
+-- on a VPS with CPU steal it sat at 400 ms with the sim thread half idle
+-- (a dedicated server pins it, tpf2_bridge_mp.dll); tpf2_engine_pace.txt
+-- still says what it thinks, for the log.
+K.CAP_WINDOW_S = 15
+K.CAP_LOW = 0.8
+K.CAP_SAMPLES = 3
+K.CAP_UP_S = 60
+function CM.hostPace()
+	local base, lever
+	local f = io.open(K.BASE .. "tpf2_engine_pace.txt", "r")
+	if f then
+		local body = f:read("*a") or ""
+		f:close()
+		base = tonumber(body:match("base=(%d+)"))
+		lever = tonumber(body:match("lever=(%d+)"))
+	end
+	return base, lever
+end
+-- eff: the speed the votes (or the request) ask for now; applied: the session
+-- speed in force since the last pass (CM.effSpeed); s: the lever as read; now:
+-- the sim clock. Returns (eff to use, the cap when it bites).
+function CM.hostCapacityCap(eff, applied, s, now)
+	if not eff or eff <= 0 then CM.capWin = nil; return eff, nil end
+	if CM.governorOff and CM.governorOff() then CM.hostCap = nil; CM.capWin = nil; return eff, nil end
+	local wall = os.time()
+	local step = CM.stepOf and CM.stepOf(now) or math.floor((now or 0) / (K.SIM_STEP or 0.2) + 0.5)
+	-- a window measures ONE applied speed with the lever running: anything else restarts it
+	if not applied or applied <= 0 or (s ~= nil and s == 0) or CM.resyncHold
+		or (CM.capWin and CM.capWin.applied ~= applied) then
+		CM.capWin = (applied and applied > 0 and not (s ~= nil and s == 0) and not CM.resyncHold)
+			and { wall = wall, step = step, applied = applied } or nil
+		return CM.hostCap and CM.hostCap < eff and CM.hostCap or eff, CM.hostCap and CM.hostCap < eff and CM.hostCap or nil
+	end
+	if not CM.capWin then CM.capWin = { wall = wall, step = step, applied = applied } end
+	local dt = wall - CM.capWin.wall
+	if dt >= K.CAP_WINDOW_S then
+		local expected = 5 * applied * dt
+		local got = step - CM.capWin.step
+		local r = expected > 0 and got / expected or 1
+		CM.capWin = { wall = wall, step = step, applied = applied }
+		CM.capLast = r
+		if r < K.CAP_LOW then
+			CM.capStretched = (CM.capStretched or 0) + 1
+			CM.capOkSince = nil
+			if CM.capStretched >= K.CAP_SAMPLES then
+				local can = math.floor(applied * r)
+				if can < 1 then can = 1 end
+				if not CM.hostCap or can < CM.hostCap then
+					CM.hostCap = can
+					local base = CM.hostPace()
+					log(string.format("SPEED2: the host keeps up with %dx (%d of %d steps in %d s at %gx%s) -- the session is capped there",
+						can, got, math.floor(expected + 0.5), dt, applied, base and string.format(", the engine's interval reads %d ms", math.floor(base / 1000)) or ""))
+				end
+			end
+		else
+			CM.capStretched = 0
+			if CM.hostCap then
+				CM.capOkSince = CM.capOkSince or wall
+				if wall - CM.capOkSince >= K.CAP_UP_S then
+					CM.capOkSince = nil
+					if CM.hostCap < eff then
+						CM.hostCap = CM.hostCap + 1
+						log(string.format("SPEED2: the host kept up for a while -- trying %dx", CM.hostCap))
+					end
+					if CM.hostCap >= eff then CM.hostCap = nil end
+				end
+			end
+		end
+	end
+	if CM.hostCap and CM.hostCap < eff then return CM.hostCap, CM.hostCap end
+	return eff, nil
+end
+
 function CM.governSpeed(now, eff)
 	if not eff or eff <= 0 then CM.govPrevNow, CM.govPrevTick = nil, nil; return eff end
 	if CM.governorOff() then CM.govFactor, CM.govWorst, CM.govWho = 1, 0, nil; return eff end
@@ -918,7 +1006,9 @@ function CM.paceV2(now)
 	-- this and hid the host's play-click. A 0 we set ourselves is `ours`.
 	local prevS = CM.spd2LastS
 	CM.spd2LastS = s
-	if CM.isLeader() then
+	-- a DEDICATED SERVER has no hand at its lever: nothing it reads is a player's
+	-- pause or speed (its 0s are the load gate, a hold, the empty-world pause)
+	if CM.isLeader() and not CM.dedicated then
 		-- A lever that has not moved is not the player's choice while the ceiling
 		-- came from a speed button: the button's speed reaches the lever only when
 		-- pacing applies it. A host whose lever pacing had never set read its old
@@ -974,16 +1064,24 @@ function CM.paceV2(now)
 		-- the mean of the players' votes, the host's pause, or a /speed request newer than the last vote
 		local avg, vt, n = CM.voteSpeed()
 		local eff, why
-		if CM.myCeiling <= 0 then
+		if CM.myCeiling <= 0 and not CM.dedicated then
 			eff, why = 0, "the host paused the session"
 		elseif avg then
 			eff, why = avg, string.format("the mean of %d: %s", n, CM.voteWords(vt))
+		elseif CM.dedicated then
+			-- nobody at the server's controls: the players' votes run the session
+			-- (voteSpeed gives 1 while players are in and none has voted); with
+			-- nobody in, the world's own speed (the empty-world pause owns that)
+			eff, why = math.max(1, CM.myCeiling), "dedicated server, no votes"
 		else
 			eff, why = CM.myCeiling, "host's speed"
 		end
 		local req = CM.speedRequest()
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
 		if CM.spdReqInForce then eff = req; why = "/speed request" end
+		-- the host's own machine first: what it sustains caps the votes and the request
+		local capped, capAt = CM.hostCapacityCap(eff, CM.effSpeed, s, now)
+		if capAt then eff = capped; why = string.format("the host keeps up with %dx", capAt) end
 		-- the governor works under the votes (or the request): the slowest peer sets the pace
 		local governed = CM.governSpeed(now, eff)
 		if governed ~= eff then eff = governed; why = string.format("governed: %s is %.1f behind", tostring(CM.govWho or "?"), CM.govWorst or 0) end
@@ -1100,10 +1198,85 @@ end
 
 -- Once per tick: the slowest peer's clock for the status and dash files
 -- (CM.slowT), then the session speed controller.
+-- A DEDICATED SERVER (2026-09-18; mp_dedicated.txt, written by the menu DLL from
+-- tpf2_menu_flags.txt dedicated=1) with pause_empty=1 stands still while nobody
+-- else is in: a world simulating for no one only burns the server's CPU and
+-- ages the towns. Read every 300 ticks (the file is written once, at start).
+-- Reads mp_dedicated.txt (the menu DLL writes it): CM.dedicated, and the speed
+-- the world runs at while nobody else is in (CM.dedEmptySpeed: 0 = paused;
+-- 1x by default since 2026-09-18, the user: "keep the server at speed 1 when no
+-- players are online"). An older DLL writes pause_empty= only: 1 = 0, else 1.
+-- Returns true when the rule has something to do (a dedicated server).
+function CM.dedicatedPauseEmpty()
+	if CM.dedCfgAt and (CM.ticks or 0) - CM.dedCfgAt < 300 then return CM.dedicated == true end
+	CM.dedCfgAt = CM.ticks or 0
+	CM.dedicated, CM.dedEmptySpeed = false, 1
+	local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+	if f then
+		local body = f:read("*a") or ""
+		f:close()
+		CM.dedicated = body:find("dedicated=1", 1, true) ~= nil
+		local es = tonumber(body:match("empty_speed=(%d)"))
+		if es == nil then es = body:find("pause_empty=1", 1, true) and 0 or 1 end
+		CM.dedEmptySpeed = math.max(0, math.min(4, es))
+	end
+	CM.dedPauseEmpty = CM.dedicated and CM.dedEmptySpeed == 0
+	return CM.dedicated == true
+end
+
+-- The empty-world speed. Alone: the world runs at CM.dedEmptySpeed (put back
+-- whenever something else moved the lever -- nobody stands at the server's
+-- controls), or stands still when that is 0; the speed it left is remembered for
+-- the resume. Somebody in: give the speed back once (the votes, else the
+-- remembered speed). Never during a world operation's hold (the frozen join that
+-- brings the newcomer in owns the clock then; resync.lua asks
+-- CM.dedicatedResumeSpeed for the speed to resume at, because the speed it finds
+-- is ours). Returns true while the rule owns the lever (alone).
+function CM.dedicatedTick()
+	if not CM.dedicatedPauseEmpty() or CM.resyncHold then return false end
+	local others = CM.othersPresent and CM.othersPresent()
+	local s
+	pcall(function() s = game.interface.getGameSpeed() end)
+	if not others then
+		if s and (CM.ticks or 0) >= (K.LOADGATE_MIN_TICKS or 0) then
+			local want = CM.dedEmptySpeed or 1
+			if not CM.dedPaused then
+				if s > 0 then CM.dedResume = s end
+				CM.dedPaused = true
+				if s ~= want then CM.setSpeed(want, want == 0 and "dedicated server: nobody is here" or string.format("dedicated server: nobody is here, %dx", want)) end
+			elseif s ~= want and (CM.ticks or 0) - (CM.dedEmptySetAt or -1000) >= 25 then
+				-- the lever moved under us (a load, a released hold): back to the empty speed
+				CM.dedEmptySetAt = CM.ticks or 0
+				CM.setSpeed(want, string.format("dedicated server: nobody is here, %dx", want))
+			end
+		end
+		return CM.dedPaused == true
+	end
+	if CM.dedPaused then
+		CM.dedPaused = false
+		CM.setSpeed((CM.voteSpeed and CM.voteSpeed()) or CM.dedResume or 1, "dedicated server: a player is in")
+	end
+	return false
+end
+
+-- The speed a dedicated server resumes a world operation at: the players' vote,
+-- else the speed it paused from, never 0 (a freshly loaded server sits at 0 --
+-- the load gate, then the empty-server pause -- and the first frozen join of
+-- 2026-09-18 17:12 handed that 0 to everyone as the resume speed).
+function CM.dedicatedResumeSpeed(found)
+	if not CM.dedicated then return found end
+	if (tonumber(found) or 0) > 0 then return found end
+	local v = CM.voteSpeed and CM.voteSpeed()
+	v = v or CM.dedResume or 1
+	if v < 1 then v = 1 end
+	return math.floor(v + 0.5)
+end
+
 function CM.paceTick(now)
 	-- the stamp our world starts from: the save's own (savedAt, written by save()),
 	-- else the first clock we read -- what the load gate asks the history after
 	if CM.loadStamp == nil then CM.loadStamp = tonumber(CM.savedAt) or now end
+	if CM.dedicatedTick() then return end
 	local slowT = CM.peerBounds()
 	CM.slowT = slowT
 	if not CM.peerSeen then return end
@@ -1119,6 +1292,15 @@ function CM.paceTick(now)
 	-- ...and while the governor still holds the speed down after the last peer
 	-- left, so it can climb back to the votes (the controller is what raises it).
 	if slowT == nil and not (CM.isLeader() and (CM.livePeers() > 0 or (CM.govFactor or 1) < 1)) then return end
+	-- ALONE AGAIN (2026-09-17): once the last other player is gone (roster 1, no
+	-- peer heard) the controller has nothing to pace against and must not keep a
+	-- governed or fractional speed on the player's lever: clear the fraction
+	-- once and leave the lever to the engine until somebody joins.
+	if CM.othersPresent and not CM.othersPresent() then
+		if CM.ditherCur ~= "" and CM.ditherCur ~= nil then CM.setDither(0); log("PACE: alone -- the fractional speed is cleared, the lever is the player's") end
+		CM.govFactor = 1
+		return
+	end
 	CM.paceV2(now)
 end
 

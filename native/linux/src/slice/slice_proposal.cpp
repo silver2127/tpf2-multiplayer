@@ -11,6 +11,9 @@ namespace {
 constexpr uintptr_t kBuildProposal = 0x15ee930;
 constexpr uintptr_t kStreetBuilder = 0xe86452;
 constexpr uintptr_t kTrackModifier = 0xed6da9;
+// TrafficControlComp::PlayerOwnedButton, paired factory/Add sites in
+// slice_core.cpp. Its proposal replaces existing edges with optional owners.
+constexpr uintptr_t kOwnershipButton = 0x12409e2;
 constexpr uintptr_t kStopBuilder = 0xeaaf79;
 constexpr uintptr_t kBulldozer = 0xdd4e99;
 constexpr size_t kMaxNodes = SIZE_MAX;
@@ -82,6 +85,9 @@ bool ValidEdges(const Snapshot& edges, const Snapshot& nodes, bool existing)
         const auto kind = Field<int32_t>(p, 0x48);
         const auto baseType = Field<int32_t>(p, 0x28);
         const auto n0 = Field<int32_t>(p, 8), n1 = Field<int32_t>(p, 12);
+        // Native optional<PlayerOwned>: byte engagement, with arbitrary padding.
+        // SLICE_CONSTRUCTION SC segment layout: 0x2f74205 / 0x2f74210.
+        if (p[0x74] > 1 || (p[0x74] && Field<int32_t>(p, 0x70) < 0)) return false;
         if ((kind != 0 && kind != 1) || baseType < 0 || baseType > 2 ||
             (baseType && Field<int32_t>(p, 0x2c) < 0) ||
             !Finite3(p, 0x10) || !Finite3(p, 0x1c) || n0 == n1 ||
@@ -249,8 +255,8 @@ void OnBuildProposal(const SliceFactoryCall& call, void*)
     if (call.script || !call.rdx || !SliceSessionLive()) return;
     SliceRecord record{};
     SliceProposalKind kind = SliceProposalKind::None;
-    if (call.retRva == kStreetBuilder || call.retRva == kTrackModifier) {
-        if (SliceProposalBuildRoadRecord(call.rdx, false, call.retRva == kTrackModifier, &record))
+    if (call.retRva == kStreetBuilder || call.retRva == kTrackModifier || call.retRva == kOwnershipButton) {
+        if (SliceProposalBuildRoadRecord(call.rdx, false, call.retRva != kStreetBuilder, &record))
             kind = SliceProposalKind::Road;
     } else if (call.retRva == kStopBuilder) {
         if (SliceProposalBuildStopRecord(call.rdx, &record)) kind = SliceProposalKind::Stop;
@@ -319,6 +325,11 @@ bool SliceProposalBuildRoadRecord(uintptr_t proposal, bool construction, bool up
     for (size_t i = 0; i < edges.count; ++i)
         SliceRecordPrintf(out, " %d %d", Field<int32_t>(edges.data + i * 0x78, 0x28),
                           Field<int32_t>(edges.data + i * 0x78, 0x2c));
+    SliceRecordAppend(out, " OWNERS", 7);
+    for (size_t i = 0; i < edges.count; ++i) {
+        const auto* edge = edges.data + i * 0x78;
+        SliceRecordPrintf(out, " %d", edge[0x74] ? Field<int32_t>(edge, 0x70) : -1);
+    }
     SliceRecordAppend(out, "\n", 1);
     return !out->failed;
 }

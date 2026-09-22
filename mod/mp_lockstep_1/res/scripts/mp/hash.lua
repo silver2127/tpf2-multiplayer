@@ -389,6 +389,22 @@ CM.hashCostSamples = {}          -- ms per stamp, newest last
 CM.hashCostMs = nil              -- their median
 CM.hashGrid = nil                -- { every =, prev =, from = }: from a HASHEVERY, or the save
 
+-- SOMEBODY TO COMPARE WITH (2026-09-17, user): the lobby's roster says two or
+-- more players, or a peer was heard within K.PEER_STALE_TICKS. Alone, the
+-- world hash is an O(world) hitch for nothing -- seconds of it on a big map --
+-- so checkHash takes no sample at all. The roster counts from the first ticks
+-- of a session, before the peer's first heartbeat, so a host resumes hashing
+-- while its joiner is still loading and the joiner's first stamps have a
+-- partner.
+function CM.othersPresent()
+	if (tonumber(CM.rosterPlayers) or 0) >= 2 then return true end
+	for _, pr in pairs(CM.peers or {}) do
+		if pr.at and (CM.ticks - pr.at) <= (K.PEER_STALE_TICKS or 25) then return true end
+	end
+	return false
+end
+CM.hashPeersPresent = CM.othersPresent
+
 -- The stamp for `now` on the agreed grid, and the interval it lies on.
 function CM.hashStampOf(now)
 	local g, every = CM.hashGrid, nil
@@ -445,7 +461,8 @@ end
 -- ladder; a rung of the ladder above it), makes the leader stamp that interval
 -- to every instance regardless of cost -- for chasing a divergence to the step
 -- it starts on. An empty or missing file hands the cadence back to the cost
--- ladder. Read by the leader only, every 15 ticks.
+-- ladder. Read by the leader only, every 15 ticks. Not on a map past
+-- Megalomaniac: see CM.mapPastMegalomaniac.
 function CM.hashEveryForced()
 	if CM.hashForcedAt and CM.ticks - CM.hashForcedAt < 15 then return CM.hashForced end
 	CM.hashForcedAt = CM.ticks
@@ -468,6 +485,29 @@ function CM.hashEveryForced()
 	return v
 end
 
+-- MAPS PAST MEGALOMANIAC keep the cost ladder even under a forced cadence
+-- (2026-09-17, user): on a tpf2_bigmap world a stamp costs seconds, so a forced
+-- 4-unit hash is a freeze every few seconds and nobody can play the game the
+-- flag was meant to debug. Vanilla's largest map, Megalomaniac, is 96 x 96 tiles
+-- (192 on an axis at 1:4); anything beyond that is read from the terrain size,
+-- which every instance loads from the same save. Decided once per world.
+K.VANILLA_MAX_TILES = 96 * 96
+K.VANILLA_MAX_TILES_AXIS = 192
+function CM.mapPastMegalomaniac()
+	if CM.mapPastMega ~= nil then return CM.mapPastMega end
+	local ok, tx, ty = pcall(function()
+		local terrain = api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.TERRAIN)
+		return terrain.size.x, terrain.size.y
+	end)
+	tx, ty = tonumber(tx), tonumber(ty)
+	if not ok or not tx or not ty or tx <= 0 or ty <= 0 then return false end   -- not readable yet: ask again next stamp
+	CM.mapPastMega = tx * ty > K.VANILLA_MAX_TILES or math.max(tx, ty) > K.VANILLA_MAX_TILES_AXIS
+	if CM.mapPastMega then
+		log(string.format("HASH CADENCE: map %d x %d tiles is past Megalomaniac -- the cost ladder decides the interval even while tpf2mp_hash_every.txt forces one", tx, ty))
+	end
+	return CM.mapPastMega
+end
+
 -- THE LEADER, after each of its own stamps: move every instance's interval when
 -- the slowest cost calls for it.
 function CM.hashCadenceTick(now)
@@ -476,6 +516,7 @@ function CM.hashCadenceTick(now)
 	if g and g.prev and now < g.from then return end   -- the last switch has not started yet
 	if CM.hashCadenceAt and CM.ticks - CM.hashCadenceAt < K.HASH_CADENCE_MIN_TICKS then return end
 	local forced = CM.hashEveryForced()
+	if forced and CM.mapPastMegalomaniac() then forced = nil end
 	if forced then
 		local _, curF = CM.hashStampOf(now)
 		if forced ~= curF then

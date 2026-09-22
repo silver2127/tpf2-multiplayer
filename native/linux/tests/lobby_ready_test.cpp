@@ -8,6 +8,9 @@ static bool allowPlace=false;
 static int placed=0;
 static int loadPercent=-1;
 int MenuGame_LoadPercent() { return loadPercent; }
+static int modRefreshes=0;
+void MenuGame_RequestModRefresh() { ++modRefreshes; }
+bool MenuGame_Loading() { return false; }
 std::string MenuGame_SaveDir() { assert(!fixtureSaveDir.empty()); return fixtureSaveDir; }
 bool MenuGame_ForceAutosave() { assert(false && "unexpected autosave"); return false; }
 bool MenuGame_NewestSave(std::string*) { assert(false && "unexpected save lookup"); return false; }
@@ -85,6 +88,8 @@ int main()
         assert(SlicePublishReady(dir.c_str(),true));
     }
     lobby::S().m.isHost=true; lobby::S().m.lobbyReady=true; lobby::S().m.dead=false;
+    assert(!lobby::StartGame().empty() && lobby::S().q.empty());
+    lobby::S().m.selectedSave="fixture.sav";
     assert(lobby::StartGame().empty() && lobby::S().q.size()==1);
     lobby::S().q.clear();
     assert(SlicePublishReady(dir.c_str(),false));
@@ -245,6 +250,41 @@ int main()
     lobby::ShareLoadedSave("chosen"); assert(lobby::S().hostLoadedItself && lobby::S().worldGenHold);
     assert(lobby::ReadSmallFile(dir+"lobby_in.jsonl",&sent) && sent.find("\"switch\":true")!=std::string::npos);
     lobby::HandleStart(sw); assert(!lobby::S().hostLoadedItself && placed==1);
+    // Selection only accepts an enumerated regular save, advertises its mods,
+    // and stays fixed while START is pending.
+    model.isHost=true;model.lobbyDone=false;model.startPending=false;lobby::S().q.clear();
+    assert(mkdir((dir+"directory.sav").c_str(),0700)==0);
+    Write(dir+"empty.sav","");
+    lobby::ReadSaves(model.gen);
+    assert(model.saves.size()==1 && model.saves[0].name=="chosen.sav");
+    assert(!lobby::SelectSave(dir+"absent.sav").empty());
+    assert(lobby::SelectSave(dir+"chosen.sav").empty());
+    assert(model.selectedSave==dir+"chosen.sav" && lobby::S().q.size()==1);
+    assert(lobby::S().q.back().line.find("advertise_mods")!=std::string::npos);
+    model.startPending=true;assert(!lobby::SelectSave(dir+"chosen.sav").empty());
+    assert(unlink((dir+"empty.sav").c_str())==0 && rmdir((dir+"directory.sav").c_str())==0);
+    // Recovery controls follow actual wire events, retain the readiness token,
+    // reject duplicate/non-host requests, and allow another sync after success.
+    model.active=true;model.dead=false;model.isHost=true;
+    lobby::S().child.gen=model.gen;queue.clear();
+    lobby::Dispatch(R"({"type":"sync_prompt","phase":"detected"})");
+    assert(model.recoveryPresent && model.recoveryPhase=="detected");
+    assert(lobby::RecoveryAction("sync_request")=="Request sent." && queue.size()==1);
+    lobby::RecoveryAction("sync_request");assert(queue.size()==1);
+    lobby::Dispatch(R"({"type":"sync_ready_state","phase":"waiting","token":"barrier-1","ready_count":1,"total":2,"is_ready":0})");
+    lobby::Snapshot(&view);assert(view.readyCount==1 && view.readyTotal==2 && !view.readyMine);
+    assert(lobby::RecoveryAction("sync_ready")=="Request sent." && queue.size()==2);
+    assert(queue.back().line.find("\"token\":\"barrier-1\"")!=std::string::npos);
+    lobby::Dispatch(R"({"type":"sync_ready_state","phase":"waiting","token":"barrier-1","ready_count":2,"total":2,"is_ready":1})");
+    lobby::RecoveryAction("sync_ready");assert(queue.size()==2);
+    lobby::Dispatch(R"({"type":"sync_state","phase":"error","operation":"operation-1","step":"load","detail":"load failed"})");
+    model.isHost=false;lobby::RecoveryAction("sync_retry");assert(queue.size()==2);
+    model.isHost=true;assert(lobby::RecoveryAction("sync_retry")=="Request sent.");
+    assert(queue.back().line.find("\"operation\":\"operation-1\"")!=std::string::npos);
+    lobby::Dispatch(R"({"type":"sync_state","phase":"complete","operation":"operation-1"})");
+    assert(!model.recoveryPresent && model.lobbyDone && !model.startPending);
+    assert(lobby::RecoveryAction("sync_request")=="Request sent.");
+    lobby::Dispatch(R"({"type":"mods_refresh"})");assert(modRefreshes==1);
     unlink((dir+"chosen.sav").c_str()); unlink((dir+"mp_company_cfg.txt").c_str());
     for (const auto& name : {"lobby_out.jsonl", "lobby_in.jsonl", "tpf2_bridge_ctl.txt"}) unlink((dir+name).c_str());
     unlink((dir+"lockstep_dash_"+letter+".txt").c_str());

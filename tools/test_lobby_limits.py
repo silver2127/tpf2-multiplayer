@@ -281,6 +281,85 @@ class ModList(unittest.TestCase):
             self.assertEqual(len(lines), 301)
 
 
+class BulkHello(unittest.TestCase):
+    """bulk_connect reads exactly the 'OK' line: a sender whose stream follows
+    its OK in the same segment used to make the client read 'OK\\n' plus five
+    payload bytes, reject the reply and close -- the host then saw the stream
+    break at 1 MiB and fell back to UDP (2026-09-20)."""
+
+    def test_ok_coalesced_with_the_payload(self):
+        import bulk_tcp, socket, threading
+        payload = bytes(range(256)) * 64
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0)); srv.listen(1)
+        hello = []
+        def serve():
+            c, _ = srv.accept()
+            line = b""
+            while not line.endswith(b"\n"):
+                line += c.recv(256)
+            hello.append(line)
+            c.sendall(b"OK\n" + payload)         # one segment: OK and the stream together
+            c.close()
+        t = threading.Thread(target=serve, daemon=True); t.start()
+        sock = bulk_tcp.bulk_connect("127.0.0.1", srv.getsockname()[1], "recv", 7, "tok", "bob")
+        self.assertIsNotNone(sock, "the OK must be recognised though the payload arrived with it")
+        got = bytearray()
+        self.assertTrue(bulk_tcp.stream_recv(sock, len(payload), got.extend))
+        self.assertEqual(bytes(got), payload, "no payload byte may be swallowed by the handshake")
+        self.assertTrue(hello[0].startswith(b"TPF2BULK1 recv 7 tok bob"))
+        t.join(2); srv.close()
+
+
+class ModsProgress(unittest.TestCase):
+    """The status line of a mods round: packaging (bytes) before anything landed,
+    then landed bytes, MB/s since the round began and the time left at that pace;
+    a batch still crossing is not counted."""
+
+    def job(self, taken, done=10, started=0.0):
+        gb = 1024 ** 3
+        plan = [[("a", 1), ("b", 1)], [("c", 1)], [("d", 1)], [("e", 1)]]
+        return {"bytes": 8 * gb, "plan": plan, "wanted": [m for g in plan for m in g], "done": done,
+                "taken": taken, "started": started, "sizes": [gb, gb, 2 * gb, 2 * gb, 2 * gb],
+                "batch_bytes": [2 * gb, 2 * gb, 2 * gb, 2 * gb], "names": "bob"}
+
+    def test_time_left_text(self):
+        self.assertEqual(lobby._time_left_text(None), "?")
+        self.assertEqual(lobby._time_left_text(20), "<1 min")
+        self.assertEqual(lobby._time_left_text(7 * 60 + 10), "7 min")
+        self.assertEqual(lobby._time_left_text(72 * 60 + 40), "1 h 13 min")
+
+    def test_packaging_then_pace_and_time_left(self):
+        j = self.job(taken=0, done=2)
+        self.assertEqual(lobby._mods_progress_text(j, False, 10.0),
+                         "Packaging mods 2.0/8.0 GB, batch 0/4 sent")
+        # one batch handed to the sender and still crossing: nothing landed yet
+        j = self.job(taken=1, done=3)
+        self.assertTrue(lobby._mods_progress_text(j, True, 10.0).startswith("Packaging mods"))
+        # two batches landed (2 GB each) in 40 s: 102 MB/s -> 4 GB left at that pace = 40 s, rounded up to a minute
+        j = self.job(taken=2, done=5)
+        text = lobby._mods_progress_text(j, False, 40.0)
+        self.assertEqual(text, "Mods 4.0/8.0 GB, 102 MB/s, 1 min left, batch 2/4")
+        # a third batch in flight does not count; a longer wall clock lowers the pace
+        j = self.job(taken=3, done=5)
+        text = lobby._mods_progress_text(j, True, 400.0)
+        self.assertIn("4.0/8.0 GB, 10 MB/s, 7 min left, batch 2/4", text)
+        # with landing times the pace is over the recent batches, not the whole round:
+        # a 60 s lead-in, then two 2 GB batches 10 s apart -> 205 MB/s, 20 s left
+        j = self.job(taken=2, done=5)
+        j["landed"] = [(70.0, 2 * 1024 ** 3), (80.0, 2 * 1024 ** 3)]
+        j["started"] = 60.0
+        text = lobby._mods_progress_text(j, False, 80.0)
+        self.assertEqual(text, "Mods 4.0/8.0 GB, 205 MB/s, <1 min left, batch 2/4")
+        # more landings than the window: only the last MODS_RATE_WINDOW count, timed
+        # from the landing before them
+        j = self.job(taken=4, done=5)
+        j["batch_bytes"] = [1024 ** 3] * 4
+        j["landed"] = [(t, 1024 ** 3) for t in (10.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0)]
+        text = lobby._mods_progress_text(j, False, 150.0)
+        self.assertIn("102 MB/s", text)      # 5 GB over 100 -> 150 s
+
+
 class MidTransfer(unittest.TestCase):
     """A joiner that has every chunk and is verifying/writing is neither
     dropped by the host's keepalive nor timed out by the transfer."""
@@ -299,6 +378,33 @@ class MidTransfer(unittest.TestCase):
         addr = ("10.0.0.5", 7)
         t = lobby._HostSaveTransfer(self.Sock(), 5, blob, meta, [(addr, "joiner")], self.IO(), lambda s: None)
         return t, addr
+
+    def test_host_nudges_a_finished_peer_that_has_not_said_done(self):
+        """A peer whose base covers every chunk and that is past its verify
+        gets the last chunk again once a second (a finished receiver answers
+        a chunk with done), so a lost done does not end in a timeout. Not
+        while it is still verifying, and not once it is done."""
+        t, addr = self.transfer()
+        p = t.peers[addr]
+        p["ready"] = True
+        p["base"] = p["next"] = t.total_chunks
+        p["verifying"] = True
+        t.pump(100.0)
+        self.assertEqual(t.sock.sent, 0, "verifying: nothing to nudge")
+        p["verifying"] = False
+        t.pump(100.0)
+        self.assertEqual(t.sock.sent, 1)
+        t.pump(100.0 + lobby.DONE_NUDGE_INTERVAL / 2)
+        self.assertEqual(t.sock.sent, 1, "not before the interval")
+        t.pump(100.0 + lobby.DONE_NUDGE_INTERVAL)
+        self.assertEqual(t.sock.sent, 2)
+        p["tcp"] = True                       # a TCP peer is reached the same way
+        t.pump(100.0 + 2 * lobby.DONE_NUDGE_INTERVAL)
+        self.assertEqual(t.sock.sent, 3)
+        t.on_fdone(addr, {"sid": t.sid, "ok": True})
+        t.pump(100.0 + 3 * lobby.DONE_NUDGE_INTERVAL)
+        self.assertEqual(t.sock.sent, 3, "done: nothing more")
+        self.assertEqual(p["state"], "done")
 
     def test_host_drop_defers_to_the_transfer(self):
         t, addr = self.transfer()
@@ -352,14 +458,14 @@ class MidTransfer(unittest.TestCase):
         fack(t, addr, 0)
         fack(t, addr, 8 << 20)
         self.assertEqual(p["verify_progress"], 8 << 20)
-        p["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+        p["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5
         fack(t, addr, 8 << 20)                            # the worker stopped moving
         t.pump(time.time())
         self.assertEqual(p["state"], "failed")
         t2, addr2 = self.transfer()
         p2 = t2.peers[addr2]
         for i in range(4):                                # a moving count: alive past the timeout, every time
-            p2["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+            p2["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5
             fack(t2, addr2, i * 4096)
             t2.pump(time.time())
             self.assertEqual(p2["state"], "active")
@@ -373,7 +479,7 @@ class MidTransfer(unittest.TestCase):
     def test_verifying_facks_are_progress_for_the_transfer_timeout(self):
         t, addr = self.transfer()
         p = t.peers[addr]
-        p["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5      # would time out now
+        p["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5      # would time out now
         t.on_fack(addr, {"t": "fack", "sid": 5, "base": t.total_chunks, "nack": [], "verifying": True})
         self.assertGreater(p["last_advance"], time.time() - 1)
         before = t.progress_at
@@ -386,7 +492,7 @@ class MidTransfer(unittest.TestCase):
         t2, addr2 = self.transfer()
         p2 = t2.peers[addr2]
         t2.on_fack(addr2, {"t": "fack", "sid": 5, "base": 1, "nack": [2]})
-        p2["last_advance"] = time.time() - lobby.PEER_XFER_TIMEOUT - 5
+        p2["last_advance"] = time.time() - lobby.PEER_XFER_VERIFY_TIMEOUT - 5
         t2.on_fack(addr2, {"t": "fack", "sid": 5, "base": 1, "nack": [2]})   # same base: no progress
         t2.pump(time.time())
         self.assertEqual(p2["state"], "failed")

@@ -775,7 +775,7 @@ end
 -- were held behind them.
 function CM.runQueued(c)
 	if c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopRun(c)
-	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then CM.execLine(c)
+	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" or c.op == "LSPARE" then CM.execLine(c)
 	else CM.execConX(c) end
 end
 end

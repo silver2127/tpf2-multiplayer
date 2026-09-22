@@ -20,9 +20,10 @@ from pathlib import Path
 import re
 import struct
 import pefile
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
 
 repo = Path(__file__).resolve().parents[1]
-source = (repo / "native/src/slice_hook.cpp").read_text(encoding="utf-8")
+source = slice_source(repo)
 
 
 def const(name):

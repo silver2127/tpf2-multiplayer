@@ -67,6 +67,9 @@ struct PanelState {
     lobby::View view;
     std::vector<lobby::PubRow> pubRows;
     std::string pubNote;
+    bool savePicker=false;
+    int savePage=0;
+    uint64_t recoverySeen=0,openPollAt=0;
 };
 static PanelState& P()
 {
@@ -368,12 +371,37 @@ static Rgb CoColor(int cid)
 static void RenderLobbyLocked(int w, int h)
 {
     const lobby::View& v = P().view;
-    const int pad = S(25), cy = S(56);
+    const int pad = S(25), cy = S(v.isHost && !v.lobbyDone ? 98 : 56);
+    if(P().savePicker && v.isHost && !v.lobbyDone) {
+        MwTitle("CHOOSE A SAVE");MwClose(w,91);
+        const int pages=std::max(1,int((v.saves.size()+7)/8));
+        P().savePage=std::min(P().savePage,pages-1);
+        for(int i=0;i<8;++i) {
+            const int index=P().savePage*8+i;
+            if(index>=int(v.saves.size()))break;
+            const auto& row=v.saves[index];const int y=S(56+i*42);
+            layer::Rect(pad,y,w-2*pad,S(36),row.path==v.selectedSave?MW_YOU:rgb(0,0,0),65);
+            layer::Text(pad+S(10),y,w-2*pad-S(20),S(36),row.name.c_str(),S(14),MW_TEXT,
+                        layer::kLeft|layer::kVCenter|layer::kEndEllipsis);
+            AddHit(pad,y,w-2*pad,S(36),100+i,true);
+        }
+        if(v.saves.empty())MwBody(pad,S(65),w-2*pad,S(60),"No saves found. Save a world in the game, then refresh this list.");
+        MwButton(pad,h-S(52),S(100),S(30),"REFRESH",92);
+        MwButton(w-pad-S(220),h-S(52),S(100),S(30),"PREVIOUS",93);
+        MwButton(w-pad-S(100),h-S(52),S(100),S(30),"NEXT",94);
+        MwStatus(w,h);return;
+    }
     const std::string title = v.title.empty() ? std::string("LOBBY") : "LOBBY  --  " + v.title;
     MwTitle(title.c_str(), 300);
     int titleW = layer::TextWidth(title.c_str(), S(18)) + S(16);
     if (titleW > S(316)) titleW = S(316);
-    MwClose(w, 5);
+    MwClose(w, v.inGame ? 4 : 5);
+    if(v.isHost && !v.lobbyDone) {
+        const auto at=v.selectedSave.find_last_of('/');
+        const std::string selected=v.selectedSave.empty()?"Choose a save before starting":v.selectedSave.substr(at==std::string::npos?0:at+1);
+        layer::Text(pad,S(55),w-2*pad-S(160),S(30),selected.c_str(),S(13),MW_TEXT,layer::kLeft|layer::kVCenter|layer::kEndEllipsis);
+        MwButton(w-pad-S(145),S(55),S(145),S(30),"CHOOSE SAVE",90);
+    }
     if (v.haveCode) {
         // ROOM CODE, DELIBERATELY NOT RENDERED (menu_hook.cpp): the code is the
         // credential, and the clipboard is the only way it leaves. A fixed
@@ -433,13 +461,15 @@ static void RenderLobbyLocked(int w, int h)
                     layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
         ly += lh;
     }
-    MwField(chatX, cy + logH + S(8), chatW, inH, P().chatInput, !v.lobbyDone, "Type a message and press Enter", 9);
+    MwField(chatX, cy + logH + S(8), chatW, inH, P().chatInput, v.active, "Type a message and press Enter", 9);
 
     // LEAVE left, START GAME right (the host), the status or the mods question between
     const int bw1 = MwButtonW("LEAVE");
     MwButton(pad, bottom, bw1, S(30), "LEAVE", 5);
     int rightCut = S(160);
-    if (v.isHost) {
+    if (v.inGame) {
+        MwButton(w-pad-S(155),bottom,S(155),S(30),"WORLD SYNC",84);
+    } else if (v.isHost) {
         const int bw2 = MwButtonW("START GAME");
         MwButton(w - pad - bw2, bottom, bw2, S(30), "START GAME", 6);
         if (!P().flagMaster.empty()) MwCheck(w - pad - bw2 - S(110), bottom, "PUBLIC", g_public, 11);
@@ -472,7 +502,7 @@ static void RenderHostJoinLocked(int w, int h)
     const int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
     layer::Rect(pad + colW + S(20), cy, 1, S(130), MW_TEXT, 40);
     MwHeader(lx, cy, colW, "HOST A GAME");
-    MwBody(lx, cy + S(24), colW, S(36), "Opens a lobby and shares your newest save with everyone who joins.");
+    MwBody(lx, cy + S(24), colW, S(36), "Open a lobby, choose a save, and share it with everyone who joins.");
     {
         // not EnsureUsername here: an emptied name field would roll a new name
         // on the next frame, before anything could be typed
@@ -549,7 +579,25 @@ static void RenderLocked(int w, int h)
     layer::Begin(w, h);
     g_hitCount = 0;
     layer::Rect(0, 0, w, h, MW_BG, MW_BG_A);
-    if (g_uiState == 2) RenderLobbyLocked(w, h);
+    if (g_uiState == 3) {
+        const auto& v=P().view;
+        MwTitle("WORLD SYNC");MwClose(w,4);
+        std::string description;
+        const auto& phase=v.recoveryPhase;
+        if(phase=="readiness")description="Ready players: "+std::to_string(v.readyCount)+" / "+std::to_string(v.readyTotal)+". Confirm when you are ready to reload the shared world.";
+        else if(phase=="complete"||phase.empty())description="The host can ask everyone to get ready to synchronize the shared world.";
+        else if(phase=="detected")description="The worlds need to be synchronized. The host can ask everyone to get ready.";
+        else if(phase=="unavailable")description="World sync is unavailable in this session.";
+        else if(phase=="error")description="World sync stopped at "+v.recoveryStep+". The host can retry when everyone is ready.";
+        else description="World sync: "+phase+". Please wait.";
+        layer::Text(S(25),S(65),w-S(50),S(110),description.c_str(),S(18),MW_TEXT,layer::kWordBreak);
+        layer::Text(S(25),S(185),w-S(50),S(180),v.recoveryDetail.c_str(),S(15),MW_DIM,layer::kWordBreak);
+        if(v.recoveryRequested)layer::Text(S(25),h-S(130),w-S(50),S(35),"Waiting for the lobby...",S(15),MW_DIM,layer::kLeft);
+        else if(phase=="readiness"&&!v.readyMine)MwButton(S(25),h-S(130),S(170),S(35),"I AM READY",82);
+        else if(v.isHost && phase=="error")MwButton(S(25),h-S(130),S(170),S(35),"RETRY SYNC",81);
+        else if(v.isHost && (phase.empty()||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))MwButton(S(25),h-S(130),S(170),S(35),"REQUEST SYNC",80);
+        MwButton(S(25),h-S(75),S(170),S(35),"BACK TO LOBBY",83);MwStatus(w,h);
+    } else if (g_uiState == 2) RenderLobbyLocked(w, h);
     else RenderHostJoinLocked(w, h);
 }
 
@@ -557,7 +605,7 @@ static void LayoutLocked(int screenW, int screenH, int* w, int* h)
 {
     g_s = UiScale(screenH);
     *w = S(780);
-    *h = (g_uiState == 2 || !P().flagMaster.empty()) ? S(540) : S(330);
+    *h = (g_uiState >= 2 || !P().flagMaster.empty()) ? S(540) : S(330);
     if (*w > screenW) *w = screenW;
     if (*h > screenH) *h = screenH;
 }
@@ -621,6 +669,9 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
     if (previous && !(id >= 20 && id < 36)) return;
     if (g_log) g_log("[panel] hit id=%d\n", id);
     switch (id) {
+        case 80:case 81:case 82:SetStatusLocked(lobby::RecoveryAction(id==82?"sync_ready":id==81?"sync_retry":"sync_request"));break;
+        case 83:g_uiState=2;break;
+        case 84:g_uiState=3;break;
         case 16: case 17: SetStatusLocked(lobby::AnswerMods(id == 16)); break;
         case 15:
             // the gathering's own verdict comes after this line: its status waits for this lock
@@ -633,8 +684,20 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
             if (P().joinCode.size() >= 8) StartLobbyLocked(true, std::string());
             else post->joinFromClipboard = true;   // menu_hook.cpp: a short field takes the clipboard's code
             break;
-        case 5:  lobby::Leave(); g_uiState = 1; break;
-        case 6: { const std::string s = lobby::StartGame(); if (!s.empty()) SetStatusLocked(s); break; }
+        case 5:  lobby::Leave(); P().savePicker=false; g_uiState = 1; break;
+        case 6: {
+            if(P().view.isHost && !P().view.lobbyDone && !P().view.startPending && P().view.selectedSave.empty()) {
+                P().savePicker=true;P().savePage=0;lobby::RefreshSaves();
+            }
+            const std::string s = lobby::StartGame(); if (!s.empty()) SetStatusLocked(s); break;
+        }
+        case 90:
+            if(P().view.isHost && !P().view.lobbyDone && !P().view.startPending) {P().savePicker=true;P().savePage=0;lobby::RefreshSaves();}
+            break;
+        case 91:P().savePicker=false;break;
+        case 92:P().savePage=0;lobby::RefreshSaves();break;
+        case 93:P().savePage=std::max(0,P().savePage-1);break;
+        case 94:P().savePage=std::min(std::max(0,int((P().view.saves.size()+7)/8)-1),P().savePage+1);break;
         case 7: {
             std::string code;
             if (lobby::CopyCode(&code)) { post->copy = code; post->copied = "Code copied to clipboard \xE2\x80\x94 share it in Discord."; }
@@ -659,7 +722,14 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
             break;
         case 12: lobby::PublicRefresh(); SetStatusLocked("Refreshing the public game list\xE2\x80\xA6"); break;
         default:
-            if (id >= 40 && id < 48) {
+            if(id>=100 && id<108 && P().savePicker) {
+                const int index=P().savePage*8+id-100;
+                if(index<int(P().view.saves.size())) {
+                    const auto why=lobby::SelectSave(P().view.saves[index].path);
+                    if(why.empty()){P().savePicker=false;SetStatusLocked("Save selected. Checking required mods.");}
+                    else SetStatusLocked(why);
+                }
+            } else if (id >= 40 && id < 48) {
                 lobby::PubRow r;
                 if (lobby::PublicRow(id - 40, &r)) {
                     P().joinCode = r.code;
@@ -766,7 +836,7 @@ static void BackspaceLocked()
     if (s) PopCharLocked(s);
 }
 
-static bool ChatFocusLocked() { return g_uiState == 2 && lobby::CapturesTyping(); }
+static bool ChatFocusLocked() { return g_uiState == 2 && P().view.active; }
 
 static bool PassKey(SDL_Keycode k)
 {
@@ -803,7 +873,7 @@ static bool HandleEventLocked(SDL_Event* e, Post* post)
     // Only while the overlay is really drawing the panel: if it stopped (a
     // Vulkan failure, a swapchain it cannot copy from), an invisible panel must
     // not keep eating the menu's clicks.
-    if (!VisibleLocked() || NowMs() - g_lastFrameMs > 1000) { g_hover = 0; g_pressed = 0; return false; }
+    if (!VisibleLocked() || NowMs() - g_lastFrameMs > 5000) { g_hover = 0; g_pressed = 0; return false; }
 
     auto inside = [](int lx, int ly) { return lx >= 0 && ly >= 0 && lx < g_pw && ly < g_ph; };
     switch (t) {
@@ -921,6 +991,20 @@ static void RunPost(const Post& post)
     }
 }
 
+static bool g_actionsHeld=false;
+static bool g_physicalKeys[SDL_NUM_SCANCODES]{};
+static uint32_t g_physicalButtons=0;
+bool SetActionsHeld(bool held)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (held && !g_actionsHeld) {
+        if (!s_SetEventFilter || g_physicalButtons) return false;
+        for (bool down:g_physicalKeys) if(down)return false;
+    }
+    g_actionsHeld=held;
+    return true;
+}
+
 static int SDLCALL EventFilter(void*, SDL_Event* e)
 {
     // re-entered from inside a clipboard call on this thread: straight through
@@ -929,7 +1013,19 @@ static int SDLCALL EventFilter(void*, SDL_Event* e)
     bool consumed;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
+        if ((e->type==SDL_KEYDOWN || e->type==SDL_KEYUP) && e->key.keysym.sym!=SDLK_ESCAPE &&
+            unsigned(e->key.keysym.scancode)<SDL_NUM_SCANCODES)
+            g_physicalKeys[e->key.keysym.scancode]=e->type==SDL_KEYDOWN;
+        if (e->type==SDL_MOUSEBUTTONDOWN && e->button.button>0 && e->button.button<=32)
+            g_physicalButtons|=1u<<(e->button.button-1);
+        if (e->type==SDL_MOUSEBUTTONUP && e->button.button>0 && e->button.button<=32)
+            g_physicalButtons&=~(1u<<(e->button.button-1));
         consumed = HandleEventLocked(e, &post);
+        if(g_actionsHeld) {
+            if(e->type==SDL_MOUSEMOTION || e->type==SDL_MOUSEBUTTONDOWN || e->type==SDL_MOUSEBUTTONUP ||
+               e->type==SDL_MOUSEWHEEL || e->type==SDL_TEXTINPUT || e->type==SDL_TEXTEDITING ||
+               ((e->type==SDL_KEYDOWN || e->type==SDL_KEYUP) && e->key.keysym.sym!=SDLK_ESCAPE)) consumed=true;
+        }
     }
     if (!post.copy.empty() || post.pasteCode || post.joinFromClipboard) RunPost(post);
     if (consumed) return 0;
@@ -1004,6 +1100,8 @@ void Init(const char* dataDir, const char* gameDir, const char* libDir, Tpf2mpLo
         cfg.relayAutosaveMin = g_flagRelayAutosaveMin;
         cfg.shareMods = g_flagShareMods;
         cfg.autoload = g_flagAutoLoad;
+        cfg.dedicated = dedicated::Get();
+        if (cfg.dedicated.enabled) cfg.autoload = true;
     }
     // Unlocked: lobby::Init calls into the menu-game area (lobby_linux.h LOCKS).
     lobby::Init(cfg, log, &StatusFromLobby, &DirtyFromLobby);
@@ -1035,7 +1133,12 @@ void OnMenuPage(int page)
     static int seen = 0;
     if (seen < 30 && g_log) { seen++; g_log("[panel] CreatePage page=%d\n", page); }
     if (page == 2) g_pageHidden = false;
-    else if (page >= 3) { g_pageHidden = true; g_focus = 0; }
+    else if (page >= 3) {
+        // Keep an open lobby/recovery panel available during catalogue refresh
+        // and world loading so players can see progress and readiness prompts.
+        g_pageHidden = g_uiState < 2;
+        g_focus = 0;
+    }
 }
 
 void OnGameUiFrame() { lobby::OnGameUiFrame(); }
@@ -1046,9 +1149,33 @@ void SetStatus(const char* utf8)
     SetStatusLocked(utf8 ? utf8 : "");
 }
 
+static void PollOpenLocked()
+{
+    if(!g_initDone)return;
+    const bool async=g_asyncDirty.exchange(false);
+    if(async)g_dirty=true;
+    const auto now=NowMs();
+    if(async || now-P().openPollAt>=250) {
+        P().openPollAt=now;lobby::Snapshot(&P().view);
+        const auto path=P().dataDir+"tpf2_lobby_open.txt";
+        if(!unlink(path.c_str()) && P().view.inGame) {
+            g_uiState=P().view.active?2:1;g_pageHidden=false;g_dirty=true;
+        }
+        if(P().recoverySeen!=P().view.recoveryVersion) {
+            P().recoverySeen=P().view.recoveryVersion;
+            if(P().view.recoveryPresent){g_uiState=3;g_pageHidden=false;}
+            else if(g_uiState==3){g_uiState=2;g_pageHidden=false;}
+            g_dirty=true;
+        }
+    }
+}
+
 bool Visible()
 {
     std::lock_guard<std::mutex> lk(g_mtx);
+    // Present asks visibility before calling Frame. Poll here so a collapsed
+    // panel can be opened by Lua or a recovery event without any input.
+    PollOpenLocked();
     return VisibleLocked();
 }
 
@@ -1063,7 +1190,8 @@ void MaxSize(int screenW, int screenH, int* w, int* h)
 bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* changed)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
-    SteamNameTickLocked();
+    SteamNameTickLocked();PollOpenLocked();
+    const auto now=NowMs();
     if (!VisibleLocked()) return false;
     int pw, ph;
     LayoutLocked(screenW, screenH, &pw, &ph);
@@ -1071,11 +1199,9 @@ bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* chang
     g_px = (screenW - pw) / 2;
     g_py = (screenH - ph) / 2;
     if (g_uiState == 1) lobby::PublicPoll();
-    const uint64_t now = NowMs();
-    const bool async = g_asyncDirty.exchange(false);
-    *changed = g_dirty || async || layer::Width() != pw || layer::Height() != ph || now - g_lastRenderMs > 500;
+    *changed = g_dirty || layer::Width() != pw || layer::Height() != ph || now - g_lastRenderMs > 500;
     if (*changed) {
-        if (g_uiState == 2) lobby::Snapshot(&P().view);
+        if (g_uiState >= 2) lobby::Snapshot(&P().view);
         else lobby::PublicSnapshot(&P().pubRows, &P().pubNote);
         RenderLocked(pw, ph);
         g_dirty = false;

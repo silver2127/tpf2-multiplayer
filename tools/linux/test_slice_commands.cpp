@@ -244,13 +244,22 @@ struct Line { std::vector<Stop> stops; float wait; uint32_t padding; int info[3]
 static void TestVehicles()
 {
     Config cfg{}; cfg.parts.resize(1); auto& p=cfg.parts[0];
-    p.model=17; p.loads={3,5}; p.color[0]=.1f; p.color[1]=.2f; p.color[2]=.3f; p.automatic={true,false}; cfg.groups={0};
+    p.model=17; p.reversed=true; p.loads={3,5}; p.color[0]=.1f; p.color[1]=.2f; p.color[2]=.3f; p.automatic={true,false}; cfg.groups={0};
     auto c=Call(slice_vehicles::kBuy); c.rdx=4;c.rcx=81;c.r8=uintptr_t(&cfg);
     Capture(c); assert(armed && writes.empty());
     alignas(8) uint8_t lambda[0x58]{}; int32_t line=23; std::memcpy(lambda+0x30,&line,4);
     uintptr_t fn[4]={uintptr_t(lambda),0,SliceAddr(0x126eb30),SliceAddr(0x1272350)};
     assert(Add(fn)); assert(writes.size()==1);
-    assert(writes[0]=="ARMED 1\nVBUY 81 1 17 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\nVBUYLINE 23\n");
+    assert(writes[0]=="ARMED 1\nVBUY 81 1 17 1 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\nVBUYLINE 23\n");
+    c=Call(slice_vehicles::kReplace); c.rdx=91; c.rcx=uintptr_t(&cfg); c.r8=0;
+    Capture(c); assert(armed);
+    assert(writes[0]=="ARMED 1\nVREPL 91 1 17 1 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\n");
+    Add();
+    p.reversed=false;
+    c=Call(slice_vehicles::kReplace); c.rdx=91; c.rcx=uintptr_t(&cfg); c.r8=0;
+    Capture(c); assert(armed);
+    assert(writes[0]=="ARMED 1\nVREPL 91 1 17 0 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\n");
+    Add();
     // Actual vector<bool> word boundary, signed low half, and erased tail bits.
     p.automatic.assign(65,true); p.loads.assign(65,0);
     SliceRecord rec{}; assert(slice_vehicles::AutoLoad(&rec,uintptr_t(&p.automatic)));
@@ -337,35 +346,26 @@ static void TestLines()
     c=Call(slice_lines::kUpdate,0x132c513);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);fn[3]=0;
     assert(!Add(fn));assert(writes.empty());
     std::string name="Coal 50%=\xc3\xa9";
-    // A plain entity: no Player component, so the rename still has no origin
-    // replay and stays blocked (no engine is set up yet either).
+    // Names/colors cancelled on Linux explicitly request origin replay.
     c=Call(slice_lines::kName);c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
-    assert(!armed && writes.empty());
-    // The game's company window: entity 7 carries a Player component, so the
-    // rename ships as VNAME and the shared Lua turns it into CMNAME.
-    FakeCompanyEngine engine(7);
-    c=Call(slice_lines::kName);c.rdx=7;c.rsi=engine.address;c.rcx=uintptr_t(&name);Capture(c);
-    assert(armed && arm.done==SliceDone::Never);
-    assert(Add());
-    // the cancelled click is shipped as one armed record, percent-encoded so the
-    // space, the '%' and the '=' survive the whitespace-split wire
-    // one armed record, percent-encoded so the space, the '%' and the '=' all
-    // survive a wire that splits on whitespace
-    assert(writes.size()==1 && writes[0].rfind("ARMED ",0)==0);
-    {
-        const std::string tail="VNAME 7 Coal%2050%25%3D%C3%A9\n";
-        assert(writes[0].size()>=tail.size() &&
-               writes[0].compare(writes[0].size()-tail.size(),tail.size(),tail)==0);
-    }
-    // A different entity in the same world has no Player component.
-    c=Call(slice_lines::kName);c.rdx=9;c.rsi=engine.address;c.rcx=uintptr_t(&name);Capture(c);
-    assert(!armed && writes.empty());
-    // An empty name cannot travel: the Lua's VNAME parser needs a third token.
+    assert(armed && Add());
+    assert(writes[0]=="ARMED 1\nVNAME 7 Coal%2050%25%3D%C3%A9 replayOrigin=1\n");
     std::string empty;
-    c=Call(slice_lines::kName);c.rdx=7;c.rsi=engine.address;c.rcx=uintptr_t(&empty);Capture(c);
+    c=Call(slice_lines::kName);c.rdx=7;c.rcx=uintptr_t(&empty);Capture(c);
     assert(!armed && writes.empty());
-    engine.Release();
+    for(bool lineName : {false,true}) {
+        c=Call(slice_lines::kName,lineName?0x1327526:0x14287df);
+        c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
+        assert(armed && arm.done==SliceDone::Required && writes.empty());
+        uintptr_t done[4]={0,0,SliceAddr(lineName?0x1325110:0x1428480),SliceAddr(lineName?0x1327640:0x1426830)};
+        assert(Add(done) && writes.size()==1);
+        c=Call(slice_lines::kName,lineName?0x1327526:0x14287df);
+        c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
+        done[3]=0;assert(!Add(done) && writes.empty());
+    }
     c=Call(slice_lines::kColor);c.rdx=7;c.xmm[0]=_mm_setr_ps(.25f,.5f,99,99);c.xmm[1]=_mm_setr_ps(.75f,99,99,99);Capture(c);
+    assert(armed && Add());assert(writes[0]=="ARMED 1\nVCOLOR 7 0.25 0.5 0.75 replayOrigin=1\n");
+    c=Call(slice_lines::kColor);c.rdx=7;c.xmm[0]=_mm_setr_ps(NAN,.5f,0,0);Capture(c);
     assert(!armed && writes.empty());
     c=Call(slice_lines::kCreate);Capture(c);assert(!armed && writes.empty());
 }
@@ -534,11 +534,27 @@ static void TestTime()
     assert(writes[0]=="SPEEDBTN 3 button\n");++Count();slice_time::DoStep(clockObject,1,2);assert(Count()==0);
 }
 
+static void TestSpareGeneration() {
+    std::vector<unsigned char> registry(0xc0),slots(24*4),gens(12*4);
+    uintptr_t begin=uintptr_t(slots.data()),end=begin+slots.size(),generations=uintptr_t(gens.data());
+    memcpy(registry.data()+0x98,&begin,8);memcpy(registry.data()+0xa0,&end,8);memcpy(registry.data()+0xb0,&generations,8);
+    for(int i=0;i<12;++i)gens[24+i]=i+1;
+    slice_lines::SpareEntry entry{};
+    assert(slice_lines::SpareGeneration(uintptr_t(registry.data()),2,&entry));
+    assert(entry.id==2 && !memcmp(entry.generation,gens.data()+24,12));
+    assert(!slice_lines::SpareGeneration(uintptr_t(registry.data()),4,&entry));
+    int32_t tombstone[2]={-1,0};begin=uintptr_t(tombstone);end=begin+8;
+    memcpy(slots.data()+48,&begin,8);memcpy(slots.data()+56,&end,8);
+    assert(!slice_lines::SpareGeneration(uintptr_t(registry.data()),2,&entry));
+    tombstone[0]=10;assert(slice_lines::SpareGeneration(uintptr_t(registry.data()),2,&entry));
+}
+
 int main(int argc, char** argv)
 {
+    TestSpareGeneration();
     testDataDir=argc>2 ? argv[2] : "/tmp/";
     slice_vehicles_area_SliceRegister();slice_lines_area_SliceRegister();slice_time_area_SliceRegister();
-    assert(handlers.size()==14 && hooks.size()==2 && hooks[1].steal==14 && hooks[1].expectedLen==27);
+    assert(handlers.size()==14 && hooks.size()==3 && hooks[2].steal==14 && hooks[2].expectedLen==27);
     TestVehicles();TestLines();TestStrictCreates();TestTime();
     if (argc > 1) {
         void* foreign = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL); assert(foreign);

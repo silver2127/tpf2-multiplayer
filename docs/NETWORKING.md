@@ -25,6 +25,7 @@ own lobby process over loopback; the lobbies carry the frames between machines.
 | STUN | outbound UDP 19302 / 3478 | `stun.l.google.com`, `stun.nextcloud.com`, `stun.cloudflare.com`, `stun.services.mozilla.com`. |
 | master server | outbound HTTPS | The public game list, and the rendezvous for hole punching (`/knock`); see [Master server](#master-server). |
 | dedicated relay | UDP 29471 on the server | Same protocol as a host. |
+| save transfers | TCP 29471 on the host or relay | The bulk channel the save and mod transfers stream over ([Save transfer](#save-transfer)). A host maps it with UPnP beside the UDP port; when it is not reachable the transfer uses the UDP path. The relay opens it in ufw. |
 
 ## Join codes
 
@@ -54,6 +55,9 @@ about 74 characters.
 
 ## Connecting
 
+Every join request, welcome and roster carries the release version, and admission needs an
+exact match on both sides; [version-checking.md](version-checking.md) has the rule and its tests.
+
 **Host.** `netpunch.exe host` observes its own socket (STUN, plus a UPnP port mapping
 it removes on exit), prints `CODE=...`, answers every HELLO, and polls the master server
 for knocks every second. For each knock it can open, it sends HELLO to that joiner's
@@ -63,7 +67,7 @@ has to be reachable directly when the master is unreachable, or when both ends s
 behind symmetric NAT or CGNAT. A dedicated relay does not poll: its port is open.
 
 **Joiner.** `netpunch.exe join <code>` decodes the code, observes its own socket (no
-UPnP), and sends HELLO every 100 ms to the host's candidates, LAN first, until an ACK
+UPnP), and sends HELLO every 100 ms to the host's candidates, VPN adapter first when the host has one (Hamachi 25.0.0.0/8 or Tailscale 100.64.0.0/10, or `TPF2MP_VPN_IP`; carried as a trailing field of the code, so two players on one virtual LAN connect without any NAT), then LAN, until an ACK
 echoes its token or 40 s pass. Punching is the fallback: a host whose port is open (UPnP,
 a forward) answers within a second and nothing else happens. If there is no answer after
 4 s, the joiner **knocks**: every 2 s it posts its own
@@ -72,9 +76,25 @@ secret (and password), under a tag also derived from the secret
 (`SHA-256("tpf2mp-rendezvous-v1|" + secret)`, 24 hex characters). The master can
 neither read a knock nor tell which lobby a tag belongs to, and keeps knocks for 60 s.
 If the joiner's public address equals the host's, only the LAN candidate is used (no
-NAT hairpin). There is no TURN server and no port prediction. `--rendezvous <url>`
+NAT hairpin). There is no port prediction. `--rendezvous <url>`
 picks the master used for knocks (default: `--publish`, else the project's);
 `--rendezvous off` disables them.
+
+**Relay fallback.** A host behind CGNAT cannot be punched and a joiner behind a
+symmetric NAT cannot be punched toward, so that pair had no path at all. From its second
+knock on, a joiner still unanswered adds `relay: 1` and a nonce to the knock; the master
+binds one UDP port of its `--relay-ports` range for that joiner and returns
+`{"relay": {"ip", "port", "id"}}`, and hands the same allocation to the host with
+the note. Each end sends a bind packet (`TRLB` + the 16-byte id + `J` or `H`) to that
+port from its game socket; from then on the port swaps every datagram between the two
+addresses it learned, verbatim. The joiner adds the port to its dial as one more
+candidate, so a direct path that answers first still wins; the host binds every
+200 ms until the joiner's frames arrive through the port. The frames stay sealed with
+the session key: the master forwards bytes it cannot read, and a port dies after 90 s
+without traffic. Save transfers to a relayed joiner take the UDP path (the TCP side
+channel dials the host directly and fails). A master started without `--relay-ip`
+offers no relay and the punch stays the only fallback; a host or joiner from before
+this ignores the field. Tested in `tools/rendezvous_test.py` (sections 5 and 6).
 
 **Joiner to joiner (mesh).** Every joiner puts its own profile code in its `join`, the
 host shares all profiles in the roster, and joiners dial each other on their single
@@ -108,6 +128,35 @@ drops an event whose text does not end inside the datagram. Unacknowledged packe
 every 250 ms; with more than 512 pending the backlog is dropped; a peer is considered gone after
 10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
 other directly.
+
+## TCP backup link
+
+Since 2026-09-17 (`netpunch/dual_tcp.py`) every sealed frame between a joiner and the host --
+control messages and game frames alike, never save chunks -- goes out twice: on the punched UDP
+socket as before, and on a TCP connection between the two. The joiner connects to the host's
+(or relay's) lobby port over TCP once its UDP punch has landed, and both sides also try a TCP
+simultaneous open toward the address the other punched from, bound to their own lobby port,
+for a NAT that preserves ports; whichever lands first is the link (`[dual] TCP link with ... up
+(joiner connected | host connected)`). A frame read from the link is written into the process's
+own UDP socket over loopback with the original sender's address in front, so every consumer sees
+it as an ordinary datagram from the peer, and the seal layer's per-sender replay window drops
+whichever copy comes second. Nothing above the socket changed.
+
+What it is for is written in the log every 10 s per peer: `[dual] bob: udp_first=.. tcp_first=..
+tcp_only=.. (udp lost, tcp covered) udp_only=.. (tcp lost/late); tcp later by p50/p90/max, udp
+later by p50/p90/max`. `tcp_only` is a UDP datagram that never arrived but whose TCP copy did;
+`udp_only` a TCP copy that never came within 3 s. The bridge's own ARQ still recovers what both
+paths lose. `python lobby.py --selftest-dual` runs a joiner losing 30% of its UDP sends: every
+frame still reaches the host with the link, 70% without it. Off with `tpf2mp_tcp_backup.txt`
+containing `0` in the lobby's folder (`<game folder>
+etpunch\`); off in an unsealed session (no nonce to dedup on).
+
+**Impairing one instance** (`netpunch/netsim.py`): `tpf2mp_netsim.txt` in the lobby's own folder
+(`<game folder>
+etpunch\`, where `lobby_state.json` lives; a box has its own copy under its overlay), `loss=0.05`, `delay=0.100`, `jitter=0.010`, drops that fraction of the datagrams the
+instance sends and delays the rest (the TCP link's frames wait the same, but are never dropped:
+TCP's loss is the OS's). Read once at the lobby's start; the log says `[netsim] impairing what
+this instance sends: ...`. Outbound only, so a two-sided setup is two files.
 
 ## Lobby protocol
 
@@ -203,11 +252,27 @@ status message.
 2. The lobby reads the `.sav`, its `.sav.lua` and `.jpg` sidecars, and sends them as one
    stream named `incoming_save.sav`, `incoming_save.sav.lua`, `incoming_save.jpg`, with a
    SHA-256 per file and overall in the (sealed) `fbegin`.
-3. Chunks are 1,350 bytes (8,192 when every receiver is on loopback), sent as plaintext
-   `NPF1` frames inside a 2,048-chunk window (16,384 on loopback). Receivers write each
-   chunk at its offset, report `{base, nack}` every 50 ms, and the sender resends NACKed
-   chunks first. It rewinds after 0.5 s without feedback and gives up on a peer after 30 s
-   without progress.
+3. **Over TCP when it can** (2026-09-17, `netpunch/bulk_tcp.py`). The host and the relay
+   listen on the lobby port over TCP as well. `fbegin` carries the listener's port and a
+   16-byte token; each receiver connects, says `TPF2BULK1 recv <sid> <token> <name>`, and
+   the file streams down that connection from offset 0, in order, nothing else. A leader
+   uploading to the relay does the same the other way round: the relay's `fbegin_ack`
+   names its port and the leader connects with role `send`. The side behind NAT always
+   connects, so no TCP hole punching is attempted; a host not reachable on TCP (no UPnP
+   TCP mapping, a firewall) costs the joiner one failed connect and the transfer runs over
+   UDP as below. A stream that breaks half way leaves the receiver's feedback naming the
+   holes and the UDP path fills them. Measured on loopback: ~10 MB/s per peer over the UDP
+   scheme, ~450 MB/s over TCP; over the internet TCP reaches the link's speed, which the
+   2.76 MB UDP window (window / round trip: ~15 MB/s at 185 ms) does not. `BULK_TCP` in
+   lobby.py turns it off for a diagnosis. A Windows host gets the firewall's one-time
+   prompt for `netpunch.exe` the first time it listens; refusing it only means joiners use
+   the UDP path.
+4. Over UDP otherwise: chunks are 1,350 bytes (8,192 when every receiver is on loopback),
+   sent as plaintext `NPF1` frames inside a 2,048-chunk window (16,384 on loopback).
+   Receivers write each chunk at its offset, report `{base, nack}` every 50 ms, and the
+   sender resends NACKed chunks first. It rewinds after 0.5 s without feedback and gives up
+   on a peer after 30 s without progress. The feedback runs on this path during a TCP
+   stream too, so progress, stages and timeouts are one mechanism.
 4. The receiver checks the proposed filenames against a whitelist before allocating, refuses
    writes past the end, verifies every hash (retrying the whole transfer up to three
    times), writes the files and emits `save_ready`.
@@ -270,14 +335,6 @@ accept inbound connections, and for an always-on public server.
 - **Persistence.** Letters (`relay_letters.json`), company chips (`relay_companies.json`) and
   the secret survive restarts. When the last player leaves, the session is closed but the
   world is kept.
-- **Player statistics** (`player_stats.json` in the data folder, relay code from 2026-09-17): per player --
-  by profile code when the client sends one, else by name -- first and last seen, joins,
-  starts into a world, time connected, frames and bytes relayed; in total the unique players,
-  joins, sessions (each time the relay goes from nobody to somebody), the peak of players at
-  once and when, and player-hours. Written at most once a minute and at shutdown; a summary
-  line goes to the relay log every ten minutes while somebody is connected.
-  `python3 /opt/tpf2mp/netpunch/player_stats.py /var/lib/tpf2mp/relay/player_stats.json`
-  prints the summary and the top players by time.
 - **It does not simulate.** The world only advances while players are connected.
 
 Operating one (all scripts take the SSH target as their first argument):

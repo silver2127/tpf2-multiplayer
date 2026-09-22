@@ -360,9 +360,7 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
     // Not folded into `ok`: the tint is cosmetic, and a refusal here must not
     // take multiplayer startup with it the way a failed permission patch does.
     SliceInstallCompanyTint(base, root, data);
-    // Still unavailable: the vehicle-icon RGBA draw (iconcolor) and the entity
-    // window wash (windowcolor) -- neither Linux ABI is established.
-    SliceLog("[company-ui] iconcolor/windowcolor unavailable: Linux tint ABI not established\n");
+    SliceLog("[company-ui] vehicle icon colour pending native draw implementation\n");
     return ok;
 }
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)

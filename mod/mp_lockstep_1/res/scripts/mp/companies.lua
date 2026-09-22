@@ -889,7 +889,19 @@ end
 -- company that saved it, so each machine then hotseat-swaps to its own
 -- company (its old one if the saved map knows its letter, else the lobby's).
 function CM.cmSaveState()
-	if CM.cmMode ~= "companies" or not CM.cmMyCompany then return { v = 1, mode = "coop" } end
+	if CM.cmMode ~= "companies" or not CM.cmMyCompany then
+		-- NOT in companies mode here, but the save this world came from had
+		-- companies: keep that record word for word. A world loaded in single
+		-- player, or on a machine whose player entity did not match, used to
+		-- write { mode = "coop" } and every company was gone from the save for
+		-- good (USETHISONE, 2026-09-18). The next machine that CAN apply it
+		-- (cmApplySaved) gets the companies back.
+		if CM.cmCarried then
+			if not CM.cmCarriedNoted then CM.cmCarriedNoted = true; CM.cmLog("CM: save keeps the companies state this world was loaded with (not applied in this session)") end
+			return CM.cmCarried
+		end
+		return { v = 1, mode = "coop" }
+	end
 	local st = { v = 1, mode = "companies", mine = CM.cmMyCompany, roster = {}, origin = {}, pw = {}, pid = {} }
 	for i, cid in ipairs(CM.cmRoster or {}) do st.roster[i] = cid end
 	for o, cid in pairs(CM.cmOriginCompany or {}) do st.origin[o] = cid end
@@ -909,7 +921,7 @@ function CM.cmSaveState()
 	return st
 end
 function CM.cmLoadState(st)
-	if type(st) == "table" and st.mode == "companies" then CM.cmSaved = st end
+	if type(st) == "table" and st.mode == "companies" then CM.cmSaved = st; CM.cmCarried = st end
 end
 function CM.cmApplySaved()
 	local sv = CM.cmSaved
@@ -918,7 +930,7 @@ function CM.cmApplySaved()
 	local human = nil; pcall(function() human = api.engine.util.getPlayer() end)
 	local savedHuman = sv.pid and sv.pid[tostring(sv.mine)]
 	if not human or savedHuman ~= human then
-		log(string.format("company: saved state ignored -- this save's player entity is %s, the state was written for %s", tostring(human), tostring(savedHuman)))
+		CM.cmLog(string.format("company: saved state ignored -- this save's player entity is %s, the state was written for %s (kept for the next save)", tostring(human), tostring(savedHuman)))
 		return
 	end
 	CM.cmMode = "companies"

@@ -37,9 +37,15 @@ While the panel is open, typing goes into its fields and the game does not see i
    shows `[locked]`.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
-4. Press **START GAME**. The most recent save in your save folder (autosaves count) is sent to
-   everyone. When the panel says the save is ready, open **LOAD GAME** and pick **mp_shared**;
-   everyone else does the same.
+4. Click **SELECT SAVE** in the lobby and choose your world. The list includes autosaves,
+   shows modification dates, and puts the newest files first. Use **NEXT** / **PREVIOUS**
+   for more saves, or **REFRESH** after saving a new world. The chosen filename stays visible
+   in the lobby. The save must have the Multiplayer mod enabled.
+5. Press **START GAME** to send the selected save to everyone. If the file was removed,
+   choose another save; the lobby never silently substitutes a different world. With automatic
+   loading disabled, open **LOAD GAME** and pick **mp_shared** when the save is ready.
+
+Hosting from an already running world continues to share a fresh snapshot of that world.
 
 Games load at different speeds; each player's game holds at the start until the host's game is
 running, so nobody plays ahead.
@@ -190,25 +196,7 @@ In a two-player host lobby, this pauses both games, saves and transfers the host
 reloads both players and compares the fresh worlds before resuming. An intentional
 pause is preserved. Client-only changes are discarded. See [One-click recovery](RESYNC.md)
 for progress, retry and supported-session limits. `/sync` serves joining players; it does not reload
-players already in the game. The Resync section is independent of log reporting below.
-
-The first desync in a session also opens a **Desync detected** window that asks whether to send
-that game's logs to the developers:
-
-- **Always send**: send them now, and in later sessions without asking.
-- **Only this once**: send them now and ask again in the next session.
-- **Never**: send nothing, and never show the window again on this computer.
-
-A desync keeps being detected until the players reload, so the window appears, and logs are sent,
-at most once per session: not again for the same desync, and not after reloading the shared save in
-the same lobby.
-
-The logs go to the project's server (the one behind the public games list): the game's log with the
-mod's script lines, the mod's DLL logs and files, and the game's graphics settings. Windows user and
-computer names, the Steam account number, IP addresses and lobby codes are removed first; player
-names and chat can remain. The lobby's own logs and crash dumps are not sent. A chat line from
-MULTIPLAYER says when they arrived. Type `/desynclogs always`, `/desynclogs ask` or `/desynclogs never`
-in the in-game chat to change your choice; it is kept in `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_prefs.txt`.
+players already in the game.
 
 For a bug report, send the logs of **every** player. The mod gathers them in one folder,
 `%LOCALAPPDATA%\tpf2mp\logs\`:

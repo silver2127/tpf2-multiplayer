@@ -58,7 +58,7 @@ L.execute(r'''
 -- a game running the real checkHash over a stub world hash
 function newGame(letter, startClock)
   local g = { letter = letter, logs = {}, sent = {}, compared = {}, now = startClock, clock = 0, n = 0 }
-  local CM = { peers = {}, ticks = 0, leader = "a", seqNo = 0 }
+  local CM = { peers = {}, ticks = 0, leader = "a", seqNo = 0, rosterPlayers = 2 }
   local K = { INSTANCE = letter, BASE = "mem://" .. letter .. "/", SIM_STEP = 0.2,
               PEER_STALE_TICKS = 25, HASH_EVERY_GAMETIME = 12, STAMP_KEEP = 64 }
   CM.isLeader = function() return K.INSTANCE == CM.leader end
@@ -94,6 +94,21 @@ function step(g, ticks)
     g.checkHash(g.now)
     g.now = tonumber(string.format("%.1f", g.now + 0.2))
   end
+end
+
+-- the solo rule (2026-09-17): a game whose lobby says one player and that hears nobody takes no
+-- sample; a peer's heartbeat (or a roster of two) turns the hash on at the next real crossing
+function soloStory()
+  local g = newGame("s", 0.0)
+  g.CM.rosterPlayers = 1
+  step(g, 130)                                   -- 26 units alone: stamps 12 and 24 pass unsampled
+  local aloneN, alonePub = g.n, published(g)
+  g.CM.peers.b = { at = g.CM.ticks }             -- a peer is heard at 26.0, mid-interval...
+  for _ = 1, 130 do                              -- ...and keeps its heartbeats coming; to 52.0: crossings at 36 and 48
+    g.CM.peers.b.at = g.CM.ticks
+    step(g, 1)
+  end
+  return aloneN, alonePub, g.n, published(g), logged(g, "world hash is off until one joins"), logged(g, "world hash is on")
 end
 
 function published(g)
@@ -214,6 +229,15 @@ print('== a peer that sends no p lane at all is still compared (old builds)')
 c4 = G.newCompare('a')
 G.runCompare(c4, 288, 'x', G.detail(288.0, 100, 5, 10), 'x', 'v0,c0:c,e10:e,t:100,n:5', 'b')
 check('no sample time on one side means compare as before', G.logged(c4, 'SYNC t=288'))
+
+print('== alone, no hash; a peer turns it on at the next real crossing')
+aloneN, alonePub, laterN, laterPub, saidOff, saidOn = G.soloStory()
+check('26 units alone take no sample and publish nothing', aloneN == 0 and alonePub == '', f'{aloneN} {alonePub!r}')
+check('it says so once', saidOff)
+check('with a peer heard mid-interval, the next crossings are sampled and published (36, 48)',
+      laterPub == '36,48', repr(laterPub))
+check('the interval the peer arrived in is not published (entered, not crossed)', '24' not in laterPub.split(','))
+check('and it says the hash is on', saidOn)
 
 print()
 if fails:

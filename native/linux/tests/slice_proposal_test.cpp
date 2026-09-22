@@ -90,7 +90,7 @@ static void RoadGoldens()
     CHECK(SliceProposalBuildRoadRecord(f.bind(), false, false, &r));
     CHECK(std::string(r.data) == "STREETP 1 2\nROADE 2 0 25 1 0 1 0 0"
           " -1 1.0000 2.0000 3.0000 -2 4.0000 5.0000 6.0000"
-          " -1 -2 10.0000 0.0000 0.0000 0.0000 10.0000 0.0000 1 7\n");
+          " -1 -2 10.0000 0.0000 0.0000 0.0000 10.0000 0.0000 1 7 OWNERS -1\n");
     SliceRecordFree(&r);
     f.nodes.clear(); f.frozen.clear();
     f.edges = {Edge(-3, 101, 102, 1)};
@@ -132,7 +132,7 @@ static void CrossingAndBridgeGoldens()
     CHECK(strstr(r.data, " 202 201 10.0000 0.0000 0.0000 0.0000 10.0000 0.0000"));
     CHECK(strstr(r.data, " 301 302 10.0000 0.0000 0.0000 0.0000 10.0000 0.0000"));
     CHECK(!strstr(r.data, "STREETP") && !strstr(r.data, "ARMED"));
-    CHECK(std::string(r.data).find(" 1 7 1 7 1 7 1 7\n") == r.len - 17);
+    CHECK(strstr(r.data, " 1 7 1 7 1 7 1 7 OWNERS -1 -1 -1 -1\n"));
     SliceRecordFree(&r);
     // Same-network companion with its own street type is also retained (bs).
     Put(f.edges[1], 0x48, 0); f.edges[1][0x64] = 0xff;
@@ -173,6 +173,18 @@ static void RoadRejections()
     f.edges[0][0x50] = 2;
     CHECK(!SliceProposalBuildRoadRecord(f.bind(), false, false, &r));
     f.edges[0][0x50] = 1;
+    // Preserve ownership for each split/companion edge; disengaged optionals
+    // never read their stale player value, and bool padding is immaterial.
+    f.edges[0][0x74]=1;f.edges[0][0x75]=0xff;Put(f.edges[0],0x70,19427);
+    CHECK(SliceProposalBuildRoadRecord(f.bind(),false,false,&r));
+    CHECK(strstr(r.data," OWNERS 19427\n"));SliceRecordFree(&r);
+    Put(f.edges[0],0x70,-7);
+    CHECK(!SliceProposalBuildRoadRecord(f.bind(),false,false,&r));
+    f.edges[0][0x74]=2;
+    CHECK(!SliceProposalBuildRoadRecord(f.bind(),false,false,&r));
+    f.edges[0][0x74]=0;
+    CHECK(SliceProposalBuildRoadRecord(f.bind(),false,false,&r));
+    CHECK(strstr(r.data," OWNERS -1\n"));SliceRecordFree(&r);
     f.edges.push_back(Edge(-4, -1, -2, 1));
     CHECK(SliceProposalBuildRoadRecord(f.bind(), false, false, &r));
     SliceRecordFree(&r);
@@ -340,6 +352,15 @@ static void CaptureOutcomes(const std::string& dir)
     g_handler.onEntry(call, nullptr);
     CHECK(!g_armed && ReadFile(inject).empty());
     g_acceptArm = true;
+    {
+        Fixture ownership;ownership.edges={Edge(-1,101,102)};ownership.removedEdges={Edge(500,101,102)};
+        ownership.edges[0][0x74]=1;Put(ownership.edges[0],0x70,19427);
+        SliceFactoryCall edit=call;edit.retRva=0x12409e2;edit.rdx=ownership.bind();
+        g_handler.onEntry(edit,nullptr);CHECK(g_armed);
+        FinishArm(SliceOutcome::CancelledFired);
+        CHECK(ReadFile(inject).find(" OWNERS 19427\n")!=std::string::npos);
+        std::ofstream(inject,std::ios::trunc).close();
+    }
     // The file can become unwritable after the factory captured successfully.
     // A pre-cancel write veto leaves no record; the core blocks the action.
     g_handler.onEntry(call, nullptr);

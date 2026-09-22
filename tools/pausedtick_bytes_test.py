@@ -27,9 +27,10 @@ import struct
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 from capstone.x86 import X86_OP_IMM
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
 
 repo = Path(__file__).resolve().parents[1]
-source = (repo / "native/src/slice_hook.cpp").read_text(encoding="utf-8")
+source = slice_source(repo)
 
 
 def const(name):

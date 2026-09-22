@@ -38,6 +38,7 @@
 #include <string>
 #include <typeinfo>
 #include "datadir_linux.h"
+#include "dedicated_linux.h"
 #include "game_image.h"
 #include "hook.h"
 #include "panel.h"
@@ -280,6 +281,7 @@ static void Init()
     g_flagSlot = ReadMenuSlot((libDir + "tpf2_menu_flags.txt").c_str());
     Log("[menu] flags: slot=%d\n", g_flagSlot);
 
+    dedicated::Configure(libDir + "tpf2_menu_flags.txt", dataDir);
     // First the overlay: the game builds its Vulkan device a few seconds in,
     // and the redirect has to be in place before that call runs.
     OverlayInstall(g_base, Log);

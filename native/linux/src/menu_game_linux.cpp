@@ -90,6 +90,7 @@
 // Process-lifetime state is leaked on purpose: static destructors run while the
 // game's threads still call in.
 #include "menu_game_linux.h"
+#include "datadir_linux.h"
 #include "near_alloc.h"
 #include "hook.h"
 #include <cxxabi.h>
@@ -962,7 +963,9 @@ static bool InstallGate(uintptr_t base)
 
 // ---- AUTO-LOAD [AL-06..18] ------------------------------------------------------------------------
 static std::atomic<bool>     g_autoloadOn{false};
+static std::atomic<bool>     g_loadAccepted{false};
 static UpdateFn              g_menuUpdate = nullptr;   // the original, published before the swap
+static std::atomic<bool> g_modRefresh{false};
 static std::atomic<uint64_t> g_alPending{0};           // the request waiting for a menu frame; 0 = none
 static std::atomic<uint64_t> g_alSeen{0};              // the last request a gated menu frame looked at
 static std::atomic<uint64_t> g_alWaitLogged{0};
@@ -1345,6 +1348,8 @@ static void LoadCleanUp(void* p)
     }
 }
 
+#include "native_io_linux.inl"
+
 // GAME PATH
 static void AutoloadTick(void* menu)
 {
@@ -1392,6 +1397,7 @@ static void AutoloadTick(void* menu)
     }
     t_alInFlight = 0;
     if (ctx.result == 1) {
+        g_loadAccepted = true;
         Log("[autoload] StartSavegame(%s) started the load\n", name);
     } else if (ctx.result == 0) {
         Log("[autoload] StartSavegame(%s) refused (mods, or a load already starting) -- the player loads it by hand\n", name);
@@ -1403,10 +1409,19 @@ static void AutoloadTick(void* menu)
 }
 
 // GAME PATH
+static void RefreshModsBody(void* menu) {reinterpret_cast<void(*)(void*,int)>(g_base+0x1154b20)(menu,8);}
 static void MenuUpdateDetour(void* menu, int64_t t, int64_t dt)
 {
     g_menuUpdate(menu, t, dt);   // first and untouched
     if (!OnFrameStep((uintptr_t)__builtin_frame_address(0))) return;
+    NativeIo::Tick(menu,false);
+    if(g_modRefresh.load() && !*reinterpret_cast<uintptr_t*>(static_cast<char*>(menu)+MENU_OFF_GAMEUI) &&
+       !*reinterpret_cast<uint8_t*>(static_cast<char*>(menu)+MENU_OFF_INITING) &&
+       !*reinterpret_cast<uintptr_t*>(static_cast<char*>(menu)+MENU_OFF_QUEUED) && g_modRefresh.exchange(false)) {
+        const bool threw=tpf2mp_mg_guarded(RefreshModsBody,menu)!=0;
+        Log("[menugame] mod catalogue refresh %s\n",threw?"threw":"requested on load page");
+    }
+
     if (!g_menuFrameLogged.load(std::memory_order_relaxed)) {
         g_menuFrameLogged = true;
         Log("[autoload] the title menu's frame update runs (CMenuUI %p)\n", menu);
@@ -1445,6 +1460,9 @@ void MenuGame_RequestAutoload(const std::string& placedName)
     Log("[autoload] %s: starting it on the next title-menu frame\n", placedName.c_str());
     StatusLater(gen, placedName, kAlWatchdogMs);
 }
+
+void MenuGame_RequestModRefresh() {g_modRefresh=true;}
+bool MenuGame_Loading() { return g_alPending.load() != 0 || g_loadAccepted.load() || NativeIo::Loading(); }
 
 // ---- HOT JOIN [HJ-03..07] -------------------------------------------------------------------------
 static std::atomic<bool>  g_forceOn{false};
@@ -1592,11 +1610,12 @@ static void GameUiUpdateDetour(void* ui, int64_t t, int64_t dt)
     if (t_forceCall.active) SettleUnwoundForce(ui, here);
     const bool current = *(const uintptr_t*)ui == g_base + RVA_GAMEUI_VTABLE &&
                          *(void* const*)(g_base + RVA_G_GAMEUI) == ui;
-    if (current) panel::OnGameUiFrame();
+    if (current) { g_loadAccepted = false; panel::OnGameUiFrame(); }
     if (!current || !OnFrameStep(here)) {
         g_gameUiUpdate(ui, t, dt);
         return;
     }
+    if(const auto menu=g_progressMenu.load()) NativeIo::Tick(reinterpret_cast<void*>(menu),true);
     if (g_frameGameUi.exchange(ui, std::memory_order_relaxed) != ui)
         Log("[hotjoin] a game's frame update runs (CGameUI %p)\n", ui);
     if (!g_forcePending.load(std::memory_order_relaxed)) {
@@ -1754,6 +1773,10 @@ static bool Install(uintptr_t base)
     Log("[menugame] autoload %s; forced autosave (hot join) and the in-game signal %s\n",
         g_autoloadOn ? "ON (CMenuUI update 1140a90 hooked in its vtable)" : "OFF",
         g_forceOn ? "ON (CGameUI update 100fb20 hooked in its vtable)" : "OFF");
+    const bool ready=g_autoloadOn && g_forceOn && guard && NativeIo::Install();
+    char dataDir[4096]{};
+    if(Tpf2mpDataDirA(dataDir,sizeof(dataDir))) NativeControl::Start(dataDir,ready);
+    Log("[native] pause/save/load controller %s\n",ready?"ON":"OFF");
     return g_autoloadOn && g_forceOn;
 }
 

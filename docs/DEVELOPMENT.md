@@ -16,8 +16,8 @@
 ## Prerequisites
 
 - Windows 10 or 11 x64, Steam, Transport Fever 2 build 35924.
-- Visual Studio 2022 Build Tools with the MSVC x64 toolchain in its default location (`build.bat` calls
-  `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`).
+- Visual Studio 2022 with the MSVC x64 toolchain, Build Tools or any edition (`build.bat` and the installer's
+  custom-action build find it through `vswhere` in `tools\msvc_env.bat`).
 - Python 3.12 with `pip install -r netpunch\requirements.txt`, plus `pyinstaller` to freeze the lobby,
   `luaparser` for `tools\luacheck.py`, `Pillow` for the logo scripts and `numpy pefile capstone` for
   `tools\re`.
@@ -130,6 +130,8 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 - **`powershell -File tools\pscheck.ps1`**: PowerShell parse errors, variables whose names differ only in
   case (PowerShell treats them as one), and array literals that flatten. To check specific files pass
   them in-process (`-Path @(...)`); with `-File`, only the first path is checked.
+- **`python tools\check_doc_links.py`** after editing documentation: dead file links, dead `#anchors`,
+  repository paths named in prose that no longer exist, and documents nothing links to.
 - **Lobby self-tests**: [NETWORKING.md](NETWORKING.md#self-tests); `python tools\relay_selftest.py` for
   the relay.
 - **Installer**: `installer\test_upgrade.ps1` ([installer/README.md](../installer/README.md#testing-an-upgrade)).
@@ -174,17 +176,30 @@ collect `tpf2_bridge.log`, `tpf2_proxy.log`, `tpf2_menu.log` or minidumps.
 
 Version numbers (2026-09-16): `0.x` is a major feature, `0.x.y` a minor feature, `0.x.y.z` a bugfix or
 the like. The lobby gate is an exact string match, so every release -- a bugfix included -- needs every
-player and the relay on it. The updater orders versions part by part (`0.5.7 < 0.5.7.1 < 0.5.8 < 0.6`); it
-accepts two to four parts from 0.5.7 on (exactly three before), so a two- or four-part release can only
-follow a release that carries that updater. Windows Installer wants at least three parts (`build_msi.ps1`
+player and the relay on it. Windows Installer wants at least three parts (`build_msi.ps1`
 pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compares versions;
-`AllowSameVersionUpgrades` in `Package.wxs` is what lets `0.5.7.1` install over `0.5.7`.
+`AllowSameVersionUpgrades` in `Package.wxs` is what lets `0.5.7.1` install over `0.5.7`. Players update by
+installing the new MSI (or running the Proton installer again): there is no in-game updater since 0.6.1.11
+(removed 2026-09-20 -- mod-hosting sites do not allow a mod that downloads and installs its own updates).
 
 1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
    game list).
+   The lobby is frozen with a PyInstaller whose bootloader was compiled on the building machine
+   (`tools/pyinstaller_from_source.py`, run by `build_msi.ps1` and the workflow): the stock stub is the
+   same bytes in every PyInstaller download and antivirus engines keep signatures for it (two VirusTotal
+   engines called `netpunch.exe` "Trojan.Win64.Krypt" on 2026-09-20). A compiled stub clears the
+   signature matches; the behaviour heuristics some engines still raise on a self-extracting exe only go
+   away with code signing.
+   Since 0.6.1.12 the lobby is a folder build (netpunch.exe beside netpunch/_internal/): a one-file exe unpacks itself at
+   run time, which four engines called a trojan even with the compiled stub; a plain program beside its libraries is
+   what their rules treat as normal. The Proton repair patches the plain miniupnpc DLL in that folder.
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
-3. Tag the commit `v<version>` and publish these `installer\out` files as GitHub release assets:
-   `TpF2Multiplayer.msi`, `TpF2Multiplayer-update.zip` (the in-game updater's payload),
+3. Tag the commit `v<version>`. The workflow builds, attaches the assets below and drafts the release with
+   a **Download** table first (direct links per platform, built from the tag) followed by
+   `installer/RELEASE-<version>.md` when that file exists, then GitHub's generated list of pull
+   requests; review the draft and publish. The Proton installers are pinned to the tag by the
+   workflow. By hand, the same `installer\out` files as GitHub release assets:
+   `TpF2Multiplayer.msi`,
    `TpF2Multiplayer-files.zip` (the MSI's files as an archive: Proton and manual installs), a
    `SHA256SUMS.txt` listing them, `tools/proton/install.py` uploaded as `install_proton.py` with its
    `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release page

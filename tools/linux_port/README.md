@@ -79,3 +79,22 @@ one PR look like eighteen.
 - Codex out of usage credits (`codex-N.log` ends with "You've hit your usage limit"): the round fails
   in seconds and the worker falls through to Claude, which ports and passes on its own (bigmap PR #4,
   2026-09-16 23:23). Nothing to do but wait for the quota window.
+
+## Live testing and backlog runs (2026-09-17)
+
+The agents may run the game, only through the two-instance lab on the laptop (`tools/sandbox/tpf2mp-lab run
+native|proton`, `docs/sandbox/INSTALL.md` on `linux-native`): its own game, saves and mod copies; Steam stays
+untouched. The worker passes the desktop session (`systemctl --user show-environment`: DISPLAY, WAYLAND_DISPLAY,
+XDG_RUNTIME_DIR) to the agents, and `prompt.md` has a "Live testing" section (gdb attach via passwordless
+sudo, hygiene, restore the actor when done). There is no input automation on the laptop (Wayland, no
+xdotool): the agents drive the game through the menu flags (`autoload=1`), saves and the lobby programs.
+
+A **backlog run** works on what earlier runs left unported, without new Windows commits:
+
+```
+python3 ~/tpf2-port/port_worker.py --revisit tpf2-multiplayer --focus ~/tpf2-port/revisit/tpf2-multiplayer.md
+```
+
+It waits for a running job, clones the current `port/dev`, hands the agents the focus list (`revisit/<repo>.md`
+here, the open items with the addresses already located), verifies and publishes like any run (the runs table
+marks it "(revisit)"). Start it by hand when the list is worth another attempt; it is not triggered by pushes.

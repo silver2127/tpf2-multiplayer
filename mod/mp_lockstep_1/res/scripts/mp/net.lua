@@ -615,8 +615,7 @@ end
 -- Declared ABOVE onLine because it is called from there: a local declared later
 -- resolves to a nil global at the call site, which is how an entire sweep in
 -- mpbridge silently aborted for hours (see the lastReplayTick note there).
--- Every desync is counted here, so the first one of a game can be reported
--- (the dash file carries it to the GUI state's popup, desyncreport.lua).
+-- Every desync is counted here; the first one of a game rides in the dash file.
 function CM.noteDesync(why, stamp)
 	CM.desyncs = CM.desyncs + 1
 	if not CM.firstDesync then CM.firstDesync = { why = tostring(why), t = stamp } end

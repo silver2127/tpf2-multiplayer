@@ -63,9 +63,15 @@ CM.conxQueue = {}
 -- build order are identical on the synced world in lockstep step order, so every
 -- instance computes the same name -- and the name is a detail lane, never hashed,
 -- so even a mismatch could only be cosmetic, never a desync.
+-- Stations: the vanilla files are modular_station / modular_terminal /
+-- harbor_modular, which read as "Alsdorf Modular station". The word is a file
+-- name detail, not a name: drop it, so a station is "<town> Station", a bus or
+-- truck terminal "<town> Terminal", the harbor "<town> Harbor" (2026-09-20).
 function CM.depotName(x, y, file)
 	local typ = tostring(file or ""):match("([^/]+)%.con$") or "construction"
-	typ = typ:gsub("_era_.*$", ""):gsub("_", " "):gsub("^%l", string.upper)   -- "Road depot"
+	typ = typ:gsub("_era_.*$", ""):gsub("modular", ""):gsub("_+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+	if typ == "" then typ = "construction" end
+	typ = typ:gsub("^%l", string.upper)   -- "Road depot", "Station", "Terminal", "Harbor"
 	local town
 	pcall(function()
 		local best, bestD

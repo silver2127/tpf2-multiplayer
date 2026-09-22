@@ -14,8 +14,8 @@ Steps, in order (each one stops the script on failure):
      failure the script retries with one, copies the result over the plain name
      if it can, and otherwise packages the suffixed file under the plain name.
      The proxy target has no suffix support; close the game if it fails.
-  2. python -m PyInstaller --onefile --name netpunch lobby.py  (in netpunch\)
-     -> netpunch\dist\netpunch.exe. -SkipFreeze reuses an existing exe.
+  2. python -m PyInstaller --onedir --name netpunch lobby.py  (in netpunch\)
+     -> netpunch\dist\netpunch\ (netpunch.exe beside _internal\). -SkipFreeze reuses an existing build.
   3. installer\ca\build_ca.bat -> installer\out\tpf2ca.dll (the custom actions).
   4. wix build -arch x64 -ext WixToolset.UI.wixext ... installer\Package.wxs installer\PluginHost.wxs
      PluginHost.wxs is the fragment SHARED with the TpF2 Big Maps package (same
@@ -35,7 +35,7 @@ flag after reading https://wixtoolset.org/osmf/ .
 Skip steps 1-3 (package whatever is in native\out, netpunch\dist and installer\out).
 
 .PARAMETER SkipFreeze
-Skip the PyInstaller step when netpunch\dist\netpunch.exe already exists (warns).
+Skip the PyInstaller step when netpunch\dist\netpunch\netpunch.exe already exists (warns).
 
 .PARAMETER Validate
 After building, extract the MSI with msiexec /a into a temp folder and list it.
@@ -131,7 +131,8 @@ function Build-Suffixable([string]$target, [string]$plainName) {
 
 $menuDll  = Join-Path $BridgeOut "tpf2_menu.dll"
 $sliceDll = Join-Path $BridgeOut "tpf2_slice.dll"
-$netExe   = Join-Path $Netpunch "dist\netpunch.exe"
+$netDir   = Join-Path $Netpunch "dist\netpunch"
+$netExe   = Join-Path $netDir "netpunch.exe"
 $caDll    = Join-Path $OutDir "tpf2ca.dll"
 
 # ---- 1. native DLLs ------------------------------------------------------
@@ -150,6 +151,11 @@ if ($SkipBuild) {
     Say "running build.bat previews"
     $rc = Run-Bat $build "previews"
     if ($rc -ne 0) { Fail "build.bat previews failed (exit $rc)" }
+    # The workshop-registration plugin ships too; a fresh checkout (CI) has no
+    # leftover copy from a manual build.bat workshop.
+    Say "running build.bat workshop"
+    $rc = Run-Bat $build "workshop"
+    if ($rc -ne 0) { Fail "build.bat workshop failed (exit $rc)" }
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
@@ -163,20 +169,27 @@ if ($SkipBuild) {
 } elseif ($SkipFreeze -and (Test-Path $netExe)) {
     Warn "-SkipFreeze: reusing $netExe (built $((Get-Item $netExe).LastWriteTime)); lobby.py changes since then are NOT in it"
 } else {
+    # the bootloader compiled here, not the stock stub (tools\pyinstaller_from_source.py; a no-op once done)
+    Say "PyInstaller bootloader: compiled from source"
+    & python (Join-Path $Repo "tools\pyinstaller_from_source.py")
+    if ($LASTEXITCODE -ne 0) { Fail "tools\pyinstaller_from_source.py failed (exit $LASTEXITCODE): the lobby would carry the stock PyInstaller stub" }
     Say "freezing netpunch\lobby.py with PyInstaller"
     Push-Location $Netpunch
     try {
         # PowerShell 5.1 otherwise treats PyInstaller's normal stderr logging
         # as a terminating NativeCommandError under ErrorActionPreference=Stop.
-        cmd /c "python -m PyInstaller --noconfirm --onefile --name netpunch lobby.py 2>&1" | ForEach-Object { Write-Host "    $_" }
+        # a FOLDER build: a one-file exe unpacks itself at run time, which is what
+        # antivirus heuristics call a packer (four engines, 2026-09-20)
+        cmd /c "python -m PyInstaller --noconfirm --onedir --name netpunch lobby.py 2>&1" | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) { Fail "PyInstaller failed (exit $LASTEXITCODE). pip install pyinstaller -r requirements.txt" }
     } finally { Pop-Location }
 }
 if (-not (Test-Path $netExe)) { Fail "missing: $netExe" }
-# Wine relocates the lobby's bundled miniupnpc DLL and its duplicated relocation
-# entries then crash every host under Proton; the repair (tools\proton\install.py,
-# pinned to that DLL) changes nothing else and is a no-op once applied.
-& python (Join-Path $Repo "tools\proton\install.py") --repair-lobby $netExe
+if (-not (Test-Path (Join-Path $netDir "_internal"))) { Fail "missing: $netDir\_internal (the lobby must be a folder build)" }
+# Wine relocates the lobby's miniupnpc DLL and its duplicated relocation entries
+# then crash every host under Proton; the repair (tools\proton\install.py, pinned
+# to that DLL) changes nothing else and is a no-op once applied.
+& python (Join-Path $Repo "tools\proton\install.py") --repair-lobby $netDir
 if ($LASTEXITCODE -ne 0) { Fail "lobby relocation repair failed" }
 
 # ---- 3. custom-action DLL ------------------------------------------------
@@ -210,7 +223,7 @@ $wixArgs = @("build") + $eula + @(
     "-d", "HostDll=$hostDll",
     "-d", "MenuDll=$menuDll",
     "-d", "SliceDll=$sliceDll",
-    "-d", "NetpunchExe=$netExe",
+    "-d", "NetpunchDir=$netDir",
     "-d", "CaDll=$caDll",
     "-o", $Msi,
     (Join-Path $Installer "Package.wxs"),
@@ -228,13 +241,6 @@ if ($rc -ne 0) { Fail "wix build failed (exit $rc)" }
 if (-not (Test-Path $Msi)) { Fail "wix reported success but $Msi is missing" }
 Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $Version)" Green
 
-# The user-local update bundle, built from the same outputs. It is NOT a release
-# asset: the release publishes only the MSI and the in-game updater extracts its
-# payload from that (netpunch/updater.py msi_payload). The zip is the offline test
-# fixture and a fallback the updater still accepts; tools/updater_test.py checks
-# that the two payloads agree byte for byte.
-& python (Join-Path $Repo "tools\build_update.py")
-if ($LASTEXITCODE -ne 0) { Fail "automatic update bundle build failed" }
 # The MSI's files as a plain archive, for the Proton installer and manual installs.
 & python (Join-Path $Repo "tools\build_files_zip.py")
 if ($LASTEXITCODE -ne 0) { Fail "files archive build failed" }

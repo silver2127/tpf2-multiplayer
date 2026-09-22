@@ -49,6 +49,8 @@ bool MenuGame_PlaceSharedSave(const std::string& src, std::string* placedName);
 // autoload not installed ends in the status line's "open LOAD GAME and pick
 // <name>" instead.
 void MenuGame_RequestAutoload(const std::string& placedName);
+bool MenuGame_Loading();
+void MenuGame_RequestModRefresh();
 
 // HOT JOIN: ask the running game for one of its own autosaves on the next
 // frame. False when unavailable (not installed, no game running, the game's

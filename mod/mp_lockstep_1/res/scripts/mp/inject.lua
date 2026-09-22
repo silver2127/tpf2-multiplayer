@@ -381,6 +381,11 @@ function CM.pollInject()
 							raw[i][5] = tonumber(w[tb + (i - 1) * 2 + 2]) or -1
 						end
 					end
+					local ob = tb + m * 2
+					if w[ob + 1] == "OWNERS" then
+						assert(#w == ob + 1 + m, "ROADE: incomplete ownership tail")
+						for i = 1, m do raw[i][6] = CM.edgeOwnerCompany(tonumber(w[ob + 1 + i])) end
+					end
 				end
 
 				if ok then
@@ -486,6 +491,7 @@ function CM.pollInject()
 					-- it is not shipped in rm as well -- rm is matched in the command's own
 					-- network only, and two removals of one edge reject the whole proposal.
 					local companionPair = {}
+					local owners = {}
 					local function pairKey(a, b) return (a < b) and (a .. ":" .. b) or (b .. ":" .. a) end
 					local upgradeShape = #raw > 0
 					do
@@ -571,6 +577,7 @@ function CM.pollInject()
 									end
 									bts[#bts + 1] = tostring(e[4] or 0)
 									bts[#bts + 1] = tostring(e[5] or -1)
+									if e[6] ~= nil then owners[#owners + 1] = tostring(e[6]) end
 								end
 							end
 						end
@@ -665,6 +672,7 @@ function CM.pollInject()
 						if #freshV > 0 then sargs.fv = table.concat(freshV, ",") end
 						if #bridges > 0 then sargs.br = table.concat(bridges, ";") end
 						if #sameBridges > 0 then sargs.bs = table.concat(sameBridges, ";") end
+						if #owners > 0 then sargs.own = table.concat(owners, ",") end
 						-- carry the bus lane / tram track the slice just decoded, so an
 						-- upgrade that ADDS either one actually reaches the peers (and the
 						-- originator, whose own upgrade was cancelled)
@@ -858,6 +866,7 @@ function CM.pollInject()
 				local ct = {}
 				for tok in tostring(tstr or ""):gmatch("[^,]+") do ct[#ct + 1] = tonumber(tok) end
 				if cfile and #ct == 16 then
+					if CM.fencesCapture and CM.fencesCapture(cfile,ct,pstr,hadRoadc) then return end
 					-- Name is generated at BUILD time (execConX -> CM.depotName): the
 					-- engine auto-names a native placement "<town> Road depot", which
 					-- a script buildProposal does not, so we reproduce it from the
@@ -986,8 +995,11 @@ function CM.pollInject()
 				-- id -> position + file, vehicle id -> cross-peer key, model ids ->
 				-- file names.
 				--
-				--   VBUY  <depotChild>    <n> <model nl loads.. r g b na autos..>*n [ng groups..]
-				--   VREPL <vehicleEntity> <n> <model nl loads.. r g b na autos..>*n [ng groups..]
+				--   VBUY  <depotChild>    <n> <model rev nl loads.. r g b na autos..>*n [ng groups..]
+				--   VREPL <vehicleEntity> <n> <model rev nl loads.. r g b na autos..>*n [ng groups..]
+				--
+				-- rev is the part's reversed flag (0/1): a turned wagon, an ICE's
+				-- tail head. It travels to the peers as the part spec's fifth field.
 				--
 				-- The config encoding is byte-identical after the first field, so
 				-- both ops share this parser: two copies of it drifted apart the
@@ -998,9 +1010,9 @@ function CM.pollInject()
 				local parts, ok = {}, (depot ~= nil and n >= 1)
 				for k = 1, n do
 					if not ok then break end
-					local model, nl = tonumber(w[i]), tonumber(w[i + 1])
-					if not (model and nl) then ok = false; break end
-					i = i + 2
+					local model, rev, nl = tonumber(w[i]), tonumber(w[i + 1]), tonumber(w[i + 2])
+					if not (model and rev and nl) then ok = false; break end
+					i = i + 3
 					local loads = {}
 					for j = 1, nl do loads[j] = tonumber(w[i]) or 0; i = i + 1 end
 					local r, g, b = tonumber(w[i]), tonumber(w[i + 1]), tonumber(w[i + 2])
@@ -1013,7 +1025,7 @@ function CM.pollInject()
 					-- the slice copies autoLoadConfig's packed vector<bool> words; the wire
 					-- carries one 0/1 per load slot (CM.autoLoadFlags, vehicles.lua)
 					if CM.autoLoadFlags then autos = CM.autoLoadFlags(autos, nl) end
-					parts[#parts + 1] = { model = model, loads = loads, color = { r, g, b }, autos = autos }
+					parts[#parts + 1] = { model = model, rev = (rev ~= 0) and 1 or 0, loads = loads, color = { r, g, b }, autos = autos }
 				end
 				local ng = tonumber(w[i]) or 0
 				i = i + 1
@@ -1030,7 +1042,8 @@ function CM.pollInject()
 						enc[#enc + 1] = table.concat({ name,
 							table.concat(p.loads, "/"),
 							string.format("%.4f,%.4f,%.4f", p.color[1], p.color[2], p.color[3]),
-							table.concat(p.autos, "/") }, "~")
+							table.concat(p.autos, "/"),
+							tostring(p.rev or 0) }, "~")
 					end
 
 					if o == "VREPL" then
@@ -1186,6 +1199,11 @@ function CM.pollInject()
 				-- a construction. Anything else (a town building, an industry) is
 				-- not ours to rename.
 				local id = tonumber(w[2])
+                -- The native Linux slice cancels these commands. Windows lets
+                -- them execute locally and omits this marker. Keep the existing
+                -- wire command: every peer already understands skipOrigin=0.
+                local skipOrigin = 1
+                if w[o == "VNAME" and 4 or 6] == "replayOrigin=1" then skipOrigin = 0 end
 				-- a VCOLOR that is our own replay coming back through the slice is
 				-- dropped, or it echoes between the instances forever (CM.takeColorEcho)
 				local echo = o == "VCOLOR" and id ~= nil and CM.takeColorEcho ~= nil
@@ -1237,7 +1255,7 @@ function CM.pollInject()
 				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
-						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = 1 })
+						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = skipOrigin })
 					else
 						log(string.format("VCOLOR: %s %s = %s,%s,%s", kind, key, w[3], w[4], w[5]))
 						-- rgb is the colour EXACTLY: encodeCmd rounds number fields to %.4f, and
@@ -1247,7 +1265,7 @@ function CM.pollInject()
 						CM.scheduleLocal("VCOLOR", { kind = kind, key = key,
 							r = tonumber(w[3]), g = tonumber(w[4]), b = tonumber(w[5]),
 							rgb = string.format("%.9g,%.9g,%.9g", tonumber(w[3]) or 0, tonumber(w[4]) or 0, tonumber(w[5]) or 0),
-							skipOrigin = 1 })
+							skipOrigin = skipOrigin })
 					end
 				else
 					log(string.format("%s: entity %s is not a tracked vehicle, line or construction -- not shipped",
@@ -1327,7 +1345,40 @@ function CM.pollInject()
 				elseif bad or not (r and g and b) or not nameTok then
 					log(string.format("LCREATE: decoded create REJECTED (%s) -- it was cancelled and is LOST; create the line again",
 						bad or "name or colour unreadable"))
+				elseif tonumber(line:match(" spare=(%d+)")) and CM.spareKey and CM.lineKeyOf[tonumber(line:match(" spare=(%d+)"))] == CM.spareKey() then
+					-- THE SPARE (lines.lua): the slice already opened the editor on our
+					-- pre-made line. Ours here and now -- ownership is not simulated --
+					-- and everyone's, renamed and re-keyed, at the stamp.
+					local spareId = tonumber(line:match(" spare=(%d+)"))
+					local spareKey = CM.spareKey()
+					local okO, errO = pcall(CM.cmSetPlayer, spareId, api.engine.util.getPlayer())
+					local seqBefore = CM.seqNo
+					CM.scheduleLocal("LCREATE", { name = nameTok, color = string.format("%.9g,%.9g,%.9g", r, g, b),
+					                           wait = wait, stops = table.concat(stops, ";"), alts = table.concat(alts, ";"),
+					                           armed = 1, spare = spareKey })
+					if CM.seqNo ~= seqBefore then
+						CM.lineRekey(spareId, K.INSTANCE .. ":" .. tostring(CM.seqNo))
+						CM.spareWrite(nil)
+						-- its colour now, here (cosmetic; the claim sets it everywhere at the
+						-- stamp; the slice echo of this replay is expected, not a click)
+						pcall(function()
+							if CM.expectColorEcho then CM.expectColorEcho(spareId, r, g, b) end
+							api.cmd.sendCommand(api.cmd.make.setColor(spareId, api.type.Vec3f.new(r, g, b)), function() end)
+						end)
+						-- the GUI thread renames it and, through that, lets the slice open
+						-- the editor on it once the line manager lists it
+						if CM.spareFireWrite then CM.spareFireWrite(spareId, nameTok) end
+						log(string.format("LCREATE: '%s' is spare line %d (%s), the editor has it already -- ours now (ok=%s%s), everyone's at the stamp as %s:%d",
+							CM.unescName(nameTok), spareId, spareKey, tostring(okO), okO and "" or " " .. tostring(errO), K.INSTANCE, CM.seqNo))
+					else
+						log(string.format("LCREATE: spare line %d could not be scheduled (a hold) -- it stays the pool's", spareId))
+					end
 				else
+					local spareId = tonumber(line:match(" spare=(%d+)"))
+					if spareId then
+						log(string.format("LCREATE: the slice opened the editor on line %d as a spare, but it is not ours here (%s) -- a fresh line is created at the stamp and the editor shows the wrong one",
+							spareId, tostring(CM.lineKeyOf[spareId])))
+					end
 					log(string.format("LCREATE: '%s' decoded, %d stop(s) (strict: created at the stamp here too)",
 						CM.unescName(nameTok), #stops))
 					-- the colour stays EXACT (%.9g): the line editor colours the NEXT new line by
@@ -1387,6 +1438,11 @@ function CM.pollInject()
 							alts[#alts + 1] = table.concat(al, "/")
 						end
 						if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
+						-- asg=<0|1>: this click ran the editor's platform assignment (a station or
+						-- waypoint added); every instance re-runs it on the replayed list at the
+						-- stamp (slice: LINE PLATFORM ASSIGNMENT AT REPLAY). Absent for a manual
+						-- terminal pick, a stop setting or a removal, which replay verbatim.
+						local asg = tonumber(line:match(" asg=(%d)"))
 						local armed = CM.lastArmed or 0
 						if bad then
 							-- The DLL's +0x00 stationGroup slot is INFERRED; this is
@@ -1414,16 +1470,26 @@ function CM.pollInject()
 										lk, (pend and pend.seq) and ("seq " .. tostring(pend.seq)) or (pend and "the last edit" or "the list it was built from"),
 										adds, dels, sets, CM.lineCount(mS)))
 									newStops, newAlts = mS, mA
+									-- the merged list lands after the one it was put onto: it must not undo
+									-- that one's platform assignment with the click's stale platforms
+									if not asg and pend and pend.asg then asg = tonumber(pend.asg) end
 								else
 									log("LUPDATE: merge failed (" .. tostring(mS) .. ") -- shipping the click as captured")
 								end
 							end
+							-- a line no vehicle runs: applied here now, everyone else at the stamp
+							-- (lines.lua CM.lineApplyNow); armed 0 = "ran natively here" to execLine
+							local free = armed == 1 and (K.LINE_EDIT_FREE or 1) == 1 and CM.lineHasVehicles and not CM.lineHasVehicles(lid)
 							log(string.format("LUPDATE: %s decoded, %d stop(s), wait %g%s", lk, #stops, wait,
-								armed == 1 and " (strict)" or ""))
+								free and " (no vehicles: applied here now, the others at the stamp)" or (armed == 1 and " (strict)" or "")))
 							CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name or "", color = snap.color or "0.9,0.2,0.2",
 							                           wait = wait, stops = newStops,
-							                           alts = newAlts, armed = armed })
-							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts) end
+							                           alts = newAlts, armed = free and 0 or armed, asg = asg })
+							if CM.noteLineSent then CM.noteLineSent(lk, newStops, newAlts, asg) end
+							if free then
+								local okA, errA = pcall(CM.lineApplyNow, lid, { key = lk, wait = wait, stops = newStops, alts = newAlts, asg = asg })
+								if not okA then log("LUPDATE: applying here now failed (" .. tostring(errA) .. ") -- it lands at the stamp with the others") end
+							end
 						end
 					else
 						-- The update ran natively here and the engine applies it on a later

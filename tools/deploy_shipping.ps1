@@ -6,7 +6,8 @@
 #   <game>\tpf2_menu.dll            lobby overlay
 #   <game>\tpf2_slice.dll           capture/cancel hooks (proxy loads it at start)
 #   <game>\tpf2_slice.cfg           installer/cfg defaults
-#   <game>\netpunch\netpunch.exe    frozen lobby (menu resolves NETDIR = <dll dir>\netpunch)
+#   <game>\netpunch\netpunch.exe    frozen lobby (menu resolves NETDIR = <dll dir>\netpunch),
+#   <game>\netpunch\_internal\      its libraries (a PyInstaller folder build)
 #   <game>\mods\mp_lockstep_1\**    the Lua mod (deploy_mod.ps1 also refreshes the userdata copy)
 #
 # Runtime data goes to %LOCALAPPDATA%\tpf2mp\data (created by the DLLs). Instance
@@ -83,7 +84,12 @@ foreach ($p in @(@{repo='tpf2-bigmap'; dll='out\tpf2_bigmap.dll'})) {
     else { Write-Host ("[ship]   plugin {0}: not built (looked in {1}) -- skipped" -f $p.repo, $src) }
 }
 New-Item -ItemType Directory -Force (Join-Path $Game 'netpunch') | Out-Null
-Put "$Repo\netpunch\dist\netpunch.exe"    (Join-Path $Game 'netpunch\netpunch.exe')
+Put "$Repo\netpunch\dist\netpunch\netpunch.exe"    (Join-Path $Game 'netpunch\netpunch.exe')
+# the lobby's libraries: mirrored (a stale extra file there is a wrong library),
+# the netpunch folder itself is not -- the lobby's logs and state files live there
+& robocopy "$Repo\netpunch\dist\netpunch\_internal" (Join-Path $Game 'netpunch\_internal') /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -ge 8) { Write-Host "[ship] robocopy of netpunch\_internal failed ($LASTEXITCODE)" -ForegroundColor Red; exit 1 }
+Write-Host "[ship]   netpunch\_internal mirrored"
 
 & "$Repo\tools\deploy_mod.ps1" -Mod mp_lockstep_1 | Select-Object -Last 1
 

@@ -11,6 +11,17 @@ from sync_lobby import publish_prompt
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_write_fields_names_a_missing_runtime_folder(self):
+        # Proton, 2026-09-21: TPF2MP_DATADIR=/tmp/tpf2mp-data resolved against the
+        # lobby's current drive; the raw open() error named only the .sync.tmp file.
+        missing = self.root / 'not-here' / 'tpf2_sync_lua.txt'
+        with self.assertRaises(OSError) as ctx:
+            write_fields(missing, dict(pid=1, phase='holding'))
+        self.assertIn('runtime folder missing', str(ctx.exception))
+        self.assertIn(str(missing.parent), str(ctx.exception))
+        self.assertIn('TPF2MP_DATADIR', str(ctx.exception))
+        self.assertFalse(list(self.root.glob('**/*.sync.tmp')))
+
     def test_native_prompt_is_local_fresh_and_does_not_reopen_after_recovery(self):
         from unittest.mock import Mock
         io = Mock()

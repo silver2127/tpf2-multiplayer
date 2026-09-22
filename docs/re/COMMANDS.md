@@ -311,9 +311,22 @@ The slice also hooks `CommandList::Add` itself (hook id 1, steal 18: eight pushe
 | offset | field | status |
 |---|---|---|
 | +0x00 | int modelId | DECOMPILED |
+| +0x04 | bool reversed | usertype member offset (below) |
 | +0x08 | `vector<int>` loadConfig | sweep EXACT |
 | +0x20 | colour, 3 floats | sweep EXACT |
+| +0x30 | `std::string` logo | usertype member offset |
+| +0x50 | purchaseTime | usertype member offset |
+| +0x58 | float maintenanceState | usertype member offset |
+| +0x5c | float targetMaintenanceState | usertype member offset |
 | +0x60 | `vector<int>` autoLoadConfig | DECOMPILED |
+
+The "usertype member offset" rows come from `RegisterUsertypesVehicle` (`0x20d4495`):
+the sol usertype registration passes each field name with its member offset as an
+int on the stack, so the disassembly reads as a struct definition. VehiclePart:
+modelId 0, reversed 4, loadConfig 8, color 0x20, logo 0x30. TransportVehiclePart:
+part 0, purchaseTime 0x50, maintenanceState 0x58, targetMaintenanceState 0x5c,
+autoLoadConfig 0x60. TransportVehicleConfig: vehicles 0, vehicleGroups 0x18 -- all
+matching the sweeps and decompiles above (tearded's fork, 2026-09-20, build 35924).
 
 `ecs::component::Line`:
 

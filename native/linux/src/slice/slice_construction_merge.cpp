@@ -108,6 +108,95 @@ void EmptyString(String& value, uintptr_t at)
 }
 }
 
+// Adopt the unique boundary connector of a modular station. Linux vectors and
+// SSO strings must be moved with their ownership intact when indices compact.
+static bool MergeStationEndpoint(uintptr_t p, const slice_terrain_assets::GameMemory* supplied)
+{
+    Transaction tx(supplied ? *supplied : slice_terrain_assets::RuntimeMemory());
+    SliceVec nv{},sv{},cv{},fv{},cfv{},tv{};
+    if(!p || !tx.Own(p,0x3c0) || !tx.Vector(p,24,MaxRecords,&nv) || nv.count<4 ||
+       !tx.Vector(p+0x18,120,MaxRecords,&sv) || sv.count<3 ||
+       !tx.Vector(p+0x2a0,0x8f0,1,&cv) || cv.count!=1)return false;
+    std::vector<Node> nodes(nv.count);std::vector<Edge> edges(sv.count);
+    if(!SliceRead(nv.begin,nodes.data(),nodes.size()*24) || !SliceRead(sv.begin,edges.data(),edges.size()*120))return false;
+    auto id=[&](size_t i){return Get<int32_t>(nodes[i].data(),20);};
+    auto find=[&](int32_t v){for(size_t i=0;i<nodes.size();++i)if(id(i)==v)return i;return SIZE_MAX;};
+    std::vector<size_t> degree(nv.count);std::vector<bool> owned(nv.count);
+    std::vector<SliceVec> objects(sv.count);
+    for(size_t i=0;i<nv.count;++i){
+        for(size_t k=0;k<12;k+=4)if(!std::isfinite(Get<float>(nodes[i].data(),k)))return false;
+        for(size_t j=0;j<i;++j)if(id(i)==id(j))return false;
+    }
+    for(size_t i=0;i<sv.count;++i){
+        const auto& e=edges[i];
+        if(e[0x74]>1 || !tx.Vector(sv.begin+i*120+0x30,8,SIZE_MAX,&objects[i]))return false;
+        for(size_t k=0x10;k<0x28;k+=4)if(!std::isfinite(Get<float>(e.data(),k)))return false;
+        if(e[0x74])for(size_t off:{size_t(8),size_t(12)}){
+            size_t n=find(Get<int32_t>(e.data(),off));if(n!=SIZE_MAX){++degree[n];owned[n]=true;}
+        }
+    }
+    size_t o=SIZE_MAX,a=0,x=0,t=0,u=0;
+    for(size_t s=0;s<sv.count;++s)if(!edges[s][0x74]){
+        int32_t v0=Get<int32_t>(edges[s].data(),8),v1=Get<int32_t>(edges[s].data(),12);
+        if((v0<0)==(v1<0))continue;
+        size_t xi=find(v0<0?v0:v1);if(xi==SIZE_MAX || owned[xi])continue;
+        float dir[3];memcpy(dir,edges[s].data()+(v0<0?0x10:0x1c),12);
+        if(v1<0)for(float& d:dir)d=-d;
+        for(size_t ti=0;ti<nv.count;++ti)if(owned[ti]){
+            float distance=0;
+            for(size_t k=0;k<3;++k){float d=Get<float>(nodes[xi].data(),k*4)-Get<float>(nodes[ti].data(),k*4);distance+=d*d;}
+            if(distance>0.0625f)continue;
+            for(size_t j=0;j<sv.count;++j)if(edges[j][0x74] && Get<int32_t>(edges[j].data(),4)==Get<int32_t>(edges[s].data(),4)){
+                int32_t j0=Get<int32_t>(edges[j].data(),8),j1=Get<int32_t>(edges[j].data(),12);
+                size_t ui=j0==id(ti)?find(j1):j1==id(ti)?find(j0):SIZE_MAX;
+                if(ui==SIZE_MAX || degree[ui]!=1)continue;
+                float dot=0,dd=0,ll=0;
+                for(size_t k=0;k<3;++k){float v=Get<float>(nodes[ui].data(),k*4)-Get<float>(nodes[ti].data(),k*4);dot+=v*dir[k];dd+=dir[k]*dir[k];ll+=v*v;}
+                if(dot<=0 || dot*dot<0.99f*dd*ll || dd<1e-6f || ll<1e-6f)continue;
+                if(o!=SIZE_MAX)return false;
+                o=s;a=j;x=xi;t=ti;u=ui;
+            }
+        }
+    }
+    if(o==SIZE_MAX || objects[o].count)return false;
+    int32_t before;size_t skip;uintptr_t head;
+    if(!SliceReadT(cv.begin+0x790,&before) || before<0 || size_t(before)>sv.count || o>=size_t(before) || a<size_t(before) ||
+       !SliceReadT(p+0x250,&skip) || skip || !SliceReadT(p+0x248,&head) || head)return false;
+    std::vector<int32_t> frozen,ceFrozen;
+    if(!ReadIndices(tx,p+0x220,nv.count,&fv,&frozen) || !ReadIndices(tx,cv.begin+0x778,nv.count,&cfv,&ceFrozen))return false;
+    for(const auto* indices:{&frozen,&ceFrozen})for(int32_t i:*indices)if(size_t(i)==u)return false;
+    // No surviving segment may reference the discarded dangling endpoint.
+    for(size_t i=0;i<sv.count;++i)if(i!=a && (Get<int32_t>(edges[i].data(),8)==id(u) || Get<int32_t>(edges[i].data(),12)==id(u)))return false;
+    if(!tx.Vector(p+0x270,32,MaxRecords,&tv) || (tv.count && tv.count!=sv.count))return false;
+    std::vector<String> tags(tv.count);
+    for(size_t i=0;i<tv.count;++i)if(!StringOwnership(tx,tv.begin+i*32,&tags[i]))return false;
+    if(!tx.Retire(objects[o].begin))return false;
+    if(tv.count){
+        uintptr_t old=Get<uintptr_t>(tags[o].data(),0);
+        if(old!=tv.begin+o*32+16 && !tx.Retire(old))return false;
+        for(size_t i=o;i+1<tv.count;++i){
+            tags[i]=tags[i+1];
+            if(Get<uintptr_t>(tags[i].data(),0)==tv.begin+(i+1)*32+16)Put(tags[i].data(),0,tv.begin+i*32+16);
+        }
+        EmptyString(tags.back(),tv.begin+(tv.count-1)*32);
+        if(!tx.Write(tv.begin,tags.data(),tags.size()*32) || !tx.Scalar(p+0x278,tv.begin+(tv.count-1)*32))return false;
+    }
+    std::vector<int32_t> remap(nv.count,-1);int32_t count=0;
+    for(size_t i=0;i<nv.count;++i)if(i!=x && i!=u)remap[i]=count++;
+    remap[x]=remap[t];
+    memcpy(edges[a].data()+8,edges[o].data()+8,32);
+    for(auto& edge:edges)for(size_t off:{size_t(8),size_t(12)})if(Get<int32_t>(edge.data(),off)==id(x))Put(edge.data(),off,id(t));
+    for(auto* indices:{&frozen,&ceFrozen})for(int32_t& i:*indices)i=remap[i];
+    size_t write=0;for(size_t i=0;i<nv.count;++i)if(i!=x && i!=u)nodes[write++]=nodes[i];
+    for(size_t i=o;i+1<sv.count;++i)edges[i]=edges[i+1];
+    edges.back()={};
+    if(!tx.Write(nv.begin,nodes.data(),nodes.size()*24) || !tx.Write(sv.begin,edges.data(),edges.size()*120) ||
+       !tx.Write(fv.begin,frozen.data(),frozen.size()*4) || !tx.Write(cfv.begin,ceFrozen.data(),ceFrozen.size()*4) ||
+       !tx.Scalar(p+8,nv.begin+(nv.count-2)*24) || !tx.Scalar(p+0x20,sv.begin+(sv.count-1)*120) || !tx.Scalar(cv.begin+0x790,before-1) || !tx.Commit())return false;
+    SliceLog("[station-weld] adopted connector %zu into segment %zu; frozen indices remapped\n",o,a);
+    return true;
+}
+
 static bool MergeTemplateStreet(uintptr_t proposal, const slice_terrain_assets::GameMemory* supplied)
 {
     Transaction tx(supplied ? *supplied : slice_terrain_assets::RuntimeMemory());
@@ -262,7 +351,7 @@ static bool MergeTemplateStreet(uintptr_t proposal, const slice_terrain_assets::
 
 bool SliceMergeTemplateStreet(uintptr_t proposal, const slice_terrain_assets::GameMemory* memory)
 {
-    try { return MergeTemplateStreet(proposal, memory); }
+    try { return MergeStationEndpoint(proposal, memory) || MergeTemplateStreet(proposal, memory); }
     catch (...) {
         // Our STL can allocate; the only game calls are the verified nothrow
         // allocator and deallocator. No foreign exception is caught here.

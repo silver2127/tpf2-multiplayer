@@ -554,6 +554,13 @@ function CM.execPolyline(c, planOnly)
 
 		local np = math.floor(#pts / 3)
 		local ne = math.floor(#links / 2)
+		local owners = {}
+		if c.own ~= nil then
+			local text = tostring(c.own)
+			assert(text:match("^%d[%d,]*$") and not text:find(",,") and text:sub(-1) ~= ",", "ROADP: invalid ownership list")
+			for value in text:gmatch("[^,]+") do owners[#owners + 1] = tonumber(value) end
+			assert(#owners == ne, "ROADP: ownership count does not match links")
+		end
 		local welds = {}
 		for tok in tostring(c.weld or ""):gmatch("[^,]+") do welds[#welds + 1] = tonumber(tok) end
 		local nw = math.floor(#welds / 3)
@@ -602,6 +609,10 @@ function CM.execPolyline(c, planOnly)
 		-- make the engine reject the ENTIRE proposal -- the same failure the
 		-- double-split guard exists for. Every removal goes through here.
 		local removeSet = {}
+		-- "a:b" (the two existing node ids, low first) -> the shipped removal
+		-- between them: a segment joining exactly those nodes REPLACES that edge
+		-- in place (the upgrade tool), see crossingsFor.
+		local rmPairs = {}
 		local function dropEdge(eid)
 			if removeSet[eid] then return false end
 			removeSet[eid] = true
@@ -650,6 +661,7 @@ function CM.execPolyline(c, planOnly)
 				return
 			end
 			dropEdge(eid)
+			rmPairs[(nA < nB) and (nA .. ":" .. nB) or (nB .. ":" .. nA)] = eid
 			log(string.format("ROADP: removal (%.1f,%.1f)-(%.1f,%.1f) -> local edge %d (nodes %d/%d)",
 				r[1], r[2], r[3], r[4], eid, nA, nB))
 		end
@@ -1041,6 +1053,13 @@ function CM.execPolyline(c, planOnly)
 		-- measurement supports.
 		K.XING_NODE_TOUCH = 0.75
 		local CROSS_BAND, CROSS_END_MIN = 5.0, 4.0   -- band = road half-width + margin: A and B both measured the rail 4.5 m off the centreline at a real crossing (2026-08-29)
+		-- An edge inside the band whose direction at the closest approach is within
+		-- this many degrees of the rail's RUNS BESIDE it: the other track of a double
+		-- track sits exactly 5 m away (2026-09-19: every second-track upgrade split
+		-- its neighbour as a "crossing" and the engine refused the proposal,
+		-- critical=true, seven times in one evening). A level crossing this shallow
+		-- cannot be built.
+		K.XING_PARALLEL_DEG = K.XING_PARALLEL_DEG or 12
 		local xingNodes = {}   -- nodes the rail was routed through as level crossings (probe below)
 
 		-- ONE-SHOT API PROBE: does the Lua proposal expose a railroad-crossing list?
@@ -1099,6 +1118,18 @@ function CM.execPolyline(c, planOnly)
 				CM.cmLog(string.format("XING: seg %d is a %s -- no level crossings", k, bT == 1 and "bridge" or "tunnel"))
 				return hits
 			end
+			-- IN-PLACE REPLACEMENT (the upgrade tool): both ends are existing nodes
+			-- and a shipped removal joins exactly those two, so this segment takes
+			-- over an edge that already stood there without crossing anything. There
+			-- is nothing to find -- and what the pass DID find was the parallel track
+			-- 5 m away (2026-09-19).
+			if n0 and n1 and n0 > 0 and n1 > 0 then
+				local rep = rmPairs[(n0 < n1) and (n0 .. ":" .. n1) or (n1 .. ":" .. n0)]
+				if rep then
+					CM.cmLog(string.format("XING: seg %d replaces edge %d between its own nodes (in place) -- no crossings", k, rep))
+					return hits
+				end
+			end
 			local a, b = { x0, y0, z0 }, { x1, y1, z1 }
 			local chord = math.sqrt((x1 - x0) ^ 2 + (y1 - y0) ^ 2)
 			if chord < 2 * CROSS_END_MIN then return hits end
@@ -1145,7 +1176,22 @@ function CM.execPolyline(c, planOnly)
 					end
 					local crossedType = 0
 					pcall(function() crossedType = comp.type or 0 end)
+					-- direction of each at the closest approach: a near-parallel edge
+					-- inside the band runs beside the rail (K.XING_PARALLEL_DEG)
+					local parDeg
+					if bestRu and bestU and dist <= CROSS_BAND then
+						local tr = CM.hermiteTangent(a, T0, b, T1, bestU)
+						local te = CM.hermiteTangent(ra, rta, rb, rtb, bestRu)
+						local lr = math.sqrt(tr[1] * tr[1] + tr[2] * tr[2])
+						local le = math.sqrt(te[1] * te[1] + te[2] * te[2])
+						if lr > 1e-6 and le > 1e-6 then
+							local c = math.abs(tr[1] * te[1] + tr[2] * te[2]) / (lr * le)
+							parDeg = math.deg(math.acos(math.max(-1, math.min(1, c))))
+						end
+					end
 					if dist > CROSS_BAND then -- too far
+					elseif parDeg and parDeg < K.XING_PARALLEL_DEG then
+						CM.cmLog(string.format("XING: seg %d runs beside edge %d (%.1f m, %.0f deg) -- parallel, not a crossing", k, eid, dist, parDeg))
 					elseif crossedType ~= 0 then
 						-- the existing edge is itself a bridge or tunnel here
 						CM.cmLog(string.format("XING: seg %d passes edge %d, a %s -- over/under, not a crossing",
@@ -1352,6 +1398,7 @@ function CM.execPolyline(c, planOnly)
 						e.trackEdge.catenary = (tonumber(c.cat) or 0) == 1
 						e.streetEdge = api.type.BaseEdgeStreet.new()
 						e.streetEdge.streetType = stype or 16
+						CM.applyEdgeOwner(e, owners[k])
 						addEdges[#addEdges + 1] = e
 					end
 					log(string.format("ROADP: segment %d routed through %d crossing node(s)", k, #hits))
@@ -1394,6 +1441,7 @@ function CM.execPolyline(c, planOnly)
 					e.streetEdge.hasBus, e.streetEdge.tramTrackType =
 						CM.streetProps(c, x0, y0, x1, y1)
 				end
+				CM.applyEdgeOwner(e, owners[k])
 				addEdges[#addEdges + 1] = e
 				end   -- (no crossings: the original single-edge build)
 			end

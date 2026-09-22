@@ -65,7 +65,8 @@ static std::atomic<int>      g_lever{0};      // the engine's own speed, as GetS
 static std::atomic<uint64_t> g_frames{0};
 // Main thread only (CGameStepSeen):
 static int g_lastWritten = 0;   // the interval we last imposed (0 = none)
-static int g_engineBase  = 0;   // the engine's own interval as last seen
+static std::atomic<int> g_engineBase{0}; // published to the bridge's control thread
+static std::atomic<int> g_pinUs{0};
 static int g_logEvery    = 0;
 
 static int GetSpeedDetour(void* gameTime)
@@ -92,21 +93,28 @@ static void CGameStepSeen(void* cgame)
     if (cur != g_lastWritten) g_engineBase = cur;
     const double target = g_target.load(std::memory_order_relaxed);
     const int lever = g_lever.load(std::memory_order_relaxed);
+    const int pin = g_pinUs.load(std::memory_order_relaxed);
+    const int engineBase = g_engineBase.load(std::memory_order_relaxed);
     if (target <= 0.0 || lever <= 0) {
-        if (g_lastWritten && cur == g_lastWritten) *field = g_engineBase;
+        if (pin > 0) {
+            if (cur != pin) *field = pin;
+            g_lastWritten = pin;
+            return;
+        }
+        if (g_lastWritten && cur == g_lastWritten) *field = engineBase;
         g_lastWritten = 0;
         return;
     }
     double m = target / (double)lever;
     if (m < 0.25) m = 0.25; else if (m > 2.0) m = 2.0;
-    int want = (int)((double)g_engineBase / m + 0.5);
+    int want = (int)((double)(pin > 0 ? pin : engineBase) / m + 0.5);
     if (want < 20000) want = 20000;                    // never below 20 ms per batch
     if (want != cur) *field = want;
     g_lastWritten = want;
     if (++g_logEvery >= 600) {                         // ~10 s at 60 fps
         g_logEvery = 0;
         g_log("[speed] target %.2f over lever %d -> batch interval %d us (engine's own %d us)\n",
-              target, lever, want, g_engineBase);
+              target, lever, want, engineBase);
     }
 }
 
@@ -164,3 +172,9 @@ void SpeedHook_SetTarget(double t) { g_target = (t > 0.0 && t < 64.0) ? t : 0.0;
 double SpeedHook_Target()          { return g_target; }
 uint64_t SpeedHook_Frames()        { return g_frames; }
 int SpeedHook_LastCount()          { return g_lever; }
+void SpeedHook_SetPin(long us)     { g_pinUs = (us > 0 && us <= INT32_MAX) ? int(us) : 0; }
+void SpeedHook_Pace(long* engineBaseUs, int* lever)
+{
+    if (engineBaseUs) *engineBaseUs = g_engineBase.load(std::memory_order_relaxed);
+    if (lever) *lever = g_lever.load(std::memory_order_relaxed);
+}

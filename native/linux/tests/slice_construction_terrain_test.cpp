@@ -282,6 +282,45 @@ struct MergeFixture {
 void MergeTemplates()
 {
     GameMemory memory{Alloc, Free, FakeCtor};
+    // A station with a boundary connector before an interior edge, many frozen
+    // nodes and both inline/heap strings. Compaction must preserve ownership.
+    for(int invalid=0;invalid<3;++invalid){
+        MergeFixture f(true);f.nodes.resize(5);f.edges.resize(3);f.tags.resize(3);
+        for(size_t i=0;i<5;++i){
+            Put(f.nodes[i].data(),0x14,-1-int32_t(i));
+            Put(f.nodes[i].data(),0,i==2?10.0f:i==3?-10.0f:0.0f);
+            Put(f.nodes[i].data(),4,i==4?10.0f:0.0f);
+        }
+        // script -1->100, template -2->-3, interior -4->-2.
+        Put(f.edges[2].data(),8,int32_t(-4));Put(f.edges[2].data(),12,int32_t(-2));f.edges[2][0x74]=1;
+        f.frozen={0,1,3,4};f.ceFrozen={1,3,4};
+        VectorAt(f.proposal.data(),0,f.nodes);VectorAt(f.proposal.data(),0x18,f.edges);
+        VectorAt(f.proposal.data(),0x220,f.frozen);VectorAt(f.construction[0].data(),0x778,f.ceFrozen);
+        for(size_t i=0;i<f.tags.size();++i){
+            const std::string text=i==0?"long discarded script connector tag":i==1?"boundary":"interior";
+            char* data=text.size()>15?static_cast<char*>(Alloc(text.size()+1)):reinterpret_cast<char*>(f.tags[i].data()+16);
+            memcpy(data,text.c_str(),text.size()+1);Put(f.tags[i].data(),0,data);Put(f.tags[i].data(),8,text.size());
+            if(text.size()>15)Put(f.tags[i].data(),16,text.size());
+        }
+        VectorAt(f.proposal.data(),0x270,f.tags);f.Objects(f.edges[1],{72,73});
+        if(invalid==1)f.ceFrozen.push_back(2);
+        if(invalid==2)Put(f.proposal.data(),0x250,size_t(1));
+        VectorAt(f.construction[0].data(),0x778,f.ceFrozen);
+        auto before=f.proposal;auto oldNodes=f.nodes;auto oldEdges=f.edges;auto oldTags=f.tags;
+        CHECK(SliceMergeTemplateStreet(f.Address(),&memory)==(invalid==0));
+        if(invalid){CHECK(f.proposal==before && f.nodes==oldNodes && f.edges==oldEdges && f.tags==oldTags);}
+        else{
+            SliceVec span;CHECK(SliceReadStdVector(f.Address(),24,64,&span) && span.count==3);
+            CHECK(SliceReadStdVector(f.Address()+0x18,120,64,&span) && span.count==2);
+            CHECK(Get<int32_t>(f.edges[0].data(),8)==-2 && Get<int32_t>(f.edges[0].data(),12)==100);
+            CHECK(f.frozen==std::vector<int32_t>({0,0,1,2}) && f.ceFrozen==std::vector<int32_t>({0,1,2}));
+            CHECK(Get<int32_t>(f.construction[0].data(),0x790)==0);
+            std::string tag;CHECK(SliceReadStdString(uintptr_t(f.tags[0].data()),&tag) && tag=="boundary");
+            CHECK(SliceReadStdString(uintptr_t(f.tags[1].data()),&tag) && tag=="interior");
+            CHECK(Get<uint64_t*>(f.edges[0].data(),0x30)[1]==73);
+        }
+        f.DestroyTransferred();CHECK(allocations.empty());
+    }
     for (const std::string& replacement : {std::string("apron"), std::string("a deliberately long construction apron tag")}) {
         MergeFixture f(true);
         f.Objects(f.edges[0], {11}); f.Objects(f.edges[1], {22,33});

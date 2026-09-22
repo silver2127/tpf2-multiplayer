@@ -16,7 +16,10 @@ The game folder is found from Steam's own uninstall entry
 (`HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780`,
 `InstallLocation`) and from the folder a previous install remembered
 (`HKLM\SOFTWARE\silver2127\TpF2 Multiplayer`, `InstallFolder`). When both exist the remembered folder
-wins. Without either, the default is `C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2`.
+wins. When neither holds `TransportFever2.exe` (a stale registration, the game moved to another
+drive), the `FindGameDir` custom action reads Steam's `libraryfolders.vdf` and takes the first library,
+on any drive, whose `steamapps\common\Transport Fever 2` holds the exe; the log says which libraries it
+probed. Only without any of those is the default `C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2`.
 The folder page refuses a folder without `TransportFever2.exe`, and a silent install fails with the
 same message.
 
@@ -100,9 +103,9 @@ in either order:
 - **Separate settings.** A plugin installed by another package keeps its settings in
   `plugins\<name>.cfg` beside its DLL, so neither installer edits a file the other owns.
 
-The Big Maps repository has `installer\test_coexist.ps1` (real `msiexec` transactions for both orders
-against a throwaway folder) and `tools\vendor_host.ps1` (copies the shared binaries from this repository
-and records the commit). After changing `PluginHost.wxs`, the proxy, the plugin host or the custom
+The Big Maps repository has `test_coexist.ps1` in its installer folder (real `msiexec` transactions for
+both orders against a throwaway folder) and `vendor_host.ps1` in its tools folder (copies the shared
+binaries from this repository and records the commit). After changing `PluginHost.wxs`, the proxy, the plugin host or the custom
 actions here, re-vendor there.
 
 ## Segment Heap
@@ -191,8 +194,8 @@ value skips both checks; it exists for test rigs.
 
 Prerequisites:
 
-- Visual Studio 2022 Build Tools with the MSVC x64 toolchain, in its default location (the `.bat` scripts
-  call its `vcvars64.bat`).
+- Visual Studio 2022 with the MSVC x64 toolchain: the Build Tools or any edition. The `.bat` scripts find it
+  through `vswhere` (`tools\msvc_env.bat`), so no fixed install path is assumed.
 - Python 3.12 with `pip install pyinstaller -r netpunch\requirements.txt`.
 - WiX Toolset v7 as a .NET global tool (`dotnet tool install --global wix`). `build_msi.ps1` runs it from
   `%USERPROFILE%\.dotnet\tools\wix.exe` and adds `WixToolset.UI.wixext` if it is missing.
@@ -202,6 +205,12 @@ Prerequisites:
 ```
 powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 [-AcceptWixEula] [-Validate]
 ```
+
+GitHub Actions runs the same script (`.github/workflows/build-msi.yml`): every push to `dev` or `main` and
+every pull request builds the MSI, `TpF2Multiplayer-files.zip`, `install_proton.py` and `SHA256SUMS.txt` on a
+`windows-2022` runner and keeps them as the run's artifact; a `v*` tag also creates a draft GitHub release
+with them attached, ready to be edited and published. The workflow passes `-AcceptWixEula`, which is the
+repository owner accepting the WiX terms for those builds.
 
 | option | effect |
 |---|---|

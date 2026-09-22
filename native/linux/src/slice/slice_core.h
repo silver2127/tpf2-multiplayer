@@ -316,9 +316,9 @@ bool SliceShipAndArm(const SliceFactoryCall& call, const SliceArm& arm, const Sl
 // ---- other hooks -----------------------------------------------------------------------
 // A decoder's own typed detour on a target slice-core does not own. Refused when
 // the stolen range overlaps one of the factories, Add or Connection(), another
-// registered hook, or a site another library of ours patches, when it shares a page
-// with such a site (C-HOOK-2, C-HOOK-8: the libraries change page protections without
-// a common lock), or when `steal` is not where PrologueSteal lands. At install the
+// registered hook, or a site another library of ours patches, or when `steal`
+// is not where PrologueSteal lands. Separate sites on one page are safe because
+// all shipped patchers write through /proc/self/mem without changing permissions. At install the
 // live bytes must equal `expected` (at least `steal` bytes), or the hook is skipped
 // with a log line. *trampoline is published before the patch is written
 // (hook_posix.cpp).

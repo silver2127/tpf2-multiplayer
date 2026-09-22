@@ -1,5 +1,7 @@
 #include "../src/panel_linux.cpp"
 #include <cassert>
+static lobby::View fixtureView;
+namespace lobby { void Snapshot(View* view) { *view=fixtureView; } }
 
 int main(int argc, char** argv)
 {
@@ -46,5 +48,16 @@ int main(int argc, char** argv)
     P().username.clear(); P().lobbyName.clear(); LoadNamesLocked();
     assert(P().username.size() == 100 && P().lobbyName.size() == 100);
     dlclose(fixture); unlink(file.c_str());
+    // Present checks Visible before Frame: opening and recovery events must
+    // work while the panel is collapsed, with no previous rendered frame.
+    g_initDone=true;g_fontsOk=true;g_uiState=0;g_pageHidden=true;
+    fixtureView.active=true;fixtureView.inGame=true;
+    const std::string openFile=P().dataDir+"tpf2_lobby_open.txt";
+    f=fopen(openFile.c_str(),"w");assert(f);fclose(f);
+    P().openPollAt=0;assert(Visible() && g_uiState==2 && access(openFile.c_str(),F_OK)!=0);
+    g_uiState=0;g_pageHidden=true;fixtureView.recoveryPresent=true;fixtureView.recoveryVersion=1;
+    g_asyncDirty=true;assert(Visible() && g_uiState==3);
+    fixtureView.recoveryPresent=false;fixtureView.recoveryVersion=2;
+    g_asyncDirty=true;assert(Visible() && g_uiState==2);
     puts("panel names: Steam availability, sanitizing, refresh, overrides, legacy files and length limits passed");
 }

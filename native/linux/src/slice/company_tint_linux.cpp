@@ -271,11 +271,66 @@ template <class T, size_t N> bool Anchored(uintptr_t base, const T (&checks)[N])
 }
 } // namespace
 
+namespace {
+constexpr uintptr_t kWindowBind=0x1444ee0;
+constexpr uintptr_t kWindowCalls[]={0x1452e80,0x1453b0f,0x1454ff4,0x1455940,
+    0x1456a2f,0x1457398,0x1457f93,0x145914c,0x145b777,0x1460fde,
+    0x146200a,0x1463600,0x1463ba6,0x14652bc};
+
+int WindowCompany(int entity)
+{
+    // Read the current render state on this UI call, never cache an engine
+    // across a world reload. CGame::Sync publishes its state at +150.
+    uintptr_t ui=0,game=0,state=0,engine=0;
+    if(entity<0 || !SliceReadT(tintBase+0x5a4fb38,&ui) || !ui ||
+       !SliceReadT(ui+0x448,&game) || !game || !SliceReadT(game+0x150,&state) || !state ||
+       !SliceReadT(state+0x28,&engine) || !engine)return 0;
+    const int owner=SliceEcsOwner(engine,entity);
+    if(owner<0)return 0;
+    const int company=CompanyOfPid(owner);if(company<=0)return 0;
+    // The lobby writes mode and our company on the first two lines. A wash
+    // identifies a foreign company's window; our own company stays unchanged.
+    FILE* f=fopen((tintData+"/mp_company_cfg.txt").c_str(),"r");
+    if(!f)return 0;
+    char mode[32]{};int mine=0;
+    const bool valid=fgets(mode,sizeof(mode),f) && fscanf(f,"%d",&mine)==1;
+    fclose(f);
+    return valid && !strcmp(mode,"companies\n") && mine>0 && company!=mine ? company:0;
+}
+
+void WindowBind(void* widget,int entity)
+{
+    reinterpret_cast<void(*)(void*,int)>(tintBase+kWindowBind)(widget,entity);
+    int company=0;
+    try { if(widget)company=WindowCompany(entity); } catch(...) { ++refused; }
+    // The foreign call sits outside our private-runtime catch/cleanup frames.
+    if(company>0){AppendClass(widget,company);++tinted;}
+}
+
+void InstallWindowTint()
+{
+    if(FlagSays("windowcolor","0"))return;
+    if(!Anchored(tintBase,kTintStyleChecks) || !SliceEcsAnchored(tintBase))return;
+    // Every bind helper call is verified before redirecting any of them.
+    for(uintptr_t site:kWindowCalls){
+        uint8_t bytes[5]{};int32_t displacement=0;
+        if(!SliceRead(tintBase+site,bytes,sizeof(bytes)) || bytes[0]!=0xe8)return;
+        memcpy(&displacement,bytes+1,4);
+        if(int64_t(site+5)+displacement!=int64_t(kWindowBind))return;
+    }
+    size_t count=0;
+    for(uintptr_t site:kWindowCalls)
+        if(Tpf2mpRedirectCall(tintBase+site,tintBase+kWindowBind,reinterpret_cast<void*>(&WindowBind)))++count;
+    SliceLog("[windowcolor] installed %zu of %zu entity window bind calls\n",count,sizeof(kWindowCalls)/sizeof(kWindowCalls[0]));
+}
+}
+
 bool SliceInstallCompanyTint(uintptr_t base, const char* rootDir, const char* dataDir)
 {
     tintBase = base;
     tintRoot = rootDir ? rootDir : "";
     tintData = dataDir ? dataDir : "";
+    InstallWindowTint();
     if (FlagSays("stationicon", "0")) {
         SliceLog("[stationicon] OFF (stationicon=0) -- HUD icons keep the game's colours\n");
         return true;

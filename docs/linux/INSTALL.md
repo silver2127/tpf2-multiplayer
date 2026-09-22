@@ -21,69 +21,41 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree combines **Windows release 0.6 (dev through `b141b123`)**.
-It includes native road-space summation, road-edge vehicle entry order, ship/aircraft order diagnostics,
-shared-station line selection, host world-switch sharing, bidirectional company
-chips and a SEPARATE COMPANIES lobby setting (co-op remains the default). Lobby
-chips, shared dashboard swatches and vehicle paint use the new 20-colour palette,
-with generated colours starting at company 21. All Lua files
-exactly match that Windows revision. See
-[UPSTREAM_dev_b141b123.md](UPSTREAM_dev_b141b123.md) for provenance, tests and
-remaining gaps. This is not a claim of live cross-platform compatibility.
-`trainorder=0`, `roadspace=0`, `roadentries=0`, `shiporder=0`, `airorder=0` and
-`sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt` disable the respective
-hooks at startup; peers need matching arithmetic/ordering settings.
+This development tree integrates **Windows 0.6.1.14, main `f766960`**, on
+top of Linux merge PR #5. The integration and live-test record is
+[PARITY_20260921.md](../re/linux/PARITY_20260921.md). Testing is ongoing; this
+is not yet a completed cross-platform compatibility certification.
 
-Native station selection now honors company permissions. Foreign station and
-vehicle icons are visible and their info windows can open read-only; `showicons=0`
-and `foreignwindows=0` disable these features. Company tinting of icons, station
-labels and native windows is not ported (`iconcolor`/`windowcolor`/`stationicon` have no native
-implementation), including the own-company icon/label colours added in
-earlier Windows revisions. Founder names, buy-time paint scheduling and the optional
-`tpf2mp_hash_every.txt` cadence override are included through the shared Lua.
+The native implementation includes command capture and replay, deterministic
+ordering hooks, company permissions, save selection, load progress, automatic
+Workshop registration, and the recovery controller used for frozen joins and
+resync. The in-game **Manage Lobby** action opens the native lobby panel;
+recovery prompts and progress appear automatically. Native dedicated mode and
+VPS service instructions are in [tools/server](../../tools/server/README.md).
 
-The HUD station/depot company wash added in `5fb7aea2` remains unavailable,
-including the earlier button-root correction, non-asserting owner lookup,
-class read-back and alive counters. The `8e31f1e0` label counters, first-six
-window-bind logs and staged no-owner station diagnostics are also unavailable. `stationicon=0` and `tintclass=mpCo`
-currently affect only Windows. See the integration record for the fresh Linux
-investigation and missing evidence. The `61578d27` shared stylesheet now targets
-the station/depot icon and window title bar, but requires the same unavailable
-native root-class tagging. The d6db920f selectors additionally target the icon
-element itself, but the corresponding native entity/owner relay remains
-unavailable; stylesheet presence does not enable company tinting on Linux. The 50d7588b
-fix removes the selector bang from Windows class names (`mpWinCoN`/`mpCoN`);
-Linux still lacks the native tint-class application path. The 66c870cf stylesheet
-now colours a second glyph image layer, preserving the blue box, and includes
-32 glyph textures at 1x/2x resolution. These shared assets are included unchanged;
-visible company tinting still requires the missing native class tagging.
-The 0.6 station-icon refinements (constructor entity, post-attach restyle)
-are not ported for the same reason. Frozen joins need the native resync
-controller, which Linux lacks: a Linux host keeps the hot-join save.
+The shared Lua is checked against that Windows baseline. One pinned Linux
+integration adds an explicit origin-replay marker for native name/colour
+commands while preserving the existing Windows packets. All 32 HUD glyph
+textures match the Windows baseline.
 
-Company creation, switching and dissolution now wait for other players to finish
-receiving the save, loading and catching up. The dashboard names those players;
-company password changes remain available.
+Station/depot glyphs use their owner's company colour. Entity-window washes
+have a native implementation and await live separate-company visual checks.
+Vehicle-icon and station-label colours remain work in progress. Other native
+parity additions, including spare-line callbacks, platform assignments and
+modular-station connector welding, have fixture coverage and still need their
+live gameplay checks. See the integration record for current test limits.
 
-The roster now shows verified engine load percentages while a world loads.
-Returning from a world to the title menu leaves the lobby. The paused GameTime
-counter fix is enabled by default; peers need matching `pausedtick` settings.
-Creating `tpf2mp_governor_off.txt` in the runtime data folder disables the Lua
-speed governor. Native in-app updates remain unsupported; use the Linux installer.
+`trainorder=0`, `roadspace=0`, `roadentries=0`, `shiporder=0`, `airorder=0`,
+`sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt`
+disable the respective hooks at startup. Peers need matching simulation
+settings. `showicons=0`, `foreignwindows=0`, `stationicon=0` and `windowcolor=0`
+disable the corresponding UI features; `tintclass=mpCo` selects the opaque
+company class. Creating `tpf2mp_governor_off.txt` in the runtime data folder
+disables the Lua speed governor.
 
-When the host changes worlds, an already-playing Linux client receives the
-new save but must open **LOAD GAME → mp_shared**. Automatic in-world loading
-still needs the native recovery controller. Installation also removes the
-obsolete `mods/m3_determinism_1` probe, with removal shown in `--dry-run`.
-
-**Known limits:** automatic resync, the wider separate-company/shared-ownership
-operations, and automatic Workshop registration still need native Linux support.
-Some player actions, including names/colors, vehicle stop/maintenance and loans,
-remain blocked in multiplayer. In particular, the shared dashboard now uses the
-game company window for renaming, but native Linux cannot yet capture that
-rename; the player-based default names and existing saved names still display. A completed cross-platform gameplay test for
-0.5.6 has not yet been recorded; the passing 0.4.22 replay does not establish
-0.5.6 compatibility.
+Returning to the title menu leaves the lobby. Use the Linux installer for
+updates. Installation also removes the obsolete `mods/m3_determinism_1` probe,
+with removal shown in `--dry-run`.
 
 Download the `.run` installer, then run:
 

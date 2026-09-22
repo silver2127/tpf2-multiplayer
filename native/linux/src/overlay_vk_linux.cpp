@@ -23,10 +23,13 @@
 #include "near_alloc.h"
 #include "panel.h"
 #include "panel_layer.h"
+#include "dedicated_linux.h"
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cerrno>
+#include <vector>
 
 static const uintptr_t RVA_INIT_DEVICE_DISPATCH = 0x35167d0;   // vk::DispatchLoaderDynamic::init(vk::Device)
 static const uintptr_t RVA_INIT_DEVICE_CALL     = 0x35096e9;   // its only call, in VulkanRenderContext's constructor
@@ -34,6 +37,8 @@ static const size_t    SLOT_CREATE_SWAPCHAIN     = 0x550;
 static const size_t    SLOT_GET_DEVICE_PROC_ADDR = 0x798;
 static const size_t    SLOT_GET_DEVICE_QUEUE     = 0x7a0;
 static const size_t    SLOT_QUEUE_PRESENT        = 0xad0;
+// 0x351814a stores the lookup of vkQueueSubmit here (build 35924).
+static const size_t    SLOT_QUEUE_SUBMIT         = 0xae0;
 
 static Tpf2mpLogFn g_log = nullptr;
 static uintptr_t   g_base = 0;
@@ -42,6 +47,8 @@ static PFN_vkGetDeviceProcAddr   g_gdpa = nullptr;
 static PFN_vkQueuePresentKHR     g_realPresent = nullptr;
 static PFN_vkGetDeviceQueue      g_origGetQueue = nullptr;
 static PFN_vkCreateSwapchainKHR  g_origCreateSc = nullptr;
+static PFN_vkQueueSubmit g_origSubmit = nullptr;
+static bool g_noRender = false;
 static VkDevice   g_dev = VK_NULL_HANDLE;
 static VkFormat   g_scFormat = VK_FORMAT_UNDEFINED;
 static VkExtent2D g_scExtent = { 0, 0 };
@@ -166,13 +173,16 @@ static void Barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
     pCmdBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
-static void SubmitAndWait(VkQueue q, VkCommandBuffer cb)
+static bool SubmitAndWait(VkQueue q, VkCommandBuffer cb, uint32_t waitCount=0, const VkSemaphore* waits=nullptr)
 {
+    std::vector<VkPipelineStageFlags> stages(waitCount,VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.waitSemaphoreCount=waitCount;si.pWaitSemaphores=waits;si.pWaitDstStageMask=stages.data();
     si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    pResetFences(g_dev, 1, &g_fence);
-    pSubmit(q, 1, &si, g_fence);
-    pWaitFences(g_dev, 1, &g_fence, VK_TRUE, 100000000ull);
+    if(pResetFences(g_dev,1,&g_fence)!=VK_SUCCESS || pSubmit(q,1,&si,g_fence)!=VK_SUCCESS)return false;
+    // Never reset/reuse a pending command buffer after an ignored 100 ms
+    // timeout: software rendering can legitimately take longer than that.
+    return pWaitFences(g_dev,1,&g_fence,VK_TRUE,UINT64_MAX)==VK_SUCCESS;
 }
 
 // A host-visible linear image of the panel's largest size, mapped, in `layout`.
@@ -212,7 +222,7 @@ static bool MakeHostImage(VkQueue q, VkImageUsageFlags usage, VkImageLayout layo
     pBeginCB(cb, &bi);
     Barrier(cb, *img, VK_IMAGE_LAYOUT_PREINITIALIZED, layout, VK_ACCESS_HOST_WRITE_BIT, access);
     pEndCB(cb);
-    SubmitAndWait(q, cb);
+    if(!SubmitAndWait(q, cb))return false;
     return true;
 }
 
@@ -274,16 +284,16 @@ static void Compose(int w, int h, const HoverState& hover)
     }
 }
 
-static void DrawPanel(VkQueue q, uint32_t imgIndex)
+static bool DrawPanel(VkQueue q, uint32_t imgIndex, uint32_t waitCount=0, const VkSemaphore* waits=nullptr)
 {
-    if (imgIndex >= g_scImgCount) return;
+    if (imgIndex >= g_scImgCount) return false;
     int px, py, pw, ph;
     bool changed = false;
-    if (!panel::Frame((int)g_scExtent.width, (int)g_scExtent.height, &px, &py, &pw, &ph, &changed)) return;
-    if (!BuildImages(q)) return;
+    if (!panel::Frame((int)g_scExtent.width, (int)g_scExtent.height, &px, &py, &pw, &ph, &changed)) return false;
+    if (!BuildImages(q)) return false;
     if (pw > g_imgW) pw = g_imgW;
     if (ph > g_imgH) ph = g_imgH;
-    if (px < 0 || py < 0 || px + pw > (int)g_scExtent.width || py + ph > (int)g_scExtent.height) return;
+    if (px < 0 || py < 0 || px + pw > (int)g_scExtent.width || py + ph > (int)g_scExtent.height) return false;
 
     VkImageCopy region = {};
     region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.srcSubresource.layerCount = 1;
@@ -311,23 +321,78 @@ static void DrawPanel(VkQueue q, uint32_t imgIndex)
     pCmdCopyImage(cb, g_panelImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     Barrier(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     pEndCB(cb);
-    SubmitAndWait(q, cb);
+    return SubmitAndWait(q,cb,waitCount,waits);
 }
 
 // ---- the three swapped dispatcher slots --------------------------------------------
 static VkResult MyPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
+    bool copied=false;
     const uint64_t n = ++g_presentCount;
     if (n == 1) {
         g_log("[overlay] first present (swapchains %u)\n", pi ? pi->swapchainCount : 0);
         panel::InstallInput();
     }
-    if (pi && pi->swapchainCount >= 1 && panel::Visible()) {
+    if (!g_noRender && pi && pi->swapchainCount >= 1 && panel::Visible()) {
         const VkSwapchainKHR sc = pi->pSwapchains[0];
         if ((!g_rInit || sc != g_theSc) && !g_rFail) InitRender(sc, q);
-        if (g_rInit && sc == g_theSc) DrawPanel(q, pi->pImageIndices[0]);
+        if (g_rInit && sc == g_theSc) copied=DrawPanel(q,pi->pImageIndices[0],pi->waitSemaphoreCount,pi->pWaitSemaphores);
+    }
+    if (dedicated::Get().enabled) {
+        timespec ts{}; clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t now = uint64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec;
+        static uint64_t logged = 0, next = 0;
+        if (now - logged >= 5000000000ULL) {
+            logged = now;
+            g_log("[dedicated] present heartbeat frames=%llu render=%d\n", (unsigned long long)n, !g_noRender);
+        }
+        const uint64_t period = 1000000000ULL / unsigned(dedicated::Get().fps);
+        if (!next || now > next + period * 4) next = now;
+        next += period;
+        const timespec deadline{time_t(next / 1000000000), long(next % 1000000000)};
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {}
+    }
+    if(copied){
+        // The copy waited for the game's completed frame and its fence has
+        // completed. Binary semaphores must not be waited a second time.
+        VkPresentInfoKHR ready=*pi;ready.waitSemaphoreCount=0;ready.pWaitSemaphores=nullptr;
+        return g_realPresent(q,&ready);
     }
     return g_realPresent(q, pi);
+}
+
+static VkResult MySubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence)
+{
+    if (!count || !submits) return g_origSubmit(queue, count, submits, fence);
+    // Preserve the real fence, waits and signals. Only GPU command buffers are
+    // omitted, matching Windows dedicated_render=0.
+    try {
+        std::vector<VkSubmitInfo> copy(submits, submits + count);
+        for (auto& item : copy) { item.commandBufferCount = 0; item.pCommandBuffers = nullptr; }
+        return g_origSubmit(queue, count, copy.data(), fence);
+    } catch (...) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
+}
+static VkResult MyQueryResults(VkDevice, VkQueryPool, uint32_t, uint32_t,
+                              size_t size, void* data, VkDeviceSize, VkQueryResultFlags)
+{
+    // The discarded command buffers never write query results; a real WAIT
+    // would block forever. The game's render profiler receives zero timings.
+    if (data && size) memset(data, 0, size);
+    return VK_SUCCESS;
+}
+
+static void** FindDeviceSlot(void** slots, PFN_vkVoidFunction value)
+{
+    if (!value) return nullptr;
+    void** found = nullptr;
+    // The verified QueueSubmit store bounds the range. Resolve pointers and
+    // require uniqueness before changing any slot.
+    for (size_t i = 0; i <= SLOT_QUEUE_SUBMIT / sizeof(void*); ++i) {
+        if (slots[i] != reinterpret_cast<void*>(value)) continue;
+        if (found) return nullptr;
+        found = &slots[i];
+    }
+    return found;
 }
 
 static void MyGetDeviceQueue(VkDevice dev, uint32_t fam, uint32_t idx, VkQueue* pq)
@@ -383,6 +448,20 @@ static void InitDeviceDetour(void* dispatcher, VkDevice dev)
     slot[SLOT_GET_DEVICE_QUEUE / 8] = (void*)&MyGetDeviceQueue;
     slot[SLOT_CREATE_SWAPCHAIN / 8] = (void*)&MyCreateSwapchain;
     slot[SLOT_QUEUE_PRESENT / 8]    = (void*)&MyPresent;
+    g_noRender = false;
+    if (dedicated::Get().enabled && !dedicated::Get().render) {
+        const auto submit = gdpa(dev, "vkQueueSubmit");
+        const auto query = gdpa(dev, "vkGetQueryPoolResults");
+        void** submitSlot = FindDeviceSlot(slot, submit);
+        void** querySlot = FindDeviceSlot(slot, query);
+        if (submitSlot && querySlot) {
+            g_origSubmit = reinterpret_cast<PFN_vkQueueSubmit>(submit);
+            *submitSlot = reinterpret_cast<void*>(&MySubmit);
+            *querySlot = reinterpret_cast<void*>(&MyQueryResults);
+            g_noRender = true;
+            g_log("[dedicated] render submissions and query waits disabled; Vulkan synchronization preserved\n");
+        } else g_log("[dedicated] render suppression unavailable: Vulkan dispatcher slots are not unique\n");
+    }
     g_log("[overlay] device %p: present, swapchain creation and queue lookup routed through the panel\n", (void*)dev);
 }
 

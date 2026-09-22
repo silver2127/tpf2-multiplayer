@@ -1,10 +1,12 @@
-# TpF2 Multiplayer
+# TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Website: [silver2127.github.io/tpf2-multiplayer](https://silver2127.github.io/tpf2-multiplayer/)** ·
-[Download](https://github.com/silver2127/tpf2-multiplayer/releases/latest) ·
+[Download the installer](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) ·
 [Privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html)
+
+**Join The Discord: [https://discord.gg/7VhmtUstqQ](https://discord.gg/7VhmtUstqQ)** ·
 
 **Multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Several players build in one
 world at the same time: the roads, track, stations, depots, vehicles and lines one player makes
@@ -36,11 +38,12 @@ compares them continuously. The lobby handles NAT traversal, encryption and send
 
 ## Install
 
-**Download `TpF2Multiplayer.msi` from the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases),
-close the game, and run it.** Everyone in a session needs the same version.
+**Download [`TpF2Multiplayer.msi`](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) (the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases/latest); Linux and Steam Deck: `install_proton.sh` from the same page),
+close the game, and run it.** Everyone in a session needs the same version. A new version is installed the same
+way, over the old one: there is no in-game updater.
 
 The installer finds the game folder through Steam, keeps the game's `alut.dll` as `alut_real.dll` and puts
-the proxy in its place, adds the DLLs, the lobby (`netpunch\netpunch.exe`) and the **Transport Fever 2 Multiplayer** mod, and
+the proxy in its place, adds the DLLs, the lobby (the `netpunch\` folder) and the **Transport Fever 2 Multiplayer** mod, and
 switches the game to the Windows Segment Heap, which makes very large maps load far faster. Runtime files go
 to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
@@ -55,6 +58,12 @@ To uninstall, use **Apps → TpF2 Multiplayer → Uninstall**, or run the MSI ag
 game's own `alut.dll` is put back. Steam's "Verify integrity of game files" also restores it, which removes the
 Multiplayer entry until you run the MSI's **Repair**.
 
+Every release is built by GitHub Actions from the tagged source
+([`.github/workflows/build-msi.yml`](.github/workflows/build-msi.yml)); `SHA256SUMS.txt` on the release page lists the
+files it produced. The lobby is a Python program frozen with PyInstaller, and unsigned software of that kind is
+sometimes flagged by antivirus heuristics. The checksums and the build log are how to check that what you downloaded
+is what the source builds.
+
 ## Play
 
 1. Title menu → **Multiplayer** → **HOST GAME**. The code is copied to your clipboard: send it to your friends,
@@ -64,9 +73,20 @@ Multiplayer entry until you run the MSI's **Repair**.
    and picks **mp_shared**.
 
 The host needs UDP port 29471 reachable from the internet (the lobby tries UPnP). If that is not possible, use a
-dedicated relay from the PUBLIC GAMES list, where nobody needs an open port. New games have the multiplayer mod enabled
+the dedicated server in the PUBLIC GAMES list, where nobody needs an open port. New games have the multiplayer mod enabled
 automatically; for an existing save, enable it once in the save's Mods panel. The full guide, including the
 in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING.md).
+
+## Privacy
+
+Nothing leaves your PC except the session itself. Your player name, chat, game commands, network address and the
+host's save go to the other players in the session, directly or through the dedicated server. The project's server
+provides the public games list, which lists your game only while **PUBLIC** is ticked, and carries a joining
+player's encrypted address note to the host so the two can connect. There is no telemetry, no usage statistics and
+no automatic bug or crash reporting: the in-game updater, the session count and the desync-report upload of earlier
+versions were removed in 0.6.1.11. When something goes wrong, the logs stay in `%LOCALAPPDATA%\tpf2mp\logs` and you
+send them yourself if you report a bug. The full text is the
+[privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html).
 
 ## Documentation
 
@@ -93,7 +113,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
 | `native/linux/`, `tools/linux/` | native Linux libraries, tests, Steam Runtime builds and `.run`/tarball packaging |
 | `mod/mp_lockstep_1/` | the game-script mod |
-| `netpunch/` | the lobby, dedicated relay and master server (Python) |
+| `netpunch/` | the lobby (the dedicated server runs it too) and the master server (Python) |
 | `installer/` | the WiX package |
 | `tools/` | deploy, rig, soak-test and check scripts; `tools/ghidra/` and `tools/re/` for reverse engineering |
 | `docs/` | the documentation |

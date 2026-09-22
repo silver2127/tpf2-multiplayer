@@ -113,6 +113,8 @@ case " ${LEFT_OUT[*]:-} " in
   *)
     [ -f "$BUILD/tpf2_previews.so" ] || die "the build did not produce tpf2_previews.so"
     PLUGINS+=(tpf2_previews.so)
+    [ -f "$BUILD/tpf2_workshop_register.so" ] || die "the build did not produce tpf2_workshop_register.so"
+    PLUGINS+=(tpf2_workshop_register.so)
     ;;
 esac
 if [ -n "$BIGMAP_REPO" ]; then

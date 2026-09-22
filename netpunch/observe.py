@@ -98,6 +98,55 @@ def preferred_ip(family=socket.AF_INET, probe=None):
 
 
 _ULA = ipaddress.ip_network("fc00::/7")          # Tailscale ULA, etc.
+
+# Virtual-LAN adapters. A friend on the same Hamachi / Tailscale / ZeroTier
+# network reaches this address directly, NAT or no NAT, so the host's code
+# carries it and the joiner dials it first (connect.py). Hamachi hands out
+# 25.0.0.0/8, Tailscale 100.64.0.0/10 (the CGNAT range, but on a LOCAL adapter
+# that is Tailscale). ZeroTier ranges are per network: TPF2MP_VPN_IP names
+# the adapter address by hand for those.
+_VPN_NETS = (ipaddress.ip_network("25.0.0.0/8"), ipaddress.ip_network("100.64.0.0/10"))
+
+
+def local_v4_addresses():
+    """Every IPv4 address of this machine's adapters (getaddrinfo on the hostname)."""
+    found = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
+            a = info[4][0]
+            if a not in found:
+                found.append(a)
+    except socket.gaierror:
+        pass
+    return found
+
+
+def vpn_ips(addresses=None):
+    """The virtual-LAN adapter addresses to advertise, at most two: a manual
+    TPF2MP_VPN_IP first, then Hamachi, then Tailscale."""
+    out = []
+    manual = os.environ.get("TPF2MP_VPN_IP", "").strip()
+    if manual:
+        try:
+            ipaddress.IPv4Address(manual)
+            out.append(manual)
+        except ValueError:
+            pass
+    addrs = local_v4_addresses() if addresses is None else addresses
+    for net in _VPN_NETS:
+        for a in addrs:
+            try:
+                ip = ipaddress.IPv4Address(a)
+            except ValueError:
+                continue
+            if ip in net and a not in out:
+                out.append(a)
+    return out[:2]
+
+
+def vpn_ip(addresses=None):
+    v = vpn_ips(addresses)
+    return v[0] if v else None
 _GLOBAL_UNICAST = ipaddress.ip_network("2000::/3")
 
 
@@ -238,6 +287,15 @@ def upnp_map(game_port, keep=False):
                 ok = u.addportmapping(game_port, "UDP", u.lanaddr, game_port,
                                       "netpunch", "")
                 result["open"] = bool(ok)
+                # the same port on TCP: the save transfers stream over a TCP
+                # connection to the host when it is reachable (bulk_tcp.py);
+                # best effort, a router that refuses it just costs the joiner
+                # one failed connect and the transfer runs over UDP
+                if ok and keep:
+                    try:
+                        u.addportmapping(game_port, "TCP", u.lanaddr, game_port, "netpunch save transfer", "")
+                    except Exception:                    # noqa: BLE001
+                        pass
                 if ok and not keep:
                     # We only needed to prove it works; connect.py re-adds it.
                     try:
@@ -288,6 +346,10 @@ def upnp_unmap(game_port):
         u.discoverdelay = 1000
         if u.discover() > 0:
             u.selectigd()
+            try:
+                u.deleteportmapping(game_port, "TCP")    # the save-transfer mapping, if the router took it
+            except Exception:                            # noqa: BLE001
+                pass
             try:
                 u.deleteportmapping(game_port, "UDP")
                 return True
@@ -369,12 +431,15 @@ def observe(local_port=DEFAULT_PORT, sock=None, do_upnp=True, keep_upnp=False):
     v6_best, v6_all = enumerate_v6()
 
     lan_ip = upnp["lan_ip"] or preferred_ip(socket.AF_INET)
+    vpns = vpn_ips() + [None, None]
 
     profile = {
         "candidates": {
             "lan_v4": _fmt(lan_ip, local_port),
             "public_v4": _fmt(public_ip, public_port),
             "v6": _fmt(v6_best, local_port),
+            "vpn_v4": _fmt(vpns[0], local_port),
+            "vpn2_v4": _fmt(vpns[1], local_port),
         },
         "flags": {
             "open": bool(upnp["open"]),

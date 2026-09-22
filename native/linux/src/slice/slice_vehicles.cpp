@@ -62,10 +62,13 @@ static bool Config(SliceRecord* rec, uintptr_t address)
     for (size_t i = 0; i < parts.count; ++i) {
         const uintptr_t p = parts.begin + i * 0x88;
         int32_t model;
+        uint8_t reversed;
         float color[3];
-        if (!SliceReadT(p, &model) || !SliceRead(p + 0x20, color, sizeof(color)) ||
+        if (!SliceReadT(p, &model) || !SliceReadT(p + 4, &reversed) || !SliceRead(p + 0x20, color, sizeof(color)) ||
             !std::isfinite(color[0]) || !std::isfinite(color[1]) || !std::isfinite(color[2])) return false;
-        SliceRecordPrintf(rec, " %d", model);
+        // VehiclePart::reversed at +4 is proven by the Linux usertype registration
+        // (SLICE_VEHICLES.md section 4). Both buy and replacement share this wire.
+        SliceRecordPrintf(rec, " %d %d", model, reversed ? 1 : 0);
         if (!IntVector(rec, p + 8)) return false;
         SliceRecordPrintf(rec, " %.4f %.4f %.4f", color[0], color[1], color[2]);
         if (!AutoLoad(rec, p + 0x60)) return false;

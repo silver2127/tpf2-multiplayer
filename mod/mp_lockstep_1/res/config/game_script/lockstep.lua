@@ -1,9 +1,3 @@
-if os.getenv("TPF2MP_RELEASE_ROOT") then
-    require("mp/update_bootstrap").setup()
-    local path = os.getenv("TPF2MP_RELEASE_ROOT") .. "/mod/res/scripts/mp/entry.lua"
-    assert(loadfile(path, "t", _ENV))()
-    return
-end
 -- MP Lockstep -- the game-script half of TpF2 Multiplayer (docs/ARCHITECTURE.md).
 --
 -- Replicates COMMANDS, not state. Every command carries the game time at which
@@ -226,6 +220,8 @@ K.HEARTBEAT_EVERY = 2     -- ticks between LSTICK broadcasts (~0.37s; was 5 -- t
 -- ~4.6s without a heartbeat = do not trust the peer's clock. Declared up here
 -- because scheduleLocal consults it too, long before the pacing section.
 K.PEER_STALE_TICKS = 25
+K.SOLO_RELEASE_TICKS = 75  -- ~15 s alone (lobby gone or roster 1) before a world-operation hold is abandoned (resync.lua)
+K.SOLO_RELEASE_SECONDS = 15 -- how stale tpf2_sync_available.txt may be before the lobby counts as gone (resync.lua)
 K.HASH_EVERY_GAMETIME = 12 -- was 4: the hash costs ~380 ms on the sim thread (a visible freeze), so ~3x rarer (2026-09-09)
 K.HASH_EVERY_MIN = 4       -- the finest interval tpf2mp_hash_every.txt may force (hash.lua CM.hashEveryForced)
 -- COST-AWARE HASH CADENCE. Measured on a 6,000-edge map: one world hash costs
@@ -535,7 +531,7 @@ K.JOURNAL_LOAN = 0
 -- a 30,000,000 loan is several ticks of settling.
 K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
-K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
 -- read from the proposal); the originator instead deletes its native copy and
 -- replays, gated by c.cancelled rather than ARMED. See execConX.
@@ -626,6 +622,7 @@ CM.boot("mp.cons")
 -- ---------- vehicles: cross-peer identity, names/colours, vehicle commands, buy, replace ----------
 -- Lives in res/scripts/mp/vehicles.lua.
 CM.boot("mp.vehicles")
+CM.boot("mp.action_sounds")
 -- ---------- lines: cross-peer identity, create/update/delete ----------
 -- Lives in res/scripts/mp/lines.lua.
 CM.boot("mp.lines")
@@ -641,6 +638,7 @@ CM.boot("mp.assets")
 local function execute(c)
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
+	elseif c.op == "FENCE" then CM.execFence(c)
 	elseif c.op == "ROADP" then CM.execPolyline(c)
 	elseif c.op == "ROAD" or c.op == "RAIL" then CM.execEdge(c)
 	elseif c.op == "CON" then CM.execCon(c)
@@ -655,7 +653,7 @@ local function execute(c)
 	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
 	elseif c.op == "VNAME" then CM.execSetName(c)
 	elseif c.op == "VCOLOR" then CM.execSetColor(c)
-	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" then
+	elseif c.op == "LCREATE" or c.op == "LUPDATE" or c.op == "LDELETE" or c.op == "LSPARE" then
 		-- behind any stop / construction replay still in flight: a line update
 		-- that re-adds a replaced stop must find that stop already there
 		if CM.conxBusy or #CM.conxQueue > 0 then
@@ -696,12 +694,11 @@ CM.boot("mp.pacing")
 -- Lives in res/scripts/mp/cursors.lua.
 CM.boot("mp.cursors")
 CM.boot("mp.previews")
+require("mp/fences_compat").bind(CM, K, log)
 -- ---------- the Multiplayer window's stats section, in words (GUI state) ----------
 -- Lives in res/scripts/mp/stats.lua.
 CM.boot("mp.stats")
 -- ---------- the desync popup: send this game's logs to the developers? (GUI state) ----------
--- Lives in res/scripts/mp/desyncreport.lua.
-CM.boot("mp.desyncreport")
 CM.boot("mp.resync")
 -- ---------- desync check ----------
 function CM.compareAt(stamp)
@@ -761,6 +758,16 @@ end
 -- A 224-tile map starts at 12 * 14 = 168 units and settles near the 576 rung at
 -- 3.5 s a stamp: one hitch roughly every ten minutes at 1x, against none before.
 local function checkHash(now)
+	-- ALONE, NO HASH (2026-09-17, user): with nobody to compare against, the walk
+	-- over every vehicle, construction and edge is a hitch for nothing. The clock
+	-- is still tracked so the first stamp after a peer arrives is judged by a
+	-- real crossing below, never by the solo stretch before it.
+	if not CM.hashPeersPresent() then
+		CM.hashPrevNow = now
+		if not CM.hashSoloNoted then CM.hashSoloNoted = true; log("hash: no other player in this game -- the world hash is off until one joins") end
+		return
+	end
+	if CM.hashSoloNoted then CM.hashSoloNoted = nil; log("hash: another player is in -- the world hash is on") end
 	-- THE AGREED GRID (hash.lua CM.hashStampOf): CM.hashEvery from the map size on
 	-- the first hash (the same on every instance: same save; the base interval
 	-- until then), then whatever the leader's HASHEVERY moved every instance to.
@@ -954,6 +961,7 @@ function data()
 			CM.drainVehCap()
 			CM.primeLineKeys()
 			CM.pollLineKeys()
+			if CM.spareTick then CM.spareTick() end   -- the pre-made "New line" (lines.lua)
 			if not CM.conxBusy and #CM.conxQueue > 0 then
 				local nowG = CM.gameTime() or 0
 				local head = CM.conxQueue[1]
@@ -1218,7 +1226,7 @@ function data()
 						-- LSTICK table, with a wall clock so a leftover file can be
 						-- told from a live one.
 						f:write("wall=" .. tostring(os.time()) .. "\n")
-						-- the first desync of this game, for the popup (desyncreport.lua)
+						-- the first desync of this game, for the dashboard
 						f:write("boot=" .. tostring(CM.bootWall or 0) .. "\n")
 						f:write("resynctoken=" .. CM.resyncToken .. "\n")
 						if CM.firstDesync then
@@ -1314,10 +1322,12 @@ function data()
 			         hashGrid = CM.hashGridSave and CM.hashGridSave() or nil,
 			         vehKeys = CM.vehKeysSaveState and CM.vehKeysSaveState() or nil,
 			         lineKeys = CM.lineKeysSaveState and CM.lineKeysSaveState() or nil,
+			         actionSounds = CM.actionSoundsSave and CM.actionSoundsSave() or nil,
 			         savedAt = CM.gameTime and CM.gameTime() or nil }
 		end,
 		load = function(s)
 			-- also the per-frame engine -> GUI sync in the GUI state: no log here
+			if type(s) == "table" and s.actionSounds and CM.actionSoundsLoad then pcall(CM.actionSoundsLoad, s.actionSounds) end
 			if type(s) == "table" and tonumber(s.savedAt) and CM.savedAt == nil then CM.savedAt = tonumber(s.savedAt) end
 			if type(s) == "table" and s.cm then pcall(CM.cmLoadState, s.cm) end
 			if type(s) == "table" and s.vposOff and CM.vposLoadState then pcall(CM.vposLoadState, s.vposOff) end
@@ -1334,11 +1344,92 @@ function data()
 		end,
 		guiUpdate = function()
 			guiTick = guiTick + 1
-			-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
-			-- the panel's own twice-a-second refresh
-			if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
-			if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
-			if guiTick % 30 ~= 0 then return end
+			-- A DEDICATED SERVER HAS NO SCREEN (2026-09-18): the other players' cursor
+			-- circles, the construction previews and the dashboard are drawn for a player
+			-- who is not there, every frame, on the thread that hands the sim its batches.
+			-- With one joiner in, the server's batch interval crept from 200 to 300 ms at
+			-- lever 1 while its own game-script update stayed under 8 ms. Read once, a
+			-- moment after the world is up; then: no per-frame work, the dashboard every
+			-- 300 ticks (the chat and the players' requests still arrive through it).
+			if CM.dedicatedGui == nil and guiTick >= 30 then
+				CM.dedicatedGui = false
+				local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+				if f then
+					local body = f:read("*a") or ""
+					f:close()
+					CM.dedicatedGui = body:find("dedicated=1", 1, true) ~= nil
+					if CM.dedicatedGui then print("[ls-gui] dedicated server: no cursors, previews or per-frame panel work") end
+				end
+			end
+			if CM.dedicatedGui then
+				if guiTick % 300 ~= 0 then return end
+			else
+				if CM.actionSoundsGuiTick then pcall(CM.actionSoundsGuiTick, CM.recoveryGuiHeld()) end
+				-- THE SPARE LINE'S EDITOR, FROM THIS THREAD (lines.lua CM.spareFireWrite,
+				-- 2026-09-19). A New line click opens the editor on a pre-made line the
+				-- game script re-owns to the player on its next tick. The editor's
+				-- callback must run on the UI thread, and its result must name a line
+				-- the player owns: once this state (the UI's own copy of the engine)
+				-- sees the spare as ours, lockstep_lfire.txt tells the slice to fire
+				-- the held callback from the next CommandList::Add on this thread --
+				-- and this rename IS that Add, sent every third frame until the slice
+				-- blanks the file, or four seconds pass.
+				if guiTick % 3 == 0 then
+					pcall(function()
+						local f = io.open(K.BASE .. "lockstep_lfire_req.txt", "r")
+						if not f then return end
+						local body = f:read("*a") or ""
+						f:close()
+						local lid, nameEsc = body:match("^(%d+)%s*(%S*)")
+						lid = tonumber(lid)
+						if not lid then CM.guiFireSince = nil; return end
+						local nowC = os.clock()
+						if not CM.guiFireSince or CM.guiFireLid ~= lid then CM.guiFireSince, CM.guiFireLid, CM.guiFireOwned = nowC, lid, nil end
+						local function blank(name)
+							local w = io.open(K.BASE .. name, "w")
+							if w then w:close() end
+						end
+						if nowC - CM.guiFireSince > 4 then
+							blank("lockstep_lfire_req.txt"); blank("lockstep_lfire.txt")
+							print(string.format("[ls-gui] spare line %d: the slice never opened the editor on it -- giving up", lid))
+							CM.guiFireSince = nil
+							return
+						end
+						if not CM.guiFireOwned then
+							local mine = false
+							pcall(function()
+								local po = api.engine.getComponent(lid, api.type.ComponentType.PLAYER_OWNED)
+								mine = po and po.player == api.engine.util.getPlayer()
+							end)
+							if not mine then return end
+							CM.guiFireOwned = guiTick
+							return   -- one more frame for the UI's tables to follow the ownership
+						end
+						local g = io.open(K.BASE .. "lockstep_lfire.txt", "r")
+						local go = g and (g:read("*a") or "") or ""
+						if g then g:close() end
+						if go == "" and CM.guiFireGone then
+							-- the slice blanked it: fired (or gave up); done
+							blank("lockstep_lfire_req.txt")
+							CM.guiFireSince, CM.guiFireGone = nil, nil
+							return
+						end
+						if go == "" then
+							local w = io.open(K.BASE .. "lockstep_lfire.txt", "w")
+							if w then w:write(tostring(lid)); w:close() end
+							CM.guiFireGone = true
+						end
+						local name = (tostring(nameEsc or ""):gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+						if name == "" then name = "Line" end
+						api.cmd.sendCommand(api.cmd.make.setName(lid, name), function() end)
+					end)
+				end
+				-- other players' cursors (cursors.lua): every frame, so the circles glide; ahead of
+				-- the panel's own twice-a-second refresh
+				if CM.cursorGuiTick then pcall(CM.cursorGuiTick) end
+				if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
+				if guiTick % 30 ~= 0 then return end
+			end
 			pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
 				-- (Window, Table, TextView, BoxLayout), so the dashboard is built
@@ -1347,13 +1438,9 @@ function data()
 				-- differ, and the last few notable events harvested from the log.
 				-- Everything comes from lockstep_dash_<a|b>.txt, written every
 				-- 15 ticks by the game-script state.
-				-- Match the native lobby's process-pinned release directory. Never fall
-				-- back to an older inbox while a release lobby is still starting.
+				-- The lobby's folder: the per-user one when a lobby has run there, else the
+				-- game folder's. Never fall back to an older inbox while a lobby is still starting.
 				function CM.netDir()
-					local okRelease, release = pcall(os.getenv, "TPF2MP_RELEASE_ROOT")
-					if okRelease and release and release ~= "" then
-						return release .. "/netpunch"
-					end
 					if CM.netDirCached then return CM.netDirCached end
 					local cands = {}
 					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
@@ -1465,10 +1552,6 @@ function data()
 				local own = K.INSTANCE or "a"
 				local ownKv = readDash(own)
 				local ownWall = ownKv and tonumber(ownKv.wall) or nil
-				if CM.desyncReportTick then
-					local okR, errR = pcall(CM.desyncReportTick, ownKv)
-					if not okR then print("[ls-gui] desync report: " .. tostring(errR)) end
-				end
 				local peerInfo = {}
 				if ownKv and ownKv.peers and ownKv.peers ~= "-" then
 					for o, pt, sk, vd in ownKv.peers:gmatch("(%a+):([%-%d]+):([%+%-%d%.]+):([^,]+)") do
@@ -1816,10 +1899,7 @@ function data()
 						end
 						D.input:onEnter(function()
 							local t = D.input:getText()
-							if t and #t > 0 then
-								-- "/desynclogs ..." sets the desync popup's choice here and never reaches the chat
-								if not (CM.desyncLogsCommand and CM.desyncLogsCommand(t)) then CM.chatSend(t) end
-							end
+							if t and #t > 0 then CM.chatSend(t) end
 							CM.chatCloseInput()
 						end)
 						pcall(function() D.input:onCancel(function() CM.chatCloseInput() end) end)

@@ -7,9 +7,10 @@ from pathlib import Path
 import re
 import struct
 import pefile
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
 
 repo = Path(__file__).resolve().parents[1]
-source = (repo / "native/src/slice_hook.cpp").read_text(encoding="utf-8")
+source = slice_source(repo)
 caller = int(re.search(r"CALLER_BRIDGE_UPGRADE\s*=\s*(0x[0-9a-f]+)", source)[1], 16)
 game = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\TransportFever2.exe")
 pe = pefile.PE(str(game), fast_load=True)

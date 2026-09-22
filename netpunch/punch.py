@@ -133,12 +133,15 @@ class Connection:
     """
 
     def __init__(self, sock, targets, *, token=None, name="peer",
-                 listen=False, stop_event=None, log=None):
+                 listen=False, stop_event=None, log=None, extra=None):
         self.sock = sock
         self.family = sock.family
         # targets: list of (ip, port) we proactively HELLO at (empty in listen
-        # mode until the peer reveals itself).
+        # mode until the peer reveals itself). ``extra`` is a list another
+        # thread may append to while we dial (the master's relay port, learnt
+        # only after the direct dial has gone unanswered for a while).
         self.targets = list(targets or [])
+        self.extra = extra if extra is not None else []
         self.token = token or os.urandom(TOKEN_LEN)
         self.name = name
         self.listen = listen
@@ -196,7 +199,8 @@ class Connection:
         # only ever move it to a worse path.
         if self.connected.is_set() and self.peer:
             return [self.peer]
-        return self.targets
+        late = [t for t in list(self.extra) if t not in self.targets]
+        return self.targets + late if late else self.targets
 
     def _run(self):
         self.sock.setblocking(False)

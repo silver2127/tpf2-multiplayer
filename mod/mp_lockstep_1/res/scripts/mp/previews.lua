@@ -417,6 +417,7 @@ local function findResource(rep, name)
 	if rep.getName(id) == name then return id end
 end
 function CM.previewNativeProposal(p)
+	if p.fence then return CM.fencesProposal(p) end
 	if p.kind == "construction" then return CM.previewNativeConstruction(p) end
 	local sp = api.type.SimpleProposal.new()
 	local nodeMap, nextNode = {}, 0
@@ -563,6 +564,25 @@ function CM.previewGuiTick()
 		end
 	end
 	CM.previewGuiDecoded = decoded
+	-- The Fences planner publishes cosmetic model geometry locally. It must
+	-- never create the mod's temporary world constructions for a preview.
+	if CM.fencesPreviewRead then
+		local ok,p,sig=pcall(CM.fencesPreviewRead)
+		local visible,controls=pcall(CM.previewControlsVisible)
+		if ok and p and visible and controls then
+			if CM.previewNativeUpdate(K.INSTANCE,p,sig,sessionOnce()) then
+				nativeWanted[K.INSTANCE]=true
+			else
+				local models=p.params and p.params.result and p.params.result.models
+				local a=models and models[1] and models[1].transf
+				local b=models and models[#models] and models[#models].transf
+				if a and b then
+					local x,y,u,v=p.x+a[13],p.y+a[14],p.x+b[13],p.y+b[14]
+					wanted.mpfences={curve={x,y,u,v,u-x,v-y,u-x,v-y},width=0.5,color={0.3,0.7,1,0.8},sig=sig}
+				end
+			end
+		end
+	end
 	if next(CM.previewNativeDrawn or {}) then CM.previewNativeFinish(nativeWanted, sessionOnce()) end
 	CM.previewDrawn = CM.previewDrawn or {}
 	for key in pairs(CM.previewDrawn) do

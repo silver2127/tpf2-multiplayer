@@ -23,6 +23,11 @@ linux-native nor in its port branch, one job:
   port_worker.py --baseline    treat every current Windows tip as handled
   port_worker.py --once        run at most one job
   port_worker.py --no-publish  run jobs but push and open nothing
+  port_worker.py --revisit REPO [--branch dev] [--focus FILE]
+                               a backlog job: no new Windows commits; the agents work on what earlier
+                               runs recorded as not ported (FILE names the items), on the current port
+                               branch, with the same verification and pull request. Waits for a running
+                               worker to finish. (2026-09-17: the agents may run the game in the lab now.)
 
 The first push of a repository records its tips as the baseline: a branch is
 only ported once its tip moves, so old, idle branches are left alone.
@@ -380,10 +385,46 @@ def followup_text(failure):
             f'REPORT.md and STATUS in the meta directory.\n\n{failure["text"]}\n')
 
 
+def job_text(cfg, job, wt, conflicts, commits, last_port):
+    """The prompt's job section: a merge of new Windows commits, or a revisit of the backlog."""
+    lines = [f'- You are in a disposable clone: `{wt}`, on branch `{job["port"]}`, which is based on '
+             f'`{cfg["base_branch"]}`.']
+    if job.get('revisit'):
+        lines += [
+            f'- This is a REVISIT run: there are no new Windows commits and no merge in progress (the steps about '
+            f'conflicts do not apply). The branch already merges Windows `{job["branch"]}` up to `{job["target"][:10]}`.',
+            '- Your task is the backlog: what earlier runs recorded as NOT PORTED (the "Not ported" sections of the '
+            'integration records and the RE notes they link). Those runs worked statically only; you may run the '
+            'game in the lab (see "Live testing"), which is how the open contracts are meant to be settled now. '
+            'Port as many of the items as you can, most valuable first; each one you finish is progress even if '
+            'the rest stay open, and each one that stays open needs a live attempt recorded, not a repeat of the '
+            'static reasoning.',
+        ]
+        if job.get('focus'):
+            lines += ['', 'The items, with what is known so far:', '', job['focus'].rstrip()]
+    else:
+        lines += [
+            f'- A merge of the Windows branch `{job["branch"]}` at `{job["target"]}` is in progress and NOT committed. '
+            f'It brings these {len(commits)} Windows commit(s) (see them with `git log -p HEAD..{job["target"]}`):',
+            *[f'  - {c}' for c in commits],
+            '- Merge conflicts to resolve: ' + (', '.join(conflicts) if conflicts else 'none'),
+        ]
+        if len(commits) < job['pending']:
+            lines.append(f'- This run merges the oldest {len(commits)} of {job["pending"]} pending commits; the rest '
+                         'follow in the next run.')
+    if last_port == 'failed':
+        lines.append('- The previous port run on this branch did NOT pass verification, so the tree may not build '
+                     'yet. Make it pass as part of this job.')
+    if job.get('base_note'):
+        lines.append('- ' + job['base_note'])
+    return '\n'.join(lines)
+
+
 def render_prompt(cfg, rcfg, job, wt, meta, conflicts, commits, last_port):
     text = (HOME / 'prompt.md').read_text()
     verify_cmds = '; '.join('`' + ' '.join(c) + '`' for c in rcfg.get('verify', [])) or '(none configured)'
     values = {
+        'JOB': job_text(cfg, job, wt, conflicts, commits, last_port),
         'REPO': job['repo'], 'BRANCH': job['branch'], 'PORT_BRANCH': job['port'], 'BASE_BRANCH': cfg['base_branch'],
         'TARGET': job['target'], 'COUNT': str(len(commits)), 'RANGE': f'HEAD..{job["target"]}',
         'COMMITS': '\n'.join(f'  - {c}' for c in commits), 'WORKDIR': str(wt), 'META': str(meta),
@@ -464,8 +505,10 @@ def compose_body(cfg, job, commits, conflicts, outcome, meta, total, runs=()):
         '| | |', '|---|---|',
         '| Latest result | ' + ('verification passed' if ok else '**verification failed: needs a person** (draft)') + ' |',
         f'| Ported so far | {ported} Windows commit(s) over {max(len(runs), 1)} run(s), up to `{job["target"][:10]}` |',
-        f'| This run | {len(commits)} commit(s) merged at `{job["target"][:10]}`'
-        + (f' ({total - len(commits)} more follow in the next run)' if len(commits) < total else '') + ' |',
+        '| This run | ' + (f'revisit of the backlog on top of `{job["target"][:10]}`' if job.get('revisit') else
+                           f'{len(commits)} commit(s) merged at `{job["target"][:10]}`'
+                           + (f' ({total - len(commits)} more follow in the next run)' if len(commits) < total else ''))
+        + ' |',
         '| Merge conflicts | ' + (', '.join(f'`{c}`' for c in conflicts) if conflicts else 'none') + ' |',
         *([f'| Base | {job["base_note"]} |'] if job.get('base_note') else []),
         f'| Agent | {outcome["agent"] or "none"}' + (f', round {outcome["round"]}' if outcome['round'] else '')
@@ -473,8 +516,8 @@ def compose_body(cfg, job, commits, conflicts, outcome, meta, total, runs=()):
         '| Verification | ' + ('; '.join('`' + ' '.join(c) + '`' for c in rcfg.get('verify', [])) or 'none') + ' |',
         '', '<details><summary>Runs</summary>', '',
         '| When | Windows commits | Up to | Agent | Result |', '|---|---|---|---|---|',
-        *[f'| {r["at"][:16].replace("T", " ")} | {r["commits"]} | `{r["target"][:10]}` | {r["agent"] or "none"} | '
-          f'{"passed" if r["ok"] else "FAILED"} |' for r in runs],
+        *[f'| {r["at"][:16].replace("T", " ")} | {r["commits"]}{" (revisit)" if r.get("kind") == "revisit" else ""} | '
+          f'`{r["target"][:10]}` | {r["agent"] or "none"} | {"passed" if r["ok"] else "FAILED"} |' for r in runs],
         '', '</details>', '',
         '<details><summary>Windows commits in this run</summary>', '', *[f'- {c}' for c in commits], '', '</details>', '',
         '<details><summary>Rounds</summary>', '', *[f'- {h}' for h in outcome['history']], '', '</details>', '',
@@ -495,7 +538,7 @@ def run_job(cfg, job, publish=True):
     rcfg = cfg['repos'][repo]
     base = cfg['base_branch']
     safe = ''.join(ch if ch.isalnum() or ch in '._-' else '_' for ch in branch)
-    stem = f'{repo}-{safe}-{job["tip"][:10]}-{datetime.now():%Y%m%d-%H%M%S}'
+    stem = f'{repo}-{safe}-{"revisit" if job.get("revisit") else job["tip"][:10]}-{datetime.now():%Y%m%d-%H%M%S}'
     JOBS.mkdir(parents=True, exist_ok=True)
     for n in range(1, 1000):        # a long branch runs several jobs on the same tip, possibly within a second
         jd = JOBS / (stem if n == 1 else f'{stem}-{n}')
@@ -506,11 +549,14 @@ def run_job(cfg, job, publish=True):
             continue
     wt, meta = jd / 'repo', jd / 'meta'
     meta.mkdir()
-    log(f'{repo} {branch}: {job["pending"]} commit(s) to port -> {jd}')
+    log(f'{repo} {branch}: ' + ('revisit of the backlog' if job.get('revisit') else f'{job["pending"]} commit(s) to port')
+        + f' -> {jd}')
 
     git(HOME, 'clone', '--quiet', '--shared', str(mirror_path(repo)), str(wt))
     git(wt, 'fetch', '--quiet', 'origin', f'+refs/windows/{branch}:refs/windows/{branch}')
     remote = refs_of(wt, 'refs/remotes/origin')
+    if job.get('revisit') and port not in remote:
+        raise GitError(f'{port} does not exist on GitHub yet: nothing to revisit')
     git(wt, 'checkout', '--quiet', '-B', port, f'origin/{port}' if port in remote else f'origin/{base}')
     git(wt, 'config', 'user.name', cfg['git_name'])
     git(wt, 'config', 'user.email', cfg['git_email'])
@@ -528,18 +574,24 @@ def run_job(cfg, job, publish=True):
                          'the conflict is resolved when the pull request is merged.')
     job['base_note'] = base_note
 
-    pending =git(wt, 'rev-list', '--reverse', '--topo-order', f'refs/windows/{branch}', '^HEAD', f'^origin/{base}').split()
-    if not pending:
-        log(f'{repo} {branch}: nothing left to port')
-        shutil.rmtree(jd)
-        return
-    job['target'] = pending[-1] if len(pending) <= cfg['max_commits'] else pending[cfg['max_commits'] - 1]
-    commits = git(wt, 'log', '--reverse', '--no-decorate', '--format=%h %s', job['target'], '^HEAD', f'^origin/{base}').splitlines()
-    merge = subprocess.run(['git', '-C', str(wt), 'merge', '--no-ff', '--no-commit', job['target']],
-                           capture_output=True, text=True)
-    conflicts = git(wt, 'diff', '--name-only', '--diff-filter=U').split()
-    if merge.returncode != 0 and not conflicts:
-        raise GitError(f'merge of {job["target"]} failed: {(merge.stderr or merge.stdout).strip()}')
+    if job.get('revisit'):
+        job['target'] = git(wt, 'rev-parse', 'HEAD')      # nothing to merge: the tree as it stands
+        pending, commits, conflicts = [], [], []
+    else:
+        pending = git(wt, 'rev-list', '--reverse', '--topo-order', f'refs/windows/{branch}', '^HEAD',
+                      f'^origin/{base}').split()
+        if not pending:
+            log(f'{repo} {branch}: nothing left to port')
+            shutil.rmtree(jd)
+            return
+        job['target'] = pending[-1] if len(pending) <= cfg['max_commits'] else pending[cfg['max_commits'] - 1]
+        commits = git(wt, 'log', '--reverse', '--no-decorate', '--format=%h %s', job['target'], '^HEAD',
+                      f'^origin/{base}').splitlines()
+        merge = subprocess.run(['git', '-C', str(wt), 'merge', '--no-ff', '--no-commit', job['target']],
+                               capture_output=True, text=True)
+        conflicts = git(wt, 'diff', '--name-only', '--diff-filter=U').split()
+        if merge.returncode != 0 and not conflicts:
+            raise GitError(f'merge of {job["target"]} failed: {(merge.stderr or merge.stdout).strip()}')
     (meta / 'job.json').write_text(json.dumps({**job, 'commits': commits, 'conflicts': conflicts}, indent=2))
 
     last_port = load_json('ports.json', {}).get(repo, {}).get(branch, {}).get('result')
@@ -551,9 +603,14 @@ def run_job(cfg, job, publish=True):
     git(wt, 'add', '-A')
     merging = git(wt, 'rev-parse', '-q', '--verify', 'MERGE_HEAD', check=False) != ''
     staged = subprocess.run(['git', '-C', str(wt), 'diff', '--cached', '--quiet']).returncode != 0
-    message = (f'Port Windows {branch} {job["target"][:7]} to Linux\n\n'
-               f'Merges {len(commits)} Windows commit(s) from {branch} and ports them to the native Linux build.\n'
-               f'Verification: {"passed" if ok else "FAILED"}. Agent: {outcome["agent"] or "none"}.\n')
+    if job.get('revisit'):
+        message = (f'Revisit the Linux port of {branch} at {job["target"][:7]}\n\n'
+                   f'Backlog run: no new Windows commits; ports what earlier runs left unported, with live testing.\n'
+                   f'Verification: {"passed" if ok else "FAILED"}. Agent: {outcome["agent"] or "none"}.\n')
+    else:
+        message = (f'Port Windows {branch} {job["target"][:7]} to Linux\n\n'
+                   f'Merges {len(commits)} Windows commit(s) from {branch} and ports them to the native Linux build.\n'
+                   f'Verification: {"passed" if ok else "FAILED"}. Agent: {outcome["agent"] or "none"}.\n')
     if merging or staged:
         (meta / 'COMMIT_MSG').write_text(message)
         git(wt, 'commit', '--quiet', '--no-verify', '-F', str(meta / 'COMMIT_MSG'))
@@ -562,7 +619,7 @@ def run_job(cfg, job, publish=True):
     entry = ports.setdefault(repo, {}).setdefault(branch, {})
     previous = entry.get('result')
     run = {'at': datetime.now().isoformat(timespec='minutes'), 'target': job['target'], 'commits': len(commits),
-           'agent': outcome['agent'], 'ok': ok, 'job': jd.name}
+           'agent': outcome['agent'], 'ok': ok, 'job': jd.name, 'kind': 'revisit' if job.get('revisit') else 'port'}
     runs = (entry.get('runs') or [])[-59:] + [run]
     body = compose_body(cfg, job, commits, conflicts, outcome, meta, len(pending), runs)
     (meta / 'PR_BODY.md').write_text(body)
@@ -601,6 +658,21 @@ def run_job(cfg, job, publish=True):
     notify(summary)
 
 
+def session_environment():
+    """Started by a git hook, the worker has no desktop environment. The agents run the
+    game in the lab (2026-09-17), which needs the user's session: take DISPLAY and its
+    companions from systemd's user environment when they are not set."""
+    try:
+        out = subprocess.run(['systemctl', '--user', 'show-environment'], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    for line in out.stdout.splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key in ('DISPLAY', 'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR', 'XAUTHORITY', 'XDG_SESSION_TYPE',
+                           'DBUS_SESSION_BUS_ADDRESS') and key not in os.environ:
+            os.environ[key] = value
+
+
 def note_failure(job, err):
     attempts = load_json('attempts.json', {})
     entry = attempts.setdefault(job['repo'], {}).get(job['branch'])
@@ -627,6 +699,9 @@ def main():
     ap.add_argument('--baseline', action='store_true')
     ap.add_argument('--once', action='store_true')
     ap.add_argument('--no-publish', action='store_true')
+    ap.add_argument('--revisit', metavar='REPO', help='run a backlog job for REPO (see the module docstring)')
+    ap.add_argument('--branch', default='dev', help='the Windows branch whose port branch a --revisit works on')
+    ap.add_argument('--focus', metavar='FILE', help='--revisit: a Markdown list of the items to work on')
     args = ap.parse_args()
     cfg = load_config()
     # Started by the inbox's post-receive hook, the worker inherits GIT_DIR=. (and the
@@ -638,7 +713,29 @@ def main():
     bus = Path(f'/run/user/{os.getuid()}/bus')
     if 'DBUS_SESSION_BUS_ADDRESS' not in os.environ and bus.exists():
         os.environ['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={bus}'   # gh's keyring and notify-send
+    session_environment()
     STATE.mkdir(parents=True, exist_ok=True)
+
+    if args.revisit:
+        if args.revisit not in cfg['repos']:
+            ap.error(f'{args.revisit} is not in config.json')
+        focus = Path(args.focus).read_text() if args.focus else ''
+        lock = open(STATE / 'worker.lock', 'w')
+        log(f'{args.revisit} {args.branch}: revisit requested; waiting for the worker lock')
+        fcntl.flock(lock, fcntl.LOCK_EX)          # after the running job, if any
+        refresh(cfg, args.revisit)
+        tips = refs_of(inbox_path(args.revisit), 'refs/heads')
+        job = {'repo': args.revisit, 'branch': args.branch, 'tip': tips.get(args.branch, 'revisit'),
+               'port': port_branch(args.branch), 'pending': 0, 'when': int(time.time()), 'revisit': True,
+               'focus': focus}
+        try:
+            run_job(cfg, job, publish=not args.no_publish)
+        except Exception as err:
+            log(f'{args.revisit} {args.branch}: revisit error: {err}\n{traceback.format_exc()}')
+            return 1
+        finally:
+            prune_jobs(cfg)
+        return 0
 
     if args.baseline:
         record_baseline(cfg)

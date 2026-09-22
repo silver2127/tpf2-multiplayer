@@ -28,14 +28,18 @@ repairs the lobby executable for Wine (below); links the prefix's Steam folders
 finds saves and mods; records what it installed for --verify and --uninstall.
 Replaced files go to <game>/.tpf2mp-proton-backups/<timestamp>/.
 
-The lobby repair. netpunch.exe (a PyInstaller bundle) embeds a miniupnpc DLL
-whose relocation table lists 64 targets twice. Wine relocates the DLL and
-applies both, and hosting a game crashes at once (docs/proton/NAT_CRASH.md).
-The repair turns the second copy of each entry into padding, changing nothing
-else, and is pinned to the exact DLL every release so far has shipped. It is
-applied to the installed netpunch.exe and to any copy the in-game updater has
-cached in the prefix. `--repair-lobby FILE` applies it to a file in place (the
-release build uses this so shipped lobbies need no repair).
+The lobby repair. The lobby ships a miniupnpc DLL whose relocation table
+lists 64 targets twice. Wine relocates the DLL and applies both, and hosting a
+game crashes at once (docs/proton/NAT_CRASH.md). The repair turns the second
+copy of each entry into padding, changing nothing else, and is pinned to the
+exact DLL every release so far has shipped. Since 0.6.1.12 the lobby is a
+folder (netpunch/netpunch.exe beside netpunch/_internal/), and the DLL is the
+plain file netpunch/_internal/miniupnpc-*.dll; releases before it were one
+PyInstaller file with the DLL embedded, and both forms are repaired: the
+installed copy, and any copy an older release's in-game updater cached in the
+prefix. `--repair-lobby PATH` repairs a lobby folder, a netpunch.exe or the
+DLL itself in place (the release build uses this so shipped lobbies need no
+repair).
 """
 import argparse
 import hashlib
@@ -318,11 +322,34 @@ def repair_lobby(data):
     return result
 
 
+def lobby_dll_in(folder):
+    """The plain miniupnpc DLL of a folder-form lobby (netpunch/_internal/miniupnpc-*.dll), or None."""
+    internal = Path(folder) / "_internal"
+    found = sorted(internal.glob(DLL_PREFIX + "*.dll")) if internal.is_dir() else []
+    return found[0] if len(found) == 1 else None
+
+
+def repair_dll_bytes(data):
+    """The DLL bytes repaired: unchanged when already repaired, Fail when it is not the known DLL."""
+    if sha256(data) == REPAIRED_DLL_SHA256:
+        return data
+    require(sha256(data) == BROKEN_DLL_SHA256, "the lobby's miniupnpc DLL is not the analysed one; not repairing it")
+    return repair_dll(data)
+
+
 def repair_lobby_file(path):
-    """Repair FILE in place. Returns True when it changed."""
+    """Repair PATH in place: a lobby folder (its _internal miniupnpc DLL), the DLL itself,
+    or a one-file netpunch.exe. Returns True when it changed."""
     path = Path(path)
+    if path.is_dir():
+        dll = lobby_dll_in(path)
+        require(dll is not None, f"{path}: no _internal/{DLL_PREFIX}*.dll -- not a lobby folder")
+        path = dll
     data = path.read_bytes()
-    repaired = repair_lobby(data)
+    if path.suffix.lower() == ".dll":
+        repaired = repair_dll_bytes(data)
+    else:
+        repaired = repair_lobby(data)
     if repaired == data:
         return False
     atomic_write(path, repaired, mode=path.stat().st_mode & 0o777)
@@ -487,7 +514,8 @@ def load_payload(root):
     missing = [r for r in REQUIRED if r not in files]
     require(not missing, "payload is missing: " + ", ".join(missing))
     extra = [f for f in files if not (f in REQUIRED or f in KEEP_IF_PRESENT or f == "tpf2mp_version.txt"
-                                      or f.startswith("mods/mp_lockstep_1/") or (f.startswith("plugins/") and f.endswith(".dll")))]
+                                      or f.startswith("mods/mp_lockstep_1/") or (f.startswith("plugins/") and f.endswith(".dll"))
+                                      or f.startswith("netpunch/_internal/"))]      # the folder lobby's libraries (0.6.1.12+)
     require(not extra, "payload has unexpected files: " + ", ".join(extra))
     version = files["tpf2mp_version.txt"].read_text().strip() if "tpf2mp_version.txt" in files else "unknown"
     return files, version
@@ -563,14 +591,24 @@ def warn_unknown_lobby(path, state):
 
 
 def plan_install(game, steam, prefix, files, repair):
-    plan = {"copy": [], "remove": [], "links": [], "lobby": [], "alut": None, "lobby_bytes": None}
+    plan = {"copy": [], "remove": [], "links": [], "lobby": [], "alut": None, "lobby_bytes": None, "dll_bytes": {}}
     plan["alut"] = check_alut(game)[0]
-    # The lobby is compared and installed in its repaired form, so a rerun finds it current.
+    # The lobby is compared and installed in its repaired form, so a rerun finds it current:
+    # a one-file lobby (releases before 0.6.1.12) as a whole, a folder lobby by its plain DLL.
     shipped = files["netpunch/netpunch.exe"].read_bytes()
     if repair:
         state = lobby_state(shipped)[0]
         warn_unknown_lobby(files["netpunch/netpunch.exe"], state)
         plan["lobby_bytes"] = repair_lobby(shipped) if state == "broken" else shipped
+        for relative, source in files.items():
+            if relative.startswith("netpunch/_internal/") and PurePosixPath(relative).name.startswith(DLL_PREFIX) \
+                    and relative.lower().endswith(".dll"):
+                data = source.read_bytes()
+                if sha256(data) == BROKEN_DLL_SHA256:
+                    plan["dll_bytes"][relative] = repair_dll(data)
+                elif sha256(data) != REPAIRED_DLL_SHA256 and duplicate_relocations(data):
+                    say(f"WARNING: {source}: its miniupnpc DLL has duplicate relocations but is not the analysed one; "
+                        "hosting from Proton may crash. Please report this.")
     else:
         plan["lobby_bytes"] = shipped
     for relative, source in files.items():
@@ -578,7 +616,12 @@ def plan_install(game, steam, prefix, files, repair):
         if relative in KEEP_IF_PRESENT and target.exists():
             continue
         require(not target.is_symlink() and (not target.exists() or target.is_file()), f"{target} is not an ordinary file")
-        wanted = sha256(plan["lobby_bytes"]) if relative == "netpunch/netpunch.exe" else digest(source)
+        if relative == "netpunch/netpunch.exe":
+            wanted = sha256(plan["lobby_bytes"])
+        elif relative in plan["dll_bytes"]:
+            wanted = sha256(plan["dll_bytes"][relative])
+        else:
+            wanted = digest(source)
         if not (target.is_file() and digest(target) == wanted):
             plan["copy"].append(relative)
     if (game / MOD).is_dir():
@@ -631,6 +674,8 @@ def apply_install(game, steam, prefix, files, version, plan, tag):
         backup_of(relative)
         if relative == "netpunch/netpunch.exe":
             atomic_write(game / relative, plan["lobby_bytes"], mode=files[relative].stat().st_mode & 0o777)
+        elif relative in plan["dll_bytes"]:
+            atomic_write(game / relative, plan["dll_bytes"][relative], mode=files[relative].stat().st_mode & 0o777)
         else:
             atomic_copy(files[relative], game / relative)
     for path in plan["lobby"]:
@@ -668,6 +713,9 @@ def verify(game, steam, prefix, quiet=False):
     lobby = game / "netpunch/netpunch.exe"
     if lobby.is_file() and lobby_state(lobby.read_bytes())[0] == "broken":
         problems.append("netpunch.exe is not repaired for Wine (hosting would crash)")
+    dll = lobby_dll_in(game / "netpunch")
+    if dll is not None and sha256(dll.read_bytes()) == BROKEN_DLL_SHA256:
+        problems.append(f"{dll.name} is not repaired for Wine (hosting would crash)")
     for cached in cached_lobbies(prefix):
         if lobby_state(cached.read_bytes())[0] == "broken":
             problems.append(f"cached update lobby not repaired: {cached}")
@@ -725,13 +773,14 @@ def main(argv=None):
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--verify", action="store_true")
     mode.add_argument("--uninstall", action="store_true")
-    mode.add_argument("--repair-lobby", type=Path, metavar="NETPUNCH_EXE", help="repair this lobby executable in place and exit")
+    mode.add_argument("--repair-lobby", type=Path, metavar="LOBBY", help="repair this lobby folder, netpunch.exe or miniupnpc DLL in place and exit")
     args = ap.parse_args(argv)
 
     if args.repair_lobby:
         changed = repair_lobby_file(args.repair_lobby)
-        say(f"{args.repair_lobby}: {'repaired (64 duplicate relocations)' if changed else 'already repaired'}; "
-            f"sha256 {digest(args.repair_lobby)}")
+        target = lobby_dll_in(args.repair_lobby) if args.repair_lobby.is_dir() else args.repair_lobby
+        say(f"{target}: {'repaired (64 duplicate relocations)' if changed else 'already repaired'}; "
+            f"sha256 {digest(target)}")
         return 0
 
     steam, game, prefix = locate(args)
@@ -785,7 +834,7 @@ def main(argv=None):
             say(f"Replaced files were kept in {backup}")
         verify(game, steam, prefix)
         say("Next: in Steam, Properties > Compatibility > force a Proton version (Proton 9 or newer), and start the game. "
-            "To update, run this script again; do not use the in-game DOWNLOAD UPDATE button under Proton.")
+            "To update, run this script again with the new release.")
         return 0
 
 

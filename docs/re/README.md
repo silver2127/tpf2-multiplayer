@@ -61,7 +61,7 @@ being sent to the engine, so a sweep changes nothing, needs no restart, and take
 sample a sentinel value so nothing depends on ordering, and accept an offset only when it held the
 swept value in every sample.
 
-The sweep mode that did this (`groundtruth=1`, the mod's `gt.lua` and `tools/gt_correlate.ps1`) was
+The sweep mode that did this (`groundtruth=1`, the mod's `gt.lua` and its `gt_correlate.ps1` script) was
 removed with the other diagnostic switches; it is in git history, for example
 `git show v0.4.11:tools/gt_correlate.ps1`.
 

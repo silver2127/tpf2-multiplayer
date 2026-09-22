@@ -28,14 +28,6 @@ $Sbie  = "C:\Program Files\Sandboxie-Plus\Start.exe"
 $Box   = "GameAgent"
 
 function Get-MenuLog([string]$gameDir, [string]$localDir) {
-    $updates = Join-Path $localDir 'tpf2mp\updates'
-    $active = Join-Path $updates 'active.txt'
-    if (Test-Path $active) {
-        $version = (Get-Content $active -Raw).Trim()
-        if ($version -match '^\d{1,5}\.\d{1,5}\.\d{1,5}$') {
-            return Join-Path $updates "releases\$version\tpf2_menu.log"
-        }
-    }
     return Join-Path $gameDir 'tpf2_menu.log'
 }
 

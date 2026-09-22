@@ -67,6 +67,8 @@
 #include "logarchive_linux.h"
 #include "menu_game_linux.h"
 #include "slice_ready_linux.h"
+#include <dirent.h>
+#include <algorithm>
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -134,6 +136,13 @@ struct Model {
     std::string speedReq;      // speed= from "/speed"
     int syncReq = 0;           // sync= from "/sync"
     std::string startSave;     // host: the save START GAME shared
+    std::vector<SaveRow> saves;
+    std::string selectedSave;
+    bool startPending=false;
+    std::string recoveryPhase,recoveryDetail,recoveryStep,recoveryOperation,readyToken;
+    bool recoveryPresent=false,readyMine=false;
+    int readyCount=0,readyTotal=0;
+    uint64_t recoveryVersion=0,recoveryRequestedAt=0;
     std::vector<std::string> players, stages;
     std::vector<int> companies;
     std::vector<std::string> letters;   // relay lobbies: the relay's origin letter per player
@@ -145,7 +154,7 @@ struct Model {
 };
 
 struct Request {
-    enum Kind { Launch, Stop, Line, ShareStart, LoadedSave } kind;
+    enum Kind { Launch, Stop, Line, ShareStart, LoadedSave, ListSaves } kind;
     uint64_t gen;
     StartRequest start;
     std::string line;
@@ -894,10 +903,10 @@ static bool UdpPortFree(int port)
 
 static int PickRelayPort(bool join)
 {
-    if (!join) return GAME_RELAY_PORT_HOST;
-    for (int p = GAME_RELAY_PORT_JOIN; p < GAME_RELAY_PORT_JOIN + 32; p++)
+    const int first=join?GAME_RELAY_PORT_JOIN:GAME_RELAY_PORT_HOST;
+    for (int p = first; p < first + 32; p++)
         if (UdpPortFree(p)) return p;
-    return GAME_RELAY_PORT_JOIN;
+    return 0; // Let the launch fail explicitly rather than attach to another game.
 }
 
 // Origin names: a..z, then aa, ab, ... (menu_hook.cpp originName).
@@ -1555,7 +1564,50 @@ static void Dispatch(const std::string& line)
         return;
     }
     const std::string ty = JStr(ev, "type");
-    if (ty == "code") {
+    if (ty == "sync_state" || ty == "sync_prompt" || ty == "sync_feedback" || ty == "sync_ready_state") {
+        const auto phase=JStr(ev,"phase");
+        bool completed=false;
+        {
+            std::lock_guard<std::mutex> lk(S().mtx);auto& m=S().m;
+            m.recoveryRequestedAt=0;
+            if(ty=="sync_state") {
+                completed=phase=="complete" && m.recoveryPhase!="complete";
+                m.recoveryOperation=JStr(ev,"operation");m.recoveryPhase=phase;
+                m.recoveryDetail=OneLine(JStr(ev,"detail"));m.recoveryStep=JStr(ev,"step");
+                m.recoveryPresent=phase!="complete";
+                if(phase=="complete") {m.lobbyDone=true;m.startPending=false;g_captures=true;}
+            } else if(ty=="sync_feedback")m.recoveryDetail=OneLine(JStr(ev,"detail"));
+            else if(ty=="sync_ready_state") {
+                if(phase=="waiting") {
+                    m.recoveryPhase="readiness";m.recoveryPresent=true;m.readyToken=JStr(ev,"token");
+                    m.readyCount=JInt(ev,"ready_count",0);m.readyTotal=JInt(ev,"total",0);m.readyMine=JInt(ev,"is_ready",0)!=0;
+                    m.recoveryDetail.clear();
+                } else if(m.recoveryPhase=="readiness") {
+                    m.recoveryPhase=phase=="cancelled"?(JStr(ev,"kind")=="sync_retry"?"error":"detected"):"holding";
+                    if(phase=="cancelled")m.recoveryDetail="The player list changed. Request readiness again.";
+                }
+            } else {
+                const bool idle=m.recoveryPhase.empty()||m.recoveryPhase=="complete"||m.recoveryPhase=="detected"||m.recoveryPhase=="unavailable";
+                if(idle) {
+                    m.recoveryPhase=phase=="clear"?"":phase;m.recoveryPresent=phase!="clear";
+                    m.recoveryDetail.clear();m.recoveryStep.clear();
+                }
+            }
+            ++m.recoveryVersion;
+        }
+        if(completed){
+            // Recovery loads bypass the legacy start/save stage watcher. Clear
+            // transfer progress explicitly so company actions are not left
+            // waiting for a player whose world has already joined the session.
+            S().stageWatch=false;S().stageSent.clear();
+            AppendIn("{\"cmd\":\"stage\",\"text\":\"\"}");
+        }
+        Dirty();
+    } else if (ty == "mods_refresh") {
+        MenuGame_RequestModRefresh();Status("Registering downloaded mods...");
+    } else if (ty == "mods_cancelled") {
+        const auto reason=JStr(ev,"text");Leave();Status(reason);
+    } else if (ty == "code") {
         const std::string cd = JStr(ev, "code");
         if (cd.empty()) return;
         // The copy waits for the next input or window event on the UI thread
@@ -1584,6 +1636,9 @@ static void Dispatch(const std::string& line)
         }
     } else if (ty == "status") {
         const std::string detail = JStr(ev, "detail");
+        if(JStr(ev,"state")=="failed" || detail.find("no players to share with")==0 || detail.find("Not shared:")==0) {
+            std::lock_guard<std::mutex> lk(S().mtx);S().m.startPending=false;
+        }
         if (!detail.empty()) Status(Cap(OneLine(detail), 300));
     } else if (ty == "transfer") {
         const std::string role = JStr(ev, "role"), st = JStr(ev, "state"), peer = JStr(ev, "peer");
@@ -1790,6 +1845,7 @@ static void Launch(const Request& r)
     const std::string dir = LobbyFolder(prog);
     S().lobbyDir = dir;
     const int relayPort = PickRelayPort(a.join);
+    if(!relayPort) { Status("No local relay port is available."); return; }
     if (a.join && relayPort != GAME_RELAY_PORT_JOIN)
         Log("[lobby] relay port %d is taken (another joiner on this machine) -> using %d\n", GAME_RELAY_PORT_JOIN, relayPort);
     const int bridgePort = ReadBridgePort();
@@ -1819,6 +1875,8 @@ static void Launch(const Request& r)
     }
     if (!a.password.empty()) argv.push_back("--password=" + a.password);
     if (!a.join) {
+        if (a.dedicated) argv.push_back("--dedicated");
+        if (a.localPort > 0) argv.push_back("--local-port=" + std::to_string(a.localPort));
         argv.push_back("--lobby-name=" + a.lobbyName);
         if (a.separateCompanies) argv.push_back("--companies");
         if (!S().cfg.masterUrl.empty()) {
@@ -1828,6 +1886,11 @@ static void Launch(const Request& r)
         if (S().cfg.shareMods == 2) argv.push_back("--no-share-mods");
     }
     argv.push_back("--io-dir=" + NoSlash(dir));
+    // Advertise the native controller to the shared recovery runtime, just as
+    // the Windows launcher does. Paths are individual argv entries on Linux.
+    argv.push_back("--sync-runtime-dir=" + NoSlash(S().cfg.dataDir));
+    argv.push_back("--save-dir=" + NoSlash(MenuGame_SaveDir()));
+    argv.push_back("--game-pid=" + std::to_string((long)getpid()));
     argv.push_back("--parent-pid");
     argv.push_back(std::to_string((long)getpid()));
     Log("[lobby] lobby cmd (in %s): %s\n", dir.c_str(), Shown(argv).c_str());
@@ -1875,9 +1938,14 @@ static void Launch(const Request& r)
 static void ShareAndStart()
 {
     std::string readiness;
-    if (!CancellationReady(&readiness)) { Status(readiness); return; }
+    if (!CancellationReady(&readiness)) {
+        {std::lock_guard<std::mutex> lk(S().mtx);S().m.startPending=false;}
+        Status(readiness); return;
+    }
     std::string save;
-    if (MenuGame_NewestSave(&save) && !save.empty()) {
+    { std::lock_guard<std::mutex> lk(S().mtx);save=S().m.selectedSave; }
+    struct stat info{};
+    if (!save.empty() && !stat(save.c_str(),&info) && S_ISREG(info.st_mode) && info.st_size>0) {
         {
             std::lock_guard<std::mutex> lk(S().mtx);
             S().m.startSave = save;
@@ -1887,10 +1955,87 @@ static void ShareAndStart()
         Log("[lobby] START GAME: sharing %s\n", save.c_str());
         Status("Sharing save & starting game\xE2\x80\xA6");
     } else {
-        AppendIn("{\"cmd\":\"start\"}");
-        Log("[lobby] START GAME: no save found in %s\n", MenuGame_SaveDir().c_str());
-        Status("No save found to share.");
+        {std::lock_guard<std::mutex> lk(S().mtx);S().m.startPending=false;}
+        Status("The selected save is no longer available. Choose another save.");
     }
+}
+
+// Runs on the lobby worker, including while no lobby exists. All engine work
+// is queued through MenuGame's verified UI frame gate.
+static void DedicatedTick()
+{
+    const auto& d = S().cfg.dedicated;
+    if (!d.enabled) return;
+    static uint64_t next = 0, menuSince = 0, lastHost = 0, lastLoad = 0, lastSave = 0, worldSince = 0;
+    const uint64_t now = NowMs();
+    if (now < next) return;
+    next = now + 1000;
+    const bool world = g_gameUiSeen.load();
+    if (!world) {
+        worldSince = 0;
+        if (!g_titleMenu.load()) { menuSince = 0; return; }
+        if (!menuSince) menuSince = now;
+        if (now - menuSince < 8000) return;
+    }
+    if (!S().child.pid) {
+        if (world || (lastHost && now - lastHost < 15000)) return;
+        lastHost = now;
+        StartRequest request;
+        request.name = d.name; request.lobbyName = d.lobby; request.password = d.password;
+        request.pub = d.publicGame; request.separateCompanies = d.companies;
+        request.dedicated = true; request.localPort = d.port;
+        std::string why;
+        if (Start(request, &why)) Log("[dedicated] hosting '%s' as '%s'\n", d.lobby.c_str(), d.name.c_str());
+        else Log("[dedicated] host waits: %s\n", why.c_str());
+        return;
+    }
+    if (!world) {
+        bool ready;
+        { std::lock_guard<std::mutex> lk(S().mtx); ready = S().m.lobbyReady; }
+        if (!ready || MenuGame_Loading() || now - menuSince < 45000 ||
+            (lastLoad && now - lastLoad < 60000)) return;
+        lastLoad = now;
+        std::string save;
+        if (!d.save.empty()) {
+            save = MenuGame_SaveDir() + "/" + d.save + ".sav";
+            if (!Exists(save)) { Log("[dedicated] %s absent; trying newest save\n", save.c_str()); save.clear(); }
+        }
+        if (save.empty() && !MenuGame_NewestSave(&save)) {
+            Log("[dedicated] no save to load in %s\n", MenuGame_SaveDir().c_str()); return;
+        }
+        { std::lock_guard<std::mutex> lk(S().mtx); S().m.startSave = save; }
+        MarkSaveShared(save);
+        WriteCompanyCfg();
+        Log("[dedicated] loading %s\n", save.c_str());
+        if (DoStartLoad(save)) { S().sessionStarted = true; ArmStageWatch("loading world"); }
+        return;
+    }
+    if (!worldSince) { worldSince = now; lastSave = now; }
+    if (d.autosaveMinutes > 0 && now - worldSince >= 60000 && !MenuGame_Loading() &&
+        now - lastSave >= uint64_t(d.autosaveMinutes) * 60000) {
+        lastSave = now;
+        if (MenuGame_ForceAutosave()) Log("[dedicated] autosave requested (every %d min)\n", d.autosaveMinutes);
+        else Log("[dedicated] autosave unavailable; check the game's autosave setting\n");
+    }
+}
+
+static void ReadSaves(uint64_t gen)
+{
+    std::vector<SaveRow> rows;
+    const std::string directory=MenuGame_SaveDir();
+    if(DIR* d=opendir(directory.c_str())) {
+        while(const auto* e=readdir(d)) {
+            std::string name=e->d_name;
+            if(name.size()<5 || name.compare(name.size()-4,4,".sav"))continue;
+            const std::string path=directory+(directory.empty() || directory.back()!='/' ? "/" : "")+name;struct stat st{};
+            if(!stat(path.c_str(),&st)&&S_ISREG(st.st_mode)&&st.st_size>0)
+                rows.push_back({path,name,MtimeNs(path,nullptr)});
+        }
+        closedir(d);
+    }
+    std::sort(rows.begin(),rows.end(),[](const SaveRow& a,const SaveRow& b){return a.modified==b.modified?a.name>b.name:a.modified>b.modified;});
+    {std::lock_guard<std::mutex> lk(S().mtx);if(S().m.gen!=gen)return;S().m.saves=std::move(rows);}
+    Dirty();
 }
 
 static void LobbyThread()
@@ -1911,6 +2056,9 @@ static void LobbyThread()
                 case Request::Stop:
                     Teardown();
                     break;
+                case Request::ListSaves:
+                    ReadSaves(r.gen);
+                    break;
                 case Request::Line:
                 case Request::ShareStart:
                 case Request::LoadedSave:
@@ -1926,6 +2074,7 @@ static void LobbyThread()
                     break;
             }
         }
+        DedicatedTick();
         if (!S().child.pid) continue;
         TailOut();
         CheckExit();
@@ -2186,12 +2335,54 @@ std::string StartGame()
         if (!S().m.active || !S().m.isHost) return std::string();
         if (S().m.dead) return kNotRunning;
         if (!S().m.lobbyReady) return "Lobby is starting\xE2\x80\xA6";
+        if(S().m.startPending)return "The selected save is being shared. Please wait.";
+        if(S().m.selectedSave.empty())return "Choose a save before starting.";
         gen = S().m.gen;
     }
     std::string readiness;
     if (!CancellationReady(&readiness)) return readiness;
+    {std::lock_guard<std::mutex> lk(S().mtx);S().m.startPending=true;}
     Queue(Request{ Request::ShareStart, gen, StartRequest(), std::string() });
     return std::string();
+}
+
+void RefreshSaves() {
+    uint64_t gen;
+    {std::lock_guard<std::mutex> lk(S().mtx);gen=S().m.gen;}
+    Queue(Request{Request::ListSaves,gen,StartRequest(),std::string()});
+}
+std::string SelectSave(const std::string& path) {
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(S().mtx);
+        if(!S().m.isHost || S().m.lobbyDone || S().m.startPending)return "The save cannot be changed while a world is starting or running.";
+        const auto& rows=S().m.saves;
+        if(std::none_of(rows.begin(),rows.end(),[&](const SaveRow& r){return r.path==path;}))return "Refresh the save list and choose a save.";
+        S().m.selectedSave=path;gen=S().m.gen;
+    }
+    QueueLine(gen,"{\"cmd\":\"advertise_mods\",\"save\":\""+JsonEscape(path)+"\"}");
+    return std::string();
+}
+
+std::string RecoveryAction(const std::string& command) {
+    uint64_t gen;std::string operation,token;
+    {
+        std::lock_guard<std::mutex> lk(S().mtx);auto& m=S().m;
+        if(!m.active||m.dead)return kNotRunning;
+        if(m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000)return "Waiting for the lobby...";
+        if(command=="sync_ready") {
+            if(m.recoveryPhase!="readiness"||m.readyMine)return "Readiness is already confirmed.";
+        } else if(command=="sync_request"||command=="sync_retry") {
+            if(!m.isHost)return "Only the host can request a resync.";
+            const auto& phase=m.recoveryPhase;
+            if(command=="sync_retry" ? phase!="error" : !(phase.empty()||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))
+                return "A world operation is already running.";
+        } else return "Unknown recovery action.";
+        m.recoveryRequestedAt=NowMs();m.recoveryDetail.clear();operation=m.recoveryOperation;token=m.readyToken;gen=m.gen;
+    }
+    QueueLine(gen,"{\"cmd\":\""+command+"\",\"operation\":\""+JsonEscape(operation)+"\",\"token\":\""+JsonEscape(token)+
+                  "\",\"id\":\"native-"+std::to_string(getpid())+"-"+std::to_string(NowMs())+"\"}");
+    return "Request sent.";
 }
 
 std::string SetSeparateCompanies(bool on)
@@ -2290,6 +2481,11 @@ void Snapshot(View* v)
 {
     std::lock_guard<std::mutex> lk(S().mtx);
     const Model& m = S().m;
+    v->recoveryPhase=m.recoveryPhase;v->recoveryDetail=m.recoveryDetail;v->recoveryStep=m.recoveryStep;
+    v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
+    v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
+    v->readyMine=m.readyMine;v->readyCount=m.readyCount;v->readyTotal=m.readyTotal;v->recoveryVersion=m.recoveryVersion;
+    v->saves=m.saves;v->selectedSave=m.selectedSave;v->startPending=m.startPending;
     v->separateCompanies = m.separateCompanies;
     v->haveCode = m.haveCode;
     v->isHost = m.isHost;
@@ -2406,7 +2602,7 @@ void OnMenuPage(int page)
         g_titleMenu = true;
         // the title menu exists only when no game runs: forget the last session's
         // CGameUI, or a start at the title menu would look like one in a game
-        if (g_gameUiSeen.exchange(false) && g_childPid.load()) {
+        if (g_gameUiSeen.exchange(false) && g_childPid.load() && !MenuGame_Loading()) {
             // Leave only enqueues teardown: never wait for the child in CreatePage.
             Leave();
             Status("Left the lobby: you left the world. HOST or JOIN to play again.");

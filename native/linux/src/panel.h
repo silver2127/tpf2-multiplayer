@@ -39,6 +39,7 @@ bool Hover(int* x, int* y, int* w, int* h, bool* pressed);
 // Install the SDL event filter. Called from the render thread on the first
 // presented frame, when SDL and the window certainly exist. Idempotent.
 void InstallInput();
+bool SetActionsHeld(bool held);
 
 // The status line under the panel (and the lobby page's). Any thread; takes the
 // panel's lock, so never from inside a panel or lobby call. For the menu-game

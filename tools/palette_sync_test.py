@@ -13,6 +13,7 @@ and that the golden-angle overflow starts at the same company id (cid - N-1) in 
 """
 from pathlib import Path
 import re
+from slice_source import slice_source   # the source with native/src/slice/*.inl inlined
 
 repo = Path(__file__).resolve().parents[1]
 
@@ -22,7 +23,7 @@ def triples(text, pat):
 
 
 menu = (repo / "native/src/menu_hook.cpp").read_text(encoding="utf-8")
-slice_ = (repo / "native/src/slice_hook.cpp").read_text(encoding="utf-8")
+slice_ = slice_source(repo)
 comp = (repo / "mod/mp_lockstep_1/res/scripts/mp/companies.lua").read_text(encoding="utf-8")
 ss = (repo / "mod/mp_lockstep_1/res/config/style_sheet/mp_lockstep.lua").read_text(encoding="utf-8")
 

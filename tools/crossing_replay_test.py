@@ -14,10 +14,22 @@ for name in ("geom", "roads", "shared_infra", "inject"):
     lua.globals()[name.upper()] = (ROOT / "mod/mp_lockstep_1/res/scripts/mp" / f"{name}.lua").read_text(encoding="utf-8")
 lua.execute(r'''
 local nodes, edges, streetMap, trackMap, proposals, logs, models
-local CT = {BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_STREET=3,BASE_EDGE_TRACK=4,MODEL_INSTANCE_LIST=5}
+local CT = {BASE_NODE=1,BASE_EDGE=2,BASE_EDGE_STREET=3,BASE_EDGE_TRACK=4,MODEL_INSTANCE_LIST=5,PLAYER_OWNED=6}
 local function vec(x,y,z) return {x=x,y=y,z=z} end
-local function edgeNew() return {comp={objects={}}} end
+local ownerType = {}
+local function edgeNew()
+  local owner
+  return setmetatable({comp={objects={}}}, {
+    __index=function(_,k) if k=='playerOwned' then return owner end end,
+    __newindex=function(t,k,v)
+      if k=='playerOwned' then
+        -- Observed on the live engine: ordinary tables silently clear it.
+        owner = getmetatable(v)==ownerType and v or nil
+      else rawset(t,k,v) end
+    end})
+end
 api={type={ComponentType=CT,Vec3f={new=vec},
+  PlayerOwned={new=function() return setmetatable({},ownerType) end},
   NodeAndEntity={new=function() return {comp={}} end},
   SegmentAndEntity={new=edgeNew},
   BaseEdgeTrack={new=function() return {} end},
@@ -32,6 +44,7 @@ api={type={ComponentType=CT,Vec3f={new=vec},
       if kind==CT.BASE_NODE then return nodes[id] end
       local e=edges[id]
       if not e then return nil end
+      if kind==CT.PLAYER_OWNED then return e.playerOwned end
       if kind==CT.BASE_EDGE then return e.comp end
       if kind==CT.BASE_EDGE_TRACK and e.type==1 then return e.trackEdge end
       if kind==CT.BASE_EDGE_STREET and e.type==0 then return e.streetEdge end
@@ -89,6 +102,34 @@ local function execute(c,keepPlan)
     assert(not seen[key],'duplicate endpoint pair');seen[key]=true
   end
   return sp,xv
+end
+function test_edge_ownership()
+  for _, pid in ipairs({2002,3003}) do
+    reset()
+    CM.cmMode='companies';CM.cmCompanyPid={[2]=pid};CM.cmEnsure=function() end
+    CM.cmCompanyOfPid=function(p) return p==pid and 2 or nil end
+    assert(CM.edgeOwnerCompany(pid)==2 and CM.edgeOwnerCompany(-1)==0)
+    assert(not pcall(CM.edgeOwnerCompany,987654),'unmapped entity escaped onto wire')
+    local sp=execute({etype=0,pts='0,0,0,10,0,0,20,0,0',links='1,2,2,3',fv='1,2,3',own='2,0'})
+    assert(sp.edgesToAdd[1].playerOwned.player==pid,'owner not translated on receiver')
+    assert(sp.edgesToAdd[2].playerOwned==nil,'public road has owner')
+  end
+  reset()
+  CM.cmMode='coop';CM.cmEnsure=function() end;CM.cmCompanyOfPid=function() end
+  assert(CM.edgeOwnerCompany(99)==1)
+  node(101,0,-20,0);node(102,0,20,0);edge(201,101,102,0)
+  edges[201].playerOwned={player=777}
+  local sp=execute({etype=1,pts='-20,0,0,20,0,0',links='1,2',fv='1,2',own=1})
+  for _, e in ipairs(sp.edgesToAdd) do
+    assert(e.playerOwned.player==(e.type==0 and 777 or 99),'crossing lost original or new ownership')
+  end
+  local e={playerOwned={player=99}};CM.applyEdgeOwner(e,0);assert(e.playerOwned==nil)
+  CM.applyEdgeOwner(e,nil);assert(e.playerOwned==nil)
+  for _, bad in ipairs({'1,0','-1','1,','1,,2','unknown','9'}) do
+    reset();CM.cmMode='companies';CM.cmCompanyPid={};CM.cmEnsure=function() end
+    CM.execPolyline({etype=0,pts='0,0,0,20,0,0',links='1,2',fv='1,2',own=bad},false)
+    assert(#proposals==0,'invalid ownership submitted a proposal: '..bad)
+  end
 end
 function test_company_build()
   for _, companyPid in ipairs({2002,3003}) do
@@ -245,6 +286,39 @@ function test_fresh_parallel()
   local sp=execute({etype=1,pts='-20,1,0,0,1,0,20,1,0',links='1,2,2,3',fv='1,2,3'})
   assert(#sp.nodesToAdd==3 and #sp.edgesToAdd==2 and #sp.edgesToRemove==0,'fresh parallel track snapped to existing one')
 end
+-- The second track of a double track sits 5 m from the first. Bulge the
+-- existing track toward the new one so the closest approach is mid-segment
+-- (a straight pair meets first at the rail's end, which the endpoint case
+-- already skips): 2.9 m apart, parallel -> not a crossing, nothing split.
+function test_parallel_neighbour()
+  reset()
+  node(101,-20,0,0);node(102,20,0,0);edge(201,101,102,1)
+  edges[201].comp.tangent0=vec(40,8,0);edges[201].comp.tangent1=vec(40,-8,0)
+  local sp=execute({etype=1,pts='-20,4.9,0,20,4.9,0',links='1,2',fv='1,2'})
+  assert(#sp.edgesToRemove==0,'a parallel track 2.9 m away was split as a crossing')
+  assert(#sp.nodesToAdd==2 and #sp.edgesToAdd==1,'parallel track changed the build shape')
+  local said=false
+  for _,l in ipairs(logs) do if l:find('parallel, not a crossing',1,true) then said=true end end
+  assert(said,'parallel guard did not fire: '..table.concat(logs,'\n'))
+end
+-- The upgrade tool replaces an edge between its own two nodes (rm= names it).
+-- Whatever stands beside that edge -- here another track brushing it at 20
+-- degrees, 1 m away, a shape the engine itself would never have allowed to
+-- cross -- the segment takes the old edge's place and the crossing pass is
+-- skipped: one removal (the replaced edge), one edge, no new node.
+function test_in_place_upgrade()
+  reset()
+  node(101,-20,0,0);node(102,20,0,0);edge(201,101,102,1)
+  node(103,-20,15,0);node(104,20,1,0);edge(202,103,104,1)
+  local sp=execute({etype=1,pts='-20,0,0,20,0,0',links='1,2',rm='-20,0,20,0'})
+  assert(#sp.edgesToRemove==1 and sp.edgesToRemove[1]==201,'in-place upgrade removed '..#sp.edgesToRemove..' edge(s)')
+  assert(#sp.nodesToAdd==0 and #sp.edgesToAdd==1,'in-place upgrade changed shape: nodes '..#sp.nodesToAdd..' edges '..#sp.edgesToAdd)
+  local e=sp.edgesToAdd[1]
+  assert((e.comp.node0==101 and e.comp.node1==102) or (e.comp.node0==102 and e.comp.node1==101),'replacement not between the old nodes')
+  local said=false
+  for _,l in ipairs(logs) do if l:find('in place) -- no crossings',1,true) then said=true end end
+  assert(said,'in-place guard did not fire: '..table.concat(logs,'\n'))
+end
 function test_bridge_companion(reverse,isTrack)
   reset()
   node(101,0,-20,20);node(102,0,20,20)
@@ -281,10 +355,12 @@ function test_same_network_companion(isTrack)
   edge(201,101,102,isTrack and 1 or 0)
   edges[201].comp.type=1;edges[201].comp.typeIndex=4;edges[201].comp.objects={{778,1}}
   edges[201].streetEdge.streetType=24;edges[201].trackEdge.trackType=1;edges[201].trackEdge.catenary=false
+  edges[201].playerOwned={player=777}
   local sp=execute({etype=isTrack and 1 or 0,pts='-20,0,0,20,0,0',links='1,2',fv='1,2',bs='40,-20,20,40,20,20,4'})
   assert(#sp.edgesToAdd==2 and #sp.nodesToAdd==2 and #sp.edgesToRemove==1,'same-network companion shape')
   assert(sp.edgesToRemove[1]==201)
   local e=sp.edgesToAdd[2]
+  assert(e.playerOwned.player==777,'companion owner lost')
   assert(e.type==(isTrack and 1 or 0) and e.comp.type==1 and e.comp.typeIndex==4,'same-network bridge kind/model lost')
   assert(e.comp.node0==101 and e.comp.node1==102 and e.comp.objects[1][1]==778,'same-network bridge orientation/object lost')
   if isTrack then assert(e.trackEdge.trackType==1 and e.trackEdge.catenary==false,'track bridge took the new track props')
@@ -310,7 +386,9 @@ if __name__ == "__main__":
                     lua.globals().test_no_crossing(is_track, bridge, planned)
             lua.globals().test_existing_crossing(is_track)
         lua.globals().test_fresh_parallel()
-        print("PASS: both bridge/height guards, existing crossing nodes, and fresh parallel tracks")
+        lua.globals().test_parallel_neighbour()
+        lua.globals().test_in_place_upgrade()
+        print("PASS: both bridge/height guards, existing crossing nodes, fresh parallel tracks, a parallel neighbour and an in-place upgrade")
     if "companions" in cases:
         for reverse in (False, True):
             for is_track in (False, True):
@@ -321,6 +399,8 @@ if __name__ == "__main__":
             lua.globals().test_same_network_companion(is_track)
         print("PASS: bridge replacement kinds (both networks), properties, objects, orientation and mismatch rejection")
     lua.globals().test_company_build()
+    lua.globals().test_edge_ownership()
+    print('PASS: owned/public edges, distinct peer player IDs, crossing and companion ownership, invalid-owner rejection')
     lua.globals().test_raised_ground_crossing()
     for count in (2, 4):
         lua.globals().test_rail_multiple_roads(count)
