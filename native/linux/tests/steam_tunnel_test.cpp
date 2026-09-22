@@ -13,6 +13,13 @@ static int registrations = 0, removals = 0;
 static std::atomic<int> reliablePackets{0}, accepted{0};
 #define API extern "C" __attribute__((visibility("default")))
 static int subscribed=0, downloaded=0;
+static std::map<int,int32_t> configValues;
+API void* SteamAPI_SteamNetworkingUtils_SteamAPI_v004() { return reinterpret_cast<void*>(4); }
+API bool SteamAPI_ISteamNetworkingUtils_SetConfigValue(void* utils,int id,int scope,intptr_t object,int type,const void* value) {
+    assert(utils==reinterpret_cast<void*>(4) && scope==1 && object==0 && type==1);
+    assert(id==10 || id==11 || id==9 || id==47);
+    configValues[id]=*static_cast<const int32_t*>(value);return true;
+}
 API void* SteamAPI_SteamUGC_v016() { return reinterpret_cast<void*>(3); }
 API uint64_t SteamAPI_ISteamUGC_SubscribeItem(void*, uint64_t id) { assert(id==123);++subscribed;return 7; }
 API bool SteamAPI_ISteamUGC_DownloadItem(void*, uint64_t id, bool high) { assert(id==123 && high);++downloaded;return true; }
@@ -116,6 +123,8 @@ int main() {
     assert(Control(caller, control, "CLOSE 2002") == "OK");
     assert(Control(caller, control, "STATUS").find("endpoints=0") != std::string::npos);
     SteamTunnel_Stop(); assert(registrations == 2 && removals == 2);
+    assert(configValues.size()==4 && configValues[10]==1024*1024 && configValues[11]==16*1024*1024);
+    assert(configValues[9]==8*1024*1024 && configValues[47]==8*1024*1024);
     std::ifstream identity(dir + "tpf2_steam.txt"); assert(identity.peek() == EOF);
     { std::ofstream disabled(dir + "tpf2mp_steam_off.txt"); disabled << "1\n"; }
     assert(!SteamTunnel_Start(dir, LogTest));

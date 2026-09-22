@@ -50,6 +50,7 @@ using SOCKET = int;
 using SocketLength = socklen_t;
 using DWORD = uint32_t;
 constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
 static int closesocket(SOCKET s) { return close(s); }
 static int WSAGetLastError() { return errno; }
 static uint64_t GetTickCount64() {
@@ -186,6 +187,10 @@ struct Endpoint {
     uint16_t port = 0;
     DWORD lastSeen = 0;
     uint64_t in = 0, out = 0, reliable = 0;
+    uint64_t inBytes = 0, outBytes = 0, failed = 0, localFailed = 0;
+    uint64_t statsIn = 0, statsOut = 0;
+    DWORD statsAt = 0, bulkAt = 0;
+    bool bulkSeen = false;
 };
 
 bool ResolveApi()
@@ -243,6 +248,14 @@ SOCKET BindLoopback(const char* ip, uint16_t port, uint16_t* portOut)
     if (s >= FD_SETSIZE || fcntl(s, F_SETFL, O_NONBLOCK) < 0 ||
         fcntl(s, F_SETFD, FD_CLOEXEC) < 0) { closesocket(s); return INVALID_SOCKET; }
 #endif
+    // 16 MB BUFFERS (2026-09-22). The lobby hands a save transfer's whole window to
+    // an endpoint socket in one burst (128 x 32 KB = 4 MB) and Windows' default UDP
+    // receive buffer is 64 KB: loopback drops everything past it without an error,
+    // so a chunk never reached Steam and the transfer stalled on that hole (base
+    // 132/4199, and 15/12781 in 0.6.1.15). Best effort: a refusal leaves the default.
+    int big = 16 * 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&big, sizeof(big));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&big, sizeof(big));
     return s;
 }
 
@@ -379,8 +392,13 @@ unsigned TunnelThread(void*)
     if (g_api.utils && g_api.setConfig) {
         void* utils = g_api.utils();
         struct { const char* name; int id; int32_t value; } cfg[] = {
-            { "SendRateMin",    23,  1 * 1024 * 1024 },
-            { "SendRateMax",    24, 16 * 1024 * 1024 },
+            // 10 and 11 (steamnetworkingtypes.h). Until 2026-09-22 these were 23 and 24,
+            // which are IP_AllowWithoutAuth and TimeoutInitial: the rate was never
+            // raised, unauthenticated IP connections were allowed and the initial
+            // timeout was 4.6 hours (the log's "SendRateMax: 10000 ->" was the
+            // 10,000 ms timeout default).
+            { "SendRateMin",    10,  1 * 1024 * 1024 },
+            { "SendRateMax",    11, 16 * 1024 * 1024 },
             { "SendBufferSize",  9,  8 * 1024 * 1024 },
             { "RecvBufferSize", 47,  8 * 1024 * 1024 },
         };
@@ -432,8 +450,13 @@ unsigned TunnelThread(void*)
     };
     auto sendP2P = [&](uint64_t id, const char* data, int len, int channel, Endpoint* e) {
         const int type = (len > (int)UNRELIABLE_MAX) ? SEND_RELIABLE : SEND_UNRELIABLE;
-        if (!g_api.send(g_api.net, id, data, (uint32_t)len, type, channel)) { sendFail++; return; }
-        if (e) { e->out++; if (type == SEND_RELIABLE) e->reliable++; }
+        if (e && (type == SEND_RELIABLE || (len >= 9 && memcmp(data + 5, "NPF1", 4) == 0))) {
+            e->bulkAt = GetTickCount(); e->bulkSeen = true;
+        }
+        if (!g_api.send(g_api.net, id, data, (uint32_t)len, type, channel)) {
+            sendFail++; if (e) e->failed++; return;
+        }
+        if (e) { e->out++; e->outBytes += len; if (type == SEND_RELIABLE) e->reliable++; }
     };
 
     while (!g_stop) {
@@ -456,9 +479,13 @@ unsigned TunnelThread(void*)
                 Endpoint* e = endpointFor(from);
                 if (!e) continue;
                 if (ch == CH_CTL) continue;                       // OPEN: the endpoint now exists, nothing to forward
-                e->in++;
+                e->in++; e->inBytes += got;
+                if (got > UNRELIABLE_MAX || (got >= 9 && memcmp(buf.data() + 5, "NPF1", 4) == 0)) {
+                    e->bulkAt = GetTickCount(); e->bulkSeen = true;
+                }
                 if (!lobby.sin_port) { dropNoLobby++; continue; }
-                sendto(e->sock, buf.data(), (int)got, 0, (sockaddr*)&lobby, sizeof(lobby));
+                if (sendto(e->sock, buf.data(), (int)got, 0, (sockaddr*)&lobby, sizeof(lobby)) == SOCKET_ERROR)
+                    e->localFailed++;
             }
         }
         // ---- outbound: the lobby's datagrams on each endpoint socket, and control
@@ -532,6 +559,25 @@ unsigned TunnelThread(void*)
                     sendto(ctl, reply.data(), (int)reply.size(), 0, (sockaddr*)&from, fl);
                 }
             }
+        }
+        // Bounded diagnostics for actual bulk activity, including a stalled queue.
+        DWORD statsNow = GetTickCount();
+        for (auto& kv : eps) {
+            auto& e = kv.second;
+            if (!e.statsAt) { e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes; }
+            DWORD dt = statsNow - e.statsAt;
+            if (dt < 5000) continue;
+            if (e.bulkSeen && statsNow - e.bulkAt <= 30000) {
+                P2PSessionState st = {};
+                bool have = g_api.sessionState && g_api.sessionState(g_api.net, kv.first, &st);
+                g_log("[steam-bulk] endpoint=%u in=%lluB out=%lluB rx=%.3fMB/s tx=%.3fMB/s queued=%dB packets=%d send_fail=%llu local_fail=%llu active=%d relay=%d\n",
+                      (unsigned)e.port, (unsigned long long)e.inBytes, (unsigned long long)e.outBytes,
+                      (e.inBytes - e.statsIn) / (dt * 1000.0), (e.outBytes - e.statsOut) / (dt * 1000.0),
+                      have ? st.bytesQueued : -1, have ? st.packetsQueued : -1,
+                      (unsigned long long)e.failed, (unsigned long long)e.localFailed,
+                      have ? st.active : -1, have ? st.usingRelay : -1);
+            }
+            e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes;
         }
         // ---- idle endpoints
         DWORD now = GetTickCount();

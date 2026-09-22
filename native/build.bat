@@ -62,7 +62,8 @@ exit /b 0
 ml64 /nologo /c /Fo out\deferrelay_slice.obj src\deferrelay_slice.asm                || exit /b 1
 ml64 /nologo /c /Fo out\trainorderrelay_slice.obj src\trainorderrelay_slice.asm      || exit /b 1
 ml64 /nologo /c /Fo out\moveorderrelay_slice.obj src\moveorderrelay_slice.asm        || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_slice%SFX%.dll out\hook_slice.obj out\slice_hook.obj out\deferrelay_slice.obj out\trainorderrelay_slice.obj out\moveorderrelay_slice.obj || exit /b 1
+ml64 /nologo /c /Fo out\hotjoinrelay_slice.obj src\hotjoinrelay_slice.asm          || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_slice%SFX%.dll out\hook_slice.obj out\slice_hook.obj out\deferrelay_slice.obj out\trainorderrelay_slice.obj out\moveorderrelay_slice.obj out\hotjoinrelay_slice.obj || exit /b 1
 exit /b 0
 
 :workshop

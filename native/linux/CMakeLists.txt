@@ -32,7 +32,7 @@ add_library(tpf2mp_boot SHARED src/boot.cpp src/lua_fixed_format_linux.cpp
             src/windows_person_seed_linux.cpp src/windows_person_cost_linux.cpp
             src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp
             src/tree_rng_linux.cpp src/animal_rng_linux.cpp src/building_order_linux.cpp
-            src/resident_hash_linux.cpp src/person_map_order_linux.cpp
+            src/resident_hash_linux.cpp src/order_canon_linux.cpp src/person_map_order_linux.cpp
             src/windows_entity_set_order_linux.cpp src/target_order_linux.cpp src/network_person_order_linux.cpp src/network_index_order_linux.cpp
             src/hook_posix.cpp)
 set_target_properties(tpf2mp_boot PROPERTIES PREFIX "lib")
@@ -186,6 +186,11 @@ if(BUILD_TESTING)
   target_compile_options(test_resident_hash PRIVATE -UNDEBUG)
   target_link_libraries(test_resident_hash PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME resident_hash COMMAND test_resident_hash $<TARGET_FILE:slice_test_foreign>)
+  add_executable(test_order_canon tests/order_canon_test.cpp src/hook_posix.cpp)
+  target_include_directories(test_order_canon PRIVATE ../src src)
+  target_compile_options(test_order_canon PRIVATE -UNDEBUG -fno-omit-frame-pointer)
+  target_link_libraries(test_order_canon PRIVATE Threads::Threads)
+  add_test(NAME order_canon COMMAND test_order_canon)
   add_executable(test_person_map_order tests/person_map_order_test.cpp src/hook_posix.cpp)
   target_include_directories(test_person_map_order PRIVATE ../src src)
   target_compile_options(test_person_map_order PRIVATE -UNDEBUG)
@@ -324,6 +329,12 @@ if(BUILD_TESTING)
   add_library(test_steam_persona SHARED tests/steam_persona_fake.cpp)
   set_target_properties(test_steam_persona PROPERTIES OUTPUT_NAME steam_api)
   target_compile_options(test_steam_persona PRIVATE -fvisibility=default)
+  add_executable(test_panel_title tests/panel_title_test.cpp src/panel_layer.cpp)
+  target_include_directories(test_panel_title PRIVATE ../src src)
+  target_compile_options(test_panel_title PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+  target_link_options(test_panel_title PRIVATE -Wl,--gc-sections)
+  target_link_libraries(test_panel_title PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME panel_title COMMAND test_panel_title)
   add_executable(test_panel_names tests/panel_names_test.cpp)
   target_include_directories(test_panel_names PRIVATE ../src src)
   target_compile_options(test_panel_names PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)

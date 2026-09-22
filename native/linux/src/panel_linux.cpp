@@ -57,7 +57,7 @@ using layer::rgb;
 
 // ---- state ------------------------------------------------------------------------
 struct PanelState {
-    std::string dataDir;
+    std::string dataDir, gameDir;
     std::string joinCode, passCode, username, lobbyName, chatInput;
     std::string status;
     bool userAuto = true;
@@ -577,11 +577,15 @@ static void RenderHostJoinLocked(int w, int h)
     MwStatus(w, h);
 }
 
+#include "menu_title_linux.inl"
+#include "menu_backdrop_linux.inl"
+
 static void RenderLocked(int w, int h)
 {
     layer::Begin(w, h);
     g_hitCount = 0;
-    layer::Rect(0, 0, w, h, MW_BG, MW_BG_A);
+    layer::Rect(0, 0, w, h, MW_BG, TitleMode()?175:MW_BG_A);
+    if(TitleMode()) { RenderTitleLocked(w,h); return; }
     if (g_uiState == 3) {
         const auto& v=P().view;
         MwTitle("WORLD SYNC");MwClose(w,4);
@@ -606,9 +610,9 @@ static void RenderLocked(int w, int h)
 
 static void LayoutLocked(int screenW, int screenH, int* w, int* h)
 {
-    g_s = UiScale(screenH);
+    g_s = std::min(UiScale(screenH),std::min(screenW/800.f,screenH/560.f));
     *w = S(780);
-    *h = (g_uiState >= 2 || !P().flagMaster.empty()) ? S(540) : S(330);
+    *h = (TitleMode() || g_uiState >= 2 || !P().flagMaster.empty()) ? S(540) : S(330);
     if (*w > screenW) *w = screenW;
     if (*h > screenH) *h = screenH;
 }
@@ -672,6 +676,12 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
 {
     if (previous && !(id >= 20 && id < 36)) return;
     if (g_log) g_log("[panel] hit id=%d\n", id);
+    if(id>=110 && id<=115 && TitleMode()) {
+        if(id<=111) { g_titleTab=id-110;g_focus=0; }
+        else if(id<=113)g_serverPage=std::max(0,g_serverPage+(id==112?-1:1));
+        else g_playerPage=std::max(0,g_playerPage+(id==114?-1:1));
+        g_dirty=true;return;
+    }
     switch (id) {
         case 80:case 81:case 82:SetStatusLocked(lobby::RecoveryAction(id==82?"sync_ready":id==81?"sync_retry":"sync_request"));break;
         case 83:g_uiState=2;break;
@@ -882,6 +892,11 @@ static bool HandleEventLocked(SDL_Event* e, Post* post)
         g_capturedRight = false;
         return true;
     }
+    static bool tabHeld=false,escapeHeld=false;
+    if(t==SDL_KEYUP) {
+        bool* held=e->key.keysym.sym==SDLK_TAB?&tabHeld:e->key.keysym.sym==SDLK_ESCAPE?&escapeHeld:nullptr;
+        if(held && *held) { *held=false;return true; }
+    }
     // Only while the overlay is really drawing the panel: if it stopped (a
     // Vulkan failure, a swapchain it cannot copy from), an invisible panel must
     // not keep eating the menu's clicks.
@@ -894,7 +909,7 @@ static bool HandleEventLocked(SDL_Event* e, Post* post)
             ToPixels(e->motion.windowID, e->motion.x, e->motion.y, &x, &y);
             const int lx = x - g_px, ly = y - g_py;
             g_hover = inside(lx, ly) ? HitAtLocked(lx, ly) : 0;
-            return inside(lx, ly);
+            return TitleMode() || inside(lx, ly);
         }
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP: {
@@ -918,11 +933,11 @@ static bool HandleEventLocked(SDL_Event* e, Post* post)
             } else if (t == SDL_MOUSEBUTTONUP) {
                 g_pressed = 0;
             }
-            return in;
+            return TitleMode() || in;
         }
         case SDL_MOUSEWHEEL:
             // SDL2 has no wheel position: consume it when the cursor is over the panel
-            return g_hover != 0;
+            return TitleMode() || g_hover != 0;
         case SDL_TEXTINPUT:
             if (ChatFocusLocked()) { TypeChatLocked(e->text.text); return true; }
             if (!g_focus) return false;
@@ -931,6 +946,17 @@ static bool HandleEventLocked(SDL_Event* e, Post* post)
         case SDL_KEYDOWN:
         case SDL_KEYUP: {
             const SDL_Keycode k = e->key.keysym.sym;
+            if(TitleMode() && !(e->key.keysym.mod & (KMOD_ALT|KMOD_CTRL|KMOD_GUI))) {
+                if(k==SDLK_TAB || k==SDLK_ESCAPE) {
+                    if(t==SDL_KEYDOWN && !e->key.repeat) {
+                        if(k==SDLK_TAB) { tabHeld=true;if(g_uiState==1)g_focus=TitleNextFocus(g_focus,e->key.keysym.mod & KMOD_SHIFT); }
+                        else { escapeHeld=true;OnHitLocked(!P().view.modsPrompt.empty()?17:P().savePicker?91:4,post); }
+                        g_dirty=true;
+                    }
+                    return true;
+                }
+                if(!g_focus && !ChatFocusLocked() && (k==SDLK_RETURN || k==SDLK_SPACE || k==SDLK_UP || k==SDLK_DOWN || k==SDLK_LEFT || k==SDLK_RIGHT || k==SDLK_HOME || k==SDLK_END))return true;
+            }
             if (ChatFocusLocked()) {
                 if (PassKey(k)) return false;
                 if (t == SDL_KEYDOWN) {
@@ -1105,6 +1131,7 @@ void Init(const char* dataDir, const char* gameDir, const char* libDir, Tpf2mpLo
         std::lock_guard<std::mutex> lk(g_mtx);
         g_log = log;
         P().dataDir = dataDir;
+        P().gameDir = game;
         ReadFlags(std::string(libDir) + "tpf2_menu_flags.txt");
         LoadNamesLocked();
         WriteDashFlagLocked();
@@ -1197,8 +1224,7 @@ void MaxSize(int screenW, int screenH, int* w, int* h)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
     g_s = UiScale(screenH);
-    *w = S(800) < screenW ? S(800) : screenW;
-    *h = S(560) < screenH ? S(560) : screenH;
+    *w = screenW; *h = screenH;
 }
 
 bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* changed)
@@ -1213,23 +1239,35 @@ bool Frame(int screenW, int screenH, int* x, int* y, int* w, int* h, bool* chang
     g_px = (screenW - pw) / 2;
     g_py = (screenH - ph) / 2;
     if (g_uiState == 1) lobby::PublicPoll();
-    *changed = g_dirty || layer::Width() != pw || layer::Height() != ph || now - g_lastRenderMs > 500;
+    const bool title=TitleMode();
+    static int lastHover=0,lastPressed=0;
+    *changed = g_dirty || layer::Width() != (title?screenW:pw) || layer::Height() != (title?screenH:ph)
+        || now - g_lastRenderMs > 500 || (title && (lastHover!=g_hover || lastPressed!=g_pressed));
     if (*changed) {
         if (g_uiState >= 2) lobby::Snapshot(&P().view);
         else lobby::PublicSnapshot(&P().pubRows, &P().pubNote);
         RenderLocked(pw, ph);
+        if(title) {
+            for(int i=0;i<g_hitCount;++i)if(g_hits[i].btn && g_hits[i].id==g_hover) {
+                const auto& hit=g_hits[i];layer::Rect(hit.x,hit.y,hit.w,hit.h,MW_TEXT,g_pressed==g_hover?65:30);
+            }
+            std::vector<unsigned char> bg(size_t(screenW)*screenH*4);
+            PaintTitleBackdrop(bg.data(),size_t(screenW)*4,screenW,screenH,g_px,g_py,pw,ph);
+            layer::PlaceOnBackdrop(screenW,screenH,g_px,g_py,bg.data());
+        }
+        lastHover=g_hover;lastPressed=g_pressed;
         g_dirty = false;
         g_lastRenderMs = now;
     }
     g_lastFrameMs = now;
-    *x = g_px; *y = g_py; *w = pw; *h = ph;
+    *x = title?0:g_px; *y = title?0:g_py; *w = title?screenW:pw; *h = title?screenH:ph;
     return true;
 }
 
 bool Hover(int* x, int* y, int* w, int* h, bool* pressed)
 {
     std::lock_guard<std::mutex> lk(g_mtx);
-    if (!g_hover) return false;
+    if (TitleMode() || !g_hover) return false;
     for (int i = 0; i < g_hitCount; i++) {
         const Hit& hh = g_hits[i];
         if (hh.btn && hh.id == g_hover) {

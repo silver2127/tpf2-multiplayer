@@ -159,6 +159,53 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(request['cmd'], 'load', mode)
             (self.root / 'tpf2_native_request.txt').unlink()
 
+    def test_a_kept_member_pauses_its_world_instead_of_loading(self):
+        # LIVE JOIN: a member in the round's `retain` keeps the world the
+        # snapshot came from -- only that world, held, paused, engine idle
+        self.state.update(mode='join', retain=['host'], members=['host', 'late'])
+        self.phase('transferring')
+        self.runtime.snapshot = self.snapshot
+        self.lua()
+        self.runtime.tick()
+        self.phase('loading')
+        self.write('bridge_ctl', instance='a', peer='127.0.0.1:7773')
+        self.assertIsNone(self.runtime.tick())
+        self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
+        self.lua(world='another')                               # not the world this round found
+        self.assertIsNone(self.runtime.tick())
+        self.assertFalse((self.root / 'tpf2_native_request.txt').exists())
+        self.lua(paused=0)
+        self.assertIsNone(self.runtime.tick())
+        self.lua()
+        self.write('native_status', supported=1, has_world=1, busy=1)
+        self.assertIsNone(self.runtime.tick())
+        self.write('native_status', supported=1, has_world=1, busy=0)
+        self.assertIsNone(self.runtime.tick())
+        self.native_done('pause', 'paused')                     # never 'load'
+        ack = self.runtime.tick()
+        self.assertTrue(ack['kept'])
+        self.assertEqual(ack['digest'], self.snapshot.digest)
+        # the fallback (retain emptied): the same member loads like everyone
+        self.state.update(retain=[], epoch='c' * 32)
+        self.phase('loading')
+        self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
+        self.runtime.tick()
+        self.assertEqual(read_fields(self.root / 'tpf2_native_request.txt')['cmd'], 'load')
+
+    def test_a_newcomer_in_a_live_join_loads(self):
+        self.runtime = SyncParticipant(self.root, self.root, 123, 'late')
+        self.state.update(mode='join', retain=['host'], members=['host', 'late'])
+        self.phase('transferring')
+        self.runtime.snapshot = self.snapshot
+        self.lua()
+        self.runtime.tick()
+        self.phase('loading')
+        self.write('bridge_ctl', instance='b', peer='127.0.0.1:7773')
+        self.runtime.tick()
+        self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
+        self.runtime.tick()
+        self.assertEqual(read_fields(self.root / 'tpf2_native_request.txt')['cmd'], 'load')
+
     def test_load_requires_bridge_epoch_native_ready_and_new_lua_world(self):
         self.runtime = SyncParticipant(self.root, self.root, 123, 'client')
         self.phase('transferring')

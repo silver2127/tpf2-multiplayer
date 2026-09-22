@@ -2586,7 +2586,7 @@ void Snapshot(View* v)
     std::lock_guard<std::mutex> lk(S().mtx);
     const Model& m = S().m;
     v->recoveryPhase=m.recoveryPhase;v->recoveryDetail=m.recoveryDetail;v->recoveryStep=m.recoveryStep;
-    v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
+    v->lobbyReady=m.lobbyReady;v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
     v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
     v->readyMine=m.readyMine;v->readyCount=m.readyCount;v->readyTotal=m.readyTotal;v->recoveryVersion=m.recoveryVersion;
     v->saves=m.saves;v->selectedSave=m.selectedSave;v->startPending=m.startPending;

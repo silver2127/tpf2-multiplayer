@@ -21,11 +21,16 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.20, dev `2b466e32`**, on
+This development tree integrates **Windows 0.6.1.25 experimental, dev `b7760259`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[UPSTREAM_dev_2b466e32.md](UPSTREAM_dev_2b466e32.md). Earlier Native/Windows frozen join
+[UPSTREAM_dev_b7760259.md](UPSTREAM_dev_b7760259.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
+
+This integration is partial. New canonical simulation ordering is default-off
+pending a loaded-game lifetime probe; `TPF2MP_ORDER_CANON=1` is an experimental
+developer switch. Do not enable retained-world joins or assume Windows/native
+simulation parity from the matching version alone. See the integration record.
 
 The native implementation includes command capture and replay, deterministic
 ordering hooks, company permissions, save selection, load progress, automatic

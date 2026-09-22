@@ -251,6 +251,22 @@ CHUNK_STEAM = 32000         # bytes of file data per chunk when every non-loopba
                             # The window below is bounded in BYTES (SEND_WINDOW_STEAM): the one
                             # earlier try at bigger Steam chunks stalled because it had the
                             # loopback window, 134 MB fired into Steam at once (2026-09-21).
+# 32 KB chunks over Steam's reliable send stalled live three times (0.6.1.15 at 15/12781,
+# 0.6.1.21 at 132/4199, 0.6.1.22 at 0/4199). The cause: bulk chunks shared the replay
+# window with control frames, and a chunk delayed in Steam's reliable queue arrived after
+# 64 later pings and rosters and was refused as too old (fixed in seal.py Sealer.sign,
+# reproduced by tools/test_steam_save_transfer.py --steam-queue). False = 1,100 B chunks.
+# 0.6.1.23 (replay windows split, send-rate ids right) STILL stalled live: base 256/4199,
+# exactly 8 MB -- the Steam send/receive buffer size the tunnel sets -- then nothing, and
+# no chunk refused as too old. Off by default again; a file tpf2mp_steam_big_chunks.txt
+# in the data dir (or TPF2MP_STEAM_BIG_CHUNKS=1), on the HOST, turns it on to test.
+def _steam_big_chunks():
+    if os.environ.get("TPF2MP_STEAM_BIG_CHUNKS") == "1":
+        return True
+    return os.path.exists(os.path.join(modshare.data_dir(), "tpf2mp_steam_big_chunks.txt"))
+
+
+STEAM_BIG_CHUNKS = True    # 0.6.1.25 experimental: exercise bounded reliable transfers without a local flag
 CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
                             # one chunk size serves everyone, and 32 KB datagrams on the open
                             # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
@@ -288,6 +304,44 @@ CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
 # feedback, verify and start messages are the same as over UDP.
 BULK = [None]
 BULK_TCP = [True]
+# TCP FOR STEAM PEERS (2026-09-22). A peer reached through the Steam tunnel is a
+# loopback endpoint here, so neither end knows the other's address to open the bulk
+# TCP channel, and a save crawled through Steam instead. Over the sealed link each
+# end now names its own addresses: the host in fbegin (tcp.addrs, its listener's
+# port), the joiner in fbegin_ack (tcp_addrs + tcp_port of a listener it opens for
+# the transfer). The joiner dials the host's, the host dials the joiner's, and the
+# first stream that connects carries the file; Steam carries it if neither does.
+# Only a peer already admitted to the sealed session ever sees these addresses.
+MY_TCP_ADDRS = [[]]      # this machine's addresses, from its NAT observation (public, LAN, v6)
+JOINER_BULK = [None]     # the joiner's own listener for a host-dialled stream (opened on first need)
+
+
+def _profile_ips(profile):
+    """The IPs an observed profile names (its candidates' 'ip:port' strings), public first."""
+    out = []
+    cands = (profile or {}).get("candidates") or {}
+    for k in ("public_v4", "lan_v4", "vpn_v4", "vpn2_v4", "v6"):
+        v = cands.get(k)
+        if not isinstance(v, str) or not v:
+            continue
+        ip = v.rsplit(":", 1)[0].strip("[]") if ":" in v else v
+        if ip and ip not in out and not ip.startswith("127."):
+            out.append(ip)
+    return out[:6]
+
+
+def _valid_tcp_addrs(v):
+    """A peer's address list as offered, filtered to plain IP strings (at most 6)."""
+    import ipaddress
+    out = []
+    for a in (v if isinstance(v, list) else [])[:6]:
+        try:
+            ip = ipaddress.ip_address(str(a))
+        except ValueError:
+            continue
+        if not ip.is_loopback and not ip.is_multicast and not ip.is_unspecified:
+            out.append(str(ip))
+    return out
 # THE TCP BACKUP LINK (dual_tcp.py): DUAL[0] is the host's DualSocket (the joiner's
 # is conn.sock); off with tpf2mp_tcp_backup.txt = 0 in the io dir or in an
 # unsealed session.
@@ -300,6 +354,18 @@ def _tcp_backup_on(io_dir):
             return f.read().strip() not in ("0", "off", "no")
     except OSError:
         return True
+
+
+def _live_join_on(io_dir):
+    """LIVE JOIN (2026-09-22): tpf2mp_live_join.txt = 1 in the host's io dir
+    lets the players already in a session keep their worlds at a hot join; only
+    the newcomer loads (sync_operation `retain`). Off by default, read at each
+    join."""
+    try:
+        with open(os.path.join(io_dir, "tpf2mp_live_join.txt"), "r", encoding="utf-8") as f:
+            return f.read().strip() in ("1", "on", "yes")
+    except OSError:
+        return False
 
 
 def _dual_hello(name):
@@ -358,6 +424,10 @@ def _start_dual_client(conn, name, log, sim=None):
     return dsock
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
+# Reliable Steam data needs stalled-stream probes, not UDP window retransmits.
+RESEND_AFTER_STEAM = 3.0
+STEAM_WINDOW_START = 16    # grow from 512 KB using delivery acknowledgements
+STEAM_RETRY_MAX = 8.0      # probe a stalled stream, never requeue its whole window
 SEND_WINDOW_STEAM  = 128    # x CHUNK_STEAM = ~4 MB in flight: half the 8 MB send buffer the
                             # tunnel gives Steam (steam_tunnel.cpp SendBufferSize), and ~40 MB/s
                             # at a 100 ms round trip, over the 16 MB/s rate it allows
@@ -414,7 +484,8 @@ def _safe_incoming_name(name):
     return (os.path.basename(name) == name
             and not os.path.isabs(name)
             and ".." not in name.split("/") and ".." not in name.split("\\"))
-XFER_BUF_BYTES = 4 * 1024 * 1024      # best-effort SO_RCVBUF/SO_SNDBUF for bursts.
+XFER_BUF_BYTES = 16 * 1024 * 1024     # best-effort SO_RCVBUF/SO_SNDBUF for bursts (4 MB until 2026-09-22:
+                                      # a Steam window of 4 MB arrives from the tunnel as one burst)
 
 
 _buffer_cap_logged = [False]
@@ -1418,7 +1489,8 @@ class _HostSaveTransfer:
             if not host.startswith("127."):
                 internet = True
         if tunnel:
-            return CHUNK_STEAM_MIXED if internet else CHUNK_STEAM
+            big = _steam_big_chunks() if STEAM_BIG_CHUNKS is None else STEAM_BIG_CHUNKS
+            return CHUNK_STEAM if big and not internet else CHUNK_STEAM_MIXED
         return CHUNK_DATA if internet else CHUNK_LOCAL
 
     @staticmethod
@@ -1474,8 +1546,11 @@ class _HostSaveTransfer:
         # the UDP pump; its feedback still drives base, stage and timeouts.
         self.tcp_token = os.urandom(16).hex() if BULK_TCP[0] else None
         self.tcp_bytes = 0
+        self._tcp_lock = threading.Lock()
         if self.tcp_token and BULK[0] is not None:
             self.begin_msg["tcp"] = {"port": BULK[0].port, "token": self.tcp_token}
+            if MY_TCP_ADDRS[0] and any(steamtunnel.is_tunnel_addr(a) for a, _ in targets):
+                self.begin_msg["tcp"]["addrs"] = list(MY_TCP_ADDRS[0])   # a Steam peer cannot see where we are
             BULK[0].expect(sid, "recv", self.tcp_token, self._tcp_serve)
         elif self.tcp_token:
             self.begin_msg["tcp"] = {"token": self.tcp_token}     # no listener: the other side may offer one
@@ -1515,15 +1590,29 @@ class _HostSaveTransfer:
         self._tcp_stream(sock, p)
 
     def _tcp_push(self, ip, port, p):
-        """A thread: WE connect (a joiner's upload to the relay's listener)."""
-        sock = bulk_tcp.bulk_connect(ip, port, "send", self.sid, self.tcp_token, p["name"])
-        if sock is None:
-            self.log(f"[host] {p['name']}: no TCP stream to {ip}:{port} -- the upload runs over UDP")
-            return
-        self._tcp_stream(sock, p)
+        """A thread: WE connect (a joiner's upload to the relay's listener; a Steam
+        joiner's own listener, ip then a list of the addresses it named)."""
+        ips = ip if isinstance(ip, list) else [ip]
+        for one in ips:
+            if p["tcp"] or p["state"] != "active":
+                return                          # its stream to us won the race
+            sock = bulk_tcp.bulk_connect(one, port, "send", self.sid, self.tcp_token, p["name"])
+            if sock is not None:
+                self.log(f"[host] {p['name']}: connected to its TCP listener at {redact(one)}:{port}")
+                self._tcp_stream(sock, p)
+                return
+        self.log(f"[host] {p['name']}: no TCP stream to {', '.join(redact(i) for i in ips)} port {port} -- "
+                 + ("Steam carries the rest" if len(ips) > 1 or steamtunnel.is_tunnel_addr(p.get('addr')) else "the upload runs over UDP"))
 
     def _tcp_stream(self, sock, p):
-        p["tcp"] = True
+        with self._tcp_lock:                    # both ends may dial: the first stream wins
+            if p["tcp"]:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            p["tcp"] = True
         p["ready"] = True
         p["tcp_done"] = 0.0
         self.log(f"[host] {p['name']} takes the {self.kind} over TCP")
@@ -1592,6 +1681,8 @@ class _HostSaveTransfer:
         if not p or msg.get("sid") != self.sid:
             return
         if not p["ready"]:
+            if self.chunk == CHUNK_STEAM:
+                p["last_advance"] = time.time()
             p["ready"] = True
             self.log(f"[host] {p['name']} ready for {self.kind}")
         # the receiver has a listener (the relay, for our upload): connect and stream
@@ -1600,6 +1691,14 @@ class _HostSaveTransfer:
                 and isinstance(addr, tuple) and not steamtunnel.is_tunnel_addr(addr):
             p["tcp_tried"] = True
             threading.Thread(target=self._tcp_push, args=(addr[0], port, p), name="bulk-push", daemon=True).start()
+        elif self.tcp_token and isinstance(port, int) and 0 < port < 65536 and not p["tcp"] and not p["tcp_tried"] \
+                and steamtunnel.is_tunnel_addr(addr):
+            ips = _valid_tcp_addrs(msg.get("tcp_addrs"))
+            if ips:
+                p["tcp_tried"] = True
+                p["addr"] = addr
+                self.log(f"[host] {p['name']} (through Steam) offers a TCP listener on {len(ips)} address(es) -- dialling")
+                threading.Thread(target=self._tcp_push, args=(ips, port, p), name="bulk-push", daemon=True).start()
         need = msg.get("need")
         if isinstance(need, list):
             # the ids this joiner does not have installed, out of self.mods
@@ -1617,6 +1716,8 @@ class _HostSaveTransfer:
         if not p or msg.get("sid") != self.sid or p["state"] != "active":
             return
         now = time.time()
+        if self.chunk == CHUNK_STEAM and not p["ready"]:
+            p["last_advance"] = now
         p["ready"] = True
         p["last_fack"] = now
         base = int(msg.get("base", 0))
@@ -1627,6 +1728,9 @@ class _HostSaveTransfer:
             p["tcp"] = False
             self.log(f"[host] {p['name']}: base {base}/{self.total_chunks} after the TCP stream -- UDP fills the rest")
         if base > p["base"]:
+            if self.chunk == CHUNK_STEAM:
+                p["steam_window"] = min(self.window, p.get("steam_window", STEAM_WINDOW_START) + base - p["base"])
+                p["steam_retry_delay"] = RESEND_AFTER_STEAM
             p["base"] = base
             p["last_advance"] = now
             self.progress_at = now
@@ -1662,6 +1766,10 @@ class _HostSaveTransfer:
             p["base"] = base
             p["next"] = base
             p["nack"] = []
+            p.pop("steam_retry_at", None)
+            p.pop("steam_started_at", None)
+            p["steam_window"] = STEAM_WINDOW_START
+            p["steam_retry_delay"] = RESEND_AFTER_STEAM
             p["last_advance"] = now
             p["last_pct"] = -1
         # Merge the reported holes with any still-pending ones (all >= base).
@@ -1669,6 +1777,11 @@ class _HostSaveTransfer:
                  if isinstance(s, int) and p["base"] <= s < self.total_chunks}
         holes |= {s for s in p["nack"] if s >= p["base"]}
         p["nack"] = sorted(holes)
+        if self.chunk == CHUNK_STEAM:
+            # With <=128 outstanding chunks MAX_NACK covers the entire window.
+            # A received chunk beyond a hole distinguishes local loss from a
+            # reliable Steam queue which simply has not delivered anything yet.
+            p["steam_missing"] = set(p["nack"])
         self._emit_pct(p)
 
     def progress_tokens(self):
@@ -1746,10 +1859,14 @@ class _HostSaveTransfer:
                 continue
             if p["tcp"]:
                 continue                        # streaming over TCP: nothing to send here
+            if self.chunk == CHUNK_STEAM:
+                self._pump_steam(addr, p, now)
+                continue
             # Receiver silent for too long? Its facks were lost -- rewind and
             # re-stream the window so it (and its facks) can catch up.
-            if (now - p["last_fack"] > RESEND_AFTER
-                    and now - p["last_resend"] > RESEND_AFTER):
+            resend_after = RESEND_AFTER
+            if (now - p["last_fack"] > resend_after
+                    and now - p["last_resend"] > resend_after):
                 p["next"] = p["base"]
                 p["last_resend"] = now
             budget = SEND_BUDGET
@@ -1766,6 +1883,45 @@ class _HostSaveTransfer:
                 self._send_chunk(addr, p["next"])
                 p["next"] += 1
                 budget -= 1
+
+    def _pump_steam(self, addr, p, now):
+        """Steam already retransmits accepted reliable messages. ACKs bound new
+        bytes in flight; a stalled contiguous cursor gets one recovery probe,
+        or a bounded batch of holes before already received reliable data.
+        This also recovers loss on either local UDP leg or a refused Steam send.
+        NACKs include not-yet-delivered/not-yet-sent chunks, not proven loss.
+        """
+        p["nack"] = []
+        started = p.setdefault("steam_started_at", now)
+        window = p.setdefault("steam_window", STEAM_WINDOW_START)
+        delay = p.setdefault("steam_retry_delay", RESEND_AFTER_STEAM)
+        if (p["base"] < p["next"] and now - max(started, p["last_advance"]) >= delay
+                and now - p.get("steam_retry_at", started) >= delay):
+            missing = p.get("steam_missing", {p["base"]})
+            end = min(p["next"], p["base"] + self.window, self.total_chunks)
+            received = [seq for seq in range(p["base"], end) if seq not in missing]
+            holes = sorted(seq for seq in missing if p["base"] <= seq < max(received, default=p["base"]))
+            probes = holes[:8] if holes else [p["base"]]
+            for seq in probes:
+                self._send_chunk(addr, seq)
+            p["steam_retry_at"] = now
+            p["steam_retry_delay"] = min(STEAM_RETRY_MAX, delay * 2)
+            if not holes:
+                window = p["steam_window"] = max(4, window // 2)
+            p["steam_retries"] = p.get("steam_retries", 0) + len(probes)
+        limit = min(self.total_chunks, p["base"] + window)
+        for _ in range(min(SEND_BUDGET, max(0, limit - p["next"]))):
+            self._send_chunk(addr, p["next"])
+            p["next"] += 1
+        if now - p.get("steam_stats_at", 0.0) >= 5.0:
+            previous = p.get("steam_stats_bytes", 0)
+            done = min(p["base"] * self.chunk, self.total_bytes)
+            elapsed = now - p.get("steam_stats_at", now)
+            rate = max(0, done - previous) / elapsed if elapsed > 0 else 0
+            self.log(f"[xfer] Steam send sid={self.sid} peer={p['name']}: acked={done}/{self.total_bytes}B "
+                     f"rate={rate / 1e6:.3f}MB/s in_flight={max(0, p['next'] - p['base']) * self.chunk}B "
+                     f"window={window} retries={p.get('steam_retries', 0)}")
+            p["steam_stats_at"], p["steam_stats_bytes"] = now, done
 
     def all_resolved(self):
         return all(p["state"] in ("done", "failed", "dropped")
@@ -1850,6 +2006,9 @@ class _ClientSaveReceiver:
         self.overall_sha = None
         self.base = 0
         self.recv_count = 0
+        self.recv_bytes = self.duplicate_chunks = 0
+        self.recv_stats_at = time.time()
+        self.recv_stats_bytes = 0
         self.complete = False
         self.failed = False
         self.retries = 0
@@ -2363,6 +2522,9 @@ class _ClientSaveReceiver:
             return
         self.base = 0
         self.recv_count = 0
+        self.recv_bytes = self.duplicate_chunks = 0
+        self.recv_stats_at = time.time()
+        self.recv_stats_bytes = 0
         self.complete = False
         self.failed = False
         self.retries = 0
@@ -2383,9 +2545,28 @@ class _ClientSaveReceiver:
                     BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
                     ack["tcp_port"] = BULK[0].port
             elif isinstance(tcp.get("port"), int) and getattr(self.conn, "peer", None) \
-                    and not steamtunnel.is_tunnel_addr(self.conn.peer):   # Steam carries the chunks: no TCP there
+                    and not steamtunnel.is_tunnel_addr(self.conn.peer):
                 threading.Thread(target=self._tcp_pull, args=(self.conn.peer[0], tcp["port"], tcp["token"], sid),
                                  name="bulk-pull", daemon=True).start()
+            elif getattr(self.conn, "peer", None) and steamtunnel.is_tunnel_addr(self.conn.peer):
+                # THROUGH STEAM: dial the addresses the host named, and name ours so the
+                # host can dial us (see MY_TCP_ADDRS); Steam carries whatever neither reaches
+                host_ips = _valid_tcp_addrs(tcp.get("addrs"))
+                if host_ips and isinstance(tcp.get("port"), int):
+                    threading.Thread(target=self._tcp_pull, args=(host_ips, tcp["port"], tcp["token"], sid),
+                                     name="bulk-pull", daemon=True).start()
+                if MY_TCP_ADDRS[0]:
+                    if JOINER_BULK[0] is None:
+                        try:
+                            JOINER_BULK[0] = bulk_tcp.BulkListener.open(self.conn.sock.getsockname()[1], self.log)
+                        except (OSError, AttributeError):
+                            JOINER_BULK[0] = None
+                    if JOINER_BULK[0] is not None:
+                        JOINER_BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
+                        ack["tcp_port"] = JOINER_BULK[0].port
+                        ack["tcp_addrs"] = list(MY_TCP_ADDRS[0])
+                self.log(f"[client] the host is reached through Steam: TCP to {len(host_ips)} host address(es)"
+                         + (f", and our listener on tcp/{ack['tcp_port']} offered" if "tcp_port" in ack else ", none offered here"))
         self._send(ack)
         if kind != "mods":
             self.io.emit({"type": "transfer", "role": "recv", "pct": 0})   # a mods batch: the round's status line stays
@@ -2399,23 +2580,34 @@ class _ClientSaveReceiver:
         is 20x slower than the stream, and nothing has been read yet, so a fresh
         stream from the start is consistent with what UDP delivers meanwhile
         (chunks already in hand are dropped as duplicates)."""
+        ips = ip if isinstance(ip, list) else [ip]
         for attempt in range(1, TCP_CONNECT_TRIES + 1):
-            if sid != self.sid:
-                return                       # a later transfer replaced this one
-            sock = bulk_tcp.bulk_connect(ip, port, "recv", sid, token, self.my_name)
-            if sock is not None:
-                self._tcp_read(sock, sid)
-                return
+            for one in ips:
+                if sid != self.sid or getattr(self, "_tcp_claim", None) == sid:
+                    return                   # a later transfer replaced this one, or the host's dial won
+                sock = bulk_tcp.bulk_connect(one, port, "recv", sid, token, self.my_name)
+                if sock is not None:
+                    self._tcp_read(sock, sid)
+                    return
             if attempt < TCP_CONNECT_TRIES:
-                self.log(f"[client] no TCP stream from {ip}:{port} (attempt {attempt}) -- trying again")
+                self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} (attempt {attempt}) -- trying again")
                 time.sleep(TCP_CONNECT_RETRY)
-        self.log(f"[client] no TCP stream from {ip}:{port} after {TCP_CONNECT_TRIES} attempts -- receiving over UDP")
+        self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} after {TCP_CONNECT_TRIES} attempts -- "
+                 + ("Steam carries it" if len(ips) > 1 or steamtunnel.is_tunnel_addr(getattr(self.conn, 'peer', None)) else "receiving over UDP"))
 
     def _tcp_accepted(self, sock, addr, name):
         """ACCEPT THREAD HELPER (the relay): the leader connected to push its upload."""
         self._tcp_read(sock, self.sid)
 
     def _tcp_read(self, sock, sid):
+        with self._progress_lock:              # both ends may dial: the first stream wins
+            if getattr(self, "_tcp_claim", None) == sid:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            self._tcp_claim = sid
         self.tcp_active, self._tcp_started = True, time.time()
         self.log(f"[client] taking the {self.kind} over TCP")
         self.io.emit({"type": "transfer", "role": "recv", "state": "tcp"})
@@ -2470,6 +2662,7 @@ class _ClientSaveReceiver:
         if self.failed or seq < 0 or seq >= self.total_chunks:
             return
         if self.have[seq]:
+            self.duplicate_chunks += 1
             return                               # dup / reorder -- already have it
         off = seq * self.chunk
         # bytearray slice-assignment GROWS the buffer when the slice runs past
@@ -2482,6 +2675,7 @@ class _ClientSaveReceiver:
         self.buf[off:off + len(data)] = data
         self.have[seq] = 1
         self.recv_count += 1
+        self.recv_bytes += len(data)
         while self.base < self.total_chunks and self.have[self.base]:
             self.base += 1
         self._emit_pct()
@@ -2511,6 +2705,21 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
+        if self.active() and self.chunk == CHUNK_STEAM and now - self.recv_stats_at >= 5.0:
+            rate = (self.recv_bytes - self.recv_stats_bytes) / (now - self.recv_stats_at)
+            self.log(f"[xfer] Steam receive sid={self.sid}: unique={self.recv_bytes}/{self.total_bytes}B "
+                     f"rate={rate / 1e6:.3f}MB/s base={self.base}/{self.total_chunks} "
+                     f"duplicates={self.duplicate_chunks}")
+            self.recv_stats_at, self.recv_stats_bytes = now, self.recv_bytes
+        # frames the replay window refused as too old: silent until 2026-09-22, when
+        # they were every Steam-delayed save chunk (seal.py Sealer.sign)
+        sealer = SEAL[0]
+        if sealer is not None and self.active() and now - getattr(self, "_old_at", 0.0) >= 5:
+            self._old_at = now
+            n, seen = getattr(sealer, "too_old", 0), getattr(self, "_old_seen", 0)
+            if n != seen:
+                self._old_seen = n
+                self.log(f"[client] {n - seen} frame(s) refused as too old by the replay window during the transfer (total {n})")
         if self.steam_items and now - self.steam_poll_at >= UGC_POLL_EVERY:
             self.steam_poll_at = now
             self._steam_poll(now)
@@ -2730,6 +2939,9 @@ class _ClientSaveReceiver:
                 self.have = bytearray(self.total_chunks)   # request everything
                 self.base = 0
                 self.recv_count = 0
+                self.recv_bytes = self.duplicate_chunks = 0
+                self.recv_stats_at = time.time()
+                self.recv_stats_bytes = 0
                 self.last_pct = -1
                 self._send_fack()
                 return
@@ -2877,7 +3089,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.6.1.20"
+LOBBY_VERSION = "0.6.1.25"
 
 
 def version_rejection(remote):
@@ -3500,7 +3712,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     recovery = HostRecovery(sync_runtime, host_name, io, recovery_send,
         roster_players, lambda: [(a, p["name"]) for a, p in peers.items()],
         recovery_transfer,
-        available=recovery_supported, unavailable_reason=recovery_unavailable_reason) if sync_runtime is not None and not relay_only else None
+        available=recovery_supported, unavailable_reason=recovery_unavailable_reason,
+        live_join=lambda: _live_join_on(io.dir)) if sync_runtime is not None and not relay_only else None
 
     def roster_companies():
         """name -> company id. Same id = same company (co-op); different ids =
@@ -5634,6 +5847,7 @@ def cmd_host(args):
         sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
                                                      password=args.password or None,
                                                      extra_candidates={"steam": tunnel.id})
+        MY_TCP_ADDRS[0] = _profile_ips(_profile)
         if tunnel.available:
             tunnel.hello(sock.getsockname()[1])
     except BaseException:
@@ -5813,6 +6027,7 @@ def cmd_join(args):
         try:
             from observe import observe
             prof = observe(args.local_port, sock=sock, do_upnp=False)
+            MY_TCP_ADDRS[0] = _profile_ips(prof)       # offered to a host reached through Steam
             if tunnel.available:
                 prof["candidates"]["steam"] = tunnel.id   # the knock tells the host to open our Steam session
             profile_code = encode_profile(prof)

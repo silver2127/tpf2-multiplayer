@@ -446,3 +446,35 @@ installs a VPN or depends on the master server's relay.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).
+
+### Diagnosing reliable Steam save transfers
+
+The optional 32 KB Steam path starts with 16 chunks in flight and grows on
+acknowledged delivery, up to 128 chunks. Missing-chunk reports alone do not
+requeue that window: Steam already guarantees delivery of messages it accepts.
+After three seconds without contiguous progress, the sender probes the first
+missing chunk. If the receiver reports later chunks already present, up to eight
+holes are repaired together. Repeated stalls back off to eight seconds. A stall
+without evidence of later delivery also reduces the window. Local UDP loss and
+refused Steam sends remain recoverable; the existing no-progress timeout remains.
+
+The 0.6.1.25 experimental release enables the large-chunk path for Steam-only
+transfers so it can be tested without a local flag file. Mixed Steam/CROSS-PLAY
+transfers keep MTU-safe chunks. A reachable direct TCP stream remains preferred.
+
+During large-chunk transfers, `[xfer]` lines in the lobby log report acknowledged
+bytes, unique received bytes, application throughput, in-flight bytes, recovery
+probes and duplicate chunks every five seconds. `[steam-bulk]` lines in the bridge
+log report the endpoint's cumulative bytes, Steam's queued bytes/packets, refused
+sends and local forwarding errors. Its `tx` rate is bytes accepted by the Steam
+API, not confirmed remote delivery; compare it with receiver `[xfer]` progress.
+These lines also cover the default plaintext small save chunks. Endpoint numbers
+identify local sockets without logging session secrets.
+
+Run `python tools/test_steam_backpressure.py` for a deterministic finite-queue,
+rate-limited transport test using the production sender and receiver. It covers
+256 KiB/s, 1 MiB/s and 16 MiB/s links, dropped local datagrams, missing feedback,
+rewind and no-progress timeout. File hashes must match. This simulation does not
+replace a two-computer Steam test. The existing `test_steam_chunks.py` additionally
+checks two receivers with 0%, 8% and 15% injected datagram loss;
+`test_steam_tcp.py` checks both TCP dialing directions and the Steam fallback.

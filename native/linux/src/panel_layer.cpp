@@ -43,6 +43,18 @@ static inline void PxOver(uint8_t* d, int r, int g, int b, int a)
     d[3] = (uint8_t)outA;
 }
 
+void PlaceOnBackdrop(int w,int h,int x,int y,const uint8_t* bg)
+{
+    std::vector<uint8_t> out(bg,bg+size_t(w)*h*4);
+    for(int py=0;py<g_h;++py)for(int px=0;px<g_w;++px) {
+        if(x+px<0 || y+py<0 || x+px>=w || y+py>=h)continue;
+        const auto* s=g_px.data()+(size_t(py)*g_w+px)*4;
+        auto* d=out.data()+(size_t(y+py)*w+x+px)*4;
+        PxOver(d,s[2],s[1],s[0],s[3]);
+    }
+    g_px.swap(out);g_w=w;g_h=h;
+}
+
 void Rect(int x, int y, int w, int h, Rgb c, int a)
 {
     int x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;

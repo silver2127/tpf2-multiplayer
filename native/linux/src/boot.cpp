@@ -40,6 +40,7 @@
 #include "resident_hash_linux.h"
 #include "person_map_order_linux.h"
 #include "target_order_linux.h"
+#include "order_canon_linux.h"
 #include "network_person_order_linux.h"
 #include "network_index_order_linux.h"
 
@@ -296,6 +297,10 @@ static void BootInit()
     Tpf2mpPersonMapOrderSetLog(Log);
     Tpf2mpInstallPersonMapOrder(img.base, img.buildId.c_str());
     Log("[boot] Windows temporary person map order: %s\n", Tpf2mpPersonMapOrderStatus());
+
+    Tpf2mpOrderCanonSetLog(Log);
+    Tpf2mpInstallOrderCanon(img.base, img.buildId.c_str());
+    Log("[boot] Hot join canonical order: %s\n", Tpf2mpOrderCanonStatus());
 
     Tpf2mpTargetOrderSetLog(Log);
     Tpf2mpInstallTargetOrder(img.base, img.buildId.c_str());
