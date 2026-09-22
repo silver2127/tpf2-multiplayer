@@ -105,6 +105,27 @@ the lobby's exact version gate guarantees that.
   `tpf2mp_boot`'s sources). Kill switch `TPF2MP_ORDER_CANON=0`. This is what
   the lab measured.
 
+### Linux default: ON (required since 0.7, the owner's call, 2026-09-22)
+
+The sorts change what the simulation decides, so every peer of a session must
+run the same set: a Windows player (sorts always on unless `hotjoinorder=0`) and
+a Linux peer with the sorts off decide apart and desync, hot join or not. The
+native port shipped them opt-in (`TPF2MP_ORDER_CANON=1`, "pending live
+validation"); the 0.7 dedicated server only matches Windows because its
+server.env sets that variable. The Linux build must default ON, exactly as the
+reference copy [`hotjoin/order_canon_linux.cpp`](hotjoin/order_canon_linux.cpp)
+does:
+
+- `native/linux/src/order_canon_linux.cpp`, the install gate: unset (or any value
+  but `0`) = on; `TPF2MP_ORDER_CANON=0` = off, status
+  `"off (TPF2MP_ORDER_CANON=0)"`.
+- `native/linux/src/person_map_order_linux.cpp`, `CanonicalMaps()`: the same rule
+  (on unless the variable is `0`), so the capacity-map walk and the order sorts
+  are never split.
+- The docs that call it an experimental opt-in (`docs/linux/INSTALL.md`, the
+  UPSTREAM notes going forward) say it is on by default, `=0` turns it off, and
+  that it must match the Windows players.
+
 ## Not an order bug: the render clock stepped back (speed hook)
 
 The retained host of the busy-world run with the freed-id sort asserted
