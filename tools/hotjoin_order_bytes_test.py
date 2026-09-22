@@ -23,7 +23,7 @@ source = slice_source(repo)
 relay = (repo / "native/src/hotjoinrelay_slice.asm").read_text(encoding="utf-8")
 
 sites = re.findall(r'\{ "([\w-]+)",\s*(0x[0-9a-f]+), (\d+), \{ ([^}]*) \}, (\d+), (\w+), &(\w+) \}', source)
-assert [s[0] for s in sites] == ["candidates", "departures", "arrivals", "idle", "capacity", "freed-ids"], sites
+assert [s[0] for s in sites] == ["candidates", "departures", "arrivals", "idle", "capacity", "freed-ids", "step"], sites
 
 game = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\TransportFever2.exe")
 pe = pefile.PE(str(game), fast_load=True)
@@ -35,12 +35,14 @@ md.detail = True
 # function ranges (the three functions the sites live in) for the branch-into check
 FUNCS = {"candidates": (0x9279f0, 0x928000), "departures": (0xa7c920, 0xa7cb00), "arrivals": (0xa59450, 0xa59b00), "idle": (0xa86760, 0xa86c80),
          "capacity": (0x2122fd0, 0x2123800),
-         "freed-ids": (0x23de130, 0x23de600)}
-VECTOR = {"candidates": "[rbp-71h]", "departures": "[rbx+78h+28h]", "arrivals": "[rbx+78h+68h]", "idle": "[r13+18h]", "capacity": "[r13+120h]", "freed-ids": "[r12]"}
+         "freed-ids": (0x23de130, 0x23de600),
+         "step": (0x23e1850, 0x23e1d00)}
+VECTOR = {"candidates": "[rbp-71h]", "departures": "[rbx+78h+28h]", "arrivals": "[rbx+78h+68h]", "idle": "[r13+18h]", "capacity": "[r13+120h]", "freed-ids": "[r12]", "step": "[rbx+60h]"}
 STOLEN_ASM = {"candidates": ["mov dword ptr [rbp-79h], 1"], "departures": ["lea rdx, [rsp+28h]"], "arrivals": ["lea rdx, [rsp+68h]"],
               "idle": ["mov rdx, qword ptr [r13+20h]", "sub rdx, qword ptr [r13+18h]"],
               "capacity": ["mov rdi, qword ptr [r13+120h]"],
-              "freed-ids": ["mov rax, qword ptr [r12]", "mov rdx, qword ptr [rax+8]"]}
+              "freed-ids": ["mov rax, qword ptr [r12]", "mov rdx, qword ptr [rax+8]"],
+              "step": ["push rdi", "push r12", "push r15"]}
 
 for idx, (name, rva_s, steal_s, expect_s, elen_s, relay_name, resume) in enumerate(sites):
     rva, steal, elen = int(rva_s, 16), int(steal_s), int(elen_s)
@@ -67,7 +69,8 @@ for idx, (name, rva_s, steal_s, expect_s, elen_s, relay_name, resume) in enumera
             "arrivals": ["lea rdx, [rsp + 0x68]"],
             "idle": ["mov rdx, qword ptr [r13 + 0x20]", "sub rdx, qword ptr [r13 + 0x18]"],
             "capacity": ["mov rdi, qword ptr [r13 + 0x120]"],
-            "freed-ids": ["mov rax, qword ptr [r12]", "mov rdx, qword ptr [rax + 8]"]}[name]
+            "freed-ids": ["mov rax, qword ptr [r12]", "mov rdx, qword ptr [rax + 8]"],
+            "step": ["push rdi", "push r12", "push r15"]}[name]
     assert stolen == want, (name, stolen)
     # nothing in the function jumps into the middle of the steal
     lo, hi = FUNCS[name]
@@ -81,7 +84,24 @@ for idx, (name, rva_s, steal_s, expect_s, elen_s, relay_name, resume) in enumera
     # the vector the relay passes is the one read next
     after = list(md.disasm(pe.get_data(rva + steal, 24), BASE + rva + steal))
     text = " ; ".join(f"{i.mnemonic} {i.op_str}" for i in after[:3])
-    if name == "freed-ids":
+    if name == "step":
+        # sub rsp,0x40 ; mov r15,[rcx+0x30] ; mov rdi,rcx -- rcx is the engine (its systems at +0x30..+0x38);
+        # the saved rcx the relay hands over is [rbx+60h]: flags, rax, then rcx in the push order
+        assert after[0].mnemonic == "sub" and after[0].op_str == "rsp, 0x40", text
+        assert after[1].op_str == "r15, qword ptr [rcx + 0x30]" and after[2].op_str == "rdi, rcx", text
+        order = ["flags"] + re.findall(r"^\s*push\s+(\w+)", re.search(r"HotJoinBody MACRO.*?ENDM", relay, re.S)[0], re.M)
+        assert (len(order) - 1 - order.index("rcx")) * 8 == 0x60, order
+        # Engine::Update's only direct caller is GameSim::Step's iteration loop
+        call = list(md.disasm(pe.get_data(0x15abbb, 5), BASE + 0x15abbb))[0]
+        assert call.mnemonic == "call" and call.operands[0].imm - BASE == 0x23e1850, call
+        # the family machinery the step walk relies on
+        assert pe.get_data(0xba990, 5) == bytes.fromhex("488d4108c3"), "GetNodeList (list)"
+        assert pe.get_data(0xbdff0, 3) == bytes.fromhex("33c0c3"), "GetNodeList (none)"
+        ups = " ; ".join(f"{i.mnemonic} {i.op_str}" for i in md.disasm(pe.get_data(0x23e18d7, 0x80), BASE + 0x23e18d7))
+        assert "rcx, qword ptr [rdi + 0x148]" in ups and "rcx, qword ptr [rbx + 0x18]" in ups and "call qword ptr [rax + 8]" in ups, ups
+        rm = " ; ".join(f"{i.mnemonic} {i.op_str}" for i in md.disasm(pe.get_data(0x241030, 0xc8), BASE + 0x241030))
+        assert "add rcx, 0x20" in rm and "rax, qword ptr [rbx + 0x38]" in rm and "dword ptr [rax + 4], esi" in rm, rm
+    elif name == "freed-ids":
         # mov r9,[rax] -- the vector's begin: [rax] .. [rax+8] is the batch appended to the free-id deque
         assert after[0].mnemonic == "mov" and after[0].op_str == "r9, qword ptr [rax]", text
     elif name == "capacity":
