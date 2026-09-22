@@ -20,11 +20,12 @@
   order at each step on every player, so a joiner who loads the host's save makes
   the same decisions the host does. In testing a live-joined pair stayed identical
   for hundreds of game units after the join.
-- **Live join (experimental, opt-in on the host):** with `tpf2mp_live_join.txt`
-  containing `1` in the host's `netpunch` folder, a player who joins a running
-  game no longer pauses everyone: no hold, no "checking that all worlds match"
-  window. The newcomer loads the host's hot-join save and catches up on the
-  command history while the others keep playing. Dedicated servers too.
+- **Live join:** a player who joins a running game no longer pauses everyone:
+  no hold, no "checking that all worlds match" window. The newcomer loads the
+  host's hot-join save and catches up on the command history while the others
+  keep playing. Dedicated servers too. On by default; a host can go back to the
+  old frozen join (everyone holds, saves and reloads) by putting `0` in
+  `netpunch\tpf2mp_live_join.txt`.
 - **The TCP backup link works for a renamed joiner.** Two players with the same
   name (the second shows as `Name#2`) lost the TCP backup link; it now connects.
   A joiner who comes in through Steam also opens its router port (UPnP) so the
@@ -46,8 +47,8 @@
 1. Close the game, run the MSI (or the Proton installer on Linux / Steam Deck).
 2. Big Maps: **New Game** shows the extra size rows after the stock sizes.
 3. Hot join: host a game, let a friend join while it runs, play on for a while;
-   the Multiplayer window's **Status** tab should keep saying the worlds match.
-   To try live join, put `1` in `netpunch\tpf2mp_live_join.txt` on the host.
+   nobody should pause, and the Multiplayer window's **Status** tab should keep
+   saying the worlds match.
 
 ### Known limitations
 

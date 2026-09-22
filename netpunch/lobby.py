@@ -410,15 +410,15 @@ def _tcp_backup_on(io_dir):
 
 
 def _live_join_on(io_dir):
-    """LIVE JOIN (2026-09-22): tpf2mp_live_join.txt = 1 in the host's io dir
-    lets the players already in a session keep their worlds at a hot join; only
-    the newcomer loads (sync_operation `retain`). Off by default, read at each
-    join."""
+    """LIVE JOIN (2026-09-22): the players already in a session keep their
+    worlds at a hot join; only the newcomer loads (sync_operation `retain`). On
+    by default since 0.7; tpf2mp_live_join.txt = 0 in the host's io dir turns it
+    off (the frozen join: everyone holds, saves, loads). Read at each join."""
     try:
         with open(os.path.join(io_dir, "tpf2mp_live_join.txt"), "r", encoding="utf-8") as f:
-            return f.read().strip() in ("1", "on", "yes")
+            return f.read().strip().lower() not in ("0", "off", "no")
     except OSError:
-        return False
+        return True
 
 
 def _dual_hello(name):

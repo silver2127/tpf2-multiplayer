@@ -131,9 +131,9 @@ load (`sync_runtime`: a kept member pauses its world -- only the one the round
 found, held, paused, engine idle -- and acks `kept=True`). The paused
 fingerprints still decide: a difference empties `retain` and repeats `loading`
 once under a fresh epoch, i.e. the frozen join everyone knows; a difference after
-that is the ordinary error. A retry is always the plain round. Off unless the
-host's io dir holds `tpf2mp_live_join.txt` = `1` (read at each join), because it
-needs every peer's engine sorts. Tests: `tools/test_sync_operation.py`,
+that is the ordinary error. A retry is always the plain round. On by default
+since 0.7 (every peer has the engine sorts); `tpf2mp_live_join.txt` = `0` in the
+host's io dir (read at each join) turns it off. Tests: `tools/test_sync_operation.py`,
 `tools/test_sync_runtime.py` (live-join cases).
 
 ## Every family's node list, in entity order at every sim iteration
