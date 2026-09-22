@@ -97,12 +97,13 @@ the player bulldozes it.
 | sell | strict | `VSELL` | Ships once every vehicle's key is bound, or the bound subset after 8 units. If the vehicle list cannot be read, the sale is not cancelled and does not replicate. |
 | send to depot | strict | `VDEPOT` | |
 | reverse | strict | `VREV` | |
+| stop / go (the vehicle window's stop toggle) | strict | `VSTOP` | Carries the new state, not a toggle, so a duplicate is harmless. |
 | replace | strict | `VREPL` | The key is re-bound to the replacement vehicle. If the new configuration cannot be read, the replacement is not cancelled and does not replicate. |
 | assign to line | strict | `VLINE` | Waits for the vehicle's and line's keys to bind. |
 | rename, recolour | replay on peers | `VNAME` / `VCOLOR` | By key, or by position for constructions. |
 | bought vehicle's name | originator ships after bind | `VNAME` | The engine names a new vehicle locally, in its own language and counter ("Train 7" / "Zug 7"), and the native reservation-order patch ranks trains by name. Once the buy's key binds on the originator (`pollVehKeys`), the engine's name ships as a `VNAME` for that key; peers rename their copy, retrying on the step grid until the key binds. |
 
-Not replicated: stop/start a vehicle, manual departure, "depart now", maintenance targets.
+Not replicated: manual departure, "depart now", maintenance targets.
 
 Cancelled local vehicle actions restore their original confirmation sounds through
 `action_sounds.lua`: buy (including clones), sell, assign line, send to depot and replace.
@@ -164,7 +165,7 @@ Stops are resolved by the station group's position (within 20 m) and the station
 
 ## Not replicated
 
-- Stop/start, manual departure, "depart now" and maintenance targets for vehicles.
+- Manual departure, "depart now" and maintenance targets for vehicles.
 - Map editor and scenario commands (towns, industries, no-costs).
 - Town growth itself: it is not sent, it is simulated identically. Its building count is a
   detector lane, so a town that grows differently shows up. The Natural Town Growth Workshop

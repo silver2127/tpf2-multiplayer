@@ -57,7 +57,7 @@ K.ACTIONS_ON_BEHIND = 2
 K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
                          CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true }
 K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
-                        VREV = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
+                        VREV = true, VSTOP = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
                         STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true }
 CM.actionsOff = false
 CM.actionsHeld = {}   -- LCREATEX lines waiting for this game to catch up
@@ -1287,6 +1287,20 @@ function CM.pollInject()
 					-- armed=1: the slice cancelled it and the originator
 					-- replays at the stamp too; 0: it ran natively, peers only.
 					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
+				end
+
+			elseif o == "VSTOP" and #w >= 3 then
+				-- The vehicle window's stop/go toggle (SetUserStopped). Strict like
+				-- VDEPOT: the slice cancels the click and every instance, the
+				-- originator included, applies it at the stamp. Left local, the
+				-- train stopped here and kept running on the peers (2026-09-19).
+				local id, stopped = tonumber(w[2]), tonumber(w[3]) or 0
+				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VSTOP", id) then k = nil end
+				if k then
+					local armed = CM.lastArmed or 0
+					log(string.format("VSTOP: %s stopped=%d%s", k, stopped, armed == 1 and " (strict)" or ""))
+					CM.scheduleLocal("VSTOP", { key = k, stopped = stopped, armed = armed })
 				end
 
 			elseif o == "VLINE" and #w >= 4 and CM.injForeignEdit("VLINE", tonumber(w[2])) then

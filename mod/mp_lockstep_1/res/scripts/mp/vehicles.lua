@@ -112,7 +112,7 @@ function CM.vehIdForKey(key) return vehIdFor(key) end   -- the drift check names
 -- so the host's a:8 was s:189156 on the joiner (measured 2026-09-16, hot join
 -- from the host's 954.6 save: both VPOS logs paired that vehicle '(nearest)',
 -- and every later host command naming a:8 -- VLINE, VSELL, VREPL, VNAME,
--- VCOLOR, VDEPOT, VREV -- would have been "unknown vehicle key" there). The
+-- VCOLOR, VDEPOT, VREV, VSTOP -- would have been "unknown vehicle key" there). The
 -- registry rides in the save: a save-loaded entity has the same id on every
 -- instance that loads the file (measured repeatedly), so entityId -> key is
 -- valid wherever the file loads. The highest seq minted per origin rides along
@@ -815,6 +815,10 @@ function CM.execVehCmd(c)
 		elseif c.op == "VREV" then
 			local id = resolve(c.key)
 			if id then cmds[#cmds + 1] = { api.cmd.make.reverseVehicle(id), "reverse " .. tostring(c.key) } end
+		elseif c.op == "VSTOP" then
+			-- the stop/go toggle: an absolute state, so a duplicate is harmless
+			local id = resolve(c.key)
+			if id then cmds[#cmds + 1] = { api.cmd.make.setUserStopped(id, tonumber(c.stopped) == 1), "setUserStopped " .. tostring(c.key) } end
 		elseif c.op == "VLINE" then
 			local id = resolve(c.key)
 			local line = CM.lineIdFor(c.line)

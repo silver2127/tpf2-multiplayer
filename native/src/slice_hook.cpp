@@ -189,6 +189,12 @@ static const Factory FACTORIES[] = {
     { 0x9de9e0, 21, 15, "SetGameSpeed",   "speed"   },  // clock buttons only: CaptureSpeedButton
     { 0x9de9b0, 21, 16, "SetDate",          "calendar" },  // editor date picker only: CaptureCalendar
     { 0x9de870, 21, 17, "SetCalendarSpeed", "calendar" },  // editor date speed slider only: CaptureCalendar
+    // The vehicle window's stop/go toggle. Its prologue is byte-for-byte
+    // SendToDepot's (mov rax,rsp / push rdi / sub rsp,0xb70 / mov [rsp+40],-2 =
+    // 20 bytes, checked in the 35924 exe, 2026-09-19): r8 = vehicle, r9 = bool.
+    // A stopped train used to halt on the clicking game only and run on the
+    // peers -- a position desync one stamp later.
+    { 0x9df070, 20, 18, "SetUserStopped", "vehicle" },
 };
 static const int NUM_FACTORIES = (int)(sizeof(FACTORIES) / sizeof(FACTORIES[0]));
 

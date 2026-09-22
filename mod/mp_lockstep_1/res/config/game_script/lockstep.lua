@@ -531,7 +531,7 @@ K.JOURNAL_LOAN = 0
 -- a 30,000,000 loan is several ticks of settling.
 K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
-K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+K.STRICT_OPS = { VREV = true, VSTOP = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
 -- read from the proposal); the originator instead deletes its native copy and
 -- replays, gated by c.cancelled rather than ARMED. See execConX.
@@ -649,7 +649,7 @@ local function execute(c)
 	elseif c.op == "CONFAIL" then CM.execConFail(c)
 	elseif c.op == "VBUY" then CM.execVBuy(c)
 	elseif c.op == "VREPL" then CM.execVReplace(c)
-	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then CM.execVehCmd(c)
+	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" or c.op == "VSTOP" then CM.execVehCmd(c)
 	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
 	elseif c.op == "VNAME" then CM.execSetName(c)
 	elseif c.op == "VCOLOR" then CM.execSetColor(c)

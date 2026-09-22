@@ -64,7 +64,7 @@ something here is fixed, the release note says so and the entry goes.
 
 ## Replication gaps
 
-- Not replicated: vehicle stop/start, manual departure, "depart now" and maintenance targets;
+- Not replicated: manual departure, "depart now" and maintenance targets;
   map editor and scenario commands. [REPLICATION.md](REPLICATION.md#not-replicated).
 - **A stop's load settings are not carried by line replays** *(from the code, 2026-09-20)*.
   Each line stop has a `stopConfig` (unload only, maximum load) that the line decoder does not

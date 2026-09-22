@@ -124,6 +124,7 @@ static bool WriteInjectVBuy(uint64_t depot, uint64_t cfg)
 // command was cancelled.
 //   VSELL  <n> <id..>            SellVehicle  (r8 = &vector<Entity>)
 //   VDEPOT <vehicle> <sell01>    SendToDepot  (r8 = Entity, r9 = bool)
+//   VSTOP  <vehicle> <stopped01> SetUserStopped (r8 = Entity, r9 = bool)
 //   VLINE  <vehicle> <line> <stopIndex>   SetLine (r8, r9 = Entity, st[0] = int)
 //   VREPL  <vehicle> <config..>  ReplaceVehicle (r8 = Entity, r9 = config*)
 // VREPL's payload after the vehicle is byte-for-byte what VBUY writes after the
