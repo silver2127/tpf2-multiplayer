@@ -40,6 +40,7 @@ EXTERN g_hjResume2:QWORD
 EXTERN g_hjResume3:QWORD
 EXTERN g_hjResume4:QWORD
 EXTERN g_hjResume5:QWORD
+EXTERN g_hjResume6:QWORD
 
 .code
 
@@ -135,5 +136,17 @@ HotJoinFreedIdsRelay PROC
     mov  rdx, qword ptr [rax+8]
     jmp  qword ptr [g_hjResume5]
 HotJoinFreedIdsRelay ENDP
+
+; step: Engine::Update entry (rva 0x23e1850, 40 57 41 54 41 57 = push rdi /
+; push r12 / push r15), rcx = the engine, xmm1 = dt (saved with xmm0-5). The
+; saved rcx sits at [rbx+60h] (pushed third, below flags and rax); the relay
+; hands its address. The stolen pushes run on the engine's stack after the restore.
+HotJoinStepRelay PROC
+    HotJoinBody 6, [rbx+60h]
+    push rdi                       ; the three stolen instructions
+    push r12
+    push r15
+    jmp  qword ptr [g_hjResume6]
+HotJoinStepRelay ENDP
 
 END

@@ -26,6 +26,7 @@ random bytes the sender put in its fbegin (sealed like every control
 message), so an unrelated connection cannot claim or feed a transfer.
 """
 import socket
+import sys
 import threading
 import time
 
@@ -52,6 +53,10 @@ class BulkListener:
         self.link_handler = None   # dual_tcp: a "TPF2LINK1 ..." hello is a peer's TCP link, not a transfer
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Linux requires this on BOTH listener and bound dial sockets.
+        # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
+        if sys.platform.startswith("linux"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         s.bind((bind, self.port))
         s.listen(16)
         s.settimeout(0.5)
@@ -152,9 +157,20 @@ class BulkListener:
                 pass
 
 
-def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT):
+def _why(e):
+    """A connect failure in words: a timeout means something dropped the SYN (a
+    firewall or a router without a mapping), a refusal that nothing listens."""
+    if isinstance(e, socket.timeout):
+        return "timed out (blocked: firewall or no port mapping)"
+    if isinstance(e, ConnectionRefusedError):
+        return "refused (nothing listening on that port)"
+    return f"{type(e).__name__}: {e}"
+
+
+def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT, errors=None):
     """Connect to a listener and say hello. A socket ready for the stream, or
-    None (the caller falls back to UDP)."""
+    None (the caller falls back to UDP). ``errors``, a list, gets one
+    'host: why' line per failure (the logs said only "no TCP stream")."""
     try:
         c = socket.create_connection((host, int(port)), timeout=timeout)
         c.sendall(BULK_MAGIC + b" " + role.encode() + b" " + str(int(sid)).encode() + b" " + str(token).encode()
@@ -174,10 +190,14 @@ def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT)
             ok += piece
         if ok != b"OK\n":
             c.close()
+            if errors is not None:
+                errors.append(f"{host}: connected, but the listener refused the hello")
             return None
         c.settimeout(None)
         return c
-    except (OSError, UnicodeEncodeError):
+    except (OSError, UnicodeEncodeError) as e:
+        if errors is not None:
+            errors.append(f"{host}: {_why(e)}")
         return None
 
 

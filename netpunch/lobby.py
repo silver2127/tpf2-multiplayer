@@ -314,6 +314,66 @@ BULK_TCP = [True]
 # Only a peer already admitted to the sealed session ever sees these addresses.
 MY_TCP_ADDRS = [[]]      # this machine's addresses, from its NAT observation (public, LAN, v6)
 JOINER_BULK = [None]     # the joiner's own listener for a host-dialled stream (opened on first need)
+_JOINER_BULK_LOCK = threading.Lock()   # one listener: Windows SO_REUSEADDR lets a second bind share the port
+# A STEAM JOINER'S LISTENER WAS UNREACHABLE (2026-09-22). Joining a friend through
+# Steam, the joiner offered only its LAN, VPN and 6to4 addresses (the STUN answer
+# was missing from its profile) and its router had no mapping for the listener's
+# port, so the host's dial could never land; with the host's own port closed to
+# TCP as well, every save crawled through Steam at 0.5-1 MB/s. The joiner now maps
+# its listener's TCP port by UPnP as soon as it is in through Steam and offers the
+# router's WAN IP first; the mapping goes when the lobby exits.
+JOINER_UPNP = {"port": None, "done": threading.Event()}
+
+
+def _joiner_bulk_listener(port, log):
+    """The joiner's bulk listener on ``port`` (opened once), or None."""
+    with _JOINER_BULK_LOCK:
+        if JOINER_BULK[0] is None:
+            try:
+                JOINER_BULK[0] = bulk_tcp.BulkListener.open(port, log)
+            except (OSError, AttributeError):
+                JOINER_BULK[0] = None
+        return JOINER_BULK[0]
+
+
+def _open_steam_joiner_tcp(port, log, mapper=None):
+    """A joiner in through Steam: open the bulk listener now and map its TCP port
+    on the router (UPnP), putting the WAN IP first in MY_TCP_ADDRS. Runs on a
+    thread; JOINER_UPNP['done'] is set when it has finished either way."""
+    done = JOINER_UPNP["done"]
+    try:
+        lst = _joiner_bulk_listener(port, log)
+        if lst is None:
+            return
+        if mapper is None:
+            from observe import upnp_map_tcp as mapper
+        ok, wan, detail = mapper(lst.port)
+        if ok:
+            JOINER_UPNP["port"] = lst.port
+        if ok and wan:
+            MY_TCP_ADDRS[0] = [wan] + [a for a in MY_TCP_ADDRS[0] if a != wan][:5]
+            log(f"[bulk] the router maps tcp/{lst.port} (UPnP): a host reached through Steam can dial {redact(wan)}")
+        elif ok:
+            log(f"[bulk] the router maps tcp/{lst.port} (UPnP) but reports no public address -- LAN/VPN offers only")
+        else:
+            log(f"[bulk] no UPnP mapping for tcp/{lst.port} ({detail}): the host can dial us only on the LAN/VPN "
+                "or through a forwarded port; Steam carries what TCP cannot")
+    except Exception as e:                           # noqa: BLE001 -- best effort, Steam still carries the save
+        log(f"[bulk] TCP listener setup through Steam failed: {e!r}")
+    finally:
+        done.set()
+
+
+def _close_steam_joiner_tcp(log):
+    port = JOINER_UPNP["port"]
+    if port:
+        JOINER_UPNP["port"] = None
+        try:
+            from observe import upnp_unmap_tcp
+            if upnp_unmap_tcp(port):
+                log(f"[bulk] UPnP mapping for tcp/{port} removed")
+        except Exception:                            # noqa: BLE001
+            pass
 
 
 def _profile_ips(profile):
@@ -380,6 +440,36 @@ def _dual_hello_ok(line, cipher):
         return None
     plain = cipher.open(sealed)
     return name if plain is not None and plain.decode("utf-8", "replace") == name else None
+
+
+def _match_link_hello(peers, name, addr, has_link):
+    """HOST: which joiner a TCP link hello belongs to -> (peer addr, None) or (None, why).
+
+    The joiner dials the moment its UDP punch lands, before the host has named
+    it, so its hello carries the name it ASKED for. When that name was taken
+    the host renamed it ('ComradeSilver' -> 'ComradeSilver#2': two instances on
+    one Steam account, 2026-09-22), and matching on the assigned name alone
+    closed every link: `tcp_first=0 tcp_only=0` for the whole session. So a
+    hello matches the assigned name first, then the asked one, among joiners
+    that have no link yet; several such joiners are told apart by the exact
+    address the connection came from (a dial is bound to the lobby port), then
+    by its IP. Still ambiguous -> refused: a link attached to the wrong joiner
+    would hand its frames to that joiner's seal window."""
+    try:
+        items = list(peers.items())
+    except RuntimeError:                       # the host loop changed the roster meanwhile
+        return None, "the roster changed -- retrying"
+    for key in ("name", "asked"):
+        cands = [a for a, p in items if isinstance(p, dict) and p.get(key) == name and not has_link(a)]
+        if len(cands) > 1:
+            same = [a for a in cands if isinstance(a, tuple) and tuple(a[:2]) == tuple(addr[:2])] \
+                or [a for a in cands if isinstance(a, tuple) and a[0] == addr[0]]
+            cands = same
+        if len(cands) == 1:
+            return cands[0], None
+        if cands:
+            return None, f"{len(cands)} joiners asked for that name from {addr[0]}"
+    return None, "no joiner by that name without a link"
 
 
 def _impair_client(conn, io_dir, log):
@@ -1599,17 +1689,19 @@ class _HostSaveTransfer:
         """A thread: WE connect (a joiner's upload to the relay's listener; a Steam
         joiner's own listener, ip then a list of the addresses it named)."""
         ips = ip if isinstance(ip, list) else [ip]
+        errs = []
         for one in ips:
             if p["tcp"] or p["state"] != "active":
                 return                          # its stream to us won the race
-            sock = bulk_tcp.bulk_connect(one, port, "send", self.sid, self.tcp_token, p["name"])
+            sock = bulk_tcp.bulk_connect(one, port, "send", self.sid, self.tcp_token, p["name"], errors=errs)
             if sock is not None:
                 self.log(f"[host] {p['name']}: connected to its TCP listener at {redact(one)}:{port}")
                 self._tcp_stream(sock, p)
                 return
         p["push_pending"] = False
         self.log(f"[host] {p['name']}: no TCP stream to {', '.join(redact(i) for i in ips)} port {port} -- "
-                 + ("Steam carries the rest" if len(ips) > 1 or steamtunnel.is_tunnel_addr(p.get('addr')) else "the upload runs over UDP"))
+                 + ("Steam carries the rest" if len(ips) > 1 or steamtunnel.is_tunnel_addr(p.get('addr')) else "the upload runs over UDP")
+                 + (f" [{redact('; '.join(errs))}]" if errs else ""))
 
     def _tcp_stream(self, sock, p):
         with self._tcp_lock:                    # both ends may dial: the first stream wins
@@ -2588,12 +2680,13 @@ class _ClientSaveReceiver:
                     ack["tcp_pull"] = True             # the host holds Steam while we dial
                     threading.Thread(target=self._tcp_pull, args=(host_ips, tcp["port"], tcp["token"], sid, True),
                                      name="bulk-pull", daemon=True).start()
+                if JOINER_UPNP.get("started"):
+                    JOINER_UPNP["done"].wait(3.0)     # the router mapping (and our WAN IP) is on its way
                 if MY_TCP_ADDRS[0]:
-                    if JOINER_BULK[0] is None:
-                        try:
-                            JOINER_BULK[0] = bulk_tcp.BulkListener.open(self.conn.sock.getsockname()[1], self.log)
-                        except (OSError, AttributeError):
-                            JOINER_BULK[0] = None
+                    try:
+                        _joiner_bulk_listener(self.conn.sock.getsockname()[1], self.log)
+                    except AttributeError:
+                        pass
                     if JOINER_BULK[0] is not None:
                         JOINER_BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
                         ack["tcp_port"] = JOINER_BULK[0].port
@@ -2615,18 +2708,21 @@ class _ClientSaveReceiver:
         (chunks already in hand are dropped as duplicates)."""
         ips = ip if isinstance(ip, list) else [ip]
         for attempt in range(1, TCP_CONNECT_TRIES + 1):
+            errs = []
             for one in ips:
                 if sid != self.sid or getattr(self, "_tcp_claim", None) == sid:
                     return                   # a later transfer replaced this one, or the host's dial won
-                sock = bulk_tcp.bulk_connect(one, port, "recv", sid, token, self.my_name)
+                sock = bulk_tcp.bulk_connect(one, port, "recv", sid, token, self.my_name, errors=errs)
                 if sock is not None:
                     self._tcp_read(sock, sid)
                     return
             if attempt < TCP_CONNECT_TRIES:
-                self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} (attempt {attempt}) -- trying again")
+                self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} (attempt {attempt}) -- trying again"
+                         + (f" [{redact('; '.join(errs))}]" if errs else ""))
                 time.sleep(TCP_CONNECT_RETRY)
         self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} after {TCP_CONNECT_TRIES} attempts -- "
-                 + ("Steam carries it" if len(ips) > 1 or steamtunnel.is_tunnel_addr(getattr(self.conn, 'peer', None)) else "receiving over UDP"))
+                 + ("Steam carries it" if len(ips) > 1 or steamtunnel.is_tunnel_addr(getattr(self.conn, 'peer', None)) else "receiving over UDP")
+                 + (f" [{redact('; '.join(errs))}]" if errs else ""))
         if tell_host and sid == self.sid:
             self._send({"t": "tcp_gave_up", "sid": sid})   # the host stops waiting for our dial
 
@@ -4016,6 +4112,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         late = False
         if addr in peers:                                   # rename in place
             peers[addr]["name"] = _dedupe(name, all_names(exclude_addr=addr))
+            peers[addr]["asked"] = name
             if profile:
                 peers[addr]["profile"] = profile
             peers[addr]["mesh"] = bool(is_mesh)
@@ -4033,7 +4130,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 company = company or free_company(taken)
             else:
                 company = 1
-            peers[addr] = {"name": assigned, "last": time.time(),
+            peers[addr] = {"name": assigned, "asked": name, "last": time.time(),
                            "started": False, "profile": profile,
                            "links": [], "mesh": bool(is_mesh),
                            "company": company}
@@ -4638,17 +4735,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             name = _dual_hello_ok(line, SEAL[0])
             # the joiner dials the moment its UDP punch lands, often before its
             # `join` has been processed here: give the roster a few seconds
-            found = []
+            found, why = None, "no joiner by that name"
             deadline = time.time() + 10.0
-            while name and not found and time.time() < deadline:
-                found = [a for a, p in peers.items() if p["name"] == name]
-                if not found:
+            while name and found is None and time.time() < deadline:
+                found, why = _match_link_hello(peers, name, addr, dual.has_link)
+                if found is None:
                     time.sleep(0.1)
-            if not found:
-                log(f"[dual] TCP link hello from {addr[0]} ({name!r}) matches no joiner -- closed")
+            if found is None:
+                log(f"[dual] TCP link hello from {addr[0]} ({name!r}) matches no joiner ({why}) -- closed")
                 c.close()
                 return
-            dual.attach(c, found[0], "joiner connected")
+            dual.attach(c, found, "joiner connected")
         BULK[0].link_handler = link_hello
 
     last_heal = last_drop = 0.0
@@ -6157,8 +6254,17 @@ def cmd_join(args):
         mesh, conn = _mesh_from_conn(conn)
         _log("[join] mesh: direct links to other joiners enabled")
     _publish_registry_at_start(_log)
-    run_client(conn, args.name, io, relay=relay, mesh=mesh,
-               profile_code=profile_code, forward_logs=args.forward_log or (), sync_runtime=make_runtime(args))
+    if steamtunnel.is_tunnel_addr(conn.peer) and BULK_TCP[0]:
+        # the host cannot see where we are: open our TCP listener and map it now,
+        # so a save's fbegin_ack can offer an address the host is able to dial
+        JOINER_UPNP["started"] = True
+        threading.Thread(target=_open_steam_joiner_tcp, args=(sock.getsockname()[1], _log),
+                         name="steam-joiner-tcp", daemon=True).start()
+    try:
+        run_client(conn, args.name, io, relay=relay, mesh=mesh,
+                   profile_code=profile_code, forward_logs=args.forward_log or (), sync_runtime=make_runtime(args))
+    finally:
+        _close_steam_joiner_tcp(_log)
     return 0
 
 
@@ -7096,7 +7202,7 @@ def selftest_transfer():
 # --------------------------------------------------------------------------- #
 # Self-test: GAME RELAY -- two stand-in bridges exchange frames via host+joiner
 # --------------------------------------------------------------------------- #
-def _run_dual_round(tag, loss, delay, dual_on, n_frames=300):
+def _run_dual_round(tag, loss, delay, dual_on, n_frames=300, joiner_name="bob"):
     """Host + joiner on loopback with game relays, SEALED; the joiner's UDP
     sends impaired (netsim) once the lobby has formed; ``n_frames`` frames each
     way. With the TCP backup link every frame the joiner sends must reach the
@@ -7105,7 +7211,9 @@ def _run_dual_round(tag, loss, delay, dual_on, n_frames=300):
     HP, P1 = 29540, 29541
     RELAY_HOST, RELAY_JOIN = 7793, 7794
     LOCAL_HOST, LOCAL_JOIN = 7791, 7792
-    names = {"host": "alice", "j1": "bob"}
+    names = {"host": "alice", "j1": joiner_name}
+    # the roster shows the name the host gave (a joiner asking for a taken name is renamed)
+    expect_roster = sorted([names["host"], _dedupe(joiner_name, {names["host"]})])
     base = tempfile.mkdtemp(prefix="lobby_dual_")
     ios = {k: LobbyIO(os.path.join(base, k)) for k in names}
     if not dual_on:
@@ -7150,7 +7258,7 @@ def _run_dual_round(tag, loss, delay, dual_on, n_frames=300):
         def both_joined():
             for k in names:
                 r = _latest_roster(ios[k].out_path)
-                if not r or sorted(r.get("players", [])) != sorted(names.values()):
+                if not r or sorted(r.get("players", [])) != expect_roster:
                     return False
             return True
         if not _wait_until(both_joined, timeout=12):

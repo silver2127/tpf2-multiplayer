@@ -24,8 +24,8 @@ with Path(sys.argv[1]).open('rb') as stream:
         return stream.read(size)
     source = (root / 'native/linux/src/order_canon_linux.cpp').read_text()
     checks = re.findall(r'\{ "([a-z-]+)", (0x[0-9a-f]+), (\d+), (-?0x[0-9a-f]+),\s*\{([^}]+)\}', source)
-    assert len(checks) == 6
-    functions = [(0x1502600,1148),(0x16f0ae0,354),(0x16b5790,2198),(0x1700540,5117),(0x2e6e0c0,6794),(0x32567a0,1315)]
+    assert len(checks) == 7
+    functions = [(0x1502600,1148),(0x16f0ae0,354),(0x16b5790,2198),(0x1700540,5117),(0x2e6e0c0,6794),(0x32567a0,1315),(0x32515b0,156)]
     md = Cs(CS_ARCH_X86, CS_MODE_64); md.detail = True
     for (name, address, steal, offset, values),(start,size) in zip(checks,functions):
         address,steal = int(address,16),int(steal)
@@ -39,4 +39,13 @@ with Path(sys.argv[1]).open('rb') as stream:
             if (i.mnemonic.startswith('j') or i.mnemonic=='call') and i.operands and i.operands[0].type==X86_OP_IMM:
                 assert not address<i.operands[0].imm<address+steal, (name,i.address)
         print(f'PASS: {name}: {address:#x}, {expected.hex(" ")}, {steal} bytes; base offset {offset}')
-    print('PASS: build-id, all six byte guards, instruction boundaries, no interior branches')
+    assert read(0xa914c0,9) == bytes.fromhex('f3 0f 1e fa 48 8d 47 08 c3')
+    assert read(0xa914e0,7) == bytes.fromhex('f3 0f 1e fa 31 c0 c3')
+    for n in range(1,6):
+        vft=0x59ac260+0x20*(n-1)
+        ti=struct.unpack('<Q',read(vft-8,8))[0]
+        name=struct.unpack('<Q',read(ti+8,8))[0]
+        assert read(name,21).split(b'\0')[0] == f'N3ecs8NodeListILi{n}EEE'.encode()
+    assert read(0xa617e8,5) == bytes.fromhex('e8 c3 fd 7e 02')
+    print('PASS: family getters, NodeList<1..5> RTTI/vtables, Step iteration call')
+    print('PASS: build-id, all seven byte guards, instruction boundaries, no interior branches')

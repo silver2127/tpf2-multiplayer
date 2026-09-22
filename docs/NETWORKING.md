@@ -141,6 +141,11 @@ for a NAT that preserves ports; whichever lands first is the link (`[dual] TCP l
 own UDP socket over loopback with the original sender's address in front, so every consumer sees
 it as an ordinary datagram from the peer, and the seal layer's per-sender replay window drops
 whichever copy comes second. Nothing above the socket changed.
+The joiner's hello carries the name it ASKED for (it dials before the host has named it);
+the host matches the assigned name, then the asked one, telling joiners that asked for the
+same name apart by the connection's address. Matching the assigned name alone closed every
+link of a renamed joiner (`ComradeSilver#2`: two instances on one Steam account, 2026-09-22).
+`tools/test_dual_link_names.py`.
 
 What it is for is written in the log every 10 s per peer: `[dual] bob: udp_first=.. tcp_first=..
 tcp_only=.. (udp lost, tcp covered) udp_only=.. (tcp lost/late); tcp later by p50/p90/max, udp
@@ -451,6 +456,11 @@ installs a VPN or depends on the master server's relay.
   the file. Steam's chunk pump holds meanwhile and starts only when neither
   connects within `TCP_FIRST_WAIT` (15 s) or both ends have given up (`tcp_gave_up`);
   a broken stream hands the rest to Steam. `tools/test_steam_tcp.py`.
+  A joiner in through Steam opens that listener at once and maps its TCP port by
+  UPnP, offering the router's WAN IP first (before, it offered only LAN, VPN and
+  6to4 addresses, so a host on another network could never dial it); the mapping
+  is removed when the lobby exits. A failed dial now says why in the log:
+  `timed out (blocked: firewall or no port mapping)` or `refused (nothing listening)`.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).

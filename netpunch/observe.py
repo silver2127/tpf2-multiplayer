@@ -367,6 +367,55 @@ def upnp_unmap(game_port):
     return False
 
 
+def upnp_map_tcp(port, desc="netpunch save transfer (joiner)"):
+    """Open tcp/``port`` on the router (a Steam-reached joiner's bulk listener).
+
+    Returns (ok, public_wan_ip_or_None, detail). Never raises. The WAN IP is
+    None when the router reports a private or CGNAT one (nothing outside can
+    dial it)."""
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 2000
+        if u.discover() <= 0:
+            return False, None, "no IGD discovered"
+        u.selectigd()
+        wan = None
+        try:
+            wan = u.externalipaddress()
+        except Exception:                                # noqa: BLE001
+            pass
+        try:
+            ok = bool(u.addportmapping(int(port), "TCP", u.lanaddr, int(port), desc, ""))
+        except Exception as e:                           # noqa: BLE001
+            return False, None, f"addportmapping failed: {e}"
+        try:
+            a = ipaddress.ip_address(wan) if wan else None
+            if a is None or a.is_private or a in _CGNAT_NET or a.is_loopback or a.is_unspecified:
+                wan = None
+        except ValueError:
+            wan = None
+        return ok, wan, None if ok else "the router refused the mapping"
+    except ImportError:
+        return False, None, "miniupnpc module unavailable"
+    except Exception as e:                               # noqa: BLE001
+        return False, None, f"miniupnpc error: {e}"
+
+
+def upnp_unmap_tcp(port):
+    """Remove ``upnp_map_tcp``'s mapping. Best effort, never raises."""
+    try:
+        import miniupnpc
+        u = miniupnpc.UPnP()
+        u.discoverdelay = 1000
+        if u.discover() > 0:
+            u.selectigd()
+            return bool(u.deleteportmapping(int(port), "TCP"))
+    except Exception:                                    # noqa: BLE001
+        pass
+    return False
+
+
 def _fmt(ip, port):
     if ip is None:
         return None

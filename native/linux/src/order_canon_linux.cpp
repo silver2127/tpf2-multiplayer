@@ -5,12 +5,17 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <chrono>
+#include <vector>
+#include <cstdint>
+#include <memory>
 
 namespace {
 constexpr char kCanonBuildId[] = "3a0e156390b0e6f1e372051c24802c8493ae454a";
 
-// Each site: 7 displaced bytes, all position-independent, replayed verbatim by
-// the trampoline; vector locations use the recorded rbp/r13 base below.
+// Each site displaces complete position-independent instructions, replayed by
+// the trampoline. Vectors use rbp/r13; the step site receives the saved rdi.
 struct CanonSite {
     const char* name;
     uintptr_t rva;
@@ -54,6 +59,10 @@ const CanonSite kCanonSites[] = {
     // replayed batches the same way (Replicator::Apply asserts the ids match).
     { "freed-ids", 0x3256930, 7, 0x208,
       { 0x49,0x8b,0x85,0x08,0x02,0x00,0x00, 0x49,0x8d,0xb5,0xe0,0x00,0x00,0x00, 0x4c,0x8b }, 0, false, true },
+    // Engine::Update, after its stack-only prologue, before any system call.
+    // rdi = Engine*, xmm0 = float dt. Replay the two system-vector loads.
+    { "step", 0x32515c5, 8, 0x0,
+      { 0x4c,0x8b,0x67,0x30, 0x4c,0x8b,0x77,0x38, 0xf3,0x0f,0x11,0x45,0xbc, 0x64,0x48,0x8b } },
 };
 constexpr unsigned kCanonSiteCount = sizeof(kCanonSites) / sizeof(kCanonSites[0]);
 
@@ -129,6 +138,8 @@ void CanonRelink(unsigned site, uintptr_t rbp) noexcept
                 (unsigned long long)c.refused.load(std::memory_order_relaxed));
 }
 
+#include "family_canon_linux.inl"
+
 void CanonSort(unsigned site, uintptr_t rbp, uintptr_t r13) noexcept
 {
     if (kCanonSites[site].relinkMaps) { CanonRelink(site, rbp); return; }
@@ -178,7 +189,10 @@ void Tpf2mpOrderCanonDispatch(CanonRegisters* r) noexcept
     const size_t index = r->resume;
     if (index >= kCanonSiteCount) std::abort(); // only fixed stubs can reach this entry
     r->resume = reinterpret_cast<uintptr_t>(g_canonOriginal[index]);
-    if (g_canonReady) CanonSort(unsigned(index), r->rbp, r->r13);
+    if (g_canonReady) {
+        if (index == 6) CanonFamilies(r->rdi);
+        else CanonSort(unsigned(index), r->rbp, r->r13);
+    }
 }
 
 // Same register-preserving entry as target_order_linux.cpp: all GP registers,
@@ -221,12 +235,12 @@ namespace {
     __attribute__((naked, noinline)) void CanonStub##index() { \
         __asm__("push $" #index "\n\tjmp Tpf2mpOrderCanonEntry\n\t"); \
     }
-CANON_STUB(0) CANON_STUB(1) CANON_STUB(2) CANON_STUB(3) CANON_STUB(4) CANON_STUB(5)
+CANON_STUB(0) CANON_STUB(1) CANON_STUB(2) CANON_STUB(3) CANON_STUB(4) CANON_STUB(5) CANON_STUB(6)
 #undef CANON_STUB
 void* const kCanonDetours[] = {
     reinterpret_cast<void*>(CanonStub0), reinterpret_cast<void*>(CanonStub1), reinterpret_cast<void*>(CanonStub2),
     reinterpret_cast<void*>(CanonStub3), reinterpret_cast<void*>(CanonStub4),
-    reinterpret_cast<void*>(CanonStub5)
+    reinterpret_cast<void*>(CanonStub5), reinterpret_cast<void*>(CanonStub6)
 };
 static_assert(sizeof(kCanonDetours) / sizeof(kCanonDetours[0]) == kCanonSiteCount);
 }
@@ -241,6 +255,14 @@ static bool InstallOrderCanon(uintptr_t base, const char* buildId, bool (*instal
         if (std::memcmp(reinterpret_cast<const void*>(base + site.rva), site.bytes, sizeof(site.bytes))) {
             g_canonStatus.store("off (unverified site bytes)"); return false;
         }
+    // GetNodeList's recognized implementations are part of the layout guard.
+    const unsigned char getList[] = {0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
+    const unsigned char noList[] = {0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
+    if (std::memcmp((void*)(base+0xa914c0),getList,sizeof(getList)) ||
+        std::memcmp((void*)(base+0xa914e0),noList,sizeof(noList))) {
+        g_canonStatus.store("off (unverified family accessors)"); return false;
+    }
+    g_familyBase = base;
     unsigned installed = 0;
     for (unsigned i = 0; i < kCanonSiteCount; ++i) {
         if (install(base + kCanonSites[i].rva, kCanonDetours[i], kCanonSites[i].steal, &g_canonOriginal[i])) {
@@ -255,7 +277,7 @@ static bool InstallOrderCanon(uintptr_t base, const char* buildId, bool (*instal
         return false;
     }
     g_canonReady = true;
-    g_canonStatus.store("enabled (candidates, departures, arrivals, idle sorted by entity id; capacity maps relinked; freed-id batches sorted)");
+    g_canonStatus.store("enabled (candidates, departures, arrivals, idle sorted by entity id; capacity maps relinked; freed-id batches sorted; all ECS families sorted per iteration)");
     return installed == kCanonSiteCount;
 }
 bool Tpf2mpInstallOrderCanon(uintptr_t base,const char* buildId) { return InstallOrderCanon(base,buildId,InstallHook); }

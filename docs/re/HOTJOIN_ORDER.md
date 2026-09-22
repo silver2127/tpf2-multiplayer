@@ -136,44 +136,53 @@ host's io dir holds `tpf2mp_live_join.txt` = `1` (read at each join), because it
 needs every peer's engine sorts. Tests: `tools/test_sync_operation.py`,
 `tools/test_sync_runtime.py` (live-join cases).
 
-## Option B: every family's node list, sorted once at the join
+## Every family's node list, in entity order at every sim iteration
 
-The complete answer for node-list consumers the sorts above do not reach
-(vehicles claiming terminals, industries, stock lists, ship/aircraft
-reservations, the town stagger): at the barrier, on every member, sort each ECS
-family's node vector by entity and rewrite its entity->position index. RE
-(2026-09-22, static only):
+The node-list consumers the batch sorts above do not reach (vehicles claiming
+terminals, industries, stock lists, ship/aircraft reservations, animal chunk
+seeds, scaffolds, the town stagger) all read an ECS family's node vector in its
+order. A live-joined pair on the user's machine (2026-09-22) matched every hash
+from t=36 to 720 and then split its town streets at 724 (e lane only: same edge
+count, same heights, other endpoints; no player command): the town stagger.
 
-- Each peer runs TWO sim engines and alternates per batch (`RunGameSimLoop`
-  Windows 0x1184d0 / native 0xa2ddd0; the other is caught up by replaying an op
-  log, `Engine::Replicate` 0x23e0cc0) -- both must be sorted. Hook `GameSim::Step`
-  entry (Windows 0x15aa00 `40 53 41 56 48 83 ec 68`, rcx = GameSim; native
-  0xa61250 `f3 0f 1e fa 55 48 89 e5`, rdi = GameSim), engine =
-  `[[GameSim+8]+0x28]`; sort each engine the first time it reaches Step after
-  the barrier arms it (paused batches still alternate).
+Fix (Windows, site `step` in `hotjoin_order.inl`): at the entry of
+`Engine::Update` (0x23e1850 `40 57 41 54 41 57`, rcx = the engine), every
+family's node list is brought to ascending entity order and its entity->position
+index rewritten, before any system runs. Engine::Update has one caller,
+`GameSim::Step`'s iteration loop (0x15abbb), so this is once per sim iteration
+on each of the peer's two engines -- NOT once per Step: Step runs `speed`
+iterations, and a peer catching up runs at another speed than the host.
+The order is then a pure function of the entity set at every iteration, on both
+engines of every peer, whatever history they have.
+
 - Families: Windows MSVC `unordered_map<type_index, IFamily*>` at engine+0x148
-  (list node {next, prev, type_info*, IFamily*}); native libstdc++ hashtable at
-  engine+0x160 (first node `*(engine+0x170)`, node {next, type_info*, IFamily*}).
-  GetNodeList: Windows vtable slot 1 (0xba990 `lea rax,[rcx+8]`, 0xbdff0 = none);
-  native slot 2 (0xa914c0). N from the node list's vtable (Windows 0x2f47a38 +
-  0x10*(N-1), native 0x59ac260 + 0x20*(N-1)); node stride 4 + 4N.
+  (list node {next, prev, type_info*, IFamily*}, size at +0x150); native
+  libstdc++ hashtable at engine+0x160 (first node `*(engine+0x170)`, node
+  {next, type_info*, IFamily*}). GetNodeList: Windows vtable slot 1 (0xba990
+  `lea rax,[rcx+8]`, 0xbdff0 = none); native slot 2 (0xa914c0). N from the node
+  list's vtable (Windows 0x2f47a38 + 0x10*(N-1), native 0x59ac260 +
+  0x20*(N-1)); node stride 4 + 4N.
 - Node list: +8/+0x10/+0x18 vector; +0x20 phmap entity->position (ctrl +0,
-  slots +8 {int32 entity, int32 pos}, size +0x10, capacity +0x18): sort the nodes,
-  rewrite each full slot's pos by lower_bound, refuse on any mismatch. Read only
-  by the five `NodeList<N>::Remove` functions; systems hold the node vector only
+  slots +8 {int32 entity, int32 pos}, size +0x10, capacity +0x18). Read only by
+  the five `NodeList<N>::Remove` functions; systems hold the node vector only
   during their own call.
-- Not implemented yet: the lab has not shown a consumer it would fix.
+- `native/src/family_canon.h` (pure, `tools/family_canon_test.cpp`): a sorted
+  list costs one scan; a disturbed one (Remove swaps the last node into the
+  hole) is repaired in O(n) -- the displaced nodes are pulled out, sorted and
+  merged back -- and each full index slot is rewritten through the old->new
+  position map after checking that every slot names its node. Anything else is
+  refused and left untouched (logged).
+- Native Linux: guarded opt-in implementation and static/fixture evidence in
+  [linux/DEV_0115785C.md](linux/DEV_0115785C.md); default activation awaits
+  loaded-game lifetime validation. Site: `Engine::Update` 0x32515b0 entry
+  (`f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55 41 54`, rdi = the engine), same
+  walk over the libstdc++ family map; family_canon.h is portable.
 
 ## Not covered yet
 
 Order-sensitive consumers the lab world did not exercise (it has two vehicles
 and no player activity between the host's load and the join), found by RE:
 
-- **TownSystem::Update2** 0xab1d20: a town develops iff `GameTime34 % 120 ==
-  (node index % 30) * 4`, one tag-21 mt19937 shared across the processed towns in
-  node order. Matters when the Town node list differs (a world that was started
-  as a new game and never reloaded). Fix: `entity id % 30`, sort the processed
-  towns (and their parallel float vector) by id.
 - **SimEntityAtTerminalSystem::Update** 0xa81810: waiting people sit in per-terminal,
   per-cargo deques -- arrival order while running, registration order after a
   load; one time-seeded mt19937 draws "give up waiting" per person in deque

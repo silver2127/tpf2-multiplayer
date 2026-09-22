@@ -1,4 +1,4 @@
-// Execute the six hot-join patches in a private image, with every GP/XMM
+// Execute the seven hot-join patches in a private image, with every GP/XMM
 // register live. The original game files and running processes are untouched.
 #include "../src/order_canon_linux.cpp"
 #include "../src/codewrite_linux.h"
@@ -110,6 +110,9 @@ static bool FailHook(uintptr_t at,void*,int n,void**) {
 }
 static void Restore(uintptr_t base) {
     g_canonReady=false;
+    const unsigned char get[]={0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
+    const unsigned char none[]={0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
+    Write(base+0xa914c0,get,sizeof(get)); Write(base+0xa914e0,none,sizeof(none));
     for(const auto& s:kCanonSites)Write(base+s.rva,s.bytes,sizeof(s.bytes));
 }
 struct Node { uintptr_t next; int32_t key; int32_t payload; };
@@ -148,6 +151,48 @@ static void FreedIdTests() {
     CanonSort(5,0,owner);
     assert(g_canonCounters[5].reordered==reordered); // sorted batch stays put
 }
+static void FamilyTests(uintptr_t base) {
+    g_familyBase=base;
+    std::array<uintptr_t,80> engine{};
+    uintptr_t vtable[]={0,0,base+0xa914c0};
+    for(unsigned n=1;n<=5;++n) {
+        const size_t stride=n+1;
+        std::vector<int32_t> nodes(3*stride);
+        const int32_t keys[]={9,2,5};
+        for(size_t i=0;i<3;++i) {
+            nodes[i*stride]=keys[i];
+            for(size_t j=1;j<stride;++j) nodes[i*stride+j]=keys[i]*100+j;
+        }
+        int8_t ctrl[]={0,1,2,-128,-128,-128,-128};
+        int32_t slots[]={9,0,2,1,5,2,0,0,0,0,0,0,0,0};
+        uintptr_t family[]={reinterpret_cast<uintptr_t>(vtable),base+0x59ac260+0x20*(n-1),
+            reinterpret_cast<uintptr_t>(nodes.data()),reinterpret_cast<uintptr_t>(nodes.data()+nodes.size()),
+            reinterpret_cast<uintptr_t>(nodes.data()+nodes.size()),reinterpret_cast<uintptr_t>(ctrl),
+            reinterpret_cast<uintptr_t>(slots),3,7};
+        uintptr_t node[]={0,0,reinterpret_cast<uintptr_t>(family)};
+        engine[0x170/8]=reinterpret_cast<uintptr_t>(node); engine[0x178/8]=1;
+        const auto addr=reinterpret_cast<uintptr_t>(engine.data());
+        const auto original=nodes;
+        // Chain validation finishes before a node list can be changed.
+        node[0]=reinterpret_cast<uintptr_t>(node); CanonFamilies(addr); assert(nodes==original); node[0]=0;
+        slots[1]=2; CanonFamilies(addr); assert(nodes==original); slots[1]=0;
+        CanonFamilies(addr);
+        assert(nodes[0]==2 && nodes[stride]==5 && nodes[2*stride]==9);
+        for(size_t i=0;i<3;++i) for(size_t j=1;j<stride;++j)
+            assert(nodes[i*stride+j]==nodes[i*stride]*100+int(j));
+        assert(slots[1]==2 && slots[3]==0 && slots[5]==1);
+        auto reordered=g_canonCounters[6].reordered.load();
+        CanonFamilies(addr); assert(g_canonCounters[6].reordered==reordered);
+        family[2]=1; CanonFamilies(addr); // inaccessible vector: refusal, no crash
+        family[0]=1; CanonFamilies(addr); // inaccessible vtable
+    }
+    assert(FamilyMappings());
+    auto* page=mmap(nullptr,4096,PROT_READ,MAP_PRIVATE|MAP_ANONYMOUS,-1,0); assert(page!=MAP_FAILED);
+    assert(FamilyMappings());
+    assert(Readable(page,4096) && !FamilyRange(reinterpret_cast<uintptr_t>(page),4096,true));
+    assert(!FamilyRange(UINTPTR_MAX-3,8));
+    munmap(page,4096);
+}
 int main() {
     MapTests();
     FreedIdTests();
@@ -166,6 +211,11 @@ int main() {
         assert(!InstallOrderCanon(base,kCanonBuildId,FailHook));
         for(const auto& s:kCanonSites)assert(!memcmp(reinterpret_cast<void*>(base+s.rva),s.bytes,16));
     }
+    for(auto accessor : {0xa914c0,0xa914e0}) {
+        Restore(base); const unsigned char bad=0xcc; Write(base+accessor,&bad,1);
+        assert(!Tpf2mpInstallOrderCanon(base,kCanonBuildId));
+    }
+    FamilyTests(base);
     auto* code=static_cast<unsigned char*>(mmap(nullptr,4096,PROT_READ|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));assert(code!=MAP_FAILED);
     std::mt19937_64 rng(35924);
     for(unsigned site=0;site<kCanonSiteCount;++site)for(unsigned alignment=0;alignment<2;++alignment) {
@@ -180,7 +230,9 @@ int main() {
         in.flags=0x202;in.rbp=reinterpret_cast<uintptr_t>(stack.data()+0x1400);
         const auto slot=in.rbp+kCanonSites[site].beginOff;
         if(site<3)memcpy(reinterpret_cast<void*>(slot),vec,sizeof(vec));
-        else if(site==5) {
+        else if(site==6) {
+            in.rdi=reinterpret_cast<uintptr_t>(system.data());
+        } else if(site==5) {
             in.r13=reinterpret_cast<uintptr_t>(system.data());
             system[0x208/8]=reinterpret_cast<uintptr_t>(vec);
         } else {
@@ -193,6 +245,7 @@ int main() {
         if(site==1)in.rdx=reinterpret_cast<uintptr_t>(load);
         if(site==2)in.rax=reinterpret_cast<uintptr_t>(load);
         State expected=in;
+        if(site==6) {expected.r12=system[6];expected.r14=system[7];}
         if(site==1 || site==2) {
             expected.rdi=load[1];
             asm volatile("testq %1,%1; pushfq; popq %0":"=r"(expected.flags):"r"(load[1]):"cc");
@@ -208,5 +261,5 @@ int main() {
         if(site==0)assert(output==0);
     }
     munmap(code,4096);munmap(image,size);
-    puts("canonical order: six real shims, GP/XMM/flags/MXCSR/RSP, both alignments, all guards and rollback, map integrity passed");
+    puts("canonical order: seven real shims, GP/XMM/flags/MXCSR/RSP, both alignments, all guards and rollback, map integrity passed");
 }

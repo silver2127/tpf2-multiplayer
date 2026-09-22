@@ -33,6 +33,7 @@ session (a plaintext frame has no nonce to dedup on).
 """
 import queue
 import socket
+import sys
 import struct
 import threading
 import time
@@ -337,6 +338,10 @@ def dial(target, local_port, hello, log, stop=None, listen_too=True, for_seconds
         try:
             lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Linux requires this on BOTH listener and bound dial sockets.
+            # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
+            if sys.platform.startswith("linux"):
+                lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             lst.bind(("0.0.0.0", local_port))
             lst.listen(4)
             lst.settimeout(0.2)
@@ -348,6 +353,10 @@ def dial(target, local_port, hello, log, stop=None, listen_too=True, for_seconds
             c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Linux requires this on BOTH listener and bound dial sockets.
+                # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
+                if sys.platform.startswith("linux"):
+                    c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 c.bind(("0.0.0.0", local_port))
                 c.settimeout(DIAL_EVERY)
                 c.connect(target)
