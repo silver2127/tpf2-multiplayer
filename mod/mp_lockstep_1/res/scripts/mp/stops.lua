@@ -156,6 +156,41 @@ local function describeStop(eo, eid)
 	return ok and d.model and d
 end
 
+-- AutoSig's destructive follow-ups identify a signal, not just the nearest
+-- edge object. Never fall back to a neighbouring stop/waypoint or another
+-- company's signal when the captured target has gone or changed.
+function CM.autoSigDescribeTarget(eo, eid, c)
+	if not eo or eo <= 0 or not eid or eid <= 0 then return nil end
+	local d = describeStop(eo, eid)
+	if not d or not d.track or d.kind ~= 2 or (d.stype ~= 0 and d.stype ~= 1) then return nil end
+	if CM.cmEnsure then CM.cmEnsure() end
+	if CM.cmMode == "companies" then
+		local pid = CM.cmCompanyPid[tonumber(c.company)]
+		if not pid then return nil end
+		local owner = CM.cmOwnerOf(eo)
+		if owner and owner ~= pid then return nil end
+	end
+	return {autosigTarget=1, rx=d.x, ry=d.y, rz=d.z, rmodel=CM.escName(d.model), rtype=d.stype,
+		rax=d.ax, ray=d.ay, rbx=d.bx, rby=d.by}
+end
+
+function CM.autoSigResolveTarget(c)
+	local eid = CM.findEdgeByEnds(true, tonumber(c.rax), tonumber(c.ray), tonumber(c.rbx), tonumber(c.rby), 0.25)
+	if not eid then return nil end
+	local objects = CM.objectsOnEdge(eid)
+	if not objects then return nil end
+	local found
+	for _, obj in ipairs(objects) do
+		local d = CM.autoSigDescribeTarget(obj[1], eid, c)
+		if d and d.rmodel == c.rmodel and d.rtype == tonumber(c.rtype)
+			and (d.rx-c.rx)^2 + (d.ry-c.ry)^2 + (d.rz-c.rz)^2 < 0.25^2 then
+			if found then return nil end -- ambiguous: remove neither
+			found = obj[1]
+		end
+	end
+	return found, eid
+end
+
 local function isPlayerStop(eo)
 	local st, sg, po
 	pcall(function() st = api.engine.getComponent(eo, api.type.ComponentType.STATION) end)
@@ -599,10 +634,17 @@ function CM.execStopAdd(c)
 		-- is the SHELTER model, which stands at the kerb -- 6-8 m off the
 		-- centreline of a medium town road -- so the search must be wide: the
 		-- 5 m split tolerance found nothing for five stops in a row (2026-09-02).
-		local eid, u
-		if c.ax and c.bx then eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0) end
+		local eid, u, autoSigTarget
+		if tonumber(c.autosigTarget) == 1 then
+			autoSigTarget, eid = CM.autoSigResolveTarget(c)
+			if not autoSigTarget then
+				log(tag .. ": AutoSig target missing, changed, foreign or ambiguous -- replacement refused")
+				return
+			end
+		elseif c.ax and c.bx then eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0) end
 		if eid then
 			u = CM.uOnEdgeFine(eid, c.x, c.y)
+			if not u and autoSigTarget then return end
 			if not u then eid = nil end
 		end
 		if not eid then eid, u = CM.findEdgeContaining(wantTrack, c.x, c.y, nil, K.STOP_EDGE_EPS) end
@@ -651,7 +693,8 @@ function CM.execStopAdd(c)
 		-- REPLACE: the object the originator's tool removed with this placement
 		local rm = nil
 		if c.rx then
-			local old, oldEid = CM.findStopNear(tonumber(c.rx), tonumber(c.ry), 2.0)
+			local old, oldEid = autoSigTarget, eid
+			if not autoSigTarget then old, oldEid = CM.findStopNear(tonumber(c.rx), tonumber(c.ry), 2.0) end
 			if old then
 				rm = { eo = old, eid = oldEid, x = tonumber(c.rx), y = tonumber(c.ry) }
 				local lines = CM.linesUsingStation(old)
@@ -753,9 +796,11 @@ function CM.execStopDel(c)
 	local sent = false
 	local ok, err = pcall(function()
 		local tag = string.format("STOPDEL seq=%s", tostring(c.seq))
-		local best, eid = CM.findStopNear(c.x, c.y, 2.0)
+		local best, eid
+		if tonumber(c.autosigTarget) == 1 then best, eid = CM.autoSigResolveTarget(c)
+		else best, eid = CM.findStopNear(c.x, c.y, 2.0) end
 		if not best then
-			log(string.format("%s: no roadside stop within 2 m of %.1f,%.1f -- skipped", tag, c.x, c.y))
+			log(string.format("%s: no matching editable stop at %.1f,%.1f -- skipped", tag, c.x, c.y))
 			return
 		end
 		local lines = CM.linesUsingStation(best)
