@@ -8,7 +8,7 @@
 #include <vector>
 #include <random>
 #include <cassert>
-#include "../src/tpf2mp_plugin.h"
+#include "../../native/src/plugin/tpf2mp_plugin.h"
 static const Tpf2mpHost* H = nullptr;
 static bool g_gog = false;
 #include "../src/alignment_batch.h"

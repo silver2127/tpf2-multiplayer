@@ -23,7 +23,10 @@
   game's own alut.dll, and the Segment Heap switch all live in PluginHost.wxs:
   they are SHARED with the TpF2 Big Maps package under fixed component GUIDs so
   the two products can be installed in either order and uninstalled in either
-  order. That file is duplicated byte-for-byte in both repositories.
+  order. Big Maps now lives in this repository (bigmap/) and ships in this
+  package: plugins\tpf2_bigmap.dll + plugins\tpf2_bigmap.cfg. An installed
+  TpF2 Big Maps product is removed by this one (its UpgradeCode is listed
+  below), so the plugin has one owner.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
@@ -32,12 +35,14 @@
   <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
   <?ifndef BridgeOut ?><?define BridgeOut = "..\native\out" ?><?endif?>
   <?ifndef ProxyDll ?><?define ProxyDll = "$(BridgeOut)\alut.dll" ?><?endif?>
-  <?ifndef HostDll ?><?define HostDll = "$(BridgeOut)	pf2_pluginhost.dll" ?><?endif?>
+  <?ifndef HostDll ?><?define HostDll = "$(BridgeOut)\tpf2_pluginhost.dll" ?><?endif?>
   <?ifndef BridgeDll ?><?define BridgeDll = "$(BridgeOut)\tpf2_bridge_mp.dll" ?><?endif?>
   <?ifndef MenuDll ?><?define MenuDll = "$(BridgeOut)\tpf2_menu.dll" ?><?endif?>
   <?ifndef SliceDll ?><?define SliceDll = "$(BridgeOut)\tpf2_slice.dll" ?><?endif?>
   <?ifndef NetpunchDir ?><?define NetpunchDir = "..\netpunch\dist\netpunch" ?><?endif?>
   <?ifndef ModSource ?><?define ModSource = "..\mod\mp_lockstep_1" ?><?endif?>
+  <?ifndef BigmapDll ?><?define BigmapDll = "..\bigmap\out\tpf2_bigmap.dll" ?><?endif?>
+  <?ifndef BigmapCfg ?><?define BigmapCfg = "..\bigmap\cfg\tpf2_bigmap.cfg" ?><?endif?>
   <?ifndef CaDll ?><?define CaDll = "out\tpf2ca.dll" ?><?endif?>
 
   <Package Name="TpF2 Multiplayer"
@@ -57,6 +62,16 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- The separate TpF2 Big Maps package (its UpgradeCode): this package ships
+         the same plugin now, so an installed Big Maps is removed with the old
+         Multiplayer (RemoveExistingProducts, scheduled by MajorUpgrade). Its own
+         base_mod restore is skipped then (it runs only on a plain uninstall),
+         and the shared proxy/host components are refcounted (PluginHost.wxs). -->
+    <Upgrade Id="C11917C5-F0E7-4C55-BC89-789B33A0B731">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" Maximum="255.0.0" IncludeMaximum="no"
+                      Property="TPF2_OLD_BIGMAPS" MigrateFeatures="no" />
+    </Upgrade>
 
     <!-- Repair stays available on purpose: Steam's "verify integrity" puts the
          stock alut.dll back over the proxy, and a Repair reinstalls it. -->
@@ -112,9 +127,26 @@
       <ComponentGroupRef Id="GameFolderFiles" />
       <ComponentGroupRef Id="NetpunchFiles" />
       <ComponentGroupRef Id="ModFiles" />
+      <ComponentGroupRef Id="BigmapFiles" />
     </Feature>
 
-    <!-- Custom actions and their sequencing: PluginHost.wxs. -->
+    <!-- Custom actions and their sequencing: PluginHost.wxs, plus the one below. -->
+
+    <!-- Big Maps patches res\config\base_mod.lua at game start (the New Game
+         density levels). That file is not installed, so on a full uninstall (not
+         an upgrade: the new plugin re-patches on its next start) the plugin's own
+         restore runs first, through 64-bit rundll32, while its DLL is still on
+         disk. Return="ignore": a stock or missing file never blocks an uninstall. -->
+    <CustomAction Id="RestoreStockBaseMod"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]rundll32.exe&quot; &quot;[PreviewPluginsFolder]tpf2_bigmap.dll&quot;,BigmapRestoreStockBaseMod"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RestoreStockBaseMod" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
 
     <!-- ===== UI ===== -->
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
@@ -160,6 +192,17 @@
       <Component Id="RememberInstallFolder" Guid="68615E50-B3D1-4EF1-9966-89EC1379F83A">
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Multiplayer" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
         <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Multiplayer" Name="Version" Type="string" Value="$(ProductVersion)" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Big Maps (bigmap/). The cfg is versioned so a modified or unversioned
+         copy is replaced on install, upgrade and repair (the tuned settings). -->
+    <ComponentGroup Id="BigmapFiles" Directory="PreviewPluginsFolder">
+      <Component Id="BigmapDll">
+        <File Id="tpf2_bigmap.dll" Name="tpf2_bigmap.dll" Source="$(BigmapDll)" KeyPath="yes" />
+      </Component>
+      <Component Id="BigmapCfg">
+        <File Id="tpf2_bigmap.cfg" Name="tpf2_bigmap.cfg" Source="$(BigmapCfg)" DefaultVersion="$(ProductVersion)" KeyPath="yes" />
       </Component>
     </ComponentGroup>
 

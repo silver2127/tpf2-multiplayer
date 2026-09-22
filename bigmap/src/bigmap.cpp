@@ -49,7 +49,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <cwchar>
-#include "tpf2mp_plugin.h"
+#include "../../native/src/plugin/tpf2mp_plugin.h"   // the plugin ABI, shared with the host
 
 #pragma intrinsic(_ReturnAddress)
 

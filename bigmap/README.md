@@ -1,6 +1,11 @@
-# tpf2-bigmap
+# Big Maps (bigmap/)
 
 Maps larger than Transport Fever 2's New Game menu will build.
+
+Big Maps lived in its own repository (tpf2-bigmap) until 2026-09-22; it is now
+part of TpF2 Multiplayer and ships in the same MSI. Build it with
+`native\build.bat bigmap` (or `all`); this folder's `build.bat` still takes the
+test targets (`-pager-test`, `-codec-test`, ...).
 
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
@@ -14,9 +19,9 @@ overflow above approximately 185 km separation. See
 [placement-distance.md](docs/placement-distance.md) for the reverse-engineered
 sites and offline validation; an in-game regeneration check is still pending.
 
-A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code
-and has no build-time dependency on the host tree — only the vendored
-`src/tpf2mp_plugin.h`, which is the whole ABI.
+A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code;
+its one build-time dependency on the rest of the repo is the plugin ABI,
+`native/src/plugin/tpf2mp_plugin.h`.
 
 Target: **Transport Fever 2 build 35924** (Steam, 2024-12-11, the last release).
 Every address here was measured on it, each site is byte-verified before it is
@@ -454,10 +459,10 @@ stock.
 
 ## Install
 
-**Download `TpF2BigMaps-<version>.msi` from the
-[latest release](https://github.com/silver2127/tpf2-bigmap/releases) and run it.**
-It finds the Transport Fever 2 folder Steam registered, asks you to confirm it,
-and puts these in place:
+**Install TpF2 Multiplayer** (`TpF2Multiplayer.msi` from the
+[latest release](https://github.com/silver2127/tpf2-multiplayer/releases)): Big
+Maps ships inside it. It finds the Transport Fever 2 folder Steam registered,
+asks you to confirm it, and puts these in place (besides the multiplayer files):
 
 | file | what |
 | --- | --- |
@@ -485,25 +490,15 @@ the way it shapes the stock ones. To set a shape yourself, add a
 `octree=1`, and the area within the street-raster budget (`street_raster=1` scales
 the cell to keep it there).
 
-### Installing alongside TpF2 Multiplayer
+### The old TpF2 Big Maps installer
 
-Both packages work in either order and can be removed in either order. They
-share the proxy and the plugin host, and both installers declare those under
-the **same component GUIDs** (`installer/PluginHost.wxs`, byte-identical in both
-repositories), so Windows Installer reference-counts them: the second install
-finds them present, the first uninstall leaves them for the other, and only the
-last one out puts the game's own `alut.dll` back. The custom actions that park
-and restore `alut.dll` check that count too, so uninstalling one product never
-restores the stock library out from under the other.
-
-Each product keeps its own config — this one in `plugins\tpf2_bigmap.cfg`, which
-the host merges over `tpf2mp.cfg` — so neither installer touches a file the
-other owns.
-
-`installer\test_coexist.ps1` proves all of it against a throwaway folder with
-the real `msiexec` transactions (both orders, both directions, the shared
-registry value tracked and restored). It needs an elevated PowerShell because
-the packages are per-machine.
+Up to 0.5.x Big Maps had its own MSI (`TpF2BigMaps-<version>.msi`), which
+coexisted with TpF2 Multiplayer by sharing the proxy and the plugin host under
+fixed component GUIDs (`installer/PluginHost.wxs`). The TpF2 Multiplayer MSI now
+lists that product's UpgradeCode and removes it when it installs, so the plugin
+has one owner; the shared components are reference-counted, so nothing is lost
+in between, and the old package's base_mod restore does not run during that
+removal (the new plugin re-patches on its next start).
 
 ### Virus-scanner findings
 

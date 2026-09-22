@@ -10,9 +10,10 @@ parser.add_argument("--accept-wix-eula", action="store_true",
                     help="pass --acceptEula wix7 to wix for this run")
 args=parser.parse_args()
 eula=['--acceptEula','wix7'] if args.accept_wix_eula else []
-repo=Path.cwd();d=Path(tempfile.mkdtemp(prefix='bigmap-config-msi-'));wix=Path(args.wix)
+repo=Path(__file__).resolve().parents[1];d=Path(tempfile.mkdtemp(prefix='bigmap-config-msi-'));wix=Path(args.wix)
 ns={'w':'http://wixtoolset.org/schemas/v4/wxs'}
-source=ET.parse(repo/'installer/Package.wxs').find(".//w:Component[@Id='BigmapCfg']",ns)
+# the plugin ships in the TpF2 Multiplayer MSI (bigmap/ is part of that repo)
+source=ET.parse(repo.parent/'installer/Package.wxs').find(".//w:Component[@Id='BigmapCfg']",ns)
 assert 'NeverOverwrite' not in source.attrib
 assert source.find('w:File',ns).get('DefaultVersion')=='$(ProductVersion)'
 guid=str(uuid.uuid4());component=str(uuid.uuid4());dest=d/'installed';dest.mkdir()

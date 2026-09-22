@@ -1,7 +1,8 @@
 @echo off
 setlocal EnableExtensions
-REM tpf2_bigmap.dll -- a tpf2mp plugin. Standalone: nothing here depends on the
-REM host's source tree, only on the vendored src\tpf2mp_plugin.h.
+REM tpf2_bigmap.dll -- a tpf2mp plugin. Its one dependency on the rest of the
+REM repo is the plugin ABI, native\src\plugin\tpf2mp_plugin.h.
+REM native\build.bat bigmap (and all) call this script.
 REM
 REM Optional %1 suffix: a loaded dll stays locked for the life of the process,
 REM so rebuilding to the same name fails with LNK1104 while the game is running.

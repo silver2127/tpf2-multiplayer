@@ -102,7 +102,8 @@ send them yourself if you report a bug. The full text is the
 
 | path | contents |
 |---|---|
-| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
+| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host and its ABI |
+| `bigmap/` | Big Maps: the plugin for maps larger than the New Game menu offers (`native\build.bat bigmap`; see [bigmap/README.md](bigmap/README.md)). Merged from tpf2-bigmap on 2026-09-22, and shipped in the same MSI |
 | `mod/mp_lockstep_1/` | the game-script mod |
 | `netpunch/` | the lobby (the dedicated server runs it too) and the master server (Python) |
 | `installer/` | the WiX package |

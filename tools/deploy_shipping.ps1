@@ -67,22 +67,18 @@ foreach ($c in "tpf2_slice.cfg", "tpf2mp.cfg") {
     else { Write-Host "[ship]   $c kept (live settings; pass -Cfg to overwrite)" }
 }
 
-# Native plugins live in their OWN repositories -- they depend on nothing here
-# but the vendored ABI header, and they must be independently releasable. For
-# local testing we pick them up from sibling checkouts if they are present; a
-# missing one is not an error, it just means that feature is not under test.
+# Native plugins. Big Maps lives in this repo (bigmap\, built by native\build.bat
+# bigmap or all); a missing build is not an error, it just means that feature is
+# not under test. Its cfg goes with it: a plugin with no cfg next to it runs on
+# built-in defaults.
 $PluginDir = Join-Path $Game 'plugins'
 New-Item -ItemType Directory -Force $PluginDir | Out-Null
 Put "$Repo\native\out\tpf2_workshop_register.dll" (Join-Path $PluginDir 'tpf2_workshop_register.dll')
-# A worktree (<main>\.claude\worktrees\<name>) has its siblings next to the main
-# checkout, not next to itself: from a worktree the plugins were silently skipped.
-$SiblingRoot = Split-Path -Parent $Repo
-if ($Repo -match '^(.*)\\\.claude\\worktrees\\[^\\]+$') { $SiblingRoot = Split-Path -Parent $Matches[1] }
-foreach ($p in @(@{repo='tpf2-bigmap'; dll='out\tpf2_bigmap.dll'})) {
-    $src = Join-Path $SiblingRoot (Join-Path $p.repo $p.dll)
-    if (Test-Path $src) { Put $src (Join-Path $PluginDir (Split-Path $p.dll -Leaf)) }
-    else { Write-Host ("[ship]   plugin {0}: not built (looked in {1}) -- skipped" -f $p.repo, $src) }
-}
+$bigmapDll = Join-Path $Repo 'bigmap\out\tpf2_bigmap.dll'
+if (Test-Path $bigmapDll) {
+    Put $bigmapDll (Join-Path $PluginDir 'tpf2_bigmap.dll')
+    Put (Join-Path $Repo 'bigmap\cfg\tpf2_bigmap.cfg') (Join-Path $PluginDir 'tpf2_bigmap.cfg')
+} else { Write-Host ("[ship]   plugin bigmap: not built (looked in {0}) -- skipped" -f $bigmapDll) }
 New-Item -ItemType Directory -Force (Join-Path $Game 'netpunch') | Out-Null
 Put "$Repo\netpunch\dist\netpunch\netpunch.exe"    (Join-Path $Game 'netpunch\netpunch.exe')
 # the lobby's libraries: mirrored (a stale extra file there is a wrong library),
