@@ -1,28 +1,42 @@
-EXPERIMENTAL: bounded Steam save-transfer retries and throughput diagnostics
+## ⚠ EXPERIMENTAL — 0.6.1.25
 
-This is a test build and a pre-release. Everyone in a session needs 0.6.1.25. The stable release remains unchanged. Real two-computer Steam validation is still needed; successful automated tests do not establish your internet transfer speed.
+**Steam save-transfer test build**
 
-What changed
+> **For testing — not a stable release.**
+> Everyone in your session needs **0.6.1.25**. Stable **0.6.1.19** is unchanged.
 
-- The reliable 32 KB Steam path starts with 512 KB in flight and grows only as the receiver acknowledges delivery, up to about 4 MB. It no longer requeues an entire window simply because Steam has not delivered it yet.
-- A stalled transfer probes the first missing piece. If later pieces have already arrived, it repairs a small group of holes. Repeated stalls back off instead of filling Steam's queue with copies.
-- This experimental release ENABLES the corrected large-piece path for Steam-only transfers without a local test file. Mixed Steam/CROSS-PLAY sessions keep small pieces. Direct TCP from 0.6.1.24 is still preferred when reachable.
-- Logs now show acknowledged/unique bytes, rate, duplicates, recovery probes, Steam queue size and send failures. A displayed 0% alone is not a byte-level diagnosis: the existing UI updates in 10% steps.
+### What changed
 
-Still included
+- **Fewer duplicate save blocks.** The sender waits for delivery acknowledgements instead of repeatedly filling Steam's queue.
+- **Controlled recovery.** Missing blocks are retried in small groups, with longer waits when a transfer stalls.
+- **Steam test enabled.** The corrected 32 KB Steam path is active without an extra test file. Direct TCP remains preferred when reachable; mixed CROSS-PLAY sessions keep small blocks.
+- **Better diagnostics.** Logs show actual byte progress, transfer rate, duplicates, Steam queue size and send failures.
 
-The 0.6.1.24 direct-TCP address exchange and optional live join, Steam ID joining, Workshop downloads, title/dashboard redesign and prior game-speed fixes. Live join remains opt-in; this build does not enable it automatically.
+### How to test
 
-Automated validation
+1. Close the game normally on **both computers** and install **0.6.1.25**.
+2. Transfer the **same save** and record its size and elapsed time.
+3. Use **OPEN LOGS** on both computers. Note whether the transfer used **TCP or Steam**.
 
-- A finite 8 MiB queue at 256 KiB/s, 1 MiB/s and 16 MiB/s; exact file hashes, local loss, lost feedback, rewind and stalled-peer timeout.
-- In the simulated 1 MiB/s case, the same 12 MiB file took about 12 seconds instead of 71 seconds with the previous retry logic. This is a simulation, not a claimed live Steam result.
-- Two-receiver transfers with 0%, 8% and 15% injected datagram loss; both direct TCP directions and fallback; normal transfer/failure/retry regression; native bridge build.
+### Known limitations
 
-How to test
+- **A real Steam fix is not yet confirmed.** Earlier large-block builds stalled; this candidate still needs your two-computer test.
+- A successful **TCP** transfer does not test the Steam fallback.
+- The progress display updates in **10% steps**. A displayed 0% can mean data is arriving below that threshold.
+- Optional **live join remains off by default**. Existing unrelated gameplay issues are outside this fix.
 
-Close the game normally on both machines, install this release's MSI, and retry the same save. Record its size and elapsed transfer time. OPEN LOGS collects the evidence: note whether it says `taking the save over TCP` or uses Steam, and retain both host and joiner logs. Avoid original-save modifications during the transfer test.
+### Validation
 
-Known limitations
+Automated queue, bandwidth, missing-packet, retry and exact-hash tests passed, including two receivers with up to 15% injected loss. TCP/fallback tests and the native build passed.
 
-The previous large-piece Steam builds stalled in live sessions. This candidate addresses reproduced retry amplification but is not yet a confirmed fix for every live stall. A direct TCP transfer does not test the reliable Steam fallback. Existing optional live-join and unrelated gameplay issues are outside this fix.
+In a **simulated 1 MiB/s connection**, a 12 MiB save took about **12 seconds instead of 71**. This is a test result, not a promise about live Steam speed.
+
+---
+
+### Downloads
+
+- **Windows:** [Download the MSI](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/TpF2Multiplayer.msi)
+- **Linux / Steam Deck:** [Proton installer](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/install_proton.sh) · [Python installer](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/install_proton.py)
+- **Manual installation:** [Files ZIP](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/TpF2Multiplayer-files.zip) · [SHA-256 checksums](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/SHA256SUMS.txt)
+
+The GitHub **Source code** archives are not the playable mod.
