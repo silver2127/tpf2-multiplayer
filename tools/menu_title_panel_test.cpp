@@ -1,4 +1,4 @@
-// Offline: render the real title-menu code and exercise hit targets, without
+// Offline: render the real menu/session code and exercise hit targets, without
 // starting a lobby, touching the installation or loading a game.
 #include "../native/src/menu_hook.cpp"
 #include <cassert>
@@ -14,7 +14,7 @@ static void check(int w,int h)
         assert(a.w>0 && a.h>0 && a.x>=0 && a.y>=0 && a.x+a.w<=w && a.y+a.h<=h);
         for(int j=0;j<i;++j) {
             const auto& b=g_hits[j];
-            if(a.id==b.id && a.id!=91) { fprintf(stderr,"Duplicate %d page=%ld tab=%d picker=%d scale=%g\n",a.id,g_uiState,g_titleTab,g_savePicker,g_flagScale); assert(false); }
+            if(a.id==b.id && a.id!=91 && a.id!=4) { fprintf(stderr,"Duplicate %d page=%ld tab=%d picker=%d scale=%g\n",a.id,g_uiState,g_titleTab,g_savePicker,g_flagScale); assert(false); }
             if(a.x<b.x+b.w && b.x<a.x+a.w && a.y<b.y+b.h && b.y<a.y+a.h) {
                 printf("Overlapping controls %d and %d\n",a.id,b.id); assert(false);
             }
@@ -23,12 +23,18 @@ static void check(int w,int h)
 }
 static void snapshot(const fs::path& path,int w,int h)
 {
-    int dw=w,dh=h; w=1280;h=800;
-    const int x=(w-dw)/2,y=(h-dh)/2;
-    std::vector<unsigned char> pixels((size_t)w*h*4);
-    PaintTitleBackdrop(pixels.data(),(size_t)w*4,w,h,x,y,dw,dh);
-    ComposeLayer(g_titleBackdrop.data()+((size_t)y*w+x)*4,(size_t)w*4,
-        pixels.data()+((size_t)y*w+x)*4,(size_t)w*4,dw,dh,true);
+    std::vector<unsigned char> pixels;
+    if(WorldLoaded()) {
+        pixels.resize((size_t)w*h*4);
+        ComposeLayer(nullptr,0,pixels.data(),(size_t)w*4,w,h);
+    } else {
+        int dw=w,dh=h; w=1280;h=800;
+        const int x=(w-dw)/2,y=(h-dh)/2;
+        pixels.resize((size_t)w*h*4);
+        PaintTitleBackdrop(pixels.data(),(size_t)w*4,w,h,x,y,dw,dh);
+        ComposeLayer(g_titleBackdrop.data()+((size_t)y*w+x)*4,(size_t)w*4,
+            pixels.data()+((size_t)y*w+x)*4,(size_t)w*4,dw,dh,true);
+    }
     BITMAPFILEHEADER file{}; file.bfType=0x4d42;
     file.bfOffBits=sizeof(file)+sizeof(BITMAPINFOHEADER); file.bfSize=file.bfOffBits+(DWORD)pixels.size();
     BITMAPINFOHEADER info{}; info.biSize=sizeof(info); info.biWidth=w; info.biHeight=-h;
@@ -100,7 +106,20 @@ int wmain(int argc,wchar_t** argv)
         g_savePicker=false;strcpy_s(g_modsPrompt,"This savegame needs 3 additional mods. Download them from the host?");
         RenderPanelLayer(w,h);check(w,h);assert(g_hitCount==3 && hit(16) && hit(17) && hit(19));
         if(scale==1) snapshot(folder/L"mods.bmp",w,h);g_modsPrompt[0]=0;
-        g_gameUi=1; assert(!RenderTitlePanel(w,h,1) && !RenderTitlePanel(w,h,2));g_gameUi=0;
+        g_gameUi=1; g_uiState=2; g_sessionStarted=1; g_isHost=1; g_hostSteam=1;
+        g_savePicker=true;
+        g_titlePlayerPage=0; RenderPanelLayer(w,h);check(w,h);
+        assert(hit(87) && hit(4) && hit(51) && hit(50) && hit(11));
+        assert(!hit(5) && !hit(6) && !hit(90) && !hit(100));
+        if(scale==1) snapshot(folder/L"session-host.bmp",w,h);
+        OnHit(115);assert(g_titlePlayerPage==1);RenderPanelLayer(w,h);check(w,h);assert(hit(114));
+        g_isHost=0;RenderPanelLayer(w,h);check(w,h);
+        assert(hit(4) && hit(9) && !hit(87) && !hit(50) && !hit(51) && !hit(11) && !hit(6));
+        if(scale==1) snapshot(folder/L"session-client.bmp",w,h);
+        g_uiState=1;g_savePicker=false;RenderPanelLayer(w,h);check(w,h);
+        assert(hit(2) && hit(4) && hit(13) && hit(14) && hit(51) && !hit(3) && !hit(110));
+        if(scale==1) snapshot(folder/L"session-setup.bmp",w,h);
+        g_gameUi=0;g_sessionStarted=0;g_hostSteam=0;
         assert(!RenderTitlePanel(w,h,3));
     }
     // Both Vulkan and OpenGL use this CPU surface path. Exercise full-frame
@@ -121,5 +140,5 @@ int wmain(int argc,wchar_t** argv)
     g_gameUi=1; g_uiState=1; PanelLayout();
     assert(ComposePanelIfDirty(rebuilt.data(),pitch));
     g_gameUi=0;
-    puts("PASS: five scales; disjoint controls; all server/player pages; host/client/transfer guards; modal isolation; title-only scope");
+    puts("PASS: five scales; disjoint controls; all server/player pages; host/client/transfer guards; modal isolation; title and in-world session flows");
 }
