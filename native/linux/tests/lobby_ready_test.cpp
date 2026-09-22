@@ -361,6 +361,31 @@ int main()
     DedicatedAutosaveTick(352000,1,lastSave); assert(DedSave().phase==0);
     assert(ReadSmallFile(dir+"tpf2_ded_autosave_done.txt",&marker) && marker=="timeout\n");
     for (const auto& name : {"new-auto.sav","tpf2_ded_autosave.txt","tpf2_ded_autosave_ack.txt","tpf2_ded_autosave_done.txt"}) unlink((dir+name).c_str());
+    // Live join: roster growth takes the existing autosave path; the dedicated
+    // waiting-member request uses that same watcher even without roster growth.
+    saveTest=true; forceAllowed=true; newestSave.clear(); nativeBusy=false;
+    S().syncAskedAt=0; S().sharedSave.clear();
+    model.isHost=true; model.lastCount=1; model.lobbyReady=true;
+    g_gameUiSeen=true; g_titleMenu=false;
+    Json live;
+    assert(ParseJson(R"({"players":["host","late"],"host":"host","you":"host","join_freeze":false})", &live));
+    const int beforeLive=savesForced;
+    ApplyRoster(live);
+    assert(!model.joinFreeze && savesForced==beforeLive+1 && S().syncAskedAt);
+    ApplyRoster(live); assert(savesForced==beforeLive+1);
+    S().syncAskedAt=0;
+    Write(dir+"tpf2_sync_save.txt", "live join\n");
+    SyncPoll();
+    assert(!Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+2 && S().syncAskedAt);
+    SyncPoll(); assert(savesForced==beforeLive+2);
+    newestSave=dir+"live-auto.sav"; Write(newestSave,"live world");
+    SyncPoll(); SyncPoll();
+    assert(!S().syncAskedAt && S().sharedSave==newestSave);
+    std::string liveCommands;
+    assert(ReadSmallFile(dir+"lobby_in.jsonl", &liveCommands));
+    assert(liveCommands.find("\"cmd\":\"start\",\"save\":\""+newestSave+"\"")!=std::string::npos);
+    assert(!Exists(dir+"tpf2_native_request.txt"));
+    unlink(newestSave.c_str()); unlink((dir+"tpf2_sync_sent.txt").c_str());
     unlink((dir+"chosen.sav").c_str()); unlink((dir+"mp_company_cfg.txt").c_str());
     for (const auto& name : {"lobby_out.jsonl", "lobby_in.jsonl", "tpf2_bridge_ctl.txt"}) unlink((dir+name).c_str());
     unlink((dir+"lockstep_dash_"+letter+".txt").c_str());

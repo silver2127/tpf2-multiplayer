@@ -189,6 +189,7 @@ for s in native_watchdog.py steam_compat.py server.env.example README.md; do
   install -m 0644 "$REPO/tools/server/$s" "$STAGE/server/$s"
 done
 install -m 0644 "$REPO/docs/re/linux/PARITY_20260921.md" "$STAGE/PARITY.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5c6c084b.md" "$STAGE/UPSTREAM_dev_5c6c084b.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6e1e4ec7.md" "$STAGE/UPSTREAM_dev_6e1e4ec7.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5a9b3ae0.md" "$STAGE/UPSTREAM_dev_5a9b3ae0.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_49b1f277.md" "$STAGE/UPSTREAM_dev_49b1f277.md"
@@ -226,7 +227,7 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows v0.6.1.28 6e1e4ec72743a889b1010013a292a99c78cc8590 (pinned Linux origin replay)"
+  echo "Lua: Windows v0.6.1.28 5c6c084b0e5ad299048920e970e2e8fb79e21002 (pinned Linux origin replay)"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"

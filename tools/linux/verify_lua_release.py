@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "6e1e4ec72743a889b1010013a292a99c78cc8590"
+REFERENCE = "5c6c084b0e5ad299048920e970e2e8fb79e21002"
 INCOMING = REFERENCE
 INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"

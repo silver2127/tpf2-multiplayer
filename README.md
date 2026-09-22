@@ -18,10 +18,10 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration includes Windows **experimental release 0.6.1.28** plus dev `6e1e4ec7` and a native
+integration includes Windows **experimental release 0.6.1.28** plus dev `5c6c084b` and a native
 dedicated server. See [Linux installation](docs/linux/INSTALL.md),
-[current integration and test evidence](docs/linux/UPSTREAM_dev_6e1e4ec7.md), and
-[dedicated server setup](tools/server/README.md). This integration is partial: the new canonical simulation ordering is
+[current integration and test evidence](docs/linux/UPSTREAM_dev_5c6c084b.md), and
+[dedicated server setup](tools/server/README.md). Earlier native parity limitations remain: canonical simulation ordering is
 default-off pending live validation, so matching versions do not establish
 Windows/native gameplay parity. The integration record lists the evidence.
 The Windows MSI instructions below apply to the Windows version.
