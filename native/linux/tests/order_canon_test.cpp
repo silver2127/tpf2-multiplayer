@@ -200,7 +200,18 @@ int main() {
     auto* image=mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(image!=MAP_FAILED);
     const auto base=reinterpret_cast<uintptr_t>(image);
     Restore(base);assert(!mprotect(image,size,PROT_READ|PROT_EXEC));
-    unsetenv("TPF2MP_ORDER_CANON");assert(!Tpf2mpInstallOrderCanon(base,kCanonBuildId));
+    for (const char* value : {static_cast<const char*>(nullptr), "", "1", "0", "00", "false"}) {
+        Restore(base);
+        if (value) setenv("TPF2MP_ORDER_CANON",value,1); else unsetenv("TPF2MP_ORDER_CANON");
+        const bool enabled = !value || std::strcmp(value,"0");
+        assert(Tpf2mpInstallOrderCanon(base,kCanonBuildId) == enabled);
+        if (!enabled) {
+            assert(!std::strcmp(g_canonStatus.load(),"off (TPF2MP_ORDER_CANON=0)"));
+            for (const auto& site:kCanonSites)
+                assert(!memcmp(reinterpret_cast<void*>(base+site.rva),site.bytes,16));
+        }
+    }
+    Restore(base);
     setenv("TPF2MP_ORDER_CANON","1",1);assert(!Tpf2mpInstallOrderCanon(base,"wrong"));
     for(const auto& s:kCanonSites) {
         Restore(base);const unsigned char bad=s.bytes[15]^1;Write(base+s.rva+15,&bad,1);

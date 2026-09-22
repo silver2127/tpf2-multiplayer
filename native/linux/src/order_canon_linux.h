@@ -23,7 +23,7 @@ inline std::atomic<bool> active{false};
 //   capacity    temporary person/cargo maps before apply
 //   freed-ids   removed-id batch before the engine appends to its free deque
 // Every peer of a session must run them (they change which building a draw
-// lands on relative to vanilla). Pending local live validation: TPF2MP_ORDER_CANON=1 opts in; default off.
+// lands on relative to vanilla). Enabled by default; TPF2MP_ORDER_CANON=0 disables it. Peers must match.
 bool Tpf2mpInstallOrderCanon(uintptr_t imageBase, const char* buildId);
 const char* Tpf2mpOrderCanonStatus();
 using Tpf2mpOrderCanonLog = void (*)(const char*, ...);

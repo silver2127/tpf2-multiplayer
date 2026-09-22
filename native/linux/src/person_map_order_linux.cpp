@@ -79,13 +79,13 @@ constexpr size_t kInfoMapCount = 5, kNativeMapSize = 0x38;
 // fixed-seed generator and frees ids in walk order, and the Windows order this
 // module reproduces is insertion history -- a host that kept its world and a
 // joiner that loaded it disagree (lab, busy world, ~120 units after a live
-// join). With the experimental TPF2MP_ORDER_CANON=1 switch, a sealed owner is walked in ascending key
+// join). By default (unless TPF2MP_ORDER_CANON=0), a sealed owner is walked in ascending key
 // order instead, as Windows does (slice/hotjoin_order.inl). The sorted arrays
 // sit beside the records, which stay intact for the validation and FindNode.
 struct SortedEntry { uint32_t key; uintptr_t gameNode; };
 bool CanonicalMaps()
 {
-    static const bool on = [] { const char* v = std::getenv("TPF2MP_ORDER_CANON"); return v && !std::strcmp(v, "1"); }();
+    static const bool on = [] { const char* v = std::getenv("TPF2MP_ORDER_CANON"); return !v || std::strcmp(v, "0"); }();
     return on && tpf2mp_order_detail::active.load(std::memory_order_acquire);
 }
 struct MapOwner {

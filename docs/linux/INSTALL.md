@@ -27,10 +27,13 @@ top of Linux merge PR #5. The integration and live-test record is
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 
-Earlier native parity limitations remain. Canonical simulation ordering is default-off
-pending a loaded-game lifetime probe; `TPF2MP_ORDER_CANON=1` is an experimental
-developer switch. Do not enable retained-world joins or assume Windows/native
-simulation parity from the matching version alone. See the integration record.
+Canonical simulation ordering is on by default since dev `ad3d66e4`.
+`TPF2MP_ORDER_CANON=0` disables it; unset or any other value enables it.
+Simulation settings must match every peer, including Windows players whose
+sorts default on. Native retained-world joins remain opt-in, and matching
+versions alone do not establish gameplay parity. Loaded-game lifetime and
+cross-platform validation remain outstanding; see
+[UPSTREAM_dev_ad3d66e4.md](UPSTREAM_dev_ad3d66e4.md).
 
 The native implementation includes command capture and replay, deterministic
 ordering hooks, company permissions, save selection, load progress, automatic

@@ -21,9 +21,10 @@ This branch also contains a **native Linux build-35924 port**. Its current
 integration includes Windows **release 0.7** plus dev `8c3c02a5` and a native
 dedicated server. See [Linux installation](docs/linux/INSTALL.md),
 [current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md), and
-[dedicated server setup](tools/server/README.md). Earlier native parity limitations remain: canonical simulation ordering is
-default-off pending live validation, so matching versions do not establish
-Windows/native gameplay parity. The integration record lists the evidence.
+[dedicated server setup](tools/server/README.md). Canonical simulation ordering is now on by default (`TPF2MP_ORDER_CANON=0`
+disables it); see the [dev ad3d66e4 integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
+Settings must match Windows peers. Loaded-game lifetime and cross-platform
+validation remain outstanding; matching versions do not establish gameplay parity.
 The Windows MSI instructions below apply to the Windows version.
 The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
 retains the Windows autosave-sidecar fix; native terrain sidecars remain unported.

@@ -249,7 +249,7 @@ static bool InstallOrderCanon(uintptr_t base, const char* buildId, bool (*instal
 {
     if (g_canonReady) return false;
     const char* env = std::getenv("TPF2MP_ORDER_CANON");
-    if (!env || std::strcmp(env, "1")) { g_canonStatus.store("off (pending live validation; TPF2MP_ORDER_CANON=1 opts in)"); return false; }
+    if (env && !std::strcmp(env, "0")) { g_canonStatus.store("off (TPF2MP_ORDER_CANON=0)"); return false; }
     if (!base || !buildId || std::strcmp(buildId, kCanonBuildId)) { g_canonStatus.store("off (unverified image)"); return false; }
     for (const auto& site : kCanonSites)
         if (std::memcmp(reinterpret_cast<const void*>(base + site.rva), site.bytes, sizeof(site.bytes))) {
