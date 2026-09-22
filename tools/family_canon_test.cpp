@@ -13,7 +13,7 @@
 //   - every index slot names its node's new position; ctrl bytes and keys are
 //     untouched;
 //   - a list that is already sorted is not written at all;
-//   - an index that does not describe the nodes is refused and nothing moves.
+//   - an invalid tail index is refused and nothing moves.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -197,11 +197,76 @@ static void TestRefusals()
     }
 }
 
+
+// Tail optimization: include prefix nodes reached by a newly appended low key,
+// retain components at all widths, and reuse scratch across shrinking/growing tails.
+static void TestTails(int N)
+{
+    FamilyCanonScratch s;
+    const std::vector<std::vector<int32_t>> cases = {
+        {1, 2, 3, 4, 6, 5},                 // two-node tail
+        {1, 3, 5, 7, 9, 4},                 // merge back into the prefix
+        {-9, -7, -5, -3, -1, -6},           // signed entity ordering
+        {1, 2, 30, 4, 5, 6, 7, 8, 9, 10, 11, 12}, // sparse extraction
+        {1, 2, 9, 8, 7, 6, 5, 4, 3},        // whole-region sort
+        {1, 2, 3, 5, 4}
+    };
+    for (const auto& ids : cases) {
+        FakeList l(N, 64, 23);
+        for (auto id : ids) l.add(id);
+        const auto before = l.nodes;
+        const auto slots = l.slots;
+        const auto ctrl = l.ctrl;
+        auto sorted = ids;
+        std::sort(sorted.begin(), sorted.end());
+        size_t expectedMoved = 0, prefix = 0;
+        while (prefix < ids.size() && ids[prefix] == sorted[prefix]) ++prefix;
+        for (size_t j = 0; j < ids.size(); ++j) expectedMoved += ids[j] != sorted[j];
+        size_t moved = 0;
+        CHECK(Canon(l, s, &moved) == FC_REORDERED);
+        CHECK(moved == expectedMoved);
+        CHECK(l.sortedWithComponents() && l.indexConsistent());
+        CHECK(std::equal(before.begin(), before.begin() + prefix * l.stride, l.nodes.begin()));
+        CHECK(l.ctrl == ctrl);
+        for (size_t j = 0; j < ctrl.size(); ++j) {
+            CHECK(l.slots[2*j] == slots[2*j]);
+            if (ctrl[j] < 0 || (size_t)slots[2*j+1] < prefix)
+                CHECK(l.slots[2*j+1] == slots[2*j+1]);
+        }
+        const auto canonical = l.nodes;
+        const auto canonicalSlots = l.slots;
+        CHECK(Canon(l, s, &moved) == FC_SORTED && moved == 0);
+        CHECK(l.nodes == canonical && l.slots == canonicalSlots);
+    }
+    // Duplicate in the region, or equal to a key in the earlier prefix.
+    for (const auto& ids : std::vector<std::vector<int32_t>>{{1,2,3,4,4}, {1,2,3,4,2}}) {
+        FakeList l(N, 64, 23);
+        for (auto id : ids) l.add(id);
+        const auto before = l.nodes;
+        const auto slots = l.slots;
+        CHECK(Canon(l, s) == FC_REFUSED);
+        CHECK(l.nodes == before && l.slots == slots);
+    }
+    // Even untouched prefix slots must have positions in range; a bad tail
+    // key must also fail before either nodes or index positions are written.
+    for (int mode = 0; mode < 3; ++mode) {
+        FakeList l(N, 64, 23);
+        for (auto id : {1,2,3,4,6,5}) l.add(id);
+        if (mode < 2) l.slots[2*l.find(1)+1] = mode ? 6 : -1;
+        else l.slots[2*l.find(6)] = 99;
+        const auto before = l.nodes;
+        const auto slots = l.slots;
+        CHECK(Canon(l, s) == FC_REFUSED);
+        CHECK(l.nodes == before && l.slots == slots);
+    }
+}
+
 int main()
 {
     TestSortedUntouched();
     TestOneRemoval();
     TestRefusals();
+    for (int N = 1; N <= 5; ++N) TestTails(N);
     for (int N = 1; N <= 5; N++)
         for (uint32_t seed = 1; seed <= 40; seed++) {
             TestHistoriesAgree(N, seed * 7919u + (uint32_t)N, 200 + (int)(seed * 23 % 900), seed & 1);
