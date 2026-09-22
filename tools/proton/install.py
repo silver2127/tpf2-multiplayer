@@ -693,6 +693,28 @@ def apply_install(game, steam, prefix, files, version, plan, tag):
     return backup
 
 
+# The proxy (alut.dll) of 0.6.1.19 and newer switches Wine's heap to its lock-free front
+# end at game start (native/src/wine_heap.h): without it the simulation spends most of
+# its time in Wine's free-list search, which caps the game speed and slows loads. The
+# fix lives in the DLL, so installing the payload installs it; this only REPORTS it, by
+# the log text the DLL carries. TPF2MP_WINE_HEAP=0 in the launch options turns it off.
+WINE_HEAP_MARKER = b"[proxy] wine heap:"
+
+
+def wine_heap_fix(game):
+    proxy = game / "alut.dll"
+    return proxy.is_file() and WINE_HEAP_MARKER in proxy.read_bytes()
+
+
+def say_wine_heap(game):
+    if wine_heap_fix(game):
+        say("Wine heap fix: included (faster loads and game speed under Proton; "
+            "TPF2MP_WINE_HEAP=0 %command% in the game's Steam launch options turns it off)")
+    else:
+        say("Note: this version predates the Wine heap fix (0.6.1.19): under Proton, loads and "
+            "high game speeds are slower than they need to be. Install a newer release when you can.")
+
+
 def verify(game, steam, prefix, quiet=False):
     manifest = read_manifest(game)
     require(manifest, f"no {MANIFEST_NAME} in {game}: nothing installed by this script")
@@ -722,6 +744,7 @@ def verify(game, steam, prefix, quiet=False):
     require(not problems, "verification failed:\n  " + "\n  ".join(problems))
     if not quiet:
         say(f"PASS: TpF2 Multiplayer {manifest['version']} ({len(manifest['files'])} files) is installed for Proton in {game}")
+        say_wine_heap(game)
 
 
 def uninstall(game, steam, prefix, dry_run):

@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <map>
@@ -72,6 +73,12 @@ typedef void     (*FnUnregisterCallback)(void* cb);
 typedef const char* (*FnPersonaName)(void* friends);
 typedef bool     (*FnSetConfig)(void* utils, int value, int scope, intptr_t obj, int dataType, const void* arg);
 typedef int      (*FnGetConfig)(void* utils, int value, int scope, intptr_t obj, int* dataType, void* result, size_t* size);
+// ISteamUGC (v016 in the game's DLL): the Workshop, for auto-subscribing a host's mods
+typedef uint64_t (*FnUgcSubscribe)(void* ugc, uint64_t id);
+typedef bool     (*FnUgcDownload)(void* ugc, uint64_t id, bool highPriority);
+typedef uint32_t (*FnUgcState)(void* ugc, uint64_t id);
+typedef bool     (*FnUgcDownloadInfo)(void* ugc, uint64_t id, uint64_t* done, uint64_t* total);
+typedef bool     (*FnUgcInstallInfo)(void* ugc, uint64_t id, uint64_t* sizeOnDisk, char* folder, uint32_t cch, uint32_t* timeStamp);
 
 struct Api {
     FnAccessor networking = nullptr, user = nullptr, friends = nullptr;
@@ -88,6 +95,12 @@ struct Api {
     FnAccessor utils = nullptr;
     FnSetConfig setConfig = nullptr;
     FnGetConfig getConfig = nullptr;
+    FnAccessor ugc = nullptr;
+    FnUgcSubscribe ugcSubscribe = nullptr;
+    FnUgcDownload ugcDownload = nullptr;
+    FnUgcState ugcState = nullptr;
+    FnUgcDownloadInfo ugcDownloadInfo = nullptr;
+    FnUgcInstallInfo ugcInstallInfo = nullptr;
     void* net = nullptr;
 };
 
@@ -202,6 +215,12 @@ bool ResolveApi()
     g_api.utils        = (FnAccessor)get("SteamAPI_SteamNetworkingUtils_SteamAPI_v004");
     g_api.setConfig    = (FnSetConfig)get("SteamAPI_ISteamNetworkingUtils_SetConfigValue");
     g_api.getConfig    = (FnGetConfig)get("SteamAPI_ISteamNetworkingUtils_GetConfigValue");
+    g_api.ugc             = (FnAccessor)get("SteamAPI_SteamUGC_v016");
+    g_api.ugcSubscribe    = (FnUgcSubscribe)get("SteamAPI_ISteamUGC_SubscribeItem");
+    g_api.ugcDownload     = (FnUgcDownload)get("SteamAPI_ISteamUGC_DownloadItem");
+    g_api.ugcState        = (FnUgcState)get("SteamAPI_ISteamUGC_GetItemState");
+    g_api.ugcDownloadInfo = (FnUgcDownloadInfo)get("SteamAPI_ISteamUGC_GetItemDownloadInfo");
+    g_api.ugcInstallInfo  = (FnUgcInstallInfo)get("SteamAPI_ISteamUGC_GetItemInstallInfo");
     return g_api.networking && g_api.user && g_api.getSteamId && g_api.send && g_api.avail && g_api.read
         && g_api.accept && g_api.closeSession && g_api.allowRelay && g_api.registerCb;
 }
@@ -247,6 +266,73 @@ bool KillSwitch()
 #else
     return access((g_dataDir + "tpf2mp_steam_off.txt").c_str(), F_OK) == 0;
 #endif
+}
+
+// THE WORKSHOP (2026-09-22). A joiner that lacks some of the host's Workshop mods
+// subscribes to them through Steam instead of receiving the host's files: the
+// lobby sends "UGC SUB <id> <id> ..." (SubscribeItem, then DownloadItem at high
+// priority, which also starts the download of an item subscribed long ago but not
+// installed) and polls "UGC STATE <id> ..." until Steam says installed. STATE
+// answers one line per id: "<id> <EItemState flags> <bytes done> <bytes total>
+// <install folder>" (the folder last: it can hold spaces). The lobby registers the
+// installed folder with the game (workshop_register) exactly as it does a folder
+// that was on disk already. A bridge without these commands answers "ERR
+// unknown" and the lobby falls back to the host's copy.
+void* UgcIface()
+{
+    if (!g_api.ugc || !g_api.ugcSubscribe || !g_api.ugcDownload || !g_api.ugcState || !g_api.ugcInstallInfo) return nullptr;
+    return g_api.ugc();
+}
+
+std::vector<uint64_t> ParseIds(const std::string& rest)
+{
+    std::vector<uint64_t> ids;
+    const char* p = rest.c_str();
+    while (*p && ids.size() < 256) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        char* end = nullptr;
+        unsigned long long v = strtoull(p, &end, 10);
+        if (end == p) break;
+        if (v) ids.push_back(v);
+        p = end;
+    }
+    return ids;
+}
+
+std::string UgcCommand(const std::string& line)
+{
+    void* ugc = UgcIface();
+    if (!ugc) return "ERR nougc";
+    if (line.compare(0, 8, "UGC SUB ") == 0) {
+        auto ids = ParseIds(line.substr(8));
+        int asked = 0;
+        for (uint64_t id : ids) {
+            if (g_api.ugcSubscribe(ugc, id)) asked++;
+            g_api.ugcDownload(ugc, id, true);
+        }
+        g_log("[steam] workshop: subscribing to %zu item(s) (%d accepted by Steam)\n", ids.size(), asked);
+        char out[48]; snprintf(out, sizeof(out), "OK %d", asked);
+        return out;
+    }
+    if (line.compare(0, 10, "UGC STATE ") == 0) {
+        auto ids = ParseIds(line.substr(10));
+        std::string reply = "STATE\n";
+        std::vector<char> folder(1024);
+        for (uint64_t id : ids) {
+            uint32_t flags = g_api.ugcState(ugc, id);
+            uint64_t done = 0, total = 0, size = 0; uint32_t ts = 0;
+            if (g_api.ugcDownloadInfo) g_api.ugcDownloadInfo(ugc, id, &done, &total);
+            folder[0] = 0;
+            if (!g_api.ugcInstallInfo(ugc, id, &size, folder.data(), (uint32_t)folder.size(), &ts)) folder[0] = 0;
+            for (char* c = folder.data(); *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+            char l[1200]; snprintf(l, sizeof(l), "%llu %u %llu %llu %s\n", (unsigned long long)id, flags,
+                                     (unsigned long long)done, (unsigned long long)total, folder.data());
+            reply += l;
+        }
+        return reply;
+    }
+    return "ERR unknown";
 }
 
 #ifdef _WIN32
@@ -425,6 +511,8 @@ unsigned TunnelThread(void*)
                         }
                     } else if (sscanf(line.c_str(), "CLOSE %llu", &id) == 1 && id) {
                         closeEndpoint(id, "closed by the lobby"); reply = "OK";
+                    } else if (line.compare(0, 4, "UGC ") == 0) {
+                        reply = UgcCommand(line);
                     } else if (line == "STATUS") {
                         char head[160]; snprintf(head, sizeof(head), "id=%llu endpoints=%zu no_lobby_drops=%llu send_failures=%llu\n",
                                                     (unsigned long long)g_myId, eps.size(), (unsigned long long)dropNoLobby, (unsigned long long)sendFail);

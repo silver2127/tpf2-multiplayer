@@ -18,9 +18,9 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration includes Windows **release 0.6.1.18** (`a5aeda76`) and a native
+integration includes Windows **release 0.6.1.20** (`2b466e32`) and a native
 dedicated server. See [Linux installation](docs/linux/INSTALL.md),
-[current integration and test evidence](docs/re/linux/PARITY_20260921.md), and
+[current integration and test evidence](docs/linux/UPSTREAM_dev_2b466e32.md), and
 [dedicated server setup](tools/server/README.md). The integration record
 distinguishes VPS checks from visual and external Steam P2P checks still pending.
 The Windows MSI instructions below apply to the Windows version.

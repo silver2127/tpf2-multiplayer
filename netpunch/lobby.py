@@ -184,11 +184,12 @@ import time
 # Reuse the transport verbatim -- do NOT reinvent the framing/handshake.
 from punch import (
     DEFAULT_PORT, TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE,
-    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, TOKEN_LEN, _pack, _unpack, open_socket,
+    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, TYPE_KEYX, TOKEN_LEN, _pack, _unpack, open_socket,
 )
 from seal import Sealer, derive_key, SECRET_LEN
 import modshare                     # share the mods a save needs (mod zips ride the save transfer)
 import steamtunnel                  # Steam's own networking as a transport (native/src/steam_tunnel.cpp), 2026-09-21
+import steamkey                     # the session secret over Steam when the join code is only a Steam ID, 2026-09-22
 # Reuse the code exchange + the connect race + observe/announce.
 from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4, parse_hostport
 from mesh import MeshNode
@@ -239,13 +240,21 @@ CHUNK_LOCAL = 8192          # bytes of file data per chunk when every target pee
                             # loopback it just multiplies the per-datagram cost.
                             # NOT used on a LAN: 8 KB fragments at 1500 MTU and one
                             # lost fragment loses the whole chunk.
-CHUNK_STEAM = 1100          # bytes of file data per chunk when a peer is reached through the
-                            # Steam tunnel (steamtunnel.is_tunnel_addr): the wire is 1100+17+28
-                            # = 1145 B, under the 1,200 B limit of Steam's UNRELIABLE P2P send.
-                            # Anything bigger the tunnel has to send reliable, and a burst of
-                            # reliable 8 KB messages stalled a real transfer at 15 of 12,781
-                            # chunks (2026-09-21): the peer looks like 127.0.0.1 and was taken
-                            # for loopback, no-loss window and all.
+CHUNK_STEAM = 32000         # bytes of file data per chunk when every non-loopback peer is
+                            # reached through the Steam tunnel (steamtunnel.is_tunnel_addr).
+                            # BIG CHUNKS OVER STEAM (2026-09-22). The tunnel sends anything over
+                            # 1,200 B with Steam's RELIABLE P2P send, so Steam segments, paces and
+                            # retransmits it in C++. 1,100 B unreliable chunks (0.6.1.16-0.6.1.20)
+                            # moved a 134 MB save at ~1.7 MB/s on a direct P2P link with Steam's
+                            # queue empty: 122k chunks, each sealed in Python, and a 2,048-chunk
+                            # window (2.25 MB) that stalled for a round trip at every lost packet.
+                            # The window below is bounded in BYTES (SEND_WINDOW_STEAM): the one
+                            # earlier try at bigger Steam chunks stalled because it had the
+                            # loopback window, 134 MB fired into Steam at once (2026-09-21).
+CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
+                            # one chunk size serves everyone, and 32 KB datagrams on the open
+                            # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
+                            # unreliable limit and every internet MTU
 CHUNK_DATA = 1350           # bytes of file data per chunk (1200 until 2026-09-10: +12% per
                             # datagram; 1350+17+28 = 1395 B stays under a 1492 PPPoE MTU and
                             # a 1400 B VPN MTU; every path measured so far is v4). Wire =
@@ -349,6 +358,15 @@ def _start_dual_client(conn, name, log, sim=None):
     return dsock
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
+SEND_WINDOW_STEAM  = 128    # x CHUNK_STEAM = ~4 MB in flight: half the 8 MB send buffer the
+                            # tunnel gives Steam (steam_tunnel.cpp SendBufferSize), and ~40 MB/s
+                            # at a 100 ms round trip, over the 16 MB/s rate it allows
+
+
+def _window_for(chunk):
+    """The flow-control window for a chunk size: both ends derive it from the
+    chunk in fbegin, so they agree how far ahead the NACK scan looks."""
+    return {CHUNK_LOCAL: SEND_WINDOW_LOCAL, CHUNK_STEAM: SEND_WINDOW_STEAM}.get(chunk, SEND_WINDOW_REMOTE)
 SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds the
                             # time one host loop iteration spends, so pings/roster
                             # for OTHER peers keep being serviced during a send.
@@ -1145,6 +1163,34 @@ class GameRelay:
 # Required mods are offered to joiners; approval and engine registration gate loading.
 SHARE_MODS = [True]
 MODS_ANSWER_WAIT = 90.0    # s the host waits for a joiner to answer the download prompt
+# THE WORKSHOP FIRST (2026-09-22). A joiner that lacks some of the host's Workshop mods
+# subscribes to them through Steam (the bridge's tunnel, steam_tunnel.cpp UgcCommand)
+# and registers what Steam installs, exactly as a mod already on disk is registered;
+# the host sends only local mods and whatever Steam could not deliver. The player's
+# YES to the mods prompt covers both (subscribing is still installing code).
+UGC_SUBSCRIBE_WAIT = 20.0  # s for Steam to confirm a subscription before the host's copy is asked for
+UGC_STALL = 120.0          # s without a byte of progress before the rest falls back to the host
+UGC_POLL_EVERY = 1.0       # s between state polls
+_UGC = [None]              # the tunnel client the Workshop requests go through (cached once up)
+
+
+def _ugc_tunnel():
+    """The Steam tunnel for Workshop requests, or None (no tunnel: the host sends everything)."""
+    t = _UGC[0]
+    if t is None or not t.available:
+        t = steamtunnel.SteamTunnel(modshare.data_dir(), _log)
+        if not t.available:
+            return None
+        _UGC[0] = t
+    return t
+
+
+def _workshop_item(name):
+    """(mod id, version, Workshop id) for a folder name '*<id>_<ver>', else None."""
+    m, sep, v = str(name).rpartition("_")
+    if not sep or not m.startswith("*") or not m[1:].isdigit() or not v.isdigit():
+        return None
+    return m, int(v), m[1:]
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
 
@@ -1363,14 +1409,17 @@ class _HostSaveTransfer:
         is 535k chunks at 1200 B against 78k at 8192 B, each costing a sign, a
         pack and a sendto in single-threaded Python.
         """
-        chunk = CHUNK_LOCAL
+        tunnel = internet = False
         for addr, _name in targets:
             if steamtunnel.is_tunnel_addr(addr):
-                return CHUNK_STEAM            # the smallest wins: Steam's unreliable limit
+                tunnel = True
+                continue
             host = addr[0] if isinstance(addr, tuple) else str(addr)
             if not host.startswith("127."):
-                chunk = CHUNK_DATA
-        return chunk
+                internet = True
+        if tunnel:
+            return CHUNK_STEAM_MIXED if internet else CHUNK_STEAM
+        return CHUNK_DATA if internet else CHUNK_LOCAL
 
     @staticmethod
     def _pick_window(chunk):
@@ -1380,7 +1429,7 @@ class _HostSaveTransfer:
         never disagree: a big window with MTU-safe chunks is precisely the
         combination that stalled a real transfer.
         """
-        return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
+        return _window_for(chunk)
 
     def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save", stage_cb=None, extra=None):
         self.sock = sock
@@ -1442,7 +1491,7 @@ class _HostSaveTransfer:
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
                  f"{self.total_chunks} chunks of {self.chunk}B "
-                 f"({'local' if self.chunk == CHUNK_LOCAL else 'steam' if self.chunk == CHUNK_STEAM else 'internet-safe'}) "
+                 f"({'local' if self.chunk == CHUNK_LOCAL else 'steam' if self.chunk == CHUNK_STEAM else 'steam+internet' if self.chunk == CHUNK_STEAM_MIXED else 'internet-safe'}) "
                  f"-> {len(self.peers)} peer(s)")
 
     # -- the TCP channel --------------------------------------------------- #
@@ -1845,6 +1894,13 @@ class _ClientSaveReceiver:
         self.batch_got = set()       # mods installed or present across the round's batches
         self.registering = []        # [(id, ver, folder)] on disk here, being registered with the game (catalogue_token pending)
         self.round_receipt = False   # the pending catalogue_token closes a download round (else it is a registration)
+        self.steam_items = {}        # Workshop id -> (mod id, ver, folder name): subscribed through Steam, not installed yet
+        self.steam_done = []         # [(id, ver, folder)] Steam installed; registered when the Steam phase ends
+        self.steam_failed = []       # folder names Steam did not deliver: the host sends those
+        self.steam_since = 0.0
+        self.steam_poll_at = 0.0
+        self.steam_progress = None
+        self.steam_progress_at = 0.0
         # THE TCP CHANNEL (bulk_tcp.py). A joiner connects to the sender's listener
         # (the host's or relay's, named in fbegin) and a reader thread queues the
         # stream; the relay, which listens itself, accepts the leader's upload the
@@ -2014,6 +2070,8 @@ class _ClientSaveReceiver:
             self._send({"t":"leave"})
             self.io.emit({"type":"mods_cancelled", "text":"Mod download cancelled; left the lobby."})
             return
+        if self.preflight and self._steam_begin():
+            return                                # tick asks the host for the rest once Steam is done
         if self.preflight:
             self.last_mod_request=time.time()
             self.first_mod_request=self.last_mod_request
@@ -2022,6 +2080,106 @@ class _ClientSaveReceiver:
             self._send({"t":"mods_answer", "sid":self.sid, "accept":True})
         shown = ", ".join(self.offered[:8]) + (f", +{len(self.offered)-8} more" if len(self.offered) > 8 else "")
         self.log(f"[client] mod download accepted -- asking the host for {len(self.offered)} mod(s): {shown}")
+
+    def _steam_begin(self):
+        """Subscribe through Steam to the Workshop mods the player just agreed to.
+        True when Steam took the request (tick polls it); False to have the host
+        send everything as before (no tunnel, an old bridge, no Workshop mods)."""
+        if self.server_cache or "ignore_steam_workshop" in modshare.test_flags():
+            return False                      # the relay; or the rig forcing the host's copies (test_flags)
+        items = {}
+        for name in self.offered:
+            w = _workshop_item(name)
+            if w:
+                items[w[2]] = (w[0], w[1], name)
+        if not items:
+            return False
+        t = _ugc_tunnel()
+        if t is None or not t.ugc_subscribe(sorted(items)):
+            self.log("[client] Steam's Workshop is not reachable from this lobby -- the host sends every mod")
+            return False
+        now = time.time()
+        self.steam_items, self.steam_done, self.steam_failed = items, [], []
+        self.steam_since = self.steam_progress_at = now
+        self.steam_poll_at = 0.0
+        self.steam_progress = None
+        rest = len(self.offered) - len(items)
+        self.log(f"[client] subscribing to {len(items)} Workshop mod(s) through Steam"
+                 + (f"; the host sends the other {rest}" if rest else "") + ": " + ", ".join(sorted(items)[:8])
+                 + (", ..." if len(items) > 8 else ""))
+        self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                      "text": f"Subscribing you to {len(items)} Workshop mod(s) this save needs; Steam downloads them."
+                              + (f" The host sends the other {rest}." if rest else "")})
+        self.io.emit({"type": "status", "state": "connected",
+                      "detail": f"subscribing to {len(items)} Workshop mod(s) through Steam\u2026"})
+        return True
+
+    def _steam_poll(self, now):
+        """One look at Steam's state for the items still coming. Installed ones
+        are kept for registration; one Steam never subscribed, or a download
+        that stopped moving, is left to the host."""
+        t = _ugc_tunnel()
+        states = t.ugc_state(sorted(self.steam_items)) if t is not None else None
+        if states is None:
+            self.log("[client] Steam's Workshop stopped answering -- the host sends the rest")
+            self.steam_failed += [n for _, _, n in self.steam_items.values()]
+            self.steam_items = {}
+            self._steam_finish()
+            return
+        got = total = 0
+        for wid, (m, v, name) in list(self.steam_items.items()):
+            flags, done, size, folder = states.get(wid, (0, 0, 0, ""))
+            busy = flags & (steamtunnel.UGC_DOWNLOADING | steamtunnel.UGC_DOWNLOAD_PENDING | steamtunnel.UGC_NEEDS_UPDATE)
+            if flags & steamtunnel.UGC_INSTALLED and not busy and folder and os.path.isfile(os.path.join(folder, "mod.lua")):
+                self.steam_done.append((m, v, modshare.on_disk_mod(m, v) or folder))
+                del self.steam_items[wid]
+            elif not flags & steamtunnel.UGC_SUBSCRIBED and now - self.steam_since > UGC_SUBSCRIBE_WAIT:
+                self.log(f"[client] Steam did not subscribe to {name} in {UGC_SUBSCRIBE_WAIT:.0f} s "
+                         "(hidden, removed, or Steam offline) -- the host sends its copy")
+                self.steam_failed.append(name)
+                del self.steam_items[wid]
+            else:
+                got += done
+                total += max(size, done)
+        mark = (len(self.steam_done), got)
+        if mark != self.steam_progress:
+            self.steam_progress, self.steam_progress_at = mark, now
+        elif self.steam_items and now - self.steam_progress_at > UGC_STALL:
+            names = [n for _, _, n in self.steam_items.values()]
+            self.log(f"[client] Steam's download made no progress in {UGC_STALL:.0f} s -- the host sends the "
+                     f"{len(names)} left: " + ", ".join(names[:8]))
+            self.steam_failed += names
+            self.steam_items = {}
+        if not self.steam_items:
+            self._steam_finish()
+            return
+        n = len(self.steam_done) + len(self.steam_items)
+        size = f", {got / 1e6:.0f} of {total / 1e6:.0f} MB" if total else ""
+        self.io.emit({"type": "status", "state": "connected",
+                      "detail": f"Steam Workshop: {len(self.steam_done)} of {n} mod(s) installed{size}\u2026"})
+
+    def _steam_finish(self):
+        """The Steam phase is over: register what Steam installed and leave the
+        rest (local mods, what Steam did not deliver) to the host's round."""
+        done, failed = self.steam_done, self.steam_failed
+        self.steam_done, self.steam_failed = [], []
+        got = {modshare.mod_folder_name(m, v) for m, v, _ in done}
+        self.offered = [n for n in self.offered if n not in got]
+        self.need = [n for n in self.need if n not in got]
+        if not self.offered:
+            self.approved = set()               # nothing is left for the host to send
+        self.log(f"[client] Steam installed {len(done)} Workshop mod(s)" + (f"; {len(failed)} fall back to the host" if failed else "")
+                 + (f"; asking the host for {len(self.offered)}" if self.offered else ""))
+        if done:
+            self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                          "text": f"Steam installed {len(done)} Workshop mod(s); you stay subscribed to them."
+                                  + (f" {len(failed)} could not come from the Workshop, so the host sends its copy." if failed else "")})
+            self._register(done)
+        elif not self.offered:
+            self.mods_satisfied = True
+            self.io.emit({"type": "mods_ready", "failed": []})
+        self.last_mod_request = 0
+        self.first_mod_request = time.time()
 
     def _refusal(self, kind, files):
         """Why this proposed transfer must not be taken, or None."""
@@ -2121,7 +2279,7 @@ class _ClientSaveReceiver:
         self.chunk = int(msg.get("chunk", CHUNK_DATA)) or CHUNK_DATA
         # Same rule as the host, derived from the chunk it actually chose,
         # so the two ends agree how far ahead the NACK scan should look.
-        self.window = SEND_WINDOW_LOCAL if self.chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
+        self.window = _window_for(self.chunk)
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = files
         self.kind = kind
@@ -2132,6 +2290,12 @@ class _ClientSaveReceiver:
         # the mods this save needs that are not installed here (told back in the ack)
         self.need = []
         previous_approval=set(self.approved) if self.preflight else set()
+        if kind == "save" and self.steam_items:
+            # the host shared its save before Steam finished: what Steam has installed
+            # is on disk and registers below; the rest the host's round sends
+            self.log(f"[client] the save arrived while Steam still had {len(self.steam_items)} Workshop mod(s) to go -- "
+                     "the host sends those")
+            self.steam_items, self.steam_done, self.steam_failed = {}, [], []
         if kind == "save":
             self.preflight=False
             self.required=[]
@@ -2347,7 +2511,10 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
-        if self.preflight and self.approved and not self.active() and not self.catalogue_token and not self.batch_open and now-self.last_mod_request>1:
+        if self.steam_items and now - self.steam_poll_at >= UGC_POLL_EVERY:
+            self.steam_poll_at = now
+            self._steam_poll(now)
+        if self.preflight and self.approved and not self.steam_items and not self.active() and not self.catalogue_token and not self.batch_open and now-self.last_mod_request>1:
             self.last_mod_request=now
             self._send({"t":"mods_request","need":list(self.offered), "batches": 1})
             first = getattr(self, "first_mod_request", 0) or now
@@ -2710,7 +2877,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.6.1.18"
+LOBBY_VERSION = "0.6.1.20"
 
 
 def version_rejection(remote):
@@ -3084,7 +3251,8 @@ class _PeerConn:
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False, punch_q=None, sync_runtime=None, companies_mode=False):
+             relay_only=False, punch_q=None, sync_runtime=None, companies_mode=False,
+             cross_code=None, steam_code=None, steam_secret=None, crossplay=True):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
@@ -3094,6 +3262,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     plain loopback socket for the self-test). ``io`` is a :class:`LobbyIO`.
     ``relay`` is an optional :class:`GameRelay`: local bridge frames fan out
     to every joiner, joiners' 'g' frames go to the local bridge.
+
+    STEAM BY DEFAULT (2026-09-22). ``steam_code`` is this host's SteamID64 when its game
+    has Steam's networking; ``cross_code`` the classic code. With ``crossplay`` off the
+    code shown and listed is the Steam ID, a joiner gets the session secret over the
+    tunnel (TYPE_KEYX, steamkey.py, answered with ``steam_secret``) and a HELLO from
+    anywhere but a Steam tunnel endpoint goes unanswered: only players on Steam get in.
+    The host's 'crossplay' command switches it live -- on, the classic code is shown and
+    listed and anyone with it can join, exactly as before this change.
     """
     stop = stop or threading.Event()
     sock.setblocking(False)
@@ -3227,8 +3403,29 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         except OSError:
             return None, None
 
-    if code:
-        io.emit({"type": "code", "code": code})
+    xplay = [bool(crossplay) or not steam_code]      # no Steam here: the classic code is the only one
+    keyx_last = {}                                   # tunnel endpoint -> (offer, answer, when)
+    shown_code = [code]
+
+    def emit_code():
+        io.emit({"type": "code", "code": shown_code[0], "steam": steam_code or "",
+                 "crossplay": xplay[0], "cross_code": cross_code or ""})
+
+    def set_crossplay(on):
+        on = bool(on) or not steam_code
+        xplay[0] = on
+        shown_code[0] = (cross_code or code) if on else steam_code
+        if publisher is not None and shown_code[0]:
+            publisher.code = shown_code[0]
+            publisher._wake.set()
+        emit_code()
+
+    if steam_code:
+        set_crossplay(xplay[0])
+        log("[host] CROSS-PLAY " + ("ON: the classic code works for players without Steam too" if xplay[0] else
+            "OFF: the code is this host's Steam ID; only players on Steam can join"))
+    elif code:
+        emit_code()
 
     # merged log: our own lines + every joiner's, tagged; extra files tailed
     peers_log = PeersLog(io.dir)
@@ -4102,6 +4299,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if set_mode(str(cmd.get("mode", ""))):
                 log(f"[host] mode -> {mode[0]} (set by host); companies {roster_companies()}")
                 roster_changed()
+        elif c == "crossplay":
+            if not steam_code:
+                log("[host] cross-play asked for, but this game has no Steam networking: the classic code is the only one")
+                emit_code()
+            else:
+                set_crossplay(bool(cmd.get("on", True)))
+                log("[host] CROSS-PLAY " + ("ON: the classic code is shown and listed" if xplay[0] else "OFF: the Steam ID is the code"))
         elif c == "publish":
             if publisher is not None:
                 publisher.set(bool(cmd.get("on", True)))
@@ -4214,7 +4418,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     if not data:
                         break
                     ptype, payload = _unpack(data)
-                    if ptype == TYPE_HELLO:
+                    if ptype == TYPE_HELLO and not xplay[0] and not steamtunnel.is_tunnel_addr(addr) \
+                            and addr not in peers:
+                        # CROSS-PLAY OFF: only a Steam tunnel endpoint gets a handshake
+                        if now - reject_sent.get(addr, 0.0) >= REJECT_PLAIN_EVERY:
+                            reject_sent[addr] = now
+                            log(f"[host] {addr[0]}:{addr[1]} knocked outside Steam while cross-play is off -- not answered")
+                    elif ptype == TYPE_HELLO:
                         # Complete the joiner's handshake: echo THEIR token.
                         try:
                             sock.sendto(_pack(TYPE_ACK, payload), addr)
@@ -4222,6 +4432,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             pass
                     elif ptype in (TYPE_ACK, TYPE_CONNECTED):
                         pass                                # informational
+                    elif ptype == TYPE_KEYX:
+                        # A Steam-code joiner asks for the session secret (steamkey.py). Only
+                        # over the tunnel, at most every ANSWER_EVERY s per endpoint; the same
+                        # offer gets the same answer, so a lost reply costs only a resend.
+                        if steam_secret is None or not steamtunnel.is_tunnel_addr(addr):
+                            continue
+                        last = keyx_last.get(addr)
+                        if last and last[0] == payload:
+                            ans = last[1]
+                        elif last and now - last[2] < steamkey.ANSWER_EVERY:
+                            continue
+                        else:
+                            ans = steamkey.answer(payload, steam_secret)
+                            if ans is None:
+                                continue
+                            keyx_last[addr] = (payload, ans, now)
+                            log(f"[steam] {addr[0]}:{addr[1]} asked for the session key -- answered over Steam")
+                        try:
+                            sock.sendto(_pack(TYPE_KEYX, ans), addr)
+                        except OSError:
+                            pass
                     elif ptype == TYPE_KEEPALIVE:
                         if addr in peers:
                             peers[addr]["last"] = now
@@ -5412,6 +5643,8 @@ def cmd_host(args):
         _host_upnp_unmap(args.local_port)
         tunnel.close()
         raise
+    steam_code = tunnel.id if tunnel.available and not args.relay_only and not getattr(args, "dedicated", False) else None
+    crossplay = bool(getattr(args, "crossplay", False)) or not steam_code
     publisher = None
     rendezvous = None
     # From here on the mapping exists: every way out -- run_host returning, or a
@@ -5425,7 +5658,7 @@ def cmd_host(args):
         _log("[host] frames are sealed (session key from the code"
              + (" + password)" if args.password else ")"))
         if args.publish:
-            publisher = _Publisher(args.publish, code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
+            publisher = _Publisher(args.publish, code if crossplay else steam_code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
                                    stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
             # systemd stops the relay with SIGTERM; without a handler Python just
             # dies and the finally: below (publisher.close -> /leave) never runs,
@@ -5455,7 +5688,9 @@ def cmd_host(args):
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
                  punch_q=rendezvous.queue if rendezvous is not None else None,
                  sync_runtime=make_runtime(args) if not args.relay_only else None,
-                 companies_mode=bool(args.companies))
+                 companies_mode=bool(args.companies),
+                 cross_code=code, steam_code=steam_code,
+                 steam_secret=secret if steam_code else None, crossplay=crossplay)
     finally:
         _STOPPING[0] = True
         if rendezvous is not None:
@@ -5465,6 +5700,49 @@ def cmd_host(args):
         tunnel.close()
         _host_upnp_unmap(args.local_port)
     return 0
+
+
+STEAM_KEYX_TIMEOUT = 30.0   # joiner: seconds to wait for the host's key over Steam
+STEAM_KEYX_EVERY = 0.5      # joiner: seconds between offers
+
+
+def _steam_key_exchange(sock, ep, timeout):
+    """Ask the host at Steam tunnel endpoint ``ep`` for the session secret (steamkey.py).
+    Resends the offer until an answer to it arrives; anything else that arrives is
+    dropped (nothing else can arrive before the handshake). The secret, or None."""
+    offer = steamkey.Offer()
+    frame = _pack(TYPE_KEYX, offer.payload())
+    old = sock.gettimeout()
+    deadline = time.time() + timeout
+    next_send = 0.0
+    try:
+        while time.time() < deadline:
+            now = time.time()
+            if now >= next_send:
+                try:
+                    sock.sendto(frame, ep)
+                except OSError:
+                    pass
+                next_send = now + STEAM_KEYX_EVERY
+            sock.settimeout(max(0.05, min(next_send, deadline) - time.time()))
+            try:
+                data, addr = sock.recvfrom(65535)
+            except (socket.timeout, BlockingIOError):
+                continue
+            except OSError:
+                continue
+            if tuple(addr[:2]) != tuple(ep):
+                continue
+            ptype, payload = _unpack(data)
+            if ptype == TYPE_KEYX:
+                secret = offer.secret_from(payload)
+                if secret is not None:
+                    _log(f"[steam] the host sent the session key over Steam ({(timeout - (deadline - time.time())):.1f} s)")
+                    return secret
+        _log(f"[steam] no key from the host over Steam within {timeout:.0f} s")
+        return None
+    finally:
+        sock.settimeout(old)
 
 
 def cmd_join(args):
@@ -5480,7 +5758,11 @@ def cmd_join(args):
         return 2
     if peer.get("stale"):
         _log(f"[join] WARNING: code is {peer['age']}s old -- may be stale")
-    if peer.get("secret"):
+    steam_only = bool(peer.get("steam_only"))
+    if steam_only:
+        _log(f"[join] the code is a Steam ID ({peer['candidates']['steam']}): joining through Steam; "
+             "the session key comes from the host over Steam")
+    elif peer.get("secret"):
         SEAL[0] = Sealer(derive_key(peer["secret"], args.password or ""))
         _log("[join] frames are sealed (session key from the code"
              + (" + password)" if args.password else ")"))
@@ -5498,6 +5780,35 @@ def cmd_join(args):
     tunnel = _steam_tunnel(args)
     if tunnel.available:
         tunnel.hello(sock.getsockname()[1])
+    steam_ep = None
+    if steam_only:
+        fail = None
+        if not tunnel.available:
+            fail = ("this host's code is a Steam ID, and this game has no Steam networking: "
+                    "start the game through Steam, or ask the host to tick CROSS-PLAY and send the long code")
+        elif peer["candidates"]["steam"] == tunnel.id:
+            fail = "that Steam ID is your own"
+        else:
+            steam_ep = tunnel.dial(peer["candidates"]["steam"])
+            if not steam_ep:
+                fail = "Steam could not open a connection to that player"
+            else:
+                secret = _steam_key_exchange(sock, steam_ep, min(args.timeout, STEAM_KEYX_TIMEOUT))
+                if secret is None:
+                    fail = ("no lobby answered through Steam: the host has not opened one, "
+                            "or its game does not have this version")
+                else:
+                    SEAL[0] = Sealer(derive_key(secret, args.password or ""))
+                    _log("[join] frames are sealed (session key from the host over Steam"
+                         + (" + password)" if args.password else ")"))
+        if fail:
+            io.emit({"type": "status", "state": "failed", "detail": fail})
+            io.write_state(state="failed")
+            _log(f"[join] FAILED: {fail}")
+            tunnel.close()
+            if relay is not None:
+                relay.close()
+            return 1
     if not getattr(args, "no_mesh", False):
         try:
             from observe import observe
@@ -5513,13 +5824,13 @@ def cmd_join(args):
     # a host whose port is not really open still gets through (see RENDEZVOUS).
     knock = None
     rv_url = _rv_url(args)
-    late_targets = []                      # the master's relay port, once asked for (see RV_RELAY_FROM_KNOCK)
+    late_targets = [steam_ep] if steam_ep else []   # the master's relay port, once asked for (see RV_RELAY_FROM_KNOCK)
     # The host's Steam identity from the code: dial it through the tunnel as one
     # more candidate. On a thread, so the direct dial starts at once; the race
     # picks the endpoint up from late_targets. Steam punches or relays on its own,
     # so this is the path that works where nothing else does (CGNAT, both closed).
     host_steam = peer.get("candidates", {}).get("steam")
-    if host_steam and tunnel.available and host_steam != tunnel.id:
+    if host_steam and tunnel.available and host_steam != tunnel.id and not steam_only:
         def _dial_steam():
             ep = tunnel.dial(host_steam)
             if ep:
@@ -7240,6 +7551,9 @@ def main(argv=None):
     ap.add_argument("--publish", default="",
                     help="master server base URL; the lobby is listed there while "
                          "public (see --public and the 'publish' command)")
+    ap.add_argument("--crossplay", action="store_true",
+                    help="host: show and list the classic code, so players without Steam can join too "
+                         "(default: a game with Steam shows its Steam ID and only Steam players get in)")
     ap.add_argument("--companies", action="store_true",
                     help="start in separate-companies mode: every player gets their own company (default: co-op, one company)")
     ap.add_argument("--dedicated", action="store_true",

@@ -21,9 +21,9 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.18, tag `a5aeda76`**, on
+This development tree integrates **Windows 0.6.1.20, dev `2b466e32`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[PARITY_20260921.md](../re/linux/PARITY_20260921.md). Native/Windows frozen join
+[UPSTREAM_dev_2b466e32.md](UPSTREAM_dev_2b466e32.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 

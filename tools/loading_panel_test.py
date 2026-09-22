@@ -45,7 +45,8 @@ gate = gate[:gate.index("__except")] if "__except" in gate else gate[:3000]
 check("the world coming up hands the loading view over to the in-game panel, open",
       "if (loadingPanel && WorldLoaded())" in gate and "InterlockedExchange(&g_ingameOverlay, 1)" in gate
       and gate.index("if (loadingPanel && WorldLoaded())") < gate.index("InterlockedExchange(&g_ingameOverlay, 1)"))
-check("quiet = no recovery world I/O and no native I/O", "const bool quiet = !g_recoveryWorldIo && !NativeIo::Busy();" in gate)
+# OverlayWanted(bool& quiet), shared by both renderers since 2026-09-21
+check("quiet = no recovery world I/O and no native I/O", "quiet = !g_recoveryWorldIo && !NativeIo::Busy();" in gate)
 check("the panel is drawn when quiet OR while the loading view is up", "(quiet || loadingPanel)" in gate)
 check("clicks are taken only when quiet", "DrawButton(q, idx); if (quiet) PollClick();" in gate)
 done = MENU[MENU.index('Back to the LOBBY VIEW when the panel is open'):][:900]

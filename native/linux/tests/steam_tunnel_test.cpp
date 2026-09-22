@@ -12,6 +12,15 @@ static std::deque<Packet> packets;
 static int registrations = 0, removals = 0;
 static std::atomic<int> reliablePackets{0}, accepted{0};
 #define API extern "C" __attribute__((visibility("default")))
+static int subscribed=0, downloaded=0;
+API void* SteamAPI_SteamUGC_v016() { return reinterpret_cast<void*>(3); }
+API uint64_t SteamAPI_ISteamUGC_SubscribeItem(void*, uint64_t id) { assert(id==123);++subscribed;return 7; }
+API bool SteamAPI_ISteamUGC_DownloadItem(void*, uint64_t id, bool high) { assert(id==123 && high);++downloaded;return true; }
+API uint32_t SteamAPI_ISteamUGC_GetItemState(void*, uint64_t id) { assert(id==123);return 5; }
+API bool SteamAPI_ISteamUGC_GetItemDownloadInfo(void*, uint64_t, uint64_t* done, uint64_t* total) { *done=42;*total=42;return true; }
+API bool SteamAPI_ISteamUGC_GetItemInstallInfo(void*, uint64_t, uint64_t* size, char* folder, uint32_t cap, uint32_t* ts) {
+    *size=42;*ts=1;snprintf(folder,cap,"/workshop/path with spaces");return true;
+}
 API void* SteamAPI_SteamNetworking_v006() { return reinterpret_cast<void*>(1); }
 API void* SteamAPI_SteamUser_v021() { return reinterpret_cast<void*>(2); }
 API uint64_t SteamAPI_ISteamUser_GetSteamID(void*) { return 1001; }
@@ -68,6 +77,12 @@ static std::string Control(int sock, uint16_t port, const std::string& text) {
     return Receive(sock);
 }
 int main() {
+    assert(ResolveApi());
+    g_log=LogTest;
+    assert(UgcCommand("UGC SUB 123")=="OK 1" && subscribed==1 && downloaded==1);
+    assert(UgcCommand("UGC STATE 123")=="STATE\n123 5 42 42 /workshop/path with spaces\n");
+    g_api.ugc=nullptr;assert(UgcCommand("UGC SUB 123")=="ERR nougc");
+
     char temporary[] = "/tmp/tpf2mp-steam.XXXXXX"; assert(mkdtemp(temporary));
     const std::string dir = std::string(temporary) + "/";
     uint16_t occupiedPort = 0;

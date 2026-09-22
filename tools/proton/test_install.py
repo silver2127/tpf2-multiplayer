@@ -102,6 +102,7 @@ def main():
         # 2. install: files, stock alut parked, links, manifest, stock mods untouched
         out = run(*env_root, "--files-zip", zip1)
         assert "PASS: TpF2 Multiplayer 0.5.7 (14 files)" in out, out
+        assert "predates the Wine heap fix" in out and "Wine heap fix: included" not in out, out   # a proxy without the marker
         assert (game / "alut_real.dll").read_bytes() == STOCK_ALUT and (game / "alut.dll").read_bytes() == b"proxy v1"
         assert (game / "mods/mp_lockstep_1/res/scripts/mp/net.lua").read_bytes() == b"net"
         assert (game / "mods/urbangames_sandbox_1/mod.lua").read_bytes() == b"stock mod"
@@ -120,13 +121,15 @@ def main():
         # 4. upgrade: a changed cfg is kept, a stale mod file is removed, replaced files are backed up
         (game / "tpf2_slice.cfg").write_bytes(b"my settings\n")
         (game / "mods/mp_lockstep_1/res/scripts/mp/old.lua").write_bytes(b"stale")
-        upgraded = dict(PAYLOAD, **{"tpf2_menu.dll": b"menu v2", "tpf2mp_version.txt": b"0.5.8\n", "tpf2_slice.cfg": b"new cfg\n"})
+        # the upgraded proxy carries the Wine heap warm-up (its log text is the marker the installer reads)
+        upgraded = dict(PAYLOAD, **{"alut.dll": b"proxy v2 [proxy] wine heap: %d heap(s)", "tpf2_menu.dll": b"menu v2", "tpf2mp_version.txt": b"0.5.8\n", "tpf2_slice.cfg": b"new cfg\n"})
         del upgraded["mods/mp_lockstep_1/res/scripts/mp/net.lua"]
         upgraded["mods/mp_lockstep_1/res/scripts/mp/new.lua"] = b"new"
         zip2 = td / "files-2.zip"
         make_zip(zip2, upgraded)
         out = run(*env_root, "--files-zip", zip2)
         assert "PASS: TpF2 Multiplayer 0.5.8" in out, out
+        assert "Wine heap fix: included" in out and "TPF2MP_WINE_HEAP=0" in out, out
         assert (game / "tpf2_slice.cfg").read_bytes() == b"my settings\n"
         assert not (game / "mods/mp_lockstep_1/res/scripts/mp/old.lua").exists()
         assert not (game / "mods/mp_lockstep_1/res/scripts/mp/net.lua").exists()
@@ -188,7 +191,7 @@ def main():
         (game / "plugins/tpf2_bigmap.dll").write_bytes(b"bigmap")
         out = run(*env_root, "--uninstall")
         assert "stay for tpf2_bigmap.dll" in out, out
-        assert (game / "alut.dll").read_bytes() == b"proxy v1" and (game / "alut_real.dll").read_bytes() == STOCK_ALUT
+        assert (game / "alut.dll").read_bytes() == upgraded["alut.dll"] and (game / "alut_real.dll").read_bytes() == STOCK_ALUT
         assert (game / "tpf2_pluginhost.dll").exists() and not (game / "tpf2_menu.dll").exists()
 
         # 10. the lobby repair on a real Windows netpunch.exe, when one is at hand

@@ -124,3 +124,5 @@ int main()
     munmap(image, imageSize);
     puts("menu slot: flags and real detour insertion order passed");
 }
+
+bool OverlayGlInstall(uintptr_t, Tpf2mpLogFn) { return true; }

@@ -102,6 +102,7 @@ static int g_hover = 0, g_pressed = 0;
 static int  g_focus = 0;            // 1 code, 2 password, 3 player name, 4 lobby name
 static bool g_public = false;
 static bool g_separateCompanies = false;
+static bool g_crossplay = false;
 static bool g_capturedRight = false;
 static bool g_dashShown = true;
 
@@ -474,6 +475,7 @@ static void RenderLobbyLocked(int w, int h)
         MwButton(w - pad - bw2, bottom, bw2, S(30), "START GAME", 6);
         if (!P().flagMaster.empty()) MwCheck(w - pad - bw2 - S(110), bottom, "PUBLIC", g_public, 11);
         MwCheck(w - pad - bw2 - S(340), bottom, "SEPARATE COMPANIES", P().view.separateCompanies, 50);
+        if (P().view.hostSteam) MwCheck(w - pad - bw2 - S(475), bottom, "CROSS-PLAY", P().view.crossplay, 51);
         const int need = bw2 + S(360);
         if (need > rightCut) rightCut = need;
     }
@@ -514,7 +516,8 @@ static void RenderHostJoinLocked(int w, int h)
         const int hb = MwButtonW("HOST GAME");
         MwButton(lx, cy + S(96), hb, S(30), "HOST GAME", 2);
         if (master) MwCheck(lx + hb + S(16), cy + S(96), "PUBLIC (listed in the browser)", g_public, 11);
-        MwCheck(lx, cy + S(128), "SEPARATE COMPANIES (off = co-op)", g_separateCompanies, 50);
+        MwCheck(lx, cy + S(128), "SEPARATE COMPANIES", g_separateCompanies, 50);
+        MwCheck(lx + S(200), cy + S(128), "CROSS-PLAY", g_crossplay, 51);
     }
     MwHeader(rx, cy, colW, "JOIN A GAME");
     MwBody(rx, cy + S(28), colW, S(24), "Paste or type the code from your host.");
@@ -648,6 +651,7 @@ static void StartLobbyLocked(bool join, const std::string& clip)
     r.lobbyName = P().lobbyName.empty() ? P().username + "'s game" : P().lobbyName;
     r.pub = g_public;
     r.separateCompanies = g_separateCompanies;
+    r.crossplay = g_crossplay;
     if (join) r.code = P().joinCode.size() >= 8 ? P().joinCode : clip;
     g_focus = 0;
     std::string why;
@@ -713,6 +717,10 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
             if (g_uiState == 2) SetStatusLocked(lobby::SetPublic(g_public));
             else SetStatusLocked(g_public ? "Your game will be listed publicly when you host." : "Your game will not be listed.");
             break;
+        case 51:
+            if (g_uiState == 2) SetStatusLocked(lobby::SetCrossplay(!P().view.crossplay));
+            else { g_crossplay = !g_crossplay; g_dirty = true; }
+            break;
         case 50:
             if (g_uiState == 2) SetStatusLocked(lobby::SetSeparateCompanies(!P().view.separateCompanies));
             else {
@@ -751,6 +759,8 @@ static decltype(&SDL_GetEventFilter)         s_GetEventFilter = nullptr;
 static decltype(&SDL_GetWindowFromID)        s_GetWindowFromID = nullptr;
 static decltype(&SDL_GetWindowSize)          s_GetWindowSize = nullptr;
 static decltype(&SDL_Vulkan_GetDrawableSize) s_GetDrawableSize = nullptr;
+static decltype(&SDL_GL_GetDrawableSize) s_GetGlDrawableSize = nullptr;
+static decltype(&SDL_GetWindowFlags) s_GetWindowFlags = nullptr;
 static decltype(&SDL_GetClipboardText)       s_GetClipboardText = nullptr;
 static decltype(&SDL_SetClipboardText)       s_SetClipboardText = nullptr;
 static decltype(&SDL_free)                   s_free = nullptr;
@@ -767,7 +777,9 @@ static void ToPixels(uint32_t windowID, int x, int y, int* px, int* py)
     if (!win || !s_GetWindowSize || !s_GetDrawableSize) return;
     int ww = 0, wh = 0, dw = 0, dh = 0;
     s_GetWindowSize(win, &ww, &wh);
-    s_GetDrawableSize(win, &dw, &dh);
+    if (s_GetWindowFlags && s_GetGlDrawableSize && (s_GetWindowFlags(win) & SDL_WINDOW_OPENGL))
+        s_GetGlDrawableSize(win, &dw, &dh);
+    else s_GetDrawableSize(win, &dw, &dh);
     if (ww > 0 && wh > 0 && dw > 0 && dh > 0) { *px = x * dw / ww; *py = y * dh / wh; }
 }
 
@@ -1045,6 +1057,8 @@ void InstallInput()
         s_GetWindowFromID  = (decltype(s_GetWindowFromID))dlsym(RTLD_DEFAULT, "SDL_GetWindowFromID");
         s_GetWindowSize    = (decltype(s_GetWindowSize))dlsym(RTLD_DEFAULT, "SDL_GetWindowSize");
         s_GetDrawableSize  = (decltype(s_GetDrawableSize))dlsym(RTLD_DEFAULT, "SDL_Vulkan_GetDrawableSize");
+        s_GetWindowFlags = (decltype(s_GetWindowFlags))dlsym(RTLD_DEFAULT, "SDL_GetWindowFlags");
+        s_GetGlDrawableSize = (decltype(s_GetGlDrawableSize))dlsym(RTLD_DEFAULT, "SDL_GL_GetDrawableSize");
         s_GetClipboardText = (decltype(s_GetClipboardText))dlsym(RTLD_DEFAULT, "SDL_GetClipboardText");
         s_SetClipboardText = (decltype(s_SetClipboardText))dlsym(RTLD_DEFAULT, "SDL_SetClipboardText");
         s_free             = (decltype(s_free))dlsym(RTLD_DEFAULT, "SDL_free");

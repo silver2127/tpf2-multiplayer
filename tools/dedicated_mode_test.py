@@ -59,7 +59,8 @@ check("dedicated_render=0: vkQueueSubmit is intercepted and its command buffers 
 check("  ... the fence and semaphores still reach the real submit (a straight copy of each VkSubmitInfo)", bool(sub) and "copy[i] = pSubmits[i];" in sub.group(0))
 check("  ... hooked through the device proc-addr interceptor", 'if (strcmp(name, "vkQueueSubmit") == 0) {' in MENU and "return (PFN_vkVoidFunction)mySubmit;" in MENU)
 check("  ... query results read as zero, available at once", "static VkResult VKAPI_CALL myQueryResults(" in MENU and 'strcmp(name, "vkGetQueryPoolResults") == 0' in MENU)
-check("  ... the panel is not drawn while not rendering", "if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0)" in MENU)
+# the draw gate is OverlayWanted, shared by the Vulkan and OpenGL paths since 2026-09-21
+check("  ... the panel is not drawn while not rendering", "return !NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0)" in MENU)
 check("  ... the swapchain is never acquired from or presented to: acquire answered here (round robin + empty signal submit)",
       "static VkResult NullAcquire(VkSemaphore sem, VkFence fence, uint32_t* pIndex)" in MENU
       and 'strcmp(name, "vkAcquireNextImageKHR") == 0' in MENU and 'strcmp(name, "vkAcquireNextImage2KHR") == 0' in MENU)

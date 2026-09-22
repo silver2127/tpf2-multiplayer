@@ -32,6 +32,14 @@ TUNNEL_PORTS = range(62100, 62200)   # endpoints live on 127.0.0.1 in this range
 IDENTITY_FILE = "tpf2_steam.txt"
 OFF_FILE = "tpf2mp_steam_off.txt"
 
+# ISteamUGC EItemState flags (UGC STATE answers them as they are)
+UGC_SUBSCRIBED = 1
+UGC_INSTALLED = 4
+UGC_NEEDS_UPDATE = 8
+UGC_DOWNLOADING = 16
+UGC_DOWNLOAD_PENDING = 32
+UGC_BATCH = 100                      # ids per control request (a STATE reply stays one datagram)
+
 
 def read_identity(data_dir):
     """(steamid64 as str, control port, persona) from <data_dir>/tpf2_steam.txt,
@@ -52,6 +60,17 @@ def read_identity(data_dir):
     if not sid.isdigit() or int(sid) == 0 or not port.isdigit() or not 0 < int(port) < 65536:
         return None
     return sid, int(port), fields.get("name", "")
+
+
+def parse_ugc_state(reply):
+    """The lines of a UGC STATE reply -> {id: (flags, done, total, folder)}."""
+    out = {}
+    for line in reply.splitlines()[1:]:
+        parts = line.split(" ", 4)
+        if len(parts) < 4 or not all(x.isdigit() for x in parts[:4]):
+            continue
+        out[parts[0]] = (int(parts[1]), int(parts[2]), int(parts[3]), parts[4].strip() if len(parts) == 5 else "")
+    return out
 
 
 def is_tunnel_addr(addr):
@@ -142,6 +161,34 @@ class SteamTunnel:
     def status(self):
         return self._ask("STATUS", tries=1) or ""
 
+    # ---- the Workshop (steam_tunnel.cpp UgcCommand) ----
+    def ugc_subscribe(self, ids):
+        """Subscribe to Workshop items and start their download. True when the
+        bridge took the request (Steam decides per item; ugc_state tells); False
+        without a tunnel or with a bridge that predates the Workshop commands."""
+        ids = [str(i) for i in ids if str(i).isdigit()]
+        if not ids:
+            return False
+        for k in range(0, len(ids), UGC_BATCH):
+            r = self._ask("UGC SUB " + " ".join(ids[k:k + UGC_BATCH]))
+            if not r or not r.startswith("OK"):
+                if r:
+                    self.log(f"[steam] workshop subscribe refused by the bridge: {r.strip()}")
+                return False
+        return True
+
+    def ugc_state(self, ids):
+        """{id: (flags, bytes done, bytes total, install folder or '')}, or None when
+        the bridge cannot answer."""
+        ids = [str(i) for i in ids if str(i).isdigit()]
+        out = {}
+        for k in range(0, len(ids), UGC_BATCH):
+            r = self._ask("UGC STATE " + " ".join(ids[k:k + UGC_BATCH]))
+            if not r or not r.startswith("STATE"):
+                return None
+            out.update(parse_ugc_state(r))
+        return out
+
     def close(self):
         if self._sock is not None:
             try:
@@ -173,6 +220,12 @@ class FakeTunnel:
         self.port = self._ctl.getsockname()[1]
         self._stop = threading.Event()
         self.sent = self.received = 0
+        # a fake Workshop: id -> the folder Steam "installs" it to (None: Steam refuses
+        # the subscription); an item finishes ugc_delay seconds after UGC SUB
+        self.workshop = {}
+        self.ugc_delay = 0.3
+        self.ugc_size = 1000000
+        self.subscribed = {}                # id -> when UGC SUB named it
         with FakeTunnel._table_lock:
             FakeTunnel._by_id[self.id] = self
         os.makedirs(data_dir, exist_ok=True)
@@ -225,7 +278,9 @@ class FakeTunnel:
                     line = data.decode("ascii", "replace").strip()
                     parts = line.split()
                     reply = "ERR unknown"
-                    if len(parts) == 2 and parts[0] == "LOBBY" and parts[1].isdigit():
+                    if len(parts) >= 3 and parts[0] == "UGC" and parts[1] in ("SUB", "STATE"):
+                        reply = self._ugc(parts[1], parts[2:])
+                    elif len(parts) == 2 and parts[0] == "LOBBY" and parts[1].isdigit():
                         self.lobby_port = int(parts[1]); reply = "OK"
                     elif len(parts) == 2 and parts[0] == "DIAL" and parts[1].isdigit():
                         if parts[1] == self.id:
@@ -258,6 +313,25 @@ class FakeTunnel:
                             other = FakeTunnel._by_id.get(peer)
                         if other is not None:
                             other.deliver(self.id, data)
+
+    def _ugc(self, verb, ids):
+        now = time.time()
+        if verb == "SUB":
+            for i in ids:
+                if self.workshop.get(i) is not None:
+                    self.subscribed.setdefault(i, now)
+            return f"OK {sum(1 for i in ids if i in self.subscribed)}"
+        lines = ["STATE"]
+        for i in ids:
+            since = self.subscribed.get(i)
+            if since is None:
+                lines.append(f"{i} 0 0 0 ")
+            elif now - since < self.ugc_delay:
+                done = int(self.ugc_size * (now - since) / self.ugc_delay)
+                lines.append(f"{i} {UGC_SUBSCRIBED | UGC_DOWNLOADING} {done} {self.ugc_size} ")
+            else:
+                lines.append(f"{i} {UGC_SUBSCRIBED | UGC_INSTALLED} {self.ugc_size} {self.ugc_size} {self.workshop[i]}")
+        return "\n".join(lines) + "\n"
 
     def close(self):
         self._stop.set()

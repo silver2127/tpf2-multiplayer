@@ -86,6 +86,22 @@ int main()
         assert(!why.empty() && lobby::S().q.empty() && lobby::S().m.gen==previous);
     }
     assert(SlicePublishReady(dir.c_str(),true));
+    for (const std::string code : {"76561198000000001", "https://steamcommunity.com/profiles/76561198000000001/"}) {
+        request.join=true;request.code=code;
+        assert(lobby::Start(request,&why));
+        assert(lobby::S().q.back().start.code=="76561198000000001");
+        lobby::S().q.clear();
+    }
+    for (const std::string code : {"https://steamcommunity.com/profiles/", "76561198000000001 --flag"}) {
+        request.join=true;request.code=code;
+        assert(!lobby::Start(request,&why) && lobby::S().q.empty());
+    }
+    lobby::S().child.gen=lobby::S().m.gen;
+    lobby::Dispatch("{\"type\":\"code\",\"code\":\"76561198000000001\",\"steam\":\"76561198000000001\",\"crossplay\":false}");
+    assert(lobby::S().m.hostSteam && !lobby::S().m.crossplay && lobby::S().q.empty());
+    lobby::Dispatch("{\"type\":\"code\",\"code\":\"ABCDEFGH\",\"steam\":\"76561198000000001\",\"crossplay\":true}");
+    assert(lobby::S().m.crossplay && lobby::S().m.code=="ABCDEFGH" && lobby::S().q.empty());
+    request.code="ABCDEFGH";
     for (bool join : {false, true}) {
         request.join=join; request.separateCompanies=true;
         assert(lobby::Start(request,&why));

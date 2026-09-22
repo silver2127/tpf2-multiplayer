@@ -130,6 +130,7 @@ struct Model {
     bool saveReady = false;    // joiner: save_ready this session
     bool lobbyDone = false;    // the shared save is placed
     bool relay = false;
+    bool crossplay = false, hostSteam = false;
     bool separateCompanies = false;
     bool haveCode = false;
     std::string code, you, host, title, modsPrompt;
@@ -1632,6 +1633,8 @@ static void Dispatch(const std::string& line)
         Status("Room code ready -- move the mouse over the game to copy it.");
         {
             std::lock_guard<std::mutex> lk(S().mtx);
+            S().m.crossplay = JBool(ev, "crossplay", true);
+            S().m.hostSteam = !JStr(ev, "steam").empty();
             S().m.code = cd;
             S().m.haveCode = true;
         }
@@ -1894,6 +1897,7 @@ static void Launch(const Request& r)
         if (a.localPort > 0) argv.push_back("--local-port=" + std::to_string(a.localPort));
         argv.push_back("--lobby-name=" + a.lobbyName);
         if (a.separateCompanies) argv.push_back("--companies");
+        if (a.crossplay) argv.push_back("--crossplay");
         if (!S().cfg.masterUrl.empty()) {
             argv.push_back("--publish=" + S().cfg.masterUrl);
             if (a.pub) argv.push_back("--public");
@@ -2356,7 +2360,11 @@ bool Start(const StartRequest& in, std::string* why)
         r.code = b == std::string::npos ? std::string() : r.code.substr(b, e - b + 1);
         if (r.code.size() < 8) { *why = "Paste or type your host's code in the field first."; return false; }
         // it becomes an argument: a crafted "code" must not smuggle options in
-        if (r.code.size() > 200 || !Base32Code(r.code)) { *why = "That is not a valid code (letters A-Z and digits 2-7 only)."; return false; }
+        while (!r.code.empty() && r.code.back() == '/') r.code.pop_back();
+        for (const std::string prefix : {"https://steamcommunity.com/profiles/", "http://steamcommunity.com/profiles/", "steamcommunity.com/profiles/"})
+            if (r.code.compare(0, prefix.size(), prefix) == 0) { r.code.erase(0, prefix.size()); break; }
+        const bool steamId = r.code.size() == 17 && r.code.find_first_not_of("0123456789") == std::string::npos;
+        if (r.code.size() < 8 || r.code.size() > 200 || (!steamId && !Base32Code(r.code))) { *why = "That is not a valid code (Steam ID or classic base32 code)."; return false; }
     }
     if (r.name.empty()) { *why = "Type a player name first."; return false; }
     if (!g_inited.load()) {
@@ -2372,6 +2380,7 @@ bool Start(const StartRequest& in, std::string* why)
         fresh.active = true;
         fresh.isHost = !r.join;
         fresh.separateCompanies = !r.join && r.separateCompanies;
+        fresh.crossplay = r.crossplay;
         S().m = fresh;
         gen = fresh.gen;
     }
@@ -2480,6 +2489,20 @@ std::string SetSeparateCompanies(bool on)
     return on ? "Separate companies: every player gets their own company." : "Co-op: everyone plays company 1 together.";
 }
 
+std::string SetCrossplay(bool on)
+{
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(S().mtx);
+        if (!S().m.active || !S().m.isHost) return "Only the host can change the cross-play mode.";
+        if (S().m.dead) return kNotRunning;
+        if (!S().m.lobbyReady) return "Lobby is starting...";
+        gen = S().m.gen;
+    }
+    QueueLine(gen, on ? "{\"cmd\":\"crossplay\",\"on\":true}" : "{\"cmd\":\"crossplay\",\"on\":false}");
+    return "Join code switch requested.";
+}
+
 std::string SetPublic(bool on)
 {
     uint64_t gen;
@@ -2567,6 +2590,8 @@ void Snapshot(View* v)
     v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
     v->readyMine=m.readyMine;v->readyCount=m.readyCount;v->readyTotal=m.readyTotal;v->recoveryVersion=m.recoveryVersion;
     v->saves=m.saves;v->selectedSave=m.selectedSave;v->startPending=m.startPending;
+    v->crossplay = m.crossplay;
+    v->hostSteam = m.hostSteam;
     v->separateCompanies = m.separateCompanies;
     v->haveCode = m.haveCode;
     v->isHost = m.isHost;

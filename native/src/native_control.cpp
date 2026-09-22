@@ -140,6 +140,20 @@ void Start(const std::wstring& path,bool ready) {
     // Ignore a mailbox left by an earlier process, even if Windows reused its
     // PID. Capture this before starting the worker so a fresh request cannot race it.
     initialRequest=read(L"tpf2_native_request.txt")["id"];
+    // The same for the mod's recovery record. No lobby of THIS process exists yet (the
+    // menu starts one only later, on HOST/JOIN) and no game script runs before a world
+    // loads, so a tpf2_sync_lua.txt carrying our pid can only be an earlier process's.
+    // Under Wine the pid is the same small number on every run of the game, and the
+    // mod honoured such a record: the dedicated server, restarted after a recovery had
+    // failed (phase=error, "Timed out waiting for all players", resume_speed=0), came
+    // back held at speed 0 for good, twice (2026-09-21). Emptied, not deleted: the
+    // mod reads an empty file as no record. Another live game's record (another pid)
+    // is left alone.
+    {
+        const auto stale=read(L"tpf2_sync_lua.txt");
+        const auto it=stale.find("pid");
+        if(it!=stale.end() && it->second==std::to_string(GetCurrentProcessId())) write(L"tpf2_sync_lua.txt","");
+    }
     HANDLE thread=CreateThread(nullptr,0,work,nullptr,0,nullptr);
     if(thread) CloseHandle(thread); else running=false;
 }

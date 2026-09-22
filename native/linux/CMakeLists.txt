@@ -51,7 +51,7 @@ target_link_libraries(tpf2_bridge_mp PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 # frames. SDL2's headers are needed for its event layout only; the game's own
 # libSDL2 is called through dlsym.
 add_library(tpf2_menu SHARED src/menu_linux.cpp src/hook_posix.cpp src/panel_linux.cpp
-            src/panel_layer.cpp src/overlay_vk_linux.cpp src/lobby_linux.cpp
+            src/panel_layer.cpp src/overlay_vk_linux.cpp src/overlay_gl_linux.cpp src/lobby_linux.cpp
             src/menu_game_linux.cpp src/dedicated_linux.cpp src/native_control_linux.cpp)
 set_target_properties(tpf2_menu PROPERTIES PREFIX "")
 target_include_directories(tpf2_menu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -120,6 +120,10 @@ if(BUILD_TESTING)
   target_compile_options(test_bridge_epoch PRIVATE -UNDEBUG -Wno-unused-function)
   target_link_libraries(test_bridge_epoch PRIVATE Threads::Threads stdc++fs)
   add_test(NAME bridge_epoch COMMAND test_bridge_epoch)
+  add_executable(test_native_control_linux tests/native_control_linux_test.cpp)
+  target_compile_options(test_native_control_linux PRIVATE -UNDEBUG)
+  target_link_libraries(test_native_control_linux PRIVATE Threads::Threads)
+  add_test(NAME native_control_linux COMMAND test_native_control_linux)
   add_executable(test_steam_tunnel tests/steam_tunnel_test.cpp)
   target_compile_options(test_steam_tunnel PRIVATE -UNDEBUG)
   target_link_options(test_steam_tunnel PRIVATE -rdynamic)

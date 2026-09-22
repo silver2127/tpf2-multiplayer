@@ -630,6 +630,17 @@ K.CAP_WINDOW_S = 15
 K.CAP_LOW = 0.8
 K.CAP_SAMPLES = 3
 K.CAP_UP_S = 60
+-- A CAP THAT COSTS SPEED IS LIFTED (2026-09-22). The premise above is a fixed
+-- capacity: the host makes N steps a second whatever the lever. A live host
+-- showed the other shape: its engine stretched EVERY speed alike (the interval
+-- read 260-280 ms, not 200), 172 of 225 steps at 3x (2.3x) and 116 of 150 at 2x
+-- (1.5x), so each cap made the world slower and the next window capped again,
+-- 3x -> 2x -> 1x with both players voting 4x. Now the first window AT the cap is
+-- compared with the speed achieved before it (CM.capFrom): if the host is still
+-- short of steps at the cap AND made fewer of them than before, the cap is lifted
+-- and no cap is set for K.CAP_OFF_S. A cap the host keeps up with stays.
+K.CAP_OFF_S = 600
+K.CAP_WORSE = 0.95
 function CM.hostPace()
 	local base, lever
 	local f = io.open(K.BASE .. "tpf2_engine_pace.txt", "r")
@@ -664,6 +675,17 @@ function CM.hostCapacityCap(eff, applied, s, now)
 		local r = expected > 0 and got / expected or 1
 		CM.capWin = { wall = wall, step = step, applied = applied }
 		CM.capLast = r
+		local achieved = applied * r
+		if r < K.CAP_LOW and CM.hostCap and applied <= CM.hostCap and CM.capFrom and achieved < CM.capFrom * K.CAP_WORSE then
+			log(string.format("SPEED2: the %dx cap made the host slower (%.2fx achieved, %.2fx before it) -- the engine "
+				.. "stretches every speed alike, so the cap is lifted for %d s", CM.hostCap, achieved, CM.capFrom, K.CAP_OFF_S))
+			CM.hostCap, CM.capFrom, CM.capStretched, CM.capOkSince = nil, nil, 0, nil
+			CM.capOffUntil = wall + K.CAP_OFF_S
+			return eff, nil
+		end
+		if r < K.CAP_LOW and CM.capOffUntil and wall < CM.capOffUntil then
+			r = 1                                    -- a lifted cap: measured, never acted on
+		end
 		if r < K.CAP_LOW then
 			CM.capStretched = (CM.capStretched or 0) + 1
 			CM.capOkSince = nil
@@ -672,6 +694,7 @@ function CM.hostCapacityCap(eff, applied, s, now)
 				if can < 1 then can = 1 end
 				if not CM.hostCap or can < CM.hostCap then
 					CM.hostCap = can
+					CM.capFrom = achieved            -- what the cap has to beat (see K.CAP_OFF_S)
 					local base = CM.hostPace()
 					log(string.format("SPEED2: the host keeps up with %dx (%d of %d steps in %d s at %gx%s) -- the session is capped there",
 						can, got, math.floor(expected + 0.5), dt, applied, base and string.format(", the engine's interval reads %d ms", math.floor(base / 1000)) or ""))

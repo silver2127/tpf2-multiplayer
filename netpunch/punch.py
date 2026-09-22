@@ -52,6 +52,7 @@ TYPE_ACK = b"A"                      # payload = the token we just received
 TYPE_CONNECTED = b"C"               # payload = our token (informational)
 TYPE_KEEPALIVE = b"K"              # payload = our token
 TYPE_DATA = b"D"                     # payload = application bytes
+TYPE_KEYX = b"X"                     # payload = a Steam-code key exchange message (steamkey.py)
 TYPE_EDATA = b"E"                    # payload = sealed application bytes (seal.py)
 # The 4-byte tag a save chunk starts with (lobby.CHUNK_MAGIC). Duplicated here
 # rather than imported because punch.py is the lower layer -- lobby imports it,

@@ -282,7 +282,17 @@ status message.
    leaves the lobby. The saved Auto-accept checkbox answers future prompts.
    Mods may download before the initial save, or in a second round after it.
    Hotjoins use the same protocol and current save list.
-   Workshop files go into the multiplayer data folder's `workshop/<id>` directory.
+   **The Workshop first (2026-09-22).** A joiner whose Steam tunnel is up subscribes
+   to the approved Workshop items through Steam instead of asking the host for them:
+   `UGC SUB <id>...` on the tunnel's control port (SubscribeItem + DownloadItem at high
+   priority), then `UGC STATE <id>...` once a second (EItemState flags, bytes, install
+   folder). An installed item is registered like a folder already on disk. The host's
+   round is asked only for local mods and for items Steam did not subscribe to within
+   20 s (hidden, removed, offline) or whose download made no progress for 120 s. A
+   bridge without the commands, no tunnel, the relay and the rig's
+   `ignore_steam_workshop` flag skip Steam. A save round that arrives first ends the
+   Steam phase and the host sends the remainder. `tools/test_workshop_subscribe.py`.
+   Workshop files the host sends go into the multiplayer data folder's `workshop/<id>` directory.
    Local mods use the game's local mod folders. Existing installations are not
    overwritten. Archive paths and unpacked sizes are checked. A fresh registry
    token and native catalogue receipt gate the final acknowledgement: a disk
@@ -418,6 +428,21 @@ installs a VPN or depends on the master server's relay.
   once the tunnel is up; `tpf2mp_steam_off.txt` keeps it off. The tunnel's
   lines in `tpf2_bridge.log` start with `[steam]`; `STATUS` on its control
   port lists every endpoint with Steam's session state (relay in use, errors).
+- **The Steam ID as the join code (2026-09-22).** A host whose tunnel is up
+  shares its SteamID64 as the code, and the lobby is Steam-only: a HELLO
+  that does not come from a tunnel endpoint is not answered (it is logged
+  once every few seconds). A Steam ID is public, so it cannot carry the
+  session secret the classic code does. The joiner gets the secret over the
+  tunnel instead, in a Diffie-Hellman exchange (`steamkey.py`, packet type
+  `X`, RFC 3526 group 14) that the host answers only from tunnel endpoints.
+  The frame key is still `derive_key(secret, password)`, so a lobby password
+  works as before. `connect.steam_code_id` accepts 17 digits in the
+  individual-account range or a pasted `steamcommunity.com/profiles/` URL.
+  **CROSS-PLAY** (`--crossplay` at start, or `{"cmd":"crossplay","on":...}`
+  live) opens the gate and switches the shown and published code to the
+  classic one; the `code` event carries `code`, `steam`, `crossplay` and
+  `cross_code`. A host without a tunnel, a relay-only host and a dedicated
+  server always use the classic code. `tools/test_steam_code.py` covers it.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).
