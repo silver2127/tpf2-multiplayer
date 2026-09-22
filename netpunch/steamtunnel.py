@@ -210,8 +210,9 @@ class FakeTunnel:
     _by_id = {}
     _table_lock = threading.Lock()
 
-    def __init__(self, data_dir, steamid, name="fake", drop=None):
+    def __init__(self, data_dir, steamid, name="fake", drop=None, endpoint_buf=16 * 1024 * 1024):
         self.data_dir, self.id, self.name = data_dir, str(steamid), name
+        self.endpoint_buf = endpoint_buf    # SO_RCVBUF/SNDBUF of the endpoints, as the native tunnel sets (None: OS default)
         self.drop = drop                    # optional predicate(bytes) -> True to lose a datagram
         self.lobby_port = None
         self.endpoints = {}                 # peer id -> socket
@@ -239,6 +240,12 @@ class FakeTunnel:
         s = self.endpoints.get(peer)
         if s is None:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            if self.endpoint_buf:
+                for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
+                    try:
+                        s.setsockopt(socket.SOL_SOCKET, opt, self.endpoint_buf)
+                    except OSError:
+                        pass
             for port in TUNNEL_PORTS:            # the first free port of the range, as the native tunnel does
                 try:
                     s.bind((TUNNEL_IP, port))

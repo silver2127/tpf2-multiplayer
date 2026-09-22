@@ -185,6 +185,14 @@ SOCKET BindLoopback(const char* ip, uint16_t port, uint16_t* portOut)
     getsockname(s, (sockaddr*)&a, &len);
     *portOut = ntohs(a.sin_port);
     u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+    // 16 MB BUFFERS (2026-09-22). The lobby hands a save transfer's whole window to
+    // an endpoint socket in one burst (128 x 32 KB = 4 MB) and Windows' default UDP
+    // receive buffer is 64 KB: loopback drops everything past it without an error,
+    // so a chunk never reached Steam and the transfer stalled on that hole (base
+    // 132/4199, and 15/12781 in 0.6.1.15). Best effort: a refusal leaves the default.
+    int big = 16 * 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&big, sizeof(big));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&big, sizeof(big));
     return s;
 }
 

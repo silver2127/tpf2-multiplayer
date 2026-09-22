@@ -351,6 +351,14 @@ def _start_dual_client(conn, name, log, sim=None):
     return dsock
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
+# OVER STEAM A RESEND IS NOT A RETRY (2026-09-22). Steam's reliable send delivers a
+# chunk it took; a hole the receiver reports is one still on its way or one lost on
+# the loopback leg. Re-sending every hole on every 50 ms fack queued 4,400 duplicate
+# 32 KB messages behind the missing one (base 132/4199, then TIMED OUT). A hole is
+# re-sent at most every NACK_HOLDOFF_STEAM, and a silent receiver rewinds after
+# RESEND_AFTER_STEAM, not the UDP path's 0.5 s.
+NACK_HOLDOFF_STEAM = 1.0
+RESEND_AFTER_STEAM = 3.0
 SEND_WINDOW_STEAM  = 128    # x CHUNK_STEAM = ~4 MB in flight: half the 8 MB send buffer the
                             # tunnel gives Steam (steam_tunnel.cpp SendBufferSize), and ~40 MB/s
                             # at a 100 ms round trip, over the 16 MB/s rate it allows
@@ -407,7 +415,8 @@ def _safe_incoming_name(name):
     return (os.path.basename(name) == name
             and not os.path.isabs(name)
             and ".." not in name.split("/") and ".." not in name.split("\\"))
-XFER_BUF_BYTES = 4 * 1024 * 1024      # best-effort SO_RCVBUF/SO_SNDBUF for bursts.
+XFER_BUF_BYTES = 16 * 1024 * 1024     # best-effort SO_RCVBUF/SO_SNDBUF for bursts (4 MB until 2026-09-22:
+                                      # a Steam window of 4 MB arrives from the tunnel as one burst)
 
 
 def _boost_socket_buffers(sock):
@@ -1719,16 +1728,23 @@ class _HostSaveTransfer:
                 continue                        # streaming over TCP: nothing to send here
             # Receiver silent for too long? Its facks were lost -- rewind and
             # re-stream the window so it (and its facks) can catch up.
-            if (now - p["last_fack"] > RESEND_AFTER
-                    and now - p["last_resend"] > RESEND_AFTER):
+            steam = self.chunk == CHUNK_STEAM
+            resend_after = RESEND_AFTER_STEAM if steam else RESEND_AFTER
+            if (now - p["last_fack"] > resend_after
+                    and now - p["last_resend"] > resend_after):
                 p["next"] = p["base"]
                 p["last_resend"] = now
             budget = SEND_BUDGET
+            resent = p.setdefault("resent", {}) if steam else None
             # 1) selective retransmits (explicit holes) first
             while budget > 0 and p["nack"]:
                 seq = p["nack"].pop(0)
                 if seq < p["base"] or seq >= self.total_chunks:
                     continue
+                if resent is not None:
+                    if now - resent.get(seq, -1e9) < NACK_HOLDOFF_STEAM:
+                        continue                # still on its way through Steam
+                    resent[seq] = now
                 self._send_chunk(addr, seq)
                 budget -= 1
             # 2) new in-order chunks, capped by the flow-control window
