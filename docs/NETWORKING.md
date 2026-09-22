@@ -486,3 +486,28 @@ rewind and no-progress timeout. File hashes must match. This simulation does not
 replace a two-computer Steam test. The existing `test_steam_chunks.py` additionally
 checks two receivers with 0%, 8% and 15% injected datagram loss;
 `test_steam_tcp.py` checks both TCP dialing directions and the Steam fallback.
+
+## Experimental Steam transport comparison (0.6.1.26)
+
+The default tunnel uses SteamNetworkingMessages v002 through the game's own
+steam_api64.dll. Vendored Valve headers provide the ABI; no additional Steam
+initialization or networking library is introduced. Both participants must use
+this version and the same mode. A missing Messages API is an explicit failure,
+not an automatic legacy fallback.
+
+For an A/B comparison, close the game on both computers and create
+`%LOCALAPPDATA%/tpf2mp/data/tpf2mp_steam_legacy.txt` on each. Start through the
+launcher and check `transport=Legacy`; remove the file with the game closed to
+return to `transport=Messages`. This startup switch persists across updates.
+Direct TCP still takes priority, so compare only runs whose save uses Steam.
+
+`[steam-messages]` reports Steam's estimated send capacity, recent wire rates,
+ping, pending bytes and sent-but-unacknowledged reliable bytes. These are distinct
+from `[steam-bulk]` tx (bytes accepted by the API) and `[xfer]` acknowledged save
+bytes. Modern packet queue count is unavailable and reported as -1. Mode changes
+require restart; mixed-mode peers cannot communicate.
+
+The measured 0.6.1.25 live run sustained about 0.54 MB/s with zero application
+retries or receiver duplicates. The new API is a test candidate, not a confirmed
+speed fix. Run `python tools/steam_messages_test.py` for the adapter boundary
+regression, and the existing transfer tests for save protocol coverage.
