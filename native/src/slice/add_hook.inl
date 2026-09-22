@@ -2,23 +2,64 @@
 // the CommandList::Add hook: cancel, callbacks, stashes, DeferHandler
 
 
-// CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into
-// its second argument, and the caller destroys that handle as soon as Add
-// returns. Cancelling the call leaves the caller's stack slot holding whatever
-// was there before -- and the destructor (exe+0x2357910) reads *handle, checks
-// it against null only, then dereferences handle[1]. A leftover
-// 0xfffffffffffffffe passes the null check and faults reading address 6: the
-// game crashed on a plane's "turn around" while it was flying to a depot
-// (2026-08-30, access violation at exe+0x235791e, rbx = -2). Earlier cancels
-// survived only because that slot happened to hold zero. Zeroing the out handle
-// makes the caller's destructor a no-op.
+// CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into its
+// second argument: a std::unique_ptr to a 16-byte {result*, control*} weak
+// reference to the queued command. The caller owns it from there.
+//
+// Cancelling the call leaves the caller's stack slot holding whatever was there
+// before -- and the destructor (exe+0x2357910) reads *handle, checks it against
+// null only, then dereferences handle[1]. A leftover 0xfffffffffffffffe passes the
+// null check and faults reading address 6: the game crashed on a plane's "turn
+// around" while it was flying to a depot (2026-08-30, at exe+0x235791e, rbx = -2).
+// Zeroing it made that destructor a no-op.
+//
+// A NULL handle is not enough for every caller. The Lines window's New Line
+// (linelist.cpp 0x610380, Add returns to 0x610441) COPIES the handle straight
+// after Add (exe+0x23577f0: `mov rdi,[rdx]` then `mov rdx,[rdi]`, no null check)
+// and hands the copy to the UI to release when the command finishes; the release
+// (exe+0x9d3210) reads handle[1] as well. With the handle zeroed the copy faulted
+// reading address 0 -- a player's game died on every press of New Line in that
+// window (2026-09-22, crash dump exe+0x235780f, two crashes in four minutes). The
+// Line manager's New Line (0x618ff0) only destroys the handle, which is why it
+// survived.
+//
+// So hand back a REAL but EMPTY handle: 16 zero bytes from the game's own
+// operator new (exe+0x2bf3a80), which its operator delete (exe+0x2bf3abc) frees.
+// Copying it touches no refcount, releasing it reads the zero control pointer and
+// returns, and destroying it frees the block. The bytes of that allocator are
+// checked against build 35924 once; if they differ (or it returns nothing) the
+// slot is zeroed as before.
+static const uintptr_t RVA_OPERATOR_NEW = 0x2bf3a80;
+static const uint8_t OPERATOR_NEW_BYTES[9] = {0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9};   // push rbx; sub rsp,20; mov rbx,rcx
+static void* GameNew16()
+{
+    static volatile LONG checked = 0;   // 0 unknown, 1 usable, 2 refused
+    typedef void* (__fastcall* NewFn)(size_t);
+    const uintptr_t fn = g_base + RVA_OPERATOR_NEW;
+    LONG state = InterlockedCompareExchange(&checked, 0, 0);
+    if (!state) {
+        state = (g_base && Readable((const void*)fn, sizeof OPERATOR_NEW_BYTES) &&
+                 memcmp((const void*)fn, OPERATOR_NEW_BYTES, sizeof OPERATOR_NEW_BYTES) == 0) ? 1 : 2;
+        InterlockedExchange(&checked, state);
+        if (state == 2) Log("[slice] operator new at %llx is not build 35924's -- cancelled Adds hand back a null handle\n",
+                            (unsigned long long)RVA_OPERATOR_NEW);
+    }
+    if (state != 1) return nullptr;
+    void* p = nullptr;
+    __try {
+        p = ((NewFn)fn)(16);
+        if (p) memset(p, 0, 16);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
+    return p;
+}
 static void ZeroAddResult(uint64_t rdx)
 {
     if (!rdx) return;
+    void* empty = GameNew16();
     __try {
-        *(volatile uint64_t*)rdx = 0;
+        *(volatile uint64_t*)rdx = (uint64_t)empty;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[slice] could not zero the Add out-handle at %llx\n", (unsigned long long)rdx);
+        Log("[slice] could not write the Add out-handle at %llx\n", (unsigned long long)rdx);
     }
 }
 
