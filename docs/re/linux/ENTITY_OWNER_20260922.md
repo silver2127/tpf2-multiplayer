@@ -40,3 +40,6 @@ The slice's foreign-patch registry includes the new site.
   and publishes it afterward.
 - All 52 soldier CTests passed. Live startup publishes the capability and runs
   under the native dedicated watchdog. The integration record tracks gameplay.
+- Live native/Windows company creation and switching replay succeeded, followed
+  by a complete resync with company state restored. An in-game probe invoked
+  the marked setter on two real lines and verified their owners afterward.
