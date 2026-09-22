@@ -69,8 +69,12 @@ end
 -- (2026-09-18 16:38) -- the round timed out in "checking" with no fingerprint.
 -- A control file left by another process is already refused by its pid.
 function CM.syncAlone()
-	local roster = tonumber(CM.rosterPlayers)
-	return roster ~= nil and roster <= 1
+	-- The normal roster poll does not run while autoSyncPump holds producers.
+	-- A host that was alone before a join must not abandon that join using its
+	-- cached one-player roster. Unknown or foreign control keeps the hold.
+	local ctl = CM.syncRead("tpf2_bridge_ctl.txt")
+	local roster = ctl and ctl.pid == K.PROCESS_ID and tonumber(ctl.players)
+	return type(roster) == "number" and roster == 1
 end
 
 function CM.autoSyncPump(now)
