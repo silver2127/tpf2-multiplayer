@@ -585,7 +585,7 @@ static void RenderLocked(int w, int h)
     layer::Begin(w, h);
     g_hitCount = 0;
     layer::Rect(0, 0, w, h, MW_BG, TitleMode()?175:MW_BG_A);
-    if(TitleMode()) { RenderTitleLocked(w,h); return; }
+    if(MenuPanelMode()) { RenderTitleLocked(w,h); return; }
     if (g_uiState == 3) {
         const auto& v=P().view;
         MwTitle("WORLD SYNC");MwClose(w,4);
@@ -612,7 +612,7 @@ static void LayoutLocked(int screenW, int screenH, int* w, int* h)
 {
     g_s = std::min(UiScale(screenH),std::min(screenW/800.f,screenH/560.f));
     *w = S(780);
-    *h = (TitleMode() || g_uiState >= 2 || !P().flagMaster.empty()) ? S(540) : S(330);
+    *h = S(540);
     if (*w > screenW) *w = screenW;
     if (*h > screenH) *h = screenH;
 }
@@ -676,7 +676,8 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
 {
     if (previous && !(id >= 20 && id < 36)) return;
     if (g_log) g_log("[panel] hit id=%d\n", id);
-    if(id>=110 && id<=115 && TitleMode()) {
+    if(id>=110 && id<=115 && MenuPanelMode()) {
+        if(P().view.inGame && id<114)return;
         if(id<=111) { g_titleTab=id-110;g_focus=0; }
         else if(id<=113)g_serverPage=std::max(0,g_serverPage+(id==112?-1:1));
         else g_playerPage=std::max(0,g_playerPage+(id==114?-1:1));

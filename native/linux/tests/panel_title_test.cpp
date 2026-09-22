@@ -22,6 +22,19 @@ static bool Has(int id) {
     for(int i=0;i<g_hitCount;++i)if(g_hits[i].id==id)return true;
     return false;
 }
+static void CheckHits(int w,int h) {
+    using namespace panel;
+    for(int i=0;i<g_hitCount;++i) {
+        const auto& a=g_hits[i];assert(a.x>=0&&a.y>=0&&a.x+a.w<=w&&a.y+a.h<=h);
+        for(int j=0;j<i;++j) {
+            const auto& b=g_hits[j];
+            if(a.x<b.x+b.w && b.x<a.x+a.w && a.y<b.y+b.h && b.y<a.y+a.h) {
+                fprintf(stderr,"overlap ids %d/%d scale=%g page=%d\n",a.id,b.id,g_s,g_uiState);
+                assert(false);
+            }
+        }
+    }
+}
 static void Key(SDL_Keycode k,bool down,int mods=0) {
     using namespace panel;
     SDL_Event e{};e.type=down?SDL_KEYDOWN:SDL_KEYUP;e.key.keysym.sym=k;e.key.keysym.mod=mods;
@@ -53,7 +66,7 @@ int main(int argc,char** argv) {
     g_uiState=1;g_focus=0;Key(SDLK_RETURN,true);Key(SDLK_RETURN,false);
     P().view.modsPrompt="Required workshop content";RenderLocked(w,h);
     assert(Has(16)&&Has(17)&&!Has(2)&&!Has(110));
-    P().view.modsPrompt.clear();g_uiState=2;P().view.isHost=true;
+    P().view.modsPrompt.clear();g_uiState=2;P().view.isHost=true;P().view.hostSteam=true;
     for(int i=0;i<16;++i)P().view.players.push_back({"Player "+std::to_string(i),"",i+1,true,false});
     RenderLocked(w,h);assert(Has(115)&&!Has(114)&&!Has(6)&&Has(51));
     P().view.lobbyReady=true;g_playerPage=1;RenderLocked(w,h);assert(Has(114)&&!Has(115)&&Has(6)&&Has(28)&&Has(35));
@@ -61,9 +74,35 @@ int main(int argc,char** argv) {
     P().view.isHost=true;
     P().savePicker=true;P().view.saves.push_back({"/save/test.sav","Test",0});RenderLocked(w,h);
     assert(Has(100)&&Has(91)&&!Has(6));
+    // The in-world panel reuses the design without title backdrop/input capture.
+    for(float scale : {0.65f,0.8f,1.f,1.4f,5.f}) {
+        g_flagScale=scale;P().view.inGame=true;g_uiState=2;
+        LayoutLocked(1280,720,&w,&h);assert(w<=1280 && h<=720);
+        P().flagMaster="test";P().view.isHost=true;P().view.hostSteam=true;
+        P().view.active=true;P().savePicker=true;g_playerPage=0;
+        RenderLocked(w,h);CheckHits(w,h);
+        assert(!TitleMode() && Has(84)&&Has(4)&&Has(51)&&Has(50)&&Has(11));
+        assert(!Has(5)&&!Has(6)&&!Has(90)&&!Has(100));
+        Post post;OnHitLocked(115,&post);assert(g_playerPage==1);
+        RenderLocked(w,h);CheckHits(w,h);assert(Has(114)&&Has(28)&&Has(35));
+        OnHitLocked(114,&post);assert(g_playerPage==0);
+        OnHitLocked(84,&post);assert(g_uiState==3);
+        RenderLocked(w,h);assert(Has(83)&&!Has(115));
+        OnHitLocked(83,&post);assert(g_uiState==2);
+        P().view.hostSteam=false;RenderLocked(w,h);assert(!Has(51));
+        P().view.isHost=false;RenderLocked(w,h);CheckHits(w,h);
+        assert(Has(4)&&Has(9)&&!Has(84)&&!Has(50)&&!Has(51)&&!Has(11)&&!Has(6));
+        g_uiState=1;RenderLocked(w,h);
+        assert(Has(2)&&Has(4)&&Has(13)&&Has(14)&&Has(51)&&Has(15)&&!Has(3)&&!Has(110));
+        const int tab=g_titleTab;OnHitLocked(110,&post);assert(g_titleTab==tab);
+        CheckHits(w,h);
+        P().view.modsPrompt="Required workshop content";RenderLocked(w,h);
+        assert(Has(16)&&Has(17)&&!Has(2)&&!Has(4));P().view.modsPrompt.clear();
+    }
+    P().view.inGame=false;
     PrepareTitleBackdrop(8,8);assert(g_titleBackdrop.size()==256);
     layer::Begin(2,2);layer::Rect(0,0,2,2,layer::rgb(255,0,0),255);
     layer::PlaceOnBackdrop(8,8,3,4,g_titleBackdrop.data());
     const auto* px=layer::Pixels();assert(px[(4*8+3)*4+2]==255 && px[0]==65 && layer::Width()==8);
-    puts("title: layout, tab fields, key down/up capture, modal isolation, roster/save paging, readiness and backdrop placement passed");
+    puts("title: layout, tab fields, key down/up capture, modal isolation, roster/save paging, readiness, in-world host/client/setup/recovery flows and backdrop placement passed");
 }

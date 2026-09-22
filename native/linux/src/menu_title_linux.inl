@@ -1,5 +1,6 @@
-// Native title presentation; actions remain in panel_linux.cpp.
+// Native title and in-game session presentation; actions remain in panel_linux.cpp.
 static int g_titleTab=0, g_serverPage=0, g_playerPage=0;
+static bool MenuPanelMode() { return g_uiState==1 || g_uiState==2; }
 static bool TitleMode() { return !P().view.inGame && (g_uiState==1 || g_uiState==2); }
 static int TitleNextFocus(int focus,bool backwards) {
     const int fields[]={3,2,g_titleTab?4:1};
@@ -16,8 +17,27 @@ static void TitleAction(int x,int y,int w,const char* s,int id,bool enabled=true
 static void RenderTitleLocked(int w,int h) {
     const int pad=S(25),width=w-2*pad;
     const auto& v=P().view;
-    MwTitle(g_uiState==1?"MULTIPLAYER":P().savePicker?"CHOOSE A SAVEGAME":"MULTIPLAYER - LOBBY");
-    if(g_uiState==1) {
+    const bool world=v.inGame;
+    MwTitle(world?(g_uiState==1?"MULTIPLAYER - HOST SESSION":"MULTIPLAYER - SESSION"):g_uiState==1?"MULTIPLAYER":P().savePicker?"CHOOSE A SAVEGAME":"MULTIPLAYER - LOBBY");
+    if(world) MwClose(w,4);
+    if(g_uiState==1 && world) {
+        const int fx=pad+S(270),fw=width-S(270);
+        TitleText(pad,S(63),width,S(28),"Invite players to the world you are currently playing.",14,MW_DIM);
+        TitleText(pad,S(117),S(255),S(28),"Player name");
+        MwField(fx,S(117),fw,S(28),P().username,g_focus==3,"Your Steam name",13);
+        TitleText(pad,S(159),S(255),S(28),"Game name");
+        MwField(fx,S(159),fw,S(28),P().lobbyName,g_focus==4,"Your multiplayer game",14);
+        TitleText(pad,S(201),S(255),S(28),"Password (optional)");
+        MwField(fx,S(201),fw,S(28),std::string(P().passCode.size(),'*'),g_focus==2,"",10);
+        TitleText(pad,S(262),width,S(26),"Session settings",18);
+        MwCheck(pad,S(303),"Separate companies",g_separateCompanies,50);
+        MwCheck(pad+S(300),S(303),"Cross-play",g_crossplay,51);
+        if(!P().flagMaster.empty())MwCheck(pad,S(345),"Show in the public game browser",g_public,11);
+        TitleText(pad,S(391),width,S(28),"New players receive a snapshot of the current world.",14,MW_DIM);
+        TitleAction(pad,h-S(68),S(90),"CLOSE",4);
+        TitleAction(pad+S(120),h-S(68),S(120),"OPEN LOGS",15);
+        TitleAction(w-pad-S(170),h-S(68),S(170),"HOST SESSION",2);
+    } else if(g_uiState==1) {
         TitleAction(w-pad-S(110),S(10),S(110),"OPEN LOGS",15);
         for(int i=0;i<2;++i) {
             TitleAction(pad+i*S(160),S(51),S(150),i?"CREATE GAME":"JOIN GAME",110+i);
@@ -65,7 +85,7 @@ static void RenderTitleLocked(int w,int h) {
         }
         TitleAction(pad,h-S(68),S(80),"BACK",4);
         TitleAction(w-pad-S(150),h-S(68),S(150),g_titleTab?"CREATE GAME":"JOIN GAME",g_titleTab?2:3,g_titleTab || !P().joinCode.empty());
-    } else if(P().savePicker && v.isHost && !v.lobbyDone) {
+    } else if(!world && P().savePicker && v.isHost && !v.lobbyDone) {
         TitleText(pad,S(57),width,S(28),"Choose the world to share with all players.",14,MW_DIM);
         layer::Rect(pad,S(88),width,S(340),rgb(0,0,0),50);
         TitleText(pad+S(10),S(88),width-S(195),S(22),"Savegame",13,MW_DIM);
@@ -91,12 +111,14 @@ static void RenderTitleLocked(int w,int h) {
         if(v.haveCode)TitleAction(w-pad-S(180),S(57),S(180),"COPY INVITATION CODE",7);
         const int rw=S(360),cx=pad+rw+S(25),cw=w-pad-cx,footer=h-S(113);
         TitleText(pad,S(100),rw,S(24),"Players",18);
-        TitleText(cx,S(100),cw,S(24),"Savegame",18);
-        layer::Rect(cx,S(133),cw,S(30),rgb(0,0,0),50);
-        const auto slash=v.selectedSave.find_last_of('/');
-        TitleText(cx+S(10),S(133),cw-S(20),S(30),!v.isHost?"Supplied by the host":v.selectedSave.empty()?"No savegame selected":v.selectedSave.substr(slash==std::string::npos?0:slash+1));
-        if(v.isHost && !v.lobbyDone)TitleAction(cx,S(170),cw,"CHOOSE SAVEGAME",90,!v.startPending);
-        TitleText(cx,S(211),cw,S(24),"Chat",18);
+        if(!world) {
+            TitleText(cx,S(100),cw,S(24),"Savegame",18);
+            layer::Rect(cx,S(133),cw,S(30),rgb(0,0,0),50);
+            const auto slash=v.selectedSave.find_last_of('/');
+            TitleText(cx+S(10),S(133),cw-S(20),S(30),!v.isHost?"Supplied by the host":v.selectedSave.empty()?"No savegame selected":v.selectedSave.substr(slash==std::string::npos?0:slash+1));
+            if(v.isHost && !v.lobbyDone)TitleAction(cx,S(170),cw,"CHOOSE SAVEGAME",90,!v.startPending);
+        }
+        TitleText(cx,world?S(100):S(211),cw,S(24),"Chat",18);
         layer::Rect(pad,S(133),rw,footer-S(139),rgb(0,0,0),50);
         TitleText(pad+S(10),S(136),S(178),S(24),"Name",13,MW_DIM);
         TitleText(pad+S(195),S(136),S(160),S(24),"Company",13,MW_DIM);
@@ -104,7 +126,7 @@ static void RenderTitleLocked(int w,int h) {
         g_playerPage=std::min(g_playerPage,std::max(0,(count-1)/per));
         for(int row=0;row<per;++row) {
             const int i=g_playerPage*per+row;if(i>=count)break;
-            const auto& p=v.players[i];const int y=S(170+row*26);
+            const auto& p=v.players[i];const int y=S(170)+row*S(26);
             TitleText(pad+S(10),y,S(178),S(26),p.name+(p.host?" (Host)":""),13);
             TitleText(pad+S(195),y,S(155),S(26),p.stage.empty()?"Company "+std::to_string(p.company):p.stage,13);
             if(p.you || v.youAreHost)AddHit(pad+S(190),y,S(170),S(26),20+i,true);
@@ -112,7 +134,7 @@ static void RenderTitleLocked(int w,int h) {
         TitleText(pad,footer-S(26),rw-S(120),S(22),std::to_string(v.players.size())+" players",12,MW_DIM);
         TitleAction(pad+rw-S(110),footer-S(35),S(50),"<",114,g_playerPage>0);
         TitleAction(pad+rw-S(55),footer-S(35),S(50),">",115,(g_playerPage+1)*per<count);
-        const int chatTop=S(245),logH=footer-chatTop-S(45),lh=S(22),lines=std::max(0,(logH-S(16))/lh);
+        const int chatTop=world?S(133):S(245),logH=footer-chatTop-S(45),lh=S(22),lines=std::max(0,(logH-S(16))/lh);
         layer::Rect(cx,chatTop,cw,logH,rgb(0,0,0),50);
         for(int i=std::max(0,int(v.chat.size())-lines),y=chatTop+S(8);i<int(v.chat.size());++i,y+=lh)
             TitleText(cx+S(10),y,cw-S(20),lh,v.chat[i],13);
@@ -120,10 +142,13 @@ static void RenderTitleLocked(int w,int h) {
         if(v.isHost) {
             MwCheck(pad,footer+S(6),"Separate companies",v.separateCompanies,50);
             if(!P().flagMaster.empty())MwCheck(pad+S(230),footer+S(6),"Public game",g_public,11);
-            MwCheck(pad+S(410),footer+S(6),"Cross-play",v.crossplay,51);
-        } else TitleText(pad,footer+S(6),width,S(28),"Waiting for the host to start.",14,MW_DIM);
-        TitleAction(pad,h-S(68),S(110),"LEAVE LOBBY",5);
-        if(v.isHost)TitleAction(w-pad-S(155),h-S(68),S(155),v.startPending?"SHARING SAVEGAME...":"START GAME",6,v.lobbyReady && !v.startPending);
+            if(v.hostSteam)MwCheck(pad+S(430),footer+S(6),"Cross-play",v.crossplay,51);
+        } else TitleText(pad,footer+S(6),width,S(28),world?"Session running. The host manages session settings.":"Waiting for the host to start.",14,MW_DIM);
+        if(world) {
+            if(v.isHost)TitleAction(pad,h-S(68),S(110),"RESYNC...",84);
+            TitleAction(w-pad-S(110),h-S(68),S(110),"CLOSE",4);
+        } else TitleAction(pad,h-S(68),S(110),"LEAVE LOBBY",5);
+        if(!world && v.isHost)TitleAction(w-pad-S(155),h-S(68),S(155),v.startPending?"SHARING SAVEGAME...":"START GAME",6,v.lobbyReady && !v.startPending);
     }
     MwStatus(w,h);
     if(!v.modsPrompt.empty()) {
