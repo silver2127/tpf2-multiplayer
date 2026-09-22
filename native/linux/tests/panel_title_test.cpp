@@ -99,6 +99,43 @@ int main(int argc,char** argv) {
         P().view.modsPrompt="Required workshop content";RenderLocked(w,h);
         assert(Has(16)&&Has(17)&&!Has(2)&&!Has(4));P().view.modsPrompt.clear();
     }
+    // Exercise the actual SDL filter with the overlay closed. Physical input
+    // must delay a hold even when suppression is disabled by default.
+    g_uiState=0;P().view.active=false;
+    s_SetEventFilter=+[](SDL_EventFilter,void*){};
+    assert(!g_flagInputHold);
+    auto event=[](Uint32 type, SDL_Keycode key=SDLK_a) {
+        SDL_Event e{};e.type=type;
+        if(type==SDL_KEYDOWN || type==SDL_KEYUP) {
+            e.key.keysym.sym=key;e.key.keysym.scancode=SDL_SCANCODE_A;
+        } else if(type==SDL_MOUSEBUTTONDOWN || type==SDL_MOUSEBUTTONUP) e.button.button=SDL_BUTTON_LEFT;
+        return EventFilter(nullptr,&e);
+    };
+    assert(event(SDL_KEYDOWN)==1 && !SetActionsHeld(true));
+    assert(event(SDL_KEYUP)==1 && SetActionsHeld(true));
+    for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
+                  SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})
+        assert(event(type)==1);
+    assert(SetActionsHeld(false));
+    assert(event(SDL_MOUSEBUTTONDOWN)==1 && !SetActionsHeld(true));
+    assert(event(SDL_MOUSEBUTTONUP)==1 && SetActionsHeld(true));
+    auto flag=[](const char* value) {
+        const char* path="panel-input-hold-test.flags";
+        FILE* f=fopen(path,"w");assert(f);fprintf(f,"input_hold=%s\n",value);fclose(f);
+        ReadFlags(path);assert(remove(path)==0);
+    };
+    flag("1");assert(g_flagInputHold);
+    for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
+                  SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})
+        assert(event(type)==0);
+    assert(event(SDL_KEYDOWN,SDLK_ESCAPE)==1 && event(SDL_KEYUP,SDLK_ESCAPE)==1);
+    assert(event(SDL_QUIT)==1);
+    assert(SetActionsHeld(false) && event(SDL_MOUSEMOTION)==1);
+    assert(event(SDL_KEYDOWN)==1 && !SetActionsHeld(true));
+    assert(event(SDL_KEYUP)==1 && SetActionsHeld(true));
+    flag("0");assert(!g_flagInputHold && event(SDL_MOUSEMOTION)==1);
+    flag("1");flag("invalid");assert(!g_flagInputHold); // same opt-in parsing as Windows
+    assert(SetActionsHeld(false));
     P().view.inGame=false;
     PrepareTitleBackdrop(8,8);assert(g_titleBackdrop.size()==256);
     layer::Begin(2,2);layer::Rect(0,0,2,2,layer::rgb(255,0,0),255);

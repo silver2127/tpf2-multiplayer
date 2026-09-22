@@ -753,6 +753,9 @@ static void ReadFlags()
             if (!strcmp(v, "0")) g_flagDedRender = 0; else if (!strcmp(v, "1")) g_flagDedRender = 1;
         } else if (!strcmp(line, "dedicated_nowsi")) {
             if (!strcmp(v, "0")) g_flagDedNoWsi = 0; else if (!strcmp(v, "1")) g_flagDedNoWsi = 1;
+        } else if (!strcmp(line, "input_hold")) {
+            // 1: a held session (resync, join) swallows all game input again; default off (native_io.h)
+            NativeIo::SetInputBlocking(!strcmp(v, "1"));
         } else if (!strcmp(line, "dedicated_pin_batch")) {
             if (!strcmp(v, "0")) g_flagDedPinBatch = 0; else if (!strcmp(v, "1")) g_flagDedPinBatch = 1;
         } else if (!strcmp(line, "dedicated_fps")) {

@@ -2213,6 +2213,8 @@ class _ClientSaveReceiver:
         whose world load died running the Boeing 777 Pack's mod file, with Car
         Parks on the same stack, while the host loaded the same save
         (2026-09-20); the error text of that run is still to be seen."""
+        # only this save's Workshop mods are registered from here on (modshare.set_registry_scope)
+        modshare.set_registry_scope(m for m, v in mods if isinstance(m, str) and m.startswith("*"))
         rows = _workshop_rows(mods, modshare.on_disk_mod)
         if not rows:
             return
@@ -4061,7 +4063,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # not available (an old client, a transfer in flight): logged.
         if late and recovery and not relay_only:
             if recovery_protocol == 4 and recovery.join(peers[addr]["name"]):
-                log(f"[host] frozen join for {peers[addr]['name']!r}: holding the session, everyone loads the shared world")
+                log(f"[host] frozen join for {peers[addr]['name']!r}: holding the session, "
+                    + ("the players in keep their worlds, the newcomer loads (live join)" if recovery.barrier.retain
+                       else "everyone loads the shared world"))
             else:
                 log(f"[host] frozen join NOT possible for {peers[addr]['name']!r} "
                     f"({'its version has no resync' if recovery_protocol != 4 else recovery_unavailable_reason()}) -- the menu's hot-join save serves it")
@@ -4448,6 +4452,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         advertised[:]=[save_path,mods]
         if mods and not relay_only:
             # the host loads this save too: its own removed-item subscriptions need the rows as much
+            modshare.set_registry_scope(m for m, v in mods if isinstance(m, str) and m.startswith("*"))
             rows = _workshop_rows(mods, modshare.find_mod)
             if rows:
                 try:
@@ -4847,8 +4852,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                         if not p.get("started") and not p.get("frozen_join") and p.get("recovery") == 4:
                             if recovery.join(p["name"]):
                                 p["frozen_join"] = True
-                                log(f"[host] frozen join for {p['name']!r} (it was waiting for the host's world): "
-                                    "holding the session, everyone loads the shared world")
+                                log(f"[host] frozen join for {p['name']!r} (it was waiting for the host's world): holding the session, "
+                                    + ("the players in keep their worlds, the newcomer loads (live join)" if recovery.barrier.retain
+                                       else "everyone loads the shared world"))
 
             if relay is not None:
                 relay.tick(now)                             # 10 s stats line
@@ -7767,6 +7773,9 @@ def _publish_registry_at_start(log):
     token, so the NEXT game start registers every consented download even if
     the round that fetched it never reached its last batch."""
     try:
+        # no save yet: register nothing beyond it; the save's own mods are
+        # scoped in when its mod list arrives (_publish_rows / start(save))
+        modshare.set_registry_scope(())
         modshare.write_registry()
         rows = modshare.read_registry()[1]
         if rows:

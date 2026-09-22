@@ -110,6 +110,7 @@ static float g_flagScale = 0.f;
 static int   g_flagRelayAutosaveMin = 2;
 static int   g_flagShareMods = 0;   // share_mods: 0 ask, 1 always, 2 never
 static bool  g_flagAutoLoad = true;
+static bool  g_flagInputHold = false; // input_hold=1 restores held-session input suppression
 static bool  g_fontsOk = false;     // set once Init is done: the panel shows, and takes clicks, from then on
 static bool  g_initDone = false;
 
@@ -272,6 +273,8 @@ static void ReadFlags(const std::string& path)
             g_flagShareMods = !strcmp(v, "always") ? 1 : !strcmp(v, "never") ? 2 : 0;
         } else if (!strcmp(line, "autoload")) {
             if (!strcmp(v, "0")) g_flagAutoLoad = false; else if (!strcmp(v, "1")) g_flagAutoLoad = true;
+        } else if (!strcmp(line, "input_hold")) {
+            g_flagInputHold = !strcmp(v, "1");
         } else if (!strcmp(line, "master_url")) {
             while (e > v && e[-1] == '/') *--e = 0;
             // an argument of the lobby: a plain http(s) URL, no blanks or quotes
@@ -281,8 +284,8 @@ static void ReadFlags(const std::string& path)
         }
     }
     fclose(f);
-    if (g_log) g_log("[panel] flags: scale=%d%% autoload=%d relay_autosave_min=%d share_mods=%d master_url=%s\n",
-                     (int)(g_flagScale * 100 + 0.5f), g_flagAutoLoad ? 1 : 0, g_flagRelayAutosaveMin, g_flagShareMods,
+    if (g_log) g_log("[panel] flags: scale=%d%% autoload=%d relay_autosave_min=%d share_mods=%d input_hold=%d master_url=%s\n",
+                     (int)(g_flagScale * 100 + 0.5f), g_flagAutoLoad ? 1 : 0, g_flagRelayAutosaveMin, g_flagShareMods, g_flagInputHold ? 1 : 0,
                      P().flagMaster.empty() ? "(none)" : P().flagMaster.c_str());
 }
 
@@ -1060,7 +1063,8 @@ static int SDLCALL EventFilter(void*, SDL_Event* e)
         if (e->type==SDL_MOUSEBUTTONUP && e->button.button>0 && e->button.button<=32)
             g_physicalButtons&=~(1u<<(e->button.button-1));
         consumed = HandleEventLocked(e, &post);
-        if(g_actionsHeld) {
+        // The hold still waits for a released gesture; only suppression is opt-in.
+        if(g_actionsHeld && g_flagInputHold) {
             if(e->type==SDL_MOUSEMOTION || e->type==SDL_MOUSEBUTTONDOWN || e->type==SDL_MOUSEBUTTONUP ||
                e->type==SDL_MOUSEWHEEL || e->type==SDL_TEXTINPUT || e->type==SDL_TEXTEDITING ||
                ((e->type==SDL_KEYDOWN || e->type==SDL_KEYUP) && e->key.keysym.sym!=SDLK_ESCAPE)) consumed=true;

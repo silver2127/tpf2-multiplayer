@@ -21,9 +21,9 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.28 experimental, dev `5a9b3ae0`**, on
+This development tree integrates **Windows 0.6.1.28 experimental plus dev `6e5eec30`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[UPSTREAM_dev_5a9b3ae0.md](UPSTREAM_dev_5a9b3ae0.md). Earlier Native/Windows frozen join
+[UPSTREAM_dev_6e5eec30.md](UPSTREAM_dev_6e5eec30.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 

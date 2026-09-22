@@ -3,6 +3,12 @@
 
 namespace panel { bool SetActionsHeld(bool) { return true; } }
 static bool originalDoneCalled=false;
+static void* expectedBinding=nullptr;
+static void* expectedLua=nullptr;
+static int legacyCalls=0;
+static int OriginalLegacy(void* binding,void* lua) {
+    assert(binding==expectedBinding && lua==expectedLua);++legacyCalls;return 7;
+}
 static void OriginalDone(void*,const bool*,const void*) { originalDoneCalled=true; }
 static void* Factory(void* out,void*,void*,void* raw,void*,bool automatic,bool flag) {
     auto& s=*static_cast<GStr*>(raw);
@@ -11,6 +17,15 @@ static void* Factory(void* out,void*,void*,void* raw,void*,bool automatic,bool f
 }
 int main() {
     using namespace NativeIo;
+    // GUI input is now allowed during holds, but legacy script producers must
+    // still be suppressed so pause/drain can finish (as on Windows).
+    int binding=1,lua=2;expectedBinding=&binding;expectedLua=&lua;
+    legacyEventOriginal=reinterpret_cast<void*>(&OriginalLegacy);
+    assert(LegacyEventHook(&binding,&lua)==7 && legacyCalls==1);
+    assert(SetActionsHeld(true));
+    assert(LegacyEventHook(&binding,&lua)==0 && legacyCalls==1);
+    assert(SetActionsHeld(false));
+    assert(LegacyEventHook(&binding,&lua)==7 && legacyCalls==2);
     assert(ValidName("mp_a") && ValidName("mp_123456789012"));
     for(const auto name:{"save","../mp_a","mp_a/b","mp_","mp_1234567890123"})assert(!ValidName(name));
     assert(!PauseAndDrain("pause") && !HasWorld() && !Busy());
