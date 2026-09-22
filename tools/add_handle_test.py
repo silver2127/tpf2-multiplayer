@@ -2,16 +2,18 @@
 
 Add writes a std::unique_ptr to a 16-byte {result*, control*} weak reference into its
 second argument; the caller owns it. When the slice cancels the command it has to put
-something valid there, and "null" is not enough: the Lines window's New Line copies the
-handle right after Add and the copy dereferences it. That crashed a player's game on
-every press (2026-09-22, exe+0x235780f, read of address 0).
+something valid there, and "null" is not enough: the NEW LINE button in a vehicle's line
+picker copies the handle right after Add and the copy dereferences it. That crashed a
+player's game on every press (2026-09-22, exe+0x235780f, read of address 0).
 
 Checked against the supported exe, so a drifting RVA fails here and not in someone's game:
 
-  * linelist.cpp's New Line calls Add and, at the return address the slice logs, COPIES
-    the handle (0x23577f0) before destroying it -- and that copy reads *handle with no
-    null check, as does the release the UI runs later (0x9d3210 reads handle[1]);
-  * linemanager.cpp's New Line only destroys it (0x2357910), which is why that one lived;
+  * the vehicle line picker's New Line (linelist.cpp) calls Add and, at the return address
+    the slice logs, COPIES the handle (0x23577f0) before destroying it -- and that copy
+    reads *handle with no null check, as does the release the UI runs later (0x9d3210
+    reads handle[1]);
+  * the Line manager window's New Line (linemanager.cpp) only destroys it (0x2357910),
+    which is why that button lived;
   * the game's operator new, whose bytes the slice verifies before calling it, is a real
     function at the recorded RVA;
   * the slice's cancel path allocates an empty handle from it instead of writing null.
@@ -51,8 +53,8 @@ RVA_ADD = 0x9D2A00            # CommandList::Add
 RVA_COPY = 0x23577F0          # copy the handle (allocates 16 bytes, reads *handle)
 RVA_DESTROY = 0x2357910       # destroy the handle
 RVA_RELEASE = 0x9D3210        # what the UI's callback runs per handle (reads handle[1])
-LINE_LIST = 0x610380          # linelist.cpp New Line: Add, COPY, hand to the UI, destroy
-LINE_MANAGER = 0x618FF0       # linemanager.cpp New Line: Add, destroy
+LINE_LIST = 0x610380          # a vehicle's line picker, New Line: Add, COPY, hand to the UI, destroy
+LINE_MANAGER = 0x618FF0       # the Line manager window, New Line: Add, destroy
 
 game = Path(r"C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\TransportFever2.exe")
 if not game.exists():
@@ -84,12 +86,12 @@ def calls(rva, length=0x160):
 list_calls = calls(LINE_LIST)
 mgr_calls = calls(LINE_MANAGER)
 after_add = [ret for ret, tgt in list_calls if tgt == RVA_ADD]
-check("the Lines window's New Line calls Add", len(after_add) == 1, "returns to %#x" % after_add[0] if after_add else "not found")
+check("the vehicle line picker's New Line calls Add", len(after_add) == 1, "returns to %#x" % after_add[0] if after_add else "not found")
 seq = [tgt for _, tgt in list_calls]
 check("... then COPIES the handle, hands it to the UI, and destroys it",
       RVA_ADD in seq and RVA_COPY in seq and RVA_DESTROY in seq
       and seq.index(RVA_ADD) < seq.index(RVA_COPY) < seq.index(RVA_DESTROY), str([hex(t) for t in seq]))
-check("the line manager's New Line only destroys it",
+check("the Line manager window's New Line only destroys it",
       RVA_ADD in [t for _, t in mgr_calls] and RVA_COPY not in [t for _, t in mgr_calls]
       and RVA_DESTROY in [t for _, t in mgr_calls], str([hex(t) for _, t in mgr_calls]))
 
@@ -123,4 +125,4 @@ if fails:
     for f in fails:
         print("  - " + f)
     sys.exit(1)
-print("PASS: a cancelled Add hands back an empty 16-byte handle from the game's allocator; the Lines window's copy and the UI's release both survive it")
+print("PASS: a cancelled Add hands back an empty 16-byte handle from the game's allocator; the vehicle line picker's copy and the UI's release both survive it")

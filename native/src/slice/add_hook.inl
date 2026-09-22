@@ -13,15 +13,17 @@
 // around" while it was flying to a depot (2026-08-30, at exe+0x235791e, rbx = -2).
 // Zeroing it made that destructor a no-op.
 //
-// A NULL handle is not enough for every caller. The Lines window's New Line
-// (linelist.cpp 0x610380, Add returns to 0x610441) COPIES the handle straight
-// after Add (exe+0x23577f0: `mov rdi,[rdx]` then `mov rdx,[rdi]`, no null check)
-// and hands the copy to the UI to release when the command finishes; the release
-// (exe+0x9d3210) reads handle[1] as well. With the handle zeroed the copy faulted
-// reading address 0 -- a player's game died on every press of New Line in that
-// window (2026-09-22, crash dump exe+0x235780f, two crashes in four minutes). The
-// Line manager's New Line (0x618ff0) only destroys the handle, which is why it
-// survived.
+// A NULL handle is not enough for every caller. The NEW LINE button in a VEHICLE's
+// line picker -- the line list a vehicle window shows when you give it a line,
+// UI::LineList (linelist.cpp 0x610380, Add returns to 0x610441) -- COPIES the handle
+// straight after Add (exe+0x23577f0: `mov rdi,[rdx]` then `mov rdx,[rdi]`, no null
+// check) and hands the copy to the UI to release when the command finishes; the
+// release (exe+0x9d3210) reads handle[1] as well. With the handle zeroed the copy
+// faulted reading address 0 -- a player's game died on every press of that button
+// (2026-09-22, crash dump exe+0x235780f, two crashes in four minutes). The Line
+// manager window's own New Line (linemanager.cpp 0x618ff0, Add returns to 0x6190b0)
+// only destroys the handle, which is why that one survived -- pressing it is what
+// the owner's own rig had been doing all along.
 //
 // So hand back a REAL but EMPTY handle: 16 zero bytes from the game's own
 // operator new (exe+0x2bf3a80), which its operator delete (exe+0x2bf3abc) frees.
