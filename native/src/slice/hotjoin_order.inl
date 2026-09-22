@@ -44,11 +44,25 @@
 // town stagger (TownSystem::Update2 by node index), the terminal waiting queues
 // (FIFO while running, registration order after a load).
 
-extern "C" uint64_t g_hjResume0 = 0, g_hjResume1 = 0, g_hjResume2 = 0, g_hjResume3 = 0;
+// capacity  SimEntityUpdateHelper (every construction build, replace or
+//           demolish, town growth included) gathers the affected people and
+//           cargo into five + four temporary unordered_maps; its destructor
+//           0x2122fd0 seeds ONE mt19937 with 5489 and ApplySimPersonData
+//           0x2125a90 / ApplySimCargo 0x2124030 walk the maps in list order,
+//           drawing stay times and freeing ids (the FIFO free-id queue) as they
+//           go. List order is insertion history: the busy lab world split two
+//           people's destination at a building ~120 units after a live join.
+//           The nine lists are relinked in ascending key order right after the
+//           generator is seeded. After that point the maps are only walked head
+//           to tail and destroyed by walking the ring (RE 2026-09-22), so the
+//           buckets, left as they are, are never read again.
+
+extern "C" uint64_t g_hjResume0 = 0, g_hjResume1 = 0, g_hjResume2 = 0, g_hjResume3 = 0, g_hjResume4 = 0;
 extern "C" void HotJoinCandidatesRelay();
 extern "C" void HotJoinDeparturesRelay();
 extern "C" void HotJoinArrivalsRelay();
 extern "C" void HotJoinIdleRelay();
+extern "C" void HotJoinCapacityRelay();
 
 struct HotJoinSite {
     const char* name;
@@ -59,14 +73,63 @@ struct HotJoinSite {
     void (*relay)();
     uint64_t* resume;
 };
-static const HotJoinSite kHotJoinSites[4] = {
+static const HotJoinSite kHotJoinSites[5] = {
     { "candidates", 0x927df6, 7, { 0xC7, 0x45, 0x87, 0x01, 0x00, 0x00, 0x00, 0xE8 }, 8, HotJoinCandidatesRelay, &g_hjResume0 },
     { "departures", 0xa7c9fd, 5, { 0x48, 0x8D, 0x54, 0x24, 0x28, 0x48, 0x8B, 0x49, 0x10, 0xE8 }, 10, HotJoinDeparturesRelay, &g_hjResume1 },
     { "arrivals",   0xa59928, 5, { 0x48, 0x8D, 0x54, 0x24, 0x68, 0x48, 0x8B, 0x49, 0x10, 0xE8 }, 10, HotJoinArrivalsRelay, &g_hjResume2 },
     { "idle",       0xa867ce, 8, { 0x49, 0x8B, 0x55, 0x20, 0x49, 0x2B, 0x55, 0x18, 0x48, 0xC1 }, 10, HotJoinIdleRelay, &g_hjResume3 },
+    { "capacity",   0x21234de, 7, { 0x49, 0x8B, 0xBD, 0x20, 0x01, 0x00, 0x00, 0x48, 0x8D, 0x9F }, 10, HotJoinCapacityRelay, &g_hjResume4 },
 };
 static const int kHotJoinSiteCount = (int)(sizeof(kHotJoinSites) / sizeof(kHotJoinSites[0]));
-static volatile LONG64 g_hjCalls[4] = { 0 }, g_hjReordered[4] = { 0 }, g_hjRefused[4] = { 0 }, g_hjFaults[4] = { 0 };
+static const int kHotJoinCapacitySite = 4;
+static volatile LONG64 g_hjCalls[5] = { 0 }, g_hjReordered[5] = { 0 }, g_hjRefused[5] = { 0 }, g_hjFaults[5] = { 0 };
+
+// MSVC unordered_map<Entity, Info> inside the helper's data block D: 0x40
+// bytes each, the ring's sentinel at map+8, the size at map+0x10; list node
+// {next +0, prev +8, int32 key +0x10}. Person maps at D+0x40*i (5), cargo maps
+// at D+0x140+0x40*j (4). Refuses (untouched) a ring that does not walk back to
+// its sentinel in exactly `size` steps.
+static const size_t HJ_MAP_MAX_NODES = (size_t)1 << 20;
+static bool HotJoinRelinkMap(uint8_t* map)
+{
+    uint8_t* head = *(uint8_t**)(map + 8);
+    const size_t size = *(size_t*)(map + 0x10);
+    if (!head || !Readable(head, 16)) return false;
+    if (size < 2) return true;
+    if (size > HJ_MAP_MAX_NODES) return false;
+    std::vector<uint8_t*> nodes;
+    nodes.reserve(size);
+    for (uint8_t* p = *(uint8_t**)head; p != head; p = *(uint8_t**)p) {
+        if (!p || nodes.size() == size || !Readable(p, 0x14)) return false;
+        nodes.push_back(p);
+    }
+    if (nodes.size() != size) return false;
+    std::sort(nodes.begin(), nodes.end(), [](uint8_t* a, uint8_t* b) { return *(int32_t*)(a + 0x10) < *(int32_t*)(b + 0x10); });
+    uint8_t* prev = head;
+    for (uint8_t* p : nodes) { *(uint8_t**)prev = p; *(uint8_t**)(p + 8) = prev; prev = p; }
+    *(uint8_t**)prev = head;
+    *(uint8_t**)(head + 8) = prev;
+    return true;
+}
+
+static void HotJoinRelinkImpl(uint8_t* data)
+{
+    const LONG64 n = InterlockedIncrement64(&g_hjCalls[kHotJoinCapacitySite]);
+    if (!data || !Readable(data, 0x240)) { InterlockedIncrement64(&g_hjRefused[kHotJoinCapacitySite]); return; }
+    int bad = 0;
+    for (int i = 0; i < 5; i++) if (!HotJoinRelinkMap(data + 0x40 * i)) bad++;
+    for (int j = 0; j < 4; j++) if (!HotJoinRelinkMap(data + 0x140 + 0x40 * j)) bad++;
+    if (bad) {
+        if (InterlockedIncrement64(&g_hjRefused[kHotJoinCapacitySite]) == 1)
+            Log("[hotjoinorder] ERROR: capacity: %d of 9 maps did not walk as rings of their size -- left as the engine built them\n", bad);
+    } else {
+        InterlockedIncrement64(&g_hjReordered[kHotJoinCapacitySite]);
+    }
+    if (n == 1 || !(n & 0xfff))
+        Log("[hotjoinorder] alive: capacity applies=%lld relinked=%lld refused=%lld faults=%lld\n", (long long)n,
+            (long long)g_hjReordered[kHotJoinCapacitySite], (long long)g_hjRefused[kHotJoinCapacitySite],
+            (long long)g_hjFaults[kHotJoinCapacitySite]);
+}
 
 static void HotJoinSortImpl(int site, int32_t** vec)
 {
@@ -94,6 +157,11 @@ static void HotJoinSortImpl(int site, int32_t** vec)
 extern "C" void HotJoinSort(int site, int32_t** vec)
 {
     if (site < 0 || site >= kHotJoinSiteCount || !vec) return;
+    if (site == kHotJoinCapacitySite) {
+        __try { HotJoinRelinkImpl(*(uint8_t**)vec); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_hjFaults[site]); }
+        return;
+    }
     __try { HotJoinSortImpl(site, vec); }
     __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_hjFaults[site]); }
 }
@@ -118,8 +186,9 @@ static void InstallHotJoinOrder()
         }
         on++;
     }
-    Log("[hotjoinorder] installed: destination candidates, departures, walk arrivals and the idle list "
-        "are read in entity-id order (rva=%llx, %llx, %llx, %llx)\n", (unsigned long long)kHotJoinSites[0].rva,
-        (unsigned long long)kHotJoinSites[1].rva, (unsigned long long)kHotJoinSites[2].rva,
-        (unsigned long long)kHotJoinSites[3].rva);
+    Log("[hotjoinorder] installed: destination candidates, departures, walk arrivals, the idle list and the "
+        "capacity-change maps are read in entity-id order (rva=%llx, %llx, %llx, %llx, %llx)\n",
+        (unsigned long long)kHotJoinSites[0].rva, (unsigned long long)kHotJoinSites[1].rva,
+        (unsigned long long)kHotJoinSites[2].rva, (unsigned long long)kHotJoinSites[3].rva,
+        (unsigned long long)kHotJoinSites[4].rva);
 }

@@ -108,6 +108,7 @@ say('round', sync_phase('lab'), sync_phase('peer'))
 world1 = lua_world('lab')
 say(f'host world token before the join {world0}, after {world1}: '
     + ('KEPT (retained host)' if world0 and world0 == world1 else 'the host loaded a new world'))
+sh('python3', str(r / 'force_hash_grid.py'), stdout=subprocess.DEVNULL)   # the 4-unit hash cadence
 wait(lambda: len(list((r / 'peer/share/tpf2mp/data').glob('hjprobe_b_*.txt'))) >= dumps, f'{dumps} peer dumps', 1800)
 say('collected')
 sh('python3', str(lab / 'hj_compare.py'))

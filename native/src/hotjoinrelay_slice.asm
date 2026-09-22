@@ -13,6 +13,10 @@
 ;   idle        SimEntityIdleSystem::Update rva 0xa867ce  49 8b 55 20 49 2b 55 18
 ;               mov rdx,[r13+20h] / sub rdx,[r13+18h]; the pending list at r13+18h
 ;               (r13 = the system; the list is the system's own, sorted in place)
+;   capacity    SimEntityUpdateHelper apply (destructor 0x2122fd0) rva 0x21234de
+;               49 8b bd 20 01 00 00  mov rdi,[r13+120h]; r13 = the helper, [r13+120h]
+;               its data block with the 5 person + 4 cargo maps the applies walk
+;               (the relay hands HotJoinSort the address of that pointer)
 ;
 ; The relay hands HotJoinSort(site, &vector) the vector's address, restores
 ; every register and the flags, executes the stolen instruction itself with rsp
@@ -30,6 +34,7 @@ EXTERN g_hjResume0:QWORD
 EXTERN g_hjResume1:QWORD
 EXTERN g_hjResume2:QWORD
 EXTERN g_hjResume3:QWORD
+EXTERN g_hjResume4:QWORD
 
 .code
 
@@ -112,5 +117,11 @@ HotJoinIdleRelay PROC
     sub  rdx, qword ptr [r13+18h]
     jmp  qword ptr [g_hjResume3]
 HotJoinIdleRelay ENDP
+
+HotJoinCapacityRelay PROC
+    HotJoinBody 4, [r13+120h]
+    mov  rdi, qword ptr [r13+120h] ; the stolen instruction
+    jmp  qword ptr [g_hjResume4]
+HotJoinCapacityRelay ENDP
 
 END

@@ -18,6 +18,7 @@ struct CanonSite {
     int32_t beginOff;   // vector<ecs::Entity> {begin, end, cap} at rbp+beginOff
     unsigned char bytes[16];
     int32_t derefOff;   // when nonzero: the vector is at [rbp+beginOff] + derefOff (inside a system)
+    bool relinkMaps;    // not a vector: [rbp+beginOff] is a SimEntityUpdateHelper; relink its 9 maps
 };
 const CanonSite kCanonSites[] = {
     // GetTargetsByLandUse 0x1502600: every path joins at the output's
@@ -37,6 +38,12 @@ const CanonSite kCanonSites[] = {
     // chunk-seeded MT draws per item; the system is at [rbp-0x180].
     { "idle", 0x17005cc, 7, -0x180,
       { 0x48,0x8b,0x8d,0x80,0xfe,0xff,0xff, 0x48,0xc7,0x85,0x10,0xff,0xff,0xff,0x00,0x00 }, 0x18 },
+    // SimEntityUpdateHelper apply 0x2e6e0c0 (every build / replace / demolish,
+    // town growth included): after the generator is seeded (0x2e6e617), before
+    // the person (0x2e6e75c) and cargo applies walk their maps with it and free
+    // ids in walk order. Helper at [rbp-0xbd8], data block D = [helper+0x120].
+    { "capacity-maps", 0x2e6e6c3, 7, -0xbd8,
+      { 0x48,0x8b,0x85,0x28,0xf4,0xff,0xff, 0x48,0x8b,0x70,0x70, 0x4c,0x8b,0xa8,0x20,0x01 }, 0, true },
 };
 constexpr unsigned kCanonSiteCount = sizeof(kCanonSites) / sizeof(kCanonSites[0]);
 
@@ -53,8 +60,68 @@ struct CanonRegisters {
 };
 static_assert(sizeof(CanonRegisters) == 136);
 
+// libstdc++ unordered_map<Entity, Info> inside the helper's data block: the
+// first node at map+0x10, the count at map+0x18, node {next +0, int32 key +8}.
+// Relinked in ascending key order; after this point the maps are only walked
+// head to tail and cleared by walking `next` (RE 2026-09-22), so the stale
+// bucket pointers are never read.
+constexpr uint32_t kMapOffsets[9] = { 0x00, 0x38, 0x70, 0xa8, 0xe0, 0x118, 0x150, 0x188, 0x1c0 };
+constexpr size_t kMapMaxNodes = 1u << 20;
+bool RelinkMap(uintptr_t map) noexcept
+{
+    size_t count;
+    std::memcpy(&count, reinterpret_cast<const void*>(map + 0x18), sizeof(count));
+    if (count < 2) return true;
+    if (count > kMapMaxNodes) return false;
+    auto* nodes = static_cast<uintptr_t*>(std::malloc(count * sizeof(uintptr_t)));
+    if (!nodes) return false;
+    size_t n = 0;
+    uintptr_t node;
+    std::memcpy(&node, reinterpret_cast<const void*>(map + 0x10), sizeof(node));
+    while (node && n <= count) {
+        if (n == count) { n = count + 1; break; }
+        nodes[n++] = node;
+        std::memcpy(&node, reinterpret_cast<const void*>(node), sizeof(node));
+    }
+    if (n != count) { std::free(nodes); return false; }
+    auto key = [](uintptr_t p) { int32_t k; std::memcpy(&k, reinterpret_cast<const void*>(p + 8), 4); return k; };
+    std::sort(nodes, nodes + n, [&](uintptr_t a, uintptr_t b) { return key(a) < key(b); });
+    std::memcpy(reinterpret_cast<void*>(map + 0x10), &nodes[0], sizeof(uintptr_t));
+    for (size_t i = 0; i < n; ++i) {
+        const uintptr_t next = i + 1 < n ? nodes[i + 1] : 0;
+        std::memcpy(reinterpret_cast<void*>(nodes[i]), &next, sizeof(next));
+    }
+    std::free(nodes);
+    return true;
+}
+
+void CanonRelink(unsigned site, uintptr_t rbp) noexcept
+{
+    auto& c = g_canonCounters[site];
+    const uint64_t n = c.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    uintptr_t helper = 0, data = 0;
+    std::memcpy(&helper, reinterpret_cast<const void*>(rbp + kCanonSites[site].beginOff), sizeof(helper));
+    if (helper) std::memcpy(&data, reinterpret_cast<const void*>(helper + 0x120), sizeof(data));
+    if (!data) { c.refused.fetch_add(1, std::memory_order_relaxed); return; }
+    unsigned bad = 0;
+    for (uint32_t off : kMapOffsets) if (!RelinkMap(data + off)) ++bad;
+    if (bad) {
+        if (!c.refused.fetch_add(1, std::memory_order_relaxed))
+            if (auto log = g_canonLog.load(std::memory_order_relaxed))
+                log("[order-canon] ERROR: capacity-maps: %u of 9 maps not walkable (count/list mismatch); left as the engine built them\n", bad);
+    } else {
+        c.reordered.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (n == 1 || !(n & 0xfff))
+        if (auto log = g_canonLog.load(std::memory_order_relaxed))
+            log("[order-canon] alive: capacity-maps applies=%llu relinked=%llu refused=%llu\n", (unsigned long long)n,
+                (unsigned long long)c.reordered.load(std::memory_order_relaxed),
+                (unsigned long long)c.refused.load(std::memory_order_relaxed));
+}
+
 void CanonSort(unsigned site, uintptr_t rbp) noexcept
 {
+    if (kCanonSites[site].relinkMaps) { CanonRelink(site, rbp); return; }
     auto& c = g_canonCounters[site];
     const uint64_t n = c.calls.fetch_add(1, std::memory_order_relaxed) + 1;
     uintptr_t at = rbp + kCanonSites[site].beginOff;
@@ -140,11 +207,11 @@ namespace {
     __attribute__((naked, noinline)) void CanonStub##index() { \
         __asm__("push $" #index "\n\tjmp Tpf2mpOrderCanonEntry\n\t"); \
     }
-CANON_STUB(0) CANON_STUB(1) CANON_STUB(2) CANON_STUB(3)
+CANON_STUB(0) CANON_STUB(1) CANON_STUB(2) CANON_STUB(3) CANON_STUB(4)
 #undef CANON_STUB
 void* const kCanonDetours[] = {
     reinterpret_cast<void*>(CanonStub0), reinterpret_cast<void*>(CanonStub1), reinterpret_cast<void*>(CanonStub2),
-    reinterpret_cast<void*>(CanonStub3)
+    reinterpret_cast<void*>(CanonStub3), reinterpret_cast<void*>(CanonStub4)
 };
 static_assert(sizeof(kCanonDetours) / sizeof(kCanonDetours[0]) == kCanonSiteCount);
 }
@@ -173,7 +240,7 @@ bool Tpf2mpInstallOrderCanon(uintptr_t base, const char* buildId)
         return false;
     }
     g_canonReady = true;
-    g_canonStatus.store("enabled (candidates, departures, arrivals, idle sorted by entity id)");
+    g_canonStatus.store("enabled (candidates, departures, arrivals, idle sorted by entity id; capacity maps relinked)");
     return installed == kCanonSiteCount;
 }
 const char* Tpf2mpOrderCanonStatus() { return g_canonStatus.load(std::memory_order_relaxed); }

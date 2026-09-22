@@ -59,6 +59,29 @@ local function dump(now)
   g:write(table.concat(vrows, "\n"))
   g:write("\n")
   g:close()
+  -- every construction's destination / target person sets (everyone, at home or out)
+  local sps = api.engine.system.simPersonSystem
+  local function members(u)
+    local r = {}
+    if u then pcall(function() for _, v in pairs(u) do r[#r + 1] = v end end) end
+    table.sort(r)
+    return table.concat(r, ",")
+  end
+  local drows = {}
+  local cons = game.interface.getEntities({ radius = 999999 }, { type = "CONSTRUCTION", includeData = false }) or {}
+  for i = 1, #cons do
+    local b = cons[i]
+    local okd, dm = pcall(sps.getSimPersonsForDestination, b)
+    local okt, tm = pcall(sps.getSimPersonsForTarget, b)
+    local ds, ts = okd and members(dm) or "?", okt and members(tm) or "?"
+    if ds ~= "" or ts ~= "" then drows[#drows + 1] = string.format("%d|d=%s|t=%s", b, ds, ts) end
+  end
+  table.sort(drows)
+  local h = io.open(K.BASE .. string.format("hjdest_%s_%.1f.txt", K.INSTANCE, now), "w")
+  h:write("ORDER -\n")
+  h:write(table.concat(drows, "\n"))
+  h:write("\n")
+  h:close()
 end
 CM.hashStampOf = function(now)
   local u = math.floor(now)
