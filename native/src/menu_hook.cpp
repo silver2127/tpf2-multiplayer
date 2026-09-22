@@ -1066,6 +1066,14 @@ static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itsel
 // chips from it, on a change and for each joiner; the roster carries the mode
 // back, so a joiner's panel shows it (and the host's stays in step).
 static volatile LONG g_sepCompanies = 0;
+// CROSS-PLAY (2026-09-22). A host on Steam shares its Steam ID as the join code and
+// is reached through Steam only; ticking CROSS-PLAY switches the lobby to the classic
+// code, which players without Steam (GOG, a Steam-offline box) can use too. The lobby
+// re-emits its "code" event on every switch; g_hostSteam says whether the host has a
+// Steam ID at all (without one the classic code is the only code and the box is hidden).
+static volatile LONG g_crossplay = 0;
+static volatile LONG g_hostSteam = 0;
+static volatile LONG g_codeSeen = 0;    // the first code event of this lobby: starts the host's snapshot
 
 // ---------------- the public game list (server browser) ----------------
 // GET <master>/list on a background thread every PUB_EVERY ms while the
@@ -1437,7 +1445,9 @@ static void RenderPanelLayer(int w, int h)
         if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
             int px2 = w - pad - bw2 - S(110);
             if (g_flagMaster[0]) mwCheck(px2, bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
-            mwCheck(px2 - S(230), bottom, L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
+            mwCheck(px2 - S(230), bottom, L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50);
+            if (InterlockedCompareExchange(&g_hostSteam, 0, 0))
+                mwCheck(px2 - S(370), bottom, L"CROSS-PLAY", InterlockedCompareExchange(&g_crossplay, 0, 0) != 0, 51); }
         if(WorldLoaded() && g_isHost) {
             bw1=mwButtonW(L"RESYNC...");
             mwButton(pad,bottom,bw1,S(30),L"RESYNC...",87);
@@ -1484,7 +1494,8 @@ static void RenderPanelLayer(int w, int h)
           mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
         { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
           if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
-          mwCheck(lx, cy + S(128), L"SEPARATE COMPANIES (each player their own)", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
+          mwCheck(lx, cy + S(128), L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50);
+          mwCheck(lx + S(200), cy + S(128), L"CROSS-PLAY (players without Steam)", InterlockedCompareExchange(&g_crossplay, 0, 0) != 0, 51); }
         mwHeader(rx, cy, colW, L"JOIN A GAME");
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
@@ -2019,6 +2030,14 @@ static void OnHit(int id, int button)
             else { LobbySend(on ? "{\"cmd\":\"mode\",\"mode\":\"companies\"}" : "{\"cmd\":\"mode\",\"mode\":\"coop\"}");
                    SetStatus(on ? "Separate companies: every player gets their own company." : "Co-op: everyone plays company 1 together."); }
         } else SetStatus(on ? "Players will each get their own company." : "Players will share one company.");
+        InterlockedExchange(&g_panelDirty, 1); } break;
+    case 51: {   // CROSS-PLAY checkbox; while hosting the lobby switches its code live
+        LONG on = InterlockedCompareExchange(&g_crossplay, 0, 0) ? 0 : 1; InterlockedExchange(&g_crossplay, on);
+        if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && InterlockedCompareExchange(&g_isHost, 0, 0)) {
+            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) SetStatus("Lobby is starting…");
+            else LobbySend(on ? "{\"cmd\":\"crossplay\",\"on\":true}" : "{\"cmd\":\"crossplay\",\"on\":false}");
+        } else SetStatus(on ? "Cross-play: you will share a classic code that players without Steam can use too."
+                            : "Steam only: your Steam ID will be the join code.");
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
         int i = id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
@@ -3779,7 +3798,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; int sep; char lobby[NAME_MAX]; };
+struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; int sep; int xplay; char lobby[NAME_MAX]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -3829,6 +3848,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
         if (a->sep) wcscat_s(wpub, L" --companies");                    // SEPARATE COMPANIES: the lobby assigns a company per player
+        if (a->xplay) wcscat_s(wpub, L" --crossplay");                  // CROSS-PLAY: the classic code, not the Steam ID
         if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");            // a stable code across restarts, listed as a dedicated server
         if (g_flagDedicated && g_flagDedPort) { wchar_t t[40]; _snwprintf_s(t, _TRUNCATE, L" --local-port %d", g_flagDedPort); wcscat_s(wpub, t); }
         _snwprintf_s(cmd, _TRUNCATE, L"%s host --name \"%s\" --game-relay-port %d --game-local-port %d %s%s%s",
@@ -3915,10 +3935,19 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         InterlockedExchange(&g_lobbyReady, 1);   // lobby.py is up and has truncated lobby_in.jsonl
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) {
-                            if (g_isHost) {
+                            // the lobby re-emits the code on a CROSS-PLAY switch: only the first starts the snapshot
+                            if (g_isHost && !InterlockedExchange(&g_codeSeen, 1)) {
                                 if (WorldLoaded()) SyncStart("host: initial world snapshot");
                             }
-                            strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
+                            char sid[40]; jsonStr(rem, "steam", sid, sizeof(sid));
+                            bool xp = jsonBool(rem, "crossplay", true);
+                            InterlockedExchange(&g_hostSteam, sid[0] ? 1 : 0);
+                            InterlockedExchange(&g_crossplay, xp ? 1 : 0);
+                            strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1);
+                            SetStatus(!sid[0] ? "Your code is copied — share it in Discord."
+                                      : xp ? "Cross-play code copied — anyone can join with it, Steam or not."
+                                           : "Your Steam ID is the code and is copied — friends on Steam join with it.");
+                            InterlockedExchange(&g_panelDirty, 1); } }
                         else if(strcmp(ty,"transport_lobby")==0) {
                             char epoch[40]; jsonStr(rem,"epoch",epoch,sizeof(epoch));
                             if(strlen(epoch)==32 && strspn(epoch,"0123456789abcdef")==32 &&
@@ -4224,6 +4253,8 @@ static void StartLobby(int join)
     a->join = join; strcpy_s(a->name, g_username); strcpy_s(a->password, g_passCode);
     a->pub = InterlockedCompareExchange(&g_public, 0, 0) ? 1 : 0;
     a->sep = InterlockedCompareExchange(&g_sepCompanies, 0, 0) ? 1 : 0;
+    a->xplay = InterlockedCompareExchange(&g_crossplay, 0, 0) ? 1 : 0;
+    InterlockedExchange(&g_codeSeen, 0); InterlockedExchange(&g_hostSteam, 0);
     InterlockedExchange(&g_joinFocus, 0); SaveNames();
     if (g_lobbyName[0]) strcpy_s(a->lobby, g_lobbyName); else snprintf(a->lobby, sizeof(a->lobby), "%s's game", g_username);
     if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); g_lobbyTitle.clear(); LeaveCriticalSection(&g_modelCs); }
@@ -4234,12 +4265,17 @@ static void StartLobby(int join)
             SetStatus("Paste or type your host's code in the field first."); free(a); return;
         }
         char* s = a->code; while (*s == ' ' || *s == '\r' || *s == '\n' || *s == '\t') memmove(s, s + 1, strlen(s));
-        // The code becomes a netpunch.exe argument. It is base32 by construction,
-        // so refuse anything else: a crafted "code" from Discord must never be
-        // able to smuggle extra arguments (e.g. --forward-log <any file>) in.
-        { int k = 0; for (; a->code[k]; k++) { char c = a->code[k]; if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7') || c == '=')) break; }
-          if (a->code[k] || k > 200) { SetStatus("That is not a valid code (letters A-Z and digits 2-7 only)."); free(a); return; } }
-        int L = (int)strlen(s); while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\r' || s[L-1] == '\n' || s[L-1] == '\t')) s[--L] = 0;
+        int L = (int)strlen(s); while (L > 0 && (s[L-1] == ' ' || s[L-1] == '\r' || s[L-1] == '\n' || s[L-1] == '\t' || s[L-1] == '/')) s[--L] = 0;
+        // A Steam ID is a code too (2026-09-22): 17 digits, or a pasted profile URL
+        // (steamcommunity.com/profiles/<id>) reduced to its digits here.
+        { const char* pr = strstr(s, "/profiles/"); if (pr) memmove(s, pr + 10, strlen(pr + 10) + 1); }
+        bool steamId = strlen(s) == 17 && strspn(s, "0123456789") == 17;
+        // The code becomes a netpunch.exe argument. It is base32 (or a Steam ID's
+        // digits) by construction, so refuse anything else: a crafted "code" from
+        // Discord must never be able to smuggle extra arguments (e.g. --forward-log
+        // <any file>) in.
+        if (!steamId) { int k = 0; for (; a->code[k]; k++) { char c = a->code[k]; if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '2' && c <= '7') || c == '=')) break; }
+          if (a->code[k] || k > 200) { SetStatus("That is not a valid code (a host's Steam ID, or letters A-Z and digits 2-7)."); free(a); return; } }
     }
     // A previous lobby.py still up (LEAVE not pressed, or a tail thread still
     // finishing) would fight the new one over lobby_in/out.jsonl: tear it down first.

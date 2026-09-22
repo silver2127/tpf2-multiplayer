@@ -177,11 +177,12 @@ import time
 # Reuse the transport verbatim -- do NOT reinvent the framing/handshake.
 from punch import (
     DEFAULT_PORT, TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE,
-    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, TOKEN_LEN, _pack, _unpack, open_socket,
+    TYPE_DATA, TYPE_EDATA, TYPE_ADATA, TYPE_KEYX, TOKEN_LEN, _pack, _unpack, open_socket,
 )
 from seal import Sealer, derive_key, SECRET_LEN
 import modshare                     # share the mods a save needs (mod zips ride the save transfer)
 import steamtunnel                  # Steam's own networking as a transport (native/src/steam_tunnel.cpp), 2026-09-21
+import steamkey                     # the session secret over Steam when the join code is only a Steam ID, 2026-09-22
 # Reuse the code exchange + the connect race + observe/announce.
 from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4, parse_hostport
 from mesh import MeshNode
@@ -3049,7 +3050,8 @@ class _PeerConn:
 
 def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
              log=_log, relay=None, forward_logs=(), publisher=None, lobby_name="",
-             relay_only=False, punch_q=None, sync_runtime=None, companies_mode=False):
+             relay_only=False, punch_q=None, sync_runtime=None, companies_mode=False,
+             cross_code=None, steam_code=None, steam_secret=None, crossplay=True):
     """Run the lobby server forever on ``sock`` (blocks until ``stop`` is set).
 
     ``punch_q`` (a queue of [(ip, port), ...] from :class:`_RendezvousHost`):
@@ -3059,6 +3061,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     plain loopback socket for the self-test). ``io`` is a :class:`LobbyIO`.
     ``relay`` is an optional :class:`GameRelay`: local bridge frames fan out
     to every joiner, joiners' 'g' frames go to the local bridge.
+
+    STEAM BY DEFAULT (2026-09-22). ``steam_code`` is this host's SteamID64 when its game
+    has Steam's networking; ``cross_code`` the classic code. With ``crossplay`` off the
+    code shown and listed is the Steam ID, a joiner gets the session secret over the
+    tunnel (TYPE_KEYX, steamkey.py, answered with ``steam_secret``) and a HELLO from
+    anywhere but a Steam tunnel endpoint goes unanswered: only players on Steam get in.
+    The host's 'crossplay' command switches it live -- on, the classic code is shown and
+    listed and anyone with it can join, exactly as before this change.
     """
     stop = stop or threading.Event()
     sock.setblocking(False)
@@ -3192,8 +3202,29 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         except OSError:
             return None, None
 
-    if code:
-        io.emit({"type": "code", "code": code})
+    xplay = [bool(crossplay) or not steam_code]      # no Steam here: the classic code is the only one
+    keyx_last = {}                                   # tunnel endpoint -> (offer, answer, when)
+    shown_code = [code]
+
+    def emit_code():
+        io.emit({"type": "code", "code": shown_code[0], "steam": steam_code or "",
+                 "crossplay": xplay[0], "cross_code": cross_code or ""})
+
+    def set_crossplay(on):
+        on = bool(on) or not steam_code
+        xplay[0] = on
+        shown_code[0] = (cross_code or code) if on else steam_code
+        if publisher is not None and shown_code[0]:
+            publisher.code = shown_code[0]
+            publisher._wake.set()
+        emit_code()
+
+    if steam_code:
+        set_crossplay(xplay[0])
+        log("[host] CROSS-PLAY " + ("ON: the classic code works for players without Steam too" if xplay[0] else
+            "OFF: the code is this host's Steam ID; only players on Steam can join"))
+    elif code:
+        emit_code()
 
     # merged log: our own lines + every joiner's, tagged; extra files tailed
     peers_log = PeersLog(io.dir)
@@ -4067,6 +4098,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if set_mode(str(cmd.get("mode", ""))):
                 log(f"[host] mode -> {mode[0]} (set by host); companies {roster_companies()}")
                 roster_changed()
+        elif c == "crossplay":
+            if not steam_code:
+                log("[host] cross-play asked for, but this game has no Steam networking: the classic code is the only one")
+                emit_code()
+            else:
+                set_crossplay(bool(cmd.get("on", True)))
+                log("[host] CROSS-PLAY " + ("ON: the classic code is shown and listed" if xplay[0] else "OFF: the Steam ID is the code"))
         elif c == "publish":
             if publisher is not None:
                 publisher.set(bool(cmd.get("on", True)))
@@ -4178,7 +4216,13 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     if not data:
                         break
                     ptype, payload = _unpack(data)
-                    if ptype == TYPE_HELLO:
+                    if ptype == TYPE_HELLO and not xplay[0] and not steamtunnel.is_tunnel_addr(addr) \
+                            and addr not in peers:
+                        # CROSS-PLAY OFF: only a Steam tunnel endpoint gets a handshake
+                        if now - reject_sent.get(addr, 0.0) >= REJECT_PLAIN_EVERY:
+                            reject_sent[addr] = now
+                            log(f"[host] {addr[0]}:{addr[1]} knocked outside Steam while cross-play is off -- not answered")
+                    elif ptype == TYPE_HELLO:
                         # Complete the joiner's handshake: echo THEIR token.
                         try:
                             sock.sendto(_pack(TYPE_ACK, payload), addr)
@@ -4186,6 +4230,27 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                             pass
                     elif ptype in (TYPE_ACK, TYPE_CONNECTED):
                         pass                                # informational
+                    elif ptype == TYPE_KEYX:
+                        # A Steam-code joiner asks for the session secret (steamkey.py). Only
+                        # over the tunnel, at most every ANSWER_EVERY s per endpoint; the same
+                        # offer gets the same answer, so a lost reply costs only a resend.
+                        if steam_secret is None or not steamtunnel.is_tunnel_addr(addr):
+                            continue
+                        last = keyx_last.get(addr)
+                        if last and last[0] == payload:
+                            ans = last[1]
+                        elif last and now - last[2] < steamkey.ANSWER_EVERY:
+                            continue
+                        else:
+                            ans = steamkey.answer(payload, steam_secret)
+                            if ans is None:
+                                continue
+                            keyx_last[addr] = (payload, ans, now)
+                            log(f"[steam] {addr[0]}:{addr[1]} asked for the session key -- answered over Steam")
+                        try:
+                            sock.sendto(_pack(TYPE_KEYX, ans), addr)
+                        except OSError:
+                            pass
                     elif ptype == TYPE_KEEPALIVE:
                         if addr in peers:
                             peers[addr]["last"] = now
@@ -5347,6 +5412,11 @@ def cmd_host(args):
                                                  extra_candidates={"steam": tunnel.id})
     if tunnel.available:
         tunnel.hello(sock.getsockname()[1])   # the code names our SteamID; joiners reach us through Steam too
+    # Steam by default: a game with Steam's networking shows its Steam ID as the code;
+    # --crossplay (the menu's CROSS-PLAY), a relay and a dedicated server keep the classic
+    # code, which players without Steam can use. Switchable live ('crossplay' command).
+    steam_code = tunnel.id if tunnel.available and not args.relay_only and not getattr(args, "dedicated", False) else None
+    crossplay = bool(getattr(args, "crossplay", False)) or not steam_code
     if args.password:
         _log("[host] the code is LOCKED: without the password it reveals nothing")
     else:
@@ -5356,7 +5426,7 @@ def cmd_host(args):
          + (" + password)" if args.password else ")"))
     publisher = None
     if args.publish:
-        publisher = _Publisher(args.publish, code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
+        publisher = _Publisher(args.publish, code if crossplay else steam_code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
                                stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
         # systemd stops the relay with SIGTERM; without a handler Python just
         # dies and the finally: below (publisher.close -> /leave) never runs,
@@ -5387,7 +5457,9 @@ def cmd_host(args):
                  lobby_name=args.lobby_name, relay_only=bool(args.relay_only),
                  punch_q=rendezvous.queue if rendezvous is not None else None,
                  sync_runtime=make_runtime(args) if not args.relay_only else None,
-                 companies_mode=bool(args.companies))
+                 companies_mode=bool(args.companies),
+                 cross_code=code, steam_code=steam_code,
+                 steam_secret=secret if steam_code else None, crossplay=crossplay)
     finally:
         if rendezvous is not None:
             rendezvous.close()
@@ -5403,6 +5475,49 @@ def cmd_host(args):
     return 0
 
 
+STEAM_KEYX_TIMEOUT = 30.0   # joiner: seconds to wait for the host's key over Steam
+STEAM_KEYX_EVERY = 0.5      # joiner: seconds between offers
+
+
+def _steam_key_exchange(sock, ep, timeout):
+    """Ask the host at Steam tunnel endpoint ``ep`` for the session secret (steamkey.py).
+    Resends the offer until an answer to it arrives; anything else that arrives is
+    dropped (nothing else can arrive before the handshake). The secret, or None."""
+    offer = steamkey.Offer()
+    frame = _pack(TYPE_KEYX, offer.payload())
+    old = sock.gettimeout()
+    deadline = time.time() + timeout
+    next_send = 0.0
+    try:
+        while time.time() < deadline:
+            now = time.time()
+            if now >= next_send:
+                try:
+                    sock.sendto(frame, ep)
+                except OSError:
+                    pass
+                next_send = now + STEAM_KEYX_EVERY
+            sock.settimeout(max(0.05, min(next_send, deadline) - time.time()))
+            try:
+                data, addr = sock.recvfrom(65535)
+            except (socket.timeout, BlockingIOError):
+                continue
+            except OSError:
+                continue
+            if tuple(addr[:2]) != tuple(ep):
+                continue
+            ptype, payload = _unpack(data)
+            if ptype == TYPE_KEYX:
+                secret = offer.secret_from(payload)
+                if secret is not None:
+                    _log(f"[steam] the host sent the session key over Steam ({(timeout - (deadline - time.time())):.1f} s)")
+                    return secret
+        _log(f"[steam] no key from the host over Steam within {timeout:.0f} s")
+        return None
+    finally:
+        sock.settimeout(old)
+
+
 def cmd_join(args):
     io = LobbyIO(args.io_dir or os.getcwd())
     io.emit({"type": "status", "state": "waiting", "detail": "dialing host"})
@@ -5416,7 +5531,11 @@ def cmd_join(args):
         return 2
     if peer.get("stale"):
         _log(f"[join] WARNING: code is {peer['age']}s old -- may be stale")
-    if peer.get("secret"):
+    steam_only = bool(peer.get("steam_only"))
+    if steam_only:
+        _log(f"[join] the code is a Steam ID ({peer['candidates']['steam']}): joining through Steam; "
+             "the session key comes from the host over Steam")
+    elif peer.get("secret"):
         SEAL[0] = Sealer(derive_key(peer["secret"], args.password or ""))
         _log("[join] frames are sealed (session key from the code"
              + (" + password)" if args.password else ")"))
@@ -5434,6 +5553,35 @@ def cmd_join(args):
     tunnel = _steam_tunnel(args)
     if tunnel.available:
         tunnel.hello(sock.getsockname()[1])
+    steam_ep = None
+    if steam_only:
+        fail = None
+        if not tunnel.available:
+            fail = ("this host's code is a Steam ID, and this game has no Steam networking: "
+                    "start the game through Steam, or ask the host to tick CROSS-PLAY and send the long code")
+        elif peer["candidates"]["steam"] == tunnel.id:
+            fail = "that Steam ID is your own"
+        else:
+            steam_ep = tunnel.dial(peer["candidates"]["steam"])
+            if not steam_ep:
+                fail = "Steam could not open a connection to that player"
+            else:
+                secret = _steam_key_exchange(sock, steam_ep, min(args.timeout, STEAM_KEYX_TIMEOUT))
+                if secret is None:
+                    fail = ("no lobby answered through Steam: the host has not opened one, "
+                            "or its game does not have this version")
+                else:
+                    SEAL[0] = Sealer(derive_key(secret, args.password or ""))
+                    _log("[join] frames are sealed (session key from the host over Steam"
+                         + (" + password)" if args.password else ")"))
+        if fail:
+            io.emit({"type": "status", "state": "failed", "detail": fail})
+            io.write_state(state="failed")
+            _log(f"[join] FAILED: {fail}")
+            tunnel.close()
+            if relay is not None:
+                relay.close()
+            return 1
     if not getattr(args, "no_mesh", False):
         try:
             from observe import observe
@@ -5449,13 +5597,13 @@ def cmd_join(args):
     # a host whose port is not really open still gets through (see RENDEZVOUS).
     knock = None
     rv_url = _rv_url(args)
-    late_targets = []                      # the master's relay port, once asked for (see RV_RELAY_FROM_KNOCK)
+    late_targets = [steam_ep] if steam_ep else []   # the master's relay port, once asked for (see RV_RELAY_FROM_KNOCK)
     # The host's Steam identity from the code: dial it through the tunnel as one
     # more candidate. On a thread, so the direct dial starts at once; the race
     # picks the endpoint up from late_targets. Steam punches or relays on its own,
     # so this is the path that works where nothing else does (CGNAT, both closed).
     host_steam = peer.get("candidates", {}).get("steam")
-    if host_steam and tunnel.available and host_steam != tunnel.id:
+    if host_steam and tunnel.available and host_steam != tunnel.id and not steam_only:
         def _dial_steam():
             ep = tunnel.dial(host_steam)
             if ep:
@@ -7031,6 +7179,9 @@ def main(argv=None):
     ap.add_argument("--publish", default="",
                     help="master server base URL; the lobby is listed there while "
                          "public (see --public and the 'publish' command)")
+    ap.add_argument("--crossplay", action="store_true",
+                    help="host: show and list the classic code, so players without Steam can join too "
+                         "(default: a game with Steam shows its Steam ID and only Steam players get in)")
     ap.add_argument("--companies", action="store_true",
                     help="start in separate-companies mode: every player gets their own company (default: co-op, one company)")
     ap.add_argument("--dedicated", action="store_true",

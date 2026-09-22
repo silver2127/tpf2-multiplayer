@@ -418,6 +418,21 @@ installs a VPN or depends on the master server's relay.
   once the tunnel is up; `tpf2mp_steam_off.txt` keeps it off. The tunnel's
   lines in `tpf2_bridge.log` start with `[steam]`; `STATUS` on its control
   port lists every endpoint with Steam's session state (relay in use, errors).
+- **The Steam ID as the join code (2026-09-22).** A host whose tunnel is up
+  shares its SteamID64 as the code, and the lobby is Steam-only: a HELLO
+  that does not come from a tunnel endpoint is not answered (it is logged
+  once every few seconds). A Steam ID is public, so it cannot carry the
+  session secret the classic code does. The joiner gets the secret over the
+  tunnel instead, in a Diffie-Hellman exchange (`steamkey.py`, packet type
+  `X`, RFC 3526 group 14) that the host answers only from tunnel endpoints.
+  The frame key is still `derive_key(secret, password)`, so a lobby password
+  works as before. `connect.steam_code_id` accepts 17 digits in the
+  individual-account range or a pasted `steamcommunity.com/profiles/` URL.
+  **CROSS-PLAY** (`--crossplay` at start, or `{"cmd":"crossplay","on":...}`
+  live) opens the gate and switches the shown and published code to the
+  classic one; the `code` event carries `code`, `steam`, `crossplay` and
+  `cross_code`. A host without a tunnel, a relay-only host and a dedicated
+  server always use the classic code. `tools/test_steam_code.py` covers it.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).

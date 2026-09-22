@@ -18,7 +18,8 @@
 
 The title menu gains a **Multiplayer** entry. It opens a panel over the menu:
 
-- **HOST A GAME**: a lobby name, the **HOST GAME** button and a **PUBLIC** checkbox.
+- **HOST A GAME**: a lobby name, the **HOST GAME** button and the **PUBLIC**, **SEPARATE COMPANIES**
+  and **CROSS-PLAY** checkboxes.
 - **JOIN A GAME**: a code field (click it to paste) and **JOIN GAME**.
 - **YOUR NAME** and an optional **PASSWORD**. Your name and lobby name are remembered; the first
   time you get a random two-word name.
@@ -35,6 +36,15 @@ While the panel is open, typing goes into its fields and the game does not see i
    **ROOM CODE** button copies it again). Send it to your friends, or tick **PUBLIC** to list the game.
    With a **password**, the code is locked: it is useless without the password, and a public row
    shows `[locked]`.
+
+   **The code is your Steam ID.** When your game runs on Steam, the code is your 17-digit SteamID64
+   (the number on your Steam profile) and players join you through Steam's networking only: no
+   ports, no IP address in the code. Your friends can also paste your Steam profile link.
+   **CROSS-PLAY** (on the host card, or in the lobby while you host) switches to the classic
+   letters-and-digits code instead. Anyone can join with that one, whether or not they run Steam:
+   GOG copies, Steam in offline mode, or a game started outside Steam. Switching it in the lobby
+   copies the new code, and players already in stay. A game that is not on Steam, and a dedicated
+   server, always use the classic code.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
 4. Click **SELECT SAVE** in the lobby and choose your world. The list includes autosaves,
@@ -183,7 +193,7 @@ or edit the Workshop mod. Every participant needs the same multiplayer build.
 
 ## Ports and firewalls
 
-- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code, and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in.
+- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code (it IS the code unless the host ticks **CROSS-PLAY**), and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in; a player without Steam needs the host to tick **CROSS-PLAY**.
 - **Most hosts need no port forwarding.** When a friend joins, both lobbies punch through
   their routers to each other with the help of the master server. The lobby also tries UPnP.
 - If friends still cannot connect, forward UDP 29471 to your PC on your router, or use a
