@@ -259,6 +259,21 @@ class SyncParticipant:
                 return None
             if ready.get('ok') != '1':
                 raise RuntimeError('Bridge could not clear the previous world')
+            # LIVE JOIN (2026-09-22): a member the host kept out of the load (a
+            # 'join' round's `retain`, see sync_operation) pauses the world it is
+            # holding instead -- the one the snapshot was taken from. Only that
+            # world: it must still be the one this round found (old_world), held
+            # and paused, and the engine idle. The paused fingerprints decide
+            # after; a difference makes the host run the load for everyone.
+            if self.state.get('mode') == 'join' and self.player in (self.state.get('retain') or ()):
+                lua = self._lua()
+                if (status.get('has_world') != '1' or status.get('busy') != '0'
+                        or not self.old_world or lua.get('world') != self.old_world
+                        or lua.get('held') != '1' or lua.get('paused') != '1'):
+                    return None
+                if self._native('pause', 'paused'):
+                    return self._ack(paused=True, digest=self.snapshot.digest, kept=True)
+                return None
             # THE HOST LOADS TOO, in every mode (2026-09-16, evening). For a few
             # hours the host kept the world it took the snapshot from, to spare
             # it a load. Measured the same evening: a joiner that loads a save

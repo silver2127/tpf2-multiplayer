@@ -283,6 +283,68 @@ class OperationTests(unittest.TestCase):
             self.both()
         self.assertEqual(self.op.phase, 'complete')
 
+    def all3(self):
+        self.ack('host'); self.ack('client'); self.ack('late')
+
+    def live_join(self, members=('host', 'client', 'late'), retain=('host', 'client')):
+        self.op.abort('host', self.op.operation)
+        self.assertTrue(self.op.request('host', list(members), 'join', retain=list(retain)))
+
+    def test_live_join_keeps_the_players_already_in_and_says_so(self):
+        # LIVE JOIN: the host and the players already in keep their worlds, only
+        # the newcomer loads; the round is otherwise the frozen join
+        self.live_join()
+        self.assertEqual(self.op.retain, ('client', 'host'))
+        self.assertEqual(self.op.view()['retain'], ['client', 'host'])
+        self.all3()                                             # holding -> saving
+        self.ack('host')                                        # saving -> transferring
+        for phase in ('loading', 'checking', 'releasing', 'complete'):
+            self.all3()
+            self.assertEqual(self.op.phase, phase)
+        self.assertEqual(self.op.retain, ('client', 'host'))
+
+    def test_retain_is_only_for_a_join_that_keeps_the_hosts_world(self):
+        self.op.abort('host', self.op.operation)
+        self.op.request('host', ['host', 'client'], 'resync', retain=['host'])
+        self.assertEqual(self.op.retain, ())                    # a resync: everyone loads
+        self.op.abort('host', self.op.operation)
+        self.op.request('host', ['host', 'client', 'late'], 'join', retain=['client'])
+        self.assertEqual(self.op.retain, ())                    # the snapshot is the host's world
+        self.op.abort('host', self.op.operation)
+        self.op.request('host', ['host', 'client'], 'join', retain=['host', 'stranger'])
+        self.assertEqual(self.op.retain, ('host',))             # only members
+
+    def test_a_kept_world_that_differs_makes_everyone_load_once(self):
+        # nobody is released unverified: a difference after a live join is the
+        # plain frozen join (every member loads the snapshot it already holds),
+        # under a fresh epoch; a difference after THAT is the ordinary error
+        self.live_join()
+        self.all3()                                             # holding -> saving
+        self.ack('host')                                        # saving -> transferring
+        self.all3()                                             # transferring -> loading
+        self.all3()                                             # loading -> checking
+        self.assertEqual(self.op.phase, 'checking')
+        epoch = self.op.epoch
+        self.ack('host'); self.ack('client')
+        self.ack('late', fingerprint='loaded-world')
+        self.assertEqual(self.op.phase, 'loading')
+        self.assertEqual(self.op.retain, ())
+        self.assertNotEqual(self.op.epoch, epoch)
+        self.assertEqual(self.op.view()['retain'], [])
+        self.all3()                                             # everyone loaded
+        self.assertEqual(self.op.phase, 'checking')
+        self.ack('host'); self.ack('client')
+        self.ack('late', fingerprint='still-other')
+        self.assertEqual(self.op.phase, 'error')
+
+    def test_live_join_leaver_and_retry(self):
+        self.live_join()
+        self.op.tick(['host', 'late'])                          # client left
+        self.assertEqual(self.op.retain, ('host',))
+        self.op.fail('transfer failed')
+        self.assertTrue(self.op.retry('host', self.op.operation, ['host', 'late']))
+        self.assertEqual(self.op.retain, ())                    # a retry is the plain round
+
     def test_retry_takes_the_roster_as_it_is_now(self):
         self.op.abort('host', self.op.operation)
         self.op.request('host', ['host', 'client', 'third'], 'resync')

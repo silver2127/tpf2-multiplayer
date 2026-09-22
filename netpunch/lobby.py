@@ -301,6 +301,18 @@ def _tcp_backup_on(io_dir):
         return True
 
 
+def _live_join_on(io_dir):
+    """LIVE JOIN (2026-09-22): tpf2mp_live_join.txt = 1 in the host's io dir
+    lets the players already in a session keep their worlds at a hot join; only
+    the newcomer loads (sync_operation `retain`). Off by default, read at each
+    join."""
+    try:
+        with open(os.path.join(io_dir, "tpf2mp_live_join.txt"), "r", encoding="utf-8") as f:
+            return f.read().strip() in ("1", "on", "yes")
+    except OSError:
+        return False
+
+
 def _dual_hello(name):
     """The hello a peer proves itself with: its name, sealed with the session key."""
     return dual_tcp.hello_bytes(name, SEAL[0].seal(name.encode("utf-8", "replace")))
@@ -3496,7 +3508,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     recovery = HostRecovery(sync_runtime, host_name, io, recovery_send,
         roster_players, lambda: [(a, p["name"]) for a, p in peers.items()],
         recovery_transfer,
-        available=recovery_supported, unavailable_reason=recovery_unavailable_reason) if sync_runtime is not None and not relay_only else None
+        available=recovery_supported, unavailable_reason=recovery_unavailable_reason,
+        live_join=lambda: _live_join_on(io.dir)) if sync_runtime is not None and not relay_only else None
 
     def roster_companies():
         """name -> company id. Same id = same company (co-op); different ids =

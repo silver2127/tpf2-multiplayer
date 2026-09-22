@@ -70,8 +70,10 @@ def make_runtime(args):
 class HostRecovery:
     def __init__(self, runtime, host, io, send, members, targets, transfer_factory,
                  available=lambda: True,
-                 unavailable_reason=lambda: "Resync is not ready. Wait for all players to finish joining."):
+                 unavailable_reason=lambda: "Resync is not ready. Wait for all players to finish joining.",
+                 live_join=lambda: False):
         self.runtime, self.io, self.send = runtime, io, send
+        self.live_join = live_join
         self.members, self.targets, self.transfer_factory = members, targets, transfer_factory
         self.is_available = available
         self.unavailable_reason = unavailable_reason
@@ -126,10 +128,19 @@ class HostRecovery:
             return True                   # admitted by the barrier on its next tick
         if not self.is_available():
             return False
-        if self.barrier.request(self.barrier.host, self.members(), 'join'):
+        # LIVE JOIN: everyone already playing keeps their world and only the
+        # newcomer loads (sync_operation `retain`); off unless the host's io dir
+        # says so (tpf2mp_live_join.txt = 1), because it needs every peer's
+        # engine sorts (docs/re/HOTJOIN_ORDER.md).
+        members = list(self.members())
+        live = bool(self.live_join())
+        retain = [m for m in members if m != newcomer] if live else []
+        if self.barrier.request(self.barrier.host, members, 'join', retain=retain):
             self.io.emit(ui_state(self.barrier.view()))
             self.io.emit(dict(type='sync_feedback',
-                              detail=f'{newcomer} joined: holding the session while everyone loads the shared world.'))
+                              detail=f'{newcomer} joined: holding the session while {newcomer} loads the shared world.'
+                              if live and self.barrier.retain else
+                              f'{newcomer} joined: holding the session while everyone loads the shared world.'))
             return True
         return False
 
