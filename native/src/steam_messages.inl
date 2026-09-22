@@ -10,6 +10,31 @@ struct MessagesApi {
     SteamNetworkingMessage_t* pending[2] = {};
 } g_messages;
 bool g_useMessages = false;
+SteamRateController g_messageRate;
+DWORD g_messageRateAt = 0;
+
+void UpdateMessagesRate(DWORD now) {
+    if (!g_messageRateAt) { g_messageRateAt = now; return; }
+    if (now - g_messageRateAt < 5000) return;
+    g_messageRateAt = now;
+    float quality = g_messageRate.quality;
+    int target = g_messageRate.Evaluate(), before = g_messageRate.rate;
+    if (target == before || !g_api.utils || !g_api.setConfig) return;
+    void* utils = g_api.utils();
+    if (!utils) return;
+    // Widen the relevant bound first, then make the pair equal. Connections
+    // inherit these global values dynamically unless explicitly overridden.
+    int first = target > before ? 11 : 10, second = target > before ? 10 : 11;
+    bool ok = g_api.setConfig(utils, first, 1, 0, 1, &target);
+    if (ok) ok = g_api.setConfig(utils, second, 1, 0, 1, &target);
+    if (ok) g_messageRate.rate = target;
+    else {
+        g_api.setConfig(utils, 10, 1, 0, 1, &before);
+        g_api.setConfig(utils, 11, 1, 0, 1, &before);
+    }
+    if (g_log) g_log("[steam-rate] %d -> %dB/s quality=%.3f ceiling=%dB/s (%s)\n",
+        before, target, quality, g_messageRate.ceiling, ok ? "set" : "REFUSED; restoring prior rate");
+}
 
 SteamNetworkingIdentity MessageIdentity(uint64_t id) {
     SteamNetworkingIdentity result{};
@@ -64,6 +89,9 @@ bool MessagesState(void*, uint64_t id, void* result) {
     out.usingRelay = (info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Relayed) != 0;
     out.bytesQueued = status.m_cbPendingReliable + status.m_cbPendingUnreliable;
     out.packetsQueued = -1; // Modern API reports bytes, not a packet count.
+    if (out.active) g_messageRate.Sample(status.m_flConnectionQualityRemote,
+        status.m_flOutBytesPerSec >= 65536 || out.bytesQueued >= 65536 || status.m_cbSentUnackedReliable >= 65536,
+        out.bytesQueued >= 65536);
     if (g_log) g_log("[steam-messages] state=%d ping=%dms capacity=%dB/s wire_out=%.0fB/s wire_in=%.0fB/s pending=%dB unacked=%dB queue_us=%lld end=%d quality_local=%.3f quality_remote=%.3f\n",
         state, status.m_nPing, status.m_nSendRateBytesPerSecond, status.m_flOutBytesPerSec,
         status.m_flInBytesPerSec, out.bytesQueued, status.m_cbSentUnackedReliable,

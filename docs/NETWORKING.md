@@ -523,3 +523,19 @@ the rate estimate to that value when the clamps match. Both clamps now use
 above its 1 MiB/s minimum. This is a fixed configured rate, not an adaptive
 bandwidth estimate or a promise of measured internet throughput. Diagnostics
 also include local/remote connection quality. Live verification is still needed.
+
+### Adaptive Messages rate (0.6.1.28)
+
+The 16 MiB/s fixed-rate experiment produced high wire traffic but poor remote
+in-order packet delivery and very little unique save progress. Messages now
+starts with equal 1 MiB/s clamps and samples active outgoing peers every five
+seconds. Remote delivery quality below 0.90 halves the rate (floor 256 KiB/s).
+Three samples with quality at least 0.98 and a send backlog permit 25% growth.
+Unknown quality, idle connections and receive-only traffic cannot increase it.
+After congestion the session ceiling is reduced to 75% of the failed rate;
+this prevents repeated aggressive probing of the same bottleneck. Worst peer
+feedback governs the process-wide inherited Steam settings. Both clamps are
+changed together; failed setters attempt to restore the previous pair and log
+failure. Actual reported capacity and unique transfer progress remain the live
+verification, not the configured target. The controller resets on game restart.
+Legacy transport retains its previous fixed configuration.

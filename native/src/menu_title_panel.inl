@@ -148,7 +148,8 @@ static void titleSetup(int w,int h)
         titleText(pad,S(241),width,S(28),L"Lobby settings",18);
         if(g_flagMaster[0]) mwCheck(pad,S(283),L"Show in the public game browser",g_public!=0,11);
         mwCheck(pad,S(325),L"Separate companies",g_sepCompanies!=0,50);
-        titleText(pad,S(369),width,S(28),L"Choose a savegame and invite players after creating the lobby.",14,MW_DIM);
+        mwCheck(pad,S(367),L"Cross-play (players without Steam)",g_crossplay!=0,51);
+        titleText(pad,S(409),width,S(28),L"Choose a savegame and invite players after creating the lobby.",14,MW_DIM);
     } else {
         if(g_flagMaster[0]) titleBrowser(w,h);
         else titleText(pad,S(278),width,S(50),L"Ask the host for an invitation code.",14,MW_DIM);
@@ -214,6 +215,7 @@ static void titleLobby(int w,int h)
     if(g_isHost) {
         mwCheck(pad,footer+S(6),L"Separate companies",g_sepCompanies!=0,50);
         if(g_flagMaster[0]) mwCheck(pad+S(230),footer+S(6),L"Public game",g_public!=0,11);
+        mwCheck(pad+S(410),footer+S(6),L"Cross-play",g_crossplay!=0,51);
     } else titleText(pad,footer+S(6),width,S(28),L"Waiting for the host to start.",14,MW_DIM);
     titleAction(pad,h-S(68),S(110),L"Leave lobby",5);
     if(g_isHost) titleAction(w-pad-S(155),h-S(68),S(155),g_saveStartPending?L"Sharing savegame...":L"Start game",6,g_lobbyReady && !g_saveStartPending,true);

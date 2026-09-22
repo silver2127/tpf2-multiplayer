@@ -24,6 +24,7 @@
 #include <share.h>
 #include "steam_tunnel.h"
 #include "../third_party/steam/steamnetworkingtypes.h"
+#include "steam_rate.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -311,6 +312,7 @@ DWORD WINAPI TunnelThread(LPVOID)
     for (auto& c : persona) if (c == '\n' || c == '\r') c = ' ';
 
     g_api.allowRelay(g_api.net, true);
+    bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
     // Set connection defaults before opening a Messages session. A successful
     // global setter does not prove these settings affect the legacy P2P path.
     // The lobby also bounds bytes in flight. Int32 = 1, scope Global = 1.
@@ -322,11 +324,10 @@ DWORD WINAPI TunnelThread(LPVOID)
             // raised, unauthenticated IP connections were allowed and the initial
             // timeout was 4.6 hours (the log's "SendRateMax: 10000 ->" was the
             // 10,000 ms timeout default).
-            // Valve documents equal clamps for a manually configured rate.
-            // A larger max alone did not raise the live Messages connection:
-            // 0.6.1.26 remained at the 1 MiB/s floor with ~4 MB pending.
-            { "SendRateMin",    10, 16 * 1024 * 1024 },
-            { "SendRateMax",    11, 16 * 1024 * 1024 },
+            // Equal clamps fix the actual rate. Messages adjusts both together
+            // using measured delivery quality; Legacy keeps its fixed setting.
+            { "SendRateMin",    10, legacy ? 16 * 1024 * 1024 : SteamRateController::Initial },
+            { "SendRateMax",    11, legacy ? 16 * 1024 * 1024 : SteamRateController::Initial },
             { "SendBufferSize",  9,  8 * 1024 * 1024 },
             { "RecvBufferSize", 47,  8 * 1024 * 1024 },
         };
@@ -341,7 +342,6 @@ DWORD WINAPI TunnelThread(LPVOID)
     }
     // Startup-only A/B switch. No silent fallback: a comparison must know which
     // transport was actually selected. Both peers need the same setting.
-    bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
     if (!legacy && !StartMessages()) {
         g_log("[steam] Messages v002 unavailable -- transport OFF; select Legacy explicitly to compare\n");
         return 0;
@@ -519,6 +519,7 @@ DWORD WINAPI TunnelThread(LPVOID)
             e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes;
         }
         // ---- idle endpoints
+        if (g_useMessages) UpdateMessagesRate(statsNow);
         DWORD now = GetTickCount();
         if (now - lastSweep > 10000) {
             lastSweep = now;
