@@ -2078,7 +2078,8 @@ static void DedicatedTick()
     if (!world) {
         bool ready;
         { std::lock_guard<std::mutex> lk(S().mtx); ready = S().m.lobbyReady; }
-        if (!ready || MenuGame_Loading() || NativeIo::Busy() || now - menuSince < 45000 ||
+        if (!ready || MenuGame_Loading() || NativeIo::Busy() ||
+            now - menuSince < uint64_t(d.loadDelaySeconds) * 1000 ||
             (lastLoad && now - lastLoad < 60000)) return;
         lastLoad = now;
         std::string save;
