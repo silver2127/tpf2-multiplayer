@@ -9,6 +9,7 @@ bool SpeedHook_Install(SpeedLogFn) { assert(false); return false; }
 void SpeedHook_SetTarget(double) { assert(false); }
 double SpeedHook_Target() { assert(false); return 0; }
 bool SetPlayerPatch_Install(SetPlayerLogFn) { assert(false); return false; }
+bool SteamTunnel_Start(const std::string&, TunnelLogFn) { assert(false); return false; }
 
 static void Write(const std::string& path, const std::string& body) {
     FILE* f = fopen(path.c_str(), "wb"); assert(f);

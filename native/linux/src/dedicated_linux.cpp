@@ -34,6 +34,7 @@ Settings Read(const std::string& path) {
         else if (key == "dedicated_public" && Number(value, 0, 1, &n)) s.publicGame = n;
         else if (key == "dedicated_companies" && Number(value, 0, 1, &n)) s.companies = n;
         else if (key == "dedicated_render" && Number(value, 0, 1, &n)) s.render = n;
+        else if (key == "dedicated_nowsi" && Number(value, 0, 1, &n)) s.noWsi = n;
         else if (key == "dedicated_pin_batch" && Number(value, 0, 1, &n)) s.pinBatch = n;
         else if (key == "dedicated_autosave_min" && Number(value, 0, 600, &n)) s.autosaveMinutes = n;
         else if (key == "dedicated_empty_speed" && Number(value, 0, 4, &n)) s.emptySpeed = n;

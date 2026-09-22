@@ -14,11 +14,11 @@ int main() {
     write("dedicated=1\r\ndedicated_lobby=Native test\n"
           "dedicated_save=mp_test\ndedicated_port=29473\n"
           "dedicated_empty_speed=4\ndedicated_pause_empty=1\n"
-          "dedicated_fps=15\ndedicated_pin_batch=0\n");
+          "dedicated_fps=15\ndedicated_pin_batch=0\ndedicated_nowsi=1\n");
     dedicated::Configure(flags, dir);
     const auto& s = dedicated::Get();
     assert(s.enabled && s.lobby == "Native test" && s.save == "mp_test");
-    assert(s.port == 29473 && s.emptySpeed == 0 && s.fps == 15 && !s.pinBatch);
+    assert(s.port == 29473 && s.emptySpeed == 0 && s.fps == 15 && !s.pinBatch && s.noWsi);
     std::ifstream input(dir + "mp_dedicated.txt");
     std::string body((std::istreambuf_iterator<char>(input)), {});
     assert(body == "dedicated=1\nempty_speed=0\npause_empty=1\npin_batch=0\n");

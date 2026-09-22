@@ -28,7 +28,7 @@ $Overlay = "C:\Sandbox\$env:USERNAME\$Box\drive\C\" + ($Game -replace '^[A-Za-z]
 
 # what is built from what: target -> (output, source globs)
 $Targets = @(
-    @{ name = 'proxy'; out = 'native\out\tpf2_bridge_mp.dll'; src = @('native\src\net.cpp', 'native\src\net.h', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\speedhook.*', 'native\src\setplayer_patch.*', 'native\src\cgamesteprelay.asm', 'native\src\setplayerrelay.asm', 'native\src\bridge_main.cpp', 'native\src\proxy_alut.cpp', 'native\src\datadir.h', 'native\src\logarchive.*') },
+    @{ name = 'proxy'; out = 'native\out\tpf2_bridge_mp.dll'; src = @('native\src\net.cpp', 'native\src\net.h', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\speedhook.*', 'native\src\setplayer_patch.*', 'native\src\cgamesteprelay.asm', 'native\src\setplayerrelay.asm', 'native\src\bridge_main.cpp', 'native\src\steam_tunnel.*', 'native\src\proxy_alut.cpp', 'native\src\datadir.h', 'native\src\logarchive.*') },
     @{ name = 'menu';  out = 'native\out\tpf2_menu.dll';      src = @('native\src\menu_hook.cpp', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\native_io.*', 'native\src\native_control.*', 'native\src\gameuirelay.asm', 'native\src\logarchive.*', 'native\src\datadir.h') },
     @{ name = 'slice'; out = 'native\out\tpf2_slice.dll';     src = @('native\src\slice_hook.cpp', 'native\src\slice\*.inl', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\deferrelay_slice.asm', 'native\src\station_weld.h', 'native\src\datadir.h') },
     @{ name = 'host';  out = 'native\out\tpf2_pluginhost.dll'; src = @('native\src\plugin\*', 'native\src\hook.cpp', 'native\src\hook.h') }

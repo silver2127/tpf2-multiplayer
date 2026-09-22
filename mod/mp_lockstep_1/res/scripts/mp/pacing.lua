@@ -274,6 +274,16 @@ function CM.speedButton(v, kind)
 	v = tonumber(v)
 	if not v then return end
 	v = math.max(0, math.floor(v))
+	-- A DEDICATED SERVER HAS NO HAND AT ITS CLOCK (2026-09-21). The clock's speed
+	-- buttons are a radio group whose callback sends SetGameSpeed(min(button,
+	-- limit)), and the engine lowers that limit when it thinks the simulation
+	-- cannot keep up. Pacing set the server to 4x, the clock re-selected its
+	-- "4x" button, the callback sent SetGameSpeed(1) -- the same caller as a
+	-- player's click -- and the server voted 1x against the players' 4x.
+	if CM.dedicatedPauseEmpty and CM.dedicatedPauseEmpty() then
+		log(string.format("SPEED2: speed button %d on a dedicated server ignored -- the engine pressed it (its own speed limit), nobody plays here", v))
+		return
+	end
 	if CM.lgHolding then
 		CM.lgPress = math.min(v, CM.MAX_SPEED or 4)
 		return
@@ -1232,11 +1242,74 @@ end
 -- brings the newcomer in owns the clock then; resync.lua asks
 -- CM.dedicatedResumeSpeed for the speed to resume at, because the speed it finds
 -- is ours). Returns true while the rule owns the lever (alone).
+-- THE SERVER'S AUTOSAVE PAUSES THE SESSION (2026-09-21). The menu DLL forces
+-- the game's own autosave every dedicated_autosave_min; a 104 MB world took the
+-- server 11 s, during which it advanced nothing while a player at 4x ran 3
+-- units ahead, was held "until the leader reaches us", and quit, taking the
+-- freeze for a broken server. Now the DLL asks first (tpf2_ded_autosave.txt):
+-- with players in, the session goes to 0 here and on every game (LSEFF 0),
+-- the DLL saves once it reads the ack, writes the done marker when the save
+-- file stopped growing, and the session resumes at the votes. Alone, the ack
+-- goes back at once and nothing pauses. A hold ends on its own after
+-- K.DED_SAVE_HOLD_TICKS whatever the DLL did.
+K.DED_SAVE_HOLD_TICKS = 300   -- ~60 s
+function CM.dedAutosaveTick(s, others)
+	local req, ack, done = K.BASE .. "tpf2_ded_autosave.txt", K.BASE .. "tpf2_ded_autosave_ack.txt", K.BASE .. "tpf2_ded_autosave_done.txt"
+	local function marker(path)   -- an EMPTIED file is no marker (no os.remove in the game's Lua)
+		local f = io.open(path, "r")
+		if not f then return false end
+		local body = f:read("*a") or ""
+		f:close()
+		return body ~= ""
+	end
+	local function write(path, text)
+		local f = io.open(path, "w")
+		if f then f:write(text) f:close() end
+	end
+	if not CM.dedSaveHold then
+		if not marker(req) then return false end
+		pcall(CM.clearFile, req)
+		if not others then
+			write(ack, "alone\n")
+			log("PACE: dedicated server autosave -- nobody else is in, no hold")
+			return false
+		end
+		-- the speed to come back to: the votes, else the lever now, never 0
+		local back = (CM.voteSpeed and CM.voteSpeed()) or ((s or 0) > 0 and s) or CM.dedResume or 1
+		CM.dedSaveHold = { since = CM.ticks or 0, resume = math.max(1, math.floor(back + 0.5)), sent = CM.ticks or 0 }
+		if s ~= 0 then CM.setSpeed(0, "dedicated server: autosave") end
+		CM.effSpeed = 0
+		if CM.broadcast and CM.lseffLine then CM.broadcast(CM.lseffLine(0, CM.voteCounted)) end
+		log(string.format("PACE: dedicated server autosave -- session held at 0 (back to %dx after)", CM.dedSaveHold.resume))
+		write(ack, "held\n")
+		return true
+	end
+	local hold = CM.dedSaveHold
+	local finished = marker(done)
+	local timedOut = (CM.ticks or 0) - hold.since > K.DED_SAVE_HOLD_TICKS
+	if not finished and not timedOut then
+		-- keep every game at 0: a lost LSEFF must not leave one running
+		if (CM.ticks or 0) - hold.sent >= 25 and CM.broadcast and CM.lseffLine then
+			hold.sent = CM.ticks or 0
+			CM.broadcast(CM.lseffLine(0, CM.voteCounted))
+		end
+		if s ~= 0 then CM.setSpeed(0, "dedicated server: autosave") end
+		return true
+	end
+	if finished then pcall(CM.clearFile, done) end
+	CM.dedSaveHold = nil
+	log(string.format("PACE: dedicated server autosave %s -- session resumes at %dx", finished and "done" or "hold timed out", hold.resume))
+	if CM.hostUnpause then CM.hostUnpause(hold.resume) end
+	CM.setSpeed(hold.resume, "dedicated server: autosave done")
+	return false
+end
+
 function CM.dedicatedTick()
 	if not CM.dedicatedPauseEmpty() or CM.resyncHold then return false end
 	local others = CM.othersPresent and CM.othersPresent()
 	local s
 	pcall(function() s = game.interface.getGameSpeed() end)
+	if CM.dedAutosaveTick(s, others) then return true end
 	if not others then
 		if s and (CM.ticks or 0) >= (K.LOADGATE_MIN_TICKS or 0) then
 			local want = CM.dedEmptySpeed or 1

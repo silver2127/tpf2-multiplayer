@@ -32,6 +32,7 @@
 #include "net.h"
 #include "setplayer_patch.h"
 #include "speedhook.h"
+#include "steam_tunnel.h"
 
 static FILE* g_log = nullptr;
 static void Log(const char* fmt, ...)
@@ -614,6 +615,7 @@ static void InitThread()
     }
 
     WriteIdentity(cfg.instance, true);
+    SteamTunnel_Start(S().dataDir, Log);
     Log("[m5] identity written: inst=%s port=%u\n", cfg.instance.c_str(),
         (unsigned)Net_LocalPort());
 
@@ -650,6 +652,7 @@ __attribute__((destructor))
 static void BridgeUnload()
 {
     g_stopping = true;
+    SteamTunnel_SignalShutdown();
     Net_SignalShutdown();
 }
 #endif

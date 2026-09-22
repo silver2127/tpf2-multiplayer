@@ -21,7 +21,7 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.14, main `f766960`**, on
+This development tree integrates **Windows 0.6.1.18, tag `a5aeda76`**, on
 top of Linux merge PR #5. The integration and live-test record is
 [PARITY_20260921.md](../re/linux/PARITY_20260921.md). Testing is ongoing; this
 is not yet a completed cross-platform compatibility certification.
@@ -40,7 +40,8 @@ textures match the Windows baseline.
 
 Station/depot glyphs use their owner's company colour. Entity-window washes
 have a native implementation and await live separate-company visual checks.
-Vehicle-icon and station-label colours remain work in progress. Other native
+Vehicle-icon and station-label colours now have native implementations and
+fixture coverage; live visual checks remain. Other native
 parity additions, including spare-line callbacks, platform assignments and
 modular-station connector welding, have fixture coverage and still need their
 live gameplay checks. See the integration record for current test limits.
@@ -48,7 +49,7 @@ live gameplay checks. See the integration record for current test limits.
 `trainorder=0`, `roadspace=0`, `roadentries=0`, `shiporder=0`, `airorder=0`,
 `sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt`
 disable the respective hooks at startup. Peers need matching simulation
-settings. `showicons=0`, `foreignwindows=0`, `stationicon=0` and `windowcolor=0`
+settings. `showicons=0`, `foreignwindows=0`, `stationicon=0`, `iconcolor=0` and `windowcolor=0`
 disable the corresponding UI features; `tintclass=mpCo` selects the opaque
 company class. Creating `tpf2mp_governor_off.txt` in the runtime data folder
 disables the Lua speed governor.

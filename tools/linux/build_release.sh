@@ -181,6 +181,14 @@ for s in install.sh uninstall.sh collect_logs.sh; do install -m 0755 "$REPO/tool
 install -m 0755 "$REPO/tools/linux/tpf2mp-launch" "$STAGE/tpf2mp-launch"
 install -m 0644 "$REPO/tools/linux/tpf2mp_paths.sh" "$STAGE/tpf2mp_paths.sh"
 install -m 0644 "$REPO/docs/linux/INSTALL.md" "$STAGE/INSTALL.md"
+mkdir -p "$STAGE/server"
+for s in setup_vps.sh tpf2server game_watchdog.sh steam_login.sh steam_bootstrap.sh; do
+  install -m 0755 "$REPO/tools/server/$s" "$STAGE/server/$s"
+done
+for s in native_watchdog.py steam_compat.py server.env.example README.md; do
+  install -m 0644 "$REPO/tools/server/$s" "$STAGE/server/$s"
+done
+install -m 0644 "$REPO/docs/re/linux/PARITY_20260921.md" "$STAGE/PARITY.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.6.md" "$STAGE/UPSTREAM_0.5.6.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_55e97a48.md" "$STAGE/UPSTREAM_dev_55e97a48.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_3edfbccd.md" "$STAGE/UPSTREAM_dev_3edfbccd.md"
@@ -213,7 +221,7 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: dev b141b1238e4559aed4ec1ed97a51e963e455923d (release 0.6); all 28 files exact"
+  echo "Lua: Windows v0.6.1.18 a5aeda76ed2927229397fe85619d1d13326e46d5 (pinned Linux origin replay)"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"

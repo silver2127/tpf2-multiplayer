@@ -40,6 +40,21 @@ int main() {
     };
     assert(MySubmit(VK_NULL_HANDLE, 1, &info, (VkFence)14) == VK_SUCCESS);
     assert(info.commandBufferCount == 1 && info.pCommandBuffers == &command);
+    g_queueCount=1;g_queues[0].q=(VkQueue)15;g_nullCount=3;g_nullNext=0;
+    g_origSubmit=[](VkQueue q,uint32_t count,const VkSubmitInfo* p,VkFence fence){
+        assert(q==(VkQueue)15 && count==1 && p->commandBufferCount==0);
+        assert(p->waitSemaphoreCount==0 && p->signalSemaphoreCount==1);
+        assert(*p->pSignalSemaphores==(VkSemaphore)12 && fence==(VkFence)14);return VK_SUCCESS;
+    };
+    for(unsigned i=0;i<7;++i){uint32_t index=99;assert(NullAcquire(signal,(VkFence)14,&index)==VK_SUCCESS && index==i%3);}
+    g_origSubmit=[](VkQueue,uint32_t,const VkSubmitInfo*,VkFence){return VK_ERROR_DEVICE_LOST;};
+    uint32_t untouched=99;assert(NullAcquire(signal,(VkFence)14,&untouched)==VK_ERROR_DEVICE_LOST && untouched==99);
+    g_origSubmit=[](VkQueue,uint32_t,const VkSubmitInfo* p,VkFence fence){
+        assert(!fence && !p->signalSemaphoreCount && p->waitSemaphoreCount==1);
+        assert(*p->pWaitSemaphores==(VkSemaphore)11 && *p->pWaitDstStageMask==VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        return VK_SUCCESS;
+    };
+    assert(NullSubmit((VkQueue)15,VK_NULL_HANDLE,VK_NULL_HANDLE,1,&wait)==VK_SUCCESS);
     uint64_t query[] = {42, 43};
     assert(MyQueryResults(VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 2, sizeof(query), query,
                           sizeof(uint64_t), VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS);

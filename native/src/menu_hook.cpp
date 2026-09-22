@@ -4208,10 +4208,76 @@ static void DedicatedTick()
                 NoWsi() ? NORENDER_FPS : (double)g_flagDedFps);
         }
     }
-    if (g_flagDedAutosaveMin > 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
+    // THE AUTOSAVE PAUSES THE SESSION FIRST (2026-09-21). A forced autosave stops
+    // this game for the save's duration (11 s for a 104 MB world on the VPS) while
+    // the players' games run on, then wait for the leader: a player at 4x took it
+    // for a broken server and quit. So: ask the mod to hold the session
+    // (tpf2_ded_autosave.txt -> mp/pacing.lua CM.dedAutosaveTick: 0 here and on
+    // every game, or "alone" with nobody in), save once the ack is back, tell the
+    // mod when the save file has stopped growing (the done marker), and say so in
+    // the chat both times. No ack within 15 s (a resync in progress holds the
+    // mod's tick): not now, again in a minute. The markers are EMPTIED, never
+    // deleted: the game's Lua reads an empty file as no marker and has no remove.
+    static int g_dedSaveState = 0;   // 0 idle, 1 asked, 2 saving
+    static ULONGLONG g_dedSaveAt = 0, g_dedSaveBaseline = 0, g_dedSaveLastSize = 0;
+    static wchar_t g_dedSaveFile[600] = L"";
+    wchar_t req[MAX_PATH], ack[MAX_PATH], done[MAX_PATH];
+    _snwprintf_s(req,  _TRUNCATE, L"%stpf2_ded_autosave.txt", g_dataDirW);
+    _snwprintf_s(ack,  _TRUNCATE, L"%stpf2_ded_autosave_ack.txt", g_dataDirW);
+    _snwprintf_s(done, _TRUNCATE, L"%stpf2_ded_autosave_done.txt", g_dataDirW);
+    auto putMarker = [](const wchar_t* path, const char* text) {
+        HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD w = 0; if (text && *text) WriteFile(h, text, (DWORD)strlen(text), &w, nullptr);
+        CloseHandle(h); return true;
+    };
+    auto markerSet = [](const wchar_t* path) {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        return GetFileAttributesExW(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh);
+    };
+    if (g_flagDedAutosaveMin > 0 && g_dedSaveState == 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
         && now - g_dedLastSave > (ULONGLONG)g_flagDedAutosaveMin * 60000ULL) {
         g_dedLastSave = now;
-        if (ForceAutosave()) Log("[dedicated] autosave forced (every %d min)\n", g_flagDedAutosaveMin);
+        putMarker(ack, ""); putMarker(done, "");
+        if (putMarker(req, "hold\n")) {
+            g_dedSaveState = 1; g_dedSaveAt = now;
+            LobbySend("{\"cmd\":\"chat\",\"text\":\"Server autosave in a moment: the game pauses for about ten seconds.\"}");
+            Log("[dedicated] autosave due (every %d min): asking the mod to hold the session\n", g_flagDedAutosaveMin);
+        } else {
+            if (ForceAutosave()) Log("[dedicated] autosave forced (every %d min), no hold: the request file could not be written\n", g_flagDedAutosaveMin);
+        }
+    } else if (g_dedSaveState == 1) {
+        if (markerSet(ack)) {
+            wchar_t cur[600] = L""; ULONGLONG sz = 0;
+            g_dedSaveBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
+            g_dedSaveFile[0] = 0; g_dedSaveLastSize = 0;
+            putMarker(ack, "");
+            g_dedSaveState = 2; g_dedSaveAt = now;
+            if (ForceAutosave()) Log("[dedicated] autosave forced (every %d min), the session held\n", g_flagDedAutosaveMin);
+            else { putMarker(done, "failed\n"); g_dedSaveState = 0; }
+        } else if (now - g_dedSaveAt > 15000) {
+            putMarker(req, "");
+            g_dedSaveState = 0;
+            g_dedLastSave = now - (ULONGLONG)g_flagDedAutosaveMin * 60000ULL + 60000ULL;   // again in a minute
+            Log("[dedicated] autosave: no hold from the mod within 15 s (a world operation?) -- not now, again in a minute\n");
+        }
+    } else if (g_dedSaveState == 2) {
+        // done when a newer save file has stopped growing (SyncPoll's rule), or after 90 s
+        bool finished = false;
+        wchar_t cur[600] = L""; ULONGLONG sz = 0;
+        if (newestSave(cur, 600)) {
+            ULONGLONG mt = saveMtime(cur, &sz);
+            if (mt > g_dedSaveBaseline && sz > 0) {
+                if (wcscmp(cur, g_dedSaveFile) == 0 && sz == g_dedSaveLastSize) finished = true;
+                wcscpy_s(g_dedSaveFile, cur); g_dedSaveLastSize = sz;
+            }
+        }
+        if (finished || now - g_dedSaveAt > 90000) {
+            putMarker(done, finished ? "saved\n" : "timeout\n");
+            g_dedSaveState = 0;
+            LobbySend("{\"cmd\":\"chat\",\"text\":\"Server autosave done, resuming.\"}");
+            Log("[dedicated] autosave %s (%llu B) -- releasing the session\n", finished ? "written" : "not seen within 90 s", (unsigned long long)g_dedSaveLastSize);
+        }
     }
 }
 

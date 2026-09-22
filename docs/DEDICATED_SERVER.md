@@ -18,7 +18,7 @@ then kept in **offline mode**, which lets the same account play online elsewhere
 |---|---|
 | no lobby | host one: `dedicated_lobby` as the name, `dedicated_name` as the player, `dedicated_password`, public per `dedicated_public`, SEPARATE COMPANIES per `dedicated_companies`; `--dedicated` keeps the session secret in `relay_secret.bin` so the code is stable |
 | lobby up, no world | load `dedicated_save` (a save name), else the newest save in the save folder, through the shared-save autoload; the lobby counts the host as started, so a joiner comes in through the frozen-join round |
-| world up | force the game's own autosave every `dedicated_autosave_min` minutes (0 = never); after a crash the next launch loads the newest save |
+| world up | force the game's own autosave every `dedicated_autosave_min` minutes (0 = never); after a crash the next launch loads the newest save. With players in, the session is paused first (a chat line says so), the save runs, and the session resumes at the players' votes: a save of a large world takes the server ten seconds, during which it would otherwise stand still while everyone else ran on |
 
 A crash to the title menu leaves the lobby (as for any player) and the first row hosts
 again. The mod's half (`mp/pacing.lua`, told through `mp_dedicated.txt`): with
@@ -26,7 +26,11 @@ again. The mod's half (`mp/pacing.lua`, told through `mp_dedicated.txt`): with
 last other player leaves, and resumes at the players' votes when one arrives.
 
 **Speed.** Nobody stands at the server's controls, so the server has no vote and
-its own lever is never read as a player's pause. The players' speed votes (the
+its own lever is never read as a player's pause, and a speed-button command
+from its clock is not a vote either: the engine lowers the highest speed the
+clock offers when it thinks the simulation cannot keep up, and the clock then
+re-sends that lower speed through the same path as a player's click (a server
+set to 4x voted 1x this way on 2026-09-21). The players' speed votes (the
 speed buttons and the multiplayer window's speed row) set the session speed, as
 in any session; with players in and no vote cast yet the world runs at 1x. A
 frozen join or a resync resumes at the votes' speed (else the speed the server

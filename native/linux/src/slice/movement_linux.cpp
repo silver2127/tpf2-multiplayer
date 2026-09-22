@@ -360,7 +360,6 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
     // Not folded into `ok`: the tint is cosmetic, and a refusal here must not
     // take multiplayer startup with it the way a failed permission patch does.
     SliceInstallCompanyTint(base, root, data);
-    SliceLog("[company-ui] vehicle icon colour pending native draw implementation\n");
     return ok;
 }
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)

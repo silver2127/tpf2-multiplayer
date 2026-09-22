@@ -24,10 +24,10 @@ a = Analysis(
     binaries=[],
     datas=[],
     # Imported inside functions. The bytecode scan finds these too; listing them
-    # keeps a refactor from dropping one silently: the desync report, the
+    # keeps a refactor from dropping one silently: Steam transport, the
     # connectivity profile, the Linux paths, UPnP, and zstandard's C backend
     # (it reads a save's mod list).
-    hiddenimports=['desynclogs', 'observe', 'linuxpaths', 'miniupnpc',
+    hiddenimports=['steamtunnel', 'observe', 'linuxpaths', 'miniupnpc',
                    'zstandard', 'zstandard.backend_c'],
     hookspath=[],
     hooksconfig={},

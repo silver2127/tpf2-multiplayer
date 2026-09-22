@@ -1,0 +1,110 @@
+// Exercise the shared transport against a fake Steam flat API and real UDP.
+#include "../../src/steam_tunnel.cpp"
+#include <cassert>
+#include <cstdarg>
+#include <deque>
+#include <fstream>
+#include <sstream>
+
+struct Packet { std::vector<char> bytes; int channel; };
+static std::mutex packetsMutex;
+static std::deque<Packet> packets;
+static int registrations = 0, removals = 0;
+static std::atomic<int> reliablePackets{0}, accepted{0};
+#define API extern "C" __attribute__((visibility("default")))
+API void* SteamAPI_SteamNetworking_v006() { return reinterpret_cast<void*>(1); }
+API void* SteamAPI_SteamUser_v021() { return reinterpret_cast<void*>(2); }
+API uint64_t SteamAPI_ISteamUser_GetSteamID(void*) { return 1001; }
+API bool SteamAPI_ISteamNetworking_SendP2PPacket(void*, uint64_t id, const void* p, uint32_t n, int mode, int channel) {
+    assert(id == 2002);
+    assert(mode == (n > 1200 ? 2 : 0));
+    if (mode == 2) ++reliablePackets;
+    std::lock_guard<std::mutex> lock(packetsMutex);
+    packets.push_back({std::vector<char>((const char*)p, (const char*)p+n), channel});
+    return true;
+}
+API bool SteamAPI_ISteamNetworking_IsP2PPacketAvailable(void*, uint32_t* n, int channel) {
+    std::lock_guard<std::mutex> lock(packetsMutex);
+    for (const auto& p : packets) if (p.channel == channel) { *n = p.bytes.size(); return true; }
+    return false;
+}
+API bool SteamAPI_ISteamNetworking_ReadP2PPacket(void*, void* dest, uint32_t cap, uint32_t* n, uint64_t* from, int channel) {
+    std::lock_guard<std::mutex> lock(packetsMutex);
+    for (auto i = packets.begin(); i != packets.end(); ++i) if (i->channel == channel) {
+        assert(i->bytes.size() <= cap); *n = i->bytes.size(); *from = 2002;
+        memcpy(dest, i->bytes.data(), *n); packets.erase(i); return true;
+    }
+    return false;
+}
+API bool SteamAPI_ISteamNetworking_AcceptP2PSessionWithUser(void*, uint64_t id) { assert(id == 2002); ++accepted; return true; }
+API bool SteamAPI_ISteamNetworking_CloseP2PSessionWithUser(void*, uint64_t id) { assert(id == 2002); return true; }
+API bool SteamAPI_ISteamNetworking_AllowP2PPacketRelay(void*, bool allow) { assert(allow); return true; }
+API void SteamAPI_RegisterCallback(void* p, int id) {
+    auto* cb = static_cast<CallbackBase*>(p); cb->id = id; cb->flags = 1; ++registrations;
+    if (id == 1202) {
+        assert(cb->GetCallbackSizeBytes() == 8);
+        P2PSessionRequest request{2002}; cb->Run(&request, false, 0);
+    } else {
+        assert(id == 1203 && cb->GetCallbackSizeBytes() == 12);
+        P2PSessionConnectFail failure{2002, 4}; cb->Run(&failure);
+    }
+}
+API void SteamAPI_UnregisterCallback(void* p) { static_cast<CallbackBase*>(p)->flags = 0; ++removals; }
+static void LogTest(const char*, ...) {}
+static sockaddr_in Address(uint16_t port) {
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); return a;
+}
+static std::string Receive(int sock, uint16_t* fromPort = nullptr) {
+    fd_set rs; FD_ZERO(&rs); FD_SET(sock, &rs); timeval tv{3, 0};
+    assert(select(sock+1, &rs, nullptr, nullptr, &tv) == 1);
+    char data[4096]; sockaddr_in a{}; socklen_t size = sizeof(a);
+    const auto n = recvfrom(sock, data, sizeof(data), 0, (sockaddr*)&a, &size);
+    assert(n >= 0); if (fromPort) *fromPort = ntohs(a.sin_port);
+    return {data, static_cast<size_t>(n)};
+}
+static std::string Control(int sock, uint16_t port, const std::string& text) {
+    const auto a = Address(port);
+    assert(sendto(sock, text.data(), text.size(), 0, (sockaddr*)&a, sizeof(a)) == (ssize_t)text.size());
+    return Receive(sock);
+}
+int main() {
+    char temporary[] = "/tmp/tpf2mp-steam.XXXXXX"; assert(mkdtemp(temporary));
+    const std::string dir = std::string(temporary) + "/";
+    uint16_t occupiedPort = 0;
+    const int occupied = BindLoopback(TUNNEL_IP, TUNNEL_PORT_LO, &occupiedPort);
+    assert(occupied >= 0); // The endpoint must skip a port used by another game.
+    assert(SteamTunnel_Start(dir, LogTest));
+    uint16_t control = 0;
+    for (int n = 0; n < 300 && !control; ++n) {
+        std::ifstream f(dir + "tpf2_steam.txt"); std::string line;
+        while (std::getline(f, line)) if (line.rfind("port=", 0) == 0) control = std::stoi(line.substr(5));
+        if (!control) Sleep(10);
+    }
+    assert(control && accepted == 1);
+    uint16_t callerPort = 0, lobbyPort = 0;
+    const int caller = BindLoopback(TUNNEL_IP, 0, &callerPort);
+    const int lobby = BindLoopback(TUNNEL_IP, 0, &lobbyPort);
+    assert(Control(caller, control, "DIAL 1001") == "ERR self");
+    assert(Control(caller, control, "LOBBY 0") == "ERR unknown");
+    assert(Control(caller, control, "LOBBY " + std::to_string(lobbyPort)) == "OK");
+    const auto reply = Control(caller, control, "DIAL 2002");
+    unsigned ep = 0; assert(sscanf(reply.c_str(), "EP 2002 127.0.0.1 %u", &ep) == 1);
+    assert(ep > occupiedPort && ep <= TUNNEL_PORT_HI);
+    for (unsigned n : {24u, 1200u, 1400u}) {
+        std::string bytes(n, '\0'); for (unsigned i = 0; i < n; ++i) bytes[i] = char(i);
+        const auto a = Address(ep);
+        assert(sendto(lobby, bytes.data(), bytes.size(), 0, (sockaddr*)&a, sizeof(a)) == (ssize_t)n);
+        uint16_t from = 0; assert(Receive(lobby, &from) == bytes && from == ep);
+    }
+    assert(reliablePackets == 1);
+    assert(Control(caller, control, "STATUS").find("endpoints=1") != std::string::npos);
+    assert(Control(caller, control, "CLOSE 2002") == "OK");
+    assert(Control(caller, control, "STATUS").find("endpoints=0") != std::string::npos);
+    SteamTunnel_Stop(); assert(registrations == 2 && removals == 2);
+    std::ifstream identity(dir + "tpf2_steam.txt"); assert(identity.peek() == EOF);
+    { std::ofstream disabled(dir + "tpf2mp_steam_off.txt"); disabled << "1\n"; }
+    assert(!SteamTunnel_Start(dir, LogTest));
+    close(caller); close(lobby); close(occupied);
+    unlink((dir + "tpf2_steam.txt").c_str()); unlink((dir + "tpf2mp_steam_off.txt").c_str()); rmdir(temporary);
+    puts("PASS: native Steam callbacks, UDP endpoints, binary packets, reliability boundary and shutdown");
+}

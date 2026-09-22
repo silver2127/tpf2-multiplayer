@@ -48,6 +48,11 @@ static PFN_vkQueuePresentKHR     g_realPresent = nullptr;
 static PFN_vkGetDeviceQueue      g_origGetQueue = nullptr;
 static PFN_vkCreateSwapchainKHR  g_origCreateSc = nullptr;
 static PFN_vkQueueSubmit g_origSubmit = nullptr;
+static PFN_vkAcquireNextImageKHR g_origAcquire = nullptr;
+static PFN_vkAcquireNextImage2KHR g_origAcquire2 = nullptr;
+static bool g_noWsi = false;
+static VkSwapchainKHR g_nullSc = VK_NULL_HANDLE;
+static uint32_t g_nullCount = 0, g_nullNext = 0;
 static bool g_noRender = false;
 static VkDevice   g_dev = VK_NULL_HANDLE;
 static VkFormat   g_scFormat = VK_FORMAT_UNDEFINED;
@@ -325,6 +330,33 @@ static bool DrawPanel(VkQueue q, uint32_t imgIndex, uint32_t waitCount=0, const 
 }
 
 // ---- the three swapped dispatcher slots --------------------------------------------
+static VkResult NullSubmit(VkQueue queue, VkSemaphore signal, VkFence fence,
+                           uint32_t count, const VkSemaphore* waits)
+{
+    if (!queue || !g_origSubmit) return VK_ERROR_INITIALIZATION_FAILED;
+    try {
+        std::vector<VkPipelineStageFlags> stages(count,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        VkSubmitInfo info{};info.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        info.waitSemaphoreCount=count;info.pWaitSemaphores=waits;info.pWaitDstStageMask=stages.data();
+        info.signalSemaphoreCount=signal?1:0;info.pSignalSemaphores=signal?&signal:nullptr;
+        return g_origSubmit(queue,1,&info,fence);
+    } catch (...) { return VK_ERROR_OUT_OF_HOST_MEMORY; }
+}
+static VkResult NullAcquire(VkSemaphore signal,VkFence fence,uint32_t* index)
+{
+    if(!index || !g_nullCount || !g_queueCount.load())return VK_ERROR_INITIALIZATION_FAILED;
+    const auto result=NullSubmit(g_queues[0].q,signal,fence,0,nullptr);
+    if(result==VK_SUCCESS)*index=g_nullNext++%g_nullCount;
+    return result;
+}
+static VkResult MyAcquire(VkDevice dev,VkSwapchainKHR sc,uint64_t timeout,VkSemaphore signal,VkFence fence,uint32_t* index)
+{
+    return g_noWsi && sc==g_nullSc?NullAcquire(signal,fence,index):g_origAcquire(dev,sc,timeout,signal,fence,index);
+}
+static VkResult MyAcquire2(VkDevice dev,const VkAcquireNextImageInfoKHR* info,uint32_t* index)
+{
+    return g_noWsi && info && info->swapchain==g_nullSc?NullAcquire(info->semaphore,info->fence,index):g_origAcquire2(dev,info,index);
+}
 static VkResult MyPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     bool copied=false;
@@ -357,6 +389,11 @@ static VkResult MyPresent(VkQueue q, const VkPresentInfoKHR* pi)
         // completed. Binary semaphores must not be waited a second time.
         VkPresentInfoKHR ready=*pi;ready.waitSemaphoreCount=0;ready.pWaitSemaphores=nullptr;
         return g_realPresent(q,&ready);
+    }
+    if(g_noWsi && pi && pi->swapchainCount==1 && pi->pSwapchains[0]==g_nullSc){
+        const auto result=NullSubmit(q,VK_NULL_HANDLE,VK_NULL_HANDLE,pi->waitSemaphoreCount,pi->pWaitSemaphores);
+        if(pi->pResults)pi->pResults[0]=result;
+        return result;
     }
     return g_realPresent(q, pi);
 }
@@ -408,6 +445,13 @@ static VkResult MyCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
 {
     const VkResult r = g_origCreateSc(dev, ci, a, sc);
     if (r == VK_SUCCESS && ci) {
+        if(g_noWsi && sc){
+            const auto images=reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(g_gdpa(dev,"vkGetSwapchainImagesKHR"));
+            uint32_t count=0;
+            if(images && images(dev,*sc,&count,nullptr)==VK_SUCCESS && count){
+                g_nullSc=*sc;g_nullCount=count;g_nullNext=0;
+            }
+        }
         g_scFormat = ci->imageFormat;
         g_scExtent = ci->imageExtent;
         g_scUsage = ci->imageUsage;
@@ -449,6 +493,7 @@ static void InitDeviceDetour(void* dispatcher, VkDevice dev)
     slot[SLOT_CREATE_SWAPCHAIN / 8] = (void*)&MyCreateSwapchain;
     slot[SLOT_QUEUE_PRESENT / 8]    = (void*)&MyPresent;
     g_noRender = false;
+    g_noWsi = false;
     if (dedicated::Get().enabled && !dedicated::Get().render) {
         const auto submit = gdpa(dev, "vkQueueSubmit");
         const auto query = gdpa(dev, "vkGetQueryPoolResults");
@@ -459,6 +504,18 @@ static void InitDeviceDetour(void* dispatcher, VkDevice dev)
             *submitSlot = reinterpret_cast<void*>(&MySubmit);
             *querySlot = reinterpret_cast<void*>(&MyQueryResults);
             g_noRender = true;
+            if(dedicated::Get().noWsi){
+                const auto acquire=gdpa(dev,"vkAcquireNextImageKHR");
+                const auto acquire2=gdpa(dev,"vkAcquireNextImage2KHR");
+                auto first=FindDeviceSlot(slot,acquire),second=FindDeviceSlot(slot,acquire2);
+                if(first){
+                    g_origAcquire=reinterpret_cast<PFN_vkAcquireNextImageKHR>(acquire);
+                    *first=reinterpret_cast<void*>(&MyAcquire);
+                    if(second){g_origAcquire2=reinterpret_cast<PFN_vkAcquireNextImage2KHR>(acquire2);*second=reinterpret_cast<void*>(&MyAcquire2);}
+                    g_noWsi=true;
+                    g_log("[dedicated] experimental dedicated_nowsi=1: acquisition and presentation use empty synchronization submits\n");
+                }
+            }
             g_log("[dedicated] render submissions and query waits disabled; Vulkan synchronization preserved\n");
         } else g_log("[dedicated] render suppression unavailable: Vulkan dispatcher slots are not unique\n");
     }

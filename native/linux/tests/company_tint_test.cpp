@@ -26,6 +26,30 @@ void* Window(uintptr_t rva, size_t len, int prot)
 }
 
 std::vector<std::pair<void*, std::string>> applied;
+struct TestBuffer { uintptr_t unused=0; std::vector<unsigned char> bytes; uintptr_t range[3]{}; };
+static uintptr_t plainBuffer[4]{}, colorBuffer[4]{};
+static unsigned char plainVertices[16*24]{}, coloredVertices[32*24]{};
+static float drawnLabel[4]{};
+static int grown=0;
+static uintptr_t FakePlainBuffer(void*,int layer,void* texture) {
+    assert(layer==2 && texture==reinterpret_cast<void*>(123)); return reinterpret_cast<uintptr_t>(plainBuffer);
+}
+static uintptr_t FakeColorBuffer(void*,int layer,void* texture) {
+    assert(layer==2 && texture==reinterpret_cast<void*>(123)); return reinterpret_cast<uintptr_t>(colorBuffer);
+}
+static DrawRect FakeVehicleDraw(void*,void* texture,int layer,float x,float y,float width,float height) {
+    assert(texture==reinterpret_cast<void*>(123) && layer==2 && x==10 && y==20 && width==30 && height==40);
+    for(int i=0;i<6;++i){float v[4]={float(i),float(i+10),float(i)/6,1};memcpy(reinterpret_cast<void*>(plainBuffer[2]),v,16);plainBuffer[2]+=16;}
+    return {0x12345678,0xabcdef01};
+}
+static void FakeColorGrow(uintptr_t vector,uintptr_t end,const DrawVertex* v) {
+    assert(vector==reinterpret_cast<uintptr_t>(colorBuffer+1) && end==colorBuffer[2]);
+    colorBuffer[3]=reinterpret_cast<uintptr_t>(coloredVertices)+sizeof(coloredVertices);
+    memcpy(reinterpret_cast<void*>(end),v,32);colorBuffer[2]+=32;++grown;
+}
+static void FakeLabelDraw(void*,void*,const float* color,uint64_t position,uint64_t size) {
+    assert(reinterpret_cast<uintptr_t>(color)%16==0 && position==91 && size==27);memcpy(drawnLabel,color,16);
+}
 void FakeAddStyleClass(void* widget, GStr* cls)
 {
     // Exactly what the engine's addStyleClass promises: an empty string is
@@ -257,8 +281,42 @@ int main()
         snprintf(text, sizeof(text), "%s%d", ClassPrefix(), cid);
         assert(strlen(text) < sizeof(GStr::buf));
     }
-    // an unknown pid is not a company, so nothing is appended
-    assert(CompanyOfPid(19427) == 0);
+    // Both own and foreign icons use their company's RGB; unowned icons
+    // retain the original buffer. The native draw still owns geometry/UVs.
+    char temporary[]="/tmp/tpf2mp-colors.XXXXXX";assert(mkdtemp(temporary));tintData=temporary;
+    {FILE* f=fopen((tintData+"/mp_company_perms.txt").c_str(),"w");assert(f);fputs("pid 19427 2\n",f);fclose(f);}
+    stub(kPlainBuffer,reinterpret_cast<void*>(&FakePlainBuffer));
+    stub(kColorBuffer,reinterpret_cast<void*>(&FakeColorBuffer));
+    stub(kVehicleDraw,reinterpret_cast<void*>(&FakeVehicleDraw));
+    stub(kColorGrow,reinterpret_cast<void*>(&FakeColorGrow));
+    stub(kLabelDraw,reinterpret_cast<void*>(&FakeLabelDraw));
+    plainBuffer[1]=plainBuffer[2]=reinterpret_cast<uintptr_t>(plainVertices);
+    plainBuffer[3]=plainBuffer[1]+sizeof(plainVertices);
+    colorBuffer[1]=colorBuffer[2]=colorBuffer[3]=reinterpret_cast<uintptr_t>(coloredVertices);
+    const int entity=28300;
+    auto rect=SliceTintVehicleDraw(nullptr,reinterpret_cast<void*>(123),2,&entity,w.Engine(),10,20,30,40);
+    assert(rect.position==0x12345678 && rect.size==0xabcdef01 && grown==1);
+    assert(plainBuffer[2]==plainBuffer[1] && colorBuffer[2]-colorBuffer[1]==6*32);
+    for(int i=0;i<6;++i){
+        auto* v=reinterpret_cast<DrawVertex*>(coloredVertices)+i;
+        assert(v->xy[0]==i && v->xy[1]==i+10 && v->uv[0]==float(i)/6 && v->uv[1]==1);
+        assert(v->rgba[0]==0 && v->rgba[1]==130/255.f && v->rgba[2]==200/255.f && v->rgba[3]==1);
+    }
+    const int town=500;
+    SliceTintVehicleDraw(nullptr,reinterpret_cast<void*>(123),2,&town,w.Engine(),10,20,30,40);
+    assert(plainBuffer[2]-plainBuffer[1]==6*16 && colorBuffer[2]-colorBuffer[1]==6*32);
+    // Label colors use aligned storage and the current world's engine.
+    unsigned char ui[0x450]{},game[0x160]{},state[0x30]{};
+    uintptr_t p=reinterpret_cast<uintptr_t>(ui);memcpy(Window(0x5a4fb38,8,PROT_READ|PROT_WRITE),&p,8);
+    p=reinterpret_cast<uintptr_t>(game);memcpy(ui+0x448,&p,8);
+    p=reinterpret_cast<uintptr_t>(state);memcpy(game+0x150,&p,8);
+    p=w.Engine();memcpy(state+0x28,&p,8);
+    alignas(16) float gray[4]={.5f,.5f,.5f,1};
+    SliceTintLabelDraw(nullptr,nullptr,gray,91,27,&entity);
+    assert(drawnLabel[0]==0 && drawnLabel[1]==130/255.f && drawnLabel[2]==200/255.f);
+    SliceTintLabelDraw(nullptr,nullptr,gray,91,27,&town);assert(!memcmp(drawnLabel,gray,16));
+    assert(CompanyOfPid(-2)==0);
+    unlink((tintData+"/mp_company_perms.txt").c_str());rmdir(temporary);tintData.clear();
 
     // ---- who slice-lines may rename --------------------------------------
     // Only an entity with a Player component is the game's company window.

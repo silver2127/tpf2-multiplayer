@@ -194,7 +194,7 @@ installing the new MSI (or running the Proton installer again): there is no in-g
    run time, which four engines called a trojan even with the compiled stub; a plain program beside its libraries is
    what their rules treat as normal. The Proton repair patches the plain miniupnpc DLL in that folder.
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
-3. Tag the commit `v<version>`. The workflow builds, attaches the assets below and drafts the release with
+3. Tag the commit `v<version>`. The workflow builds, attaches the assets below and drafts the release with Push the tag before fast-forwarding `main` to it: the workflow builds on tags and on `main`, and a `main` push whose commit a tag already built is skipped, so a release costs one build. Nothing builds on `dev`.
    a **Download** table first (direct links per platform, built from the tag) followed by
    `installer/RELEASE-<version>.md` when that file exists, then GitHub's generated list of pull
    requests; review the draft and publish. The Proton installers are pinned to the tag by the

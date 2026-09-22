@@ -12,8 +12,12 @@ static int modRefreshes=0;
 void MenuGame_RequestModRefresh() { ++modRefreshes; }
 bool MenuGame_Loading() { return false; }
 std::string MenuGame_SaveDir() { assert(!fixtureSaveDir.empty()); return fixtureSaveDir; }
-bool MenuGame_ForceAutosave() { assert(false && "unexpected autosave"); return false; }
-bool MenuGame_NewestSave(std::string*) { assert(false && "unexpected save lookup"); return false; }
+static bool saveTest = false, nativeBusy = false, forceAllowed = true;
+static int savesForced = 0;
+static std::string newestSave;
+namespace NativeIo { bool Busy() { return nativeBusy; } }
+bool MenuGame_ForceAutosave() { assert(saveTest); ++savesForced; return forceAllowed; }
+bool MenuGame_NewestSave(std::string* path) { assert(saveTest); *path = newestSave; return !path->empty(); }
 
 bool MenuGame_PlaceSharedSave(const std::string& source, std::string* name) { assert(allowPlace && source.find("incoming_save.sav")!=std::string::npos); ++placed; *name="mp_shared"; return true; }
 void MenuGame_RequestAutoload(const std::string&) { assert(false && "unexpected load"); }
@@ -285,6 +289,36 @@ int main()
     assert(!model.recoveryPresent && model.lobbyDone && !model.startPending);
     assert(lobby::RecoveryAction("sync_request")=="Request sent.");
     lobby::Dispatch(R"({"type":"mods_refresh"})");assert(modRefreshes==1);
+    // Dedicated saves request a session hold, wait for its ack, then release
+    // only after a newer save is stable. Recovery and failure paths also run.
+    saveTest=true; S().cfg.dedicated.autosaveMinutes=1;
+    uint64_t lastSave=0;
+    nativeBusy=true; DedicatedAutosaveTick(61000,1,lastSave);
+    assert(DedSave().phase==0 && savesForced==0);
+    nativeBusy=false; DedicatedAutosaveTick(61000,1,lastSave);
+    assert(DedSave().phase==1 && savesForced==0);
+    std::string marker;
+    assert(ReadSmallFile(dir+"tpf2_ded_autosave.txt",&marker) && marker=="hold\n");
+    DedicatedAutosaveTick(62000,1,lastSave); assert(savesForced==0);
+    Write(dir+"tpf2_ded_autosave_ack.txt","held\n");
+    DedicatedAutosaveTick(63000,1,lastSave); assert(DedSave().phase==2 && savesForced==1);
+    newestSave=dir+"new-auto.sav"; Write(newestSave,"fresh save");
+    DedicatedAutosaveTick(64000,1,lastSave); assert(DedSave().phase==2);
+    DedicatedAutosaveTick(65000,1,lastSave); assert(DedSave().phase==0);
+    assert(ReadSmallFile(dir+"tpf2_ded_autosave_done.txt",&marker) && marker=="saved\n");
+    DedicatedAutosaveTick(122000,1,lastSave); assert(DedSave().phase==1);
+    DedicatedAutosaveTick(138000,1,lastSave); assert(DedSave().phase==0 && savesForced==1);
+    DedicatedAutosaveTick(197000,1,lastSave); assert(DedSave().phase==0);
+    DedicatedAutosaveTick(198000,1,lastSave); assert(DedSave().phase==1);
+    Write(dir+"tpf2_ded_autosave_ack.txt","held\n"); forceAllowed=false;
+    DedicatedAutosaveTick(199000,1,lastSave); assert(DedSave().phase==0 && savesForced==2);
+    assert(ReadSmallFile(dir+"tpf2_ded_autosave_done.txt",&marker) && marker=="failed\n");
+    forceAllowed=true; DedicatedAutosaveTick(260000,1,lastSave);
+    Write(dir+"tpf2_ded_autosave_ack.txt","alone\n");
+    DedicatedAutosaveTick(261000,1,lastSave); assert(DedSave().phase==2);
+    DedicatedAutosaveTick(352000,1,lastSave); assert(DedSave().phase==0);
+    assert(ReadSmallFile(dir+"tpf2_ded_autosave_done.txt",&marker) && marker=="timeout\n");
+    for (const auto& name : {"new-auto.sav","tpf2_ded_autosave.txt","tpf2_ded_autosave_ack.txt","tpf2_ded_autosave_done.txt"}) unlink((dir+name).c_str());
     unlink((dir+"chosen.sav").c_str()); unlink((dir+"mp_company_cfg.txt").c_str());
     for (const auto& name : {"lobby_out.jsonl", "lobby_in.jsonl", "tpf2_bridge_ctl.txt"}) unlink((dir+name).c_str());
     unlink((dir+"lockstep_dash_"+letter+".txt").c_str());

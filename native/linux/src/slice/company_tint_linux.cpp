@@ -325,12 +325,16 @@ void InstallWindowTint()
 }
 }
 
+#include "company_draw_checks_linux.h"
+#include "company_draw_linux.inl"
+
 bool SliceInstallCompanyTint(uintptr_t base, const char* rootDir, const char* dataDir)
 {
     tintBase = base;
     tintRoot = rootDir ? rootDir : "";
     tintData = dataDir ? dataDir : "";
     InstallWindowTint();
+    InstallDrawTint();
     if (FlagSays("stationicon", "0")) {
         SliceLog("[stationicon] OFF (stationicon=0) -- HUD icons keep the game's colours\n");
         return true;

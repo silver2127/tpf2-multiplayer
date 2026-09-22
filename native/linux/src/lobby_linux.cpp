@@ -66,6 +66,7 @@
 #include "datadir_linux.h"
 #include "logarchive_linux.h"
 #include "menu_game_linux.h"
+#include "native_io_linux.h"
 #include "slice_ready_linux.h"
 #include <dirent.h>
 #include <algorithm>
@@ -903,8 +904,12 @@ static bool UdpPortFree(int port)
 
 static int PickRelayPort(bool join)
 {
-    const int first=join?GAME_RELAY_PORT_JOIN:GAME_RELAY_PORT_HOST;
-    for (int p = first; p < first + 32; p++)
+    int first=join?GAME_RELAY_PORT_JOIN:GAME_RELAY_PORT_HOST;
+    if(const char* configured=getenv("TPF2MP_RELAY_PORT")) {
+        char* end=nullptr;errno=0;const long port=strtol(configured,&end,10);
+        if(!errno && end && end!=configured && !*end && port>=1024 && port<=65535)first=int(port);
+    }
+    for (int p = first; p < first + 32 && p<=65535; p++)
         if (UdpPortFree(p)) return p;
     return 0; // Let the launch fail explicitly rather than attach to another game.
 }
@@ -1962,6 +1967,71 @@ static void ShareAndStart()
 
 // Runs on the lobby worker, including while no lobby exists. All engine work
 // is queued through MenuGame's verified UI frame gate.
+struct DedicatedSaveState {
+    int phase = 0;
+    uint64_t at = 0, baseline = 0, size = 0;
+    std::string file;
+};
+static DedicatedSaveState& DedSave() { static auto* s = new DedicatedSaveState; return *s; }
+
+static void DedicatedAutosaveTick(uint64_t now, uint64_t worldSince, uint64_t& lastSave)
+{
+    auto& s = DedSave();
+    const auto interval = uint64_t(S().cfg.dedicated.autosaveMinutes) * 60000;
+    const auto marker = [](const char* name) { return S().cfg.dataDir + "tpf2_ded_autosave" + name + ".txt"; };
+    const auto put = [&](const char* name, const char* text) {
+        std::string why;
+        if (WriteFileAtomic(marker(name), text, &why)) return true;
+        Log("[dedicated] autosave marker: %s\n", why.c_str()); return false;
+    };
+    if (!s.phase) {
+        if (!interval || now - worldSince < 60000 || now - lastSave < interval ||
+            MenuGame_Loading() || NativeIo::Busy()) return;
+        lastSave = now;
+        // Never force an uncoordinated save when the hold cannot be requested.
+        if (!put("_ack", "") || !put("_done", "") || !put("", "hold\n")) return;
+        s.phase = 1; s.at = now;
+        AppendIn("{\"cmd\":\"chat\",\"text\":\"Server autosave in a moment: the game pauses for about ten seconds.\"}");
+        Log("[dedicated] autosave due: requesting the session hold\n");
+    } else if (s.phase == 1) {
+        uint64_t size = 0;
+        MtimeNs(marker("_ack"), &size);
+        if (size && !NativeIo::Busy()) {
+            std::string current;
+            s.baseline = MenuGame_NewestSave(&current) ? MtimeNs(current, nullptr) : 0;
+            s.file.clear(); s.size = 0;
+            put("_ack", "");
+            s.phase = 2; s.at = now;
+            if (!MenuGame_ForceAutosave()) {
+                put("_done", "failed\n"); s.phase = 0;
+                Log("[dedicated] autosave unavailable; releasing the session\n");
+            }
+        } else if (now - s.at > 15000) {
+            put("", ""); put("_done", "cancelled\n"); s.phase = 0;
+            lastSave = now - interval + 60000;
+            Log("[dedicated] no autosave hold within 15 s; retry in a minute\n");
+        }
+    } else {
+        std::string current;
+        bool finished = false;
+        if (MenuGame_NewestSave(&current)) {
+            uint64_t size = 0;
+            const auto modified = MtimeNs(current, &size);
+            if (modified > s.baseline && size) {
+                finished = current == s.file && size == s.size;
+                s.file = current; s.size = size;
+            }
+        }
+        if (finished || now - s.at > 90000) {
+            if (!put("_done", finished ? "saved\n" : "timeout\n")) return;
+            s.phase = 0;
+            AppendIn("{\"cmd\":\"chat\",\"text\":\"Server autosave done, resuming.\"}");
+            Log("[dedicated] autosave %s (%llu B), releasing the session\n",
+                finished ? "written" : "timed out", (unsigned long long)s.size);
+        }
+    }
+}
+
 static void DedicatedTick()
 {
     const auto& d = S().cfg.dedicated;
@@ -1972,6 +2042,12 @@ static void DedicatedTick()
     next = now + 1000;
     const bool world = g_gameUiSeen.load();
     if (!world) {
+        if(DedSave().phase){
+            std::string why;
+            WriteFileAtomic(S().cfg.dataDir+"tpf2_ded_autosave.txt","",&why);
+            WriteFileAtomic(S().cfg.dataDir+"tpf2_ded_autosave_done.txt","cancelled\n",&why);
+            DedSave()=DedicatedSaveState{};
+        }
         worldSince = 0;
         if (!g_titleMenu.load()) { menuSince = 0; return; }
         if (!menuSince) menuSince = now;
@@ -1992,7 +2068,7 @@ static void DedicatedTick()
     if (!world) {
         bool ready;
         { std::lock_guard<std::mutex> lk(S().mtx); ready = S().m.lobbyReady; }
-        if (!ready || MenuGame_Loading() || now - menuSince < 45000 ||
+        if (!ready || MenuGame_Loading() || NativeIo::Busy() || now - menuSince < 45000 ||
             (lastLoad && now - lastLoad < 60000)) return;
         lastLoad = now;
         std::string save;
@@ -2011,12 +2087,7 @@ static void DedicatedTick()
         return;
     }
     if (!worldSince) { worldSince = now; lastSave = now; }
-    if (d.autosaveMinutes > 0 && now - worldSince >= 60000 && !MenuGame_Loading() &&
-        now - lastSave >= uint64_t(d.autosaveMinutes) * 60000) {
-        lastSave = now;
-        if (MenuGame_ForceAutosave()) Log("[dedicated] autosave requested (every %d min)\n", d.autosaveMinutes);
-        else Log("[dedicated] autosave unavailable; check the game's autosave setting\n");
-    }
+    DedicatedAutosaveTick(now, worldSince, lastSave);
 }
 
 static void ReadSaves(uint64_t gen)
