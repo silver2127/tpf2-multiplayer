@@ -152,9 +152,20 @@ class BulkListener:
                 pass
 
 
-def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT):
+def _why(e):
+    """A connect failure in words: a timeout means something dropped the SYN (a
+    firewall or a router without a mapping), a refusal that nothing listens."""
+    if isinstance(e, socket.timeout):
+        return "timed out (blocked: firewall or no port mapping)"
+    if isinstance(e, ConnectionRefusedError):
+        return "refused (nothing listening on that port)"
+    return f"{type(e).__name__}: {e}"
+
+
+def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT, errors=None):
     """Connect to a listener and say hello. A socket ready for the stream, or
-    None (the caller falls back to UDP)."""
+    None (the caller falls back to UDP). ``errors``, a list, gets one
+    'host: why' line per failure (the logs said only "no TCP stream")."""
     try:
         c = socket.create_connection((host, int(port)), timeout=timeout)
         c.sendall(BULK_MAGIC + b" " + role.encode() + b" " + str(int(sid)).encode() + b" " + str(token).encode()
@@ -174,10 +185,14 @@ def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT)
             ok += piece
         if ok != b"OK\n":
             c.close()
+            if errors is not None:
+                errors.append(f"{host}: connected, but the listener refused the hello")
             return None
         c.settimeout(None)
         return c
-    except (OSError, UnicodeEncodeError):
+    except (OSError, UnicodeEncodeError) as e:
+        if errors is not None:
+            errors.append(f"{host}: {_why(e)}")
         return None
 
 
