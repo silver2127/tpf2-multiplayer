@@ -21,6 +21,13 @@ something here is fixed, the release note says so and the entry goes.
 
 ## Native side
 
+- **The OpenGL renderer is new and untested in a game** *(2026-09-21)*. Until then the Multiplayer
+  window drew only on Vulkan: on OpenGL the MULTIPLAYER button opened a window that never
+  appeared, and the lobby's per-frame work never ran (reported: "my son's multiplayer button
+  ... doesn't click"). The menu DLL now also hooks SDL2's `SwapBuffers` import and draws the
+  same panel with a framebuffer blit (`native/src/gl_overlay.h`, tested offline by
+  `tools/test_gl_overlay.py`). `tpf2_menu.log` says `OpenGL: hooked SDL2's SwapBuffers import`
+  at start and `OpenGL overlay off: <why>` if the driver refuses it; Vulkan is unchanged.
 - **After a crash, the restarted game can lose its instance letter.** The slice reads
   `tpf2_instance.txt` at attach; when the file still names the crashed process (the bridge
   rewrites it a moment later), the slice refuses the letter and logs `identity file pid=... !=

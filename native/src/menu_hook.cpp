@@ -29,6 +29,7 @@
 #include "hook.h"
 #include "native_io.h"
 #include "native_control.h"
+#include "gl_overlay.h"
 static HMODULE g_nativeModule = nullptr;
 #include "datadir.h"
 #include "logarchive.h"
@@ -1708,13 +1709,19 @@ static void PanelLayout()
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
 }
 
-static void DrawButton(VkQueue q, uint32_t imgIndex)
+// Both renderers, each frame the panel may show: false when it is collapsed (the
+// native list entry IS the button then).  The public list is polled on its page.
+static bool PanelFramePrep()
 {
-    if (imgIndex >= g_scImgCount) return;
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) { g_hitCount = 0; return; }   // collapsed: the native list entry IS the button
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 0) { g_hitCount = 0; return false; }
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 1) PubPoll();
-    if (!BuildPanelImage()) return;
-    PanelLayout();
+    return true;
+}
+
+// Both renderers: compose the panel into `dst` (BGRA, rows `pitch` bytes apart) when it
+// changed. True when it did (the caller uploads it); PanelLayout has run.
+static bool ComposePanelIfDirty(void* dst, size_t pitch)
+{
     // THE PANEL IS COMPOSED ONLY WHEN IT CHANGES, AND IT IS OPAQUE.
     //
     // It used to be composited over a blurred read-back of the live game frame on
@@ -1738,15 +1745,25 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
                     || g_layer.w != g_copyW || g_layer.h != g_copyH
                     || g_hover != lastHover || g_active != lastActive   // hover wash is composed in
                     || now - lastRender > 500;
-    if (dirty) {
-        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-        RenderPanelLayer(g_copyW, g_copyH); lastRender = now;
-        lastHover = g_hover; lastActive = g_active;
-        ComposeLayer(nullptr, 0, g_panelPtr, g_panelPitch, g_copyW, g_copyH);
-        if (pFlush) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r); }
-        QueryPerformanceCounter(&t1);
-        static int n = 0; if (++n % 60 == 1) Log("[menu] panel compose %dx%d hover=%d %.2f ms (only when changed)\n",
-            g_copyW, g_copyH, g_hover, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
+    if (!dirty) return false;
+    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    RenderPanelLayer(g_copyW, g_copyH); lastRender = now;
+    lastHover = g_hover; lastActive = g_active;
+    ComposeLayer(nullptr, 0, dst, pitch, g_copyW, g_copyH);
+    QueryPerformanceCounter(&t1);
+    static int n = 0; if (++n % 60 == 1) Log("[menu] panel compose %dx%d hover=%d %.2f ms (only when changed)\n",
+        g_copyW, g_copyH, g_hover, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
+    return true;
+}
+
+static void DrawButton(VkQueue q, uint32_t imgIndex)
+{
+    if (imgIndex >= g_scImgCount) return;
+    if (!PanelFramePrep()) return;
+    if (!BuildPanelImage()) return;
+    PanelLayout();
+    if (ComposePanelIfDirty(g_panelPtr, g_panelPitch) && pFlush) {
+        VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r);
     }
     VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2041,7 +2058,11 @@ static void OnHit(int id, int button)
     }
 }
 
-static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
+// The per-frame work both renderers run -- the lobby's events, leaving the lobby with the
+// world, the load stage, the dedicated server's tick, the frame meter. It lived in the
+// Vulkan present hook alone, so on the OpenGL renderer none of it ran (2026-09-21).
+// Returns the frame number.
+static LONG FrameTick()
 {
     PollLobbyOpen();
     if (InterlockedExchange(&g_leaveOnMenu, 0)) {
@@ -2079,22 +2100,37 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         Log("[menu] autoload: no menu frame picked the load up within 12 s -- the player loads mp_shared\n");
         SetStatus("Save ready -- open LOAD GAME and pick \"mp_shared\".");
     }
+    return n;
+}
+
+// Both renderers: whether the panel draws this frame, after the loading view hands over
+// to the in-game panel once the world is up. `quiet`: no world I/O in flight, clicks count.
+static bool OverlayWanted(bool& quiet)
+{
+    const bool loadingPanel = InterlockedCompareExchange(&g_loadingPanel, 0, 0) != 0;
+    if (loadingPanel && WorldLoaded()) {
+        // the world is up: the loading view hands over to the in-game panel, open
+        InterlockedExchange(&g_loadingPanel, 0);
+        InterlockedExchange(&g_showOverlay, 0);
+        InterlockedExchange(&g_ingameOverlay, 1);
+        InterlockedExchange(&g_uiState, 2);
+        InterlockedExchange(&g_panelDirty, 1);
+    }
+    quiet = !g_recoveryWorldIo && !NativeIo::Busy();
+    return !NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent)
+        && (quiet || loadingPanel);
+}
+
+static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
+{
+    const LONG n = FrameTick();
     if (n == 1) Log("[menu] PRESENT #1 swapchains=%u dev=%p\n", pi->swapchainCount, g_dev);
     if (n % 300 == 0) Log("[menu] present state: show=%ld swc=%u rInit=%d rFail=%d dev=%p fam=%u fmt=%d\n",
         InterlockedCompareExchange(&g_showOverlay, 0, 0), pi->swapchainCount,
         (int)g_rInit, (int)g_rFail, g_dev, g_qfam, (int)g_scFormat);
     __try {
-        const bool loadingPanel = InterlockedCompareExchange(&g_loadingPanel, 0, 0) != 0;
-        if (loadingPanel && WorldLoaded()) {
-            // the world is up: the loading view hands over to the in-game panel, open
-            InterlockedExchange(&g_loadingPanel, 0);
-            InterlockedExchange(&g_showOverlay, 0);
-            InterlockedExchange(&g_ingameOverlay, 1);
-            InterlockedExchange(&g_uiState, 2);
-            InterlockedExchange(&g_panelDirty, 1);
-        }
-        const bool quiet = !g_recoveryWorldIo && !NativeIo::Busy();
-        if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && (quiet || loadingPanel) && pi->swapchainCount >= 1) {
+        bool quiet = false;
+        if (OverlayWanted(quiet) && pi->swapchainCount >= 1) {
             VkSwapchainKHR sc = pi->pSwapchains[0];
             uint32_t idx = pi->pImageIndices[0];
             if ((!g_rInit || sc != g_theSc) && !g_rFail) InitRender(sc);
@@ -2115,6 +2151,116 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
     }
     if (NoRender()) NullPace((double)g_flagDedFps);   // headless with the window system: dedicated_fps
     return g_realPresent(q, pi);
+}
+
+// ---------------- OpenGL: the same panel on the OpenGL renderer ----------------
+// SDL2.dll presents an OpenGL frame through GDI32!SwapBuffers; InstallGlPresentHook patches
+// that import. Each frame: the same FrameTick, the same CPU-composed panel, moved onto the
+// window by gl_overlay.h (a texture upload when it changed, a framebuffer blit, every
+// touched piece of GL state put back). The game's context is current on this thread.
+typedef BOOL (WINAPI* SwapBuffersFn)(HDC);
+static SwapBuffersFn g_origSwapBuffers = nullptr;
+static HGLRC (WINAPI* g_wglGetCurrentContext)() = nullptr;
+static GlOverlay::State g_gl;
+static std::vector<unsigned char> g_glPanel;   // the composed panel, CPU side
+static size_t g_glPitch = 0;
+static bool g_glPanelBuilt = false, g_glLoggedFail = false;
+static void DrawPanelGL(HDC hdc)
+{
+    HWND wnd = WindowFromDC(hdc);
+    RECT rc = {};
+    if (!wnd || !GetClientRect(wnd, &rc)) return;
+    const int fbW = rc.right - rc.left, fbH = rc.bottom - rc.top;
+    if (fbW <= 0 || fbH <= 0) return;
+    if ((int)g_scExtent.width != fbW || (int)g_scExtent.height != fbH) {
+        // g_scExtent is what UiScale and PanelLayout size against (the swapchain on Vulkan)
+        g_scExtent.width = (uint32_t)fbW; g_scExtent.height = (uint32_t)fbH;
+        g_glPanelBuilt = false;
+        Log("[menu] OpenGL: window %dx%d\n", fbW, fbH);
+    }
+    if (!PanelFramePrep()) return;
+    if (!GlOverlay::Load(g_gl)) return;
+    if (!g_glPanelBuilt) {
+        g_s = UiScale(); g_panelW = S(800); g_panelH = S(560);   // as BuildPanelImage sizes the Vulkan image
+        if (g_panelW > fbW) g_panelW = fbW; if (g_panelH > fbH) g_panelH = fbH;
+        g_glPitch = (size_t)g_panelW * 4;
+        g_glPanel.assign(g_glPitch * (size_t)g_panelH, 0);
+        if (!GlOverlay::Ensure(g_gl, g_panelW, g_panelH)) return;
+        g_glPanelBuilt = true;
+        InterlockedExchange(&g_panelDirty, 1);
+        Log("[menu] OpenGL: panel texture %dx%d\n", g_panelW, g_panelH);
+    }
+    PanelLayout();
+    const bool upload = ComposePanelIfDirty(g_glPanel.data(), g_glPitch);
+    GlOverlay::Draw(g_gl, g_glPanel.data(), g_glPitch, g_copyW, g_copyH, upload, g_panelX, g_panelY, fbH);
+}
+// SEH only in this frame (no C++ objects): a fault turns the OpenGL overlay off, never the game.
+static void GlFrame(HDC hdc)
+{
+    __try {
+        bool quiet = false;
+        if (!g_gl.failed && OverlayWanted(quiet)) { DrawPanelGL(hdc); if (quiet) PollClick(); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_gl.failed = true;
+        Log("[menu] OpenGL: FAULT exc=%lx while drawing the panel\n", GetExceptionCode());
+    }
+    if (g_gl.failed && !g_glLoggedFail) {
+        g_glLoggedFail = true;
+        Log("[menu] OpenGL overlay off: %s\n", g_gl.why[0] ? g_gl.why : "a fault while drawing");
+    }
+}
+static BOOL WINAPI mySwapBuffers(HDC hdc)
+{
+    if (g_wglGetCurrentContext && g_wglGetCurrentContext()) {
+        const LONG n = FrameTick();
+        if (n == 1) Log("[menu] OpenGL: first SwapBuffers (hdc=%p) -- the Multiplayer panel draws with OpenGL\n", hdc);
+        if (n % 300 == 0) Log("[menu] OpenGL present state: show=%ld loaded=%d failed=%d %ux%u\n",
+            InterlockedCompareExchange(&g_showOverlay, 0, 0), (int)g_gl.loaded, (int)g_gl.failed, g_scExtent.width, g_scExtent.height);
+        GlFrame(hdc);
+    }
+    return g_origSwapBuffers ? g_origSwapBuffers(hdc) : FALSE;
+}
+// Point `mod`'s import of `func` from `dll` at `repl`. *orig is written BEFORE the slot,
+// so a call landing in between already finds the real function.
+static bool PatchImport(HMODULE mod, const char* dll, const char* func, void* repl, void** orig)
+{
+    uint8_t* base = (uint8_t*)mod;
+    if (!base) return false;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress) return false;
+    for (IMAGE_IMPORT_DESCRIPTOR* imp = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); imp->Name; ++imp) {
+        if (_stricmp((const char*)(base + imp->Name), dll) != 0 || !imp->OriginalFirstThunk) continue;
+        IMAGE_THUNK_DATA* names = (IMAGE_THUNK_DATA*)(base + imp->OriginalFirstThunk);
+        IMAGE_THUNK_DATA* slots = (IMAGE_THUNK_DATA*)(base + imp->FirstThunk);
+        for (; names->u1.AddressOfData; ++names, ++slots) {
+            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal)) continue;
+            const IMAGE_IMPORT_BY_NAME* byName = (const IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
+            if (strcmp((const char*)byName->Name, func) != 0) continue;
+            DWORD old = 0;
+            if (!VirtualProtect(&slots->u1.Function, sizeof(void*), PAGE_READWRITE, &old)) return false;
+            *orig = (void*)slots->u1.Function;
+            InterlockedExchangePointer((PVOID*)&slots->u1.Function, repl);
+            VirtualProtect(&slots->u1.Function, sizeof(void*), old, &old);
+            return true;
+        }
+    }
+    return false;
+}
+static void InstallGlPresentHook()
+{
+    // The game itself imports only wglGetProcAddress/wglGetCurrentContext; its window and
+    // buffer swap are SDL2's, which imports GDI32!SwapBuffers (build 35924).
+    HMODULE sdl = GetModuleHandleW(L"SDL2.dll"), ogl = GetModuleHandleW(L"opengl32.dll");
+    if (ogl) g_wglGetCurrentContext = (HGLRC (WINAPI*)())GetProcAddress(ogl, "wglGetCurrentContext");
+    if (!sdl) { Log("[menu] OpenGL: SDL2.dll is not loaded -- no OpenGL overlay\n"); return; }
+    if (!g_wglGetCurrentContext) { Log("[menu] OpenGL: opengl32.dll is not loaded -- no OpenGL overlay\n"); return; }
+    if (PatchImport(sdl, "GDI32.dll", "SwapBuffers", (void*)&mySwapBuffers, (void**)&g_origSwapBuffers))
+        Log("[menu] OpenGL: hooked SDL2's SwapBuffers import (real=%p) -- the panel also draws on the OpenGL renderer\n", (void*)g_origSwapBuffers);
+    else Log("[menu] OpenGL: SDL2.dll imports no GDI32!SwapBuffers -- no OpenGL overlay\n");
 }
 
 static void myGetQueue(VkDevice dev, uint32_t fam, uint32_t idx, VkQueue* pQ)
@@ -4693,6 +4839,8 @@ static DWORD WINAPI Init(LPVOID)
             Log("[menu] vulkan-1.dll not loaded -- game may use a different Vulkan path\n");
         }
     }
+
+    InstallGlPresentHook();   // the same panel and per-frame work on the OpenGL renderer
 
     g_origCreatePage = (CreatePageFn)tramp;
     Log("[menu] hooked CreatePage rva=%llx steal=%d tramp=%p -- overlay thread started\n",
