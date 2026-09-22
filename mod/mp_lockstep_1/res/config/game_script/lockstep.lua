@@ -1548,7 +1548,14 @@ function data()
 				-- the GUI state never runs the engine-side identity detection: read
 				-- the identity file here, or every instance's window thinks it is "a"
 				-- (B's "new company" click went into lockstep_inject_a.txt, 2026-09-09)
-				if not K.INSTANCE then pcall(CM.detectInstance) end
+				-- Re-read every ~2 s, not once: the GUI state can start before the
+				-- bridge rewrites the identity file, and then read LAST session's
+				-- letter. A host that had joined as "b" earlier in the day kept
+				-- "B (you)", an empty status, speed "-", and its clicks went into
+				-- lockstep_inject_b.txt, which nothing on that machine reads
+				-- (2026-09-22). detectInstance returns early when unchanged.
+				CM.guiIdentityTick = (CM.guiIdentityTick or 0) + 1
+				if not K.INSTANCE or CM.guiIdentityTick % 4 == 1 then pcall(CM.detectInstance) end
 				local own = K.INSTANCE or "a"
 				local ownKv = readDash(own)
 				local ownWall = ownKv and tonumber(ownKv.wall) or nil
