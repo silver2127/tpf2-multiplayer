@@ -1,8 +1,8 @@
-## ⚠ EXPERIMENTAL — 0.6.1.25
+## EXPERIMENTAL - 0.6.1.25
 
 **Steam save-transfer test build**
 
-> **For testing — not a stable release.**
+> **For testing - not a stable release.**
 > Everyone in your session needs **0.6.1.25**. Stable **0.6.1.19** is unchanged.
 
 ### What changed
@@ -36,7 +36,7 @@ In a **simulated 1 MiB/s connection**, a 12 MiB save took about **12 seconds ins
 ### Downloads
 
 - **Windows:** [Download the MSI](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/TpF2Multiplayer.msi)
-- **Linux / Steam Deck:** [Proton installer](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/install_proton.sh) · [Python installer](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/install_proton.py)
-- **Manual installation:** [Files ZIP](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/TpF2Multiplayer-files.zip) · [SHA-256 checksums](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/SHA256SUMS.txt)
+- **Linux / Steam Deck:** [Proton installer](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/install_proton.sh) / [Python installer](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/install_proton.py)
+- **Manual installation:** [Files ZIP](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/TpF2Multiplayer-files.zip) / [SHA-256 checksums](https://github.com/silver2127/tpf2-multiplayer/releases/download/v0.6.1.25/SHA256SUMS.txt)
 
 The GitHub **Source code** archives are not the playable mod.
