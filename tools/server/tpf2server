@@ -68,6 +68,7 @@ dedicated_autosave_min=$AUTOSAVE_MIN
 dedicated_empty_speed=$EMPTY_SPEED
 dedicated_render=$RENDER
 dedicated_fps=$FPS
+dedicated_load_delay_sec=${LOAD_DELAY_SEC:-45}
 dedicated_port=$LOBBY_PORT
 autoload=1
 ${MASTER_URL:+master_url=$MASTER_URL}

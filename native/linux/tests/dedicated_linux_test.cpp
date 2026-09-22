@@ -12,15 +12,18 @@ int main() {
     auto write = [&](const char* text) { std::ofstream f(flags); f << text; assert(f.good()); };
     assert(!dedicated::Read(flags).enabled);
     assert(dedicated::Read(flags).recycleSets);
+    assert(dedicated::Read(flags).loadDelaySeconds == 45);
     write("dedicated=1\r\ndedicated_lobby=Native test\n"
           "dedicated_save=mp_test\ndedicated_port=29473\n"
           "dedicated_empty_speed=4\ndedicated_pause_empty=1\n"
-          "dedicated_fps=15\ndedicated_pin_batch=0\ndedicated_nowsi=1\ndedicated_recycle_sets=0\n");
+          "dedicated_fps=15\ndedicated_pin_batch=0\ndedicated_nowsi=1\ndedicated_recycle_sets=0\n"
+          "dedicated_load_delay_sec=15\n");
     dedicated::Configure(flags, dir);
     const auto& s = dedicated::Get();
     assert(s.enabled && s.lobby == "Native test" && s.save == "mp_test");
     assert(!s.recycleSets);
     assert(s.port == 29473 && s.emptySpeed == 0 && s.fps == 15 && !s.pinBatch && s.noWsi);
+    assert(s.loadDelaySeconds == 15);
     std::ifstream input(dir + "mp_dedicated.txt");
     std::string body((std::istreambuf_iterator<char>(input)), {});
     assert(body == "dedicated=1\nempty_speed=0\npause_empty=1\npin_batch=0\n");
