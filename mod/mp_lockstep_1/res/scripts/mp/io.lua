@@ -98,6 +98,9 @@ function CM.detectInstance()
 			pcall(CM.clearFile, K.BASE .. "lockstep_dash_" .. letter .. ".txt")
 		end
 	end
+	-- the spare line the slice may open the editor on (lines.lua): last
+	-- world's id must never reach a click in this one
+	pcall(CM.clearFile, K.BASE .. "lockstep_lspare_" .. inst .. ".txt")
 	log("identity " .. K.INSTANCE .. " (peer " .. K.PEER .. ")")
 	-- WALL CLOCK AT SCRIPT START. The game times a few of its own phases
 	-- (ModelRep, shader reload) and those add up to a couple of seconds, which

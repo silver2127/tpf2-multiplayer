@@ -7,7 +7,14 @@
 # update the code or the settings; the service restarts and keeps its code (the
 # relay keeps its secret in its io dir). It announces to the master server on the
 # same machine; set MASTER_URL for one elsewhere.
+# Loopback ports 7783 -> 7781 (not the defaults 7773 -> 7771): the dedicated game
+# server on the same box (tools/server) uses the defaults for its own bridge, and the
+# two must not exchange frames (2026-09-18).
 set -e
+# RETIRED 2026-09-18: the relay-only lobby is replaced by the dedicated game server
+# (tools/server, tpf2server). The VPS unit tpf2mp-relay is stopped and disabled; this
+# script stays for a future relay and refuses to run unless RELAY_RETIRED_OK=1 is set.
+if [ "${RELAY_RETIRED_OK:-0}" != 1 ]; then echo "the relay-only lobby is retired (2026-09-18); set RELAY_RETIRED_OK=1 to deploy one anyway"; exit 3; fi
 HOST="${1:-root@76.13.109.115}"
 LOBBY="${2:-Dedicated Test Server All Welcome}"
 PORT="${3:-29471}"
@@ -18,10 +25,14 @@ if [ "${FORCE:-0}" != "1" ]; then
   N=$(ssh "$HOST" 'python3 -c "import json;d=json.load(open(\"/var/lib/tpf2mp/relay/lobby_state.json\"));print(len(d.get(\"players\",[])))" 2>/dev/null' || echo 0)
   if [ "${N:-0}" -gt 0 ]; then echo "relay has $N player(s) connected -- not restarting (FORCE=1 to override)"; exit 3; fi
 fi
-tar -C netpunch -cf - lobby.py punch.py seal.py connect.py mesh.py observe.py modshare.py desynclogs.py updater.py sync_lobby.py sync_operation.py sync_runtime.py sync_snapshot.py 2>/dev/null \
+tar -C netpunch -cf - $(cd netpunch && ls *.py | grep -v '^masterserver.py$' | tr '
+' ' ') 2>/dev/null \
   | ssh "$HOST" 'mkdir -p /opt/tpf2mp/netpunch && tar -C /opt/tpf2mp/netpunch -xf -'
 ssh "$HOST" "set -e
 python3 -c 'import stun' 2>/dev/null || pip3 install --quiet --break-system-packages pystun3 || apt-get install -y -qq python3-pip && pip3 install --quiet --break-system-packages pystun3
+# the mod list of a stored save is zstd-compressed inside the .sav (modshare.save_mod_list); without
+# this module the relay advertised every stored world as needing no mods until 2026-09-16
+python3 -c 'import zstandard' 2>/dev/null || pip3 install --quiet --break-system-packages zstandard
 id -u tpf2mp >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin tpf2mp
 mkdir -p /var/lib/tpf2mp/relay /etc/tpf2mp
 chown -R tpf2mp:tpf2mp /var/lib/tpf2mp
@@ -41,6 +52,7 @@ User=tpf2mp
 EnvironmentFile=/etc/tpf2mp/relay.env
 WorkingDirectory=/var/lib/tpf2mp/relay
 ExecStart=/usr/bin/python3 /opt/tpf2mp/netpunch/lobby.py host --relay-only --name relay \\
+  --game-relay-port 7783 --game-local-port 7781 \\
   --lobby-name \"\${LOBBY_NAME}\" --local-port \${RELAY_PORT} \\
   --publish \${MASTER_URL} --public \\
   --io-dir /var/lib/tpf2mp/relay
@@ -55,7 +67,7 @@ ReadWritePaths=/var/lib/tpf2mp/relay
 [Install]
 WantedBy=multi-user.target
 EOF
-if command -v ufw >/dev/null 2>&1; then ufw allow $PORT/udp >/dev/null && echo \"ufw: udp/$PORT open\"; fi
+if command -v ufw >/dev/null 2>&1; then ufw allow $PORT/udp >/dev/null && echo \"ufw: udp/$PORT open\"; ufw allow $PORT/tcp >/dev/null && echo \"ufw: tcp/$PORT open (save transfers)\"; fi
 systemctl daemon-reload
 systemctl enable --now tpf2mp-relay
 systemctl restart tpf2mp-relay

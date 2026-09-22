@@ -22,8 +22,7 @@
 //   InstallHook copies whatever bytes it finds, so a second hook on a target would
 //   chain into the first. slice-core owns the Add and factory targets; several areas
 //   register handlers behind one detour. SliceRegisterHook covers other targets and
-//   refuses anything owned here, patched by our other libraries, or on a page one of
-//   their patches touches (C-HOOK-2, C-HOOK-8).
+//   refuses anything owned here, patched by our other libraries, or overlapping their patch bytes (C-HOOK-2, C-HOOK-8).
 //
 // INSTALL ORDER (C-HOOK-4)
 //   1. Connection() 0x3190240: its 51 bytes must verify, or Add is not hooked
@@ -75,10 +74,14 @@ const uint8_t kSliceConnectionCtorBytes[51] = {
 // verify or write. The plugin host patches only what a plugin asks for at run time,
 // so its sites cannot be listed here.
 static const struct { uintptr_t rva; size_t len; const char* owner; } kForeignPatches[] = {
+    { 0x15ed140, 15, "tpf2_menu: typed native save factory hook (stack arguments)" },
+    { 0x1019f40, 14, "tpf2_menu: native save completion observer" },
+    { 0x1d86ff0, 15, "tpf2_menu: native input hold legacy script-event gate" },
     { 0xc0dc30,  14, "tpf2_bridge_mp: CGameTime::GetSpeed hook" },
     { 0xa31c30,  15, "tpf2_bridge_mp: CGame::Step hook" },
     { 0x1dc51d4, 44, "tpf2_bridge_mp: setPlayer patch A and its cave" },
     { 0x1dc5290,  9, "tpf2_bridge_mp: setPlayer patch B" },
+    { 0x1dc4f8f, 14, "tpf2_bridge_mp: entity-only setPlayer dispatch" },
     { 0x113ca70, 17, "tpf2_menu: main page builder hook" },
     { 0x30de940, 16, "tpf2_menu: list-add hook" },
     { 0x1154b20, 16, "tpf2_menu: UI::CMenuUI::CreatePage hook" },
@@ -571,21 +574,12 @@ static bool HookImageRange(uintptr_t rva, size_t bytes)
     return false;
 }
 
-// Do [a, a+alen) and [b, b+blen) touch a common page? InstallHook and the call
-// redirects mprotect whole pages with no lock between libraries: one library can
-// restore r-x between another's mprotect and its write.
-static bool SharesPage(uintptr_t a, size_t alen, uintptr_t b, size_t blen)
-{
-    const uintptr_t mask = ~((uintptr_t)sysconf(_SC_PAGESIZE) - 1);
-    const uintptr_t a0 = a & mask, a1 = (a + alen - 1) & mask;
-    const uintptr_t b0 = b & mask, b1 = (b + blen - 1) & mask;
-    return a0 <= b1 && b0 <= a1;
-}
-
-static const char* ForeignPageOwner(uintptr_t rva, size_t len)
+// All shipped patchers use Tpf2mpCodeWriteSelf without changing permissions.
+// Separate sites on one RX page are safe; overlapping bytes remain forbidden.
+static const char* ForeignPatchOwner(uintptr_t rva, size_t len)
 {
     for (const auto& fp : kForeignPatches)
-        if (SharesPage(rva, len, fp.rva, fp.len)) return fp.owner;
+        if (Overlaps(rva, len, fp.rva, fp.len)) return fp.owner;
     return nullptr;
 }
 
@@ -698,13 +692,9 @@ bool SliceRegisterHook(const SliceHookSpec& s)
             snprintf(why, sizeof(why), "overlaps CommandList::Add, owned by slice-core (use SliceOnAdd)");
         if (!why[0] && Overlaps(s.rva, (size_t)s.steal, kSliceRvaConnectionCtor, sizeof(kSliceConnectionCtorBytes)))
             snprintf(why, sizeof(why), "overlaps Connection(), which the cancel calls");
-        for (const auto& fp : kForeignPatches)
-            if (!why[0] && Overlaps(s.rva, (size_t)s.steal, fp.rva, fp.len))
-                snprintf(why, sizeof(why), "overlaps a site patched by %s", fp.owner);
         if (!why[0]) {
-            if (const char* owner = ForeignPageOwner(s.rva, (size_t)s.steal))
-                snprintf(why, sizeof(why), "shares a page with a site patched by %s (page protections race across "
-                         "libraries)", owner);
+            if (const char* owner = ForeignPatchOwner(s.rva, (size_t)s.steal))
+                snprintf(why, sizeof(why), "overlaps a site patched by %s", owner);
         }
         for (int i = 0; i < g_nHooks && !why[0]; i++)
             if (Overlaps(s.rva, (size_t)s.steal, g_hooks[i].spec.rva, (size_t)g_hooks[i].spec.steal))
@@ -812,13 +802,13 @@ SliceInstallReport SliceCoreInstall()
     // 1 + 2. Connection() and Add.
     rep.connectionOk = LiveBytesMatch(kSliceRvaConnectionCtor, kSliceConnectionCtorBytes, sizeof(kSliceConnectionCtorBytes));
     g_connectionOk.store(rep.connectionOk);
-    const char* addPageOwner = ForeignPageOwner(kSliceRvaAdd, kSliceStealAdd);
+    const char* addPageOwner = ForeignPatchOwner(kSliceRvaAdd, kSliceStealAdd);
     if (!wantAdd) {
         SliceLog("[slice] no handler arms a cancel or observes Add -- CommandList::Add not hooked\n");
     } else if (!rep.connectionOk) {
         SliceLog("[slice] Connection() at 3190240 differs from build 35924 -- CommandList::Add NOT hooked, nothing can be cancelled\n");
     } else if (addPageOwner) {
-        SliceLog("[slice] CommandList::Add shares a page with a site patched by %s -- NOT hooked, nothing can be cancelled\n",
+        SliceLog("[slice] CommandList::Add overlaps a site patched by %s -- NOT hooked, nothing can be cancelled\n",
                  addPageOwner);
     } else if (!LiveBytesMatch(kSliceRvaAdd, kSliceAddPrologue, sizeof(kSliceAddPrologue)) ||
                PrologueSteal((const unsigned char*)(base + kSliceRvaAdd), 14) != kSliceStealAdd) {
@@ -840,8 +830,8 @@ SliceInstallReport SliceCoreInstall()
         FactorySlot& s = g_slots[i];
         if (!s.nHandlers) continue;
         const SliceFactoryInfo* f = s.info;
-        if (const char* owner = ForeignPageOwner(f->rva, f->steal)) {
-            SliceLog("[slice] %s shares a page with a site patched by %s -- NOT hooked (%d handler(s) idle)\n", f->name,
+        if (const char* owner = ForeignPatchOwner(f->rva, f->steal)) {
+            SliceLog("[slice] %s overlaps a site patched by %s -- NOT hooked (%d handler(s) idle)\n", f->name,
                      owner, s.nHandlers);
             rep.factoriesSkipped++;
             continue;

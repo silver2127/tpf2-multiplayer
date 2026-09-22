@@ -48,6 +48,7 @@ static uintptr_t       g_base = 0;
 static SpeedLogFn      g_log  = nullptr;
 
 static volatile double   g_target  = 0.0;   // 0 = off
+static volatile LONG     g_pinUs   = 0;     // 0 = the engine's own estimate; else the interval imposed every frame
 static volatile LONG     g_lever   = 0;     // the engine's own speed, as GetSpeed last returned it
 static volatile uint64_t g_frames  = 0;
 static uintptr_t         g_retPause = 0, g_retCount = 0;
@@ -88,14 +89,21 @@ extern "C" void CGameStepSeen(uint64_t cgame)
     if (cur != g_lastWritten) g_engineBase = cur;      // the engine spoke since we last wrote
     const double target = g_target;
     const int lever = g_lever;
+    const LONG pin = g_pinUs;
     if (target <= 0.0 || lever <= 0) {
+        if (pin > 0) {
+            // no fractional target: the pinned interval, re-imposed whenever the engine rewrote it
+            if (cur != pin) *field = pin;
+            g_lastWritten = pin; g_applied = pin;
+            return;
+        }
         if (g_lastWritten && cur == g_lastWritten) { *field = g_engineBase; g_applied = g_engineBase; }
         g_lastWritten = 0;
         return;
     }
     double m = target / (double)lever;                 // desired rate over the engine's own
     if (m < 0.25) m = 0.25; else if (m > 2.0) m = 2.0;
-    LONG want = (LONG)((double)g_engineBase / m + 0.5);
+    LONG want = (LONG)((double)(pin > 0 ? pin : g_engineBase) / m + 0.5);
     if (want < 20000) want = 20000;                    // never below 20 ms per batch
     if (want != cur) { *field = want; }
     g_lastWritten = want; g_applied = want;
@@ -106,6 +114,15 @@ extern "C" void CGameStepSeen(uint64_t cgame)
     }
 }
 
+void SpeedHook_SetPin(long us)
+{
+    InterlockedExchange(&g_pinUs, us > 0 ? (LONG)us : 0);
+}
+void SpeedHook_Pace(long* engineBaseUs, int* lever)
+{
+    if (engineBaseUs) *engineBaseUs = (long)g_engineBase;
+    if (lever) *lever = (int)g_lever;
+}
 // A 12-byte stub within +/-2 GB of the exe so a rel32 call can reach our
 // handler: mov rax, imm64 ; jmp rax.
 static void* AllocNear(uintptr_t anchor)

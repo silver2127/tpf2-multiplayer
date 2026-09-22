@@ -71,11 +71,11 @@ void Construction()
     CHECK(std::string(out.data) == "{[\"enabled\"]=false,[\"modules\"]={[1]=true,[2]=\"a\\010\\\"\\\\\\000z\"},[\"seed\"]=123}");
     SliceRecordFree(&out);
     // 0.5.6 regression: modular station params must not truncate at 8 KB.
-    // Linux's dynamic record already supports up to 256 KB.
+    // Exceed both the old node and text limits.
     Table large;
     const std::string payload(1024, 'x');
     std::string expected = "{";
-    for (int i = 1; i <= 64; ++i) {
+    for (int i = 1; i <= 2050; ++i) {
         large.emplace(Number(i), String(payload));
         if (i > 1) expected += ",";
         expected += "[" + std::to_string(i) + "]=\"" + payload + "\"";
@@ -83,14 +83,28 @@ void Construction()
     expected += "}";
     CHECK(expected.size() > 65536);
     CHECK(SliceConstructionParams(uintptr_t(&large), &out, &nodes));
-    CHECK(nodes == 64 && std::string(out.data, out.len) == expected);
+    CHECK(nodes == 2050 && std::string(out.data, out.len) == expected);
     SliceRecordFree(&out);
+    // 100 nested maps use a heap traversal stack, with valid parent headers.
+    Table deep;
+    std::vector<Table*> nestedTables;
+    Table* at = &deep;
+    for (int i=0; i<100; ++i) {
+        auto entry = at->emplace(Number(i), Value{}).first;
+        entry->second.tag = 4;
+        at = new (entry->second.payload.data()) Table;
+        nestedTables.push_back(at);
+    }
+    at->emplace(Number(100), Boolean(true));
+    CHECK(SliceConstructionParams(uintptr_t(&deep), &out, &nodes) && nodes == 101);
+    SliceRecordFree(&out);
+    for (auto i=nestedTables.rbegin(); i!=nestedTables.rend(); ++i) (*i)->~Table();
     Table bad; bad.emplace(Number(1), Number(INFINITY));
     CHECK(!SliceConstructionParams(uintptr_t(&bad), &out, nullptr)); SliceRecordFree(&out);
     CHECK(!SliceConstructionParams(1, &out, nullptr)); SliceRecordFree(&out);
     Table empty;
-    CHECK(!SliceConstructionParams(uintptr_t(&empty), &out, nullptr)); SliceRecordFree(&out);
-    // Cycle nested payload back into itself: must hit a depth limit, never hang.
+    CHECK(SliceConstructionParams(uintptr_t(&empty), &out, nullptr)); SliceRecordFree(&out);
+    // Cycle nested payload back into itself: must reject the ancestor alias, never hang.
     Table cycle; cycle.emplace(Number(1), Value{});
     cycle.begin()->second = Nested(cycle);
     CHECK(!SliceConstructionParams(uintptr_t(&cycle), &out, nullptr)); SliceRecordFree(&out);
@@ -160,7 +174,7 @@ void Codecs()
     Assets a; a.groups.resize(1); a.originalRemovals = 2; a.removals = {12};
     Model model; model.model = "tree.mdl"; model.extra = "tag"; for (int i = 0; i < 16; i += 5) model.matrix[i] = 1;
     a.groups[0].push_back(model);
-    CHECK(EncodeAssets(a, &bytes)); CHECK(std::memcmp(bytes.data(), "TPAS\1\0\0\0\1\0\0\0\2\0\0\0", 16) == 0);
+    CHECK(EncodeAssets(a, &bytes)); CHECK(std::memcmp(bytes.data(), "TPAS\2\0\0\0\1\0\0\0\2\0\0\0", 16) == 0);
     Assets decoded; CHECK(DecodeAssets(bytes, &decoded));
     CHECK(decoded.groups[0][0].model == "tree.mdl" && decoded.originalRemovals == 2);
     CHECK(ParseAssetsFile("rm 12\n" + Base64(bytes), &decoded) && decoded.removals == std::vector<int32_t>{12});
@@ -168,6 +182,15 @@ void Codecs()
     for (const char* prefix : {"rm \n", "rm 1,\n", "rm 0\n", "rm -1\n", "rm 2147483648\n", "rm 1,2,3\n"})
         CHECK(!ParseAssetsFile(std::string(prefix) + Base64(bytes), &decoded));
     bytes.push_back(0); CHECK(!DecodeAssets(bytes, &decoded));
+    a.groups[0][0].model.assign(70000, 'm');
+    a.originalRemovals = 5000;
+    CHECK(EncodeAssets(a, &bytes) && DecodeAssets(bytes, &decoded));
+    CHECK(decoded.groups[0][0].model.size() == 70000 && decoded.originalRemovals == 5000);
+    auto old = bytes; old[4] = 1; CHECK(!DecodeAssets(old, &decoded));
+    for (size_t n : {size_t(16), size_t(20), size_t(24), bytes.size()-1}) {
+        std::vector<uint8_t> truncated(bytes.begin(), bytes.begin()+n);
+        CHECK(!DecodeAssets(truncated, &decoded));
+    }
     a.groups[0][0].model = "a\0b"s; CHECK(!EncodeAssets(a, &bytes));
 }
 
@@ -259,6 +282,45 @@ struct MergeFixture {
 void MergeTemplates()
 {
     GameMemory memory{Alloc, Free, FakeCtor};
+    // A station with a boundary connector before an interior edge, many frozen
+    // nodes and both inline/heap strings. Compaction must preserve ownership.
+    for(int invalid=0;invalid<3;++invalid){
+        MergeFixture f(true);f.nodes.resize(5);f.edges.resize(3);f.tags.resize(3);
+        for(size_t i=0;i<5;++i){
+            Put(f.nodes[i].data(),0x14,-1-int32_t(i));
+            Put(f.nodes[i].data(),0,i==2?10.0f:i==3?-10.0f:0.0f);
+            Put(f.nodes[i].data(),4,i==4?10.0f:0.0f);
+        }
+        // script -1->100, template -2->-3, interior -4->-2.
+        Put(f.edges[2].data(),8,int32_t(-4));Put(f.edges[2].data(),12,int32_t(-2));f.edges[2][0x74]=1;
+        f.frozen={0,1,3,4};f.ceFrozen={1,3,4};
+        VectorAt(f.proposal.data(),0,f.nodes);VectorAt(f.proposal.data(),0x18,f.edges);
+        VectorAt(f.proposal.data(),0x220,f.frozen);VectorAt(f.construction[0].data(),0x778,f.ceFrozen);
+        for(size_t i=0;i<f.tags.size();++i){
+            const std::string text=i==0?"long discarded script connector tag":i==1?"boundary":"interior";
+            char* data=text.size()>15?static_cast<char*>(Alloc(text.size()+1)):reinterpret_cast<char*>(f.tags[i].data()+16);
+            memcpy(data,text.c_str(),text.size()+1);Put(f.tags[i].data(),0,data);Put(f.tags[i].data(),8,text.size());
+            if(text.size()>15)Put(f.tags[i].data(),16,text.size());
+        }
+        VectorAt(f.proposal.data(),0x270,f.tags);f.Objects(f.edges[1],{72,73});
+        if(invalid==1)f.ceFrozen.push_back(2);
+        if(invalid==2)Put(f.proposal.data(),0x250,size_t(1));
+        VectorAt(f.construction[0].data(),0x778,f.ceFrozen);
+        auto before=f.proposal;auto oldNodes=f.nodes;auto oldEdges=f.edges;auto oldTags=f.tags;
+        CHECK(SliceMergeTemplateStreet(f.Address(),&memory)==(invalid==0));
+        if(invalid){CHECK(f.proposal==before && f.nodes==oldNodes && f.edges==oldEdges && f.tags==oldTags);}
+        else{
+            SliceVec span;CHECK(SliceReadStdVector(f.Address(),24,64,&span) && span.count==3);
+            CHECK(SliceReadStdVector(f.Address()+0x18,120,64,&span) && span.count==2);
+            CHECK(Get<int32_t>(f.edges[0].data(),8)==-2 && Get<int32_t>(f.edges[0].data(),12)==100);
+            CHECK(f.frozen==std::vector<int32_t>({0,0,1,2}) && f.ceFrozen==std::vector<int32_t>({0,1,2}));
+            CHECK(Get<int32_t>(f.construction[0].data(),0x790)==0);
+            std::string tag;CHECK(SliceReadStdString(uintptr_t(f.tags[0].data()),&tag) && tag=="boundary");
+            CHECK(SliceReadStdString(uintptr_t(f.tags[1].data()),&tag) && tag=="interior");
+            CHECK(Get<uint64_t*>(f.edges[0].data(),0x30)[1]==73);
+        }
+        f.DestroyTransferred();CHECK(allocations.empty());
+    }
     for (const std::string& replacement : {std::string("apron"), std::string("a deliberately long construction apron tag")}) {
         MergeFixture f(true);
         f.Objects(f.edges[0], {11}); f.Objects(f.edges[1], {22,33});

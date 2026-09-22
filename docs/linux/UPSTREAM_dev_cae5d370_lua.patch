@@ -1,0 +1,75 @@
+diff --git a/mod/mp_lockstep_1/res/config/game_script/lockstep.lua b/mod/mp_lockstep_1/res/config/game_script/lockstep.lua
+index c04e337..bffeb48 100644
+--- a/mod/mp_lockstep_1/res/config/game_script/lockstep.lua
++++ b/mod/mp_lockstep_1/res/config/game_script/lockstep.lua
+@@ -1460,3 +1460,25 @@ function data()
+-					CM.dashShowStats = (CM.dashShowStats == true)          -- hidden by default
+-					CM.dashShowChat = (CM.dashShowChat ~= false)
+-					CM.dashShowCompanies = (CM.dashShowCompanies == true)  -- hidden by default
++					-- Sections as tabs (2026-09-16): lobby, stats, chat, companies and speed
++					-- show one at a time. A section's button opens it and closes the
++					-- others; the open section's button closes it. CM.dashTab survives a
++					-- rebuild of the window (false = every section closed).
++					local TABS = { { "lobby", "dashShowLobby" }, { "stats", "dashShowStats" }, { "chat", "dashShowChat" },
++					               { "companies", "dashShowCompanies" }, { "speed", "dashShowSpeed" } }
++					if CM.dashTab == nil then CM.dashTab = "chat" end   -- the chat was the section open by default
++					local function applyTabs()
++						for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
++						-- a chat input left open behind a hidden chat would keep taking keys
++						if not CM.dashShowChat and D.chatOpen and CM.chatCloseInput then pcall(CM.chatCloseInput) end
++						pcall(function() D.lobbyBox:setVisible(CM.dashShowLobby, false) end)
++						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
++						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
++						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
++						D.speedShown = nil   -- the GUI tick re-applies the speed row
++						for name, label in pairs(D.tabLabels or {}) do
++							pcall(function() label:setText(CM.dashTab == name and ("[ " .. name .. " ]") or ("  " .. name .. "  ")) end)
++						end
++					end
++					local function selectTab(name)
++						CM.dashTab = (CM.dashTab ~= name) and name or false
++						applyTabs()
++					end
++					for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
+@@ -1475,22 +1497,8 @@ function data()
+-					tog:addItem(toggleBtn("  lobby  ", function()
+-						CM.dashShowLobby = not CM.dashShowLobby
+-						D.lobbyBox:setVisible(CM.dashShowLobby, false)
+-					end))
+-					tog:addItem(toggleBtn("  stats  ", function()
+-						CM.dashShowStats = not CM.dashShowStats
+-						pcall(function() D.statsBox:setVisible(CM.dashShowStats, false) end)
+-					end))
+-					tog:addItem(toggleBtn("  chat  ", function()
+-						CM.dashShowChat = not CM.dashShowChat
+-						pcall(function() D.chatBox:setVisible(CM.dashShowChat, false) end)
+-					end))
+-					tog:addItem(toggleBtn("  companies  ", function()
+-						CM.dashShowCompanies = not CM.dashShowCompanies
+-						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
+-					end))
+-					-- the speed vote row: shown by default, this toggle hides it
+-					CM.dashShowSpeed = (CM.dashShowSpeed ~= false)
+-					tog:addItem(toggleBtn("  speed  ", function()
+-						CM.dashShowSpeed = not CM.dashShowSpeed
+-						D.speedShown = nil   -- the GUI tick re-applies the row's visibility
+-					end))
++					D.tabLabels = {}
++					for _, t in ipairs(TABS) do
++						local name = t[1]
++						D.tabLabels[name] = api.gui.comp.TextView.new("  " .. name .. "  ")
++						local b = api.gui.comp.Button.new(D.tabLabels[name], true)
++						b:onClick(function() selectTab(name) end)
++						tog:addItem(b)
++					end
+@@ -1525 +1532,0 @@ function data()
+-					D.lobbyBox:setVisible(CM.dashShowLobby == true, false)
+@@ -1771,6 +1778,2 @@ function data()
+-					pcall(function()
+-						D.statsBox:setVisible(CM.dashShowStats, false)
+-						D.rawBox:setVisible(CM.dashShowNumbers, false)
+-						D.chatBox:setVisible(CM.dashShowChat, false)
+-						D.coBox:setVisible(CM.dashShowCompanies, false)
+-					end)
++					pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
++					applyTabs()

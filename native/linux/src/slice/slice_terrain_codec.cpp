@@ -76,7 +76,6 @@ std::string Base64(const std::vector<uint8_t>& bytes)
 bool Unbase64(const std::string& text, std::vector<uint8_t>* out)
 {
     out->clear();
-    if (text.size() > ((MaxBytes + 512) * 4 / 3 + 16)) return false;
     unsigned q[4]; size_t count = 0; bool padded = false;
     for (unsigned char c : text) {
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
@@ -99,7 +98,6 @@ bool Unbase64(const std::string& text, std::vector<uint8_t>* out)
         if (q[2] != 64) out->push_back(uint8_t((q[1] << 4) | (q[2] >> 2)));
         if (q[3] != 64) out->push_back(uint8_t((q[2] << 6) | q[3]));
         padded = q[3] == 64;
-        if (out->size() > MaxBytes + 512) return false;
     }
     return count == 0;
 }
@@ -149,9 +147,9 @@ bool DecodeTerrain(const std::vector<uint8_t>& bytes, Terrain* out)
 bool EncodeAssets(const Assets& assets, std::vector<uint8_t>* out)
 {
     out->clear();
-    if (assets.groups.size() > MaxAssetGroups || assets.originalRemovals > 4096) return false;
+    if (assets.groups.size() > MaxAssetGroups) return false;
     if (assets.groups.empty() && !assets.originalRemovals) return false;
-    Bytes(*out, "TPAS", 4); Put(*out, uint32_t(1));
+    Bytes(*out, "TPAS", 4); Put(*out, uint32_t(2));
     Put(*out, uint32_t(assets.groups.size())); Put(*out, assets.originalRemovals);
     size_t totalModels = 0;
     for (const auto& group : assets.groups) {
@@ -160,10 +158,9 @@ bool EncodeAssets(const Assets& assets, std::vector<uint8_t>* out)
         for (const Model& model : group) {
             if (!ValidString(model.model, true) || !ValidString(model.extra, false)) return false;
             for (float f : model.matrix) if (!std::isfinite(f)) return false;
-            Put(*out, uint16_t(model.model.size())); Bytes(*out, model.model.data(), model.model.size());
-            Put(*out, uint16_t(model.extra.size())); Bytes(*out, model.extra.data(), model.extra.size());
+            Put(*out, uint32_t(model.model.size())); Bytes(*out, model.model.data(), model.model.size());
+            Put(*out, uint32_t(model.extra.size())); Bytes(*out, model.extra.data(), model.extra.size());
             Bytes(*out, model.matrix.data(), 64);
-            if (out->size() > MaxBytes) return false;
         }
     }
     return true;
@@ -171,19 +168,18 @@ bool EncodeAssets(const Assets& assets, std::vector<uint8_t>* out)
 bool DecodeAssets(const std::vector<uint8_t>& bytes, Assets* out)
 {
     *out = {};
-    if (bytes.size() > MaxBytes) return false;
     Reader r{bytes}; char magic[4]; uint32_t version, count;
-    if (!r.take(magic, 4) || std::memcmp(magic, "TPAS", 4) || !r.get(&version) || version != 1 ||
-        !r.get(&count) || count > MaxAssetGroups || !r.get(&out->originalRemovals) || out->originalRemovals > 4096 ||
+    if (!r.take(magic, 4) || std::memcmp(magic, "TPAS", 4) || !r.get(&version) || version != 2 ||
+        !r.get(&count) || count > MaxAssetGroups || !r.get(&out->originalRemovals) ||
         (!count && !out->originalRemovals)) return false;
     size_t totalModels = 0;
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t n;
-        if (!r.get(&n) || !n || n > MaxAssetModels || (totalModels += n) > MaxTotalModels || n > (bytes.size() - r.pos) / 69) return false;
+        if (!r.get(&n) || !n || n > MaxAssetModels || (totalModels += n) > MaxTotalModels || n > (bytes.size() - r.pos) / 73) return false;
         std::vector<Model> group(n);
         for (Model& m : group) {
             for (std::string* s : {&m.model, &m.extra}) {
-                uint16_t len;
+                uint32_t len;
                 if (!r.get(&len) || len > MaxAssetString || len > bytes.size() - r.pos) return false;
                 s->resize(len);
                 if (!r.take(s->data(), len) || !ValidString(*s, s == &m.model)) return false;
@@ -198,7 +194,7 @@ bool DecodeAssets(const std::vector<uint8_t>& bytes, Assets* out)
 bool ParseAssetsFile(const std::string& text, Assets* out)
 {
     const size_t nl = text.find('\n');
-    if (text.compare(0, 3, "rm ") || nl == std::string::npos || nl > 45060) return false;
+    if (text.compare(0, 3, "rm ") || nl == std::string::npos) return false;
     size_t end = nl;
     while (end > 3 && (text[end - 1] == '\r' || text[end - 1] == ' ')) --end;
     std::vector<int32_t> ids;
@@ -212,7 +208,7 @@ bool ParseAssetsFile(const std::string& text, Assets* out)
                 id = id * 10 + unsigned(text[i++] - '0');
                 if (id > INT32_MAX) return false;
             }
-            if (!id || ids.size() >= 4096) return false;
+            if (!id) return false;
             ids.push_back(int32_t(id));
             if (i == end) break;
             if (text[i++] != ',' || i == end) return false;

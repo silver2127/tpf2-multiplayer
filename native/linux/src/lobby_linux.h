@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "dedicated_linux.h"
 
 using Tpf2mpLogFn = void (*)(const char* fmt, ...);
 
@@ -35,6 +36,7 @@ struct Config {
     int  relayAutosaveMin = 2;    // relay_autosave_min: the relay leader's periodic upload (0 = never)
     int  shareMods = 0;           // share_mods: 0 ask, 1 always, 2 never
     bool autoload = true;         // autoload: START loads the shared save in-process
+    dedicated::Settings dedicated;
 };
 
 using StatusFn = void (*)(const char* utf8);   // the panel's status line
@@ -52,7 +54,10 @@ struct StartRequest {
     std::string name;        // --name
     std::string password;    // --password, when not empty
     std::string lobbyName;   // host: --lobby-name
+    bool separateCompanies = false; // host: --companies
     bool pub = false;        // host: --public
+    bool dedicated = false;
+    int localPort = 0;       // dedicated host port; 0 uses the normal host default
 };
 
 // Checks the request and hands the launch to the lobby thread, which stops a
@@ -65,10 +70,14 @@ void Leave();                                    // quit; after 1.5 s SIGTERM; a
 // missing, failed to start or has exited answers "The lobby is not running --
 // ...", so the panel keeps the typed text and the status says why.
 std::string SendChat(const std::string& text);
-std::string StartGame();                         // host: share the newest save, then start
+std::string StartGame();                         // host: share the selected save, then start
+void RefreshSaves();                             // enumerate on the lobby worker
+std::string SelectSave(const std::string& path);
+std::string RecoveryAction(const std::string& command);
+std::string SetSeparateCompanies(bool on);
 std::string SetPublic(bool on);                  // host: list or delist the running lobby
 std::string AnswerMods(bool yes);                // YES / NO to the mods question
-void CycleCompany(int rosterIndex);              // a company chip was clicked
+void CycleCompany(int rosterIndex, bool previous = false);              // a company chip was clicked
 
 // The room code for the clipboard. The panel copies it on the UI thread; the
 // code is never drawn (menu_hook.cpp, "ROOM CODE, DELIBERATELY NOT RENDERED").
@@ -78,11 +87,21 @@ bool TakeAutoCopy(std::string* code);
 bool CapturesTyping();                           // lock-free: false once the shared save is placed
 
 struct Player {
-    std::string name;
+    std::string name, stage;
     int company = 1;
     bool you = false, host = false;
 };
+struct SaveRow { std::string path, name; uint64_t modified=0; };
 struct View {
+    bool active=false,inGame=false;
+    std::string recoveryPhase,recoveryDetail,recoveryStep;
+    bool recoveryPresent=false,recoveryRequested=false,readyMine=false;
+    int readyCount=0,readyTotal=0;
+    uint64_t recoveryVersion=0;
+    std::vector<SaveRow> saves;
+    std::string selectedSave;
+    bool startPending=false;
+    bool separateCompanies = false;
     bool haveCode = false;
     bool isHost = false;          // START GAME: the host, or a relay lobby's leader
     bool youAreHost = false;      // chips: the host may set anyone's company

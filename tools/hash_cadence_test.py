@@ -15,6 +15,8 @@ stamp, and a hot joiner that takes the grid from the save:
   - down only with headroom, and at most once per K.HASH_CADENCE_MIN_TICKS
   - a bad HASHEVERY is refused; the grid survives save/load, and a hot joiner that loads it
     hashes the same stamps (one that does not, does not -- the check can fail)
+  - tpf2mp_hash_every.txt forces the interval on a vanilla-size map, and is ignored in favour of
+    the cost ladder on a map past Megalomaniac (2026-09-17)
 
     python tools/hash_cadence_test.py
 """
@@ -156,6 +158,68 @@ bad = G.newGame('q', 'q')
 bad.CM.execHashEvery(L.eval('{ op = "HASHEVERY", every = 100, prev = 60, at = 5000, origin = "q", seq = 1 }'))
 bad.CM.execHashEvery(L.eval('{ op = "HASHEVERY", every = 6, prev = 60, at = 5000, origin = "q", seq = 2 }'))
 check('a HASHEVERY off the 12-unit grid is refused', bad.CM.hashGrid is None and G.logged(bad, 'bad interval every=100'))
+bad.K.HASH_EVERY_MIN = 4
+bad.CM.execHashEvery(L.eval('{ op = "HASHEVERY", every = 4, prev = 12, at = 5000, origin = "q", seq = 3 }'))
+check('a forced 4-unit interval (K.HASH_EVERY_MIN) is accepted', bad.CM.hashGrid is not None and bad.CM.hashGrid.every == 4)
+# the forced cadence: the leader stamps the file's interval whatever the cost says
+fz = G.newGame('z', 'z')
+fz.K.HASH_EVERY_MIN = 4
+fz.CM.hashEveryForced = lambda: 4
+for ms in (2000, 2000):
+    fz.CM.hashCostNote(ms)
+fz.CM.hashCadenceTick(1000)
+forcedCmds = [G.BUS[i] for i in range(1, len(G.BUS) + 1) if G.BUS[i].op == 'HASHEVERY' and G.BUS[i].origin == 'z']
+check('tpf2mp_hash_every.txt forces the interval regardless of cost', len(forcedCmds) == 1 and forcedCmds[0].every == 4 and forcedCmds[0].prev == 12,
+      str([(c.every, c.prev) for c in forcedCmds]))
+L.execute('for k in pairs(BUS) do BUS[k] = nil end')   # the forced command is not part of the three-game story below
+# the same forced flag on a map past Megalomaniac: the cost ladder decides (2000 ms -> 288), the flag is ignored
+L.execute(r'''
+TILES = { x = 96, y = 96 }
+api = { engine = { util = { getWorld = function() return 7 end },
+                   getComponent = function(w, t) assert(w == 7 and t == "TERRAIN"); return { size = TILES } end },
+        type = { ComponentType = { TERRAIN = "TERRAIN" } } }
+''')
+fm = G.newGame('m', 'm')
+fm.K.HASH_EVERY_MIN = 4
+fm.CM.hashEveryForced = lambda: 4
+for ms in (2000, 2000):
+    fm.CM.hashCostNote(ms)
+fm.CM.hashCadenceTick(1000)
+megaCmds = [G.BUS[i] for i in range(1, len(G.BUS) + 1) if G.BUS[i].op == 'HASHEVERY' and G.BUS[i].origin == 'm']
+check('Megalomaniac itself (96 x 96) still takes the forced interval', len(megaCmds) == 1 and megaCmds[0].every == 4,
+      str([(c.every, c.prev) for c in megaCmds]))
+L.execute('TILES = { x = 224, y = 224 }')
+fb = G.newGame('n', 'n')
+fb.K.HASH_EVERY_MIN = 4
+fb.CM.hashEveryForced = lambda: 4
+for ms in (2000, 2000):
+    fb.CM.hashCostNote(ms)
+fb.CM.hashCadenceTick(1000)
+bigCmds = [G.BUS[i] for i in range(1, len(G.BUS) + 1) if G.BUS[i].op == 'HASHEVERY' and G.BUS[i].origin == 'n']
+check('a 224 x 224 map ignores the forced 4 and takes the ladder rung for 2000 ms (288)',
+      len(bigCmds) == 1 and bigCmds[0].every == 288 and bigCmds[0].prev == 12, str([(c.every, c.prev) for c in bigCmds]))
+check('the decision is logged once and remembered', G.logged(fb, 'past Megalomaniac') and fb.CM.mapPastMega is True)
+L.execute('TILES = { x = 48, y = 192 }')
+fw = G.newGame('w', 'w')
+fw.K.HASH_EVERY_MIN = 4
+fw.CM.hashEveryForced = lambda: 4
+for ms in (100, 100):
+    fw.CM.hashCostNote(ms)
+fw.CM.hashCadenceTick(1000)
+wideCmds = [G.BUS[i] for i in range(1, len(G.BUS) + 1) if G.BUS[i].op == 'HASHEVERY' and G.BUS[i].origin == 'w']
+check('192 on an axis (1:4 Megalomaniac) is still vanilla: forced', len(wideCmds) == 1 and wideCmds[0].every == 4,
+      str([(c.every, c.prev) for c in wideCmds]))
+L.execute('TILES = { x = 48, y = 200 }')
+fx = G.newGame('x2', 'x2')
+fx.K.HASH_EVERY_MIN = 4
+fx.CM.hashEveryForced = lambda: 4
+for ms in (90, 90):
+    fx.CM.hashCostNote(ms)
+fx.CM.hashCadenceTick(1000)
+axisCmds = [G.BUS[i] for i in range(1, len(G.BUS) + 1) if G.BUS[i].op == 'HASHEVERY' and G.BUS[i].origin == 'x2']
+check('200 on an axis is past it: the ladder (90 ms -> 12, already there: no command)', len(axisCmds) == 0,
+      str([(c.every, c.prev) for c in axisCmds]))
+L.execute('api = nil; for k in pairs(BUS) do BUS[k] = nil end')
 
 print('== three games through three switches')
 a, b, c = G.newGame('a', 'a', 0), G.newGame('b', 'a', 0.2), G.newGame('c', 'a', 0.4)

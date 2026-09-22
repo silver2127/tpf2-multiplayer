@@ -14,6 +14,8 @@
 #include <share.h>
 #include <windows.h>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <iphlpapi.h>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
@@ -228,10 +230,6 @@ static bool netDirUsable(const wchar_t* dir)
 static void resolveNetDir(wchar_t* out, int cch)
 {
     wchar_t la[MAX_PATH];
-    if (GetEnvironmentVariableW(L"TPF2MP_RELEASE_ROOT", la, MAX_PATH)) {
-        _snwprintf_s(out, cch, _TRUNCATE, L"%s\\netpunch", la);
-        return;
-    }
     if (GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH)) {
         wchar_t cand[MAX_PATH]; _snwprintf_s(cand, _TRUNCATE, L"%s\\tpf2mp\\netpunch", la);
         if (netDirUsable(cand)) { wcscpy_s(out, cch, cand); return; }
@@ -262,6 +260,44 @@ static CreatePageFn g_origCreatePage = nullptr;
 // resolves them, then draw a clear-attachment button rect each frame.
 static PFN_vkGetDeviceProcAddr g_origGdpa    = nullptr;
 static PFN_vkQueuePresentKHR   g_realPresent = nullptr;
+// NO RENDERING (2026-09-18, user: "can we disable the renderer"): a dedicated
+// server has no GPU; its Vulkan is lavapipe, which rasterizes on the CPU at
+// vkQueueSubmit -- six llvmpipe threads at 180% for a town nobody looks at, and
+// the sim, which advances per frame, crawled. With dedicated_render=0 (the
+// default in dedicated mode) every submit goes through EMPTY: the same fences
+// and semaphores are signalled, no command buffer runs; query results read as
+// zero so nothing waits on a query that never executed; the panel is not drawn.
+// The engine's frame loop, the swapchain and the present are untouched.
+static PFN_vkQueueSubmit        g_origSubmit  = nullptr;
+static PFN_vkGetQueryPoolResults g_origQueryResults = nullptr;
+// ... and NO WINDOW SYSTEM either (same evening): with the command buffers gone
+// the server still presented through lavapipe's X11 swapchain at 30 frames a
+// second, and the engine steps the simulation per frame as if there were 60 --
+// the world ran at exactly half of every speed asked (0.45 units/s at 1x, 0.9 at
+// 2x; a PC does 0.9 at 1x). With dedicated_render=0 the swapchain is never
+// acquired from or presented to: acquire hands out image indices in turn and
+// signals the semaphore/fence through an empty submit, present consumes its
+// wait semaphores the same way and returns, and the frame loop is paced here to
+// NORENDER_FPS instead of by the X server.
+static PFN_vkAcquireNextImageKHR g_origAcquire = nullptr;
+static PFN_vkAcquireNextImage2KHR g_origAcquire2 = nullptr;
+static PFN_vkGetSwapchainImagesKHR g_origGetScImages = nullptr;
+static volatile LONG g_noWsi = 0;            // dedicated_nowsi=1 (opt-in, needs render=0): acquire/present answered here -- crashed the engine on the VPS 2026-09-18 22:42, under study
+static volatile LONG g_nullScCount = 0;      // images in the current swapchain (for the round robin)
+static volatile LONG g_nullScNext = 0;
+static const double NORENDER_FPS = 60.0;     // the frame rate the engine's per-frame stepping assumes (the DLL-answered present)
+// dedicated_fps=<n> (default 30): with render=0 and the window system still in
+// place, the present is paced here to this many frames a second. The engine
+// needs only 5 batches a second; every headless frame beyond that is scene
+// prep for nobody on the thread that hands the sim its batches (2026-09-18).
+static int g_flagDedFps = 30;
+static int g_flagDedPinBatch = 1;             // dedicated_pin_batch=0|1: 1 (default) pins the engine's batch interval at 200 ms (tpf2_bridge_mp.dll speedhook)
+static void NullSignal(VkQueue q, VkSemaphore signalSem, VkFence fence, uint32_t waitCount, const VkSemaphore* waitSems);
+static void NullPace(double fps);
+static volatile LONG g_noRender = 0;
+static volatile LONG g_noRenderSubmits = 0, g_noRenderCmdBufs = 0;
+static bool NoRender() { return InterlockedCompareExchange(&g_noRender, 0, 0) != 0; }
+static bool NoWsi() { return InterlockedCompareExchange(&g_noWsi, 0, 0) != 0; }
 static PFN_vkGetDeviceQueue    g_origGetQueue = nullptr;
 static PFN_vkCreateSwapchainKHR g_origCreateSc = nullptr;
 static VkDevice   g_dev   = VK_NULL_HANDLE;
@@ -312,9 +348,22 @@ static bool           g_panelBuilt = false;
 static char           g_code[128] = "";                   // host/own code to display
 static volatile LONG  g_haveCode = 0;
 static wchar_t        g_startSaveW[600] = L"";             // host: the .sav it chose to share
+// Picker state belongs to the presentation thread; g_startSaveW is the transfer snapshot.
+struct LobbySave { std::wstring path, name; FILETIME modified; };
+static std::vector<LobbySave> g_lobbySaves;
+static std::wstring g_selectedSave;
+static bool g_savePicker = false;
+static volatile LONG g_saveStartPending = 0;
+static void SaveStartStatus(const char* state, const char* detail)
+{
+    // A refusal permits choosing another world; ordinary progress must keep the snapshot fixed.
+    if (!strcmp(state,"failed") || strstr(detail,"no players to share with")==detail || strstr(detail,"Not shared:")==detail)
+        InterlockedExchange(&g_saveStartPending,0);
+}
+static int g_savePage = 0;
+static const int SAVE_ROWS = 8;
+static void RefreshLobbySaves();
 static volatile LONG  g_panelDirty = 1;       // re-render the GDI content
-static volatile LONG g_updateAvailable = 0, g_updateBusy = 0;
-static void StartUpdateCheck();
 static int            g_panelX = 0, g_panelY = 0;   // top-left on the swapchain
 
 // render resources
@@ -334,14 +383,25 @@ static bool WorldLoaded();
 static bool LobbyRunning();
 static void SyncStart(const char* why);
 static void PollLobbyOpen();
+static void StageTick();
+static void MarkSaveShared();
 static volatile LONG g_showOverlay = 0;   // set by the CreatePage detour (page==2)
+// LEAVING THE WORLD LEAVES THE LOBBY (2026-09-16). Set by the CreatePage detour
+// when the title menu comes up while a CGameUI was still known (a world was up
+// a frame ago) and a lobby runs; consumed on the present thread (myPresent),
+// where LEAVE's teardown already runs, so the menu build is never stalled by
+// the 1.5 s the lobby gets to quit. A joiner waiting at the title menu for a
+// save never had a CGameUI, so it is not affected; a world switch (a start with
+// switch=1) and a resync load happen in place and never build the title menu.
+static volatile LONG g_leaveOnMenu = 0;
 static HWND g_gameWnd = nullptr;
 static BOOL CALLBACK FindGameWnd(HWND h, LPARAM lp);
 static void StartLobby(int join);     // host=0 / join=1 -> spawns lobby.py
+static void DedicatedTick();          // dedicated server mode (tpf2_menu_flags.txt dedicated=1): host, load, keep up
 static void LeaveLobby();
 static DWORD WINAPI KbHookThread(LPVOID);
 static bool LobbySend(const char* jsonLine);
-static const char* originLetterFor(const char* name);
+static std::string originLetterFor(const std::string& name);
 static void ClipboardSet(const char* utf8);
 static bool ClipboardGet(char* out, int outsz);
 static bool newestSave(wchar_t* out, int cch);
@@ -354,6 +414,28 @@ static bool doStartLoad(const wchar_t* srcSav);
 //    incoming_save.* files are complete and a 'start' with save=true may load them.
 static volatile LONG g_lobbyReady = 0;
 static volatile LONG g_saveReady  = 0;
+// WORLD SWITCH: the host loads ANOTHER world while a session is running (the
+// game's own LOAD GAME, in the title menu or in game, or NEW GAME/CONTINUE).
+// Everyone else has to leave the world they are playing and load that one, so
+// the save goes out with "switch":true and a joiner takes it even though it
+// already started. See OnStartSavegame (the load the player asked for) and
+// PollWorldGen (the loads that carry no save name).
+//  g_selfLoad         -- our own AutoLoadCall is inside StartSavegame: never share it
+//  g_hostLoadedItself -- the host shared the save its OWN menu is loading; the
+//                        'start' that comes back must not load it a second time
+//  g_sessionStarted   -- the lobby has started this session (a start event arrived)
+//  g_worldGen         -- last value read from the mod's tpf2mp_world_gen.txt
+//  g_worldGenHold     -- absorb the next change: it is a load WE caused
+//  g_switchShare      -- the save SyncPoll is about to share is a world switch
+static volatile LONG g_selfLoad = 0, g_hostLoadedItself = 0, g_lastPage = -1;
+//  g_hostMenuLoad -- the host's own mid-session LOAD GAME is in flight (a world
+//  switch it shared); the title page the engine builds on the way is not a
+//  "left the world" (consumed by MyCreatePage, one shot).
+static volatile LONG g_hostMenuLoad = 0;
+static volatile LONG g_sessionStarted = 0;
+static volatile LONG g_worldGenHold = 0, g_switchShare = 0;
+static char g_worldGen[160] = "";
+static void PollWorldGen();
 static CRITICAL_SECTION g_lobbyCs; static bool g_lobbyCsInit = false;   // guards g_lobbyProc handle use vs close
 
 template <class T> static T rget(const char* n) { return (T)g_origGdpa(g_dev, n); }
@@ -443,6 +525,13 @@ static bool InitRender(VkSwapchainKHR sc)
 // ---- multiplayer panel state ----
 static volatile LONG g_recoveryPresent = 0;
 static volatile LONG g_recoveryWorldIo = 0;
+// THE PANEL STAYS UP WHILE A WORLD LOADS (2026-09-18, user): with a lobby running,
+// the loading screen (CreatePage 16) keeps the lobby view -- the roster with what
+// every player is doing (receiving the save N%, loading world N%, catching up).
+// It is drawn even during a native save/load (the frozen join is one) but takes
+// no clicks then; when the world is up it hands over to the in-game panel, open,
+// so the catch-up is visible too, until the player closes it.
+static volatile LONG g_loadingPanel = 0;
 static ULONGLONG g_recoveryRequestedAt = 0; // guarded by g_modelCs
 static char g_recoveryOperation[40] = "", g_recoveryEpoch[40] = "";
 static char g_recoveryPhase[24] = "", g_recoveryDetail[420] = "", g_recoveryFailedStep[24] = "";
@@ -482,15 +571,61 @@ static void ModDownloadPreference(bool save) {
     else { _wfopen_s(&f,path,L"rb"); if (f) { int v=0; if (fscanf_s(f,"%d",&v)==1) g_flagShareMods=v==1 ? 1:0; fclose(f); } }
 }
 
-// lobby model (fed from lobby_out.jsonl)
-static char g_players[200][40]; static int g_playerCount = 0;
-static int  g_companies[200];   // company id per roster entry (1..200), 0 = unset -> 1
+// Player and lobby names (2026-09-16: longer names). A Steam persona is up to 32
+// characters, in UTF-8 up to 96 bytes; the panel takes 64 typed characters. The
+// roster itself is unbounded (below); these size what THIS player types/launches.
+#define NAME_MAX 128
+#define NAME_TYPED_MAX 64
+// lobby model (fed from lobby_out.jsonl). One entry per roster row in roster
+// order. No cap of ours on the count or on a name's length: the roster is
+// whatever lobby.py sends (its CAP is the admission rule, not this parser), and
+// the origin letter, the company map and the panel all work from the full name.
+// A name cut short here would make two players look alike, give a joiner the
+// wrong letter and leave the load gate waiting for the wrong player count.
+static std::vector<std::string> g_players;
+static std::vector<int>         g_companies;   // company id per roster entry (1..200), 0 = unset -> 1
+static std::vector<std::string> g_stages;      // hot-join progress per roster entry ("loading world"), "" = none (2026-09-16)
+static int playerCount() { return (int)g_players.size(); }
+
+// ---- small string helpers (no fixed buffers) ----
+// JSON-escape the two characters json.dumps escapes in our payloads.
+static std::string jsonEscape(const char* text)
+{
+    std::string out; for (const char* p = text; *p; ++p) { if (*p == '\\' || *p == '"') out += '\\'; out += *p; }
+    return out;
+}
+// Read a JSON string body: r points just past the opening quote and is left on
+// the closing (unescaped) quote or the NUL. Decodes the escapes json.dumps
+// emits for our payloads: \\ -> \, \" -> ", \/ -> /. Anything else (\uXXXX,
+// \n ...) is left verbatim -- the backslash is copied and the next character
+// follows on the next iteration.
+static std::string jsonUnquote(const char*& r)
+{
+    std::string out;
+    while (*r && *r != '"') {
+        if (*r == '\\' && (r[1] == '\\' || r[1] == '"' || r[1] == '/')) { out += r[1]; r += 2; }
+        else out += *r++;
+    }
+    return out;
+}
+static std::wstring wideOf(const char* utf8)
+{
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
+    std::wstring w; if (n > 1) { w.resize(n - 1); MultiByteToWideChar(CP_UTF8, 0, utf8, -1, &w[0], n); }
+    return w;
+}
+static std::string utf8Of(const wchar_t* wide)
+{
+    int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    std::string u; if (n > 1) { u.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, wide, -1, &u[0], n, nullptr, nullptr); }
+    return u;
+}
 // Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
 static COLORREF coColor(int cid)
 {
-    static const COLORREF first[6] = { RGB(220,80,80), RGB(80,140,230), RGB(90,190,110), RGB(230,180,60), RGB(180,100,220), RGB(80,200,200) };
-    if (cid >= 1 && cid <= 6) return first[cid - 1];
-    float h = (float)(((cid - 7) * 137.508) - (int)(((cid - 7) * 137.508) / 360.0) * 360.0);   // degrees
+    static const COLORREF first[20] = { RGB(230,25,75), RGB(0,130,200), RGB(60,180,75), RGB(245,130,48), RGB(145,30,180), RGB(70,240,240), RGB(240,50,230), RGB(255,225,25), RGB(0,128,128), RGB(170,110,40), RGB(210,245,60), RGB(128,0,0), RGB(0,0,128), RGB(128,128,0), RGB(250,190,212), RGB(220,190,255), RGB(170,255,195), RGB(255,215,180), RGB(128,128,128), RGB(255,250,200) };
+    if (cid >= 1 && cid <= 20) return first[cid - 1];
+    float h = (float)(((cid - 21) * 137.508) - (int)(((cid - 21) * 137.508) / 360.0) * 360.0);   // degrees
     float sat = 0.62f, val = 0.85f, c = val * sat, x = c * (1.f - fabsf(fmodf(h / 60.f, 2.f) - 1.f)), m = val - c;
     float r, g, b;
     if (h < 60) { r = c; g = x; b = 0; } else if (h < 120) { r = x; g = c; b = 0; } else if (h < 180) { r = 0; g = c; b = x; }
@@ -504,9 +639,9 @@ static void originName(int idx, char* out)
     if (idx < 26) { out[0] = (char)('a' + idx); out[1] = 0; return; }
     idx -= 26; out[0] = (char)('a' + (idx / 26) % 26); out[1] = (char)('a' + idx % 26); out[2] = 0;
 }
-static char g_you[40] = ""; static char g_host[40] = ""; static char g_lobbyTitle[40] = "";   // the lobby's name, from the roster
+static std::string g_you, g_host, g_lobbyTitle;   // the lobby's name, from the roster; all three are whatever the roster says, any length
 static volatile LONG g_lobbyRelay = 0;   // the host is a relay-only server: "host" in the roster is the LEADER (oldest joiner)
-static char g_letters[200][3];           // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
+static std::vector<std::string> g_letters;   // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
 static char g_chatInput[200] = ""; static int g_chatLen = 0;
 static volatile LONG g_isHost = 0;       // this instance is the lobby host
@@ -525,8 +660,8 @@ static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSecti
 
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
 static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
-struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field 11=PUBLIC 12=REFRESH 30..37=public game rows; btn = hover wash
-static const int MAX_PLAYERS = 200, MAX_COMPANIES = 200;   // lobby.py CAP / MAX_COMPANIES; origins a..z then aa, ab, ...
+struct Hit { int x, y, w, h; int id; bool btn; };   // id: 2=HOST 3=JOIN 4=close 5=LEAVE 6=START 7=copy code 8=code field 11=PUBLIC 12=REFRESH 50=SEPARATE COMPANIES 30..37=public game rows; btn = hover wash
+static const int MAX_COMPANIES = 200;   // lobby.py MAX_COMPANIES (one addPlayer() entity each on every peer); the roster itself has no cap here -- origins a..z then aa, ab, ...
 static const int ROSTER_ROWS = 16;                        // rows the lobby page can show; the rest is a "+N more" line
 static Hit g_hits[64]; static int g_hitCount = 0;
 static void addHit(int x,int y,int w,int h,int id,bool btn=false){ if(g_hitCount<64){g_hits[g_hitCount++]={x,y,w,h,id,btn};} }
@@ -545,7 +680,26 @@ static int   g_flagSlot = 0;
 static char  g_flagMaster[256] = "https://srv1306562.hstgr.cloud/tpf2mp";   // master server base URL ("" disables the browser)
 static int   g_flagRelayAutosaveMin = 2;    // relay lobbies: the leader uploads a fresh save this often (0 = never)
 static int   g_flagAutoLoad = 1;            // START loads the shared save in-process (autoload=0: the player opens LOAD GAME)
+// DEDICATED SERVER (2026-09-18): a game that hosts by itself. With dedicated=1 the
+// title menu hosts a lobby the moment it is up, loads dedicated_save (else the
+// newest save), keeps the game's own autosave going, and hosts + loads again
+// after a crash to the title menu. The world pauses while nobody else is in
+// (dedicated_pause_empty=1, mp/pacing.lua) and joiners come in through the
+// frozen-join round like on any host. DedicatedTick, once a second from myPresent.
+static int   g_flagDedicated = 0;
+static char  g_flagDedSave[64] = "";        // dedicated_save=<name without .sav>; empty = the newest save in the save folder
+static char  g_flagDedLobby[64] = "";       // dedicated_lobby=<lobby name shown in the public list>
+static char  g_flagDedName[32] = "";        // dedicated_name=<the server's player name>
+static char  g_flagDedPassword[40] = "";    // dedicated_password=<lobby password>; empty = open
+static int   g_flagDedPublic = 1;           // dedicated_public=0|1: listed on the master server
+static int   g_flagDedCompanies = 0;        // dedicated_companies=0|1: SEPARATE COMPANIES (a company per player)
+static int   g_flagDedAutosaveMin = 10;     // dedicated_autosave_min=<n>, 0-600: the game's own autosave this often (0 = never)
+static int   g_flagDedEmptySpeed = 1;       // dedicated_empty_speed=0..4: the world's speed while nobody else is in (0 = paused); dedicated_pause_empty=1 is 0
+static int   g_flagDedPort = 0;             // dedicated_port=<udp/tcp port> for the lobby (0 = the default 29471); a box that also runs the relay needs another
+static int   g_flagDedRender = 0;           // dedicated_render=0|1: 0 (default) submits no command buffers -- a software renderer then costs nothing; 1 draws (screenshots)
+static int   g_flagDedNoWsi = 0;            // dedicated_nowsi=0|1: 1 also answers acquire/present in the DLL, paced to 60 frames/s (opt-in: it crashed the engine on the VPS)
 static volatile LONG g_storedAge = -1, g_storedMax = -1;   // relay roster: age of the relay's stored world / how fresh counts as fresh
+static volatile LONG g_joinFreeze = 0;   // roster join_freeze: the lobby brings a late joiner in through a world sync (everyone reloads); this DLL takes no hot-join save (2026-09-16)
 static bool  g_latoLoaded = false;
 static void ReadFlags()
 {
@@ -567,6 +721,44 @@ static void ReadFlags()
             if (!strcmp(v, "always")) g_flagShareMods = 1; else if (!strcmp(v, "never")) g_flagShareMods = 2; else g_flagShareMods = 0;
         } else if (!strcmp(line, "autoload")) {
             if (!strcmp(v, "0")) g_flagAutoLoad = 0; else if (!strcmp(v, "1")) g_flagAutoLoad = 1;
+        } else if (!strcmp(line, "dedicated")) {
+            if (!strcmp(v, "0")) g_flagDedicated = 0; else if (!strcmp(v, "1")) g_flagDedicated = 1;
+        } else if (!strcmp(line, "dedicated_save")) {
+            // a save NAME (it becomes <save dir>\<name>.sav): no path parts, no quotes
+            if (v[0] && strlen(v) < sizeof(g_flagDedSave) && !strpbrk(v, "\\/:*?\"<>|")) strcpy_s(g_flagDedSave, v);
+            else if (v[0]) Log("[menu] flags: dedicated_save ignored (a plain save name, under 64 characters)\n");
+        } else if (!strcmp(line, "dedicated_lobby")) {
+            if (v[0] && strlen(v) < sizeof(g_flagDedLobby) && !strpbrk(v, "\"")) strcpy_s(g_flagDedLobby, v);
+        } else if (!strcmp(line, "dedicated_name")) {
+            if (v[0] && strlen(v) < sizeof(g_flagDedName) && !strpbrk(v, "\" \t")) strcpy_s(g_flagDedName, v);
+        } else if (!strcmp(line, "dedicated_password")) {
+            // it becomes a netpunch.exe argument: no blanks or quotes
+            if (strlen(v) < sizeof(g_flagDedPassword) && !strpbrk(v, "\" \t")) strcpy_s(g_flagDedPassword, v);
+        } else if (!strcmp(line, "dedicated_public")) {
+            if (!strcmp(v, "0")) g_flagDedPublic = 0; else if (!strcmp(v, "1")) g_flagDedPublic = 1;
+        } else if (!strcmp(line, "dedicated_companies")) {
+            if (!strcmp(v, "0")) g_flagDedCompanies = 0; else if (!strcmp(v, "1")) g_flagDedCompanies = 1;
+        } else if (!strcmp(line, "dedicated_autosave_min")) {
+            int m = atoi(v);
+            if (digit && m >= 0 && m <= 600) g_flagDedAutosaveMin = m;
+        } else if (!strcmp(line, "dedicated_empty_speed")) {
+            int es = atoi(v);
+            if (digit && es >= 0 && es <= 4) g_flagDedEmptySpeed = es;
+        } else if (!strcmp(line, "dedicated_pause_empty")) {
+            // the older flag: 1 = paused while empty; 0 = the (old) "keep simulating" = 1x
+            if (!strcmp(v, "0")) g_flagDedEmptySpeed = 1; else if (!strcmp(v, "1")) g_flagDedEmptySpeed = 0;
+        } else if (!strcmp(line, "dedicated_render")) {
+            if (!strcmp(v, "0")) g_flagDedRender = 0; else if (!strcmp(v, "1")) g_flagDedRender = 1;
+        } else if (!strcmp(line, "dedicated_nowsi")) {
+            if (!strcmp(v, "0")) g_flagDedNoWsi = 0; else if (!strcmp(v, "1")) g_flagDedNoWsi = 1;
+        } else if (!strcmp(line, "dedicated_pin_batch")) {
+            if (!strcmp(v, "0")) g_flagDedPinBatch = 0; else if (!strcmp(v, "1")) g_flagDedPinBatch = 1;
+        } else if (!strcmp(line, "dedicated_fps")) {
+            int fv = atoi(v);
+            if (digit && fv >= 5 && fv <= 240) g_flagDedFps = fv;
+        } else if (!strcmp(line, "dedicated_port")) {
+            int pt = atoi(v);
+            if (digit && pt >= 1024 && pt <= 65535) g_flagDedPort = pt;
         } else if (!strcmp(line, "slot")) {
             // the title menu builds 8 entries (9 with CONTINUE): a slot past them never inserts ours
             int s = atoi(v);
@@ -580,6 +772,12 @@ static void ReadFlags()
     }
     fclose(f);
     Log("[menu] flags: slot=%d scale=%.2f autoload=%d relay_autosave_min=%d\n", g_flagSlot, g_flagScale, g_flagAutoLoad, g_flagRelayAutosaveMin);
+    if (g_flagDedicated)
+        Log("[dedicated] on: save='%s' lobby='%s' name='%s' password=%s public=%d companies=%d autosave_min=%d empty_speed=%d port=%d render=%d\n",
+            g_flagDedSave, g_flagDedLobby, g_flagDedName, g_flagDedPassword[0] ? "yes" : "no", g_flagDedPublic,
+            g_flagDedCompanies, g_flagDedAutosaveMin, g_flagDedEmptySpeed, g_flagDedPort, g_flagDedRender);
+    if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);
+    if (g_flagDedicated && !g_flagDedRender && g_flagDedNoWsi) InterlockedExchange(&g_noWsi, 1);
 }
 // The game's own menu face: <gamedir>\res\fonts\Lato2OFL\Lato-Regular.ttf, loaded
 // process-private so GDI can select "Lato" without touching the system font table.
@@ -769,42 +967,111 @@ static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, siz
 #define MW_YOU    RGB(150, 210, 170)
 static char g_joinCode[256] = ""; static int g_joinLen = 0; static volatile LONG g_joinFocus = 0;   // 1 = code field, 2 = password field
 static char g_passCode[40] = "";  static int g_passLen = 0;   // optional lobby password (mixed into the session key)
-static char g_username[40] = "";   // the player name (random two-word default, see ensureUsername)
-static char g_lobbyName[40] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
+static char g_username[NAME_MAX] = "";   // the player name (random two-word default, see ensureUsername)
+static char g_lobbyName[NAME_MAX] = ""; static int g_lobbyNameLen = 0;   // what the host calls the lobby (focus 4); the player name is g_username (focus 3)
 static int  g_userLen = 0;
 static void ensureUsername();
 static void SaveNames();
-// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=...) so they
-// survive a relaunch; a blank file leaves the random two-word default.
+static bool IsGeneratedName(const char* n);   // one of ensureUsername's Adjective+Noun defaults
+// The player name follows the STEAM persona name (2026-09-16) unless the
+// player typed one. g_userAuto says which: auto names are re-read from Steam
+// every launch (the persona can change), a typed one is kept as typed. Clearing
+// the field and pressing Enter goes back to Steam.
+static bool g_userAuto = true;
+static char g_steamName[NAME_MAX] = "";
+static bool SteamPersonaName(char* out, size_t cap)
+{
+    HMODULE h = GetModuleHandleW(L"steam_api64.dll"); if (!h) return false;
+    typedef int (*HUserFn)(); typedef void* (*FriendsFn)(); typedef const char* (*PersonaFn)(void*);
+    HUserFn huser = (HUserFn)GetProcAddress(h, "SteamAPI_GetHSteamUser");
+    FriendsFn friends = (FriendsFn)GetProcAddress(h, "SteamAPI_SteamFriends_v017");
+    PersonaFn persona = (PersonaFn)GetProcAddress(h, "SteamAPI_ISteamFriends_GetPersonaName");
+    if (!huser || !friends || !persona || huser() == 0) return false;   // the game has not initialised Steam yet
+    void* fr = friends(); if (!fr) return false;
+    const char* n = persona(fr); if (!n || !n[0]) return false;
+    // The name is a command-line argument, a JSON string and a roster key:
+    // printable only, no quotes or backslashes, no '#' (the lobby's own
+    // de-dup suffix, "name#2"), spaces collapsed and trimmed.
+    size_t o = 0; bool sp = false;
+    for (size_t i = 0; n[i] && o + 1 < cap; i++) {
+        unsigned char c = (unsigned char)n[i];
+        if (c < 32 || c == '"' || c == '\\' || c == '#') continue;
+        if (c == ' ') { sp = o > 0; continue; }
+        if (sp) { out[o++] = ' '; sp = false; if (o + 1 >= cap) break; }
+        out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return o > 0;
+}
+// Names persist in <data dir>\tpf2_names.txt (player=..., lobby=..., auto=1)
+// so they survive a relaunch. No file, or auto=1: the name follows Steam
+// (the random two-word default stands in until Steam answers).
 static void LoadNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
-    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: keep the random name from now on
-    char line[128];
+    FILE* f = _wfopen(p, L"r"); if (!f) { SaveNames(); return; }   // first run: follow Steam from now on
+    char line[512]; bool sawAuto = false, sawPlayer = false;
     while (fgets(line, sizeof(line), f)) {
         char* e = line + strlen(line); while (e > line && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
         char* eq = strchr(line, '='); if (!eq) continue; *eq = 0; const char* v = eq + 1;
-        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, 30); }
-        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, 36); }
+        if (!strcmp(line, "player") && v[0]) { strncpy_s(g_username, v, NAME_MAX - 1); sawPlayer = true; }
+        else if (!strcmp(line, "lobby")) { strncpy_s(g_lobbyName, v, NAME_MAX - 1); }
+        else if (!strcmp(line, "auto")) { sawAuto = true; g_userAuto = v[0] == '1'; }
     }
     fclose(f);
+    // a file from before auto= existed holds a name the player kept: treat it as typed
+    if (!sawAuto) g_userAuto = !sawPlayer;
+    // ...unless it is one of OUR random defaults (HappyDingo, DaringOcelot): nobody
+    // typed that. The first run of the Steam-name build found such a name in the
+    // file, called it typed, wrote auto=0, and the persona ("steam persona:
+    // ComradeSilver" in every log since) never replaced it on either rig
+    // instance (2026-09-17). A generated name is never a typed one.
+    if (sawPlayer && !g_userAuto && IsGeneratedName(g_username)) {
+        g_userAuto = true;
+        Log("[menu] names: %s is one of our random defaults, not a typed name -- following Steam\n", g_username);
+    }
     g_userLen = (int)strlen(g_username); g_lobbyNameLen = (int)strlen(g_lobbyName);
-    Log("[menu] names: player=%s lobby=%s\n", g_username, g_lobbyName);
+    Log("[menu] names: player=%s (%s) lobby=%s\n", g_username, g_userAuto ? "follows Steam" : "typed", g_lobbyName);
 }
 static void SaveNames()
 {
     wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2_names.txt", g_dataDirW);
     FILE* f = _wfopen(p, L"w"); if (!f) return;
-    fprintf(f, "player=%s\nlobby=%s\n", g_username, g_lobbyName); fclose(f);
+    fprintf(f, "player=%s\nlobby=%s\nauto=%d\n", g_username, g_lobbyName, g_userAuto ? 1 : 0); fclose(f);
+}
+// Called from the present hook: Steam is initialised by the game some time
+// after our DLL loads, so the persona is asked for until it answers, then
+// re-checked now and then (the player can rename themselves in Steam).
+static void SteamNameTick()
+{
+    static ULONGLONG next = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now < next) return;
+    next = now + (g_steamName[0] ? 30000 : 2000);
+    char n[NAME_MAX];
+    if (!SteamPersonaName(n, sizeof(n))) return;
+    if (strcmp(n, g_steamName) != 0) { strcpy_s(g_steamName, n); Log("[menu] steam persona: %s\n", n); }
+    if (!g_userAuto || InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3) return;   // typed, or being typed right now
+    if (strcmp(g_username, n) == 0) return;
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) >= 2) return;   // in a lobby already: the roster has the old name; next time
+    strcpy_s(g_username, n); g_userLen = (int)strlen(g_username);
+    SaveNames();
+    InterlockedExchange(&g_panelDirty, 1);
+    Log("[menu] username follows Steam: %s\n", g_username);
 }
 static volatile LONG g_public = 0;   // PUBLIC ticked: the lobby announces itself to the master server
+// SEPARATE COMPANIES ticked (2026-09-16): the lobby gives every player their own
+// company; unticked, everyone shares company 1 (co-op). The lobby assigns the
+// chips from it, on a change and for each joiner; the roster carries the mode
+// back, so a joiner's panel shows it (and the host's stays in step).
+static volatile LONG g_sepCompanies = 0;
 
 // ---------------- the public game list (server browser) ----------------
 // GET <master>/list on a background thread every PUB_EVERY ms while the
 // HOST/JOIN page is up; rows render below the password field and a click
 // drops the row's code into the join field. The list is what hosts chose to
 // publish (see _Publisher in lobby.py); nothing here talks to a host directly.
-struct PubRow { char name[48]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
+struct PubRow { char name[NAME_MAX]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
 static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
@@ -841,21 +1108,41 @@ static bool httpGet(const char* url, char* out, int n)
     uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 512;
     if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return false;
     bool ok = false; out[0] = 0;
+    // 2026-09-18: a player's browser answered "no response" 99 times out of 99
+    // while his own lobby.py published to the same host over Python: the
+    // failure was silent (no error code) and the 5 s budget covered one
+    // address family. The master has an AAAA record, so a machine whose IPv6
+    // routes nowhere spent the whole budget on the v6 connect. Now: IPv6 fast
+    // fallback (the connect races both families), a longer budget, the
+    // WinHTTP error code in the note the panel shows, and one retry.
+    // WINHTTP_OPTION_IPV6_FAST_FALLBACK is 140 (Windows 10 1709+); an older
+    // WinHTTP just refuses the option.
     HINTERNET s = WinHttpOpen(L"tpf2mp-menu/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!s) return false;
-    WinHttpSetTimeouts(s, 5000, 5000, 5000, 5000);
-    HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
-    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                         uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
-    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
-        DWORD st = 0, sl = sizeof(st);
-        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
-        int got = 0; DWORD rd = 0;
-        while (got < n - 1 && WinHttpReadData(r, out + got, (DWORD)(n - 1 - got), &rd) && rd) got += (int)rd;
-        out[got] = 0; ok = (st == 200);
-        if (!ok) snprintf(out, n, "HTTP %lu", (unsigned long)st);
+    if (!s) { snprintf(out, n, "winhttp open error %lu", (unsigned long)GetLastError()); return false; }
+    { DWORD on = 1; WinHttpSetOption(s, 140 /* WINHTTP_OPTION_IPV6_FAST_FALLBACK */, &on, sizeof(on)); }
+    WinHttpSetTimeouts(s, 8000, 10000, 10000, 10000);   // resolve, connect, send, receive
+    DWORD err = 0; const char* stage = "";
+    for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+        HINTERNET c = WinHttpConnect(s, host, uc.nPort, 0);
+        HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                             uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0) : nullptr;
+        if (!c) { err = GetLastError(); stage = "connect"; }
+        else if (!r) { err = GetLastError(); stage = "request"; }
+        else if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) { err = GetLastError(); stage = "send"; }
+        else if (!WinHttpReceiveResponse(r, nullptr)) { err = GetLastError(); stage = "receive"; }
+        else {
+            DWORD st = 0, sl = sizeof(st);
+            WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX);
+            int got = 0; DWORD rd = 0;
+            while (got < n - 1 && WinHttpReadData(r, out + got, (DWORD)(n - 1 - got), &rd) && rd) got += (int)rd;
+            out[got] = 0; ok = (st == 200);
+            if (!ok) { snprintf(out, n, "HTTP %lu", (unsigned long)st); err = 0; stage = ""; }
+        }
+        if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c);
+        if (!ok && stage[0] && attempt == 0) Log("[menu] server browser: %s failed (winhttp %lu), retrying", stage, (unsigned long)err);
     }
-    if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+    WinHttpCloseHandle(s);
+    if (!ok && stage[0]) snprintf(out, n, "winhttp %lu at %s", (unsigned long)err, stage);   // 12002 timeout, 12007 no such host, 12029 cannot connect
     return ok;
 }
 static DWORD WINAPI PubFetchThread(LPVOID)
@@ -1014,17 +1301,49 @@ static void RenderPanelLayer(int w, int h)
         if(!requested) {
             if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
             else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
-            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted")))
-                mwButton(pad,h-S(76),S(210),S(30),g_playerCount>2 ? L"Request readiness" : L"Resync now",84);
+            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted"))) {
+                mwButton(pad,h-S(76),S(210),S(30),playerCount()>2 ? L"Request readiness" : L"Resync now",84);
+                // The host declines: the panel closes on every game and stays
+                // closed for this world (a later resync, or a new lobby, lifts it).
+                if(detected) mwButton(pad+S(222),h-S(76),S(150),S(30),L"Keep playing",88);
+            }
             else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
                 mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
         }
         mwStatus(w,h);
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
+        if (g_savePicker && g_isHost && !WorldLoaded() && !g_sessionStarted) {
+            mwTitle(L"SELECT SAVE"); mwClose(w, 91);
+            mwBody(pad, cy, w-2*pad, S(40), L"Choose the world to share. Newest saves first, including autosaves.");
+            HFONT font = mkLato(S(14));
+            for (int row=0; row<SAVE_ROWS; ++row) {
+                int i=g_savePage*SAVE_ROWS+row;
+                if (i >= (int)g_lobbySaves.size()) break;
+                const auto& save=g_lobbySaves[i];
+                int y=cy+S(48)+row*S(40);
+                layerRect(pad,y,w-2*pad,S(36),save.path==g_selectedSave ? MW_YOU : RGB(0,0,0),65);
+                layerText(pad+S(10),y,w-2*pad-S(185),S(36),save.name.c_str(),font,MW_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+                FILETIME local; SYSTEMTIME date; wchar_t stamp[40]=L"";
+                if (FileTimeToLocalFileTime(&save.modified,&local) && FileTimeToSystemTime(&local,&date))
+                    _snwprintf_s(stamp,_TRUNCATE,L"%04u-%02u-%02u %02u:%02u",date.wYear,date.wMonth,date.wDay,date.wHour,date.wMinute);
+                layerText(w-pad-S(170),y,S(160),S(36),stamp,font,MW_DIM,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+                addHit(pad,y,w-2*pad,S(36),100+row,true);
+            }
+            DeleteObject(font);
+            if (g_lobbySaves.empty()) mwBody(pad,cy+S(55),w-2*pad,S(60),L"No saves found. Create and save a world with the Multiplayer mod enabled, then refresh.");
+            int y=h-S(85);
+            mwButton(pad,y,S(110),S(30),L"BACK",91);
+            mwButton(pad+S(125),y,S(110),S(30),L"REFRESH",92);
+            if (g_savePage>0) mwButton(w-pad-S(240),y,S(110),S(30),L"PREVIOUS",93);
+            if ((g_savePage+1)*SAVE_ROWS<(int)g_lobbySaves.size()) mwButton(w-pad-S(110),y,S(110),S(30),L"NEXT",94);
+            mwStatus(w,h);
+            return;
+        }
         int titleW = S(90);
-        { wchar_t wt[64] = L"LOBBY"; if (g_lobbyTitle[0]) { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, g_lobbyTitle, -1, wl, 48); _snwprintf_s(wt, _TRUNCATE, L"LOBBY  --  %s", wl); }
-          mwTitle(wt); HFONT ft = mkLato(S(18)); titleW = textW(wt, ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
+        { std::wstring wt = L"LOBBY";
+          if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_lobbyTitle.empty()) wt = L"LOBBY  --  " + wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
+          mwTitle(wt.c_str()); HFONT ft = mkLato(S(18)); titleW = textW(wt.c_str(), ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
         if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
             // ROOM CODE, DELIBERATELY NOT RENDERED.
             //
@@ -1046,29 +1365,44 @@ static void RenderPanelLayer(int w, int h)
             HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy (never shown)", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
             addHit(cx, S(11), cw, S(26), 7, true);
         }
+        if (g_isHost && !WorldLoaded() && !g_sessionStarted) {
+            int bw=mwButtonW(L"SELECT SAVE");
+            mwButton(pad,cy,bw,S(30),L"SELECT SAVE",90);
+            const wchar_t* name=g_selectedSave.empty() ? L"Choose a save before starting" : wcsrchr(g_selectedSave.c_str(),L'\\');
+            if (!g_selectedSave.empty()) name=name ? name+1 : g_selectedSave.c_str();
+            HFONT font=mkLato(S(14));
+            layerText(pad+bw+S(12),cy,w-2*pad-bw-S(12),S(30),name,font,MW_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+            DeleteObject(font);
+            cy+=S(44);
+        }
         int bottom = h - S(44);
         int listW = S(220), chatX = pad + listW + S(20), chatW = w - chatX - pad;
         int contentH = bottom - cy - S(12);
         // players
         char hdr[48]; int n = 0;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); n = g_playerCount; }
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); n = playerCount(); }
         snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", n);
         wchar_t whdr[48]; MultiByteToWideChar(CP_UTF8, 0, hdr, -1, whdr, 48);
         mwHeader(pad, cy, listW, whdr);
         HFONT fr = mkLato(S(14)), fs = mkLato(S(11));
         for (int i = 0; i < n && i < ROSTER_ROWS; i++) {
-            wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_players[i], -1, wn, 64);
-            bool isYou = strcmp(g_players[i], g_you) == 0, isHost = strcmp(g_players[i], g_host) == 0;
+            std::wstring wn = wideOf(g_players[i].c_str());
+            bool isYou = g_players[i] == g_you, isHost = g_players[i] == g_host;
             int ry = cy + S(30) + i * S(26);
-            // company chip: colour + number; click your own (the host: anyone's) to cycle 1..16
+            // company chip: colour + number; left/right-click your own (the host: anyone's) to cycle
             int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
             layerRect(pad, ry + S(4), S(22), S(16), coColor(cid), 220);
             wchar_t wc[4]; _snwprintf_s(wc, _TRUNCATE, L"%d", cid);
             layerText(pad, ry + S(4), S(22), S(16), wc, fs, RGB(0, 0, 0), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            bool amHost = strcmp(g_you, g_host) == 0;
+            bool amHost = g_you == g_host;
             if (isYou || amHost) addHit(pad, ry + S(2), S(24), S(20), 20 + i, true);   // chip ids 20..35
-            layerText(pad + S(30), ry, listW - S(80), S(24), wn, fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
+            bool staged = i < (int)g_stages.size() && !g_stages[i].empty();
+            layerText(pad + S(30), ry, listW - (staged ? S(150) : S(80)), S(24), wn.c_str(), fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            if (staged) {   // hot-join progress, dim, in place of the HOST tag (a host has none)
+                std::wstring ws = wideOf(g_stages[i].c_str());
+                layerText(pad + listW - S(120), ry, S(120), S(24), ws.c_str(), fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 200);
+            }
+            else if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
         }
         { HFONT fl = mkLato(S(11));
           int shown = n < ROSTER_ROWS ? n : ROSTER_ROWS;
@@ -1076,7 +1410,9 @@ static void RenderPanelLayer(int w, int h)
               layerText(pad + S(30), cy + S(30) + ROSTER_ROWS * S(26), listW, S(20), more, fl, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); }
           int legendY = cy + S(30) + (shown < 8 ? 8 : shown) * S(26) + S(6) + (n > ROSTER_ROWS ? S(22) : 0);
           if (legendY > bottom - S(44)) legendY = bottom - S(44);
-          layerText(pad, legendY, listW, S(40), L"Same number = one company together. Different numbers = separate companies. Click a chip to change.",
+          layerText(pad, legendY, listW, S(40), InterlockedCompareExchange(&g_sepCompanies, 0, 0)
+                    ? L"Separate companies: each player runs their own. Left-click a chip for the next company, right-click for the previous."
+                    : L"Co-op: everyone runs company 1 together. Left-click a chip for the next company, right-click for the previous.",
                     fl, MW_DIM, DT_LEFT | DT_TOP | DT_WORDBREAK, 170); DeleteObject(fl); }
         DeleteObject(fr); DeleteObject(fs);
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
@@ -1098,7 +1434,9 @@ static void RenderPanelLayer(int w, int h)
         int bw1 = 0;
         if (!WorldLoaded()) { bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5); }
         if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
-            if (g_flagMaster[0]) mwCheck(w - pad - bw2 - S(110), bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
+            int px2 = w - pad - bw2 - S(110);
+            if (g_flagMaster[0]) mwCheck(px2, bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
+            mwCheck(px2 - S(230), bottom, L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
         if(WorldLoaded() && g_isHost) {
             bw1=mwButtonW(L"RESYNC...");
             mwButton(pad,bottom,bw1,S(30),L"RESYNC...",87);
@@ -1121,29 +1459,31 @@ static void RenderPanelLayer(int w, int h)
             mwButton(dx+dw-S(20)-bwN,dy+S(175),bwN,S(32),L"CANCEL",17);
         }
         wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), wst, fst, mp[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fst);
+        // The status sits between LEAVE and the right-hand buttons: a line longer than
+        // that space ends in an ellipsis rather than a hard cut (the mods-round line
+        // with a joiner's name in front ran to the edge, 2026-09-20).
+        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), wst, fst, mp[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS); DeleteObject(fst);
     } else {
         // ---------------- HOST / JOIN ----------------
         mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
-        { int lb = mwButtonW(L"OPEN LOGS"); mwButton(w - S(65) - lb, S(10), lb, S(28), L"OPEN LOGS", 15);
-          const wchar_t* label = InterlockedCompareExchange(&g_updateAvailable, 0, 0) ? L"DOWNLOAD UPDATE" : L"CHECK UPDATES";
-          int ub = mwButtonW(label); mwButton(w - S(75) - lb - ub, S(10), ub, S(28), label, 18); }
+        { int lb = mwButtonW(L"OPEN LOGS"); mwButton(w - S(65) - lb, S(10), lb, S(28), L"OPEN LOGS", 15); }
         int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
         layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
         mwHeader(lx, cy, colW, L"HOST A GAME");
         mwBody(lx, cy + S(24), colW, S(36), WorldLoaded()
             ? L"Opens a lobby and saves this world for everyone who joins."
-            : L"Opens a lobby and shares your newest save with everyone who joins.");
+            : L"Open a lobby, choose a save, then share it with everyone who joins.");
         // NOT ensureUsername() here: this runs every frame, so emptying the name
         // field made the next frame roll a new random name before anything could be
         // typed (2026-09-11). An empty name is filled only on HOST/JOIN or Enter.
-        { char def[64];
+        { char def[NAME_MAX + 48];
           if (g_username[0]) snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
           else snprintf(def, sizeof(def), "Your game  (click to name the lobby)");
           wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
           mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
         { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
-          if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11); }
+          if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
+          mwCheck(lx, cy + S(128), L"SEPARATE COMPANIES (each player their own)", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50); }
         mwHeader(rx, cy, colW, L"JOIN A GAME");
         mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
         mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
@@ -1151,18 +1491,18 @@ static void RenderPanelLayer(int w, int h)
         mwCheck(rx + S(150), cy + S(98), L"Auto-accept mod downloads", g_flagShareMods==1, 19);
         // The mod has to be on in the shared save: without it nothing replicates,
         // and START GAME refuses such a save (2026-09-10). Said up front here.
-        mwBody(pad, cy + S(136), w - 2 * pad, S(20), L"Everyone needs the Transport Fever 2 Multiplayer mod, and the shared save must have it enabled.");
+        mwBody(rx, cy + S(134), colW, S(20), L"The shared save must have the Multiplayer mod enabled.");
         // optional password: mixed into the session key, so the host and every
         // joiner must type the same one. Shown masked.
         mwHeader(pad, cy + S(162), S(260), L"YOUR NAME");
-        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Click to type a name", 13);
+        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Steam name (click to type your own)", 13);
         mwHeader(pad + S(290), cy + S(162), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
         { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
           mwField(pad + S(290), cy + S(186), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
         // ---- PUBLIC GAMES: the server browser (OpenTTD style) ----
         if (g_flagMaster[0]) {
             int ly = cy + S(230); int lw = w - 2 * pad;
-            mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row to fill in its code, then JOIN GAME");
+            mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row, then JOIN GAME");
             { int rb = mwButtonW(L"REFRESH"); mwButton(w - pad - rb, ly - S(4), rb, S(30), L"REFRESH", 12); }
             ly += S(26);
             PubRow rows[8]; int cnt = 0; char note[96] = "";
@@ -1184,7 +1524,7 @@ static void RenderPanelLayer(int w, int h)
                 wchar_t wn[64], wv[32], wp[32], wa[32];
                 MultiByteToWideChar(CP_UTF8, 0, r.name, -1, wn, 64); MultiByteToWideChar(CP_UTF8, 0, r.version, -1, wv, 32);
                 // a master from before the type field: the relay is known by its game string
-                const wchar_t* wt = !strcmp(r.type, "relay") ? L"dedicated server" : !strcmp(r.type, "host") ? L"player hosted"
+                const wchar_t* wt = (!strcmp(r.type, "relay") || !strcmp(r.type, "dedicated")) ? L"dedicated server" : !strcmp(r.type, "host") ? L"player hosted"
                                   : !strcmp(r.game, "dedicated relay") ? L"dedicated server" : L"player hosted";
                 if (r.locked) { wchar_t t[64]; _snwprintf_s(t, _TRUNCATE, L"%s  [locked]", wn); wcscpy_s(wn, t); }
                 _snwprintf_s(wp, _TRUNCATE, L"%d / %d", r.players, r.max);
@@ -1430,7 +1770,7 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
 // In-frame click: the button is not a window, so poll the cursor + left button
 // against the button rect (converted to the game window's client area). One-shot
 // per press, 1s debounce.
-static void OnHit(int id);
+static void OnHit(int id, int button = 1);
 // True only when the foreground window belongs to THIS game process. GetAsyncKeyState
 // reads GLOBAL input, so without this gate the overlay would steal the user's mouse
 // and keyboard while they are alt-tabbed to another app (e.g. typing in a terminal).
@@ -1443,13 +1783,16 @@ static bool gameHasFocus()
 }
 
 static volatile LONG g_pendingPanelClick=0, g_mouseInstalled=0;
+static volatile LONG g_panelClickButton=1;   // 1 = left, 2 = right (chips cycle backwards)
 static volatile LONG64 g_panelClickPoint=0;
 static void PollClick()
 {
-    static bool prevDown = false;
+    static bool prevDown = false, prevRDown = false;
     static ULONGLONG lastFire = 0;
     bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    bool rdown = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
     const bool clicked=InterlockedExchange(&g_pendingPanelClick,0)!=0;
+    int button = clicked ? (int)InterlockedCompareExchange(&g_panelClickButton, 0, 0) : (down && !prevDown ? 1 : 2);
     // hover / pressed tracking for the native-look overlay (Button:hover / :active)
     {
         int hv = 0;
@@ -1463,7 +1806,7 @@ static void PollClick()
         }
         g_hover = hv; g_active = (hv && down) ? hv : 0;
     }
-    if ((clicked || (!g_mouseInstalled && down && !prevDown)) && gameHasFocus()) {
+    if ((clicked || (!g_mouseInstalled && ((down && !prevDown) || (rdown && !prevRDown)))) && gameHasFocus()) {
         POINT pt; GetCursorPos(&pt);
         if(clicked) { const auto packed=InterlockedCompareExchange64(&g_panelClickPoint,0,0);
             pt.x=(LONG)(packed&0xffffffff); pt.y=(LONG)((unsigned long long)packed>>32); }
@@ -1479,49 +1822,16 @@ static void PollClick()
             for (int i = 0; i < g_hitCount; i++) {
                 const Hit& hh = g_hits[i];
                 if (lx >= hh.x && lx < hh.x + hh.w && ly >= hh.y && ly < hh.y + hh.h) {
-                    lastFire = now; OnHit(hh.id); break;
+                    lastFire = now; OnHit(hh.id, button); break;
                 }
             }
         }
     }
-    prevDown = down;
+    prevDown = down; prevRDown = rdown;
 }
 
 // OPEN LOGS remains a worker operation; it must not block presentation.
 static volatile LONG g_logsBusy = 0;
-static DWORD WINAPI UpdateThread(LPVOID)
-{
-    wchar_t net[600], data[MAX_PATH], result[600], exe[650], cmd[1600];
-    resolveNetDir(net, 600);
-    if (!Tpf2mpDataDirW(data, MAX_PATH, nullptr)) { InterlockedExchange(&g_updateBusy, 0); return 1; }
-    _snwprintf_s(result, _TRUNCATE, L"%supdate-%lu-%llu.txt", data, GetCurrentProcessId(), GetTickCount64());
-    _snwprintf_s(exe, _TRUNCATE, L"%s\\netpunch.exe", net);
-    bool download = InterlockedCompareExchange(&g_updateAvailable, 0, 0) != 0;
-    _snwprintf_s(cmd, _TRUNCATE, L"\"%s\" --update %s --result \"%s\"", exe, download ? L"download" : L"check", result);
-    DeleteFileW(result);
-    STARTUPINFOW si = { sizeof(si) }; PROCESS_INFORMATION pi = {};
-    SetStatus(download ? "Downloading multiplayer update..." : "Checking for multiplayer updates...");
-    if (CreateProcessW(exe, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, net, &si, &pi)) {
-        DWORD waited = WaitForSingleObject(pi.hProcess, 180000);
-        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-        FILE* f = nullptr;
-        if (waited == WAIT_OBJECT_0 && !_wfopen_s(&f, result, L"rb") && f) {
-            char state[32] = {}, message[512] = {};
-            fgets(state, sizeof(state), f); fread(message, 1, sizeof(message) - 1, f); fclose(f);
-            InterlockedExchange(&g_updateAvailable, strncmp(state, "Available", 9) == 0);
-            SetStatus(message[0] ? message : "Update check returned no result.");
-            DeleteFileW(result);
-        } else SetStatus("Update check did not finish. Try again later.");
-    } else SetStatus("Cannot start the updater. Install the latest multiplayer MSI once to enable updates.");
-    InterlockedExchange(&g_updateBusy, 0);
-    return 0;
-}
-static void StartUpdateCheck()
-{
-    if (InterlockedExchange(&g_updateBusy, 1)) return;
-    HANDLE thread = CreateThread(nullptr, 0, UpdateThread, nullptr, 0, nullptr);
-    if (thread) CloseHandle(thread); else InterlockedExchange(&g_updateBusy, 0);
-}
 static DWORD WINAPI CollectLogsThread(LPVOID)
 {
     Tpf2mpLogArchive a;
@@ -1542,9 +1852,32 @@ static DWORD WINAPI CollectLogsThread(LPVOID)
     return 0;
 }
 
-static void OnHit(int id)
+static void OnHit(int id, int button)
 {
+    if (button == 2 && !(id >= 20 && id <= 35)) return;   // right-click: company chips only
     Log("[menu] hit id=%d\n", id);
+    if (id>=90 && id<100+SAVE_ROWS) {
+        if (!g_isHost || WorldLoaded() || g_sessionStarted) return;
+        if (g_saveStartPending) { SetStatus("The selected save is being shared. Wait for the transfer to finish."); return; }
+        if (id==90 || id==92) { RefreshLobbySaves(); g_savePicker=true; }
+        else if (id==91) g_savePicker=false;
+        else if (id==93 && g_savePage>0) --g_savePage;
+        else if (id==94 && (g_savePage+1)*SAVE_ROWS<(int)g_lobbySaves.size()) ++g_savePage;
+        else if (id>=100 && g_savePicker) {
+            int i=g_savePage*SAVE_ROWS+id-100;
+            if (i<(int)g_lobbySaves.size()) {
+                g_selectedSave=g_lobbySaves[i].path;
+                g_savePicker=false;
+                if (g_lobbyReady) {
+                    std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+jsonEscape(utf8Of(g_selectedSave.c_str()).c_str())+"\"}";
+                    LobbySend(line.c_str());
+                }
+                SetStatus("Save selected. Press START GAME to share it.");
+            }
+        }
+        InterlockedExchange(&g_panelDirty,1);
+        return;
+    }
     switch (id) {
     case 19:
         g_flagShareMods = g_flagShareMods==1 ? 0:1;
@@ -1552,7 +1885,6 @@ static void OnHit(int id)
         if (g_flagShareMods==1 && g_modsPrompt[0]) OnHit(16);
         InterlockedExchange(&g_panelDirty,1);
         break;
-    case 18: StartUpdateCheck(); break;
     case 16: case 17: {   // YES / NO to the mod download
         const bool yes = (id == 16);
         if (g_csInit) { EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs); }
@@ -1568,6 +1900,20 @@ static void OnHit(int id)
             if (t) CloseHandle(t); else InterlockedExchange(&g_logsBusy, 0);
         }
         break;
+    case 88: { // The host keeps playing: every game's panel closes and stays closed for this world.
+        if(!InterlockedCompareExchange(&g_isHost,0,0)) break;
+        static LONG declineNo = 0;
+        char line[160]; snprintf(line,sizeof(line),"{\"cmd\":\"sync_decline\",\"id\":\"decline-%lu-%llu-%ld\"}",
+            GetCurrentProcessId(), GetTickCount64(), InterlockedIncrement(&declineNo));
+        LobbySend(line);
+        EnterCriticalSection(&g_modelCs);
+        if(!strcmp(g_recoveryPhase,"detected") || !strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual")) {
+            g_recoveryPhase[0]=0;
+            InterlockedExchange(&g_uiState,0); InterlockedExchange(&g_recoveryPresent,0);
+            InterlockedExchange(&g_panelDirty,1);
+        }
+        LeaveCriticalSection(&g_modelCs);
+    } break;
     case 85: // Dismiss a preflight notice; never hide a held operation.
         EnterCriticalSection(&g_modelCs);
         if(!strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual") || !strcmp(g_recoveryPhase,"detected")) {
@@ -1616,19 +1962,25 @@ static void OnHit(int id)
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: if (WorldLoaded()) SetStatus("Return to the main menu to join another world."); else StartLobby(1); break;
     case 5: if (!WorldLoaded()) LeaveLobby(); break;                // title-menu LEAVE only
-    case 6: if (InterlockedCompareExchange(&g_isHost,0,0)) {   // START GAME (host): share newest save, then start
+    case 6: if (InterlockedCompareExchange(&g_isHost,0,0)) {   // START GAME (host): share the selected save
         // Hosting from a running map already starts its snapshot/hot-join flow.
         // Dismiss the panel without resending the world or waiting for loaders.
         if (WorldLoaded()) { OnHit(4); break; }
         // lobby.py truncates lobby_in.jsonl when it starts: a command appended
         // before its first event line would be lost. Wait for that first line.
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) { SetStatus("Lobby is starting…"); break; }
-        if (newestSave(g_startSaveW, 600)) {
-            char u[900]; WideCharToMultiByte(CP_UTF8, 0, g_startSaveW, -1, u, sizeof(u), nullptr, nullptr);
-            char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
-            char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
-            LobbySend(line); SetStatus("Sharing save & starting game…");
-        } else { LobbySend("{\"cmd\":\"start\"}"); SetStatus("No save found to share."); }
+        if (g_saveStartPending) { SetStatus("The selected save is being shared. Please wait."); break; }
+        if (g_selectedSave.empty()) { OnHit(90); SetStatus("Choose a save before starting."); break; }
+        DWORD attributes=GetFileAttributesW(g_selectedSave.c_str());
+        if (attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_DIRECTORY)) {
+            SetStatus("The selected save is no longer available. Choose another save."); break;
+        }
+        if (wcscpy_s(g_startSaveW,g_selectedSave.c_str())==0) {
+            std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(g_startSaveW).c_str()) + "\"}";
+            InterlockedExchange(&g_saveStartPending,1);
+            if (LobbySend(line.c_str())) { SetStatus("Sharing save & starting game…"); MarkSaveShared(); }
+            else { InterlockedExchange(&g_saveStartPending,0); SetStatus("Could not send the start request. Please try again."); }
+        }
     } break;
     case 7: if (InterlockedCompareExchange(&g_haveCode,0,0)) { ClipboardSet(g_code); SetStatus("Code copied to clipboard — share it in Discord."); } break;
     case 10: InterlockedExchange(&g_joinFocus, 2); InterlockedExchange(&g_panelDirty, 1); break;   // password field
@@ -1643,27 +1995,47 @@ static void OnHit(int id)
         } else SetStatus(on ? "Your game will be listed publicly when you host." : "Your game will not be listed.");
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 12: InterlockedExchange(&g_pubForce, 1); g_pubLast = 0; SetStatus("Refreshing the public game list…"); break;
+    case 50: {   // SEPARATE COMPANIES checkbox; while hosting the lobby re-assigns every chip at once
+        LONG on = InterlockedCompareExchange(&g_sepCompanies, 0, 0) ? 0 : 1; InterlockedExchange(&g_sepCompanies, on);
+        if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2 && InterlockedCompareExchange(&g_isHost, 0, 0)) {
+            if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) SetStatus("Lobby is starting…");
+            else { LobbySend(on ? "{\"cmd\":\"mode\",\"mode\":\"companies\"}" : "{\"cmd\":\"mode\",\"mode\":\"coop\"}");
+                   SetStatus(on ? "Separate companies: every player gets their own company." : "Co-op: everyone plays company 1 together."); }
+        } else SetStatus(on ? "Players will each get their own company." : "Players will share one company.");
+        InterlockedExchange(&g_panelDirty, 1); } break;
     case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
-        int i = id - 40; char code[256] = ""; char name[48] = ""; bool locked = false;
+        int i = id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
         if (code[0]) { strcpy_s(g_joinCode, code); g_joinLen = (int)strlen(g_joinCode); InterlockedExchange(&g_joinFocus, 1);
                        char st[200]; snprintf(st, sizeof(st), locked ? "%s's game needs its password: type it below, then JOIN GAME." : "%s's code is filled in -- press JOIN GAME.", name); SetStatus(st); }
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
     case 28: case 29: case 30: case 31: case 32: case 33: case 34: case 35: {   // company chip
-        int i = id - 20; char name[40] = ""; int cur = 1;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < g_playerCount) { strcpy_s(name, g_players[i]); cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
-        // cycle: the next company id somebody already uses, then one brand-new id, then back to 1
+        int i = id - 20; std::string name; int cur = 1;
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (i < playerCount()) { name = g_players[i]; cur = g_companies[i]; } LeaveCriticalSection(&g_modelCs); }
+        // Left click increases: the next company id somebody already uses, then
+        // one brand-new id (which is then in use, so the next click makes another).
+        // Right click (2026-09-16) decreases: the previous used id, and from the
+        // lowest round to the highest in use. Only a left click creates a company.
         bool used[MAX_COMPANIES + 2] = {}; int maxUsed = 0;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); for (int k = 0; k < g_playerCount; k++) { int c2 = g_companies[k]; if (c2 >= 1 && c2 <= MAX_COMPANIES) { used[c2] = true; if (c2 > maxUsed) maxUsed = c2; } } LeaveCriticalSection(&g_modelCs); }
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); for (int k = 0; k < playerCount(); k++) { int c2 = g_companies[k]; if (c2 >= 1 && c2 <= MAX_COMPANIES) { used[c2] = true; if (c2 > maxUsed) maxUsed = c2; } } LeaveCriticalSection(&g_modelCs); }
         int next = 0;
-        for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[c2]) { next = c2; break; }
-        if (!next) next = (cur <= maxUsed && maxUsed < MAX_COMPANIES) ? maxUsed + 1 : 1;
-        if (name[0]) { char line[160]; snprintf(line, sizeof(line), "{\"cmd\":\"company\",\"player\":\"%s\",\"id\":%d}", name, next); LobbySend(line); }
+        bool fresh = maxUsed < MAX_COMPANIES;   // a brand-new id (maxUsed + 1) is on the ring
+        if (button == 2) {
+            for (int c2 = cur - 1; c2 >= 1; c2--) if (used[c2]) { next = c2; break; }
+            if (!next) next = maxUsed;
+            if (next == cur) break;   // the only company there is
+        } else {
+            for (int c2 = cur + 1; c2 <= maxUsed; c2++) if (used[c2]) { next = c2; break; }
+            if (!next) next = (cur <= maxUsed && fresh) ? maxUsed + 1 : 1;
+        }
+        if (next < 1) next = 1;
+        if (!name.empty()) { std::string line = "{\"cmd\":\"company\",\"player\":\"" + jsonEscape(name.c_str()) + "\",\"id\":" + std::to_string(next) + "}"; LobbySend(line.c_str()); }
     } break;
-    case 8: {   // code field: focus; if empty, paste the clipboard
+    case 8: {   // code field: a click on a code CLEARS it (2026-09-16), a click on the empty field pastes the clipboard
         InterlockedExchange(&g_joinFocus, 1);
-        if (g_joinLen == 0) { char buf[128]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
+        if (g_joinLen > 0) { g_joinCode[0] = 0; g_joinLen = 0; InterlockedExchange(&g_panelDirty, 1); break; }
+        if (g_joinLen == 0) { char buf[256]; if (ClipboardGet(buf, sizeof(buf))) { int j = 0; for (int i = 0; buf[i] && j < 200; i++) if ((unsigned char)buf[i] > 32) g_joinCode[j++] = buf[i]; g_joinCode[j] = 0; g_joinLen = j; } }
         InterlockedExchange(&g_panelDirty, 1); } break;
     case 9: break;   // chat field is always focused in the lobby
     }
@@ -1672,7 +2044,35 @@ static void OnHit(int id)
 static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
 {
     PollLobbyOpen();
+    if (InterlockedExchange(&g_leaveOnMenu, 0)) {
+        // the player left the world for the title menu: leave the lobby with it
+        // (the host leaving ends the session for everyone, as LEAVE would)
+        Log("[menu] the world was left for the title menu -- leaving the lobby\n");
+        LeaveLobby();
+        SetStatus("Left the lobby: you left the world. HOST or JOIN to play again.");
+    }
+    SteamNameTick();
+    StageTick();
+    PollWorldGen();
+    DedicatedTick();
     LONG n = InterlockedIncrement(&g_presentCount);
+    {   // The frame meter: frames per second and the LONGEST frame of the last
+        // 5 s, in the log. The longest frame is the stutter number (a 60 fps
+        // average hides a 200 ms hitch). An overlay's own FPS counter (NVIDIA's)
+        // hooks the same present call and does not attach beside this detour
+        // (2026-09-20); Steam's counter does. Render thread only: plain statics.
+        static LARGE_INTEGER freq{}, last{}, windowStart{}; static double longest = 0; static LONG frames = 0;
+        LARGE_INTEGER t; QueryPerformanceCounter(&t);
+        if (!freq.QuadPart) { QueryPerformanceFrequency(&freq); last = windowStart = t; }
+        double dt = double(t.QuadPart - last.QuadPart) * 1000.0 / double(freq.QuadPart); last = t;
+        if (dt > longest) longest = dt;
+        frames++;
+        double win = double(t.QuadPart - windowStart.QuadPart) / double(freq.QuadPart);
+        if (win >= 5.0) {
+            Log("[menu] frames: %.0f/s, longest %.0f ms, over %.1f s\n", frames / win, longest, win);
+            frames = 0; longest = 0; windowStart = t;
+        }
+    }
     if ((n & 63) == 0 && InterlockedCompareExchange(&g_autoLoadPending, 0, 0) && GetTickCount64() - g_autoLoadSince > 12000) {
         // no menu frame took the load (not on a screen whose update runs): say how to load it by hand
         InterlockedExchange(&g_autoLoadPending, 0);
@@ -1684,17 +2084,36 @@ static VkResult myPresent(VkQueue q, const VkPresentInfoKHR* pi)
         InterlockedCompareExchange(&g_showOverlay, 0, 0), pi->swapchainCount,
         (int)g_rInit, (int)g_rFail, g_dev, g_qfam, (int)g_scFormat);
     __try {
-        if ((InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && !g_recoveryWorldIo && !NativeIo::Busy() && pi->swapchainCount >= 1) {
+        const bool loadingPanel = InterlockedCompareExchange(&g_loadingPanel, 0, 0) != 0;
+        if (loadingPanel && WorldLoaded()) {
+            // the world is up: the loading view hands over to the in-game panel, open
+            InterlockedExchange(&g_loadingPanel, 0);
+            InterlockedExchange(&g_showOverlay, 0);
+            InterlockedExchange(&g_ingameOverlay, 1);
+            InterlockedExchange(&g_uiState, 2);
+            InterlockedExchange(&g_panelDirty, 1);
+        }
+        const bool quiet = !g_recoveryWorldIo && !NativeIo::Busy();
+        if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent) && (quiet || loadingPanel) && pi->swapchainCount >= 1) {
             VkSwapchainKHR sc = pi->pSwapchains[0];
             uint32_t idx = pi->pImageIndices[0];
             if ((!g_rInit || sc != g_theSc) && !g_rFail) InitRender(sc);
-            if (g_rInit && !g_rFail && sc == g_theSc) { DrawButton(q, idx); PollClick(); }
+            if (g_rInit && !g_rFail && sc == g_theSc) { DrawButton(q, idx); if (quiet) PollClick(); }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         static bool once = false;
         if (!once) { once = true; Log("[menu] myPresent FAULT exc=%lx (rInit=%d rFail=%d)\n",
             GetExceptionCode(), (int)g_rInit, (int)g_rFail); }
     }
+    if (NoWsi() && pi) {
+        // the window system never sees this frame: consume the wait semaphores,
+        // report success for every swapchain, pace the loop to NORENDER_FPS
+        NullSignal(q, VK_NULL_HANDLE, VK_NULL_HANDLE, pi->waitSemaphoreCount, pi->pWaitSemaphores);
+        if (pi->pResults) for (uint32_t i = 0; i < pi->swapchainCount; ++i) pi->pResults[i] = VK_SUCCESS;
+        NullPace(NORENDER_FPS);
+        return VK_SUCCESS;
+    }
+    if (NoRender()) NullPace((double)g_flagDedFps);   // headless with the window system: dedicated_fps
     return g_realPresent(q, pi);
 }
 
@@ -1710,6 +2129,12 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
 {
     VkResult r = g_origCreateSc(dev, ci, a, sc);
     if (r == VK_SUCCESS && ci) {
+        if (!g_origGetScImages && g_origGdpa) g_origGetScImages = (PFN_vkGetSwapchainImagesKHR)g_origGdpa(dev, "vkGetSwapchainImagesKHR");
+        uint32_t cnt = 0;
+        if (g_origGetScImages && sc && g_origGetScImages(dev, *sc, &cnt, nullptr) == VK_SUCCESS && cnt > 0) {
+            InterlockedExchange(&g_nullScCount, (LONG)cnt); InterlockedExchange(&g_nullScNext, 0);
+            if (NoWsi()) Log("[menu] no-render: swapchain of %u images -- acquire and present are answered here, never by the window system\n", cnt);
+        }
         g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent; g_scUsage = ci->imageUsage;
         g_rInit = false; g_rFail = false;   // rebuild on next present
         // The panel and backdrop images were created against the OLD format and
@@ -1726,10 +2151,103 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
     return r;
 }
 
+// an empty submit that only signals (acquire) or only waits (present): what the
+// window system would have done to those semaphores and that fence
+static void NullSignal(VkQueue q, VkSemaphore signalSem, VkFence fence, uint32_t waitCount, const VkSemaphore* waitSems)
+{
+    if (!g_origSubmit || q == VK_NULL_HANDLE) return;
+    VkPipelineStageFlags stages[16];
+    if (waitCount > 16) waitCount = 16;
+    for (uint32_t i = 0; i < waitCount; ++i) stages[i] = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkSubmitInfo si{}; si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.waitSemaphoreCount = waitCount; si.pWaitSemaphores = waitCount ? waitSems : nullptr; si.pWaitDstStageMask = waitCount ? stages : nullptr;
+    si.signalSemaphoreCount = signalSem != VK_NULL_HANDLE ? 1 : 0; si.pSignalSemaphores = signalSem != VK_NULL_HANDLE ? &signalSem : nullptr;
+    g_origSubmit(q, 1, &si, fence);
+}
+static VkResult NullAcquire(VkSemaphore sem, VkFence fence, uint32_t* pIndex)
+{
+    LONG cnt = InterlockedCompareExchange(&g_nullScCount, 0, 0);
+    if (cnt <= 0) cnt = 3;
+    LONG i = InterlockedIncrement(&g_nullScNext) - 1;
+    if (pIndex) *pIndex = (uint32_t)(i % cnt);
+    NullSignal(g_qFromFam, sem, fence, 0, nullptr);
+    return VK_SUCCESS;
+}
+static VkResult VKAPI_CALL myAcquire(VkDevice dev, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence fence, uint32_t* pIndex)
+{
+    if (!NoWsi()) return g_origAcquire(dev, sc, timeout, sem, fence, pIndex);
+    return NullAcquire(sem, fence, pIndex);
+}
+static VkResult VKAPI_CALL myAcquire2(VkDevice dev, const VkAcquireNextImageInfoKHR* info, uint32_t* pIndex)
+{
+    if (!NoWsi()) return g_origAcquire2(dev, info, pIndex);
+    return NullAcquire(info ? info->semaphore : VK_NULL_HANDLE, info ? info->fence : VK_NULL_HANDLE, pIndex);
+}
+// the frame pace: `fps` frames a second, slept here (the window system's pace,
+// or the lack of one, no longer decides)
+static void NullPace(double fps)
+{
+    static LARGE_INTEGER freq{}, next{};
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const LONGLONG period = (LONGLONG)(freq.QuadPart / (fps > 1.0 ? fps : 1.0));
+    if (!next.QuadPart || now.QuadPart > next.QuadPart + 4 * period) next.QuadPart = now.QuadPart;   // first frame, or far behind: restart the grid
+    next.QuadPart += period;
+    LONGLONG wait = next.QuadPart - now.QuadPart;
+    if (wait > 0) {
+        DWORD ms = (DWORD)(wait * 1000 / freq.QuadPart);
+        if (ms > 1) Sleep(ms - 1);
+        do { QueryPerformanceCounter(&now); } while (now.QuadPart < next.QuadPart);
+    }
+}
+
+// vkQueueSubmit with the command buffers taken out: the fence and the semaphores
+// are signalled as the engine expects, nothing is rasterized. Our own overlay
+// submits go through pSubmit (the real one) and are skipped anyway (myPresent).
+static VkResult VKAPI_CALL mySubmit(VkQueue q, uint32_t n, const VkSubmitInfo* pSubmits, VkFence fence)
+{
+    if (!InterlockedCompareExchange(&g_noRender, 0, 0) || n == 0 || !pSubmits) return g_origSubmit(q, n, pSubmits, fence);
+    VkSubmitInfo local[8];
+    VkSubmitInfo* copy = (n <= 8) ? local : (VkSubmitInfo*)_alloca(sizeof(VkSubmitInfo) * n);
+    LONG dropped = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        copy[i] = pSubmits[i];
+        dropped += (LONG)copy[i].commandBufferCount;
+        copy[i].commandBufferCount = 0;
+        copy[i].pCommandBuffers = nullptr;
+    }
+    InterlockedIncrement(&g_noRenderSubmits);
+    InterlockedAdd(&g_noRenderCmdBufs, dropped);
+    return g_origSubmit(q, n, copy, fence);
+}
+// a query that never ran has no result: zeros, available now (a WAIT would never return)
+static VkResult VKAPI_CALL myQueryResults(VkDevice dev, VkQueryPool pool, uint32_t first, uint32_t count,
+                                          size_t dataSize, void* pData, VkDeviceSize stride, VkQueryResultFlags flags)
+{
+    if (!InterlockedCompareExchange(&g_noRender, 0, 0)) return g_origQueryResults(dev, pool, first, count, dataSize, pData, stride, flags);
+    if (pData && dataSize) memset(pData, 0, dataSize);
+    return VK_SUCCESS;
+}
 static PFN_vkVoidFunction myGdpa(VkDevice dev, const char* name)
 {
     PFN_vkVoidFunction real = g_origGdpa(dev, name);
     if (!name || !real) return real;
+    if (strcmp(name, "vkQueueSubmit") == 0) {
+        g_origSubmit = (PFN_vkQueueSubmit)real;
+        if (NoRender()) Log("[menu] intercepted vkQueueSubmit dev=%p -- dedicated_render=0: no command buffer will run\n", dev);
+        return (PFN_vkVoidFunction)mySubmit;
+    }
+    if (strcmp(name, "vkGetQueryPoolResults") == 0) {
+        g_origQueryResults = (PFN_vkGetQueryPoolResults)real; return (PFN_vkVoidFunction)myQueryResults;
+    }
+    if (strcmp(name, "vkAcquireNextImageKHR") == 0) {
+        g_origAcquire = (PFN_vkAcquireNextImageKHR)real; return (PFN_vkVoidFunction)myAcquire;
+    }
+    if (strcmp(name, "vkAcquireNextImage2KHR") == 0) {
+        g_origAcquire2 = (PFN_vkAcquireNextImage2KHR)real; return (PFN_vkVoidFunction)myAcquire2;
+    }
+    if (NoRender() && (strcmp(name, "vkQueueSubmit2") == 0 || strcmp(name, "vkQueueSubmit2KHR") == 0))
+        Log("[menu] the game resolves %s -- not intercepted, rendering may still run\n", name);
     if (strcmp(name, "vkQueuePresentKHR") == 0) {
         g_realPresent = (PFN_vkQueuePresentKHR)real; g_dev = dev;
         Log("[menu] intercepted vkQueuePresentKHR dev=%p real=%p\n", dev, real);
@@ -1772,7 +2290,7 @@ static PrepFn    g_prep = nullptr;
 static volatile LONG g_inMainBuild = 0;
 static void* g_mainList = nullptr;
 static int   g_mainListAdds = 0;
-static void OnHit(int id);
+static void OnHit(int id, int button);   // default on the first declaration
 
 struct FuncBase { const void* const* vptr; void* capture; };
 static FuncBase* __fastcall MpCopy(const FuncBase* self, void* dest) { FuncBase* d = (FuncBase*)dest; d->vptr = self->vptr; d->capture = self->capture; return d; }
@@ -1898,16 +2416,27 @@ static void jsonStr(const char* s, const char* key, char* dst, int dsz)
         p += plen;
     }
     if (!last) return;
-    // Copy up to the closing (unescaped) quote, decoding the escapes json.dumps
-    // emits for our payloads: \\ -> \, \" -> ", \/ -> /. Anything else (\uXXXX,
-    // \n ...) is left verbatim -- the backslash is copied and the next character
-    // follows on the next iteration.
-    int i = 0; const char* r = last;
-    while (*r && *r != '"' && i < dsz - 1) {
-        if (*r == '\\' && (r[1] == '\\' || r[1] == '"' || r[1] == '/')) { dst[i++] = r[1]; r += 2; }
-        else dst[i++] = *r++;
+    // dst holds a protocol-bounded field (a type, a phase, a token); a value the
+    // roster feeds (names, the lobby title, a save path) goes through jsonStrS.
+    std::string v = jsonUnquote(last);
+    if ((int)v.size() > dsz - 1) { Log("[menu] jsonStr: \"%s\" is %zu bytes, the field holds %d -- cut\n", key, v.size(), dsz - 1); v.resize(dsz - 1); }
+    memcpy(dst, v.c_str(), v.size() + 1);
+}
+// The same, any length: the string value for `key` (last occurrence), "" if absent.
+static std::string jsonStrS(const char* s, const char* key)
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    size_t plen = strlen(pat);
+    const char* last = nullptr; const char* p = s;
+    while ((p = strstr(p, pat)) != nullptr) {
+        const char* q = p + plen;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == ':') { q++; while (*q == ' ' || *q == '\t') q++;
+                         if (*q == '"') last = q + 1; }
+        p += plen;
     }
-    dst[i] = 0;
+    if (!last) return std::string();
+    return jsonUnquote(last);
 }
 
 // Extract a boolean for `key` (e.g. start "save"). Absent/unparseable -> dflt.
@@ -1975,6 +2504,20 @@ static const char* const NAME_NOUN[] = {
     "Marmot","Newt","Ocelot","Puffin","Quail","Rabbit","Salmon","Toucan","Urchin","Viper",
     "Wombat","Yak","Zebra","Engine","Signal","Depot","Tender","Boxcar","Caboose","Tram",
     "Ferry","Barge","Trolley","Wagon","Piston","Rail","Switch","Girder","Trestle","Viaduct" };
+// Is this exactly one of the names ensureUsername makes up (an adjective from
+// NAME_ADJ followed by a noun from NAME_NOUN, nothing else)? Such a name was
+// never typed by the player, so it must not be kept over the Steam persona.
+static bool IsGeneratedName(const char* n)
+{
+    if (!n || !n[0]) return false;
+    for (size_t a = 0; a < sizeof(NAME_ADJ) / sizeof(NAME_ADJ[0]); a++) {
+        const size_t la = strlen(NAME_ADJ[a]);
+        if (strncmp(n, NAME_ADJ[a], la) != 0) continue;
+        for (size_t b = 0; b < sizeof(NAME_NOUN) / sizeof(NAME_NOUN[0]); b++)
+            if (strcmp(n + la, NAME_NOUN[b]) == 0) return true;
+    }
+    return false;
+}
 static void ensureUsername()
 {
     if (g_username[0]) return;
@@ -1992,8 +2535,8 @@ static bool LobbySend(const char* jsonLine)   // append a command to lobby_in.js
     HANDLE h = CreateFileW(p, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
     SetFilePointer(h, 0, nullptr, FILE_END);
-    DWORD w; char line[1600]; int L = snprintf(line, sizeof(line), "%s\n", jsonLine);   // start lines carry a full save path
-    const bool ok = WriteFile(h, line, L, &w, nullptr) && w == (DWORD)L;
+    DWORD w; std::string line(jsonLine); line += '\n';   // start lines carry a full save path: no fixed buffer here
+    const bool ok = WriteFile(h, line.data(), (DWORD)line.size(), &w, nullptr) && w == (DWORD)line.size();
     CloseHandle(h);
     return ok;
 }
@@ -2068,8 +2611,15 @@ extern "C" {
     void* g_gameUiTramp = nullptr;
     void  GameUiRelay();
     volatile uint64_t g_gameUi = 0;                 // UI::CGameUI 'this', per frame
-    void GameUiSeen(uint64_t rcx) { g_gameUi = rcx; }
+    void GameUiSeen(uint64_t rcx) {
+        if (!g_gameUi && rcx) InterlockedExchange(&g_hostMenuLoad, 0);   // a NEW world is up: a switch in flight is over
+        g_gameUi = rcx;
+    }
 }
+// tpf2_slice.dll reads the CGameUI through this (its game-state provider at
+// +0x450 is how the slice builds a MovePathUtilContext for the line platform
+// assignment at replay). 0 between worlds.
+extern "C" __declspec(dllexport) uint64_t Tpf2mpGameUi() { return g_gameUi; }
 static const uintptr_t RVA_GAMEUI_UPDATE = 0x5741d0;
 static const int       STEAL_GAMEUI      = 21;
 static const uint8_t   GAMEUI_EXPECTED[STEAL_GAMEUI] = {
@@ -2123,6 +2673,33 @@ static ULONGLONG saveMtime(const wchar_t* path, ULONGLONG* size)
     return ((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
 }
 static ULONGLONG g_syncBaseline = 0, g_syncAskedAt = 0, g_syncLastSize = 0;
+// A RECENT SAVE SERVES THE NEXT HOT JOINER (2026-09-16). Every roster increase
+// used to take a fresh autosave; three people joining a minute apart meant
+// three saves (each a multi-second freeze for everyone). If the save last
+// shared is younger than HOTJOIN_REUSE_MS of UNPAUSED play, the lobby's
+// serve-again pushes that one to the newcomer instead. Paused time does not
+// count: g_unpausedMs advances only while the mod's dash says paused=no.
+static const ULONGLONG HOTJOIN_REUSE_MS = 15000;
+static ULONGLONG g_unpausedMs = 0, g_unpausedLast = 0, g_syncSharedUnpaused = 0;
+static bool g_syncSharedValid = false;
+static void UnpausedTick()
+{
+    static ULONGLONG nextRead = 0; static bool paused = false;
+    ULONGLONG now = GetTickCount64();
+    if (now >= nextRead) {
+        nextRead = now + 500;
+        // the host's dash file (letter a on a plain host; the roster's letter otherwise)
+        char letter[3] = "a";
+        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_you.empty()) strcpy_s(letter, originLetterFor(g_you).c_str()); LeaveCriticalSection(&g_modelCs); }
+        wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%slockstep_dash_%hs.txt", g_dataDirW, letter);
+        paused = false;   // unknown counts as running: the window then closes, never lingers
+        FILE* f = _wfsopen(p, L"r", _SH_DENYNO);
+        if (f) { char line[200]; while (fgets(line, sizeof(line), f)) if (!strncmp(line, "paused=yes", 10)) { paused = true; break; } fclose(f); }
+    }
+    if (g_unpausedLast && !paused) g_unpausedMs += now - g_unpausedLast;
+    g_unpausedLast = now;
+}
+static void MarkSaveShared() { g_syncSharedUnpaused = g_unpausedMs; g_syncSharedValid = true; }
 static wchar_t   g_syncSave[600] = L"";
 static CRITICAL_SECTION g_syncCs; static bool g_syncCsInit = false;
 // Take the sync save now (host, in game). Called for a "/sync" request and,
@@ -2133,6 +2710,22 @@ static void SyncStart(const char* why)
     if (!g_gameUi) { Log("[sync] %s before the game is running -- ignored\n", why); return; }
     if (g_syncCsInit) EnterCriticalSection(&g_syncCs);
     if (g_syncAskedAt) { Log("[sync] %s while a save is pending -- one save serves everyone who joined\n", why); }
+    else if (strncmp(why, "hot join", 8) == 0 && g_syncSharedValid && g_startSaveW[0]
+             && GetFileAttributesW(g_startSaveW) != INVALID_FILE_ATTRIBUTES
+             && g_unpausedMs - g_syncSharedUnpaused < HOTJOIN_REUSE_MS) {
+        // Re-send the start with the file we already shared: the lobby transfers
+        // it to whoever is unstarted. Its serve-again would do that on its own
+        // only for a session it has latched as started -- a host that loaded a
+        // world ALONE never latched (nobody to share with), so the first joiner
+        // got nothing at all (2026-09-16: "fresh enough ... no new save", then
+        // silence). The explicit start covers both cases.
+        Log("[sync] %s -> the save shared %.1f s of unpaused play ago is fresh enough: sharing it again, no new save\n",
+            why, (g_unpausedMs - g_syncSharedUnpaused) / 1000.0);
+        std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(g_startSaveW).c_str()) + "\"}";
+        LobbySend(line.c_str());
+        SetStatus("Hot join: sending the recent save\xE2\x80\xA6");
+        SendChat("!hotjoin A game is running. Hold on: the host is sending you the world; your game loads it by itself.");
+    }
     else {
         wchar_t cur[600] = L""; ULONGLONG sz = 0;
         g_syncBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
@@ -2149,7 +2742,9 @@ static void SyncStart(const char* why)
             // ...but only for a real hot join. The relay's periodic upload
             // took the same path and every panel got "!hotjoin ..." in its
             // chat every two minutes (2026-09-10).
-            if (strncmp(why, "relay:", 6) != 0)
+            if (strncmp(why, "world switch", 12) == 0)
+                SendChat("!hotjoin The host has moved to another world. Hold on: it is being sent to you and your game loads it by itself.");
+            else if (strncmp(why, "relay:", 6) != 0)
                 SendChat("!hotjoin A game is running. Hold on: the host is saving and will send you the world; your game loads it by itself.");
         }
     }
@@ -2157,6 +2752,7 @@ static void SyncStart(const char* why)
 }
 static void SyncPoll()
 {
+    UnpausedTick();
     wchar_t req[MAX_PATH]; _snwprintf_s(req, _TRUNCATE, L"%stpf2_sync_save.txt", g_dataDirW);
     if (GetFileAttributesW(req) != INVALID_FILE_ATTRIBUTES) {
         DeleteFileW(req);
@@ -2169,16 +2765,18 @@ static void SyncPoll()
         if (mt > g_syncBaseline && sz > 0) {
             // wait until the file stops growing (the sidecars are written after the .sav)
             if (wcscmp(cur, g_syncSave) == 0 && sz == g_syncLastSize) {
-                char u[900]; WideCharToMultiByte(CP_UTF8, 0, cur, -1, u, sizeof(u), nullptr, nullptr);
-                char esc[1024]; int j = 0; for (int i = 0; u[i] && j < 1010; i++) { if (u[i] == '\\' || u[i] == '"') esc[j++] = '\\'; esc[j++] = u[i]; } esc[j] = 0;
-                char line[1200]; snprintf(line, sizeof(line), "{\"cmd\":\"start\",\"save\":\"%s\"}", esc);
+                std::string u = utf8Of(cur);
+                const bool sw = InterlockedExchange(&g_switchShare, 0) != 0;
+                std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(u.c_str()) + "\""
+                                 + (sw ? ",\"switch\":true" : "") + "}";
                 wcscpy_s(g_startSaveW, cur);
-                LobbySend(line);
+                LobbySend(line.c_str());
+                MarkSaveShared();
                 Log("[sync] new save %ls (%llu B) -> sharing with every joiner\n", cur, (unsigned long long)sz);
                 SetStatus("Sync: sharing the save\xE2\x80\xA6");
                 wchar_t sent[MAX_PATH]; _snwprintf_s(sent, _TRUNCATE, L"%stpf2_sync_sent.txt", g_dataDirW);
                 HANDLE h = CreateFileW(sent, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, u, (DWORD)strlen(u), &w, nullptr); CloseHandle(h); }
+                if (h != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(h, u.data(), (DWORD)u.size(), &w, nullptr); CloseHandle(h); }
                 g_syncAskedAt = 0;
                 return;
             }
@@ -2189,7 +2787,84 @@ static void SyncPoll()
         Log("[sync] no new save appeared within 90 s -- giving up (is autosave writable? see the game log)\n");
         SetStatus("Sync: the save did not appear");
         g_syncAskedAt = 0;
+        InterlockedExchange(&g_switchShare, 0);
     }
+}
+
+// A resync loads a world too. Its load is not a world switch: everyone is
+// already being moved to it by the recovery protocol, and pushing the save
+// again would start a second transfer on top of the one that just finished.
+static bool RecoveryBusy()
+{
+    if (InterlockedCompareExchange(&g_recoveryWorldIo, 0, 0) || NativeIo::Busy()) return true;
+    bool busy = false;
+    if (g_modelCsInit) {
+        EnterCriticalSection(&g_modelCs);
+        busy = g_recoveryRequestedAt != 0
+            || (g_recoveryPhase[0] && strcmp(g_recoveryPhase, "complete") && strcmp(g_recoveryPhase, "detected")
+                && strcmp(g_recoveryPhase, "unavailable") && strcmp(g_recoveryPhase, "manual"));
+        LeaveCriticalSection(&g_modelCs);
+    }
+    return busy;
+}
+
+// ---------------- WORLD SWITCH without a save name ----------------
+// NEW GAME never passes through StartSavegame, and neither does anything else
+// that builds a world from something other than a save file, so the detour
+// above cannot see those. The MOD can: lockstep.lua stamps a fresh value into
+// tpf2mp_world_gen.txt on the first sim tick of every world it loads (with the
+// game's own pid, so a second instance sharing this data dir is not mistaken
+// for us). A change in that value means THIS game is in another world now.
+// Host only -- a joiner's own token says nothing about what anyone must load.
+static void PollWorldGen()
+{
+    static ULONGLONG last = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - last < 500 || !g_dataDirW[0]) return;
+    last = now;
+    // A resync loads a world of its own. Arm the hold for as long as one runs,
+    // not only when the change is noticed: the token is stamped on the new
+    // world's first tick, and this poll may not see it until the recovery has
+    // already reported "complete".
+    if (RecoveryBusy()) InterlockedExchange(&g_worldGenHold, 1);
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%stpf2mp_world_gen.txt", g_dataDirW);
+    FILE* f = _wfsopen(p, L"r", _SH_DENYNO); if (!f) return;
+    char buf[400] = ""; size_t got = fread(buf, 1, sizeof(buf) - 1, f); buf[got] = 0; fclose(f);
+    char gen[160] = ""; unsigned long pid = 0; bool sawPid = false;
+    for (char* line = buf; line && *line; ) {
+        char* nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        if (!strncmp(line, "gen=", 4)) strncpy_s(gen, sizeof(gen), line + 4, _TRUNCATE);
+        else if (!strncmp(line, "pid=", 4)) { sawPid = line[4] != 0; pid = strtoul(line + 4, nullptr, 10); }
+        line = nl ? nl + 1 : nullptr;
+        while (line && (*line == '\r' || *line == '\n')) line++;
+    }
+    if (!gen[0]) return;
+    if (sawPid && pid != GetCurrentProcessId()) return;    // another instance's token
+    if (!strcmp(gen, g_worldGen)) return;
+    // The value is followed from the title menu on -- a world the game loaded
+    // before anyone hosted is still a baseline, and a token first seen at a
+    // session boundary would otherwise read as a switch. The hold says "the
+    // next value is the world WE just started loading", and is spent on the
+    // first sighting too: with no token file at all (a process that has never
+    // loaded a world) that first sighting IS our load.
+    const bool first = g_worldGen[0] == 0;
+    const bool mine = InterlockedExchange(&g_worldGenHold, 0) != 0;
+    strcpy_s(g_worldGen, gen);
+    if (first) { Log("[menu] world token %s (first seen%s)\n", gen, mine ? ", our own load" : ""); return; }
+    if (mine) { Log("[menu] world token %s -- the load we started\n", gen); return; }
+    if (!InterlockedCompareExchange(&g_isHost, 0, 0)) return;   // a joiner never switches anyone
+    if (RecoveryBusy()) { Log("[menu] world token %s during a resync -- not a switch\n", gen); return; }
+    int players = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); players = playerCount(); LeaveCriticalSection(&g_modelCs); }
+    const bool live = WorldLoaded() && InterlockedCompareExchange(&g_sessionStarted, 0, 0)
+                   && InterlockedCompareExchange(&g_lobbyReady, 0, 0);
+    if (!live || players < 2) {
+        Log("[menu] world token %s -- nobody to switch (live=%d players=%d)\n", gen, live ? 1 : 0, players);
+        return;
+    }
+    Log("[menu] world token changed to %s while %d player(s) are playing -- switching everyone\n", gen, players - 1);
+    InterlockedExchange(&g_switchShare, 1);
+    SyncStart("world switch");
 }
 
 // "/speed 2.5" typed in the lobby chat (by anyone -- the host's game script
@@ -2202,6 +2877,122 @@ static int  g_syncReq = 0;
 static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")
 static char g_transportLobby[33] = ""; // owned by LobbyThread
 static void writeBridgeCtl(bool isHost);
+// Our own hot-join stage for the roster (2026-09-16). Sent as {"cmd":"stage"}
+// when it changes: "loading world" as the shared save starts loading, "loading
+// world N%" from the engine's own loading bar while it loads, then what the
+// mod's status line says (stage=starting / catchup / behind / live) once the
+// world is up, and "" (cleared) at live.
+static char g_stageSent[80] = "";
+static volatile LONG g_stageWatch = 0;
+// The engine's loading bar (RE 2026-09-16, build 35924 -- static: decompiled
+// and byte-scanned, the live values are what a run has to confirm):
+//   UI::CMenuUI + 0x498   UI::CProgressBar* m_progressBar, stored by the CMenuUI
+//                         ctor 0x64e220, asserted non-null by the load's
+//                         completion lambda 0x67ca00 (MenuUI.cpp:0xe65)
+//   CProgressBar + 0x440  shared_ptr<UI::ProgressMonitor> (ptr; control block at
+//                         +0x448), made in the bar's creator 0x22e3140
+//                         (lib\ui\popupmanager.cpp), handed out by 0x22e3c50
+//   ProgressMonitor+0x08  float 0..1, written atomically by SetProgress (vslot 1,
+//                         0x22e3dc0) and read by GetProgress (vslot 2, 0x156720);
+//                         vftable 0x389b4a8 is the sanity check below
+// The load launcher 0x65a0f0 (the task StartSavegame 0x6785c0 posts) resets
+// the bar to menu+0x19b4 and titles it "Loading..."; the loader job 0x67d130
+// owns the span up to 0.7 (LoadGame 0x2e5ec0 splits it 0.1 header+mods / 0.9
+// CGame::Load through SubProgressMonitor 0x2380000, whose dtor 0x2380050 lands
+// the parent on base+span) and the completion lambda 0x67ca00 hands StartGame
+// 0x676480 the rest, so 1.0 means the new CGameUI exists. Between loads the
+// value keeps the last one (1.0 after a load, 0 from the ctor): a 100 is never
+// shown as a number, it is the previous load until the launcher resets it.
+static const uintptr_t RVA_PROGRESSMON_VFT  = 0x389b4a8;   // UI::ProgressMonitor::vftable
+static const size_t    MENU_OFF_PROGRESSBAR = 0x498;
+static const size_t    BAR_OFF_MONITOR      = 0x440;
+static const size_t    PM_OFF_PROGRESS      = 0x8;
+static volatile uint64_t g_menuUiPtr = 0;          // UI::CMenuUI 'this' (from CreatePage)
+static volatile LONG g_stageArmedInWorld = 0;      // armed while a world was up: an in-place switch
+static volatile LONG g_stageSawLoad = 0;           // the bar moved, or the old world went, since arming
+static volatile LONG g_stageNoPctLogged = 0;
+static ULONGLONG     g_stageArmedAt = 0;
+// SEH only in this frame (no C++ objects): the pointers are the engine's.
+// -1 no menu yet, -2 no bar / monitor, -3 not a ProgressMonitor or out of range,
+// -4 faulted; else 0..100 (floored: 100 only at exactly 1.0).
+static int ReadLoadPercent()
+{
+    uint64_t menu = g_menuUiPtr;
+    if (!menu) return -1;
+    __try {
+        uint64_t bar = *(volatile uint64_t*)(menu + MENU_OFF_PROGRESSBAR);
+        if (!bar) return -2;
+        uint64_t pm = *(volatile uint64_t*)(bar + BAR_OFF_MONITOR);
+        if (!pm) return -2;
+        if (*(volatile uint64_t*)pm != (uint64_t)(g_base + RVA_PROGRESSMON_VFT)) return -3;
+        float f = *(volatile float*)(pm + PM_OFF_PROGRESS);
+        if (!(f >= 0.0f && f <= 1.0f)) return -3;
+        int pct = (int)(f * 100.0f);
+        return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -4; }
+}
+static void ReportStage(const char* text)
+{
+    if (strcmp(text, g_stageSent) == 0) return;
+    strcpy_s(g_stageSent, text);
+    char esc[200]; int j = 0;
+    for (int i = 0; text[i] && j < 190; i++) { if (text[i] == '"' || text[i] == '\\') esc[j++] = '\\'; esc[j++] = text[i]; }
+    esc[j] = 0;
+    char line[260]; snprintf(line, sizeof(line), "{\"cmd\":\"stage\",\"text\":\"%s\"}", esc);
+    LobbySend(line);
+    Log("[menu] stage: %s\n", text[0] ? text : "(clear)");
+}
+static void ArmStageWatch(const char* text)
+{
+    ReportStage(text);
+    g_stageArmedAt = GetTickCount64();
+    InterlockedExchange(&g_stageArmedInWorld, (NativeIo::HasWorld() || WorldLoaded()) ? 1 : 0);
+    InterlockedExchange(&g_stageSawLoad, 0);
+    InterlockedExchange(&g_stageWatch, 1);
+}
+static void StageTick()
+{
+    static ULONGLONG next = 0;
+    if (!InterlockedCompareExchange(&g_stageWatch, 0, 0)) return;
+    ULONGLONG now = GetTickCount64(); if (now < next) return; next = now + 1000;
+    // 1. the engine's loading bar: "loading world N%" while it is short of 1.0
+    const int pct = ReadLoadPercent();
+    if (pct >= 0 && pct < 100) {
+        InterlockedExchange(&g_stageSawLoad, 1);
+        char t[48]; snprintf(t, sizeof(t), "loading world %d%%", pct); ReportStage(t); return;
+    }
+    if (pct < 0 && !InterlockedExchange(&g_stageNoPctLogged, 1))
+        Log("[menu] stage: the engine's load progress is not readable (menu=%llx code=%d) -- no percentage\n",
+            (unsigned long long)g_menuUiPtr, pct);
+    // 2. is the world up? NativeIo sees the CGameUI constructor and the world
+    // destructor (g_gameUi stays stale through an in-place switch); the per-frame
+    // CGameUI relay covers a title-menu load should the native hooks be off.
+    const bool inWorldArm = InterlockedCompareExchange(&g_stageArmedInWorld, 0, 0) != 0;
+    const bool worldUp = NativeIo::HasWorld() || (!inWorldArm && WorldLoaded());
+    if (!worldUp) { InterlockedExchange(&g_stageSawLoad, 1); return; }   // pct 100 here is the LAST load's: keep the arm text
+    // 3. an in-place switch: the old world stays up until StartGame swaps it, so a
+    // fresh arm must not read the old world's status line as the new world's
+    if (inWorldArm && !InterlockedCompareExchange(&g_stageSawLoad, 0, 0) && now - g_stageArmedAt < 20000) return;
+    // 4. the world is up: what the mod's status line says
+    char letter[3] = "a";
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_you.empty()) strcpy_s(letter, originLetterFor(g_you).c_str()); LeaveCriticalSection(&g_modelCs); }
+    wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%slockstep_status_%hs.txt", g_dataDirW, letter);
+    FILE* f = _wfsopen(p, L"r", _SH_DENYNO); if (!f) { ReportStage("world loaded"); return; }
+    char line[512] = ""; fgets(line, sizeof(line), f); fclose(f);
+    const char* st = strstr(line, "stage=");
+    if (!st) { ReportStage("world loaded"); return; }
+    st += 6; char stage[64]; int k = 0; while (st[k] && st[k] > ' ' && k < 63) { stage[k] = st[k]; k++; } stage[k] = 0;
+    if (strcmp(stage, "live") == 0) { ReportStage(""); InterlockedExchange(&g_stageWatch, 0); return; }
+    if (strcmp(stage, "starting") == 0) { ReportStage("world loaded, waiting for the session"); return; }
+    if (strncmp(stage, "catchup:", 8) == 0) {
+        const char* ph = stage + 8; const char* b = strchr(ph, ':'); double behind = b ? atof(b + 1) : 0;
+        char t[80];
+        if (strncmp(ph, "fetch", 5) == 0) snprintf(t, sizeof(t), "catching up: fetching history (%.0f s behind)", behind);
+        else snprintf(t, sizeof(t), "catching up (%.0f s behind)", behind);
+        ReportStage(t); return;
+    }
+    if (strncmp(stage, "behind:", 7) == 0) { char t[80]; snprintf(t, sizeof(t), "%.0f s behind", atof(stage + 7)); ReportStage(t); return; }
+}
 static void speedFromChat(const char* text)
 {
     if (strncmp(text, "/sync", 5) == 0) {
@@ -2232,24 +3023,23 @@ static void writeBridgeCtl(bool isHost)
     // Letters for N players: the host is 'a'; joiners take b, c, d... in roster
     // order, skipping the host. Every client derives the same assignment from
     // the same roster, so nobody has to be told.
-    char letter[3] = "a";
+    std::string letter = "a";
     bool fromRelay = false;
     if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-        for (int i = 0; i < g_playerCount; i++) if (strcmp(g_players[i], g_you) == 0 && g_letters[i][0]) { strcpy_s(letter, g_letters[i]); fromRelay = true; break; }
+        for (int i = 0; i < playerCount(); i++) if (g_players[i] == g_you && !g_letters[i].empty()) { letter = g_letters[i]; fromRelay = true; break; }
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
     }
     if (!isHost && !fromRelay) {
         int idx = 0;
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-        for (int i = 0; i < g_playerCount; i++) {
-            if (strcmp(g_players[i], g_host) == 0) continue;
-            if (strcmp(g_players[i], g_you) == 0) break;
+        for (int i = 0; i < playerCount(); i++) {
+            if (g_players[i] == g_host) continue;
+            if (g_players[i] == g_you) break;
             idx++;
         }
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-        if (idx > MAX_PLAYERS - 2) idx = MAX_PLAYERS - 2;
-        originName(idx + 1, letter);
+        char nm[3]; originName(idx + 1, nm); letter = nm;
     }
     // players= is the LOBBY ROSTER SIZE, including the host. The game script
     // needs it to know when everybody has finished loading: nothing else tells
@@ -2258,7 +3048,7 @@ static void writeBridgeCtl(bool isHost)
     // everyone". Without it the load gate had to fall back to a settle timer
     // and released with two of three players in.
     snprintf(content, sizeof(content), "instance=%s\npeer=127.0.0.1:%d\npid=%lu\nplayers=%d\n",
-             letter, relayPortFor(isHost), bpid, g_playerCount);
+             letter.c_str(), relayPortFor(isHost), bpid, playerCount());
     if (g_transportLobby[0]) {
         size_t n = strlen(content);
         snprintf(content+n,sizeof(content)-n,"lobby=%s\n",g_transportLobby);
@@ -2277,7 +3067,7 @@ static void writeBridgeCtl(bool isHost)
     }
     {   // the session clock: the roster's host (a relay lobby moves it when the leader leaves)
         size_t n = strlen(content);
-        snprintf(content + n, sizeof(content) - n, "leader=%s\n", g_host[0] ? originLetterFor(g_host) : "a");
+        snprintf(content + n, sizeof(content) - n, "leader=%s\n", !g_host.empty() ? originLetterFor(g_host).c_str() : "a");
     }
     if (strcmp(content, last) == 0) return;
     wchar_t path[MAX_PATH], tmp[MAX_PATH];
@@ -2293,26 +3083,33 @@ static void writeBridgeCtl(bool isHost)
     }
     strcpy_s(last, content);
     Log("[menu] bridge ctl -> %ls: instance=%s peer=127.0.0.1:%d\n",
-        path, letter, relayPortFor(isHost));
+        path, letter.c_str(), relayPortFor(isHost));
 }
 
 // The origin letter each machine's bridge uses: the host is 'a', joiners take
 // b, c, ... in roster order skipping the host (same rule as writeBridgeCtl).
-static const char* originLetterFor(const char* name)
+static std::string originLetterFor(const std::string& name)
 {
-    static char buf[3];
+    // the critical section is recursive: writeCompanyCfg calls this with it held
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    std::string out;
     if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
-        for (int i = 0; i < g_playerCount; i++) if (strcmp(g_players[i], name) == 0 && g_letters[i][0]) { strcpy_s(buf, g_letters[i]); return buf; }
+        for (int i = 0; i < playerCount(); i++) if (g_players[i] == name && !g_letters[i].empty()) { out = g_letters[i]; break; }
     }
-    if (strcmp(name, g_host) == 0) return "a";
-    int idx = 0;
-    for (int i = 0; i < g_playerCount; i++) {
-        if (strcmp(g_players[i], g_host) == 0) continue;
-        if (strcmp(g_players[i], name) == 0) break;
-        idx++;
+    if (out.empty()) {
+        if (name == g_host) out = "a";
+        else {
+            int idx = 0;
+            for (int i = 0; i < playerCount(); i++) {
+                if (g_players[i] == g_host) continue;
+                if (g_players[i] == name) break;
+                idx++;
+            }
+            char nm[3]; originName(idx + 1, nm); out = nm;
+        }
     }
-    if (idx > MAX_PLAYERS - 2) idx = MAX_PLAYERS - 2;
-    originName(idx + 1, buf); return buf;
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    return out;
 }
 
 // mp_company_cfg.txt for the game script (lockstep.lua companies mode):
@@ -2323,70 +3120,120 @@ static const char* originLetterFor(const char* name)
 // Written at START from the roster every machine already agrees on.
 static void writeCompanyCfg()
 {
-    static char l3[1024], l4[2048]; l3[0] = 0; l4[0] = 0; int mine = 1, distinct = 0; bool seen[MAX_COMPANIES + 1] = {};
+    std::string l3, l4; int mine = 1, distinct = 0; bool seen[MAX_COMPANIES + 1] = {};
     if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-    for (int i = 0; i < g_playerCount; i++) {
+    const bool separate = InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0;
+    for (int i = 0; i < playerCount(); i++) {
         int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
-        if (strcmp(g_players[i], g_you) == 0) mine = cid;
+        if (g_players[i] == g_you) mine = cid;
         if (!seen[cid]) { seen[cid] = true; distinct++; }
-        char e[24]; snprintf(e, sizeof(e), "%s%s=%d", l4[0] ? "," : "", originLetterFor(g_players[i]), cid); strcat_s(l4, 2048, e);
+        if (!l4.empty()) l4 += ','; l4 += originLetterFor(g_players[i]) + "=" + std::to_string(cid);
     }
     if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-    for (int c = 1; c <= MAX_COMPANIES; c++) if (seen[c]) { char e[8]; snprintf(e, sizeof(e), "%s%d", l3[0] ? "," : "", c); strcat_s(l3, 1024, e); }
-    static char content[4096]; snprintf(content, sizeof(content), "%s\n%d\n%s\n%s\n", distinct > 1 ? "companies" : "coop", mine, l3, l4);
+    for (int c = 1; c <= MAX_COMPANIES; c++) if (seen[c]) { if (!l3.empty()) l3 += ','; l3 += std::to_string(c); }
+    const char* mode = separate || distinct > 1 ? "companies" : "coop";
+    std::string content = std::string(mode) + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
     wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW);
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { Log("[menu] company cfg: cannot write %ls\n", path); return; }
-    DWORD w = 0; WriteFile(h, content, (DWORD)strlen(content), &w, nullptr); CloseHandle(h);
-    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3, l4);
+    DWORD w = 0; WriteFile(h, content.data(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
+    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, mode, mine, l3.c_str(), l4.c_str());
+}
+
+// mp_players.txt: "letter=name" per roster entry, with the same letters the
+// bridge ctl and the company cfg use. The in-game dashboard's company picker
+// shows player names instead of origin letters from it (2026-09-16). Written on
+// every roster change so a hot joiner appears by name too.
+static void writePlayerNames()
+{
+    std::string content;
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    for (int i = 0; i < playerCount(); i++) {
+        content += originLetterFor(g_players[i]); content += '='; content += g_players[i]; content += '\n';
+    }
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_players.txt", g_dataDirW);
+    HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0; WriteFile(h, content.c_str(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
+    // mp_loading.txt (2026-09-16): "letter=name=stage" for every player still loading in
+    // (receiving the save, loading the world, catching up); empty once everyone is in.
+    // The mod refuses company switches while it is not empty (companies.lua).
+    std::string loading;
+    if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    for (int i = 0; i < playerCount() && i < (int)g_stages.size(); i++) {
+        if (g_stages[i].empty()) continue;
+        loading += originLetterFor(g_players[i]); loading += '='; loading += g_players[i]; loading += '='; loading += g_stages[i]; loading += '\n';
+    }
+    if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
+    _snwprintf_s(path, _TRUNCATE, L"%smp_loading.txt", g_dataDirW);
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    WriteFile(h, loading.c_str(), (DWORD)loading.size(), &w, nullptr); CloseHandle(h);
 }
 
 // parse a roster event: "players":["a","b"], "you":"a", "host":"a"
 static void applyRoster(const char* s)
 {
     if (!g_modelCsInit) return; EnterCriticalSection(&g_modelCs);
-    g_playerCount = 0;
-    // whitespace-tolerant: find "players", then its '[' .. ']', pull each "quoted" name.
+    g_players.clear(); g_companies.clear(); g_letters.clear();
+    // whitespace-tolerant: find "players", then its '[' and pull each "quoted"
+    // name until the list ends. Every name, in full, however many: the roster
+    // is the load gate's player count and the origin-letter order on every peer.
     const char* pa = strstr(s, "\"players\"");
-    if (pa) { pa = strchr(pa, '['); const char* end = pa ? strchr(pa, ']') : nullptr;
-        if (pa && end) { const char* q = pa;
-            while (g_playerCount < MAX_PLAYERS) {
-                q = strchr(q, '"'); if (!q || q > end) break; q++;
-                int k = 0; while (*q && *q != '"' && k < 38) g_players[g_playerCount][k++] = *q++;
-                g_players[g_playerCount][k] = 0; g_playerCount++;
+    if (pa) { pa = strchr(pa, '[');
+        if (pa) { const char* q = pa + 1;
+            for (;;) {
+                while (*q == ' ' || *q == '\t' || *q == ',') q++;
+                if (*q != '"') break;   // ']' (or anything that is not a name): end of the list
+                q++;
+                g_players.push_back(jsonUnquote(q));
                 if (*q == '"') q++;
             } } }
+    g_companies.assign(g_players.size(), 1); g_letters.assign(g_players.size(), std::string());
     // "companies":{"name":id,...} -> g_companies[i] for each roster entry (default 1)
     const char* co = strstr(s, "\"companies\"");
-    for (int i = 0; i < g_playerCount; i++) {
-        g_companies[i] = 1;
-        if (!co) continue;
-        char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
-        const char* k = strstr(co, keyq);
-        if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
+    for (int i = 0; co && i < playerCount(); i++) {
+        std::string keyq = "\"" + jsonEscape(g_players[i].c_str()) + "\"";
+        const char* k = strstr(co, keyq.c_str());
+        if (k) { k += keyq.size(); while (*k == ' ' || *k == ':') k++; int id = atoi(k); if (id >= 1 && id <= MAX_COMPANIES) g_companies[i] = id; }
     }
-    char v[40];
-    jsonStr(s, "you", v, sizeof(v)); if (v[0]) strcpy_s(g_you, v);
-    jsonStr(s, "host", v, sizeof(v)); if (v[0]) strcpy_s(g_host, v);
-    jsonStr(s, "lobby", v, sizeof(v)); strcpy_s(g_lobbyTitle, v);
+    // "mode":"coop"|"companies" -> the checkbox (a joiner sees the host's choice)
+    { char md[16] = ""; jsonStr(s, "mode", md, sizeof(md));
+      if (md[0]) InterlockedExchange(&g_sepCompanies, strcmp(md, "companies") == 0 ? 1 : 0); }
+    // "join_freeze":true -> the lobby freezes the session for a late joiner and
+    // reloads everyone (a recovery round); absent or false -> the hot-join save below
+    { const char* jf = strstr(s, "\"join_freeze\"");
+      InterlockedExchange(&g_joinFreeze, (jf && strstr(jf, "true") && strstr(jf, "true") < jf + 24) ? 1 : 0); }
+    // "stages":{"name":"text",...} -> g_stages[i]: what each joiner is doing
+    g_stages.assign(g_players.size(), std::string());
+    { const char* sg = strstr(s, "\"stages\"");
+      for (int i = 0; sg && i < playerCount(); i++) {
+          std::string keyq = "\"" + jsonEscape(g_players[i].c_str()) + "\"";
+          const char* k = strstr(sg, keyq.c_str());
+          if (k) { k += keyq.size(); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; g_stages[i] = jsonUnquote(k); } }
+      } }
+    std::string v;
+    v = jsonStrS(s, "you");  if (!v.empty()) g_you = v;
+    v = jsonStrS(s, "host"); if (!v.empty()) g_host = v;
+    g_lobbyTitle = jsonStrS(s, "lobby");
     InterlockedExchange(&g_lobbyRelay, jsonBool(s, "relay", false) ? 1 : 0);
     InterlockedExchange(&g_storedAge, jsonInt(s, "stored_age")); InterlockedExchange(&g_storedMax, jsonInt(s, "stored_max"));
     // relay lobbies: the relay assigns every player a sticky origin letter
-    for (int i = 0; i < g_playerCount; i++) g_letters[i][0] = 0;
     { const char* lm = strstr(s, "\"letters\"");
       if (lm && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
-          for (int i = 0; i < g_playerCount; i++) {
-              char keyq[48]; snprintf(keyq, sizeof(keyq), "\"%s\"", g_players[i]);
-              const char* k = strstr(lm, keyq);
-              if (k) { k += strlen(keyq); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; int j = 0; while (*k && *k != '"' && j < 2) g_letters[i][j++] = *k++; g_letters[i][j] = 0; } }
+          for (int i = 0; i < playerCount(); i++) {
+              std::string keyq = "\"" + jsonEscape(g_players[i].c_str()) + "\"";
+              const char* k = strstr(lm, keyq.c_str());
+              if (k) { k += keyq.size(); while (*k == ' ' || *k == ':') k++; if (*k == '"') { k++; g_letters[i] = jsonUnquote(k); } }
           }
       } }
     // Role is decided by the roster: you==host -> instance a, else b. Re-evaluated
     // on every roster (a host change re-points the bridge); writeBridgeCtl is a
     // no-op when nothing changed.
-    bool roleKnown = g_you[0] && g_host[0];
-    bool isHost = roleKnown && strcmp(g_you, g_host) == 0;
-    int count = g_playerCount;
+    bool roleKnown = !g_you.empty() && !g_host.empty();
+    bool isHost = roleKnown && g_you == g_host;
+    int count = playerCount();
     LeaveCriticalSection(&g_modelCs); InterlockedExchange(&g_panelDirty, 1);
     // a relay lobby: the leader takes the host role here (START GAME, the sync
     // save for hot joiners); it changes when the leader leaves
@@ -2408,6 +3255,10 @@ static void applyRoster(const char* s)
     // start path) and catches up on the command history. No button, no
     // pause, no ordering to get right.
     static int lastCount = 0;
+    writePlayerNames();
+    // Frozen joins bypass the legacy start handler. Keep config ready for
+    // their NativeControl load too; saved live company state wins in Lua.
+    writeCompanyCfg();
     bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
     if (isHost && inGame && count > lastCount && lastCount > 0) {
         LONG age = InterlockedCompareExchange(&g_storedAge, 0, 0), mx = InterlockedCompareExchange(&g_storedMax, 0, 0);
@@ -2415,6 +3266,14 @@ static void applyRoster(const char* s)
             // the relay holds a copy fresh enough to serve the newcomer itself
             // (the periodic upload keeps it that way): no autosave, no upload here
             Log("[menu] hot join: roster %d -> %d -- the relay serves its %ld s old world, no sync taken\n", lastCount, count, age);
+        } else if (InterlockedCompareExchange(&g_joinFreeze, 0, 0)) {
+            // FROZEN JOIN (2026-09-16): the lobby holds the session and runs a
+            // recovery round -- the host saves, EVERYONE (this game included)
+            // loads that save -- so the newcomer's world registers its entities
+            // in the same order as ours. A catch-up joiner never did, and its
+            // person sim split within ~35 game units. No autosave from here.
+            Log("[menu] hot join: roster %d -> %d -- the lobby freezes the session and reloads everyone; no hot-join save taken here\n", lastCount, count);
+            SetStatus("A player joined: holding the game while everyone loads the shared world\xE2\x80\xA6");
         } else {
             char why[96]; snprintf(why, sizeof(why), "hot join: roster %d -> %d", lastCount, count);
             SyncStart(why);
@@ -2429,6 +3288,25 @@ static void applyRoster(const char* s)
 // redirected to B's overlay -- both peers use this same constant.
 static const wchar_t* SAVE_DIR =   // placeholder: resolveSaveDir() replaces it at init
     L"C:\\Program Files (x86)\\Steam\\userdata\\0\\1066780\\local\\save";
+
+static void RefreshLobbySaves()
+{
+    g_lobbySaves.clear(); g_savePage=0;
+    wchar_t pattern[700]; _snwprintf_s(pattern,_TRUNCATE,L"%s\\*.sav",SAVE_DIR);
+    WIN32_FIND_DATAW data; HANDLE find=FindFirstFileW(pattern,&data);
+    if (find==INVALID_HANDLE_VALUE) return;
+    do {
+        if (data.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring path=std::wstring(SAVE_DIR)+L"\\"+data.cFileName;
+        if (path.size()>=600) continue; // the native load/transfer path uses 600 wchar_t
+        g_lobbySaves.push_back({path,data.cFileName,data.ftLastWriteTime});
+    } while (FindNextFileW(find,&data));
+    FindClose(find);
+    std::sort(g_lobbySaves.begin(),g_lobbySaves.end(),[](const LobbySave& a,const LobbySave& b) {
+        LONG order=CompareFileTime(&a.modified,&b.modified);
+        return order ? order>0 : a.name<b.name;
+    });
+}
 
 // newest *.sav in SAVE_DIR (full path). Returns false if none. mp_shared.sav is
 // OUR OWN placed copy (always stamped newest by placeSaveNewest), so it is skipped
@@ -2515,6 +3393,98 @@ static bool placeSaveNewest(const wchar_t* srcSav)
     return true;
 }
 
+// ---------------- VANILLA LOAD = SHARE (host) ----------------
+// UI::CMenuUI::StartSavegame 0x6785c0 is where every UI load path converges
+// (title menu, in-game menu, CONTINUE), so one observer sees them all. It is
+// NOT a second inline hook: native_io.cpp already detours that address with a
+// 20-byte steal, and a second InstallHook there would copy the jump the first
+// one wrote into its trampoline. NativeIo::ObserveStart calls us instead, on
+// the engine's UI thread, with the LoadGameParams the game was handed.
+// Re-verified against build 35924 (2026-09-16, capstone over the exe):
+//   rcx = UI::CMenuUI* (it reads this+0x1988, the "initialization is already
+//         active" flag), rdx = const LoadGameParams&, r8 = const SavegameInfo&
+//   prologue: push rbp/rsi/rdi/r12/r13/r14/r15 (12 B) + lea rbp,[rsp-0x3a0]
+//         (8 B) = a 20-byte steal on an instruction boundary, nothing
+//         RIP-relative before +27 (sub rsp,0x4a0 at +20).
+//   LoadGameParams holds 32-byte std::strings: the campaign/mission sizes the
+//         engine compares sit at +0x108 and +0x128, i.e. the strings at +0xF8
+//         and +0x118; the save NAME is the string at +0x00 (the field our own
+//         AutoLoadCall fills for mp_shared).
+// LoadGameParams +0x00 is the save NAME (no extension, namespace "savegame");
+// the file is <SAVE_DIR>\<name>.sav.
+static void GStringRead(const void* gs, char* out, size_t cap)
+{
+    const GString* g = (const GString*)gs;
+    const char* src = g->cap >= 16 ? *(const char* const*)g->buf : g->buf;
+    size_t n = g->size < cap - 1 ? g->size : cap - 1;
+    if (g->size > 4096 || !src) { out[0] = 0; return; }
+    memcpy(out, src, n); out[n] = 0;
+}
+// SEH only in this frame (no C++ objects): the params pointer is the engine's.
+static bool SafeParamsName(const void* params, char* out, size_t cap)
+{
+    __try { GStringRead(params, out, cap); } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; }
+    return out[0] != 0;
+}
+
+static void OnStartSavegame(const void* params, bool accepted, bool ours)
+{
+    // our own autoload / the resync's in-place load: not the player picking a world
+    if (ours || InterlockedCompareExchange(&g_selfLoad, 0, 0)) return;
+    if (!accepted) return;                     // the engine refused it; nothing changed
+    char name[300] = "";
+    SafeParamsName(params, name, sizeof(name));
+    const bool hosting = InterlockedCompareExchange(&g_isHost, 0, 0) != 0
+                      && InterlockedCompareExchange(&g_lobbyReady, 0, 0) != 0;
+    int players = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); players = playerCount(); LeaveCriticalSection(&g_modelCs); }
+    Log("[menu] menu load of '%s' from page %ld (hosting=%d players=%d)\n",
+        name, InterlockedCompareExchange(&g_lastPage, 0, 0), hosting ? 1 : 0, players);
+    if (!hosting || !name[0]) return;
+    // On a relay lobby the relay keeps the world for the next player, so the
+    // leader's load is uploaded even with nobody else in (2026-09-18: a swap
+    // taken alone was "not shared", the relay kept the old save, and the
+    // leader's next join got the old world back).
+    const bool relay = InterlockedCompareExchange(&g_lobbyRelay, 0, 0) != 0;
+    if (players < 2 && !relay) { Log("[menu] menu load while hosting with nobody in the lobby -- not shared\n"); return; }
+    wchar_t wn[300]; MultiByteToWideChar(CP_UTF8, 0, name, -1, wn, 300);
+    wchar_t path[600]; _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        Log("[menu] menu load: %ls not found in the save folder -- not shared\n", path);
+        return;
+    }
+    // A SWITCH is a load taken while the session is already running: the others
+    // are IN a world and have to leave it. Before that -- everyone still in the
+    // lobby -- it is the ordinary "the host picked the save to start with".
+    const bool switching = WorldLoaded() || InterlockedCompareExchange(&g_sessionStarted, 0, 0) != 0;
+    wcscpy_s(g_startSaveW, path);
+    writeCompanyCfg();
+    // the mod stamps a fresh world token the moment this world is up: that
+    // change is THIS load, not another switch
+    InterlockedExchange(&g_worldGenHold, 1);
+    std::string line = "{\"cmd\":\"start\",\"save\":\"" + jsonEscape(utf8Of(path).c_str()) + "\"";
+    if (switching) line += ",\"switch\":true";
+    line += "}";
+    LobbySend(line.c_str());
+    MarkSaveShared();     // a joiner arriving right after reuses this save
+    // The engine builds the title page between the old world and the loading
+    // screen of THIS load; MyCreatePage must not read that as "left the world"
+    // (it did: the host's every mid-session load LEFT the lobby, 2026-09-18).
+    if (switching) InterlockedExchange(&g_hostMenuLoad, 1);
+    char st[240];
+    if (switching) {
+        if (relay && players < 2) snprintf(st, sizeof(st), "Uploading '%s' to the server\xE2\x80\xA6", name);
+        else snprintf(st, sizeof(st), "Switching everyone to '%s'\xE2\x80\xA6", name);
+        Log("[menu] world switch: the host loaded %ls mid-session -- pushing it to %d player(s)%s\n", path, players - 1, relay ? " and the relay" : "");
+    } else {
+        InterlockedExchange(&g_hostLoadedItself, 1);
+        snprintf(st, sizeof(st), "Sharing '%s' with %d player(s)\xE2\x80\xA6", name, players - 1);
+        Log("[menu] menu load: sharing %ls with the lobby (the game loads it here)\n", path);
+    }
+    SetStatus(st);
+    ArmStageWatch("loading world");   // the host's own row shows its percentage too (2026-09-16)
+}
+
 // ---------------- AUTO-LOAD: start the shared save in-process ----------------
 // Every menu load ends in bool UI::CMenuUI::StartSavegame(this, const
 // LoadGameParams&, const SavegameInfo&) (0x6785c0). CONTINUE feeds it from the
@@ -2567,7 +3537,12 @@ static int AutoLoadCall(void* menu, const char* name)
         ((void* (*)(void*))(g_base + RVA_LOADPARAMS_CTOR))(params);
         g_strAssign(params + 0x00, name, strlen(name));
         stage = 3;
+        // OUR load, not the player's: the share observer (OnStartSavegame) has
+        // to pass it straight through, or a host would re-share mp_shared the
+        // moment it loaded the save it had just shared.
+        InterlockedExchange(&g_selfLoad, 1);
         char started = ((char (*)(void*, void*, void*))(g_base + RVA_START_SAVEGAME))(menu, params, info);
+        InterlockedExchange(&g_selfLoad, 0);
         stage = 4;
         ((void (*)(void*))(g_base + RVA_LOADPARAMS_DTOR))(params);
         ((void (*)(void*))(g_base + RVA_SAVEINFO_DTOR))(info);
@@ -2602,7 +3577,7 @@ static void AutoLoadTick(void* menu)
     InterlockedExchange(&g_autoLoadPending, 0);
     int r = AutoLoadCall(menu, "mp_shared");
     Log("[menu] autoload: StartSavegame(mp_shared) -> %d\n", r);
-    if (r != 1) SetStatus("Couldn't start the shared save by itself -- open LOAD GAME and pick \"mp_shared\".");
+    if (r != 1) SetStatus("The game refused to start mp_shared (a mod it needs is not installed here?) -- open LOAD GAME and pick \"mp_shared\" to see why.");
 }
 
 static void MyMenuUpdate(void* menu, void* a2, void* a3, void* a4)
@@ -2659,13 +3634,13 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[40]; char password[40]; int pub; char lobby[48]; };
+struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; int sep; char lobby[NAME_MAX]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
     LobbyArg* a = (LobbyArg*)param;
     g_transportLobby[0]=0;
-    wchar_t wname[40]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, 40);
+    wchar_t wname[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->name, -1, wname, NAME_MAX);
     wchar_t cmd[4096];
     // Prefer the frozen netpunch.exe next to the scripts (no Python dependency on
     // the target machine); fall back to `python lobby.py` when only the scripts are there.
@@ -2698,17 +3673,20 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     wchar_t wpass[96] = L"";
     if (a->password[0]) { wchar_t wp[40]; MultiByteToWideChar(CP_UTF8, 0, a->password, -1, wp, 40); _snwprintf_s(wpass, _TRUNCATE, L" --password %s", wp); }
     if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
-                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name %s --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
+                   _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name \"%s\" --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
                                 base, wc, wname, relayPort, bridgePort, fwd, wpass); }
     else {
         // the public list: always tell the lobby where the master server is (the
         // PUBLIC checkbox can be flipped later, in the lobby); --public starts listed
-        wchar_t wpub[560] = L"";
-        { wchar_t wl[48]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, 48); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
+        wchar_t wpub[560 + NAME_MAX] = L"";
+        { wchar_t wl[NAME_MAX]; MultiByteToWideChar(CP_UTF8, 0, a->lobby, -1, wl, NAME_MAX); _snwprintf_s(wpub, _TRUNCATE, L" --lobby-name \"%s\"", wl); }
         if (g_flagMaster[0]) { wchar_t wm[300]; MultiByteToWideChar(CP_UTF8, 0, g_flagMaster, -1, wm, 300);
                                wchar_t t[400]; _snwprintf_s(t, _TRUNCATE, L" --publish %s%s", wm, a->pub ? L" --public" : L""); wcscat_s(wpub, t); }
         if (g_flagShareMods == 2) wcscat_s(wpub, L" --no-share-mods");   // the host never sends its mods either
-        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name %s --game-relay-port %d --game-local-port %d %s%s%s",
+        if (a->sep) wcscat_s(wpub, L" --companies");                    // SEPARATE COMPANIES: the lobby assigns a company per player
+        if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");            // a stable code across restarts, listed as a dedicated server
+        if (g_flagDedicated && g_flagDedPort) { wchar_t t[40]; _snwprintf_s(t, _TRUNCATE, L" --local-port %d", g_flagDedPort); wcscat_s(wpub, t); }
+        _snwprintf_s(cmd, _TRUNCATE, L"%s host --name \"%s\" --game-relay-port %d --game-local-port %d %s%s%s",
                      base, wname, relayPort, bridgePort, fwd, wpass, wpub);
     }
     { wchar_t recoveryArgs[1100];
@@ -2733,7 +3711,18 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
-    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // KEEP LOGS: with <data dir>\tpf2mp_keep_logs.txt present the previous run's
+    // lobby_proc.log is kept and this run appends after a banner.
+    wchar_t keepFlag[MAX_PATH]; _snwprintf_s(keepFlag, _TRUNCATE, L"%stpf2mp_keep_logs.txt", g_dataDirW);
+    const bool keepLogs = g_dataDirW[0] && GetFileAttributesW(keepFlag) != INVALID_FILE_ATTRIBUTES;
+    HANDLE hLog = CreateFileW(logPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, keepLogs ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (keepLogs && hLog != INVALID_HANDLE_VALUE) {
+        SetFilePointer(hLog, 0, nullptr, FILE_END);
+        SYSTEMTIME st; GetLocalTime(&st);
+        char banner[160]; int n = snprintf(banner, sizeof(banner), "\n==== lobby session %04u-%02u-%02u %02u:%02u:%02u (tpf2mp_keep_logs.txt present: appending) ====\n",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        DWORD w; WriteFile(hLog, banner, (DWORD)n, &w, nullptr);
+    }
     STARTUPINFOW si = { sizeof(si) };
     // Redirect the lobby's output ONLY if the log actually opened. Handing
     // CreateProcess an INVALID_HANDLE_VALUE as stdout/stderr gives the child a
@@ -2760,7 +3749,11 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     g_lobbyProc = pi.hProcess;
 
     // tail lobby_out.jsonl line by line
-    LARGE_INTEGER off = { 0 }; char rem[2048]; int remLen = 0; char buf[8192];
+    // rem accumulates one event line up to its newline, whatever its length: a
+    // roster of a few dozen players is well past any fixed line buffer, and a
+    // line cut short would parse as a smaller roster (wrong letters, a load
+    // gate waiting for the wrong count).
+    LARGE_INTEGER off = { 0 }; std::string remS; char buf[8192];
     bool stop = false;   // set once the game load is under way: lobby.py is done, end the tail
     for (;;) {
         HANDLE h = CreateFileW(outPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -2772,19 +3765,13 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                 for (DWORD i = 0; i < got && !stop; i++) {
                     char c = buf[i];
                     if (c == '\n') {
-                        rem[remLen] = 0;
+                        const char* rem = remS.c_str();
                         // dispatch one event line
                         InterlockedExchange(&g_lobbyReady, 1);   // lobby.py is up and has truncated lobby_in.jsonl
                         char ty[24]; jsonStr(rem, "type", ty, sizeof(ty));
                         if (strcmp(ty, "code") == 0) { char cd[160]; jsonStr(rem, "code", cd, sizeof(cd)); if (cd[0]) {
                             if (g_isHost) {
-                                wchar_t save[600];
                                 if (WorldLoaded()) SyncStart("host: initial world snapshot");
-                                else if (newestSave(save,600)) {
-                                    char u[1800]; WideCharToMultiByte(CP_UTF8,0,save,-1,u,sizeof(u),nullptr,nullptr);
-                                    std::string escaped; for (const char* p=u;*p;++p) { if (*p=='\\' || *p=='"') escaped+='\\'; escaped+=*p; }
-                                    std::string line="{\"cmd\":\"advertise_mods\",\"save\":\""+escaped+"\"}"; LobbySend(line.c_str());
-                                }
                             }
                             strcpy_s(g_code, cd); ClipboardSet(cd); InterlockedExchange(&g_haveCode, 1); SetStatus("Your code is copied — share it in Discord."); } }
                         else if(strcmp(ty,"transport_lobby")==0) {
@@ -2861,7 +3848,15 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             if(!strcmp(phase,"complete")) {
                                 InterlockedExchange(&g_recoveryPresent,0);
                                 InterlockedExchange(&g_lobbyDone,1);
-                                if(InterlockedCompareExchange(&g_uiState,0,0)==3) InterlockedExchange(&g_uiState,0);
+                                // Back to the LOBBY VIEW when the panel is open (2026-09-18, user:
+                                // "keep the lobby view up after we load into the game"): the loading
+                                // screen hands the panel over to the game open on the roster, then the
+                                // frozen join's phases took it to this recovery view and its completion
+                                // collapsed it to nothing. Collapsed only when nothing had it open.
+                                if(InterlockedCompareExchange(&g_uiState,0,0)==3) {
+                                    const bool open = InterlockedCompareExchange(&g_ingameOverlay,0,0) || InterlockedCompareExchange(&g_showOverlay,0,0);
+                                    InterlockedExchange(&g_uiState, open ? 2 : 0);
+                                }
                             } else {
                                 InterlockedExchange(&g_uiState,3);
                             }
@@ -2869,14 +3864,18 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         }
                         else if (strcmp(ty, "roster") == 0) applyRoster(rem);
                         else if (strcmp(ty, "chat") == 0) {
-                            char fr[40], tx[256]; jsonStr(rem, "from", fr, sizeof(fr)); jsonStr(rem, "text", tx, sizeof(tx));
+                            std::string fr = jsonStrS(rem, "from"); char tx[256]; jsonStr(rem, "text", tx, sizeof(tx));
                             if (strncmp(tx, "!hotjoin ", 9) == 0) {
                                 // the host is saving for a newcomer: only a panel still at
                                 // the title menu needs it, as its status line
                                 if (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 && !g_gameUi) SetStatus(tx + 9);
-                            } else { chatPush(fr, tx); speedFromChat(tx); }
+                            } else { chatPush(fr.c_str(), tx); speedFromChat(tx); }
                         }
-                        else if (strcmp(ty, "status") == 0) { char de[200]; jsonStr(rem, "detail", de, sizeof(de)); if (de[0]) SetStatus(de); }
+                        else if (strcmp(ty, "status") == 0) {
+                            char de[200], state[24]; jsonStr(rem, "detail", de, sizeof(de)); jsonStr(rem,"state",state,sizeof(state));
+                            SaveStartStatus(state,de);
+                            if (de[0]) SetStatus(de);
+                        }
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));
                             int pct = jsonInt(rem, "pct"); char msg[96];
@@ -2910,18 +3909,44 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         else if (strcmp(ty, "mods_ready") == 0) { SetStatus("Mods received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "save_ready") == 0) { InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "start") == 0) {
+                            InterlockedExchange(&g_saveStartPending,0);
                             // {"type":"start","save":true|false}: save=true means a save
                             // transfer completed for this peer this session; absent => true.
                             bool withSave = jsonBool(rem, "save", true);
+                            // "switch":true -- the host left the world it was in and
+                            // everyone follows it into this save (see OnStartSavegame).
+                            bool isSwitch = jsonBool(rem, "switch", false);
                             bool saveReady = InterlockedCompareExchange(&g_saveReady, 0, 0) != 0;
-                            wchar_t src[600] = L""; bool go = true;
-                            if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi) {
+                            const bool amHost = InterlockedCompareExchange(&g_isHost, 0, 0) != 0;
+                            if (amHost) InterlockedExchange(&g_sessionStarted, 1);
+                            wchar_t src[600] = L""; bool go = true, inPlace = false;
+                            if (amHost && isSwitch) {
+                                // the host IS the new world: it loaded it itself
+                                Log("[menu] start(switch) on the host -- it is already in the new world\n");
+                                go = false;
+                            } else if (amHost && InterlockedExchange(&g_hostLoadedItself, 0)) {
+                                // the host loaded the save from the game's own LOAD GAME:
+                                // the game is already loading it, the joiners load theirs
+                                Log("[menu] start: the host loaded its save itself -- nothing to load here\n");
+                                go = false;
+                            } else if (isSwitch) {
+                                // A WORLD SWITCH is for us even though we are playing.
+                                if (!(withSave && saveReady)) {
+                                    Log("[menu] start(switch) but no save arrived this session -- staying in this world\n");
+                                    SetStatus("The host switched world but its save did not arrive."); go = false;
+                                } else {
+                                    _snwprintf_s(src, _TRUNCATE, L"%s\\incoming_save.sav", NETDIR);
+                                    inPlace = WorldLoaded();
+                                    // g_saveReady is latched for the session; a LATER switch
+                                    // must wait for its own transfer, not reuse this one
+                                    InterlockedExchange(&g_saveReady, 0);
+                                }
+                            } else if (InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi) {
                                 // HOT JOIN: we are already playing; this start is the
                                 // sync save going out to a newcomer. Nothing to load here.
                                 Log("[menu] start while in game -- a sync for a newcomer, ignored here\n");
                                 go = false;
-                            }
-                            if (InterlockedCompareExchange(&g_isHost, 0, 0) && !(withSave && saveReady)) {
+                            } else if (amHost && !(withSave && saveReady)) {
                                 // our own save (the one we shared / uploaded); a leader that RECEIVED a
                                 // save this session (a relay loading its stored world) falls through and loads that.
                                 // No guessing: our newest save need not be what anyone else has.
@@ -2938,10 +3963,30 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 Log("[menu] start(save=%d) but no save_ready this session -- not loading\n", withSave ? 1 : 0);
                                 SetStatus("Start received but no save arrived -- ask the host to START again"); go = false;
                             }
-                            if (go) {
+                            if (go && inPlace) {
+                                // IN GAME: there is no menu to hand the load to. Place the
+                                // save as mp_shared and ask the engine for it the way the
+                                // resync does (NativeIo::Load -> CMenuUI::StartSavegame on
+                                // the engine's own thread). The mod re-initialises on the
+                                // new world and catches up from the host like a hot joiner.
                                 writeCompanyCfg();
-                                SetStatus("Loading shared save…"); Sleep(400);
+                                SetStatus("Loading the host's new world\xE2\x80\xA6");
+                                char op[64]; snprintf(op, sizeof(op), "world_switch_%lu", (unsigned long)GetTickCount64());
+                                InterlockedExchange(&g_worldGenHold, 1);   // the token the new world stamps is ours
+                                bool queued = placeSaveNewest(src) && NativeIo::Load(op, "mp_shared");
+                                if (queued) {
+                                    Log("[menu] world switch: loading mp_shared in place (%s)\n", op);
+                                    ArmStageWatch("loading the host's new world");
+                                } else {
+                                    Log("[menu] world switch: the engine would not take the in-place load -- the player loads mp_shared\n");
+                                    SetStatus("The host changed world -- open LOAD GAME and pick \"mp_shared\".");
+                                }
+                            } else if (go) {
+                                writeCompanyCfg();
+                                InterlockedExchange(&g_worldGenHold, 1);   // the token the new world stamps is ours
+                                SetStatus(isSwitch ? "Loading the host's new world…" : "Loading shared save…"); Sleep(400);
                                 if (doStartLoad(src)) {
+                                    ArmStageWatch("loading world");
                                     // The game is loading. The lobby process STAYS ALIVE: since the
                                     // game-frame relay (--game-relay-port) the lobby IS the lockstep
                                     // transport between machines -- quitting it here left both bridges
@@ -2952,8 +3997,8 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 }
                             }
                         }
-                        remLen = 0;
-                    } else if (remLen < (int)sizeof(rem) - 1) rem[remLen++] = c;
+                        remS.clear();
+                    } else remS.push_back(c);
                 }
             }
             CloseHandle(h);
@@ -3011,6 +4056,11 @@ static void TeardownLobby(int waitMs, bool joinThread)
     if (g_lobbyCsInit) EnterCriticalSection(&g_lobbyCs);
     QuitLobbyProc(g_lobbyProc, waitMs);
     if (g_lobbyCsInit) LeaveCriticalSection(&g_lobbyCs);
+    // The lobby's company assignment dies with the lobby. Left behind, the file
+    // made a single-player load read as a two-company lobby session and the
+    // save's own companies record was the loser (2026-09-18); with no file the
+    // game script keeps whatever companies the save carries.
+    { wchar_t cfg[MAX_PATH]; _snwprintf_s(cfg, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW); DeleteFileW(cfg); }
     if (joinThread && g_lobbyThread) {
         if (WaitForSingleObject(g_lobbyThread, 3000) != WAIT_OBJECT_0) Log("[menu] lobby tail thread did not exit in time\n");
         CloseHandle(g_lobbyThread); g_lobbyThread = nullptr;
@@ -3028,9 +4078,10 @@ static void StartLobby(int join)
     LobbyArg* a = (LobbyArg*)calloc(1, sizeof(LobbyArg)); if (!a) return;
     a->join = join; strcpy_s(a->name, g_username); strcpy_s(a->password, g_passCode);
     a->pub = InterlockedCompareExchange(&g_public, 0, 0) ? 1 : 0;
+    a->sep = InterlockedCompareExchange(&g_sepCompanies, 0, 0) ? 1 : 0;
     InterlockedExchange(&g_joinFocus, 0); SaveNames();
     if (g_lobbyName[0]) strcpy_s(a->lobby, g_lobbyName); else snprintf(a->lobby, sizeof(a->lobby), "%s's game", g_username);
-    g_lobbyTitle[0] = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); g_lobbyTitle.clear(); LeaveCriticalSection(&g_modelCs); }
     // (no game name: the public list shows the server type, not the host's newest save)
     if (join) {
         if (g_joinLen >= 8) strcpy_s(a->code, g_joinCode);
@@ -3050,10 +4101,18 @@ static void StartLobby(int join)
     if (g_lobbyProc || g_lobbyThread) TeardownLobby(1500, true);
     InterlockedExchange(&g_lobbyReady, 0);
     InterlockedExchange(&g_saveReady, 0);
+    InterlockedExchange(&g_sessionStarted, 0);
+    g_selectedSave.clear(); g_savePicker=false; g_lobbySaves.clear(); g_savePage=0;
+    InterlockedExchange(&g_saveStartPending,0);
+    InterlockedExchange(&g_hostLoadedItself, 0);
+    InterlockedExchange(&g_worldGenHold, 0);
+    InterlockedExchange(&g_switchShare, 0);
+    g_worldGen[0] = 0;
     InterlockedExchange(&g_isHost, join ? 0 : 1);
     InterlockedExchange(&g_lobbyDone, 0);   // a new lobby captures typing again
     InterlockedExchange(&g_uiState, 2); InterlockedExchange(&g_panelDirty, 1);
-    g_chatCount = 0; g_chatHead = 0; g_playerCount = 0;
+    g_chatCount = 0; g_chatHead = 0;
+    if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); g_players.clear(); g_companies.clear(); g_letters.clear(); LeaveCriticalSection(&g_modelCs); }
     g_lobbyThread = CreateThread(nullptr, 0, LobbyThread, a, 0, nullptr);
     if (!g_lobbyThread) { free(a); SetStatus("Couldn't start the lobby thread."); }
 }
@@ -3063,6 +4122,168 @@ static void LeaveLobby()
     EnterCriticalSection(&g_statusCs); g_modsPrompt[0] = 0; LeaveCriticalSection(&g_statusCs);
     InterlockedExchange(&g_modRefreshPending, 0);
     InterlockedExchange(&g_uiState, 1); InterlockedExchange(&g_panelDirty, 1);
+}
+
+// ---------------- dedicated server ----------------
+// Runs once a second from myPresent while dedicated=1. Three states, each
+// self-healing: no lobby -> host one; lobby but no world -> load the configured
+// (else the newest) save through the ordinary shared-save autoload, so a joiner
+// arriving later reuses that save and the lobby counts the host as started;
+// world up -> force the game's own autosave every dedicated_autosave_min, so a
+// crash restarts from a fresh world (the newest save is what the next launch
+// loads). A crash to the title menu leaves the lobby (g_leaveOnMenu), and the
+// first state hosts again.
+static ULONGLONG g_dedLastHost = 0, g_dedLastLoad = 0, g_dedLastSave = 0, g_dedWorldUpSince = 0, g_dedMenuSince = 0;
+static bool g_dedFileWritten = false;
+static const ULONGLONG DED_MENU_SETTLE_MS = 8000;   // the title menu's main page has been up this long before we act on it
+static const ULONGLONG DED_LOAD_MIN_UPTIME_MS = 45000;   // and this long before the first LOAD: two launches that loaded ~10 s in crashed mid-load (16:26, no assertion)
+static void DedicatedTick()
+{
+    if (!g_flagDedicated) return;
+    const ULONGLONG now = GetTickCount64();
+    static ULONGLONG lastTick = 0;
+    if (now - lastTick < 1000) return;   // by the clock: on a software renderer 60 presents of the title menu took minutes
+    lastTick = now;
+    if (!g_dedFileWritten) {
+        // the mod's half: pause while nobody else is in (mp/pacing.lua CM.dedicatedPauseEmpty)
+        g_dedFileWritten = true;
+        wchar_t p[MAX_PATH]; _snwprintf_s(p, _TRUNCATE, L"%smp_dedicated.txt", g_dataDirW);
+        FILE* f = _wfsopen(p, L"w", _SH_DENYNO);
+        if (f) { fprintf(f, "dedicated=1\nempty_speed=%d\npause_empty=%d\npin_batch=%d\n", g_flagDedEmptySpeed, g_flagDedEmptySpeed == 0 ? 1 : 0, g_flagDedPinBatch); fclose(f); }
+    }
+    const bool world = WorldLoaded();
+    // At the title menu, act only once its main page (CreatePage 2 -> g_showOverlay) has
+    // been up for a while. Hosting on the first CMenuUI frame and loading a second later
+    // ran StartSavegame inside the page's own InvokeStoredFunctions and the engine
+    // asserted `!m_isInvoking` (the first run on the VPS, 2026-09-18 16:05).
+    if (!world) {
+        if (!InterlockedCompareExchange(&g_showOverlay, 0, 0)) { g_dedMenuSince = 0; return; }
+        if (!g_dedMenuSince) g_dedMenuSince = now;
+        if (now - g_dedMenuSince < DED_MENU_SETTLE_MS) return;
+    }
+    if (!LobbyRunning()) {
+        if (world) return;   // a world without a lobby is the moment after a crash to the menu: wait for it
+        if (now - g_dedLastHost < 15000) return;
+        g_dedLastHost = now;
+        if (g_flagDedName[0]) strcpy_s(g_username, g_flagDedName);
+        if (g_flagDedLobby[0]) strcpy_s(g_lobbyName, g_flagDedLobby);
+        strcpy_s(g_passCode, g_flagDedPassword); g_passLen = (int)strlen(g_passCode);
+        InterlockedExchange(&g_public, g_flagDedPublic ? 1 : 0);
+        InterlockedExchange(&g_sepCompanies, g_flagDedCompanies ? 1 : 0);
+        ensureUsername();
+        Log("[dedicated] hosting lobby '%s' as '%s' (%s, %s)\n", g_lobbyName[0] ? g_lobbyName : "(default)", g_username,
+            g_flagDedPublic ? "public" : "unlisted", g_flagDedPassword[0] ? "password" : "open");
+        StartLobby(0);
+        return;
+    }
+    if (!world) {
+        g_dedWorldUpSince = 0;
+        if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) return;
+        if (InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()) return;
+        if (now - g_dedLastLoad < 60000) return;   // a load takes as long as it takes: one request a minute
+        if (now - g_dedMenuSince < DED_LOAD_MIN_UPTIME_MS) return;   // let the engine finish its own start-up work first
+        g_dedLastLoad = now;
+        wchar_t path[600] = L"";
+        if (g_flagDedSave[0]) {
+            wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagDedSave, -1, wn, 64);
+            _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
+            if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { Log("[dedicated] %ls not found -- loading the newest save instead\n", path); path[0] = 0; }
+        }
+        if (!path[0] && !newestSave(path, 600)) {
+            Log("[dedicated] no save in %ls -- nothing to load (put one there, or set dedicated_save)\n", SAVE_DIR);
+            return;
+        }
+        wcscpy_s(g_startSaveW, path);
+        MarkSaveShared();                     // a joiner arriving before the first autosave reuses this save
+        Log("[dedicated] loading %ls\n", path);
+        if (doStartLoad(path)) ArmStageWatch("loading world");
+        return;
+    }
+    if (!g_dedWorldUpSince) g_dedWorldUpSince = now;
+    if (NoRender()) {
+        static ULONGLONG lastCount = 0;
+        if (now - lastCount >= 60000) {
+            lastCount = now;
+            static LONG lastPresents = 0; static ULONGLONG lastAt = 0;
+            const LONG presents = InterlockedCompareExchange(&g_presentCount, 0, 0);
+            const double fps = lastAt ? (presents - lastPresents) * 1000.0 / (double)(now - lastAt) : 0.0;
+            lastPresents = presents; lastAt = now;
+            Log("[dedicated] no-render: %ld submits, %ld command buffers dropped so far; %.1f frames/s (paced to %.0f)\n",
+                InterlockedCompareExchange(&g_noRenderSubmits, 0, 0), InterlockedCompareExchange(&g_noRenderCmdBufs, 0, 0), fps,
+                NoWsi() ? NORENDER_FPS : (double)g_flagDedFps);
+        }
+    }
+    // THE AUTOSAVE PAUSES THE SESSION FIRST (2026-09-21). A forced autosave stops
+    // this game for the save's duration (11 s for a 104 MB world on the VPS) while
+    // the players' games run on, then wait for the leader: a player at 4x took it
+    // for a broken server and quit. So: ask the mod to hold the session
+    // (tpf2_ded_autosave.txt -> mp/pacing.lua CM.dedAutosaveTick: 0 here and on
+    // every game, or "alone" with nobody in), save once the ack is back, tell the
+    // mod when the save file has stopped growing (the done marker), and say so in
+    // the chat both times. No ack within 15 s (a resync in progress holds the
+    // mod's tick): not now, again in a minute. The markers are EMPTIED, never
+    // deleted: the game's Lua reads an empty file as no marker and has no remove.
+    static int g_dedSaveState = 0;   // 0 idle, 1 asked, 2 saving
+    static ULONGLONG g_dedSaveAt = 0, g_dedSaveBaseline = 0, g_dedSaveLastSize = 0;
+    static wchar_t g_dedSaveFile[600] = L"";
+    wchar_t req[MAX_PATH], ack[MAX_PATH], done[MAX_PATH];
+    _snwprintf_s(req,  _TRUNCATE, L"%stpf2_ded_autosave.txt", g_dataDirW);
+    _snwprintf_s(ack,  _TRUNCATE, L"%stpf2_ded_autosave_ack.txt", g_dataDirW);
+    _snwprintf_s(done, _TRUNCATE, L"%stpf2_ded_autosave_done.txt", g_dataDirW);
+    auto putMarker = [](const wchar_t* path, const char* text) {
+        HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD w = 0; if (text && *text) WriteFile(h, text, (DWORD)strlen(text), &w, nullptr);
+        CloseHandle(h); return true;
+    };
+    auto markerSet = [](const wchar_t* path) {
+        WIN32_FILE_ATTRIBUTE_DATA fa;
+        return GetFileAttributesExW(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh);
+    };
+    if (g_flagDedAutosaveMin > 0 && g_dedSaveState == 0 && now - g_dedWorldUpSince > 60000 && !NativeIo::Busy()
+        && now - g_dedLastSave > (ULONGLONG)g_flagDedAutosaveMin * 60000ULL) {
+        g_dedLastSave = now;
+        putMarker(ack, ""); putMarker(done, "");
+        if (putMarker(req, "hold\n")) {
+            g_dedSaveState = 1; g_dedSaveAt = now;
+            LobbySend("{\"cmd\":\"chat\",\"text\":\"Server autosave in a moment: the game pauses for about ten seconds.\"}");
+            Log("[dedicated] autosave due (every %d min): asking the mod to hold the session\n", g_flagDedAutosaveMin);
+        } else {
+            if (ForceAutosave()) Log("[dedicated] autosave forced (every %d min), no hold: the request file could not be written\n", g_flagDedAutosaveMin);
+        }
+    } else if (g_dedSaveState == 1) {
+        if (markerSet(ack)) {
+            wchar_t cur[600] = L""; ULONGLONG sz = 0;
+            g_dedSaveBaseline = newestSave(cur, 600) ? saveMtime(cur, &sz) : 0;
+            g_dedSaveFile[0] = 0; g_dedSaveLastSize = 0;
+            putMarker(ack, "");
+            g_dedSaveState = 2; g_dedSaveAt = now;
+            if (ForceAutosave()) Log("[dedicated] autosave forced (every %d min), the session held\n", g_flagDedAutosaveMin);
+            else { putMarker(done, "failed\n"); g_dedSaveState = 0; }
+        } else if (now - g_dedSaveAt > 15000) {
+            putMarker(req, "");
+            g_dedSaveState = 0;
+            g_dedLastSave = now - (ULONGLONG)g_flagDedAutosaveMin * 60000ULL + 60000ULL;   // again in a minute
+            Log("[dedicated] autosave: no hold from the mod within 15 s (a world operation?) -- not now, again in a minute\n");
+        }
+    } else if (g_dedSaveState == 2) {
+        // done when a newer save file has stopped growing (SyncPoll's rule), or after 90 s
+        bool finished = false;
+        wchar_t cur[600] = L""; ULONGLONG sz = 0;
+        if (newestSave(cur, 600)) {
+            ULONGLONG mt = saveMtime(cur, &sz);
+            if (mt > g_dedSaveBaseline && sz > 0) {
+                if (wcscmp(cur, g_dedSaveFile) == 0 && sz == g_dedSaveLastSize) finished = true;
+                wcscpy_s(g_dedSaveFile, cur); g_dedSaveLastSize = sz;
+            }
+        }
+        if (finished || now - g_dedSaveAt > 90000) {
+            putMarker(done, finished ? "saved\n" : "timeout\n");
+            g_dedSaveState = 0;
+            LobbySend("{\"cmd\":\"chat\",\"text\":\"Server autosave done, resuming.\"}");
+            Log("[dedicated] autosave %s (%llu B) -- releasing the session\n", finished ? "written" : "not seen within 90 s", (unsigned long long)g_dedSaveLastSize);
+        }
+    }
 }
 
 // in-frame chat text input: poll key edges while in the lobby
@@ -3086,8 +4307,9 @@ static HHOOK g_kbHook = nullptr;
 static HHOOK g_mouseHook = nullptr;
 static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
 {
-    static bool captured=false;
+    static bool captured=false, capturedR=false;
     if(code==HC_ACTION && wp==WM_LBUTTONUP && captured) { captured=false; return 1; }
+    if(code==HC_ACTION && wp==WM_RBUTTONUP && capturedR) { capturedR=false; return 1; }
     // g_ingameOverlay belongs here just as much as g_showOverlay: the title-menu
     // detour sets g_showOverlay (page 2 only), while the panel opened from inside a
     // loaded game sets g_ingameOverlay (PollLobbyOpen). Without the second flag this
@@ -3096,7 +4318,10 @@ static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
     // panel button worked -- including the "x" that closes it, which is the only way
     // out in game (LEAVE is drawn only when no world is loaded). The present gate and
     // the keyboard hook already test both flags; this one was the odd man out.
-    if(code==HC_ACTION && wp==WM_LBUTTONDOWN && gameHasFocus() && g_uiState!=0
+    // A right click on the panel is a panel click too (company chips cycle
+    // backwards) and is swallowed like a left one: behind the panel it would
+    // cancel or rotate a construction tool.
+    if(code==HC_ACTION && (wp==WM_LBUTTONDOWN || wp==WM_RBUTTONDOWN) && gameHasFocus() && g_uiState!=0
        && (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0
            || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) != 0
            || g_recoveryPresent)
@@ -3106,8 +4331,9 @@ static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
         const int x=data->pt.x-origin.x-g_panelX, y=data->pt.y-origin.y-g_panelY;
         if(x>=0 && y>=0 && x<g_copyW && y<g_copyH) {
             InterlockedExchange64(&g_panelClickPoint,(LONG64)((unsigned long long)(DWORD)data->pt.y<<32 | (DWORD)data->pt.x));
+            InterlockedExchange(&g_panelClickButton, wp==WM_RBUTTONDOWN ? 2 : 1);
             InterlockedExchange(&g_pendingPanelClick,1);
-            captured=true;
+            if (wp==WM_RBUTTONDOWN) capturedR=true; else captured=true;
             return 1; // panel clicks never reach a construction tool behind it
         }
     }
@@ -3171,12 +4397,21 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
         if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && nameField) {
             // player name: one word (it is a bare --name argument); lobby name: words, digits, ' - _ .
             bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = focus == 3 ? 24 : 36;
+            char* buf = focus == 3 ? g_username : g_lobbyName; int* len = focus == 3 ? &g_userLen : &g_lobbyNameLen; int cap = NAME_TYPED_MAX;
             if (vk == VK_BACK) { if (*len > 0) { buf[--*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
-            else if (vk == VK_RETURN) { if (focus == 3 && !g_username[0]) ensureUsername(); InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
+            else if (vk == VK_RETURN) {
+                if (focus == 3) {
+                    if (!g_username[0]) {   // cleared: back to the Steam name (or the random default until Steam answers)
+                        g_userAuto = true;
+                        if (g_steamName[0]) { strcpy_s(g_username, g_steamName); g_userLen = (int)strlen(g_username); } else ensureUsername();
+                        Log("[menu] username cleared -> follows Steam (%s)\n", g_username);
+                    } else g_userAuto = strcmp(g_username, g_steamName) == 0    // typed back exactly the Steam name: still follows it
+                                        || IsGeneratedName(g_username);          // Enter on an untouched random default: not a typed name either
+                }
+                InterlockedExchange(&g_joinFocus, 0); SaveNames(); InterlockedExchange(&g_panelDirty, 1); }
             else { char c = vkToChar((int)vk, shift);
                    bool word = c && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.');
-                   bool okc = word || (focus == 4 && (c == ' ' || c == '\'') && *len > 0);
+                   bool okc = word || ((focus == 4 || focus == 3) && c == ' ' && *len > 0) || (focus == 4 && c == '\'' && *len > 0);
                    if (okc && *len < cap) { buf[(*len)++] = c; buf[*len] = 0; InterlockedExchange(&g_panelDirty, 1); } }
         }
         else if ((wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN) && passField) {
@@ -3221,8 +4456,10 @@ static DWORD WINAPI KbHookThread(LPVOID)
 // button visible on the main page (page 2), hidden elsewhere.
 static void MyCreatePage(uint64_t thisp, int page)
 {
+    g_menuUiPtr = thisp;
     NativeIo::ObserveMenu(thisp);
     g_origCreatePage(thisp, page);
+    InterlockedExchange(&g_lastPage, page);
     // The main menu builds pages 0 -> 2 -> 1 (2 is the main content, 0/1 are its
     // sub-layers). Full-screen replacements (Settings/Campaign/Load...) are all
     // page >= 3. So SET on 2, CLEAR only on >= 3; leave 0/1 alone -- otherwise
@@ -3233,8 +4470,21 @@ static void MyCreatePage(uint64_t thisp, int page)
         // captured in the last session. It used to survive "quit to menu", so a
         // start arriving while the title menu sat on another page looked like
         // "start while in game" and was ignored (relay resume, 2026-09-10).
+        // A pointer still set here means the player just left a world: with a
+        // lobby running, that leaves the lobby too (g_leaveOnMenu, myPresent).
+        // Not when the load is ours: a resync loads the host's snapshot through
+        // the engine's own load path, which builds this page between the old
+        // world and the loading screen. Reading that as "left the world" made
+        // every joiner LEAVE mid-resync, and the host's barrier failed with
+        // "Player disconnected or roster changed" (2026-09-16).
+        if (g_gameUi != 0 && LobbyRunning()) {
+            if (NativeIo::Loading()) Log("[menu] the title menu was built by our own load (resync) -- staying in the lobby\n");
+            else if (InterlockedExchange(&g_hostMenuLoad, 0)) Log("[menu] the title menu was built by the host's own world switch -- staying in the lobby\n");
+            else InterlockedExchange(&g_leaveOnMenu, 1);
+        }
         g_gameUi = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
+        InterlockedExchange(&g_loadingPanel, 0);
         // Keep recovery reachable at the title menu after a failed load.
         if (InterlockedCompareExchange(&g_recoveryPresent, 0, 0) && g_modelCsInit) {
             EnterCriticalSection(&g_modelCs);
@@ -3243,7 +4493,14 @@ static void MyCreatePage(uint64_t thisp, int page)
             if (open) { InterlockedExchange(&g_uiState, 3); InterlockedExchange(&g_panelDirty, 1); }
         }
     }
-    else if (page >= 3) InterlockedExchange(&g_showOverlay, 0);
+    else if (page == 16 && LobbyRunning()) {
+        InterlockedExchange(&g_showOverlay, 1);
+        InterlockedExchange(&g_loadingPanel, 1);
+        if (InterlockedCompareExchange(&g_uiState, 0, 0) != 2) InterlockedExchange(&g_uiState, 2);
+        InterlockedExchange(&g_panelDirty, 1);
+        Log("[menu] loading screen with a lobby running -- the panel stays up with the roster\n");
+    }
+    else if (page >= 3) { InterlockedExchange(&g_showOverlay, 0); InterlockedExchange(&g_loadingPanel, 0); }
     static int seen = 0;
     if (seen < 30) { seen++; Log("[menu] CreatePage page=%d show=%ld\n", page,
         InterlockedCompareExchange(&g_showOverlay, 0, 0)); }
@@ -3333,11 +4590,14 @@ static DWORD WINAPI Init(LPVOID)
     // the runtime data dir the bridge uses for tpf2_instance.txt / tpf2_bridge_ctl.txt
     if (!Tpf2mpDataDirW(g_dataDirW, MAX_PATH, (const void*)&Init)) wcscpy_s(g_dataDirW, ourDirW());
     NativeControl::Start(g_dataDirW, NativeIo::Initialize(g_base, g_nativeModule, g_saveDirW));
+    // Every UI load reaches us through the StartSavegame detour native_io.cpp
+    // already owns (one hook, one steal): a host that loads another world
+    // shares it, mid-session as a world switch (see OnStartSavegame).
+    NativeIo::ObserveStart(&OnStartSavegame);
     InitializeCriticalSection(&g_statusCs); g_csInit = true;
     InitializeCriticalSection(&g_modelCs); g_modelCsInit = true;
     InitializeCriticalSection(&g_lobbyCs); g_lobbyCsInit = true;
     InitializeCriticalSection(&g_syncCs); g_syncCsInit = true;
-    StartUpdateCheck();
     CreateThread(nullptr, 0, KbHookThread, nullptr, 0, nullptr);  // chat keyboard capture/swallow
     Log("[menu] attached, base=%llx  save=%ls  net=%ls  data=%ls  our=%ls\n",
         (unsigned long long)g_base, g_saveDirW, g_netDirW, g_dataDirW, ourDirW());

@@ -64,7 +64,12 @@ static void TestInstallReadiness()
     const auto savedEnv=SliceCoreEnvGet();
     auto& env=const_cast<SliceCoreEnv&>(SliceCoreEnvGet());
     env.base=uintptr_t(image);env.exec[0]={env.base,env.base+size};env.nExec=1;
-    const auto* factory=SliceFactoryByRva(0x15eb600);
+    // SetLine shares an RX page with the menu's typed SaveGame hook.
+    // It must still install, while actual overlapping bytes remain forbidden.
+    assert(ForeignPatchOwner(0x15ed140,15));
+    assert(ForeignPatchOwner(0x15ed13f,2));
+    assert(!ForeignPatchOwner(0x15ed14f,14));
+    const auto* factory=SliceFactoryByRva(0x15ed550);
     assert(factory && !factory->stackArgs);
     const uintptr_t auxiliaryRva=0x2000000;
     uint8_t auxiliary[14];memset(auxiliary,0x90,sizeof(auxiliary));

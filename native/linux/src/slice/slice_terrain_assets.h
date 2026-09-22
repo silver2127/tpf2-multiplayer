@@ -6,8 +6,8 @@
 
 namespace slice_terrain_assets {
 constexpr size_t MaxBytes = 64u << 20;
-constexpr size_t MaxAssetGroups = 4096, MaxAssetModels = 20000, MaxAssetString = 511;
-constexpr size_t MaxTotalModels = MaxBytes / 69; // smallest TPAS model record
+constexpr size_t MaxAssetGroups = UINT32_MAX, MaxAssetModels = UINT32_MAX, MaxAssetString = UINT32_MAX;
+constexpr size_t MaxTotalModels = SIZE_MAX / 73; // smallest TPAS model record
 struct Grid {
     std::array<int32_t, 4> rect{}; // x0,y0,width,height
     std::vector<uint8_t> data;

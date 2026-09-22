@@ -18,6 +18,7 @@ State state = State::Idle;
 std::string operation, name;
 uintptr_t menu = 0, ui = 0;
 DWORD owner = 0;
+DWORD commandThread = 0;     // executes the world's commands (see WorkThreads)
 HHOOK pumpHook = nullptr;
 std::atomic<bool> enabled{false}, initializationAttempted{false};
 bool accepted = false;
@@ -121,6 +122,7 @@ void saveComplete(FunctionObject* object, const bool* success, const void*) {
         std::lock_guard<std::mutex> lock(mutex);
         current=ui==ticket->world && state==State::Saving && operation==ticket->id;
         if(current) {
+            commandThread=GetCurrentThreadId();
             field<unsigned char>(ui,0xb48)=0;
             field<uint64_t>(ui,0x648)=0;
             state=State::Idle;
@@ -139,6 +141,7 @@ void pauseComplete(FunctionObject* object,const unsigned char* command) {
     {
         std::lock_guard<std::mutex> lock(mutex);
         current=ui==ticket->world && state==State::Pausing && operation==ticket->id;
+        if(current) commandThread=GetCurrentThreadId();
         if(current && success) {
             const auto queue=field<uintptr_t>(field<uintptr_t>(ui,0x448),0x160);
             const auto impl=field<uintptr_t>(queue,0);
@@ -206,10 +209,17 @@ void saveNow(uintptr_t world,const std::string& id,const std::string& basename) 
 
 using StartFn=bool(*)(uintptr_t,void*,void*);
 StartFn originalStart;
+std::atomic<StartObserver> startObserver{nullptr};
 bool startHook(uintptr_t target,void* params,void* info) {
     const bool result=originalStart(target,params,info);
-    std::lock_guard<std::mutex> lock(mutex);
-    if(state==State::Loading && target==menu) accepted=result;
+    bool ours;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        ours=state==State::Loading;
+        if(ours && target==menu) accepted=result;
+    }
+    // Outside the lock: the observer writes files and talks to the lobby.
+    if(auto observer=startObserver.load()) observer(params,result,ours);
     return result;
 }
 // All 26 parameters are pointers/references or MSVC indirect by-value objects.
@@ -237,7 +247,7 @@ uintptr_t destructorHook(uintptr_t world,unsigned flags) {
     {
         std::lock_guard<std::mutex> lock(mutex);
         if(ui==world) {
-            ui=0;
+            ui=0; commandThread=0;
             if(state==State::Saving || state==State::QueuedSave || state==State::Pausing || state==State::QueuedPause) {
                 failedStep=(state==State::Pausing || state==State::QueuedPause) ? "paused" : "saved";
                 failed=operation; state=State::Idle;
@@ -317,6 +327,7 @@ bool Initialize(uintptr_t image,HMODULE self,const wchar_t* saves) {
     originalLegacyScriptEvent=reinterpret_cast<LegacyScriptEvent>(scriptEvent);
     enabled=true; return true;
 }
+void ObserveStart(StartObserver observer) { startObserver.store(observer); }
 void ObserveMenu(uintptr_t target) {
     std::lock_guard<std::mutex> lock(mutex);
     menu=target;
@@ -340,6 +351,8 @@ bool PauseAndDrain(const std::string& id) {
 bool Poll(Event& event) { std::lock_guard<std::mutex> lock(mutex); if(events.empty()) return false; event=events.front(); events.pop_front(); return true; }
 bool HasWorld() { std::lock_guard<std::mutex> lock(mutex); return ui!=0; }
 bool Busy() { std::lock_guard<std::mutex> lock(mutex); return state!=State::Idle; }
+bool Loading() { std::lock_guard<std::mutex> lock(mutex); return state==State::QueuedLoad || state==State::Loading; }
+void WorkThreads(DWORD& uiThread,DWORD& command) { std::lock_guard<std::mutex> lock(mutex); uiThread=owner; command=commandThread; }
 bool SetActionsHeld(bool held) {
     std::lock_guard<std::mutex> lock(mutex);
     if(held && !inputWindow) return false;

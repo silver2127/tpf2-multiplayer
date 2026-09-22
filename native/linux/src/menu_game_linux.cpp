@@ -90,7 +90,9 @@
 // Process-lifetime state is leaked on purpose: static destructors run while the
 // game's threads still call in.
 #include "menu_game_linux.h"
+#include "datadir_linux.h"
 #include "near_alloc.h"
+#include "hook.h"
 #include <cxxabi.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -803,6 +805,41 @@ using StepFn   = void (*)(void* component, int64_t t, int64_t dt);
 using UpdateFn = void (*)(void* self, int64_t t, int64_t dt);
 
 static uintptr_t g_base = 0;
+#include "progress_checks_linux.h"
+#include <sys/uio.h>
+static std::atomic<uintptr_t> g_progressMenu{0};
+static std::atomic<bool> g_progressReady{false};
+static bool ProgressRead(uintptr_t address, void* out, size_t size)
+{
+    if (!address || address+size<address) return false;
+    iovec local{out,size}, remote{reinterpret_cast<void*>(address),size};
+    return process_vm_readv(getpid(),&local,1,&remote,1,0)==ssize_t(size);
+}
+void MenuGame_ObserveMenu(void* menu) { g_progressMenu=uintptr_t(menu); }
+int MenuGame_LoadPercent()
+{
+    if (!g_progressReady.load()) return -1;
+    const uintptr_t menu=g_progressMenu.load();
+    uintptr_t bar=0, monitor=0, vtable=0;
+    float value=0;
+    if (!menu || !ProgressRead(menu+0x498,&bar,sizeof(bar)) || !bar ||
+        !ProgressRead(bar+0x440,&monitor,sizeof(monitor)) || !monitor ||
+        !ProgressRead(monitor,&vtable,sizeof(vtable)) || vtable!=g_base+0x59d8c60 ||
+        !ProgressRead(monitor+8,&value,sizeof(value)) || !(value>=0 && value<=1)) return -1;
+    return int(value*100);
+}
+static bool CheckProgress(uintptr_t base)
+{
+    for (const auto& check:kProgressChecks) {
+        uint8_t bytes[64];
+        if (!ProgressRead(base+check.rva,bytes,check.size) || memcmp(bytes,check.bytes,check.size)) return false;
+    }
+    uintptr_t slots[4];
+    if (!ProgressRead(base+0x59d8c60,slots,sizeof(slots))) return false;
+    return slots[0]==base+0x30ebcd0 && slots[1]==base+0x30ebe00 &&
+           slots[2]==base+0x30ebd30 && slots[3]==base+0x30ebd10;
+}
+
 static std::atomic<bool> g_gateOk{false};
 
 // The Step wrappers a thread is inside, by frame address. The stack grows down,
@@ -926,7 +963,9 @@ static bool InstallGate(uintptr_t base)
 
 // ---- AUTO-LOAD [AL-06..18] ------------------------------------------------------------------------
 static std::atomic<bool>     g_autoloadOn{false};
+static std::atomic<bool>     g_loadAccepted{false};
 static UpdateFn              g_menuUpdate = nullptr;   // the original, published before the swap
+static std::atomic<bool> g_modRefresh{false};
 static std::atomic<uint64_t> g_alPending{0};           // the request waiting for a menu frame; 0 = none
 static std::atomic<uint64_t> g_alSeen{0};              // the last request a gated menu frame looked at
 static std::atomic<uint64_t> g_alWaitLogged{0};
@@ -936,6 +975,25 @@ static const int kAlWatchdogMs = 15000;
 // game took it (checked on the next gated frame).
 static thread_local uint64_t t_alInFlight = 0;
 static thread_local char     t_alInFlightName[256];
+
+static std::atomic<MenuGameLoadObserver> g_loadObserver{nullptr};
+static void* g_originalStartSavegame;
+static uint8_t StartSavegameDetour(void* menu, void* params, void* info)
+{
+    // No C++ cleanup/catch encloses the foreign engine call.
+    const uint8_t accepted = reinterpret_cast<uint8_t (*)(void*,void*,void*)>(g_originalStartSavegame)(menu,params,info);
+    if (!accepted || t_alInFlight) return accepted;
+    const GStr* name = static_cast<const GStr*>(params); // libstdc++ string +0
+    if (!name || !name->p || !name->len || name->len > 200) return accepted;
+    char text[201]; memcpy(text,name->p,name->len); text[name->len]=0;
+    if (strlen(text)!=name->len || text[0]=='.' || strpbrk(text,"/\\")) return accepted;
+    if (const auto observer=g_loadObserver.load()) {
+        try { observer(text); }
+        catch (...) { Log("[menu] accepted load could not be queued for sharing\n"); }
+    }
+    return accepted;
+}
+void MenuGame_ObserveLoads(MenuGameLoadObserver observer) { g_loadObserver.store(observer); }
 
 struct AlState {
     SpinLock lock;
@@ -1290,6 +1348,8 @@ static void LoadCleanUp(void* p)
     }
 }
 
+#include "native_io_linux.inl"
+
 // GAME PATH
 static void AutoloadTick(void* menu)
 {
@@ -1337,6 +1397,7 @@ static void AutoloadTick(void* menu)
     }
     t_alInFlight = 0;
     if (ctx.result == 1) {
+        g_loadAccepted = true;
         Log("[autoload] StartSavegame(%s) started the load\n", name);
     } else if (ctx.result == 0) {
         Log("[autoload] StartSavegame(%s) refused (mods, or a load already starting) -- the player loads it by hand\n", name);
@@ -1348,10 +1409,19 @@ static void AutoloadTick(void* menu)
 }
 
 // GAME PATH
+static void RefreshModsBody(void* menu) {reinterpret_cast<void(*)(void*,int)>(g_base+0x1154b20)(menu,8);}
 static void MenuUpdateDetour(void* menu, int64_t t, int64_t dt)
 {
     g_menuUpdate(menu, t, dt);   // first and untouched
     if (!OnFrameStep((uintptr_t)__builtin_frame_address(0))) return;
+    NativeIo::Tick(menu,false);
+    if(g_modRefresh.load() && !*reinterpret_cast<uintptr_t*>(static_cast<char*>(menu)+MENU_OFF_GAMEUI) &&
+       !*reinterpret_cast<uint8_t*>(static_cast<char*>(menu)+MENU_OFF_INITING) &&
+       !*reinterpret_cast<uintptr_t*>(static_cast<char*>(menu)+MENU_OFF_QUEUED) && g_modRefresh.exchange(false)) {
+        const bool threw=tpf2mp_mg_guarded(RefreshModsBody,menu)!=0;
+        Log("[menugame] mod catalogue refresh %s\n",threw?"threw":"requested on load page");
+    }
+
     if (!g_menuFrameLogged.load(std::memory_order_relaxed)) {
         g_menuFrameLogged = true;
         Log("[autoload] the title menu's frame update runs (CMenuUI %p)\n", menu);
@@ -1390,6 +1460,9 @@ void MenuGame_RequestAutoload(const std::string& placedName)
     Log("[autoload] %s: starting it on the next title-menu frame\n", placedName.c_str());
     StatusLater(gen, placedName, kAlWatchdogMs);
 }
+
+void MenuGame_RequestModRefresh() {g_modRefresh=true;}
+bool MenuGame_Loading() { return g_alPending.load() != 0 || g_loadAccepted.load() || NativeIo::Loading(); }
 
 // ---- HOT JOIN [HJ-03..07] -------------------------------------------------------------------------
 static std::atomic<bool>  g_forceOn{false};
@@ -1537,11 +1610,12 @@ static void GameUiUpdateDetour(void* ui, int64_t t, int64_t dt)
     if (t_forceCall.active) SettleUnwoundForce(ui, here);
     const bool current = *(const uintptr_t*)ui == g_base + RVA_GAMEUI_VTABLE &&
                          *(void* const*)(g_base + RVA_G_GAMEUI) == ui;
-    if (current) panel::OnGameUiFrame();
+    if (current) { g_loadAccepted = false; panel::OnGameUiFrame(); }
     if (!current || !OnFrameStep(here)) {
         g_gameUiUpdate(ui, t, dt);
         return;
     }
+    if(const auto menu=g_progressMenu.load()) NativeIo::Tick(reinterpret_cast<void*>(menu),true);
     if (g_frameGameUi.exchange(ui, std::memory_order_relaxed) != ui)
         Log("[hotjoin] a game's frame update runs (CGameUI %p)\n", ui);
     if (!g_forcePending.load(std::memory_order_relaxed)) {
@@ -1662,6 +1736,8 @@ static bool Install(uintptr_t base)
         return false;
     }
     g_base = base;
+    g_progressReady=CheckProgress(base);
+    Log("[menugame] load percentage %s\n",g_progressReady ? "verified" : "OFF (byte/vtable check failed)");
     const bool guard = ResolveGameRuntime();
     const uint8_t bad = CheckBytes(base);
     const bool menuVt = VtableIs(base, "CMenuUI", RVA_MENUUI_VTABLE, RVA_MENUUI_TYPEINFO, RVA_MENUUI_TYPENAME,
@@ -1681,6 +1757,10 @@ static bool Install(uintptr_t base)
         return false;
     }
     if (wantAutoload) {
+        // CheckBytes includes the exact 16-byte, relocation-free prologue.
+        const bool observed = InstallHook(base+RVA_START_SAVEGAME,
+            reinterpret_cast<void*>(&StartSavegameDetour),16,&g_originalStartSavegame);
+        Log("[menu] accepted vanilla load observer %s\n", observed ? "ON" : "OFF (hook refused)");
         g_menuUpdate = (UpdateFn)(base + RVA_MENUUI_UPDATE);
         g_autoloadOn = StoreSlot(base + RVA_MENUUI_VTABLE + SLOT_UPDATE * sizeof(uintptr_t), base + RVA_MENUUI_UPDATE,
                                  (uintptr_t)&MenuUpdateDetour, "CMenuUI");
@@ -1693,6 +1773,10 @@ static bool Install(uintptr_t base)
     Log("[menugame] autoload %s; forced autosave (hot join) and the in-game signal %s\n",
         g_autoloadOn ? "ON (CMenuUI update 1140a90 hooked in its vtable)" : "OFF",
         g_forceOn ? "ON (CGameUI update 100fb20 hooked in its vtable)" : "OFF");
+    const bool ready=g_autoloadOn && g_forceOn && guard && NativeIo::Install();
+    char dataDir[4096]{};
+    if(Tpf2mpDataDirA(dataDir,sizeof(dataDir))) NativeControl::Start(dataDir,ready);
+    Log("[native] pause/save/load controller %s\n",ready?"ON":"OFF");
     return g_autoloadOn && g_forceOn;
 }
 

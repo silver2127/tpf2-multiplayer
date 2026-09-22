@@ -14,8 +14,8 @@ Steps, in order (each one stops the script on failure):
      failure the script retries with one, copies the result over the plain name
      if it can, and otherwise packages the suffixed file under the plain name.
      The proxy target has no suffix support; close the game if it fails.
-  2. python -m PyInstaller --onefile --name netpunch lobby.py  (in netpunch\)
-     -> netpunch\dist\netpunch.exe. -SkipFreeze reuses an existing exe.
+  2. python -m PyInstaller --onedir --name netpunch lobby.py  (in netpunch\)
+     -> netpunch\dist\netpunch\ (netpunch.exe beside _internal\). -SkipFreeze reuses an existing build.
   3. installer\ca\build_ca.bat -> installer\out\tpf2ca.dll (the custom actions).
   4. wix build -arch x64 -ext WixToolset.UI.wixext ... installer\Package.wxs installer\PluginHost.wxs
      PluginHost.wxs is the fragment SHARED with the TpF2 Big Maps package (same
@@ -35,7 +35,7 @@ flag after reading https://wixtoolset.org/osmf/ .
 Skip steps 1-3 (package whatever is in native\out, netpunch\dist and installer\out).
 
 .PARAMETER SkipFreeze
-Skip the PyInstaller step when netpunch\dist\netpunch.exe already exists (warns).
+Skip the PyInstaller step when netpunch\dist\netpunch\netpunch.exe already exists (warns).
 
 .PARAMETER Validate
 After building, extract the MSI with msiexec /a into a temp folder and list it.
@@ -44,7 +44,7 @@ After building, extract the MSI with msiexec /a into a temp folder and list it.
 Pass --acceptEula wix7 to wix for this run.
 
 .PARAMETER Version
-Package version (three-part). Defaults to the contents of installer\VERSION, which
+Package version (0.x.y, or 0.x.y.z for a bugfix). Defaults to the contents of installer\VERSION, which
 is the single source of truth for what a release is called -- every 0.1.x MSI up to
 2026-08-30 shipped as ProductVersion 0.1.0 because this defaulted to a literal, so
 Windows showed the same version for every build and could not tell an upgrade from
@@ -60,7 +60,8 @@ param(
     [switch]$SkipFreeze,
     [switch]$Validate,
     [switch]$AcceptWixEula,
-    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    # two to four parts (the body checks the same); a two-part version is padded for the package below
+    [ValidatePattern('^\d+\.\d+(\.\d+){0,2}$')]
     [string]$Version
 )
 
@@ -71,7 +72,11 @@ if (-not $Version) {
     $vf = Join-Path $PSScriptRoot "VERSION"
     if (-not (Test-Path $vf)) { throw "installer\VERSION is missing and no -Version was given" }
     $Version = (Get-Content $vf -Raw).Trim()
-    if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "installer\VERSION does not contain a three-part version: '$Version'" }
+    # 0.x (a major feature), 0.x.y (a minor one) or 0.x.y.z (a bugfix). Windows
+    # Installer wants at least three parts and ignores a fourth when it compares
+    # versions; AllowSameVersionUpgrades in Package.wxs is what lets 0.5.7.1 install
+    # over 0.5.7. A two-part version is padded to 0.x.0 for the package only.
+    if ($Version -notmatch '^\d+\.\d+(\.\d+){0,2}$') { throw "installer\VERSION does not contain a version of two to four parts: '$Version'" }
 }
 $Repo      = Split-Path -Parent $Installer
 $Bridge    = Join-Path $Repo "native"
@@ -126,7 +131,8 @@ function Build-Suffixable([string]$target, [string]$plainName) {
 
 $menuDll  = Join-Path $BridgeOut "tpf2_menu.dll"
 $sliceDll = Join-Path $BridgeOut "tpf2_slice.dll"
-$netExe   = Join-Path $Netpunch "dist\netpunch.exe"
+$netDir   = Join-Path $Netpunch "dist\netpunch"
+$netExe   = Join-Path $netDir "netpunch.exe"
 $caDll    = Join-Path $OutDir "tpf2ca.dll"
 
 # ---- 1. native DLLs ------------------------------------------------------
@@ -145,6 +151,11 @@ if ($SkipBuild) {
     Say "running build.bat previews"
     $rc = Run-Bat $build "previews"
     if ($rc -ne 0) { Fail "build.bat previews failed (exit $rc)" }
+    # The workshop-registration plugin ships too; a fresh checkout (CI) has no
+    # leftover copy from a manual build.bat workshop.
+    Say "running build.bat workshop"
+    $rc = Run-Bat $build "workshop"
+    if ($rc -ne 0) { Fail "build.bat workshop failed (exit $rc)" }
 }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
@@ -158,16 +169,28 @@ if ($SkipBuild) {
 } elseif ($SkipFreeze -and (Test-Path $netExe)) {
     Warn "-SkipFreeze: reusing $netExe (built $((Get-Item $netExe).LastWriteTime)); lobby.py changes since then are NOT in it"
 } else {
+    # the bootloader compiled here, not the stock stub (tools\pyinstaller_from_source.py; a no-op once done)
+    Say "PyInstaller bootloader: compiled from source"
+    & python (Join-Path $Repo "tools\pyinstaller_from_source.py")
+    if ($LASTEXITCODE -ne 0) { Fail "tools\pyinstaller_from_source.py failed (exit $LASTEXITCODE): the lobby would carry the stock PyInstaller stub" }
     Say "freezing netpunch\lobby.py with PyInstaller"
     Push-Location $Netpunch
     try {
         # PowerShell 5.1 otherwise treats PyInstaller's normal stderr logging
         # as a terminating NativeCommandError under ErrorActionPreference=Stop.
-        cmd /c "python -m PyInstaller --noconfirm --onefile --name netpunch lobby.py 2>&1" | ForEach-Object { Write-Host "    $_" }
+        # a FOLDER build: a one-file exe unpacks itself at run time, which is what
+        # antivirus heuristics call a packer (four engines, 2026-09-20)
+        cmd /c "python -m PyInstaller --noconfirm --onedir --name netpunch lobby.py 2>&1" | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) { Fail "PyInstaller failed (exit $LASTEXITCODE). pip install pyinstaller -r requirements.txt" }
     } finally { Pop-Location }
 }
 if (-not (Test-Path $netExe)) { Fail "missing: $netExe" }
+if (-not (Test-Path (Join-Path $netDir "_internal"))) { Fail "missing: $netDir\_internal (the lobby must be a folder build)" }
+# Wine relocates the lobby's miniupnpc DLL and its duplicated relocation entries
+# then crash every host under Proton; the repair (tools\proton\install.py, pinned
+# to that DLL) changes nothing else and is a no-op once applied.
+& python (Join-Path $Repo "tools\proton\install.py") --repair-lobby $netDir
+if ($LASTEXITCODE -ne 0) { Fail "lobby relocation repair failed" }
 
 # ---- 3. custom-action DLL ------------------------------------------------
 if ($SkipBuild -and (Test-Path $caDll)) {
@@ -195,12 +218,12 @@ New-Item -ItemType Directory -Force $OutDir | Out-Null
 $wixArgs = @("build") + $eula + @(
     "-arch", "x64",
     "-ext", "WixToolset.UI.wixext",
-    "-d", "ProductVersion=$Version",
+    "-d", "ProductVersion=$(if ($Version -match '^\d+\.\d+$') { "$Version.0" } else { $Version })",
     "-d", "ProxyDll=$proxyDll",
     "-d", "HostDll=$hostDll",
     "-d", "MenuDll=$menuDll",
     "-d", "SliceDll=$sliceDll",
-    "-d", "NetpunchExe=$netExe",
+    "-d", "NetpunchDir=$netDir",
     "-d", "CaDll=$caDll",
     "-o", $Msi,
     (Join-Path $Installer "Package.wxs"),
@@ -218,9 +241,9 @@ if ($rc -ne 0) { Fail "wix build failed (exit $rc)" }
 if (-not (Test-Path $Msi)) { Fail "wix reported success but $Msi is missing" }
 Say "built $Msi ($([math]::Round((Get-Item $Msi).Length / 1MB, 1)) MB, version $Version)" Green
 
-# Ship this alongside the MSI in the GitHub release for user-local updates.
-& python (Join-Path $Repo "tools\build_update.py")
-if ($LASTEXITCODE -ne 0) { Fail "automatic update bundle build failed" }
+# The MSI's files as a plain archive, for the Proton installer and manual installs.
+& python (Join-Path $Repo "tools\build_files_zip.py")
+if ($LASTEXITCODE -ne 0) { Fail "files archive build failed" }
 
 # ---- 5. optional validation ----------------------------------------------
 if ($Validate) {

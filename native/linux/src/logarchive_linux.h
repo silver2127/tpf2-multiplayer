@@ -413,6 +413,10 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
     char data[PATH_MAX];
     if (!LaLogsRoot(out->root, sizeof(out->root), data, sizeof(data))) { out->root[0] = 0; return false; }
 
+    char keepPath[PATH_MAX];
+    const bool keepLogs = LaFmt(keepPath, sizeof(keepPath), "%stpf2mp_keep_logs.txt", data) && access(keepPath, F_OK) == 0;
+    if (keepLogs) moveLogs = false;
+
     // The existing archives, by kind; the newest one's time bounds the dumps.
     // A folder's mtime is when its last file was placed: the end of that archive.
     timespec since = {};
@@ -480,7 +484,8 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
     // Logs held by another live game are copied: a rename would leave that game
     // writing into this archive.
     const bool moveData = previousSession && moveLogs;
-    if (previousSession && !moveData)
+    if (keepLogs) LaNote(about, "  tpf2mp_keep_logs.txt: copy logs and retain all archives\n");
+    else if (previousSession && !moveData)
         LaNote(about, "  another Transport Fever 2 is still running: the data folder's logs are copied, not moved\n");
 
     uint64_t budget = TPF2_COPY_BUDGET_BYTES;
@@ -628,7 +633,7 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
     // Keep the newest TPF2_LOG_KEEP of this kind, this one included (names sort
     // by time). A folder a killed start left half-written goes the same way.
     size_t n = count[myKind];
-    if (n + 1 > (size_t)TPF2_LOG_KEEP) {
+    if (!keepLogs && n + 1 > (size_t)TPF2_LOG_KEEP) {
         char (*list)[32] = names[myKind];
         for (size_t i = 0; i < n; i++)
             for (size_t j = i + 1; j < n; j++)

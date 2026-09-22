@@ -1,0 +1,36 @@
+{
+  "github_owner": "silver2127",
+  "base_branch": "linux-native",
+  "include": ["dev"],
+  "exclude": ["linux-native", "port/*", "gh-pages", "worktree-*", "release-*"],
+  "max_commits": 20,
+  "rounds_per_agent": 3,
+  "agent_timeout_minutes": 240,
+  "verify_timeout_minutes": 90,
+  "publish": "gh",
+  "agents": [
+    {
+      "name": "codex",
+      "cmd": ["codex", "exec", "-C", "{workdir}", "--dangerously-bypass-approvals-and-sandbox",
+              "--skip-git-repo-check", "-o", "{meta}/codex-last-message.txt", "-"],
+      "session_from_log": "^session id: ([0-9a-f-]{36})$",
+      "continue_cmd": ["codex", "exec", "resume", "{session}", "--dangerously-bypass-approvals-and-sandbox",
+                       "--skip-git-repo-check", "-o", "{meta}/codex-last-message.txt", "-"]
+    },
+    {
+      "name": "claude",
+      "cmd": ["claude", "-p", "--dangerously-skip-permissions", "--add-dir", "{meta}"],
+      "continue_cmd": ["claude", "-p", "--continue", "--dangerously-skip-permissions", "--add-dir", "{meta}"]
+    }
+  ],
+  "repos": {
+    "tpf2-multiplayer": {
+      "docs": "README.md, docs/linux/ (UPSTREAM_<version>.md records each Windows integration; INSTALL.md), docs/re/linux/",
+      "verify": [["tools/linux/build_native.sh"], ["python3", "tools/linux/verify_lua_release.py"]]
+    },
+    "tpf2-bigmap": {
+      "docs": "README.md, docs/linux/PORT.md (baseline Windows commit, every patched site with its evidence)",
+      "verify": [["tools/linux/build.sh"]]
+    }
+  }
+}

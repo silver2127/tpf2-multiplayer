@@ -387,7 +387,43 @@ function CM.streetProps(c, x0, y0, x1, y1)
 	return bus, tram
 end
 
+-- Wire ownership is a company number, never the sender's player entity.
+-- 0 is public; co-op uses company 1. A missing field is a legacy capture.
+function CM.edgeOwnerCompany(pid)
+	if pid == -1 then return 0 end
+	assert(type(pid) == "number" and pid >= 0 and pid == math.floor(pid), "invalid captured edge owner")
+	CM.cmEnsure()
+	local cid = CM.cmCompanyOfPid(pid)
+	if not cid and CM.cmMode ~= "companies" and pid == api.engine.util.getPlayer() then cid = 1 end
+	assert(cid and cid >= 1, "edge owner has no company mapping")
+	return cid
+end
+
+function CM.applyEdgeOwner(edge, cid)
+	if cid == nil then return end
+	assert(type(cid) == "number" and cid >= 0 and cid == math.floor(cid), "invalid edge owner company")
+	if cid == 0 then edge.playerOwned = nil; return end
+	CM.cmEnsure()
+	local pid
+	if CM.cmMode == "companies" then pid = (CM.cmCompanyPid or {})[cid]
+	elseif cid == 1 then pid = api.engine.util.getPlayer() end
+	assert(type(pid) == "number" and pid >= 0, "edge owner company is unavailable")
+	-- The engine silently drops a Lua table assigned to this optional component.
+	local owner = api.type.PlayerOwned.new()
+	owner.player = pid
+	edge.playerOwned = owner
+end
+
 local function copyEdgeProps(dst, srcEid, isTrack, stype)
+	-- Splits and unchanged bridge companions retain THIS edge's owner, not the builder's.
+	local owner = api.engine.getComponent(srcEid, api.type.ComponentType.PLAYER_OWNED)
+	if owner then
+		local copied = api.type.PlayerOwned.new()
+		copied.player = owner.player
+		dst.playerOwned = copied
+	else
+		dst.playerOwned = nil
+	end
 	-- A half of a split edge keeps the split edge's BRIDGE/TUNNEL type too
 	-- (BaseEdge.type 0 ground / 1 bridge / 2 tunnel, typeIndex = the type's
 	-- resource index, -1 on the ground). Callers stamp 0/-1 first; override.

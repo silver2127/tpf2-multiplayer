@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 
-from sync_operation import SyncOperation, SyncReplica, ACTIVE
+from sync_operation import SyncOperation, SyncReplica, ACTIVE, SILENCE
 from sync_runtime import SyncParticipant
 
 
@@ -26,6 +26,14 @@ def publish_prompt(runtime, io, available, now):
     except (KeyError, ValueError):
         return
     key = (world, count, bool(available))
+    # The host declined a resync: no prompt for the rest of this world. A
+    # resync that completes afterwards (a fresh epoch) or a new lobby lifts it.
+    if getattr(runtime, 'prompt_muted', False):
+        if runtime.state and runtime.state['phase'] == 'complete' and runtime.state['epoch'] != getattr(runtime, 'prompt_muted_epoch', None):
+            runtime.prompt_muted = False
+        else:
+            runtime.prompt_seen = key
+            return
     if notice.get('held') != '0' or (runtime.state and runtime.state['phase'] != 'complete'):
         # Consume observations of the old world while recovering so completion
         # cannot reopen its prompt before the new GUI publishes its dashboard.
@@ -42,6 +50,13 @@ def ui_state(state):
     error = state.get('error') or {}
     return dict(state, type='sync_state', step=error.get('step', ''),
                 detail=error.get('detail', ''))
+
+
+def mute_prompt(runtime, io):
+    """Close this game's resync prompt and keep it closed for the current world."""
+    runtime.prompt_muted = True
+    runtime.prompt_muted_epoch = runtime.state['epoch'] if runtime.state else None
+    io.emit(dict(type='sync_prompt', phase='clear'))
 
 
 def make_runtime(args):
@@ -95,6 +110,29 @@ class HostRecovery:
     def held(self):
         return self.barrier.operation is not None and self.barrier.phase != 'complete'
 
+    def join(self, newcomer):
+        """A player arrived in the running session: a FROZEN JOIN (2026-09-16).
+
+        The session holds, the host saves, everyone -- host included -- loads
+        that save, the paused worlds are compared, and only then does anyone
+        play again. The old shape (the host keeps running, the newcomer loads
+        an autosave and catches up on the command history) diverged the
+        person sim within ~35 game units and the buses followed; see
+        sync_runtime. Returns True when the newcomer is covered: a round
+        started for it, or a round already running that admits it (the
+        barrier's tick reads the roster). False when recovery is unavailable
+        (an old client version, a transfer in flight): the caller falls back."""
+        if self.held:
+            return True                   # admitted by the barrier on its next tick
+        if not self.is_available():
+            return False
+        if self.barrier.request(self.barrier.host, self.members(), 'join'):
+            self.io.emit(ui_state(self.barrier.view()))
+            self.io.emit(dict(type='sync_feedback',
+                              detail=f'{newcomer} joined: holding the session while everyone loads the shared world.'))
+            return True
+        return False
+
     def world_epoch(self):
         """The epoch every member's bridge runs in after a COMPLETED resync, else None.
 
@@ -123,12 +161,16 @@ class HostRecovery:
 
     def command(self, sender, message):
         kind = message.get('cmd', message.get('t'))
-        if kind not in ('sync_request', 'sync_retry', 'sync_abort', 'sync_ack', 'sync_ready'):
+        if kind not in ('sync_request', 'sync_retry', 'sync_abort', 'sync_ack', 'sync_ready', 'sync_decline', 'sync_progress'):
             return False
         if sender not in self.members():
             return True
         if kind == 'sync_ack':
             self.barrier.acknowledge(sender, message)
+            return True
+        if kind == 'sync_progress':
+            # a member's engine or receiver is advancing: the phase's silence timeout moves out
+            self.barrier.progress(sender, message)
             return True
         request = message.get('id')
         if not isinstance(request, str) or not 1 <= len(request) <= 128:
@@ -150,6 +192,14 @@ class HostRecovery:
         # Enforce authority on the authenticated sender, not a UI flag or a
         # claimed identity inside the command. Clients may only confirm ready.
         if sender != self.barrier.host:
+            return True
+        if kind == 'sync_decline':
+            # the host keeps playing: every game's panel closes and stays closed
+            # for this world (a completed resync or a new lobby lifts it)
+            mute_prompt(self.runtime, self.io)
+            for member in self.members():
+                if member != self.barrier.host:
+                    self.send(member, {'t': 'sync_declined'})
             return True
         if self.readiness and self.readiness['phase'] == 'waiting':
             self.ready_state()
@@ -186,6 +236,17 @@ class HostRecovery:
         else:
             self.barrier.abort(sender, message.get('operation'))
         return True
+
+    def _local_progress(self, token, member=None):
+        """The host's own progress -- its engine -- counts for the barrier
+        like any member's report; the transfer it drives is reported per
+        RECEIVING member (``member``), since that is whose part is advancing:
+        the host has long acknowledged 'transferring' itself, and an
+        acknowledged member's reports do not count."""
+        if isinstance(token, str) and token:
+            self.barrier.progress(member or self.barrier.host, dict(
+                {k: getattr(self.barrier, k) for k in ('operation', 'revision', 'epoch', 'phase')},
+                progress=token))
 
     def feedback(self, address, message):
         if self.transfer is None or message.get('sid') != self.transfer.sid:
@@ -227,6 +288,7 @@ class HostRecovery:
         ack = self.runtime.tick()
         if ack:
             self.barrier.acknowledge(self.barrier.host, ack)
+        self._local_progress(self.runtime.progress())
         if self.barrier.phase == 'transferring':
             try:
                 if self.transfer_epoch != self.barrier.epoch:
@@ -235,6 +297,10 @@ class HostRecovery:
                     self.transfer.begin_msg.update(operation=self.barrier.operation, epoch=self.barrier.epoch)
                     self.transfer_epoch = self.barrier.epoch
                 self.transfer.pump(now)
+                for member, token in self.transfer.progress_tokens():
+                    # a receiver got further, or its verify/write moved on: progress
+                    # for THAT member (the barrier ignores a token it saw before)
+                    self._local_progress(token, member)
                 if self.transfer.failed_names():
                     self.barrier.fail('Snapshot transfer failed')
             except (OSError, ValueError, RuntimeError, AttributeError) as error:
@@ -256,12 +322,20 @@ class ClientRecovery:
         self.local_seen = runtime._read('tpf2_sync_request.txt').get('id')
         self.received_epoch = None
         self.sent = self.available = 0
+        self.progress_sent = 0
         self.supported = False
         self.readiness = None
 
     @property
     def held(self):
         return self.runtime.state is not None and self.runtime.state['phase'] != 'complete'
+
+    @property
+    def completed(self):
+        """This game finished a recovery round: it is IN the shared world. A
+        newcomer that joined through a frozen join never received START
+        GAME's save, and the roster's started:true must not make it load one."""
+        return self.runtime.finished
 
     def identify(self, player, host, supported):
         self.supported = supported
@@ -297,6 +371,9 @@ class ClientRecovery:
             return True
         if kind == 'sync_command_ack':
             self.pending.pop(message.get('id'), None)
+            return True
+        if kind == 'sync_declined':
+            mute_prompt(self.runtime, self.io)
             return True
         if kind != 'sync_state':
             return False
@@ -336,6 +413,14 @@ class ClientRecovery:
                 except (ValueError, OSError) as error:
                     self.runtime._failure(error)
         ack = self.runtime.tick()
+        if state and not ack and state['phase'] in SILENCE and now - self.progress_sent >= 1:
+            # not done with this phase yet: tell the host how far along we are, so a
+            # long save, transfer or load is judged by its progress, not by a clock
+            self.progress_sent = now
+            token = '%s|recv=%s/%s' % (self.runtime.progress(), getattr(self.receiver, 'recv_count', 0),
+                                       getattr(self.receiver, 'finalizing', False))
+            self.send(dict({k: state[k] for k in ('operation', 'revision', 'epoch', 'phase')},
+                           t='sync_progress', progress=token))
         if now - self.sent >= .25:
             self.sent = now
             for command in list(self.pending.values()):

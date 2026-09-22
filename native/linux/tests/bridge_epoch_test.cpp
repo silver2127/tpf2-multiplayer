@@ -9,6 +9,7 @@ bool SpeedHook_Install(SpeedLogFn) { assert(false); return false; }
 void SpeedHook_SetTarget(double) { assert(false); }
 double SpeedHook_Target() { assert(false); return 0; }
 bool SetPlayerPatch_Install(SetPlayerLogFn) { assert(false); return false; }
+bool SteamTunnel_Start(const std::string&, TunnelLogFn) { assert(false); return false; }
 
 static void Write(const std::string& path, const std::string& body) {
     FILE* f = fopen(path.c_str(), "wb"); assert(f);
@@ -31,6 +32,12 @@ int main() {
     ApplyControl(control);
     assert(Net_WorldEpoch() == lobby && S().tailEpoch == lobby && S().tailFromZero);
     std::string text;
+    WriteIdentity("b",false);
+    assert(ReadSmallFile(S().dataDir+"tpf2_instance.txt",text));
+    assert(text.find("entity_owner_v1") == std::string::npos);
+    g_entityOwnerReady=true; WriteIdentity("b",false);
+    assert(ReadSmallFile(S().dataDir+"tpf2_instance.txt",text));
+    assert(text.find("\nentity_owner_v1=1\n") != std::string::npos);
     assert(ReadSmallFile(events, text) && text.empty());
     assert(ReadSmallFile(S().tailPath, text) && text.empty());
     assert(ReadSmallFile(S().dataDir + "tpf2_epoch_ready.txt", text));

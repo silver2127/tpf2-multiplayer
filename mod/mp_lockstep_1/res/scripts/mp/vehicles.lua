@@ -65,10 +65,23 @@ local function vehPurchaseTime(vid)
 	return pt
 end
 
+-- origin -> the highest key seq this registry has seen under that letter (the
+-- save carries it; see CM.vehKeysSaveState). Never lowered: a sold vehicle's
+-- key is gone from vehKeyOf but its number stays used.
+CM.vehKeyNext = {}
+local vehKeysGen = 0     -- bumped on every registry change; the save state is rebuilt only then
+local function noteVehKeySeq(key)
+	local o, s = tostring(key):match("^(.+):(%d+)$")
+	s = tonumber(s)
+	if o and s and s > (CM.vehKeyNext[o] or 0) then CM.vehKeyNext[o] = s end
+end
+
 local function registerVehKey(key, vid)
 	CM.vehKeyOf[vid] = key
 	vehIdOf[key] = vid
 	knownVeh[vid] = true
+	noteVehKeySeq(key)
+	vehKeysGen = vehKeysGen + 1
 	log(string.format("veh: %s <-> local vehicle %d purchaseTime=%s", key, vid, tostring(vehPurchaseTime(vid))))
 end
 
@@ -90,6 +103,79 @@ local function vehIdFor(key)
 	if id and CM.primedVeh[id] then return id end
 	return nil
 end
+function CM.vehIdForKey(key) return vehIdFor(key) end   -- the drift check names the vehicle that drifts
+
+-- ---------- vehicle keys in the save ----------
+--
+-- A bound key used to live only in the memory of the instance that bound it.
+-- A joiner that loaded the host's save primed every vehicle in it as s:<id>,
+-- so the host's a:8 was s:189156 on the joiner (measured 2026-09-16, hot join
+-- from the host's 954.6 save: both VPOS logs paired that vehicle '(nearest)',
+-- and every later host command naming a:8 -- VLINE, VSELL, VREPL, VNAME,
+-- VCOLOR, VDEPOT, VREV -- would have been "unknown vehicle key" there). The
+-- registry rides in the save: a save-loaded entity has the same id on every
+-- instance that loads the file (measured repeatedly), so entityId -> key is
+-- valid wherever the file loads. The highest seq minted per origin rides along
+-- so an instance that takes a letter the save already used never mints a key
+-- the save holds (CM.seqNo is K.INSTANCE's mint counter).
+--
+-- The save hook runs every frame in the GUI state (engine -> GUI sync): the
+-- keys table is rebuilt only when the registry changed. The load hook runs
+-- every frame there too: the first state is stashed, the first tick adopts it
+-- (before priming, so priming only hands s:<id> to what the save carried no
+-- key for), and every later echo is ignored. Ids are string keys, as
+-- companies.lua stores its pids: the save serializer keeps sparse tables that way.
+local vehKeysSaved = nil
+local vehKeysAdopted = false
+local vehKeysCache, vehKeysCacheGen = nil, -1
+function CM.vehKeysSaveState()
+	if not vehKeysCache or vehKeysCacheGen ~= vehKeysGen then
+		vehKeysCache = {}
+		for vid, key in pairs(CM.vehKeyOf) do vehKeysCache[tostring(vid)] = key end
+		vehKeysCacheGen = vehKeysGen
+	end
+	local nxt = {}
+	for o, s in pairs(CM.vehKeyNext) do nxt[o] = s end
+	if (CM.seqNo or 0) > (nxt[K.INSTANCE] or 0) then nxt[K.INSTANCE] = CM.seqNo end
+	return { v = 1, keys = vehKeysCache, next = nxt }
+end
+function CM.vehKeysLoadState(st)
+	if type(st) ~= "table" or vehKeysSaved or vehKeysAdopted then return end
+	vehKeysSaved = st
+end
+local function adoptSavedVehKeys()
+	local st = vehKeysSaved
+	vehKeysSaved = nil
+	vehKeysAdopted = true
+	local n, gone, held = 0, 0, 0
+	for sid, key in pairs(type(st.keys) == "table" and st.keys or {}) do
+		local vid = tonumber(sid)
+		if vid and type(key) == "string" then
+			local alive = false
+			pcall(function() alive = api.engine.entityExists(vid) end)
+			if not alive then gone = gone + 1
+			elseif CM.vehKeyOf[vid] or vehIdOf[key] then held = held + 1   -- bound here already; a fresh load never is
+			else
+				CM.vehKeyOf[vid] = key
+				vehIdOf[key] = vid
+				knownVeh[vid] = true
+				noteVehKeySeq(key)
+				n = n + 1
+			end
+		end
+	end
+	if n > 0 then vehKeysGen = vehKeysGen + 1 end
+	for o, s in pairs(type(st.next) == "table" and st.next or {}) do
+		s = tonumber(s)
+		if type(o) == "string" and s and s > (CM.vehKeyNext[o] or 0) then CM.vehKeyNext[o] = s end
+	end
+	local mine = CM.vehKeyNext[K.INSTANCE]
+	if mine and mine > (CM.seqNo or 0) then
+		log(string.format("veh: seq %d -> %d, past every %s: key the save holds", CM.seqNo or 0, mine, K.INSTANCE))
+		CM.seqNo = mine
+	end
+	log(string.format("veh: adopted %d key(s) from the save, %d for vehicles no longer there, %d already bound here", n, gone, held))
+end
 
 -- Prime knownVeh from every player depot once constructions are primed.
 function CM.primeVehKeys()
@@ -102,6 +188,10 @@ function CM.primeVehKeys()
 	-- the "new" vehicle. transportVehicleSystem lists parked vehicles. The list
 	-- is taken on the FIRST call, before anything can be bought: a vehicle
 	-- bought in the seconds before priming binds to its purchase key instead.
+	--
+	-- The save's keys come first: a vehicle the save keyed keeps that key on
+	-- every instance; the passes below only hand s:<id> to the rest.
+	if vehKeysSaved then adoptSavedVehKeys() end
 	if not CM.vehParkedAtLoad then
 		CM.vehParkedAtLoad = {}
 		pcall(function()
@@ -228,6 +318,107 @@ function CM.drainVehCap()
 end
 
 -- Resolve pending purchase keys: the depot's vehicle that is not yet known.
+-- Which STEP each keyed vehicle leaves its depot on, logged on every instance:
+-- two clones bought 0.8 s apart onto one line left the same depot in opposite
+-- order on the two games (a:58/a:59, 2026-09-16) with every command of ours on
+-- the same step on both, so the order was decided inside the engine. This
+-- names the step so the next pair says whether the departures themselves
+-- differ. One transportVehicleSystem query per tick.
+function CM.watchDepartures()
+	local parked = {}
+	local ok = pcall(function()
+		local st = api.type.enum.TransportVehicleState.IN_DEPOT
+		if st == nil then return end
+		local list = api.engine.system.transportVehicleSystem.getVehiclesWithState(st)
+		for i = 1, #list do parked[list[i]] = true end
+	end)
+	if not ok then return end
+	local step = CM.stepOf(CM.gameTime() or 0)
+	CM.depotSince = CM.depotSince or {}
+	for vid, since in pairs(CM.depotSince) do
+		if not parked[vid] then
+			local key = CM.vehKeyOf[vid] or (CM.primedVeh[vid] and ("s:" .. tostring(vid))) or ("id " .. tostring(vid))
+			log(string.format("veh: %s left its depot at step %d (parked since step %d)", key, step, since))
+			CM.depotSince[vid] = nil
+		end
+	end
+	for vid in pairs(parked) do
+		if not CM.depotSince[vid] then CM.depotSince[vid] = step end
+	end
+end
+
+-- TRAIN PATHS AND HALTS, STEP-STAMPED (2026-09-16). A desync at t=19008 had no
+-- command in 1,450 game units, identical positions 288 units earlier, identical
+-- edge/node ids at the junction, and the world hash still equal -- yet on one
+-- game two trains queued on one track while the other track's train went
+-- through, and on the other game the opposite. That is something the engine
+-- decides on its own: which train gets a junction, when a path result lands.
+-- Every train's path signature (edge count, first and last edge) and its
+-- stop/go transitions are logged with the SIM STEP, so two games' logs can be
+-- diffed to the step: a path that changes on step N here and N+2 there is the
+-- finding. Rail only, refreshed every 300 ticks, one MOVE_PATH read per train
+-- per update; off past 200 trains.
+CM.trainWatch = { list = {}, last = {}, at = -1e9, off = false }
+function CM.watchTrains()
+	local W = CM.trainWatch
+	if W.off then return end
+	local step = CM.stepOf(CM.gameTime() or 0)
+	if CM.ticks - W.at >= 300 then
+		W.at = CM.ticks
+		local list, ok = {}, pcall(function()
+			local rail = api.type.enum.Carrier.RAIL
+			local t = game.interface.getEntities({ radius = 999999 }, { type = "VEHICLE" }) or {}
+			for _, vid in pairs(t) do
+				local tv = api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
+				if tv and tv.carrier == rail then list[#list + 1] = vid end
+			end
+		end)
+		if not ok then W.off = true; log("TRAIN watch: cannot list rail vehicles -- off"); return end
+		if #list > 200 then W.off = true; log(string.format("TRAIN watch: %d trains -- off", #list)); return end
+		table.sort(list)
+		W.list = list
+		local keep = {}
+		for _, vid in ipairs(list) do keep[vid] = W.last[vid] end
+		W.last = keep
+	end
+	for _, vid in ipairs(W.list) do
+		local okR, err = pcall(function()
+			local mp = api.engine.getComponent(vid, api.type.ComponentType.MOVE_PATH)
+			if not mp then return end
+			local edges = mp.path.edges
+			local n = #edges
+			local sig = n .. ":" .. (n > 0 and tostring(edges[1].edgeId.entity) or "-") .. ":" .. (n > 0 and tostring(edges[n].edgeId.entity) or "-")
+			local speed = mp.dyn.speed or 0
+			local idx = mp.dyn.pathPos and mp.dyn.pathPos.edgeIndex or -1
+			local key = CM.vehKeyOf[vid] or (CM.primedVeh[vid] and ("s:" .. tostring(vid))) or ("id " .. tostring(vid))
+			local L = W.last[vid]
+			if not L then W.last[vid] = { sig = sig, speed = speed, since = step }; return end
+			if sig ~= L.sig then
+				log(string.format("TRAIN %s path -> %s at step %d (was %s; idx %d)", key, sig, step, L.sig, idx))
+				L.sig = sig
+			end
+			local wasMoving, moving = (L.speed or 0) > 0.01, speed > 0.01
+			if wasMoving ~= moving then
+				local state = "?"
+				pcall(function() state = tostring(api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE).state) end)
+				local edge = (idx >= 0 and idx < n) and tostring(edges[idx + 1].edgeId.entity) or "?"
+				if moving then
+					log(string.format("TRAIN %s moving at step %d after %d steps halted (edge %s idx %d/%d state %s)", key, step, step - (L.since or step), edge, idx, n, state))
+				else
+					log(string.format("TRAIN %s halted at step %d (edge %s idx %d/%d state %s)", key, step, edge, idx, n, state))
+				end
+				L.since = step
+			end
+			L.speed = speed
+		end)
+		if not okR then
+			W.off = true
+			log("TRAIN watch: MOVE_PATH unreadable (" .. tostring(err) .. ") -- off")
+			return
+		end
+	end
+end
+
 function CM.pollVehKeys()
 	if #pendingVehKeys == 0 then return end
 	local now = CM.gameTime()
@@ -306,7 +497,7 @@ end
 -- A sold vehicle's key must not outlive it: entity ids get reused.
 function forgetVehicle(vid)
 	local key = CM.vehKeyOf[vid]
-	if key then vehIdOf[key] = nil end
+	if key then vehIdOf[key] = nil; vehKeysGen = vehKeysGen + 1 end
 	CM.vehKeyOf[vid] = nil
 end
 
@@ -457,11 +648,27 @@ end
 
 function CM.execSetColor(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+	-- A vehicle paint whose key is not bound yet (its buy is still draining, one
+	-- per tick, or its VBUY arrived behind this) retries on the same step grid
+	-- as a VLINE, K.VCOLOR_RETRY_MAX times: the company paint follows the buy by
+	-- a few units and a batch of buys drains slower than that (2026-09-16).
+	if tostring(c.kind or "") == "veh" and c.key and not targetFor("veh", tostring(c.key)) then
+		c.tries = (c.tries or 0) + 1
+		if c.tries <= (K.VCOLOR_RETRY_MAX or 50) then
+			c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+			CM.retryQueue = CM.retryQueue or {}
+			CM.retryQueue[#CM.retryQueue + 1] = c
+			if c.tries == 1 or c.tries == 10 then
+				log(string.format("VCOLOR seq=%s: vehicle key %s not bound yet -- retry %d (step %d)", tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep))
+			end
+			return
+		end
+	end
 	local ok, err = pcall(function()
 		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
 		if not id then
-			log(string.format("VCOLOR seq=%s: no local %s for key %s -- skipped",
-				tostring(c.seq), tostring(c.kind), tostring(c.key)))
+			log(string.format("VCOLOR seq=%s: no local %s for key %s -- skipped%s",
+				tostring(c.seq), tostring(c.kind), tostring(c.key), (c.tries or 0) > 0 and string.format(" after %d retries", c.tries) or ""))
 			return
 		end
 		local r, g, b = tonumber(c.r) or 0, tonumber(c.g) or 0, tonumber(c.b) or 0
@@ -478,11 +685,25 @@ function CM.execSetColor(c)
 	if not ok then log("exec VCOLOR error: " .. tostring(err)) end
 end
 
+local pendingLineOrders = {}
 function CM.execVehCmd(c)
-	-- Strict ops replay on the originator ONLY if the slice actually cancelled
-	-- the local command (armed=1). A Reverse left to run natively and then
-	-- replayed is a toggle applied twice.
+	-- A delayed automatic assignment must not undo a newer player order.
+	if c.op == "VLINE" and c.key then
+		if c.lineStarted then
+			if pendingLineOrders[c.key] ~= c then return end
+		else
+			c.lineStarted = true
+			pendingLineOrders[c.key] = c
+		end
+	elseif c.op == "VDEPOT" and c.key then
+		pendingLineOrders[c.key] = nil
+	elseif c.op == "VSELL" then
+		for key in tostring(c.keys or ""):gmatch("[^,]+") do pendingLineOrders[key] = nil end
+	end
+	-- Even an uncancelled local order supersedes a pending automatic search,
+	-- but it must not be applied twice (Reverse, for example, is a toggle).
 	if c.origin == K.INSTANCE and (not K.STRICT_OPS[c.op] or tonumber(c.armed or 1) == 0) then
+		if c.op == "VLINE" and c.key then pendingLineOrders[c.key] = nil end
 		log(string.format("%s seq=%s: originator already applied locally, skipping", c.op, tostring(c.seq)))
 		return
 	end
@@ -494,24 +715,30 @@ function CM.execVehCmd(c)
 	-- left the vehicle unassigned on the peer while the host assigned it, and a
 	-- setLine on the unresolved id crashed both peers on GetComponentDataIndex
 	-- (2026-09-01). Same retry the "line not here yet" path uses.
-	if c.op == "VLINE" and c.origin ~= K.INSTANCE then
+	-- EVERY instance, the originator included (2026-09-16): its strict buy
+	-- replays like everyone's, so its key binds a tick after the stamp too. The
+	-- originator used to fall through to "unknown vehicle key" and DROP the
+	-- assignment while the peers retried and assigned: seven cloned trucks
+	-- stayed parked on the host and ran on the joiner (a:40..a:46, v64 vs v65).
+	if c.op == "VLINE" then
 		local haveAll = true
 		if c.key and not vehIdFor(c.key) then haveAll = false end
 		if not haveAll then
 			c.tries = (c.tries or 0) + 1
-			if c.tries <= 30 then
-				-- advance by a FIXED number of steps from this command's own
-				-- (agreed) target, never from local game-time: the retry schedule
-				-- is then the same sim-steps on every instance
-				c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
-				CM.retryQueue = CM.retryQueue or {}
-				CM.retryQueue[#CM.retryQueue + 1] = c
-				if c.tries == 1 or c.tries % 10 == 0 then
-					log(string.format("VLINE seq=%s: vehicle key not bound yet -- retry %d (step %d)", tostring(c.seq), c.tries, c.notBeforeStep))
-				end
-				return
+			-- advance by a FIXED number of steps from this command's own
+			-- (agreed) target, never from local game-time: the retry schedule
+			-- is then the same sim-steps on every instance. FOR AS LONG AS IT
+			-- TAKES (2026-09-16): the 30-try cap left a vehicle unassigned when a
+			-- big batch's buys drained one per tick for longer than that -- a limit
+			-- on how many vehicles a player may buy at once. Only a buy that failed
+			-- here never binds, and that is already a missing vehicle on this game.
+			c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+			CM.retryQueue = CM.retryQueue or {}
+			CM.retryQueue[#CM.retryQueue + 1] = c
+			if c.tries == 1 or c.tries == 10 or c.tries % 100 == 0 then
+				log(string.format("VLINE seq=%s: vehicle key %s not bound yet -- retry %d (step %d)%s", tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep,
+					c.tries >= 100 and "; if its buy failed here this vehicle is missing on this game (DIVERGENCE)" or ""))
 			end
-			log(string.format("VLINE seq=%s: vehicle key never bound after %d tries -- left unassigned (DIVERGENCE)", tostring(c.seq), c.tries))
 			return
 		end
 	end
@@ -545,47 +772,50 @@ function CM.execVehCmd(c)
 			-- failed).
 			if id and not line then
 				c.tries = (tonumber(c.tries) or 0) + 1
-				if c.tries <= 20 then
-					-- DETERMINISTIC retry step from the AGREED stamp, never local
-					-- game-time: rewriting c.at to nowG+1 put the retry on a
-					-- different sim-step on each instance, so a vehicle that needed
-					-- one retry left the depot a step apart on host and peers -- the
-					-- "vehicles left at different times" drift (2026-09-08). Matches
-					-- the vehicle-key retry above. NOT straight back onto `queue`:
-					-- the pump rebuilds that table (`queue = keep`) and would discard
-					-- the append; the retry list is merged in, and the seq forgiven,
-					-- at the top of the next pump.
-					c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
-					CM.retryQueue = CM.retryQueue or {}
-					CM.retryQueue[#CM.retryQueue + 1] = c
-					if c.tries == 1 or c.tries % 10 == 0 then
-						log(string.format("VLINE seq=%s: line %s not here yet -- retry %d (step %d)",
-							tostring(c.seq), tostring(c.line), c.tries, c.notBeforeStep))
-					end
-				else
-					log(string.format("VLINE seq=%s: line %s never arrived -- vehicle %s left unassigned (DIVERGENCE)",
-						tostring(c.seq), tostring(c.line), tostring(c.key)))
+				-- DETERMINISTIC retry step from the AGREED stamp, never local
+				-- game-time: rewriting c.at to nowG+1 put the retry on a
+				-- different sim-step on each instance, so a vehicle that needed
+				-- one retry left the depot a step apart on host and peers -- the
+				-- "vehicles left at different times" drift (2026-09-08). Matches
+				-- the vehicle-key retry above. NOT straight back onto `queue`:
+				-- the pump rebuilds that table (`queue = keep`) and would discard
+				-- the append; the retry list is merged in, and the seq forgiven,
+				-- at the top of the next pump. No try cap (it was 20, 2026-09-16):
+				-- a line still on its way through a big batch is not a lost one.
+				c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+				CM.retryQueue = CM.retryQueue or {}
+				CM.retryQueue[#CM.retryQueue + 1] = c
+				if c.tries == 1 or c.tries == 10 or c.tries % 100 == 0 then
+					log(string.format("VLINE seq=%s: line %s not here yet -- retry %d (step %d)%s",
+						tostring(c.seq), tostring(c.line), c.tries, c.notBeforeStep,
+						c.tries >= 100 and string.format("; if its LCREATE failed here vehicle %s stays unassigned on this game (DIVERGENCE)", tostring(c.key)) or ""))
 				end
 				return
 			end
 			if id and line then
-				-- Types, because a wrong one here surfaced as an unreadable Lua
-				-- error ("execVLINE error: function: 0000018D4AC0FF60") with
-				-- nothing to say which argument was wrong.
-				-- A stop of -1 means "engine, pick one", which is what the UI sends when a
-				-- vehicle is assigned without choosing a stop -- the normal way a TRAIN is
-				-- assigned. Replaying it verbatim had the engine refuse the command every
-				-- time (EXEC VLINE ... success=false), and because the slice has already
-				-- cancelled the player's own SetLine, the assignment was simply lost --
-				-- "I can't set a line on a train" (2026-09-03). Buses were unaffected
-				-- because the UI ships a real stop index for them. Clamp to the first stop:
-				-- deterministic, since every instance clamps identically.
+				-- The script API refused -1 in earlier tests. For automatic selection
+				-- try stops in line order, on agreed steps. Stop 0 alone is insufficient:
+				-- a real train from the Spitzkehre depot failed at 0 and succeeded at 1.
+				-- Explicit player-selected stops must never fall back to another stop.
 				local stopIx = tonumber(c.stop) or 0
-				if stopIx < 0 then stopIx = 0 end
+				if stopIx < 0 then
+					stopIx = c.autoStop or 0
+					local lc = api.engine.getComponent(line, api.type.ComponentType.LINE)
+					local count = lc and lc.stops and #lc.stops or 0
+					c.autoStopCount = math.min(c.autoStopCount or count, count)
+					if stopIx >= c.autoStopCount then
+						pendingLineOrders[c.key] = nil
+						log(string.format("VLINE seq=%s: no remaining stop on line %s -- unassigned", tostring(c.seq), tostring(c.line)))
+						return
+					end
+				end
 				local okMake, made = pcall(api.cmd.make.setLine, id, line, stopIx)
 				if okMake and made then
-					cmds[#cmds + 1] = { made, "setLine " .. tostring(c.key) }
+					cmds[#cmds + 1] = { made, "setLine " .. tostring(c.key)
+						.. " line=" .. tostring(c.line) .. " stop=" .. tostring(stopIx)
+						.. " requestedStop=" .. tostring(c.stop), nil, stopIx }
 				else
+					pendingLineOrders[c.key] = nil
 					log(string.format("VLINE seq=%s: setLine(%s:%s, %s:%s, %s) refused by the maker: %s",
 						tostring(c.seq), type(id), tostring(id), type(line), tostring(line),
 						tostring(stopIx), tostring(made)))
@@ -594,15 +824,17 @@ function CM.execVehCmd(c)
 		end
 		for _, pair in ipairs(cmds) do
 			local what, vid = pair[2], pair[3]
+			local attemptedStop = pair[4]
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(pair[1], function(res, success)
-				local why = ""
+				local why = string.format(" step=%d +%d ticks", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick)
 				if not success then
 					-- the engine's own reason, which this callback used to discard:
 					-- "success=false" alone cannot tell a refused command from a lost one
 					pcall(function()
 						local es = res and res.resultProposalData and res.resultProposalData.errorState
 						if es then
-							why = " critical=" .. tostring(es.critical)
+							why = why .. " critical=" .. tostring(es.critical)
 							for i = 1, #es.messages do why = why .. " '" .. tostring(es.messages[i]) .. "'" end
 						end
 					end)
@@ -610,6 +842,21 @@ function CM.execVehCmd(c)
 				log(string.format("EXEC %s seq=%s origin=%s at=%s %s success=%s%s",
 					c.op, tostring(c.seq), tostring(c.origin), tostring(c.at), what, tostring(success), why))
 				if success and c.op == "VSELL" and vid then forgetVehicle(vid) end
+				if success and CM.actionSoundSuccess then pcall(CM.actionSoundSuccess, c) end
+				if c.op == "VLINE" and pendingLineOrders[c.key] == c then
+					if not success and (tonumber(c.stop) or 0) < 0
+							and attemptedStop + 1 < (c.autoStopCount or 0) then
+						c.autoStop = attemptedStop + 1
+						-- Never dispatch from a callback or use local frame/game time.
+						c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+						CM.retryQueue = CM.retryQueue or {}
+						CM.retryQueue[#CM.retryQueue + 1] = c
+						log(string.format("VLINE seq=%s: trying stop %d on line %s at step %d",
+							tostring(c.seq), c.autoStop, tostring(c.line), c.notBeforeStep))
+					else
+						pendingLineOrders[c.key] = nil
+					end
+				end
 			end)
 		end
 	end)
@@ -656,8 +903,8 @@ end
 
 -- The TransportVehicleConfig a command carries, rebuilt on this instance.
 --
--- VBUY and VREPL ship the SAME encoding (name~loads~colour~autoloads;... plus a
--- vehicleGroups list), so they decode it with the same code: a second copy of
+-- VBUY and VREPL ship the SAME encoding (name~loads~colour~autoloads~reversed;...
+-- plus a vehicleGroups list), so they decode it with the same code: a second copy of
 -- this would drift the moment one op learned about a new field, and a wrong
 -- config is a wrong vehicle in a depot -- an uncatchable native assert away.
 -- A global (not a `local function`): the chunk is at Lua 5.1's 200-local limit.
@@ -669,7 +916,12 @@ function buildVehConfig(c)
 	local config = api.type.TransportVehicleConfig.new()
 	local u = 0
 	for spec in tostring(c.parts or ""):gmatch("[^;]+") do
-		local name, loads, col, autos = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+		local name, loads, col, autos, rev = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+		if not name then
+			-- a four-field spec (before the reversed flag rode along): every part forward
+			name, loads, col, autos = spec:match("^([^~]*)~([^~]*)~([^~]*)~([^~]*)$")
+			rev = "0"
+		end
 		if not name then error("bad part spec: " .. spec) end
 		local mid = tonumber(name:match("^#(%-?%d+)$") or "")
 		if not mid then pcall(function() mid = api.res.modelRep.find(name) end) end
@@ -682,7 +934,10 @@ function buildVehConfig(c)
 		-- an empty loadConfig is a native assert (`!loadConfig.empty()`), not an error
 		if n == 0 then error("part without load slots: " .. spec) end
 		part.loadConfig = lc
-		part.reversed = false     -- offset not yet decoded; TODO sweep
+		-- the originator's flag (the slice reads it at VehiclePart+0x04); a turned
+		-- wagon or an ICE's tail head used to come out facing forward on every
+		-- instance, the originator's included (its buy is replayed too)
+		part.reversed = (rev == "1")
 		local r, g, b = col:match("^([^,]+),([^,]+),([^,]+)$")
 		part.color = api.type.Vec3f.new(tonumber(r) or -1, tonumber(g) or -1, tonumber(b) or -1)
 		part.logo = ""
@@ -725,17 +980,67 @@ end
 -- later in pollVehKeys), and a poll-time setLine would land on a frame-tick-dependent
 -- step. Instead every instance queues the same VLINE at the buy's stamp, due a fixed
 -- BIND_GUARD_STEPS later; VLINE already retries an unbound key on fixed steps. Its own
--- seq (+0.5) keeps it apart from the buy in the executed set. Stop 0, not the game's
--- -1: the engine refuses -1 for trains (see VLINE), and every instance clamps alike.
+-- seq (+0.5) keeps it apart from the buy in the executed set. Automatic stop
+-- selection follows the same bounded stop search as a player's VLINE.
 function CM.queueCloneAssign(c, key)
 	local vl = { op = "VLINE", at = c.at, origin = c.origin, seq = (tonumber(c.seq) or 0) + 0.5,
-	             key = key, line = tostring(c.cline), stop = 0, armed = 1,
+	             key = key, line = tostring(c.cline), stop = -1, armed = 1,
 	             notBeforeStep = CM.stepOf(c.at) + K.BIND_GUARD_STEPS }
 	if c.company then vl.company = c.company end
 	CM.retryQueue = CM.retryQueue or {}
 	CM.retryQueue[#CM.retryQueue + 1] = vl
 	log(string.format("VBUY seq=%s: a clone -- %s joins line %s at step %d",
 		tostring(c.seq), key, tostring(c.cline), vl.notBeforeStep))
+end
+
+-- A construction's spatial-query position need not be its transform origin.
+-- Offset mod depots (UEP catenary terminal) were captured at the transform but
+-- absent from the 6 m replay query. Search globally only on a cache/local miss,
+-- then match the SAME transform key and file, never the nearest arbitrary depot.
+-- Keep this cache separate from consByKey: adopting a purchase target must not
+-- change construction edit/parameter tracking. Validate cached ids on every buy.
+local buyDepotCache = {}
+local function findBuyDepot(x, y, want)
+	local key = CM.conKey(x, y)
+	local cacheKey = key .. "|" .. want
+	local function matches(id)
+		if type(id) ~= "number" or id < 0 then return false end
+		local ok, yes = pcall(function()
+			if not api.engine.entityExists(id) then return false end
+			local co = api.engine.getComponent(id, api.type.ComponentType.CONSTRUCTION)
+			return co and co.transf and co.depots and #co.depots > 0
+				and (want == "?" or tostring(co.fileName) == want)
+				and CM.conKey(co.transf[13], co.transf[14]) == key
+		end)
+		return ok and yes
+	end
+	local cached = buyDepotCache[cacheKey]
+	if matches(cached) then return cached end
+	buyDepotCache[cacheKey] = nil
+	local rec = CM.consByKey[key]
+	if rec and matches(rec.id) then return rec.id end
+	local function scan(area)
+		local found, ambiguous
+		local ok = pcall(function()
+			local list = game.interface.getEntities(area, { type = "CONSTRUCTION", includeData = false }) or {}
+			for _, id in pairs(list) do
+				if matches(id) then
+					if found and found ~= id then ambiguous = true end
+					found = id
+				end
+			end
+		end)
+		if not ok or ambiguous then return nil, true end
+		return found, false
+	end
+	local found, uncertain = scan({ pos = { x, y }, radius = 6 })
+	if not found and not uncertain then found, uncertain = scan({ radius = 999999 }) end
+	if uncertain then
+		log("VBUY: depot lookup ambiguous or unavailable at " .. key .. " -- refusing")
+		return nil
+	end
+	buyDepotCache[cacheKey] = found
+	return found
 end
 
 function CM.execVBuy(c)
@@ -757,18 +1062,7 @@ function CM.execVBuy(c)
 	local ok, err = pcall(function()
 		local x, y = tonumber(c.x), tonumber(c.y)
 		if not (x and y) then log("VBUY: no depot position"); return end
-		local rec = CM.consByKey[CM.conKey(x, y)]
-		local depot = rec and rec.id
-		local alive = false
-		if depot then pcall(function() alive = api.engine.entityExists(depot) end) end
-		if not alive then
-			depot = nil
-			pcall(function()
-				local list = game.interface.getEntities({ pos = { x, y }, radius = 6 },
-					{ type = "CONSTRUCTION", includeData = false }) or {}
-				for _, id in pairs(list) do depot = depot or id end
-			end)
-		end
+		local depot = findBuyDepot(x, y, tostring(c.file or "?"))
 		if not depot then
 			log(string.format("EXEC VBUY seq=%s: no depot at %.1f,%.1f -- vehicle NOT bought", tostring(c.seq), x, y))
 			return
@@ -831,11 +1125,13 @@ function CM.execVBuy(c)
 				return
 			end
 			local bal0 = retry and CM.cmBalance(CM.cmCompanyPid[CM.cmMyCompany]) or nil
+			local sentTick = CM.ticks
 			api.cmd.sendCommand(cmd, function(res, success)
-				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s",
+				log(string.format("EXEC VBUY seq=%s origin=%s at=%s construction=%d depot=%s parts=%d success=%s%s step=%d +%d ticks",
 					tostring(seq), tostring(origin), tostring(at), depot, tostring(target), u, tostring(success),
-					retry and " (as our own player)" or ""))
+					retry and " (as our own player)" or "", CM.stepOf(CM.gameTime() or 0), (CM.ticks or 0) - sentTick))
 				if success then
+					if CM.actionSoundSuccess then pcall(CM.actionSoundSuccess, c) end
 					-- buyVehicle is entity-returning (same shape VREPL reads): bind
 					-- this key to THAT entity, not to whichever new id sorts first
 					local nid = nil
@@ -921,6 +1217,7 @@ function CM.execVReplace(c)
 				.. "result=%s success=%s",
 				tostring(seq), tostring(origin), tostring(at), key, tostring(veh), u,
 				tostring(nid), tostring(success)))
+			if success and CM.actionSoundSuccess then pcall(CM.actionSoundSuccess, c) end
 			if success and nid and nid > 0 and nid ~= veh then
 				forgetVehicle(veh)          -- the old id is dead; ids get reused
 				registerVehKey(key, nid)

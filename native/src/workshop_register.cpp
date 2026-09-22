@@ -26,9 +26,12 @@ static bool Hook(void* rep, const Result* source) {
         std::string line;
         if (std::getline(in, line) && line.size()==32 && line.find_first_not_of("0123456789abcdef")==std::string::npos) {
             token=line;
-            unsigned count=0;
+            // No cap on the row count or the row length: every consented Workshop
+            // mod in the registry is shadow-registered, however many there are and
+            // however long its folder path. A cap here rejected the WHOLE registry,
+            // so no Workshop mod was registered and the game loaded a different mod
+            // set from its peers. A malformed row still rejects the file (below).
             while (std::getline(in,line)) {
-                if (++count>128 || line.size()>4096) throw std::runtime_error("registry limit");
                 auto tab=line.find('\t');
                 if (tab==std::string::npos) throw std::runtime_error("registry row");
                 auto id=line.substr(0,tab);
@@ -37,7 +40,14 @@ static bool Hook(void* rep, const Result* source) {
                 auto folder=std::filesystem::u8path(line.substr(tab+1));
                 std::error_code ec;
                 if (!folder.is_absolute() || !std::filesystem::is_regular_file(folder/L"mod.lua",ec)) continue;
-                shadows.push_back(std::make_unique<Shadow>(*input,steam,id,folder.wstring()));
+                // REPLACE the Steam backend's own entry for this id, never sit beside it:
+                // without replace mode a registry row for an id the backend already
+                // listed was dropped as a duplicate, so whatever Steam held for it --
+                // an entry without a folder for an item it has not (yet) installed --
+                // was what the loader ran at world load. The row's folder is one the
+                // lobby found on disk (Steam's own for a subscribed item), so for the
+                // normal case this is the same folder under the same id.
+                shadows.push_back(std::make_unique<Shadow>(*input,steam,id,folder.wstring(),true));
                 input=&shadows.back()->result;
             }
         }

@@ -21,16 +21,43 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This experimental Linux release follows **0.5.6**. Use matching 0.5.6 peers.
-All 28 shared Lua files match the Windows release byte for byte. See
-[UPSTREAM_0.5.6.md](UPSTREAM_0.5.6.md) for technical validation details.
+This development tree integrates **Windows 0.6.1.18, tag `a5aeda76`**, on
+top of Linux merge PR #5. The integration and live-test record is
+[PARITY_20260921.md](../re/linux/PARITY_20260921.md). Native/Windows frozen join
+and company-command replay were exercised on the VPS; see that record for
+desktop visual checks and external Steam P2P checks still outstanding.
 
-**Known limits:** automatic resync, the new separate-company/shared-ownership
-operations, and automatic Workshop registration still need native Linux support.
-Some player actions, including names/colors, vehicle stop/maintenance and loans,
-remain blocked in multiplayer. A completed cross-platform gameplay test for
-0.5.6 has not yet been recorded; the passing 0.4.22 replay does not establish
-0.5.6 compatibility.
+The native implementation includes command capture and replay, deterministic
+ordering hooks, company permissions, save selection, load progress, automatic
+Workshop registration, and the recovery controller used for frozen joins and
+resync. The in-game **Manage Lobby** action opens the native lobby panel;
+recovery prompts and progress appear automatically. Native dedicated mode and
+VPS service instructions are in [tools/server](../../tools/server/README.md).
+
+The shared Lua is checked against that Windows baseline. One pinned Linux
+integration adds an explicit origin-replay marker for native name/colour
+commands while preserving the existing Windows packets. All 32 HUD glyph
+textures match the Windows baseline.
+
+Station/depot glyphs use their owner's company colour. Entity-window washes
+have a native implementation and await live separate-company visual checks.
+Vehicle-icon and station-label colours now have native implementations and
+fixture coverage; live visual checks remain. Other native
+parity additions, including spare-line callbacks, platform assignments and
+modular-station connector welding, have fixture coverage and still need their
+live gameplay checks. See the integration record for current test limits.
+
+`trainorder=0`, `roadspace=0`, `roadentries=0`, `shiporder=0`, `airorder=0`,
+`sharedstations=0` and `pausedtick=0` in the root/data `tpf2_menu_flags.txt`
+disable the respective hooks at startup. Peers need matching simulation
+settings. `showicons=0`, `foreignwindows=0`, `stationicon=0`, `iconcolor=0` and `windowcolor=0`
+disable the corresponding UI features; `tintclass=mpCo` selects the opaque
+company class. Creating `tpf2mp_governor_off.txt` in the runtime data folder
+disables the Lua speed governor.
+
+Returning to the title menu leaves the lobby. Use the Linux installer for
+updates. Installation also removes the obsolete `mods/m3_determinism_1` probe,
+with removal shown in `--dry-run`.
 
 Download the `.run` installer, then run:
 
@@ -149,6 +176,8 @@ the script fallback. Logs are in `<data home>/tpf2mp/data/tpf2mp_host.log`.
 
   This also works after a crash: just start the game again. The last 2 are kept. `about.txt` in each
   folder lists what is there, with sizes.
+  Create `tpf2mp_keep_logs.txt` in the runtime data folder to keep every archive
+  and append mod/lobby logs across starts. Remove it to restore normal retention.
 - **`./collect_logs.sh`** packs everything a bug report needs into
   `tpf2mp-logs-<computer>-<time>.zip` in your Downloads folder, without uploading anything:
   - the data folder and the saved runs;
@@ -219,3 +248,14 @@ The script:
 The lobby builder uses pinned Python and manylinux wheels, checks every bundled ELF dependency against glibc 2.31, and supports `--test` for its five local network/transfer tests. Native build provenance, source commit, included libraries and lobby checksum are recorded in `BUILDINFO`.
 
 The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the source tree for implementation coverage and remaining runtime validation; packaging success alone does not establish multiplayer parity.
+
+### Optional Big Maps worktree in development packages
+
+Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`
+or `tools/linux/auto_install.py` to build and ship that checkout's native
+plugin and configuration. Source is mounted read-only; outputs go in the
+multiplayer build directory. Plugin-only source changes trigger a rebuild
+and installation after all games close. The selected checkout must contain
+`linux/CMakeLists.txt` and `linux/tpf2_bigmap.cfg`. This option never launches
+the game. Automatic recovery and Workshop registration remain unsupported as
+recorded in the integration notes.

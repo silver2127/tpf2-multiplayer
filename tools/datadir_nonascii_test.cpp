@@ -9,6 +9,8 @@
 #include "../native/src/datadir.h"
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <cwctype>
 #include <string>
 
 static int fails = 0;
@@ -69,6 +71,40 @@ int wmain(int argc, wchar_t** argv)
     wchar_t again[MAX_PATH] = L"";
     GetEnvironmentVariableW(L"TPF2MP_DATADIR", again, MAX_PATH);
     check("a harness pin is left alone", wcscmp(again, L"C:\\pinned\\") == 0);
+
+    // 4. a RELATIVE pin is made absolute against the current folder (the game's folder
+    //    in the game process) and republished, so every process sees one folder
+    SetCurrentDirectoryW(argv[1]);
+    SetEnvironmentVariableW(L"TPF2MP_DATADIR", L"pin_rel");
+    Tpf2mpPublishDataDir();
+    wchar_t rel[MAX_PATH] = L"";
+    GetEnvironmentVariableW(L"TPF2MP_DATADIR", rel, MAX_PATH);
+    std::wstring wantRel = std::wstring(argv[1]) + L"\\pin_rel";
+    check("relative pin: republished absolute", Tpf2mpPathIsAbsoluteW(rel) && _wcsnicmp(rel, wantRel.c_str(), wantRel.size()) == 0);
+    check("relative pin: the folder was created", GetFileAttributesW(wantRel.c_str()) != INVALID_FILE_ATTRIBUTES);
+    const char* gr = getenv("TPF2MP_DATADIR");
+    check("relative pin: CRT getenv sees the absolute form", gr && strchr(gr, ':') != nullptr, gr ? gr : "");
+
+    // 5. a Unix-style (rootless) pin, the Proton case: /tmp/tpf2mp-data becomes
+    //    <current drive>:\tmp\tpf2mp-data in every consumer
+    SetEnvironmentVariableW(L"TPF2MP_DATADIR", L"/tpf2mp_datadir_test_rootless/data");
+    wchar_t rootless[MAX_PATH] = L"";
+    check("rootless pin: Tpf2mpDataDirW resolves it", Tpf2mpDataDirW(rootless, MAX_PATH, nullptr));
+    check("rootless pin: absolute, on the current drive", Tpf2mpPathIsAbsoluteW(rootless) && towupper(rootless[0]) == towupper(argv[1][0]), std::string(rootless, rootless + wcslen(rootless)));
+    check("rootless pin: backslashes, trailing backslash", wcsstr(rootless, L":\\tpf2mp_datadir_test_rootless\\data\\") != nullptr);
+    Tpf2mpPublishDataDir();
+    wchar_t pubRootless[MAX_PATH] = L"";
+    GetEnvironmentVariableW(L"TPF2MP_DATADIR", pubRootless, MAX_PATH);
+    check("rootless pin: republished absolute", Tpf2mpPathIsAbsoluteW(pubRootless));
+    RemoveDirectoryW(rootless);   // created at the drive root only when that is writable
+    { std::wstring parent = rootless; parent.erase(parent.find_last_of(L'\\')); parent.erase(parent.find_last_of(L'\\')); RemoveDirectoryW(parent.c_str()); }
+
+    // 6. an absolute pin with forward slashes is absolute already and stays as it is
+    SetEnvironmentVariableW(L"TPF2MP_DATADIR", L"C:/pinned/fwd");
+    Tpf2mpPublishDataDir();
+    wchar_t fwd[MAX_PATH] = L"";
+    GetEnvironmentVariableW(L"TPF2MP_DATADIR", fwd, MAX_PATH);
+    check("forward-slash absolute pin is left alone", wcscmp(fwd, L"C:/pinned/fwd") == 0);
 
     printf("\n%s\n", fails ? "FAILED" : "all passed");
     return fails ? 1 : 0;

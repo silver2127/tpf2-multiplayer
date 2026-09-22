@@ -9,22 +9,31 @@
 return function(CM, K, log)
 -- ---------- load gate ----------
 --
--- LOAD GATE. Ticks are ~5.4 Hz (300 ticks measured over 56 s), so these are
--- ~11 s and ~2.8 min.
--- How soon the gate may act. Long enough for game.interface to answer, short
--- enough that an instance is not simulating alone while the others load.
-K.LOADGATE_MIN_TICKS = 5
-K.LOADGATE_SETTLE    = 60    -- ticks with no NEW peer before the roster counts as complete
-K.LOADGATE_MAX_TICKS = 900   -- absolute cap: a session must never hang forever
--- The manual override ("press play to start anyway") is honoured only after
--- this many ticks of holding (~60 s). A friends' 4-player night (2026-09-09)
--- started with the host pressing play at "2 of 3 in": the third player was
--- still loading, missed a station placed at t=7, and every hash from t=16 on
--- disagreed -- 618 desync reports, stops on roads the host did not have,
--- vehicles 100 m apart. Nothing replays history to a player who arrives after
--- a command's stamp, so an early start is a guaranteed fork. Before the window
--- a play press is put back to 0 and the log says how long until it counts.
-K.LOADGATE_FORCE_TICKS = 320
+-- LOAD GATE. Ticks are ~5.4 Hz (300 ticks measured over 56 s).
+-- How soon the gate may act: from the first tick game.interface answers (the
+-- call is guarded), so as little as possible is simulated at the save's own
+-- speed before the hold lands. It was 5 (~1 s), and that second of play ran
+-- without the commands stamped in it.
+K.LOADGATE_MIN_TICKS = 1
+-- NO TICK BUDGET (2026-09-16). The gate used to give up after 900 ticks and
+-- honour a play press only after 320: a slow machine loading a big save was
+-- released -- or released itself -- into a session it had not caught up with,
+-- and missed every command issued before it went live (a friends' 4-player
+-- night, 2026-09-09: the host started at "2 of 3 in", the third missed a
+-- station at t=7, 618 desync reports). Now a game that loads holds until it
+-- hears the leader AND has the command history since its save (CM.lgFetch:
+-- LSNEED ... save=1, the same feed a hot joiner gets), however long that
+-- takes; the feed is re-asked for whenever it stalls (K.HIST_STALL_TICKS),
+-- never abandoned. Then EVERY game, the leader included, holds while a member
+-- of the lobby roster (players= in the bridge ctl, re-read as it changes) has
+-- not been heard: that member is still loading, and holding is what keeps it
+-- from loading into a session that has moved on. The player's override is two
+-- play presses: the first is put back and says who is missing, the second
+-- starts and logs who it leaves to catch up (a late loader still takes the
+-- hot-join path above and loses nothing; the override only decides whether
+-- the others wait for it).
+K.HIST_STALL_TICKS = 30      -- ~5.5 s without a history line: ask again (a request or its end can be lost)
+CM.lgFetch = "wait"          -- "wait" until the leader is heard, "fetch" while the history since our save arrives, "done"
 
 -- ---------- session speed ----------
 --
@@ -189,12 +198,14 @@ function CM.votesCounted()
 	local list, me = {}, K.INSTANCE
 	local mine, cast = CM.speedVotes[me], CM.myVoteCast
 	if cast and (not mine or cast.ct > mine.ct) then mine = cast end
-	if mine then
+	if mine and not CM.dedicated then
 		list[#list + 1] = { letter = me, v = mine.v }
-	else
+	elseif not CM.dedicated then
 		local own = ((CM.myCeiling or 0) > 0) and CM.myCeiling or CM.ceilBeforePause
 		if own and own > 0 then list[#list + 1] = { letter = me, v = CM.voteValue(own), own = true } end
 	end
+	-- A DEDICATED SERVER (2026-09-18, user) has no vote and no own speed in the
+	-- mean: the players' votes are the session speed; with none cast yet, 1x.
 	for letter, vote in pairs(CM.speedVotes) do
 		local pr = CM.peers[letter]
 		if letter ~= me and pr and pr.at and (CM.ticks - pr.at) <= K.VOTE_PRESENT_TICKS then
@@ -211,7 +222,10 @@ end
 -- a vote), and how many. nil when nothing counts.
 function CM.voteSpeed()
 	local list = CM.votesCounted()
-	if #list == 0 then return nil, "", 0 end
+	if #list == 0 then
+		if CM.dedicated and CM.othersPresent and CM.othersPresent() then return 1, "", 0 end   -- players in, nobody voted yet
+		return nil, "", 0
+	end
 	local sum, parts = 0, {}
 	for i, e in ipairs(list) do
 		sum = sum + e.v
@@ -260,6 +274,16 @@ function CM.speedButton(v, kind)
 	v = tonumber(v)
 	if not v then return end
 	v = math.max(0, math.floor(v))
+	-- A DEDICATED SERVER HAS NO HAND AT ITS CLOCK (2026-09-21). The clock's speed
+	-- buttons are a radio group whose callback sends SetGameSpeed(min(button,
+	-- limit)), and the engine lowers that limit when it thinks the simulation
+	-- cannot keep up. Pacing set the server to 4x, the clock re-selected its
+	-- "4x" button, the callback sent SetGameSpeed(1) -- the same caller as a
+	-- player's click -- and the server voted 1x against the players' 4x.
+	if CM.dedicatedPauseEmpty and CM.dedicatedPauseEmpty() then
+		log(string.format("SPEED2: speed button %d on a dedicated server ignored -- the engine pressed it (its own speed limit), nobody plays here", v))
+		return
+	end
 	if CM.lgHolding then
 		CM.lgPress = math.min(v, CM.MAX_SPEED or 4)
 		return
@@ -559,6 +583,167 @@ end
 -- pacing takes over. cu=1 on
 -- our heartbeat keeps the others from pacing against us meanwhile. Returns
 -- the speed to impose while active, nil otherwise.
+-- THE GOVERNOR (2026-09-16). A joiner that cannot run the session speed stays
+-- behind for good: its PID is already at its ceiling. The LEADER now lowers the
+-- session speed, gradually, while the slowest peer falls behind, and raises it
+-- again, more gradually, while everyone keeps up -- so the session settles at
+-- the fastest speed the slowest machine sustains, on its own. One decision
+-- per K.FRAC_PACE_TICKS; the votes remain the ceiling it works under.
+K.GOV_LAG_START = 3      -- units behind before the governor acts (while the gap grows)...
+K.GOV_LAG_HARD = 8       -- ...or at once, growing or not
+K.GOV_LAG_OK = 1.0       -- everyone within this: the speed may climb again
+K.GOV_DOWN = 0.94        -- per decision while a peer falls behind (~4%/s at 1.5 s decisions)
+K.GOV_UP = 1.02          -- per decision while everyone keeps up
+K.GOV_MIN = 0.25         -- never below this fraction of the voted speed: below the slow
+                         -- machine's own ceiling, or it can never make up what it lost
+K.GOV_UP_HOLD = 4        -- decisions everyone must keep up before a raise
+-- KILL SWITCH (2026-09-16): a file tpf2mp_governor_off.txt in the data dir turns
+-- the governor off (checked at most every 1.5 s, logged on change). Every town
+-- split of 2026-09-16 happened while the governor held the host at a
+-- fractional speed during a joiner's catch-up; this is the A/B test for it.
+function CM.governorOff()
+	if CM.govOffAt and (CM.ticks - CM.govOffAt) < 8 then return CM.govOff end
+	CM.govOffAt = CM.ticks
+	local f = io.open(K.BASE .. "tpf2mp_governor_off.txt", "r")
+	local off = f ~= nil
+	if f then f:close() end
+	if off ~= CM.govOff then
+		CM.govOff = off
+		log(off and "GOV: off (tpf2mp_governor_off.txt present) -- the session runs at the voted speed" or "GOV: on")
+	end
+	return off
+end
+-- HOST CAPACITY (2026-09-18). The engine runs 5 sim steps a second per unit
+-- of session speed (a batch of `lever` 200 ms iterations every 200 ms), and
+-- what it cannot afford it simply does not do: the lever still reads 4 while
+-- the world runs at 2 and a joiner runs ahead until it holds. Every
+-- K.CAP_WINDOW_S wall seconds the leader compares the steps it made with
+-- 5 x the session speed x the seconds; three short windows in a row (one is a
+-- hash stamp or an autosave) cap the session speed at what the host sustains,
+-- a whole number (a fraction would need the dither on top); an unstretched
+-- minute at the cap tries one step up. A pause, a hold and a speed change
+-- restart the window. The engine's own interval estimate is NOT the measure:
+-- on a VPS with CPU steal it sat at 400 ms with the sim thread half idle
+-- (a dedicated server pins it, tpf2_bridge_mp.dll); tpf2_engine_pace.txt
+-- still says what it thinks, for the log.
+K.CAP_WINDOW_S = 15
+K.CAP_LOW = 0.8
+K.CAP_SAMPLES = 3
+K.CAP_UP_S = 60
+function CM.hostPace()
+	local base, lever
+	local f = io.open(K.BASE .. "tpf2_engine_pace.txt", "r")
+	if f then
+		local body = f:read("*a") or ""
+		f:close()
+		base = tonumber(body:match("base=(%d+)"))
+		lever = tonumber(body:match("lever=(%d+)"))
+	end
+	return base, lever
+end
+-- eff: the speed the votes (or the request) ask for now; applied: the session
+-- speed in force since the last pass (CM.effSpeed); s: the lever as read; now:
+-- the sim clock. Returns (eff to use, the cap when it bites).
+function CM.hostCapacityCap(eff, applied, s, now)
+	if not eff or eff <= 0 then CM.capWin = nil; return eff, nil end
+	if CM.governorOff and CM.governorOff() then CM.hostCap = nil; CM.capWin = nil; return eff, nil end
+	local wall = os.time()
+	local step = CM.stepOf and CM.stepOf(now) or math.floor((now or 0) / (K.SIM_STEP or 0.2) + 0.5)
+	-- a window measures ONE applied speed with the lever running: anything else restarts it
+	if not applied or applied <= 0 or (s ~= nil and s == 0) or CM.resyncHold
+		or (CM.capWin and CM.capWin.applied ~= applied) then
+		CM.capWin = (applied and applied > 0 and not (s ~= nil and s == 0) and not CM.resyncHold)
+			and { wall = wall, step = step, applied = applied } or nil
+		return CM.hostCap and CM.hostCap < eff and CM.hostCap or eff, CM.hostCap and CM.hostCap < eff and CM.hostCap or nil
+	end
+	if not CM.capWin then CM.capWin = { wall = wall, step = step, applied = applied } end
+	local dt = wall - CM.capWin.wall
+	if dt >= K.CAP_WINDOW_S then
+		local expected = 5 * applied * dt
+		local got = step - CM.capWin.step
+		local r = expected > 0 and got / expected or 1
+		CM.capWin = { wall = wall, step = step, applied = applied }
+		CM.capLast = r
+		if r < K.CAP_LOW then
+			CM.capStretched = (CM.capStretched or 0) + 1
+			CM.capOkSince = nil
+			if CM.capStretched >= K.CAP_SAMPLES then
+				local can = math.floor(applied * r)
+				if can < 1 then can = 1 end
+				if not CM.hostCap or can < CM.hostCap then
+					CM.hostCap = can
+					local base = CM.hostPace()
+					log(string.format("SPEED2: the host keeps up with %dx (%d of %d steps in %d s at %gx%s) -- the session is capped there",
+						can, got, math.floor(expected + 0.5), dt, applied, base and string.format(", the engine's interval reads %d ms", math.floor(base / 1000)) or ""))
+				end
+			end
+		else
+			CM.capStretched = 0
+			if CM.hostCap then
+				CM.capOkSince = CM.capOkSince or wall
+				if wall - CM.capOkSince >= K.CAP_UP_S then
+					CM.capOkSince = nil
+					if CM.hostCap < eff then
+						CM.hostCap = CM.hostCap + 1
+						log(string.format("SPEED2: the host kept up for a while -- trying %dx", CM.hostCap))
+					end
+					if CM.hostCap >= eff then CM.hostCap = nil end
+				end
+			end
+		end
+	end
+	if CM.hostCap and CM.hostCap < eff then return CM.hostCap, CM.hostCap end
+	return eff, nil
+end
+
+function CM.governSpeed(now, eff)
+	if not eff or eff <= 0 then CM.govPrevNow, CM.govPrevTick = nil, nil; return eff end
+	if CM.governorOff() then CM.govFactor, CM.govWorst, CM.govWho = 1, 0, nil; return eff end
+	-- our own clock rate, to project a heartbeat forward by its age
+	if CM.govPrevTick and CM.ticks > CM.govPrevTick then
+		local r = (now - CM.govPrevNow) / (CM.ticks - CM.govPrevTick)
+		if r >= 0 and r < 5 then CM.govRate = CM.govRate and (CM.govRate * 0.7 + r * 0.3) or r end
+	end
+	CM.govPrevNow, CM.govPrevTick = now, CM.ticks
+	local f = CM.govFactor or 1
+	local function apply(v)
+		if f >= 1 then return v end
+		return math.max(0.25, math.floor(v * f / 0.05 + 0.5) * 0.05)
+	end
+	if CM.govAt and (CM.ticks - CM.govAt) < K.FRAC_PACE_TICKS then return apply(eff) end
+	CM.govAt = CM.ticks
+	local worst, who = 0, nil
+	local hb = K.HEARTBEAT_EVERY or 2
+	for letter, pr in pairs(CM.peers) do
+		-- only a peer heard THIS heartbeat interval: one gone quiet (an autosave, a
+		-- drop) is absent, not behind, and its stale clock must not slow the rest
+		if pr.at and (CM.ticks - pr.at) <= hb + 1 and (pr.step or pr.time) then
+			local t = pr.step and (pr.step * K.SIM_STEP) or pr.time
+			local lag = now - (t + (CM.ticks - pr.at) * (CM.govRate or 0))
+			if lag > worst then worst, who = lag, letter end
+		end
+	end
+	local prev = CM.govPrevWorst
+	CM.govPrevWorst = worst
+	local growing = prev ~= nil and worst > prev + 0.2
+	local was = f
+	if worst >= K.GOV_LAG_HARD or (worst >= K.GOV_LAG_START and growing) then
+		f = math.max(K.GOV_MIN, f * K.GOV_DOWN)
+		CM.govOkRuns = 0
+	elseif worst <= K.GOV_LAG_OK then
+		CM.govOkRuns = (CM.govOkRuns or 0) + 1
+		if f < 1 and CM.govOkRuns >= K.GOV_UP_HOLD then f = math.min(1, f * K.GOV_UP) end
+	else
+		CM.govOkRuns = 0
+	end
+	CM.govFactor, CM.govWorst, CM.govWho = f, worst, who
+	if math.abs(f - was) > 1e-9 then
+		log(string.format("GOV: %s is %.1f behind%s -> session x%.2f of %g = %.2f", tostring(who or "?"), worst,
+			growing and " and falling further" or (worst <= K.GOV_LAG_OK and ", everyone keeps up" or ""), f, eff, apply(eff)))
+	end
+	return apply(eff)
+end
+
 K.CATCHUP_MIN = 8          -- below this the PID closes the gap gradually; catch-up (hold + 4x) is for hot joins and stalls
 K.PACE_OTHER_GAME = 1800   -- units: a leader clock this far off is another game, not one to pace against
 K.FRAC_PACE_TICKS = 8      -- ~1.5 s between pacing decisions (heartbeats are 2 ticks apart)
@@ -751,24 +936,45 @@ function CM.catchUpTick(now, s)
 	if not CM.catchingUp2 then
 		if behind > K.CATCHUP_MIN then
 			CM.catchingUp2 = true
-			CM.cuPhase = "fetch"
-			CM.cuSince = CM.ticks
-			CM.histEndSeen = false
-			CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
-			log(string.format("CATCHUP: %.1f unit(s) behind the leader -- holding, asked the host for the command history after %.1f", behind, now))
-			return 0
+			CM.cuSince, CM.cuFrom, CM.cuAsks = CM.ticks, now, 1
+			if CM.lgFetchedFrom and now >= CM.lgFetchedFrom - 1e-6 then
+				-- straight out of the load gate: its feed (everything after the save's
+				-- stamp) is this history, and we have been listening since -- asking
+				-- again cost a long history twice (review 2026-09-16)
+				CM.cuPhase = "run"
+				log(string.format("CATCHUP: %.1f unit(s) behind the leader -- the load gate's history (everything after %.1f) covers it; running at %gx",
+					behind, CM.lgFetchedFrom, math.max(K.CATCHUP_SPEED_MAX, CM.effSpeed or 1)))
+				CM.lgFetchedFrom = nil
+			else
+				CM.cuPhase = "fetch"
+				CM.histEndSeen, CM.histProgressAt = false, CM.ticks
+				CM.histLive = true   -- a live clock, not a save: gaps below the feed stay owed (net.lua rxHistRange)
+				CM.broadcast(string.format("LSNEED t=%.4f o=%s", now, K.INSTANCE))
+				log(string.format("CATCHUP: %.1f unit(s) behind the leader -- holding, asked the host for the command history after %.1f", behind, now))
+				return 0
+			end
+		else
+			return nil
 		end
-		return nil
 	end
 	if CM.cuPhase == "fetch" then
 		local gaps = CM.rxGaps()
 		if CM.histEndSeen and gaps == 0 then
 			CM.cuPhase = "run"
 			log(string.format("CATCHUP: history complete -- running at %gx to close %.1f unit(s)", K.CATCHUP_SPEED_MAX, behind))
-		elseif CM.ticks - CM.cuSince > 160 then
-			CM.cuPhase = "run"
-			log(string.format("CATCHUP: no complete history after ~30 s (end=%s, gaps=%d) -- running anyway", tostring(CM.histEndSeen), gaps))
 		else
+			-- BOUND BY PROGRESS, NOT BY A CLOCK (2026-09-16): it used to run on after 160
+			-- ticks with whatever had arrived, which for a long history is a fork. While
+			-- lines keep arriving we wait; when none has for K.HIST_STALL_TICKS the
+			-- request (or its end marker) was lost, so it is asked for again -- from the
+			-- same stamp, for as long as it takes. Duplicates are harmless.
+			if CM.ticks - (CM.histProgressAt or CM.cuSince) > K.HIST_STALL_TICKS then
+				CM.histProgressAt = CM.ticks
+				CM.cuAsks = (CM.cuAsks or 1) + 1
+				CM.broadcast(string.format("LSNEED t=%.4f o=%s", CM.cuFrom or now, K.INSTANCE))
+				log(string.format("CATCHUP: no history line for ~%d s (end=%s, gaps=%d, %d received) -- asked the host again (%d)",
+					math.floor(K.HIST_STALL_TICKS / 5.4), tostring(CM.histEndSeen), gaps, CM.histGot or 0, CM.cuAsks))
+			end
 			return 0
 		end
 	end
@@ -810,7 +1016,9 @@ function CM.paceV2(now)
 	-- this and hid the host's play-click. A 0 we set ourselves is `ours`.
 	local prevS = CM.spd2LastS
 	CM.spd2LastS = s
-	if CM.isLeader() then
+	-- a DEDICATED SERVER has no hand at its lever: nothing it reads is a player's
+	-- pause or speed (its 0s are the load gate, a hold, the empty-world pause)
+	if CM.isLeader() and not CM.dedicated then
 		-- A lever that has not moved is not the player's choice while the ceiling
 		-- came from a speed button: the button's speed reaches the lever only when
 		-- pacing applies it. A host whose lever pacing had never set read its old
@@ -866,16 +1074,27 @@ function CM.paceV2(now)
 		-- the mean of the players' votes, the host's pause, or a /speed request newer than the last vote
 		local avg, vt, n = CM.voteSpeed()
 		local eff, why
-		if CM.myCeiling <= 0 then
+		if CM.myCeiling <= 0 and not CM.dedicated then
 			eff, why = 0, "the host paused the session"
 		elseif avg then
 			eff, why = avg, string.format("the mean of %d: %s", n, CM.voteWords(vt))
+		elseif CM.dedicated then
+			-- nobody at the server's controls: the players' votes run the session
+			-- (voteSpeed gives 1 while players are in and none has voted); with
+			-- nobody in, the world's own speed (the empty-world pause owns that)
+			eff, why = math.max(1, CM.myCeiling), "dedicated server, no votes"
 		else
 			eff, why = CM.myCeiling, "host's speed"
 		end
 		local req = CM.speedRequest()
 		CM.spdReqInForce = req and eff > 0 and (CM.spdReqChangedAt or 0) >= (CM.btnAt or -1) or false
 		if CM.spdReqInForce then eff = req; why = "/speed request" end
+		-- the host's own machine first: what it sustains caps the votes and the request
+		local capped, capAt = CM.hostCapacityCap(eff, CM.effSpeed, s, now)
+		if capAt then eff = capped; why = string.format("the host keeps up with %dx", capAt) end
+		-- the governor works under the votes (or the request): the slowest peer sets the pace
+		local governed = CM.governSpeed(now, eff)
+		if governed ~= eff then eff = governed; why = string.format("governed: %s is %.1f behind", tostring(CM.govWho or "?"), CM.govWorst or 0) end
 		CM.syncTick(now, s)
 		local changed = (eff ~= CM.effSpeed)
 		local recounted = (vt ~= CM.voteCounted)
@@ -989,7 +1208,148 @@ end
 
 -- Once per tick: the slowest peer's clock for the status and dash files
 -- (CM.slowT), then the session speed controller.
+-- A DEDICATED SERVER (2026-09-18; mp_dedicated.txt, written by the menu DLL from
+-- tpf2_menu_flags.txt dedicated=1) with pause_empty=1 stands still while nobody
+-- else is in: a world simulating for no one only burns the server's CPU and
+-- ages the towns. Read every 300 ticks (the file is written once, at start).
+-- Reads mp_dedicated.txt (the menu DLL writes it): CM.dedicated, and the speed
+-- the world runs at while nobody else is in (CM.dedEmptySpeed: 0 = paused;
+-- 1x by default since 2026-09-18, the user: "keep the server at speed 1 when no
+-- players are online"). An older DLL writes pause_empty= only: 1 = 0, else 1.
+-- Returns true when the rule has something to do (a dedicated server).
+function CM.dedicatedPauseEmpty()
+	if CM.dedCfgAt and (CM.ticks or 0) - CM.dedCfgAt < 300 then return CM.dedicated == true end
+	CM.dedCfgAt = CM.ticks or 0
+	CM.dedicated, CM.dedEmptySpeed = false, 1
+	local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+	if f then
+		local body = f:read("*a") or ""
+		f:close()
+		CM.dedicated = body:find("dedicated=1", 1, true) ~= nil
+		local es = tonumber(body:match("empty_speed=(%d)"))
+		if es == nil then es = body:find("pause_empty=1", 1, true) and 0 or 1 end
+		CM.dedEmptySpeed = math.max(0, math.min(4, es))
+	end
+	CM.dedPauseEmpty = CM.dedicated and CM.dedEmptySpeed == 0
+	return CM.dedicated == true
+end
+
+-- The empty-world speed. Alone: the world runs at CM.dedEmptySpeed (put back
+-- whenever something else moved the lever -- nobody stands at the server's
+-- controls), or stands still when that is 0; the speed it left is remembered for
+-- the resume. Somebody in: give the speed back once (the votes, else the
+-- remembered speed). Never during a world operation's hold (the frozen join that
+-- brings the newcomer in owns the clock then; resync.lua asks
+-- CM.dedicatedResumeSpeed for the speed to resume at, because the speed it finds
+-- is ours). Returns true while the rule owns the lever (alone).
+-- THE SERVER'S AUTOSAVE PAUSES THE SESSION (2026-09-21). The menu DLL forces
+-- the game's own autosave every dedicated_autosave_min; a 104 MB world took the
+-- server 11 s, during which it advanced nothing while a player at 4x ran 3
+-- units ahead, was held "until the leader reaches us", and quit, taking the
+-- freeze for a broken server. Now the DLL asks first (tpf2_ded_autosave.txt):
+-- with players in, the session goes to 0 here and on every game (LSEFF 0),
+-- the DLL saves once it reads the ack, writes the done marker when the save
+-- file stopped growing, and the session resumes at the votes. Alone, the ack
+-- goes back at once and nothing pauses. A hold ends on its own after
+-- K.DED_SAVE_HOLD_TICKS whatever the DLL did.
+K.DED_SAVE_HOLD_TICKS = 300   -- ~60 s
+function CM.dedAutosaveTick(s, others)
+	local req, ack, done = K.BASE .. "tpf2_ded_autosave.txt", K.BASE .. "tpf2_ded_autosave_ack.txt", K.BASE .. "tpf2_ded_autosave_done.txt"
+	local function marker(path)   -- an EMPTIED file is no marker (no os.remove in the game's Lua)
+		local f = io.open(path, "r")
+		if not f then return false end
+		local body = f:read("*a") or ""
+		f:close()
+		return body ~= ""
+	end
+	local function write(path, text)
+		local f = io.open(path, "w")
+		if f then f:write(text) f:close() end
+	end
+	if not CM.dedSaveHold then
+		if not marker(req) then return false end
+		pcall(CM.clearFile, req)
+		if not others then
+			write(ack, "alone\n")
+			log("PACE: dedicated server autosave -- nobody else is in, no hold")
+			return false
+		end
+		-- the speed to come back to: the votes, else the lever now, never 0
+		local back = (CM.voteSpeed and CM.voteSpeed()) or ((s or 0) > 0 and s) or CM.dedResume or 1
+		CM.dedSaveHold = { since = CM.ticks or 0, resume = math.max(1, math.floor(back + 0.5)), sent = CM.ticks or 0 }
+		if s ~= 0 then CM.setSpeed(0, "dedicated server: autosave") end
+		CM.effSpeed = 0
+		if CM.broadcast and CM.lseffLine then CM.broadcast(CM.lseffLine(0, CM.voteCounted)) end
+		log(string.format("PACE: dedicated server autosave -- session held at 0 (back to %dx after)", CM.dedSaveHold.resume))
+		write(ack, "held\n")
+		return true
+	end
+	local hold = CM.dedSaveHold
+	local finished = marker(done)
+	local timedOut = (CM.ticks or 0) - hold.since > K.DED_SAVE_HOLD_TICKS
+	if not finished and not timedOut then
+		-- keep every game at 0: a lost LSEFF must not leave one running
+		if (CM.ticks or 0) - hold.sent >= 25 and CM.broadcast and CM.lseffLine then
+			hold.sent = CM.ticks or 0
+			CM.broadcast(CM.lseffLine(0, CM.voteCounted))
+		end
+		if s ~= 0 then CM.setSpeed(0, "dedicated server: autosave") end
+		return true
+	end
+	if finished then pcall(CM.clearFile, done) end
+	CM.dedSaveHold = nil
+	log(string.format("PACE: dedicated server autosave %s -- session resumes at %dx", finished and "done" or "hold timed out", hold.resume))
+	if CM.hostUnpause then CM.hostUnpause(hold.resume) end
+	CM.setSpeed(hold.resume, "dedicated server: autosave done")
+	return false
+end
+
+function CM.dedicatedTick()
+	if not CM.dedicatedPauseEmpty() or CM.resyncHold then return false end
+	local others = CM.othersPresent and CM.othersPresent()
+	local s
+	pcall(function() s = game.interface.getGameSpeed() end)
+	if CM.dedAutosaveTick(s, others) then return true end
+	if not others then
+		if s and (CM.ticks or 0) >= (K.LOADGATE_MIN_TICKS or 0) then
+			local want = CM.dedEmptySpeed or 1
+			if not CM.dedPaused then
+				if s > 0 then CM.dedResume = s end
+				CM.dedPaused = true
+				if s ~= want then CM.setSpeed(want, want == 0 and "dedicated server: nobody is here" or string.format("dedicated server: nobody is here, %dx", want)) end
+			elseif s ~= want and (CM.ticks or 0) - (CM.dedEmptySetAt or -1000) >= 25 then
+				-- the lever moved under us (a load, a released hold): back to the empty speed
+				CM.dedEmptySetAt = CM.ticks or 0
+				CM.setSpeed(want, string.format("dedicated server: nobody is here, %dx", want))
+			end
+		end
+		return CM.dedPaused == true
+	end
+	if CM.dedPaused then
+		CM.dedPaused = false
+		CM.setSpeed((CM.voteSpeed and CM.voteSpeed()) or CM.dedResume or 1, "dedicated server: a player is in")
+	end
+	return false
+end
+
+-- The speed a dedicated server resumes a world operation at: the players' vote,
+-- else the speed it paused from, never 0 (a freshly loaded server sits at 0 --
+-- the load gate, then the empty-server pause -- and the first frozen join of
+-- 2026-09-18 17:12 handed that 0 to everyone as the resume speed).
+function CM.dedicatedResumeSpeed(found)
+	if not CM.dedicated then return found end
+	if (tonumber(found) or 0) > 0 then return found end
+	local v = CM.voteSpeed and CM.voteSpeed()
+	v = v or CM.dedResume or 1
+	if v < 1 then v = 1 end
+	return math.floor(v + 0.5)
+end
+
 function CM.paceTick(now)
+	-- the stamp our world starts from: the save's own (savedAt, written by save()),
+	-- else the first clock we read -- what the load gate asks the history after
+	if CM.loadStamp == nil then CM.loadStamp = tonumber(CM.savedAt) or now end
+	if CM.dedicatedTick() then return end
 	local slowT = CM.peerBounds()
 	CM.slowT = slowT
 	if not CM.peerSeen then return end
@@ -1002,7 +1362,18 @@ function CM.paceTick(now)
 	-- re-sent, and a pause it made was undone by the sync-point run once a
 	-- joiner arrived (tools/pacing_sim.py: click_during_catchup,
 	-- pause_during_catchup).
-	if slowT == nil and not (CM.isLeader() and CM.livePeers() > 0) then return end
+	-- ...and while the governor still holds the speed down after the last peer
+	-- left, so it can climb back to the votes (the controller is what raises it).
+	if slowT == nil and not (CM.isLeader() and (CM.livePeers() > 0 or (CM.govFactor or 1) < 1)) then return end
+	-- ALONE AGAIN (2026-09-17): once the last other player is gone (roster 1, no
+	-- peer heard) the controller has nothing to pace against and must not keep a
+	-- governed or fractional speed on the player's lever: clear the fraction
+	-- once and leave the lever to the engine until somebody joins.
+	if CM.othersPresent and not CM.othersPresent() then
+		if CM.ditherCur ~= "" and CM.ditherCur ~= nil then CM.setDither(0); log("PACE: alone -- the fractional speed is cleared, the lever is the player's") end
+		CM.govFactor = 1
+		return
+	end
 	CM.paceV2(now)
 end
 
@@ -1018,7 +1389,7 @@ end
 local didInitialUnpause = false
 function CM.recoveryReleasePacing(speed)
 	didInitialUnpause = true
-	CM.lgHolding, CM.lgHeld = false, false
+	CM.lgHolding, CM.lgHeld, CM.lgFetch, CM.lgReleased = false, false, "done", true   -- a resync starts everyone from one save at one step
 	CM.myCeiling, CM.effSpeed = speed, speed
 	CM.pidHold, CM.pidI, CM.pidLastE = nil, 0, nil
 	CM.catchingUp2, CM.cuPhase = false, nil
@@ -1075,80 +1446,135 @@ end
 -- needs no watchdog of its own: the player pressing play is a first-class
 -- override, handled by the s ~= 0 branch in ensureRunning below.
 --
--- With the lobby roster's player count (players= in tpf2_bridge_ctl.txt) it
--- waits for that many; without one it waits for at least one peer and then
--- for the count to stop changing (K.LOADGATE_SETTLE), which handles players
--- trickling in without needing to be told how many to expect.
+-- What it waits for (2026-09-16): the LEADER, then the command history since
+-- the save we loaded, then the ROSTER. A game that finishes loading after the
+-- session has moved on -- the slow machine with the 600 MB save, or a hot
+-- joiner -- takes exactly the hot-join path: it asks the host for every
+-- command stamped after its save (LSNEED t=<savedAt> save=1, served from the
+-- host's history) and holds until that history is complete, then plays it
+-- through the ordinary queue and catches up (CM.catchUpTick, which does not
+-- fetch again what the gate just did). Then every game, the leader included,
+-- holds while a lobby roster member (players= in the bridge ctl, re-read)
+-- has not been heard: it is still loading. No tick budget.
+-- What a game held here misses: nothing. Its bridge started listening when
+-- its script did, so the commands issued while it loaded are exactly the
+-- history the gate fetches; anything issued after arrives live and waits for
+-- its stamp like everywhere else.
+-- Who this can still strand: nobody, unless the player overrides it (two play
+-- presses, CM.ensureRunning) -- then the log names who is left to catch up
+-- (the leader's override) or what will land out of step (a joiner's, pressed
+-- before its own history was complete).
+function CM.lgLoadStamp()
+	return tonumber(CM.loadStamp) or tonumber(CM.savedAt) or CM.gameTime() or 0
+end
+-- the lobby roster against the peers heard: how many members are still loading, and who is in
+function CM.lgRosterMissing()
+	local roster = tonumber(CM.rosterPlayers)
+	local heard, names = 0, {}
+	for o, pr in pairs(CM.peers) do
+		if pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then heard = heard + 1; names[#names + 1] = o end
+	end
+	table.sort(names)
+	local missing = roster and math.max(0, roster - 1 - heard) or 0
+	return missing, roster, (#names > 0 and table.concat(names, ",") or "nobody")
+end
+function CM.lgAskHistory(why)
+	local S = CM.lgLoadStamp()
+	CM.histEndSeen, CM.histProgressAt = false, CM.ticks
+	CM.histLive = false   -- from a save: what lies below the feed is in the file
+	CM.lgFetchAsks = (CM.lgFetchAsks or 0) + 1
+	CM.broadcast(string.format("LSNEED t=%.4f o=%s save=1", S, K.INSTANCE))
+	log(string.format("LOADGATE: %s -- asked the host for every command stamped after our save (%.1f%s)%s", why, S,
+		CM.savedAt and ", the save's own stamp" or ", the first clock read: an older build's save carries no stamp",
+		CM.lgFetchAsks > 1 and string.format(" (request %d)", CM.lgFetchAsks) or ""))
+end
+-- one line for the player and the log: what the gate is still waiting for
+function CM.lgWaitingFor()
+	if not CM.isLeader() then
+		local ld = CM.peers[CM.leader or "a"]
+		local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
+		if not leaderIn then return string.format("the leader (%s) has not been heard", CM.leader or "a") end
+		if CM.lgFetch ~= "done" then
+			local gaps = CM.rxGaps and CM.rxGaps() or 0
+			return string.format("the command history since our save (%.1f) is incomplete: %d line(s) received, end %s, %d gap(s)",
+				CM.lgLoadStamp(), CM.histGot or 0, CM.histEndSeen and "seen" or "not seen", gaps)
+		end
+	end
+	local missing, roster, heard = CM.lgRosterMissing()
+	if missing > 0 then
+		return string.format("%d of %d other roster member(s) not heard yet, still loading (heard: %s)", missing, roster - 1, heard)
+	end
+	return nil
+end
 function CM.loadGateReady()
-	-- THE LEADER NEVER WAITS. It is the session clock: whoever loads later is
-	-- a hot joiner and catches up to it (LSNEED + the history ring). Holding
-	-- the leader for a roster member whose game is still downloading the save
-	-- froze the leader for minutes (live 2026-09-09, twice).
+	if CM.lgReleased then return true end
+	-- the lobby roster (players=) and the session clock (leader=), re-read every
+	-- ~2 s inside: a relay lobby names another leader when the host leaves, and
+	-- the roster shrinks when a member leaves while the others load
+	if CM.speedRequest then pcall(CM.speedRequest) end
 	if CM.isLeader() then
-		if not CM.lgAnnounced then CM.lgAnnounced = true; log("LOADGATE: we are the leader -- the session clock waits for nobody") end
-		return true
-	end
-	local n = 0
-	for _ in pairs(CM.peers) do n = n + 1 end
-	if n ~= CM.lgCount then
-		CM.lgCount = n
-		CM.lgChangedAt = CM.ticks
-	end
-	if CM.ticks > K.LOADGATE_MAX_TICKS then
-		if not CM.lgAnnounced then
-			CM.lgAnnounced = true
-			log(string.format("LOADGATE: giving up after %d ticks with %d peer(s) -- starting anyway. "
-				.. "Anything done before the others arrive will NOT reach them.",
-				K.LOADGATE_MAX_TICKS, n))
+		-- the session clock has nothing to catch up with; it still waits for the
+		-- roster below (its override is what lets it start without a slow loader)
+		if CM.lgFetch ~= "done" then
+			CM.lgFetch = "done"
+			log("LOADGATE: we are the leader -- the session clock; holding only for roster members still loading")
 		end
-		return true
-	end
-	-- How many instances to expect. In order of authority:
-	--   1. players= in tpf2_bridge_ctl.txt -- the LOBBY ROSTER, written by the
-	--      menu DLL, which is the only thing that actually knows.
-	--   2. the settle heuristic, which is a guess and can only ever be wrong in
-	--      one of the two directions.
-	-- Decided ONCE, at the first look: the roster as it was when WE loaded is
-	-- who loaded with us. A player who joins later is a hot joiner -- it
-	-- catches up to the running world -- and must never freeze anyone; and a
-	-- leader who loaded alone (a relay's auto-resume) has nobody to wait for.
-	-- Re-reading players= every tick did both (live 2026-09-09: the leader sat
-	-- at speed 0 for minutes while a joiner's save was still in transit).
-	if CM.lgWant == nil then
-		local want = 0
-		local f = io.open(K.BASE .. "tpf2_bridge_ctl.txt", "r")
-		if f then
-			local body = f:read("*a") or ""
-			f:close()
-			want = tonumber(body:match("players=(%d+)")) or 0
+	elseif tonumber(CM.rosterPlayers) == 1 then
+		CM.lgFetch = "done"
+		log("LOADGATE: loaded alone (roster of one) -- nothing to wait for")
+	elseif CM.lgFetch ~= "done" then
+		local n = CM.livePeers()
+		local ld = CM.peers[CM.leader or "a"]
+		local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
+		if not leaderIn then
+			-- roughly every two seconds, so the player can see WHY it is paused
+			if (CM.ticks % 12) == 0 then
+				log(string.format("LOADGATE: holding at the loaded save -- %s; %d peer(s) heard%s. Press play twice to start without it.",
+					CM.lgWaitingFor(), n, tonumber(CM.rosterPlayers) and string.format(", roster of %d", CM.rosterPlayers) or ""))
+			end
+			return false
 		end
-		CM.lgWant = want
-		if want == 1 then log("LOADGATE: loaded alone (roster of one) -- nothing to wait for") end
+		if CM.lgFetch == "wait" then
+			CM.lgFetch = "fetch"
+			local lt = ld.step and (ld.step * K.SIM_STEP) or ld.time
+			CM.lgAskHistory(string.format("the leader is in at %s", lt and string.format("%.1f", lt) or "?"))
+			return false
+		end
+		-- "fetch": the history since our save is arriving
+		local gaps = CM.rxGaps and CM.rxGaps() or 0
+		if CM.histEndSeen and gaps == 0 then
+			CM.lgFetch = "done"
+			-- what the feed covered: the catch-up that follows must not fetch it again
+			CM.lgFetchedFrom = CM.lgLoadStamp()
+			log(string.format("LOADGATE: the command history since our save is complete (%d line(s)%s)", CM.histGot or 0,
+				CM.histHole and string.format("; !! the host had pruned below %.1f: this game is FORKED", CM.histHole) or ""))
+		else
+			if CM.ticks - (CM.histProgressAt or CM.ticks) > K.HIST_STALL_TICKS then
+				CM.lgAskHistory(string.format("no history line for ~%d s (end %s, %d gap(s))", math.floor(K.HIST_STALL_TICKS / 5.4),
+					CM.histEndSeen and "seen" or "not seen", gaps))
+			end
+			if (CM.ticks % 12) == 0 then
+				log(string.format("LOADGATE: holding at the loaded save -- %s. Press play twice to start without it.", CM.lgWaitingFor()))
+			end
+			return false
+		end
 	end
-	local want = CM.lgWant
-	local ready
-	local ld = CM.peers[CM.leader or "a"]
-	local leaderIn = ld and ld.at and (CM.ticks - ld.at) <= K.PEER_STALE_TICKS
-	if leaderIn or want == 1 then
-		ready = true
-	elseif want > 1 then
-		ready = (n >= want - 1)
-	else
-		ready = (n >= 1 and (CM.ticks - (CM.lgChangedAt or CM.ticks)) >= K.LOADGATE_SETTLE)
-	end
-	if not ready then
-		-- roughly every two seconds, so the player can see WHY it is paused
+	-- EVERYONE, the leader included: the roster. A member not heard is still
+	-- loading (the lobby's players= counts it), and a session that runs on
+	-- meanwhile is one it must catch up with. No tick budget: the hold lasts
+	-- while it is missing, or until the player's two presses (CM.ensureRunning),
+	-- which log who is left to catch up.
+	local missing, roster, heard = CM.lgRosterMissing()
+	if missing > 0 then
 		if (CM.ticks % 12) == 0 then
-			log(string.format("LOADGATE: holding at the loaded save -- %d peer(s) in%s. Press play to start anyway.",
-				n, (want > 1) and string.format(", waiting for %d", want - 1)
-				   or " (roster size unknown -- holding until it settles)"))
+			log(string.format("LOADGATE: holding at the loaded save -- %d of %d other roster member(s) not heard yet, still loading (heard: %s). Press play twice to start without them.",
+				missing, roster - 1, heard))
 		end
 		return false
 	end
-	if not CM.lgAnnounced then
-		CM.lgAnnounced = true
-		log(string.format("LOADGATE: %d peer(s) in -- releasing", n))
-	end
+	CM.lgReleased = true
+	log(string.format("LOADGATE: %s -- releasing", CM.isLeader() and string.format("every roster member is in (%s)", heard)
+		or (tonumber(CM.rosterPlayers) == 1 and "loaded alone" or string.format("the history since our save is complete and every roster member is in (%s)", heard))))
 	return true
 end
 
@@ -1174,22 +1600,41 @@ function CM.ensureRunning()
 	--
 	-- Safe despite commanding 0: ensureRunning is called UNCONDITIONALLY from
 	-- the update loop (right after paceTick), so it always gets a chance to
-	-- release. It releases on all three of: the roster filling up,
-	-- K.LOADGATE_MAX_TICKS expiring, and the player taking the lever back.
+	-- release. It releases on either of: the leader heard and the history since
+	-- our save complete, or the player pressing play TWICE (the override).
 	if not CM.loadGateReady() then
+		-- THE OVERRIDE: the first press is put back to 0 and the log says who is
+		-- missing; the second starts. Not a time window (it was ~60 s): a hasty
+		-- click is absorbed, a deliberate one is honoured at once.
+		local function forced(speed)
+			didInitialUnpause = true
+			local why = CM.lgWaitingFor() or "waiting"
+			local missing = CM.lgRosterMissing()
+			local ownHist = not CM.isLeader() and CM.lgFetch ~= "done"
+			CM.lgHolding, CM.lgFetch, CM.lgReleased = false, "done", true
+			if ownHist then
+				log(string.format("!! LOADGATE: started manually at speed %d while %s -- releasing. What the others did meanwhile lands here late, OUT OF STEP: this game may fork from the session.",
+					speed, why))
+			else
+				log(string.format("!! LOADGATE: started manually at speed %d while %s -- releasing; %s left to catch up from the history when they arrive (a hot join: nothing is lost for them, they just come in later).",
+					speed, why, missing > 0 and string.format("%d roster member(s)", missing) or "nobody"))
+			end
+		end
+		local function warn()
+			CM.lgPressWarned = true
+			log(string.format("LOADGATE: play pressed while %s -- held. Press play again to start anyway (this game would then apply what the others did meanwhile out of step).",
+				CM.lgWaitingFor() or "waiting"))
+		end
 		-- A play press the slice cancelled (SPEEDBTN, CM.speedButton): no lever
 		-- moved, so the lever tests below cannot see it.
 		local press = CM.lgPress
 		CM.lgPress = nil
 		if press and press > 0 and CM.lgHeld then
-			if (CM.ticks - (CM.lgHeldAt or 0)) < K.LOADGATE_FORCE_TICKS then
-				log(string.format("LOADGATE: play pressed with players still loading -- held. Starting now would fork the session; the override unlocks in %d s",
-					math.floor((K.LOADGATE_FORCE_TICKS - (CM.ticks - (CM.lgHeldAt or 0))) * 0.19)))
+			if not CM.lgPressWarned then
+				warn()
 			else
-				didInitialUnpause = true
-				CM.lgHolding = false
+				forced(press)
 				CM.setSpeed(press, "load gate: started manually")
-				log(string.format("LOADGATE: game started manually at speed %d -- releasing. Anything done before the others arrive will NOT reach them.", press))
 				return
 			end
 		end
@@ -1202,21 +1647,19 @@ function CM.ensureRunning()
 			-- so the speed controller recognises the 0 as OURS. A raw send once had
 			-- the gate's pause taken for the player's lever and shared with every
 			-- joiner, which is how a three-player start broke.
-			CM.setSpeed(0, "load gate: holding until the other players are in")
-			log(string.format("LOADGATE: pausing (was speed %d) until the other players are in", s))
-		elseif CM.lgSawZero and (CM.ticks - (CM.lgHeldAt or 0)) < K.LOADGATE_FORCE_TICKS then
-			-- The player pressed play while someone is still loading. Too early
-			-- to honour (see K.LOADGATE_FORCE_TICKS): put it back and say why.
+			CM.setSpeed(0, "load gate: holding until the session can start")
+			log(string.format("LOADGATE: pausing (was speed %d) until %s", s,
+				CM.isLeader() and "every roster member is in" or "the leader is heard, the history since our save is in and every roster member is in"))
+		elseif CM.lgSawZero and not CM.lgPressWarned then
+			-- The player pressed play while we wait. Put it back and say why; a
+			-- second press is the override.
 			CM.lgSawZero = false
-			CM.setSpeed(0, "load gate: still waiting for players")
-			log(string.format("LOADGATE: play pressed with players still loading -- held. Starting now would fork the session; the override unlocks in %d s",
-				math.floor((K.LOADGATE_FORCE_TICKS - (CM.ticks - (CM.lgHeldAt or 0))) * 0.19)))
+			CM.setSpeed(0, "load gate: still waiting")
+			warn()
 		elseif CM.lgSawZero then
 			-- We held it at 0, saw that take effect, and it is running again:
-			-- the player pressed play after the window. Their lever wins.
-			didInitialUnpause = true
-			CM.lgHolding = false
-			log(string.format("LOADGATE: game started manually at speed %d -- releasing. Anything done before the others arrive will NOT reach them.", s))
+			-- the player pressed play a second time. Their lever wins.
+			forced(s)
 		elseif (CM.ticks - (CM.lgHeldAt or 0)) > 12 then
 			-- Never saw it reach 0, so the command was lost rather than
 			-- overridden. Re-send rather than mistaking this for the player.

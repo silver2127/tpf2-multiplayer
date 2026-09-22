@@ -1,0 +1,13 @@
+# Targets for DecompileTargets.java. RVAs; image base is 0x140000000.
+#
+# Second pass of the line-terminal question (2026-09-20): the completion
+# callbacks the line editor attaches to its UpdateLine commands, and the
+# function only reachable through a function pointer that calls
+# UpdateLineAssignment (0x5fe260). vftable slot 2 (_Do_call) read off the
+# executable: lambda_942546c6 (the add-stop click, 0x603a00) -> 0x60bf10,
+# lambda_ccbbb5bf (the assignment's own corrective update) -> 0x60c3a0.
+
+60bf10  lineed_addstop_cb_docall
+60c3a0  lineed_assign_cb_docall
+60b580  lineed_60b580_calls_assignment
+6033c0  lineed_update_6033c0_again

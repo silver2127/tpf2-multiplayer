@@ -44,10 +44,11 @@ fi
 bwrap --die-with-parent --unshare-pid --unshare-net \
   --ro-bind "$sdk" / --proc /proc --dev /dev --tmpfs /tmp \
   --ro-bind "$repo" /work --bind "$build" /build --chdir /work \
+  --setenv TPF2MP_BUILD_JOBS "${TPF2MP_BUILD_JOBS:-4}" \
   --setenv PATH /usr/bin:/bin --unsetenv LD_PRELOAD --unsetenv LD_LIBRARY_PATH \
   /bin/bash -ec '
     cmake -S native/linux -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release
-    cmake --build /build --parallel 4
+    cmake --build /build --parallel "${TPF2MP_BUILD_JOBS:-4}"
     cd /build
     ctest --output-on-failure
     { cat /etc/os-release; c++ --version; } > NATIVE_BUILDINFO

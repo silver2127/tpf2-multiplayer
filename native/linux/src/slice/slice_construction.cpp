@@ -3,6 +3,8 @@
 #include "slice_construction_checks.h"
 #include "slice_proposal.h"
 #include <cmath>
+#include <vector>
+#include <set>
 #include <cstring>
 #include <atomic>
 #include <cstdio>
@@ -11,16 +13,6 @@
 #include <unistd.h>
 
 namespace {
-constexpr size_t kMaxNodes = 2048, kMaxText = 256 * 1024;
-struct Walk {
-    SliceRecord* out;
-    size_t nodes = 0;
-    unsigned depth = 0;
-    bool ok = true;
-    bool first = true;
-};
-bool Value(Walk& w, uintptr_t value, bool key);
-bool Table(Walk& w, uintptr_t table);
 void Quoted(SliceRecord* out, const char* text, size_t len)
 {
     SliceRecordAppend(out, "\"", 1);
@@ -32,53 +24,70 @@ void Quoted(SliceRecord* out, const char* text, size_t len)
     }
     SliceRecordAppend(out, "\"", 1);
 }
-bool Visit(uintptr_t, uintptr_t key, void* arg)
-{
-    Walk& w = *static_cast<Walk*>(arg);
-    if (++w.nodes > kMaxNodes || w.out->len > kMaxText) return w.ok = false;
-    if (!w.first) SliceRecordAppend(w.out, ",", 1);
-    SliceRecordAppend(w.out, "[", 1);
-    if (!Value(w, key, true)) return w.ok = false;
-    SliceRecordAppend(w.out, "]=", 2);
-    if (!Value(w, key + 0x38, false)) return w.ok = false;
-    w.first = false;
-    return w.ok = !w.out->failed && w.out->len <= kMaxText;
-}
-bool Table(Walk& w, uintptr_t table)
-{
-    // Refuse lossy depth/node truncation: cancelling requires a complete replay.
-    if (w.depth >= 8) return false;
-    const bool first = w.first;
-    w.first = true;
-    ++w.depth;
-    SliceRecordAppend(w.out, "{", 1);
-    size_t seen = 0;
-    const bool ok = SliceWalkStdMap(table, kMaxNodes, Visit, &w, &seen);
-    SliceRecordAppend(w.out, "}", 1);
-    --w.depth;
-    w.first = first;
-    return ok && w.ok && !w.out->failed;
-}
-bool Value(Walk& w, uintptr_t value, bool key)
+bool Scalar(SliceRecord* out, uintptr_t value, bool key)
 {
     uint8_t tag = 0xff;
     if (!SliceReadT(value + 0x30, &tag)) return false;
     if (tag == 2) {
         double number;
         if (!SliceReadT(value, &number) || !std::isfinite(number)) return false;
-        SliceRecordPrintf(w.out, "%.14g", number);
+        SliceRecordPrintf(out, "%.14g", number);
     } else if (tag == 3) {
-        char text[4097]; size_t len;
-        if (!SliceReadStdString(value, text, sizeof(text), &len, 4096)) return false;
-        Quoted(w.out, text, len);
+        std::string text;
+        if (!SliceReadStdString(value, &text)) return false;
+        Quoted(out, text.data(), text.size());
     } else if (!key && tag == 1) {
         uint8_t b;
         if (!SliceReadT(value, &b) || b > 1) return false;
-        SliceRecordAppend(w.out, b ? "true" : "false", b ? 4 : 5);
-    } else if (!key && tag == 4) return Table(w, value);
-    else return false;
-    return !w.out->failed;
+        SliceRecordAppend(out, b ? "true" : "false", b ? 4 : 5);
+    } else return false;
+    return !out->failed;
 }
+bool Collect(uintptr_t, uintptr_t key, void* context)
+{
+    static_cast<std::vector<uintptr_t>*>(context)->push_back(key);
+    return true;
+}
+// An explicit stack follows nested Param maps without consuming the C stack.
+// Every map retains its libstdc++ count/link checks; ancestor aliases are cycles.
+bool Params(uintptr_t table, SliceRecord* out, size_t* nodes)
+{
+    struct Frame { uintptr_t table; std::vector<uintptr_t> keys; size_t next = 0; };
+    std::vector<Frame> stack;
+    std::set<uintptr_t> active;
+    size_t count = 0;
+    auto push = [&](uintptr_t at) {
+        if (!active.insert(at).second) return false;
+        Frame f{at, {}};
+        if (!SliceWalkStdMap(at, SIZE_MAX, Collect, &f.keys, nullptr)) return false;
+        stack.push_back(std::move(f));
+        SliceRecordAppend(out, "{", 1);
+        return !out->failed;
+    };
+    if (!push(table)) return false;
+    while (!stack.empty()) {
+        Frame& f = stack.back();
+        if (f.next == f.keys.size()) {
+            SliceRecordAppend(out, "}", 1);
+            active.erase(f.table); stack.pop_back(); continue;
+        }
+        if (f.next) SliceRecordAppend(out, ",", 1);
+        uintptr_t key = f.keys[f.next++]; ++count;
+        SliceRecordAppend(out, "[", 1);
+        if (!Scalar(out, key, true)) return false;
+        SliceRecordAppend(out, "]=", 2);
+        uint8_t tag;
+        if (!SliceReadT(key + 0x38 + 0x30, &tag)) return false;
+        if (tag == 4) { if (!push(key + 0x38)) return false; }
+        else if (!Scalar(out, key + 0x38, false)) return false;
+        if (out->failed) return false;
+    }
+    if (nodes) *nodes = count;
+    return !out->failed;
+}
+std::atomic<unsigned long long> placementSerial{0};
+thread_local unsigned long long currentSerial = 0;
+thread_local bool currentRoad = false;
 
 thread_local SliceRecord pending{};
 thread_local bool pendingPlacement = false;
@@ -154,13 +163,19 @@ void OnProposal(const SliceFactoryCall& c, void*)
     // the shared Lua construction replay. Module edits carry the new params.
     if (!placement && c.retRva != 0xe4f6bd && c.retRva != 0xf229a5 && c.retRva != 0xdd4e99) return;
     SliceVec add{};
-    if (c.retRva == 0xdd4e99 && SliceReadStdVector(c.rdx + 0x2a0, 0x8f0, 256, &add) && !add.count) return;
+    if (c.retRva == 0xdd4e99 && SliceReadStdVector(c.rdx + 0x2a0, 0x8f0, SIZE_MAX, &add) && !add.count) return;
     SliceRecord rec{};
     SliceVec edges{};
-    if (placement && !SliceReadStdVector(c.rdx + 0x18, 120, 4096, &edges)) return;
+    if (placement && !SliceReadStdVector(c.rdx + 0x18, 120, SIZE_MAX, &edges)) return;
     const bool road = placement && edges.count;
-    if ((road && !SliceProposalBuildRoadRecord(c.rdx, true, false, &rec)) ||
-        !SliceConstructionRecord(c.rdx, !placement, &rec)) {
+    currentSerial = placement ? ++placementSerial : 0;
+    currentRoad = road;
+    bool decoded = !road || SliceProposalBuildRoadRecord(c.rdx, true, false, &rec);
+    if (road && decoded && rec.len && rec.data[rec.len-1] == '\n') {
+        rec.data[--rec.len] = 0;
+        SliceRecordPrintf(&rec, " ps=%llu\n", currentSerial);
+    }
+    if (!decoded || !SliceConstructionRecord(c.rdx, !placement, &rec)) {
         SliceRecordFree(&rec);
         SliceLog("[construction] proposal failed construction decode; strict action awaits the core block\n");
         return;
@@ -179,30 +194,29 @@ void OnProposal(const SliceFactoryCall& c, void*)
 
 bool SliceConstructionParams(uintptr_t table, SliceRecord* out, size_t* nodes)
 {
-    Walk walk{out};
-    const bool ok = Table(walk, table);
-    if (nodes) *nodes = walk.nodes;
-    return ok && walk.nodes > 0 && out->len <= kMaxText;
+    return Params(table, out, nodes);
 }
 bool SliceConstructionRecord(uintptr_t proposal, bool upgrade, SliceRecord* out)
 {
     SliceVec add{}, remove{};
     // .22 StashConxpFromProposal serializes the first CE; its upgrade shape
     // accepts nonempty add/remove lists and sends their first entries.
-    if (!SliceReadStdVector(proposal + 0x2a0, 0x8f0, 256, &add) || !add.count ||
-        !SliceReadStdVector(proposal + 0x288, 4, 16384, &remove) || (upgrade && !remove.count)) return false;
+    if (!SliceReadStdVector(proposal + 0x2a0, 0x8f0, SIZE_MAX, &add) || !add.count ||
+        !SliceReadStdVector(proposal + 0x288, 4, SIZE_MAX, &remove) || (upgrade && !remove.count)) return false;
     int32_t old = 0;
     if (upgrade && (!SliceReadT(remove.begin, &old) || old <= 0)) return false;
-    char name[4097]; size_t len;
-    if (!SliceReadStdString(add.begin, name, sizeof(name), &len, 4096) || !len) return false;
+    std::string name;
+    if (!SliceReadStdString(add.begin, &name) || name.empty()) return false;
+    const size_t len = name.size();
     // Filename is a whitespace-delimited wire token; refuse ambiguous paths.
     for (size_t i = 0; i < len; ++i) if (static_cast<unsigned char>(name[i]) <= 32 || name[i] == 127) return false;
     float transform[16];
     if (!SliceRead(add.begin + 0x738, transform, sizeof(transform))) return false;
     for (float f : transform) if (!std::isfinite(f)) return false;
-    if (upgrade) SliceRecordPrintf(out, "CONUP %d %s t=", old, name);
-    else SliceRecordPrintf(out, "CONXP %s t=", name);
+    if (upgrade) SliceRecordPrintf(out, "CONUP %d %s t=", old, name.c_str());
+    else SliceRecordPrintf(out, "CONXP %s t=", name.c_str());
     for (unsigned i = 0; i < 16; ++i) SliceRecordPrintf(out, "%s%.4f", i ? "," : "", transform[i]);
+    if (!upgrade) SliceRecordPrintf(out, " ps=%llu rc=%d", currentSerial, int(currentRoad));
     SliceRecordAppend(out, " params=", 8);
     if (!SliceConstructionParams(add.begin + 0x448, out, nullptr)) return false;
     SliceRecordAppend(out, "\n", 1);

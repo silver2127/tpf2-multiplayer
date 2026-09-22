@@ -49,9 +49,21 @@ bool MenuGame_PlaceSharedSave(const std::string& src, std::string* placedName);
 // autoload not installed ends in the status line's "open LOAD GAME and pick
 // <name>" instead.
 void MenuGame_RequestAutoload(const std::string& placedName);
+bool MenuGame_Loading();
+void MenuGame_RequestModRefresh();
 
 // HOT JOIN: ask the running game for one of its own autosaves on the next
 // frame. False when unavailable (not installed, no game running, the game's
 // autosave interval is 0); true means queued. The save shows up as a new
 // autosave_*.sav in MenuGame_SaveDir().
 bool MenuGame_ForceAutosave();
+
+// Accepted vanilla UI loads only; called on the UI thread. The receiver must
+// copy the name and enqueue work, never load another world in this callback.
+using MenuGameLoadObserver = void (*)(const char* name);
+void MenuGame_ObserveLoads(MenuGameLoadObserver observer);
+
+// Capture the menu from the verified CreatePage hook; safe reads, no game calls.
+void MenuGame_ObserveMenu(void* menu);
+// -1 unavailable; otherwise floored 0..100 from the verified ProgressMonitor.
+int MenuGame_LoadPercent();

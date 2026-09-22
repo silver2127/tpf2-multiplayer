@@ -32,6 +32,7 @@
 #include "net.h"
 #include "setplayer_patch.h"
 #include "speedhook.h"
+#include "steam_tunnel.h"
 
 static FILE* g_log = nullptr;
 static void Log(const char* fmt, ...)
@@ -143,6 +144,7 @@ static bool ReadSmallFile(const std::string& path, std::string& out)
 
 // Identity file: line 1 the letter, line 2 our pid, line 3 the bound UDP port
 // once the socket is up (bridge_main.cpp: WriteIdentity).
+static bool g_entityOwnerReady = false;
 static void WriteIdentity(const std::string& inst, bool warnMismatch)
 {
     const std::string idPath = S().dataDir + "tpf2_instance.txt";
@@ -166,6 +168,10 @@ static void WriteIdentity(const std::string& inst, bool warnMismatch)
     if (port) {
         int m = snprintf(buf + n, sizeof(buf) - n, "port=%u\n", port);
         if (m > 0) n += m;
+    }
+    if (g_entityOwnerReady) {
+        const int m = snprintf(buf+n,sizeof(buf)-n,"entity_owner_v1=1\n");
+        if(m>0)n+=m;
     }
     // Written beside it and renamed over: the mod, the slice and the lobby read
     // this file at any moment, and a rename is atomic where truncate-then-write
@@ -434,9 +440,35 @@ static void CtlThread()
     const std::string speedPath = S().dataDir + "tpf2_speed.txt";
     if (unlink(speedPath.c_str()) == 0) Log("[speed] removed a stale tpf2_speed.txt from a previous session\n");
     std::string last, cur, lastSpeed, curSpeed, epochControl, lastEpoch;
+    unsigned paceTicks = 0;
+    bool pinned = false;
     while (!g_stopping) {
         SleepMs(500);
         PublishEpochReady();
+        if (++paceTicks % 2 == 0) {
+            long base = 0; int lever = 0;
+            SpeedHook_Pace(&base, &lever);
+            if (base > 0) {
+                const std::string target = S().dataDir + "tpf2_engine_pace.txt";
+                const std::string temporary = target + ".tmp";
+                if (FILE* f = fopen(temporary.c_str(), "w")) {
+                    const bool written = fprintf(f, "base=%ld lever=%d\n", base, lever) > 0;
+                    const bool closed = fclose(f) == 0;
+                    if (written && closed) rename(temporary.c_str(), target.c_str());
+                }
+            }
+        }
+        if (paceTicks % 10 == 0) {
+            std::string dedicated;
+            const bool want = ReadSmallFile(S().dataDir + "mp_dedicated.txt", dedicated) &&
+                ("\n" + dedicated).find("\ndedicated=1\n") != std::string::npos &&
+                ("\n" + dedicated).find("\npin_batch=1\n") != std::string::npos;
+            if (want != pinned) {
+                pinned = want;
+                SpeedHook_SetPin(want ? 200000 : 0);
+                Log("[speed] dedicated batch interval pin %s\n", want ? "200 ms" : "off");
+            }
+        }
         if (ReadSmallFile(S().dataDir + "tpf2_epoch_request.txt", epochControl) && epochControl != lastEpoch) {
             const auto owner = epochControl.find("pid=");
             unsigned long pid = 0;
@@ -510,6 +542,12 @@ static void InitThread()
         cfg.localPort = guestPort;
         cfg.peerPort = hostPort;
     }
+    if(const char* pinned=getenv("TPF2MP_BRIDGE_PORT")) {
+        char* end=nullptr; const long port=strtol(pinned,&end,10);
+        if(*pinned&&end&&!*end&&port>0&&port<=65535) {
+            cfg.localPort=uint16_t(port);cfg.instance="a";cfg.peerPort=0;
+        } else { Log("[m5] invalid TPF2MP_BRIDGE_PORT; bridge not started\n");return; }
+    }
     Log("[m5] auto identity: port %u %s -> instance %s\n", hostPort,
         cfg.instance == "a" ? "free" : "taken", cfg.instance.c_str());
 
@@ -582,6 +620,7 @@ static void InitThread()
     }
 
     WriteIdentity(cfg.instance, true);
+    SteamTunnel_Start(S().dataDir, Log);
     Log("[m5] identity written: inst=%s port=%u\n", cfg.instance.c_str(),
         (unsigned)Net_LocalPort());
 
@@ -592,8 +631,9 @@ static void InitThread()
         Log("[m5] TPF2MP_NO_PATCHES=1: speed hook and setPlayer patch skipped\n");
     } else {
         SpeedHook_Install(Log);
-        SetPlayerPatch_Install(Log);
+        g_entityOwnerReady = SetPlayerPatch_Install(Log);
     }
+    WriteIdentity(cfg.instance, false);
 
     std::thread(HealthThread).detach();
 
@@ -618,6 +658,7 @@ __attribute__((destructor))
 static void BridgeUnload()
 {
     g_stopping = true;
+    SteamTunnel_SignalShutdown();
     Net_SignalShutdown();
 }
 #endif

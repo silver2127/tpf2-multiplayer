@@ -12,9 +12,12 @@ only when every current participant has confirmed. No new save/load or recovery
 hold is initiated before that point. A changed roster invalidates the request;
 old confirmations cannot carry over to another request. The system then holds
 all games, saves the host under a unique recovery name, transfers and verifies
-that exact save set, reloads all worlds in the existing processes and compares
-the freshly loaded, paused worlds. It resumes only after the shared comparison
-succeeds. The host's previous speed is restored, including an intentional pause.
+that exact save set, reloads every world in the existing processes -- the host's
+included: a world kept running from memory holds its entities in creation order,
+a loaded one in save order, and the person and town simulation consume that
+order, so a host that skipped the load diverged from the reloaded clients within
+~35 game units (measured 2026-09-16) -- and compares the paused worlds. It
+resumes only after the shared comparison succeeds. The host's previous speed is restored, including an intentional pause.
 Changes present only on the client are replaced by the host's world.
 
 A single compact native **Multiplayer Resync** panel appears automatically when
@@ -50,9 +53,32 @@ The current implementation allows **two or more players in a player-hosted lobby
 the same package, on the exact supported Windows game build 35924. A whole
 executable SHA-256 check guards the build-specific native adapter. Dedicated
 relays do not advertise automatic recovery. There is no recovery-specific player
-limit beyond the existing lobby limit. Once recovery
-has begun, the player roster is fixed; adding or replacing a player requires a
-new session. Ordinary lobby start and save selection keep their existing flow.
+limit beyond the existing lobby limit. The roster may change while a recovery
+runs: a client that leaves is dropped and the round completes for the others
+(its own copy stays held); a player that arrives is admitted -- into the current
+phase while everyone is still pausing, otherwise as pending, in which case the
+round finishes for its members and, instead of releasing them, sends the same
+snapshot round once more under a fresh epoch with the newcomer as a member.
+Nobody is released until every member is in. Ordinary lobby start and save
+selection keep their existing flow.
+
+## Frozen joins
+
+Since 2026-09-16 a player joining a running player-hosted session is brought in
+through this same round, started by the host lobby itself in mode `join` (no
+button, no readiness): the session holds, the host saves, everyone -- the host
+too -- loads that save, the paused worlds are compared, and play resumes at the
+host's previous speed. The earlier shape (the host kept running, the newcomer
+loaded an autosave and caught up on the command history) left the joiner's
+entities registered in save order against the host's creation order; its
+simulated-people count split within ~35 game units and the buses on a line
+drifted at the next stop, on two identical replays, while a session whose
+members had all loaded together stayed locked. The host's roster event carries
+`join_freeze` so the menu DLL takes no hot-join autosave of its own; when
+recovery cannot run (a client whose version lacks it, a save transfer in
+flight, a relay lobby) the flag is off and the old autosave path still serves
+the newcomer. `tools/test_auto_sync_lobby.py` covers the round end to end with
+simulated engines, a leaver dropped mid-round and a late joiner.
 
 ## Implementation
 

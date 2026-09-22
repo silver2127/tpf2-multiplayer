@@ -47,6 +47,32 @@ function CM.recoveryGuiHeld()
 	return CM.recoveryGuiHold
 end
 
+-- The lobby that runs a world operation refreshes tpf2_sync_available.txt (wall=)
+-- every second or two while it lives. Read every 15 ticks.
+function CM.syncLobbyAlive()
+	if CM.syncLobbyAt and (CM.ticks or 0) - CM.syncLobbyAt < 15 then return CM.syncLobbyAliveCached end
+	CM.syncLobbyAt = CM.ticks or 0
+	local a = CM.syncRead("tpf2_sync_available.txt")
+	local wall = a and tonumber(a.wall)
+	CM.syncLobbyAliveCached = wall ~= nil and math.abs(os.time() - wall) <= (K.SOLO_RELEASE_SECONDS or 15)
+	return CM.syncLobbyAliveCached
+end
+
+-- ALONE, for a hold: the lobby's roster is KNOWN to be one player. Nothing
+-- else. Not "no peer heard": right after the load every member is deaf for a
+-- while (fresh Lua state, peers still loading), and the first frozen join
+-- with three players abandoned its hold on every machine 15 s after the load
+-- for exactly that reason (2026-09-17 21:51). Not "the lobby's heartbeat is
+-- stale" either: tpf2_sync_available.txt is refreshed only while a resync CAN
+-- be started, not during one, so a joiner in the dedicated server's frozen
+-- join read the lobby as gone 15 s after its reload and abandoned the hold
+-- (2026-09-18 16:38) -- the round timed out in "checking" with no fingerprint.
+-- A control file left by another process is already refused by its pid.
+function CM.syncAlone()
+	local roster = tonumber(CM.rosterPlayers)
+	return roster ~= nil and roster <= 1
+end
+
 function CM.autoSyncPump(now)
 	local incoming = CM.syncRead("tpf2_sync_lua.txt")
 	if incoming and incoming.pid == K.PROCESS_ID and incoming.operation and incoming.epoch
@@ -54,12 +80,18 @@ function CM.autoSyncPump(now)
 		and #incoming.epoch == 32 and not incoming.epoch:find("[^0-9a-f]")
 		and tonumber(incoming.revision) and tonumber(incoming.revision) >= 1
 		and ({holding=true, waiting=true, saving=true, transferring=true, loading=true,
-			checking=true, releasing=true, complete=true, error=true, aborted=true})[incoming.phase] then
+			checking=true, releasing=true, complete=true, error=true, aborted=true})[incoming.phase]
+		and incoming.operation ~= CM.autoAbandoned then     -- an operation abandoned alone (below) stays abandoned
 		local old = CM.autoSync
 		if (old or incoming.phase ~= "complete") and (not old or tonumber(incoming.revision) > tonumber(old.revision)) then
 			CM.autoSync = incoming
 			if not old or old.operation ~= incoming.operation then
 				local speed; pcall(function() speed = game.interface.getGameSpeed() end)
+				-- a dedicated server pauses itself while empty (pacing.lua): the
+				-- speed to resume at is the players' vote, else the one it paused
+				-- from, never that 0 (CM.dedicatedResumeSpeed)
+				if CM.dedicatedPauseEmpty then CM.dedicatedPauseEmpty() end   -- refreshes CM.dedicated
+				if CM.dedicated then CM.dedPaused = false; speed = CM.dedicatedResumeSpeed(speed) end
 				CM.autoResumeSpeed = speed or CM.baseSpeed or 0
 				CM.setSpeed(0, "automatic world operation")
 			end
@@ -72,6 +104,7 @@ function CM.autoSyncPump(now)
 		if not CM.autoReleased or CM.autoReleased ~= state.epoch then
 			local speed = tonumber(state.resume_speed)
 			if speed ~= 0 and speed ~= 1 and speed ~= 2 and speed ~= 3 and speed ~= 4 then return true end
+			if CM.dedicated and CM.dedicatedResumeSpeed then speed = CM.dedicatedResumeSpeed(speed) end
 			CM.autoReleased = state.epoch
 			CM.recoveryReleasePacing(speed)
 			CM.lgHolding, CM.resyncHold = false, false
@@ -80,7 +113,31 @@ function CM.autoSyncPump(now)
 		end
 		return false
 	end
-	-- Missing/partial control or an error NEVER releases an existing hold.
+	-- Missing/partial control or an error NEVER releases an existing hold --
+	-- while there is a session to protect. ALONE (2026-09-17, user: "with only
+	-- 1 person in game I cannot increase game speed"): the lobby gone, or its
+	-- roster known to be one, for K.SOLO_RELEASE_TICKS means nobody will ever
+	-- advance this operation; the hold would pin the speed at 0 for the rest of
+	-- the game. Abandon it and give the lever back. (CM.syncAlone: not by
+	-- unheard peers -- see there.)
+	if CM.syncAlone() then
+		CM.autoAloneSince = CM.autoAloneSince or (CM.ticks or 0)
+		if (CM.ticks or 0) - CM.autoAloneSince >= (K.SOLO_RELEASE_TICKS or 75) then
+			local speed = tonumber(CM.autoResumeSpeed) or 0
+			if speed < 1 or speed > 4 then speed = 1 end
+			log(string.format("RESYNC: %s left in phase %s with nobody else in the game -- abandoned, speed back to %d",
+				tostring(state.operation), tostring(state.phase), speed))
+			CM.autoAbandoned = state.operation
+			CM.autoSync, CM.autoFingerprint, CM.autoAloneSince = nil, nil, nil
+			CM.recoveryReleasePacing(speed)
+			CM.lgHolding, CM.resyncHold = false, false
+			CM.baseSpeed = speed
+			CM.setSpeed(speed, "the other players are gone; the world operation is abandoned")
+			return false
+		end
+	else
+		CM.autoAloneSince = nil
+	end
 	CM.resyncHold = true
 	local speed; pcall(function() speed = game.interface.getGameSpeed() end)
 	if state.phase == "checking" and speed == 0 and not CM.autoFingerprint then

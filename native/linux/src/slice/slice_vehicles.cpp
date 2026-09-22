@@ -2,6 +2,7 @@
 #include "slice_core.h"
 #include <cmath>
 #include <climits>
+#include <vector>
 #include <initializer_list>
 
 namespace slice_vehicles {
@@ -11,7 +12,7 @@ constexpr uintptr_t kDepot = 0x15ec220, kReverse = 0x15ebe00;
 static bool IntVector(SliceRecord* rec, uintptr_t address, bool requireOne = false)
 {
     SliceVec v{};
-    if (!SliceReadStdVector(address, 4, 256, &v) || (requireOne && !v.count)) return false;
+    if (!SliceReadStdVector(address, 4, SIZE_MAX, &v) || (requireOne && !v.count)) return false;
     SliceRecordPrintf(rec, " %zu", v.count);
     for (size_t i = 0; i < v.count; ++i) {
         int32_t value;
@@ -23,7 +24,7 @@ static bool IntVector(SliceRecord* rec, uintptr_t address, bool requireOne = fal
 
 // libstdc++ stores 64-bit words; Lua expects signed 32-bit words, low half first.
 // Normalize the start offset and erase unused tail bits, including garbage left
-// in vector<bool>'s allocation. Limit matches the 256 load slots on the wire.
+// in vector<bool>'s allocation. Storage grows with the actual bit count.
 static bool AutoLoad(SliceRecord* rec, uintptr_t address)
 {
     struct Bits { uintptr_t begin; uint32_t first, pad0; uintptr_t end; uint32_t last, pad1; uintptr_t cap; } b{};
@@ -34,12 +35,12 @@ static bool AutoLoad(SliceRecord* rec, uintptr_t address)
         return !rec->failed;
     }
     if (b.end < b.begin || b.cap < b.end || (b.end - b.begin) % 8 || (b.cap - b.begin) % 8 ||
-        b.end - b.begin > 32 || (b.end == b.cap && b.last)) return false;
+        b.end - b.begin > SliceSanityBytes || (b.end == b.cap && b.last)) return false;
     const int64_t n = int64_t((b.end - b.begin) * 8) + b.last - b.first;
-    if (n < 0 || n > 256) return false;
-    uint64_t source[5]{};
+    if (n < 0) return false;
     const size_t sourceWords = n ? (b.first + size_t(n) + 63) / 64 : 0;
-    if (sourceWords && !SliceRead(b.begin, source, sourceWords * sizeof(source[0]))) return false;
+    std::vector<uint64_t> source(sourceWords);
+    if (sourceWords && !SliceRead(b.begin, source.data(), sourceWords * sizeof(source[0]))) return false;
     const size_t words = (size_t(n) + 31) / 32;
     SliceRecordPrintf(rec, " %zu", words);
     for (size_t w = 0; w < words; ++w) {
@@ -56,15 +57,18 @@ static bool AutoLoad(SliceRecord* rec, uintptr_t address)
 static bool Config(SliceRecord* rec, uintptr_t address)
 {
     SliceVec parts{};
-    if (!SliceReadStdVector(address, 0x88, 64, &parts) || !parts.count) return false;
+    if (!SliceReadStdVector(address, 0x88, SIZE_MAX, &parts) || !parts.count) return false;
     SliceRecordPrintf(rec, " %zu", parts.count);
     for (size_t i = 0; i < parts.count; ++i) {
         const uintptr_t p = parts.begin + i * 0x88;
         int32_t model;
+        uint8_t reversed;
         float color[3];
-        if (!SliceReadT(p, &model) || !SliceRead(p + 0x20, color, sizeof(color)) ||
+        if (!SliceReadT(p, &model) || !SliceReadT(p + 4, &reversed) || !SliceRead(p + 0x20, color, sizeof(color)) ||
             !std::isfinite(color[0]) || !std::isfinite(color[1]) || !std::isfinite(color[2])) return false;
-        SliceRecordPrintf(rec, " %d", model);
+        // VehiclePart::reversed at +4 is proven by the Linux usertype registration
+        // (SLICE_VEHICLES.md section 4). Both buy and replacement share this wire.
+        SliceRecordPrintf(rec, " %d %d", model, reversed ? 1 : 0);
         if (!IntVector(rec, p + 8)) return false;
         SliceRecordPrintf(rec, " %.4f %.4f %.4f", color[0], color[1], color[2]);
         if (!AutoLoad(rec, p + 0x60)) return false;

@@ -64,6 +64,28 @@ with TemporaryDirectory() as temporary:
     end=main.index('pcall(CM.sampleSimRate)',begin)
     lua.execute('function worker() '+main[begin:end]+" error('producer reached') end")
     lua.execute('worker()')
+    # WORLD TOKEN: the first sim tick of every world stamps which world this
+    # game is in, addressed to this game's own pid. The host's menu reads a
+    # CHANGE as "it loaded another world" and pushes that world to everyone
+    # (a NEW GAME reaches no other hook), so one load must write exactly one
+    # value and two loads must never write the same one. It is written before
+    # the recovery hold above, so a resync's own load is stamped while the menu
+    # still knows it is busy and does not mistake it for the player's doing.
+    token=directory/'tpf2mp_world_gen.txt'
+    first=token.read_text()
+    assert first.startswith('pid=123\ngen=') and first.endswith('\n') and len(first.split('\n')[1])>8, first
+    lua.execute('worker()')                       # same world, same tick loop: one value per load
+    assert token.read_text()==first
+    reboot=LuaRuntime(unpack_returned_tuples=True)   # another world = another Lua state
+    reboot.globals().base=str(directory).replace('\\','/')+'/'
+    reboot.execute('CM={ticks=0}; K={BASE=base,PROCESS_ID="123",INSTANCE="a"}\n'
+                   'CM.detectInstance=function() return true end\n'
+                   'CM.gameTime=function() return 100 end\n'
+                   'CM.autoSyncPump=function() return true end')
+    reboot.execute('function worker() '+main[begin:end]+' end')
+    reboot.execute('worker()')
+    second=token.read_text()
+    assert second.startswith('pid=123\ngen=') and second!=first, (first, second)
     available=directory/'tpf2_sync_available.txt'
     available.write_text('pid=999\nprotocol=4\nwall='+str(int(time.time()))+'\n')
     lua.execute('assert(not CM.syncRequest("sync_request"))')
@@ -91,4 +113,38 @@ with TemporaryDirectory() as temporary:
     assert notice.read_text() == previous
     lua.execute("CM.resyncGuiTick(dash({desyncs='0'}))")
     assert 'desyncs=0\nheld=0\n' in notice.read_text()
-print('PASS: real Lua 5.2 producer hold, fresh paused comparison, stale/partial IPC, PID guard, pause preservation and native-panel notices; engine simulated')
+    # ALONE (2026-09-17): a hold whose other players are gone (roster 1, no peer heard) is abandoned
+    # after K.SOLO_RELEASE_TICKS and the lever comes back; with others present it is held for good.
+    lua.execute("alone=false; CM.syncAlone=function() return alone or tonumber(CM.rosterPlayers) == 1 end; CM.rosterPlayers=nil; K.SOLO_RELEASE_TICKS=75; "
+                "CM.ticks=1000; speed=3; changes=0; CM.autoSync=nil; CM.autoReleased=nil; CM.resyncHold=false")
+    control(20, 'loading')
+    lua.execute("assert(CM.autoSyncPump(100) and speed==0 and CM.resyncHold and CM.autoResumeSpeed==3)")
+    lua.execute("for i=1,200 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0 and CM.resyncHold)")
+    lua.execute("alone=true; for i=1,75 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0)")  # the clock starts at the first alone tick
+    lua.execute("CM.ticks=CM.ticks+1; assert(not CM.autoSyncPump(100)); assert(speed==3 and not CM.resyncHold and CM.autoSync==nil)")
+    lua.execute("assert(not CM.autoSyncPump(100)); assert(speed==3)")   # stays released: the stale file is not re-read as new
+    lua.execute("alone=false; CM.autoAloneSince=nil")
+    (directory / 'tpf2_sync_lua.txt').write_text('pid=123\noperation=' + 'c' * 32 + '\nepoch=' + 'b' * 32
+                                                 + '\nrevision=21\nphase=loading\nresume_speed=0\n')
+    lua.execute("assert(CM.autoSyncPump(100) and speed==0)")            # a fresh operation with others present holds again
+    lua.execute("alone=true; for i=1,40 do CM.ticks=CM.ticks+1 end; alone=false; assert(CM.autoSyncPump(100)); "
+                "alone=true; for i=1,74 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0)")  # the alone clock restarts
+    # THE FROZEN JOIN OF 21:51 (2026-09-17): a freshly loaded Lua state hears no peer and knows no roster yet,
+    # but the lobby is alive -- that is not alone, however long it lasts
+    lua.execute("alone=false; CM.autoAloneSince=nil; CM.rosterPlayers=nil; CM.peers={}; "
+                "for i=1,600 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; assert(speed==0 and CM.resyncHold)")
+    # a roster the lobby says is one player, lobby still alive: that IS alone (the other player left)
+    lua.execute("CM.rosterPlayers=1; for i=1,75 do CM.ticks=CM.ticks+1; assert(CM.autoSyncPump(100)) end; "
+                "CM.ticks=CM.ticks+1; assert(not CM.autoSyncPump(100)); assert(speed==3)")
+    # the real liveness reader: a fresh wall is alive, a stale one is not, a missing file is not
+    lua.execute("CM.syncLobbyAlive=nil; CM.syncAlone=nil")
+    lua.execute(source)(lua.globals().CM, lua.globals().K, lambda _: None)   # reload the module's functions
+    (directory / 'tpf2_sync_available.txt').write_text('protocol=4\nwall=%d\npid=123\n' % int(time.time()))
+    lua.execute("CM.syncLobbyAt=nil; assert(CM.syncLobbyAlive()); CM.rosterPlayers=nil; assert(not CM.syncAlone())")
+    (directory / 'tpf2_sync_available.txt').write_text('protocol=4\nwall=%d\npid=123\n' % (int(time.time()) - 60))
+    lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=nil; assert(not CM.syncAlone())")  # stale heartbeat: not alone
+    (directory / 'tpf2_sync_available.txt').unlink()
+    lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=3; assert(not CM.syncAlone())")  # a stale heartbeat is NOT alone (16:38)
+    lua.execute("CM.rosterPlayers=nil; assert(not CM.syncAlone()); CM.rosterPlayers=1; assert(CM.syncAlone())")
+print('PASS: real Lua 5.2 producer hold, fresh paused comparison, stale/partial IPC, PID guard, pause preservation, '
+      'one fresh world token per load and native-panel notices, a hold abandoned once alone; engine simulated')

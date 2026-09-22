@@ -1,15 +1,24 @@
-// tpf2ca.dll -- custom actions for the TpF2 Multiplayer MSI (installer\Package.wxs).
+// tpf2ca.dll -- custom actions for the TpF2 Multiplayer and TpF2 Big Maps MSIs
+// (installer\Package.wxs in either repository).
 //
 // Why a DLL and not cmd.exe / VBScript: the game-folder check has to put a
 // readable sentence in front of the user (an ExeCommand can only fail with
 // "a program run as part of the setup did not finish as expected"), VBScript
 // is on Microsoft's removal list, and a console window flashing during install
-// is not something a player should see. Four entry points, all tiny:
+// is not something a player should see. Five entry points, all tiny:
 //
+//   FindGameDir       immediate, after AppSearch in both sequences. When the
+//                     default INSTALLFOLDER (Steam's registration, a remembered
+//                     folder, or nothing yet) holds no TransportFever2.exe, it
+//                     reads Steam's libraryfolders.vdf and takes the first
+//                     library that has the game -- a second drive, a second
+//                     library on C:. A player never types the folder for that.
 //   CheckGameDir      immediate, UI sequence (DoAction from the folder dialog).
 //                     Sets TPF2_GAMEDIR_OK to 1/0 and shows a warning box when
-//                     INSTALLFOLDER holds no TransportFever2.exe, or one that
-//                     is not Steam build 35924 (GOG, a patched exe, a game
+//                     INSTALLFOLDER holds no TransportFever2.exe, or one that is
+//                     neither Steam build 35924 nor, when the package asks for
+//                     it with TPF2_ALLOW_GOG=1, the GOG build of that same
+//                     version (so: another store, a patched exe, a game
 //                     update), or an alut.dll another mod replaced. Asks
 //                     whether to go on when mods ship native DLLs. Never fails.
 //   RequireGameDir    immediate, execute sequence (covers /qn installs).
@@ -102,10 +111,17 @@ const wchar_t* NO_GAME_MSG =
 const DWORD GAME_EXE_TIMEDATESTAMP = 0x675abcc6;   // IMAGE_FILE_HEADER.TimeDateStamp, build 35924
 const DWORD GAME_EXE_SIZEOFIMAGE   = 0x046ce000;   // IMAGE_OPTIONAL_HEADER64.SizeOfImage
 
+// The GOG build of the same game version. Big Maps supports both layouts (its
+// plugin byte-verifies its own RVAs for each); multiplayer supports only Steam,
+// so this build is accepted here only when the package asks for it with
+// TPF2_ALLOW_GOG=1. Measured on the GOG 2024-12-12 executable, not assumed.
+const DWORD GOG_EXE_TIMEDATESTAMP  = 0x675ad7cc;   // IMAGE_FILE_HEADER.TimeDateStamp
+const DWORD GOG_EXE_SIZEOFIMAGE    = 0x0467d000;   // IMAGE_OPTIONAL_HEADER64.SizeOfImage
+
 const wchar_t* GOG_MSG =
     L"The folder [1] holds the GOG version of Transport Fever 2.\n\n"
-    L"TpF2 Multiplayer works only with the Steam version (build 35924): it hooks that exact "
-    L"TransportFever2.exe, and on any other executable multiplayer never starts.";
+    L"This package works only with the Steam version (build 35924): it patches that exact "
+    L"TransportFever2.exe, and on any other executable its changes never apply.";
 
 const wchar_t* WRONG_EXE_MSG =
     L"The TransportFever2.exe in [1] is not the Steam build 35924 that TpF2 Multiplayer is made "
@@ -116,7 +132,7 @@ const wchar_t* WRONG_EXE_MSG =
     L"choose Properties, Installed Files, Verify integrity of game files, then run this "
     L"installer again.";
 
-enum class ExeBuild { Match, Mismatch, Unreadable };
+enum class ExeBuild { Match, MatchGog, Mismatch, Unreadable };
 
 // Reads the PE header of the exe on disk. Unreadable covers a file too short or
 // not a PE32+ image, and a file that cannot be opened.
@@ -141,7 +157,9 @@ ExeBuild ReadExeBuild(const std::wstring& exe, DWORD* ts, DWORD* soi)
     if (memcmp(nt, "PE\0\0", 4) != 0 || magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return ExeBuild::Unreadable;
     memcpy(ts, nt + 0x08, 4);
     memcpy(soi, nt + 0x18 + 0x38, 4);
-    return (*ts == GAME_EXE_TIMEDATESTAMP && *soi == GAME_EXE_SIZEOFIMAGE) ? ExeBuild::Match : ExeBuild::Mismatch;
+    if (*ts == GAME_EXE_TIMEDATESTAMP && *soi == GAME_EXE_SIZEOFIMAGE) return ExeBuild::Match;
+    if (*ts == GOG_EXE_TIMEDATESTAMP  && *soi == GOG_EXE_SIZEOFIMAGE)  return ExeBuild::MatchGog;
+    return ExeBuild::Mismatch;
 }
 
 // GOG installs put goggame-<product id>.info beside the executable.
@@ -163,8 +181,13 @@ std::wstring Hex(DWORD v)
 
 // ---- native DLLs that are not the game's or ours ---------------------------
 
-// The game's own alut.dll (build 35924). The proxy parks it as alut_real.dll.
-const wchar_t* STOCK_ALUT_SHA256 = L"3DF103AE3D94A6B90C4D2A6D75DCB388CD835F5E3AF9962B22C20D4473CFC035";
+// The game's own alut.dll. Steam build 35924 and the GOG build ship DIFFERENT
+// bytes under the same name and the same 65536-byte size: measured, not
+// assumed. Both are "the game's own file". The GOG one is accepted only by a
+// package that supports the GOG build, so a Steam-only product keeps refusing a
+// folder it could not patch either way.
+const wchar_t* STOCK_ALUT_SHA256     = L"3DF103AE3D94A6B90C4D2A6D75DCB388CD835F5E3AF9962B22C20D4473CFC035";
+const wchar_t* GOG_STOCK_ALUT_SHA256 = L"53ED311AE634A041E96C051541999032A8E4B1476E93AB5B8D51F6457CBBCE6D";
 
 // Every DLL build 35924 ships beside the exe, plus this project's own. A DLL
 // beside the exe that is not listed is loaded by name before the system copy
@@ -177,15 +200,16 @@ const wchar_t* KNOWN_TOP_DLLS[] = {
 
 const wchar_t* FOREIGN_ALUT_MSG =
     L"The alut.dll in [1] is not the game's own file: another mod or tool has replaced it.\n\n"
-    L"TpF2 Multiplayer loads through alut.dll, and two replacements of that file cannot both work: the "
-    L"game would fail to start. Uninstall that mod, or close the game and run Steam's Verify integrity "
-    L"of game files, then run this installer again.";
+    L"This package loads through alut.dll, and two replacements of that file cannot both work: the "
+    L"game would fail to start. Uninstall that mod, or close the game and repair the installation "
+    L"(Steam: Verify integrity of game files; GOG Galaxy: Manage installation, Verify/Repair), then "
+    L"run this installer again.";
 
 const wchar_t* MOD_DLLS_MSG =
-    L"These native DLLs belong neither to Transport Fever 2 nor to TpF2 Multiplayer:\n\n[1]\n\n"
+    L"These native DLLs belong neither to Transport Fever 2 nor to this product:\n\n[1]\n\n"
     L"Mods that load their own DLLs (CommonAPI2, for example) change the game underneath the game "
-    L"script, and multiplayer does not expect that: it can fail to start, refuse commands or fall out "
-    L"of sync. Remove or disable them before playing multiplayer.\n\nInstall anyway?";
+    L"script, and this product does not expect that: it can fail to start, refuse commands or fall out "
+    L"of sync. Remove or disable them before relying on it.\n\nInstall anyway?";
 
 bool EqualsNoCase(const std::wstring& a, const wchar_t* b) { return _wcsicmp(a.c_str(), b) == 0; }
 
@@ -247,6 +271,82 @@ std::wstring SteamRoot()
     std::wstring s = v;
     for (auto& c : s) if (c == L'/') c = L'\\';
     return WithSlash(s);
+}
+
+std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+bool DirExists(const std::wstring& p)
+{
+    DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Every Steam library root: the Steam folder itself, then each folder named in
+// config\libraryfolders.vdf (2021+: a "path" per entry) or the older
+// steamapps\libraryfolders.vdf ("1" "D:\\Games"). The file is Valve's KeyValues
+// text; rather than parse the nesting, every quoted string that unescapes to an
+// existing drive-letter folder is a candidate, which covers both layouts and
+// skips the per-app sizes. `steam` carries a trailing backslash.
+std::vector<std::wstring> SteamLibraries(const std::wstring& steam)
+{
+    std::vector<std::wstring> out;
+    auto add = [&](std::wstring p) {
+        for (auto& c : p) if (c == L'/') c = L'\\';
+        p = WithSlash(p);
+        for (const auto& e : out) if (_wcsicmp(e.c_str(), p.c_str()) == 0) return;
+        if (DirExists(p)) out.push_back(p);
+    };
+    if (steam.empty()) return out;
+    add(steam);
+    const wchar_t* files[] = { L"config\\libraryfolders.vdf", L"steamapps\\libraryfolders.vdf" };
+    for (const wchar_t* rel : files) {
+        HANDLE f = CreateFileW((steam + rel).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        std::string text(1 << 20, '\0');
+        DWORD got = 0;
+        bool ok = ReadFile(f, &text[0], (DWORD)text.size(), &got, nullptr) != 0;
+        CloseHandle(f);
+        if (!ok) continue;
+        text.resize(got);
+        size_t pos = 0;
+        while (true) {
+            size_t q1 = text.find('"', pos);
+            if (q1 == std::string::npos) break;
+            size_t q2 = text.find('"', q1 + 1);
+            if (q2 == std::string::npos) break;
+            pos = q2 + 1;
+            std::string val;
+            for (size_t i = q1 + 1; i < q2; i++) {
+                if (text[i] == '\\' && i + 1 < q2) { val += text[++i]; } else val += text[i];
+            }
+            if (val.size() < 3 || val[1] != ':' || (val[2] != '\\' && val[2] != '/')) continue;
+            add(Utf8ToWide(val));
+        }
+    }
+    return out;
+}
+
+// The game folder (with a trailing backslash) in the first Steam library that
+// holds TransportFever2.exe, else empty. Every library probed is logged.
+std::wstring GameInLibraries(MSIHANDLE h, const std::wstring& steam, const wchar_t* who)
+{
+    std::vector<std::wstring> libs = SteamLibraries(steam);
+    if (libs.empty()) Log(h, std::wstring(who) + L": no Steam library found (Steam not registered?)");
+    for (const std::wstring& lib : libs) {
+        std::wstring dir = lib + L"steamapps\\common\\Transport Fever 2\\";
+        bool hit = FileExists(dir + L"TransportFever2.exe");
+        Log(h, std::wstring(who) + L": library " + lib + (hit ? L" -> holds the game" : L" -> no game there"));
+        if (hit) return dir;
+    }
+    return L"";
 }
 
 // The mod's display name from its mod.lua when that is a literal string. A
@@ -350,6 +450,14 @@ std::vector<std::wstring> ForeignDllLines(const std::wstring& dir, size_t* count
     return lines;
 }
 
+// Whether this package accepts the GOG build. Set by the Big Maps GOG package
+// (Package.wxs, GogVariant); unset everywhere else, which keeps the Steam-only
+// behaviour the multiplayer product still needs.
+bool GogAllowed(MSIHANDLE h)
+{
+    return GetProp(h, L"TPF2_ALLOW_GOG") == L"1";
+}
+
 // alut.dll: with alut_real.dll present, alut_real.dll must be the stock file
 // (alut.dll is then a proxy: ours, or a sibling product's); without it,
 // alut.dll itself must be. Anything else is another mod's replacement.
@@ -359,8 +467,10 @@ const wchar_t* AlutProblem(MSIHANDLE h, const std::wstring& dir, const wchar_t* 
     std::wstring checked = FileExists(real) ? real : live;
     if (!FileExists(checked)) return nullptr;   // PreserveStockAlut reports a missing alut.dll itself
     std::wstring hash = Sha256Hex(checked);
-    if (hash.empty() || _wcsicmp(hash.c_str(), STOCK_ALUT_SHA256) == 0) return nullptr;
-    Log(h, std::wstring(who) + L": " + checked.substr(dir.size()) + L" is not the stock alut.dll (SHA-256 " + hash + L")");
+    if (hash.empty()) return nullptr;
+    if (_wcsicmp(hash.c_str(), STOCK_ALUT_SHA256) == 0) return nullptr;
+    if (GogAllowed(h) && _wcsicmp(hash.c_str(), GOG_STOCK_ALUT_SHA256) == 0) return nullptr;
+    Log(h, std::wstring(who) + L": " + checked.substr(dir.size()) + L" is not a stock alut.dll of either build (SHA-256 " + hash + L")");
     return FOREIGN_ALUT_MSG;
 }
 
@@ -379,6 +489,13 @@ const wchar_t* GameDirProblem(MSIHANDLE h, std::wstring* dirOut, const wchar_t* 
     case ExeBuild::Match:
         Log(h, std::wstring(who) + L": " + dir + L" -> TransportFever2.exe is build 35924");
         return AlutProblem(h, dir, who);
+    case ExeBuild::MatchGog:
+        if (GogAllowed(h)) {
+            Log(h, std::wstring(who) + L": " + dir + L" -> TransportFever2.exe is the GOG build; allowed (TPF2_ALLOW_GOG)");
+            return AlutProblem(h, dir, who);
+        }
+        Log(h, std::wstring(who) + L": " + dir + L" -> TransportFever2.exe is the GOG build; refused (no TPF2_ALLOW_GOG)");
+        return GOG_MSG;
     case ExeBuild::Unreadable:
         // Not a verdict on the build: the DLLs still refuse a wrong exe at run
         // time, so an install is not blocked on a header this code could not read.
@@ -394,6 +511,27 @@ const wchar_t* GameDirProblem(MSIHANDLE h, std::wstring* dirOut, const wchar_t* 
 }
 
 } // namespace
+
+extern "C" __declspec(dllexport) UINT __stdcall FindGameDir(MSIHANDLE h)
+{
+    // Before costing, a Directory property that no search set reads as empty;
+    // one Steam's registration or a remembered install set is a real path.
+    std::wstring cur = GetProp(h, L"INSTALLFOLDER");
+    if (!cur.empty() && FileExists(WithSlash(cur) + L"TransportFever2.exe")) {
+        Log(h, L"FindGameDir: " + cur + L" holds the game; keeping it");
+        return ERROR_SUCCESS;
+    }
+    Log(h, L"FindGameDir: default folder " + (cur.empty() ? std::wstring(L"(none)") : cur) +
+           L" holds no TransportFever2.exe; looking through the Steam libraries");
+    std::wstring found = GameInLibraries(h, SteamRoot(), L"FindGameDir");
+    if (!found.empty()) {
+        MsiSetPropertyW(h, L"INSTALLFOLDER", found.c_str());
+        Log(h, L"FindGameDir: INSTALLFOLDER = " + found);
+    } else {
+        Log(h, L"FindGameDir: no library holds the game; the folder page will ask");
+    }
+    return ERROR_SUCCESS;
+}
 
 extern "C" __declspec(dllexport) UINT __stdcall CheckGameDir(MSIHANDLE h)
 {
@@ -582,3 +720,18 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
 {
     return TRUE;
 }
+
+#ifdef TPF2CA_HARNESS
+// tools\test_find_game_dir.py builds this file as a console program and hands it
+// a fake Steam folder: prints every library found and the game folder chosen.
+#include <cstdio>
+int wmain(int argc, wchar_t** argv)
+{
+    if (argc < 2) { wprintf(L"usage: harness <steam root>\n"); return 2; }
+    std::wstring steam = WithSlash(argv[1]);
+    for (const std::wstring& lib : SteamLibraries(steam)) wprintf(L"library %s\n", lib.c_str());
+    std::wstring game = GameInLibraries(0, steam, L"harness");
+    wprintf(L"game %s\n", game.empty() ? L"(none)" : game.c_str());
+    return 0;
+}
+#endif

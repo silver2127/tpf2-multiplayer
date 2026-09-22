@@ -133,12 +133,15 @@ class Connection:
     """
 
     def __init__(self, sock, targets, *, token=None, name="peer",
-                 listen=False, stop_event=None, log=None):
+                 listen=False, stop_event=None, log=None, extra=None):
         self.sock = sock
         self.family = sock.family
         # targets: list of (ip, port) we proactively HELLO at (empty in listen
-        # mode until the peer reveals itself).
+        # mode until the peer reveals itself). ``extra`` is a list another
+        # thread may append to while we dial (the master's relay port, learnt
+        # only after the direct dial has gone unanswered for a while).
         self.targets = list(targets or [])
+        self.extra = extra if extra is not None else []
         self.token = token or os.urandom(TOKEN_LEN)
         self.name = name
         self.listen = listen
@@ -157,12 +160,17 @@ class Connection:
 
     # -- internal reader / sender loop ------------------------------------- #
     def _send_to(self, ptype, payload, addr):
+        """One frame out. Punch traffic (HELLO/ACK/KEEPALIVE) swallows a
+        failure: Windows spits ICMP-port-unreachable back as an exception when
+        the peer isn't listening yet, and the punch loop keeps retrying. An
+        APPLICATION frame's failure is raised to the caller (send), which
+        logs it: a joiner's control message that never left the socket was
+        invisible until 2026-09-16."""
         try:
             self.sock.sendto(_pack(ptype, payload), addr)
         except (ConnectionResetError, OSError):
-            # Windows spits ICMP-port-unreachable back as an exception when the
-            # peer isn't listening yet. Ignore; the punch loop keeps retrying.
-            pass
+            if ptype in (TYPE_DATA, TYPE_EDATA, TYPE_ADATA):
+                raise
 
     def _hello_destinations(self):
         """Where to aim HELLOs right now."""
@@ -191,7 +199,8 @@ class Connection:
         # only ever move it to a worse path.
         if self.connected.is_set() and self.peer:
             return [self.peer]
-        return self.targets
+        late = [t for t in list(self.extra) if t not in self.targets]
+        return self.targets + late if late else self.targets
 
     def _run(self):
         self.sock.setblocking(False)
@@ -297,6 +306,9 @@ class Connection:
         return self.connected.wait(timeout)
 
     def send(self, data: bytes):
+        """Send one application datagram. Raises RuntimeError before a peer
+        is resolved and OSError when the socket refused the frame (too big
+        for the path, peer gone): a failed send is never silent."""
         if self.peer is None:
             raise RuntimeError("no peer resolved yet")
         if self.cipher is not None:

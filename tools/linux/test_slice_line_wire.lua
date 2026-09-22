@@ -48,3 +48,19 @@ for _,record in ipairs({"VNAME 12 Name", "VCOLOR 12 0.25 0.5 0.75"}) do
     assert(captured and captured.skipOrigin==1)
 end
 print("slice line wire: unchanged Windows create records and name/color origin-skip boundary passed")
+
+-- Fractional/negative/infinite native waits survive the real Lua 5.2 wire path.
+cm.stationGroupPos = function() return 1, 2 end
+cm.stationPosInGroup = function() return nil end
+cm.scheduleLocal = function(op, args) assert(op == "LCREATE"); captured = args end
+cm.readFrom = function()
+    return "ARMED 1\nLCREATEX 1 0 0 inf 1 98 100 200 3 -1.25 -inf 0 name=Waits\n", 4
+end
+captured = nil
+cm.pollInject()
+assert(captured and captured.wait == math.huge)
+assert(captured.stops:find(",100,200,3,-1.25,-inf", 1, true))
+local waits = decode(encode {op="LCREATE", at=1, origin="A", seq=4,
+    wait=captured.wait, stops=captured.stops, armed=1})
+assert(cm.waitNum(waits.wait) == math.huge and waits.stops == captured.stops)
+print("slice line wire: fractional/negative/infinite waits passed")

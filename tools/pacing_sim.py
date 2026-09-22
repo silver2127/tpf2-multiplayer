@@ -89,7 +89,7 @@ api = { cmd = { make = { setGameSpeed = function(v) return { speed = v } end },
                 sendCommand = function(c) SIM.cur.pendingLever = c.speed; SIM.cur.pendingAt = SIM.tick + 1 end } }
 
 function newInst(spec)
-  local I = { letter = spec.letter, T = spec.T0, lever = spec.lever or 4, startTick = spec.start or 1 }
+  local I = { letter = spec.letter, T = spec.T0, lever = spec.lever or 4, startTick = spec.start or 1, hwMax = spec.hw }
   local CM, K = {}, {}
   I.CM, I.K = CM, K
   K.INSTANCE = spec.letter
@@ -139,6 +139,9 @@ function newInst(spec)
   end
   SIM.cur = I
   FACTORY(CM, K, log)
+  -- the load gate is not modelled: every game starts with the history since its save in hand
+  -- (CM.lgFetch, pacing.lua; tools/late_loader_test.py drives the gate itself)
+  CM.lgFetch = "done"
   for _, nm in ipairs({ "hostUnpause", "syncBegin", "syncEnd" }) do
     if not CM[nm] then CM[nm] = function() end; SIM.stubbed = (SIM.stubbed or "") .. nm .. " " end
   end
@@ -161,7 +164,7 @@ local function advance(I, dt)
     if m < 0.25 then m = 0.25 elseif m > 2.0 then m = 2.0 end
     rate = L * m
   end
-  if rate > SIM.hwMax then rate = SIM.hwMax end
+  if rate > (I.hwMax or SIM.hwMax) then rate = I.hwMax or SIM.hwMax end   -- hw: this machine's own ceiling
   I.T = I.T + rate * dt
   return rate
 end
@@ -287,6 +290,7 @@ function SIM.run(sc)
     end
   end
   for _, l in ipairs(SIM.logs) do if l:find(" a: CATCHUP", 1, true) then M.aCatchup = M.aCatchup + 1 end end
+  M.effEnd = A.CM.effSpeed or -1
   -- each game's vote table at the end, "a:2,b:4"
   M.votes = {}
   for _, I in ipairs(insts) do
@@ -352,6 +356,14 @@ SCENARIOS = {
         insts = { {letter="a", T0=3000, lever=4, start=1, native=true}, {letter="b", T0=3000.4, lever=4, start=1},
                   {letter="c", T0=3000.6, lever=4, start=1} },
         actions = { {tick=150, who="a", kind="button", value=0}, {tick=500, who="a", kind="button", value=4} } }''',
+    # THE GOVERNOR (2026-09-16): b's machine cannot run more than 2x. The session is voted 4x; the
+    # leader must slow down to what b sustains, gradually, and b must end within reach of it
+    'slow_joiner': '''{ ticks = 2400,
+        insts = { {letter="a", T0=2000, lever=4, ceil=4, start=1}, {letter="b", T0=2000, lever=4, start=1, hw=2} } }''',
+    # ...and climb back once the slow machine is gone (b leaves at tick 1200)
+    'slow_joiner_leaves': '''{ ticks = 2400,
+        insts = { {letter="a", T0=2000, lever=4, ceil=4, start=1}, {letter="b", T0=2000, lever=4, start=1, hw=2} },
+        stalls = { {who="b", tick=1200, ticks=100000} } }''',
     # AUTOSAVE (2026-09-10 live: joiners 5-7.6 behind after "Saving...: 3.4-4 s"). Everyone saves at the
     # same game date, but not for as long: the leader 3 s, a sandboxed joiner 6.7 s, another 3.5 s. At 2x.
     'autosave_joiner_2x': '''{ ticks = 700,
@@ -562,6 +574,14 @@ def main():
             checks += [('catches up (within 1.5 by tick 600)', st['last_out'] <= 600),
                        ('no overshoot past the leader (max ahead < 1.5)', st['max_ahead'] < 1.5),
                        ('stays in step after', post is not None and post['max_behind'] < 1.5)]
+        if name == 'slow_joiner':
+            st = summarize(m, series, 1800)['b']
+            gov = [l for l in logs if ' a: GOV: ' in l]
+            checks += [('the leader slows the session (GOV lines)', len(gov) >= 3),
+                       ('the session settles near what b can run (1.6..2.4 at the end)', 1.6 <= m['effEnd'] <= 2.4),
+                       ('b stays within 4 of the leader from tick 1800', st['max_behind'] <= 4.0)]
+        elif name == 'slow_joiner_leaves':
+            checks += [('the session climbs back to the votes once b is gone', m['effEnd'] >= 3.9)]
         for label, ok in checks:
             failures += 0 if ok else 1
             print('  %s  %s' % ('OK  ' if ok else 'FAIL', label))

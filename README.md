@@ -1,10 +1,12 @@
-# TpF2 Multiplayer
+# TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Website: [silver2127.github.io/tpf2-multiplayer](https://silver2127.github.io/tpf2-multiplayer/)** ·
-[Download](https://github.com/silver2127/tpf2-multiplayer/releases/latest) ·
+[Download the installer](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) ·
 [Privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html)
+
+**Join The Discord: [https://discord.gg/7VhmtUstqQ](https://discord.gg/7VhmtUstqQ)** ·
 
 **Multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Several players build in one
 world at the same time: the roads, track, stations, depots, vehicles and lines one player makes
@@ -15,17 +17,12 @@ It is unofficial, reverse-engineered without the engine's source, and **experime
 four players have been run, on one PC and between PCs on different networks. Read
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
-This branch also contains a **native Linux build-35924 port**, based on Windows release **0.4.22**.
-Build/install instructions are in [docs/linux/INSTALL.md](docs/linux/INSTALL.md), and tested coverage
-and remaining gaps are in [docs/linux/RESUME_STATUS.md](docs/linux/RESUME_STATUS.md).
-The `.desync.5` candidate passed six complete native/Proton person-state and movement
-checkpoints through simulation time 1800, including the first town-growth and resident-birth
-event, with 21 passing SDK checks. This was a controlled test on one computer: fast-forward
-previous-frame histories still differed at two checkpoints, newborn travel was not exercised,
-and complete action/replay coverage remains unfinished. All 24 Lua files are unchanged from
-Windows 0.4.22; newer Windows 0.5.x releases are outside this baseline. Linux release tags
-identify the Windows baseline, with the uncommitted Linux implementation supplied in the
-accompanying curated source overlay.
+This branch also contains a **native Linux build-35924 port**. Its current
+integration includes Windows **release 0.6.1.18** (`a5aeda76`) and a native
+dedicated server. See [Linux installation](docs/linux/INSTALL.md),
+[current integration and test evidence](docs/re/linux/PARITY_20260921.md), and
+[dedicated server setup](tools/server/README.md). The integration record
+distinguishes VPS checks from visual and external Steam P2P checks still pending.
 The Windows MSI instructions below apply to the Windows version.
 
 ## How it works
@@ -41,19 +38,31 @@ compares them continuously. The lobby handles NAT traversal, encryption and send
 
 ## Install
 
-**Download `TpF2Multiplayer.msi` from the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases),
-close the game, and run it.** Everyone in a session needs the same version.
+**Download [`TpF2Multiplayer.msi`](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) (the [latest release](https://github.com/silver2127/tpf2-multiplayer/releases/latest); Linux and Steam Deck: `install_proton.sh` from the same page),
+close the game, and run it.** Everyone in a session needs the same version. A new version is installed the same
+way, over the old one: there is no in-game updater.
 
 The installer finds the game folder through Steam, keeps the game's `alut.dll` as `alut_real.dll` and puts
-the proxy in its place, adds the DLLs, the lobby (`netpunch\netpunch.exe`) and the **Transport Fever 2 Multiplayer** mod, and
+the proxy in its place, adds the DLLs, the lobby (the `netpunch\` folder) and the **Transport Fever 2 Multiplayer** mod, and
 switches the game to the Windows Segment Heap, which makes very large maps load far faster. Runtime files go
 to `%LOCALAPPDATA%\tpf2mp\data\`. It installs alongside
 [TpF2 Big Maps](https://github.com/silver2127/tpf2-bigmap) in either order. Details:
 [installer/README.md](installer/README.md).
 
+**Linux and Steam Deck (the Windows game under Proton):** download `install_proton.sh` from the same release and run
+`sh install_proton.sh` (no Python needed; `install_proton.py` is the Python equivalent); it installs the same files into the Proton game. Details, including the lobby
+repair Wine needs: [docs/proton/INSTALL.md](docs/proton/INSTALL.md). The native Linux game has its own
+build on the `linux-native` branch.
+
 To uninstall, use **Apps → TpF2 Multiplayer → Uninstall**, or run the MSI again and choose **Remove**; the
 game's own `alut.dll` is put back. Steam's "Verify integrity of game files" also restores it, which removes the
 Multiplayer entry until you run the MSI's **Repair**.
+
+Every release is built by GitHub Actions from the tagged source
+([`.github/workflows/build-msi.yml`](.github/workflows/build-msi.yml)); `SHA256SUMS.txt` on the release page lists the
+files it produced. The lobby is a Python program frozen with PyInstaller, and unsigned software of that kind is
+sometimes flagged by antivirus heuristics. The checksums and the build log are how to check that what you downloaded
+is what the source builds.
 
 ## Play
 
@@ -64,9 +73,20 @@ Multiplayer entry until you run the MSI's **Repair**.
    and picks **mp_shared**.
 
 The host needs UDP port 29471 reachable from the internet (the lobby tries UPnP). If that is not possible, use a
-dedicated relay from the PUBLIC GAMES list, where nobody needs an open port. New games have the multiplayer mod enabled
+the dedicated server in the PUBLIC GAMES list, where nobody needs an open port. New games have the multiplayer mod enabled
 automatically; for an existing save, enable it once in the save's Mods panel. The full guide, including the
 in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING.md).
+
+## Privacy
+
+Nothing leaves your PC except the session itself. Your player name, chat, game commands, network address and the
+host's save go to the other players in the session, directly or through the dedicated server. The project's server
+provides the public games list, which lists your game only while **PUBLIC** is ticked, and carries a joining
+player's encrypted address note to the host so the two can connect. There is no telemetry, no usage statistics and
+no automatic bug or crash reporting: the in-game updater, the session count and the desync-report upload of earlier
+versions were removed in 0.6.1.11. When something goes wrong, the logs stay in `%LOCALAPPDATA%\tpf2mp\logs` and you
+send them yourself if you report a bug. The full text is the
+[privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html).
 
 ## Documentation
 
@@ -83,6 +103,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | [docs/TESTING.md](docs/TESTING.md) | the manual test plan: what to check before pushing, and before a release |
 | [docs/re/](docs/re/README.md) | the engine reference for build 35924 that the hooks rest on |
 | [installer/README.md](installer/README.md) | the MSI: what it changes, upgrades, building it |
+| [docs/proton/INSTALL.md](docs/proton/INSTALL.md) | Linux and Steam Deck: installing into the Windows game under Proton |
 | [netpunch/README.md](netpunch/README.md) | the lobby's source |
 
 ## Repository layout
@@ -92,7 +113,7 @@ in-game window, companies and troubleshooting, is [docs/PLAYING.md](docs/PLAYING
 | `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
 | `native/linux/`, `tools/linux/` | native Linux libraries, tests, Steam Runtime builds and `.run`/tarball packaging |
 | `mod/mp_lockstep_1/` | the game-script mod |
-| `netpunch/` | the lobby, dedicated relay and master server (Python) |
+| `netpunch/` | the lobby (the dedicated server runs it too) and the master server (Python) |
 | `installer/` | the WiX package |
 | `tools/` | deploy, rig, soak-test and check scripts; `tools/ghidra/` and `tools/re/` for reverse engineering |
 | `docs/` | the documentation |

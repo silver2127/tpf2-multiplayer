@@ -37,12 +37,24 @@ While the panel is open, typing goes into its fields and the game does not see i
    shows `[locked]`.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
-4. Press **START GAME**. The most recent save in your save folder (autosaves count) is sent to
-   everyone. When the panel says the save is ready, open **LOAD GAME** and pick **mp_shared**;
-   everyone else does the same.
+4. Click **SELECT SAVE** in the lobby and choose your world. The list includes autosaves,
+   shows modification dates, and puts the newest files first. Use **NEXT** / **PREVIOUS**
+   for more saves, or **REFRESH** after saving a new world. The chosen filename stays visible
+   in the lobby. The save must have the Multiplayer mod enabled.
+5. Press **START GAME** to send the selected save to everyone. If the file was removed,
+   choose another save; the lobby never silently substitutes a different world. With automatic
+   loading disabled, open **LOAD GAME** and pick **mp_shared** when the save is ready.
+
+Hosting from an already running world continues to share a fresh snapshot of that world.
 
 Games load at different speeds; each player's game holds at the start until the host's game is
 running, so nobody plays ahead.
+
+**Changing world mid-session.** Whatever the host loads, everyone loads. If the host uses the
+game's own **LOAD GAME** (from the title screen or from the in-game menu), or starts a **NEW GAME**
+or **CONTINUE**, that world is sent to every player and their games load it where they are — no
+one has to go back to the title screen. Each player then catches up from the host as if they had
+just joined.
 
 ## Joining
 
@@ -127,24 +139,32 @@ buttons toggle three sections:
 
 ### Companies
 
-By default everyone plays one shared company (co-op). To play separate companies, give players
-different company chips in the lobby before START GAME: click your own chip to change its number
-(the host, or a relay lobby's leader, can change anyone's). Players with the same number share a company; different numbers
-are different companies with their own money, and buildings and vehicles stay owned by the company
-that built them.
+By default everyone plays one shared company (co-op). The host's **SEPARATE COMPANIES** checkbox
+(on the HOST A GAME card, and in the lobby) gives every player their own company instead: the host
+is company 1 and each joiner gets the next number, including players who join later. Turning it
+off puts everyone back on company 1. A relay lobby's leader has the same checkbox.
+
+The chips can still be set by hand before START GAME: left-click your own chip for the next
+company number, right-click for the previous (the host, or a relay lobby's leader, can change
+anyone's). Players with the same number share a company; different numbers are different
+companies with their own money, and buildings and vehicles stay owned by the company that built
+them.
 
 Roadside bus, tram and truck stops belong to the company that placed them, on every player's game,
 and that company pays for them. Another company cannot bulldoze them, or replace one by placing its
 own stop on the same side of the road; the game tells you whose stop it is. Stops placed before this
 version keep whatever owner each game gave them.
 
-In game, the **companies** section of the Multiplayer window shows your company and how many are
-in the session. Use **<** and **>** to select one, **switch to it** to play that company instead
-of yours, **new company** to start a fresh one, and the **company password** field with **set on
-mine** to lock yours (switching into a locked company needs its password).
+In game, the **companies** section of the Multiplayer window shows your company's colour and
+name. Pick a company from the dropdown and **switch to it** to play that company instead of yours,
+**new company** to start a fresh one, and use the **company password** field with **set on mine**
+to lock yours (switching into a locked company needs its password). A company is named in the
+game's own company window; until then it is named after the player who founded it: "<player>'s
+company", then "<player>'s 2nd company" and so on, whoever plays it now.
 
 ## Ports and firewalls
 
+- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code, and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in.
 - **Most hosts need no port forwarding.** When a friend joins, both lobbies punch through
   their routers to each other with the help of the master server. The lobby also tries UPnP.
 - If friends still cannot connect, forward UDP 29471 to your PC on your router, or use a
@@ -177,25 +197,7 @@ In a two-player host lobby, this pauses both games, saves and transfers the host
 reloads both players and compares the fresh worlds before resuming. An intentional
 pause is preserved. Client-only changes are discarded. See [One-click recovery](RESYNC.md)
 for progress, retry and supported-session limits. `/sync` serves joining players; it does not reload
-players already in the game. The Resync section is independent of log reporting below.
-
-The first desync in a session also opens a **Desync detected** window that asks whether to send
-that game's logs to the developers:
-
-- **Always send**: send them now, and in later sessions without asking.
-- **Only this once**: send them now and ask again in the next session.
-- **Never**: send nothing, and never show the window again on this computer.
-
-A desync keeps being detected until the players reload, so the window appears, and logs are sent,
-at most once per session: not again for the same desync, and not after reloading the shared save in
-the same lobby.
-
-The logs go to the project's server (the one behind the public games list): the game's log with the
-mod's script lines, the mod's DLL logs and files, and the game's graphics settings. Windows user and
-computer names, the Steam account number, IP addresses and lobby codes are removed first; player
-names and chat can remain. The lobby's own logs and crash dumps are not sent. A chat line from
-MULTIPLAYER says when they arrived. Type `/desynclogs always`, `/desynclogs ask` or `/desynclogs never`
-in the in-game chat to change your choice; it is kept in `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_prefs.txt`.
+players already in the game.
 
 For a bug report, send the logs of **every** player. The mod gathers them in one folder,
 `%LOCALAPPDATA%\tpf2mp\logs\`:

@@ -1,6 +1,7 @@
 // Off-game integration harness: real libstdc++ objects + guarded process reads,
 // with the slice-core registration, Add, session and inject services modelled.
 // Run: tools/linux/test_slice_commands.sh
+#include <algorithm>
 #include <cassert>
 #include <cstdarg>
 #include <cstdio>
@@ -11,9 +12,12 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include "../../native/linux/src/slice/ecs_checks_linux.h"
 #include "../../native/linux/src/slice/slice_vehicles.cpp"
 #include "../../native/linux/src/slice/slice_lines.cpp"
 #include "../../native/linux/src/slice/slice_time.cpp"
@@ -124,6 +128,59 @@ bool SliceShipAndArm(const SliceFactoryCall& c,const SliceArm& a,const SliceReco
     return false;
 }
 
+
+// A minimal ecs engine for the company-rename branch: the type-index lookup the
+// walk calls lives at its own RVA, so the image is a private reservation with
+// just that page executable. Layout as gdb found it in the running game
+// (docs/re/linux/DEV_D6DB920F.md): engine+0x80 pools, engine+0x98 records.
+static uint8_t* fakeImage;
+static uint64_t fakePlayerNode[4];
+static uintptr_t FakeTypeFind(void*, const uintptr_t* ti)
+{
+    return *ti == uintptr_t(fakeImage) + SLICE_TI_PLAYER ? uintptr_t(fakePlayerNode) : 0;
+}
+struct FakeCompanyEngine {
+    static constexpr int kPlayerType = 18;
+    uint8_t engine[0x200]{};
+    uintptr_t pools[64]{};
+    struct Record { uintptr_t begin, end, cap; } records[16]{};
+    int32_t pairs[2];
+    uintptr_t address;
+    explicit FakeCompanyEngine(int32_t company)
+    {
+        const size_t span = 0x6000000;
+        fakeImage = static_cast<uint8_t*>(mmap(nullptr, span, PROT_NONE,
+            MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0));
+        assert(fakeImage != MAP_FAILED);
+        uint8_t* at = fakeImage + (SLICE_RVA_TYPE_FIND & ~uintptr_t(0xfff));
+        assert(mprotect(at, 0x2000, PROT_READ|PROT_WRITE) == 0);
+        uint8_t code[12]={0x48,0xB8,0,0,0,0,0,0,0,0,0xFF,0xE0};   // mov rax,imm64; jmp rax
+        const uintptr_t target = uintptr_t(&FakeTypeFind);
+        std::memcpy(code+2,&target,8);
+        std::memcpy(fakeImage+SLICE_RVA_TYPE_FIND,code,sizeof(code));
+        assert(mprotect(at, 0x2000, PROT_READ|PROT_EXEC) == 0);
+        at = fakeImage + (SLICE_TI_PLAYER & ~uintptr_t(0xfff));
+        assert(mprotect(at, 0x1000, PROT_READ|PROT_WRITE) == 0);
+        fakePlayerNode[2] = kPlayerType + 1;      // node+0x10 = index + 1
+        pairs[0] = kPlayerType; pairs[1] = 0;
+        assert(company >= 0 && company < 16);
+        records[company] = {uintptr_t(pairs), uintptr_t(pairs)+sizeof(pairs), uintptr_t(pairs)+sizeof(pairs)};
+        const uintptr_t p = uintptr_t(pools), r = uintptr_t(records);
+        std::memcpy(engine+0x80,&p,8);
+        std::memcpy(engine+0x98,&r,8);
+        address = uintptr_t(engine);
+        for (const auto& check : kEcsChecks) {
+            uint8_t* page = fakeImage + (check.rva & ~uintptr_t(0xfff));
+            assert(mprotect(page, ((check.rva & 0xfff) + check.size + 0xfff) & ~size_t(0xfff),
+                            PROT_READ|PROT_WRITE) == 0);
+            std::memcpy(fakeImage + check.rva, check.bytes, check.size);
+        }
+        SliceEcsSetBase(uintptr_t(fakeImage));
+        assert(SliceEcsAnchored(uintptr_t(fakeImage)));
+    }
+    void Release() { SliceEcsSetBase(0); munmap(fakeImage, 0x6000000); fakeImage=nullptr; }
+};
+
 static SliceFactoryCall Call(uintptr_t rva, uintptr_t ret = 1)
 {
     if (armed && arm.landed) arm.landed(nullptr,SliceOutcome::Superseded,arm.ctx);
@@ -146,10 +203,10 @@ static SliceFactoryCall Call(uintptr_t rva, uintptr_t ret = 1)
 }
 static void Capture(const SliceFactoryCall& c)
 { for (const auto& h:handlers) if(h.factoryRva==c.factory->rva && h.onEntry) h.onEntry(c,nullptr); }
-static bool Add(void* done=nullptr,uintptr_t site=0)
+static bool Add(void* done=nullptr,uintptr_t site=0,void* replayCommand=command)
 {
     uintptr_t ret=1;
-    SliceAddCall add{&ret,nullptr,command,done,nullptr,0,site,0};
+    SliceAddCall add{&ret,nullptr,replayCommand,done,nullptr,0,site,0};
     overrideDone=nullptr;overrideAfter=nullptr;overrideContext=nullptr;
     for (auto f:observers) f(add,nullptr);
     if (overrideDone) {
@@ -187,17 +244,35 @@ struct Line { std::vector<Stop> stops; float wait; uint32_t padding; int info[3]
 static void TestVehicles()
 {
     Config cfg{}; cfg.parts.resize(1); auto& p=cfg.parts[0];
-    p.model=17; p.loads={3,5}; p.color[0]=.1f; p.color[1]=.2f; p.color[2]=.3f; p.automatic={true,false}; cfg.groups={0};
+    p.model=17; p.reversed=true; p.loads={3,5}; p.color[0]=.1f; p.color[1]=.2f; p.color[2]=.3f; p.automatic={true,false}; cfg.groups={0};
     auto c=Call(slice_vehicles::kBuy); c.rdx=4;c.rcx=81;c.r8=uintptr_t(&cfg);
     Capture(c); assert(armed && writes.empty());
     alignas(8) uint8_t lambda[0x58]{}; int32_t line=23; std::memcpy(lambda+0x30,&line,4);
     uintptr_t fn[4]={uintptr_t(lambda),0,SliceAddr(0x126eb30),SliceAddr(0x1272350)};
     assert(Add(fn)); assert(writes.size()==1);
-    assert(writes[0]=="ARMED 1\nVBUY 81 1 17 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\nVBUYLINE 23\n");
+    assert(writes[0]=="ARMED 1\nVBUY 81 1 17 1 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\nVBUYLINE 23\n");
+    c=Call(slice_vehicles::kReplace); c.rdx=91; c.rcx=uintptr_t(&cfg); c.r8=0;
+    Capture(c); assert(armed);
+    assert(writes[0]=="ARMED 1\nVREPL 91 1 17 1 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\n");
+    Add();
+    p.reversed=false;
+    c=Call(slice_vehicles::kReplace); c.rdx=91; c.rcx=uintptr_t(&cfg); c.r8=0;
+    Capture(c); assert(armed);
+    assert(writes[0]=="ARMED 1\nVREPL 91 1 17 0 2 3 5 0.1000 0.2000 0.3000 1 1 1 0\n");
+    Add();
     // Actual vector<bool> word boundary, signed low half, and erased tail bits.
     p.automatic.assign(65,true); p.loads.assign(65,0);
     SliceRecord rec{}; assert(slice_vehicles::AutoLoad(&rec,uintptr_t(&p.automatic)));
     assert(std::string(rec.data)==" 3 -1 -1 1"); SliceRecordFree(&rec);
+    p.automatic.assign(1025, true);
+    assert(slice_vehicles::AutoLoad(&rec, uintptr_t(&p.automatic)));
+    assert(std::string(rec.data).find(" 33 -1 -1") == 0 && std::string(rec.data).substr(rec.len-2) == " 1");
+    SliceRecordFree(&rec);
+    Config huge; huge.parts.assign(100, p); huge.groups.assign(300, 0);
+    assert(slice_vehicles::Config(&rec, uintptr_t(&huge))); SliceRecordFree(&rec);
+    std::vector<int> sale(1000, 17);
+    assert(slice_vehicles::IntVector(&rec, uintptr_t(&sale), true));
+    assert(std::string(rec.data).find(" 1000 17 17") == 0); SliceRecordFree(&rec);
     // An iterator with a nonzero start offset is normalized before serialization.
     uint64_t source[2]={0x8000000000000000ULL,1};
     uintptr_t bits[5]={uintptr_t(source),63,uintptr_t(source+1),1,uintptr_t(source+2)};
@@ -219,10 +294,10 @@ static void TestLines()
 {
     Line line{};line.wait=180.4f;
     auto c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
-    assert(armed && writes[0]=="ARMED 1\nLUPDATE 42 180 0\n");Add();
+    assert(armed && writes[0]=="ARMED 1\nLUPDATE 42 180.399994 0\n");Add();
     line.stops.reserve(2);line.stops.resize(1);auto& s=line.stops[0];s.group=98;s.station=1;s.terminal=2;s.loadMode=3;s.min=20.4f;s.max=10.7f;
     s.alternatives={{2,3},{4,5}};c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
-    assert(writes[0]=="ARMED 1\nLUPDATE 42 180 1 98 1 2 3 20 11 2 2 3 4 5\n");Add();
+    assert(writes[0]=="ARMED 1\nLUPDATE 42 180.399994 1 98 1 2 3 20.3999996 10.6999998 2 2 3 4 5\n");Add();
     // Preserve waypoint order and 1-based stop positions in both wire records.
     s.waypoints={uint64_t(123) | (uint64_t(2)<<32),uint64_t(456)};
     SliceRecord rec{};
@@ -238,15 +313,28 @@ static void TestLines()
     assert(std::string(rec.data).find(",2:123:2,2:456:0")!=std::string::npos);
     SliceRecordFree(&rec);
     line.stops.pop_back();
-    for (uint64_t invalid : {uint64_t(0),uint64_t(123)|(uint64_t(65)<<32)}) {
+    for (uint64_t invalid : {uint64_t(0),uint64_t(123)|(uint64_t(0xffffffff)<<32)}) {
         line.stops[0].waypoints={invalid};
         assert(!slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
     }
     line.stops[0].waypoints.assign(65,123);
-    assert(!slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
+    assert(slice_lines::Decode(&rec,42,uintptr_t(&line))); SliceRecordFree(&rec);
     line.stops[0].waypoints.clear();
-    s.min=-1;c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
+    s.min=NAN;c=Call(slice_lines::kUpdate);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(!armed && writes.empty());s.min=0;
+    // More than all former caps, large indices, negative/infinite/fractional waits.
+    Line large = line;
+    large.wait = INFINITY;
+    large.stops[0].min = -1.25f; large.stops[0].max = -INFINITY;
+    large.stops[0].station = 100; large.stops[0].terminal = 200;
+    large.stops[0].alternatives.assign(40, {100, 200});
+    large.stops[0].waypoints.assign(80, uint64_t(123) | (uint64_t(9999)<<32));
+    large.stops.resize(70, large.stops[0]);
+    assert(slice_lines::Decode(&rec,42,uintptr_t(&large)));
+    assert(std::string(rec.data).find("inf 70 98 100 200 3 -1.25 -inf 40") != std::string::npos);
+    assert(std::string(rec.data).find("70:123:9999") != std::string::npos);
+    SliceRecordFree(&rec);
+
     c=Call(slice_lines::kUpdate,0x132c513);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);
     assert(armed && arm.done==SliceDone::Required && writes.empty());
     int counter=1;uintptr_t lambda=uintptr_t(&counter);
@@ -258,9 +346,26 @@ static void TestLines()
     c=Call(slice_lines::kUpdate,0x132c513);c.rdx=42;c.rcx=uintptr_t(&line);Capture(c);fn[3]=0;
     assert(!Add(fn));assert(writes.empty());
     std::string name="Coal 50%=\xc3\xa9";
+    // Names/colors cancelled on Linux explicitly request origin replay.
     c=Call(slice_lines::kName);c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
+    assert(armed && Add());
+    assert(writes[0]=="ARMED 1\nVNAME 7 Coal%2050%25%3D%C3%A9 replayOrigin=1\n");
+    std::string empty;
+    c=Call(slice_lines::kName);c.rdx=7;c.rcx=uintptr_t(&empty);Capture(c);
     assert(!armed && writes.empty());
+    for(bool lineName : {false,true}) {
+        c=Call(slice_lines::kName,lineName?0x1327526:0x14287df);
+        c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
+        assert(armed && arm.done==SliceDone::Required && writes.empty());
+        uintptr_t done[4]={0,0,SliceAddr(lineName?0x1325110:0x1428480),SliceAddr(lineName?0x1327640:0x1426830)};
+        assert(Add(done) && writes.size()==1);
+        c=Call(slice_lines::kName,lineName?0x1327526:0x14287df);
+        c.rdx=7;c.rcx=uintptr_t(&name);Capture(c);
+        done[3]=0;assert(!Add(done) && writes.empty());
+    }
     c=Call(slice_lines::kColor);c.rdx=7;c.xmm[0]=_mm_setr_ps(.25f,.5f,99,99);c.xmm[1]=_mm_setr_ps(.75f,99,99,99);Capture(c);
+    assert(armed && Add());assert(writes[0]=="ARMED 1\nVCOLOR 7 0.25 0.5 0.75 replayOrigin=1\n");
+    c=Call(slice_lines::kColor);c.rdx=7;c.xmm[0]=_mm_setr_ps(NAN,.5f,0,0);Capture(c);
     assert(!armed && writes.empty());
     c=Call(slice_lines::kCreate);Capture(c);assert(!armed && writes.empty());
 }
@@ -323,11 +428,46 @@ static void TestStrictCreates()
     p.name="Identical Line";
     WriteClaim(105);create(true);command[0]=uintptr_t(&p);directUsed=false;
     slice_lines::DirectSink(nullptr,command,luaFn);assert(directUsed && !slice_lines::g_creates[1]);
+    // dev 1d0ca473: sendCommand rebuilds the maker's command. Both Add
+    // sinks must hand off once, only on the claiming thread and call site.
+    uint64_t nonce=106;
+    for (uintptr_t site : {uintptr_t(0xa2f5c2),uintptr_t(0x11225a9)}) {
+        original[2]=SliceAddr(0x10d44b0);create(false);assert(Add(original));
+        WriteClaim(nonce++);const auto maker=create(true);
+        const uint64_t heldId=slice_lines::t_carrier.id;assert(heldId);
+        CreatePayload rebuilt=p;
+        uintptr_t rebuiltCommand[7]={uintptr_t(&rebuilt)};
+        assert(uintptr_t(rebuiltCommand)!=maker.rdi && &rebuilt!=&p);
+        // An unrelated caller does not consume the reservation.
+        assert(!Add(luaFn,0x10d4c34,rebuiltCommand));assert(!overrideDone);
+        assert(slice_lines::t_carrier.id==heldId);
+        std::thread other([&] {
+            assert(!slice_lines::t_carrier.id);
+            assert(!Add(luaFn,site,rebuiltCommand));assert(!overrideDone);
+        });
+        other.join();
+        assert(slice_lines::t_carrier.id==heldId);
+        assert(!Add(luaFn,site,rebuiltCommand));assert(overrideDone);
+        assert(!slice_lines::t_carrier.id && luaFn[2]==777);
+        for (auto* h:slice_lines::g_creates) assert(!h || h->id!=heldId);
+        assert(!Add(luaFn,site,rebuiltCommand));assert(!overrideDone);
+    }
     // I/O failure restores the source function's ownership; core blocks the create.
     original[2]=SliceAddr(0x10d44b0);create(false);writeFails=true;assert(!Add(original));writeFails=false;
     assert(original[2]==SliceAddr(0x10d44b0));assert(!slice_lines::g_creates[0]);
     // A mismatched callback emits no replay or legacy read-back event.
     create(false);assert(!Add(luaFn));assert(writes.empty());
+    // A burst beyond the former eight slots retains every callback and expires safely.
+    p.name.assign(10000, 'n');
+    for (int i=0; i<20; ++i) {
+        original[2]=SliceAddr(0x10d44b0); create(false); assert(Add(original));
+        assert(writes[0].find(p.name) != std::string::npos);
+    }
+    assert(std::count_if(slice_lines::g_creates.begin(), slice_lines::g_creates.end(), [](auto* h){return h != nullptr;}) == 20);
+    // Mock managers are addresses, so clear them before the expiry destructor.
+    for (auto* h : slice_lines::g_creates) if (h) h->fn[2]=0;
+    nowMs += 60001; slice_lines::ExpireCreates();
+    for (auto* h : slice_lines::g_creates) assert(!h);
     // Actual libstdc++ function move/destruction: no clone and no double release.
     auto state=std::make_shared<int>(0);
     std::function<void(int)> fn=[state](int v){*state=v;};assert(state.use_count()==2);
@@ -394,11 +534,27 @@ static void TestTime()
     assert(writes[0]=="SPEEDBTN 3 button\n");++Count();slice_time::DoStep(clockObject,1,2);assert(Count()==0);
 }
 
+static void TestSpareGeneration() {
+    std::vector<unsigned char> registry(0xc0),slots(24*4),gens(12*4);
+    uintptr_t begin=uintptr_t(slots.data()),end=begin+slots.size(),generations=uintptr_t(gens.data());
+    memcpy(registry.data()+0x98,&begin,8);memcpy(registry.data()+0xa0,&end,8);memcpy(registry.data()+0xb0,&generations,8);
+    for(int i=0;i<12;++i)gens[24+i]=i+1;
+    slice_lines::SpareEntry entry{};
+    assert(slice_lines::SpareGeneration(uintptr_t(registry.data()),2,&entry));
+    assert(entry.id==2 && !memcmp(entry.generation,gens.data()+24,12));
+    assert(!slice_lines::SpareGeneration(uintptr_t(registry.data()),4,&entry));
+    int32_t tombstone[2]={-1,0};begin=uintptr_t(tombstone);end=begin+8;
+    memcpy(slots.data()+48,&begin,8);memcpy(slots.data()+56,&end,8);
+    assert(!slice_lines::SpareGeneration(uintptr_t(registry.data()),2,&entry));
+    tombstone[0]=10;assert(slice_lines::SpareGeneration(uintptr_t(registry.data()),2,&entry));
+}
+
 int main(int argc, char** argv)
 {
+    TestSpareGeneration();
     testDataDir=argc>2 ? argv[2] : "/tmp/";
     slice_vehicles_area_SliceRegister();slice_lines_area_SliceRegister();slice_time_area_SliceRegister();
-    assert(handlers.size()==14 && hooks.size()==2 && hooks[1].steal==14 && hooks[1].expectedLen==27);
+    assert(handlers.size()==14 && hooks.size()==3 && hooks[2].steal==14 && hooks[2].expectedLen==27);
     TestVehicles();TestLines();TestStrictCreates();TestTime();
     if (argc > 1) {
         void* foreign = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL); assert(foreign);

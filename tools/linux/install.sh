@@ -209,6 +209,15 @@ else
   mv "$NEW" "$MOD"
   rm -rf "$OLD"
 fi
+# Superseded determinism mod conflicts with the integrated multiplayer wrapper.
+LEGACY_MOD=$GAME/mods/m3_determinism_1
+if [ -e "$LEGACY_MOD" ] || [ -L "$LEGACY_MOD" ]; then
+  if [ "$TPF2MP_DRY" = 1 ]; then
+    tpf2mp_say "  would remove $(tpf2mp_tilde "$LEGACY_MOD")"
+  else
+    rm -rf -- "$LEGACY_MOD"
+  fi
+fi
 MANIFEST+=("moddir"$'\t'"$MOD")
 
 # ---- loading --------------------------------------------------------------------

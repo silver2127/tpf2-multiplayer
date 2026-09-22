@@ -22,6 +22,49 @@ bool Hover(int* x, int* y, int* w, int* h, bool* pressed) {
 }
 }
 int main() {
+    VkSemaphore wait = (VkSemaphore)11, signal = (VkSemaphore)12;
+    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    VkCommandBuffer command = (VkCommandBuffer)13;
+    VkSubmitInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    info.waitSemaphoreCount = info.signalSemaphoreCount = info.commandBufferCount = 1;
+    info.pWaitSemaphores = &wait; info.pSignalSemaphores = &signal;
+    info.pWaitDstStageMask = &stage; info.pCommandBuffers = &command;
+    g_origSubmit = [](VkQueue, uint32_t n, const VkSubmitInfo* p, VkFence fence) {
+        assert(n == 1 && p && fence == (VkFence)14);
+        assert(p->commandBufferCount == 0 && !p->pCommandBuffers);
+        assert(p->waitSemaphoreCount == 1 && p->signalSemaphoreCount == 1);
+        assert(*p->pWaitSemaphores == (VkSemaphore)11 && *p->pSignalSemaphores == (VkSemaphore)12);
+        assert(*p->pWaitDstStageMask == VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        return VK_SUCCESS;
+    };
+    assert(MySubmit(VK_NULL_HANDLE, 1, &info, (VkFence)14) == VK_SUCCESS);
+    assert(info.commandBufferCount == 1 && info.pCommandBuffers == &command);
+    g_queueCount=1;g_queues[0].q=(VkQueue)15;g_nullCount=3;g_nullNext=0;
+    g_origSubmit=[](VkQueue q,uint32_t count,const VkSubmitInfo* p,VkFence fence){
+        assert(q==(VkQueue)15 && count==1 && p->commandBufferCount==0);
+        assert(p->waitSemaphoreCount==0 && p->signalSemaphoreCount==1);
+        assert(*p->pSignalSemaphores==(VkSemaphore)12 && fence==(VkFence)14);return VK_SUCCESS;
+    };
+    for(unsigned i=0;i<7;++i){uint32_t index=99;assert(NullAcquire(signal,(VkFence)14,&index)==VK_SUCCESS && index==i%3);}
+    g_origSubmit=[](VkQueue,uint32_t,const VkSubmitInfo*,VkFence){return VK_ERROR_DEVICE_LOST;};
+    uint32_t untouched=99;assert(NullAcquire(signal,(VkFence)14,&untouched)==VK_ERROR_DEVICE_LOST && untouched==99);
+    g_origSubmit=[](VkQueue,uint32_t,const VkSubmitInfo* p,VkFence fence){
+        assert(!fence && !p->signalSemaphoreCount && p->waitSemaphoreCount==1);
+        assert(*p->pWaitSemaphores==(VkSemaphore)11 && *p->pWaitDstStageMask==VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        return VK_SUCCESS;
+    };
+    assert(NullSubmit((VkQueue)15,VK_NULL_HANDLE,VK_NULL_HANDLE,1,&wait)==VK_SUCCESS);
+    uint64_t query[] = {42, 43};
+    assert(MyQueryResults(VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 2, sizeof(query), query,
+                          sizeof(uint64_t), VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS);
+    assert(query[0] == 0 && query[1] == 0);
+    void* slots[SLOT_QUEUE_SUBMIT / sizeof(void*) + 1]{};
+    auto function = reinterpret_cast<PFN_vkVoidFunction>(&MySubmit);
+    assert(!FindDeviceSlot(slots, function));
+    slots[SLOT_QUEUE_SUBMIT / sizeof(void*)] = reinterpret_cast<void*>(function);
+    assert(FindDeviceSlot(slots, function) == &slots[SLOT_QUEUE_SUBMIT / sizeof(void*)]);
+    slots[8] = reinterpret_cast<void*>(function); assert(!FindDeviceSlot(slots, function));
     g_panelPtr = output; g_panelPitch = 12; g_imgW = g_imgH = 2;
     g_imagesBuilt = true; g_scImgCount = 1; g_scExtent = {2,2};
     g_panelImg = (VkImage)1; g_scImages[0] = (VkImage)2;
@@ -34,7 +77,7 @@ int main() {
         uint32_t, const VkImageCopy*) { assert(src == g_panelImg && dst == g_scImages[0]); ++copies; };
     pResetFences = [](VkDevice, uint32_t, const VkFence*) { return VK_SUCCESS; };
     pSubmit = [](VkQueue, uint32_t, const VkSubmitInfo*, VkFence) { ++submits; return VK_SUCCESS; };
-    pWaitFences = [](VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t) { return VK_SUCCESS; };
+    pWaitFences = [](VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t timeout) { assert(timeout==UINT64_MAX);return VK_SUCCESS; };
     pFlush = [](VkDevice, uint32_t, const VkMappedMemoryRange*) { ++flushes; return VK_SUCCESS; };
     DrawPanel(VK_NULL_HANDLE,0);
     assert(output[0]==40 && output[1]==25 && output[2]==5 && output[3]==255);
@@ -51,4 +94,11 @@ int main() {
     g_rgbaOrder=true; g_composed=false; DrawPanel(VK_NULL_HANDLE,0);
     assert(output[0]==30 && output[2]==10 && output[16]==5 && output[18]==40);
     assert(copies==7 && submits==7 && flushes==6);
+    pSubmit=[](VkQueue,uint32_t count,const VkSubmitInfo* info,VkFence){
+        assert(count==1 && info->waitSemaphoreCount==1);
+        assert(info->pWaitSemaphores[0]==(VkSemaphore)11);
+        assert(info->pWaitDstStageMask[0]==VK_PIPELINE_STAGE_TRANSFER_BIT);
+        return VK_SUCCESS;
+    };
+    assert(DrawPanel(VK_NULL_HANDLE,0,1,&wait));
 }

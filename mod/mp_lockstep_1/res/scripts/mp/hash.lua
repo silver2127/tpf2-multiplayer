@@ -111,6 +111,9 @@ local function collectEdges()
 	return out
 end
 local warnedNoEdges = false
+-- said once if this build's vehicle records carry no `carrier` field (see the
+-- train-name lane in worldHash)
+local warnedNoCarrier = false
 -- node id -> "x,y", valid for ONE hash pass only. Ids are recycled: a node that
 -- is bulldozed hands its id to whatever is built next, so a cache kept across
 -- passes reports the dead node's position for the live one -- a phantom desync
@@ -239,22 +242,53 @@ function CM.vposCompare(stamp, o)
 		log(string.format("VPOS t=%d vs %s: n=%d/%d -- nothing to pair", stamp, o, #a, #b))
 		return
 	end
+	-- Pair by the vehicle's cross-peer key when both sides carry it: THE SAME
+	-- vehicle, not whichever of theirs happens to be closest. Only a vehicle one
+	-- side has not bound yet falls back to the nearest point.
+	local byKey = {}
+	for j = 1, #b do if b[j][3] then byKey[b[j][3]] = b[j] end end
 	local sum, mx, over1, over10 = 0, 0, 0, 0
+	local worst = {}
 	for i = 1, #a do
-		local ax, ay = a[i][1], a[i][2]
-		local best = nil
-		for j = 1, #b do
-			local dx, dy = b[j][1] - ax, b[j][2] - ay
-			local d = dx * dx + dy * dy
-			if not best or d < best then best = d end
+		local ax, ay, ak = a[i][1], a[i][2], a[i][3]
+		local best, pair = nil, ak and byKey[ak] or nil
+		if pair then
+			local dx, dy = pair[1] - ax, pair[2] - ay
+			best = dx * dx + dy * dy
+		else
+			for j = 1, #b do
+				local dx, dy = b[j][1] - ax, b[j][2] - ay
+				local d = dx * dx + dy * dy
+				if not best or d < best then best = d; pair = b[j] end
+			end
 		end
 		local d = math.sqrt(best)
 		sum = sum + d
 		if d > mx then mx = d end
-		if d > 1 then over1 = over1 + 1 end
+		if d > 1 then
+			over1 = over1 + 1
+			worst[#worst + 1] = { d = d, key = ak, x = ax, y = ay, px = pair and pair[1], py = pair and pair[2], byKey = ak and byKey[ak] ~= nil }
+		end
 		if d > 10 then over10 = over10 + 1 end
 	end
 	local mean = sum / #a
+	-- the offenders, worst first: which vehicle, on which line, where each side has it
+	table.sort(worst, function(p, q) return p.d > q.d end)
+	for i = 1, math.min(3, #worst) do
+		local w = worst[i]
+		local line = "?"
+		pcall(function()
+			local vid = w.key and CM.vehIdForKey and CM.vehIdForKey(w.key)
+			local tv = vid and api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
+			if tv and tv.line and tv.line > 0 then
+				local nm = api.engine.getComponent(tv.line, api.type.ComponentType.NAME)
+				line = tostring(tv.line) .. (nm and nm.name and (" '" .. tostring(nm.name) .. "'") or "")
+			end
+		end)
+		log(string.format("VPOS t=%d vs %s: drift #%d %s (%s) line %s: mine %.1f,%.1f  %s's %s,%s  off by %.1f m",
+			stamp, o, i, tostring(w.key or "unbound"), w.byKey and "same key" or "nearest", line, w.x, w.y, o,
+			w.px and string.format("%.1f", w.px) or "?", w.py and string.format("%.1f", w.py) or "?", w.d))
+	end
 	local h = CM.vposHist[o] or {}
 	CM.vposHist[o] = h
 	h[#h + 1] = { t = stamp, mean = mean, max = mx }
@@ -310,8 +344,8 @@ function CM.vposRecv(line)
 	rec.seen[i] = true
 	rec.got = rec.got + 1
 	if d and d ~= "-" then
-		for x, y in d:gmatch("([%-%d%.]+),([%-%d%.]+)") do
-			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0 }
+		for x, y, k in d:gmatch("([%-%d%.]+),([%-%d%.]+),?([^;]*)") do
+			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0, (k ~= "" and k ~= "-") and k or nil }
 		end
 	end
 	CM.vposCompare(stamp, o)
@@ -354,6 +388,22 @@ K.HASH_DOWN_HEADROOM = 0.8       -- a shorter interval only once the cost fits i
 CM.hashCostSamples = {}          -- ms per stamp, newest last
 CM.hashCostMs = nil              -- their median
 CM.hashGrid = nil                -- { every =, prev =, from = }: from a HASHEVERY, or the save
+
+-- SOMEBODY TO COMPARE WITH (2026-09-17, user): the lobby's roster says two or
+-- more players, or a peer was heard within K.PEER_STALE_TICKS. Alone, the
+-- world hash is an O(world) hitch for nothing -- seconds of it on a big map --
+-- so checkHash takes no sample at all. The roster counts from the first ticks
+-- of a session, before the peer's first heartbeat, so a host resumes hashing
+-- while its joiner is still loading and the joiner's first stamps have a
+-- partner.
+function CM.othersPresent()
+	if (tonumber(CM.rosterPlayers) or 0) >= 2 then return true end
+	for _, pr in pairs(CM.peers or {}) do
+		if pr.at and (CM.ticks - pr.at) <= (K.PEER_STALE_TICKS or 25) then return true end
+	end
+	return false
+end
+CM.hashPeersPresent = CM.othersPresent
 
 -- The stamp for `now` on the agreed grid, and the interval it lies on.
 function CM.hashStampOf(now)
@@ -406,6 +456,58 @@ function CM.hashCostSlowest()
 	return worst, who
 end
 
+-- FORCED CADENCE (2026-09-16): tpf2mp_hash_every.txt in the data dir, holding a
+-- number of game units (a multiple of K.HASH_EVERY_MIN, 4, below the 12-unit
+-- ladder; a rung of the ladder above it), makes the leader stamp that interval
+-- to every instance regardless of cost -- for chasing a divergence to the step
+-- it starts on. An empty or missing file hands the cadence back to the cost
+-- ladder. Read by the leader only, every 15 ticks. Not on a map past
+-- Megalomaniac: see CM.mapPastMegalomaniac.
+function CM.hashEveryForced()
+	if CM.hashForcedAt and CM.ticks - CM.hashForcedAt < 15 then return CM.hashForced end
+	CM.hashForcedAt = CM.ticks
+	local v = nil
+	local f = io.open(K.BASE .. "tpf2mp_hash_every.txt", "r")
+	if f then
+		v = tonumber((f:read("*l") or ""):match("%d+"))
+		f:close()
+	end
+	local minU = K.HASH_EVERY_MIN or K.HASH_EVERY_GAMETIME
+	if v and (v < minU or v % minU ~= 0 or (v > K.HASH_EVERY_GAMETIME and v % K.HASH_EVERY_GAMETIME ~= 0)) then
+		if CM.hashForcedBad ~= v then CM.hashForcedBad = v; log(string.format("HASH CADENCE: tpf2mp_hash_every.txt says %d -- not a multiple of %d (or of %d above it), ignored", v, minU, K.HASH_EVERY_GAMETIME)) end
+		v = nil
+	end
+	if v ~= CM.hashForced then
+		log(v and string.format("HASH CADENCE: forced to every %d game units by tpf2mp_hash_every.txt", v)
+		      or "HASH CADENCE: tpf2mp_hash_every.txt gone -- back to the cost ladder")
+	end
+	CM.hashForced = v
+	return v
+end
+
+-- MAPS PAST MEGALOMANIAC keep the cost ladder even under a forced cadence
+-- (2026-09-17, user): on a tpf2_bigmap world a stamp costs seconds, so a forced
+-- 4-unit hash is a freeze every few seconds and nobody can play the game the
+-- flag was meant to debug. Vanilla's largest map, Megalomaniac, is 96 x 96 tiles
+-- (192 on an axis at 1:4); anything beyond that is read from the terrain size,
+-- which every instance loads from the same save. Decided once per world.
+K.VANILLA_MAX_TILES = 96 * 96
+K.VANILLA_MAX_TILES_AXIS = 192
+function CM.mapPastMegalomaniac()
+	if CM.mapPastMega ~= nil then return CM.mapPastMega end
+	local ok, tx, ty = pcall(function()
+		local terrain = api.engine.getComponent(api.engine.util.getWorld(), api.type.ComponentType.TERRAIN)
+		return terrain.size.x, terrain.size.y
+	end)
+	tx, ty = tonumber(tx), tonumber(ty)
+	if not ok or not tx or not ty or tx <= 0 or ty <= 0 then return false end   -- not readable yet: ask again next stamp
+	CM.mapPastMega = tx * ty > K.VANILLA_MAX_TILES or math.max(tx, ty) > K.VANILLA_MAX_TILES_AXIS
+	if CM.mapPastMega then
+		log(string.format("HASH CADENCE: map %d x %d tiles is past Megalomaniac -- the cost ladder decides the interval even while tpf2mp_hash_every.txt forces one", tx, ty))
+	end
+	return CM.mapPastMega
+end
+
 -- THE LEADER, after each of its own stamps: move every instance's interval when
 -- the slowest cost calls for it.
 function CM.hashCadenceTick(now)
@@ -413,6 +515,17 @@ function CM.hashCadenceTick(now)
 	local g = CM.hashGrid
 	if g and g.prev and now < g.from then return end   -- the last switch has not started yet
 	if CM.hashCadenceAt and CM.ticks - CM.hashCadenceAt < K.HASH_CADENCE_MIN_TICKS then return end
+	local forced = CM.hashEveryForced()
+	if forced and CM.mapPastMegalomaniac() then forced = nil end
+	if forced then
+		local _, curF = CM.hashStampOf(now)
+		if forced ~= curF then
+			CM.hashCadenceAt = CM.ticks
+			CM.scheduleLocal("HASHEVERY", { every = forced, prev = curF })
+			log(string.format("HASH CADENCE: every %d game units instead of %d (forced by tpf2mp_hash_every.txt)", forced, curF))
+		end
+		return
+	end
 	local cost, who = CM.hashCostSlowest()
 	if not cost then return end
 	local _, cur = CM.hashStampOf(now)
@@ -431,7 +544,9 @@ end
 function CM.execHashEvery(c)
 	local every, prev, at = tonumber(c.every), tonumber(c.prev), tonumber(c.at)
 	local base = K.HASH_EVERY_GAMETIME
-	local function onGrid(v) return v ~= nil and v >= base and v % base == 0 end
+	local minU = K.HASH_EVERY_MIN or base
+	-- a rung of the ladder, or a forced interval below it (a multiple of K.HASH_EVERY_MIN)
+	local function onGrid(v) return v ~= nil and v >= minU and ((v % base == 0) or (v < base and v % minU == 0)) end
 	if not (onGrid(every) and onGrid(prev) and at) then
 		log(string.format("EXEC HASHEVERY seq=%s origin=%s: bad interval every=%s prev=%s -- not applied",
 			tostring(c.seq), tostring(c.origin), tostring(c.every), tostring(c.prev)))
@@ -456,6 +571,12 @@ function CM.hashGridLoad(t)
 end
 
 local function worldHash(now)
+	-- The companies state (mode, the company entities, the saved origin map) is
+	-- applied lazily; the m/l lanes and the construction classification read it.
+	-- Apply it before sampling, so a joiner's first samples after the load gate
+	-- describe the same world as the host's (2026-09-16: two coop-mode samples
+	-- against a companies-mode host declared a false town-lane desync).
+	if CM.cmEnsure then pcall(CM.cmEnsure) end
 	-- Where the ~0.5 s per hash goes (2026-09-11): each lane is timed and the
 	-- split rides on the PERF line (CM.hashPartsMs), so the next session says
 	-- which part to make cheaper instead of guessing.
@@ -476,6 +597,25 @@ local function worldHash(now)
 	-- to read, not a verdict, until the evidence says otherwise.
 	local nv = 0
 	local vpos = {}
+	-- TRAIN NAMES (the r lane). The native reservation-order patch
+	-- (native/src/slice_hook.cpp, "TRAIN RESERVATION ORDER") ranks trains by
+	-- their NAME to decide which one reserves track first at a junction. That
+	-- makes a name a piece of simulation input, not decoration: two peers whose
+	-- trains are named differently send them through a junction in different
+	-- orders, and every geometry lane in this hash stays identical while it
+	-- happens. So the names get a lane of their own, gathered in the same pass
+	-- (and therefore at the same cadence) as the vehicle positions.
+	--
+	-- TWO hashes in one lane, because the ranking depends on two things:
+	--   by-id    the names in entity-id order -- the patch's tie-break is the id,
+	--            so this also catches ids that RANK differently between peers
+	--   sorted   the names alone, sorted, so a pure name difference is
+	--            distinguishable from an id-order one. Ids legitimately differ in
+	--            value between peers (hash-world-by-geometry-not-ids), so a lane
+	--            that could only say "something differs" would be the kind of
+	--            detector that fires constantly and proves nothing.
+	-- net.lua's compareOne tells the two apart and says which it is.
+	local tnById, tnSorted, tnCarrier = {}, {}, false
 	pcall(function()
 		-- includeData=true hands back every vehicle's record in ONE call. The
 		-- first version did a getEntity per vehicle inside its own closure --
@@ -484,8 +624,25 @@ local function worldHash(now)
 		local t = game.interface.getEntities({ radius = 999999 },
 			{ type = "VEHICLE", includeData = true }) or {}
 		local raw = (not CM.vposOff) and {} or nil
+		local rail = {}
 		for vid, e in pairs(t) do
 			nv = nv + 1
+			-- Rail only: the patch orders trains, and a bus cannot contest a
+			-- track reservation. `carrier` is read by CALLING, not by testing
+			-- for it -- and if this build never hands one back, the lane falls
+			-- back to every vehicle rather than to nothing (a lane that silently
+			-- covers no vehicles is worse than a noisy one).
+			local id = (type(e) == "table" and tonumber(e.id)) or tonumber(vid)
+			local carrier = type(e) == "table" and e.carrier or nil
+			if carrier ~= nil then tnCarrier = true end
+			if id and (carrier == nil or tostring(carrier):upper() == "RAIL") then
+				local nm = ""
+				pcall(function()
+					local nc = api.engine.getComponent(id, api.type.ComponentType.NAME)
+					if nc and nc.name then nm = tostring(nc.name) end
+				end)
+				rail[#rail + 1] = { id = id, name = nm }
+			end
 			local p = type(e) == "table" and e.position or nil
 			if p then
 				-- sorted below, so this says nothing about WHICH vehicle is
@@ -495,13 +652,24 @@ local function worldHash(now)
 				-- quantised exactly as it ships (0.1 m), so a peer's copy of an
 				-- identical world compares at 0.00 and not at the rounding floor
 				-- (measured 0.04-0.05 m before this)
-				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10 } end
+				-- with the vehicle's cross-peer key, so the drift check pairs the SAME
+				-- vehicle on both sides and can name the one that drifts (a nearest-
+				-- neighbour pairing read 10 m on the host while the joiner's copy of one
+				-- train was 1,150 m away, 2026-09-16). Silent for a vehicle not bound yet.
+				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10,
+					CM.vehKeyOf and CM.vehKeyOf[vid] or (CM.primedVeh and CM.primedVeh[vid] and ("s:" .. tostring(vid))) or nil } end
 			end
 		end
 		-- the raw positions feed the drift METRIC (CM.vposShip / CM.vposCompare):
 		-- the hash says equal-or-not, the metric says by how many metres. Never
 		-- past K.VPOS_MAX_VEHICLES, and never again once past it (CM.vposCapReached).
 		if raw and not CM.vposCapReached(nv, "in this game") then CM.lastVposRaw, CM.lastVposT = raw, now end
+		-- pairs() order is undefined and differs run to run, so BOTH orders are
+		-- imposed here and neither depends on how the engine enumerated them.
+		table.sort(rail, function(a, b) return a.id < b.id end)
+		for i = 1, #rail do tnById[i] = rail[i].name end
+		for i = 1, #rail do tnSorted[i] = rail[i].name end
+		table.sort(tnSorted)
 	end)
 	table.sort(vpos)
 	local tV = os.clock()
@@ -653,9 +821,19 @@ local function worldHash(now)
 	local function ms(a, b) return math.floor((b - a) * 1000 + 0.5) end
 	CM.hashPartsMs = string.format("vehicles %d, constructions %d, stops %d, edges %d + sort %d (%d edges), money+people %d, total %d ms",
 		ms(tH0, tV), ms(tV, tC), ms(tC, tO), ms(tO, tE1), ms(tE1, tE2), #egeo, ms(tE2, tN), ms(tH0, tN))
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,m:%s,l:%s,t:%d,n:%d",
+	-- r: the train-name lane. "|" separates the names so "ab","c" cannot hash
+	-- the same as "a","bc"; the lane letter is a single character on purpose --
+	-- net.lua matches a lane by its leading letters, and a two-letter name would
+	-- be found inside itself by the single-letter lanes it contains.
+	local rLane = string.format("r%d:%s/%s", #tnById,
+		hashStr(table.concat(tnById, "|")), hashStr(table.concat(tnSorted, "|")))
+	if not tnCarrier and #tnById > 0 and not warnedNoCarrier then
+		warnedNoCarrier = true
+		log("train-name lane: no vehicle reported a carrier -- the r lane covers EVERY vehicle, not just trains")
+	end
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,%s,m:%s,l:%s,t:%d,n:%d",
 		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
-		#vpos, now or -1, hashStr(table.concat(vpos, "|")), mBal, mLoan, nt, np)
+		#vpos, now or -1, hashStr(table.concat(vpos, "|")), rLane, mBal, mLoan, nt, np)
 	return verdict, detail
 end
 
