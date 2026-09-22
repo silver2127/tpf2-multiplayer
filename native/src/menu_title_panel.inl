@@ -1,4 +1,4 @@
-// Title-menu presentation only. Existing lobby actions and wire messages stay in
+// Shared title-menu and in-game session presentation. Existing lobby actions and wire messages stay in
 // menu_hook.cpp. Lato, spacing and colours follow the game's MenuWindow / NavList
 // styles (res/config/style_sheet/{main-menu-windows,window,default}.lua).
 // This is still the mod's renderer, not an engine-owned widget tree.
@@ -159,23 +159,51 @@ static void titleSetup(int w,int h)
     titleAction(w-pad-S(150),h-S(68),S(150),g_titleTab?L"Create game":L"Join game",g_titleTab?2:3,g_titleTab || g_joinCode[0]);
     titleStatus(w,h);
 }
+// Hosting an already loaded world has no join/save/start flow.
+static void sessionSetup(int w,int h)
+{
+    const int pad=S(25), fieldX=pad+S(270),fieldW=w-pad-fieldX;
+    titleHeading(w,L"MULTIPLAYER - HOST SESSION",4); mwClose(w,4);
+    titleText(pad,S(63),w-S(50),S(28),L"Invite players to the world you are currently playing.",14,MW_DIM);
+    titleText(pad,S(117),S(255),S(28),L"Player name");
+    mwField(fieldX,S(117),fieldW,S(28),g_username,g_joinFocus==3,L"Your Steam name",13);
+    titleText(pad,S(159),S(255),S(28),L"Game name");
+    mwField(fieldX,S(159),fieldW,S(28),g_lobbyName,g_joinFocus==4,L"Your multiplayer game",14);
+    titleText(pad,S(201),S(255),S(28),L"Password (optional)");
+    char masked[40]="";for(int i=0;i<g_passLen && i<39;++i) masked[i]='*';
+    mwField(fieldX,S(201),fieldW,S(28),masked,g_joinFocus==2,L"",10);
+    titleText(pad,S(262),w-S(50),S(26),L"Session settings",18);
+    mwCheck(pad,S(303),L"Separate companies",g_sepCompanies!=0,50);
+    mwCheck(pad+S(300),S(303),L"Cross-play",g_crossplay!=0,51);
+    if(g_flagMaster[0]) mwCheck(pad,S(345),L"Show in the public game browser",g_public!=0,11);
+    titleText(pad,S(391),w-S(50),S(28),L"New players receive a snapshot of the current world.",14,MW_DIM);
+    titleAction(pad,h-S(68),S(90),L"Close",4);
+    titleAction(pad+S(120),h-S(68),S(120),L"Open logs",15);
+    titleAction(w-pad-S(170),h-S(68),S(170),L"Host session",2);
+    titleStatus(w,h);
+    titleModPrompt(w,h);
+}
 static void titleLobby(int w,int h)
 {
-    if(g_savePicker && g_isHost && !g_sessionStarted) { titleSavePicker(w,h); titleModPrompt(w,h); return; }
+    const bool world=WorldLoaded();
+    if(!world && g_savePicker && g_isHost && !g_sessionStarted) { titleSavePicker(w,h); titleModPrompt(w,h); return; }
     const int pad=S(25), width=w-2*pad, rosterW=S(360), chatX=pad+rosterW+S(25), chatW=w-pad-chatX;
     std::wstring title=L"Multiplayer lobby";
     if(g_modelCsInit) { EnterCriticalSection(&g_modelCs); if(!g_lobbyTitle.empty()) title=wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
-    titleHeading(w,L"MULTIPLAYER - LOBBY",4);
+    titleHeading(w,world?L"MULTIPLAYER - SESSION":L"MULTIPLAYER - LOBBY",4);
+    if(world) mwClose(w,4);
     titleText(pad,S(58),width-S(180),S(28),title.c_str(),14,MW_DIM);
     if(g_haveCode) titleAction(w-pad-S(170),S(57),S(170),L"Copy invitation code",7);
-    const wchar_t* save=g_selectedSave.empty()?L"No savegame selected":wcsrchr(g_selectedSave.c_str(),L'\\');
-    if(!g_selectedSave.empty()) save=save?save+1:g_selectedSave.c_str();
-    titleText(chatX,S(100),chatW,S(24),L"Savegame",18);
-    layerRect(chatX,S(133),chatW,S(30),RGB(0,0,0),50);
-    titleText(chatX+S(10),S(133),chatW-S(20),S(30),g_isHost?save:L"Supplied by the host",14);
-    if(g_isHost && !g_sessionStarted) titleAction(chatX,S(170),chatW,L"Choose savegame",90,!g_saveStartPending);
+    if(!world) {
+        const wchar_t* save=g_selectedSave.empty()?L"No savegame selected":wcsrchr(g_selectedSave.c_str(),L'\\');
+        if(!g_selectedSave.empty()) save=save?save+1:g_selectedSave.c_str();
+        titleText(chatX,S(100),chatW,S(24),L"Savegame",18);
+        layerRect(chatX,S(133),chatW,S(30),RGB(0,0,0),50);
+        titleText(chatX+S(10),S(133),chatW-S(20),S(30),g_isHost?save:L"Supplied by the host",14);
+        if(g_isHost && !g_sessionStarted) titleAction(chatX,S(170),chatW,L"Choose savegame",90,!g_saveStartPending);
+    }
     titleText(pad,S(100),rosterW,S(24),L"Players",18);
-    titleText(chatX,S(211),chatW,S(24),L"Chat",18);
+    titleText(chatX,world?S(100):S(211),chatW,S(24),L"Chat",18);
     const int footer=h-S(113), rowH=S(26), top=S(170);
     layerRect(pad,S(133),rosterW,footer-S(139),RGB(0,0,0),50);
     titleText(pad+S(10),S(136),S(178),S(24),L"Name",13,MW_DIM);
@@ -204,7 +232,7 @@ static void titleLobby(int w,int h)
             titleAction(pad+rosterW-S(110),footer-S(35),S(50),L"<",114,g_titlePlayerPage>0);
             titleAction(pad+rosterW-S(55),footer-S(35),S(50),L">",115,(g_titlePlayerPage+1)*capacity<(std::min)(n,ROSTER_ROWS));
         }
-        const int chatTop=S(245), logH=footer-chatTop-S(45), lh=S(22), maxLines=(std::max)(0,(logH-S(16))/lh);
+        const int chatTop=world?S(133):S(245), logH=footer-chatTop-S(45), lh=S(22), maxLines=(std::max)(0,(logH-S(16))/lh);
         layerRect(chatX,chatTop,chatW,logH,RGB(0,0,0),50);
         for(int i=(std::max)(0,g_chatCount-maxLines),y=chatTop+S(8);i<g_chatCount;++i,y+=lh)
             titleText(chatX+S(10),y,chatW-S(20),lh,wideOf(g_chatLog[(g_chatHead+i)%14]).c_str(),13);
@@ -215,16 +243,20 @@ static void titleLobby(int w,int h)
     if(g_isHost) {
         mwCheck(pad,footer+S(6),L"Separate companies",g_sepCompanies!=0,50);
         if(g_flagMaster[0]) mwCheck(pad+S(230),footer+S(6),L"Public game",g_public!=0,11);
-        mwCheck(pad+S(410),footer+S(6),L"Cross-play",g_crossplay!=0,51);
-    } else titleText(pad,footer+S(6),width,S(28),L"Waiting for the host to start.",14,MW_DIM);
-    titleAction(pad,h-S(68),S(110),L"Leave lobby",5);
-    if(g_isHost) titleAction(w-pad-S(155),h-S(68),S(155),g_saveStartPending?L"Sharing savegame...":L"Start game",6,g_lobbyReady && !g_saveStartPending,true);
+        if(g_hostSteam) mwCheck(pad+S(430),footer+S(6),L"Cross-play",g_crossplay!=0,51);
+    } else titleText(pad,footer+S(6),width,S(28),world?L"Session running. The host manages session settings.":L"Waiting for the host to start.",14,MW_DIM);
+    if(world) {
+        if(g_isHost) titleAction(pad,h-S(68),S(110),L"Resync...",87);
+        titleAction(w-pad-S(110),h-S(68),S(110),L"Close",4);
+    } else titleAction(pad,h-S(68),S(110),L"Leave lobby",5);
+    if(!world && g_isHost) titleAction(w-pad-S(155),h-S(68),S(155),g_saveStartPending?L"Sharing savegame...":L"Start game",6,g_lobbyReady && !g_saveStartPending,true);
     titleStatus(w,h);
     titleModPrompt(w,h);
 }
 static bool RenderTitlePanel(int w,int h,LONG page)
 {
-    if(WorldLoaded() || (page!=1 && page!=2)) return false;
-    if(page==1) titleSetup(w,h); else titleLobby(w,h);
+    if(page!=1 && page!=2) return false;
+    if(page==1) { if(WorldLoaded()) sessionSetup(w,h); else titleSetup(w,h); }
+    else titleLobby(w,h);
     return true;
 }

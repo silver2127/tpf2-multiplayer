@@ -794,8 +794,8 @@ static void LoadLato()
 }
 static float UiScale() {
     float scale = g_flagScale > 0.f ? g_flagScale : (g_scExtent.height ? g_scExtent.height / 1080.f : 1.f);
-    // Keep the title dialog inside the viewport even with a large manual scale.
-    if (!WorldLoaded() && g_scExtent.width && g_scExtent.height) {
+    // Keep the menu dialog inside the viewport even with a large manual scale.
+    if ((g_uiState==1 || g_uiState==2) && g_scExtent.width && g_scExtent.height) {
         scale = (std::min)(scale, g_scExtent.width / 800.f);
         scale = (std::min)(scale, g_scExtent.height / 560.f);
     }
@@ -1728,8 +1728,7 @@ static void PanelLayout()
 {
     g_s = UiScale();
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 3) { g_copyW = S(520); g_copyH = S(300); }
-    else if (!WorldLoaded() || InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
-    else                                                     { g_copyW = S(780); g_copyH = g_flagMaster[0] ? S(540) : S(300); }
+    else { g_copyW = S(780); g_copyH = S(540); }
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
@@ -1916,7 +1915,7 @@ static void OnHit(int id, int button)
         return;
     }
     if(id>=110 && id<=115) {
-        if(WorldLoaded()) return;
+        if(WorldLoaded() && id<114) return;
         if(g_uiState==1 && id<=113) {
             if(id<=111) { g_titleTab=id-110; InterlockedExchange(&g_joinFocus,0); }
             else g_titleServerPage=(std::max)(0,g_titleServerPage+(id==112?-1:1));
