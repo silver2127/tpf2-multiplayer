@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  TpF2 Big Maps - per-machine x64 MSI.
+
+  Build: installer\build_msi.ps1, or from this directory
+    wix build -arch x64 -ext WixToolset.UI.wixext -d ProxyDll=vendor\alut.dll
+        -d HostDll=vendor\tpf2_pluginhost.dll -d CaDll=vendor\tpf2ca.dll
+        -o out\TpF2BigMaps.msi Package.wxs PluginHost.wxs
+
+  What goes where (INSTALLFOLDER = the Transport Fever 2 game folder):
+    alut.dll, tpf2_pluginhost.dll        SHARED with TpF2 Multiplayer - PluginHost.wxs
+    plugins\tpf2_bigmap.dll              the plugin
+    plugins\tpf2_bigmap.cfg              its settings (replaced with this release's tuned config)
+    res\config\base_mod.lua              NOT installed: the plugin patches it at game start
+                                         for the New Game density levels, and a full
+                                         uninstall puts the stock file back
+
+  COEXISTENCE WITH TpF2 MULTIPLAYER
+  Both packages need the alut.dll proxy and the plugin host, and both put
+  them in the same folder. PluginHost.wxs declares them under FIXED component
+  GUIDs that are identical in both packages, so Windows Installer treats them
+  as one shared component: install either first, install the other over it,
+  uninstall either - the files stay until the last product is gone, and only
+  then is the game's own alut.dll put back. The custom actions in that file
+  are refcount-aware for the same reason. PluginHost.wxs is duplicated
+  byte-for-byte in both repositories; installer\vendor\VENDORED.md records
+  which tpf2-multiplayer commit the shared binaries came from.
+
+  INSTALLFOLDER defaults to the Transport Fever 2 folder Steam registered
+  (Steam App 1066780 / InstallLocation), then to the folder remembered by a
+  previous install, then to the stock Steam library path. The folder must hold
+  TransportFever2.exe: the folder dialog refuses to continue without it and a
+  silent install fails at RequireGameDir with the same message.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <!-- Source overrides: pass -d Name=value to wix. ProxyDll / HostDll / CaDll
+       are REQUIRED by PluginHost.wxs and have no defaults on purpose - the
+       fragment is shared with another repository whose layout differs. -->
+  <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
+  <?ifndef BigmapDll ?><?define BigmapDll = "..\out\tpf2_bigmap.dll" ?><?endif?>
+  <?ifndef BigmapCfg ?><?define BigmapCfg = "..\cfg\tpf2_bigmap.cfg" ?><?endif?>
+
+  <Package Name="TpF2 Big Maps"
+           Manufacturer="silver2127"
+           Version="$(ProductVersion)"
+           UpgradeCode="C11917C5-F0E7-4C55-BC89-789B33A0B731"
+           Language="1033"
+           Codepage="1252"
+           Scope="perMachine"
+           InstallerVersion="500"
+           Compressed="yes">
+
+    <SummaryInformation Description="TpF2 Big Maps $(ProductVersion)" Manufacturer="silver2127" />
+
+    <!-- AllowSameVersionUpgrades: a rebuilt 0.1.0 replaces an installed 0.1.0
+         instead of landing beside it (the ProductCode is regenerated per build). -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Repair stays available on purpose: Steam's "verify integrity" puts the
+         stock alut.dll back over the proxy, and a Repair reinstalls it. -->
+    <Property Id="ARPCOMMENTS" Value="Maps larger than the New Game menu offers, for Transport Fever 2. Coexists with TpF2 Multiplayer; the game's own alut.dll is restored when the last of the two is uninstalled." />
+
+    <!-- Public properties that may arrive on the msiexec command line; Secure
+         lets them cross into the elevated half of a UAC-prompted install. -->
+    <Property Id="TPF2_SKIP_GAMEDIR_CHECK" Secure="yes" />
+
+    <!-- Default install folder. AppSearch rows for one property run in
+         Signature order, last hit wins, hence the 1/2 prefixes: a folder
+         remembered from an earlier install beats Steam's registration. -->
+    <Property Id="INSTALLFOLDER" Secure="yes">
+      <RegistrySearch Id="Search1SteamAppInstallLocation"
+                      Root="HKLM"
+                      Key="SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1066780"
+                      Name="InstallLocation"
+                      Type="directory"
+                      Bitness="always64" />
+      <RegistrySearch Id="Search2RememberedInstallFolder"
+                      Root="HKLM"
+                      Key="SOFTWARE\silver2127\TpF2 Big Maps"
+                      Name="InstallFolder"
+                      Type="directory"
+                      Bitness="always64" />
+    </Property>
+
+    <!-- Stock Steam library layout as the last resort (32-bit Program Files:
+         Steam itself is a 32-bit application). -->
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Name="Steam">
+        <Directory Name="steamapps">
+          <Directory Name="common">
+            <Directory Id="INSTALLFOLDER" Name="Transport Fever 2">
+              <Directory Id="PluginsFolder" Name="plugins" />
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="TpF2 Big Maps" Level="1" AllowAbsent="no">
+      <!-- Proxy, plugin host, alut custom actions, Segment Heap switch:
+           PluginHost.wxs, shared with TpF2 Multiplayer. The Segment Heap
+           switch is what makes a big map load in a minute instead of a
+           quarter of an hour (tpf2-multiplayer/installer/README.md,
+           "Segment Heap"); it is machine-wide for TransportFever2.exe and
+           removed when the last of the two products is uninstalled. -->
+      <ComponentGroupRef Id="PluginHostShared" />
+      <ComponentGroupRef Id="BigmapFiles" />
+    </Feature>
+
+    <!-- Custom actions and their sequencing: PluginHost.wxs, plus the one below. -->
+
+    <!-- The plugin patches res\config\base_mod.lua at game start to add the New
+         Game density levels. That file is not installed, so nothing else would
+         put the stock text back once the plugin is gone. On a full uninstall (not an upgrade: the new plugin
+         re-patches on its next start) the plugin's own restore runs first,
+         through 64-bit rundll32, while its DLL is still on disk. Return="ignore":
+         a stock or missing file must never block an uninstall. -->
+    <CustomAction Id="RestoreStockBaseMod"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]rundll32.exe&quot; &quot;[PluginsFolder]tpf2_bigmap.dll&quot;,BigmapRestoreStockBaseMod"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RestoreStockBaseMod" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+
+    <!-- ===== UI ===== -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <UIRef Id="WixUI_InstallDir_Tpf2" />
+  </Package>
+
+  <!-- ===== files ===== -->
+  <Fragment>
+    <ComponentGroup Id="BigmapFiles" Directory="PluginsFolder">
+      <Component Id="BigmapDll">
+        <File Id="tpf2_bigmap.dll" Name="tpf2_bigmap.dll" Source="$(BigmapDll)" KeyPath="yes" />
+      </Component>
+      <!-- Treat the shipped config as versioned so modified/unversioned copies
+           are replaced on install, upgrade and repair. -->
+      <Component Id="BigmapCfg">
+        <File Id="tpf2_bigmap.cfg" Name="tpf2_bigmap.cfg" Source="$(BigmapCfg)" DefaultVersion="$(ProductVersion)" KeyPath="yes" />
+      </Component>
+      <Component Id="RememberInstallFolder" Guid="5E747B2F-6385-4BC6-8FF1-F6312E24407E" Directory="INSTALLFOLDER">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Big Maps" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\silver2127\TpF2 Big Maps" Name="Version" Type="string" Value="$(ProductVersion)" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- ===== WixUI_InstallDir with a game-folder check =====
+       A copy of the extension's WixUI_InstallDir (v7 layout) whose folder
+       dialog runs CheckGameDir between CheckTargetPath and SetTargetPath and
+       only moves on when TPF2_GAMEDIR_OK is not "0". The stock set cannot be
+       extended in place: its Next-button events carry no condition, so a
+       DoAction added beside them could never stop the wizard. Identical to
+       the TpF2 Multiplayer copy. -->
+  <Fragment>
+    <UI Id="WixUI_InstallDir_Tpf2">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+      <Property Id="ARPNOMODIFY" Value="1" />
+
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="LicenseAgreementDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="LicenseAgreementDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" />
+      <Publish Dialog="LicenseAgreementDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Condition="LicenseAccepted = &quot;1&quot;" />
+
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="DoAction" Value="CheckGameDir" Order="2" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+
+      <?ifndef Wix5BrowseDialog ?>
+      <Publish Dialog="BrowseDlg" Control="OK" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+      <?endif?>
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="1" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+
+    <UIRef Id="WixUI_Common" />
+  </Fragment>
+</Wix>

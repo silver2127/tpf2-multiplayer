@@ -1,0 +1,128 @@
+# Builds TpF2BigMaps.msi the way a release does: installer\build_msi.ps1
+# (build.bat -> out\tpf2_bigmap.dll, the vendored shared binaries, wix build,
+# then an administrative-install validation). A push to main, a v* tag or a manual run
+# gets the MSI and its checksum as an artifact; a v* tag also gets a draft GitHub
+# release with them attached. Nothing builds on dev or pull requests.
+#
+# build.bat finds the runner's Visual Studio through vswhere, so no Build Tools
+# path is assumed. WiX v7 is installed as a .NET global tool; passing
+# -AcceptWixEula means the repository owner accepts the WiX Open Source
+# Maintenance Fee terms (https://wixtoolset.org/osmf/) for CI builds.
+#
+# The runner has no tpf2-multiplayer checkout beside this one, so the script's
+# own PluginHost.wxs drift check would be skipped; the "Shared fragment" step
+# fetches the multiplayer copy at the release recorded in vendor\VENDORED.md
+# and compares it instead (line endings aside, like the script does).
+name: Build MSI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    # docs and every Markdown file, release notes included, change no byte of the
+    # package. A release commit always touches installer/VERSION, so a tag is
+    # never filtered out by this.
+    paths-ignore: ['docs/**', '**/*.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # release upload on tags; read-only is enough for everything else
+
+concurrency:
+  group: msi-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ONE BUILD PER RELEASE. A release is a tag on a commit that main is then
+  # fast-forwarded to; both pushes would build the same bytes. The tag goes up
+  # first (tools/ci_run.py, the release recipe), so a main push finds its tag's
+  # run here and steps aside. A main push nobody tagged still builds.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.dup.outputs.skip }}
+    steps:
+      - id: dup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          skip=false
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            tag=$(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${{ github.sha }}&per_page=30" \
+              --jq '[.workflow_runs[] | select(.event == "push" and (.head_branch | startswith("v")) and (.id != ${{ github.run_id }}))] | .[0].head_branch // empty')
+            if [ -n "$tag" ]; then skip=true; echo "commit ${{ github.sha }} is release $tag: its tag run builds it"; fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+
+  msi:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content installer\VERSION -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "installer\VERSION is not a three-part version: '$v'" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          $ref = "${{ github.ref }}"
+          if ($ref -like 'refs/tags/v*' -and $ref -ne "refs/tags/v$v") {
+            throw "tag $ref does not match installer\VERSION ($v): bump VERSION before tagging"
+          }
+          "installer\VERSION = $v"
+
+      - name: Shared fragment matches the vendored multiplayer release
+        shell: pwsh
+        run: |
+          $rel = (Select-String -Path installer\vendor\VENDORED.md -Pattern '^source release:\s*(v\S+)').Matches[0].Groups[1].Value
+          if (-not $rel) { throw "installer\vendor\VENDORED.md names no source release" }
+          $url = "https://raw.githubusercontent.com/silver2127/tpf2-multiplayer/$rel/installer/PluginHost.wxs"
+          "comparing installer\PluginHost.wxs with $url"
+          $theirs = (Invoke-WebRequest -Uri $url -UseBasicParsing).Content -replace "`r`n", "`n"
+          $ours = [IO.File]::ReadAllText("installer\PluginHost.wxs") -replace "`r`n", "`n"
+          if ($ours -cne $theirs) { throw "installer\PluginHost.wxs differs from the tpf2-multiplayer copy at $rel -- the two packages must share it" }
+          "PluginHost.wxs matches tpf2-multiplayer $rel"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: WiX Toolset v7
+        run: |
+          dotnet tool install --global wix
+          wix --version
+
+      - name: Build the MSI
+        run: powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate
+
+      - name: Checksums
+        shell: pwsh
+        working-directory: installer/out
+        run: |
+          $msi = "TpF2BigMaps-${{ steps.version.outputs.version }}.msi"
+          Get-FileHash $msi -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content SHA256SUMS.txt -Encoding ascii
+          Get-Content SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TpF2BigMaps-${{ github.sha }}
+          path: |
+            installer/out/TpF2BigMaps-${{ steps.version.outputs.version }}.msi
+            installer/out/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            installer/out/TpF2BigMaps-${{ steps.version.outputs.version }}.msi
+            installer/out/SHA256SUMS.txt
+          draft: true
+          generate_release_notes: true
