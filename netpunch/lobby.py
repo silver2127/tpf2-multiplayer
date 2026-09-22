@@ -259,7 +259,7 @@ def _steam_big_chunks():
     return os.path.exists(os.path.join(modshare.data_dir(), "tpf2mp_steam_big_chunks.txt"))
 
 
-STEAM_BIG_CHUNKS = None    # None: ask _steam_big_chunks() per transfer; True/False: forced (tests)
+STEAM_BIG_CHUNKS = True    # 0.6.1.25 experimental: exercise bounded reliable transfers without a local flag
 CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
                             # one chunk size serves everyone, and 32 KB datagrams on the open
                             # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
@@ -3060,7 +3060,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.6.1.24"
+LOBBY_VERSION = "0.6.1.25"
 
 
 def version_rejection(remote):

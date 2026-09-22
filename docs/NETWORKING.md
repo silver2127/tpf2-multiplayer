@@ -458,9 +458,9 @@ holes are repaired together. Repeated stalls back off to eight seconds. A stall
 without evidence of later delivery also reduces the window. Local UDP loss and
 refused Steam sends remain recoverable; the existing no-progress timeout remains.
 
-This does not enable the large-chunk experiment by default. The host's existing
-`tpf2mp_steam_big_chunks.txt` / `TPF2MP_STEAM_BIG_CHUNKS=1` switch still controls it.
-The default small-chunk fallback and the direct TCP path are unchanged.
+The 0.6.1.25 experimental release enables the large-chunk path for Steam-only
+transfers so it can be tested without a local flag file. Mixed Steam/CROSS-PLAY
+transfers keep MTU-safe chunks. A reachable direct TCP stream remains preferred.
 
 During large-chunk transfers, `[xfer]` lines in the lobby log report acknowledged
 bytes, unique received bytes, application throughput, in-flight bytes, recovery
