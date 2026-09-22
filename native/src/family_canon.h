@@ -57,7 +57,57 @@ static int FamilyCanonList(uint8_t* nl, size_t stride, FamilyCanonScratch& s, si
     }
     if (i == n) return FC_SORTED;
 
-    // the index must describe exactly these nodes before anything moves
+    // Only the tail can change. [0, lo) is ascending (i is the first break;
+    // node i-1 may be the displaced one, so it joins the region). The region
+    // [lo, n) is put in order: the few nodes that break it are pulled out,
+    // sorted and merged back (a region mostly out of order is sorted whole).
+    const size_t lo = i - 1;
+    const size_t rn = n - lo;
+    s.pairs.resize(rn);
+    for (size_t j = 0; j < rn; j++) s.pairs[j] = FcPair(*(int32_t*)(b + (lo + j) * stride), lo + j);
+    s.kept.clear();
+    s.extracted.clear();
+    for (size_t j = 0; j < rn; j++) {
+        const uint64_t p = s.pairs[j];
+        const bool aboveKept = s.kept.empty() || FcKeyBits(p) > FcKeyBits(s.kept.back());
+        const bool belowNext = j + 1 == rn || FcKeyBits(p) < FcKeyBits(s.pairs[j + 1]);
+        if (aboveKept && belowNext) s.kept.push_back(p);
+        else s.extracted.push_back(p);
+    }
+    const std::vector<uint64_t>* region;
+    if (s.extracted.size() * 4 > rn) {
+        std::sort(s.pairs.begin(), s.pairs.end());
+        region = &s.pairs;
+    } else {
+        std::sort(s.extracted.begin(), s.extracted.end());
+        s.merged.resize(rn);
+        std::merge(s.kept.begin(), s.kept.end(), s.extracted.begin(), s.extracted.end(), s.merged.begin());
+        region = &s.merged;
+    }
+    // prefix nodes below the region's smallest key stay where they are;
+    // the rest of the prefix merges with the region
+    const uint32_t minKey = FcKeyBits((*region)[0]);
+    size_t start = 0, hi = lo;
+    while (start < hi) {
+        const size_t mid = (start + hi) / 2;
+        if (FcKeyBits(FcPair(*(int32_t*)(b + mid * stride), 0)) < minKey) start = mid + 1; else hi = mid;
+    }
+    const size_t tn = n - start;
+    s.nodes.resize(tn * 8);   // (reused as the merged tail order, 8 bytes per entry)
+    uint64_t* order = (uint64_t*)s.nodes.data();
+    {
+        size_t a = start, r = 0, o = 0;
+        while (a < lo || r < rn) {
+            const uint64_t pa = a < lo ? FcPair(*(int32_t*)(b + a * stride), a) : ~(uint64_t)0;
+            const uint64_t pr = r < rn ? (*region)[r] : ~(uint64_t)0;
+            if (pa < pr) { order[o++] = pa; a++; } else { order[o++] = pr; r++; }
+        }
+    }
+    for (size_t j = 1; j < tn; j++)
+        if (FcKeyBits(order[j]) == FcKeyBits(order[j - 1])) { *why = "duplicate entity"; return FC_REFUSED; }
+
+    // the index must describe these nodes before anything moves: every slot
+    // counted, every slot that points into the tail checked against its node
     int8_t* ctrl = *(int8_t**)(nl + 0x20);
     int32_t* slots = *(int32_t**)(nl + 0x28);
     const size_t size = *(size_t*)(nl + 0x30);
@@ -70,54 +120,32 @@ static int FamilyCanonList(uint8_t* nl, size_t stride, FamilyCanonScratch& s, si
     size_t full = 0;
     for (size_t j = 0; j < cap; j++) {
         if (ctrl[j] < 0) continue;
-        const int32_t key = slots[2 * j];
-        const int32_t pos = slots[2 * j + 1];
-        if (pos < 0 || (size_t)pos >= n || *(int32_t*)(b + (size_t)pos * stride) != key) { *why = "index entry"; return FC_REFUSED; }
         full++;
+        const int32_t pos = slots[2 * j + 1];
+        if (pos < 0 || (size_t)pos >= n) { *why = "index entry"; return FC_REFUSED; }
+        if ((size_t)pos >= start && *(int32_t*)(b + (size_t)pos * stride) != slots[2 * j]) { *why = "index entry"; return FC_REFUSED; }
     }
     if (full != n) { *why = "index count"; return FC_REFUSED; }
 
-    // (key, old position) pairs; pull out the few that break the order, sort
-    // those, merge them back. A list that is mostly out of order is sorted whole.
-    s.pairs.resize(n);
-    for (size_t j = 0; j < n; j++) s.pairs[j] = FcPair(*(int32_t*)(b + j * stride), j);
-    s.kept.clear();
-    s.extracted.clear();
-    for (size_t j = 0; j < n; j++) {
-        const uint64_t p = s.pairs[j];
-        const bool aboveKept = s.kept.empty() || FcKeyBits(p) > FcKeyBits(s.kept.back());
-        const bool belowNext = j + 1 == n || FcKeyBits(p) < FcKeyBits(s.pairs[j + 1]);
-        if (aboveKept && belowNext) s.kept.push_back(p);
-        else s.extracted.push_back(p);
-    }
-    const std::vector<uint64_t>* order;
-    if (s.extracted.size() * 4 > n) {
-        std::sort(s.pairs.begin(), s.pairs.end());
-        order = &s.pairs;
-    } else {
-        std::sort(s.extracted.begin(), s.extracted.end());
-        s.merged.resize(n);
-        std::merge(s.kept.begin(), s.kept.end(), s.extracted.begin(), s.extracted.end(), s.merged.begin());
-        order = &s.merged;
-    }
-    for (size_t j = 1; j < n; j++)
-        if (FcKeyBits((*order)[j]) == FcKeyBits((*order)[j - 1])) { *why = "duplicate entity"; return FC_REFUSED; }
-
-    // write back: nodes in the new order, then every full slot's position
-    s.perm.resize(n);
-    s.nodes.resize(n * stride);
-    memcpy(s.nodes.data(), b, n * stride);
+    // write back the tail: nodes in the new order, then the slots pointing into it
+    s.perm.resize(tn);
+    s.merged.resize(tn * ((stride + 7) / 8));   // the old tail nodes (the region is consumed: order holds it)
+    uint8_t* old = (uint8_t*)s.merged.data();
+    memcpy(old, b + start * stride, tn * stride);
     size_t m = 0;
-    for (size_t j = 0; j < n; j++) {
-        const uint32_t old = (uint32_t)(*order)[j];
-        s.perm[old] = (uint32_t)j;
-        if (old != j) {
-            memcpy(b + j * stride, s.nodes.data() + (size_t)old * stride, stride);
+    for (size_t j = 0; j < tn; j++) {
+        const size_t from = (size_t)(uint32_t)order[j] - start;
+        s.perm[from] = (uint32_t)(start + j);
+        if (from != j) {
+            memcpy(b + (start + j) * stride, old + from * stride, stride);
             m++;
         }
     }
-    for (size_t j = 0; j < cap; j++)
-        if (ctrl[j] >= 0) slots[2 * j + 1] = (int32_t)s.perm[(size_t)slots[2 * j + 1]];
+    for (size_t j = 0; j < cap; j++) {
+        if (ctrl[j] < 0) continue;
+        const size_t pos = (size_t)slots[2 * j + 1];
+        if (pos >= start) slots[2 * j + 1] = (int32_t)s.perm[pos - start];
+    }
     *moved = m;
     return FC_REORDERED;
 }
