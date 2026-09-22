@@ -1,0 +1,21 @@
+--- a/netpunch/sync_runtime.py
++++ b/netpunch/sync_runtime.py
+@@ -259,6 +259,18 @@
+                 return None
+             if ready.get('ok') != '1':
+                 raise RuntimeError('Bridge could not clear the previous world')
++            # PRIVATE LAB ONLY: retain a held host for one join experiment.
++            if (os.environ.get('TPF2MP_EXPERIMENT_RETAIN_HOST') == '1'
++                    and self.state['mode'] == 'join' and self.player == self.state['host']):
++                lua = self._lua()
++                if (status.get('has_world') != '1' or status.get('busy') != '0'
++                        or not self.old_world or lua.get('world') != self.old_world
++                        or lua.get('held') != '1' or lua.get('paused') != '1'):
++                    return None
++                if self._native('pause', 'paused'):
++                    print('[retained-world-experiment] host kept world ' + self.old_world, flush=True)
++                    return self._ack(paused=True, digest=self.snapshot.digest)
++                return None
+             # THE HOST LOADS TOO, in every mode (2026-09-16, evening). For a few
+             # hours the host kept the world it took the snapshot from, to spare
+             # it a load. Measured the same evening: a joiner that loads a save

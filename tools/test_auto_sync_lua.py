@@ -19,6 +19,16 @@ with TemporaryDirectory() as temporary:
     ''')
     lua.execute('CM.recoveryReleasePacing=function() didInitialUnpause=true end')
     lua.execute(source)(lua.globals().CM, lua.globals().K, lambda _:None)
+    roster = directory / 'tpf2_bridge_ctl.txt'
+    lua.execute('CM.rosterPlayers=1; assert(not CM.syncAlone())')
+    roster.write_text('pid=123\nplayers=2\n')
+    lua.execute('assert(not CM.syncAlone())')
+    roster.write_text('pid=999\nplayers=1\n')
+    lua.execute('assert(not CM.syncAlone())')
+    roster.write_text('pid=123\nplayers=1\n')
+    lua.execute('assert(CM.syncAlone())')
+    roster.write_text('pid=123\nplayers=2\n')
+    lua.execute('CM.rosterPlayers=nil')
     def control(revision, phase, pid='123', **fields):
         values = dict(pid=pid, operation='a'*32, epoch='b'*32,
                       revision=revision, phase=phase, resume_speed=0, **fields)
@@ -30,6 +40,11 @@ with TemporaryDirectory() as temporary:
     control(1, 'holding')
     lua.execute('assert(CM.autoSyncPump(100)); assert(changes==1 and CM.resyncHold)')
     lua.execute('assert(CM.autoSyncPump(100)); assert(changes==1)')
+    # Joining a previously empty server: normal polling is held, so its cached
+    # roster can still say one even after the lobby published two members.
+    lua.execute('CM.rosterPlayers=1; CM.ticks=0; '
+                'for i=1,100 do CM.ticks=i; assert(CM.autoSyncPump(100)) end; '
+                'assert(speed==0 and CM.resyncHold); CM.rosterPlayers=nil')
     (directory / 'tpf2_sync_lua.txt').unlink()
     lua.execute('assert(CM.autoSyncPump(100)); assert(changes==1)')
     control(2, 'checking')
@@ -145,6 +160,8 @@ with TemporaryDirectory() as temporary:
     lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=nil; assert(not CM.syncAlone())")  # stale heartbeat: not alone
     (directory / 'tpf2_sync_available.txt').unlink()
     lua.execute("CM.syncLobbyAt=nil; assert(not CM.syncLobbyAlive()); CM.rosterPlayers=3; assert(not CM.syncAlone())")  # a stale heartbeat is NOT alone (16:38)
-    lua.execute("CM.rosterPlayers=nil; assert(not CM.syncAlone()); CM.rosterPlayers=1; assert(CM.syncAlone())")
+    lua.execute("CM.rosterPlayers=1; assert(not CM.syncAlone())")
+    roster.write_text('pid=123\nplayers=1\n')
+    lua.execute("CM.rosterPlayers=3; assert(CM.syncAlone())")
 print('PASS: real Lua 5.2 producer hold, fresh paused comparison, stale/partial IPC, PID guard, pause preservation, '
       'one fresh world token per load and native-panel notices, a hold abandoned once alone; engine simulated')
