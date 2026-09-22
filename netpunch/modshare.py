@@ -376,6 +376,25 @@ def read_registry():
     return token, rows
 
 
+# REGISTRY SCOPE (2026-09-22, user: "most of the mods are not enabled so it
+# shouldn't do that"): None registers every consented download (the old rule);
+# a set of Workshop ids registers only those -- the Workshop mods of the save
+# being played, set by the lobby as soon as that save's mod list is known.
+# Registering all of them made the game's catalogue refresh at the world load
+# read every folder a big mods round ever installed (556 of them, ~93 GB):
+# a joiner's load read 10+ GB and took minutes. A mod the save needs that is
+# on disk is still registered (it is in scope), and so is anything passed as
+# `extra` (a mods round's installs).
+_registry_scope = None
+
+
+def set_registry_scope(ids):
+    """None: register every consented download; an iterable of Workshop ids
+    (with or without the leading '*'): register only those."""
+    global _registry_scope
+    _registry_scope = None if ids is None else {str(i).lstrip("*") for i in ids}
+
+
 def write_registry(token=None, extra=None):
     """Atomically publish the Workshop registry: every consented install under
     the managed workshop folder, every row already published whose folder
@@ -396,11 +415,13 @@ def write_registry(token=None, extra=None):
     root = data_dir()
     os.makedirs(root, exist_ok=True)
     old_token, rows = read_registry()
-    rows = {item: path for item, path in rows.items() if os.path.isfile(os.path.join(path, "mod.lua"))}
+    scope = _registry_scope
+    rows = {item: path for item, path in rows.items() if os.path.isfile(os.path.join(path, "mod.lua"))
+            and (scope is None or item in scope)}
     if os.path.isdir(managed_workshop()):
         for item in sorted(os.listdir(managed_workshop())):
             path = os.path.abspath(os.path.join(managed_workshop(), item))
-            if item.isdigit() and os.path.isfile(os.path.join(path, "mod.lua")):
+            if item.isdigit() and os.path.isfile(os.path.join(path, "mod.lua")) and (scope is None or item in scope):
                 rows[item] = path
     for item, path in (extra or []):
         if isinstance(item, str) and item.isdigit() and path and os.path.isfile(os.path.join(path, "mod.lua")):

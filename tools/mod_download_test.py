@@ -46,6 +46,7 @@ class Downloads(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.root=Path(self.tmp.name)
         self.patch=patch.object(modshare,'data_dir',return_value=str(self.root));self.patch.start()
+        modshare.set_registry_scope(None)   # module state: a lobby path in an earlier test scopes it to a save
         self.conn=Conn();self.io=IO(self.root);self.r=lobby._ClientSaveReceiver(self.conn,self.io,lambda _:None)
     def tearDown(self): self.patch.stop();self.tmp.cleanup()
     def offer(self): self.r.on_manifest([['*9876543210',1]])
@@ -228,6 +229,21 @@ class Downloads(unittest.TestCase):
         push(r,2,'mods',[(modshare.mod_zip_name('*9876543210',1),archive())])
         self.assertTrue(r.complete and r.mods_satisfied)
         self.assertTrue((self.root/'cache'/modshare.cache_name('*9876543210',1)).exists())
+
+    def test_registry_is_scoped_to_the_save(self):
+        # a scope (the save's Workshop mods) keeps every other consented download
+        # out: registering all of them made a joiner's world load read ~10 GB
+        managed=Path(modshare.managed_workshop()); managed.mkdir(parents=True,exist_ok=True)
+        for mid in ('4000000001','4000000002','4000000003'):
+            (managed/mid).mkdir(); (managed/mid/'mod.lua').write_text('function data() return {} end')
+        modshare.set_registry_scope(['*4000000002'])
+        modshare.write_registry()
+        self.assertEqual(sorted(modshare.read_registry()[1]),['4000000002'])
+        modshare.write_registry(None,[('4000000003',str(managed/'4000000003'))])   # a round's install passed as extra
+        self.assertEqual(sorted(modshare.read_registry()[1]),['4000000002','4000000003'])
+        modshare.set_registry_scope(())
+        modshare.write_registry()
+        self.assertEqual(modshare.read_registry()[1],{})
 
     def test_registry_has_no_row_cap(self):
         # 128 rows used to reject the WHOLE registry on the reader (workshop_register.cpp)

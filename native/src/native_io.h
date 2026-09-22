@@ -43,5 +43,14 @@ bool Loading();
 void WorkThreads(DWORD& ui, DWORD& command);
 // Suppress new game input before it can create a command/callback. Native MP
 // progress controls use their separate input path. Escape remains available.
+// The hold itself (waiting for a gesture to finish) always applies; whether the
+// game window then SWALLOWS keys and the mouse while held is SetInputBlocking.
 bool SetActionsHeld(bool held);
+// Off by default since 2026-09-22 (user: "disable the resync guard disabling all
+// game input"): a held session freezes nothing but the sim -- the camera, menus
+// and windows stay usable. What protects the world is the Lua hold (the GUI
+// capture stops) and the slice's strict lockstep (a build is cancelled at the
+// engine and replayed at a stamped step after the release, on every peer).
+// `input_hold=1` in tpf2_menu_flags.txt turns the old block back on.
+void SetInputBlocking(bool on);
 }

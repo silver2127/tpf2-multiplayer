@@ -23,12 +23,13 @@ HHOOK pumpHook = nullptr;
 std::atomic<bool> enabled{false}, initializationAttempted{false};
 bool accepted = false;
 std::atomic<bool> actionsHeld{false};
+std::atomic<bool> inputBlocking{false};   // input_hold=1 (see native_io.h SetInputBlocking)
 WNDPROC originalWindowProc=nullptr;
 HWND inputWindow=nullptr;
 const UINT pumpMessage = WM_APP + 0x392;
 
 LRESULT CALLBACK inputProc(HWND window,UINT message,WPARAM w,LPARAM l) {
-    if(actionsHeld.load()) {
+    if(actionsHeld.load() && inputBlocking.load()) {
         switch(message) {
         case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
         case WM_CHAR: case WM_SYSCHAR:
@@ -364,4 +365,5 @@ bool SetActionsHeld(bool held) {
     }
     actionsHeld.store(held); return true;
 }
+void SetInputBlocking(bool on) { inputBlocking.store(on); }
 }
