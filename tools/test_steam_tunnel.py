@@ -123,9 +123,10 @@ with tempfile.TemporaryDirectory() as ta, tempfile.TemporaryDirectory() as tb:
 
 # ---- the save transfer's view of a tunnel peer: not loopback
 pick, win = lobby._HostSaveTransfer._pick_chunk, lobby._HostSaveTransfer._pick_window
-check("tunnel peers (and loopback ones) get big Steam chunks",
-      pick([((TUNNEL_IP, 62100), "bob")]) == lobby.CHUNK_STEAM
-      and pick([(("127.0.0.1", 29521), "carol"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM)
+big = lobby.CHUNK_STEAM if lobby.STEAM_BIG_CHUNKS else lobby.CHUNK_STEAM_MIXED
+check("tunnel peers (and loopback ones) get the Steam chunk (big only while STEAM_BIG_CHUNKS is on)",
+      pick([((TUNNEL_IP, 62100), "bob")]) == big
+      and pick([(("127.0.0.1", 29521), "carol"), ((TUNNEL_IP, 62105), "bob")]) == big)
 check("a tunnel peer beside an internet peer: the small size that fits both",
       pick([(("198.51.100.7", 29471), "dave"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM_MIXED
       and lobby.CHUNK_STEAM_MIXED + 17 + 28 < 1200 and win(lobby.CHUNK_STEAM_MIXED) == lobby.SEND_WINDOW_REMOTE)

@@ -244,6 +244,12 @@ CHUNK_STEAM = 32000         # bytes of file data per chunk when every non-loopba
                             # The window below is bounded in BYTES (SEND_WINDOW_STEAM): the one
                             # earlier try at bigger Steam chunks stalled because it had the
                             # loopback window, 134 MB fired into Steam at once (2026-09-21).
+# OFF (2026-09-22): 32 KB chunks over Steam's reliable send stalled live on a real Steam
+# link three times (0.6.1.15 at 15/12781, 0.6.1.21 at 132/4199, 0.6.1.22 at 0/4199: the
+# receiver never took chunk 0 however often it was re-sent), while every fake-tunnel test
+# passed. Until it is understood from the receiver's log, a Steam transfer uses the
+# proven 1,100 B unreliable chunks (CHUNK_STEAM_MIXED) with the remote window.
+STEAM_BIG_CHUNKS = False
 CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
                             # one chunk size serves everyone, and 32 KB datagrams on the open
                             # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
@@ -1398,7 +1404,7 @@ class _HostSaveTransfer:
             if not host.startswith("127."):
                 internet = True
         if tunnel:
-            return CHUNK_STEAM_MIXED if internet else CHUNK_STEAM
+            return CHUNK_STEAM if STEAM_BIG_CHUNKS and not internet else CHUNK_STEAM_MIXED
         return CHUNK_DATA if internet else CHUNK_LOCAL
 
     @staticmethod

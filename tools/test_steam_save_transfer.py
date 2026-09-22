@@ -1,6 +1,6 @@
 """A WHOLE SAVE THROUGH THE STEAM TUNNEL: host and joiner meet only through two fake
 tunnels (steamtunnel.FakeTunnel) and the host shares a 48 MB save, which goes at
-CHUNK_STEAM (32 KB) with SEND_WINDOW_STEAM.
+the chunk the host picks for a Steam peer (CHUNK_STEAM_MIXED while STEAM_BIG_CHUNKS is off).
 
 The fakes relay over loopback UDP like the native tunnel does, so the loopback
 leg is real: the lobby hands its window to an endpoint socket in one burst, and
@@ -83,5 +83,5 @@ with tempfile.TemporaryDirectory() as ta, tempfile.TemporaryDirectory() as tb:
 
 if DEFAULT:
     sys.exit(0)
-print("PASS: a 48 MB save crossed the Steam tunnel at 32 KB chunks" if same else "FAIL")
+print("PASS: a 48 MB save crossed the Steam tunnel" if same else "FAIL")
 sys.exit(0 if same else 1)
