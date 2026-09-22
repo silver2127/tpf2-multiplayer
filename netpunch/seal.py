@@ -33,7 +33,7 @@ import threading
 SECRET_LEN = 12
 NONCE_LEN = 8
 TAG_LEN = 16
-WINDOW = 64
+WINDOW = 1024   # frames per sender salt (64 until 2026-09-22: see Sealer.sign)
 
 # Domain separator for sign()/unsign(). Without it a signed (plaintext) frame
 # and a sealed (encrypted) frame share one MAC construction, so either could
@@ -68,9 +68,12 @@ class Sealer:
         self.mac_key = hashlib.sha256(key + b"|mac").digest()
         self.salt = os.urandom(4)
         self.ctr = 0
+        self.bulk_salt = os.urandom(4)   # sign()'s own nonce space: its own replay window at the receiver
+        self.bulk_ctr = 0
         self._lock = threading.Lock()
         self._windows = {}          # sender salt -> [highest, bitmap]
         self.rejected = 0
+        self.too_old = 0            # of those: outside the replay window (logged by the lobby)
 
     def seal(self, plain: bytes) -> bytes:
         with self._lock:
@@ -112,13 +115,23 @@ class Sealer:
     #
     # Enabled per-frame by the caller, never globally: see TYPE_ADATA in
     # punch.py and _pack_data(bulk=True) in lobby.py.
+    #
+    # ITS OWN NONCE SPACE (2026-09-22). Bulk chunks used the control frames'
+    # counter, so both shared one replay window at the receiver. Over Steam a
+    # 32 KB chunk goes reliable and waits in Steam's queue behind megabytes of
+    # others, while later pings, rosters and game frames (small, unreliable)
+    # overtake it: once 64 newer frames were accepted, the chunk arrived "too
+    # old" and was dropped without a word, and so was every re-send of it (each
+    # queued the same way) -- chunk 0 never landed (0.6.1.22, base 0/4199).
+    # A separate salt gives chunks a separate window (the receiver keys windows
+    # on the salt), and WINDOW is wider for the reorder the rest may see.
     def sign(self, plain: bytes) -> bytes:
         with self._lock:
-            self.ctr += 1
-            if self.ctr > 0xFFFFFFFF:
-                self.salt = os.urandom(4)
-                self.ctr = 1
-            nonce = self.salt + struct.pack("!I", self.ctr)
+            self.bulk_ctr += 1
+            if self.bulk_ctr > 0xFFFFFFFF:
+                self.bulk_salt = os.urandom(4)
+                self.bulk_ctr = 1
+            nonce = self.bulk_salt + struct.pack("!I", self.bulk_ctr)
         tag = hmac.new(self.mac_key, SIGN_DOMAIN + nonce + plain,
                        hashlib.sha256).digest()[:TAG_LEN]
         return nonce + plain + tag
@@ -155,6 +168,8 @@ class Sealer:
             back = high - ctr
             if back >= WINDOW or (bits >> back) & 1:
                 self.rejected += 1
+                if back >= WINDOW:
+                    self.too_old += 1
                 return False                     # replayed or too old
             w[1] = bits | (1 << back)
             return True
@@ -220,6 +235,23 @@ def selftest():
         ok = False; print("[seal] FAIL counter wrap did not re-salt")
     if Sealer(k).open(wrapped) != b"wrap":
         ok = False; print("[seal] FAIL frame after wrap does not open")
+    # A CHUNK OVERTAKEN BY CONTROL FRAMES (0.6.1.22 over Steam): signed first,
+    # delivered after 2,000 frames sealed later -- it must still be taken, once
+    snd, rcv = Sealer(k), Sealer(k)
+    late = snd.sign(b"chunk 0")
+    for i in range(2000):
+        if rcv.open(snd.seal(b"ping %d" % i)) is None:
+            ok = False; print("[seal] FAIL control frame rejected"); break
+    if rcv.unsign(late) != b"chunk 0":
+        ok = False; print("[seal] FAIL a chunk overtaken by later control frames was rejected")
+    if rcv.unsign(late) is not None:
+        ok = False; print("[seal] FAIL the overtaken chunk was accepted twice")
+    # chunks reordered among themselves within WINDOW: all taken; far older: refused
+    chunks = [snd.sign(bytes([i % 256])) for i in range(WINDOW + 5)]
+    if any(rcv.unsign(f) is None for f in chunks[5:][::-1]):
+        ok = False; print("[seal] FAIL chunk reorder within the window rejected")
+    if rcv.unsign(chunks[0]) is not None:
+        ok = False; print("[seal] FAIL a chunk older than the window was accepted")
     import time
     t0 = time.time(); n = 0
     while time.time() - t0 < 0.5:

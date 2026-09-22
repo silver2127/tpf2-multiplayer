@@ -244,12 +244,12 @@ CHUNK_STEAM = 32000         # bytes of file data per chunk when every non-loopba
                             # The window below is bounded in BYTES (SEND_WINDOW_STEAM): the one
                             # earlier try at bigger Steam chunks stalled because it had the
                             # loopback window, 134 MB fired into Steam at once (2026-09-21).
-# OFF (2026-09-22): 32 KB chunks over Steam's reliable send stalled live on a real Steam
-# link three times (0.6.1.15 at 15/12781, 0.6.1.21 at 132/4199, 0.6.1.22 at 0/4199: the
-# receiver never took chunk 0 however often it was re-sent), while every fake-tunnel test
-# passed. Until it is understood from the receiver's log, a Steam transfer uses the
-# proven 1,100 B unreliable chunks (CHUNK_STEAM_MIXED) with the remote window.
-STEAM_BIG_CHUNKS = False
+# 32 KB chunks over Steam's reliable send stalled live three times (0.6.1.15 at 15/12781,
+# 0.6.1.21 at 132/4199, 0.6.1.22 at 0/4199). The cause: bulk chunks shared the replay
+# window with control frames, and a chunk delayed in Steam's reliable queue arrived after
+# 64 later pings and rosters and was refused as too old (fixed in seal.py Sealer.sign,
+# reproduced by tools/test_steam_save_transfer.py --steam-queue). False = 1,100 B chunks.
+STEAM_BIG_CHUNKS = True    # back on: the stall was the shared replay window (seal.py Sealer.sign)
 CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
                             # one chunk size serves everyone, and 32 KB datagrams on the open
                             # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
@@ -2504,6 +2504,15 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
+        # frames the replay window refused as too old: silent until 2026-09-22, when
+        # they were every Steam-delayed save chunk (seal.py Sealer.sign)
+        sealer = SEAL[0]
+        if sealer is not None and self.active() and now - getattr(self, "_old_at", 0.0) >= 5:
+            self._old_at = now
+            n, seen = getattr(sealer, "too_old", 0), getattr(self, "_old_seen", 0)
+            if n != seen:
+                self._old_seen = n
+                self.log(f"[client] {n - seen} frame(s) refused as too old by the replay window during the transfer (total {n})")
         if self.steam_items and now - self.steam_poll_at >= UGC_POLL_EVERY:
             self.steam_poll_at = now
             self._steam_poll(now)

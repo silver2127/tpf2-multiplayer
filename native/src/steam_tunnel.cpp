@@ -315,8 +315,13 @@ DWORD WINAPI TunnelThread(LPVOID)
     if (g_api.utils && g_api.setConfig) {
         void* utils = g_api.utils();
         struct { const char* name; int id; int32_t value; } cfg[] = {
-            { "SendRateMin",    23,  1 * 1024 * 1024 },
-            { "SendRateMax",    24, 16 * 1024 * 1024 },
+            // 10 and 11 (steamnetworkingtypes.h). Until 2026-09-22 these were 23 and 24,
+            // which are IP_AllowWithoutAuth and TimeoutInitial: the rate was never
+            // raised, unauthenticated IP connections were allowed and the initial
+            // timeout was 4.6 hours (the log's "SendRateMax: 10000 ->" was the
+            // 10,000 ms timeout default).
+            { "SendRateMin",    10,  1 * 1024 * 1024 },
+            { "SendRateMax",    11, 16 * 1024 * 1024 },
             { "SendBufferSize",  9,  8 * 1024 * 1024 },
             { "RecvBufferSize", 47,  8 * 1024 * 1024 },
         };

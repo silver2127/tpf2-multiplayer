@@ -9,7 +9,11 @@ stalled the live 0.6.1.21 transfer (base 132/4199, TIMED OUT); the native
 tunnel now gives its endpoints 16 MB buffers, as the fakes do by default.
 
     python tools/test_steam_save_transfer.py            # 16 MB endpoint buffers: must finish
-    python tools/test_steam_save_transfer.py --default  # the OS default: shows the stall (not asserted)
+    python tools/test_steam_save_transfer.py --default  # the OS default endpoint buffers (not asserted)
+
+Big datagrams (over 1,200 B, which Steam sends reliable) are held QUEUE seconds in
+order while small control frames overtake them, as in Steam's reliable queue: with
+the replay window shared, that is the live 0.6.1.22 stall (chunk 0 refused as too old).
 """
 import hashlib
 import json
@@ -29,12 +33,13 @@ from punch import open_socket                                     # noqa: E402
 import lobby                                                      # noqa: E402
 
 DEFAULT = "--default" in sys.argv
+QUEUE = float(os.environ.get("TPF2MP_TEST_QUEUE", "0.4"))   # s a big (reliable) datagram waits, as in Steam's reliable queue
 SIZE = 48 * 1024 * 1024
 buf = None if DEFAULT else 16 * 1024 * 1024
 
 with tempfile.TemporaryDirectory() as ta, tempfile.TemporaryDirectory() as tb:
-    A = FakeTunnel(ta, 1001, "alice", endpoint_buf=buf)
-    B = FakeTunnel(tb, 2002, "bob", endpoint_buf=buf)
+    A = FakeTunnel(ta, 1001, "alice", endpoint_buf=buf, big_delay=QUEUE)
+    B = FakeTunnel(tb, 2002, "bob", endpoint_buf=buf, big_delay=QUEUE)
     ca, cb = SteamTunnel(ta), SteamTunnel(tb)
     base = tempfile.mkdtemp(prefix="steam_xfer_")
     io_h, io_j = lobby.LobbyIO(os.path.join(base, "h")), lobby.LobbyIO(os.path.join(base, "j"))

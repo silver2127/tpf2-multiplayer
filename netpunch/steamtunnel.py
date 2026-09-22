@@ -38,6 +38,7 @@ UGC_INSTALLED = 4
 UGC_NEEDS_UPDATE = 8
 UGC_DOWNLOADING = 16
 UGC_DOWNLOAD_PENDING = 32
+UNRELIABLE_MAX = 1200                # Steam's unreliable P2P limit: bigger goes reliable (queued)
 UGC_BATCH = 100                      # ids per control request (a STATE reply stays one datagram)
 
 
@@ -210,8 +211,12 @@ class FakeTunnel:
     _by_id = {}
     _table_lock = threading.Lock()
 
-    def __init__(self, data_dir, steamid, name="fake", drop=None, endpoint_buf=16 * 1024 * 1024):
+    def __init__(self, data_dir, steamid, name="fake", drop=None, endpoint_buf=16 * 1024 * 1024, big_delay=0.0):
         self.data_dir, self.id, self.name = data_dir, str(steamid), name
+        # Steam's reliable queue: a datagram over UNRELIABLE_MAX is delivered big_delay seconds
+        # late, in order among the big ones, while small ones go at once (and overtake it)
+        self.big_delay = big_delay
+        self._late = []                     # [(due, peer id, data)] in send order
         self.endpoint_buf = endpoint_buf    # SO_RCVBUF/SNDBUF of the endpoints, as the native tunnel sets (None: OS default)
         self.drop = drop                    # optional predicate(bytes) -> True to lose a datagram
         self.lobby_port = None
@@ -316,10 +321,20 @@ class FakeTunnel:
                         if peer is None or (self.drop and self.drop(data)):
                             continue
                         self.sent += 1
+                        if self.big_delay and len(data) > UNRELIABLE_MAX:
+                            self._late.append((time.time() + self.big_delay, peer, data))
+                            continue
                         with FakeTunnel._table_lock:
                             other = FakeTunnel._by_id.get(peer)
                         if other is not None:
                             other.deliver(self.id, data)
+            now = time.time()
+            while self._late and self._late[0][0] <= now:
+                _, peer, data = self._late.pop(0)
+                with FakeTunnel._table_lock:
+                    other = FakeTunnel._by_id.get(peer)
+                if other is not None:
+                    other.deliver(self.id, data)
 
     def _ugc(self, verb, ids):
         now = time.time()
