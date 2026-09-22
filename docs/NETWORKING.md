@@ -511,3 +511,15 @@ The measured 0.6.1.25 live run sustained about 0.54 MB/s with zero application
 retries or receiver duplicates. The new API is a test candidate, not a confirmed
 speed fix. Run `python tools/steam_messages_test.py` for the adapter boundary
 regression, and the existing transfer tests for save protocol coverage.
+
+### Local Messages rate candidate on 0.6.1.26
+
+The actual 0.6.1.26 session reported capacity=1048576B/s, ~1.01 MB/s unique
+save bytes and ~4 MB pending, without application retries or duplicates. The
+Valve header comment at SendRateMin/SendRateMax instructs equal values for a
+manually configured rate. SNP_ClampSendRate in the matching Valve source forces
+the rate estimate to that value when the clamps match. Both clamps now use
+16 MiB/s; a high maximum alone did not cause the observed connection to grow
+above its 1 MiB/s minimum. This is a fixed configured rate, not an adaptive
+bandwidth estimate or a promise of measured internet throughput. Diagnostics
+also include local/remote connection quality. Live verification is still needed.

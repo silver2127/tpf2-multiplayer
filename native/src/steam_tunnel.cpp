@@ -322,7 +322,10 @@ DWORD WINAPI TunnelThread(LPVOID)
             // raised, unauthenticated IP connections were allowed and the initial
             // timeout was 4.6 hours (the log's "SendRateMax: 10000 ->" was the
             // 10,000 ms timeout default).
-            { "SendRateMin",    10,  1 * 1024 * 1024 },
+            // Valve documents equal clamps for a manually configured rate.
+            // A larger max alone did not raise the live Messages connection:
+            // 0.6.1.26 remained at the 1 MiB/s floor with ~4 MB pending.
+            { "SendRateMin",    10, 16 * 1024 * 1024 },
             { "SendRateMax",    11, 16 * 1024 * 1024 },
             { "SendBufferSize",  9,  8 * 1024 * 1024 },
             { "RecvBufferSize", 47,  8 * 1024 * 1024 },
