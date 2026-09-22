@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cwctype>
 #define VK_NO_PROTOTYPES
 #include "../third_party/vk/vulkan_core.h"
 #include "hook.h"
@@ -791,7 +792,15 @@ static void LoadLato()
     g_latoLoaded = n > 0;
     Log("[menu] font: %ls -> %d faces\n", path, n);
 }
-static float UiScale() { return g_flagScale > 0.f ? g_flagScale : (g_scExtent.height ? g_scExtent.height / 1080.f : 1.f); }
+static float UiScale() {
+    float scale = g_flagScale > 0.f ? g_flagScale : (g_scExtent.height ? g_scExtent.height / 1080.f : 1.f);
+    // Keep the title dialog inside the viewport even with a large manual scale.
+    if (!WorldLoaded() && g_scExtent.width && g_scExtent.height) {
+        scale = (std::min)(scale, g_scExtent.width / 800.f);
+        scale = (std::min)(scale, g_scExtent.height / 560.f);
+    }
+    return scale;
+}
 
 // the menu face, grayscale-antialiased (coverage is read back as alpha, so no ClearType fringes)
 static HFONT mkLato(int px)
@@ -803,7 +812,7 @@ static HFONT mkLato(int px)
 // ---------------- software compositing layer ----------------
 // The panel is drawn into a straight-alpha BGRA layer (rect fills with alpha, GDI
 // text rendered white-on-black and used as coverage), then composited over a
-// readback of the game frame every present. That is what lets it look like a
+// cached native title artwork (or a solid in-game base). This gives it a
 // MenuWindow (window.lua): a translucent (5,25,40) sheet, transparent buttons
 // whose hover/press is a white wash, black@50 text fields.
 struct Layer { int w, h; unsigned char* px; };
@@ -863,8 +872,8 @@ static int textW(const wchar_t* s, HFONT f)
 struct Hit; static const Hit* hoveredHit();
 static unsigned char* g_stage = nullptr; static size_t g_stageSz = 0;
 // MenuWindow has blurRadius = 64 behind its sheet (main-menu-windows.lua). Same
-// look here, cheaply: average the readback down 4x, two running-sum box blurs
-// (radius 16 at quarter size ~= 64 full-size), bilinear back up. ~1-2 ms at 4K.
+// legacy readback path: average down 4x, two running-sum box blurs
+// (radius 16 at quarter size ~= 64 full-size), bilinear back up. Not used by the title renderer.
 static unsigned char* g_blurA = nullptr; static unsigned char* g_blurB = nullptr; static size_t g_blurSz = 0;
 static void boxBlurH(const unsigned char* src, unsigned char* dst, int w, int h, int r)
 {
@@ -927,13 +936,13 @@ static void BlurStage(int w, int h)
         }
     }
 }
-static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h)
+static void ComposeLayer(const unsigned char* bg, size_t bgPitch, void* dst, size_t pitch, int w, int h, bool preblurred = false)
 {
     size_t need = (size_t)w * 4 * h;
     if (g_stageSz < need) { free(g_stage); g_stage = (unsigned char*)malloc(need); g_stageSz = need; }
     if (bg) {
         for (int y = 0; y < h; y++) memcpy(g_stage + (size_t)y * w * 4, bg + y * bgPitch, (size_t)w * 4);
-        BlurStage(w, h);
+        if(!preblurred) BlurStage(w, h);
     } else {
         // Opaque sheet (bg == nullptr): no read-back of the game frame, no blur.
         // 40,25,5 is MW_BG = RGB(5,25,40) in the swapchain's B,G,R,A order; the
@@ -1241,13 +1250,17 @@ static void mwStatus(int w, int h)
     HFONT f = mkLato(S(12)); layerText(S(25), h - S(34), w - S(50), S(24), wst, f, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
 }
 
+#include "menu_title_panel.inl"
+#include "menu_title_backdrop.inl"
+
 // Build the layer + hit rects for the current page. Called only when dirty.
 static void RenderPanelLayer(int w, int h)
 {
     g_s = UiScale(); layerBegin(w, h); g_hitCount = 0;
-    layerRect(0, 0, w, h, MW_BG, MW_BG_A);
+    layerRect(0, 0, w, h, MW_BG, !WorldLoaded() && (g_uiState==1 || g_uiState==2) ? 175 : MW_BG_A);
     int pad = S(25), cy = S(56);
     const LONG page=InterlockedCompareExchange(&g_uiState,0,0);
+    if(RenderTitlePanel(w,h,page)) return;
     if(page==3) {
         char phase[24],detail[420],failedStep[24]; bool requested, readyMine; int readyCount, readyTotal;
         EnterCriticalSection(&g_modelCs);
@@ -1558,11 +1571,12 @@ static void barrierImage(VkCommandBuffer cb, VkImage img, VkImageLayout from, Vk
 }
 
 // Create the host-visible linear panel image + memory, once.
+static bool g_titleSurfaceNeedsUpload=true;
 static bool BuildPanelImage()
 {
     if (g_panelBuilt) return true;
     if (!pCreateImage || !pAllocMem || !pMapMem) return false;
-    g_s = UiScale(); g_panelW = S(800); g_panelH = S(560);
+    g_s = UiScale(); g_panelW = (int)g_scExtent.width; g_panelH = (int)g_scExtent.height;
     if (g_panelW > (int)g_scExtent.width) g_panelW = (int)g_scExtent.width; if (g_panelH > (int)g_scExtent.height) g_panelH = (int)g_scExtent.height;
     VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     ici.imageType = VK_IMAGE_TYPE_2D; ici.format = g_scFormat;
@@ -1610,6 +1624,7 @@ static bool BuildPanelImage()
         return false;
     }
     g_panelBuilt = true;
+    g_titleSurfaceNeedsUpload=true;
     Log("[menu] vk: panel image ready %dx%d pitch=%zu\n", g_panelW, g_panelH, g_panelPitch);
     return true;
 }
@@ -1702,7 +1717,7 @@ static void PanelLayout()
 {
     g_s = UiScale();
     if (InterlockedCompareExchange(&g_uiState, 0, 0) == 3) { g_copyW = S(520); g_copyH = S(300); }
-    else if (InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
+    else if (!WorldLoaded() || InterlockedCompareExchange(&g_uiState, 0, 0) == 2) { g_copyW = S(780); g_copyH = S(540); }
     else                                                     { g_copyW = S(780); g_copyH = g_flagMaster[0] ? S(540) : S(300); }
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
@@ -1718,52 +1733,46 @@ static bool PanelFramePrep()
     return true;
 }
 
-// Both renderers: compose the panel into `dst` (BGRA, rows `pitch` bytes apart) when it
-// changed. True when it did (the caller uploads it); PanelLayout has run.
+// Shared CPU composition for Vulkan and OpenGL. Title artwork is cached per viewport.
+// dst is a full-frame surface; the in-game panel remains at its origin.
 static bool ComposePanelIfDirty(void* dst, size_t pitch)
 {
-    // THE PANEL IS COMPOSED ONLY WHEN IT CHANGES, AND IT IS OPAQUE.
-    //
-    // It used to be composited over a blurred read-back of the live game frame on
-    // EVERY present: CopyBackdrop submits a GPU copy and waits on a fence, then
-    // BlurStage runs over ~1.5M pixels. That measured 40-65 ms per frame
-    // (tpf2_menu.log: "panel blend 1502x1040 hover=0 48.58 ms"), i.e. 20 FPS before
-    // the game does anything of its own. In the main menu the GPU is idle and the
-    // fence wait is nearly free, which is why it went unnoticed there; with a
-    // savegame loaded it stalls a busy pipeline, so hosting from inside a game fell
-    // to 10-15 FPS and clicks started missing (PollClick samples the mouse once per
-    // frame, so at 10 FPS a normal click can land entirely between samples and the
-    // window cannot be closed). Reported 2026-09-15.
-    //
-    // Now a normal frame only blits the ready panel image. CopyBackdrop, BlurStage
-    // and BuildBackdropImage are kept, unused, for the frosted look if it is ever
-    // wanted back -- but it must not go back on a per-frame path.
-    static ULONGLONG lastRender = 0; ULONGLONG now = GetTickCount64();
-    static int lastHover = -1, lastActive = -1;
-    // the caret blinks and chat arrives asynchronously: re-render at most 2x/s when not dirty
-    const bool dirty = InterlockedCompareExchange(&g_panelDirty, 0, 1) == 1
-                    || g_layer.w != g_copyW || g_layer.h != g_copyH
-                    || g_hover != lastHover || g_active != lastActive   // hover wash is composed in
-                    || now - lastRender > 500;
-    if (!dirty) return false;
-    LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
-    RenderPanelLayer(g_copyW, g_copyH); lastRender = now;
-    lastHover = g_hover; lastActive = g_active;
-    ComposeLayer(nullptr, 0, dst, pitch, g_copyW, g_copyH);
-    QueryPerformanceCounter(&t1);
-    static int n = 0; if (++n % 60 == 1) Log("[menu] panel compose %dx%d hover=%d %.2f ms (only when changed)\n",
-        g_copyW, g_copyH, g_hover, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart);
+    const bool title=!WorldLoaded() && (g_uiState==1 || g_uiState==2);
+    static bool lastTitle=false;
+    static void* lastDst=nullptr;
+    static int bgX=-1,bgY=-1,bgW=0,bgH=0;
+    const bool surfaceChanged=lastDst!=dst || g_titleSurfaceNeedsUpload;
+    const bool backgroundChanged=title && (surfaceChanged || !lastTitle || bgX!=g_panelX || bgY!=g_panelY || bgW!=g_panelW || bgH!=g_panelH);
+    if(backgroundChanged) {
+        PaintTitleBackdrop(dst,pitch,g_panelW,g_panelH,g_panelX,g_panelY,g_copyW,g_copyH);
+        bgX=g_panelX;bgY=g_panelY;bgW=g_panelW;bgH=g_panelH;
+    }
+    static ULONGLONG lastRender=0;
+    static int lastHover=-1,lastActive=-1;
+    const ULONGLONG now=GetTickCount64();
+    const bool requested=InterlockedExchange(&g_panelDirty,0)!=0;
+    const bool dirty=surfaceChanged || backgroundChanged || title!=lastTitle || requested
+        || g_layer.w!=g_copyW || g_layer.h!=g_copyH
+        || g_hover!=lastHover || g_active!=lastActive || now-lastRender>500;
+    if(!dirty) return false;
+    RenderPanelLayer(g_copyW,g_copyH);
+    if(title) {
+        const auto* bg=g_titleBackdrop.data()+((size_t)g_panelY*g_panelW+g_panelX)*4;
+        auto* panel=(unsigned char*)dst+(size_t)g_panelY*pitch+g_panelX*4;
+        ComposeLayer(bg,(size_t)g_panelW*4,panel,pitch,g_copyW,g_copyH,true);
+    } else ComposeLayer(nullptr,0,dst,pitch,g_copyW,g_copyH);
+    lastTitle=title;lastDst=dst;lastRender=now;lastHover=g_hover;lastActive=g_active;
+    g_titleSurfaceNeedsUpload=false;
     return true;
 }
 
 static void DrawButton(VkQueue q, uint32_t imgIndex)
 {
-    if (imgIndex >= g_scImgCount) return;
-    if (!PanelFramePrep()) return;
-    if (!BuildPanelImage()) return;
+    if(imgIndex>=g_scImgCount || !PanelFramePrep() || !BuildPanelImage()) return;
     PanelLayout();
-    if (ComposePanelIfDirty(g_panelPtr, g_panelPitch) && pFlush) {
-        VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_panelMem; r.size = VK_WHOLE_SIZE; pFlush(g_dev, 1, &r);
+    const bool title=!WorldLoaded() && (g_uiState==1 || g_uiState==2);
+    if(ComposePanelIfDirty(g_panelPtr,g_panelPitch) && pFlush) {
+        VkMappedMemoryRange r={VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=g_panelMem;r.size=VK_WHOLE_SIZE;pFlush(g_dev,1,&r);
     }
     VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1772,8 +1781,8 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
     VkImageCopy region = {};
     region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.srcSubresource.layerCount = 1;
     region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.dstSubresource.layerCount = 1;
-    region.dstOffset = { g_panelX, g_panelY, 0 };
-    region.extent = { (uint32_t)g_copyW, (uint32_t)g_copyH, 1 };
+    region.dstOffset = { title?0:g_panelX, title?0:g_panelY, 0 };
+    region.extent = { (uint32_t)(title?g_panelW:g_copyW), (uint32_t)(title?g_panelH:g_copyH), 1 };
     pCmdCopyImage(cb, g_panelImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
     barrierImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
     pEndCB(cb);
@@ -1892,6 +1901,15 @@ static void OnHit(int id, int button)
                 SetStatus("Save selected. Press START GAME to share it.");
             }
         }
+        InterlockedExchange(&g_panelDirty,1);
+        return;
+    }
+    if(id>=110 && id<=115) {
+        if(WorldLoaded()) return;
+        if(g_uiState==1 && id<=113) {
+            if(id<=111) { g_titleTab=id-110; InterlockedExchange(&g_joinFocus,0); }
+            else g_titleServerPage=(std::max)(0,g_titleServerPage+(id==112?-1:1));
+        } else if(g_uiState==2 && id>=114) g_titlePlayerPage=(std::max)(0,g_titlePlayerPage+(id==114?-1:1));
         InterlockedExchange(&g_panelDirty,1);
         return;
     }
@@ -2181,18 +2199,20 @@ static void DrawPanelGL(HDC hdc)
     if (!PanelFramePrep()) return;
     if (!GlOverlay::Load(g_gl)) return;
     if (!g_glPanelBuilt) {
-        g_s = UiScale(); g_panelW = S(800); g_panelH = S(560);   // as BuildPanelImage sizes the Vulkan image
+        g_s = UiScale(); g_panelW = fbW; g_panelH = fbH;   // full-frame title backdrop, as on Vulkan
         if (g_panelW > fbW) g_panelW = fbW; if (g_panelH > fbH) g_panelH = fbH;
         g_glPitch = (size_t)g_panelW * 4;
         g_glPanel.assign(g_glPitch * (size_t)g_panelH, 0);
         if (!GlOverlay::Ensure(g_gl, g_panelW, g_panelH)) return;
         g_glPanelBuilt = true;
+        g_titleSurfaceNeedsUpload = true;
         InterlockedExchange(&g_panelDirty, 1);
         Log("[menu] OpenGL: panel texture %dx%d\n", g_panelW, g_panelH);
     }
     PanelLayout();
     const bool upload = ComposePanelIfDirty(g_glPanel.data(), g_glPitch);
-    GlOverlay::Draw(g_gl, g_glPanel.data(), g_glPitch, g_copyW, g_copyH, upload, g_panelX, g_panelY, fbH);
+    const bool title=!WorldLoaded() && (g_uiState==1 || g_uiState==2);
+    GlOverlay::Draw(g_gl, g_glPanel.data(), g_glPitch, title?g_panelW:g_copyW, title?g_panelH:g_copyH, upload, title?0:g_panelX, title?0:g_panelY, fbH);
 }
 // SEH only in this frame (no C++ objects): a fault turns the OpenGL overlay off, never the game.
 static void GlFrame(HDC hdc)
@@ -4494,7 +4514,9 @@ static LRESULT CALLBACK LlMouse(int code,WPARAM wp,LPARAM lp)
         const auto data=reinterpret_cast<MSLLHOOKSTRUCT*>(lp);
         POINT origin{}; if(g_gameWnd) ClientToScreen(g_gameWnd,&origin);
         const int x=data->pt.x-origin.x-g_panelX, y=data->pt.y-origin.y-g_panelY;
-        if(x>=0 && y>=0 && x<g_copyW && y<g_copyH) {
+        if((x>=0 && y>=0 && x<g_copyW && y<g_copyH) ||
+           (!WorldLoaded() && g_showOverlay && (g_uiState==1 || g_uiState==2) &&
+            x+g_panelX>=0 && y+g_panelY>=0 && x+g_panelX<(int)g_scExtent.width && y+g_panelY<(int)g_scExtent.height)) {
             InterlockedExchange64(&g_panelClickPoint,(LONG64)((unsigned long long)(DWORD)data->pt.y<<32 | (DWORD)data->pt.x));
             InterlockedExchange(&g_panelClickButton, wp==WM_RBUTTONDOWN ? 2 : 1);
             InterlockedExchange(&g_pendingPanelClick,1);
@@ -4536,6 +4558,30 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             InterlockedExchange(&g_dashShown, now);
             WriteDashFlag();
             Log("[menu] dashboard %s (Ctrl+Shift+D)\n", now ? "shown" : "hidden");
+            return 1;
+        }
+    }
+    // Title-menu field navigation. Consume the matching key-up too, even if
+    // Escape just closed the panel. Alt+Tab / OS chords remain untouched.
+    static bool titleTabHeld=false, titleEscapeHeld=false;
+    if(code==HC_ACTION) {
+        const DWORD vk=((KBDLLHOOKSTRUCT*)lp)->vkCode;
+        bool* held=vk==VK_TAB?&titleTabHeld:vk==VK_ESCAPE?&titleEscapeHeld:nullptr;
+        if(held && (wp==WM_KEYUP || wp==WM_SYSKEYUP) && *held) { *held=false; return 1; }
+        if(held && (wp==WM_KEYDOWN || wp==WM_SYSKEYDOWN) && gameHasFocus()
+           && !WorldLoaded() && g_showOverlay && (g_uiState==1 || g_uiState==2)
+           && !(GetAsyncKeyState(VK_MENU)&0x8000) && !(GetAsyncKeyState(VK_CONTROL)&0x8000)
+           && !(GetAsyncKeyState(VK_LWIN)&0x8000) && !(GetAsyncKeyState(VK_RWIN)&0x8000)) {
+            if(*held) return 1;
+            *held=true;
+            if(vk==VK_ESCAPE) {
+                bool modal=false;
+                if(g_csInit) { EnterCriticalSection(&g_statusCs); modal=g_modsPrompt[0]!=0; LeaveCriticalSection(&g_statusCs); }
+                OnHit(modal?17:g_savePicker?91:4);
+            } else if(g_uiState==1) {
+                InterlockedExchange(&g_joinFocus,TitleNextFocus(g_joinFocus,(GetAsyncKeyState(VK_SHIFT)&0x8000)!=0));
+                InterlockedExchange(&g_panelDirty,1);
+            }
             return 1;
         }
     }
@@ -4603,6 +4649,16 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
             else { char c = vkToChar((int)vk, shift); if (c && g_chatLen < 190) { g_chatInput[g_chatLen++] = c; g_chatInput[g_chatLen] = 0; InterlockedExchange(&g_panelDirty, 1); } }
         }
         return 1;   // swallow down AND up so no WM_CHAR / keyup binding leaks to the game
+    }
+    // The title sheet covers the original menu. Do not let its navigation keys
+    // activate an invisible Continue/Load button when no text field has focus.
+    if(code==HC_ACTION && gameHasFocus() && !WorldLoaded() && g_showOverlay &&
+       (g_uiState==1 || g_uiState==2) && !(GetAsyncKeyState(VK_MENU)&0x8000) &&
+       !(GetAsyncKeyState(VK_CONTROL)&0x8000) && !(GetAsyncKeyState(VK_LWIN)&0x8000) &&
+       !(GetAsyncKeyState(VK_RWIN)&0x8000)) {
+        DWORD key=((KBDLLHOOKSTRUCT*)lp)->vkCode;
+        if(key==VK_RETURN || key==VK_SPACE || key==VK_UP || key==VK_DOWN ||
+           key==VK_LEFT || key==VK_RIGHT || key==VK_HOME || key==VK_END) return 1;
     }
     return CallNextHookEx(g_kbHook, code, wp, lp);
 }
