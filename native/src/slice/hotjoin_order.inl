@@ -57,12 +57,24 @@
 //           to tail and destroyed by walking the ring (RE 2026-09-22), so the
 //           buckets, left as they are, are never read again.
 
-extern "C" uint64_t g_hjResume0 = 0, g_hjResume1 = 0, g_hjResume2 = 0, g_hjResume3 = 0, g_hjResume4 = 0;
+// freed-ids Engine::EndModification 0x23de130 appends the batch of removed ids
+//           (a vector at [engine+0x200]) to the FIFO free-id deque in removal
+//           order; AddEntity 0x23dca30 pops the front. Removal order is history
+//           order (a ship unloading its cargo set, ...), so the busy lab world
+//           gave the same new cargo different ids ~280 units after a live join,
+//           and a town building next. Each batch is sorted before the append:
+//           the deque then depends only on which ids each batch removed. The
+//           replicated second engine replays the same removals through its own
+//           EndModification, so it sorts identically (Replicator::Apply 0x23dd700
+//           asserts the replayed ids match).
+
+extern "C" uint64_t g_hjResume0 = 0, g_hjResume1 = 0, g_hjResume2 = 0, g_hjResume3 = 0, g_hjResume4 = 0, g_hjResume5 = 0;
 extern "C" void HotJoinCandidatesRelay();
 extern "C" void HotJoinDeparturesRelay();
 extern "C" void HotJoinArrivalsRelay();
 extern "C" void HotJoinIdleRelay();
 extern "C" void HotJoinCapacityRelay();
+extern "C" void HotJoinFreedIdsRelay();
 
 struct HotJoinSite {
     const char* name;
@@ -73,16 +85,18 @@ struct HotJoinSite {
     void (*relay)();
     uint64_t* resume;
 };
-static const HotJoinSite kHotJoinSites[5] = {
+static const HotJoinSite kHotJoinSites[6] = {
     { "candidates", 0x927df6, 7, { 0xC7, 0x45, 0x87, 0x01, 0x00, 0x00, 0x00, 0xE8 }, 8, HotJoinCandidatesRelay, &g_hjResume0 },
     { "departures", 0xa7c9fd, 5, { 0x48, 0x8D, 0x54, 0x24, 0x28, 0x48, 0x8B, 0x49, 0x10, 0xE8 }, 10, HotJoinDeparturesRelay, &g_hjResume1 },
     { "arrivals",   0xa59928, 5, { 0x48, 0x8D, 0x54, 0x24, 0x68, 0x48, 0x8B, 0x49, 0x10, 0xE8 }, 10, HotJoinArrivalsRelay, &g_hjResume2 },
     { "idle",       0xa867ce, 8, { 0x49, 0x8B, 0x55, 0x20, 0x49, 0x2B, 0x55, 0x18, 0x48, 0xC1 }, 10, HotJoinIdleRelay, &g_hjResume3 },
     { "capacity",   0x21234de, 7, { 0x49, 0x8B, 0xBD, 0x20, 0x01, 0x00, 0x00, 0x48, 0x8D, 0x9F }, 10, HotJoinCapacityRelay, &g_hjResume4 },
+    { "freed-ids",  0x23de385, 8, { 0x49, 0x8B, 0x04, 0x24, 0x48, 0x8B, 0x50, 0x08, 0x4C, 0x8B }, 10, HotJoinFreedIdsRelay, &g_hjResume5 },
 };
 static const int kHotJoinSiteCount = (int)(sizeof(kHotJoinSites) / sizeof(kHotJoinSites[0]));
 static const int kHotJoinCapacitySite = 4;
-static volatile LONG64 g_hjCalls[5] = { 0 }, g_hjReordered[5] = { 0 }, g_hjRefused[5] = { 0 }, g_hjFaults[5] = { 0 };
+static const int kHotJoinFreedIdsSite = 5;   // the relay hands the address of the slot holding the vector's address
+static volatile LONG64 g_hjCalls[6] = { 0 }, g_hjReordered[6] = { 0 }, g_hjRefused[6] = { 0 }, g_hjFaults[6] = { 0 };
 
 // MSVC unordered_map<Entity, Info> inside the helper's data block D: 0x40
 // bytes each, the ring's sentinel at map+8, the size at map+0x10; list node
@@ -162,7 +176,10 @@ extern "C" void HotJoinSort(int site, int32_t** vec)
         __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_hjFaults[site]); }
         return;
     }
-    __try { HotJoinSortImpl(site, vec); }
+    __try {
+        if (site == kHotJoinFreedIdsSite) vec = *(int32_t***)vec;
+        if (vec) HotJoinSortImpl(site, vec);
+    }
     __except (EXCEPTION_EXECUTE_HANDLER) { InterlockedIncrement64(&g_hjFaults[site]); }
 }
 
@@ -187,8 +204,9 @@ static void InstallHotJoinOrder()
         on++;
     }
     Log("[hotjoinorder] installed: destination candidates, departures, walk arrivals, the idle list and the "
-        "capacity-change maps are read in entity-id order (rva=%llx, %llx, %llx, %llx, %llx)\n",
+        "capacity-change maps are read in entity-id order, freed ids join the free list sorted "
+        "(rva=%llx, %llx, %llx, %llx, %llx, %llx)\n",
         (unsigned long long)kHotJoinSites[0].rva, (unsigned long long)kHotJoinSites[1].rva,
         (unsigned long long)kHotJoinSites[2].rva, (unsigned long long)kHotJoinSites[3].rva,
-        (unsigned long long)kHotJoinSites[4].rva);
+        (unsigned long long)kHotJoinSites[4].rva, (unsigned long long)kHotJoinSites[5].rva);
 }

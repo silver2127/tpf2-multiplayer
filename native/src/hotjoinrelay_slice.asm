@@ -17,6 +17,10 @@
 ;               49 8b bd 20 01 00 00  mov rdi,[r13+120h]; r13 = the helper, [r13+120h]
 ;               its data block with the 5 person + 4 cargo maps the applies walk
 ;               (the relay hands HotJoinSort the address of that pointer)
+;   freed-ids   Engine::EndModification 0x23de130  rva 0x23de385
+;               49 8b 04 24 48 8b 50 08  mov rax,[r12] / mov rdx,[rax+8]; r12 =
+;               engine+0x200, [r12] -> the removed-id vector about to be appended to
+;               the free-id deque (the relay hands over r12, the slot's address)
 ;
 ; The relay hands HotJoinSort(site, &vector) the vector's address, restores
 ; every register and the flags, executes the stolen instruction itself with rsp
@@ -35,6 +39,7 @@ EXTERN g_hjResume1:QWORD
 EXTERN g_hjResume2:QWORD
 EXTERN g_hjResume3:QWORD
 EXTERN g_hjResume4:QWORD
+EXTERN g_hjResume5:QWORD
 
 .code
 
@@ -123,5 +128,12 @@ HotJoinCapacityRelay PROC
     mov  rdi, qword ptr [r13+120h] ; the stolen instruction
     jmp  qword ptr [g_hjResume4]
 HotJoinCapacityRelay ENDP
+
+HotJoinFreedIdsRelay PROC
+    HotJoinBody 5, [r12]
+    mov  rax, qword ptr [r12]      ; the two stolen instructions
+    mov  rdx, qword ptr [rax+8]
+    jmp  qword ptr [g_hjResume5]
+HotJoinFreedIdsRelay ENDP
 
 END
