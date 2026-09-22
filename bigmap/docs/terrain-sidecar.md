@@ -46,6 +46,20 @@ sidecar and `terrain_sidecar=1` was inert. How it works now:
   the sidecar above n grid records.
   `terrain_sidecar_write=0` reads sidecars without writing them.
 - **Test:** `python tools\test_sidecar_io.py` (16 checks, a non-ASCII folder).
+- **Autosaves (fixed 2026-09-22).** An autosave's file is not `<id.name>.sav`
+  (the engine names and rotates it: `autosave_<game>_<date>.sav`), so the
+  expected file never changed and every autosave's sidecar was discarded ("the
+  save was not written"), on the host and in the Sandboxie box alike; manual
+  saves were fine. Now, when the expected `.sav` did not change, the one `.sav`
+  in that folder written during the call takes the sidecar (two or more: none,
+  so a sidecar never carries another save's hash). A hot join's shared save is
+  such an autosave. `tools/test_sidecar_io.py` section 5.
+- **Not sent to joiners, on purpose.** On a 66,248-tile map the `.terr` is
+  1.6 GB beside a 755 MB save, and what it can save is part of the alignment
+  pass: 8.9-10.4 s of a 185 s world entry (road connections alone took 125 s).
+  Sending it would make a join slower even on a fast link, and far slower
+  through a Steam relay; the lobby also holds a transfer in memory. A joiner
+  loads stock; the sidecar serves the host's own loads.
 - **Not yet measured in a game.** What a served load saves is the refine's and
   the pass's *publication* into served tiles; their compute still runs. The
   first real numbers should come from the `terrain sidecar:` log lines and the

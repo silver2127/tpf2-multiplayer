@@ -188,11 +188,49 @@ static int SweepOrphans(const char* savPath) {
     return removed;
 }
 
-struct PendingWrite { bool active; char sav[1040], tmp[1056], terr[1048]; long tiles; uint64_t bytes; FILETIME before; bool hadBefore; LONGLONG encodeMs; };
+struct PendingWrite { bool active; char sav[1040], tmp[1056], terr[1048]; long tiles; uint64_t bytes; FILETIME before; bool hadBefore; LONGLONG encodeMs; FILETIME callStart; };
+
+// The .sav in the resolved save's folder that the engine wrote during this call
+// (write time at or after callStart); false when there is none, or more than one.
+// An autosave's file is not "<id.name>.sav" -- the engine names and rotates it
+// (autosave_<game>_<date>.sav) -- so its sidecar was always discarded
+// ("the save was not written"), and a hot join shares exactly such a save.
+static bool WrittenDuringCall(const char* resolved, const FILETIME& callStart, char* out, size_t cap) {
+    wchar_t dir[1040];
+    if (!TerrainSidecar::WidePath(resolved, dir, 1040)) return false;
+    wchar_t* slash = wcsrchr(dir, L'\\'); wchar_t* fwd = wcsrchr(dir, L'/');
+    if (fwd && (!slash || fwd > slash)) slash = fwd;
+    if (!slash) return false;
+    slash[1] = 0;
+    wchar_t pattern[1040]; wcscpy_s(pattern, dir); wcscat_s(pattern, L"*.sav");
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    // FAT/NTFS write-time granularity and clock steps: allow two seconds before the call
+    ULARGE_INTEGER floor{}; floor.LowPart = callStart.dwLowDateTime; floor.HighPart = callStart.dwHighDateTime;
+    floor.QuadPart -= 2ull * 10000000ull;
+    // Exactly one: a sidecar stamped with ANOTHER save's hash would serve this
+    // world's terrain when that save loads (e.g. the lobby copying mp_shared.sav
+    // during the call). Two candidates = no sidecar.
+    int found = 0; wchar_t bestName[600] = L"";
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        const size_t len = wcslen(fd.cFileName);
+        if (len < 5 || _wcsicmp(fd.cFileName + len - 4, L".sav") != 0) continue;   // not *.sav.lua
+        ULARGE_INTEGER t{}; t.LowPart = fd.ftLastWriteTime.dwLowDateTime; t.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        if (t.QuadPart < floor.QuadPart) continue;
+        ++found; wcscpy_s(bestName, fd.cFileName);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (found != 1) return false;
+    wchar_t full[1100]; wcscpy_s(full, dir); wcscat_s(full, bestName);
+    const int got = WideCharToMultiByte(CP_UTF8, 0, full, -1, out, int(cap), nullptr, nullptr);
+    return got > 0;
+}
 
 // Entry of SaveGame: capture the terrain into "<save>.terr.tmp".
 static void BeforeSave(const SaveGameId* id, PendingWrite& p) {
     p = PendingWrite{};
+    GetSystemTimeAsFileTime(&p.callStart);
     InterlockedIncrement64(&saves);
     if (!g_sidecarWrite || !g_terrainServe) return;
     if (!ResolveSavePath(id, p.sav, sizeof p.sav)) { InterlockedIncrement64(&skipped); if (H) H->log("terrain sidecar: this save's path could not be resolved; no sidecar"); return; }
@@ -227,7 +265,18 @@ static void AfterSave(PendingWrite& p) {
     if (!p.active) return;
     FILETIME after{};
     const bool have = WriteTime(p.sav, &after);
-    const bool fresh = have && (!p.hadBefore || CompareFileTime(&after, &p.before) != 0);
+    bool fresh = have && (!p.hadBefore || CompareFileTime(&after, &p.before) != 0);
+    char resolved[1040]; strcpy_s(resolved, p.sav);
+    if (!fresh) {
+        // not the file the engine wrote (an autosave): the one it did write in that folder
+        char written[1040];
+        if (WrittenDuringCall(p.sav, p.callStart, written, sizeof written)) {
+            strcpy_s(p.sav, written);
+            TerrainSidecar::SidecarPath(p.sav, p.terr, sizeof p.terr);
+            fresh = p.terr[0] != 0;
+            if (fresh && H) H->log("terrain sidecar: the engine wrote %s, not %s; the sidecar goes beside it", p.sav, resolved);
+        }
+    }
     uint64_t fp = fresh ? TerrainSidecar::HashFile(p.sav) : 0;
     bool ok = fp && TerrainSidecar::Refingerprint(p.tmp, fp);
     if (ok) {
@@ -237,7 +286,9 @@ static void AfterSave(PendingWrite& p) {
     }
     if (!ok) {
         TerrainSidecar::RemoveFile(p.tmp); InterlockedIncrement64(&skipped);
-        if (H) H->log("terrain sidecar: the save was not written (or could not be hashed); the captured sidecar is discarded");
+        if (H) H->log("terrain sidecar: the save was not written (or could not be hashed); the captured sidecar is discarded "
+                      "(expected %s: %s, %s; no .sav in that folder written during the save)", resolved,
+                      have ? "exists" : "absent", !have ? "-" : fresh ? "written" : "unchanged");
         return;
     }
     InterlockedIncrement64(&written);
@@ -309,3 +360,11 @@ extern "C" __declspec(dllexport) int BigmapTestSidecarResolve(const void* id, ch
 extern "C" __declspec(dllexport) int BigmapTestSidecarRefingerprint(const char* path, uint64_t fp) { return TerrainSidecar::Refingerprint(path, fp) ? 1 : 0; }
 extern "C" __declspec(dllexport) int BigmapTestSidecarFind(uint64_t fp, char* path, int cap) { return TerrainSidecar::FindByFingerprint(fp, path, size_t(cap)) ? 1 : 0; }
 extern "C" __declspec(dllexport) int BigmapTestSidecarSweep(const char* savPath) { return SidecarIo::SweepOrphans(savPath); }
+// secondsAgo: the save call started that many seconds before now
+extern "C" __declspec(dllexport) int BigmapTestSidecarWrittenDuring(const char* resolved, int secondsAgo, char* out, int cap) {
+    FILETIME now{}; GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER t{}; t.LowPart = now.dwLowDateTime; t.HighPart = now.dwHighDateTime;
+    t.QuadPart -= uint64_t(secondsAgo) * 10000000ull;
+    FILETIME start{}; start.dwLowDateTime = t.LowPart; start.dwHighDateTime = t.HighPart;
+    return SidecarIo::WrittenDuringCall(resolved, start, out, size_t(cap)) ? 1 : 0;
+}
