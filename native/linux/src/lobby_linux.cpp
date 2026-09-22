@@ -1004,10 +1004,12 @@ static void WriteCompanyCfg()
 {
     std::string l3, l4;
     int mine = 1, distinct = 0;
+    bool separate = false;
     std::vector<bool> seen((size_t)MAX_COMPANIES + 1, false);
     {
         std::lock_guard<std::mutex> lk(S().mtx);
         const Model& m = S().m;
+        separate = m.separateCompanies;
         for (size_t i = 0; i < m.players.size(); i++) {
             int cid = m.companies[i];
             cid = cid < 1 ? 1 : cid > MAX_COMPANIES ? MAX_COMPANIES : cid;
@@ -1018,7 +1020,7 @@ static void WriteCompanyCfg()
     }
     for (int c = 1; c <= MAX_COMPANIES; c++)
         if (seen[(size_t)c]) l3 += (l3.empty() ? "" : ",") + std::to_string(c);
-    const std::string mode = distinct > 1 ? "companies" : "coop";
+    const std::string mode = separate || distinct > 1 ? "companies" : "coop";
     const std::string content = mode + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
     std::string err;
     if (!WriteFileAtomic(S().cfg.dataDir + "mp_company_cfg.txt", content, &err)) {
@@ -1364,6 +1366,10 @@ static void ApplyRoster(const Json& ev)
                         : "Waiting for the leader to press START GAME.");
     }
     WritePlayerNames();
+    // Frozen joins load through NativeControl, without HandleStart. Publish the
+    // config with the roster so every load path sees it. Saved live company
+    // commands remain authoritative in companies.lua.
+    WriteCompanyCfg();
     if (roleKnown) WriteBridgeCtl(isHost);
     // HOT JOIN: the roster grew while we host a running game -- take a save and
     // share it; the newcomer's game loads it by itself.
@@ -1510,12 +1516,16 @@ static void HandleStart(const Json& ev)
         { std::lock_guard<std::mutex> lk(S().mtx); S().m.saveReady = false; }
         S().worldGenHold = true;
         if (InGame()) {
-            // Linux has no verified in-place load controller. Place the current
-            // transfer and give the player an actionable manual load fallback.
             std::string placed;
             WriteCompanyCfg();
-            if (MenuGame_PlaceSharedSave(S().lobbyDir + "incoming_save.sav", &placed))
-                Status("The host changed world -- open LOAD GAME and pick \"mp_shared\".");
+            if (MenuGame_PlaceSharedSave(S().lobbyDir + "incoming_save.sav", &placed)) {
+                const std::string operation = "world_switch_" + std::to_string(NowMs());
+                if (NativeIo::Load(operation, placed)) {
+                    Status("Loading the host's new world...");
+                    ArmStageWatch("loading the host's new world");
+                    Log("[lobby] world switch: loading %s in place (%s)\n", placed.c_str(), operation.c_str());
+                } else Status("The host changed world -- open LOAD GAME and pick \"mp_shared\".");
+            }
             else Status("Could not place the host's new save -- ask the host to START again.");
             return;
         }

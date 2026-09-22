@@ -1,4 +1,10 @@
-## Latest Windows integration: dev 23419163, release 0.6 (2026-09-17)
+## Current integration: release 0.6.1.18 (2026-09-21)
+
+See [the current integration and VPS test record](../re/linux/PARITY_20260921.md)
+and [native installation](INSTALL.md). It supersedes the coverage gaps in the
+historical entries below, including recovery, Steam transport and company tint.
+
+## Previous Windows integration: dev 23419163, release 0.6 (2026-09-17)
 
 See [UPSTREAM_dev_23419163.md](UPSTREAM_dev_23419163.md). Ported the Windows
 road-edge entry order (`roadentries`) to the Linux ELF with byte-verified

@@ -3122,6 +3122,7 @@ static void writeCompanyCfg()
 {
     std::string l3, l4; int mine = 1, distinct = 0; bool seen[MAX_COMPANIES + 1] = {};
     if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    const bool separate = InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0;
     for (int i = 0; i < playerCount(); i++) {
         int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
         if (g_players[i] == g_you) mine = cid;
@@ -3130,12 +3131,13 @@ static void writeCompanyCfg()
     }
     if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
     for (int c = 1; c <= MAX_COMPANIES; c++) if (seen[c]) { if (!l3.empty()) l3 += ','; l3 += std::to_string(c); }
-    std::string content = std::string(distinct > 1 ? "companies" : "coop") + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
+    const char* mode = separate || distinct > 1 ? "companies" : "coop";
+    std::string content = std::string(mode) + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
     wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW);
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { Log("[menu] company cfg: cannot write %ls\n", path); return; }
     DWORD w = 0; WriteFile(h, content.data(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
-    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3.c_str(), l4.c_str());
+    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, mode, mine, l3.c_str(), l4.c_str());
 }
 
 // mp_players.txt: "letter=name" per roster entry, with the same letters the
@@ -3254,6 +3256,9 @@ static void applyRoster(const char* s)
     // pause, no ordering to get right.
     static int lastCount = 0;
     writePlayerNames();
+    // Frozen joins bypass the legacy start handler. Keep config ready for
+    // their NativeControl load too; saved live company state wins in Lua.
+    writeCompanyCfg();
     bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
     if (isHost && inGame && count > lastCount && lastCount > 0) {
         LONG age = InterlockedCompareExchange(&g_storedAge, 0, 0), mx = InterlockedCompareExchange(&g_storedMax, 0, 0);

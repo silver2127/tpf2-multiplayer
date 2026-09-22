@@ -15,7 +15,16 @@ std::string MenuGame_SaveDir() { assert(!fixtureSaveDir.empty()); return fixture
 static bool saveTest = false, nativeBusy = false, forceAllowed = true;
 static int savesForced = 0;
 static std::string newestSave;
-namespace NativeIo { bool Busy() { return nativeBusy; } }
+static bool allowLoad = true;
+static int loads = 0;
+static std::string lastStatus;
+namespace NativeIo {
+bool Busy() { return nativeBusy; }
+bool Load(const std::string& operation, const std::string& name) {
+    assert(operation.find("world_switch_") == 0 && name == "mp_shared");
+    ++loads; return allowLoad;
+}
+}
 bool MenuGame_ForceAutosave() { assert(saveTest); ++savesForced; return forceAllowed; }
 bool MenuGame_NewestSave(std::string* path) { assert(saveTest); *path = newestSave; return !path->empty(); }
 
@@ -239,12 +248,29 @@ int main()
     assert(lobby::ParseJson("{\"players\":[],\"mode\":\"coop\"}",&roster));
     lobby::ApplyRoster(roster); lobby::Snapshot(&view); assert(!view.separateCompanies);
     lobby::g_titleMenu=false;
-    // A world switch consumes its own transfer once, with a manual load in-game.
+    // Company config is ready before a frozen join (which never calls HandleStart).
+    model.relay=false;
+    std::string companyConfig;
+    assert(lobby::ParseJson(R"({"players":["host"],"you":"host","host":"host","mode":"companies"})", &roster));
+    lobby::ApplyRoster(roster);
+    assert(lobby::ReadSmallFile(dir+"mp_company_cfg.txt", &companyConfig));
+    assert(companyConfig == "companies\n1\n1\na=1\n");
+    assert(lobby::ParseJson(R"({"players":["host","joiner"],"you":"joiner","mode":"companies","companies":{"host":1,"joiner":2}})", &roster));
+    lobby::ApplyRoster(roster);
+    assert(lobby::ReadSmallFile(dir+"mp_company_cfg.txt", &companyConfig));
+    assert(companyConfig == "companies\n2\n1,2\na=1,b=2\n");
+    // A world switch consumes its transfer once and queues the engine's load.
     model.players={"host","joiner"}; model.companies={1,2}; model.you="joiner";
     model.isHost=false; model.saveReady=true; allowPlace=true;
     lobby::Json sw; assert(lobby::ParseJson("{\"save\":true,\"switch\":true}",&sw));
     lobby::HandleStart(sw); assert(placed==1 && !model.saveReady);
+    assert(loads==1 && lobby::S().stageWatch);
     lobby::HandleStart(sw); assert(placed==1); // stale start cannot reuse an old transfer
+    model.saveReady=true; allowLoad=false;
+    lobby::S().status=[](const char* status) { lastStatus=status; };
+    lobby::HandleStart(sw); assert(placed==2 && loads==2 && !model.saveReady);
+    assert(lastStatus.find("LOAD GAME") != std::string::npos);
+    placed=1; allowLoad=true;
     model.isHost=true; model.saveReady=true;
     lobby::HandleStart(sw); assert(placed==1); // host keeps its already loaded world
     // A vanilla load queues the same session and shares its named file.
