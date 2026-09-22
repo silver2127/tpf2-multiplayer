@@ -249,7 +249,17 @@ CHUNK_STEAM = 32000         # bytes of file data per chunk when every non-loopba
 # window with control frames, and a chunk delayed in Steam's reliable queue arrived after
 # 64 later pings and rosters and was refused as too old (fixed in seal.py Sealer.sign,
 # reproduced by tools/test_steam_save_transfer.py --steam-queue). False = 1,100 B chunks.
-STEAM_BIG_CHUNKS = True    # back on: the stall was the shared replay window (seal.py Sealer.sign)
+# 0.6.1.23 (replay windows split, send-rate ids right) STILL stalled live: base 256/4199,
+# exactly 8 MB -- the Steam send/receive buffer size the tunnel sets -- then nothing, and
+# no chunk refused as too old. Off by default again; a file tpf2mp_steam_big_chunks.txt
+# in the data dir (or TPF2MP_STEAM_BIG_CHUNKS=1), on the HOST, turns it on to test.
+def _steam_big_chunks():
+    if os.environ.get("TPF2MP_STEAM_BIG_CHUNKS") == "1":
+        return True
+    return os.path.exists(os.path.join(modshare.data_dir(), "tpf2mp_steam_big_chunks.txt"))
+
+
+STEAM_BIG_CHUNKS = None    # None: ask _steam_big_chunks() per transfer; True/False: forced (tests)
 CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
                             # one chunk size serves everyone, and 32 KB datagrams on the open
                             # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
@@ -287,6 +297,44 @@ CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
 # feedback, verify and start messages are the same as over UDP.
 BULK = [None]
 BULK_TCP = [True]
+# TCP FOR STEAM PEERS (2026-09-22). A peer reached through the Steam tunnel is a
+# loopback endpoint here, so neither end knows the other's address to open the bulk
+# TCP channel, and a save crawled through Steam instead. Over the sealed link each
+# end now names its own addresses: the host in fbegin (tcp.addrs, its listener's
+# port), the joiner in fbegin_ack (tcp_addrs + tcp_port of a listener it opens for
+# the transfer). The joiner dials the host's, the host dials the joiner's, and the
+# first stream that connects carries the file; Steam carries it if neither does.
+# Only a peer already admitted to the sealed session ever sees these addresses.
+MY_TCP_ADDRS = [[]]      # this machine's addresses, from its NAT observation (public, LAN, v6)
+JOINER_BULK = [None]     # the joiner's own listener for a host-dialled stream (opened on first need)
+
+
+def _profile_ips(profile):
+    """The IPs an observed profile names (its candidates' 'ip:port' strings), public first."""
+    out = []
+    cands = (profile or {}).get("candidates") or {}
+    for k in ("public_v4", "lan_v4", "vpn_v4", "vpn2_v4", "v6"):
+        v = cands.get(k)
+        if not isinstance(v, str) or not v:
+            continue
+        ip = v.rsplit(":", 1)[0].strip("[]") if ":" in v else v
+        if ip and ip not in out and not ip.startswith("127."):
+            out.append(ip)
+    return out[:6]
+
+
+def _valid_tcp_addrs(v):
+    """A peer's address list as offered, filtered to plain IP strings (at most 6)."""
+    import ipaddress
+    out = []
+    for a in (v if isinstance(v, list) else [])[:6]:
+        try:
+            ip = ipaddress.ip_address(str(a))
+        except ValueError:
+            continue
+        if not ip.is_loopback and not ip.is_multicast and not ip.is_unspecified:
+            out.append(str(ip))
+    return out
 # THE TCP BACKUP LINK (dual_tcp.py): DUAL[0] is the host's DualSocket (the joiner's
 # is conn.sock); off with tpf2mp_tcp_backup.txt = 0 in the io dir or in an
 # unsealed session.
@@ -1404,7 +1452,8 @@ class _HostSaveTransfer:
             if not host.startswith("127."):
                 internet = True
         if tunnel:
-            return CHUNK_STEAM if STEAM_BIG_CHUNKS and not internet else CHUNK_STEAM_MIXED
+            big = _steam_big_chunks() if STEAM_BIG_CHUNKS is None else STEAM_BIG_CHUNKS
+            return CHUNK_STEAM if big and not internet else CHUNK_STEAM_MIXED
         return CHUNK_DATA if internet else CHUNK_LOCAL
 
     @staticmethod
@@ -1460,8 +1509,11 @@ class _HostSaveTransfer:
         # the UDP pump; its feedback still drives base, stage and timeouts.
         self.tcp_token = os.urandom(16).hex() if BULK_TCP[0] else None
         self.tcp_bytes = 0
+        self._tcp_lock = threading.Lock()
         if self.tcp_token and BULK[0] is not None:
             self.begin_msg["tcp"] = {"port": BULK[0].port, "token": self.tcp_token}
+            if MY_TCP_ADDRS[0] and any(steamtunnel.is_tunnel_addr(a) for a, _ in targets):
+                self.begin_msg["tcp"]["addrs"] = list(MY_TCP_ADDRS[0])   # a Steam peer cannot see where we are
             BULK[0].expect(sid, "recv", self.tcp_token, self._tcp_serve)
         elif self.tcp_token:
             self.begin_msg["tcp"] = {"token": self.tcp_token}     # no listener: the other side may offer one
@@ -1501,15 +1553,29 @@ class _HostSaveTransfer:
         self._tcp_stream(sock, p)
 
     def _tcp_push(self, ip, port, p):
-        """A thread: WE connect (a joiner's upload to the relay's listener)."""
-        sock = bulk_tcp.bulk_connect(ip, port, "send", self.sid, self.tcp_token, p["name"])
-        if sock is None:
-            self.log(f"[host] {p['name']}: no TCP stream to {ip}:{port} -- the upload runs over UDP")
-            return
-        self._tcp_stream(sock, p)
+        """A thread: WE connect (a joiner's upload to the relay's listener; a Steam
+        joiner's own listener, ip then a list of the addresses it named)."""
+        ips = ip if isinstance(ip, list) else [ip]
+        for one in ips:
+            if p["tcp"] or p["state"] != "active":
+                return                          # its stream to us won the race
+            sock = bulk_tcp.bulk_connect(one, port, "send", self.sid, self.tcp_token, p["name"])
+            if sock is not None:
+                self.log(f"[host] {p['name']}: connected to its TCP listener at {redact(one)}:{port}")
+                self._tcp_stream(sock, p)
+                return
+        self.log(f"[host] {p['name']}: no TCP stream to {', '.join(redact(i) for i in ips)} port {port} -- "
+                 + ("Steam carries the rest" if len(ips) > 1 or steamtunnel.is_tunnel_addr(p.get('addr')) else "the upload runs over UDP"))
 
     def _tcp_stream(self, sock, p):
-        p["tcp"] = True
+        with self._tcp_lock:                    # both ends may dial: the first stream wins
+            if p["tcp"]:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            p["tcp"] = True
         p["ready"] = True
         p["tcp_done"] = 0.0
         self.log(f"[host] {p['name']} takes the {self.kind} over TCP")
@@ -1586,6 +1652,14 @@ class _HostSaveTransfer:
                 and isinstance(addr, tuple) and not steamtunnel.is_tunnel_addr(addr):
             p["tcp_tried"] = True
             threading.Thread(target=self._tcp_push, args=(addr[0], port, p), name="bulk-push", daemon=True).start()
+        elif self.tcp_token and isinstance(port, int) and 0 < port < 65536 and not p["tcp"] and not p["tcp_tried"] \
+                and steamtunnel.is_tunnel_addr(addr):
+            ips = _valid_tcp_addrs(msg.get("tcp_addrs"))
+            if ips:
+                p["tcp_tried"] = True
+                p["addr"] = addr
+                self.log(f"[host] {p['name']} (through Steam) offers a TCP listener on {len(ips)} address(es) -- dialling")
+                threading.Thread(target=self._tcp_push, args=(ips, port, p), name="bulk-push", daemon=True).start()
         need = msg.get("need")
         if isinstance(need, list):
             # the ids this joiner does not have installed, out of self.mods
@@ -2376,9 +2450,28 @@ class _ClientSaveReceiver:
                     BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
                     ack["tcp_port"] = BULK[0].port
             elif isinstance(tcp.get("port"), int) and getattr(self.conn, "peer", None) \
-                    and not steamtunnel.is_tunnel_addr(self.conn.peer):   # Steam carries the chunks: no TCP there
+                    and not steamtunnel.is_tunnel_addr(self.conn.peer):
                 threading.Thread(target=self._tcp_pull, args=(self.conn.peer[0], tcp["port"], tcp["token"], sid),
                                  name="bulk-pull", daemon=True).start()
+            elif getattr(self.conn, "peer", None) and steamtunnel.is_tunnel_addr(self.conn.peer):
+                # THROUGH STEAM: dial the addresses the host named, and name ours so the
+                # host can dial us (see MY_TCP_ADDRS); Steam carries whatever neither reaches
+                host_ips = _valid_tcp_addrs(tcp.get("addrs"))
+                if host_ips and isinstance(tcp.get("port"), int):
+                    threading.Thread(target=self._tcp_pull, args=(host_ips, tcp["port"], tcp["token"], sid),
+                                     name="bulk-pull", daemon=True).start()
+                if MY_TCP_ADDRS[0]:
+                    if JOINER_BULK[0] is None:
+                        try:
+                            JOINER_BULK[0] = bulk_tcp.BulkListener.open(self.conn.sock.getsockname()[1], self.log)
+                        except (OSError, AttributeError):
+                            JOINER_BULK[0] = None
+                    if JOINER_BULK[0] is not None:
+                        JOINER_BULK[0].expect(sid, "send", tcp["token"], self._tcp_accepted)
+                        ack["tcp_port"] = JOINER_BULK[0].port
+                        ack["tcp_addrs"] = list(MY_TCP_ADDRS[0])
+                self.log(f"[client] the host is reached through Steam: TCP to {len(host_ips)} host address(es)"
+                         + (f", and our listener on tcp/{ack['tcp_port']} offered" if "tcp_port" in ack else ", none offered here"))
         self._send(ack)
         if kind != "mods":
             self.io.emit({"type": "transfer", "role": "recv", "pct": 0})   # a mods batch: the round's status line stays
@@ -2392,23 +2485,34 @@ class _ClientSaveReceiver:
         is 20x slower than the stream, and nothing has been read yet, so a fresh
         stream from the start is consistent with what UDP delivers meanwhile
         (chunks already in hand are dropped as duplicates)."""
+        ips = ip if isinstance(ip, list) else [ip]
         for attempt in range(1, TCP_CONNECT_TRIES + 1):
-            if sid != self.sid:
-                return                       # a later transfer replaced this one
-            sock = bulk_tcp.bulk_connect(ip, port, "recv", sid, token, self.my_name)
-            if sock is not None:
-                self._tcp_read(sock, sid)
-                return
+            for one in ips:
+                if sid != self.sid or getattr(self, "_tcp_claim", None) == sid:
+                    return                   # a later transfer replaced this one, or the host's dial won
+                sock = bulk_tcp.bulk_connect(one, port, "recv", sid, token, self.my_name)
+                if sock is not None:
+                    self._tcp_read(sock, sid)
+                    return
             if attempt < TCP_CONNECT_TRIES:
-                self.log(f"[client] no TCP stream from {ip}:{port} (attempt {attempt}) -- trying again")
+                self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} (attempt {attempt}) -- trying again")
                 time.sleep(TCP_CONNECT_RETRY)
-        self.log(f"[client] no TCP stream from {ip}:{port} after {TCP_CONNECT_TRIES} attempts -- receiving over UDP")
+        self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} after {TCP_CONNECT_TRIES} attempts -- "
+                 + ("Steam carries it" if len(ips) > 1 or steamtunnel.is_tunnel_addr(getattr(self.conn, 'peer', None)) else "receiving over UDP"))
 
     def _tcp_accepted(self, sock, addr, name):
         """ACCEPT THREAD HELPER (the relay): the leader connected to push its upload."""
         self._tcp_read(sock, self.sid)
 
     def _tcp_read(self, sock, sid):
+        with self._progress_lock:              # both ends may dial: the first stream wins
+            if getattr(self, "_tcp_claim", None) == sid:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return
+            self._tcp_claim = sid
         self.tcp_active, self._tcp_started = True, time.time()
         self.log(f"[client] taking the {self.kind} over TCP")
         self.io.emit({"type": "transfer", "role": "recv", "state": "tcp"})
@@ -5607,6 +5711,7 @@ def cmd_host(args):
     sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
                                                  password=args.password or None,
                                                  extra_candidates={"steam": tunnel.id})
+    MY_TCP_ADDRS[0] = _profile_ips(_profile)      # named to Steam peers for the TCP bulk channel
     if tunnel.available:
         tunnel.hello(sock.getsockname()[1])   # the code names our SteamID; joiners reach us through Steam too
     # Steam by default: a game with Steam's networking shows its Steam ID as the code;
@@ -5783,6 +5888,7 @@ def cmd_join(args):
         try:
             from observe import observe
             prof = observe(args.local_port, sock=sock, do_upnp=False)
+            MY_TCP_ADDRS[0] = _profile_ips(prof)       # offered to a host reached through Steam
             if tunnel.available:
                 prof["candidates"]["steam"] = tunnel.id   # the knock tells the host to open our Steam session
             profile_code = encode_profile(prof)
