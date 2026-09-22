@@ -417,14 +417,10 @@ def _start_dual_client(conn, name, log, sim=None):
     return dsock
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
-# OVER STEAM A RESEND IS NOT A RETRY (2026-09-22). Steam's reliable send delivers a
-# chunk it took; a hole the receiver reports is one still on its way or one lost on
-# the loopback leg. Re-sending every hole on every 50 ms fack queued 4,400 duplicate
-# 32 KB messages behind the missing one (base 132/4199, then TIMED OUT). A hole is
-# re-sent at most every NACK_HOLDOFF_STEAM, and a silent receiver rewinds after
-# RESEND_AFTER_STEAM, not the UDP path's 0.5 s.
-NACK_HOLDOFF_STEAM = 1.0
+# Reliable Steam data needs stalled-stream probes, not UDP window retransmits.
 RESEND_AFTER_STEAM = 3.0
+STEAM_WINDOW_START = 16    # grow from 512 KB using delivery acknowledgements
+STEAM_RETRY_MAX = 8.0      # probe a stalled stream, never requeue its whole window
 SEND_WINDOW_STEAM  = 128    # x CHUNK_STEAM = ~4 MB in flight: half the 8 MB send buffer the
                             # tunnel gives Steam (steam_tunnel.cpp SendBufferSize), and ~40 MB/s
                             # at a 100 ms round trip, over the 16 MB/s rate it allows
@@ -1656,6 +1652,8 @@ class _HostSaveTransfer:
         if not p or msg.get("sid") != self.sid:
             return
         if not p["ready"]:
+            if self.chunk == CHUNK_STEAM:
+                p["last_advance"] = time.time()
             p["ready"] = True
             self.log(f"[host] {p['name']} ready for {self.kind}")
         # the receiver has a listener (the relay, for our upload): connect and stream
@@ -1689,6 +1687,8 @@ class _HostSaveTransfer:
         if not p or msg.get("sid") != self.sid or p["state"] != "active":
             return
         now = time.time()
+        if self.chunk == CHUNK_STEAM and not p["ready"]:
+            p["last_advance"] = now
         p["ready"] = True
         p["last_fack"] = now
         base = int(msg.get("base", 0))
@@ -1699,6 +1699,9 @@ class _HostSaveTransfer:
             p["tcp"] = False
             self.log(f"[host] {p['name']}: base {base}/{self.total_chunks} after the TCP stream -- UDP fills the rest")
         if base > p["base"]:
+            if self.chunk == CHUNK_STEAM:
+                p["steam_window"] = min(self.window, p.get("steam_window", STEAM_WINDOW_START) + base - p["base"])
+                p["steam_retry_delay"] = RESEND_AFTER_STEAM
             p["base"] = base
             p["last_advance"] = now
             self.progress_at = now
@@ -1734,6 +1737,10 @@ class _HostSaveTransfer:
             p["base"] = base
             p["next"] = base
             p["nack"] = []
+            p.pop("steam_retry_at", None)
+            p.pop("steam_started_at", None)
+            p["steam_window"] = STEAM_WINDOW_START
+            p["steam_retry_delay"] = RESEND_AFTER_STEAM
             p["last_advance"] = now
             p["last_pct"] = -1
         # Merge the reported holes with any still-pending ones (all >= base).
@@ -1741,6 +1748,11 @@ class _HostSaveTransfer:
                  if isinstance(s, int) and p["base"] <= s < self.total_chunks}
         holes |= {s for s in p["nack"] if s >= p["base"]}
         p["nack"] = sorted(holes)
+        if self.chunk == CHUNK_STEAM:
+            # With <=128 outstanding chunks MAX_NACK covers the entire window.
+            # A received chunk beyond a hole distinguishes local loss from a
+            # reliable Steam queue which simply has not delivered anything yet.
+            p["steam_missing"] = set(p["nack"])
         self._emit_pct(p)
 
     def progress_tokens(self):
@@ -1818,25 +1830,22 @@ class _HostSaveTransfer:
                 continue
             if p["tcp"]:
                 continue                        # streaming over TCP: nothing to send here
+            if self.chunk == CHUNK_STEAM:
+                self._pump_steam(addr, p, now)
+                continue
             # Receiver silent for too long? Its facks were lost -- rewind and
             # re-stream the window so it (and its facks) can catch up.
-            steam = self.chunk == CHUNK_STEAM
-            resend_after = RESEND_AFTER_STEAM if steam else RESEND_AFTER
+            resend_after = RESEND_AFTER
             if (now - p["last_fack"] > resend_after
                     and now - p["last_resend"] > resend_after):
                 p["next"] = p["base"]
                 p["last_resend"] = now
             budget = SEND_BUDGET
-            resent = p.setdefault("resent", {}) if steam else None
             # 1) selective retransmits (explicit holes) first
             while budget > 0 and p["nack"]:
                 seq = p["nack"].pop(0)
                 if seq < p["base"] or seq >= self.total_chunks:
                     continue
-                if resent is not None:
-                    if now - resent.get(seq, -1e9) < NACK_HOLDOFF_STEAM:
-                        continue                # still on its way through Steam
-                    resent[seq] = now
                 self._send_chunk(addr, seq)
                 budget -= 1
             # 2) new in-order chunks, capped by the flow-control window
@@ -1845,6 +1854,45 @@ class _HostSaveTransfer:
                 self._send_chunk(addr, p["next"])
                 p["next"] += 1
                 budget -= 1
+
+    def _pump_steam(self, addr, p, now):
+        """Steam already retransmits accepted reliable messages. ACKs bound new
+        bytes in flight; a stalled contiguous cursor gets one recovery probe,
+        or a bounded batch of holes before already received reliable data.
+        This also recovers loss on either local UDP leg or a refused Steam send.
+        NACKs include not-yet-delivered/not-yet-sent chunks, not proven loss.
+        """
+        p["nack"] = []
+        started = p.setdefault("steam_started_at", now)
+        window = p.setdefault("steam_window", STEAM_WINDOW_START)
+        delay = p.setdefault("steam_retry_delay", RESEND_AFTER_STEAM)
+        if (p["base"] < p["next"] and now - max(started, p["last_advance"]) >= delay
+                and now - p.get("steam_retry_at", started) >= delay):
+            missing = p.get("steam_missing", {p["base"]})
+            end = min(p["next"], p["base"] + self.window, self.total_chunks)
+            received = [seq for seq in range(p["base"], end) if seq not in missing]
+            holes = sorted(seq for seq in missing if p["base"] <= seq < max(received, default=p["base"]))
+            probes = holes[:8] if holes else [p["base"]]
+            for seq in probes:
+                self._send_chunk(addr, seq)
+            p["steam_retry_at"] = now
+            p["steam_retry_delay"] = min(STEAM_RETRY_MAX, delay * 2)
+            if not holes:
+                window = p["steam_window"] = max(4, window // 2)
+            p["steam_retries"] = p.get("steam_retries", 0) + len(probes)
+        limit = min(self.total_chunks, p["base"] + window)
+        for _ in range(min(SEND_BUDGET, max(0, limit - p["next"]))):
+            self._send_chunk(addr, p["next"])
+            p["next"] += 1
+        if now - p.get("steam_stats_at", 0.0) >= 5.0:
+            previous = p.get("steam_stats_bytes", 0)
+            done = min(p["base"] * self.chunk, self.total_bytes)
+            elapsed = now - p.get("steam_stats_at", now)
+            rate = max(0, done - previous) / elapsed if elapsed > 0 else 0
+            self.log(f"[xfer] Steam send sid={self.sid} peer={p['name']}: acked={done}/{self.total_bytes}B "
+                     f"rate={rate / 1e6:.3f}MB/s in_flight={max(0, p['next'] - p['base']) * self.chunk}B "
+                     f"window={window} retries={p.get('steam_retries', 0)}")
+            p["steam_stats_at"], p["steam_stats_bytes"] = now, done
 
     def all_resolved(self):
         return all(p["state"] in ("done", "failed", "dropped")
@@ -1929,6 +1977,9 @@ class _ClientSaveReceiver:
         self.overall_sha = None
         self.base = 0
         self.recv_count = 0
+        self.recv_bytes = self.duplicate_chunks = 0
+        self.recv_stats_at = time.time()
+        self.recv_stats_bytes = 0
         self.complete = False
         self.failed = False
         self.retries = 0
@@ -2442,6 +2493,9 @@ class _ClientSaveReceiver:
             return
         self.base = 0
         self.recv_count = 0
+        self.recv_bytes = self.duplicate_chunks = 0
+        self.recv_stats_at = time.time()
+        self.recv_stats_bytes = 0
         self.complete = False
         self.failed = False
         self.retries = 0
@@ -2579,6 +2633,7 @@ class _ClientSaveReceiver:
         if self.failed or seq < 0 or seq >= self.total_chunks:
             return
         if self.have[seq]:
+            self.duplicate_chunks += 1
             return                               # dup / reorder -- already have it
         off = seq * self.chunk
         # bytearray slice-assignment GROWS the buffer when the slice runs past
@@ -2591,6 +2646,7 @@ class _ClientSaveReceiver:
         self.buf[off:off + len(data)] = data
         self.have[seq] = 1
         self.recv_count += 1
+        self.recv_bytes += len(data)
         while self.base < self.total_chunks and self.have[self.base]:
             self.base += 1
         self._emit_pct()
@@ -2620,6 +2676,12 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
+        if self.active() and self.chunk == CHUNK_STEAM and now - self.recv_stats_at >= 5.0:
+            rate = (self.recv_bytes - self.recv_stats_bytes) / (now - self.recv_stats_at)
+            self.log(f"[xfer] Steam receive sid={self.sid}: unique={self.recv_bytes}/{self.total_bytes}B "
+                     f"rate={rate / 1e6:.3f}MB/s base={self.base}/{self.total_chunks} "
+                     f"duplicates={self.duplicate_chunks}")
+            self.recv_stats_at, self.recv_stats_bytes = now, self.recv_bytes
         # frames the replay window refused as too old: silent until 2026-09-22, when
         # they were every Steam-delayed save chunk (seal.py Sealer.sign)
         sealer = SEAL[0]
@@ -2848,6 +2910,9 @@ class _ClientSaveReceiver:
                 self.have = bytearray(self.total_chunks)   # request everything
                 self.base = 0
                 self.recv_count = 0
+                self.recv_bytes = self.duplicate_chunks = 0
+                self.recv_stats_at = time.time()
+                self.recv_stats_bytes = 0
                 self.last_pct = -1
                 self._send_fack()
                 return

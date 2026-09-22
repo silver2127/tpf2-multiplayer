@@ -139,6 +139,10 @@ struct Endpoint {
     uint16_t port = 0;
     DWORD lastSeen = 0;
     uint64_t in = 0, out = 0, reliable = 0;
+    uint64_t inBytes = 0, outBytes = 0, failed = 0, localFailed = 0;
+    uint64_t statsIn = 0, statsOut = 0;
+    DWORD statsAt = 0, bulkAt = 0;
+    bool bulkSeen = false;
 };
 
 bool ResolveApi()
@@ -374,8 +378,13 @@ DWORD WINAPI TunnelThread(LPVOID)
     };
     auto sendP2P = [&](uint64_t id, const char* data, int len, int channel, Endpoint* e) {
         const int type = (len > (int)UNRELIABLE_MAX) ? SEND_RELIABLE : SEND_UNRELIABLE;
-        if (!g_api.send(g_api.net, id, data, (uint32_t)len, type, channel)) { sendFail++; return; }
-        if (e) { e->out++; if (type == SEND_RELIABLE) e->reliable++; }
+        if (e && (type == SEND_RELIABLE || (len >= 9 && memcmp(data + 5, "NPF1", 4) == 0))) {
+            e->bulkAt = GetTickCount(); e->bulkSeen = true;
+        }
+        if (!g_api.send(g_api.net, id, data, (uint32_t)len, type, channel)) {
+            sendFail++; if (e) e->failed++; return;
+        }
+        if (e) { e->out++; e->outBytes += len; if (type == SEND_RELIABLE) e->reliable++; }
     };
 
     while (!g_stop) {
@@ -398,9 +407,13 @@ DWORD WINAPI TunnelThread(LPVOID)
                 Endpoint* e = endpointFor(from);
                 if (!e) continue;
                 if (ch == CH_CTL) continue;                       // OPEN: the endpoint now exists, nothing to forward
-                e->in++;
+                e->in++; e->inBytes += got;
+                if (got > UNRELIABLE_MAX || (got >= 9 && memcmp(buf.data() + 5, "NPF1", 4) == 0)) {
+                    e->bulkAt = GetTickCount(); e->bulkSeen = true;
+                }
                 if (!lobby.sin_port) { dropNoLobby++; continue; }
-                sendto(e->sock, buf.data(), (int)got, 0, (sockaddr*)&lobby, sizeof(lobby));
+                if (sendto(e->sock, buf.data(), (int)got, 0, (sockaddr*)&lobby, sizeof(lobby)) == SOCKET_ERROR)
+                    e->localFailed++;
             }
         }
         // ---- outbound: the lobby's datagrams on each endpoint socket, and control
@@ -470,6 +483,25 @@ DWORD WINAPI TunnelThread(LPVOID)
                     sendto(ctl, reply.data(), (int)reply.size(), 0, (sockaddr*)&from, fl);
                 }
             }
+        }
+        // Bounded diagnostics for actual bulk activity, including a stalled queue.
+        DWORD statsNow = GetTickCount();
+        for (auto& kv : eps) {
+            auto& e = kv.second;
+            if (!e.statsAt) { e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes; }
+            DWORD dt = statsNow - e.statsAt;
+            if (dt < 5000) continue;
+            if (e.bulkSeen && statsNow - e.bulkAt <= 30000) {
+                P2PSessionState st = {};
+                bool have = g_api.sessionState && g_api.sessionState(g_api.net, kv.first, &st);
+                g_log("[steam-bulk] endpoint=%u in=%lluB out=%lluB rx=%.3fMB/s tx=%.3fMB/s queued=%dB packets=%d send_fail=%llu local_fail=%llu active=%d relay=%d\n",
+                      (unsigned)e.port, (unsigned long long)e.inBytes, (unsigned long long)e.outBytes,
+                      (e.inBytes - e.statsIn) / (dt * 1000.0), (e.outBytes - e.statsOut) / (dt * 1000.0),
+                      have ? st.bytesQueued : -1, have ? st.packetsQueued : -1,
+                      (unsigned long long)e.failed, (unsigned long long)e.localFailed,
+                      have ? st.active : -1, have ? st.usingRelay : -1);
+            }
+            e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes;
         }
         // ---- idle endpoints
         DWORD now = GetTickCount();
