@@ -3842,7 +3842,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # roster grows -- the lobby brings the newcomer in through a recovery
         # round (do_join). Off when recovery cannot run (an old client, a
         # transfer in flight, a relay), so the menu's save still serves then.
-        freeze = bool(recovery is not None and not relay_only and (recovery.held or recovery_supported()))
+        freeze = bool(recovery is not None and not relay_only and (recovery.held or recovery_supported())
+                      and not (_live_join_on(io.dir) and not recovery.held))   # live join: the menu's save serves
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
                  "relay": relay_only, "companies": roster_companies(), "stages": roster_stages(),
@@ -4026,7 +4027,17 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         # The menu's own hot-join save stands down when the roster says
         # join_freeze (emit_roster). Falls back to that path when recovery is
         # not available (an old client, a transfer in flight): logged.
-        if late and recovery and not relay_only:
+        # LIVE JOIN (2026-09-22, user: "get rid of the forced pausing and the
+        # screen that pops up"): with tpf2mp_live_join.txt = 1 there is no round
+        # at all -- nobody holds, nobody sees the recovery window. The host's
+        # menu takes its hot-join save while the session runs (join_freeze is
+        # false, emit_roster), the newcomer loads it and catches up on the
+        # command history. That path diverged the person sim until the engine
+        # read its batches in entity-id order (docs/re/HOTJOIN_ORDER.md).
+        if late and recovery and not relay_only and _live_join_on(io.dir):
+            log(f"[host] live join for {peers[addr]['name']!r}: the session keeps running; the menu's hot-join save "
+                "serves it and it catches up on the command history")
+        elif late and recovery and not relay_only:
             if recovery_protocol == 4 and recovery.join(peers[addr]["name"]):
                 log(f"[host] frozen join for {peers[addr]['name']!r}: holding the session, "
                     + ("the players in keep their worlds, the newcomer loads (live join)" if recovery.barrier.retain
