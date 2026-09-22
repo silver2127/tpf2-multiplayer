@@ -6,6 +6,8 @@ bulk TCP channel (lobby.MY_TCP_ADDRS):
   2. the host has no listener: the joiner's offer (fbegin_ack tcp_addrs/tcp_port)
      lets the HOST dial the JOINER, and the save streams that way
   3. no TCP at all: Steam carries the save, complete and identical
+  4. addresses that do not answer: both ends give up, Steam takes over before TCP_FIRST_WAIT
+TCP FIRST: with a stream possible, Steam carries no save chunks (case 1).
 
 Addresses are this machine's LAN IP (loopback is filtered out of offers on purpose).
 
@@ -92,21 +94,26 @@ def run(label, addrs, host_listener=True):
         got = os.path.join(io_j.dir, "incoming_save.sav")
         same = done() and os.path.isfile(got) and hashlib.sha256(open(got, "rb").read()).hexdigest() == want
         via_tcp = any(e.get("type") == "transfer" and e.get("state") == "tcp" for e in lobby._read_events(io_j.out_path))
-        print(f"     {label}: {SIZE / 1e6:.0f} MB in {dt:.1f} s, tcp={via_tcp}, identical={same}")
+        steam_dgrams = A.sent
+        print(f"     {label}: {SIZE / 1e6:.0f} MB in {dt:.1f} s, tcp={via_tcp}, identical={same}, host->Steam datagrams={steam_dgrams}")
         stop.set()
         time.sleep(0.6)
         A.close(); B.close(); ca.close(); cb.close()
         if lobby.JOINER_BULK[0] is not None and hasattr(lobby.JOINER_BULK[0], "close"):
             lobby.JOINER_BULK[0].close()
         lobby.JOINER_BULK[0] = None
-        return same, via_tcp
+        return same, via_tcp, steam_dgrams, dt
 
 
 print(f"LAN address used for the offers: {LAN}")
 r = run("host listener reachable", [LAN])
 check("1. the joiner dials the host's address and the save takes TCP", r and r[0] and r[1], str(r))
+check("   ... TCP FIRST: Steam carried no save chunks (control traffic only)", r and r[2] < 400, str(r and r[2]))
 r = run("no host listener, joiner's offered", [LAN], host_listener=False)
 check("2. the host dials the joiner's listener and the save takes TCP", r and r[0] and r[1], str(r))
+r = run("addresses that do not answer (TEST-NET)", ["192.0.2.1"])
+check("4. nothing answers: both ends give up and Steam carries the save, identical", r and r[0] and not r[1], str(r))
+check("   ... Steam took over before the TCP_FIRST_WAIT cap", r and r[3] < lobby.TCP_FIRST_WAIT + 8, str(r and r[3]))
 r = run("no addresses at all", [])
 check("3. no TCP either way: Steam carries the save, identical", r and r[0] and not r[1], str(r))
 

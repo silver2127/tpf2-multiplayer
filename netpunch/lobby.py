@@ -419,6 +419,12 @@ SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
 # Reliable Steam data needs stalled-stream probes, not UDP window retransmits.
 RESEND_AFTER_STEAM = 3.0
+# TCP FIRST, STEAM AS THE FALLBACK (2026-09-22). For a peer reached through Steam the
+# chunk pump holds while a TCP stream can still come (the joiner dialling the host's
+# addresses, the host dialling the joiner's listener): Steam starts only when neither
+# connects within TCP_FIRST_WAIT, or sooner when both ends have given up. A stream
+# that breaks hands the rest to Steam as before.
+TCP_FIRST_WAIT = 15.0
 STEAM_WINDOW_START = 16    # grow from 512 KB using delivery acknowledgements
 STEAM_RETRY_MAX = 8.0      # probe a stalled stream, never requeue its whole window
 SEND_WINDOW_STEAM  = 128    # x CHUNK_STEAM = ~4 MB in flight: half the 8 MB send buffer the
@@ -1572,6 +1578,7 @@ class _HostSaveTransfer:
                 self.log(f"[host] {p['name']}: connected to its TCP listener at {redact(one)}:{port}")
                 self._tcp_stream(sock, p)
                 return
+        p["push_pending"] = False
         self.log(f"[host] {p['name']}: no TCP stream to {', '.join(redact(i) for i in ips)} port {port} -- "
                  + ("Steam carries the rest" if len(ips) > 1 or steamtunnel.is_tunnel_addr(p.get('addr')) else "the upload runs over UDP"))
 
@@ -1668,8 +1675,17 @@ class _HostSaveTransfer:
             if ips:
                 p["tcp_tried"] = True
                 p["addr"] = addr
+                p["push_pending"] = True
                 self.log(f"[host] {p['name']} (through Steam) offers a TCP listener on {len(ips)} address(es) -- dialling")
                 threading.Thread(target=self._tcp_push, args=(ips, port, p), name="bulk-push", daemon=True).start()
+        if steamtunnel.is_tunnel_addr(addr) and not p["tcp"] and "tcp_first_until" not in p:
+            pull = bool(msg.get("tcp_pull"))           # the joiner is dialling our addresses
+            if pull or p.get("push_pending"):
+                p["tcp_first_until"] = time.time() + TCP_FIRST_WAIT
+                p["pull_pending"] = pull
+                self.log(f"[host] {p['name']}: TCP first ("
+                         + " and ".join(w for w, on in (("it dials us", pull), ("we dial it", p.get("push_pending"))) if on)
+                         + f"), Steam after {TCP_FIRST_WAIT:.0f} s if no stream connects")
         need = msg.get("need")
         if isinstance(need, list):
             # the ids this joiner does not have installed, out of self.mods
@@ -1681,6 +1697,13 @@ class _HostSaveTransfer:
                 self.log(f"[host] {p['name']} lacks {len(p['need'])} mod(s): "
                          + ", ".join(modshare.mod_folder_name(m, v) for m, v in p['need'])
                          + (" -- waiting for their yes/no" if p["ask"] else ""))
+
+    def on_tcp_gave_up(self, addr, msg):
+        """The joiner could not reach any address we named: its dialling is over."""
+        p = self.peers.get(addr)
+        if p and msg.get("sid") == self.sid and p.get("pull_pending"):
+            p["pull_pending"] = False
+            self.log(f"[host] {p['name']} could not reach us over TCP")
 
     def on_fack(self, addr, msg):
         p = self.peers.get(addr)
@@ -1830,6 +1853,13 @@ class _HostSaveTransfer:
                 continue
             if p["tcp"]:
                 continue                        # streaming over TCP: nothing to send here
+            until = p.get("tcp_first_until")
+            if until:
+                if now < until and (p.get("push_pending") or p.get("pull_pending")):
+                    p["last_advance"] = now     # waiting for TCP is not a stall
+                    continue
+                p.pop("tcp_first_until", None)
+                self.log(f"[host] {p['name']}: no TCP stream -- Steam carries the {self.kind}")
             if self.chunk == CHUNK_STEAM:
                 self._pump_steam(addr, p, now)
                 continue
@@ -2524,7 +2554,8 @@ class _ClientSaveReceiver:
                 # host can dial us (see MY_TCP_ADDRS); Steam carries whatever neither reaches
                 host_ips = _valid_tcp_addrs(tcp.get("addrs"))
                 if host_ips and isinstance(tcp.get("port"), int):
-                    threading.Thread(target=self._tcp_pull, args=(host_ips, tcp["port"], tcp["token"], sid),
+                    ack["tcp_pull"] = True             # the host holds Steam while we dial
+                    threading.Thread(target=self._tcp_pull, args=(host_ips, tcp["port"], tcp["token"], sid, True),
                                      name="bulk-pull", daemon=True).start()
                 if MY_TCP_ADDRS[0]:
                     if JOINER_BULK[0] is None:
@@ -2545,7 +2576,7 @@ class _ClientSaveReceiver:
             self._finalize()
 
     # -- the TCP channel --------------------------------------------------- #
-    def _tcp_pull(self, ip, port, token, sid):
+    def _tcp_pull(self, ip, port, token, sid, tell_host=False):
         """A thread: connect to the sender's listener and read the file. A
         connect that fails is tried again (TCP_CONNECT_TRIES): the UDP fallback
         is 20x slower than the stream, and nothing has been read yet, so a fresh
@@ -2565,6 +2596,8 @@ class _ClientSaveReceiver:
                 time.sleep(TCP_CONNECT_RETRY)
         self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} after {TCP_CONNECT_TRIES} attempts -- "
                  + ("Steam carries it" if len(ips) > 1 or steamtunnel.is_tunnel_addr(getattr(self.conn, 'peer', None)) else "receiving over UDP"))
+        if tell_host and sid == self.sid:
+            self._send({"t": "tcp_gave_up", "sid": sid})   # the host stops waiting for our dial
 
     def _tcp_accepted(self, sock, addr, name):
         """ACCEPT THREAD HELPER (the relay): the leader connected to push its upload."""
@@ -4260,6 +4293,9 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         elif t == "fbegin_ack":
             if transfer[0] is not None:
                 transfer[0].on_begin_ack(addr, msg)
+        elif t == "tcp_gave_up":
+            if transfer[0] is not None:
+                transfer[0].on_tcp_gave_up(addr, msg)
         elif t in ("fack", "fdone"):
             xf = transfer[0]
             if xf is not None:

@@ -443,6 +443,14 @@ installs a VPN or depends on the master server's relay.
   classic one; the `code` event carries `code`, `steam`, `crossplay` and
   `cross_code`. A host without a tunnel, a relay-only host and a dedicated
   server always use the classic code. `tools/test_steam_code.py` covers it.
+- **Saves take TCP first (2026-09-22).** A Steam peer is a loopback endpoint, so
+  over the sealed link each end names its own addresses (`MY_TCP_ADDRS`, from its
+  NAT observation): the host in `fbegin` (`tcp.addrs`), the joiner in `fbegin_ack`
+  (`tcp_addrs`, `tcp_port` of a listener it opens, `tcp_pull` when it dials). The
+  joiner dials the host, the host dials the joiner, and the first stream carries
+  the file. Steam's chunk pump holds meanwhile and starts only when neither
+  connects within `TCP_FIRST_WAIT` (15 s) or both ends have given up (`tcp_gave_up`);
+  a broken stream hands the rest to Steam. `tools/test_steam_tcp.py`.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).
