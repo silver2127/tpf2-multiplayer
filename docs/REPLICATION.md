@@ -40,6 +40,7 @@ settings files say ([CONFIGURATION.md](CONFIGURATION.md)).
 | bridge, tunnel | strict | `ROADP` | Each link carries its BaseEdge type (1 bridge, 2 tunnel) and type index; split halves keep them. |
 | upgrade: street/track type, catenary, bus lane, tram track | strict | `ROADP` | The removed edges travel as positions so the replay replaces instead of stacking a second edge. |
 | road ownership tool | strict | `ROADP` | Each link carries `own`: 0 for public, otherwise a logical company number resolved to the receiver's player entity. The native `OWNERS` tail contains local player entities only in local IPC; they never travel over the network. Splits and unchanged bridge companions retain their original owners. Replay uses typed PlayerOwned components: the engine silently discards plain Lua tables assigned to this optional field. Captures without the optional tail retain legacy behavior. Ownership capture and replay have automated coverage; an in-game multiplayer test of this fix is still pending. |
+| AutoSig2 placement, replacement and removal | strict follow-up | `STOPADD` / `STOPREP` / `STOPDEL` | The initial signal captures mode, spacing and direction. After successful replay, only its origin runs the installed AutoSig2 route algorithm as a proposal planner. Additions carry positional commands; replacements/removals also identify the original rail signal by track endpoints, model, type and 3D position. Changed, missing, foreign-company or ambiguous targets are refused without nearest-object fallback. A replacement removes and adds in one proposal. Planning restores the Workshop settings and engine APIs, performs no local build or accounting, and validates the whole batch before scheduling. Follow-ups cannot expand recursively. Workshop files stay unchanged; AutoSig2 remains a separate required mod. Automated tests exercise the real Workshop planner and distinct peer ID/company maps. A two-instance engine test (2026-09-22) exercised placement in both directions and replacement/removal forward and backward through the synchronized command path: identical signal snapshots, SYNC, zero desyncs and empty queues. The test drove captured seed settings from a private script, not the Workshop GUI. |
 | level crossing | strict (part of the track build) | `ROADP` | A track vertex within 4.0 m of a road node shares that node, taking the road's height when they differ by more than 0.25 m (moving the road node instead asserts the engine). Otherwise the road under the vertex is split. Crossings in the middle of a track segment are found analytically; routing through an existing node requires it to be touched (0.75 m) and straight-through. A crossing the engine refuses ("Too much slope") is refused on every instance. |
 | demolish road or track | strict | `EDEMO` | Edges are matched by their end nodes (same kind, within 1 m). An edge that carries stops or signals is refused. Orphaned nodes are removed. |
 | Snowball Fences / hedges | strict | `FENCE` | Cancelled `CONXP` cursor placements feed the installed mod's planner through a resource wrapper. Start/finish points create no construction; confirmed segments carry model names and transforms, never entity ids. Planning virtualizes build/bulldoze and isolates decorative RNG. Replays add one construction at the command stamp, with the originating company's local player and no building/field gathering or graph cleanup. Geometry is anchored near the fence, not world zero. Cursor previews are cosmetic, using native 3D when available and an outline otherwise; Workshop files stay unchanged. Segments are built with `ignoreErrors=true`, as the mod's own `buildConstruction` does: a segment touches the one before it, and a checked build refused every segment after a drag's first ("Kollision"). Automated coverage includes the real installed Fences planner, but a multiplayer game test remains pending. All participants need the new command handler. |
@@ -96,11 +97,13 @@ the player bulldozes it.
 | sell | strict | `VSELL` | Ships once every vehicle's key is bound, or the bound subset after 8 units. If the vehicle list cannot be read, the sale is not cancelled and does not replicate. |
 | send to depot | strict | `VDEPOT` | |
 | reverse | strict | `VREV` | |
+| stop / go (the vehicle window's stop toggle) | strict | `VSTOP` | Carries the new state, not a toggle, so a duplicate is harmless. |
 | replace | strict | `VREPL` | The key is re-bound to the replacement vehicle. If the new configuration cannot be read, the replacement is not cancelled and does not replicate. |
 | assign to line | strict | `VLINE` | Waits for the vehicle's and line's keys to bind. |
 | rename, recolour | replay on peers | `VNAME` / `VCOLOR` | By key, or by position for constructions. |
+| bought vehicle's name | originator ships after bind | `VNAME` | The engine names a new vehicle locally, in its own language and counter ("Train 7" / "Zug 7"), and the native reservation-order patch ranks trains by name. Once the buy's key binds on the originator (`pollVehKeys`), the engine's name ships as a `VNAME` for that key; peers rename their copy, retrying on the step grid until the key binds. |
 
-Not replicated: stop/start a vehicle, manual departure, "depart now", maintenance targets.
+Not replicated: manual departure, "depart now", maintenance targets.
 
 Cancelled local vehicle actions restore their original confirmation sounds through
 `action_sounds.lua`: buy (including clones), sell, assign line, send to depot and replace.
@@ -162,7 +165,7 @@ Stops are resolved by the station group's position (within 20 m) and the station
 
 ## Not replicated
 
-- Stop/start, manual departure, "depart now" and maintenance targets for vehicles.
+- Manual departure, "depart now" and maintenance targets for vehicles.
 - Map editor and scenario commands (towns, industries, no-costs).
 - Town growth itself: it is not sent, it is simulated identically. Its building count is a
   detector lane, so a town that grows differently shows up. The Natural Town Growth Workshop

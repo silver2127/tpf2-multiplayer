@@ -6,6 +6,8 @@
 [Download the installer](https://github.com/silver2127/tpf2-multiplayer/releases/latest/download/TpF2Multiplayer.msi) ·
 [Privacy policy](https://silver2127.github.io/tpf2-multiplayer/privacy.html)
 
+**Join The Discord: [https://discord.gg/7VhmtUstqQ](https://discord.gg/7VhmtUstqQ)** ·
+
 **Multiplayer for Transport Fever 2** (Steam, Windows, build 35924). Several players build in one
 world at the same time: the roads, track, stations, depots, vehicles and lines one player makes
 appear for everyone, applied at the same moment of the simulation on every machine. Play one shared

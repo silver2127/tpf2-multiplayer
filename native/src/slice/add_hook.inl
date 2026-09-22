@@ -430,7 +430,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             //
             // _Do_call(this, Command const&) -> rcx = r9, rdx = the Command,
             // which is r8 at this call site.
-            // FIRE-AND-FORGET FIRST. SetLine (6) and Reverse (10) are armed
+            // FIRE-AND-FORGET FIRST. SetLine (6), Reverse (10) and SetUserStopped (18) are armed
             // with g_pendingNoCb=1: nothing waits on their callback, and
             // FIRING it here with the command's success byte still 0 makes the
             // UI take its FAILURE branch -- SetLine then pops "unable to find a
@@ -629,7 +629,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         return 0;
     }
 
-    if ((id >= 2 && id <= 10) || id == 13 || id == 14) {
+    if ((id >= 2 && id <= 10) || id == 13 || id == 14 || id == 18) {
         const Factory* f = nullptr;
         for (int i = 0; i < NUM_FACTORIES; i++) if (FACTORIES[i].id == (int)id) f = &FACTORIES[i];
         if (!f) return 0;
@@ -648,6 +648,9 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         //   SellVehicle (3), SendToDepot (5) -- the sell refund moved the
         //                       originator's balance at click time and the
         //                       peers' at the stamp, a coop money-split source.
+        //   SetUserStopped (18) -- the stop/go toggle: applied at click time it
+        //                       halted the train a stamp early on the clicking
+        //                       game only (vehicle drift alarm, 2026-09-19).
         //   UpdateLine (8), DeleteLine (9) -- the new stop list is decoded off
         //                       the command (DecodeLine); CaptureFactory clears
         //                       `cancel` when that decode fails.
@@ -668,7 +671,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         //                       originator's own replay at the stamp instead.
         const bool luaPath = IsScriptCaller(caller);
         const bool strictId = (id == 2 || id == 3 || id == 4 || id == 5 ||
-                               id == 6 || id == 8 || id == 9 || id == 10) ||
+                               id == 6 || id == 8 || id == 9 || id == 10 || id == 18) ||
                               (id == 7 && caller == CALLER_UI_CREATELINE);
         bool cancel = !luaPath && strictId;
         __try {

@@ -162,6 +162,25 @@ to lock yours (switching into a locked company needs its password). A company is
 game's own company window; until then it is named after the player who founded it: "<player>'s
 company", then "<player>'s 2nd company" and so on, whoever plays it now.
 
+### AutoSig2
+
+With AutoSig2 enabled, its existing controls work through multiplayer replay:
+automatic placement with the selected spacing, **Replace** and **Remove**, and
+the **Forward/Backward** direction for those two modes. Place the initial signal
+as usual. Its settings are captured with the click; changing controls while the
+command is in flight does not change that action.
+
+The initial signal and its follow-up actions appear after the lockstep delay.
+Replace/remove follow AutoSig2's route rules, including its branch, station and
+route-length limits. As in AutoSig2, the temporary initial signal is removed in
+these modes. A replacement uses the selected model and one-way setting. Signals
+belonging to another company and waypoints are not editable AutoSig targets;
+a plan containing one is refused. A target changed before replay is skipped,
+never substituted with a nearby object.
+
+AutoSig2 must be installed and enabled separately; this adapter does not bundle
+or edit the Workshop mod. Every participant needs the same multiplayer build.
+
 ## Ports and firewalls
 
 - **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code, and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in.
