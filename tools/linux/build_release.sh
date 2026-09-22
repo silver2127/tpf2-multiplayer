@@ -115,13 +115,17 @@ case " ${LEFT_OUT[*]:-} " in
     PLUGINS+=(tpf2_previews.so)
     [ -f "$BUILD/tpf2_workshop_register.so" ] || die "the build did not produce tpf2_workshop_register.so"
     PLUGINS+=(tpf2_workshop_register.so)
+    if [ -z "$BIGMAP_REPO" ]; then
+      install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+      PLUGINS+=(tpf2_bigmap.so)
+    fi
     ;;
 esac
 if [ -n "$BIGMAP_REPO" ]; then
   case " ${LEFT_OUT[*]:-} " in *" tpf2_pluginhost.so "*) die "Big Maps requires tpf2_pluginhost.so" ;; esac
   case "$BIGMAP_REPO/" in "$STAGE/"*) die "Big Maps source must be outside staging" ;; esac
-  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap"
-  install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap-override"
+  install -m 0755 "$BUILD/bigmap-override/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
   PLUGINS+=(tpf2_bigmap.so)
 fi
 # A symbol the loader exports wins over the game's own for the whole process
@@ -165,9 +169,17 @@ if [ ${#PLUGINS[@]} -gt 0 ]; then
   mkdir -p "$STAGE/lib/plugins"
   for l in "${PLUGINS[@]}"; do install -m 0755 "$BUILD/$l" "$STAGE/lib/plugins/$l"; done
 fi
-if [ -n "$BIGMAP_REPO" ]; then
-  install -m 0644 "$BIGMAP_REPO/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
-fi
+case " ${LEFT_OUT[*]:-} " in
+ *" tpf2_pluginhost.so "*) ;;
+ *)
+  BIGMAP_SOURCE=${BIGMAP_REPO:-$REPO/bigmap}
+  BIGMAP_BUILD=$BUILD/bigmap
+  [ -z "$BIGMAP_REPO" ] || BIGMAP_BUILD=$BUILD/bigmap-override
+  install -m 0755 "$BIGMAP_BUILD/bigmap-density-restore" "$STAGE/lib/bigmap-density-restore"
+  install -m 0644 "$BIGMAP_SOURCE/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
+ ;;
+esac
+install -m 0644 "$REPO/bigmap/docs/linux/PORT.md" "$STAGE/BIGMAP_PORT.md"
 cp -R "$REPO/mod/mp_lockstep_1" "$STAGE/mod/"
 python3 "$REPO/tools/linux/verify_lua_release.py" --mod-dir "$STAGE/mod/mp_lockstep_1"
 NP_BIN=""   # the lobby executable taken, for its date in BUILDINFO
@@ -192,6 +204,7 @@ install -m 0644 "$REPO/docs/re/linux/PARITY_20260921.md" "$STAGE/PARITY.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5c6c084b.md" "$STAGE/UPSTREAM_dev_5c6c084b.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4465474.md" "$STAGE/UPSTREAM_dev_b4465474.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ef275a3c.md" "$STAGE/UPSTREAM_dev_ef275a3c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8c3c02a5.md" "$STAGE/UPSTREAM_dev_8c3c02a5.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0115785c.md" "$STAGE/UPSTREAM_dev_0115785c.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6e1e4ec7.md" "$STAGE/UPSTREAM_dev_6e1e4ec7.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5a9b3ae0.md" "$STAGE/UPSTREAM_dev_5a9b3ae0.md"
@@ -230,7 +243,8 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows v0.6.1.28 ef275a3c392451f78470ecd3c1ed08db58fc7a9b (pinned Linux origin replay)"
+  echo "Lua: Windows 0.7 8c3c02a5a886151c54133669dae9ef2437644d28 (pinned Linux origin replay)"
+  echo "Bundled Big Maps native source: imported 4769cd3; see BIGMAP_PORT.md for limits"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"

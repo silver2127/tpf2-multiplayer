@@ -33,14 +33,11 @@ $Targets = @(
     @{ name = 'slice'; out = 'native\out\tpf2_slice.dll';     src = @('native\src\slice_hook.cpp', 'native\src\slice\*.inl', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\deferrelay_slice.asm', 'native\src\station_weld.h', 'native\src\datadir.h') },
     @{ name = 'host';  out = 'native\out\tpf2_pluginhost.dll'; src = @('native\src\plugin\*', 'native\src\hook.cpp', 'native\src\hook.h') }
 )
-# native plugins built in their own sibling checkouts; deploy_shipping.ps1 ships them into
-# <game>\plugins. From a worktree (<main>\.claude\worktrees\<name>) the siblings sit next
-# to the main checkout. A plugin rebuilt on its own must trigger an install too.
-$SiblingRoot = Split-Path $Repo -Parent
-if ($Repo -match '^(.*)\\\.claude\\worktrees\\[^\\]+$') { $SiblingRoot = Split-Path $Matches[1] -Parent }
+# native plugins with their own build script in this repo; deploy_shipping.ps1 ships them
+# into <game>\plugins. A plugin rebuilt on its own must trigger an install too.
 $Plugins = @(
-    @{ name = 'bigmap'; repo = (Join-Path $SiblingRoot 'tpf2-bigmap'); out = 'out\tpf2_bigmap.dll'; ok = 'BUILD BIGMAP OK'
-       src = @('src\*', 'mod\minimap\*', 'tools\embed_lua.ps1', 'build.bat') }
+    @{ name = 'bigmap'; repo = (Join-Path $Repo 'bigmap'); out = 'out\tpf2_bigmap.dll'; ok = 'BUILD BIGMAP OK'
+       src = @('src\*', 'mod\minimap\*', 'tools\embed_lua.ps1', 'build.bat', '..\native\src\plugin\tpf2mp_plugin.h') }
 )
 
 # Mods to REMOVE from the game folder and every box overlay at the next install:

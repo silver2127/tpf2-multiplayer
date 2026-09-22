@@ -18,9 +18,9 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration includes Windows **experimental release 0.6.1.28** plus dev `ef275a3c` and a native
+integration includes Windows **release 0.7** plus dev `8c3c02a5` and a native
 dedicated server. See [Linux installation](docs/linux/INSTALL.md),
-[current integration and test evidence](docs/linux/UPSTREAM_dev_ef275a3c.md), and
+[current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md), and
 [dedicated server setup](tools/server/README.md). Earlier native parity limitations remain: canonical simulation ordering is
 default-off pending live validation, so matching versions do not establish
 Windows/native gameplay parity. The integration record lists the evidence.
@@ -111,8 +111,9 @@ send them yourself if you report a bug. The full text is the
 
 | path | contents |
 |---|---|
-| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
+| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host and its ABI |
 | `native/linux/`, `tools/linux/` | native Linux libraries, tests, Steam Runtime builds and `.run`/tarball packaging |
+| `bigmap/` | Big Maps, shipped in the same Windows MSI and native Linux package; Linux feature limits: [port record](bigmap/docs/linux/PORT.md) |
 | `mod/mp_lockstep_1/` | the game-script mod |
 | `netpunch/` | the lobby (the dedicated server runs it too) and the master server (Python) |
 | `installer/` | the WiX package |

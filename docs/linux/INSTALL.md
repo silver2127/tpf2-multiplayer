@@ -21,9 +21,9 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.28 experimental plus dev `ef275a3c`**, on
+This development tree integrates **Windows 0.7 plus dev `8c3c02a5`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[UPSTREAM_dev_ef275a3c.md](UPSTREAM_dev_ef275a3c.md). Earlier Native/Windows frozen join
+[UPSTREAM_dev_8c3c02a5.md](UPSTREAM_dev_8c3c02a5.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 
@@ -254,7 +254,20 @@ The lobby builder uses pinned Python and manylinux wheels, checks every bundled 
 
 The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the source tree for implementation coverage and remaining runtime validation; packaging success alone does not establish multiplayer parity.
 
-### Optional Big Maps worktree in development packages
+### Big Maps in the unified package
+
+`tools/linux/build_native.sh` builds and tests the in-tree `bigmap/linux` plugin.
+The release includes `plugins/tpf2_bigmap.so` and its **Linux** configuration;
+`--without tpf2_pluginhost.so` omits plugins. The native defaults cap depth at 11
+and tiles at 512 (510 on square maps), with terrain paging opt-in. The Windows
+configuration requests unsupported depth 13 and must not replace the Linux one.
+See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
+[current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.
+The installed `bigmap-density-restore` helper restores the plugin's exact density
+patch before upgrade/uninstall; modified patches are left intact and removal stops.
+Native live join remains opt-in (`tpf2mp_live_join.txt` = `1`); Windows 0.7 defaults on.
+
+### Optional Big Maps worktree override in development packages
 
 Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`
 or `tools/linux/auto_install.py` to build and ship that checkout's native

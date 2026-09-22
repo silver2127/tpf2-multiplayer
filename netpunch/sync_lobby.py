@@ -129,9 +129,10 @@ class HostRecovery:
         if not self.is_available():
             return False
         # LIVE JOIN: everyone already playing keeps their world and only the
-        # newcomer loads (sync_operation `retain`); off unless the host's io dir
-        # says so (tpf2mp_live_join.txt = 1), because it needs every peer's
-        # engine sorts (docs/re/HOTJOIN_ORDER.md).
+        # newcomer loads (sync_operation `retain`); on by default since 0.7
+        # (every peer has the engine sorts, docs/re/HOTJOIN_ORDER.md), off when
+        # the host's io dir says tpf2mp_live_join.txt = 0. Native Linux
+        # supplies an opt-in callback until engine ordering is live-validated.
         members = list(self.members())
         live = bool(self.live_join())
         retain = [m for m in members if m != newcomer] if live else []

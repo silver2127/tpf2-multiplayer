@@ -53,7 +53,7 @@ bwrap --die-with-parent --unshare-pid --unshare-net \
     ctest --output-on-failure
     { cat /etc/os-release; c++ --version; } > NATIVE_BUILDINFO
   '
-for lib in "$build"/*.so; do
+for lib in "$build"/*.so "$build"/bigmap/*.so; do
   newest=$(objdump -T "$lib" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n 1 || true)
   [ -z "$newest" ] || [ "$(printf '2.31\n%s\n' "$newest" | sort -V | tail -n 1)" = 2.31 ] || {
     echo "$lib requires glibc $newest, newer than the 2.31 baseline" >&2; exit 1;

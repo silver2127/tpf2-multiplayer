@@ -26,6 +26,9 @@ with tempfile.TemporaryDirectory(prefix="tpf2mp-installer-test-") as temp:
     run(["bash", Path(sys.argv[1]).resolve(), "--extract", release], env)
     if (release / "lib/tpf2_pluginhost.so").exists():
         assert (release / "lib/plugins/tpf2_previews.so").is_file(), "native preview plugin missing from release"
+        assert (release / "lib/plugins/tpf2_bigmap.so").is_file(), "Big Maps missing from unified release"
+        assert (release / "lib/plugins/tpf2_bigmap.cfg").is_file()
+        assert (release / "lib/bigmap-density-restore").is_file()
 
     def checksum_release():
         rows = []
@@ -106,7 +109,16 @@ with tempfile.TemporaryDirectory(prefix="tpf2mp-installer-test-") as temp:
     (installed / "data").mkdir(exist_ok=True)
     (installed / "data/user-save.txt").write_text("keep")
     (installed / "user.cfg").write_text("keep")
+    # A density record must be handled before an upgrade removes its helper.
+    base_mod = game / 'base_mod.lua'
+    base_mod.write_text('-- stock fixture\n')
+    density_record = installed / 'data/bigmap-base-mod.path'
+    density_record.write_text(str(base_mod) + '\n')
+    run(install + ['--dry-run'], env)
+    assert density_record.exists()
     run(install, env)
+    assert not density_record.exists()
+    assert base_mod.read_text() == '-- stock fixture\n'
     verify_installed()
     assert not (installed / "old-library.so").exists()
     assert not (installed / "old-alias.so").is_symlink()
@@ -151,7 +163,9 @@ with tempfile.TemporaryDirectory(prefix="tpf2mp-installer-test-") as temp:
     bad = subprocess.run([str(a) for a in install], env=env, capture_output=True)
     assert bad.returncode != 0
     assert hashlib.sha256((installed / "libtpf2mp_boot.so").read_bytes()).digest() == before
+    density_record.write_text(str(base_mod) + '\n')
     run(["bash", release / "uninstall.sh", "--game", game, "--data-home", requested_data_home, "--force"], env)
+    assert not density_record.exists()
     assert not (installed / "libtpf2mp_boot.so").exists()
     assert not (installed / "netpunch/netpunch").exists()
     assert not (installed / "tpf2mp-launch").exists()

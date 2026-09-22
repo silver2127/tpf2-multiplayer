@@ -28,6 +28,8 @@ LAYOUT = {
     "netpunch/netpunch.exe": "netpunch/dist/netpunch/netpunch.exe",
     "plugins/tpf2_previews.dll": "native/out/tpf2_previews.dll",
     "plugins/tpf2_workshop_register.dll": "native/out/tpf2_workshop_register.dll",
+    "plugins/tpf2_bigmap.dll": "bigmap/out/tpf2_bigmap.dll",
+    "plugins/tpf2_bigmap.cfg": "bigmap/cfg/tpf2_bigmap.cfg",
 }
 MOD = "mod/mp_lockstep_1"
 

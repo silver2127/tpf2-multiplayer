@@ -405,3 +405,7 @@ if(BUILD_TESTING)
     endif()
   endif()
 endif()
+
+# Big Maps ships in the same native build and release.
+enable_language(ASM)
+add_subdirectory(../../bigmap/linux bigmap)
