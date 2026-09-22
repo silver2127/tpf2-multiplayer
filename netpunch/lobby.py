@@ -4339,9 +4339,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     # frozen join is started now (no START GAME push for it)
                     for p in peers.values():
                         p["started"] = True
+                        p["stage"] = ""
+                    # The barrier has verified every loaded world. Legacy menu
+                    # stage watchers are bypassed by frozen joins, so Windows
+                    # 0.6.1.18 can otherwise leave "receiving save 100%" forever
+                    # and block company changes on every participant.
+                    host_stage[0] = ""
                     started[0] = True
                     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
                     send_roster_packets()
+                    emit_roster()
 
             if now - last_heal >= ROSTER_HEAL:
                 last_heal = now

@@ -144,6 +144,7 @@ static bool ReadSmallFile(const std::string& path, std::string& out)
 
 // Identity file: line 1 the letter, line 2 our pid, line 3 the bound UDP port
 // once the socket is up (bridge_main.cpp: WriteIdentity).
+static bool g_entityOwnerReady = false;
 static void WriteIdentity(const std::string& inst, bool warnMismatch)
 {
     const std::string idPath = S().dataDir + "tpf2_instance.txt";
@@ -167,6 +168,10 @@ static void WriteIdentity(const std::string& inst, bool warnMismatch)
     if (port) {
         int m = snprintf(buf + n, sizeof(buf) - n, "port=%u\n", port);
         if (m > 0) n += m;
+    }
+    if (g_entityOwnerReady) {
+        const int m = snprintf(buf+n,sizeof(buf)-n,"entity_owner_v1=1\n");
+        if(m>0)n+=m;
     }
     // Written beside it and renamed over: the mod, the slice and the lobby read
     // this file at any moment, and a rename is atomic where truncate-then-write
@@ -626,8 +631,9 @@ static void InitThread()
         Log("[m5] TPF2MP_NO_PATCHES=1: speed hook and setPlayer patch skipped\n");
     } else {
         SpeedHook_Install(Log);
-        SetPlayerPatch_Install(Log);
+        g_entityOwnerReady = SetPlayerPatch_Install(Log);
     }
+    WriteIdentity(cfg.instance, false);
 
     std::thread(HealthThread).detach();
 

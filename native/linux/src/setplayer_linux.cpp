@@ -38,6 +38,8 @@
 #include "setplayer_patch.h"
 #include "game_image.h"
 #include "codewrite_linux.h"
+#include "near_alloc.h"
+#include "setplayer_entity_linux.h"
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cerrno>
@@ -75,6 +77,31 @@ static const uint8_t CAVE[10] = {
 };
 static const uint8_t JE_TO_CAVE[6] = { 0x0f, 0x84, 0x5d, 0xff, 0xff, 0xff };   // je 0x1dc51f6
 
+static bool InstallEntityOnly(SetPlayerLogFn log, uintptr_t base)
+{
+    static bool installed = false;
+    if (installed) return true;
+    const uintptr_t site = base + OWNER_DISPATCH;
+    if (memcmp(reinterpret_cast<void*>(site),OWNER_DISPATCH_BYTES,sizeof(OWNER_DISPATCH_BYTES))) {
+        log("[setplayer] entity-only dispatch mismatch; capability unavailable\n"); return false;
+    }
+    void* relay = Tpf2mpAllocNear(site);
+    if (!relay) return false;
+    const auto code = EntityOwnerRelay(reinterpret_cast<uintptr_t>(relay),
+        base+0x5a03398,base+0x325ce90,base+0x1dc51e2,site+sizeof(OWNER_DISPATCH_BYTES));
+    memcpy(relay,code.data(),code.size());
+    if (mprotect(relay,4096,PROT_READ|PROT_EXEC)) { munmap(relay,4096); return false; }
+    uint8_t patch[sizeof(OWNER_DISPATCH_BYTES)]; memset(patch,0x90,sizeof(patch));
+    patch[0]=0xe9;
+    const int32_t rel=static_cast<int32_t>(reinterpret_cast<uintptr_t>(relay)-(site+5));
+    memcpy(patch+1,&rel,4);
+    int error=0;
+    if (Tpf2mpCodeWriteSelf(site,patch,sizeof(patch),&error)!=TPF2MP_CW_OK) return false;
+    installed=true;
+    log("[setplayer] entity-only ownership enabled; shared infrastructure retains its owner\n");
+    return true;
+}
+
 bool SetPlayerPatch_Install(SetPlayerLogFn log)
 {
     const Tpf2GameImage img = Tpf2mpGameImage();
@@ -93,7 +120,7 @@ bool SetPlayerPatch_Install(SetPlayerLogFn log)
     memcpy(doneB + B_JE, JE_TO_CAVE, sizeof(JE_TO_CAVE));
     if (memcmp((void*)a, doneA, sizeof(doneA)) == 0 && memcmp((void*)b, doneB, sizeof(doneB)) == 0) {
         log("[setplayer] already patched\n");
-        return true;
+        return InstallEntityOnly(log,img.base);
     }
     if (memcmp((void*)a, EXPECTED_A, sizeof(EXPECTED_A)) != 0 ||
         memcmp((void*)b, EXPECTED_B, sizeof(EXPECTED_B)) != 0 ||
@@ -114,5 +141,5 @@ bool SetPlayerPatch_Install(SetPlayerLogFn log)
     }
     log("[setplayer] patched %lx and %lx: setPlayer re-owns any entity through the engine's owner setter "
         "(no interface.cpp:2340 assert)\n", (unsigned long)(RVA_A + A_JE), (unsigned long)(RVA_B + B_JE));
-    return true;
+    return InstallEntityOnly(log,img.base);
 }

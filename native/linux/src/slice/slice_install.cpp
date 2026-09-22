@@ -81,6 +81,7 @@ static const struct { uintptr_t rva; size_t len; const char* owner; } kForeignPa
     { 0xa31c30,  15, "tpf2_bridge_mp: CGame::Step hook" },
     { 0x1dc51d4, 44, "tpf2_bridge_mp: setPlayer patch A and its cave" },
     { 0x1dc5290,  9, "tpf2_bridge_mp: setPlayer patch B" },
+    { 0x1dc4f8f, 14, "tpf2_bridge_mp: entity-only setPlayer dispatch" },
     { 0x113ca70, 17, "tpf2_menu: main page builder hook" },
     { 0x30de940, 16, "tpf2_menu: list-add hook" },
     { 0x1154b20, 16, "tpf2_menu: UI::CMenuUI::CreatePage hook" },

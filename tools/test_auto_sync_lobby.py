@@ -229,6 +229,10 @@ with tempfile.TemporaryDirectory() as temporary:
             wait_for(lambda: all(r.finished and r.state['mode'] == 'join' for r in runtimes.values()))
             nonce_follows_world()
             assert runtimes['host'].saves == before[0] + 1
+            # No native menu is driving stage reports in this fixture. The
+            # completed barrier itself must clear transfer stages everywhere.
+            wait_for(lambda: all(not (lobby._latest_roster(io.out_path) or {}).get('stages')
+                                 for io in ios.values()))
             assert runtimes['late'].loads == 1
             assert all(runtimes[n].loads == before[1][n] + 1 for n in before[1]), 'everyone loads, the host too'
             assert set(runtimes['host'].state['members']) == {'host', 'client', 'late'}
