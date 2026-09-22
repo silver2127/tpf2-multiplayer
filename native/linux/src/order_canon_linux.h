@@ -20,6 +20,8 @@ inline std::atomic<bool> active{false};
 //   departures  SimEntityAtBuildingSystem::Update2's leave batch
 //   arrivals    PersonMoveSystem::Update2's walk-arrival batch
 //   idle        SimEntityIdleSystem's pending list (PathFactory::Compute, per trip)
+//   capacity    temporary person/cargo maps before apply
+//   freed-ids   removed-id batch before the engine appends to its free deque
 // Every peer of a session must run them (they change which building a draw
 // lands on relative to vanilla). Pending local live validation: TPF2MP_ORDER_CANON=1 opts in; default off.
 bool Tpf2mpInstallOrderCanon(uintptr_t imageBase, const char* buildId);

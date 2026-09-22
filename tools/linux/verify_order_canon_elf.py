@@ -23,9 +23,9 @@ with Path(sys.argv[1]).open('rb') as stream:
         stream.seek(s['p_offset'] + addr - s['p_vaddr'])
         return stream.read(size)
     source = (root / 'native/linux/src/order_canon_linux.cpp').read_text()
-    checks = re.findall(r'\{ "([a-z-]+)", (0x[0-9a-f]+), (\d+), (-0x[0-9a-f]+),\s*\{([^}]+)\}', source)
-    assert len(checks) == 5
-    functions = [(0x1502600,1148),(0x16f0ae0,354),(0x16b5790,2198),(0x1700540,5117),(0x2e6e0c0,6794)]
+    checks = re.findall(r'\{ "([a-z-]+)", (0x[0-9a-f]+), (\d+), (-?0x[0-9a-f]+),\s*\{([^}]+)\}', source)
+    assert len(checks) == 6
+    functions = [(0x1502600,1148),(0x16f0ae0,354),(0x16b5790,2198),(0x1700540,5117),(0x2e6e0c0,6794),(0x32567a0,1315)]
     md = Cs(CS_ARCH_X86, CS_MODE_64); md.detail = True
     for (name, address, steal, offset, values),(start,size) in zip(checks,functions):
         address,steal = int(address,16),int(steal)
@@ -38,5 +38,5 @@ with Path(sys.argv[1]).open('rb') as stream:
         for i in instructions:
             if (i.mnemonic.startswith('j') or i.mnemonic=='call') and i.operands and i.operands[0].type==X86_OP_IMM:
                 assert not address<i.operands[0].imm<address+steal, (name,i.address)
-        print(f'PASS: {name}: {address:#x}, {expected.hex(" ")}, {steal} bytes; frame offset {offset}')
-    print('PASS: build-id, all five byte guards, instruction boundaries, no interior branches')
+        print(f'PASS: {name}: {address:#x}, {expected.hex(" ")}, {steal} bytes; base offset {offset}')
+    print('PASS: build-id, all six byte guards, instruction boundaries, no interior branches')

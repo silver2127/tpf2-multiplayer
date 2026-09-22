@@ -33,6 +33,7 @@ static const uintptr_t RVA_GETSPEED     = 0xc0dc30;
 static const uintptr_t RVA_SITE_PAUSE   = 0xa616b9;   // GameSim::Step: call GetSpeed; test eax
 static const uintptr_t RVA_SITE_COUNT   = 0xa61710;   // GameSim::Step: call GetSpeed; loop count
 static const uintptr_t RVA_CGAME_STEP   = 0xa31c30;
+static const uintptr_t RVA_CGAME_SYNC   = 0xa30cc0;   // "bool CGame::Sync(const std::function<void()>&)"
 static const uintptr_t OFF_MDATA        = 0x160;
 static const uintptr_t OFF_GUIFRAMETIME = 0x1a8;
 
@@ -52,18 +53,29 @@ static const uint8_t CGAME_STEP_EXPECTED[15] = {
     0x41, 0x54,                    // push r12
 };
 
+static const uint8_t CGAME_SYNC_EXPECTED[15] = {
+    0xF3, 0x0F, 0x1E, 0xFA,        // endbr64
+    0x55,                          // push rbp
+    0x48, 0x89, 0xE5,              // mov  rbp, rsp
+    0x41, 0x57,                    // push r15
+    0x49, 0x89, 0xFF,              // mov  r15, rdi
+    0x41, 0x56,                    // push r14
+};
+
 using GetSpeedFn  = int (*)(void* gameTime);
+using CGameSyncFn = bool (*)(void* cgame, const void* fn);
 using CGameStepFn = void (*)(void* cgame, long long dt, const void* fn);
 
 static void*      g_getSpeedTramp = nullptr;
 static void*      g_stepTramp     = nullptr;
+static void*      g_syncTramp     = nullptr;
 static uintptr_t  g_retPause      = 0;
 static SpeedLogFn g_log           = nullptr;
 
 static std::atomic<double>   g_target{0.0};   // 0 = off
 static std::atomic<int>      g_lever{0};      // the engine's own speed, as GetSpeed last returned it
 static std::atomic<uint64_t> g_frames{0};
-// Main thread only (CGameStepSeen):
+// Main thread only (ImposeInterval, after CGame::Sync):
 static int g_lastWritten = 0;   // the interval we last imposed (0 = none)
 static std::atomic<int> g_engineBase{0}; // published to the bridge's control thread
 static std::atomic<int> g_pinUs{0};
@@ -79,10 +91,16 @@ static int GetSpeedDetour(void* gameTime)
     return real;
 }
 
-// CGame::Step, main thread, once per render frame, before the "is a batch due"
-// test. Sync rewrites guiFrameTime every batch, so the override is re-applied
-// each frame: a value we did not write is the engine's fresh estimate.
-static void CGameStepSeen(void* cgame)
+// THE INTERVAL CHANGES ONLY AT A BATCH BOUNDARY (2026-09-22; speedhook.cpp has
+// the whole story). CGame::Step calls Sync for each due batch and then, in the
+// same frame, clamps totalTime and computes the render alpha with whatever
+// guiFrameTime Sync wrote. Re-imposing the override at the next frame's Step
+// entry changed the interval inside a batch: when ours was the larger (the
+// dedicated server's 200 ms pin over a faster estimate) alpha fell, the render
+// clock stepped back, and a ship wake started in between asserted
+// ShipFoamRenderer.cpp:137 `startAge >= 0` (lab, retained host after a live
+// join). So the override is imposed right after Sync returns, and nowhere else.
+static void ImposeInterval(void* cgame)
 {
     if (!cgame) return;
     const uintptr_t mdata = *(uintptr_t*)((uintptr_t)cgame + OFF_MDATA);
@@ -90,7 +108,7 @@ static void CGameStepSeen(void* cgame)
     int* field = (int*)(mdata + OFF_GUIFRAMETIME);
     const int cur = *field;
     if (cur <= 0) return;
-    if (cur != g_lastWritten) g_engineBase = cur;
+    g_engineBase = cur;                                // Sync always writes its estimate
     const double target = g_target.load(std::memory_order_relaxed);
     const int lever = g_lever.load(std::memory_order_relaxed);
     const int pin = g_pinUs.load(std::memory_order_relaxed);
@@ -101,8 +119,7 @@ static void CGameStepSeen(void* cgame)
             g_lastWritten = pin;
             return;
         }
-        if (g_lastWritten && cur == g_lastWritten) *field = engineBase;
-        g_lastWritten = 0;
+        g_lastWritten = 0;                             // the engine's own estimate stands
         return;
     }
     double m = target / (double)lever;
@@ -111,16 +128,23 @@ static void CGameStepSeen(void* cgame)
     if (want < 20000) want = 20000;                    // never below 20 ms per batch
     if (want != cur) *field = want;
     g_lastWritten = want;
-    if (++g_logEvery >= 600) {                         // ~10 s at 60 fps
+    if (++g_logEvery >= 50) {                          // once per 50 batches (~10 s at 200 ms)
         g_logEvery = 0;
         g_log("[speed] target %.2f over lever %d -> batch interval %d us (engine's own %d us)\n",
               target, lever, want, engineBase);
     }
 }
 
+static bool CGameSyncDetour(void* cgame, const void* fn)
+{
+    const bool ok = ((CGameSyncFn)g_syncTramp)(cgame, fn);
+    if (ok) ImposeInterval(cgame);
+    return ok;
+}
+
+// CGame::Step, main thread, once per frame: nothing is written here any more.
 static void CGameStepDetour(void* cgame, long long dt, const void* fn)
 {
-    CGameStepSeen(cgame);
     ((CGameStepFn)g_stepTramp)(cgame, dt, fn);
 }
 
@@ -154,6 +178,10 @@ bool SpeedHook_Install(SpeedLogFn log)
             (unsigned long)RVA_SITE_PAUSE, (unsigned long)RVA_SITE_COUNT);
         return false;
     }
+    if (memcmp((void*)(base + RVA_CGAME_SYNC), CGAME_SYNC_EXPECTED, sizeof(CGAME_SYNC_EXPECTED)) != 0) {
+        log("[speed] CGame::Sync prologue differs from build 35924 -- not installed\n");
+        return false;
+    }
     g_retPause = base + RVA_SITE_PAUSE + 5;
     if (!InstallHook(base + RVA_GETSPEED, (void*)&GetSpeedDetour, sizeof(GETTER_EXPECTED), &g_getSpeedTramp)) {
         log("[speed] InstallHook FAILED on CGameTime::GetSpeed -- fractional speed unavailable\n");
@@ -163,8 +191,12 @@ bool SpeedHook_Install(SpeedLogFn log)
         log("[speed] InstallHook FAILED on CGame::Step -- fractional speed unavailable (GetSpeed stays hooked, passing values through)\n");
         return false;
     }
-    log("[speed] hooked CGameTime::GetSpeed (%lx) and CGame::Step (%lx): fractional speed scales the batch interval; target off\n",
-        (unsigned long)RVA_GETSPEED, (unsigned long)RVA_CGAME_STEP);
+    if (!InstallHook(base + RVA_CGAME_SYNC, (void*)&CGameSyncDetour, sizeof(CGAME_SYNC_EXPECTED), &g_syncTramp)) {
+        log("[speed] InstallHook FAILED on CGame::Sync -- fractional speed unavailable (GetSpeed stays hooked, passing values through)\n");
+        return false;
+    }
+    log("[speed] hooked CGameTime::GetSpeed (%lx), CGame::Sync (%lx) and CGame::Step (%lx): fractional speed scales the batch interval, imposed after Sync only; target off\n",
+        (unsigned long)RVA_GETSPEED, (unsigned long)RVA_CGAME_SYNC, (unsigned long)RVA_CGAME_STEP);
     return true;
 }
 

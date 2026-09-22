@@ -27,7 +27,9 @@ reachability.
 | control (host reloads too) | reloads | none | 25 / 25 |
 | retained, vanilla | keeps its world | **2-5 game units after release** | 2 / 25 |
 | retained, with the sorts below (3 sites) | keeps its world | none | 59 / 59 over ~290 game units, 55 / 55 hash stamps |
-| busy world (the dedicated server's save: 10 ships, ~130 cargo, ~2,800 people out), host alone 5 min first, live-join lobby path, 4 sites | keeps its world | none | persons, vehicles and cargo dumps and every hash stamp equal (see the run log below) |
+| busy world (the dedicated server's save: 10 ships, ~130 cargo, ~2,800 people out), host alone 5 min first, live-join lobby path, 4 sites | keeps its world | ~120 units: two people swap a destination slot at one building (capacity maps, below) | 23 hash stamps equal, persons/destinations differ from +120 |
+| busy world, + capacity maps relinked | keeps its world | ~280 units: one new cargo gets another recycled id; a town building's id and residents follow (freed ids, below) | 72 hash stamps equal, 174/175 dumps |
+| busy world, + freed-id batches sorted | keeps its world | see the run log | |
 
 What differs first in the vanilla run is a person's **choice of destination**
 (`destinations[2]` or `[3]`, and the move mode with it), everything else equal;
@@ -76,6 +78,24 @@ the lobby's exact version gate guarantees that.
 | departures | 0xa7c9fd `48 8d 54 24 28` | `[rsp+0x28]` | 0x16f0bcb `48 8b 7a 08 48 85 ff` | `[rbp-0x50]` |
 | arrivals | 0xa59928 `48 8d 54 24 68` | `[rsp+0x68]` | 0x16b5dc6 `48 8b 78 08 48 85 ff` | `[rbp-0x88]` |
 | idle | 0xa867ce `49 8b 55 20 49 2b 55 18` | `[r13+0x18]` (the system's own list, sorted in place) | 0x17005cc `48 8b 8d 80 fe ff ff` | `[[rbp-0x180]+0x18]` |
+| capacity maps | 0x21234de `49 8b bd 20 01 00 00` | 9 MSVC lists relinked (D = `[r13+0x120]`) | 0x2e6e6c3 `48 8b 85 28 f4 ff ff` | 9 libstdc++ lists relinked (D = `[[rbp-0xbd8]+0x120]`) |
+| freed ids | 0x23de385 `49 8b 04 24 48 8b 50 08` | `[[r12]]` (engine+0x200) | 0x3256930 `49 8b 85 08 02 00 00` | `[[r13+0x208]]` |
+
+5. **capacity maps** -- every construction build, replace or demolish (town
+   growth included) runs `SimEntityUpdateHelper`: the affected people and cargo
+   go into 5 + 4 temporary `unordered_map`s, and its destructor 0x2122fd0 seeds
+   one mt19937 with 5489 while `ApplySimPersonData` 0x2125a90 / `ApplySimCargo`
+   0x2124030 walk the maps in list order (stay draws, freed ids). The lists are
+   relinked in ascending key order after the seed; nothing reads the buckets
+   again (the maps are walked head to tail and destroyed by walking the ring).
+   On Linux `person_map_order_linux.cpp` redirects the person walks to Windows
+   order: [`hotjoin/person_map_order_canonical.patch`](hotjoin/person_map_order_canonical.patch)
+   makes it ascending.
+6. **freed ids** -- `Engine::EndModification` 0x23de130 appends each batch of
+   removed ids to the FIFO free-id deque in removal order; `AddEntity` 0x23dca30
+   pops the front. Each batch is sorted before the append, so the deque depends
+   only on which ids each batch removed (identical in lockstep); the replicated
+   second engine replays the same removals through its own EndModification.
 
 - Windows: `native/src/slice/hotjoin_order.inl` + `native/src/hotjoinrelay_slice.asm`,
   verified by `tools/hotjoin_order_bytes_test.py`. Kill switch `hotjoinorder=0`.
@@ -84,6 +104,24 @@ the lobby's exact version gate guarantees that.
   (installed from `boot.cpp` after the person-order modules; add the .cpp to
   `tpf2mp_boot`'s sources). Kill switch `TPF2MP_ORDER_CANON=0`. This is what
   the lab measured.
+
+## Not an order bug: the render clock stepped back (speed hook)
+
+The retained host of the busy-world run with the freed-id sort asserted
+`ShipFoamRenderer.cpp:137 startAge >= 0` ~210 units after the join (all dumps
+and hash stamps equal until then). A ship wake's first point was later than the
+render time: the interpolated clock `prev + alpha * (cur - prev)` had stepped
+back. Vanilla keeps `guiFrameTime` constant inside a batch (`CGame::Sync` writes
+it once per batch, and `CGame::Step` computes `alpha = (totalTime - lastSync) /
+guiFrameTime` right after); `speedhook.cpp` re-imposed its interval (the
+dedicated server's 200 ms pin, fractional speed) at the NEXT frame's Step entry,
+so each batch's first frame used the engine's estimate and the rest ours. Fix:
+the override is imposed right after Sync returns (Windows: Step's call at
+0x118ee6 redirected to `SyncWrap`; native: `CGame::Sync` 0xa30cc0 hooked at its
+entry, [`hotjoin/speedhook_batch_boundary.patch`](hotjoin/speedhook_batch_boundary.patch))
+and nowhere else. Any dedicated server or fractional-speed session with ships
+could hit it; entity ids and the order sorts cannot (ship traces are keyed by id
+AND revision).
 
 ## Live join in the lobby
 

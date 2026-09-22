@@ -10,7 +10,7 @@ namespace {
 constexpr char kCanonBuildId[] = "3a0e156390b0e6f1e372051c24802c8493ae454a";
 
 // Each site: 7 displaced bytes, all position-independent, replayed verbatim by
-// the trampoline; the entity vector's begin/end are rbp-relative there.
+// the trampoline; vector locations use the recorded rbp/r13 base below.
 struct CanonSite {
     const char* name;
     uintptr_t rva;
@@ -19,6 +19,7 @@ struct CanonSite {
     unsigned char bytes[16];
     int32_t derefOff;   // when nonzero: the vector is at [rbp+beginOff] + derefOff (inside a system)
     bool relinkMaps;    // not a vector: [rbp+beginOff] is a SimEntityUpdateHelper; relink its 9 maps
+    bool r13Base;       // the base is r13, not rbp, and [r13+beginOff] points AT the vector object
 };
 const CanonSite kCanonSites[] = {
     // GetTargetsByLandUse 0x1502600: every path joins at the output's
@@ -44,6 +45,15 @@ const CanonSite kCanonSites[] = {
     // ids in walk order. Helper at [rbp-0xbd8], data block D = [helper+0x120].
     { "capacity-maps", 0x2e6e6c3, 7, -0xbd8,
       { 0x48,0x8b,0x85,0x28,0xf4,0xff,0xff, 0x48,0x8b,0x70,0x70, 0x4c,0x8b,0xa8,0x20,0x01 }, 0, true },
+    // Engine::EndModification 0x32567a0: the batch of removed ids, about to be
+    // appended to the FIFO free-id deque (engine+0xe0) in removal order --
+    // history order, so a retained host and a loaded joiner later hand the same
+    // new entity different ids (upstream lab report, busy world, +280 units). r13 = the engine,
+    // [r13+0x208] -> the removed-id vector. Sorted, the deque depends only on
+    // which ids each batch removed; the replicated second engine sorts its own
+    // replayed batches the same way (Replicator::Apply asserts the ids match).
+    { "freed-ids", 0x3256930, 7, 0x208,
+      { 0x49,0x8b,0x85,0x08,0x02,0x00,0x00, 0x49,0x8d,0xb5,0xe0,0x00,0x00,0x00, 0x4c,0x8b }, 0, false, true },
 };
 constexpr unsigned kCanonSiteCount = sizeof(kCanonSites) / sizeof(kCanonSites[0]);
 
@@ -119,13 +129,16 @@ void CanonRelink(unsigned site, uintptr_t rbp) noexcept
                 (unsigned long long)c.refused.load(std::memory_order_relaxed));
 }
 
-void CanonSort(unsigned site, uintptr_t rbp) noexcept
+void CanonSort(unsigned site, uintptr_t rbp, uintptr_t r13) noexcept
 {
     if (kCanonSites[site].relinkMaps) { CanonRelink(site, rbp); return; }
     auto& c = g_canonCounters[site];
     const uint64_t n = c.calls.fetch_add(1, std::memory_order_relaxed) + 1;
     uintptr_t at = rbp + kCanonSites[site].beginOff;
-    if (kCanonSites[site].derefOff) {
+    if (kCanonSites[site].r13Base) {
+        std::memcpy(&at, reinterpret_cast<const void*>(r13 + kCanonSites[site].beginOff), sizeof(at));
+        if (!at) { c.refused.fetch_add(1, std::memory_order_relaxed); return; }
+    } else if (kCanonSites[site].derefOff) {
         uintptr_t sys;
         std::memcpy(&sys, reinterpret_cast<const void*>(at), sizeof(sys));
         if (!sys) { c.refused.fetch_add(1, std::memory_order_relaxed); return; }
@@ -138,7 +151,7 @@ void CanonSort(unsigned site, uintptr_t rbp) noexcept
         || (begin == 0) != (end == 0)) {
         if (!c.refused.fetch_add(1, std::memory_order_relaxed)) {
             if (auto log = g_canonLog.load(std::memory_order_relaxed))
-                log("[order-canon] ERROR: %s: not an entity vector at rbp%+d (%p %p %p); left as is\n",
+                log("[order-canon] ERROR: %s: not an entity vector at base offset %+d (%p %p %p); left as is\n",
                     kCanonSites[site].name, kCanonSites[site].beginOff, (void*)begin, (void*)end, (void*)cap);
         }
         return;
@@ -165,7 +178,7 @@ void Tpf2mpOrderCanonDispatch(CanonRegisters* r) noexcept
     const size_t index = r->resume;
     if (index >= kCanonSiteCount) std::abort(); // only fixed stubs can reach this entry
     r->resume = reinterpret_cast<uintptr_t>(g_canonOriginal[index]);
-    if (g_canonReady) CanonSort(unsigned(index), r->rbp);
+    if (g_canonReady) CanonSort(unsigned(index), r->rbp, r->r13);
 }
 
 // Same register-preserving entry as target_order_linux.cpp: all GP registers,
@@ -208,11 +221,12 @@ namespace {
     __attribute__((naked, noinline)) void CanonStub##index() { \
         __asm__("push $" #index "\n\tjmp Tpf2mpOrderCanonEntry\n\t"); \
     }
-CANON_STUB(0) CANON_STUB(1) CANON_STUB(2) CANON_STUB(3) CANON_STUB(4)
+CANON_STUB(0) CANON_STUB(1) CANON_STUB(2) CANON_STUB(3) CANON_STUB(4) CANON_STUB(5)
 #undef CANON_STUB
 void* const kCanonDetours[] = {
     reinterpret_cast<void*>(CanonStub0), reinterpret_cast<void*>(CanonStub1), reinterpret_cast<void*>(CanonStub2),
-    reinterpret_cast<void*>(CanonStub3), reinterpret_cast<void*>(CanonStub4)
+    reinterpret_cast<void*>(CanonStub3), reinterpret_cast<void*>(CanonStub4),
+    reinterpret_cast<void*>(CanonStub5)
 };
 static_assert(sizeof(kCanonDetours) / sizeof(kCanonDetours[0]) == kCanonSiteCount);
 }
@@ -241,7 +255,7 @@ static bool InstallOrderCanon(uintptr_t base, const char* buildId, bool (*instal
         return false;
     }
     g_canonReady = true;
-    g_canonStatus.store("enabled (candidates, departures, arrivals, idle sorted by entity id; capacity maps relinked)");
+    g_canonStatus.store("enabled (candidates, departures, arrivals, idle sorted by entity id; capacity maps relinked; freed-id batches sorted)");
     return installed == kCanonSiteCount;
 }
 bool Tpf2mpInstallOrderCanon(uintptr_t base,const char* buildId) { return InstallOrderCanon(base,buildId,InstallHook); }

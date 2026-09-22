@@ -1,4 +1,4 @@
-// Execute the five hot-join patches in a private image, with every GP/XMM
+// Execute the six hot-join patches in a private image, with every GP/XMM
 // register live. The original game files and running processes are untouched.
 #include "../src/order_canon_linux.cpp"
 #include "../src/codewrite_linux.h"
@@ -127,9 +127,31 @@ static void MapTests() {
     nodes[0].next=first;assert(!RelinkMap(reinterpret_cast<uintptr_t>(map))); // cycle
     map[3]=kMapMaxNodes+1;assert(!RelinkMap(reinterpret_cast<uintptr_t>(map)));
 }
+static void FreedIdTests() {
+    std::array<uintptr_t,80> engine{};
+    const auto owner=reinterpret_cast<uintptr_t>(engine.data());
+    const auto refused=g_canonCounters[5].refused.load();
+    CanonSort(5,0,owner); // absent modification payload
+    assert(g_canonCounters[5].refused==refused+1);
+    uintptr_t vec[3]{};
+    engine[0x208/8]=reinterpret_cast<uintptr_t>(vec);
+    CanonSort(5,0,owner); // empty batch
+    assert(g_canonCounters[5].refused==refused+1);
+    int32_t ids[]={9,2,9,1};
+    vec[0]=reinterpret_cast<uintptr_t>(ids);
+    vec[1]=vec[0]+sizeof(ids);vec[2]=vec[1]-4;
+    CanonSort(5,0,owner); // end exceeds capacity; do not mutate
+    assert(g_canonCounters[5].refused==refused+2 && ids[0]==9);
+    vec[2]=vec[1];CanonSort(5,0,owner);
+    assert(ids[0]==1 && ids[1]==2 && ids[2]==9 && ids[3]==9);
+    const auto reordered=g_canonCounters[5].reordered.load();
+    CanonSort(5,0,owner);
+    assert(g_canonCounters[5].reordered==reordered); // sorted batch stays put
+}
 int main() {
     MapTests();
-    const size_t size=0x2e80000;
+    FreedIdTests();
+    const size_t size=0x3258000;
     auto* image=mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(image!=MAP_FAILED);
     const auto base=reinterpret_cast<uintptr_t>(image);
     Restore(base);assert(!mprotect(image,size,PROT_READ|PROT_EXEC));
@@ -149,7 +171,7 @@ int main() {
     for(unsigned site=0;site<kCanonSiteCount;++site)for(unsigned alignment=0;alignment<2;++alignment) {
         Restore(base);assert(Tpf2mpInstallOrderCanon(base,kCanonBuildId));
         std::array<unsigned char,0x1800> stack{};
-        std::array<uintptr_t,40> system{};std::array<uintptr_t,64> maps{};
+        std::array<uintptr_t,80> system{};std::array<uintptr_t,64> maps{};
         std::vector<int32_t> ids={8,2,4,1};
         uintptr_t vec[]={reinterpret_cast<uintptr_t>(ids.data()),reinterpret_cast<uintptr_t>(ids.data()+ids.size()),reinterpret_cast<uintptr_t>(ids.data()+ids.size())};
         State in{},out{};auto* gp=reinterpret_cast<uint64_t*>(&in);
@@ -158,7 +180,10 @@ int main() {
         in.flags=0x202;in.rbp=reinterpret_cast<uintptr_t>(stack.data()+0x1400);
         const auto slot=in.rbp+kCanonSites[site].beginOff;
         if(site<3)memcpy(reinterpret_cast<void*>(slot),vec,sizeof(vec));
-        else {
+        else if(site==5) {
+            in.r13=reinterpret_cast<uintptr_t>(system.data());
+            system[0x208/8]=reinterpret_cast<uintptr_t>(vec);
+        } else {
             const auto sys=reinterpret_cast<uintptr_t>(system.data());memcpy(reinterpret_cast<void*>(slot),&sys,8);
             if(site==3)memcpy(system.data()+3,vec,sizeof(vec));
             else system[0x120/8]=reinterpret_cast<uintptr_t>(maps.data());
@@ -173,14 +198,15 @@ int main() {
             asm volatile("testq %1,%1; pushfq; popq %0":"=r"(expected.flags):"r"(load[1]):"cc");
         }
         if(site==3)expected.rcx=reinterpret_cast<uintptr_t>(system.data());
+        if(site==5)expected.rax=reinterpret_cast<uintptr_t>(vec);
         if(site==4)expected.rax=reinterpret_cast<uintptr_t>(system.data());
         auto fixture=MakeFixture(base,site,alignment,code);
         const auto oldMxcsr=_mm_getcsr();const auto mxcsr=(oldMxcsr&~0x6000u)|(alignment<<13);_mm_setcsr(mxcsr);
         fixture(&in,&out);assert(_mm_getcsr()==mxcsr);_mm_setcsr(oldMxcsr);
         assert(!memcmp(&out,&expected,128));assert(!memcmp(out.xmm,in.xmm,sizeof(in.xmm)));assert(out.rspBefore==out.rspAfter);
-        if(site<4)assert((ids==std::vector<int32_t>{1,2,4,8}));
+        if(site<4 || site==5)assert((ids==std::vector<int32_t>{1,2,4,8}));
         if(site==0)assert(output==0);
     }
     munmap(code,4096);munmap(image,size);
-    puts("canonical order: five real shims, GP/XMM/flags/MXCSR/RSP, both alignments, all guards and rollback, map integrity passed");
+    puts("canonical order: six real shims, GP/XMM/flags/MXCSR/RSP, both alignments, all guards and rollback, map integrity passed");
 }
