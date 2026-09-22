@@ -44,3 +44,31 @@ off for the production load-time configuration.
 - Persistent terrain calculation caching and its exact-output tests are
   documented in Big Maps `docs/linux/LOAD_PERFORMANCE.md`; it is optional and
   must be judged by whole-load timings rather than cache hit counts.
+
+## In-session comparison
+
+A held/paused private world saved successfully in 4.271 seconds. Loading that
+same 117,305,444-byte file in one process took 69.484 seconds with the new
+terrain kernels, 73.711 with stock refinement/alignment restored, then 72.371
+with the kernels restored again. Min/max and row-copy stayed enabled. All
+loads reported `world_ready` and accepted subsequent hold/pause requests.
+The observed reload gain is small; the shorter startup grace does not shorten
+this path. Disk caching remained slower even after revision (118.19 seconds
+for a warm whole startup), so it is disabled in the VPS configuration.
+
+## Production
+
+Deployment saved the current live world as `mp_o_6ab2acae` before stopping
+the idle server. Backups are under
+`/opt/tpf2mp-linux-parity-20260921/production-before-perf-1790094515`.
+The running server uses `LOAD_DELAY_SEC=15`, the tested Big Maps native
+performance-only configuration, no disk terrain cache, and normal presentation.
+Steam remains offline. The original source-based lobby launcher is preserved.
+
+The live restart took 193.50 seconds, with slower rendering initialization
+than the warmed private test environment. The native controller reports
+`has_world=1`, `busy=0`; lobby TCP/UDP 29472, bridge 7771 and relay 7773 listen.
+No end-to-end desktop join was claimed while the test machine is offline.
+
+Deployed menu SHA-256:
+`d839cf0e66e9ce539cfab8a3f78f9fb75e7be1237b142e2939384018b672d0db`.
