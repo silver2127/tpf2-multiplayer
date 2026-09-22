@@ -28,8 +28,20 @@ WNDPROC originalWindowProc=nullptr;
 HWND inputWindow=nullptr;
 const UINT pumpMessage = WM_APP + 0x392;
 
+// OUR SAVE RUNS ON THE COMMAND THREAD WHILE THE UI THREAD KEEPS RENDERING. With
+// the camera free during it, rendering pages in terrain tiles tpf2_bigmap.dll
+// had evicted while the save thread writes Big Maps' terrain sidecar, and the
+// two threads deadlocked in TerrainPager::Fault (2026-09-22, the host of a live
+// join froze in `saving`; the dump has both threads waiting in the handler, the
+// UI thread from materialdata.cpp's render path). So input stays blocked for
+// the few seconds a native save is actually running, whatever input_hold says.
+bool savingNow() {
+    std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+    if(!lock.owns_lock()) return true;     // contended: hold this one message back
+    return state==State::QueuedSave || state==State::Saving;
+}
 LRESULT CALLBACK inputProc(HWND window,UINT message,WPARAM w,LPARAM l) {
-    if(actionsHeld.load() && inputBlocking.load()) {
+    if(actionsHeld.load() && (inputBlocking.load() || savingNow())) {
         switch(message) {
         case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_KEYUP: case WM_SYSKEYUP:
         case WM_CHAR: case WM_SYSCHAR:
