@@ -15,7 +15,15 @@ PHASES = ('holding', 'waiting', 'saving', 'transferring', 'loading', 'checking',
           'releasing', 'complete', 'error', 'aborted')
 ACTIVE = frozenset(PHASES[:-3])
 # Phases whose length does not depend on the world: a fixed wait from entry.
-TIMEOUT = {'holding': 45, 'checking': 60, 'releasing': 30}
+# 'holding' and 'checking' have NO total limit (2026-09-21, the owner: "can you get rid of
+# the timeout"). Both wait for every member's game script to answer, and on the dedicated
+# server that script starts ticking only one to two minutes after its world has loaded:
+# a player joining while the server was still loading was refused after 45 s with
+# "Timed out waiting for all players" every time, and the error record left behind held
+# the server at speed 0. A round still ends when the host leaves (_admit), a member
+# reports a failure, or someone presses abort; a member that leaves is dropped and the
+# rest carry on.
+TIMEOUT = {'releasing': 30}
 # Phases whose length DOES depend on the world -- the engine writing the save,
 # the bytes crossing the wire, every engine loading it -- have no total limit.
 # A 1 GB save to a slow uplink is however long it is. What ends them early is
@@ -190,8 +198,8 @@ class SyncOperation:
         if new:
             if self.phase in ('holding', 'waiting'):
                 self.members = tuple(sorted(set(self.members) | set(new)))
-                if self.phase == 'holding':
-                    self.deadline = self.clock() + TIMEOUT['holding']   # the newcomer's own hold
+                if self.phase in TIMEOUT:
+                    self.deadline = self.clock() + TIMEOUT[self.phase]   # the newcomer's own wait
             else:
                 self.pending = tuple(sorted(set(self.pending) | set(new)))
         return True

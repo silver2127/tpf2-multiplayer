@@ -87,12 +87,22 @@ class OperationTests(unittest.TestCase):
         self.assertFalse(self.op.acknowledge('client', first))
         self.assertEqual(self.op.phase, 'saving')
 
-    def test_lost_ack_times_out_without_release(self):
+    def test_holding_waits_as_long_as_it_takes(self):
+        # no total limit (2026-09-21): a dedicated server's script answers only 1-2
+        # minutes after its world loads; the round waits, and still never releases
         self.ack('host')
-        self.now = 46
+        self.now = 600
         self.op.tick(['host', 'client'])
-        self.assertEqual(self.op.phase, 'error')
-        self.assertEqual(self.op.error['step'], 'holding')
+        self.assertEqual(self.op.phase, 'holding')
+        self.assertIsNone(self.op.error)
+        self.ack('client')
+        self.assertEqual(self.op.phase, 'saving')
+
+    def test_holding_member_who_leaves_is_dropped_not_waited_for(self):
+        self.ack('host')
+        self.now = 600
+        self.op.tick(['host'])
+        self.assertNotEqual(self.op.phase, 'error')
 
     def progress(self, sender, token):
         data = {k: getattr(self.op, k) for k in ('operation', 'revision', 'epoch', 'phase')}
