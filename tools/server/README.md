@@ -26,7 +26,7 @@ values in `/etc/tpf2mp/server.env`:
 RUNTIME=native
 GAME_DIR="/home/tpf2server/.steam/steam/steamapps/common/Transport Fever 2"
 XDG_DATA_HOME=/home/tpf2server/.local/share
-NATIVE_RELEASE_DIR=/opt/tpf2mp/releases/tpf2mp-linux-0.6.1.18
+NATIVE_RELEASE_DIR=/opt/tpf2mp/releases/tpf2mp-linux-0.6.1.18-native
 SAVE=server_world
 RENDER=0
 ```
