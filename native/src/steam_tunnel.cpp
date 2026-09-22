@@ -36,6 +36,7 @@
 #include <map>
 #include <mutex>
 #include "steam_tunnel.h"
+#include "steam_rate.h"
 #include "../third_party/steam/steamnetworkingtypes.h"
 
 #ifdef _WIN32
@@ -384,6 +385,13 @@ unsigned TunnelThread(void*)
     for (auto& c : persona) if (c == '\n' || c == '\r') c = ' ';
 
     g_api.allowRelay(g_api.net, true);
+    // Startup-only selection; both peers must match. Never silently fall back.
+#ifdef _WIN32
+    bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    bool legacy = access((g_dataDir + "tpf2mp_steam_legacy.txt").c_str(), F_OK) == 0;
+#endif
+
     // Set defaults before opening a Messages session. Successful setters do
     // not establish that the legacy P2P path honors these settings.
     if (g_api.utils && g_api.setConfig) {
@@ -394,11 +402,10 @@ unsigned TunnelThread(void*)
             // raised, unauthenticated IP connections were allowed and the initial
             // timeout was 4.6 hours (the log's "SendRateMax: 10000 ->" was the
             // 10,000 ms timeout default).
-            // Valve documents equal clamps for a manually configured rate.
-            // A larger max alone did not raise the live Messages connection:
-            // 0.6.1.26 remained at the 1 MiB/s floor with ~4 MB pending.
-            { "SendRateMin",    10, 16 * 1024 * 1024 },
-            { "SendRateMax",    11, 16 * 1024 * 1024 },
+            // Equal clamps fix the actual rate. Messages adjusts both together
+            // using measured delivery quality; Legacy keeps its fixed setting.
+            { "SendRateMin",    10, legacy ? 16 * 1024 * 1024 : SteamRateController::Initial },
+            { "SendRateMax",    11, legacy ? 16 * 1024 * 1024 : SteamRateController::Initial },
             { "SendBufferSize",  9,  8 * 1024 * 1024 },
             { "RecvBufferSize", 47,  8 * 1024 * 1024 },
         };
@@ -411,12 +418,6 @@ unsigned TunnelThread(void*)
     } else {
         g_log("[steam] no SteamNetworkingUtils in this steam_api64.dll -- the send-rate cap stays at Steam's default\n");
     }
-    // Startup-only selection; both peers must match. Never silently fall back.
-#ifdef _WIN32
-    bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
-#else
-    bool legacy = access((g_dataDir + "tpf2mp_steam_legacy.txt").c_str(), F_OK) == 0;
-#endif
     g_useMessages = false;
     if (!legacy && !StartMessages()) {
         g_log("[steam] Messages v002 unavailable -- transport OFF; select Legacy explicitly to compare\n");
@@ -594,6 +595,7 @@ unsigned TunnelThread(void*)
             e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes;
         }
         // ---- idle endpoints
+        if (g_useMessages) UpdateMessagesRate(statsNow);
         DWORD now = GetTickCount();
         if (now - lastSweep > 10000) {
             lastSweep = now;

@@ -1,3 +1,5 @@
+Current incremental integration: [dev 0620342e / 0.6.1.28](UPSTREAM_dev_0620342e.md): adaptive Steam rate and redesigned-menu Cross-play. No new inherited gameplay gaps closed; lab launch blocked by uid-map permission.
+
 ## Current integration: release 0.6.1.18 (2026-09-21)
 
 See [the current integration and VPS test record](../re/linux/PARITY_20260921.md)

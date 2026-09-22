@@ -16,6 +16,14 @@ struct TestMessage : SteamNetworkingMessage_t {
 };
 static int released = 0, flagsSeen = -1, resultCode = 1;
 static SteamNetworkingMessage_t* incoming = nullptr;
+static std::vector<std::pair<int, int>> configWrites;
+static bool refuseSecond = false;
+static void* UtilsTest() { return reinterpret_cast<void*>(1); }
+static bool ConfigTest(void*, int key, int scope, intptr_t object, int type, const void* value) {
+    assert(scope == 1 && object == 0 && type == 1);
+    configWrites.emplace_back(key, *static_cast<const int*>(value));
+    return !(refuseSecond && configWrites.size() == 2);
+}
 static void ReleaseTest(SteamNetworkingMessage_t* msg) { ++released; delete static_cast<TestMessage*>(msg); }
 static int SendTest(void*, const SteamNetworkingIdentity* peer, const void*, uint32_t len, int flags, int channel) {
     assert(peer->GetSteamID64() == 123); assert(len == 3); assert(channel == CH_DATA);
@@ -26,9 +34,10 @@ static int ReceiveTest(void*, int, SteamNetworkingMessage_t** out, int) {
     *out = incoming; incoming = nullptr; return 1;
 }
 static bool AcceptTest(void*, const SteamNetworkingIdentity* peer) { return peer->GetSteamID64() == 123; }
+static int testPending = 100;
 static int StateTest(void*, const SteamNetworkingIdentity*, SteamNetConnectionInfo_t* info, SteamNetConnectionRealTimeStatus_t* status) {
     info->m_nFlags = k_nSteamNetworkConnectionInfoFlags_Relayed;
-    status->m_cbPendingReliable = 100; status->m_cbPendingUnreliable = 20;
+    status->m_cbPendingReliable = testPending; status->m_cbPendingUnreliable = 20;
     status->m_cbSentUnackedReliable = 50;
     status->m_flConnectionQualityLocal = 0.875f;
     status->m_flConnectionQualityRemote = 0.625f;
@@ -70,6 +79,58 @@ int main() {
     P2PSessionState state{}; assert(MessagesState(nullptr, 123, &state));
     assert(state.active == 1 && state.usingRelay == 1 && state.bytesQueued == 120 && state.packetsQueued == -1);
     assert(statusLog.find("quality_local=0.875 quality_remote=0.625") != std::string::npos);
+    assert(!g_messageRate.active); // low-volume feedback must not govern the rate
+    testPending = 65536;
+    assert(MessagesState(nullptr, 123, &state));
+    assert(g_messageRate.active && g_messageRate.queued);
+    assert(g_messageRate.Evaluate() == SteamRateController::Initial / 2);
     assert(MessagesClose(nullptr, 123));
+    SteamRateController rate;
+    for (int i = 0; i < 2; ++i) {
+        rate.Sample(1.0f, true, true);
+        assert(rate.Evaluate() == SteamRateController::Initial);
+    }
+    rate.Sample(1.0f, true, true);
+    rate.rate = rate.Evaluate();
+    assert(rate.rate == 1280 * 1024);
+    // A bad peer wins even when another peer is healthy.
+    rate.Sample(1.0f, true, true); rate.Sample(0.15f, true, true);
+    rate.rate = rate.Evaluate();
+    assert(rate.rate == 640 * 1024 && rate.ceiling == 960 * 1024);
+    for (int i = 0; i < 30; ++i) {
+        rate.Sample(1.0f, true, true); rate.rate = rate.Evaluate();
+    }
+    assert(rate.rate == 960 * 1024); // does not repeatedly probe failed rate
+    for (int i = 0; i < 12; ++i) {
+        rate.Sample(0.1f, true, true); rate.rate = rate.Evaluate();
+    }
+    assert(rate.rate == SteamRateController::Minimum);
+    SteamRateController unknown;
+    for (int i = 0; i < 12; ++i) {
+        unknown.Sample(-1.0f, true, true); assert(unknown.Evaluate() == unknown.Initial);
+        unknown.Sample(1.0f, false, true); assert(unknown.Evaluate() == unknown.Initial);
+        unknown.Sample(1.0f, true, false); assert(unknown.Evaluate() == unknown.Initial);
+    }
+    g_api.utils = UtilsTest; g_api.setConfig = ConfigTest;
+    g_messageRate = SteamRateController{}; g_messageRateAt = 1000;
+    g_messageRate.Sample(0.15f, true, true);
+    UpdateMessagesRate(5999); assert(configWrites.empty());
+    UpdateMessagesRate(6000);
+    assert(g_messageRate.rate == 512 * 1024);
+    assert(configWrites.size() == 2 && configWrites[0].first == 10 && configWrites[1].first == 11);
+    assert(configWrites[0].second == 512 * 1024 && configWrites[1].second == 512 * 1024);
+    configWrites.clear(); refuseSecond = true;
+    g_messageRate.Sample(0.15f, true, true); UpdateMessagesRate(11000);
+    assert(g_messageRate.rate == 512 * 1024 && configWrites.size() == 4);
+    assert(configWrites[2].second == 512 * 1024 && configWrites[3].second == 512 * 1024);
+    configWrites.clear(); refuseSecond = false;
+    g_messageRate = SteamRateController{}; g_messageRateAt = 20000;
+    for (DWORD now = 25000; now <= 35000; now += 5000) {
+        g_messageRate.Sample(1.0f, true, true); UpdateMessagesRate(now);
+    }
+    assert(g_messageRate.rate == 1280 * 1024 && configWrites.size() == 2);
+    assert(configWrites[0].first == 11 && configWrites[1].first == 10);
+    assert(configWrites[0].second == 1280 * 1024 && configWrites[1].second == 1280 * 1024);
+    puts("PASS: adaptive backoff, slow growth, learned ceiling, unknown/idle guards, multi-peer loss, setter rollback");
     puts("PASS: reliable flags, API failures, receive ownership/bounds, callbacks, modern status");
 }

@@ -45,7 +45,7 @@ int main(int argc,char** argv) {
     int w,h;g_flagScale=5;LayoutLocked(1280,720,&w,&h);assert(w<=1280 && h<=720);
     g_flagScale=0;LayoutLocked(1920,1080,&w,&h);assert(w==780 && h==540);
     RenderLocked(w,h);assert(Has(110)&&Has(111)&&Has(8)&&!Has(14)&&!Has(3));
-    g_titleTab=1;RenderLocked(w,h);assert(Has(14)&&!Has(8)&&Has(2)&&Has(50));
+    g_titleTab=1;RenderLocked(w,h);assert(Has(14)&&!Has(8)&&Has(2)&&Has(50)&&Has(51));
     Key(SDLK_TAB,true);assert(g_focus==3);Key(SDLK_TAB,false);
     Key(SDLK_TAB,true);assert(g_focus==2);Key(SDLK_TAB,false);
     Key(SDLK_TAB,true,KMOD_SHIFT);assert(g_focus==3);Key(SDLK_TAB,false);
@@ -55,8 +55,10 @@ int main(int argc,char** argv) {
     assert(Has(16)&&Has(17)&&!Has(2)&&!Has(110));
     P().view.modsPrompt.clear();g_uiState=2;P().view.isHost=true;
     for(int i=0;i<16;++i)P().view.players.push_back({"Player "+std::to_string(i),"",i+1,true,false});
-    RenderLocked(w,h);assert(Has(115)&&!Has(114)&&!Has(6));
+    RenderLocked(w,h);assert(Has(115)&&!Has(114)&&!Has(6)&&Has(51));
     P().view.lobbyReady=true;g_playerPage=1;RenderLocked(w,h);assert(Has(114)&&!Has(115)&&Has(6)&&Has(28)&&Has(35));
+    P().view.isHost=false;RenderLocked(w,h);assert(!Has(51));
+    P().view.isHost=true;
     P().savePicker=true;P().view.saves.push_back({"/save/test.sav","Test",0});RenderLocked(w,h);
     assert(Has(100)&&Has(91)&&!Has(6));
     PrepareTitleBackdrop(8,8);assert(g_titleBackdrop.size()==256);

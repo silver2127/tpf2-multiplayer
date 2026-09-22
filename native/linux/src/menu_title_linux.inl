@@ -34,8 +34,8 @@ static void RenderTitleLocked(int w,int h) {
             TitleText(pad,S(241),width,S(28),"Lobby settings",18);
             if(!P().flagMaster.empty())MwCheck(pad,S(283),"Show in the public game browser",g_public,11);
             MwCheck(pad,S(325),"Separate companies",g_separateCompanies,50);
-            MwCheck(pad,S(363),"Cross-play",g_crossplay,51);
-            TitleText(pad,S(403),width,S(28),"Choose a savegame and invite players after creating the lobby.",13,MW_DIM);
+            MwCheck(pad,S(367),"Cross-play (players without Steam)",g_crossplay,51);
+            TitleText(pad,S(409),width,S(28),"Choose a savegame and invite players after creating the lobby.",13,MW_DIM);
         } else {
             MwCheck(pad,S(221),"Auto-accept mod downloads",g_flagShareMods==1,19);
             TitleText(pad,S(278),width-S(250),S(30),"Public games",16);
@@ -120,7 +120,7 @@ static void RenderTitleLocked(int w,int h) {
         if(v.isHost) {
             MwCheck(pad,footer+S(6),"Separate companies",v.separateCompanies,50);
             if(!P().flagMaster.empty())MwCheck(pad+S(230),footer+S(6),"Public game",g_public,11);
-            if(v.hostSteam)MwCheck(pad+S(400),footer+S(6),"Cross-play",v.crossplay,51);
+            MwCheck(pad+S(410),footer+S(6),"Cross-play",v.crossplay,51);
         } else TitleText(pad,footer+S(6),width,S(28),"Waiting for the host to start.",14,MW_DIM);
         TitleAction(pad,h-S(68),S(110),"LEAVE LOBBY",5);
         if(v.isHost)TitleAction(w-pad-S(155),h-S(68),S(155),v.startPending?"SHARING SAVEGAME...":"START GAME",6,v.lobbyReady && !v.startPending);

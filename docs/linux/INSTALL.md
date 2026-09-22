@@ -21,9 +21,9 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.27 experimental, dev `66a584cb`**, on
+This development tree integrates **Windows 0.6.1.28 experimental, dev `0620342e`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[UPSTREAM_dev_66a584cb.md](UPSTREAM_dev_66a584cb.md). Earlier Native/Windows frozen join
+[UPSTREAM_dev_0620342e.md](UPSTREAM_dev_0620342e.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 
@@ -265,7 +265,7 @@ and installation after all games close. The selected checkout must contain
 the game. Automatic recovery and Workshop registration remain unsupported as
 recorded in the integration notes.
 
-## Experimental Steam transport (0.6.1.27)
+## Experimental Steam transport (0.6.1.28)
 
 Messages v002 is the default, resolved from the game's loaded `libsteam_api.so`.
 To compare Legacy, close the game and create `tpf2mp_steam_legacy.txt` in this
@@ -275,3 +275,9 @@ or `transport=Legacy` in the bridge log. An unavailable Messages API disables
 Steam transport without falling back. Direct TCP remains preferred for saves;
 only transfers actually using Steam measure this comparison. No Linux internet
 throughput improvement has been measured for this integration.
+
+Messages now starts with equal 1 MiB/s clamps and adjusts them every five
+seconds using active outgoing peers' remote delivery quality. Legacy retains
+its fixed configuration. Look for [steam-rate] adjustments; configured rates
+are not measured save-transfer throughput. The redesigned Create Game and host
+lobby views expose Cross-play through the existing invitation-code switch.
