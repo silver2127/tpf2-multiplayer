@@ -3549,6 +3549,9 @@ static int AutoLoadCall(void* menu, const char* name)
     }
 }
 
+// The dedicated server's load request in flight (DedicatedTick, below): set when doStartLoad
+// accepts it, cleared when a world is up or the engine refuses the save.
+static ULONGLONG g_dedLoadInFlightSince = 0;
 static void AutoLoadTick(void* menu)
 {
     if (InterlockedExchange(&g_modLeavePending,0)) { LeaveLobby(); SetStatus(g_modLeaveReason); return; }
@@ -3572,6 +3575,7 @@ static void AutoLoadTick(void* menu)
     InterlockedExchange(&g_autoLoadPending, 0);
     int r = AutoLoadCall(menu, "mp_shared");
     Log("[menu] autoload: StartSavegame(mp_shared) -> %d\n", r);
+    if (r != 1) g_dedLoadInFlightSince = 0;   // refused: the dedicated server may ask again
     if (r != 1) SetStatus("The game refused to start mp_shared (a mod it needs is not installed here?) -- open LOAD GAME and pick \"mp_shared\" to see why.");
 }
 
@@ -4131,6 +4135,20 @@ static void LeaveLobby()
 static ULONGLONG g_dedLastHost = 0, g_dedLastLoad = 0, g_dedLastSave = 0, g_dedWorldUpSince = 0, g_dedMenuSince = 0;
 static bool g_dedFileWritten = false;
 static const ULONGLONG DED_MENU_SETTLE_MS = 8000;   // the title menu's main page has been up this long before we act on it
+// ONE LOAD REQUEST PER LOAD (2026-09-21). The request used to repeat every minute while no
+// world was up, guarded only by g_autoLoadPending and NativeIo::Busy() -- and this load is
+// neither: the menu frame clears g_autoLoadPending the moment it calls StartSavegame, and
+// NativeIo only knows the loads IT queued. A load on the VPS takes 3-5 minutes, so every
+// start asked two or three more times (t+110, t+170, t+220 s). Each extra request copied the
+// save over mp_shared.sav while the engine was reading it and shared the save again, and the
+// lobby answered with a load of its own: the world came up, dropped to the title menu and
+// loaded a second time (7 minutes to playable instead of 4). A player who joined in between
+// found the server's mod not running: the pause for his frozen join was never acknowledged,
+// the recovery timed out ("Timed out waiting for all players"), and the error record it left
+// in the data folder held every later start at speed 0. So: a request is in flight from the
+// moment doStartLoad accepts it until a world is up; only a load that has shown no world for
+// DED_LOAD_GIVE_UP_MS is asked for again, and that is logged.
+static const ULONGLONG DED_LOAD_GIVE_UP_MS = 30ull * 60 * 1000;
 static const ULONGLONG DED_LOAD_MIN_UPTIME_MS = 45000;   // and this long before the first LOAD: two launches that loaded ~10 s in crashed mid-load (16:26, no assertion)
 static void DedicatedTick()
 {
@@ -4175,7 +4193,12 @@ static void DedicatedTick()
         g_dedWorldUpSince = 0;
         if (!InterlockedCompareExchange(&g_lobbyReady, 0, 0)) return;
         if (InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()) return;
-        if (now - g_dedLastLoad < 60000) return;   // a load takes as long as it takes: one request a minute
+        if (now - g_dedLastLoad < 60000) return;   // never more than one request a minute
+        if (g_dedLoadInFlightSince) {
+            if (now - g_dedLoadInFlightSince < DED_LOAD_GIVE_UP_MS) return;   // that load is still running: leave it alone
+            Log("[dedicated] the load asked for %llu min ago never produced a world -- asking again\n", (now - g_dedLoadInFlightSince) / 60000);
+            g_dedLoadInFlightSince = 0;
+        }
         if (now - g_dedMenuSince < DED_LOAD_MIN_UPTIME_MS) return;   // let the engine finish its own start-up work first
         g_dedLastLoad = now;
         wchar_t path[600] = L"";
@@ -4191,9 +4214,10 @@ static void DedicatedTick()
         wcscpy_s(g_startSaveW, path);
         MarkSaveShared();                     // a joiner arriving before the first autosave reuses this save
         Log("[dedicated] loading %ls\n", path);
-        if (doStartLoad(path)) ArmStageWatch("loading world");
+        if (doStartLoad(path)) { g_dedLoadInFlightSince = now; ArmStageWatch("loading world"); }
         return;
     }
+    g_dedLoadInFlightSince = 0;   // the world is up: the request is served
     if (!g_dedWorldUpSince) g_dedWorldUpSince = now;
     if (NoRender()) {
         static ULONGLONG lastCount = 0;
