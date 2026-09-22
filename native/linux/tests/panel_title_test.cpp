@@ -1,5 +1,9 @@
 #include "../src/panel_linux.cpp"
 #include <cassert>
+namespace NativeIo {
+static bool saving=false;
+bool SavingNow(){return saving;}
+}
 namespace lobby {
 void Snapshot(View* v) { *v=panel::P().view; }
 bool AutoCopyPending(){return false;} bool TakeAutoCopy(std::string*){return false;}
@@ -124,6 +128,18 @@ int main(int argc,char** argv) {
         FILE* f=fopen(path,"w");assert(f);fprintf(f,"input_hold=%s\n",value);fclose(f);
         ReadFlags(path);assert(remove(path)==0);
     };
+    // Our queued/running save overrides input_hold=0 for the same input
+    // classes, then releases input while the round remains held.
+    NativeIo::saving=true;
+    for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
+                  SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})
+        assert(event(type)==0);
+    assert(event(SDL_KEYDOWN,SDLK_ESCAPE)==1 && event(SDL_KEYUP,SDLK_ESCAPE)==1);
+    assert(event(SDL_QUIT)==1);
+    assert(SetActionsHeld(false) && event(SDL_MOUSEMOTION)==1);
+    assert(SetActionsHeld(true) && event(SDL_MOUSEMOTION)==0);
+    NativeIo::saving=false;
+    assert(event(SDL_MOUSEMOTION)==1);
     flag("1");assert(g_flagInputHold);
     for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
                   SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})

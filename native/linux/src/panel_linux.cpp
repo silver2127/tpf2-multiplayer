@@ -36,6 +36,7 @@
 #include "panel.h"
 #include "panel_layer.h"
 #include "lobby_linux.h"
+#include "native_io_linux.h"
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
 #include <dlfcn.h>
@@ -1063,8 +1064,9 @@ static int SDLCALL EventFilter(void*, SDL_Event* e)
         if (e->type==SDL_MOUSEBUTTONUP && e->button.button>0 && e->button.button<=32)
             g_physicalButtons&=~(1u<<(e->button.button-1));
         consumed = HandleEventLocked(e, &post);
-        // The hold still waits for a released gesture; only suppression is opt-in.
-        if(g_actionsHeld && g_flagInputHold) {
+        // Keep the camera still while our save writes the terrain sidecar.
+        // SavingNow try-locks: never wait for the command thread from input.
+        if(g_actionsHeld && (g_flagInputHold || NativeIo::SavingNow())) {
             if(e->type==SDL_MOUSEMOTION || e->type==SDL_MOUSEBUTTONDOWN || e->type==SDL_MOUSEBUTTONUP ||
                e->type==SDL_MOUSEWHEEL || e->type==SDL_TEXTINPUT || e->type==SDL_TEXTEDITING ||
                ((e->type==SDL_KEYDOWN || e->type==SDL_KEYUP) && e->key.keysym.sym!=SDLK_ESCAPE)) consumed=true;

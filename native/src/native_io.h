@@ -51,6 +51,9 @@ bool SetActionsHeld(bool held);
 // and windows stay usable. What protects the world is the Lua hold (the GUI
 // capture stops) and the slice's strict lockstep (a build is cancelled at the
 // engine and replayed at a stamped step after the release, on every peer).
-// `input_hold=1` in tpf2_menu_flags.txt turns the old block back on.
+// `input_hold=1` in tpf2_menu_flags.txt turns the old block back on. While OUR
+// native save itself runs (a few seconds) input stays blocked regardless: the
+// camera paging terrain in during the save deadlocked Big Maps' pager against
+// its sidecar writer (native_io.cpp, savingNow).
 void SetInputBlocking(bool on);
 }

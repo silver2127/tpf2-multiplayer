@@ -11,6 +11,8 @@ bool Poll(Event&);
 bool HasWorld();
 bool Busy();
 bool Loading();
+// Conservative, nonblocking input gate: true also when the state mutex is busy.
+bool SavingNow();
 bool SetActionsHeld(bool);
 void WorkThreads(unsigned&, unsigned&);
 }

@@ -199,6 +199,11 @@ bool Poll(Event& e){std::lock_guard<std::mutex> lock(C().mutex);if(C().events.em
 bool HasWorld(){std::lock_guard<std::mutex> lock(C().mutex);return C().world!=0;}
 bool Busy(){std::lock_guard<std::mutex> lock(C().mutex);return C().state!=State::Idle;}
 bool Loading(){std::lock_guard<std::mutex> lock(C().mutex);return C().state==State::Loading||C().state==State::QueuedLoad;}
+bool SavingNow() {
+    std::unique_lock<std::mutex> lock(C().mutex,std::try_to_lock);
+    if(!lock.owns_lock())return true;
+    return C().state==State::QueuedSave||C().state==State::Saving;
+}
 bool SetActionsHeld(bool held){if(!panel::SetActionsHeld(held))return false;actionsHeld=held;return true;}
 void WorkThreads(unsigned& ui,unsigned& command){std::lock_guard<std::mutex> lock(C().mutex);ui=C().uiThread;command=C().commandThread;}
 }
