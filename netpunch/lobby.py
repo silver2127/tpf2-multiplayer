@@ -1117,6 +1117,34 @@ class GameRelay:
 # Required mods are offered to joiners; approval and engine registration gate loading.
 SHARE_MODS = [True]
 MODS_ANSWER_WAIT = 90.0    # s the host waits for a joiner to answer the download prompt
+# THE WORKSHOP FIRST (2026-09-22). A joiner that lacks some of the host's Workshop mods
+# subscribes to them through Steam (the bridge's tunnel, steam_tunnel.cpp UgcCommand)
+# and registers what Steam installs, exactly as a mod already on disk is registered;
+# the host sends only local mods and whatever Steam could not deliver. The player's
+# YES to the mods prompt covers both (subscribing is still installing code).
+UGC_SUBSCRIBE_WAIT = 20.0  # s for Steam to confirm a subscription before the host's copy is asked for
+UGC_STALL = 120.0          # s without a byte of progress before the rest falls back to the host
+UGC_POLL_EVERY = 1.0       # s between state polls
+_UGC = [None]              # the tunnel client the Workshop requests go through (cached once up)
+
+
+def _ugc_tunnel():
+    """The Steam tunnel for Workshop requests, or None (no tunnel: the host sends everything)."""
+    t = _UGC[0]
+    if t is None or not t.available:
+        t = steamtunnel.SteamTunnel(modshare.data_dir(), _log)
+        if not t.available:
+            return None
+        _UGC[0] = t
+    return t
+
+
+def _workshop_item(name):
+    """(mod id, version, Workshop id) for a folder name '*<id>_<ver>', else None."""
+    m, sep, v = str(name).rpartition("_")
+    if not sep or not m.startswith("*") or not m[1:].isdigit() or not v.isdigit():
+        return None
+    return m, int(v), m[1:]
 MOD_DISPLAY_NAME = "Transport Fever 2 Multiplayer"   # the mod's name in the game's mod list
 _mod_refusal_notes = {}                               # save path -> when the chat was last told
 
@@ -1817,6 +1845,13 @@ class _ClientSaveReceiver:
         self.batch_got = set()       # mods installed or present across the round's batches
         self.registering = []        # [(id, ver, folder)] on disk here, being registered with the game (catalogue_token pending)
         self.round_receipt = False   # the pending catalogue_token closes a download round (else it is a registration)
+        self.steam_items = {}        # Workshop id -> (mod id, ver, folder name): subscribed through Steam, not installed yet
+        self.steam_done = []         # [(id, ver, folder)] Steam installed; registered when the Steam phase ends
+        self.steam_failed = []       # folder names Steam did not deliver: the host sends those
+        self.steam_since = 0.0
+        self.steam_poll_at = 0.0
+        self.steam_progress = None
+        self.steam_progress_at = 0.0
         # THE TCP CHANNEL (bulk_tcp.py). A joiner connects to the sender's listener
         # (the host's or relay's, named in fbegin) and a reader thread queues the
         # stream; the relay, which listens itself, accepts the leader's upload the
@@ -1986,6 +2021,8 @@ class _ClientSaveReceiver:
             self._send({"t":"leave"})
             self.io.emit({"type":"mods_cancelled", "text":"Mod download cancelled; left the lobby."})
             return
+        if self.preflight and self._steam_begin():
+            return                                # tick asks the host for the rest once Steam is done
         if self.preflight:
             self.last_mod_request=time.time()
             self.first_mod_request=self.last_mod_request
@@ -1994,6 +2031,106 @@ class _ClientSaveReceiver:
             self._send({"t":"mods_answer", "sid":self.sid, "accept":True})
         shown = ", ".join(self.offered[:8]) + (f", +{len(self.offered)-8} more" if len(self.offered) > 8 else "")
         self.log(f"[client] mod download accepted -- asking the host for {len(self.offered)} mod(s): {shown}")
+
+    def _steam_begin(self):
+        """Subscribe through Steam to the Workshop mods the player just agreed to.
+        True when Steam took the request (tick polls it); False to have the host
+        send everything as before (no tunnel, an old bridge, no Workshop mods)."""
+        if self.server_cache or "ignore_steam_workshop" in modshare.test_flags():
+            return False                      # the relay; or the rig forcing the host's copies (test_flags)
+        items = {}
+        for name in self.offered:
+            w = _workshop_item(name)
+            if w:
+                items[w[2]] = (w[0], w[1], name)
+        if not items:
+            return False
+        t = _ugc_tunnel()
+        if t is None or not t.ugc_subscribe(sorted(items)):
+            self.log("[client] Steam's Workshop is not reachable from this lobby -- the host sends every mod")
+            return False
+        now = time.time()
+        self.steam_items, self.steam_done, self.steam_failed = items, [], []
+        self.steam_since = self.steam_progress_at = now
+        self.steam_poll_at = 0.0
+        self.steam_progress = None
+        rest = len(self.offered) - len(items)
+        self.log(f"[client] subscribing to {len(items)} Workshop mod(s) through Steam"
+                 + (f"; the host sends the other {rest}" if rest else "") + ": " + ", ".join(sorted(items)[:8])
+                 + (", ..." if len(items) > 8 else ""))
+        self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                      "text": f"Subscribing you to {len(items)} Workshop mod(s) this save needs; Steam downloads them."
+                              + (f" The host sends the other {rest}." if rest else "")})
+        self.io.emit({"type": "status", "state": "connected",
+                      "detail": f"subscribing to {len(items)} Workshop mod(s) through Steam\u2026"})
+        return True
+
+    def _steam_poll(self, now):
+        """One look at Steam's state for the items still coming. Installed ones
+        are kept for registration; one Steam never subscribed, or a download
+        that stopped moving, is left to the host."""
+        t = _ugc_tunnel()
+        states = t.ugc_state(sorted(self.steam_items)) if t is not None else None
+        if states is None:
+            self.log("[client] Steam's Workshop stopped answering -- the host sends the rest")
+            self.steam_failed += [n for _, _, n in self.steam_items.values()]
+            self.steam_items = {}
+            self._steam_finish()
+            return
+        got = total = 0
+        for wid, (m, v, name) in list(self.steam_items.items()):
+            flags, done, size, folder = states.get(wid, (0, 0, 0, ""))
+            busy = flags & (steamtunnel.UGC_DOWNLOADING | steamtunnel.UGC_DOWNLOAD_PENDING | steamtunnel.UGC_NEEDS_UPDATE)
+            if flags & steamtunnel.UGC_INSTALLED and not busy and folder and os.path.isfile(os.path.join(folder, "mod.lua")):
+                self.steam_done.append((m, v, modshare.on_disk_mod(m, v) or folder))
+                del self.steam_items[wid]
+            elif not flags & steamtunnel.UGC_SUBSCRIBED and now - self.steam_since > UGC_SUBSCRIBE_WAIT:
+                self.log(f"[client] Steam did not subscribe to {name} in {UGC_SUBSCRIBE_WAIT:.0f} s "
+                         "(hidden, removed, or Steam offline) -- the host sends its copy")
+                self.steam_failed.append(name)
+                del self.steam_items[wid]
+            else:
+                got += done
+                total += max(size, done)
+        mark = (len(self.steam_done), got)
+        if mark != self.steam_progress:
+            self.steam_progress, self.steam_progress_at = mark, now
+        elif self.steam_items and now - self.steam_progress_at > UGC_STALL:
+            names = [n for _, _, n in self.steam_items.values()]
+            self.log(f"[client] Steam's download made no progress in {UGC_STALL:.0f} s -- the host sends the "
+                     f"{len(names)} left: " + ", ".join(names[:8]))
+            self.steam_failed += names
+            self.steam_items = {}
+        if not self.steam_items:
+            self._steam_finish()
+            return
+        n = len(self.steam_done) + len(self.steam_items)
+        size = f", {got / 1e6:.0f} of {total / 1e6:.0f} MB" if total else ""
+        self.io.emit({"type": "status", "state": "connected",
+                      "detail": f"Steam Workshop: {len(self.steam_done)} of {n} mod(s) installed{size}\u2026"})
+
+    def _steam_finish(self):
+        """The Steam phase is over: register what Steam installed and leave the
+        rest (local mods, what Steam did not deliver) to the host's round."""
+        done, failed = self.steam_done, self.steam_failed
+        self.steam_done, self.steam_failed = [], []
+        got = {modshare.mod_folder_name(m, v) for m, v, _ in done}
+        self.offered = [n for n in self.offered if n not in got]
+        self.need = [n for n in self.need if n not in got]
+        if not self.offered:
+            self.approved = set()               # nothing is left for the host to send
+        self.log(f"[client] Steam installed {len(done)} Workshop mod(s)" + (f"; {len(failed)} fall back to the host" if failed else "")
+                 + (f"; asking the host for {len(self.offered)}" if self.offered else ""))
+        if done:
+            self.io.emit({"type": "chat", "from": "MULTIPLAYER",
+                          "text": f"Steam installed {len(done)} Workshop mod(s); you stay subscribed to them."
+                                  + (f" {len(failed)} could not come from the Workshop, so the host sends its copy." if failed else "")})
+            self._register(done)
+        elif not self.offered:
+            self.mods_satisfied = True
+            self.io.emit({"type": "mods_ready", "failed": []})
+        self.last_mod_request = 0
+        self.first_mod_request = time.time()
 
     def _refusal(self, kind, files):
         """Why this proposed transfer must not be taken, or None."""
@@ -2104,6 +2241,12 @@ class _ClientSaveReceiver:
         # the mods this save needs that are not installed here (told back in the ack)
         self.need = []
         previous_approval=set(self.approved) if self.preflight else set()
+        if kind == "save" and self.steam_items:
+            # the host shared its save before Steam finished: what Steam has installed
+            # is on disk and registers below; the rest the host's round sends
+            self.log(f"[client] the save arrived while Steam still had {len(self.steam_items)} Workshop mod(s) to go -- "
+                     "the host sends those")
+            self.steam_items, self.steam_done, self.steam_failed = {}, [], []
         if kind == "save":
             self.preflight=False
             self.required=[]
@@ -2319,7 +2462,10 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
-        if self.preflight and self.approved and not self.active() and not self.catalogue_token and not self.batch_open and now-self.last_mod_request>1:
+        if self.steam_items and now - self.steam_poll_at >= UGC_POLL_EVERY:
+            self.steam_poll_at = now
+            self._steam_poll(now)
+        if self.preflight and self.approved and not self.steam_items and not self.active() and not self.catalogue_token and not self.batch_open and now-self.last_mod_request>1:
             self.last_mod_request=now
             self._send({"t":"mods_request","need":list(self.offered), "batches": 1})
             first = getattr(self, "first_mod_request", 0) or now

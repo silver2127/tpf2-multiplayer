@@ -5,6 +5,7 @@
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
 - The host advertises the save's required mods. Missing mods are offered in a **Download Mods / Cancel** dialog; Cancel leaves the lobby. **Auto-accept mod downloads** in the multiplayer menu saves your choice for future joins and hotjoins. Downloads must be recognised by the game before it loads the save.
+- **Workshop mods come from the Workshop.** When your game runs on Steam, saying yes subscribes you to the missing Workshop mods and Steam downloads them; you stay subscribed afterwards. The host sends only its local (non-Workshop) mods, plus any Workshop item Steam cannot deliver: a hidden or removed item, Steam in offline mode, or a download that stops moving for two minutes. The mods are registered with the running game, so no restart is needed.
 - Deluxe and Early Supporter content are DLC, never transferred. Each player must have the required DLC installed.
   Per-save mod settings need nothing: they travel inside the save. The multiplayer mod itself
   (**Transport Fever 2 Multiplayer**) comes with the installer.
