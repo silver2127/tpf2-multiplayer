@@ -267,6 +267,10 @@ The installed `bigmap-density-restore` helper restores the plugin's exact densit
 patch before upgrade/uninstall; modified patches are left intact and removal stops.
 Native live join remains opt-in (`tpf2mp_live_join.txt` = `1`); Windows 0.7 defaults on.
 
+The [dev `60d237c5` integration](UPSTREAM_dev_60d237c5.md) retains the Windows
+autosave-sidecar fix. Native Big Maps does not yet capture or restore `.terr`
+sidecars, so this fix does not enable them on Linux.
+
 ### Optional Big Maps worktree override in development packages
 
 Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`

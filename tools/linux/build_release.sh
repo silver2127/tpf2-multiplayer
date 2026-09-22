@@ -205,6 +205,7 @@ install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5c6c084b.md" "$STAGE/UPSTREAM_dev
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4465474.md" "$STAGE/UPSTREAM_dev_b4465474.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ef275a3c.md" "$STAGE/UPSTREAM_dev_ef275a3c.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8c3c02a5.md" "$STAGE/UPSTREAM_dev_8c3c02a5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_60d237c5.md" "$STAGE/UPSTREAM_dev_60d237c5.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0115785c.md" "$STAGE/UPSTREAM_dev_0115785c.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6e1e4ec7.md" "$STAGE/UPSTREAM_dev_6e1e4ec7.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5a9b3ae0.md" "$STAGE/UPSTREAM_dev_5a9b3ae0.md"

@@ -25,6 +25,8 @@ dedicated server. See [Linux installation](docs/linux/INSTALL.md),
 default-off pending live validation, so matching versions do not establish
 Windows/native gameplay parity. The integration record lists the evidence.
 The Windows MSI instructions below apply to the Windows version.
+The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
+retains the Windows autosave-sidecar fix; native terrain sidecars remain unported.
 
 ## How it works
 
