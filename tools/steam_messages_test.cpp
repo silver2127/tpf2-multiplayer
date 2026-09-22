@@ -1,6 +1,15 @@
 // Exercise the actual adapter with a fake Steam boundary. No game/Steam init.
 #include "../native/src/steam_tunnel.cpp"
 #include <cassert>
+#include <cstdarg>
+
+static std::string statusLog;
+static void CaptureLog(const char* format, ...) {
+    char text[1024];
+    va_list args; va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args); va_end(args);
+    statusLog = text;
+}
 
 struct TestMessage : SteamNetworkingMessage_t {
     TestMessage() { memset(static_cast<SteamNetworkingMessage_t*>(this), 0, sizeof(SteamNetworkingMessage_t)); }
@@ -21,6 +30,8 @@ static int StateTest(void*, const SteamNetworkingIdentity*, SteamNetConnectionIn
     info->m_nFlags = k_nSteamNetworkConnectionInfoFlags_Relayed;
     status->m_cbPendingReliable = 100; status->m_cbPendingUnreliable = 20;
     status->m_cbSentUnackedReliable = 50;
+    status->m_flConnectionQualityLocal = 0.875f;
+    status->m_flConnectionQualityRemote = 0.625f;
     return k_ESteamNetworkingConnectionState_Connected;
 }
 static void Enqueue(int size, uint64_t peer = 123) {
@@ -55,8 +66,10 @@ int main() {
     assert(g_cbQueue.size() == 1 && g_cbQueue[0].first == 123 && g_cbQueue[0].second == 0);
     SteamNetConnectionInfo_t failure{}; failure.m_identityRemote = id; failure.m_eEndReason = 5003;
     g_messagesFail.Run(&failure); assert(g_cbQueue.back().second == 5004);
+    g_log = CaptureLog;
     P2PSessionState state{}; assert(MessagesState(nullptr, 123, &state));
     assert(state.active == 1 && state.usingRelay == 1 && state.bytesQueued == 120 && state.packetsQueued == -1);
+    assert(statusLog.find("quality_local=0.875 quality_remote=0.625") != std::string::npos);
     assert(MessagesClose(nullptr, 123));
     puts("PASS: reliable flags, API failures, receive ownership/bounds, callbacks, modern status");
 }

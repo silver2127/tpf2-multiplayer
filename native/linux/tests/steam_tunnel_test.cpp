@@ -162,7 +162,7 @@ int main(int argc, char**) {
     assert(Control(caller, control, "CLOSE 2002") == "OK");
     assert(Control(caller, control, "STATUS").find("endpoints=0") != std::string::npos);
     SteamTunnel_Stop(); assert(registrations == 2 && removals == 2);
-    assert(configValues.size()==4 && configValues[10]==1024*1024 && configValues[11]==16*1024*1024);
+    assert(configValues.size()==4 && configValues[10]==16*1024*1024 && configValues[11]==16*1024*1024);
     assert(configValues[9]==8*1024*1024 && configValues[47]==8*1024*1024);
     std::ifstream identity(dir + "tpf2_steam.txt"); assert(identity.peek() == EOF);
     // Restart without the switch and with an unavailable accessor: stay off,

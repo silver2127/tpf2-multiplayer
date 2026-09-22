@@ -64,10 +64,11 @@ bool MessagesState(void*, uint64_t id, void* result) {
     out.usingRelay = (info.m_nFlags & k_nSteamNetworkConnectionInfoFlags_Relayed) != 0;
     out.bytesQueued = status.m_cbPendingReliable + status.m_cbPendingUnreliable;
     out.packetsQueued = -1; // Modern API reports bytes, not a packet count.
-    if (g_log) g_log("[steam-messages] state=%d ping=%dms capacity=%dB/s wire_out=%.0fB/s wire_in=%.0fB/s pending=%dB unacked=%dB queue_us=%lld end=%d\n",
+    if (g_log) g_log("[steam-messages] state=%d ping=%dms capacity=%dB/s wire_out=%.0fB/s wire_in=%.0fB/s pending=%dB unacked=%dB queue_us=%lld end=%d quality_local=%.3f quality_remote=%.3f\n",
         state, status.m_nPing, status.m_nSendRateBytesPerSecond, status.m_flOutBytesPerSec,
         status.m_flInBytesPerSec, out.bytesQueued, status.m_cbSentUnackedReliable,
-        (long long)status.m_usecQueueTime, info.m_eEndReason);
+        (long long)status.m_usecQueueTime, info.m_eEndReason,
+        status.m_flConnectionQualityLocal, status.m_flConnectionQualityRemote);
     return state != k_ESteamNetworkingConnectionState_None;
 }
 struct MessagesRequestCb : CallbackBase {

@@ -21,9 +21,9 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.26 experimental, dev `1eb30002`**, on
+This development tree integrates **Windows 0.6.1.27 experimental, dev `66a584cb`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[UPSTREAM_dev_1eb30002.md](UPSTREAM_dev_1eb30002.md). Earlier Native/Windows frozen join
+[UPSTREAM_dev_66a584cb.md](UPSTREAM_dev_66a584cb.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 
@@ -265,7 +265,7 @@ and installation after all games close. The selected checkout must contain
 the game. Automatic recovery and Workshop registration remain unsupported as
 recorded in the integration notes.
 
-## Experimental Steam transport (0.6.1.26)
+## Experimental Steam transport (0.6.1.27)
 
 Messages v002 is the default, resolved from the game's loaded `libsteam_api.so`.
 To compare Legacy, close the game and create `tpf2mp_steam_legacy.txt` in this
