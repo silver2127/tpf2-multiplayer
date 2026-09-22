@@ -123,14 +123,17 @@ with tempfile.TemporaryDirectory() as ta, tempfile.TemporaryDirectory() as tb:
 
 # ---- the save transfer's view of a tunnel peer: not loopback
 pick, win = lobby._HostSaveTransfer._pick_chunk, lobby._HostSaveTransfer._pick_window
-check("a tunnel peer gets Steam-sized chunks, whoever else is there",
+check("tunnel peers (and loopback ones) get big Steam chunks",
       pick([((TUNNEL_IP, 62100), "bob")]) == lobby.CHUNK_STEAM
-      and pick([(("127.0.0.1", 29521), "carol"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM
-      and pick([(("198.51.100.7", 29471), "dave"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM)
+      and pick([(("127.0.0.1", 29521), "carol"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM)
+check("a tunnel peer beside an internet peer: the small size that fits both",
+      pick([(("198.51.100.7", 29471), "dave"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM_MIXED
+      and lobby.CHUNK_STEAM_MIXED + 17 + 28 < 1200 and win(lobby.CHUNK_STEAM_MIXED) == lobby.SEND_WINDOW_REMOTE)
 check("loopback-only stays local, an internet peer stays internet-safe",
       pick([(("127.0.0.1", 29521), "carol")]) == lobby.CHUNK_LOCAL and pick([(("198.51.100.7", 29471), "dave")]) == lobby.CHUNK_DATA)
-check("Steam chunks use the remote window and fit the unreliable limit",
-      win(lobby.CHUNK_STEAM) == lobby.SEND_WINDOW_REMOTE and lobby.CHUNK_STEAM + 17 + 28 < 1200)
+check("big Steam chunks: a byte-bounded window under Steam's 8 MB send buffer, one loopback datagram each",
+      win(lobby.CHUNK_STEAM) == lobby.SEND_WINDOW_STEAM and lobby.CHUNK_STEAM * lobby.SEND_WINDOW_STEAM <= 4 * 1024 * 1024
+      and lobby.CHUNK_STEAM + 17 + 28 + 64 < 65507)
 
 # ---- the C++ half, by anchor
 src = open(os.path.join(ROOT, "native", "src", "steam_tunnel.cpp"), encoding="utf-8").read()

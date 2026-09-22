@@ -233,13 +233,21 @@ CHUNK_LOCAL = 8192          # bytes of file data per chunk when every target pee
                             # loopback it just multiplies the per-datagram cost.
                             # NOT used on a LAN: 8 KB fragments at 1500 MTU and one
                             # lost fragment loses the whole chunk.
-CHUNK_STEAM = 1100          # bytes of file data per chunk when a peer is reached through the
-                            # Steam tunnel (steamtunnel.is_tunnel_addr): the wire is 1100+17+28
-                            # = 1145 B, under the 1,200 B limit of Steam's UNRELIABLE P2P send.
-                            # Anything bigger the tunnel has to send reliable, and a burst of
-                            # reliable 8 KB messages stalled a real transfer at 15 of 12,781
-                            # chunks (2026-09-21): the peer looks like 127.0.0.1 and was taken
-                            # for loopback, no-loss window and all.
+CHUNK_STEAM = 32000         # bytes of file data per chunk when every non-loopback peer is
+                            # reached through the Steam tunnel (steamtunnel.is_tunnel_addr).
+                            # BIG CHUNKS OVER STEAM (2026-09-22). The tunnel sends anything over
+                            # 1,200 B with Steam's RELIABLE P2P send, so Steam segments, paces and
+                            # retransmits it in C++. 1,100 B unreliable chunks (0.6.1.16-0.6.1.20)
+                            # moved a 134 MB save at ~1.7 MB/s on a direct P2P link with Steam's
+                            # queue empty: 122k chunks, each sealed in Python, and a 2,048-chunk
+                            # window (2.25 MB) that stalled for a round trip at every lost packet.
+                            # The window below is bounded in BYTES (SEND_WINDOW_STEAM): the one
+                            # earlier try at bigger Steam chunks stalled because it had the
+                            # loopback window, 134 MB fired into Steam at once (2026-09-21).
+CHUNK_STEAM_MIXED = 1100    # a transfer with Steam peers AND internet UDP peers (CROSS-PLAY):
+                            # one chunk size serves everyone, and 32 KB datagrams on the open
+                            # internet fragment; 1100+17+28 = 1145 B fits Steam's 1,200 B
+                            # unreliable limit and every internet MTU
 CHUNK_DATA = 1350           # bytes of file data per chunk (1200 until 2026-09-10: +12% per
                             # datagram; 1350+17+28 = 1395 B stays under a 1492 PPPoE MTU and
                             # a 1400 B VPN MTU; every path measured so far is v4). Wire =
@@ -343,6 +351,15 @@ def _start_dual_client(conn, name, log, sim=None):
     return dsock
 SEND_WINDOW_LOCAL  = 16384  # ~19.7 MB in flight: loopback only, no loss to lose
 SEND_WINDOW_REMOTE = 2048   # ~2.4 MB, inside XFER_BUF_BYTES
+SEND_WINDOW_STEAM  = 128    # x CHUNK_STEAM = ~4 MB in flight: half the 8 MB send buffer the
+                            # tunnel gives Steam (steam_tunnel.cpp SendBufferSize), and ~40 MB/s
+                            # at a 100 ms round trip, over the 16 MB/s rate it allows
+
+
+def _window_for(chunk):
+    """The flow-control window for a chunk size: both ends derive it from the
+    chunk in fbegin, so they agree how far ahead the NACK scan looks."""
+    return {CHUNK_LOCAL: SEND_WINDOW_LOCAL, CHUNK_STEAM: SEND_WINDOW_STEAM}.get(chunk, SEND_WINDOW_REMOTE)
 SEND_BUDGET = 256           # max datagrams sent per peer per pump() -- bounds the
                             # time one host loop iteration spends, so pings/roster
                             # for OTHER peers keep being serviced during a send.
@@ -1363,14 +1380,17 @@ class _HostSaveTransfer:
         is 535k chunks at 1200 B against 78k at 8192 B, each costing a sign, a
         pack and a sendto in single-threaded Python.
         """
-        chunk = CHUNK_LOCAL
+        tunnel = internet = False
         for addr, _name in targets:
             if steamtunnel.is_tunnel_addr(addr):
-                return CHUNK_STEAM            # the smallest wins: Steam's unreliable limit
+                tunnel = True
+                continue
             host = addr[0] if isinstance(addr, tuple) else str(addr)
             if not host.startswith("127."):
-                chunk = CHUNK_DATA
-        return chunk
+                internet = True
+        if tunnel:
+            return CHUNK_STEAM_MIXED if internet else CHUNK_STEAM
+        return CHUNK_DATA if internet else CHUNK_LOCAL
 
     @staticmethod
     def _pick_window(chunk):
@@ -1380,7 +1400,7 @@ class _HostSaveTransfer:
         never disagree: a big window with MTU-safe chunks is precisely the
         combination that stalled a real transfer.
         """
-        return SEND_WINDOW_LOCAL if chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
+        return _window_for(chunk)
 
     def __init__(self, sock, sid, blob, files_meta, targets, io, log, mods=None, kind="save", stage_cb=None, extra=None):
         self.sock = sock
@@ -1442,7 +1462,7 @@ class _HostSaveTransfer:
             }
         self.log(f"[host] save transfer sid={sid} {self.total_bytes}B in "
                  f"{self.total_chunks} chunks of {self.chunk}B "
-                 f"({'local' if self.chunk == CHUNK_LOCAL else 'steam' if self.chunk == CHUNK_STEAM else 'internet-safe'}) "
+                 f"({'local' if self.chunk == CHUNK_LOCAL else 'steam' if self.chunk == CHUNK_STEAM else 'steam+internet' if self.chunk == CHUNK_STEAM_MIXED else 'internet-safe'}) "
                  f"-> {len(self.peers)} peer(s)")
 
     # -- the TCP channel --------------------------------------------------- #
@@ -2230,7 +2250,7 @@ class _ClientSaveReceiver:
         self.chunk = int(msg.get("chunk", CHUNK_DATA)) or CHUNK_DATA
         # Same rule as the host, derived from the chunk it actually chose,
         # so the two ends agree how far ahead the NACK scan should look.
-        self.window = SEND_WINDOW_LOCAL if self.chunk == CHUNK_LOCAL else SEND_WINDOW_REMOTE
+        self.window = _window_for(self.chunk)
         self.total_chunks = int(msg.get("total_chunks", 0))
         self.files = files
         self.kind = kind
