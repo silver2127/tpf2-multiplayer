@@ -419,6 +419,44 @@ function CM.watchTrains()
 	end
 end
 
+-- THE NAME A BUY GETS IS LOCAL (2026-09-19). No instance names a bought vehicle:
+-- the engine does, from ITS OWN language file and ITS OWN per-type counter
+-- ("Train 7" on an English game, "Zug 7" on a German one; a different number
+-- when a buy failed on one side). Under strict replay every instance creates
+-- the vehicle itself, so nothing on the wire ever carried a name, and the
+-- native reservation-order patch (slice_hook.cpp, "TRAIN RESERVATION ORDER")
+-- ranks trains BY NAME: two peers whose copies of one train are named
+-- differently send it through a junction in a different order. The r lane of
+-- the world hash saw exactly that after every train purchase between an
+-- English and a German game (logs of 2026-09-18: "DESYNC (train names)" a
+-- stamp after each new train left its depot, geometry equal throughout).
+--
+-- So the ORIGINATOR's copy is the name. Once its key binds here, the name the
+-- engine gave it travels as a VNAME with the buy's key -- the same command a
+-- player's rename already uses -- and every peer renames its copy. A peer whose
+-- key is not bound yet retries on the step grid (CM.execSetName). The
+-- originator itself skips the apply: it already holds that name, and a
+-- make.setName is never echoed by the slice. Clones and company buys take the
+-- same path, as they bind through the same poll.
+local function shipVehicleName(key, vid)
+	local o = tostring(key):match("^(%a+):")
+	if o ~= K.INSTANCE then return end
+	local nm = nil
+	pcall(function()
+		local nc = api.engine.getComponent(vid, api.type.ComponentType.NAME)
+		if nc and nc.name ~= nil then nm = tostring(nc.name) end
+	end)
+	if not nm or nm == "" then
+		log(string.format("VNAME: vehicle %s (%d) has no name to share -- the peers keep their own", key, vid))
+		return
+	end
+	local esc = CM.escName and CM.escName(nm)
+		or (nm:gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end))
+	CM.scheduleLocal("VNAME", { kind = "veh", key = key, name = esc, skipOrigin = 1 })
+	log(string.format("VNAME: vehicle %s = %s (the engine's name here, shipped so every peer's copy is named the same)", key, esc))
+end
+CM.shipVehicleName = shipVehicleName
+
 function CM.pollVehKeys()
 	if #pendingVehKeys == 0 then return end
 	local now = CM.gameTime()
@@ -467,6 +505,7 @@ function CM.pollVehKeys()
 		end
 		if #fresh >= 1 then
 			registerVehKey(p.key, fresh[1])
+			shipVehicleName(p.key, fresh[1])
 			-- companies mode: a remote company's purchase landed on our player;
 			-- hand the vehicle over and move the cost (balance delta since apply).
 			if p.company and CM.cmMode == "companies" then
@@ -630,11 +669,27 @@ end
 
 function CM.execSetName(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+	-- A vehicle name whose key is not bound yet (the buy it follows is still
+	-- draining, or its VBUY arrived behind this) retries on the same step grid
+	-- and budget as a company paint: the buy's own name ships right behind the
+	-- buy (shipVehicleName), and a batch of buys binds slower than that.
+	if tostring(c.kind or "") == "veh" and c.key and not targetFor("veh", tostring(c.key)) then
+		c.tries = (c.tries or 0) + 1
+		if c.tries <= (K.VCOLOR_RETRY_MAX or 50) then
+			c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+			CM.retryQueue = CM.retryQueue or {}
+			CM.retryQueue[#CM.retryQueue + 1] = c
+			if c.tries == 1 or c.tries == 10 then
+				log(string.format("VNAME seq=%s: vehicle key %s not bound yet -- retry %d (step %d)", tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep))
+			end
+			return
+		end
+	end
 	local ok, err = pcall(function()
 		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
 		if not id then
-			log(string.format("VNAME seq=%s: no local %s for key %s -- skipped",
-				tostring(c.seq), tostring(c.kind), tostring(c.key)))
+			log(string.format("VNAME seq=%s: no local %s for key %s -- skipped%s",
+				tostring(c.seq), tostring(c.kind), tostring(c.key), (c.tries or 0) > 0 and string.format(" after %d retries", c.tries) or ""))
 			return
 		end
 		local name = CM.unescName(tostring(c.name or ""))
