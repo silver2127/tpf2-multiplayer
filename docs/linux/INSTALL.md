@@ -21,9 +21,9 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.25 experimental, dev `b7760259`**, on
+This development tree integrates **Windows 0.6.1.26 experimental, dev `1eb30002`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[UPSTREAM_dev_b7760259.md](UPSTREAM_dev_b7760259.md). Earlier Native/Windows frozen join
+[UPSTREAM_dev_1eb30002.md](UPSTREAM_dev_1eb30002.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
 
@@ -264,3 +264,14 @@ and installation after all games close. The selected checkout must contain
 `linux/CMakeLists.txt` and `linux/tpf2_bigmap.cfg`. This option never launches
 the game. Automatic recovery and Workshop registration remain unsupported as
 recorded in the integration notes.
+
+## Experimental Steam transport (0.6.1.26)
+
+Messages v002 is the default, resolved from the game's loaded `libsteam_api.so`.
+To compare Legacy, close the game and create `tpf2mp_steam_legacy.txt` in this
+installation's runtime `data/` directory. Remove it with the game closed to
+return to Messages. Both peers must choose the same mode; check `transport=Messages`
+or `transport=Legacy` in the bridge log. An unavailable Messages API disables
+Steam transport without falling back. Direct TCP remains preferred for saves;
+only transfers actually using Steam measure this comparison. No Linux internet
+throughput improvement has been measured for this integration.

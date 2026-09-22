@@ -443,6 +443,14 @@ installs a VPN or depends on the master server's relay.
   classic one; the `code` event carries `code`, `steam`, `crossplay` and
   `cross_code`. A host without a tunnel, a relay-only host and a dedicated
   server always use the classic code. `tools/test_steam_code.py` covers it.
+- **Saves take TCP first (2026-09-22).** A Steam peer is a loopback endpoint, so
+  over the sealed link each end names its own addresses (`MY_TCP_ADDRS`, from its
+  NAT observation): the host in `fbegin` (`tcp.addrs`), the joiner in `fbegin_ack`
+  (`tcp_addrs`, `tcp_port` of a listener it opens, `tcp_pull` when it dials). The
+  joiner dials the host, the host dials the joiner, and the first stream carries
+  the file. Steam's chunk pump holds meanwhile and starts only when neither
+  connects within `TCP_FIRST_WAIT` (15 s) or both ends have given up (`tcp_gave_up`);
+  a broken stream hands the rest to Steam. `tools/test_steam_tcp.py`.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).
@@ -478,3 +486,28 @@ rewind and no-progress timeout. File hashes must match. This simulation does not
 replace a two-computer Steam test. The existing `test_steam_chunks.py` additionally
 checks two receivers with 0%, 8% and 15% injected datagram loss;
 `test_steam_tcp.py` checks both TCP dialing directions and the Steam fallback.
+
+## Experimental Steam transport comparison (0.6.1.26)
+
+The default tunnel uses SteamNetworkingMessages v002 through the game's own
+steam_api64.dll. Vendored Valve headers provide the ABI; no additional Steam
+initialization or networking library is introduced. Both participants must use
+this version and the same mode. A missing Messages API is an explicit failure,
+not an automatic legacy fallback.
+
+For an A/B comparison, close the game on both computers and create
+`%LOCALAPPDATA%/tpf2mp/data/tpf2mp_steam_legacy.txt` on each. Start through the
+launcher and check `transport=Legacy`; remove the file with the game closed to
+return to `transport=Messages`. This startup switch persists across updates.
+Direct TCP still takes priority, so compare only runs whose save uses Steam.
+
+`[steam-messages]` reports Steam's estimated send capacity, recent wire rates,
+ping, pending bytes and sent-but-unacknowledged reliable bytes. These are distinct
+from `[steam-bulk]` tx (bytes accepted by the API) and `[xfer]` acknowledged save
+bytes. Modern packet queue count is unavailable and reported as -1. Mode changes
+require restart; mixed-mode peers cannot communicate.
+
+The measured 0.6.1.25 live run sustained about 0.54 MB/s with zero application
+retries or receiver duplicates. The new API is a test candidate, not a confirmed
+speed fix. Run `python tools/steam_messages_test.py` for the adapter boundary
+regression, and the existing transfer tests for save protocol coverage.

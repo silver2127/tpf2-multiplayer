@@ -2,7 +2,7 @@
 //
 // Everything Steam-side goes through the flat C API that the game's own
 // steam_api64.dll exports (SteamAPI_ISteamNetworking_*), resolved with
-// GetProcAddress: no SDK headers, no import library, no second SteamAPI_Init.
+// GetProcAddress (Linux: dlsym): ABI headers only, no second SteamAPI_Init.
 // The game initialised Steam long before this thread runs; the accessors
 // return null until then, so the thread simply waits.
 //
@@ -36,6 +36,7 @@
 #include <map>
 #include <mutex>
 #include "steam_tunnel.h"
+#include "../third_party/steam/steamnetworkingtypes.h"
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
@@ -181,6 +182,8 @@ struct ConnectFailCb : CallbackBase {
 };
 SessionRequestCb g_reqCb;
 ConnectFailCb g_failCb;
+
+#include "steam_messages.inl"
 
 struct Endpoint {
     SOCKET sock = INVALID_SOCKET;
@@ -381,14 +384,8 @@ unsigned TunnelThread(void*)
     for (auto& c : persona) if (c == '\n' || c == '\r') c = ' ';
 
     g_api.allowRelay(g_api.net, true);
-    // THE SEND-RATE CAP (2026-09-21). In today's Steam client the legacy P2P API
-    // rides on the SteamNetworkingSockets stack, whose per-connection send rate
-    // defaults to 1 MB/s (k_ESteamNetworkingConfig_SendRateMax) with 512 KB
-    // buffers: a 104 MB save moved at 1 MB/s while the lobby offered 1.6, and the
-    // rest was dropped as over-rate. Raised globally: the lobby's own window is
-    // the pacing after that. Values from steamnetworkingtypes.h; Int32 = 1,
-    // scope Global = 1. Each set is logged with its result; a client whose
-    // legacy path ignores them loses nothing.
+    // Set defaults before opening a Messages session. Successful setters do
+    // not establish that the legacy P2P path honors these settings.
     if (g_api.utils && g_api.setConfig) {
         void* utils = g_api.utils();
         struct { const char* name; int id; int32_t value; } cfg[] = {
@@ -411,11 +408,25 @@ unsigned TunnelThread(void*)
     } else {
         g_log("[steam] no SteamNetworkingUtils in this steam_api64.dll -- the send-rate cap stays at Steam's default\n");
     }
+    // Startup-only selection; both peers must match. Never silently fall back.
+#ifdef _WIN32
+    bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    bool legacy = access((g_dataDir + "tpf2mp_steam_legacy.txt").c_str(), F_OK) == 0;
+#endif
+    g_useMessages = false;
+    if (!legacy && !StartMessages()) {
+        g_log("[steam] Messages v002 unavailable -- transport OFF; select Legacy explicitly to compare\n");
+        return 0;
+    }
+    CallbackBase* requestCb = g_useMessages ? static_cast<CallbackBase*>(&g_messagesRequest) : &g_reqCb;
+    CallbackBase* failCb = g_useMessages ? static_cast<CallbackBase*>(&g_messagesFail) : &g_failCb;
     uint16_t ctlPort = 0;
     SOCKET ctl = BindLoopback("127.0.0.1", 0, &ctlPort);
     if (ctl == INVALID_SOCKET) { g_log("[steam] control socket failed (%d) -- transport off\n", WSAGetLastError()); return 0; }
-    g_api.registerCb(&g_reqCb, CB_SESSION_REQUEST);
-    g_api.registerCb(&g_failCb, CB_CONNECT_FAIL);
+    g_api.registerCb(requestCb, g_useMessages ? 1251 : CB_SESSION_REQUEST);
+    g_api.registerCb(failCb, g_useMessages ? 1252 : CB_CONNECT_FAIL);
+    g_log("[steam] transport=%s (startup selection; both peers must match)\n", g_useMessages ? "Messages" : "Legacy");
     WriteIdentity(g_myId, ctlPort, persona.c_str());
     g_log("[steam] up: id=%llu (%s), control 127.0.0.1:%u, endpoints on %s:%u-%u, relay allowed\n",
           (unsigned long long)g_myId, persona.c_str(), (unsigned)ctlPort, TUNNEL_IP, (unsigned)TUNNEL_PORT_LO, (unsigned)TUNNEL_PORT_HI);
@@ -590,7 +601,8 @@ unsigned TunnelThread(void*)
     }
     for (auto& kv6 : eps) { closesocket(kv6.second.sock); g_api.closeSession(g_api.net, kv6.first); }
     closesocket(ctl);
-    if (g_api.unregisterCb) { g_api.unregisterCb(&g_reqCb); g_api.unregisterCb(&g_failCb); }
+    if (g_api.unregisterCb) { g_api.unregisterCb(requestCb); g_api.unregisterCb(failCb); }
+    for (auto*& msg : g_messages.pending) { if (msg) msg->Release(); msg = nullptr; }
     WriteIdentity(0, 0, nullptr);
     return 0;
 }

@@ -57,7 +57,14 @@ API bool SteamAPI_ISteamNetworking_CloseP2PSessionWithUser(void*, uint64_t id) {
 API bool SteamAPI_ISteamNetworking_AllowP2PPacketRelay(void*, bool allow) { assert(allow); return true; }
 API void SteamAPI_RegisterCallback(void* p, int id) {
     auto* cb = static_cast<CallbackBase*>(p); cb->id = id; cb->flags = 1; ++registrations;
-    if (id == 1202) {
+    if (id == 1251) {
+        assert(cb->GetCallbackSizeBytes() == sizeof(SteamNetworkingIdentity));
+        auto identity = MessageIdentity(2002); cb->Run(&identity);
+    } else if (id == 1252) {
+        assert(cb->GetCallbackSizeBytes() == sizeof(SteamNetConnectionInfo_t));
+        SteamNetConnectionInfo_t info{}; info.m_identityRemote = MessageIdentity(2002);
+        info.m_eEndReason = 5003; cb->Run(&info);
+    } else if (id == 1202) {
         assert(cb->GetCallbackSizeBytes() == 8);
         P2PSessionRequest request{2002}; cb->Run(&request, false, 0);
     } else {
@@ -66,6 +73,35 @@ API void SteamAPI_RegisterCallback(void* p, int id) {
     }
 }
 API void SteamAPI_UnregisterCallback(void* p) { static_cast<CallbackBase*>(p)->flags = 0; ++removals; }
+static bool messagesMode = false, messagesUnavailable = false;
+API void* SteamAPI_SteamNetworkingMessages_SteamAPI_v002() {
+    return messagesUnavailable ? nullptr : reinterpret_cast<void*>(5);
+}
+API int SteamAPI_ISteamNetworkingMessages_SendMessageToUser(void*, const SteamNetworkingIdentity* id, const void* data, uint32_t len, int flags, int channel) {
+    assert(flags == (len > 1200 ? 8 : 0));
+    return SteamAPI_ISteamNetworking_SendP2PPacket(nullptr, id->GetSteamID64(), data, len, flags == 8 ? 2 : 0, channel) ? 1 : 2;
+}
+struct TunnelMessage : SteamNetworkingMessage_t {};
+static void ReleaseMessage(SteamNetworkingMessage_t* msg) { delete[] static_cast<char*>(msg->m_pData); delete static_cast<TunnelMessage*>(msg); }
+API int SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel(void*, int channel, SteamNetworkingMessage_t** out, int count) {
+    assert(count == 1);
+    uint32_t size = 0;
+    if (!SteamAPI_ISteamNetworking_IsP2PPacketAvailable(nullptr, &size, channel)) return 0;
+    auto* msg = new TunnelMessage{};
+    msg->m_pData = new char[size]; uint64_t peer = 0;
+    assert(SteamAPI_ISteamNetworking_ReadP2PPacket(nullptr, msg->m_pData, size, &size, &peer, channel));
+    msg->m_cbSize = size; msg->m_identityPeer = MessageIdentity(peer); msg->m_pfnRelease = ReleaseMessage;
+    *out = msg; return 1;
+}
+API bool SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser(void*, const SteamNetworkingIdentity* id) {
+    return SteamAPI_ISteamNetworking_AcceptP2PSessionWithUser(nullptr, id->GetSteamID64());
+}
+API bool SteamAPI_ISteamNetworkingMessages_CloseSessionWithUser(void*, const SteamNetworkingIdentity* id) {
+    return SteamAPI_ISteamNetworking_CloseP2PSessionWithUser(nullptr, id->GetSteamID64());
+}
+API int SteamAPI_ISteamNetworkingMessages_GetSessionConnectionInfo(void*, const SteamNetworkingIdentity*, SteamNetConnectionInfo_t*, SteamNetConnectionRealTimeStatus_t*) {
+    return k_ESteamNetworkingConnectionState_Connected;
+}
 static void LogTest(const char*, ...) {}
 static sockaddr_in Address(uint16_t port) {
     sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); return a;
@@ -83,7 +119,8 @@ static std::string Control(int sock, uint16_t port, const std::string& text) {
     assert(sendto(sock, text.data(), text.size(), 0, (sockaddr*)&a, sizeof(a)) == (ssize_t)text.size());
     return Receive(sock);
 }
-int main() {
+int main(int argc, char**) {
+    messagesMode = argc > 1;
     assert(ResolveApi());
     g_log=LogTest;
     assert(UgcCommand("UGC SUB 123")=="OK 1" && subscribed==1 && downloaded==1);
@@ -92,6 +129,7 @@ int main() {
 
     char temporary[] = "/tmp/tpf2mp-steam.XXXXXX"; assert(mkdtemp(temporary));
     const std::string dir = std::string(temporary) + "/";
+    if (!messagesMode) { std::ofstream legacy(dir + "tpf2mp_steam_legacy.txt"); legacy << "1\n"; }
     uint16_t occupiedPort = 0;
     const int occupied = BindLoopback(TUNNEL_IP, TUNNEL_PORT_LO, &occupiedPort);
     assert(occupied >= 0); // The endpoint must skip a port used by another game.
@@ -103,6 +141,7 @@ int main() {
         if (!control) Sleep(10);
     }
     assert(control && accepted == 1);
+    assert(g_useMessages == messagesMode);
     uint16_t callerPort = 0, lobbyPort = 0;
     const int caller = BindLoopback(TUNNEL_IP, 0, &callerPort);
     const int lobby = BindLoopback(TUNNEL_IP, 0, &lobbyPort);
@@ -126,9 +165,17 @@ int main() {
     assert(configValues.size()==4 && configValues[10]==1024*1024 && configValues[11]==16*1024*1024);
     assert(configValues[9]==8*1024*1024 && configValues[47]==8*1024*1024);
     std::ifstream identity(dir + "tpf2_steam.txt"); assert(identity.peek() == EOF);
+    // Restart without the switch and with an unavailable accessor: stay off,
+    // publish no identity and register no callbacks (no implicit Legacy).
+    unlink((dir + "tpf2mp_steam_legacy.txt").c_str());
+    messagesUnavailable = true;
+    assert(SteamTunnel_Start(dir, LogTest));
+    Sleep(50); SteamTunnel_Stop();
+    assert(registrations == 2 && removals == 2 && !g_useMessages);
+    std::ifstream unavailable(dir + "tpf2_steam.txt"); assert(unavailable.peek() == EOF);
     { std::ofstream disabled(dir + "tpf2mp_steam_off.txt"); disabled << "1\n"; }
     assert(!SteamTunnel_Start(dir, LogTest));
     close(caller); close(lobby); close(occupied);
-    unlink((dir + "tpf2_steam.txt").c_str()); unlink((dir + "tpf2mp_steam_off.txt").c_str()); rmdir(temporary);
+    unlink((dir + "tpf2_steam.txt").c_str()); unlink((dir + "tpf2mp_steam_off.txt").c_str()); unlink((dir + "tpf2mp_steam_legacy.txt").c_str()); rmdir(temporary);
     puts("PASS: native Steam callbacks, UDP endpoints, binary packets, reliability boundary and shutdown");
 }
