@@ -189,3 +189,6 @@ attempt-budget parity remain unported; the lab launch was blocked before game st
 The [dev `aaae03f8` integration](docs/linux/UPSTREAM_dev_aaae03f8.md) retains
 the Windows GOG octree fallback and batch deployment fixes. Native Steam
 depths 11/12/13 keep their existing verified patches and ceiling checks.
+
+The [dev `7469fce7` integration](docs/linux/UPSTREAM_dev_7469fce7.md) incorporates
+Big Maps Windows GOG documentation; native runtime behavior is unchanged.
