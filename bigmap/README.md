@@ -23,14 +23,29 @@ A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code;
 its one build-time dependency on the rest of the repo is the plugin ABI,
 `native/src/plugin/tpf2mp_plugin.h`.
 
-Target: **Transport Fever 2 build 35924** (Steam, 2024-12-11, the last release).
-Every address here was measured on it, each site is byte-verified before it is
-patched, and the plugin refuses to patch anything else.
+Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
+(2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
+is byte-verified before it is patched, and the plugin refuses to patch anything
+else.
 
-**GOG is not supported** (since 0.2.0). The installer refuses a GOG folder, and the
-New Game menu rows and density levels exist only for the Steam binary. The GOG
-addresses 0.1.1 added for the size ladder, street raster and octree are still in
-`src/bigmap.cpp`, but nothing tests or maintains them.
+The two builds share their code shape but not their addresses — the same
+function sits at a different RVA in each — so the plugin keeps a pair of
+constants per patched site and byte-verifies the one it is about to write. At
+start it reports which build it found:
+
+```
+[host] tpf2_bigmap: game build is the GOG 2024-12-12 binary -- all three sites byte-verify; using the GOG layout
+```
+
+Some features remain Steam-only because their sites were never measured on the
+GOG build, or because the replacement is a Steam code shape. They **degrade with
+a log line** rather than failing the load: the density levels, the added size
+dropdown rows, the placement/instance/material experiments, and the minimap.
+`octree_depth=12`/`13` degrades the same way — see below.
+
+To install on GOG, use **`TpF2BigMaps-<version>-gog.msi`** instead of the
+standard package: the standard one refuses a GOG game folder, because the
+installer's folder check knows only the Steam executable.
 
 ---
 
@@ -228,14 +243,25 @@ and `max_tiles=2048` for **2,048-tile (524.288 km) edge capacity**, or depth 12
 and `max_tiles=1024` for 262.144 km. Both retain **128 m leaves**. The patch
 assigns compact IDs to levels 11/12 and updates the renderer's level decoder.
 It is byte-verified and tested offline against original engine insertion
-instructions, but **not yet validated in a running game**. Heightmap area
+instructions, and **validated in a running game** on GOG: a 57 x 57 km map was
+created, played and reloaded with no duplicate street nodes and no assertion.
+Heightmap area
 limits still apply, so the longest maps must be narrow. See
 [the implementation and test notes](docs/octree-depth12.md) for configuration,
 evidence and remaining live checks. Defaults retain depth 11.
 
-**Steam 35924 only.** Depths 12 and 13 rewrite two prologues the GOG build does
+**Steam 35924 only.** Depths 12 and 13 replace two prologues the GOG build does
 not share, so there `octree_depth=12`/`13` fall back to the depth-11 root
-instead of refusing to load: the ceiling stays 512 tiles and the log says so.
+instead of refusing to load: the plugin still loads, the ceiling stays 512 tiles,
+and the log says which depth was asked for and what went in.
+
+```
+[host] tpf2_bigmap: octree: octree_depth=13 is Steam 35924 only -- this build keeps depth 11 and loads,
+                     so the edge ceiling stays 512 tiles, not 2048
+```
+
+That fallback is why the shipped config can keep `octree_depth=13` for both
+builds: Steam gets 2,048-tile edges, GOG gets the valid 512-tile root and works.
 
 Terrain LOD at the edge was **not** traced to the same limit. The only
 terrain-side 32,768 is an asymmetric legacy vertex packer (tiles −128..895),
@@ -483,6 +509,19 @@ It also sets the Segment Heap switch for `TransportFever2.exe` (a registry
 value, removed on uninstall) — that is what makes a big map load in about a
 minute instead of a quarter of an hour; the measurements are in the
 [multiplayer installer README](https://github.com/silver2127/tpf2-multiplayer/blob/main/installer/README.md#segment-heap).
+
+### GOG
+
+Use **`TpF2BigMaps-<version>-gog.msi`**. It is the same package with one
+difference — it tells the folder check that the GOG build of the game is a
+supported target — so it validates the folder exactly like the standard one
+instead of refusing it. A standard package can do the same from the command line
+with `TPF2_ALLOW_GOG=1`; without it a GOG folder is refused, because the check
+knows only the Steam executable and would rather say so than install into a game
+it cannot patch.
+
+On GOG the folder dialog starts on the Steam default, which does not exist
+there: point it at the game folder once, and every later install remembers it.
 
 Then: **New Game**. The size dropdown has rows after the stock sizes, from
 32 x 32 km up to 128 x 128 km, with *experimental map sizes* on or off, and
