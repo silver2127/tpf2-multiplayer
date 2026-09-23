@@ -155,7 +155,24 @@ once under a fresh epoch, i.e. the frozen join everyone knows; a difference afte
 that is the ordinary error. A retry is always the plain round. Windows 0.7 enables live join by default;
 `tpf2mp_live_join.txt` = `0` turns it off. Native Linux keeps explicit opt-in
 (`1`, `on`, `yes`) until the canonical-order lifetime checks below pass.
-Read at each join. Tests: `tools/test_sync_operation.py`,
+Read at each join.
+
+Nobody waits for members still loading (0.7, `pacing.lua` load gate): the roster
+hold is gone (`loadgate_roster=1` in tpf2_slice.cfg brings it back locally). A
+joiner still waits for the leader and the command history since its save.
+
+**The bridge's world id must reach it on every platform.** Each game's bridge
+drops datagrams from another world (`other-world=` in tpf2_bridge.log); its world
+id is the lobby nonce, which the menu writes into `tpf2_bridge_ctl.txt` as
+`lobby=<32 hex>` when the lobby emits `transport_lobby`. On the native Linux
+dedicated server (0.7-native, 2026-09-22) the ctl file had no `lobby=` line, so its
+bridge stayed in world `00000000`: a live joiner's game and the server dropped each
+other's frames and both held (joiner: "the leader (a) has not been heard"). Writing
+the line by hand joined them at once. The Linux menu (`native/linux/`) now writes
+`lobby=` like `native/src/menu_hook.cpp` (the `bridge ctl` writer), also
+when the `transport_lobby` event arrived before the menu first wrote the file.
+The nonce is retained in the session model and cleared for a new session; see
+[the native integration](../linux/UPSTREAM_dev_0a35d0a8.md). Tests: `tools/test_sync_operation.py`,
 `tools/test_sync_runtime.py` (live-join cases).
 
 ## Every family's node list, in entity order at every sim iteration

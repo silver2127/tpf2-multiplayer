@@ -135,6 +135,7 @@ struct Model {
     bool haveCode = false;
     std::string code, you, host, title, modsPrompt;
     std::string xfer;          // xfer= for the in-game window
+    std::string transportLobby; // session nonce from transport_lobby; reset with Model
     std::string speedReq;      // speed= from "/speed"
     int syncReq = 0;           // sync= from "/sync"
     std::string startSave;     // host: the save START GAME shared
@@ -957,7 +958,7 @@ static bool ValidLetter(const std::string& s)
 static void WriteBridgeCtl(bool isHost)
 {
     const unsigned long bpid = ReadBridgePid();
-    std::string letter = "a", leader = "a", speed, xfer;
+    std::string letter = "a", leader = "a", speed, xfer, transportLobby;
     int count, port, sync;
     {
         std::lock_guard<std::mutex> lk(S().mtx);
@@ -977,6 +978,7 @@ static void WriteBridgeCtl(bool isHost)
         }
         count = (int)m.players.size();
         port = m.relayPort ? m.relayPort : (isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN);
+        transportLobby = m.transportLobby;
         speed = m.speedReq;
         sync = m.syncReq;
         xfer = m.xfer;
@@ -984,6 +986,7 @@ static void WriteBridgeCtl(bool isHost)
     }
     std::string content = "instance=" + letter + "\npeer=127.0.0.1:" + std::to_string(port) + "\npid=" + std::to_string(bpid)
                         + "\nplayers=" + std::to_string(count) + "\n";
+    if (!transportLobby.empty()) content += "lobby=" + transportLobby + "\n";
     if (!speed.empty()) content += "speed=" + speed + "\n";
     if (sync) content += "sync=" + std::to_string(sync) + "\n";
     if (!xfer.empty()) content += "xfer=" + xfer + "\n";
@@ -1641,6 +1644,18 @@ static void Dispatch(const std::string& line)
         g_autoCopy = true;   // the panel copies it on the UI thread, then says so
         Log("[lobby] room code received (%zu chars, not logged)\n", cd.size());
         Dirty();
+    } else if (ty == "transport_lobby") {
+        const std::string epoch = JStr(ev, "epoch");
+        if (epoch.size() != 32 || epoch.find_first_not_of("0123456789abcdef") != std::string::npos) return;
+        bool isHost;
+        {
+            std::lock_guard<std::mutex> lk(S().mtx);
+            S().m.transportLobby = epoch;
+            isHost = S().m.isHost;
+        }
+        // Keep the nonce in Model even if this first write fails. Every later
+        // roster/start/speed rewrite must preserve the same bridge world.
+        WriteBridgeCtl(isHost);
     } else if (ty == "roster") {
         ApplyRoster(ev);
     } else if (ty == "chat") {

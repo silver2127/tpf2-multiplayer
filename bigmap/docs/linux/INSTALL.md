@@ -26,7 +26,7 @@ Linux defaults are placed in `.cfg.example`.
 
 Use the plugin when loading worlds that need its expanded octree. Back up
 important saves before testing. Larger maps need substantially more RAM and
-generation time. Optional terrain compression reduces settled RAM use, but does
+generation time. Default-on terrain compression reduces settled RAM use, but does
 not eliminate the peak memory needed while loading or generating a world.
 
 ## Supported scope
@@ -38,7 +38,7 @@ not eliminate the peak memory needed while loading or generating a world.
   The largest square is 510 tiles; the preview distance calculation imposes
   a separate diagonal bound until its Linux overflow fix is ported.
 - Exact SSE2 terrain min/max scan and faster zstd saves, enabled by default.
-- Experimental lossless terrain compression using Linux userfaultfd, opt-in.
+- Experimental lossless terrain compression using Linux userfaultfd, on by default.
 - Byte/build guards and a shared host that coexists with native multiplayer.
 
 Depth 12/13 (1024/2048-tile edges), material compression, terrain copy sharing,
@@ -77,8 +77,8 @@ unchanged; files can be larger. `terrain_minmax_fast=1` uses an exact SSE2 scan
 for terrain height bounds. Both default to on even with an older config.
 Set either to 0 and restart to disable it.
 
-To try terrain RAM compression, add or change these keys under `[tpf2_bigmap]`
-in your installed config and restart:
+Terrain RAM compression uses these defaults under `[tpf2_bigmap]`, including
+when the compression key is absent:
 
 ```ini
 terrain_cache_compress=1
@@ -93,14 +93,16 @@ The plugin reserves a large virtual address range; use resident memory (RSS),
 not virtual size (VIRT), when comparing RAM use. Compressed data and other game
 allocations still need RAM. More cache space can reduce decompression activity.
 
-Compression is **off by default**. It requires a Linux kernel that permits
+Compression is **on by default** since multiplayer 0.7. It requires a Linux kernel that permits
 user-mode userfaultfd with missing-page and write-protection support. Unsupported
 systems log `terrain compression unavailable` and continue without compression;
 no root permissions or kernel setting changes are required by the installer.
 The backend handles userspace faults only: a kernel operation directly accessing
 an evicted terrain page is outside its supported path. The tested game paths are
 loading, rendering, simulation, track construction and save/reload; other mods,
-GPU drivers and long sessions need further testing. See PORT.md for details.
+GPU drivers and long sessions need further testing. Kernel-origin faults on
+evicted pages can cause SIGBUS. If a driver or mod triggers SIGBUS, set
+`terrain_cache_compress=0` and restart. See PORT.md for details.
 
 One 128x128-tile save settled at 4.98 GiB RSS versus 7.78 GiB with dev.2, using a
 1 GiB terrain budget. Loading peaks were about 9.8 GiB in both runs. This is a

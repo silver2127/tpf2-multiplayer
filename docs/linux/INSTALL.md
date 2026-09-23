@@ -262,7 +262,10 @@ The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the sourc
 `tools/linux/build_native.sh` builds and tests the in-tree `bigmap/linux` plugin.
 The release includes `plugins/tpf2_bigmap.so` and its **Linux** configuration;
 `--without tpf2_pluginhost.so` omits plugins. The native defaults cap depth at 11
-and tiles at 512 (510 on square maps), with terrain paging opt-in. The Windows
+and tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
+`terrain_cache_compress=0` and restart after SIGBUS; kernel-origin faults on
+evicted pages cannot be served by this pager. Unsupported userfaultfd setup
+keeps stock allocation paths. The Windows
 configuration requests unsupported depth 13 and must not replace the Linux one.
 See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
 [current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.

@@ -307,7 +307,7 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         if(!Plan(0xc7b524,levelBefore,levelAfter,6) || !Plan(0xc7b6b1,cmpBefore,cmpAfter,9) ||
            !Plan(0xc7c3a0,allocBefore,allocAfter,5) || !Plan(0xc7c3aa,sizeBefore,sizeAfter,9))return TPF2MP_ERR_BUILD;
     }
-    if(H->cfgBool(Section,"terrain_cache_compress",0)) {
+    if(H->cfgBool(Section,"terrain_cache_compress",1)) {
         // Scope allocation changes to CTerrain's append and detached-copy calls.
         // Dispose is the shared-vector control block's exact native free path.
         auto* candidate=new linux_pager::TerrainPager;

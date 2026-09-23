@@ -75,6 +75,36 @@ int main()
     assert(unlink(path.c_str())==0);
 
     lobby::S().cfg.dataDir=dir;
+    // Nonce before the first successful ctl write, subsequent rewrites,
+    // malformed events and a fresh session all use the actual dispatcher.
+    S().child.gen=S().m.gen;
+    const std::string nonce(32, 'a'), nextNonce(32, 'b');
+    auto nonceEvent=[](const std::string& value) {
+        Dispatch("{\"type\":\"transport_lobby\",\"epoch\":\""+value+"\"}");
+    };
+    S().cfg.dataDir=dir+"missing/";
+    nonceEvent(nonce);
+    assert(S().m.transportLobby==nonce && S().ctlLast.empty());
+    S().cfg.dataDir=dir;
+    WriteBridgeCtl(true);
+    std::string ctl;
+    auto checkNonce=[&](const std::string& value) {
+        assert(ReadSmallFile(dir+"tpf2_bridge_ctl.txt", &ctl));
+        assert(ctl.find("lobby="+value+"\n")!=std::string::npos);
+    };
+    checkNonce(nonce);
+    S().m.speedReq="2"; WriteBridgeCtl(false); checkNonce(nonce);
+    for(const auto& bad : {std::string(), std::string(31,'a'), std::string(33,'a'),
+                          std::string(32,'A'), std::string(31,'a')+"\n"}) {
+        nonceEvent(bad); checkNonce(nonce);
+    }
+    nonceEvent(nextNonce); checkNonce(nextNonce);
+    nonceEvent(nextNonce); checkNonce(nextNonce);
+    ++S().m.gen; nonceEvent(nonce); checkNonce(nextNonce); // stale child
+    S().m=Model{}; S().child.gen=S().m.gen;
+    WriteBridgeCtl(true);
+    assert(ReadSmallFile(dir+"tpf2_bridge_ctl.txt", &ctl) && ctl.find("lobby=")==std::string::npos);
+
     lobby::g_inited=true; // Do not start the real worker or server browser.
     lobby::StartRequest request;
     request.name="Readiness test";

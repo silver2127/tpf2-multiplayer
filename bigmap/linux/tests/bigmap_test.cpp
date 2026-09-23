@@ -10,6 +10,13 @@ static int writes, failWrite, mismatch;
 static uintptr_t mismatchSite;
 static bool build=true;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
+// Keep fixture initialization independent of host userfaultfd permissions.
+static int compressionRequested=-1;
+static int Bool(const char* section,const char* key,int fallback){
+    const int value=Int(section,key,fallback);
+    if(std::string(key)=="terrain_cache_compress") {compressionRequested=value;return 0;}
+    return value;
+}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
 static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
@@ -25,7 +32,7 @@ static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
 static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);return Pack(96,96);}
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
-static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
+static Tpf2mpHost host={sizeof(host),1,Log,Int,Bool,Str,Base,Build,Verify,Hook,PatchBytes,Data};
 static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;mismatchSite=0;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
@@ -43,6 +50,11 @@ int main(){
     assert(TestTown(townEntry,10)==1.f && TestTown(townEntry,-1)==1.f);
     munmap(townPage,4096);
     Tpf2mpPluginInfo info{};
+    Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && compressionRequested==1);
+    Reset();config["terrain_cache_compress"]=0;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && compressionRequested==0);
+    Reset();config["terrain_cache_compress"]=1;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && compressionRequested==1);
     Reset();config["alignment_batch_tiles"]=512;
     assert(Tpf2mpPluginInit(&host,&info)==0 && alignmentBatch==512);
     assert(memory[0x173e443][0]==0xe8);

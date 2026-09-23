@@ -135,8 +135,9 @@ No allocation hooks are enabled if userfaultfd setup fails. The backend uses
 mode cannot service kernel-origin faults: kernel access to a missing terrain
 page can produce SIGBUS. See the [Linux userfaultfd documentation](https://docs.kernel.org/admin-guide/mm/userfaultfd.html).
 The game paths tested here perform terrain reads/writes in userspace; this is
-not proof for every graphics driver, mod or engine path. Compression therefore
-remains opt-in. Material grids, copy-on-write sharing and multi-worker restores
+not proof for every graphics driver, mod or engine path. Compression is on by default since multiplayer 0.7, including with a missing
+config key, by the owner's decision on 2026-09-22. If a driver or mod triggers
+SIGBUS, set `terrain_cache_compress=0` and restart. Material grids, copy-on-write sharing and multi-worker restores
 are not implemented in this backend. Terrain resolution remains 1 m; the
 abandoned 2 m Windows cache mode is not ported.
 
@@ -197,12 +198,10 @@ physical MiB / 30, clamped to 256..4096 MiB, exactly the Windows
 cgroup limit or an available-memory/headroom controller. Examples: 16 GiB ->
 546 MiB; 32 GiB -> 1092 MiB. The live candidate logged 1022 MiB on this lab.
 
-Compression still requires `terrain_cache_compress=1`. Dedicated default-on is
-**not completed**: `dedicated=1, dedicated_render=0` requests suppression, but
-`overlay_vk_linux.cpp` can refuse it when Vulkan dispatcher slots fail validation.
-A flag alone therefore cannot establish the no-render condition required by
-UFFD_USER_MODE_ONLY. Future automatic activation must depend on successful
-suppression, including its initialization order and any device recreation.
+The earlier dedicated-only default proposal is superseded by dev `747fd4d`:
+compression now defaults on for every native game, without a rendering-suppression
+prerequisite. The kernel-origin fault risk above remains; setup failure still
+retains stock allocation paths. No version or simulation change is involved.
 The native pager currently never sleeps to throttle faults; no unconditional
 throttle was introduced. Windows' dynamic headroom and load-only throttle policy
 remain unported and must not be inferred from the new hot-budget calculation.

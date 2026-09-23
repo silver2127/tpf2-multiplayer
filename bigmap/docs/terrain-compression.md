@@ -7,6 +7,25 @@ both rail segments intact. Extended gameplay remains untested.
 This is separate from the discontinued 2 m experiment. Source heightmaps,
 derived 257x257 samples, physical tile dimensions and octree depth are unchanged.
 
+## Native Linux: ON by default for everyone (the owner's call, 2026-09-22)
+
+The Linux port (`bigmap/linux/`, the userfaultfd pager) shipped
+`terrain_cache_compress=0` as an opt-in, because `UFFD_USER_MODE_ONLY` cannot
+serve a kernel-origin fault on an evicted tile. Without it the native game holds
+every tile raw: the dedicated server (31 GB) was OOM-killed at 29.3 GB loading a
+~52,000-tile map that Windows holds at 8-10 GB. The owner: "turn it on for
+everyone".
+
+- `bigmap/linux/tpf2_bigmap.cfg`: `terrain_cache_compress=1`, and the code's
+  built-in default for a missing key is 1 too.
+- It stays a cfg switch (`terrain_cache_compress=0` turns it off) and still falls
+  back to stock paths when userfaultfd setup fails.
+- The Linux docs (`bigmap/docs/linux/PORT.md`, `INSTALL.md`) say it is on by
+  default, name the kernel-fault risk and how to turn it off if a graphics driver
+  or mod trips it (SIGBUS in the log).
+- Released within 0.7: no version change. Compression changes no simulation
+  result, so peers with and without it stay in sync.
+
 ## Format 3 and pager capacity (September 15, built and tested offline, NOT deployed)
 
 Three changes, all in `src/terrain_codec.h` and `src/terrain_pager.h`:

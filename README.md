@@ -25,6 +25,9 @@ dedicated server. See [Linux installation](docs/linux/INSTALL.md),
 disables it); see the [dev ad3d66e4 integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
 Settings must match Windows peers. Loaded-game lifetime and cross-platform
 validation remain outstanding; matching versions do not establish gameplay parity.
+The [dev `0a35d0a8` integration](docs/linux/UPSTREAM_dev_0a35d0a8.md) enables
+native terrain compression by default and fixes bridge lobby identity; release
+version remains 0.7.
 The Windows MSI instructions below apply to the Windows version.
 The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
 retains the Windows autosave-sidecar fix; native terrain sidecars remain unported.
