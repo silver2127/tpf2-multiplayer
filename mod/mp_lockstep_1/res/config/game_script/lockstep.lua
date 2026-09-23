@@ -870,7 +870,8 @@ function data()
 			if CM.autoSyncPump(CM.gameTime() or 0) then return end
 			CM.pollEvents()
 			pcall(CM.sampleSimRate)
-			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end   -- companies: vehicles left to follow their lines in a switch
+			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end
+			if CM.cmSwitchWanted then pcall(CM.cmLoadSwitchTick) end   -- companies: the load-time switch waits for a world that answers   -- companies: vehicles left to follow their lines in a switch
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
 				if not CM.detectInstance() then return end
 				-- a save's company state (load hook) is applied here, on the sim

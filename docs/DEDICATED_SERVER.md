@@ -132,6 +132,27 @@ while the session ran. Numbers for the native Linux build; under Proton only the
   time measured before the pager budget was raised was the pager decoding tiles,
   not the allocator's shape.
 
+### What the port's fix bought (same server, 22:36 the same evening)
+
+`port/dev b1ac39f` ships both the `Readable()` rewrite (it probes with
+`process_vm_readv` instead of parsing the mapping table) and the MSVC
+random-number parity modules, built in the soldier SDK and installed on the test
+server. Measured again with one player in, 1x, world settled:
+
+- `tpf2_engine_pace.txt` reads **`base=200000`**: the engine's own estimate is the
+  nominal 200 ms a batch again. Before the fix it asked for 240,000 at 1x and
+  400,000 at 2x -- it was 20-100% behind. That is the whole point of the fix.
+- The simulation thread is **12% of a core** at 1x (it was ~80% on-CPU, a third of
+  that in the maps parse). No `/proc/self/maps` open in an 8 s syscall census and
+  no `seq_file` symbols in a 12 s profile; `process_vm_readv` and `RawRead` show
+  at ~0.9% each, which is the new probe doing its job.
+- What is left at the top is **lavapipe's mapping churn**: 6,030 `mmap` and 6,060
+  `munmap` a second, and the TLB-shootdown IPIs they cause
+  (`smp_call_function_many_cond`) are now the single largest kernel cost on every
+  thread. 49,000 mappings still stand. The bullet above is the item to take next.
+- Memory: 27.3 GiB resident, and the load pushed swap use to 3.9 GiB (the
+  alignment pass peaked at 28.8 GiB resident with `memory.pressure` around 2%).
+
 ## Limits
 
 - One Steam account per server, in offline mode; the account must own the game and
