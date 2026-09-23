@@ -112,7 +112,8 @@ static void Restore(uintptr_t base) {
     g_canonReady=false;
     const unsigned char get[]={0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
     const unsigned char none[]={0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
-    Write(base+0xa914c0,get,sizeof(get)); Write(base+0xa914e0,none,sizeof(none));
+    for(uintptr_t rva:kFamilyListGetters) Write(base+rva,get,sizeof(get));
+    for(uintptr_t rva:kFamilyNoListGetters) Write(base+rva,none,sizeof(none));
     for(const auto& s:kCanonSites)Write(base+s.rva,s.bytes,sizeof(s.bytes));
 }
 struct Node { uintptr_t next; int32_t key; int32_t payload; };
@@ -151,10 +152,69 @@ static void FreedIdTests() {
     CanonSort(5,0,owner);
     assert(g_canonCounters[5].reordered==reordered); // sorted batch stays put
 }
+// One family, width n, keys 9,2,5: returns true when CanonFamilies put it in
+// entity order (and repaired the index), false when it left it untouched.
+static bool CanonOneFamily(uintptr_t base, uintptr_t getter, unsigned n) {
+    std::array<uintptr_t,80> engine{};
+    uintptr_t vtable[]={0,0,getter};
+    const size_t stride=n+1;
+    std::vector<int32_t> nodes(3*stride);
+    const int32_t keys[]={9,2,5};
+    for(size_t i=0;i<3;++i) {
+        nodes[i*stride]=keys[i];
+        for(size_t j=1;j<stride;++j) nodes[i*stride+j]=keys[i]*100+j;
+    }
+    int8_t ctrl[]={0,1,2,-128,-128,-128,-128};
+    int32_t slots[]={9,0,2,1,5,2,0,0,0,0,0,0,0,0};
+    uintptr_t family[]={reinterpret_cast<uintptr_t>(vtable),base+0x59ac260+0x20*(n-1),
+        reinterpret_cast<uintptr_t>(nodes.data()),reinterpret_cast<uintptr_t>(nodes.data()+nodes.size()),
+        reinterpret_cast<uintptr_t>(nodes.data()+nodes.size()),reinterpret_cast<uintptr_t>(ctrl),
+        reinterpret_cast<uintptr_t>(slots),3,7};
+    uintptr_t node[]={0,0,reinterpret_cast<uintptr_t>(family)};
+    engine[0x170/8]=reinterpret_cast<uintptr_t>(node); engine[0x178/8]=1;
+    const auto original=nodes;
+    CanonFamilies(reinterpret_cast<uintptr_t>(engine.data()));
+    if(nodes==original) { assert(slots[1]==0 && slots[3]==1 && slots[5]==2); return false; }
+    assert(nodes[0]==2 && nodes[stride]==5 && nodes[2*stride]==9);
+    for(size_t i=0;i<3;++i) for(size_t j=1;j<stride;++j)
+        assert(nodes[i*stride+j]==nodes[i*stride]*100+int(j));
+    assert(slots[1]==2 && slots[3]==0 && slots[5]==1);
+    return true;
+}
+// Every node-list getter of the inventory is recognised, not only the first one:
+// build 35924 has 28 distinct copies (GCC does not fold them as MSVC does), and
+// with only 0xa914c0 recognised the native server sorted 1 of 28 lists
+// (Town, TownBuilding, Construction, BaseEdge, ... stayed in history order).
+static void GetterInventoryTests(uintptr_t base) {
+    g_familyBase=base;
+    static_assert(kFamilyListGetterCount==28 && kFamilyNoListGetterCount==35);
+    for(uintptr_t rva:kFamilyListGetters)
+        for(unsigned n=1;n<=5;++n) {
+            const auto refused=g_canonCounters[6].refused.load();
+            assert(CanonOneFamily(base,base+rva,n));
+            assert(g_canonCounters[6].refused==refused);
+        }
+    // Town's family (0xa917d0) and TownBuilding's (0xa917c0) specifically: the
+    // town stagger (node index % 30) and the town building walk read them.
+    assert(FamilyGetter(base+0xa917d0)==FG_LIST && FamilyGetter(base+0xa917c0)==FG_LIST);
+    // A no-list family is skipped: not sorted, not counted as refused.
+    for(uintptr_t rva:kFamilyNoListGetters) {
+        const auto refused=g_canonCounters[6].refused.load();
+        assert(!CanonOneFamily(base,base+rva,1));
+        assert(g_canonCounters[6].refused==refused);
+    }
+    // Anything else is refused and left untouched: an unknown address, the
+    // middle of a known getter, a getter of another image.
+    for(uintptr_t get:{base+0xa914c4,base+0xa914c8,base+0x1234,uintptr_t(0xa914c0),uintptr_t(0)}) {
+        const auto refused=g_canonCounters[6].refused.load();
+        assert(!CanonOneFamily(base,get,1));
+        assert(g_canonCounters[6].refused==refused+1);
+    }
+}
 static void FamilyTests(uintptr_t base) {
     g_familyBase=base;
     std::array<uintptr_t,80> engine{};
-    uintptr_t vtable[]={0,0,base+0xa914c0};
+    uintptr_t vtable[]={0,0,base+0xa917d0};   // ecs::ComponentGroupFamily1<Town>
     for(unsigned n=1;n<=5;++n) {
         const size_t stride=n+1;
         std::vector<int32_t> nodes(3*stride);
@@ -255,11 +315,19 @@ int main() {
         assert(!InstallOrderCanon(base,kCanonBuildId,FailHook));
         for(const auto& s:kCanonSites)assert(!memcmp(reinterpret_cast<void*>(base+s.rva),s.bytes,16));
     }
-    for(auto accessor : {0xa914c0,0xa914e0}) {
-        Restore(base); const unsigned char bad=0xcc; Write(base+accessor,&bad,1);
+    // Every inventoried getter is part of the install guard, not only the first two.
+    std::vector<uintptr_t> accessors(std::begin(kFamilyListGetters),std::end(kFamilyListGetters));
+    accessors.insert(accessors.end(),std::begin(kFamilyNoListGetters),std::end(kFamilyNoListGetters));
+    for(auto accessor : accessors) for(unsigned at : {0u,4u,6u}) {
+        Restore(base); unsigned char byte; memcpy(&byte,reinterpret_cast<void*>(base+accessor+at),1);
+        byte^=0x40; Write(base+accessor+at,&byte,1);
         assert(!Tpf2mpInstallOrderCanon(base,kCanonBuildId));
+        assert(!strcmp(g_canonStatus.load(),"off (unverified family accessors)"));
+        for(const auto& s:kCanonSites)assert(!memcmp(reinterpret_cast<void*>(base+s.rva),s.bytes,16));
     }
+    Restore(base);
     FamilyTests(base);
+    GetterInventoryTests(base);
     auto* code=static_cast<unsigned char*>(mmap(nullptr,4096,PROT_READ|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));assert(code!=MAP_FAILED);
     std::mt19937_64 rng(35924);
     for(unsigned site=0;site<kCanonSiteCount;++site)for(unsigned alignment=0;alignment<2;++alignment) {

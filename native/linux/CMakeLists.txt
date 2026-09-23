@@ -32,7 +32,7 @@ set_source_files_properties(src/windows_ucrt_math_linux.cpp PROPERTIES COMPILE_O
 add_library(tpf2mp_boot SHARED src/boot.cpp src/lua_fixed_format_linux.cpp
             src/destination_rng_linux.cpp src/windows_uniform_int_linux.cpp
             src/windows_person_seed_linux.cpp src/windows_person_cost_linux.cpp
-            src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
+            src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/town_trace_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
             src/libm_parity_linux.cpp src/windows_ucrt_math_linux.cpp
             src/tree_rng_linux.cpp src/animal_rng_linux.cpp src/building_order_linux.cpp
             src/resident_hash_linux.cpp src/order_canon_linux.cpp src/person_map_order_linux.cpp
@@ -171,7 +171,7 @@ if(BUILD_TESTING)
   target_include_directories(test_float_rng PRIVATE src)
   target_compile_options(test_float_rng PRIVATE -UNDEBUG)
   add_test(NAME float_rng COMMAND test_float_rng)
-  add_executable(test_town_seed tests/town_seed_test.cpp src/windows_person_seed_linux.cpp src/hook_posix.cpp)
+  add_executable(test_town_seed tests/town_seed_test.cpp src/windows_person_seed_linux.cpp src/town_trace_linux.cpp src/hook_posix.cpp)
   target_include_directories(test_town_seed PRIVATE ../src src)
   target_compile_options(test_town_seed PRIVATE -UNDEBUG)
   add_test(NAME town_seed COMMAND test_town_seed)
@@ -209,11 +209,22 @@ if(BUILD_TESTING)
   target_compile_options(test_resident_hash PRIVATE -UNDEBUG)
   target_link_libraries(test_resident_hash PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME resident_hash COMMAND test_resident_hash $<TARGET_FILE:slice_test_foreign>)
-  add_executable(test_order_canon tests/order_canon_test.cpp src/hook_posix.cpp)
+  add_executable(test_order_canon tests/order_canon_test.cpp src/town_trace_linux.cpp src/hook_posix.cpp)
   target_include_directories(test_order_canon PRIVATE ../src src)
   target_compile_options(test_order_canon PRIVATE -UNDEBUG -fno-omit-frame-pointer)
   target_link_libraries(test_order_canon PRIVATE Threads::Threads)
   add_test(NAME order_canon COMMAND test_order_canon)
+  add_executable(test_town_trace tests/town_trace_test.cpp src/town_trace_linux.cpp)
+  target_include_directories(test_town_trace PRIVATE ../src src)
+  target_compile_options(test_town_trace PRIVATE -UNDEBUG)
+  target_link_libraries(test_town_trace PRIVATE Threads::Threads)
+  add_test(NAME town_trace COMMAND test_town_trace)
+  # Manual integration fixture: requires the private build-35924 game ELF.
+  add_executable(test_family_canon_elf tests/family_canon_elf_test.cpp
+                 src/town_trace_linux.cpp src/hook_posix.cpp)
+  target_include_directories(test_family_canon_elf PRIVATE ../src src)
+  target_compile_options(test_family_canon_elf PRIVATE -UNDEBUG -fno-omit-frame-pointer)
+  target_link_libraries(test_family_canon_elf PRIVATE Threads::Threads)
   add_executable(test_family_canon ../../tools/family_canon_test.cpp)
   add_test(NAME family_canon COMMAND test_family_canon)
   add_executable(test_person_map_order tests/person_map_order_test.cpp src/hook_posix.cpp)

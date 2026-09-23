@@ -204,3 +204,7 @@ Runtime behavior is unchanged; the listed gains are upstream measurements.
 The [dev `c9ac009d` integration](docs/linux/UPSTREAM_dev_c9ac009d.md) retains
 the standalone Big Maps sync and unified Windows MSI documentation while
 preserving native Linux guidance. Runtime behavior is unchanged.
+
+The [dev `0610033` integration](docs/linux/UPSTREAM_dev_0610033.md) fixes native
+family ordering to recognize all 28 node lists and adds the opt-in town trace.
+Static and fixture checks pass; live validation was blocked at lab startup.

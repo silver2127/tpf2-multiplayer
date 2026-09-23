@@ -346,3 +346,13 @@ Version remains 0.7.
 The [dev `bd69b864` integration](UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
 target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
 attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+## Town-development diagnostics (dev 0610033)
+
+Set `TPF2MP_TOWN_TRACE=1` in the game's launch environment to write
+`$XDG_DATA_HOME/tpf2mp/data/tpf2_towntrace.txt` (default XDG data home:
+`~/.local/share`). Restart without the variable to disable it. The trace is off
+by default and requires the verified town-seed hook. Compare captures from the
+same session with `python3 tools/town_trace_diff.py NATIVE_TRACE WINDOWS_TRACE`;
+Windows enables its half with `towntrace=1` in `tpf2_slice.cfg`.
+See [integration and validation limits](UPSTREAM_dev_0610033.md).

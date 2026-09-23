@@ -324,6 +324,48 @@ engines of every peer, whatever history they have.
   (`f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55 41 54`, rdi = the engine), same
   walk over the libstdc++ family map; family_canon.h is portable.
 
+### Native: GCC keeps one GetNodeList per family (fixed 2026-09-23)
+
+The native step canon recognised a family's node list by ONE getter address,
+`0xa914c0` (`endbr64; lea rax,[rdi+8]; ret`), and a list-less family by
+`0xa914e0`. That is the Windows design, where MSVC's identical-code folding
+makes every `ComponentGroupFamily<...>::GetNodeList` one function (0xba990).
+GCC does not fold them: build 35924 has **28** node-list getters and **35**
+no-list getters, one per family template instantiation
+(`tools/linux/gen_family_getters.py` lists them from the ELF's own vtables).
+Only PersonCapacity used `0xa914c0` and only VehicleOrder `0xa914e0`, so every
+native peer since 0.7 sorted 1 of its 28 node lists and refused the other 61
+families -- Town, TownBuilding, Construction, BaseEdge, TownConnection,
+SimBuilding, StockList, Station, the vehicle families -- while every Windows
+peer sorted all 28. The production server logged it at every iteration:
+
+```
+[order-canon] step engine=... families=63/63 lists=1 reordered=0 moved=0 unknown/refused=61
+```
+
+(Windows: `63 families, 28 node lists ..., 0 not understood`.) The native
+lists therefore stayed in load/history order while the Windows lists were in
+entity order: the TownSystem staggers town `i` of its node list to
+`t % 120 == (i % 30) * 4` and hands every town of a tick one mt19937 seeded
+from `t`, so a list in another order develops towns at other ticks with other
+draws (the native load order is not entity order: the one list it did sort,
+PersonCapacity, needed ~5,300 nodes moved at the first iteration after every
+load). Every native session since 0.7 split in town growth within one to
+three hash stamps of each join (for example 390 and 475 game units after the
+joiner's load on 2026-09-23), in several towns at once; the
+0.6.1.28-native sessions, which had no step canon on either side, held
+(1,800 units and 36 new street edges, 2026-09-22).
+
+Fix: `native/linux/src/family_getters_linux.h`, generated from the ELF,
+lists all 63 getters; install verifies each byte for byte; the canon
+classifies a family by that table and still calls none of them.
+`tests/family_canon_elf_test.cpp` (manual, needs the game ELF) maps the real
+image, applies its relocations, gives an engine the binary's own 63 family
+vtables with unsorted lists and runs one iteration: 28 lists sorted, 0
+refused; with the old check it prints the server's `lists=1 ...
+unknown/refused=61`. After deployment the server's log must read
+`lists=28 ... unknown/refused=0`.
+
 ## Not covered yet
 
 Order-sensitive consumers the lab world did not exercise (it has two vehicles
