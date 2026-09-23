@@ -192,3 +192,7 @@ depths 11/12/13 keep their existing verified patches and ceiling checks.
 
 The [dev `7469fce7` integration](docs/linux/UPSTREAM_dev_7469fce7.md) incorporates
 Big Maps Windows GOG documentation; native runtime behavior is unchanged.
+
+The [dev `63a3b8df` integration](docs/linux/UPSTREAM_dev_63a3b8df.md) records
+upstream depth-13 gameplay and native dedicated multiplayer results. Native
+defaults and placement limits remain unchanged; no local live run was repeated.

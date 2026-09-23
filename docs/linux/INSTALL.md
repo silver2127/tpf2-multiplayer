@@ -266,10 +266,14 @@ and cap tiles at 512 (510 on square maps), with terrain paging on by default (mi
 `terrain_cache_compress=0` and restart after SIGBUS; kernel-origin faults on
 evicted pages cannot be served by this pager. Unsupported userfaultfd setup
 keeps stock allocation paths. The Windows
-configuration requests experimental depth 13; keep the packaged Linux configuration
+configuration requests depth 13; keep the packaged Linux configuration
 for its native defaults. Depths 12/13 are available on the verified Steam ELF;
 the Windows GOG fallback does not apply to it. See
 [dev aaae03f8 integration](UPSTREAM_dev_aaae03f8.md).
+Upstream now reports successful depth-13 play, save/reload and multiplayer
+with a native Linux dedicated server; every peer needs the same `octree_depth`.
+See [dev 63a3b8df integration](UPSTREAM_dev_63a3b8df.md) for attribution
+and the distinction from local validation.
 See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
 [current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.
 The installed `bigmap-density-restore` helper restores the plugin's exact density

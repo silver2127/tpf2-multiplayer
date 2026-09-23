@@ -27,9 +27,11 @@ its one build-time dependency on the rest of the repo is the plugin ABI,
 describe the Windows plugin. For the native Steam ELF, use the
 [Linux installer](../docs/linux/INSTALL.md) and consult the
 [Linux port evidence and limits](docs/linux/PORT.md#octree-depth-1213-experimental).
-Native defaults remain depth 11 / 512 tiles; depths 12/13 are experimental
-and have offline validation only. The upstream GOG run described below
-exercised its depth-11 fallback, not a depth-12/13 root or the Linux port.
+Native defaults remain depth 11 / 512 tiles. Upstream reports successful
+depth-13 play, save/reload and multiplayer with a native Linux dedicated server;
+these results were not repeated in this local integration. Native placement
+limits still apply (see the port evidence). The upstream GOG run below
+exercised its depth-11 fallback. Every peer needs the same `octree_depth`.
 
 Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
 (2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
@@ -246,17 +248,21 @@ b2 0b              mov  dl, 0xb            ; depth 11
 ceiling remains **512 tiles (131 km)** with 128 m leaves. The default patch is
 applied only when the configuration asks for a size over 256 tiles.
 
-**Experimental actual depths 12 and 13 are available.** Set `octree_depth=13`
+**Actual depths 12 and 13 are available, and tested.** Set `octree_depth=13`
 and `max_tiles=2048` for **2,048-tile (524.288 km) edge capacity**, or depth 12
 and `max_tiles=1024` for 262.144 km. Both retain **128 m leaves**. The patch
 assigns compact IDs to levels 11/12 and updates the renderer's level decoder.
 It is byte-verified and tested offline against original engine insertion
-instructions, and **validated in a running game** on GOG: a 57 x 57 km map was
-created, played and reloaded with no duplicate street nodes and no assertion.
-Heightmap area
-limits still apply, so the longest maps must be narrow. See
-[the implementation and test notes](docs/octree-depth12.md) for configuration,
-evidence and remaining live checks. Defaults retain depth 11.
+instructions, and the higher depths have been **tested in play and work fine**:
+large maps at depth 13 created, played, saved and reloaded on Steam, in single
+player and in multiplayer (Windows players with the native Linux dedicated
+server, which supports depths 12/13 since 2026-09-23), with no duplicate street
+nodes and no assertion. On GOG the fallback below was validated in a running
+game (a 57 x 57 km map created, played and reloaded). Heightmap area limits
+still apply, so the longest maps must be narrow. Every multiplayer peer needs
+the same `octree_depth`. See
+[the implementation and test notes](docs/octree-depth12.md) for configuration
+and evidence.
 
 **Steam 35924 only.** Depths 12 and 13 replace two prologues the GOG build does
 not share, so there `octree_depth=12`/`13` fall back to the depth-11 root
