@@ -84,8 +84,26 @@ a.execute('''
     -- A different script cannot consume this one's saved random stream.
     local z = compat.wrap(basic, 'other')
     sim=1002; z.update(); z.update()
-    y.load(saved); sim=1001; y.update()
+    -- a real reload puts the world's clock back first (the save's time)
+    sim=1000; y.load(saved); sim=1001; y.update()
     assert(draws[#draws] == expected)
+    -- NEVER A REWIND: an older state arriving while this world runs on (the
+    -- engine's per-frame sync from its other script copy) is ignored ...
+    sim=1005; y.update()
+    local ahead = draws[#draws]
+    y.load(saved)                                   -- clock 1000, ours 1005, the world at 1005
+    sim=1006; y.update()
+    local n = #draws
+    sim=1006; y.update()
+    assert(#draws == n)                              -- 1006 ran once: the stale load did not rewind the grid
+    -- ... and a NEWER state (the other copy ran ahead) is still taken
+    local w = compat.wrap(basic, 'test')
+    sim=1010; w.update()
+    local newer = w.save()                           -- clock 1010
+    y.load(newer)
+    local before = #draws
+    sim=1010; y.update()
+    assert(#draws == before)                         -- 1010 already done by the newer state
     local broken = compat.wrap({update=function() error('intentional failure') end}, 'broken')
     assert(not pcall(broken.update))
     assert(math.random == originalRandom and os.time == originalTime)

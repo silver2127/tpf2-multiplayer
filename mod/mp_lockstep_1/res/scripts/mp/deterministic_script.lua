@@ -198,13 +198,33 @@ function M.wrap(script, id, options)
 		echoed = {seed = seed, lastUpdate = lastUpdate}
 		return saved
 	end
-	local echoes = 0
+	local echoes, rewinds = 0, 0
 	out.load = function(saved, ...)
 		local meta = type(saved) == "table" and saved[KEY]
 		if meta and echoed and meta.seed == echoed.seed and meta.lastUpdate == echoed.lastUpdate then
 			echoes = echoes + 1
 			if echoes == 1 or echoes % 1000 == 0 then
 				print("[mpdet] " .. id .. ": load is the engine echoing our own state (x" .. echoes .. ") -- ignored")
+			end
+			return
+		end
+		-- NEVER A REWIND (2026-09-22). The per-frame load does not come back from
+		-- this Lua state's own save but from the engine's OTHER copy of the
+		-- script, so the echo test above never matched on any platform (0 echoes
+		-- against ~7,000 restores in a session) and every frame put the town-growth
+		-- state back to whatever that copy held. On Windows that was current; on
+		-- the native Linux dedicated server it was not, and its towns froze (4,846
+		-- buildings for 800+ units while the joiner grew 900): a desync. A load
+		-- whose clock is not ahead of ours, while this world's own clock has not
+		-- gone back, is a state sync and is ignored; a real world load (a fresh
+		-- state: lastUpdate nil, or a world whose clock is earlier) still applies,
+		-- and a newer state (the other copy ran ahead) is still taken.
+		if meta and lastUpdate ~= nil and type(meta.lastUpdate) == "number" and meta.lastUpdate <= lastUpdate
+				and simTime() >= lastUpdate then
+			rewinds = rewinds + 1
+			if rewinds == 1 or rewinds % 1000 == 0 then
+				print(string.format("[mpdet] %s: load carries clock %s, ours is %s and the world runs on -- a state sync, not a rewind (x%d) -- ignored",
+					id, tostring(meta.lastUpdate), tostring(lastUpdate), rewinds))
 			end
 			return
 		end
