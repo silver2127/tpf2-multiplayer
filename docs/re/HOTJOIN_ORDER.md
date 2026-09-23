@@ -154,7 +154,22 @@ fingerprints still decide: a difference empties `retain` and repeats `loading`
 once under a fresh epoch, i.e. the frozen join everyone knows; a difference after
 that is the ordinary error. A retry is always the plain round. On by default
 since 0.7 (every peer has the engine sorts); `tpf2mp_live_join.txt` = `0` in the
-host's io dir (read at each join) turns it off. Tests: `tools/test_sync_operation.py`,
+host's io dir (read at each join) turns it off.
+
+Nobody waits for members still loading (0.7, `pacing.lua` load gate): the roster
+hold is gone (`loadgate_roster=1` in tpf2_slice.cfg brings it back locally). A
+joiner still waits for the leader and the command history since its save.
+
+**The bridge's world id must reach it on every platform.** Each game's bridge
+drops datagrams from another world (`other-world=` in tpf2_bridge.log); its world
+id is the lobby nonce, which the menu writes into `tpf2_bridge_ctl.txt` as
+`lobby=<32 hex>` when the lobby emits `transport_lobby`. On the native Linux
+dedicated server (0.7-native, 2026-09-22) the ctl file had no `lobby=` line, so its
+bridge stayed in world `00000000`: a live joiner's game and the server dropped each
+other's frames and both held (joiner: "the leader (a) has not been heard"). Writing
+the line by hand joined them at once. The Linux menu (`native/linux/`) must write
+`lobby=` exactly like `native/src/menu_hook.cpp` (the `bridge ctl` writer), also
+when the `transport_lobby` event arrived before the menu first wrote the file. Tests: `tools/test_sync_operation.py`,
 `tools/test_sync_runtime.py` (live-join cases).
 
 ## Every family's node list, in entity order at every sim iteration
