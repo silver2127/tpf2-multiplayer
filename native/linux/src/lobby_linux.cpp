@@ -2072,6 +2072,41 @@ static void DedicatedAutosaveTick(uint64_t now, uint64_t worldSince, uint64_t& l
     }
 }
 
+// Restart the placed world when its own autosave is newer than the configured
+// seed. Keep the existing newest-save fallback when that seed is absent.
+static std::string DedicatedStartupSave(const std::string& configured)
+{
+    const std::string directory = MenuGame_SaveDir();
+    std::string save;
+    if (!configured.empty()) {
+        save = directory + "/" + configured + ".sav";
+        if (!Exists(save)) {
+            Log("[dedicated] %s absent; trying newest save\n", save.c_str());
+            save.clear();
+        } else {
+            uint64_t bestTime = MtimeNs(save, nullptr);
+            const std::string seed = save;
+            if (DIR* scan = opendir(directory.c_str())) {
+                while (const dirent* entry = readdir(scan)) {
+                    const std::string name = entry->d_name;
+                    if (name.find("autosave_mp_shared") != 0 || name.size() < 4 ||
+                        name.compare(name.size() - 4, 4, ".sav") != 0) continue;
+                    const std::string candidate = directory + "/" + name;
+                    struct stat st;
+                    if (stat(candidate.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                    const uint64_t modified = MtimeNs(candidate, nullptr);
+                    if (modified > bestTime) { bestTime = modified; save = candidate; }
+                }
+                closedir(scan);
+            }
+            if (save != seed)
+                Log("[dedicated] %s is newer than the configured save -- resuming that world\n", save.c_str());
+        }
+    }
+    if (save.empty()) MenuGame_NewestSave(&save);
+    return save;
+}
+
 static void DedicatedTick()
 {
     const auto& d = S().cfg.dedicated;
@@ -2111,12 +2146,8 @@ static void DedicatedTick()
         if (!ready || MenuGame_Loading() || NativeIo::Busy() || now - menuSince < 45000 ||
             (lastLoad && now - lastLoad < 60000)) return;
         lastLoad = now;
-        std::string save;
-        if (!d.save.empty()) {
-            save = MenuGame_SaveDir() + "/" + d.save + ".sav";
-            if (!Exists(save)) { Log("[dedicated] %s absent; trying newest save\n", save.c_str()); save.clear(); }
-        }
-        if (save.empty() && !MenuGame_NewestSave(&save)) {
+        const std::string save = DedicatedStartupSave(d.save);
+        if (save.empty()) {
             Log("[dedicated] no save to load in %s\n", MenuGame_SaveDir().c_str()); return;
         }
         { std::lock_guard<std::mutex> lk(S().mtx); S().m.startSave = save; }

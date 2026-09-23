@@ -361,6 +361,45 @@ int main()
     assert(!model.recoveryPresent && model.lobbyDone && !model.startPending);
     assert(lobby::RecoveryAction("sync_request")=="Request sent.");
     lobby::Dispatch(R"({"type":"mods_refresh"})");assert(modRefreshes==1);
+    // Restart selection uses real files and nanosecond mtimes, without a game.
+    saveTest=true;
+    const std::string restartDir = dir+"restart";
+    assert(mkdir(restartDir.c_str(), 0700)==0);
+    fixtureSaveDir=restartDir;
+    auto dated = [&](const char* name, long ns) {
+        const std::string file=restartDir+"/"+name;
+        Write(file,"save");
+        const timespec times[2]={{100,ns},{100,ns}};
+        assert(utimensat(AT_FDCWD,file.c_str(),times,0)==0);
+    };
+    newestSave.clear();
+    assert(DedicatedStartupSave("missing").empty());
+    dated("seed.sav",100);
+    assert(DedicatedStartupSave("seed")==restartDir+"/seed.sav");
+    dated("autosave_mp_shared_old.sav",90);
+    dated("autosave_mp_shared_equal.sav",100);
+    dated("autosave_unrelated.sav",900);
+    dated("mp_shared.sav",900);
+    dated("autosave_mp_shared_new.sav.lua",900);
+    dated("prefix_autosave_mp_shared.sav",900);
+    assert(mkdir((restartDir+"/autosave_mp_shared_dir.sav").c_str(),0700)==0);
+    assert(DedicatedStartupSave("seed")==restartDir+"/seed.sav");
+    dated("autosave_mp_shared_new.sav",101);
+    dated("autosave_mp_shared_newest.sav",102);
+    assert(DedicatedStartupSave("seed")==restartDir+"/autosave_mp_shared_newest.sav");
+    dated("seed.sav",103);
+    assert(DedicatedStartupSave("seed")==restartDir+"/seed.sav");
+    newestSave=restartDir+"/autosave_unrelated.sav";
+    assert(DedicatedStartupSave("missing")==newestSave);
+    assert(DedicatedStartupSave("")==newestSave);
+    for (const char* name : {"seed.sav", "autosave_mp_shared_old.sav",
+         "autosave_mp_shared_equal.sav", "autosave_unrelated.sav", "mp_shared.sav",
+         "autosave_mp_shared_new.sav.lua", "prefix_autosave_mp_shared.sav",
+         "autosave_mp_shared_new.sav", "autosave_mp_shared_newest.sav"})
+        assert(unlink((restartDir+"/"+name).c_str())==0);
+    assert(rmdir((restartDir+"/autosave_mp_shared_dir.sav").c_str())==0);
+    assert(rmdir(restartDir.c_str())==0);
+    fixtureSaveDir=dir; newestSave.clear();
     // Dedicated saves request a session hold, wait for its ack, then release
     // only after a newer save is stable. Recovery and failure paths also run.
     saveTest=true; S().cfg.dedicated.autosaveMinutes=1;

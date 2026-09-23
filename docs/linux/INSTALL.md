@@ -322,3 +322,7 @@ Windows RNG seed/distribution/engine compatibility modules, enabled by default.
 `TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
 Static ELF checks and 65 native tests pass; the lab launch was blocked before
 the game started, so cross-platform gameplay validation remains outstanding.
+
+The [dev `582a380` integration](UPSTREAM_dev_582a380.md) makes native dedicated
+restarts prefer a newer autosave of the hosted `mp_shared` world over the
+configured save. Version remains 0.7.
