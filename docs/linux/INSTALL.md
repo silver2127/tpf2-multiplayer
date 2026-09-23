@@ -316,3 +316,9 @@ parsing the process mapping table. Older kernels, or environments denying the
 ioctl, retain a fresh buffered snapshot per iteration; very large mapping
 counts can still cost simulation time there. No kernel setting is changed by
 the native libraries. See [integration evidence](UPSTREAM_dev_7cacbaaf.md).
+
+The [dev `2c05099a` integration](UPSTREAM_dev_2c05099a.md) adds the remaining supplied
+Windows RNG seed/distribution/engine compatibility modules, enabled by default.
+`TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
+Static ELF checks and 65 native tests pass; the lab launch was blocked before
+the game started, so cross-platform gameplay validation remains outstanding.

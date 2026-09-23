@@ -155,3 +155,9 @@ takes the save when the game UI is ready. Version remains 0.7.
 The [dev `7cacbaaf` integration](docs/linux/UPSTREAM_dev_7cacbaaf.md)
 removes full mapping-table scans from family guards on Linux 6.11+ and retains
 a faster snapshot fallback for older kernels. Version remains 0.7.
+
+The [dev `2c05099a` integration](docs/linux/UPSTREAM_dev_2c05099a.md) adds the remaining supplied
+Windows RNG seed/distribution/engine compatibility modules, enabled by default.
+`TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
+Static ELF checks and 65 native tests pass; the lab launch was blocked before
+the game started, so cross-platform gameplay validation remains outstanding.

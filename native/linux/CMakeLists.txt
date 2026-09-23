@@ -30,7 +30,7 @@ find_package(Threads REQUIRED)
 add_library(tpf2mp_boot SHARED src/boot.cpp src/lua_fixed_format_linux.cpp
             src/destination_rng_linux.cpp src/windows_uniform_int_linux.cpp
             src/windows_person_seed_linux.cpp src/windows_person_cost_linux.cpp
-            src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp
+            src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
             src/tree_rng_linux.cpp src/animal_rng_linux.cpp src/building_order_linux.cpp
             src/resident_hash_linux.cpp src/order_canon_linux.cpp src/person_map_order_linux.cpp
             src/windows_entity_set_order_linux.cpp src/target_order_linux.cpp src/network_person_order_linux.cpp src/network_index_order_linux.cpp
@@ -172,6 +172,10 @@ if(BUILD_TESTING)
   target_include_directories(test_town_seed PRIVATE ../src src)
   target_compile_options(test_town_seed PRIVATE -UNDEBUG)
   add_test(NAME town_seed COMMAND test_town_seed)
+  add_executable(test_sim_seed tests/sim_seed_test.cpp src/windows_person_seed_linux.cpp src/hook_posix.cpp)
+  target_include_directories(test_sim_seed PRIVATE ../src src)
+  target_compile_options(test_sim_seed PRIVATE -UNDEBUG)
+  add_test(NAME sim_seed COMMAND test_sim_seed)
   add_executable(test_tree_rng tests/tree_rng_test.cpp src/windows_uniform_int_linux.cpp)
   target_include_directories(test_tree_rng PRIVATE ../src src)
   target_compile_options(test_tree_rng PRIVATE -UNDEBUG)
@@ -182,6 +186,12 @@ if(BUILD_TESTING)
   target_compile_options(test_animal_rng PRIVATE -UNDEBUG)
   target_link_libraries(test_animal_rng PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME animal_rng COMMAND test_animal_rng)
+  add_executable(test_engine_parity tests/engine_parity_test.cpp src/windows_msvc_random_linux.cpp
+                 src/windows_uniform_int_linux.cpp src/hook_posix.cpp)
+  target_include_directories(test_engine_parity PRIVATE ../src src tests)
+  target_compile_options(test_engine_parity PRIVATE -UNDEBUG)
+  target_link_libraries(test_engine_parity PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+  add_test(NAME engine_parity COMMAND test_engine_parity)
   add_executable(test_building_order tests/building_order_test.cpp src/hook_posix.cpp)
   target_include_directories(test_building_order PRIVATE ../src src)
   target_compile_options(test_building_order PRIVATE -UNDEBUG)

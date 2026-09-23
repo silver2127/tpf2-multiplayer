@@ -34,6 +34,8 @@
 #include "person_cost_linux.h"
 #include "float_rng_linux.h"
 #include "town_seed_linux.h"
+#include "sim_seed_linux.h"
+#include "engine_parity_linux.h"
 #include "tree_rng_linux.h"
 #include "animal_rng_linux.h"
 #include "building_order_linux.h"
@@ -282,6 +284,9 @@ static void BootInit()
     Tpf2mpInstallTownSeed(img.base, img.buildId.c_str());
     Log("[boot] Windows town development seed hashing: %s\n", Tpf2mpTownSeedStatus());
 
+    Tpf2mpInstallSimSeeds(img.base, img.buildId.c_str());
+    Log("[boot] Windows simulation seed hashing: %s\n", Tpf2mpSimSeedStatus());
+
     Tpf2mpInstallTreeRng(img.base, img.buildId.c_str());
     Log("[boot] Windows town tree selection: %s\n", Tpf2mpTreeRngStatus());
 
@@ -317,6 +322,9 @@ static void BootInit()
     Tpf2mpNetworkIndexOrderSetLog(Log);
     Tpf2mpInstallNetworkIndexOrder(img.base, img.buildId.c_str());
     Log("[boot] Windows persistent person-route index order: %s\n", Tpf2mpNetworkIndexOrderStatus());
+
+    Tpf2mpInstallEngineParity(img.base, img.buildId.c_str());
+    Log("[boot] Windows engine/distribution parity: %s\n", Tpf2mpEngineParityStatus());
 
     // dlopen from a constructor is safe with glibc (the loader lock is
     // recursive), so unlike the Windows proxy there is no loader thread: the
