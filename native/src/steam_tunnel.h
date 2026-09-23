@@ -35,5 +35,10 @@ typedef void (*TunnelLogFn)(const char* fmt, ...);
 
 // Starts the tunnel thread; returns false when the kill switch is set. The
 // thread waits for Steam to come up on its own.
+#ifdef _WIN32
 bool SteamTunnel_Start(const std::wstring& dataDir, TunnelLogFn log);
+#else
+bool SteamTunnel_Start(const std::string& dataDir, TunnelLogFn log);
+#endif
 void SteamTunnel_Stop();
+void SteamTunnel_SignalShutdown();

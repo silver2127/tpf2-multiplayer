@@ -1,0 +1,4 @@
+# These entry points are executed by Linux even when edited on Windows.
+*.sh text eol=lf
+tools/linux/tpf2mp-launch text eol=lf
+tools/server/tpf2server text eol=lf

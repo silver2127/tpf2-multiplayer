@@ -2,7 +2,7 @@
 //
 // Everything Steam-side goes through the flat C API that the game's own
 // steam_api64.dll exports (SteamAPI_ISteamNetworking_*), resolved with
-// GetProcAddress: ABI headers only, no import library or second SteamAPI_Init.
+// GetProcAddress (Linux: dlsym): ABI headers only, no second SteamAPI_Init.
 // The game initialised Steam long before this thread runs; the accessors
 // return null until then, so the thread simply waits.
 //
@@ -10,9 +10,23 @@
 // The two Steam callbacks (session request, connect failure) run on whichever
 // thread the game runs SteamAPI_RunCallbacks on; they only call the accept
 // function (the API is thread-safe) and push to a queue for the log.
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <share.h>
+#else
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <cerrno>
+#include <chrono>
+#include <thread>
+#endif
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -21,14 +35,33 @@
 #include <vector>
 #include <map>
 #include <mutex>
-#include <share.h>
 #include "steam_tunnel.h"
-#include "../third_party/steam/steamnetworkingtypes.h"
 #include "steam_rate.h"
+#include "../third_party/steam/steamnetworkingtypes.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace {
+
+#ifdef _WIN32
+using SocketLength = int;
+#else
+using SOCKET = int;
+using SocketLength = socklen_t;
+using DWORD = uint32_t;
+constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+static int closesocket(SOCKET s) { return close(s); }
+static int WSAGetLastError() { return errno; }
+static uint64_t GetTickCount64() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static DWORD GetTickCount() { return static_cast<DWORD>(GetTickCount64()); }
+static void Sleep(unsigned ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+#endif
 
 typedef void*    (*FnAccessor)();
 typedef uint64_t (*FnGetSteamID)(void* user);
@@ -74,12 +107,20 @@ struct Api {
     void* net = nullptr;
 };
 
-// P2PSessionState_t (steam_api, 8-byte packing on x64): 24 bytes.
+// Steam callbacks use 4-byte packing on Linux, 8-byte packing on Windows.
+#ifdef _WIN32
 #pragma pack(push, 8)
+#else
+#pragma pack(push, 4)
+#endif
 struct P2PSessionState { uint8_t active, connecting, error, usingRelay; int32_t bytesQueued, packetsQueued; uint32_t remoteIp; uint16_t remotePort; };
 struct P2PSessionRequest { uint64_t steamId; };
 struct P2PSessionConnectFail { uint64_t steamId; uint8_t error; };
 #pragma pack(pop)
+static_assert(sizeof(P2PSessionState) == 20, "Steam session state ABI");
+#ifndef _WIN32
+static_assert(sizeof(P2PSessionConnectFail) == 12, "Linux Steam callback ABI");
+#endif
 
 const int CB_SESSION_REQUEST = 1202;   // k_iSteamNetworkingCallbacks + 2
 const int CB_CONNECT_FAIL    = 1203;   // + 3
@@ -106,13 +147,20 @@ struct CallbackBase {
 };
 
 TunnelLogFn g_log = nullptr;
-std::wstring g_dataDir;
-volatile LONG g_stop = 0;
+#ifdef _WIN32
+using TunnelPath = std::wstring;
 HANDLE g_thread = nullptr;
+#else
+using TunnelPath = std::string;
+std::thread* g_thread = nullptr;
+#endif
+// Process-lifetime storage: shutdown can race the game's callback thread.
+TunnelPath& g_dataDir = *new TunnelPath;
+std::atomic<bool> g_stop{false};
 Api g_api;
 uint64_t g_myId = 0;
-std::mutex g_cbMtx;
-std::vector<std::pair<uint64_t, int>> g_cbQueue;   // (steamid, kind): 0 request accepted, 1+ connect fail error
+std::mutex& g_cbMtx = *new std::mutex;
+auto& g_cbQueue = *new std::vector<std::pair<uint64_t, int>>; // (steamid, kind)
 
 struct SessionRequestCb : CallbackBase {
     void Run(void* p) override {
@@ -151,9 +199,14 @@ struct Endpoint {
 
 bool ResolveApi()
 {
+#ifdef _WIN32
     HMODULE m = GetModuleHandleW(L"steam_api64.dll");
     if (!m) return false;
     auto get = [&](const char* name) { return GetProcAddress(m, name); };
+#else
+    // The game owns loading and initializing Steam. Never load a second copy.
+    auto get = [](const char* name) { return dlsym(RTLD_DEFAULT, name); };
+#endif
     g_api.networking   = (FnAccessor)get("SteamAPI_SteamNetworking_v006");
     g_api.user         = (FnAccessor)get("SteamAPI_SteamUser_v021");
     g_api.friends      = (FnAccessor)get("SteamAPI_SteamFriends_v017");
@@ -189,10 +242,16 @@ SOCKET BindLoopback(const char* ip, uint16_t port, uint16_t* portOut)
     sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons(port);
     inet_pton(AF_INET, ip, &a.sin_addr);
     if (bind(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return INVALID_SOCKET; }
-    int len = sizeof(a);
+    SocketLength len = sizeof(a);
     getsockname(s, (sockaddr*)&a, &len);
     *portOut = ntohs(a.sin_port);
-    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+#ifdef _WIN32
+    u_long nb = 1;
+    if (ioctlsocket(s, FIONBIO, &nb)) { closesocket(s); return INVALID_SOCKET; }
+#else
+    if (s >= FD_SETSIZE || fcntl(s, F_SETFL, O_NONBLOCK) < 0 ||
+        fcntl(s, F_SETFD, FD_CLOEXEC) < 0) { closesocket(s); return INVALID_SOCKET; }
+#endif
     // 16 MB BUFFERS (2026-09-22). The lobby hands a save transfer's whole window to
     // an endpoint socket in one burst (128 x 32 KB = 4 MB) and Windows' default UDP
     // receive buffer is 64 KB: loopback drops everything past it without an error,
@@ -206,8 +265,12 @@ SOCKET BindLoopback(const char* ip, uint16_t port, uint16_t* portOut)
 
 void WriteIdentity(uint64_t id, uint16_t port, const char* name)
 {
+#ifdef _WIN32
     std::wstring p = g_dataDir + L"tpf2_steam.txt";
     FILE* f = _wfsopen(p.c_str(), L"w", _SH_DENYNO);
+#else
+    FILE* f = fopen((g_dataDir + "tpf2_steam.txt").c_str(), "w");
+#endif
     if (!f) return;
     if (id) fprintf(f, "id=%llu\nport=%u\nname=%s\n", (unsigned long long)id, (unsigned)port, name ? name : "");
     fclose(f);
@@ -215,7 +278,11 @@ void WriteIdentity(uint64_t id, uint16_t port, const char* name)
 
 bool KillSwitch()
 {
+#ifdef _WIN32
     return GetFileAttributesW((g_dataDir + L"tpf2mp_steam_off.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    return access((g_dataDir + "tpf2mp_steam_off.txt").c_str(), F_OK) == 0;
+#endif
 }
 
 // THE WORKSHOP (2026-09-22). A joiner that lacks some of the host's Workshop mods
@@ -262,7 +329,7 @@ std::string UgcCommand(const std::string& line)
             g_api.ugcDownload(ugc, id, true);
         }
         g_log("[steam] workshop: subscribing to %zu item(s) (%d accepted by Steam)\n", ids.size(), asked);
-        char out[48]; _snprintf_s(out, sizeof(out), _TRUNCATE, "OK %d", asked);
+        char out[48]; snprintf(out, sizeof(out), "OK %d", asked);
         return out;
     }
     if (line.compare(0, 10, "UGC STATE ") == 0) {
@@ -276,7 +343,7 @@ std::string UgcCommand(const std::string& line)
             folder[0] = 0;
             if (!g_api.ugcInstallInfo(ugc, id, &size, folder.data(), (uint32_t)folder.size(), &ts)) folder[0] = 0;
             for (char* c = folder.data(); *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
-            char l[1200]; _snprintf_s(l, sizeof(l), _TRUNCATE, "%llu %u %llu %llu %s\n", (unsigned long long)id, flags,
+            char l[1200]; snprintf(l, sizeof(l), "%llu %u %llu %llu %s\n", (unsigned long long)id, flags,
                                      (unsigned long long)done, (unsigned long long)total, folder.data());
             reply += l;
         }
@@ -285,11 +352,17 @@ std::string UgcCommand(const std::string& line)
     return "ERR unknown";
 }
 
+#ifdef _WIN32
 DWORD WINAPI TunnelThread(LPVOID)
+#else
+unsigned TunnelThread(void*)
+#endif
 {
+#ifdef _WIN32
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     // Steam comes up on the game's schedule: wait for it (2 minutes, then give up quietly)
-    DWORD t0 = GetTickCount64() & 0xffffffff;
+    DWORD t0 = GetTickCount();
     void* user = nullptr;
     while (!g_stop) {
         if (ResolveApi()) {
@@ -300,7 +373,7 @@ DWORD WINAPI TunnelThread(LPVOID)
                 if (g_myId) break;
             }
         }
-        if ((GetTickCount64() & 0xffffffff) - t0 > 120000) {
+        if (DWORD(GetTickCount() - t0) > 120000) {
             g_log("[steam] no Steam identity after 120 s -- the Steam transport stays off this session\n");
             return 0;
         }
@@ -312,10 +385,15 @@ DWORD WINAPI TunnelThread(LPVOID)
     for (auto& c : persona) if (c == '\n' || c == '\r') c = ' ';
 
     g_api.allowRelay(g_api.net, true);
+    // Startup-only selection; both peers must match. Never silently fall back.
+#ifdef _WIN32
     bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
-    // Set connection defaults before opening a Messages session. A successful
-    // global setter does not prove these settings affect the legacy P2P path.
-    // The lobby also bounds bytes in flight. Int32 = 1, scope Global = 1.
+#else
+    bool legacy = access((g_dataDir + "tpf2mp_steam_legacy.txt").c_str(), F_OK) == 0;
+#endif
+
+    // Set defaults before opening a Messages session. Successful setters do
+    // not establish that the legacy P2P path honors these settings.
     if (g_api.utils && g_api.setConfig) {
         void* utils = g_api.utils();
         struct { const char* name; int id; int32_t value; } cfg[] = {
@@ -340,25 +418,19 @@ DWORD WINAPI TunnelThread(LPVOID)
     } else {
         g_log("[steam] no SteamNetworkingUtils in this steam_api64.dll -- the send-rate cap stays at Steam's default\n");
     }
-    // Startup-only A/B switch. No silent fallback: a comparison must know which
-    // transport was actually selected. Both peers need the same setting.
+    g_useMessages = false;
     if (!legacy && !StartMessages()) {
         g_log("[steam] Messages v002 unavailable -- transport OFF; select Legacy explicitly to compare\n");
         return 0;
     }
     CallbackBase* requestCb = g_useMessages ? static_cast<CallbackBase*>(&g_messagesRequest) : &g_reqCb;
     CallbackBase* failCb = g_useMessages ? static_cast<CallbackBase*>(&g_messagesFail) : &g_failCb;
+    uint16_t ctlPort = 0;
+    SOCKET ctl = BindLoopback("127.0.0.1", 0, &ctlPort);
+    if (ctl == INVALID_SOCKET) { g_log("[steam] control socket failed (%d) -- transport off\n", WSAGetLastError()); return 0; }
     g_api.registerCb(requestCb, g_useMessages ? 1251 : CB_SESSION_REQUEST);
     g_api.registerCb(failCb, g_useMessages ? 1252 : CB_CONNECT_FAIL);
     g_log("[steam] transport=%s (startup selection; both peers must match)\n", g_useMessages ? "Messages" : "Legacy");
-
-    uint16_t ctlPort = 0;
-    SOCKET ctl = BindLoopback("127.0.0.1", 0, &ctlPort);
-    if (ctl == INVALID_SOCKET) {
-        g_log("[steam] control socket failed (%d) -- transport off\n", WSAGetLastError());
-        if (g_api.unregisterCb) { g_api.unregisterCb(requestCb); g_api.unregisterCb(failCb); }
-        return 0;
-    }
     WriteIdentity(g_myId, ctlPort, persona.c_str());
     g_log("[steam] up: id=%llu (%s), control 127.0.0.1:%u, endpoints on %s:%u-%u, relay allowed\n",
           (unsigned long long)g_myId, persona.c_str(), (unsigned)ctlPort, TUNNEL_IP, (unsigned)TUNNEL_PORT_LO, (unsigned)TUNNEL_PORT_HI);
@@ -434,14 +506,18 @@ DWORD WINAPI TunnelThread(LPVOID)
         // ---- outbound: the lobby's datagrams on each endpoint socket, and control
         fd_set rs; FD_ZERO(&rs);
         FD_SET(ctl, &rs);
-        for (auto& kv2 : eps) FD_SET(kv2.second.sock, &rs);
+        SOCKET maxSocket = ctl;
+        for (auto& kv2 : eps) {
+            FD_SET(kv2.second.sock, &rs);
+            if (kv2.second.sock > maxSocket) maxSocket = kv2.second.sock;
+        }
         timeval tv = { 0, 2000 };
-        int r = select(0, &rs, nullptr, nullptr, &tv);
+        int r = select(static_cast<int>(maxSocket) + 1, &rs, nullptr, nullptr, &tv);
         if (r > 0) {
             for (auto& kv3 : eps) { auto& id = kv3.first; auto& e = kv3.second;
                 if (!FD_ISSET(e.sock, &rs)) continue;
                 for (int n = 0; n < 256; n++) {
-                    sockaddr_in from = {}; int fl = sizeof(from);
+                    sockaddr_in from = {}; SocketLength fl = sizeof(from);
                     int got = recvfrom(e.sock, buf.data(), (int)buf.size(), 0, (sockaddr*)&from, &fl);
                     if (got <= 0) break;
                     e.lastSeen = GetTickCount();
@@ -450,7 +526,7 @@ DWORD WINAPI TunnelThread(LPVOID)
             }
             if (FD_ISSET(ctl, &rs)) {
                 for (int n = 0; n < 32; n++) {
-                    sockaddr_in from = {}; int fl = sizeof(from);
+                    sockaddr_in from = {}; SocketLength fl = sizeof(from);
                     int got = recvfrom(ctl, buf.data(), (int)buf.size() - 1, 0, (sockaddr*)&from, &fl);
                     if (got <= 0) break;
                     buf[got] = 0;
@@ -458,11 +534,11 @@ DWORD WINAPI TunnelThread(LPVOID)
                     while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) line.pop_back();
                     std::string reply;
                     unsigned long long id = 0; unsigned port = 0;
-                    if (sscanf_s(line.c_str(), "LOBBY %u", &port) == 1 && port > 0 && port < 65536) {
+                    if (sscanf(line.c_str(), "LOBBY %u", &port) == 1 && port > 0 && port < 65536) {
                         lobby.sin_port = htons((uint16_t)port);
                         reply = "OK";
                         g_log("[steam] the lobby listens on 127.0.0.1:%u\n", port);
-                    } else if (sscanf_s(line.c_str(), "DIAL %llu", &id) == 1 && id) {
+                    } else if (sscanf(line.c_str(), "DIAL %llu", &id) == 1 && id) {
                         if (id == g_myId) { reply = "ERR self"; }
                         else {
                             Endpoint* e = endpointFor(id);
@@ -471,22 +547,22 @@ DWORD WINAPI TunnelThread(LPVOID)
                                 // an OPEN on the control channel: implicitly accepts the peer's
                                 // session on our side and opens ours on theirs
                                 sendP2P(id, "O", 1, CH_CTL, nullptr);
-                                char out[96]; _snprintf_s(out, sizeof(out), _TRUNCATE, "EP %llu %s %u", id, TUNNEL_IP, (unsigned)e->port);
+                                char out[96]; snprintf(out, sizeof(out), "EP %llu %s %u", id, TUNNEL_IP, (unsigned)e->port);
                                 reply = out;
                             }
                         }
-                    } else if (sscanf_s(line.c_str(), "CLOSE %llu", &id) == 1 && id) {
+                    } else if (sscanf(line.c_str(), "CLOSE %llu", &id) == 1 && id) {
                         closeEndpoint(id, "closed by the lobby"); reply = "OK";
                     } else if (line.compare(0, 4, "UGC ") == 0) {
                         reply = UgcCommand(line);
                     } else if (line == "STATUS") {
-                        char head[160]; _snprintf_s(head, sizeof(head), _TRUNCATE, "id=%llu endpoints=%zu no_lobby_drops=%llu send_failures=%llu\n",
+                        char head[160]; snprintf(head, sizeof(head), "id=%llu endpoints=%zu no_lobby_drops=%llu send_failures=%llu\n",
                                                     (unsigned long long)g_myId, eps.size(), (unsigned long long)dropNoLobby, (unsigned long long)sendFail);
                         reply = head;
                         for (auto& kv4 : eps) { auto& pid = kv4.first; auto& e = kv4.second;
                             P2PSessionState st = {};
                             bool have = g_api.sessionState && g_api.sessionState(g_api.net, pid, &st);
-                            char l[200]; _snprintf_s(l, sizeof(l), _TRUNCATE, "%llu %s:%u in=%llu out=%llu reliable=%llu active=%d connecting=%d relay=%d error=%d queued=%d\n",
+                            char l[200]; snprintf(l, sizeof(l), "%llu %s:%u in=%llu out=%llu reliable=%llu active=%d connecting=%d relay=%d error=%d queued=%d\n",
                                                      (unsigned long long)pid, TUNNEL_IP, (unsigned)e.port, (unsigned long long)e.in, (unsigned long long)e.out,
                                                      (unsigned long long)e.reliable, have ? st.active : -1, have ? st.connecting : -1, have ? st.usingRelay : -1,
                                                      have ? st.error : -1, have ? st.bytesQueued : -1);
@@ -538,17 +614,29 @@ DWORD WINAPI TunnelThread(LPVOID)
 
 } // namespace
 
-bool SteamTunnel_Start(const std::wstring& dataDir, TunnelLogFn log)
+bool SteamTunnel_Start(const TunnelPath& dataDir, TunnelLogFn log)
 {
+    if (g_thread) return false;
+    g_stop = false;
     g_dataDir = dataDir; g_log = log;
     if (KillSwitch()) { log("[steam] tpf2mp_steam_off.txt present -- the Steam transport stays off\n"); WriteIdentity(0, 0, nullptr); return false; }
     WriteIdentity(0, 0, nullptr);   // no stale identity from a previous run
+#ifdef _WIN32
     g_thread = CreateThread(nullptr, 0, TunnelThread, nullptr, 0, nullptr);
+#else
+    g_thread = new std::thread([] { TunnelThread(nullptr); });
+#endif
     return g_thread != nullptr;
 }
 
 void SteamTunnel_Stop()
 {
-    InterlockedExchange(&g_stop, 1);
+    g_stop = true;
+#ifdef _WIN32
     if (g_thread) { WaitForSingleObject(g_thread, 3000); CloseHandle(g_thread); g_thread = nullptr; }
+#else
+    if (g_thread) { g_thread->join(); delete g_thread; g_thread = nullptr; }
+#endif
 }
+
+void SteamTunnel_SignalShutdown() { g_stop = true; }

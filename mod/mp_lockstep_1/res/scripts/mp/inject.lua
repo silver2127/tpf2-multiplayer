@@ -1200,6 +1200,11 @@ function CM.pollInject()
 				-- a construction. Anything else (a town building, an industry) is
 				-- not ours to rename.
 				local id = tonumber(w[2])
+                -- The native Linux slice cancels these commands. Windows lets
+                -- them execute locally and omits this marker. Keep the existing
+                -- wire command: every peer already understands skipOrigin=0.
+                local skipOrigin = 1
+                if w[o == "VNAME" and 4 or 6] == "replayOrigin=1" then skipOrigin = 0 end
 				-- a VCOLOR that is our own replay coming back through the slice is
 				-- dropped, or it echoes between the instances forever (CM.takeColorEcho)
 				local echo = o == "VCOLOR" and id ~= nil and CM.takeColorEcho ~= nil
@@ -1251,7 +1256,7 @@ function CM.pollInject()
 				elseif key then
 					if o == "VNAME" then
 						log(string.format("VNAME: %s %s = %s", kind, key, tostring(w[3])))
-						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = 1 })
+						CM.scheduleLocal("VNAME", { kind = kind, key = key, name = w[3], skipOrigin = skipOrigin })
 					else
 						log(string.format("VCOLOR: %s %s = %s,%s,%s", kind, key, w[3], w[4], w[5]))
 						-- rgb is the colour EXACTLY: encodeCmd rounds number fields to %.4f, and
@@ -1261,7 +1266,7 @@ function CM.pollInject()
 						CM.scheduleLocal("VCOLOR", { kind = kind, key = key,
 							r = tonumber(w[3]), g = tonumber(w[4]), b = tonumber(w[5]),
 							rgb = string.format("%.9g,%.9g,%.9g", tonumber(w[3]) or 0, tonumber(w[4]) or 0, tonumber(w[5]) or 0),
-							skipOrigin = 1 })
+							skipOrigin = skipOrigin })
 					end
 				else
 					log(string.format("%s: entity %s is not a tracked vehicle, line or construction -- not shipped",

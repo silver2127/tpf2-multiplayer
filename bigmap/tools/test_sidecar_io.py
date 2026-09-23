@@ -188,6 +188,24 @@ def main():
         removed = dll.BigmapTestSidecarSweep(u8(os.path.join(folder, "world.sav")))
         left = sorted(os.listdir(folder))
         check("the two orphans are deleted, the live save's sidecar stays", removed == 2 and left == ["world.sav", "world.terr"], f"removed={removed} left={left}")
+
+        print("== 5. an autosave: the engine wrote another name than the id's")
+        dll.BigmapTestSidecarWrittenDuring.argtypes = [C.c_char_p, C.c_int, C.c_char_p, C.c_int]
+        old = os.path.join(folder, "world.sav")
+        past = os.path.getmtime(old) - 3600
+        os.utime(old, (past, past))                                   # an old save, not this call's
+        auto = os.path.join(folder, "autosave_New Game_1850-01-04.sav")
+        open(auto, "wb").write(b"autosave")
+        open(auto + ".lua", "wb").write(b"meta")                     # *.sav.lua is not a save
+        expected = os.path.join(folder, "autosave.sav")                # what the id resolves to: absent
+        out = C.create_string_buffer(1040)
+        got = dll.BigmapTestSidecarWrittenDuring(u8(expected), 30, out, 1040)
+        check("the one .sav written during the save is found", got == 1 and out.value.decode("utf-8") == auto, out.value.decode("utf-8"))
+        check("a save call that started after every write finds nothing", dll.BigmapTestSidecarWrittenDuring(u8(expected), -60, out, 1040) == 0)
+        other = os.path.join(folder, "mp_shared.sav")
+        open(other, "wb").write(b"copied during the save")
+        check("two .sav written during the save: none is taken (never another save's hash)",
+              dll.BigmapTestSidecarWrittenDuring(u8(expected), 30, out, 1040) == 0)
     finally:
         shutil.rmtree(base, ignore_errors=True)
 

@@ -105,6 +105,134 @@ the lobby's exact version gate guarantees that.
   `tpf2mp_boot`'s sources). Kill switch `TPF2MP_ORDER_CANON=0`. This is what
   the lab measured.
 
+### Linux default: ON (required since 0.7, the owner's call, 2026-09-22)
+
+The sorts change what the simulation decides, so every peer of a session must
+run the same set: a Windows player (sorts always on unless `hotjoinorder=0`) and
+a Linux peer with the sorts off decide apart and desync, hot join or not. The
+native port shipped them opt-in (`TPF2MP_ORDER_CANON=1`, "pending live
+validation"); the 0.7 dedicated server only matches Windows because its
+server.env sets that variable. The Linux build must default ON, exactly as the
+reference copy [`hotjoin/order_canon_linux.cpp`](hotjoin/order_canon_linux.cpp)
+does:
+
+- `native/linux/src/order_canon_linux.cpp`, the install gate: unset (or any value
+  but `0`) = on; `TPF2MP_ORDER_CANON=0` = off, status
+  `"off (TPF2MP_ORDER_CANON=0)"`.
+- `native/linux/src/person_map_order_linux.cpp`, `CanonicalMaps()`: the same rule
+  (on unless the variable is `0`), so the capacity-map walk and the order sorts
+  are never split.
+- The docs that call it an experimental opt-in (`docs/linux/INSTALL.md`, the
+  UPSTREAM notes going forward) say it is on by default, `=0` turns it off, and
+  that it must match the Windows players.
+
+### Linux `Readable()` costs a /proc/self/maps parse: 32% of the sim thread (measured 2026-09-22)
+
+The native dedicated server, profiled with `perf -t` on its simulation thread
+while a two-player session ran (49,000-tile world, 1x, pager budget 6 GiB), spent
+**a third of that thread reading and parsing `/proc/self/maps`**:
+
+```
+6.07% [k] mangle_path      <- seq_path/show_map_vma/show_map/seq_read/vfs_read/read
+4.76% [.] __vfscanf_internal   <- _IO_fgets <- (anonymous namespace)::FamilyMappings()
+3.26% [k] strchr    3.25% [k] seq_put_hex_ll   1.79% [k] seq_putc
+1.74% [k] show_map_vma   1.65% [k] lock_next_vma   1.47% [k] show_vma_header_prefix
+2.00% [.] __GI_____strtoull_l_internal ...          (~24% kernel + ~8% libc in total)
+3.52% [.] Tpf2mpOrderCanonDispatch   3.45% TargetErase   2.95% TargetInsert
+```
+
+`libtpf2mp_boot.so`'s `FamilyMappings()` opened `/proc/self/maps` 5.6 times a
+second -- once per simulation batch, for `family_canon.h`'s two `Readable()`
+calls -- and each parse walked **50,000 mappings** (48,000 of them lavapipe's
+per-frame memfd buffers, see `docs/DEDICATED_SERVER.md`), about 4.5 MB of
+kernel-generated text at roughly 57 ms a time. On Windows the same contract is
+one `VirtualQuery`, about a microsecond (`native/src/slice_hook.cpp`).
+
+FOR THE LINUX PORT -- `Readable(p, n)` must be O(1). It is called from the sim
+thread and from every slice validation (`station_weld.h`, `trainorder.h`,
+`moveorder.h`, `roadspace.h`, `family_canon.h`), not only once a batch:
+
+- Cheapest correct probe, no enumeration at all: `process_vm_readv` on self for
+  the first and last byte of the range (the port already links it) -- `EFAULT`
+  means "not mapped", which is exactly what `Readable` answers. `msync(addr,
+  len, MS_ASYNC)` returning `ENOMEM` says the same thing in one syscall.
+- If a mapping table is kept, parse it once into a sorted array of
+  begin/end/prot and re-parse only when a lookup misses: the engine's heap
+  ranges are stable for a whole session, and a miss is the only event that can
+  mean "a new mapping appeared".
+- Read the file with `read()` into one buffer and scan it; never `fgets` plus
+  `sscanf` per line, which is the 8% of libc above (glibc's `%x` conversions
+  dominate it).
+- Whatever the implementation, it must not allocate or take a lock the render
+  thread holds: it runs inside the sim step.
+
+That one change should give the server's simulation about 1.4x the headroom it
+has now. The order sorts themselves (dispatch plus target insert/erase, ~10% of
+the thread) are the next item down and are inherent to the canon.
+
+### The person target-set order costs 20% of the sim thread (measured 2026-09-23)
+
+The native dedicated server, one player in, the session voting 3x on the
+49,000-tile world: it delivered **2.02x** (its clock advanced 2.02 units a second;
+one unit is one second at 1x), and the engine agreed -- `tpf2_engine_pace.txt`
+read `base=380000`, i.e. it needed 380 ms batches where the nominal is 200, and
+3 x (200/380) = 1.58. Nothing was saturated: 1.7 of 8 cores busy, the frame pacer
+at exactly 30 sleeps a second (good for 6x), `memory.pressure` 0.00. The limit is
+how long one batch takes, and a 15 s `perf` of the simulation thread says where
+that goes:
+
+```
+38.8% [kernel]   25.8% TransportFever2   20.9% libtpf2mp_boot.so   11.2% libc
+10.43% [.] (anonymous namespace)::TargetInsert(unsigned int const*, int const*, void*)
+ 9.90% [.] (anonymous namespace)::TargetErase(unsigned int const*, int const*, void*)
+ 2.82% [.] _int_malloc      2.19% [.] process_vm_readv      1.09% [.] malloc_consolidate
+ 1.88% [k] mt_find   1.39% [k] mod_node_page_state   1.28% [k] __radix_tree_lookup
+```
+
+**FOR THE LINUX PORT: `TargetInsert` and `TargetErase` are 20.3% of the
+simulation thread** -- the boot module that gives the person target sets Windows'
+order ("Windows person target set order: enabled" in the boot log). The world had
+2,258 sim persons at the time, and the pair is called per person per step, so an
+O(n) scan inside either one is O(n^2) a step. Suggestions, cheapest first:
+
+- If a position in the Windows order is found by scanning a vector, add an index
+  (key -> slot) and keep it with the vector: insert and erase become O(1) plus
+  the memmove, and `_int_malloc`/`malloc_consolidate` above (4%) suggests a
+  container that also reallocates per operation -- reserve it once.
+- If the order is only ever *read* in bulk (a traversal at the end of the step),
+  do not maintain it per operation at all: keep the engine's own container and
+  produce the Windows order once, where it is read, as
+  `family_canon.h` was changed to rebuild only the tail after the first displaced
+  node (dev b446547).
+- Time it in the lab the way the rest of the canon is timed, and put the cost in
+  the boot log so the next profile does not have to be a `perf` run on the live
+  server.
+
+**The slow patches are the same two functions.** The server's clock does not run
+evenly: in a 120 s window it advanced at 2.02 units a second overall but twice
+crawled for ~5 s. A capture triggered on the stall itself (watch the dash at
+20 Hz, profile the moment the clock has not moved for 1.6 s) caught two of them,
+and both read the same:
+
+```
+9.70% TargetInsert  8.93% TargetErase  5.31% exe+0xa6139c  4.18% _int_malloc
+10.72% TargetErase  10.52% TargetInsert  3.24% exe+0xa6139c  2.61% process_vm_readv
+```
+
+So there is no separate hitch to chase: the clock slows when the person target
+churn spikes, and the same pair dominates. The libc share beside them (4-6%
+`_int_malloc`, `__libc_malloc2`, `malloc_consolidate`) most likely belongs to the
+same containers, so a fix that stops reallocating per operation takes that too:
+about 25-27% of the thread in total.
+
+The other measured cost on that thread, for scale: the `Readable` probe's
+`process_vm_readv` plus its kernel iovec and radix paths is ~5%, and it replaced a
+`/proc/self/maps` parse that was 32%, so it is already the cheap version. The
+mod's own world hash is NOT a factor at the live cadence: the leader had stamped
+`HASHEVERY every=576` with `hc=3089` in the heartbeat, which is 3.1 s every 576
+game units -- about 1% of wall time at 2x and 2% at 4x. (The 84-unit interval the
+log prints at load is only the starting value, before the cost ladder lands.)
+
 ## Not an order bug: the render clock stepped back (speed hook)
 
 The retained host of the busy-world run with the freed-id sort asserted
@@ -131,9 +259,27 @@ load (`sync_runtime`: a kept member pauses its world -- only the one the round
 found, held, paused, engine idle -- and acks `kept=True`). The paused
 fingerprints still decide: a difference empties `retain` and repeats `loading`
 once under a fresh epoch, i.e. the frozen join everyone knows; a difference after
-that is the ordinary error. A retry is always the plain round. On by default
-since 0.7 (every peer has the engine sorts); `tpf2mp_live_join.txt` = `0` in the
-host's io dir (read at each join) turns it off. Tests: `tools/test_sync_operation.py`,
+that is the ordinary error. A retry is always the plain round. Windows 0.7 enables live join by default;
+`tpf2mp_live_join.txt` = `0` turns it off. Native Linux keeps explicit opt-in
+(`1`, `on`, `yes`) until the canonical-order lifetime checks below pass.
+Read at each join.
+
+Nobody waits for members still loading (0.7, `pacing.lua` load gate): the roster
+hold is gone (`loadgate_roster=1` in tpf2_slice.cfg brings it back locally). A
+joiner still waits for the leader and the command history since its save.
+
+**The bridge's world id must reach it on every platform.** Each game's bridge
+drops datagrams from another world (`other-world=` in tpf2_bridge.log); its world
+id is the lobby nonce, which the menu writes into `tpf2_bridge_ctl.txt` as
+`lobby=<32 hex>` when the lobby emits `transport_lobby`. On the native Linux
+dedicated server (0.7-native, 2026-09-22) the ctl file had no `lobby=` line, so its
+bridge stayed in world `00000000`: a live joiner's game and the server dropped each
+other's frames and both held (joiner: "the leader (a) has not been heard"). Writing
+the line by hand joined them at once. The Linux menu (`native/linux/`) now writes
+`lobby=` like `native/src/menu_hook.cpp` (the `bridge ctl` writer), also
+when the `transport_lobby` event arrived before the menu first wrote the file.
+The nonce is retained in the session model and cleared for a new session; see
+[the native integration](../linux/UPSTREAM_dev_0a35d0a8.md). Tests: `tools/test_sync_operation.py`,
 `tools/test_sync_runtime.py` (live-join cases).
 
 ## Every family's node list, in entity order at every sim iteration
@@ -172,7 +318,9 @@ engines of every peer, whatever history they have.
   merged back -- and each full index slot is rewritten through the old->new
   position map after checking that every slot names its node. Anything else is
   refused and left untouched (logged).
-- Native Linux: not ported yet. Site: `Engine::Update` 0x32515b0 entry
+- Native Linux: guarded implementation, enabled by default since dev ad3d66e4.
+  Static/fixture evidence is in [linux/DEV_0115785C.md](linux/DEV_0115785C.md);
+  loaded-game lifetime validation remains outstanding. Site: `Engine::Update` 0x32515b0 entry
   (`f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55 41 54`, rdi = the engine), same
   walk over the libstdc++ family map; family_canon.h is portable.
 
@@ -203,3 +351,8 @@ both, collects paired dumps and compares; `--control` makes the host reload too,
 `--save NAME` picks the host's world, `--prejoin S` lets the host run alone
 first. `hj_watch.py` follows a long run (hash lanes + dumps), `hj_long.py` /
 `hj_compare.py` compare. Production (`tpf2mp-game`) is never touched.
+
+Native integration: [dev 7cacbaaf](../linux/UPSTREAM_dev_7cacbaaf.md) replaces
+family mapping snapshots with permission-aware PROCMAP_QUERY on Linux 6.11+;
+older kernels keep a buffered snapshot fallback. Endpoint-only probes and
+refresh-on-miss caches do not preserve the full range/write-permission contract.

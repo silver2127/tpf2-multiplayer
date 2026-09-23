@@ -32,6 +32,9 @@ folder after a multiplayer download. An id is any name the game accepts as a
 mod folder (spaces and non-ASCII included); only what no folder can carry --
 control characters, path separators and Windows' reserved characters -- is
 refused.
+
+On Linux the folders come from linuxpaths.py (every Steam root and library,
+the TransportFever2 binary) instead of the registry.
 """
 from __future__ import annotations
 import io
@@ -75,7 +78,12 @@ def valid_id(m):
 # ---------------------------------------------------------------------------
 def steam_root():
     """Steam's install folder, from the registry (the same keys the menu DLL
-    reads), else the default. None only if nothing looks like Steam."""
+    reads), else the default. None only if nothing looks like Steam. On Linux
+    the first Steam root linuxpaths finds (native, snap, Flatpak)."""
+    if sys.platform != "win32":
+        import linuxpaths
+        roots = linuxpaths.steam_roots()
+        return roots[0] if roots else None
     cands = []
     if sys.platform == "win32":
         try:
@@ -103,8 +111,12 @@ def steam_root():
 
 def game_dir():
     """The Transport Fever 2 folder: beside the frozen lobby when it runs from
-    <gamedir>\\netpunch (the installed layout), else via Steam."""
+    <gamedir>\\netpunch (the installed layout), else via Steam. On Linux:
+    TPF2MP_GAME_DIR, beside the lobby, then every Steam library."""
     here = os.path.dirname(os.path.abspath(getattr(sys, "frozen", False) and sys.executable or __file__))
+    if sys.platform != "win32":
+        import linuxpaths
+        return linuxpaths.game_dir(beside=here)
     parent = os.path.dirname(here)
     if os.path.isfile(os.path.join(parent, "TransportFever2.exe")):
         return parent
@@ -119,6 +131,10 @@ def game_dir():
 def _newest_local():
     """<steam>\\userdata\\<account>\\1066780\\local of the account that has a save
     folder (newest wins), like the menu DLL's resolveSaveDir; None without Steam."""
+    if sys.platform != "win32":
+        import linuxpaths
+        mods = linuxpaths.userdata_mods_dir()
+        return os.path.dirname(mods) if mods else None
     root = steam_root()
     if not root:
         return None
@@ -195,6 +211,9 @@ def _readable(mod_id, folder):
 
 
 def data_dir():
+    if sys.platform != "win32":
+        import linuxpaths
+        return linuxpaths.data_dir()
     return os.environ.get("TPF2MP_DATADIR") or os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "tpf2mp", "data")
 
 
@@ -477,7 +496,12 @@ def workshop_dirs():
     library first, then Steam's own folder (the same place when the game is
     installed there)."""
     out = []
-    for root in (library_root(), steam_root()):
+    roots = [library_root(), steam_root()]
+    if sys.platform != "win32":
+        import linuxpaths
+        for steam in linuxpaths.steam_roots():
+            roots.extend(linuxpaths.library_dirs(steam))
+    for root in roots:
         if root:
             p = os.path.join(root, "steamapps", "workshop", "content", TF2_APPID)
             if p not in out:

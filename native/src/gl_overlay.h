@@ -15,9 +15,15 @@
 // back, so the game's next frame starts exactly where it left off.
 //
 // Needs a current context of GL 3.0 or newer (framebuffer objects and blit are core
-// there). Windows only: GL 1.1 from opengl32.dll, the rest from wglGetProcAddress.
+// there). Windows resolves through opengl32/wgl; Linux uses SDL_GL_GetProcAddress.
 #pragma once
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#include <cstddef>
+#define WINAPI
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -72,11 +78,17 @@ struct State {
 // wglGetProcAddress returns 1, 2, 3 or -1 for "not found" on some drivers. Looked up at
 // run time: the menu DLL does not link opengl32.lib (the game has it loaded already).
 inline void* WglProc(const char* name) {
+#ifdef _WIN32
     typedef PROC (WINAPI* GetProcFn)(LPCSTR);
     static GetProcFn get = nullptr;
     if (!get) { HMODULE gl = GetModuleHandleW(L"opengl32.dll"); if (gl) get = reinterpret_cast<GetProcFn>(GetProcAddress(gl, "wglGetProcAddress")); }
     if (!get) return nullptr;
     void* p = reinterpret_cast<void*>(get(name));
+#else
+    using GetProcFn = void* (*)(const char*);
+    static auto get = reinterpret_cast<GetProcFn>(dlsym(RTLD_DEFAULT, "SDL_GL_GetProcAddress"));
+    void* p = get ? get(name) : nullptr;
+#endif
     const intptr_t v = reinterpret_cast<intptr_t>(p);
     return (v == 0 || v == 1 || v == 2 || v == 3 || v == -1) ? nullptr : p;
 }
@@ -85,9 +97,13 @@ inline void* WglProc(const char* name) {
 inline bool Load(State& s) {
     if (s.loaded) return true;
     if (s.failed) return false;
+#ifdef _WIN32
     HMODULE gl = GetModuleHandleW(L"opengl32.dll");
     if (!gl) { strcpy_s(s.why, "opengl32.dll is not loaded"); s.failed = true; return false; }
     auto base = [&](const char* n) { return reinterpret_cast<void*>(GetProcAddress(gl, n)); };
+#else
+    auto base = [](const char* n) { return WglProc(n); };
+#endif
     Fns& f = s.f;
     *reinterpret_cast<void**>(&f.GetIntegerv) = base("glGetIntegerv");
     *reinterpret_cast<void**>(&f.IsEnabled) = base("glIsEnabled");
@@ -177,7 +193,7 @@ inline bool Draw(State& s, const void* pixels, size_t pitch, int w, int h, bool 
     const Fns& f = s.f;
     while (f.GetError() != GL_OK) {}   // start clean, so an error below is ours
     Saved v; Save(f, v);
-    if (f.GetError() != GL_OK) { strcpy_s(s.why, "reading the GL state failed"); s.failed = true; return false; }
+    if (f.GetError() != GL_OK) { snprintf(s.why, sizeof(s.why), "reading the GL state failed"); s.failed = true; return false; }
     if (upload && pixels) {
         f.BindBuffer(PIXEL_UNPACK_BUFFER, 0);
         f.PixelStorei(UNPACK_ALIGNMENT, 4); f.PixelStorei(UNPACK_ROW_LENGTH, GLint(pitch / 4));

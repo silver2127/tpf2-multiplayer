@@ -8,8 +8,9 @@ We learn everything a peer needs to reach us, and how constrained our NAT is:
   of several public servers. Two answers with the same mapped port => the NAT
   keeps one external port per socket (endpoint-independent = "normal"). Two
   different ports => symmetric NAT, which is very hard to punch.
-* UPnP (miniupnpc, falling back to the upnpc.exe CLI): ask the router for its
-  WAN IP and for an explicit port mapping on the game port. Success => "open".
+* UPnP (miniupnpc, falling back to the upnpc CLI -- upnpc.exe on Windows): ask
+  the router for its WAN IP and for an explicit port mapping on the game port.
+  Success => "open".
 * IPv6 enumeration, preferring a 2002: 6to4 address (globally routable via HE
   relays even when the ISP gives no native v6).
 
@@ -41,6 +42,7 @@ import json
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 import stun
@@ -244,6 +246,22 @@ def stun_map(sock, servers=None, want=2, deadline=STUN_TOTAL_DEADLINE):
 # --------------------------------------------------------------------------- #
 # UPnP
 # --------------------------------------------------------------------------- #
+# The CLI fallback's name in the profile and in errors.
+_UPNPC_LABEL = "upnpc.exe" if sys.platform == "win32" else "upnpc"
+
+
+def _upnpc_run(exe, args):
+    """Run the upnpc CLI. On Linux a frozen lobby has its bundled libraries
+    (_internal/) first in LD_LIBRARY_PATH; the system's upnpc gets the caller's
+    value back (linuxpaths.child_env) so it loads its own."""
+    env = None
+    if sys.platform != "win32":
+        import linuxpaths
+        env = linuxpaths.child_env()
+    return subprocess.run([exe] + list(args), capture_output=True, text=True,
+                          timeout=8, env=env)
+
+
 def upnp_map(game_port, keep=False):
     """Try to open ``game_port`` on the router. Degrades gracefully.
 
@@ -294,23 +312,20 @@ def upnp_map(game_port, keep=False):
     except Exception as e:                               # noqa: BLE001
         result["detail"] = f"miniupnpc error: {e}"
 
-    # --- Fallback: the upnpc.exe CLI, if present on PATH ---
+    # --- Fallback: the upnpc CLI (upnpc.exe on Windows), if present on PATH ---
     exe = shutil.which("upnpc") or shutil.which("upnpc.exe")
     if exe:
         try:
-            out = subprocess.run([exe, "-l"], capture_output=True, text=True,
-                                 timeout=8).stdout
-            result["method"] = "upnpc.exe"
+            out = _upnpc_run(exe, ["-l"]).stdout
+            result["method"] = _UPNPC_LABEL
             for line in out.splitlines():
                 low = line.lower()
                 if "externalipaddress" in low.replace(" ", ""):
                     result["wan_ip"] = line.split("=")[-1].strip()
                 if "local lan ip address" in low:
                     result["lan_ip"] = line.split(":")[-1].strip()
-            add = subprocess.run(
-                [exe, "-a", result["lan_ip"] or "", str(game_port),
-                 str(game_port), "UDP"],
-                capture_output=True, text=True, timeout=8)
+            add = _upnpc_run(exe, ["-a", result["lan_ip"] or "", str(game_port),
+                                   str(game_port), "UDP"])
             result["open"] = "is redirected" in add.stdout.lower() \
                 or add.returncode == 0
             if keep:
@@ -320,10 +335,9 @@ def upnp_map(game_port, keep=False):
                 result["tcp_open"] = "is redirected" in tcp.stdout.lower() or tcp.returncode == 0
                 result["tcp_detail"] = None if result["tcp_open"] else "upnpc TCP mapping failed"
             if result["open"] and not keep:
-                subprocess.run([exe, "-d", str(game_port), "UDP"],
-                               capture_output=True, text=True, timeout=8)
+                _upnpc_run(exe, ["-d", str(game_port), "UDP"])
         except Exception as e:                           # noqa: BLE001
-            result["detail"] = f"upnpc.exe error: {e}"
+            result["detail"] = f"{_UPNPC_LABEL} error: {e}"
     return result
 
 
@@ -353,10 +367,8 @@ def upnp_unmap(game_port):
     exe = shutil.which("upnpc") or shutil.which("upnpc.exe")
     if exe:
         try:
-            subprocess.run([exe, "-d", str(game_port), "TCP"],
-                           capture_output=True, text=True, timeout=8)
-            subprocess.run([exe, "-d", str(game_port), "UDP"],
-                           capture_output=True, text=True, timeout=8)
+            _upnpc_run(exe, ["-d", str(game_port), "TCP"])
+            _upnpc_run(exe, ["-d", str(game_port), "UDP"])
             return True
         except Exception:                                # noqa: BLE001
             return False

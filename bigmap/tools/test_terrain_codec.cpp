@@ -92,7 +92,11 @@ int main(int argc, char** argv) {
 
     if (argc > 1) {
         FILE* f = nullptr;
+#ifdef _WIN32
         fopen_s(&f, argv[1], "rb");
+#else
+        f = fopen(argv[1], "rb");
+#endif
         CHECK(f != nullptr);
         std::vector<std::vector<uint16_t>> tiles;
         while (f && fread(t.data(), RawBytes, 1, f) == 1) tiles.push_back(t);

@@ -795,7 +795,11 @@ local function checkHash(now)
 		-- hitch is visible in the log as ms per stamp
 		local dt = (os.clock() - ph0) * 1000
 		local pf = CM.perfHash or { n = 0, sum = 0, max = 0 }
-		pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
+		pf.n = pf.n + 1; pf.sum = pf.sum + dt
+		-- the split of the DEAREST stamp, not whichever hashed last: on the
+		-- 49,000-tile world the cheap stamps read 1.6 s and the dear ones 8.8 s,
+		-- and it was always a cheap one whose lanes reached the log (2026-09-23)
+		if dt > pf.max then pf.max = dt; CM.hashPartsWorst = CM.hashPartsMs end
 		CM.perfHash = pf
 	end
 	if not sawCrossing then
@@ -813,6 +817,7 @@ local function checkHash(now)
 		CM.pruneOldest(pr.hashes, K.STAMP_KEEP)
 		CM.pruneOldest(pr.details, K.STAMP_KEEP)
 	end
+	local pp0 = os.clock()
 	CM.broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
 	pcall(CM.vposShip, stamp)
 	CM.dashLastDetail = detail
@@ -820,6 +825,14 @@ local function checkHash(now)
 	-- One shared comparison, used from here and from the LSHASH handler, so the
 	-- check fires whichever side's hash lands second.
 	CM.compareAt(stamp)
+	do  -- what the stamp costs AFTER the hash: the LSHASH frame, the drift
+		-- positions and the comparison (O(vehicles), O(peers)); the hash timer
+		-- above stops at worldHash and this was never in the PERF line
+		local dp = (os.clock() - pp0) * 1000
+		local pp = CM.perfPost or { n = 0, sum = 0, max = 0 }
+		pp.n = pp.n + 1; pp.sum = pp.sum + dp; if dp > pp.max then pp.max = dp end
+		CM.perfPost = pp
+	end
 	-- what this stamp cost, and on the leader the interval that cost calls for
 	-- (hash.lua CM.hashCostNote, CM.hashCadenceTick)
 	CM.hashCostNote((os.clock() - ph0) * 1000)
@@ -870,7 +883,8 @@ function data()
 			if CM.autoSyncPump(CM.gameTime() or 0) then return end
 			CM.pollEvents()
 			pcall(CM.sampleSimRate)
-			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end   -- companies: vehicles left to follow their lines in a switch
+			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end
+			if CM.cmSwitchWanted then pcall(CM.cmLoadSwitchTick) end   -- companies: the load-time switch waits for a world that answers   -- companies: vehicles left to follow their lines in a switch
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
 				if not CM.detectInstance() then return end
 				-- a save's company state (load hook) is applied here, on the sim
@@ -1292,13 +1306,14 @@ function data()
 					if #parts > 0 then log("STEPS: " .. table.concat(parts, " | ")) end
 				end)
 				pcall(function()
-					local u, h = CM.perfUpd, CM.perfHash
+					local u, h, pp = CM.perfUpd, CM.perfHash, CM.perfPost
 					if u and u.n > 0 then
-						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps%s",
+						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps%s%s",
 							u.sum / u.n, u.max, u.n, h and h.n > 0 and h.sum / h.n or 0, h and h.max or 0, h and h.n or 0,
-							CM.hashPartsMs and (" | last hash: " .. CM.hashPartsMs) or ""))
+							pp and pp.n > 0 and string.format(" | after the hash avg=%.1f ms max=%.1f ms", pp.sum / pp.n, pp.max) or "",
+							(CM.hashPartsWorst or CM.hashPartsMs) and (" | dearest hash: " .. (CM.hashPartsWorst or CM.hashPartsMs)) or ""))
 					end
-					CM.perfUpd, CM.perfHash = nil, nil
+					CM.perfUpd, CM.perfHash, CM.perfPost, CM.hashPartsWorst = nil, nil, nil, nil
 				end)
 				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d",
 					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),

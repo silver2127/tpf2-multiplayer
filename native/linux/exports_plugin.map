@@ -1,0 +1,4 @@
+{
+  global: Tpf2mpPluginInit;
+  local: *;
+};

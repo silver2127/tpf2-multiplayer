@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+"""Create and run isolated native Linux / Proton Transport Fever 2 test instances."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+
+DEFAULT_ROOT = Path.home() / ".local/share/tpf2mp-lab"
+REPO = Path(__file__).resolve().parents[2]
+APPID = "1066780"
+
+
+def require(value, message):
+    if not value:
+        raise ValueError(message)
+
+
+def check_source_paths(root, steam):
+    for label, path in (("Lab root", root), ("Steam root", steam)):
+        require(not path.is_relative_to(Path("/tmp")), f"{label} must be outside /tmp, which the lab replaces with private temporary files")
+
+
+def container_helper(runtime4):
+    helper = Path(runtime4).parent / "pressure-vessel/libexec/steam-runtime-tools-0/srt-bwrap"
+    require(helper.is_file() and os.access(helper, os.X_OK), f"Steam Linux Runtime 4 container helper is missing or not executable: {helper}")
+    return str(helper)
+
+
+def copy(source, target):
+    if source.is_dir():
+        shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
+    elif source.is_symlink():
+        target.unlink(missing_ok=True)
+        target.symlink_to(os.readlink(source))
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+
+def excluded_mods(config):
+    """A removal requested for either actor applies to the next launch of both."""
+    root = Path(config["root"])
+    names = config.get("excluded_mods", [])
+    require(isinstance(names, list) and all(isinstance(name, str) for name in names),
+            "lab.json excluded_mods must be a list of mod directory names")
+    excluded = set(names)
+    for name in ("native", "proton"):
+        actor = root / name
+        disabled = actor / "disabled-mods"
+        if disabled.is_dir():
+            excluded.update(p.name for p in disabled.iterdir())
+        request = actor / "legacy-removal.json"
+        if request.exists():
+            # The request survives the watcher's waiting -> moved transition.
+            # Treat an incomplete JSON write as an error, never as permission
+            # to restore the requested mod.
+            source = Path(json.loads(request.read_text())["source"])
+            require(source.parent == actor / "game/mods", f"Unexpected pending mod removal source: {source}")
+            excluded.add(source.name)
+    for name in excluded:
+        require(isinstance(name, str) and name not in ("", ".", "..", "mp_lockstep_1")
+                and Path(name).name == name and "\\" not in name,
+                f"Invalid excluded mod directory: {name!r}")
+    return excluded
+
+
+def actor_processes(config, name, proc=Path("/proc")):
+    """Also catches directly launched games and leftover Wine children."""
+    identity = os.fsencode("STEAM_COMPAT_DATA_PATH=" + str(Path(config["root"]) / name / "compatdata"))
+    found = []
+    for process in proc.iterdir():
+        if not process.name.isdecimal() or int(process.name) == os.getpid():
+            continue
+        try:
+            if identity in (process / "environ").read_bytes().split(b"\0"):
+                found.append(int(process.name))
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            pass
+    return sorted(found)
+
+
+def shared_mods(config):
+    return {p.name: p for p in sorted((Path(config["game"]) / "mods").iterdir())
+            if p.name != "mp_lockstep_1" and p.is_dir()}
+
+
+def mod_migration(config, name, excluded):
+    """Validate the whole plan before altering an inactive actor's directory entries."""
+    actor = Path(config["root"]) / name
+    actions = []
+    for mod in shared_mods(config):
+        target = actor / "game/mods" / mod
+        exists = target.exists() or target.is_symlink()
+        if mod in excluded:
+            if exists:
+                request = actor / "legacy-removal.json"
+                if request.exists():
+                    pending = json.loads(request.read_text())
+                    require(Path(pending["source"]) != target or not str(pending.get("status", "")).startswith("waiting"),
+                            f"Pending removal of {mod} has not finished; retry after its watcher completes")
+                disabled = actor / "disabled-mods" / mod
+                require(not disabled.exists() and not disabled.is_symlink(), f"Both enabled and disabled copies exist for {mod}; preserve and resolve them before launching")
+                actions.append(("disable", target, disabled))
+            continue
+        if target.is_symlink():
+            require(os.readlink(target) == str(actor / "shared-game/mods" / mod),
+                    f"Unrecognized stock mod symlink; refusing to replace {target}")
+            actions.append(("directory", target, None))
+        elif not exists:
+            actions.append(("directory", target, None))
+        else:
+            require(target.is_dir() and not any(target.iterdir()),
+                    f"Private stock mod directory has contents; refusing to hide them: {target}")
+    return actions
+
+
+def prepare_mods(config, name):
+    running = actor_processes(config, name)
+    require(not running, f"The {name} actor is running (PID(s) {running}); its mod layout will change only after it closes")
+    excluded = excluded_mods(config)
+    actions = mod_migration(config, name, excluded)
+    for action, target, disabled in actions:
+        if action == "disable":
+            disabled.parent.mkdir(exist_ok=True)
+            target.rename(disabled)
+        else:
+            if target.is_symlink():
+                target.unlink()
+            target.mkdir()
+    if actions:
+        print(f"Prepared {name} stock mod directories: {len(actions)} change(s); excluded: {', '.join(sorted(excluded)) or 'none'}")
+    return excluded
+
+
+def mod_mounts(config, name, excluded=None):
+    if excluded is None:
+        excluded = excluded_mods(config)
+    game = Path(config["game"])
+    command = []
+    for mod, source in shared_mods(config).items():
+        if mod not in excluded:
+            command += ["--ro-bind", str(source), str(game / "mods" / mod)]
+    return command
+
+
+def setup(args):
+    root, steam, depot = (p.expanduser().resolve() for p in (args.root, args.steam_root, args.native_depot))
+    check_source_paths(root, steam)
+    game = steam / "steamapps/common/Transport Fever 2"
+    native_mod = (args.native_mod or steam.parent / "tpf2mp").expanduser().resolve()
+    require((game / "TransportFever2.exe").is_file(), "Steam must have the Windows game installed")
+    require((depot / "TransportFever2").is_file(), "Native depot has no TransportFever2 executable")
+    require((native_mod / "libtpf2mp_boot.so").is_file(), "Installed native multiplayer loader is missing; use --native-mod")
+    require(not root.is_relative_to(steam) and not steam.is_relative_to(root), "Lab root must be separate from the Steam installation")
+    require(not root.is_relative_to(depot) and not depot.is_relative_to(root), "Lab root must be separate from the native depot")
+    config_path = root / "lab.json"
+    if config_path.exists():
+        config = load(root)
+        require(config["steam"] == str(steam) and config["depot"] == str(depot), "Existing lab uses different source paths")
+        for name in ("native", "proton"):
+            if actor_processes(config, name):
+                print(f"Deferred {name} mod layout migration until that actor closes")
+            else:
+                prepare_mods(config, name)
+        print(f"Lab already configured at {root}; saves and actor files preserved")
+        return
+    require(not root.exists() or not any(root.iterdir()), "Lab root is nonempty without lab.json; choose a fresh directory")
+    local_candidates = [p for p in (steam / "userdata").glob(f"*/{APPID}/local") if p.is_dir()]
+    require(local_candidates, "No Transport Fever 2 userdata exists to seed the lab")
+    # Copy exactly one account's TF2 local directory, never unrelated account data.
+    local = max(local_candidates, key=lambda p: (p / "settings.lua").stat().st_mtime_ns if (p / "settings.lua").exists() else p.stat().st_mtime_ns)
+    relative_local = local.relative_to(steam / "userdata")
+    account = relative_local.parts[0]
+    state_candidates = [steam.parents[2] / ".steam", Path.home() / ".steam"]
+    steam_state = next((p for p in state_candidates if (p / "steam.pid").is_file()), None)
+    require(steam_state, "Steam control directory with steam.pid was not found; start Steam first")
+    proton = steam / "steamapps/common/Proton 11.0/proton"
+    runtime4 = steam / "steamapps/common/SteamLinuxRuntime_4/_v2-entry-point"
+    soldier = steam / "steamapps/common/SteamLinuxRuntime_soldier/_v2-entry-point"
+    require(proton.is_file() and runtime4.is_file() and soldier.is_file(), "Install Proton 11, Steam Linux Runtime 4, and Steam Linux Runtime soldier")
+    container_helper(runtime4)
+    # Check the same pinned upstream baseline as the native release builder.
+    # The separate Proton 0.4.22 setup manifest is an archived package, not the
+    # current mod's source of truth.
+    subprocess.run([sys.executable, str(REPO / "tools/linux/verify_lua_release.py"),
+                    "--mod-dir", str(game / "mods/mp_lockstep_1")], check=True)
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("native", "proton"):
+        actor = root / name
+        for folder in ("game", "userdata", "share", "config", "cache", "tmp", "runtime-var", "compatdata", "logs", "shared-game", "shared-steam-state", "steam-links"):
+            (actor / folder).mkdir(parents=True)
+        clone = actor / "game"
+        # Immutable assets resolve through an alias bound BEFORE the real game path is overlaid.
+        for name_in_game in ("res", "dlcs"):
+            if (game / name_in_game).exists():
+                (clone / name_in_game).symlink_to(actor / "shared-game" / name_in_game, target_is_directory=True)
+        (clone / "mods").mkdir()
+        for mod in (game / "mods").iterdir():
+            if mod.name == "mp_lockstep_1":
+                copy(mod, clone / "mods" / mod.name)
+            elif mod.is_dir():
+                # Windows skips symlinked mod directories during discovery.
+                # The launcher mounts their shared contents read-only here.
+                (clone / "mods" / mod.name).mkdir()
+            else:
+                copy(mod, clone / "mods" / mod.name)
+        if name == "native":
+            for item in depot.iterdir():
+                if item.name not in ("res", "dlcs", "mods"):
+                    copy(item, clone / item.name)
+            destination = actor / "share/tpf2mp"
+            destination.mkdir()
+            for item in native_mod.iterdir():
+                if item.name == "netpunch":
+                    (destination / "netpunch").mkdir()
+                    for member in ("netpunch", "_internal"):
+                        copy(item / member, destination / "netpunch" / member)
+                elif item.name not in ("data", "logs", "tpf2mp_install.txt") and not item.name.endswith(".log"):
+                    copy(item, destination / item.name)
+            (destination / "data").mkdir()
+        else:
+            for item in game.iterdir():
+                if item.is_file() and not item.name.endswith((".log", ".tpf2mp-orig")) and not item.name.startswith("."):
+                    copy(item, clone / item.name)
+            for directory in ("extra", "plugins"):
+                if (game / directory).is_dir():
+                    copy(game / directory, clone / directory)
+            (clone / "netpunch").mkdir()
+            copy(game / "netpunch/netpunch.exe", clone / "netpunch/netpunch.exe")
+            winsteam = actor / "compatdata/pfx/drive_c/Program Files (x86)/Steam"
+            (winsteam / "steamapps").mkdir(parents=True)
+            (winsteam / "userdata").symlink_to(steam / "userdata", target_is_directory=True)
+            (winsteam / "steamapps/common").symlink_to(game.parent, target_is_directory=True)
+            (winsteam / "steamapps/workshop").symlink_to(steam / "steamapps/workshop", target_is_directory=True)
+        copy(local, actor / "userdata" / relative_local)
+        for label, destination in {"root": steam, "steam": steam, "sdk64": steam / "linux64", "sdk32": steam / "linux32",
+                                   "bin64": steam / "ubuntu12_64", "bin32": steam / "ubuntu12_32"}.items():
+            (actor / "steam-links" / label).symlink_to(destination, target_is_directory=True)
+        for filename in ("steam.pid", "steam.pipe", "steam.token", "registry.vdf"):
+            if (steam_state / filename).exists():
+                (actor / "steam-links" / filename).symlink_to(actor / "shared-steam-state" / filename)
+        (actor / "probe-source.txt").write_text(name + "\n")
+        print(f"Prepared {name}: private game files, userdata/{relative_local}, caches and mod data")
+    config = {"version": 1, "root": str(root), "steam": str(steam), "game": str(game), "depot": str(depot),
+              "native_mod": str(native_mod), "steam_state": str(steam_state), "account": account,
+              "local": str(relative_local), "proton": str(proton), "runtime4": str(runtime4), "soldier": str(soldier)}
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"Lab ready: {root}\nOriginal Steam/game files were only read. Run check before launching.")
+
+
+def load(root):
+    root = root.expanduser().resolve()
+    config = json.loads((root / "lab.json").read_text())
+    require(config["version"] == 1 and config["root"] == str(root), "Lab configuration/root mismatch")
+    check_source_paths(root, Path(config["steam"]))
+    container_helper(config["runtime4"])
+    return config
+
+
+def runtime_refs(config, name):
+    actor = Path(config["root"]) / name
+    runtime = Path(config["soldier" if name == "native" else "runtime4"]).parent
+    refs = sorted(runtime.glob("*/files/.ref"))
+    require(refs, f"Installed runtime has no deployment reference file: {runtime}")
+    for ref in refs:
+        require(ref.is_file() and ref.stat().st_size == 0, f"Unexpected runtime reference file: {ref}")
+    locks = [(actor / "runtime-var" / (ref.parent.parent.name + ".ref"), ref) for ref in refs]
+    if name == "proton":
+        proton = Path(config["proton"]).parent
+        require((proton / "files/share/default_pfx").is_dir(), "Initialize this Proton version by launching a Steam game normally once before using the lab")
+        fixups, marker = proton / "steampipe_fixups.json", proton / "files/steampipe_fixups_mtime"
+        if fixups.exists():
+            require(marker.is_file() and marker.read_text().strip() == str(fixups.stat().st_mtime), "Proton distribution fixups are pending; launch this Proton version through Steam once before using the lab")
+        lock = proton / "dist.lock"
+        require(lock.is_file() and lock.stat().st_size == 0, f"Proton distribution lock is missing or unexpected: {lock}")
+        locks.append((actor / "runtime-var/proton-dist.lock", lock))
+    return locks
+
+
+def prepare_runtime_refs(config, name):
+    # Runtime copying still opens its source .ref read/write for a lock. Keep that
+    # lock private while the source deployment itself remains read-only.
+    for private, _ in runtime_refs(config, name):
+        private.touch(exist_ok=True)
+    (Path(config["root"]) / name / "cache/steam-shadercache").mkdir(exist_ok=True)
+
+
+def sandbox(config, name, excluded=None):
+    actor = Path(config["root"]) / name
+    steam, game = Path(config["steam"]), Path(config["game"])
+    actual_home = Path(os.environ["HOME"])
+    # Use the installed Steam helper for both container layers. Ubuntu's system
+    # bwrap AppArmor profile can deny creation of the nested runtime namespace.
+    command = [container_helper(config["runtime4"]), "--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+               "--ro-bind", "/", "/", "--tmpfs", str(actual_home),
+               "--ro-bind", str(steam), str(steam), "--bind", str(actor), str(actor),
+               "--ro-bind", str(game), str(actor / "shared-game"),
+               "--ro-bind", config["steam_state"], str(actor / "shared-steam-state"),
+               "--bind", str(actor / "userdata"), str(steam / "userdata"),
+               "--bind", str(actor / "game"), str(game),
+               "--symlink", str(actor / "steam-links"), str(actual_home / ".steam"),
+               "--bind", str(actor / "tmp"), "/tmp", "--proc", "/proc", "--dev-bind", "/dev", "/dev",
+               "--chdir", str(game)]
+    command += mod_mounts(config, name, excluded)
+    for private, ref in runtime_refs(config, name):
+        command += ["--bind", str(private), str(ref)]
+    shadercache = steam / "steamapps/shadercache"
+    if shadercache.is_dir():
+        command += ["--bind", str(actor / "cache/steam-shadercache"), str(shadercache)]
+    if Path("/tmp/.X11-unix").is_dir():
+        command += ["--ro-bind", "/tmp/.X11-unix", "/tmp/.X11-unix"]
+    authority = os.environ.get("XAUTHORITY")
+    if authority and Path(authority).is_file() and Path(authority).is_relative_to(actual_home):
+        command += ["--ro-bind", authority, authority]
+    env = dict(os.environ)
+    for key in ("LD_PRELOAD", "LD_LIBRARY_PATH", "LOCALAPPDATA", "TPF2MP_DATADIR", "WINEPREFIX", "PRESSURE_VESSEL_RUNTIME", "PRESSURE_VESSEL_RUNTIME_BASE", "PRESSURE_VESSEL_VARIABLE_DIR"):
+        env.pop(key, None)
+    env.update(SteamAppId=APPID, SteamGameId=APPID, STEAM_COMPAT_CLIENT_INSTALL_PATH=str(steam),
+               STEAM_COMPAT_INSTALL_PATH=str(game), STEAM_COMPAT_DATA_PATH=str(actor / "compatdata"),
+               XDG_DATA_HOME=str(actor / "share"), XDG_CONFIG_HOME=str(actor / "config"), XDG_CACHE_HOME=str(actor / "cache"),
+               TMPDIR="/tmp", PRESSURE_VESSEL_VARIABLE_DIR=str(actor / "runtime-var"),
+               PROTON_LOG="1", PROTON_LOG_DIR=str(actor / "logs"),
+               TPF2MP_STEAM_ROOT=str(steam), TPF2MP_GAME_DIR=str(game))
+    return command, env
+
+
+def run(args):
+    config = load(args.root)
+    actor = Path(config["root"]) / args.actor
+    game = Path(config["game"])
+    excluded = excluded_mods(config) if args.dry_run else prepare_mods(config, args.actor)
+    command, env = sandbox(config, args.actor, excluded)
+    if args.actor == "proton":
+        command += ["--", config["runtime4"], "--verb=run", "--", config["proton"], "run", str(game / "TransportFever2.exe")]
+    else:
+        command += ["--", config["soldier"], "--verb=run", "--", "/usr/bin/env",
+                    "LD_PRELOAD=" + str(actor / "share/tpf2mp/libtpf2mp_boot.so"),
+                    "LD_LIBRARY_PATH=" + str(game / "extra/liburing") + ":" + str(game),
+                    "TPF2MP_DATADIR=" + str(actor / "share/tpf2mp/data"),
+                    str(game / "TransportFever2")]
+    if args.dry_run:
+        print(shlex.join(command))
+        print(json.dumps({k: env[k] for k in ("HOME", "STEAM_COMPAT_DATA_PATH", "XDG_DATA_HOME", "XDG_CACHE_HOME")}, indent=2))
+        return
+    prepare_runtime_refs(config, args.actor)
+    print(f"Launching {args.actor}; game files and saves write only inside {actor}", flush=True)
+    os.execvpe(command[0], command, env)
+
+
+def check(args):
+    config = load(args.root)
+    steam = Path(config["steam"])
+    # Sends one packet to an ephemeral private test listener; never binds game ports.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.settimeout(3)
+        for name in ("native", "proton"):
+            actor = Path(config["root"]) / name
+            excluded = excluded_mods(config)
+            require(not mod_migration(config, name, excluded), f"{name} mod layout needs migration; close that actor and run setup or launch it again")
+            prepare_runtime_refs(config, name)
+            command, env = sandbox(config, name, excluded)
+            code = """import json,os,socket,sys,tempfile
+from pathlib import Path
+actor,userdata,marker,port=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3],int(sys.argv[4])
+assert (actor/'probe-source.txt').read_text().strip()==marker
+with tempfile.TemporaryFile(dir=userdata) as probe:
+ probe.write(marker.encode());probe.seek(0);assert probe.read()==marker.encode()
+assert (Path.home()/'.steam/sdk64/steamclient.so').is_file()
+assert (Path.cwd()/'res').is_dir()
+try:
+ with tempfile.TemporaryFile(dir=Path(sys.argv[5])): raise AssertionError('Steam root writable')
+except OSError as error: assert error.errno==30,error
+fd=os.open('/proc/self/mem',os.O_RDWR);os.close(fd)
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.sendto(marker.encode(),('127.0.0.1',port))
+print(json.dumps({'actor':marker,'home':str(Path.home()),'network':os.readlink('/proc/self/ns/net'),'filesystem':'isolated','steam_sdk':'visible','self_mem':'writable'}))
+"""
+            command += ["--", "/usr/bin/python3", "-c", code, str(actor), str(steam / "userdata"), name,
+                        str(listener.getsockname()[1]), str(steam)]
+            result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=20)
+            require(result.returncode == 0, f"{name} isolation check failed:\n{result.stdout}{result.stderr}")
+            report = json.loads(result.stdout)
+            require(report["network"] == os.readlink("/proc/self/ns/net"), "Network namespace is not shared")
+            require(listener.recvfrom(128)[0] == name.encode(), "Loopback did not reach the outside listener")
+            print(f"PASS {name}: private writable userdata, readonly Steam, Steam SDK visible, self-memory writable, shared loopback")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    create = sub.add_parser("setup")
+    create.add_argument("--steam-root", type=Path, required=True)
+    create.add_argument("--native-depot", type=Path, required=True)
+    create.add_argument("--native-mod", type=Path)
+    create.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    launch = sub.add_parser("run")
+    launch.add_argument("actor", choices=("native", "proton"))
+    launch.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    launch.add_argument("--dry-run", action="store_true")
+    verify = sub.add_parser("check")
+    verify.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    args = parser.parse_args()
+    {"setup": setup, "run": run, "check": check}[args.action](args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise SystemExit(1)

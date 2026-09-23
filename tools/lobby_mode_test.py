@@ -107,6 +107,17 @@ def companies(st):
 
 
 def main():
+    solo = Host("Solo")
+    try:
+        solo.wait(lambda s: s.get("mode") == "coop")
+        for mode in ("companies", "coop"):
+            solo.command(cmd="mode", mode=mode)
+            st = solo.wait(lambda s: s.get("mode") == mode)
+            check("solo host mode-only change reaches state and roster: " + mode,
+                  st.get("mode") == mode and companies(st) == {"Solo": 1}
+                  and any(e.get("type") == "roster" and e.get("mode") == mode for e in solo.events()))
+    finally:
+        solo.close()
     h = Host("Ada")
     try:
         for n in ("bob", "cid", "dan"):

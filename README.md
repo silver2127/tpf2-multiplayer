@@ -17,6 +17,24 @@ It is unofficial, reverse-engineered without the engine's source, and **experime
 four players have been run, on one PC and between PCs on different networks. Read
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
+This branch also contains a **native Linux build-35924 port**. Its current
+integration includes Windows **release 0.7** plus dev `8c3c02a5` and a native
+dedicated server. See [Linux installation](docs/linux/INSTALL.md),
+[current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md), and
+[dedicated server setup](tools/server/README.md). Canonical simulation ordering is now on by default (`TPF2MP_ORDER_CANON=0`
+disables it); see the [dev ad3d66e4 integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
+Settings must match Windows peers. Loaded-game lifetime and cross-platform
+validation remain outstanding; matching versions do not establish gameplay parity.
+The [dev `0a35d0a8` integration](docs/linux/UPSTREAM_dev_0a35d0a8.md) enables
+native terrain compression by default and fixes bridge lobby identity; release
+version remains 0.7.
+The [dev `ea35eb8a` integration](docs/linux/UPSTREAM_dev_ea35eb8a.md)
+adds native terrain pager recency, automatic memory headroom and fault-rate
+logging; loaded-big-map performance validation remains outstanding.
+The Windows MSI instructions below apply to the Windows version.
+The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
+retains the Windows autosave-sidecar fix; native terrain sidecars remain unported.
+
 ## How it works
 
 The game has no network code, so this adds lockstep multiplayer from outside. A forwarding `alut.dll`
@@ -103,7 +121,8 @@ send them yourself if you report a bug. The full text is the
 | path | contents |
 |---|---|
 | `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host and its ABI |
-| `bigmap/` | Big Maps: the plugin for maps larger than the New Game menu offers (`native\build.bat bigmap`; see [bigmap/README.md](bigmap/README.md)). Merged from tpf2-bigmap on 2026-09-22, and shipped in the same MSI |
+| `native/linux/`, `tools/linux/` | native Linux libraries, tests, Steam Runtime builds and `.run`/tarball packaging |
+| `bigmap/` | Big Maps, shipped in the same Windows MSI and native Linux package; Linux feature limits: [port record](bigmap/docs/linux/PORT.md) |
 | `mod/mp_lockstep_1/` | the game-script mod |
 | `netpunch/` | the lobby (the dedicated server runs it too) and the master server (Python) |
 | `installer/` | the WiX package |
@@ -128,3 +147,42 @@ the rig before they merge, and a field identification counts only when a differe
 Transport Fever 2 installation (`alut.dll`, kept as `alut_real.dll`) and patches game code in memory while the
 game runs. Use it at your own risk and keep backups of your saves. Multiplayer saves are ordinary `.sav` files;
 the mod adds its company assignment to the save's script state.
+
+The [dev `a42dab6c` integration](docs/linux/UPSTREAM_dev_a42dab6c.md)
+keeps hot-join save requests pending while the host world loads, then
+takes the save when the game UI is ready. Version remains 0.7.
+
+The [dev `7cacbaaf` integration](docs/linux/UPSTREAM_dev_7cacbaaf.md)
+removes full mapping-table scans from family guards on Linux 6.11+ and retains
+a faster snapshot fallback for older kernels. Version remains 0.7.
+
+The [dev `2c05099a` integration](docs/linux/UPSTREAM_dev_2c05099a.md) adds the remaining supplied
+Windows RNG seed/distribution/engine compatibility modules, enabled by default.
+`TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
+Static ELF checks and 65 native tests pass; the lab launch was blocked before
+the game started, so cross-platform gameplay validation remains outstanding.
+
+The [dev `582a380` integration](docs/linux/UPSTREAM_dev_582a380.md) makes native dedicated
+restarts prefer a newer autosave of the hosted `mp_shared` world over the
+configured save. Version remains 0.7.
+
+The [dev `e63ceefc` integration](docs/linux/UPSTREAM_dev_e63ceefc.md) retains
+upstream's dedicated-server performance report; runtime code is unchanged.
+
+The [dev `cf5f8a0e` integration](docs/linux/UPSTREAM_dev_cf5f8a0e.md) makes load-time company
+switches wait for entity queries to answer and reuses live saved player entities.
+Version remains 0.7; loaded-world validation is still outstanding.
+
+The [dev `b4b629a2` integration](docs/linux/UPSTREAM_dev_b4b629a2.md) prevents
+per-frame script state sync from rewinding the town-growth clock. Shared Lua
+and native tests pass; live growth validation remains outstanding. Version remains 0.7.
+
+The [dev `522a303b` integration](docs/linux/UPSTREAM_dev_522a303b.md) reports the slowest hash's
+lane breakdown and the cost of post-hash broadcast, drift and comparison work.
+Shared Lua regression tests pass; no live performance measurement is claimed.
+Version remains 0.7.
+
+The [dev `12407af7` integration](docs/linux/UPSTREAM_dev_12407af7.md) adds native Windows UCRT float
+math, experimental octree depth 12/13, and indexed person target records.
+Placement-distance saturation and placement-attempt budgets remain unported;
+oversized Windows-created saves still have a placement parity gap.

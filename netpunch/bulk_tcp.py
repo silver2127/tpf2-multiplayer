@@ -26,6 +26,7 @@ random bytes the sender put in its fbegin (sealed like every control
 message), so an unrelated connection cannot claim or feed a transfer.
 """
 import socket
+import sys
 import threading
 import time
 
@@ -69,6 +70,10 @@ class BulkListener:
         s = socket.socket(family, socket.SOCK_STREAM)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Linux requires this on BOTH listener and bound dial sockets.
+            # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
+            if sys.platform.startswith("linux"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             if family == socket.AF_INET6:
                 s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
             s.bind((bind, port))

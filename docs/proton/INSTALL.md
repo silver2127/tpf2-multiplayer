@@ -129,3 +129,9 @@ such copies when it finds them.
   Windows and Proton players rests on the same code, but has had only short tests.
 - Steam's "Verify integrity of game files" restores the game's `alut.dll` and
   removes the mod's entry point; run the installer again afterwards.
+
+## Historical pinned setup
+
+The [0.4.22 extracted-payload instructions](INSTALL_0.4.22.md) document
+`setup.py`, its pinned checksums and the original test scope. They remain
+available for reproducing that older setup; use the installer above for current releases.

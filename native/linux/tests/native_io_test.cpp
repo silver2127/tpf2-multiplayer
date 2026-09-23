@@ -1,0 +1,85 @@
+#include "../src/menu_game_linux.cpp"
+#include <cassert>
+#include <thread>
+
+namespace panel { bool SetActionsHeld(bool) { return true; } }
+static bool originalDoneCalled=false;
+static void* expectedBinding=nullptr;
+static void* expectedLua=nullptr;
+static int legacyCalls=0;
+static int OriginalLegacy(void* binding,void* lua) {
+    assert(binding==expectedBinding && lua==expectedLua);++legacyCalls;return 7;
+}
+static void OriginalDone(void*,const bool*,const void*) { originalDoneCalled=true; }
+static void* Factory(void* out,void*,void*,void* raw,void*,bool automatic,bool flag) {
+    auto& s=*static_cast<GStr*>(raw);
+    assert(std::string(s.p,s.len)=="mp_saved" && !automatic && flag);
+    return out;
+}
+int main() {
+    using namespace NativeIo;
+    for(auto state:{State::Idle,State::QueuedLoad,State::QueuedPause,State::Loading,State::Pausing}) {
+        C().state=state;assert(!SavingNow());
+    }
+    for(auto state:{State::QueuedSave,State::Saving}) {
+        C().state=state;assert(SavingNow());
+    }
+    C().state=State::Idle;
+    {
+        // A different thread owns the mutex: input must return immediately,
+        // conservatively blocked, even if the protected state is idle.
+        std::lock_guard<std::mutex> lock(C().mutex);
+        std::thread input([]{assert(SavingNow());});input.join();
+    }
+    assert(!SavingNow());
+    // GUI input is now allowed during holds, but legacy script producers must
+    // still be suppressed so pause/drain can finish (as on Windows).
+    int binding=1,lua=2;expectedBinding=&binding;expectedLua=&lua;
+    legacyEventOriginal=reinterpret_cast<void*>(&OriginalLegacy);
+    assert(LegacyEventHook(&binding,&lua)==7 && legacyCalls==1);
+    assert(SetActionsHeld(true));
+    assert(LegacyEventHook(&binding,&lua)==0 && legacyCalls==1);
+    assert(SetActionsHeld(false));
+    assert(LegacyEventHook(&binding,&lua)==7 && legacyCalls==2);
+    assert(ValidName("mp_a") && ValidName("mp_123456789012"));
+    for(const auto name:{"save","../mp_a","mp_a/b","mp_","mp_1234567890123"})assert(!ValidName(name));
+    assert(!PauseAndDrain("pause") && !HasWorld() && !Busy());
+    // libstdc++ owns copies of the closure; our manager retains the ticket
+    // until all copies have been destroyed by the engine.
+    auto* ticket=new Ticket;ticket->world=1;ticket->id="pause";
+    Function a{},b{};a.data[0]=ticket;
+    Manager(&b,&a,2); assert(ticket->refs==2 && b.data[0]==ticket);
+    void* target=nullptr;Manager(&target,&a,1);assert(target==&a);
+    Manager(&b,&b,3);assert(ticket->refs==1);Manager(&a,&a,3);
+    SaveCall call{};call.name.p=call.name.buf;call.name.len=8;memcpy(call.name.buf,"mp_saved",9);
+    ownSave=&call;saveFactoryOriginal=reinterpret_cast<void*>(&Factory);
+    assert(SaveFactoryHook(&call,nullptr,nullptr,nullptr,nullptr,true,true)==&call && call.captured);
+    ownSave=nullptr;
+    saveDoneOriginal=reinterpret_cast<void*>(&OriginalDone);
+    C().state=State::Saving;C().operation="save";C().requestedWorld=42;
+    uintptr_t closure=41;bool ok=true;
+    SaveDoneHook(&closure,&ok,nullptr);assert(originalDoneCalled && Busy() && SavingNow());
+    closure=42;SaveDoneHook(&closure,&ok,nullptr);assert(!Busy() && !SavingNow());
+    Event e;assert(Poll(e)&&e.operation=="save"&&e.step=="saved"&&e.success);
+    assert(!Poll(e));
+    C().state=State::Saving;ok=false;
+    SaveDoneHook(&closure,&ok,nullptr);
+    assert(!SavingNow() && Poll(e) && !e.success);
+    C().state=State::QueuedSave;
+    Finish("saved",false,"Engine did not queue save");
+    assert(!SavingNow() && Poll(e) && !e.success);
+    // A pause is acknowledged from the engine callback, only after its FIFO
+    // command list is empty, never when the request was merely enqueued.
+    alignas(8) unsigned char world[0x450]{},game[0x160]{},queue[8]{},data[24]{},command[0x38]{};
+    Field<uintptr_t>(uintptr_t(world),0x448)=uintptr_t(game);
+    Field<uintptr_t>(uintptr_t(game),0x158)=uintptr_t(queue);
+    Field<uintptr_t>(uintptr_t(queue),0)=uintptr_t(data);
+    C().world=uintptr_t(world);C().state=State::Pausing;C().operation="pause";
+    ticket=new Ticket;ticket->world=C().world;ticket->id="pause";ticket->pass=64;
+    command[0x30]=1;PauseDone(&ticket,command);
+    assert(Poll(e)&&e.step=="paused"&&e.success&&!Busy());
+    C().state=State::Pausing;Field<uintptr_t>(uintptr_t(data),8)=8;
+    PauseDone(&ticket,command);
+    assert(Poll(e)&&!e.success&&e.detail=="Command producers did not become idle");
+    delete ticket;
+}

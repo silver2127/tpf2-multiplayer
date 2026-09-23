@@ -1,0 +1,5 @@
+/* The libraries the loader dlopens export nothing: their constructors are all
+   the game process needs from them. */
+{
+  local: *;
+};

@@ -1,0 +1,60 @@
+.text
+.hidden TerrainMinMaxBridge
+.globl TerrainMinMaxBridge
+.type TerrainMinMaxBridge,@function
+TerrainMinMaxBridge:
+ push %rdi
+ push %rsi
+ push %rcx
+ push %r8
+ push %r9
+ push %r10
+ push %r11
+ sub $232,%rsp
+ movdqu %xmm2,0(%rsp)
+ movdqu %xmm3,16(%rsp)
+ movdqu %xmm4,32(%rsp)
+ movdqu %xmm5,48(%rsp)
+ movdqu %xmm6,64(%rsp)
+ movdqu %xmm7,80(%rsp)
+ movdqu %xmm8,96(%rsp)
+ movdqu %xmm9,112(%rsp)
+ movdqu %xmm10,128(%rsp)
+ movdqu %xmm11,144(%rsp)
+ movdqu %xmm12,160(%rsp)
+ movdqu %xmm13,176(%rsp)
+ movdqu %xmm14,192(%rsp)
+ movdqu %xmm15,208(%rsp)
+ mov %rbx,%rdi
+ mov %r14,%rsi
+ call BigmapMinMax
+ mov %eax,%edx
+ shr $16,%edx
+ movzwl %ax,%eax
+ movdqu 0(%rsp),%xmm2
+ movdqu 16(%rsp),%xmm3
+ movdqu 32(%rsp),%xmm4
+ movdqu 48(%rsp),%xmm5
+ movdqu 64(%rsp),%xmm6
+ movdqu 80(%rsp),%xmm7
+ movdqu 96(%rsp),%xmm8
+ movdqu 112(%rsp),%xmm9
+ movdqu 128(%rsp),%xmm10
+ movdqu 144(%rsp),%xmm11
+ movdqu 160(%rsp),%xmm12
+ movdqu 176(%rsp),%xmm13
+ movdqu 192(%rsp),%xmm14
+ movdqu 208(%rsp),%xmm15
+ add $232,%rsp
+ pop %r11
+ pop %r10
+ pop %r9
+ pop %r8
+ pop %rcx
+ pop %rsi
+ pop %rdi
+ mov %r14,%rbx
+ jmp *bigmap_minmax_return(%rip)
+.hidden bigmap_minmax_return
+.hidden BigmapMinMax
+.section .note.GNU-stack,"",@progbits

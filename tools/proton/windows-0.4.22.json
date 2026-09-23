@@ -1,0 +1,173 @@
+{
+  "release": "https://github.com/silver2127/tpf2-multiplayer/releases/tag/v0.4.22",
+  "commit": "7990a86edd941dd65fe0350a22d28fbc5757abab",
+  "msi_sha256": "1f7aa947bc069aaec5d14e89a28ec2ac98d284a37b3f065302bc9fa923efd08d",
+  "stock_alut_sha256": "3df103ae3d94a6b90c4d2a6d75dcb388cd835f5e3af9962b22c20d4473cfc035",
+  "files": [
+    {
+      "path": "alut.dll",
+      "size": 177664,
+      "sha256": "d230eecdc9de8fe24eb62a2752b96a48f36aa144c9f3efc3a8272e1e15f83240"
+    },
+    {
+      "path": "mods/mp_lockstep_1/image_00.tga",
+      "size": 172844,
+      "sha256": "aee461b347967bf409da065151475a368a11b52f5983aaaed2d38230c48517e6"
+    },
+    {
+      "path": "mods/mp_lockstep_1/mod.lua",
+      "size": 1156,
+      "sha256": "64b8ca02a51b221e9aecdef83935dcdf72021ea7bf669fa0305f578b0f0d6b25"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/config/game_script/lockstep.lua",
+      "size": 87994,
+      "sha256": "9a17e0a39ce6cb292bc4fd51601640a5c1293040966457de2d7fb96c3e7538db"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/config/style_sheet/mp_lockstep.lua",
+      "size": 1503,
+      "sha256": "27ad63e2c107c5efaa2135ee6fe56d7bd98382ec23785addc883154f4d606e58"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/assets.lua",
+      "size": 6656,
+      "sha256": "89a00ac4b5f51d0c21925c55fc6a37b3a2fbcbd9718b80451fc4acfc6dd9e838"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/companies.lua",
+      "size": 40402,
+      "sha256": "542f02b8e3726dc9ef9f9e0c85c7def57ac38f38bf4d46788db3a4154be1df64"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/cons.lua",
+      "size": 70542,
+      "sha256": "48b302721a57cb45e4bfa5e79ec93bf9668dcf52e2aad783dbec8e9ce6963e46"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/conx.lua",
+      "size": 81548,
+      "sha256": "0bb98ef3b932b6e8eda96a0c58097feadfa530c0d2f308626ddaf74b6d20750c"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/cursors.lua",
+      "size": 25350,
+      "sha256": "b9a61a89fd870752bc4842f44ded0cf22dd87e4e7b07a0e953cb583ed130cda8"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/desyncreport.lua",
+      "size": 8494,
+      "sha256": "24aa9dbfbb05db9d00fcd51ee6cadbcf0b1621fce12473071b62f4f1e042918e"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/deterministic_script.lua",
+      "size": 6489,
+      "sha256": "af1a3e624c72c89598eb31dc150cbc6f377a2c7f96e6d7f24be3acc2bc77defb"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/geom.lua",
+      "size": 19124,
+      "sha256": "dcceb8bb467c7e6038a9825fd42ead424aa6cf5c21624b51bac5f6994e2c83d2"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/hash.lua",
+      "size": 22327,
+      "sha256": "2e4e6bdc19e7601415809d59c5846ff313b7c10df2e7dd3f359637193bc0138e"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/inject.lua",
+      "size": 72940,
+      "sha256": "1aec32875ac9a10dbbd68c8960c7d76f527915f4823f8c5316469c4de824bd6c"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/io.lua",
+      "size": 5946,
+      "sha256": "be5c6754faa943734c3212b10b5d93347d08073afdbc5a78119fa5063cebf146"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/lines.lua",
+      "size": 23897,
+      "sha256": "c192948aa64e6af24a64a7c26c00c52c81f62b9ae7e82e160c2e458c6078f07b"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/net.lua",
+      "size": 40543,
+      "sha256": "ce3e32d5e3699bcf8ad02ee99ba88f23c767411c9a7c9271c887737c83197cc6"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/pacing.lua",
+      "size": 54966,
+      "sha256": "6d082f27479ca41c449bc0100d662d914b44b1c200754131a95f031ba38e7c6c"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/preview_constructions.lua",
+      "size": 6028,
+      "sha256": "97230632ab31931271dcb299dc1c18b9d509fe36f0de04e662c2716adeca8d82"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/previews.lua",
+      "size": 24908,
+      "sha256": "34368d5fc357de5d7cd5923a7bb2205b4603efeafa4bedab2fe7fd4384bdfeb7"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/roads.lua",
+      "size": 82909,
+      "sha256": "3bbb86fba11c94aadf1916bf2355f3dbac9781d12bc020313124fe826ac2d538"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/stats.lua",
+      "size": 9004,
+      "sha256": "42f16dddf7335ce6efaa0cf3c87f879e31f75531fcbf5eccec8b3052257e8d58"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/stops.lua",
+      "size": 36470,
+      "sha256": "dedda392f75bf0a9ac6166e250125a50a18316379df6f4f9fc9610e6458107aa"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/terrain.lua",
+      "size": 4775,
+      "sha256": "34f0c42376874d0bb6684e4c0b64c3962d4e3e0c280a1981447873f46b25d02c"
+    },
+    {
+      "path": "mods/mp_lockstep_1/res/scripts/mp/vehicles.lua",
+      "size": 45205,
+      "sha256": "7204b3f85836a884f041ebb9f352d260cf96724c957f98309e13e626ed7ccc68"
+    },
+    {
+      "path": "netpunch/netpunch.exe",
+      "size": 9884524,
+      "sha256": "54bed86eaa76a54c70560f380716fef9bf5bded6ac549df4643853e6a7e6882c"
+    },
+    {
+      "path": "plugins/tpf2_previews.dll",
+      "size": 189440,
+      "sha256": "8eadc65c51398865e0aa4493aff46310a95ca52499146d66a76e858b801715c1"
+    },
+    {
+      "path": "tpf2_bridge_mp.dll",
+      "size": 274944,
+      "sha256": "a13696f1b8202c33266077aa682b4c1173ed4af4d9ac15ce06eb946fc01498ae"
+    },
+    {
+      "path": "tpf2_menu.dll",
+      "size": 332800,
+      "sha256": "9ad4a3be0006073af898cfba00f60dce2b396bac3fa0627ccb708e7e341d3235"
+    },
+    {
+      "path": "tpf2_pluginhost.dll",
+      "size": 218624,
+      "sha256": "7f62c2be94dc5368b026fd0fe7cabe451d166b9d3f336197269fc9a40f0d0b56"
+    },
+    {
+      "path": "tpf2_slice.cfg",
+      "size": 791,
+      "sha256": "d935b0919d9ecae45837593bdf296f6a8477a604921f3d5f1e587cacd6e0a4e8"
+    },
+    {
+      "path": "tpf2_slice.dll",
+      "size": 314368,
+      "sha256": "8ad0e3f79d8aaf5ffea50e722f2e4bc7973c62b3b20aeb64cbf81138822fa319"
+    }
+  ]
+}

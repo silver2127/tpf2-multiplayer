@@ -120,9 +120,16 @@ struct MessagesFailCb : CallbackBase {
 } g_messagesFail;
 
 bool StartMessages() {
+#ifdef _WIN32
     auto module = GetModuleHandleW(L"steam_api64.dll");
-    auto accessor = reinterpret_cast<FnAccessor>(GetProcAddress(module, "SteamAPI_SteamNetworkingMessages_SteamAPI_v002"));
-    #define MESSAGE_API(field, name) g_messages.field = reinterpret_cast<decltype(g_messages.field)>(GetProcAddress(module, "SteamAPI_ISteamNetworkingMessages_" name))
+    if (!module) return false;
+    auto get = [&](const char* name) { return GetProcAddress(module, name); };
+#else
+    // Resolve only the game's loaded Steam API; no dlopen or SteamAPI_Init.
+    auto get = [](const char* name) { return dlsym(RTLD_DEFAULT, name); };
+#endif
+    auto accessor = reinterpret_cast<FnAccessor>(get("SteamAPI_SteamNetworkingMessages_SteamAPI_v002"));
+    #define MESSAGE_API(field, name) g_messages.field = reinterpret_cast<decltype(g_messages.field)>(get("SteamAPI_ISteamNetworkingMessages_" name))
     MESSAGE_API(send, "SendMessageToUser");
     MESSAGE_API(receive, "ReceiveMessagesOnChannel");
     MESSAGE_API(accept, "AcceptSessionWithUser");

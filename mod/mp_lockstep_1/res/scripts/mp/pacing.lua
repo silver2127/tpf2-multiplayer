@@ -1582,12 +1582,25 @@ function CM.loadGateReady()
 			return false
 		end
 	end
-	-- EVERYONE, the leader included: the roster. A member not heard is still
-	-- loading (the lobby's players= counts it), and a session that runs on
-	-- meanwhile is one it must catch up with. No tick budget: the hold lasts
-	-- while it is missing, or until the player's two presses (CM.ensureRunning),
-	-- which log who is left to catch up.
+	-- The roster hold (every game, the leader included, waited until every
+	-- roster member was heard) is gone since 0.7: live join is the default, so
+	-- a member still loading catches up from the command history when it
+	-- arrives, like any hot joiner, and nobody waits for it. A dedicated server
+	-- sat paused after its own load until the joiner's game had loaded too
+	-- (2026-09-22; the owner: "it shouldn't wait for that, that's why we have
+	-- hot join"). A frozen join (tpf2mp_live_join.txt = 0) is held by its
+	-- recovery round, not here. A joiner still waits above for the LEADER and
+	-- the history since its save. loadgate_roster=1 in tpf2_slice.cfg brings
+	-- the old hold back on this machine.
 	local missing, roster, heard = CM.lgRosterMissing()
+	if missing > 0 and not CM.cfgFlag("loadgate_roster", false) then
+		if not CM.lgRosterNoted then
+			CM.lgRosterNoted = true
+			log(string.format("LOADGATE: %d of %d other roster member(s) still loading (heard: %s) -- not waiting: they catch up when they arrive",
+				missing, roster - 1, heard))
+		end
+		missing = 0
+	end
 	if missing > 0 then
 		if (CM.ticks % 12) == 0 then
 			log(string.format("LOADGATE: holding at the loaded save -- %d of %d other roster member(s) not heard yet, still loading (heard: %s). Press play twice to start without them.",

@@ -15,6 +15,11 @@
 # world alike). A game process whose menu log has not moved for STALL_SECONDS is
 # stuck: it is killed -9 (no crash handler, no stray dump) and launched again.
 set -u
+case "${RUNTIME:-proton}" in
+    native) exec python3 "$(dirname "$0")/native_watchdog.py" ;;
+    proton) ;;
+    *) echo "RUNTIME must be native or proton" >&2; exit 2 ;;
+esac
 APPID=1066780
 : "${DISPLAY:=:9}"
 export DISPLAY

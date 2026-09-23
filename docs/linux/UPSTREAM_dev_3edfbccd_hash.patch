@@ -1,0 +1,67 @@
+diff --git a/mod/mp_lockstep_1/res/scripts/mp/hash.lua b/mod/mp_lockstep_1/res/scripts/mp/hash.lua
+index c8de8b4..b669cc0 100644
+--- a/mod/mp_lockstep_1/res/scripts/mp/hash.lua
++++ b/mod/mp_lockstep_1/res/scripts/mp/hash.lua
+@@ -244,0 +245,5 @@ function CM.vposCompare(stamp, o)
++	-- Pair by the vehicle's cross-peer key when both sides carry it: THE SAME
++	-- vehicle, not whichever of theirs happens to be closest. Only a vehicle one
++	-- side has not bound yet falls back to the nearest point.
++	local byKey = {}
++	for j = 1, #b do if b[j][3] then byKey[b[j][3]] = b[j] end end
+@@ -245,0 +251 @@ function CM.vposCompare(stamp, o)
++	local worst = {}
+@@ -247,6 +253,11 @@ function CM.vposCompare(stamp, o)
+-		local ax, ay = a[i][1], a[i][2]
+-		local best = nil
+-		for j = 1, #b do
+-			local dx, dy = b[j][1] - ax, b[j][2] - ay
+-			local d = dx * dx + dy * dy
+-			if not best or d < best then best = d end
++		local ax, ay, ak = a[i][1], a[i][2], a[i][3]
++		local best, pair = nil, ak and byKey[ak] or nil
++		if pair then
++			local dx, dy = pair[1] - ax, pair[2] - ay
++			best = dx * dx + dy * dy
++		else
++			for j = 1, #b do
++				local dx, dy = b[j][1] - ax, b[j][2] - ay
++				local d = dx * dx + dy * dy
++				if not best or d < best then best = d; pair = b[j] end
++			end
+@@ -257 +268,4 @@ function CM.vposCompare(stamp, o)
+-		if d > 1 then over1 = over1 + 1 end
++		if d > 1 then
++			over1 = over1 + 1
++			worst[#worst + 1] = { d = d, key = ak, x = ax, y = ay, px = pair and pair[1], py = pair and pair[2], byKey = ak and byKey[ak] ~= nil }
++		end
+@@ -260,0 +275,17 @@ function CM.vposCompare(stamp, o)
++	-- the offenders, worst first: which vehicle, on which line, where each side has it
++	table.sort(worst, function(p, q) return p.d > q.d end)
++	for i = 1, math.min(3, #worst) do
++		local w = worst[i]
++		local line = "?"
++		pcall(function()
++			local vid = w.key and CM.vehIdForKey and CM.vehIdForKey(w.key)
++			local tv = vid and api.engine.getComponent(vid, api.type.ComponentType.TRANSPORT_VEHICLE)
++			if tv and tv.line and tv.line > 0 then
++				local nm = api.engine.getComponent(tv.line, api.type.ComponentType.NAME)
++				line = tostring(tv.line) .. (nm and nm.name and (" '" .. tostring(nm.name) .. "'") or "")
++			end
++		end)
++		log(string.format("VPOS t=%d vs %s: drift #%d %s (%s) line %s: mine %.1f,%.1f  %s's %s,%s  off by %.1f m",
++			stamp, o, i, tostring(w.key or "unbound"), w.byKey and "same key" or "nearest", line, w.x, w.y, o,
++			w.px and string.format("%.1f", w.px) or "?", w.py and string.format("%.1f", w.py) or "?", w.d))
++	end
+@@ -316,2 +347,2 @@ function CM.vposRecv(line)
+-		for x, y in d:gmatch("([%-%d%.]+),([%-%d%.]+)") do
+-			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0 }
++		for x, y, k in d:gmatch("([%-%d%.]+),([%-%d%.]+),?([^;]*)") do
++			rec.pts[#rec.pts + 1] = { tonumber(x) or 0, tonumber(y) or 0, (k ~= "" and k ~= "-") and k or nil }
+@@ -537 +568,6 @@ local function worldHash(now)
+-				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10 } end
++				-- with the vehicle's cross-peer key, so the drift check pairs the SAME
++				-- vehicle on both sides and can name the one that drifts (a nearest-
++				-- neighbour pairing read 10 m on the host while the joiner's copy of one
++				-- train was 1,150 m away, 2026-09-16). Silent for a vehicle not bound yet.
++				if raw then raw[#raw + 1] = { math.floor((p[1] or p.x or 0) * 10 + 0.5) / 10, math.floor((p[2] or p.y or 0) * 10 + 0.5) / 10,
++					CM.vehKeyOf and CM.vehKeyOf[vid] or (CM.primedVeh and CM.primedVeh[vid] and ("s:" .. tostring(vid))) or nil } end

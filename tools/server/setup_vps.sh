@@ -34,6 +34,7 @@ install -m 755 "$HERE/steam_login.sh" $DEST/steam_login.sh
 install -m 755 "$HERE/steam_bootstrap.sh" $DEST/steam_bootstrap.sh
 install -m 644 "$HERE/steam_compat.py" $DEST/steam_compat.py
 install -m 755 "$HERE/game_watchdog.sh" $DEST/game_watchdog.sh
+install -m 644 "$HERE/native_watchdog.py" $DEST/native_watchdog.py
 install -m 644 "$HERE/server.env.example" $DEST/server.env.example
 [ -f /etc/tpf2mp/server.env ] || { mkdir -p /etc/tpf2mp; install -m 644 "$HERE/server.env.example" /etc/tpf2mp/server.env; }
 sed -i "s/^DISPLAY=.*/DISPLAY=:$DISPLAY_NUM/" /etc/tpf2mp/server.env
@@ -98,6 +99,14 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now tpf2mp-xvfb >/dev/null
+echo "== kernel limits (vm.max_map_count, vm.swappiness)"
+if [ -f "$HERE/sysctl-tpf2mp.conf" ]; then
+  install -m 0644 "$HERE/sysctl-tpf2mp.conf" /etc/sysctl.d/99-tpf2mp.conf
+  sysctl --system >/dev/null 2>&1
+  echo "sysctl: max_map_count=$(cat /proc/sys/vm/max_map_count) swappiness=$(cat /proc/sys/vm/swappiness)"
+else
+  echo "sysctl: sysctl-tpf2mp.conf not beside this script -- skipped"
+fi
 echo "== firewall"
 if command -v ufw >/dev/null 2>&1; then
   # the host lobby: UDP for the session, TCP for save transfers (same port; the relay uses 29471)

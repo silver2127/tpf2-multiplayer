@@ -2885,8 +2885,20 @@ static void SyncPoll()
     UnpausedTick();
     wchar_t req[MAX_PATH]; _snwprintf_s(req, _TRUNCATE, L"%stpf2_sync_save.txt", g_dataDirW);
     if (GetFileAttributesW(req) != INVALID_FILE_ATTRIBUTES) {
-        DeleteFileW(req);
-        SyncStart("sync request (chat or button)");
+        // A request that arrives while the world is still loading WAITS for it
+        // (2026-09-22): the lobby asks once for a member who joined while the
+        // host's world was loading (a dedicated server's 10-minute big-map
+        // load), and taking the file then dropped it ("before the game is
+        // running -- ignored"); the joiner never got a save and played on in
+        // its old world. The file stays until a game is running.
+        static bool waitingNoted = false;
+        if (!g_gameUi) {
+            if (!waitingNoted) { waitingNoted = true; Log("[sync] sync request before the game is running -- kept until it is\n"); }
+        } else {
+            waitingNoted = false;
+            DeleteFileW(req);
+            SyncStart("sync request (chat or button)");
+        }
     }
     if (!g_syncAskedAt) return;
     wchar_t cur[600] = L""; ULONGLONG sz = 0;
@@ -3265,6 +3277,7 @@ static void writeCompanyCfg()
 {
     std::string l3, l4; int mine = 1, distinct = 0; bool seen[MAX_COMPANIES + 1] = {};
     if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
+    const bool separate = InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0;
     for (int i = 0; i < playerCount(); i++) {
         int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
         if (g_players[i] == g_you) mine = cid;
@@ -3273,12 +3286,13 @@ static void writeCompanyCfg()
     }
     if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
     for (int c = 1; c <= MAX_COMPANIES; c++) if (seen[c]) { if (!l3.empty()) l3 += ','; l3 += std::to_string(c); }
-    std::string content = std::string(distinct > 1 ? "companies" : "coop") + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
+    const char* mode = separate || distinct > 1 ? "companies" : "coop";
+    std::string content = std::string(mode) + "\n" + std::to_string(mine) + "\n" + l3 + "\n" + l4 + "\n";
     wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%smp_company_cfg.txt", g_dataDirW);
     HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) { Log("[menu] company cfg: cannot write %ls\n", path); return; }
     DWORD w = 0; WriteFile(h, content.data(), (DWORD)content.size(), &w, nullptr); CloseHandle(h);
-    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, distinct > 1 ? "companies" : "coop", mine, l3.c_str(), l4.c_str());
+    Log("[menu] company cfg -> %ls: mode=%s me=%d ids=%s map=%s\n", path, mode, mine, l3.c_str(), l4.c_str());
 }
 
 // mp_players.txt: "letter=name" per roster entry, with the same letters the
@@ -3397,6 +3411,9 @@ static void applyRoster(const char* s)
     // pause, no ordering to get right.
     static int lastCount = 0;
     writePlayerNames();
+    // Frozen joins bypass the legacy start handler. Keep config ready for
+    // their NativeControl load too; saved live company state wins in Lua.
+    writeCompanyCfg();
     bool inGame = InterlockedCompareExchange(&g_showOverlay, 0, 0) == 0 && g_gameUi != 0;
     if (isHost && inGame && count > lastCount && lastCount > 0) {
         LONG age = InterlockedCompareExchange(&g_storedAge, 0, 0), mx = InterlockedCompareExchange(&g_storedMax, 0, 0);
@@ -3466,6 +3483,29 @@ static bool newestSave(wchar_t* out, int cch)
     if (!bestName[0] && sharedName[0]) wcscpy_s(bestName, sharedName);   // nothing else: fall back to our copy
     if (!bestName[0]) return false;
     _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", SAVE_DIR, bestName);
+    return true;
+}
+
+// The newest autosave THIS server made of the world it is hosting. The engine
+// names an autosave of mp_shared.sav (our placed copy) autosave_mp_shared_<date>.sav,
+// so the pattern matches our own saves only and never an unrelated world someone
+// dropped in the folder. A server that has been playing has one of these newer than
+// its configured dedicated_save, and that is the world the players were in.
+static bool newestOwnAutosave(wchar_t* out, int cch, ULONGLONG* mtimeOut)
+{
+    wchar_t pat[700]; _snwprintf_s(pat, _TRUNCATE, L"%s\\autosave_mp_shared*.sav", SAVE_DIR);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    ULONGLONG best = 0; wchar_t bestName[300] = L"";
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (t > best) { best = t; wcscpy_s(bestName, fd.cFileName); }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!bestName[0]) return false;
+    _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", SAVE_DIR, bestName);
+    if (mtimeOut) *mtimeOut = best;
     return true;
 }
 
@@ -4372,6 +4412,19 @@ static void DedicatedTick()
             wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagDedSave, -1, wn, 64);
             _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
             if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { Log("[dedicated] %ls not found -- loading the newest save instead\n", path); path[0] = 0; }
+            // ... but never rewind a world that has been played: the configured save is
+            // whatever the operator last put there (hours ago), while this server's own
+            // autosaves are where the players actually are. A restart or a crash comes
+            // back to the newest of those (2026-09-22: a restart would have thrown away
+            // an hour of a live session).
+            if (path[0]) {
+                wchar_t res[600] = L""; ULONGLONG rt = 0, sz = 0;
+                const ULONGLONG ct = saveMtime(path, &sz);
+                if (newestOwnAutosave(res, 600, &rt) && rt > ct) {
+                    Log("[dedicated] %ls is newer than the configured save -- resuming that world\n", res);
+                    wcscpy_s(path, res);
+                }
+            }
         }
         if (!path[0] && !newestSave(path, 600)) {
             Log("[dedicated] no save in %ls -- nothing to load (put one there, or set dedicated_save)\n", SAVE_DIR);

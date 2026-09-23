@@ -8,6 +8,9 @@ depends on the following third-party material.
 - **Vulkan headers** (`native/third_party/vk/`) — Copyright 2015-2026 The Khronos
   Group Inc. Licensed under `Apache-2.0 OR MIT` (SPDX identifiers are in each
   file). Used unmodified by the in-game overlay.
+- **stb_truetype** (`native/third_party/stb/stb_truetype.h`) — Sean Barrett and
+  contributors. Offered under the MIT License or public domain dedication,
+  reproduced in the header. Used by the Linux panel to rasterize system fonts.
 
 ## Dependencies (not vendored; installed via `netpunch/requirements.txt` or
 bundled into the frozen `netpunch.exe` by PyInstaller)

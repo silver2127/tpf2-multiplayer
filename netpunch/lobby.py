@@ -145,8 +145,14 @@ CLI
     python lobby.py --selftest                      # 1 host + 2 joiners, loopback
     python lobby.py --selftest-transfer             # reliable save transfer
     python lobby.py --selftest-relay                # game relay both ways
+    python lobby.py --print-public-list <url>       # GET <url>/list, print the body
 Optional: --local-port 29471, --timeout 40, --io-dir <dir>,
-          --game-relay-port <P> --game-local-port <L> (see GAME RELAY).
+          --game-relay-port <P> --game-local-port <L> (see GAME RELAY),
+          --parent-pid <pid> (not on Windows: leave once that process exits).
+
+On Linux the game starts this program itself (docs/linux/NETPUNCH.md): paths
+come from linuxpaths.py, SIGTERM leaves like a quit, and --parent-pid stands in
+for the Windows DLL's kill-on-close Job object.
 """
 
 from __future__ import annotations
@@ -168,6 +174,7 @@ import queue
 import random
 import select
 import shutil
+import signal
 import socket
 import struct
 import sys
@@ -414,12 +421,16 @@ def _live_join_on(io_dir):
     """LIVE JOIN (2026-09-22): the players already in a session keep their
     worlds at a hot join; only the newcomer loads (sync_operation `retain`). On
     by default since 0.7; tpf2mp_live_join.txt = 0 in the host's io dir turns it
-    off (the frozen join: everyone holds, saves, loads). Read at each join."""
+    off (the frozen join: everyone holds, saves, loads). Native Linux remains
+    opt-in pending live validation of canonical ordering. Read at each join."""
     try:
         with open(os.path.join(io_dir, "tpf2mp_live_join.txt"), "r", encoding="utf-8") as f:
-            return f.read().strip().lower() not in ("0", "off", "no")
+            value = f.read().strip().lower()
+            if sys.platform.startswith("linux"):
+                return value in ("1", "on", "yes")
+            return value not in ("0", "off", "no")
     except OSError:
-        return True
+        return not sys.platform.startswith("linux")
 
 
 def _dual_hello(name):
@@ -578,15 +589,33 @@ XFER_BUF_BYTES = 16 * 1024 * 1024     # best-effort SO_RCVBUF/SO_SNDBUF for burs
                                       # a Steam window of 4 MB arrives from the tunnel as one burst)
 
 
+_buffer_cap_logged = [False]
+
+
 def _boost_socket_buffers(sock):
     """Best-effort: enlarge the socket's send/recv buffers so bursty chunk
     traffic during a big save transfer isn't dropped in the kernel. Silently
-    ignored where the OS clamps or rejects it -- the ARQ layer copes with loss."""
+    ignored where the OS clamps or rejects it -- the ARQ layer copes with loss.
+
+    Linux clamps SO_RCVBUF to net.core.rmem_max without an error (212992 B on
+    a stock kernel, under a tenth of what SEND_WINDOW_REMOTE puts in flight),
+    so the clamp is logged once per process: it is the first thing to check
+    when a Linux player's save transfer crawls."""
     for opt in (socket.SO_RCVBUF, socket.SO_SNDBUF):
         try:
             sock.setsockopt(socket.SOL_SOCKET, opt, XFER_BUF_BYTES)
         except (OSError, AttributeError):
             pass
+    if sys.platform.startswith("linux") and not _buffer_cap_logged[0]:
+        try:
+            granted = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) // 2   # Linux reports double
+        except (OSError, AttributeError):
+            return
+        _buffer_cap_logged[0] = True
+        if granted < XFER_BUF_BYTES:
+            _log(f"[net] the kernel caps UDP receive buffers at {granted} B "
+                 f"(net.core.rmem_max), not {XFER_BUF_BYTES}: a big save transfer may "
+                 f"lose and resend more (sysctl -w net.core.rmem_max={XFER_BUF_BYTES} lifts it)")
 
 
 # Everything below /24 is masked out of the logs. These files get pasted into
@@ -730,6 +759,10 @@ class PeersLog:
         # KEEP LOGS: with <io dir>/tpf2mp_keep_logs.txt present the previous run's
         # merged log is kept and this run appends after its banner.
         keep = os.path.isfile(os.path.join(directory, "tpf2mp_keep_logs.txt"))
+        if sys.platform != "win32":
+            import linuxpaths
+            data = linuxpaths.data_dir()
+            keep = keep or bool(data and os.path.isfile(os.path.join(data, "tpf2mp_keep_logs.txt")))
         with open(self.path, "a" if keep else "w", encoding="utf-8") as f:
             f.write(("\n" if keep else "") + "# merged lobby log, started " + time.strftime("%Y-%m-%d %H:%M:%S")
                     + (" (tpf2mp_keep_logs.txt present: appending)" if keep else "") + "\n")
@@ -3457,7 +3490,11 @@ class _RendezvousHost:
 
     def close(self):
         self._stop.set()
-        self._t.join(timeout=3)
+        # Linux's launcher gives quit 1.5 s, then SIGTERM 2 s. A daemon HTTP
+        # poll owns no cleanup resources: waiting for it here can exhaust that
+        # budget before the publisher sends /leave and UPnP unmaps the port.
+        # Setting the event prevents another poll; process exit ends this one.
+        self._t.join(timeout=3 if sys.platform == "win32" else 0)
 
     @staticmethod
     def relay_from(k):
@@ -3555,7 +3592,9 @@ class _RendezvousKnock:
 
     def close(self):
         self._stop.set()
-        self._t.join(timeout=3)
+        # As with the host poll, an in-flight daemon request must not hold up
+        # Linux process teardown. It has no save/socket/mapping cleanup duty.
+        self._t.join(timeout=3 if sys.platform == "win32" else 0)
 
     def _run(self):
         import base64
@@ -4029,7 +4068,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log("[relay] everyone left -- session closed" + (f"; holding a save from {int(age)} s ago -- the next player continues it" if spath else ""))
         if broadcast:
             send_roster_packets()
-        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())))
+        key = (tuple(roster_players()), tuple(sorted(roster_companies().items())), mode[0])
         if last_emitted_roster[0] != key:
             last_emitted_roster[0] = key
             emit_roster()
@@ -4748,6 +4787,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             else:
                 broadcast_start(save=False)       # legacy start, no transfer
         elif c == "quit":
+            _STOPPING[0] = True               # a SIGTERM from here on must not cut the cleanup short
             stop.set()
         elif not relay_only:
             _report_command(cmd, io, log, publisher.url if publisher is not None else None)
@@ -4966,9 +5006,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     # frozen join is started now (no START GAME push for it)
                     for p in peers.values():
                         p["started"] = True
+                        p["stage"] = ""
+                    # The barrier has verified every loaded world. Legacy menu
+                    # stage watchers are bypassed by frozen joins, so Windows
+                    # 0.6.1.18 can otherwise leave "receiving save 100%" forever
+                    # and block company changes on every participant.
+                    host_stage[0] = ""
                     started[0] = True
                     io.emit(dict(type='transport_lobby', epoch=transport_lobby))
                     send_roster_packets()
+                    emit_roster()
 
             if now - last_heal >= ROSTER_HEAL:
                 last_heal = now
@@ -5339,6 +5386,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     except KeyboardInterrupt:
         pass
     finally:
+        _STOPPING[0] = True
         try:
             _log_sinks.remove(own_fwd.add)
         except ValueError:
@@ -5822,6 +5870,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                          "detail": "uploading the save to the relay..."})
                 log(f"[client] uploading {cmd.get('save')} ({len(blob)} B) to the relay")
         elif c == "quit":
+            _STOPPING[0] = True
             send({"t": "leave"})
             io.emit({"type": "status", "state": "failed", "detail": "left lobby"})
             stop.set()
@@ -5953,6 +6002,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     except KeyboardInterrupt:
         send({"t": "leave"})
     finally:
+        _STOPPING[0] = True
         io.write_state(state="failed" if io._state.get("state") == "failed" else "disconnected", started=False)
         lines = fwd.drain(time.time() + LOG_FLUSH_INTERVAL)   # last words
         if lines:
@@ -5991,6 +6041,17 @@ def _make_relay(args):
         return None
 
 
+def _host_upnp_unmap(port):
+    """Remove the UPnP mapping the host's observe step keeps for the session
+    (observe(..., keep_upnp=True)). Best-effort."""
+    try:
+        from observe import upnp_unmap
+        if upnp_unmap(port):
+            _log(f"[host] UPnP mapping for udp/{port} removed")
+    except Exception as e:                            # noqa: BLE001
+        _log(f"[host] UPnP unmap skipped: {e}")
+
+
 def cmd_host(args):
     io = LobbyIO(args.io_dir or os.getcwd())
     io.emit({"type": "status", "state": "waiting", "detail": "observing NAT"})
@@ -6024,48 +6085,56 @@ def cmd_host(args):
         secret = os.urandom(SECRET_LEN)
     SEAL[0] = Sealer(derive_key(secret, args.password or ""))
     tunnel = _steam_tunnel(args)
-    sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
-                                                 password=args.password or None,
-                                                 extra_candidates={"steam": tunnel.id})
-    MY_TCP_ADDRS[0] = _profile_ips(_profile)      # named to Steam peers for the TCP bulk channel
-    if tunnel.available:
-        tunnel.hello(sock.getsockname()[1])   # the code names our SteamID; joiners reach us through Steam too
-    # Steam by default: a game with Steam's networking shows its Steam ID as the code;
-    # --crossplay (the menu's CROSS-PLAY), a relay and a dedicated server keep the classic
-    # code, which players without Steam can use. Switchable live ('crossplay' command).
+    try:
+        sock, _profile, code = _observe_and_announce(args.local_port, secret=secret,
+                                                     password=args.password or None,
+                                                     extra_candidates={"steam": tunnel.id})
+        MY_TCP_ADDRS[0] = _profile_ips(_profile)
+        if tunnel.available:
+            tunnel.hello(sock.getsockname()[1])
+    except BaseException:
+        # Stopped while observing (outside Windows: SIGTERM or --parent-pid).
+        # observe() may already have added the mapping it keeps for the session,
+        # and the try/finally below that removes it does not exist yet.
+        _host_upnp_unmap(args.local_port)
+        tunnel.close()
+        raise
     steam_code = tunnel.id if tunnel.available and not args.relay_only and not getattr(args, "dedicated", False) else None
     crossplay = bool(getattr(args, "crossplay", False)) or not steam_code
-    if args.password:
-        _log("[host] the code is LOCKED: without the password it reveals nothing")
-    else:
-        _log("[host] the code is plain: anyone who sees it can read your address "
-             "-- set a password to lock it")
-    _log("[host] frames are sealed (session key from the code"
-         + (" + password)" if args.password else ")"))
     publisher = None
-    if args.publish:
-        publisher = _Publisher(args.publish, code if crossplay else steam_code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
-                               stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
-        # systemd stops the relay with SIGTERM; without a handler Python just
-        # dies and the finally: below (publisher.close -> /leave) never runs,
-        # so the public list kept the dead row for a full TTL
-        import signal as _sig
-        def _term(_signo, _frame):
-            raise KeyboardInterrupt
-        try:
-            _sig.signal(_sig.SIGTERM, _term)
-        except (ValueError, OSError):
-            pass
-        publisher.update(args.lobby_name or args.name, 0 if args.relay_only else 1)
-        if args.public:
-            publisher.set(True)
-    # a dedicated relay's port is open by construction: only a player host punches
     rendezvous = None
-    rv_url = "" if args.relay_only else _rv_url(args)
-    if rv_url:
-        rendezvous = _RendezvousHost(rv_url, secret, args.password or "", _log, tunnel=tunnel)
-        _log(f"[rendezvous] polling {rv_url} for joiners to punch toward")
+    # From here on the mapping exists: every way out -- run_host returning, or a
+    # stop before the lobby loop is up -- goes through the finally.
     try:
+        if args.password:
+            _log("[host] the code is LOCKED: without the password it reveals nothing")
+        else:
+            _log("[host] the code is plain: anyone who sees it can read your address "
+                 "-- set a password to lock it")
+        _log("[host] frames are sealed (session key from the code"
+             + (" + password)" if args.password else ")"))
+        if args.publish:
+            publisher = _Publisher(args.publish, code if crossplay else steam_code, "relay" if args.relay_only else ("dedicated" if getattr(args, "dedicated", False) else "host"), bool(args.password), _log,
+                                   stable_key=f"relay|{args.lobby_name}|{args.local_port}" if args.relay_only else None)
+            # systemd stops the relay with SIGTERM; without a handler Python just
+            # dies and the finally: below (publisher.close -> /leave) never runs,
+            # so the public list kept the dead row for a full TTL
+            import signal as _sig
+            def _term(_signo, _frame):
+                raise KeyboardInterrupt
+            try:
+                # outside Windows main() already installed the once-only _on_sigterm
+                _sig.signal(_sig.SIGTERM, _term if sys.platform == "win32" else _on_sigterm)
+            except (ValueError, OSError):
+                pass
+            publisher.update(args.lobby_name or args.name, 0 if args.relay_only else 1)
+            if args.public:
+                publisher.set(True)
+        # A dedicated relay's port is open by construction; only player hosts punch.
+        rv_url = "" if args.relay_only else _rv_url(args)
+        if rv_url:
+            rendezvous = _RendezvousHost(rv_url, secret, args.password or "", _log, tunnel=tunnel)
+            _log(f"[rendezvous] polling {rv_url} for joiners to punch toward")
         if args.relay_only:
             _log("[host] RELAY-ONLY: no game here; the oldest joiner is the leader")
         else:
@@ -6079,17 +6148,13 @@ def cmd_host(args):
                  cross_code=code, steam_code=steam_code,
                  steam_secret=secret if steam_code else None, crossplay=crossplay)
     finally:
+        _STOPPING[0] = True
         if rendezvous is not None:
             rendezvous.close()
         if publisher is not None:
             publisher.close()
         tunnel.close()
-        try:
-            from observe import upnp_unmap
-            if upnp_unmap(args.local_port):
-                _log(f"[host] UPnP mapping for udp/{args.local_port} removed")
-        except Exception as e:                            # noqa: BLE001
-            _log(f"[host] UPnP unmap skipped: {e}")
+        _host_upnp_unmap(args.local_port)
     return 0
 
 
@@ -7426,13 +7491,17 @@ def selftest_relay():
             return False
         print("[selftest-relay] lobby formed; sending frames")
 
-        # (a) N frames each way, interleaved, lightly paced (bursts are what a
-        #     real bridge does too, but we're proving routing, not buffers).
-        for i in range(N):
-            bridge_a.sendto(frame(b"A", i), ("127.0.0.1", RELAY_HOST))
-            bridge_b.sendto(frame(b"B", i), ("127.0.0.1", RELAY_JOIN))
-            if i % 20 == 19:
-                time.sleep(0.002)
+        # (a) Drain while transmitting, like the real bridge. Waiting until
+        # all 200 packets were sent overflowed Linux's default receive queue
+        # at 185 packets even though both relay delivery counters read 200.
+        def send_frames():
+            for i in range(N):
+                bridge_a.sendto(frame(b"A", i), ("127.0.0.1", RELAY_HOST))
+                bridge_b.sendto(frame(b"B", i), ("127.0.0.1", RELAY_JOIN))
+                if i % 20 == 19:
+                    time.sleep(0.002)
+        sender = threading.Thread(target=send_frames, name="relay-test-sender", daemon=True)
+        sender.start()
 
         got = {b"A": set(), b"B": set()}          # tag -> indices received
         bad = 0
@@ -7462,6 +7531,7 @@ def selftest_relay():
                         continue
                     got[tag].add(idx)
 
+        sender.join(timeout=1)
         for tag, dst in ((b"A", "joiner"), (b"B", "host")):
             missing = sorted(set(range(N)) - got[tag])
             if missing:
@@ -7706,6 +7776,146 @@ def selftest_mesh():
 
 
 # --------------------------------------------------------------------------- #
+# Linux: the process around the lobby
+# --------------------------------------------------------------------------- #
+# On Windows the menu DLL starts netpunch.exe inside a kill-on-close Job object
+# and reads the public list with WinHTTP. On Linux the game's menu library starts
+# this program itself (docs/linux/NETPUNCH.md), so three things live here:
+#   * --print-public-list URL: the server browser's GET <master>/list;
+#   * SIGTERM leaves like a quit (leave / bye), so the launcher can stop us;
+#   * --parent-pid PID: leave once the game has exited, crashed or not. A dead
+#     game sends no quit, and PR_SET_PDEATHSIG fires when the THREAD that
+#     started us ends, not the game.
+PUBLIC_LIST_TIMEOUT = 5.0       # s, the Windows panel's WinHTTP timeouts
+PARENT_POLL = 1.0               # s between looks at --parent-pid
+
+# True once the lobby is leaving on its own: a quit command, or the finally: of
+# run_host / run_client / cmd_host. The launcher follows its quit with SIGTERM
+# after a fixed wait (lobby_linux.cpp: 1.5 s), and the host's cleanup after
+# run_host -- publisher.close() waiting for /leave (up to 6 s), the UPnP unmap
+# (a blocking discover) -- can take longer; a KeyboardInterrupt there would skip
+# /leave and the unmap. Only _on_sigterm reads it.
+_STOPPING = [False]
+
+
+def print_public_list(master_url, timeout=PUBLIC_LIST_TIMEOUT):
+    """GET <master_url>/list and print the body; 0 on HTTP 200. Anything else
+    prints one line on stdout -- ``HTTP <code>`` or the error -- and returns 1:
+    the two outcomes httpGet() in menu_hook.cpp tells apart. The answer goes to
+    stdout only. A reader that stops reading early gets exit status 1 and no
+    traceback on stderr."""
+    import http.client
+    import urllib.error
+    import urllib.request
+    url = str(master_url).rstrip("/") + "/list"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "tpf2mp-lobby/" + LOBBY_VERSION})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            status, body = r.status, r.read()
+        if status == 200:
+            rc, out = 0, body if body.endswith(b"\n") else body + b"\n"
+        else:
+            rc, out = 1, f"HTTP {status}\n".encode("ascii")
+    except urllib.error.HTTPError as e:
+        rc, out = 1, f"HTTP {e.code}\n".encode("ascii")
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as e:
+        detail = getattr(e, "reason", None) or e
+        line = " ".join(str(detail).split()) or type(e).__name__
+        rc, out = 1, (line + "\n").encode("utf-8", "replace")
+    if sys.stdout is None:
+        return rc
+    try:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(out)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader has gone (a 500-row list is about 170 KB). Point stdout at
+        # /dev/null, or the interpreter's own flush at exit reports the same
+        # broken pipe on stderr.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 1
+    return rc
+
+
+def _on_sigterm(_signo, _frame):
+    # Once: the launcher's group SIGTERM, PR_SET_PDEATHSIG and the --parent-pid
+    # watch can all arrive, and a second KeyboardInterrupt landing in the first
+    # one's cleanup would cut the leave / bye short. Not at all while the lobby
+    # is already leaving (_STOPPING): that cleanup keeps running and gets the
+    # launcher's whole SIGTERM wait before its SIGKILL.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if _STOPPING[0]:
+        return
+    raise KeyboardInterrupt
+
+
+def _proc_identity(pid):
+    """(start time, alive) of ``pid`` from /proc/<pid>/stat. The start time
+    (field 22) and the pid together name one process, so a reused pid is not
+    taken for the game; a zombie counts as gone."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read().decode("ascii", "replace")
+    except OSError:
+        return None, False
+    fields = stat[stat.rfind(")") + 2:].split()      # the name may hold spaces
+    if len(fields) < 20:
+        return None, True
+    return fields[19], fields[0] != "Z"
+
+
+def _parent_alive(pid, start):
+    if os.path.isdir("/proc/self"):
+        now_start, alive = _proc_identity(pid)
+        return alive and (start is None or now_start == start)
+    try:                                              # no /proc: existence only
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+def _watch_parent(pid, log=_log):
+    """Leave once process ``pid`` has exited: SIGTERM to ourselves, so the
+    KeyboardInterrupt paths that send leave / bye run. False when that process
+    is not running to begin with. Not on Windows (os.kill ends a process there)."""
+    start = _proc_identity(pid)[0] if os.path.isdir("/proc/self") else None
+    if not _parent_alive(pid, start):
+        return False
+
+    def run():
+        while _parent_alive(pid, start):
+            time.sleep(PARENT_POLL)
+        log(f"[lobby] the process that started us (pid {pid}) has exited -- leaving")
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except OSError:
+            os._exit(1)
+
+    threading.Thread(target=run, name="parent-watch", daemon=True).start()
+    return True
+
+
+def _run_mode(fn, args):
+    """cmd_host / cmd_join. Outside Windows a SIGTERM (or --parent-pid) that
+    lands before the lobby loop is up -- while observing or dialling -- ends
+    the process with a log line and exit status 130 instead of a traceback.
+    cmd_host has removed its UPnP mapping by the time this sees it."""
+    if sys.platform == "win32":
+        return fn(args)
+    try:
+        return fn(args)
+    except KeyboardInterrupt:
+        _log("[lobby] stopped before the lobby was up")
+        return 130
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def _time_left_text(seconds):
@@ -7860,8 +8070,28 @@ def main(argv=None):
                     help="the local bridge's UDP port that relayed frames are "
                          "delivered to (the menu reads it from "
                          "tpf2_instance.txt; default %(default)s)")
+    ap.add_argument("--print-public-list", metavar="MASTER_URL", default=None,
+                    help="GET MASTER_URL/list, print the body and exit 0 on HTTP "
+                         "200; otherwise print 'HTTP <code>' or the error and exit 1")
+    ap.add_argument("--parent-pid", type=int, default=0, metavar="PID",
+                    help="not on Windows: leave the lobby once process PID (the "
+                         "game that started it) has exited")
     args = ap.parse_args(argv)
     SHARE_MODS[0] = not getattr(args, "no_share_mods", False)
+
+    ca_bundle = None
+    if sys.platform != "win32":
+        import linuxpaths
+        ca_bundle = linuxpaths.ssl_cert_fallback()     # before the first HTTPS request
+    if args.print_public_list:
+        return print_public_list(args.print_public_list)
+    if args.mode in ("host", "join") and sys.platform != "win32":
+        if ca_bundle:
+            _log(f"[lobby] no CA certificates where this build's OpenSSL looks; using {ca_bundle}")
+        signal.signal(signal.SIGTERM, _on_sigterm)
+        if args.parent_pid > 0 and not _watch_parent(args.parent_pid):
+            _log(f"[lobby] --parent-pid {args.parent_pid} is not running -- not starting")
+            return 1
 
     if args.selftest:
         return 0 if selftest() else 1
@@ -7876,11 +8106,11 @@ def main(argv=None):
     if args.selftest_mesh:
         return 0 if selftest_mesh() else 1
     if args.mode == "host":
-        return cmd_host(args)
+        return _run_mode(cmd_host, args)
     if args.mode == "join":
         if not args.code:
             ap.error("join requires a CODE argument")
-        return cmd_join(args)
+        return _run_mode(cmd_join, args)
     ap.error("give a mode: host / join / --selftest / --selftest-transfer / "
              "--selftest-relay")
     return 2

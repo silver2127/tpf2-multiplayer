@@ -11,7 +11,7 @@
 #
 # Run as root (systemctl) or as tpf2server (files).
 set -eu
-ENV=/etc/tpf2mp/server.env
+ENV=${TPF2_SERVER_ENV:-/etc/tpf2mp/server.env}
 [ -f "$ENV" ] && . "$ENV"
 : "${DISPLAY:=:9}" "${LOBBY_PORT:=29472}" "${LOBBY_NAME:=Dedicated Server}" "${SERVER_NAME:=Server}" "${LOBBY_PASSWORD:=}"
 : "${COMPANIES:=1}" "${SAVE:=}" "${AUTOSAVE_MIN:=10}" "${EMPTY_SPEED:=1}" "${RENDER:=0}" "${FPS:=30}" "${MOD_RELEASE:=}" "${MASTER_URL:=}"
@@ -20,17 +20,31 @@ ENV=/etc/tpf2mp/server.env
 : "${STEAM_ROOT:=/home/tpf2server/.steam/steam}"
 : "${GAME_DIR:=$STEAM_ROOT/steamapps/common/Transport Fever 2}"
 NETDIR="$GAME_DIR/netpunch"
+: "${RUNTIME:=proton}" "${XDG_DATA_HOME:=/home/tpf2server/.local/share}"
+case "$RUNTIME" in
+native) MODDIR="$XDG_DATA_HOME/tpf2mp"; NETDIR="$MODDIR/netpunch"; MENU_LOG="$MODDIR/data/tpf2_menu.log" ;;
+proton) MODDIR="$GAME_DIR"; MENU_LOG="$GAME_DIR/tpf2_menu.log" ;;
+*) echo "RUNTIME must be native or proton" >&2; exit 2 ;;
+esac
 as_server() { if [ "$(id -un)" = tpf2server ]; then "$@"; else sudo -u tpf2server "$@"; fi; }
 
 cmd=${1:-status}; shift || true
 case "$cmd" in
 status)
     for u in tpf2mp-xvfb tpf2mp-steam tpf2mp-game; do printf '%-14s %s\n' "$u" "$(systemctl is-active $u 2>/dev/null || echo unknown)"; done
-    if pgrep -f TransportFever2.exe >/dev/null 2>&1; then echo "game: running (pid $(pgrep -f TransportFever2.exe | head -1))"; else echo "game: not running"; fi
+    if [ "$RUNTIME" = native ]; then pattern='(^|/)TransportFever2($| )'; else pattern='TransportFever2[.]exe'; fi
+    game_pid=$(pgrep -u tpf2server -f "$pattern" | head -1 || true)
+    if [ -n "$game_pid" ]; then echo "game: running ($RUNTIME, pid $game_pid)"; else echo "game: not running ($RUNTIME)"; fi
     [ -f "$NETDIR/lobby_proc.log" ] && grep -a "^CODE=\|\[host\] JOIN\|\[host\] LEAVE\|DROP\|listed publicly" "$NETDIR/lobby_proc.log" | tail -6
-    [ -f "$GAME_DIR/tpf2_menu.log" ] && grep -a "\[dedicated\]" "$GAME_DIR/tpf2_menu.log" | tail -4
+    if [ -f "$MENU_LOG" ]; then grep -a "\[dedicated\]" "$MENU_LOG" | tail -4; fi
     ;;
 install)
+    if [ "$RUNTIME" = native ]; then
+        : "${NATIVE_RELEASE_DIR:?Set NATIVE_RELEASE_DIR to an unpacked Linux mod release}"
+        as_server bash "$NATIVE_RELEASE_DIR/install.sh" --game "$GAME_DIR" --data-home "$XDG_DATA_HOME" "$@"
+        echo "installed; now: tpf2server configure"
+        exit 0
+    fi
     # the release's installer: it finds Steam, the game and the Proton prefix by itself
     url="https://github.com/silver2127/tpf2-multiplayer/releases/${MOD_RELEASE:+download/v$MOD_RELEASE}${MOD_RELEASE:-latest/download}/install_proton.sh"
     tmp=$(mktemp -d); chmod 755 "$tmp"          # readable by the tpf2server user the installer runs as
@@ -41,8 +55,8 @@ install)
     ;;
 configure)
     [ -d "$GAME_DIR" ] || { echo "game dir not found: $GAME_DIR (install the game in the Steam client first)"; exit 1; }
-    flags="$GAME_DIR/tpf2_menu_flags.txt"
-    as_server sh -c "cat > '$flags'" <<EOF
+    flags="$MODDIR/tpf2_menu_flags.txt"
+    as_server sh -c 'cat > "$1"' sh "$flags" <<EOF
 dedicated=1
 dedicated_save=$SAVE
 dedicated_lobby=$LOBBY_NAME
@@ -86,14 +100,14 @@ EOF
     done
     ;;
 start)   systemctl start tpf2mp-game ;;
-stop)    systemctl stop tpf2mp-game; pkill -9 -f "^[A-Za-z]:.*TransportFever2[.]exe" 2>/dev/null || true ;;
-restart) systemctl restart tpf2mp-game; pkill -9 -f "^[A-Za-z]:.*TransportFever2[.]exe" 2>/dev/null || true ;;
-logs)    tail -n "${1:-40}" "$GAME_DIR/tpf2_menu.log" ;;
+stop)    systemctl stop tpf2mp-game; [ "$RUNTIME" = native ] || pkill -9 -u tpf2server -f "^[A-Za-z]:.*TransportFever2[.]exe" 2>/dev/null || true ;;
+restart) systemctl stop tpf2mp-game; if [ "$RUNTIME" = proton ]; then pkill -9 -u tpf2server -f "^[A-Za-z]:.*TransportFever2[.]exe" 2>/dev/null || true; fi; systemctl start tpf2mp-game ;;
+logs)    tail -n "${1:-40}" "$MENU_LOG" ;;
 code)    grep -a "^CODE=" "$NETDIR/lobby_proc.log" | tail -1 ;;
 say)
     [ $# -gt 0 ] || { echo "usage: tpf2server say <text>"; exit 2; }
     text=$(printf '%s' "$*" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
-    as_server sh -c "printf '%s\n' '{\"cmd\":\"chat\",\"text\":$text}' >> '$NETDIR/lobby_in.jsonl'"
+    printf '{"cmd":"chat","text":%s}\n' "$text" | as_server sh -c 'cat >> "$1"' sh "$NETDIR/lobby_in.jsonl"
     ;;
 *) sed -n 2,12p "$0"; exit 2 ;;
 esac
