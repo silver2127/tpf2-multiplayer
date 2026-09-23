@@ -196,3 +196,7 @@ Big Maps Windows GOG documentation; native runtime behavior is unchanged.
 The [dev `63a3b8df` integration](docs/linux/UPSTREAM_dev_63a3b8df.md) records
 upstream depth-13 gameplay and native dedicated multiplayer results. Native
 defaults and placement limits remain unchanged; no local live run was repeated.
+
+The [dev `4616c16a` integration](docs/linux/UPSTREAM_dev_4616c16a.md) adds
+upstream's Big Maps performance catalog with native feature/default scope.
+Runtime behavior is unchanged; the listed gains are upstream measurements.
