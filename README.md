@@ -176,3 +176,8 @@ Version remains 0.7; loaded-world validation is still outstanding.
 The [dev `b4b629a2` integration](docs/linux/UPSTREAM_dev_b4b629a2.md) prevents
 per-frame script state sync from rewinding the town-growth clock. Shared Lua
 and native tests pass; live growth validation remains outstanding. Version remains 0.7.
+
+The [dev `522a303b` integration](docs/linux/UPSTREAM_dev_522a303b.md) reports the slowest hash's
+lane breakdown and the cost of post-hash broadcast, drift and comparison work.
+Shared Lua regression tests pass; no live performance measurement is claimed.
+Version remains 0.7.

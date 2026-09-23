@@ -330,3 +330,8 @@ configured save. Version remains 0.7.
 The [dev `cf5f8a0e` integration](UPSTREAM_dev_cf5f8a0e.md) makes load-time company
 switches wait for entity queries to answer and reuses live saved player entities.
 Version remains 0.7; loaded-world validation is still outstanding.
+
+The [dev `522a303b` integration](UPSTREAM_dev_522a303b.md) reports the slowest hash's
+lane breakdown and the cost of post-hash broadcast, drift and comparison work.
+Shared Lua regression tests pass; no live performance measurement is claimed.
+Version remains 0.7.
