@@ -165,3 +165,6 @@ the game started, so cross-platform gameplay validation remains outstanding.
 The [dev `582a380` integration](docs/linux/UPSTREAM_dev_582a380.md) makes native dedicated
 restarts prefer a newer autosave of the hosted `mp_shared` world over the
 configured save. Version remains 0.7.
+
+The [dev `e63ceefc` integration](docs/linux/UPSTREAM_dev_e63ceefc.md) retains
+upstream's dedicated-server performance report; runtime code is unchanged.
