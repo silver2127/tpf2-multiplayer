@@ -208,12 +208,30 @@ O(n) scan inside either one is O(n^2) a step. Suggestions, cheapest first:
   the boot log so the next profile does not have to be a `perf` run on the live
   server.
 
-The other measured costs on that thread, for scale: the `Readable` probe's
-`process_vm_readv` plus its kernel iovec and radix paths is ~5% (it replaced a
-`/proc/self/maps` parse that was 32%, so this is already the cheap version), and
-the mod's own world hash freezes the clock for ~5 s every 84 game units -- two
-stalls of 5.30 s and 4.82 s in a 120 s window, about 8% of wall time at 2x and
-~24% at 4x. That one is ours, in `mod/mp_lockstep_1/res/scripts/mp/hash.lua`.
+**The slow patches are the same two functions.** The server's clock does not run
+evenly: in a 120 s window it advanced at 2.02 units a second overall but twice
+crawled for ~5 s. A capture triggered on the stall itself (watch the dash at
+20 Hz, profile the moment the clock has not moved for 1.6 s) caught two of them,
+and both read the same:
+
+```
+9.70% TargetInsert  8.93% TargetErase  5.31% exe+0xa6139c  4.18% _int_malloc
+10.72% TargetErase  10.52% TargetInsert  3.24% exe+0xa6139c  2.61% process_vm_readv
+```
+
+So there is no separate hitch to chase: the clock slows when the person target
+churn spikes, and the same pair dominates. The libc share beside them (4-6%
+`_int_malloc`, `__libc_malloc2`, `malloc_consolidate`) most likely belongs to the
+same containers, so a fix that stops reallocating per operation takes that too:
+about 25-27% of the thread in total.
+
+The other measured cost on that thread, for scale: the `Readable` probe's
+`process_vm_readv` plus its kernel iovec and radix paths is ~5%, and it replaced a
+`/proc/self/maps` parse that was 32%, so it is already the cheap version. The
+mod's own world hash is NOT a factor at the live cadence: the leader had stamped
+`HASHEVERY every=576` with `hc=3089` in the heartbeat, which is 3.1 s every 576
+game units -- about 1% of wall time at 2x and 2% at 4x. (The 84-unit interval the
+log prints at load is only the starting value, before the cost ladder lands.)
 
 ## Not an order bug: the render clock stepped back (speed hook)
 
