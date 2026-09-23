@@ -3525,6 +3525,29 @@ static bool newestSave(wchar_t* out, int cch)
     return true;
 }
 
+// The newest autosave THIS server made of the world it is hosting. The engine
+// names an autosave of mp_shared.sav (our placed copy) autosave_mp_shared_<date>.sav,
+// so the pattern matches our own saves only and never an unrelated world someone
+// dropped in the folder. A server that has been playing has one of these newer than
+// its configured dedicated_save, and that is the world the players were in.
+static bool newestOwnAutosave(wchar_t* out, int cch, ULONGLONG* mtimeOut)
+{
+    wchar_t pat[700]; _snwprintf_s(pat, _TRUNCATE, L"%s\\autosave_mp_shared*.sav", SAVE_DIR);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    ULONGLONG best = 0; wchar_t bestName[300] = L"";
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (t > best) { best = t; wcscpy_s(bestName, fd.cFileName); }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    if (!bestName[0]) return false;
+    _snwprintf_s(out, cch, _TRUNCATE, L"%s\\%s", SAVE_DIR, bestName);
+    if (mtimeOut) *mtimeOut = best;
+    return true;
+}
+
 static void stampNow(const wchar_t* path)
 {
     HANDLE f = CreateFileW(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -4422,6 +4445,19 @@ static void DedicatedTick()
             wchar_t wn[64]; MultiByteToWideChar(CP_UTF8, 0, g_flagDedSave, -1, wn, 64);
             _snwprintf_s(path, _TRUNCATE, L"%s\\%s.sav", SAVE_DIR, wn);
             if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) { Log("[dedicated] %ls not found -- loading the newest save instead\n", path); path[0] = 0; }
+            // ... but never rewind a world that has been played: the configured save is
+            // whatever the operator last put there (hours ago), while this server's own
+            // autosaves are where the players actually are. A restart or a crash comes
+            // back to the newest of those (2026-09-22: a restart would have thrown away
+            // an hour of a live session).
+            if (path[0]) {
+                wchar_t res[600] = L""; ULONGLONG rt = 0, sz = 0;
+                const ULONGLONG ct = saveMtime(path, &sz);
+                if (newestOwnAutosave(res, 600, &rt) && rt > ct) {
+                    Log("[dedicated] %ls is newer than the configured save -- resuming that world\n", res);
+                    wcscpy_s(path, res);
+                }
+            }
         }
         if (!path[0] && !newestSave(path, 600)) {
             Log("[dedicated] no save in %ls -- nothing to load (put one there, or set dedicated_save)\n", SAVE_DIR);

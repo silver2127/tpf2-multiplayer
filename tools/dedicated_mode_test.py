@@ -47,6 +47,10 @@ check("no lobby -> host one (StartLobby(0)) with the flags' names", "StartLobby(
 check("a world without a lobby is left alone (the moment after a crash to the menu)", "if (world) return;" in tick)
 check("lobby up, no world -> the configured save, else the newest, through the shared-save autoload",
       "newestSave(path, 600)" in tick and "doStartLoad(path)" in tick and "MarkSaveShared();" in tick)
+check("a restart resumes this server's newest autosave when it is newer than the configured save",
+      "newestOwnAutosave(res, 600, &rt) && rt > ct" in tick and "wcscpy_s(path, res);" in tick)
+check("that autosave scan matches only the world this server placed (autosave_mp_shared*)",
+      'L"%s\\\\autosave_mp_shared*.sav", SAVE_DIR' in MENU)
 check("no load while one is pending or the native side is busy",
       "InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()" in tick)
 check("world up -> the game's own autosave every dedicated_autosave_min, never during a native operation",
