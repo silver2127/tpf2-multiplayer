@@ -1731,9 +1731,12 @@ class _HostSaveTransfer:
         if state == "connecting" and now - p.setdefault("tcp_ui_since", now) >= TCP_FIRST_WAIT:
             state = "unavailable"
         event = p["ui_meter"].event(now, min(p["base"] * self.chunk, self.total_bytes),
-                                   self.total_bytes, transport, state, "send", p["name"])
+                                   self.total_bytes, transport, state, "send", p["name"],
+                                   (self.begin_msg.get("tcp") or {}).get("port"))
         if event:
             self.io.emit(event)
+            if event["show_hint"]:
+                self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": event["hint"]})
 
     def _emit_pct(self, p):
         if self.total_bytes == 0:
@@ -2654,6 +2657,7 @@ class _ClientSaveReceiver:
         self.batch_done = False
         self.ui_meter = TransferMeter()
         self.tcp_status = "connecting" if msg.get("tcp") and BULK_TCP[0] else "off"
+        self.tcp_host_port = (msg.get("tcp") or {}).get("port") if isinstance(msg.get("tcp"), dict) else None
         self.tcp_active = False
         self.log(f"[client] save incoming sid={sid} {self.total_bytes}B "
                  f"{self.total_chunks} chunks")
@@ -2854,9 +2858,11 @@ class _ClientSaveReceiver:
         transport = "TCP" if self.tcp_active or (self.tcp_bytes and self.recv_bytes >= self.total_bytes) else (
             "Steam" if steamtunnel.is_tunnel_addr(getattr(self.conn, "peer", None)) else "UDP")
         event = self.ui_meter.event(now, self.recv_bytes, self.total_bytes,
-                                    transport, self.tcp_status, "recv")
+                                    transport, self.tcp_status, "recv", host_port=getattr(self, "tcp_host_port", None))
         if event:
             self.io.emit(event)
+            if event["show_hint"]:
+                self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": event["hint"]})
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):

@@ -146,6 +146,13 @@ retransmissions are not counted as useful throughput. `TCP failed` or
 `TCP unavailable` means Steam/UDP is carrying the transfer; it does not identify
 which router or firewall blocked the connection.
 
+The normal host uses **TCP 29471**. A joiner's local port is selected dynamically;
+`--local-port` or the dedicated-server port setting can change the host port.
+When TCP fails, the lobby chat and resync panel name the actual advertised host
+port to check in the router/firewall. For IPv4, forward that TCP port to the host
+PC if automatic mapping is unavailable. No manual mapping is required when a
+direct path already works; opening both participants' ports is not necessary.
+
 Regression checks: `python tools/test_tcp_connectivity.py`,
 `python tools/test_transfer_status.py` and `python tools/test_steam_tcp.py`.
 These are local socket/simulation tests, not proof of Internet reachability.

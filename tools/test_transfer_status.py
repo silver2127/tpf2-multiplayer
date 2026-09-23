@@ -8,6 +8,17 @@ from transfer_status import TransferMeter
 
 
 class TransferStatus(unittest.TestCase):
+    def test_hint_uses_actual_host_port_and_is_announced_once(self):
+        meter = TransferMeter()
+        self.assertEqual(meter.event(0, 0, 10, "Steam", "connecting", "recv", host_port=34567)["hint"], "")
+        event = meter.event(1, 1, 10, "Steam", "failed", "recv", host_port=34567)
+        self.assertIn("TCP 34567", event["hint"])
+        self.assertTrue(event["show_hint"])
+        self.assertFalse(meter.event(2, 2, 10, "Steam", "failed", "recv", host_port=34567)["show_hint"])
+        self.assertEqual(meter.event(3, 3, 10, "TCP", "connected", "recv", host_port=34567)["hint"], "")
+        for port in (None, 0, -1, 65536, True):
+            self.assertEqual(TransferMeter().event(0, 0, 10, "Steam", "failed", "recv", host_port=port)["hint"], "")
+
     def test_progress_stall_and_retry(self):
         meter = TransferMeter()
         event = meter.event(10, 0, 113_000_000, "Steam", "connecting", "send", "Player")

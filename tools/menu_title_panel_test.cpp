@@ -129,10 +129,11 @@ int wmain(int argc,wchar_t** argv)
     g_gameUi=1; g_uiState=3; g_flagScale=1;
     strcpy_s(g_recoveryPhase,"transferring");
     strcpy_s(g_recoveryDetail,"Waiting for all players to receive the host snapshot.");
-    SetTransferDetail("To Player 1 | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s");
+    SetTransferDetail("To Player 1 | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s",
+        "Check host router/firewall: allow TCP 29471. IPv4 may need port forwarding to the host PC.");
     RenderPanelLayer(520,360); check(520,360);
     snapshot(folder/L"resync-transfer.bmp",520,360);
-    SetTransferDetail(""); g_recoveryPhase[0]=0;
+    SetTransferDetail(""); assert(!g_transferHint[0]); g_recoveryPhase[0]=0;
     // Both Vulkan and OpenGL use this CPU surface path. Exercise full-frame
     // composition with padded rows and a rebuilt allocation at the same size.
     g_gameUi=0; g_uiState=1; g_titleTab=0; g_scExtent={1280,800};

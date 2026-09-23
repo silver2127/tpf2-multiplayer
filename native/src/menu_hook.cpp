@@ -559,6 +559,7 @@ static volatile LONG g_autoLoadPending = 0;
 static ULONGLONG     g_autoLoadSince = 0;
 static char g_status[256] = "";
 static char g_transferDetail[256] = ""; // shared by lobby and resync; guarded by g_statusCs
+static char g_transferHint[192] = "";
 // A pending "download the mods this save needs?" question from the lobby
 // (guarded by g_statusCs). YES / NO buttons take the status line while set.
 static char g_modsPrompt[300] = "";
@@ -660,8 +661,9 @@ static void chatPush(const char* from, const char* text)
 static CRITICAL_SECTION g_statusCs; static bool g_csInit = false;
 static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSection(&g_statusCs);
     strncpy_s(g_status, s, _TRUNCATE); LeaveCriticalSection(&g_statusCs); InterlockedExchange(&g_panelDirty, 1); }
-static void SetTransferDetail(const char* s) { if (!g_csInit) return; EnterCriticalSection(&g_statusCs);
-    strncpy_s(g_transferDetail, s, _TRUNCATE); LeaveCriticalSection(&g_statusCs); InterlockedExchange(&g_panelDirty, 1); }
+static void SetTransferDetail(const char* s, const char* hint="") { if (!g_csInit) return; EnterCriticalSection(&g_statusCs);
+    strncpy_s(g_transferDetail, s, _TRUNCATE); strncpy_s(g_transferHint, hint, _TRUNCATE);
+    LeaveCriticalSection(&g_statusCs); InterlockedExchange(&g_panelDirty, 1); }
 
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
 static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
@@ -1316,6 +1318,11 @@ static void RenderPanelLayer(int w, int h)
             label=readyLabel;
         }
         mwBody(pad,cy,w-2*pad,S(40),label);
+        if(!strcmp(phase,"transferring")) {
+            EnterCriticalSection(&g_statusCs);
+            if(g_transferHint[0]) strncpy_s(detail,g_transferHint,_TRUNCATE);
+            LeaveCriticalSection(&g_statusCs);
+        }
         if(detail[0]) { wchar_t text[420]; MultiByteToWideChar(CP_UTF8,0,detail,-1,text,420);
             mwBody(pad,cy+S(42),w-2*pad,S(60),text,MW_DIM); }
         if(!strcmp(phase,"transferring")) {
@@ -4086,11 +4093,12 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));
                             char detail[256]; jsonStr(rem, "detail", detail, sizeof(detail));
+                            char hint[192]; jsonStr(rem, "hint", hint, sizeof(hint));
                             int pct = jsonInt(rem, "pct"); char msg[96];
                             char peer[40]; jsonStr(rem, "peer", peer, sizeof(peer));
                             bool toRelay = strcmp(peer, "relay") == 0;
                             if (strcmp(st, "done") == 0) { SetTransferDetail(""); SetStatus(WorldLoaded() ? "Game running. New players can join this lobby." : "Save transfer complete."); g_xfer[0] = 0; }
-                            else if (detail[0] && !st[0]) { SetTransferDetail(detail); SetStatus(detail); strncpy_s(g_xfer,detail,_TRUNCATE); }
+                            else if (detail[0] && !st[0]) { SetTransferDetail(detail,hint); SetStatus(detail); strncpy_s(g_xfer,detail,_TRUNCATE); }
                             else if (st[0]) { if(strcmp(st,"tcp")) { SetTransferDetail(""); if(detail[0]) SetStatus(detail); } g_xfer[0] = 0; }
                             else if (strcmp(role, "recv") == 0) { if (pct >= 0) { snprintf(msg, sizeof(msg), "Receiving save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); snprintf(g_xfer, sizeof(g_xfer), "receiving %d%%", pct); } }
                             else if (pct >= 0) { snprintf(msg, sizeof(msg), toRelay ? "Uploading save to the relay\xE2\x80\xA6 %d%%" : "Sending save\xE2\x80\xA6 %d%%", pct); SetStatus(msg);
