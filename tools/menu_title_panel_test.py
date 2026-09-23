@@ -1,7 +1,8 @@
 """Build and exercise the real menu renderer without installing or starting the game."""
 import os
-import shutil
+import argparse
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
@@ -9,6 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--artifacts", type=Path, help="Keep rendered BMP previews in this directory")
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="tpf2-title-test-") as folder:
         out = Path(folder)
         commands = [
@@ -31,8 +35,10 @@ def main():
         script.write_text("\n".join(commands) + "\n", encoding="utf-8")
         env = dict(os.environ, TPF2_BUILD_NO_DEPLOY="1")
         subprocess.run(["cmd", "/d", "/c", str(script)], cwd=ROOT, env=env, check=True)
-        if os.environ.get("TPF2_TEST_ARTIFACTS"):
-            shutil.copytree(out / "menu_title_panel_test-fixture", os.environ["TPF2_TEST_ARTIFACTS"], dirs_exist_ok=True)
+        if args.artifacts:
+            args.artifacts.mkdir(parents=True, exist_ok=True)
+            for preview in (out / "menu_title_panel_test-fixture").glob("*.bmp"):
+                shutil.copy2(preview, args.artifacts / preview.name)
 
 
 if __name__ == "__main__":

@@ -534,6 +534,9 @@ static volatile LONG g_recoveryWorldIo = 0;
 // no clicks then; when the world is up it hands over to the in-game panel, open,
 // so the catch-up is visible too, until the player closes it.
 static volatile LONG g_loadingPanel = 0;
+// NativeControl resync loads bypass the lobby's start handler. The engine's
+// loading page must arm progress too; consume this on the render/stage thread.
+static volatile LONG g_loadingStagePending = 0;
 static ULONGLONG g_recoveryRequestedAt = 0; // guarded by g_modelCs
 static char g_recoveryOperation[40] = "", g_recoveryEpoch[40] = "";
 static char g_recoveryPhase[24] = "", g_recoveryDetail[420] = "", g_recoveryFailedStep[24] = "";
@@ -803,7 +806,7 @@ static void LoadLato()
 static float UiScale() {
     float scale = g_flagScale > 0.f ? g_flagScale : (g_scExtent.height ? g_scExtent.height / 1080.f : 1.f);
     // Keep the menu dialog inside the viewport even with a large manual scale.
-    if ((g_uiState==1 || g_uiState==2) && g_scExtent.width && g_scExtent.height) {
+    if ((g_uiState>=1 && g_uiState<=3) && g_scExtent.width && g_scExtent.height) {
         scale = (std::min)(scale, g_scExtent.width / 800.f);
         scale = (std::min)(scale, g_scExtent.height / 560.f);
     }
@@ -1273,85 +1276,11 @@ static void mwStatus(int w, int h)
 static void RenderPanelLayer(int w, int h)
 {
     g_s = UiScale(); layerBegin(w, h); g_hitCount = 0;
-    layerRect(0, 0, w, h, MW_BG, !WorldLoaded() && (g_uiState==1 || g_uiState==2) ? 175 : MW_BG_A);
+    layerRect(0, 0, w, h, MW_BG, !WorldLoaded() && (g_uiState>=1 && g_uiState<=3) ? 175 : MW_BG_A);
     int pad = S(25), cy = S(56);
     const LONG page=InterlockedCompareExchange(&g_uiState,0,0);
     if(RenderTitlePanel(w,h,page)) return;
-    if(page==3) {
-        char phase[24],detail[420],failedStep[24]; bool requested, readyMine; int readyCount, readyTotal;
-        EnterCriticalSection(&g_modelCs);
-        strcpy_s(phase,g_recoveryPhase); strcpy_s(detail,g_recoveryDetail); strcpy_s(failedStep,g_recoveryFailedStep);
-        requested = g_recoveryRequestedAt != 0;
-        readyMine=g_readyMine; readyCount=g_readyCount; readyTotal=g_readyTotal;
-        LeaveCriticalSection(&g_modelCs);
-        mwTitle(L"MULTIPLAYER RESYNC");
-        const bool manual = !strcmp(phase,"manual");
-        const bool detected = !strcmp(phase,"detected");
-        const bool unavailable = !strcmp(phase,"unavailable");
-        const bool readiness = !strcmp(phase,"readiness");
-        const bool host = InterlockedCompareExchange(&g_isHost,0,0)!=0;
-        if(unavailable || manual || detected) mwClose(w,85); // No hold has been acquired.
-        const wchar_t* label=L"1 / 5  Pausing all games";
-        if(manual) label=L"Reload all players from the host world.";
-        else if(detected) label=L"The game worlds are out of sync.";
-        else if(readiness) label=L"The host has requested a resync.";
-        else if(unavailable) label=L"Automatic resync is unavailable.";
-        else if(!strcmp(phase,"waiting")) label=L"All games are paused. Ready to resync.";
-        else if(!strcmp(phase,"saving")) label=L"2 / 5  Saving the host world";
-        else if(!strcmp(phase,"transferring")) label=L"3 / 5  Transferring the save";
-        else if(!strcmp(phase,"loading")) label=L"4 / 5  Loading the save";
-        else if(!strcmp(phase,"checking") || !strcmp(phase,"releasing")) label=L"5 / 5  Checking that all worlds match";
-        else if(!strcmp(phase,"complete")) label=L"All players are in sync.";
-        else if(!strcmp(phase,"aborted")) label=L"All games are paused. Ready to resync.";
-        else if(!strcmp(phase,"error")) {
-            label=L"Resync could not finish. All games remain paused.";
-            if(!strcmp(failedStep,"holding")) label=L"Could not pause all games.";
-            else if(!strcmp(failedStep,"saving")) label=L"Could not save the host world.";
-            else if(!strcmp(failedStep,"transferring")) label=L"Could not transfer the save.";
-            else if(!strcmp(failedStep,"loading")) label=L"Could not load the save.";
-            else if(!strcmp(failedStep,"checking") || !strcmp(failedStep,"releasing")) label=L"Could not verify that all worlds match.";
-        }
-        if(requested) label=host ? L"Starting resync. Waiting for confirmation..." : L"Sending your ready confirmation...";
-        wchar_t readyLabel[100];
-        if(readiness && !requested) {
-            swprintf_s(readyLabel,L"%d / %d players ready",readyCount,readyTotal);
-            label=readyLabel;
-        }
-        mwBody(pad,cy,w-2*pad,S(40),label);
-        if(!strcmp(phase,"transferring")) {
-            EnterCriticalSection(&g_statusCs);
-            if(g_transferHint[0]) strncpy_s(detail,g_transferHint,_TRUNCATE);
-            LeaveCriticalSection(&g_statusCs);
-        }
-        if(detail[0]) { wchar_t text[420]; MultiByteToWideChar(CP_UTF8,0,detail,-1,text,420);
-            mwBody(pad,cy+S(42),w-2*pad,S(60),text,MW_DIM); }
-        if(!strcmp(phase,"transferring")) {
-            char progress[256];
-            EnterCriticalSection(&g_statusCs); strcpy_s(progress,g_transferDetail); LeaveCriticalSection(&g_statusCs);
-            mwBody(pad,cy+S(108),w-2*pad,S(54),wideOf(progress[0]?progress:"Connecting for save transfer...").c_str());
-        }
-        mwBody(pad,h-S(130),w-2*pad,S(40),L"The host world is used. Client-only changes will be lost.",MW_DIM);
-        if((detected || manual) && !detail[0]) mwBody(pad,cy+S(42),w-2*pad,S(60),
-            L"Reload all games from the host's save. Play resumes automatically when all worlds match.",MW_DIM);
-        if(unavailable) mwBody(pad,cy+S(42),w-2*pad,S(60),
-            L"Resync requires all players on the same version in a player-hosted lobby.",MW_DIM);
-        if(readiness) mwBody(pad,cy+S(42),w-2*pad,S(60),
-            readyMine ? L"You are ready. Resync starts when everyone has confirmed." :
-            L"The host wants to reload all games. Confirm when you are ready.",MW_DIM);
-        if(!requested) {
-            if(readiness && !readyMine) mwButton(pad,h-S(76),S(210),S(30),L"Ready",86);
-            else if(host && !strcmp(phase,"error")) mwButton(pad,h-S(76),S(210),S(30),L"Retry",82);
-            else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted"))) {
-                mwButton(pad,h-S(76),S(210),S(30),playerCount()>2 ? L"Request readiness" : L"Resync now",84);
-                // The host declines: the panel closes on every game and stays
-                // closed for this world (a later resync, or a new lobby, lifts it).
-                if(detected) mwButton(pad+S(222),h-S(76),S(150),S(30),L"Keep playing",88);
-            }
-            else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
-                mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
-        }
-        if(strcmp(phase,"transferring")) mwStatus(w,h);
-    } else if (page == 2) {
+    if (page == 2) {
         // ---------------- LOBBY ----------------
         if (g_savePicker && g_isHost && !WorldLoaded() && !g_sessionStarted) {
             mwTitle(L"SELECT SAVE"); mwClose(w, 91);
@@ -1745,8 +1674,7 @@ static bool CopyBackdrop(VkQueue q, uint32_t imgIndex)
 static void PanelLayout()
 {
     g_s = UiScale();
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 3) { g_copyW = S(520); g_copyH = S(360); }
-    else { g_copyW = S(780); g_copyH = S(540); }
+    g_copyW = S(780); g_copyH = S(540);
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
@@ -1765,7 +1693,7 @@ static bool PanelFramePrep()
 // dst is a full-frame surface; the in-game panel remains at its origin.
 static bool ComposePanelIfDirty(void* dst, size_t pitch)
 {
-    const bool title=!WorldLoaded() && (g_uiState==1 || g_uiState==2);
+    const bool title=!WorldLoaded() && (g_uiState>=1 && g_uiState<=3);
     static bool lastTitle=false;
     static void* lastDst=nullptr;
     static int bgX=-1,bgY=-1,bgW=0,bgH=0;
@@ -1798,7 +1726,7 @@ static void DrawButton(VkQueue q, uint32_t imgIndex)
 {
     if(imgIndex>=g_scImgCount || !PanelFramePrep() || !BuildPanelImage()) return;
     PanelLayout();
-    const bool title=!WorldLoaded() && (g_uiState==1 || g_uiState==2);
+    const bool title=!WorldLoaded() && (g_uiState>=1 && g_uiState<=3);
     if(ComposePanelIfDirty(g_panelPtr,g_panelPitch) && pFlush) {
         VkMappedMemoryRange r={VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=g_panelMem;r.size=VK_WHOLE_SIZE;pFlush(g_dev,1,&r);
     }
@@ -2247,7 +2175,7 @@ static void DrawPanelGL(HDC hdc)
     }
     PanelLayout();
     const bool upload = ComposePanelIfDirty(g_glPanel.data(), g_glPitch);
-    const bool title=!WorldLoaded() && (g_uiState==1 || g_uiState==2);
+    const bool title=!WorldLoaded() && (g_uiState>=1 && g_uiState<=3);
     GlOverlay::Draw(g_gl, g_glPanel.data(), g_glPitch, title?g_panelW:g_copyW, title?g_panelH:g_copyH, upload, title?0:g_panelX, title?0:g_panelY, fbH);
 }
 // SEH only in this frame (no C++ objects): a fault turns the OpenGL overlay off, never the game.
@@ -3135,6 +3063,10 @@ static int ReadLoadPercent()
 }
 static void ReportStage(const char* text)
 {
+    // The footer must advance too, not just the roster sent through the lobby.
+    // Refresh before deduplication: a late transfer event can replace the footer.
+    SetTransferDetail(""); // A late transfer event must not mask loading progress.
+    SetStatus(text[0] ? text : "World loaded. Session running.");
     if (strcmp(text, g_stageSent) == 0) return;
     strcpy_s(g_stageSent, text);
     char esc[200]; int j = 0;
@@ -3150,11 +3082,16 @@ static void ArmStageWatch(const char* text)
     g_stageArmedAt = GetTickCount64();
     InterlockedExchange(&g_stageArmedInWorld, (NativeIo::HasWorld() || WorldLoaded()) ? 1 : 0);
     InterlockedExchange(&g_stageSawLoad, 0);
+    InterlockedExchange(&g_stageNoPctLogged, 0);
     InterlockedExchange(&g_stageWatch, 1);
 }
 static void StageTick()
 {
     static ULONGLONG next = 0;
+    if (InterlockedExchange(&g_loadingStagePending, 0)) {
+        ArmStageWatch("loading world");
+        next = 0;
+    }
     if (!InterlockedCompareExchange(&g_stageWatch, 0, 0)) return;
     ULONGLONG now = GetTickCount64(); if (now < next) return; next = now + 1000;
     // 1. the engine's loading bar: "loading world N%" while it is short of 1.0
@@ -3171,7 +3108,11 @@ static void StageTick()
     // CGameUI relay covers a title-menu load should the native hooks be off.
     const bool inWorldArm = InterlockedCompareExchange(&g_stageArmedInWorld, 0, 0) != 0;
     const bool worldUp = NativeIo::HasWorld() || (!inWorldArm && WorldLoaded());
-    if (!worldUp) { InterlockedExchange(&g_stageSawLoad, 1); return; }   // pct 100 here is the LAST load's: keep the arm text
+    if (!worldUp) {
+        InterlockedExchange(&g_stageSawLoad, 1);
+        ReportStage("loading world"); // no invented percentage if the bar is unavailable
+        return;
+    }   // pct 100 here is the LAST load's, not proof that the new world is ready
     // 3. an in-place switch: the old world stays up until StartGame swaps it, so a
     // fresh arm must not read the old world's status line as the new world's
     if (inWorldArm && !InterlockedCompareExchange(&g_stageSawLoad, 0, 0) && now - g_stageArmedAt < 20000) return;
@@ -4649,9 +4590,10 @@ static LRESULT CALLBACK LlKeyboard(int code, WPARAM wp, LPARAM lp)
     bool codeField = st == 1 && focus == 1;
     bool passField = st == 1 && focus == 2;
     bool nameField = st == 1 && (focus == 3 || focus == 4);
-    bool chatField = st == 2 && InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0;
+    bool chatField = (st == 2 && InterlockedCompareExchange(&g_lobbyDone, 0, 0) == 0)
+        || ((st == 3 || (st == 2 && g_recoveryPresent)) && !g_recoveryWorldIo && !NativeIo::Busy());
     if (code == HC_ACTION && (codeField || passField || nameField || chatField) &&
-        (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) != 0) &&
+        (InterlockedCompareExchange(&g_showOverlay, 0, 0) != 0 || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) != 0 || (st == 3 && g_recoveryPresent)) &&
         gameHasFocus())
     {
         KBDLLHOOKSTRUCT* k = (KBDLLHOOKSTRUCT*)lp;
@@ -4776,6 +4718,7 @@ static void MyCreatePage(uint64_t thisp, int page)
     else if (page == 16 && LobbyRunning()) {
         InterlockedExchange(&g_showOverlay, 1);
         InterlockedExchange(&g_loadingPanel, 1);
+        InterlockedExchange(&g_loadingStagePending, 1);
         if (InterlockedCompareExchange(&g_uiState, 0, 0) != 2) InterlockedExchange(&g_uiState, 2);
         InterlockedExchange(&g_panelDirty, 1);
         Log("[menu] loading screen with a lobby running -- the panel stays up with the roster\n");

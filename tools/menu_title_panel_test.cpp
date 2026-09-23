@@ -47,6 +47,11 @@ int wmain(int argc,wchar_t** argv)
     assert(argc==2); fs::path folder=fs::absolute(argv[1]); assert(!fs::exists(folder)); fs::create_directories(folder);
     InitializeCriticalSection(&g_statusCs); g_csInit=true;
     InitializeCriticalSection(&g_modelCs); g_modelCsInit=true;
+    wchar_t artwork[MAX_PATH]{};
+    if(GetEnvironmentVariableW(L"TPF2_MENU_TEST_ARTWORK",artwork,MAX_PATH)) {
+        assert(ReadTitleArt(artwork,g_titleArt,g_titleArtW,g_titleArtH));
+        g_titleArtTried=true;
+    }
     InitializeCriticalSection(&g_pubCs); g_pubCsInit=true;
     // The installed font is read only; missing fonts use the production fallback.
     g_latoLoaded=AddFontResourceExW(L"D:/SteamLibrary/steamapps/common/Transport Fever 2/res/fonts/Lato2OFL/Lato-Regular.ttf",FR_PRIVATE,nullptr)>0;
@@ -124,16 +129,55 @@ int wmain(int argc,wchar_t** argv)
         assert(hit(2) && hit(4) && hit(13) && hit(14) && hit(51) && !hit(3) && !hit(110));
         if(scale==1) snapshot(folder/L"session-setup.bmp",w,h);
         g_gameUi=0;g_sessionStarted=0;g_hostSteam=0;
-        assert(!RenderTitlePanel(w,h,3));
+        assert(!RenderTitlePanel(w,h,4));
+        g_uiState=3; g_readyTotal=16; g_readyCount=8; g_readyMine=false;
+        g_stages.assign(16,"loading world 42%");
+        for(bool host : {false,true}) for(bool world : {false,true}) {
+            g_isHost=host; g_gameUi=world?1:0; g_titlePlayerPage=0;
+            for(const char* phase : {"manual","detected","readiness","holding","saving","transferring","loading","checking","releasing","complete","error","unavailable","waiting","aborted"}) {
+                strcpy_s(g_recoveryPhase,phase); g_recoveryRequestedAt=0;
+                g_recoveryDetail[0]=0;
+                SetTransferDetail(!strcmp(phase,"transferring") ?
+                    "To Player 1 | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s" : "",
+                    !strcmp(phase,"transferring") ?
+                    "Check host router/firewall: allow TCP 29471. IPv4 may need port forwarding to the host PC." : "");
+                RenderPanelLayer(w,h); check(w,h);
+                const bool preflight=!strcmp(phase,"manual") || !strcmp(phase,"detected") || !strcmp(phase,"unavailable");
+                const bool start=!strcmp(phase,"manual") || !strcmp(phase,"detected") || !strcmp(phase,"waiting") || !strcmp(phase,"aborted");
+                assert(hit(85)==preflight);
+                assert(hit(84)==(host && start));
+                assert(hit(82)==(host && !strcmp(phase,"error")));
+                assert(hit(86)==!strcmp(phase,"readiness"));
+                assert(hit(88)==(host && !strcmp(phase,"detected")));
+                assert(!hit(5) && !hit(6) && hit(9) && !hit(20) && !hit(50));
+                if(scale==1 && host && world && (!strcmp(phase,"manual") || !strcmp(phase,"loading") || !strcmp(phase,"error")))
+                    snapshot(folder/(std::string("resync-")+phase+".bmp"),w,h);
+                g_recoveryRequestedAt=1; RenderPanelLayer(w,h); check(w,h);
+                assert(!hit(84) && !hit(82) && !hit(86) && !hit(88));
+            }
+        }
+        strcpy_s(g_recoveryPhase,"readiness");g_recoveryRequestedAt=0;g_readyMine=true;
+        RenderPanelLayer(w,h);check(w,h);assert(!hit(86));
+        g_stages.clear();g_gameUi=0;g_recoveryPhase[0]=0;
     }
-    g_gameUi=1; g_uiState=3; g_flagScale=1;
-    strcpy_s(g_recoveryPhase,"transferring");
-    strcpy_s(g_recoveryDetail,"Waiting for all players to receive the host snapshot.");
-    SetTransferDetail("To Player 1 | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s",
+    // Representative two-player previews, separate from the stress fixtures above.
+    g_flagScale=1;g_uiState=3;g_gameUi=0;g_isHost=1;g_titlePlayerPage=0;
+    g_players={"Alex","Sam"};g_you="Alex";g_host="Alex";g_companies={1,2};
+    g_lobbyTitle="Alpine railways";g_chatCount=2;g_chatHead=0;
+    strcpy_s(g_chatLog[0],"Alex: Ready for resync?");strcpy_s(g_chatLog[1],"Sam: Ready!");
+    g_stages.clear();g_recoveryRequestedAt=0;g_recoveryDetail[0]=0;SetStatus("");
+    strcpy_s(g_recoveryPhase,"manual");RenderPanelLayer(780,540);check(780,540);
+    snapshot(folder/L"resync-manual.bmp",780,540);
+    strcpy_s(g_recoveryPhase,"loading");g_stages={"loading world 63%","loading world 42%"};
+    SetStatus("loading world 63%");RenderPanelLayer(780,540);check(780,540);
+    snapshot(folder/L"resync-loading.bmp",780,540);
+    strcpy_s(g_recoveryPhase,"transferring");g_stages={"sending save 84%","receiving save 84%"};
+    SetTransferDetail("To Sam | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s",
         "Check host router/firewall: allow TCP 29471. IPv4 may need port forwarding to the host PC.");
-    RenderPanelLayer(520,360); check(520,360);
-    snapshot(folder/L"resync-transfer.bmp",520,360);
-    SetTransferDetail(""); assert(!g_transferHint[0]); g_recoveryPhase[0]=0;
+    RenderPanelLayer(780,540);check(780,540);
+    snapshot(folder/L"resync-transfer.bmp",780,540);
+    SetTransferDetail(""); assert(!g_transferHint[0]);
+    g_recoveryPhase[0]=0;g_stages.clear();
     // Both Vulkan and OpenGL use this CPU surface path. Exercise full-frame
     // composition with padded rows and a rebuilt allocation at the same size.
     g_gameUi=0; g_uiState=1; g_titleTab=0; g_scExtent={1280,800};
@@ -152,5 +196,47 @@ int wmain(int argc,wchar_t** argv)
     g_gameUi=1; g_uiState=1; PanelLayout();
     assert(ComposePanelIfDirty(rebuilt.data(),pitch));
     g_gameUi=0;
+    // Resync enters the engine loading page without the lobby start handler.
+    // Exercise the real page hook, stage tick, progress reader and footer state.
+    const auto netdir=folder.wstring(); NETDIR=netdir.c_str();
+    g_lobbyProc=CreateEventW(nullptr,TRUE,FALSE,nullptr); assert(g_lobbyProc);
+    g_origCreatePage=[](uint64_t,int) {};
+    alignas(8) unsigned char menu[0x500]{},bar[0x480]{},monitor[16]{};
+    *reinterpret_cast<uint64_t*>(menu+MENU_OFF_PROGRESSBAR)=reinterpret_cast<uint64_t>(bar);
+    *reinterpret_cast<uint64_t*>(bar+BAR_OFF_MONITOR)=reinterpret_cast<uint64_t>(monitor);
+    *reinterpret_cast<uint64_t*>(monitor)=g_base+RVA_PROGRESSMON_VFT;
+    float& percent=*reinterpret_cast<float*>(monitor+PM_OFF_PROGRESS);
+    for(float value : {0.0f,0.5f,1.0f}) {
+        percent=value; g_stageWatch=0; SetStatus("Receiving save... 100%");
+        MyCreatePage(reinterpret_cast<uint64_t>(menu),16);
+        assert(g_loadingPanel && g_showOverlay && g_loadingStagePending);
+        StageTick();
+        assert(g_stageWatch && !g_loadingStagePending);
+        const char* expected=value==0?"loading world 0%":value==0.5f?"loading world 50%":"loading world";
+        assert(!strcmp(g_status,expected) && !strcmp(g_stageSent,expected));
+        // A late transfer event cannot permanently pin the footer at 100%.
+        SetStatus("Receiving save... 100%");
+        SetTransferDetail("Receiving | Steam (TCP failed) | 113.0 / 113.0 MB | 0.48 MB/s",
+            "Check host router/firewall: allow TCP 29471.");
+        ReportStage(expected);
+        assert(!strcmp(g_status,expected) && !g_transferDetail[0] && !g_transferHint[0]);
+    }
+    *reinterpret_cast<uint64_t*>(bar+BAR_OFF_MONITOR)=0;
+    MyCreatePage(reinterpret_cast<uint64_t>(menu),16); StageTick();
+    assert(!strcmp(g_status,"loading world")); // unavailable progress, no made-up %
+    g_recoveryPresent=1;strcpy_s(g_recoveryPhase,"loading");g_isHost=1;
+    RenderPanelLayer(780,540);check(780,540);
+    assert(g_uiState==2 && !hit(6) && !hit(90) && hit(9)); // loading page keeps the resync lobby
+    g_gameUi=1; bool quiet=false;
+    assert(OverlayWanted(quiet) && quiet && !g_loadingPanel && g_ingameOverlay);
+    g_recoveryPresent=0;g_recoveryPhase[0]=0;
+    ReportStage("world loaded, waiting for the session");
+    assert(!strcmp(g_status,"world loaded, waiting for the session"));
+    ReportStage(""); assert(!strcmp(g_status,"World loaded. Session running."));
+    std::ifstream commands(folder/L"lobby_in.jsonl");
+    const std::string wire((std::istreambuf_iterator<char>(commands)),{});
+    assert(wire.find("loading world 50%")!=std::string::npos);
+    CloseHandle(g_lobbyProc); g_lobbyProc=nullptr;
+    puts("PASS: resync page rearms progress; footer/roster advance; late transfer, missing progress and world handover");
     puts("PASS: five scales; disjoint controls; all server/player pages; host/client/transfer guards; modal isolation; title and in-world session flows");
 }
