@@ -200,3 +200,7 @@ defaults and placement limits remain unchanged; no local live run was repeated.
 The [dev `4616c16a` integration](docs/linux/UPSTREAM_dev_4616c16a.md) adds
 upstream's Big Maps performance catalog with native feature/default scope.
 Runtime behavior is unchanged; the listed gains are upstream measurements.
+
+The [dev `c9ac009d` integration](docs/linux/UPSTREAM_dev_c9ac009d.md) retains
+the standalone Big Maps sync and unified Windows MSI documentation while
+preserving native Linux guidance. Runtime behavior is unchanged.
