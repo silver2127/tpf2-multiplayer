@@ -6,6 +6,11 @@ leaf cells; it does not substitute coarser leaves. Depth 12 uses a root of
 ±131,072 m (1,024-tile / 262.144 km edges). Depth 13 uses ±262,144 m
 (2,048-tile / 524.288 km edges).
 
+**Steam 35924 only.** On the GOG build neither replacement prologue is at a
+verified address, so `octree_depth=12`/`13` degrade to the depth-11 root there:
+the plugin loads instead of refusing, the edge ceiling stays 512 tiles, and the
+log line says which depth was asked for and what went in.
+
 ## Configuration and build
 
 Run `build.bat` to produce `out/tpf2_bigmap.dll`. The build does not deploy.
@@ -14,7 +19,10 @@ In the existing `[tpf2_bigmap]` configuration section, set `octree=1`,
 to the desired dimensions, for example `size7_format0=1280x32` with
 `size_label7=Depth13 test`. Replace existing assignments rather than duplicating
 keys. This example crosses the old root boundary with a relatively narrow map.
-The shipped configuration retains `octree_depth=11` and `max_tiles=512`.
+The shipped `cfg\tpf2_bigmap.cfg` sets `octree_depth=13` and `max_tiles=2048`
+(its size ladder runs 128 to 512 tiles). On the GOG build those two values are
+inert: 12 and 13 fall back to the depth-11 root described below, so the ceiling
+there is 512 tiles.
 
 Depth 12/13 is installed even when the configured menu sizes are small, because
 loading a world does not pass through the menu sizing hook. Keep the setting

@@ -289,6 +289,24 @@ def main():
         bounds(depth,cap,enabled,C.byref(x),C.byref(y))
         assert (x.value,y.value) == expected, (wanted,x.value,y.value)
         assert (x.value*64+1)*(y.value*64+1) <= 2147483647
+    # The GOG build cannot install depths 12/13, so its ceiling is the patched
+    # depth-11 box whatever the config asks: the menu may never offer more tiles
+    # than the root that actually went in can hold.
+    ceiling = dll.BigmapTestOctreeCeiling
+    ceiling.argtypes = [C.c_int]*4
+    for gog, depth, cap, enabled, expected in [
+        (0,13,2048,1,2048),
+        (0,12,2048,1,1024),
+        (0,11,2048,1,512),
+        (1,13,2048,1,512),
+        (1,12,2048,1,512),
+        (1,11,2048,1,512),
+        (1,13,2048,0,256),
+        (0,13,2048,0,256),
+        (1,13,256,1,256),
+    ]:
+        got = ceiling(gog,depth,cap,enabled)
+        assert got == expected, (gog,depth,cap,enabled,got,expected)
     shape = dll.BigmapTestDeriveShape
     shape.argtypes = [C.c_int]*3 + [C.POINTER(C.c_int)]*2
     for side in range(2, 2049, 2):

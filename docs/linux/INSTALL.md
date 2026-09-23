@@ -261,12 +261,15 @@ The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the sourc
 
 `tools/linux/build_native.sh` builds and tests the in-tree `bigmap/linux` plugin.
 The release includes `plugins/tpf2_bigmap.so` and its **Linux** configuration;
-`--without tpf2_pluginhost.so` omits plugins. The native defaults cap depth at 11
-and tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
+`--without tpf2_pluginhost.so` omits plugins. The native defaults select depth 11
+and cap tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
 `terrain_cache_compress=0` and restart after SIGBUS; kernel-origin faults on
 evicted pages cannot be served by this pager. Unsupported userfaultfd setup
 keeps stock allocation paths. The Windows
-configuration requests unsupported depth 13 and must not replace the Linux one.
+configuration requests experimental depth 13; keep the packaged Linux configuration
+for its native defaults. Depths 12/13 are available on the verified Steam ELF;
+the Windows GOG fallback does not apply to it. See
+[dev aaae03f8 integration](UPSTREAM_dev_aaae03f8.md).
 See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
 [current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.
 The installed `bigmap-density-restore` helper restores the plugin's exact density

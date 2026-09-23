@@ -2,6 +2,17 @@
 // See docs/octree-depth12.md for the binary audit and remaining live checks.
 static int g_octreeDepth = 11;
 static bool g_depth12Active = false;
+
+// What this build can actually install. Depths 12 and 13 replace the root
+// descent prologue and the level builder, and both replacements are Steam-35924
+// code shapes: the GOG build has neither at a verified address, so there the
+// shipped depth-11 widening is the ceiling. Everything that sizes the menu has
+// to agree with what really went in -- see the octree block in Tpf2mpPluginInit.
+static int EffectiveOctreeDepth()
+{
+    return (g_gog && g_octreeDepth >= 12) ? 11 : g_octreeDepth;
+}
+
 static volatile LONG g_compactNext[2] = { 0x4fffffff, 0x5fffffff };
 static const uintptr_t RVA_OCT_DESCEND = 0xa507e0;
 static const uintptr_t RVA_OCT_LEVEL = 0x853d30;

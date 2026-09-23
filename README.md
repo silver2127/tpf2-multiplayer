@@ -185,3 +185,7 @@ Version remains 0.7.
 The [dev `bd69b864` integration](docs/linux/UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
 target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
 attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+The [dev `aaae03f8` integration](docs/linux/UPSTREAM_dev_aaae03f8.md) retains
+the Windows GOG octree fallback and batch deployment fixes. Native Steam
+depths 11/12/13 keep their existing verified patches and ceiling checks.
