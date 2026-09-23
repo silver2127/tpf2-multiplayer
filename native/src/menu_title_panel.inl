@@ -37,7 +37,7 @@ static void titleHeading(int w,const wchar_t* label,int closeId)
 static void titleStatus(int w,int h)
 {
     char value[256]="";
-    if(g_csInit) { EnterCriticalSection(&g_statusCs); strcpy_s(value,g_status); LeaveCriticalSection(&g_statusCs); }
+    if(g_csInit) { EnterCriticalSection(&g_statusCs); strcpy_s(value,g_transferDetail[0]?g_transferDetail:g_status); LeaveCriticalSection(&g_statusCs); }
     titleText(S(25),h-S(29),w-S(50),S(22),wideOf(value).c_str(),12,MW_DIM);
 }
 static void titleModPrompt(int w,int h)
@@ -183,31 +183,14 @@ static void sessionSetup(int w,int h)
     titleStatus(w,h);
     titleModPrompt(w,h);
 }
-static void titleLobby(int w,int h)
+static void titleRoster(int h,bool interactive)
 {
-    const bool world=WorldLoaded();
-    if(!world && g_savePicker && g_isHost && !g_sessionStarted) { titleSavePicker(w,h); titleModPrompt(w,h); return; }
-    const int pad=S(25), width=w-2*pad, rosterW=S(360), chatX=pad+rosterW+S(25), chatW=w-pad-chatX;
-    std::wstring title=L"Multiplayer lobby";
-    if(g_modelCsInit) { EnterCriticalSection(&g_modelCs); if(!g_lobbyTitle.empty()) title=wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
-    titleHeading(w,world?L"MULTIPLAYER - SESSION":L"MULTIPLAYER - LOBBY",4);
-    if(world) mwClose(w,4);
-    titleText(pad,S(58),width-S(180),S(28),title.c_str(),14,MW_DIM);
-    if(g_haveCode) titleAction(w-pad-S(170),S(57),S(170),L"Copy invitation code",7);
-    if(!world) {
-        const wchar_t* save=g_selectedSave.empty()?L"No savegame selected":wcsrchr(g_selectedSave.c_str(),L'\\');
-        if(!g_selectedSave.empty()) save=save?save+1:g_selectedSave.c_str();
-        titleText(chatX,S(100),chatW,S(24),L"Savegame",18);
-        layerRect(chatX,S(133),chatW,S(30),RGB(0,0,0),50);
-        titleText(chatX+S(10),S(133),chatW-S(20),S(30),g_isHost?save:L"Supplied by the host",14);
-        if(g_isHost && !g_sessionStarted) titleAction(chatX,S(170),chatW,L"Choose savegame",90,!g_saveStartPending);
-    }
+    const int pad=S(25),rosterW=S(360);
     titleText(pad,S(100),rosterW,S(24),L"Players",18);
-    titleText(chatX,world?S(100):S(211),chatW,S(24),L"Chat",18);
     const int footer=h-S(113), rowH=S(26), top=S(170);
     layerRect(pad,S(133),rosterW,footer-S(139),RGB(0,0,0),50);
     titleText(pad+S(10),S(136),S(178),S(24),L"Name",13,MW_DIM);
-    titleText(pad+S(195),S(136),S(160),S(24),L"Company",13,MW_DIM);
+    titleText(pad+S(195),S(136),S(160),S(24),interactive?L"Company":L"Progress",13,MW_DIM);
     if(g_modelCsInit) {
         EnterCriticalSection(&g_modelCs);
         int n=playerCount(), capacity=(std::min)(ROSTER_ROWS,(std::max)(0,(footer-top-S(30))/rowH));
@@ -222,8 +205,8 @@ static void titleLobby(int w,int h)
             titleText(pad+S(10),y,S(178),rowH,name.c_str(),13);
             wchar_t company[32]; _snwprintf_s(company,_TRUNCATE,L"Company %d",cid);
             std::wstring stage=i<(int)g_stages.size()?wideOf(g_stages[i].c_str()):L"";
-            titleText(pad+S(195),y,S(155),rowH,stage.empty()?company:stage.c_str(),13);
-            if(g_players[i]==g_you || g_you==g_host) addHit(pad+S(190),y,S(170),rowH,20+i,true);
+            titleText(pad+S(195),y,S(155),rowH,stage.empty()?(interactive?company:L"Waiting"):stage.c_str(),13);
+            if(interactive && (g_players[i]==g_you || g_you==g_host)) addHit(pad+S(190),y,S(170),rowH,20+i,true);
 
         }
         wchar_t count[80]; _snwprintf_s(count,_TRUNCATE,L"%d players",n);
@@ -232,7 +215,109 @@ static void titleLobby(int w,int h)
             titleAction(pad+rosterW-S(110),footer-S(35),S(50),L"<",114,g_titlePlayerPage>0);
             titleAction(pad+rosterW-S(55),footer-S(35),S(50),L">",115,(g_titlePlayerPage+1)*capacity<(std::min)(n,ROSTER_ROWS));
         }
-        const int chatTop=world?S(133):S(245), logH=footer-chatTop-S(45), lh=S(22), maxLines=(std::max)(0,(logH-S(16))/lh);
+        LeaveCriticalSection(&g_modelCs);
+    }
+}
+
+// Resync uses the existing lobby's savegame area and footer; roster and chat stay put.
+static void titleRecoverySection(int w,int h)
+{
+    const int pad=S(25),right=pad+S(385),width=w-pad-right;
+    char phase[24],detail[420],failedStep[24]; bool requested, readyMine; int readyCount, readyTotal;
+    EnterCriticalSection(&g_modelCs);
+    strcpy_s(phase,g_recoveryPhase); strcpy_s(detail,g_recoveryDetail); strcpy_s(failedStep,g_recoveryFailedStep);
+    requested = g_recoveryRequestedAt != 0;
+    readyMine=g_readyMine; readyCount=g_readyCount; readyTotal=g_readyTotal;
+    LeaveCriticalSection(&g_modelCs);
+    const bool manual = !strcmp(phase,"manual");
+    const bool detected = !strcmp(phase,"detected");
+    const bool unavailable = !strcmp(phase,"unavailable");
+    const bool readiness = !strcmp(phase,"readiness");
+    const bool host = InterlockedCompareExchange(&g_isHost,0,0)!=0;
+    const wchar_t* label=L"Pausing all games";
+    if(manual) label=L"Reload all players from the host world.";
+    else if(detected) label=L"The game worlds are out of sync.";
+    else if(readiness) label=L"The host has requested a resync.";
+    else if(unavailable) label=L"Automatic resync is unavailable.";
+    else if(!strcmp(phase,"waiting")) label=L"All games are paused. Ready to resync.";
+    else if(!strcmp(phase,"saving")) label=L"Saving the host world";
+    else if(!strcmp(phase,"transferring")) label=L"Transferring the save";
+    else if(!strcmp(phase,"loading")) label=L"Loading the save";
+    else if(!strcmp(phase,"checking") || !strcmp(phase,"releasing")) label=L"Checking that all worlds match";
+    else if(!strcmp(phase,"complete")) label=L"All players are in sync.";
+    else if(!strcmp(phase,"aborted")) label=L"All games are paused. Ready to resync.";
+    else if(!strcmp(phase,"error")) {
+        label=L"Resync could not finish. All games remain paused.";
+        if(!strcmp(failedStep,"holding")) label=L"Could not pause all games.";
+        else if(!strcmp(failedStep,"saving")) label=L"Could not save the host world.";
+        else if(!strcmp(failedStep,"transferring")) label=L"Could not transfer the save.";
+        else if(!strcmp(failedStep,"loading")) label=L"Could not load the save.";
+        else if(!strcmp(failedStep,"checking") || !strcmp(failedStep,"releasing")) label=L"Could not verify that all worlds match.";
+    }
+    if(requested) label=host ? L"Starting resync. Waiting for confirmation..." : L"Sending your ready confirmation...";
+    wchar_t readyLabel[100];
+    if(readiness && !requested) {
+        swprintf_s(readyLabel,L"%d / %d players ready",readyCount,readyTotal);
+        label=readyLabel;
+    }
+
+    titleText(right,S(100),width,S(24),L"Resync",18);
+    layerRect(right,S(133),width,S(30),RGB(0,0,0),50);
+    titleText(right+S(10),S(133),width-S(20),S(30),label,14);
+    const wchar_t* explanation=L"Play resumes automatically when all worlds match.";
+    if(manual || detected) explanation=L"Everyone reloads the host's world. Changes made only on clients will be lost.";
+    else if(unavailable) explanation=L"All players need the same version and a player-hosted lobby.";
+    else if(readiness) explanation=readyMine ? L"You are ready. Waiting for the other players." : L"Confirm when you are ready to reload the host's world.";
+    else if(!strcmp(phase,"error")) explanation=host ? L"Check the issue below, then try again. The games remain paused." : L"Waiting for the host to try again. The games remain paused.";
+    // Keep the TCP guidance in the lobby explanation area; live transfer
+    // metrics use the shared footer, leaving player progress and chat visible.
+    if(!strcmp(phase,"transferring")) {
+        EnterCriticalSection(&g_statusCs);
+        if(g_transferHint[0]) strcpy_s(detail,g_transferHint);
+        LeaveCriticalSection(&g_statusCs);
+    }
+    if(detail[0] && !readiness && !manual && !detected) {
+        const auto text=wideOf(detail);
+        mwBody(pad,h-S(108),w-2*pad,S(36),text.c_str(),MW_DIM);
+    } else mwBody(pad,h-S(108),w-2*pad,S(36),explanation,MW_DIM);
+    if(unavailable || manual || detected) titleAction(w-pad-S(110),h-S(68),S(110),L"Close",85);
+    if(!requested) {
+        if(readiness && !readyMine) titleAction(right,S(170),width,L"Ready",86);
+        else if(host && !strcmp(phase,"error")) titleAction(right,S(170),width,L"Try again",82);
+        else if(host && (manual || detected || !strcmp(phase,"waiting") || !strcmp(phase,"aborted"))) {
+            titleAction(right,S(170),width,playerCount()>2 ? L"Request readiness" : L"Start resync",84);
+            if(detected) titleAction(pad,h-S(68),S(155),L"Keep playing",88);
+        }
+        else if(readiness || manual || detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")) titleText(right,S(170),width,S(30),readiness?L"Waiting for other players...":L"Waiting for the host...",13,MW_DIM);
+    }
+}
+
+static void titleLobby(int w,int h,bool recovery=false)
+{
+    const bool world=WorldLoaded();
+    if(!recovery && !world && g_savePicker && g_isHost && !g_sessionStarted) { titleSavePicker(w,h); titleModPrompt(w,h); return; }
+    const int pad=S(25), width=w-2*pad, rosterW=S(360), chatX=pad+rosterW+S(25), chatW=w-pad-chatX;
+    std::wstring title=L"Multiplayer lobby";
+    if(g_modelCsInit) { EnterCriticalSection(&g_modelCs); if(!g_lobbyTitle.empty()) title=wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
+    titleHeading(w,world?L"MULTIPLAYER - SESSION":L"MULTIPLAYER - LOBBY",4);
+    if(world && !recovery) mwClose(w,4);
+    titleText(pad,S(58),width-S(180),S(28),title.c_str(),14,MW_DIM);
+    if(g_haveCode && !recovery) titleAction(w-pad-S(170),S(57),S(170),L"Copy invitation code",7);
+    if(recovery) titleRecoverySection(w,h);
+    else if(!world) {
+        const wchar_t* save=g_selectedSave.empty()?L"No savegame selected":wcsrchr(g_selectedSave.c_str(),L'\\');
+        if(!g_selectedSave.empty()) save=save?save+1:g_selectedSave.c_str();
+        titleText(chatX,S(100),chatW,S(24),L"Savegame",18);
+        layerRect(chatX,S(133),chatW,S(30),RGB(0,0,0),50);
+        titleText(chatX+S(10),S(133),chatW-S(20),S(30),g_isHost?save:L"Supplied by the host",14);
+        if(g_isHost && !g_sessionStarted) titleAction(chatX,S(170),chatW,L"Choose savegame",90,!g_saveStartPending);
+    }
+    titleRoster(h,!recovery);
+    titleText(chatX,world && !recovery?S(100):S(211),chatW,S(24),L"Chat",18);
+    const int footer=h-S(113);
+    if(g_modelCsInit) {
+        EnterCriticalSection(&g_modelCs);
+        const int chatTop=world && !recovery?S(133):S(245), logH=footer-chatTop-S(45), lh=S(22), maxLines=(std::max)(0,(logH-S(16))/lh);
         layerRect(chatX,chatTop,chatW,logH,RGB(0,0,0),50);
         for(int i=(std::max)(0,g_chatCount-maxLines),y=chatTop+S(8);i<g_chatCount;++i,y+=lh)
             titleText(chatX+S(10),y,chatW-S(20),lh,wideOf(g_chatLog[(g_chatHead+i)%14]).c_str(),13);
@@ -240,6 +325,7 @@ static void titleLobby(int w,int h)
     }
     mwField(chatX,footer-S(37),chatW,S(30),g_chatInput,true,L"Message (Enter to send)",9);
 
+    if(!recovery) {
     if(g_isHost) {
         mwCheck(pad,footer+S(6),L"Separate companies",g_sepCompanies!=0,50);
         if(g_flagMaster[0]) mwCheck(pad+S(230),footer+S(6),L"Public game",g_public!=0,11);
@@ -250,13 +336,15 @@ static void titleLobby(int w,int h)
         titleAction(w-pad-S(110),h-S(68),S(110),L"Close",4);
     } else titleAction(pad,h-S(68),S(110),L"Leave lobby",5);
     if(!world && g_isHost) titleAction(w-pad-S(155),h-S(68),S(155),g_saveStartPending?L"Sharing savegame...":L"Start game",6,g_lobbyReady && !g_saveStartPending,true);
+    }
     titleStatus(w,h);
-    titleModPrompt(w,h);
+    if(!recovery) titleModPrompt(w,h);
 }
 static bool RenderTitlePanel(int w,int h,LONG page)
 {
-    if(page!=1 && page!=2) return false;
+    if(page!=1 && page!=2 && page!=3) return false;
+    if(page==3) { titleLobby(w,h,true); return true; }
     if(page==1) { if(WorldLoaded()) sessionSetup(w,h); else titleSetup(w,h); }
-    else titleLobby(w,h);
+    else titleLobby(w,h,InterlockedCompareExchange(&g_recoveryPresent,0,0)!=0);
     return true;
 }

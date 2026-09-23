@@ -154,6 +154,7 @@ from __future__ import annotations
 import argparse
 from sync_lobby import HostRecovery, ClientRecovery, make_runtime
 import bulk_tcp                            # the TCP side channel the save/mod transfers stream over (2026-09-17)
+from transfer_status import TransferMeter
 import dual_tcp                            # every sealed frame a second time over a TCP link, first copy wins (2026-09-17)
 import netsim                              # tpf2mp_netsim.txt: loss and delay for one instance, for the rig (2026-09-17)
 import collections
@@ -1625,7 +1626,7 @@ class _HostSaveTransfer:
         self.peers = {}          # addr -> per-peer send state
         for addr, name in targets:
             self.peers[addr] = {
-                "name": name, "ready": False, "base": 0, "next": 0,
+                "name": name, "addr": addr, "ready": False, "base": 0, "next": 0,
                 "nack": [], "last_fack": now, "last_begin": 0.0,
                 "last_resend": 0.0, "last_advance": now,
                 "state": "active", "last_pct": -1, "need": [], "ask": False, "ask_since": 0.0, "ask_logged": False,
@@ -1670,6 +1671,8 @@ class _HostSaveTransfer:
                 self._tcp_stream(sock, p)
                 return
         p["push_pending"] = False
+        if not p.get("pull_pending") and not p["tcp"]:
+            p["tcp_status"] = "failed"
         self.log(f"[host] {p['name']}: no TCP stream to {', '.join(redact(i) for i in ips)} port {port} -- "
                  + ("Steam carries the rest" if len(ips) > 1 or steamtunnel.is_tunnel_addr(p.get('addr')) else "the upload runs over UDP")
                  + (f" [{redact('; '.join(errs))}]" if errs else ""))
@@ -1683,6 +1686,7 @@ class _HostSaveTransfer:
                     pass
                 return
             p["tcp"] = True
+            p["tcp_status"] = "connected"
         p["ready"] = True
         p["tcp_done"] = 0.0
         self.log(f"[host] {p['name']} takes the {self.kind} over TCP")
@@ -1699,6 +1703,7 @@ class _HostSaveTransfer:
         else:
             # the receiver's feedback names what is missing; the UDP pump resumes from its base
             p["tcp"] = False
+            p["tcp_status"] = "interrupted"
             self.log(f"[host] {p['name']}: the TCP stream broke after {p.get('tcp_sent', 0)} B -- UDP takes over")
 
     def _stage_word(self):
@@ -1716,6 +1721,23 @@ class _HostSaveTransfer:
         return self.kind
 
     # -- progress ---------------------------------------------------------- #
+    def _emit_details(self, p, now):
+        if self.kind == "mods":
+            return
+        if "ui_meter" not in p:
+            p["ui_meter"] = TransferMeter()
+        transport = "TCP" if p["tcp"] else ("Steam" if steamtunnel.is_tunnel_addr(p.get("addr")) else "UDP")
+        state = p.get("tcp_status", "connecting" if self.tcp_token else "off")
+        if state == "connecting" and now - p.setdefault("tcp_ui_since", now) >= TCP_FIRST_WAIT:
+            state = "unavailable"
+        event = p["ui_meter"].event(now, min(p["base"] * self.chunk, self.total_bytes),
+                                   self.total_bytes, transport, state, "send", p["name"],
+                                   (self.begin_msg.get("tcp") or {}).get("port"))
+        if event:
+            self.io.emit(event)
+            if event["show_hint"]:
+                self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": event["hint"]})
+
     def _emit_pct(self, p):
         if self.total_bytes == 0:
             pct = 100
@@ -1729,8 +1751,7 @@ class _HostSaveTransfer:
                 # ("Sending save... N%", then "Save transfer complete."). A mods
                 # batch crosses in under a second and the round's own status
                 # line (landed GB, MB/s, time left) is the one to keep in view.
-                self.io.emit({"type": "transfer", "role": "send",
-                              "peer": p["name"], "pct": pct})
+                self._emit_details(p, time.time())
             if self.stage_cb:
                 self.stage_cb(p["name"], (f"{self._stage_word()} {pct}%" if self.kind == "mods"
                                           else f"receiving save {pct}%"), pct)
@@ -1795,6 +1816,8 @@ class _HostSaveTransfer:
         p = self.peers.get(addr)
         if p and msg.get("sid") == self.sid and p.get("pull_pending"):
             p["pull_pending"] = False
+            if not p.get("push_pending") and not p["tcp"]:
+                p["tcp_status"] = "failed"
             self.log(f"[host] {p['name']} could not reach us over TCP")
 
     def on_fack(self, addr, msg):
@@ -1919,6 +1942,7 @@ class _HostSaveTransfer:
         for addr, p in self.peers.items():
             if p["state"] != "active":
                 continue
+            self._emit_details(p, now)
             verifying = p.get("verifying") and p["base"] >= self.total_chunks
             if now - p["last_advance"] > (PEER_XFER_VERIFY_TIMEOUT if verifying else PEER_XFER_TIMEOUT):
                 p["state"] = "failed"
@@ -1951,6 +1975,8 @@ class _HostSaveTransfer:
                     p["last_advance"] = now     # waiting for TCP is not a stall
                     continue
                 p.pop("tcp_first_until", None)
+                if p.get("tcp_status") != "failed":
+                    p["tcp_status"] = "unavailable"
                 self.log(f"[host] {p['name']}: no TCP stream -- Steam carries the {self.kind}")
             if self.chunk == CHUNK_STEAM:
                 self._pump_steam(addr, p, now)
@@ -2100,6 +2126,9 @@ class _ClientSaveReceiver:
         self.base = 0
         self.recv_count = 0
         self.recv_bytes = self.duplicate_chunks = 0
+        self.ui_meter = TransferMeter()
+        self.tcp_status = "off"
+        self.tcp_active = False
         self.recv_stats_at = time.time()
         self.recv_stats_bytes = 0
         self.complete = False
@@ -2626,6 +2655,10 @@ class _ClientSaveReceiver:
         self.last_pct = -1
         self.done_sends = 0
         self.batch_done = False
+        self.ui_meter = TransferMeter()
+        self.tcp_status = "connecting" if msg.get("tcp") and BULK_TCP[0] else "off"
+        self.tcp_host_port = (msg.get("tcp") or {}).get("port") if isinstance(msg.get("tcp"), dict) else None
+        self.tcp_active = False
         self.log(f"[client] save incoming sid={sid} {self.total_bytes}B "
                  f"{self.total_chunks} chunks")
         ack = {"t": "fbegin_ack", "sid": sid, "need": self.need, "ask": self.ask}
@@ -2685,8 +2718,8 @@ class _ClientSaveReceiver:
                     return                   # a later transfer replaced this one, or the host's dial won
                 sock = bulk_tcp.bulk_connect(one, port, "recv", sid, token, self.my_name, errors=errs)
                 if sock is not None:
-                    self._tcp_read(sock, sid)
-                    return
+                    if self._tcp_read(sock, sid):
+                        return
             if attempt < TCP_CONNECT_TRIES:
                 self.log(f"[client] no TCP stream from {', '.join(redact(i) for i in ips)} port {port} (attempt {attempt}) -- trying again"
                          + (f" [{redact('; '.join(errs))}]" if errs else ""))
@@ -2696,19 +2729,34 @@ class _ClientSaveReceiver:
                  + (f" [{redact('; '.join(errs))}]" if errs else ""))
         if tell_host and sid == self.sid:
             self._send({"t": "tcp_gave_up", "sid": sid})   # the host stops waiting for our dial
+        if sid == self.sid and getattr(self, "_tcp_claim", None) != sid:
+            self.tcp_status = "failed"
 
     def _tcp_accepted(self, sock, addr, name):
         """ACCEPT THREAD HELPER (the relay): the leader connected to push its upload."""
         self._tcp_read(sock, self.sid)
 
     def _tcp_read(self, sock, sid):
+        # Both ends may dial simultaneously. The sender chooses one stream;
+        # claim only the stream on which it actually sends data. Claiming the
+        # first completed hello can choose the opposite stream at each end,
+        # closing BOTH connections and falling back despite reachable TCP.
+        try:
+            sock.settimeout(bulk_tcp.HELLO_TIMEOUT)
+            first = sock.recv(1)
+            sock.settimeout(None)
+        except OSError:
+            first = b""
+        if not first or sid != self.sid:
+            sock.close()
+            return False
         with self._progress_lock:              # both ends may dial: the first stream wins
             if getattr(self, "_tcp_claim", None) == sid:
                 try:
                     sock.close()
                 except OSError:
                     pass
-                return
+                return True
             self._tcp_claim = sid
         self.tcp_active, self._tcp_started = True, time.time()
         self.log(f"[client] taking the {self.kind} over TCP")
@@ -2719,10 +2767,12 @@ class _ClientSaveReceiver:
             while q.qsize() > 16:            # ~64 MB queued: let the loop thread catch up
                 time.sleep(0.005)
             q.put((sid, bytes(data)))
-        ok = bulk_tcp.stream_recv(sock, self.total_bytes, sink)
+        sink(first)
+        ok = bulk_tcp.stream_recv(sock, self.total_bytes - 1, sink)
         q.put((sid, None if ok else b""))
         if not ok:
             self.log("[client] the TCP stream broke -- the rest comes over UDP")
+        return True
 
     def _drain_tcp(self):
         """LOOP THREAD: feed queued stream bytes to on_chunk, chunk by chunk.
@@ -2737,6 +2787,8 @@ class _ClientSaveReceiver:
                 continue
             if data is None or data == b"":
                 self.tcp_active = False
+                if data == b"":
+                    self.tcp_status = "interrupted"
                 if data is None:
                     self.tcp_bytes = self._tcp_off
                     self.log(f"[client] received over TCP, {bulk_tcp.rate_text(self._tcp_off, time.time() - self._tcp_started)}")
@@ -2792,13 +2844,25 @@ class _ClientSaveReceiver:
         if pct // 10 > self.last_pct // 10:
             self.last_pct = pct
             if self.kind != "mods":
-                self.io.emit({"type": "transfer", "role": "recv", "pct": pct})
+                self._emit_details(time.time())
             # the roster's stage column is 120 px wide: "mods 32/140 90%", not a sentence
             if self.kind == "mods":
                 what = f"mods {self.batch[0]}/{self.batch[1]}" if self.batch else "mods"
                 self._send({"t": "stage", "text": f"{what} {pct}%"})
             else:
                 self._send({"t": "stage", "text": f"receiving save {pct}%"})
+
+    def _emit_details(self, now):
+        if self.kind == "mods" or not hasattr(self, "ui_meter"):
+            return
+        transport = "TCP" if self.tcp_active or (self.tcp_bytes and self.recv_bytes >= self.total_bytes) else (
+            "Steam" if steamtunnel.is_tunnel_addr(getattr(self.conn, "peer", None)) else "UDP")
+        event = self.ui_meter.event(now, self.recv_bytes, self.total_bytes,
+                                    transport, self.tcp_status, "recv", host_port=getattr(self, "tcp_host_port", None))
+        if event:
+            self.io.emit(event)
+            if event["show_hint"]:
+                self.io.emit({"type": "chat", "from": "MULTIPLAYER", "text": event["hint"]})
 
     # -- periodic (called from the client loop) ---------------------------- #
     def tick(self, now):
@@ -2807,6 +2871,8 @@ class _ClientSaveReceiver:
             self._drain_tcp()
         if self.cancelled:
             return
+        if self.active():
+            self._emit_details(now)
         if self.active() and self.chunk == CHUNK_STEAM and now - self.recv_stats_at >= 5.0:
             rate = (self.recv_bytes - self.recv_stats_bytes) / (now - self.recv_stats_at)
             self.log(f"[xfer] Steam receive sid={self.sid}: unique={self.recv_bytes}/{self.total_bytes}B "
@@ -3191,7 +3257,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.7"
+LOBBY_VERSION = "0.7.0.2"
 
 
 def version_rejection(remote):
