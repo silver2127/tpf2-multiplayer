@@ -558,6 +558,7 @@ static volatile LONG g_lobbyDone = 0;
 static volatile LONG g_autoLoadPending = 0;
 static ULONGLONG     g_autoLoadSince = 0;
 static char g_status[256] = "";
+static char g_transferDetail[256] = ""; // shared by lobby and resync; guarded by g_statusCs
 // A pending "download the mods this save needs?" question from the lobby
 // (guarded by g_statusCs). YES / NO buttons take the status line while set.
 static char g_modsPrompt[300] = "";
@@ -659,6 +660,8 @@ static void chatPush(const char* from, const char* text)
 static CRITICAL_SECTION g_statusCs; static bool g_csInit = false;
 static void SetStatus(const char* s) { if (!g_csInit) return; EnterCriticalSection(&g_statusCs);
     strncpy_s(g_status, s, _TRUNCATE); LeaveCriticalSection(&g_statusCs); InterlockedExchange(&g_panelDirty, 1); }
+static void SetTransferDetail(const char* s) { if (!g_csInit) return; EnterCriticalSection(&g_statusCs);
+    strncpy_s(g_transferDetail, s, _TRUNCATE); LeaveCriticalSection(&g_statusCs); InterlockedExchange(&g_panelDirty, 1); }
 
 // button rects WITHIN the panel image (local coords). Filled by RenderPanelGDI.
 static int g_hover = 0, g_active = 0;     // hit id under the cursor / pressed
@@ -1315,6 +1318,11 @@ static void RenderPanelLayer(int w, int h)
         mwBody(pad,cy,w-2*pad,S(40),label);
         if(detail[0]) { wchar_t text[420]; MultiByteToWideChar(CP_UTF8,0,detail,-1,text,420);
             mwBody(pad,cy+S(42),w-2*pad,S(60),text,MW_DIM); }
+        if(!strcmp(phase,"transferring")) {
+            char progress[256];
+            EnterCriticalSection(&g_statusCs); strcpy_s(progress,g_transferDetail); LeaveCriticalSection(&g_statusCs);
+            mwBody(pad,cy+S(108),w-2*pad,S(54),wideOf(progress[0]?progress:"Connecting for save transfer...").c_str());
+        }
         mwBody(pad,h-S(130),w-2*pad,S(40),L"The host world is used. Client-only changes will be lost.",MW_DIM);
         if((detected || manual) && !detail[0]) mwBody(pad,cy+S(42),w-2*pad,S(60),
             L"Reload all games from the host's save. Play resumes automatically when all worlds match.",MW_DIM);
@@ -1335,7 +1343,7 @@ static void RenderPanelLayer(int w, int h)
             else if(!host && !readiness && (detected || !strcmp(phase,"error") || !strcmp(phase,"aborted")))
                 mwBody(pad,h-S(76),w-2*pad,S(30),L"Waiting for the host to start resync.",MW_DIM);
         }
-        mwStatus(w,h);
+        if(strcmp(phase,"transferring")) mwStatus(w,h);
     } else if (page == 2) {
         // ---------------- LOBBY ----------------
         if (g_savePicker && g_isHost && !WorldLoaded() && !g_sessionStarted) {
@@ -1730,7 +1738,7 @@ static bool CopyBackdrop(VkQueue q, uint32_t imgIndex)
 static void PanelLayout()
 {
     g_s = UiScale();
-    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 3) { g_copyW = S(520); g_copyH = S(300); }
+    if (InterlockedCompareExchange(&g_uiState, 0, 0) == 3) { g_copyW = S(520); g_copyH = S(360); }
     else { g_copyW = S(780); g_copyH = S(540); }
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
@@ -3061,7 +3069,7 @@ static void PollWorldGen()
 // "/sync off" clears it.
 static char g_speedReq[16] = "";
 static int  g_syncReq = 0;
-static char g_xfer[48] = "";        // save transfer progress for the in-game window ("uploading 60%", "sending 30%", "")
+static char g_xfer[256] = "";       // shared transfer details for the in-game window
 static char g_transportLobby[33] = ""; // owned by LobbyThread
 static void writeBridgeCtl(bool isHost);
 // Our own hot-join stage for the roster (2026-09-16). Sent as {"cmd":"stage"}
@@ -3892,6 +3900,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
     wchar_t inPath[512];  _snwprintf_s(inPath,  _TRUNCATE, L"%s\\lobby_in.jsonl", NETDIR);
     wchar_t logPath[512]; _snwprintf_s(logPath, _TRUNCATE, L"%s\\lobby_proc.log", NETDIR);
     DeleteFileW(outPath); DeleteFileW(inPath);
+    SetTransferDetail(""); g_xfer[0]=0;
     if (a->join) {   // never let last session's transfer pass for this one (lobby.py does this too)
         static const wchar_t* const stale[] = { L"incoming_save.sav", L"incoming_save.sav.lua", L"incoming_save.jpg" };
         for (const wchar_t* nm : stale) { wchar_t f[560]; _snwprintf_s(f, _TRUNCATE, L"%s\\%s", NETDIR, nm); DeleteFileW(f); }
@@ -4027,6 +4036,8 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             InterlockedExchange(&g_panelDirty,1);
                         }
                         else if(strcmp(ty,"sync_state")==0) {
+                            char transferPhase[24]; jsonStr(rem,"phase",transferPhase,sizeof(transferPhase));
+                            if(strcmp(transferPhase,"transferring")) { SetTransferDetail(""); g_xfer[0]=0; }
                             char operation[40],epoch[40],phase[24],detail[420];
                             jsonStr(rem,"operation",operation,sizeof(operation)); jsonStr(rem,"epoch",epoch,sizeof(epoch));
                             jsonStr(rem,"phase",phase,sizeof(phase)); jsonStr(rem,"detail",detail,sizeof(detail));
@@ -4074,11 +4085,13 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         }
                         else if (strcmp(ty, "transfer") == 0) {
                             char role[16], st[16]; jsonStr(rem, "role", role, sizeof(role)); jsonStr(rem, "state", st, sizeof(st));
+                            char detail[256]; jsonStr(rem, "detail", detail, sizeof(detail));
                             int pct = jsonInt(rem, "pct"); char msg[96];
                             char peer[40]; jsonStr(rem, "peer", peer, sizeof(peer));
                             bool toRelay = strcmp(peer, "relay") == 0;
-                            if (strcmp(st, "done") == 0) { SetStatus(WorldLoaded() ? "Game running. New players can join this lobby." : "Save transfer complete."); g_xfer[0] = 0; }
-                            else if (st[0]) { g_xfer[0] = 0; }
+                            if (strcmp(st, "done") == 0) { SetTransferDetail(""); SetStatus(WorldLoaded() ? "Game running. New players can join this lobby." : "Save transfer complete."); g_xfer[0] = 0; }
+                            else if (detail[0] && !st[0]) { SetTransferDetail(detail); SetStatus(detail); strncpy_s(g_xfer,detail,_TRUNCATE); }
+                            else if (st[0]) { if(strcmp(st,"tcp")) { SetTransferDetail(""); if(detail[0]) SetStatus(detail); } g_xfer[0] = 0; }
                             else if (strcmp(role, "recv") == 0) { if (pct >= 0) { snprintf(msg, sizeof(msg), "Receiving save\xE2\x80\xA6 %d%%", pct); SetStatus(msg); snprintf(g_xfer, sizeof(g_xfer), "receiving %d%%", pct); } }
                             else if (pct >= 0) { snprintf(msg, sizeof(msg), toRelay ? "Uploading save to the relay\xE2\x80\xA6 %d%%" : "Sending save\xE2\x80\xA6 %d%%", pct); SetStatus(msg);
                                                  snprintf(g_xfer, sizeof(g_xfer), toRelay ? "uploading %d%%" : "sending %d%%", pct); }
@@ -4103,7 +4116,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                         else if (strcmp(ty, "mods_refresh") == 0) { InterlockedExchange(&g_modRefreshPending,1); SetStatus("Registering downloaded mods..."); }
                         else if (strcmp(ty, "mods_cancelled") == 0) { jsonStr(rem,"text",g_modLeaveReason,sizeof(g_modLeaveReason)); InterlockedExchange(&g_modLeavePending,1); }
                         else if (strcmp(ty, "mods_ready") == 0) { SetStatus("Mods received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
-                        else if (strcmp(ty, "save_ready") == 0) { InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
+                        else if (strcmp(ty, "save_ready") == 0) { SetTransferDetail(""); g_xfer[0]=0; InterlockedExchange(&g_saveReady, 1); SetStatus("Save received \xE2\x80\x94 waiting for start\xE2\x80\xA6"); }
                         else if (strcmp(ty, "start") == 0) {
                             InterlockedExchange(&g_saveStartPending,0);
                             // {"type":"start","save":true|false}: save=true means a save

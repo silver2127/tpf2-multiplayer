@@ -1,5 +1,6 @@
 """Build and exercise the real menu renderer without installing or starting the game."""
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,8 @@ def main():
         script.write_text("\n".join(commands) + "\n", encoding="utf-8")
         env = dict(os.environ, TPF2_BUILD_NO_DEPLOY="1")
         subprocess.run(["cmd", "/d", "/c", str(script)], cwd=ROOT, env=env, check=True)
+        if os.environ.get("TPF2_TEST_ARTIFACTS"):
+            shutil.copytree(out / "menu_title_panel_test-fixture", os.environ["TPF2_TEST_ARTIFACTS"], dirs_exist_ok=True)
 
 
 if __name__ == "__main__":

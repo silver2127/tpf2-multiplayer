@@ -96,6 +96,10 @@ int wmain(int argc,wchar_t** argv)
         g_titlePlayerPage=0;
         RenderPanelLayer(w,h); check(w,h); assert(hit(6) && hit(90) && hit(115));
         if(scale==1) snapshot(folder/L"lobby.bmp",w,h);
+        SetTransferDetail("To Player 1 | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s");
+        RenderPanelLayer(w,h); check(w,h);
+        if(scale==1) snapshot(folder/L"lobby-transfer.bmp",w,h);
+        SetTransferDetail("");
         OnHit(115); RenderPanelLayer(w,h); check(w,h); assert(hit(114) && hit(35));
         g_saveStartPending=1;RenderPanelLayer(w,h);check(w,h);assert(!hit(6) && !hit(90));g_saveStartPending=0;
         g_isHost=0;RenderPanelLayer(w,h);check(w,h);assert(!hit(6) && !hit(50) && !hit(90));g_isHost=1;
@@ -122,6 +126,13 @@ int wmain(int argc,wchar_t** argv)
         g_gameUi=0;g_sessionStarted=0;g_hostSteam=0;
         assert(!RenderTitlePanel(w,h,3));
     }
+    g_gameUi=1; g_uiState=3; g_flagScale=1;
+    strcpy_s(g_recoveryPhase,"transferring");
+    strcpy_s(g_recoveryDetail,"Waiting for all players to receive the host snapshot.");
+    SetTransferDetail("To Player 1 | Steam (TCP failed) | 94.9 / 113.0 MB | 0.48 MB/s");
+    RenderPanelLayer(520,360); check(520,360);
+    snapshot(folder/L"resync-transfer.bmp",520,360);
+    SetTransferDetail(""); g_recoveryPhase[0]=0;
     // Both Vulkan and OpenGL use this CPU surface path. Exercise full-frame
     // composition with padded rows and a rebuilt allocation at the same size.
     g_gameUi=0; g_uiState=1; g_titleTab=0; g_scExtent={1280,800};

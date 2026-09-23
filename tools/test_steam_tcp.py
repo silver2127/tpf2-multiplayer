@@ -94,6 +94,12 @@ def run(label, addrs, host_listener=True):
         got = os.path.join(io_j.dir, "incoming_save.sav")
         same = done() and os.path.isfile(got) and hashlib.sha256(open(got, "rb").read()).hexdigest() == want
         via_tcp = any(e.get("type") == "transfer" and e.get("state") == "tcp" for e in lobby._read_events(io_j.out_path))
+        for side, io in (("host", io_h), ("client", io_j)):
+            metrics = [e for e in lobby._read_events(io.out_path)
+                       if e.get("type") == "transfer" and "bytes_total" in e]
+            check(f"{label}: {side} UI reports size, route and speed", bool(metrics) and
+                  all(e["bytes_total"] >= SIZE and e["bytes_per_second"] >= 0 and
+                      "MB/s" in e["detail"] and e["transport"] in ("TCP", "Steam", "UDP") for e in metrics))
         steam_dgrams = A.sent
         print(f"     {label}: {SIZE / 1e6:.0f} MB in {dt:.1f} s, tcp={via_tcp}, identical={same}, host->Steam datagrams={steam_dgrams}")
         stop.set()

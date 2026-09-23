@@ -37,7 +37,7 @@ static void titleHeading(int w,const wchar_t* label,int closeId)
 static void titleStatus(int w,int h)
 {
     char value[256]="";
-    if(g_csInit) { EnterCriticalSection(&g_statusCs); strcpy_s(value,g_status); LeaveCriticalSection(&g_statusCs); }
+    if(g_csInit) { EnterCriticalSection(&g_statusCs); strcpy_s(value,g_transferDetail[0]?g_transferDetail:g_status); LeaveCriticalSection(&g_statusCs); }
     titleText(S(25),h-S(29),w-S(50),S(22),wideOf(value).c_str(),12,MW_DIM);
 }
 static void titleModPrompt(int w,int h)

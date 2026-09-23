@@ -129,6 +129,27 @@ every 250 ms; with more than 512 pending the backlog is dropped; a peer is consi
 10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
 other directly.
 
+## TCP reachability and transfer display
+
+The save-transfer listener accepts IPv4 and IPv6 on the same port. IPv6 failure
+leaves IPv4 available and is logged. At least one participant must be reachable:
+IPv4 usually needs a TCP router mapping (normally UPnP); IPv6 still needs inbound
+firewall permission. A successful UDP mapping does not prove TCP reachability.
+Host TCP mappings are attempted independently of UDP and their result is logged.
+When both participants dial simultaneously, the receiver follows the stream on
+which the sender actually supplies data, avoiding opposite connection choices.
+
+Lobby and resync panels show the transfer route, TCP status, received/total MB
+and current MB/s. Progress updates about once per second. Sender figures count
+receiver-confirmed bytes; receiver figures count unique bytes. Queued bytes and
+retransmissions are not counted as useful throughput. `TCP failed` or
+`TCP unavailable` means Steam/UDP is carrying the transfer; it does not identify
+which router or firewall blocked the connection.
+
+Regression checks: `python tools/test_tcp_connectivity.py`,
+`python tools/test_transfer_status.py` and `python tools/test_steam_tcp.py`.
+These are local socket/simulation tests, not proof of Internet reachability.
+
 ## TCP backup link
 
 Since 2026-09-17 (`netpunch/dual_tcp.py`) every sealed frame between a joiner and the host --

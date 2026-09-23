@@ -83,6 +83,12 @@ jobs:
       - name: Steam Messages adapter regression
         run: python tools\steam_messages_test.py
 
+      - name: TCP connectivity regression
+        run: |
+          python tools\test_tcp_connectivity.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools\test_transfer_status.py
+
       - name: Build the MSI
         run: powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate
 
