@@ -26,6 +26,26 @@ everyone".
 - Released within 0.7: no version change. Compression changes no simulation
   result, so peers with and without it stay in sync.
 
+### The Linux pager thrashes a running big map (measured 2026-09-22)
+
+On the dedicated server with the ~52,000-tile map and the automatic budget (about
+1 GiB hot; 1.9 GiB resident), the running game faulted **~790 tiles a second**
+(23,700 faults in 30 s) and evicted as many again, and the engine stretched its
+200 ms batch to 400 ms: the session ran at half speed, 30+ units behind a joiner.
+The Linux policy evicts round-robin ("not an LRU cache: ordinary reads of
+resident pages do not refresh their age", `bigmap/docs/linux/PORT.md`), so it keeps
+evicting the tiles the simulation touches every step. FOR THE LINUX PORT:
+
+- Evict by recency, like the Windows pager: a tile faulted in (or written) is
+  young; the scan skips young tiles and takes the oldest cold ones. Without a
+  cheap access bit (userfaultfd sees only faults), age = time since its last
+  fault-in; a tile that faulted twice within a few seconds is hot and stays.
+- The automatic hot budget (RAM / 30) is far too small for a running big map;
+  size it from the machine and the live tile count like Windows'
+  `AutoTerrainBudgets` headroom, and count faults per second in the 30 s status
+  line so thrashing is visible.
+- Stopgap on the server: `terrain_cache_hot_mb=6144` in its cfg.
+
 ## Format 3 and pager capacity (September 15, built and tested offline, NOT deployed)
 
 Three changes, all in `src/terrain_codec.h` and `src/terrain_pager.h`:
