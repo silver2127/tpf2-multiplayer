@@ -1245,8 +1245,19 @@ static void SyncPoll()
     PollWorldGen();
     const std::string req = S().cfg.dataDir + "tpf2_sync_save.txt";
     if (Exists(req)) {
-        unlink(req.c_str());
-        SyncStart("sync request (chat or button)");
+        // The lobby asks once when a member joins during the host's load.
+        // Keep the request until the existing game-UI callback reports ready.
+        static bool waitingNoted = false;
+        if (!g_gameUiSeen.load()) {
+            if (!waitingNoted) {
+                waitingNoted = true;
+                Log("[sync] sync request before the game is running -- kept until it is\n");
+            }
+        } else {
+            waitingNoted = false;
+            unlink(req.c_str());
+            SyncStart("sync request (chat or button)");
+        }
     }
     if (!S().syncAskedAt) return;
     std::string cur;

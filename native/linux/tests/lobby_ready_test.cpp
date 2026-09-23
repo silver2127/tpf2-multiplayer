@@ -405,9 +405,22 @@ int main()
     ApplyRoster(live); assert(savesForced==beforeLive+1);
     S().syncAskedAt=0;
     Write(dir+"tpf2_sync_save.txt", "live join\n");
+    OnMenuPage(2); // No world yet: the request must survive repeated polls.
+    for (int i=0; i<3; ++i) {
+        SyncPoll();
+        assert(Exists(dir+"tpf2_sync_save.txt"));
+        assert(savesForced==beforeLive+1 && !S().syncAskedAt);
+    }
+    OnMenuPage(16); // Loading page alone is not readiness.
+    SyncPoll();
+    assert(Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+1);
+    OnGameUiFrame();
     SyncPoll();
     assert(!Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+2 && S().syncAskedAt);
     SyncPoll(); assert(savesForced==beforeLive+2);
+    Write(dir+"tpf2_sync_save.txt", "another joiner\n");
+    SyncPoll(); // The pending save still serves every joiner.
+    assert(!Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+2);
     newestSave=dir+"live-auto.sav"; Write(newestSave,"live world");
     SyncPoll(); SyncPoll();
     assert(!S().syncAskedAt && S().sharedSave==newestSave);

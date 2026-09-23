@@ -144,3 +144,7 @@ the rig before they merge, and a field identification counts only when a differe
 Transport Fever 2 installation (`alut.dll`, kept as `alut_real.dll`) and patches game code in memory while the
 game runs. Use it at your own risk and keep backups of your saves. Multiplayer saves are ordinary `.sav` files;
 the mod adds its company assignment to the save's script state.
+
+The [dev `a42dab6c` integration](docs/linux/UPSTREAM_dev_a42dab6c.md)
+keeps hot-join save requests pending while the host world loads, then
+takes the save when the game UI is ready. Version remains 0.7.

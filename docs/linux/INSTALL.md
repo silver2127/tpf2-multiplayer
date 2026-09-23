@@ -304,3 +304,7 @@ seconds using active outgoing peers' remote delivery quality. Legacy retains
 its fixed configuration. Look for [steam-rate] adjustments; configured rates
 are not measured save-transfer throughput. The redesigned Create Game and host
 lobby views expose Cross-play through the existing invitation-code switch.
+
+The [dev `a42dab6c` integration](UPSTREAM_dev_a42dab6c.md)
+keeps hot-join save requests pending while the host world loads, then
+takes the save when the game UI is ready. Version remains 0.7.

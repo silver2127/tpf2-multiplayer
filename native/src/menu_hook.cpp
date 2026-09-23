@@ -2942,8 +2942,20 @@ static void SyncPoll()
     UnpausedTick();
     wchar_t req[MAX_PATH]; _snwprintf_s(req, _TRUNCATE, L"%stpf2_sync_save.txt", g_dataDirW);
     if (GetFileAttributesW(req) != INVALID_FILE_ATTRIBUTES) {
-        DeleteFileW(req);
-        SyncStart("sync request (chat or button)");
+        // A request that arrives while the world is still loading WAITS for it
+        // (2026-09-22): the lobby asks once for a member who joined while the
+        // host's world was loading (a dedicated server's 10-minute big-map
+        // load), and taking the file then dropped it ("before the game is
+        // running -- ignored"); the joiner never got a save and played on in
+        // its old world. The file stays until a game is running.
+        static bool waitingNoted = false;
+        if (!g_gameUi) {
+            if (!waitingNoted) { waitingNoted = true; Log("[sync] sync request before the game is running -- kept until it is\n"); }
+        } else {
+            waitingNoted = false;
+            DeleteFileW(req);
+            SyncStart("sync request (chat or button)");
+        }
     }
     if (!g_syncAskedAt) return;
     wchar_t cur[600] = L""; ULONGLONG sz = 0;
