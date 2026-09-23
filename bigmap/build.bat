@@ -118,35 +118,37 @@ cl /nologo /O2 /MT /W3 /EHsc /c src\bigmap.cpp /Fo:out\bigmap.obj || exit /b 1
 link /nologo /DLL /MAP:out\tpf2_bigmap.map /OUT:out\tpf2_bigmap.dll out\bigmap.obj          || exit /b 1
 echo BUILD BIGMAP OK
 
-REM One install, not two. The plugin host scans the datadir FIRST, so a datadir
-REM copy silently shadows a game-folder one -- and the two drift: the datadir
-REM gets this build and the repo cfg, while the game folder keeps whatever the
-REM user edited. This MUST stay outside the `if` block below: cmd expands a
-REM parenthesised block before it runs, so a `call :find_game_dir` inside it
-REM expands %GAMEDIR% to nothing and the check passes whatever the answer is.
-call :find_game_dir
-
-if /i "%1"=="-deploy" (
-    if defined GAMEDIR if exist "%GAMEDIR%\plugins\tpf2_bigmap.dll" (
-        echo.
-        echo DEPLOY REFUSED: a game-folder install already exists:
-        echo     %GAMEDIR%\plugins\tpf2_bigmap.dll
-        echo The plugin host scans %%LOCALAPPDATA%%\tpf2mp\data\plugins FIRST, so a
-        echo datadir copy would shadow it and run against the repo cfg, not yours.
-        echo Remove one of the two installs, or pass -deploy-force to overwrite anyway.
-        echo.
-        if /i not "%2"=="-deploy-force" exit /b 1
-    )
-    if not exist "%LOCALAPPDATA%\tpf2mp\data\plugins" mkdir "%LOCALAPPDATA%\tpf2mp\data\plugins"
-    copy /y out\tpf2_bigmap.dll "%LOCALAPPDATA%\tpf2mp\data\plugins\" >nul ^
-        && echo DEPLOYED to %LOCALAPPDATA%\tpf2mp\data\plugins ^
-        || echo DEPLOY SKIPPED ^(dll locked by a running game^)
-    REM A datadir deploy must carry the cfg too: the plugin host scans the
-    REM datadir plugins folder first, and a plugin there with no cfg next to it
-    REM silently runs on built-in defaults (no size ladder, no octree).
-    if exist cfg\tpf2_bigmap.cfg copy /y cfg\tpf2_bigmap.cfg "%LOCALAPPDATA%\tpf2mp\data\plugins\" >nul
-)
+if /i "%1"=="-deploy" call :deploy %2 || exit /b 1
 endlocal
+exit /b 0
+
+REM ---- -deploy: one install, not two ---------------------------------------
+REM The plugin host scans the datadir FIRST, so a datadir copy silently shadows a
+REM game-folder one -- and the two drift: the datadir gets this build and the repo
+REM cfg, while the game folder keeps whatever the user edited. A subroutine, not
+REM a parenthesised block: cmd expands a block before it runs, so %GAMEDIR% set
+REM inside it read as nothing, and a game folder under "Program Files (x86)"
+REM closed the block at its ")" ("...Transport was unexpected at this time") --
+REM even on a plain build that never asked to deploy.
+:deploy
+call :find_game_dir
+if not defined GAMEDIR goto :deploy_copy
+if not exist "%GAMEDIR%\plugins\tpf2_bigmap.dll" goto :deploy_copy
+echo.
+echo DEPLOY REFUSED: a game-folder install already exists:
+echo     %GAMEDIR%\plugins\tpf2_bigmap.dll
+echo The plugin host scans %%LOCALAPPDATA%%\tpf2mp\data\plugins FIRST, so a
+echo datadir copy would shadow it and run against the repo cfg, not yours.
+echo Remove one of the two installs, or pass -deploy-force to overwrite anyway.
+echo.
+if /i not "%~1"=="-deploy-force" exit /b 1
+:deploy_copy
+if not exist "%LOCALAPPDATA%\tpf2mp\data\plugins" mkdir "%LOCALAPPDATA%\tpf2mp\data\plugins"
+copy /y out\tpf2_bigmap.dll "%LOCALAPPDATA%\tpf2mp\data\plugins\" >nul && echo DEPLOYED to %LOCALAPPDATA%\tpf2mp\data\plugins || echo DEPLOY SKIPPED: dll locked by a running game
+REM A datadir deploy must carry the cfg too: the plugin host scans the datadir
+REM plugins folder first, and a plugin there with no cfg next to it silently runs
+REM on built-in defaults (no size ladder, no octree).
+if exist cfg\tpf2_bigmap.cfg copy /y cfg\tpf2_bigmap.cfg "%LOCALAPPDATA%\tpf2mp\data\plugins\" >nul
 exit /b 0
 
 REM ---- locate the game folder, for the -deploy shadow check ----------------
@@ -165,10 +167,15 @@ for /f "tokens=2,*" %%a in ('reg query "HKLM\SOFTWARE\GOG.com\Games" /s /v path 
     if not defined GAMEDIR if exist "%%b\TransportFever2.exe" set "GAMEDIR=%%b"
 )
 if defined GAMEDIR goto :eof
+REM %ProgramFiles(x86)% must not appear inside the parenthesised list: its ")"
+REM closes the list early ("\Steam\steamapps\common\Transport was unexpected at
+REM this time"), which failed every build on a machine where no GOG registry
+REM entry answered first. Expanded into a variable before the loop instead.
+set "PF86=%ProgramFiles(x86)%"
 for %%d in (
     "C:\Games\Transport Fever 2"
-    "%ProgramFiles(x86)%\Steam\steamapps\common\Transport Fever 2"
+    "%PF86%\Steam\steamapps\common\Transport Fever 2"
     "%ProgramFiles%\Steam\steamapps\common\Transport Fever 2"
-    "%ProgramFiles(x86)%\GOG Galaxy\Games\Transport Fever 2"
+    "%PF86%\GOG Galaxy\Games\Transport Fever 2"
 ) do if not defined GAMEDIR if exist "%%~d\TransportFever2.exe" set "GAMEDIR=%%~d"
 goto :eof
