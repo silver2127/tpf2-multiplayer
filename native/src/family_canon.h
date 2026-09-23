@@ -1,7 +1,11 @@
 // family_canon.h -- bring one ECS NodeList<N> to ascending entity order and
 // rewrite its entity->position index (slice/hotjoin_order.inl, site "step").
 // Pure memory work, no engine calls: tools/family_canon_test.cpp runs it on
-// built lists. The includer supplies Readable(const void*, size_t).
+// built lists. The includer supplies Readable(const void*, size_t), which must
+// be O(1): this runs once a sim batch on the simulation thread, and the native
+// Linux port's version cost 32% of that thread by parsing /proc/self/maps for
+// every call (docs/re/HOTJOIN_ORDER.md, "Linux Readable() costs a
+// /proc/self/maps parse").
 //
 // NodeList<N> (build 35924; Add 0x21d660, Remove 0x241030):
 //   +0x08 node* begin   +0x10 node* end   +0x18 node* cap
