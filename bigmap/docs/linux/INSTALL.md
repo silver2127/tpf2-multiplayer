@@ -82,11 +82,13 @@ in your installed config and restart:
 
 ```ini
 terrain_cache_compress=1
-terrain_cache_hot_mb=1024
+terrain_cache_hot_mb=0
 ```
 
 This keeps the original 1 m terrain samples and restores identical bytes on
 access. The budget is a soft limit for uncompressed terrain, not total game RAM.
+Zero selects installed RAM / 30, bounded to 256..4096 MiB; a positive value
+selects an explicit MiB budget. This does not account for cgroup limits.
 The plugin reserves a large virtual address range; use resident memory (RSS),
 not virtual size (VIRT), when comparing RAM use. Compressed data and other game
 allocations still need RAM. More cache space can reduce decompression activity.
@@ -113,3 +115,7 @@ if you used it; an existing multiplayer launch line should stay.
 
 Logs: `<prefix>/data/tpf2mp_host.log`. Look for `tpf2_bigmap ... -> OK (0)` and
 `size dropdown: ... stock + 9 native Linux rows`.
+
+Experimental `alignment_batch_tiles=512` enables native alignment batching.
+It defaults to 0 (stock): loaded-world lifetime and memory acceptance remain
+unvalidated because the revisit lab could not initialize Steam. See PORT.md.

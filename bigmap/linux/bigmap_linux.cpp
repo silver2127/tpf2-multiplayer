@@ -11,6 +11,8 @@
 #include <sys/mman.h>
 #include "density.h"
 #include "terrain_pager.h"
+#include "alignment_batch.h"
+#include "memory_budget.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -153,6 +155,13 @@ uint8_t* TownStub(uint8_t* page,uintptr_t ret) {
     std::memcpy(page+3000,values,sizeof(values));
     return entry;
 }
+size_t alignmentBatch=0;
+void AlignmentUpdate(void* self,const linux_alignment::Map* map) {
+    const auto update=reinterpret_cast<linux_alignment::Update>(H->moduleBase()+0x173dae0);
+    const auto next=reinterpret_cast<linux_alignment::Increment>(H->moduleBase()+0x6dc1c0);
+    const size_t n=linux_alignment::Run(self,map,alignmentBatch,update,next);
+    if(n)H->log("alignment batch: %zu blocks in %zu batches of %zu",n,(n+alignmentBatch-1)/alignmentBatch,alignmentBatch);
+}
 linux_pager::TerrainPager* terrainPager=nullptr;
 struct TerrainVector {uint16_t *begin,*end,*capacity;};
 void TerrainAppend(TerrainVector* v,size_t n) {
@@ -263,6 +272,25 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         uint8_t after[sizeof(before)];std::memset(after,0x90,sizeof(after));Jump(after,uintptr_t(entry));
         if(!Plan(site,before,after,sizeof(before)))return TPF2MP_ERR_BUILD;
     }
+    // Experimental until a live load proves the publication/lifetime contract.
+    alignmentBatch=size_t(std::clamp(H->cfgInt(Section,"alignment_batch_tiles",0),0,65536));
+    if(alignmentBatch) {
+        const uint8_t entry[]={0xf3,0x0f,0x1e,0xfa,0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x49,0x89,0xfe,0x41,0x55,0x41,0x54,0x49,0x89,0xf4};
+        const uint8_t iter[]={0x4c,0x89,0xff,0xe8,0xa3,0xe1,0xf9,0xfe,0x49,0x89,0xc7};
+        const uint8_t value[]={0x49,0x8d,0x47,0x28,0x49,0x8b,0x76,0x08,0x4d,0x8d,0x46,0x20};
+        const uint8_t head[]={0x4d,0x8b,0x7c,0x24,0x18,0x49,0x8d,0x7c,0x24,0x08};
+        const uint8_t caller[]={0x4c,0x8d,0xa7,0xa0,0,0,0,0x53,0x48,0x83,0xbf,0xc8,0,0,0,0};
+        const uint8_t publish[]={0x49,0x8b,0x7e,0x08,0x4c,0x89,0xee,0xe8,0x5c,0x75,0x5b,0xff};
+        if(!H->verifyBytes(0x173dae0,entry,sizeof(entry)) ||
+           !H->verifyBytes(0x173e015,iter,sizeof(iter)) ||
+           !H->verifyBytes(0x173df1f,value,sizeof(value)) ||
+           !H->verifyBytes(0x173db87,head,sizeof(head)) ||
+           !H->verifyBytes(0x173e3ea,caller,sizeof(caller)) ||
+           !H->verifyBytes(0x173e168,publish,sizeof(publish)) ||
+           !PlanCall(0x173e443,0x173dae0,reinterpret_cast<void*>(AlignmentUpdate),stub)) {
+            alignmentBatch=0;H->log("alignment batch: byte mismatch; stock path retained");
+        }
+    }
     const bool minMax=H->cfgBool(Section,"terrain_minmax_fast",1);
     if(minMax) {
         const uint8_t before[]={0xf,0xb7,0x13,0x48,0x83,0xc3,0x2,0xf,0xb7,0xc2,0x41,0x89,0xd5,0xeb,0x16,0xf,0x1f,0x80,0x0,0x0,0x0,0x0,0x44,0xf,0xb7,0x3b,0x41,0x89,0xc5,0x48,0x83,0xc3,0x2,0x41,0xf,0xb7,0xc7,0x66,0x44,0x39,0xe8,0x72,0xa,0x66,0x39,0xc2,0xf,0x42,0xd0,0x41,0xf,0xb7,0xc5,0x49,0x39,0xde,0x75,0xdc};
@@ -283,7 +311,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         // Scope allocation changes to CTerrain's append and detached-copy calls.
         // Dispose is the shared-vector control block's exact native free path.
         auto* candidate=new linux_pager::TerrainPager;
-        const int hot=std::clamp(H->cfgInt(Section,"terrain_cache_hot_mb",1024),128,16384);
+        const int hot=linux_memory::TerrainHotMB(linux_memory::PhysicalBytes(),H->cfgInt(Section,"terrain_cache_hot_mb",0));
+        H->log("terrain compression: resident budget %d MiB",hot);
         if(!candidate->Start(1u<<20,size_t(hot)<<20)) {
             delete candidate;H->log("terrain compression unavailable: userfaultfd missing/write-protect support required");
         } else {

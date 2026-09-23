@@ -179,3 +179,129 @@ Windows block-copy optimization is not part of this change.
 - Testing used the isolated native lab with the multiplayer Lua mod retained,
   but no second peer. Multiplayer synchronization and long-session stability
   remain untested for these additions.
+
+## Memory revisit, 2026-09-22 (partial)
+
+Windows baseline is already merged through `0b249268ab`; this revisit does not
+merge history. Sources examined: `alignment_batch.h`, `terrain_compression.h`
+(including the 9180629 load-only throttle), `material_compression.h`,
+`small_pager.h`, `instance_shrink.h`, and the terrain COW sharing notes.
+
+### Automatic terrain budget (implemented)
+
+`terrain_cache_hot_mb=0` (now the packaged and built-in default) uses installed
+physical MiB / 30, clamped to 256..4096 MiB, exactly the Windows
+`AutoTerrainBudgets` hot calculation. Positive explicit settings retain the
+128..16384 MiB native limits. Failed RAM discovery uses the 256 MiB floor.
+`sysconf(_SC_PHYS_PAGES/_SC_PAGESIZE)` supplies physical memory; this is not a
+cgroup limit or an available-memory/headroom controller. Examples: 16 GiB ->
+546 MiB; 32 GiB -> 1092 MiB. The live candidate logged 1022 MiB on this lab.
+
+Compression still requires `terrain_cache_compress=1`. Dedicated default-on is
+**not completed**: `dedicated=1, dedicated_render=0` requests suppression, but
+`overlay_vk_linux.cpp` can refuse it when Vulkan dispatcher slots fail validation.
+A flag alone therefore cannot establish the no-render condition required by
+UFFD_USER_MODE_ONLY. Future automatic activation must depend on successful
+suppression, including its initialization order and any device recreation.
+The native pager currently never sleeps to throttle faults; no unconditional
+throttle was introduced. Windows' dynamic headroom and load-only throttle policy
+remain unported and must not be inferred from the new hot-budget calculation.
+
+### Alignment batching (implemented, experimental, default OFF)
+
+The native implementation is opt-in with `alignment_batch_tiles=512`; zero
+retains the stock call. This is a prototype pending loaded-world validation,
+**not a claim that the load peak is fixed**.
+
+Anchor: the `funcsig.csv` assertion/source mapping identifies the worker at
+`0x173cbe0` as `ThreadPool::LoopImpl` for
+`TerrainAlignmentSystem::UpdateSubterrains(const std::map<CVec2i,
+std::vector<Box2>>&)`. Its caller is `0x173dae0`; it calls `CreateTileBlock`
+(`0xda3010`, independently named by its box/grid assertions) at `0x173df44`.
+`0x173e3e0` supplies the dirty map at self+0xa0, tests its count at self+0xc8,
+calls the update at `0x173e443`, and erases the original map afterwards via
+`0x173ecf0`. SysV arguments: RDI = system, RSI = const map. The terrain pointer
+is loaded from system+8. Unlike Windows, this is a libstdc++ map, not MSVC's
+sentinel tree.
+
+The update loads begin at map+0x18 and compares with the embedded header at
+map+8. Nodes have a 32-byte link followed by the 8-byte CVec2i key and three
+vector pointers. `lea rax,[r15+0x28]` passes the Box2 vector as the seventh
+argument to CreateTileBlock (RDI holds its hidden result pointer). Increment is
+the const libstdc++ `_Rb_tree_increment` PLT entry at `0x6dc1c0`. After gathering
+88-byte work records, the worker call at `0x173e0a6` completes, publication calls
+`0xcf56d0` at `0x173e16f`, and buffers are freed at `0x173e1a9/1b7/1d4`.
+Whether publication changes any input used by subsequent batches remains a live
+contract; static resemblance to Windows does not settle it.
+
+Seven guards, also included in `linux/sites.json` and checked against the actual
+build-id `3a0e156390b0e6f1e372051c24802c8493ae454a` ELF:
+
+| RVA | Verified bytes | Meaning |
+|---|---|---|
+| 173dae0 | f30f1efa554889e5415741564989fe415541544989f4 | update entry, RDI/RSI saved |
+| 173db87 | 4d8b7c2418498d7c2408 | begin and header offsets |
+| 173df1f | 498d4728498b76084d8d4620 | node vector, terrain, scale |
+| 173e015 | 4c89ffe8a3e1f9fe4989c7 | const iterator increment |
+| 173e3ea | 4c8da7a0000000534883bfc800000000 | caller map and count offsets |
+| 173e168 | 498b7e084c89eee85c755bff | terrain publication |
+| 173e443 | e898f6ffff | redirected update call |
+
+The hook snapshots all keys and borrowed vector triples before processing,
+constructs temporary left-chain trees with the native embedded-header layout,
+and calls the original once per batch. It never destroys borrowed vectors or
+mutates the source tree. Allocation failure or inconsistent traversal falls
+back before any publication. All seven guards must pass; otherwise only this
+feature stays off. The existing patch transaction handles write rollback.
+
+Tests iterate actual libstdc++ maps using the library's const increment routine,
+including empty, single-node, exact and partial batches, batch sizes 0/1/7/512/
+65536, source contents and vector-pointer preservation. The host fixture checks
+all seven mismatches independently and default-off behavior. These tests do not
+substitute for a real terrain output comparison.
+
+### Live attempt and remaining backlog
+
+Evidence is archived in job
+`tpf2-multiplayer-dev-revisit-20260922-202412/meta/live/`:
+`native-stock-launch*.log`, `native-candidate-launch.log`,
+`native-memory*-gdb*.log`, actor data/log snapshots, disassembly, and probe scripts.
+The ordinary lab helper failed with `bwrap: setting up uid map: Permission
+denied`. A temporary copy used `/usr/bin/bwrap` and omitted the inner soldier
+runtime, as in the earlier lab workaround, preserving all filesystem overlays.
+No host policy or Steam files were modified.
+
+The candidate was installed into the actor's **data/plugins** directory, which
+shadows its root plugins directory, with batching 512, compression on and hot
+budget auto. Sparse density was disabled because the lab shares base_mod.lua
+read-only. Host logs confirm build match, patch of 173e443, successful pager
+setup, 1022 MiB budget and plugin OK. The game then exited 53, reporting that
+Steam was not running. Process inspection found neither `steam` nor
+`steamwebhelper`; Steam was not started or restarted.
+
+GDB first verified the mapped addresses. Software breakpoints interfered with
+byte guards, and a subsequent SIGTRAP-pass trial terminated at a startup trap;
+neither is gameplay evidence. The final probe used four hardware breakpoints
+and suppressed incidental SIGTRAP delivery. It reached Steam's application-load
+error `T:0000067431` and exited with GDB's octal code 0124 (decimal 84), before
+any target breakpoint. Every game process exited; no world, GPU selection or
+RSS load peak was observed.
+
+| Unfinished item | Static work and actual live attempt | Missing evidence |
+|---|---|---|
+| Alignment load peak | Native map/call/worker/publication located above; candidate installed; hardware breakpoint at 173dae0 armed, never hit before Steam failure | map ownership, lifetime across worker completion, output equivalence, large-map RSS |
+| Dedicated default and loading throttle | Existing Vulkan suppression failure paths reviewed; dedicated=1/render=0 configured; candidate UFFD setup succeeded, world startup failed | successful no-render activation, loading transitions, pressure behavior |
+| Material paging | Windows InternCreate/Destroy and vector migration contract reviewed; native byte-grid read accessor d04850 anchored by IBaseGrid assertion; hardware breakpoint armed, never hit | allocation/destruction/assign paths and GPU lifetime, not just reads |
+| Terrain COW/dedup | Existing native detached allocation cf7783 and control disposal cf7bb0 reviewed; detached-copy hardware probe armed, never hit | identical live tile pairs, write privatization, full lifetime |
+| Small pager | Windows variable blocks contrasted with native CreateTileBlock da3010 and 88-byte gathered records; software breakpoint armed in first GDB attempt, startup trap prevented reaching it | variable allocation/free ownership and useful size distribution |
+| Instance shrink | Windows thin/fat relocation constraints reviewed; native a85590 anchored by ModelInstanceList replica-copy assertion; hardware probe armed, never hit | actual publication/move site and embedded-vector ownership; replica copy is not publication |
+| Depth 12/13 | Kept gated on preceding work; existing a84234 depth-11 site inspected in live mapped image, first software probe never reached | preceding memory work and wider placement contracts |
+
+The supplied pristine save was only `mp_multi_company.sav` (~34 MiB);
+NewMPSAVE was absent. No map could be loaded or generated, and no two-instance
+multiplayer check could run. The <16 GB / ~52k-tile acceptance is **unmet**.
+Native libraries and Lua actor copies were backed up before installation and
+restored after archiving. No save was loaded or modified by gameplay.
+
+Validation: soldier build and 63/63 CTests, including the real userfaultfd pager
+test; all 27 ELF guard sites; shared Lua release verification; `git diff --check`.

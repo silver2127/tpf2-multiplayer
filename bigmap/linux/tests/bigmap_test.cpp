@@ -7,6 +7,7 @@
 static std::map<std::string,int> config;
 static std::map<uintptr_t,std::vector<uint8_t>> memory;
 static int writes, failWrite, mismatch;
+static uintptr_t mismatchSite;
 static bool build=true;
 static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
 static const char* Str(const char*,const char*,const char* fallback){return fallback;}
@@ -14,7 +15,7 @@ static uintptr_t Base(){return 0x40000000;}
 static int Build(){return build;}
 static void Log(const char*,...){}
 static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
-    if(mismatch)return 0;
+    if(mismatch || rva==mismatchSite)return 0;
     memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
 }
 static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
@@ -25,7 +26,7 @@ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);retu
 static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
 static const char* Data(){return "/tmp/";}
 static Tpf2mpHost host={sizeof(host),1,Log,Int,Int,Str,Base,Build,Verify,Hook,PatchBytes,Data};
-static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;}
+static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;mismatchSite=0;}
 extern "C" float TestTown(void*,int);
 extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
 extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
@@ -42,6 +43,16 @@ int main(){
     assert(TestTown(townEntry,10)==1.f && TestTown(townEntry,-1)==1.f);
     munmap(townPage,4096);
     Tpf2mpPluginInfo info{};
+    Reset();config["alignment_batch_tiles"]=512;
+    assert(Tpf2mpPluginInit(&host,&info)==0 && alignmentBatch==512);
+    assert(memory[0x173e443][0]==0xe8);
+    for(uintptr_t site:{0x173dae0,0x173e015,0x173df1f,0x173db87,0x173e3ea,0x173e168,0x173e443}) {
+        Reset();config["alignment_batch_tiles"]=512;mismatchSite=site;
+        assert(Tpf2mpPluginInit(&host,&info)==0 && alignmentBatch==0);
+        assert(memory.count(0x173e443)==0);
+    }
+    Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && alignmentBatch==0);
+    assert(memory.count(0x173e443)==0);
     assert(Tpf2mpPluginInit(nullptr,&info)==TPF2MP_ERR_ABI);
     Reset();build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();config["enabled"]=0;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_DISABLED && writes==0);
