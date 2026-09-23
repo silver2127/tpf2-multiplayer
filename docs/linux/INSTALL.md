@@ -308,3 +308,11 @@ lobby views expose Cross-play through the existing invitation-code switch.
 The [dev `a42dab6c` integration](UPSTREAM_dev_a42dab6c.md)
 keeps hot-join save requests pending while the host world loads, then
 takes the save when the game UI is ready. Version remains 0.7.
+
+### Family guard performance (dev 7cacbaaf)
+
+Linux 6.11+ can validate family memory ranges through `PROCMAP_QUERY` without
+parsing the process mapping table. Older kernels, or environments denying the
+ioctl, retain a fresh buffered snapshot per iteration; very large mapping
+counts can still cost simulation time there. No kernel setting is changed by
+the native libraries. See [integration evidence](UPSTREAM_dev_7cacbaaf.md).

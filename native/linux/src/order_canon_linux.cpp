@@ -10,6 +10,10 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 
 namespace {
 constexpr char kCanonBuildId[] = "3a0e156390b0e6f1e372051c24802c8493ae454a";

@@ -126,6 +126,50 @@ does:
   UPSTREAM notes going forward) say it is on by default, `=0` turns it off, and
   that it must match the Windows players.
 
+### Linux `Readable()` costs a /proc/self/maps parse: 32% of the sim thread (measured 2026-09-22)
+
+The native dedicated server, profiled with `perf -t` on its simulation thread
+while a two-player session ran (49,000-tile world, 1x, pager budget 6 GiB), spent
+**a third of that thread reading and parsing `/proc/self/maps`**:
+
+```
+6.07% [k] mangle_path      <- seq_path/show_map_vma/show_map/seq_read/vfs_read/read
+4.76% [.] __vfscanf_internal   <- _IO_fgets <- (anonymous namespace)::FamilyMappings()
+3.26% [k] strchr    3.25% [k] seq_put_hex_ll   1.79% [k] seq_putc
+1.74% [k] show_map_vma   1.65% [k] lock_next_vma   1.47% [k] show_vma_header_prefix
+2.00% [.] __GI_____strtoull_l_internal ...          (~24% kernel + ~8% libc in total)
+3.52% [.] Tpf2mpOrderCanonDispatch   3.45% TargetErase   2.95% TargetInsert
+```
+
+`libtpf2mp_boot.so`'s `FamilyMappings()` opened `/proc/self/maps` 5.6 times a
+second -- once per simulation batch, for `family_canon.h`'s two `Readable()`
+calls -- and each parse walked **50,000 mappings** (48,000 of them lavapipe's
+per-frame memfd buffers, see `docs/DEDICATED_SERVER.md`), about 4.5 MB of
+kernel-generated text at roughly 57 ms a time. On Windows the same contract is
+one `VirtualQuery`, about a microsecond (`native/src/slice_hook.cpp`).
+
+FOR THE LINUX PORT -- `Readable(p, n)` must be O(1). It is called from the sim
+thread and from every slice validation (`station_weld.h`, `trainorder.h`,
+`moveorder.h`, `roadspace.h`, `family_canon.h`), not only once a batch:
+
+- Cheapest correct probe, no enumeration at all: `process_vm_readv` on self for
+  the first and last byte of the range (the port already links it) -- `EFAULT`
+  means "not mapped", which is exactly what `Readable` answers. `msync(addr,
+  len, MS_ASYNC)` returning `ENOMEM` says the same thing in one syscall.
+- If a mapping table is kept, parse it once into a sorted array of
+  begin/end/prot and re-parse only when a lookup misses: the engine's heap
+  ranges are stable for a whole session, and a miss is the only event that can
+  mean "a new mapping appeared".
+- Read the file with `read()` into one buffer and scan it; never `fgets` plus
+  `sscanf` per line, which is the 8% of libc above (glibc's `%x` conversions
+  dominate it).
+- Whatever the implementation, it must not allocate or take a lock the render
+  thread holds: it runs inside the sim step.
+
+That one change should give the server's simulation about 1.4x the headroom it
+has now. The order sorts themselves (dispatch plus target insert/erase, ~10% of
+the thread) are the next item down and are inherent to the canon.
+
 ## Not an order bug: the render clock stepped back (speed hook)
 
 The retained host of the busy-world run with the freed-id sort asserted
@@ -244,3 +288,8 @@ both, collects paired dumps and compares; `--control` makes the host reload too,
 `--save NAME` picks the host's world, `--prejoin S` lets the host run alone
 first. `hj_watch.py` follows a long run (hash lanes + dumps), `hj_long.py` /
 `hj_compare.py` compare. Production (`tpf2mp-game`) is never touched.
+
+Native integration: [dev 7cacbaaf](../linux/UPSTREAM_dev_7cacbaaf.md) replaces
+family mapping snapshots with permission-aware PROCMAP_QUERY on Linux 6.11+;
+older kernels keep a buffered snapshot fallback. Endpoint-only probes and
+refresh-on-miss caches do not preserve the full range/write-permission contract.

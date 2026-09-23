@@ -151,3 +151,7 @@ the mod adds its company assignment to the save's script state.
 The [dev `a42dab6c` integration](docs/linux/UPSTREAM_dev_a42dab6c.md)
 keeps hot-join save requests pending while the host world loads, then
 takes the save when the game UI is ready. Version remains 0.7.
+
+The [dev `7cacbaaf` integration](docs/linux/UPSTREAM_dev_7cacbaaf.md)
+removes full mapping-table scans from family guards on Linux 6.11+ and retains
+a faster snapshot fallback for older kernels. Version remains 0.7.

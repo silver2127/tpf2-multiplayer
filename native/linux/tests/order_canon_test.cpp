@@ -193,7 +193,40 @@ static void FamilyTests(uintptr_t base) {
     assert(!FamilyRange(UINTPTR_MAX-3,8));
     munmap(page,4096);
 }
+// Real kernel permission changes: endpoint-only probes and stale positive
+// caches would incorrectly accept the inaccessible middle page.
+static void FamilyRangeTests(bool query) {
+    const bool saved = g_familyMapFd.query;
+    g_familyMapFd.query = query;
+    const size_t page = sysconf(_SC_PAGESIZE);
+    auto* mem = static_cast<char*>(mmap(nullptr, page*3, PROT_READ|PROT_WRITE,
+                                       MAP_PRIVATE|MAP_ANONYMOUS, -1, 0));
+    assert(mem != MAP_FAILED);
+    const auto at = reinterpret_cast<uintptr_t>(mem);
+    auto refresh = [query] { if (!query) assert(FamilyMappings()); };
+    refresh();
+    assert(FamilyRange(at+1,page*3-1,true));
+    assert(!mprotect(mem+page,page,PROT_READ)); refresh();
+    assert(FamilyRange(at,page*3));
+    assert(!FamilyRange(at,page*3,true));
+    assert(!mprotect(mem+page,page,PROT_NONE)); refresh();
+    assert(!FamilyRange(at,page*3));
+    assert(FamilyRange(at,page,true) && FamilyRange(at+2*page,page,true));
+    assert(!munmap(mem+page,page)); refresh();
+    assert(!FamilyRange(at,page*3));
+    assert(mmap(mem+page,page,PROT_READ|PROT_WRITE,
+                MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==mem+page);
+    refresh(); assert(FamilyRange(at,page*3,true));
+    assert(!FamilyRange(0,1) && FamilyRange(0,0));
+    assert(!FamilyRange(UINTPTR_MAX-3,8));
+    assert(!munmap(mem,page*3)); refresh();
+    assert(!FamilyRange(at,page*3));
+    g_familyMapFd.query = saved;
+}
 int main() {
+    printf("family mapping query: %s\n", g_familyMapFd.query ? "PROCMAP_QUERY" : "snapshot fallback");
+    FamilyRangeTests(false);
+    if (g_familyMapFd.query) FamilyRangeTests(true);
     MapTests();
     FreedIdTests();
     const size_t size=0x3258000;

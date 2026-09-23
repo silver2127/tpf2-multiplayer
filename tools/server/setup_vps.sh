@@ -99,6 +99,14 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now tpf2mp-xvfb >/dev/null
+echo "== kernel limits (vm.max_map_count, vm.swappiness)"
+if [ -f "$HERE/sysctl-tpf2mp.conf" ]; then
+  install -m 0644 "$HERE/sysctl-tpf2mp.conf" /etc/sysctl.d/99-tpf2mp.conf
+  sysctl --system >/dev/null 2>&1
+  echo "sysctl: max_map_count=$(cat /proc/sys/vm/max_map_count) swappiness=$(cat /proc/sys/vm/swappiness)"
+else
+  echo "sysctl: sysctl-tpf2mp.conf not beside this script -- skipped"
+fi
 echo "== firewall"
 if command -v ufw >/dev/null 2>&1; then
   # the host lobby: UDP for the session, TCP for save transfers (same port; the relay uses 29471)

@@ -336,6 +336,10 @@ static void Log(const char* fmt, ...)
     fflush(g_log);
 }
 
+// One VirtualQuery, about a microsecond: cheap enough to call per validation,
+// which every caller assumes. A port of this must keep that property -- see
+// docs/re/HOTJOIN_ORDER.md for what a /proc/self/maps parse per call cost the
+// Linux server's simulation thread.
 static bool Readable(const void* p, size_t n)
 {
     MEMORY_BASIC_INFORMATION mbi;
