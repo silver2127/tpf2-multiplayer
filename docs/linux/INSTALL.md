@@ -326,3 +326,7 @@ the game started, so cross-platform gameplay validation remains outstanding.
 The [dev `582a380` integration](UPSTREAM_dev_582a380.md) makes native dedicated
 restarts prefer a newer autosave of the hosted `mp_shared` world over the
 configured save. Version remains 0.7.
+
+The [dev `cf5f8a0e` integration](UPSTREAM_dev_cf5f8a0e.md) makes load-time company
+switches wait for entity queries to answer and reuses live saved player entities.
+Version remains 0.7; loaded-world validation is still outstanding.

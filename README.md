@@ -168,3 +168,7 @@ configured save. Version remains 0.7.
 
 The [dev `e63ceefc` integration](docs/linux/UPSTREAM_dev_e63ceefc.md) retains
 upstream's dedicated-server performance report; runtime code is unchanged.
+
+The [dev `cf5f8a0e` integration](docs/linux/UPSTREAM_dev_cf5f8a0e.md) makes load-time company
+switches wait for entity queries to answer and reuses live saved player entities.
+Version remains 0.7; loaded-world validation is still outstanding.

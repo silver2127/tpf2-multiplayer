@@ -83,6 +83,15 @@ function CM.cmReadConfig()
 	CM.cmApplySaved()
 end
 
+-- Is this player entity still in the world? (a saved map can name one a later
+-- save no longer has)
+function CM.cmPidAlive(pid)
+	if type(pid) ~= "number" or pid <= 0 then return false end
+	local alive = false
+	pcall(function() alive = api.engine.entityExists(pid) end)
+	return alive
+end
+
 -- Lazily set up the player entities for companies mode. The local player is our
 -- own company; each other company gets an addPlayer() entity, once.
 function CM.cmEnsure()
@@ -93,11 +102,20 @@ function CM.cmEnsure()
 	for _, cid in ipairs(CM.cmRoster) do
 		if cid ~= CM.cmMyCompany and not CM.cmCompanyPid[cid] then
 			local pid = nil
-			pcall(function() pid = game.interface.addPlayer() end)
-			if pid then
-				CM.cmCompanyPid[cid] = pid
-				pcall(function() game.interface.setMaximumLoan(pid, 100000000) end)
-				CM.cmLog(string.format("CM: company %d -> AI player %s", cid, tostring(pid)))
+			-- the save knows this company's player entity, and it is in this world: take
+			-- it. A fresh addPlayer() here is an empty company beside the real one, and
+			-- the real one's assets then belong to nobody the session knows (2026-09-22).
+			local kept = CM.cmSavedPid and CM.cmSavedPid[cid]
+			if kept and CM.cmPidAlive(kept) then
+				CM.cmCompanyPid[cid] = kept
+				CM.cmLog(string.format("CM: company %d -> player %s from the save", cid, tostring(kept)))
+			else
+				pcall(function() pid = game.interface.addPlayer() end)
+				if pid then
+					CM.cmCompanyPid[cid] = pid
+					pcall(function() game.interface.setMaximumLoan(pid, 100000000) end)
+					CM.cmLog(string.format("CM: company %d -> AI player %s", cid, tostring(pid)))
+				end
 			end
 		end
 	end
@@ -849,6 +867,39 @@ function CM.cmVehRecheck()
 	CM.cmNote(string.format("vehicles after the switch: %d of %d moved with their lines%s", #p - direct, #p,
 		direct > 0 and string.format(", %d handed over directly", direct) or ""))
 end
+-- Does this world answer entity queries yet? A world a tick or two out of its
+-- load does not, and every company decision that follows depends on the answer.
+function CM.cmWorldAnswers()
+	local n = 0
+	pcall(function()
+		local t = game.interface.getEntities({ radius = 999999 }, { type = "CONSTRUCTION", includeData = false }) or {}
+		for _ in pairs(t) do n = n + 1; break end
+	end)
+	if n > 0 then return true end
+	pcall(function()
+		local ls = api.engine.system.lineSystem.getLines() or {}
+		if #ls > 0 then n = 1 end
+	end)
+	return n > 0
+end
+-- The switch the saved state asks for, once the world answers. Called from the
+-- game script's tick while CM.cmSwitchWanted is set.
+CM.CM_SWITCH_WAIT_TICKS = 3600      -- about a minute: then switch anyway and say so
+function CM.cmLoadSwitchTick()
+	local want = CM.cmSwitchWanted
+	if not want then return end
+	if want == CM.cmMyCompany then CM.cmSwitchWanted = nil; return end
+	CM.cmSwitchTries = (CM.cmSwitchTries or 0) + 1
+	if not CM.cmWorldAnswers() then
+		if CM.cmSwitchTries == 1 or CM.cmSwitchTries % 60 == 0 then
+			CM.cmLog(string.format("CM: the load switch to co%d waits for a world that answers entity queries (try %d)", want, CM.cmSwitchTries))
+		end
+		if CM.cmSwitchTries < CM.CM_SWITCH_WAIT_TICKS then return end
+		CM.cmLog(string.format("CM: the world answered nothing for %d tries -- switching to co%d anyway", CM.cmSwitchTries, want))
+	end
+	CM.cmSwitchWanted = nil
+	CM.cmLocalSwitch(want)
+end
 -- The hotseat swap on THIS machine: everything the human player owns goes to
 -- company cid's AI entity, cid's assets and wallet (balance + loan) come to
 -- the human, and the cid -> entity map is updated. Local representation
@@ -939,7 +990,8 @@ function CM.cmApplySaved()
 	CM.cmPw = {}
 	for k, h in pairs(sv.pw or {}) do CM.cmPw[tonumber(k)] = h end
 	CM.cmCompanyPid = {}
-	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid end
+	CM.cmSavedPid = {}
+	for k, pid in pairs(sv.pid or {}) do CM.cmCompanyPid[tonumber(k)] = pid; CM.cmSavedPid[tonumber(k)] = pid end
 	CM.cmName = {}
 	for k, n in pairs(sv.names or {}) do if type(n) == "string" and n ~= "" then CM.cmName[tonumber(k)] = n end end
 	CM.cmOpen = {}
@@ -957,7 +1009,18 @@ function CM.cmApplySaved()
 	CM.cmLive = true
 	CM.cmReady = true
 	log(string.format("company: state restored from the save: %d companies, saver was co%d, we take co%d", #CM.cmRoster, tonumber(sv.mine), want))
-	if want ~= CM.cmMyCompany then CM.cmLocalSwitch(want) end
+	-- THE WORLD MUST ANSWER FIRST (2026-09-22). This switch used to run on the
+	-- first tick after the load; on the 49,000-tile server world the entity
+	-- queries and the wallet read still answered nothing, so it moved "0 + 0
+	-- entities": every company's assets stayed on the pid the save had, the human
+	-- played an empty company, and the player could not reach his own company
+	-- again (the only trace was the dash note). It now waits for a world that
+	-- answers, and says so when it never does.
+	if want ~= CM.cmMyCompany then
+		CM.cmSwitchWanted = want
+		CM.cmSwitchTries = 0
+		CM.cmLoadSwitchTick()
+	end
 	CM.cmApplyNames()
 	CM.cmRepairAt = (CM.ticks or 0) + 25              -- the saver too: its lines may carry another company's vehicles
 end
