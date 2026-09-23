@@ -188,6 +188,18 @@ static void CheckHistory()
     auto threaded=[](uint32_t first) { for(unsigned i=0;i<100;++i) { FakeOuter local; local.Bind(); Add(local,1,first+i); Add(local,1,first+i+1000); assert(Walk(local,1).size()==2); TargetClearOwner(&local); } };
     std::thread a(threaded,100),b(threaded,20000),c(threaded,40000);a.join();b.join();c.join();
     assert(!g_targetOwners);
+    // Thousands of different targets, including bucket collisions, keep their
+    // independent Windows histories across erase-all, recreation and cleanup.
+    FakeOuter many; many.Bind();
+    for (uint32_t i=0;i<4096;++i) { Add(many,i,10); Add(many,i,20); }
+    for (uint32_t i=0;i<4096;++i) {
+        Erase(many,i,10); Add(many,i,10);
+        assert(Walk(many,i) == std::vector<uint32_t>({20,10}));
+        Erase(many,i,20); Erase(many,i,10);
+        Add(many,i,30);
+        assert(Walk(many,i) == std::vector<uint32_t>({30}));
+    }
+    TargetClearOwner(&many); assert(!g_targetOwners);
     // A missed mutation is diagnosed once and retains native traversal.
     Tpf2mpTargetOrderSetLog(TestLog); logCalls = 0;
     FakeOuter missing; missing.Bind(); Add(missing,1,1);

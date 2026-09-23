@@ -181,3 +181,8 @@ The [dev `522a303b` integration](docs/linux/UPSTREAM_dev_522a303b.md) reports th
 lane breakdown and the cost of post-hash broadcast, drift and comparison work.
 Shared Lua regression tests pass; no live performance measurement is claimed.
 Version remains 0.7.
+
+The [dev `12407af7` integration](docs/linux/UPSTREAM_dev_12407af7.md) adds native Windows UCRT float
+math, experimental octree depth 12/13, and indexed person target records.
+Placement-distance saturation and placement-attempt budgets remain unported;
+oversized Windows-created saves still have a placement parity gap.

@@ -36,6 +36,7 @@
 #include "town_seed_linux.h"
 #include "sim_seed_linux.h"
 #include "engine_parity_linux.h"
+#include "libm_parity_linux.h"
 #include "tree_rng_linux.h"
 #include "animal_rng_linux.h"
 #include "building_order_linux.h"
@@ -325,6 +326,11 @@ static void BootInit()
 
     Tpf2mpInstallEngineParity(img.base, img.buildId.c_str());
     Log("[boot] Windows engine/distribution parity: %s\n", Tpf2mpEngineParityStatus());
+
+    // Float trigonometry exactly as ucrtbase.dll computes it (town street
+    // developer, TownDeveloper, street geometry): GOT + three atan2 sites.
+    Tpf2mpInstallLibmParity(img.base, img.buildId.c_str());
+    Log("[boot] Windows UCRT float math: %s\n", Tpf2mpLibmParityStatus());
 
     // dlopen from a constructor is safe with glibc (the loader lock is
     // recursive), so unlike the Windows proxy there is no loader thread: the

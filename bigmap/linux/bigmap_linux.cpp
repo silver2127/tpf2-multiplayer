@@ -13,6 +13,7 @@
 #include "terrain_pager.h"
 #include "alignment_batch.h"
 #include "memory_budget.h"
+#include "octree_depth.h"
 
 extern "C" void TerrainMinMaxBridge();
 extern "C" void* bigmap_minmax_return;
@@ -28,6 +29,9 @@ constexpr uint8_t SizeBytes[] = {0x55,0x48,0x89,0xe5,0x41,0x55,0x41,0x89,0xf5,0x
 constexpr uint8_t OctreeBytes[] = {0xf3,0x0f,0x10,0x05,0x48,0x7c,0x40,0x03,0xbe,0x0a,0,0,0};
 constexpr uint8_t RatioLoop[] = {0x83,0xfb,0x05};
 constexpr uint8_t RatioGate[] = {0x83,0xfb,0x02};
+// Compact-ID counters for depth 12/13 (level 11, level 12). Only the child
+// stub writes them, with lock xadd; never reset or recycled in-process.
+alignas(8) uint32_t octreeNext[2]={linux_octree::CounterStart[0],linux_octree::CounterStart[1]};
 using SizeFn = uint64_t (*)(int,int,void*);
 using RasterFn = void (*)(void*,const float*,float);
 using ComboFn = void* (*)(const void*,void*,int,void*,int);
@@ -216,12 +220,12 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     const bool sparse=enabled && H->cfgBool(Section,"newgame_density",1);
     if(sparse && !restored){H->log("density restore failed: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;}
     if(!enabled)return TPF2MP_ERR_DISABLED;
-    const int depth=H->cfgInt(Section,"octree_depth",11);
-    if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
-    cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;
+    const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
+    const int depth=octree?H->cfgInt(Section,"octree_depth",11):11;
+    if(!linux_octree::ValidDepth(depth)){H->log("octree_depth must be 11, 12 or 13; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
+    cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,linux_octree::EdgeTiles(depth))&~1;
     maxRatio=std::clamp(H->cfgInt(Section,"max_ratio",20),5,20);
     cellBudget=double(std::clamp(H->cfgInt(Section,"cell_budget_millions",1500),1,2000))*1e6;
-    const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
     if(!octree)cap=std::min(cap,256);
     if(!raster)cap=std::min(cap,180); // never offer overflowing generation
     tilesX=H->cfgInt(Section,"tiles_x",0);tilesY=H->cfgInt(Section,"tiles_y",0);
@@ -247,11 +251,24 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     auto* page=static_cast<uint8_t*>(Near(H->moduleBase()+SizeRva));if(!page)return TPF2MP_ERR_FAILED;
     uint8_t* stub=page;
     // A relocated constant keeps the stock instruction shape and register ABI.
-    const float extent=65536.f;std::memcpy(page+4000,&extent,4);
+    const float extent=linux_octree::RootHalfExtent(octree?depth:11);std::memcpy(page+4000,&extent,4);
+    if(octree && depth>=12) {
+        // Preflight both ID sites before the root; they are published first and
+        // the root/depth change last. Any mismatch refuses with nothing written.
+        using namespace linux_octree;
+        uint8_t child[sizeof(ChildBytes)],level[sizeof(LevelBytes)];
+        BuildLevelStub(page+1024,H->moduleBase()+LevelBack);
+        BuildChildStub(page+1280,H->moduleBase()+ChildBack,octreeNext);
+        SitePatch(level,sizeof(level),uintptr_t(page+1024));
+        SitePatch(child,sizeof(child),uintptr_t(page+1280));
+        if(!Plan(ChildSite,ChildBytes,child,sizeof(child)) || !Plan(LevelSite,LevelBytes,level,sizeof(level))) {
+            H->log("octree: depth %d byte mismatch; refused, nothing patched",depth);return TPF2MP_ERR_BUILD;
+        }
+    }
     if(octree) {
         uint8_t patch[13];std::memcpy(patch,OctreeBytes,13);
         int32_t rel=int32_t(uintptr_t(page+4000)-(H->moduleBase()+OctreeSite+8));
-        std::memcpy(patch+4,&rel,4);patch[9]=11;
+        std::memcpy(patch+4,&rel,4);patch[9]=uint8_t(depth);
         if(!Plan(OctreeSite,OctreeBytes,patch,13))return TPF2MP_ERR_BUILD;
     }
     if(raster)for(auto call:RasterCalls)if(!PlanCall(call,RasterRva,reinterpret_cast<void*>(Raster),stub))return TPF2MP_ERR_BUILD;
@@ -360,7 +377,9 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
             }
         }).detach();
     }
-    H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
-    H->log("Experimental port: depth 12/13 and material compression are not enabled");
+    H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?depth:10,rows,maxRatio);
+    if(octree && depth>=12)H->log("octree: EXPERIMENTAL depth %d, root +-%.0f m, 128 m leaves; %d-tile edge capacity; compact IDs enabled",
+        depth,double(linux_octree::RootHalfExtent(depth)),linux_octree::EdgeTiles(depth));
+    H->log("Experimental port: material compression is not enabled");
     return TPF2MP_OK;
 }
