@@ -177,7 +177,7 @@ Proposed test on strelka, with the user's go-ahead: install a boot library from 
 
 ## 9. State-changing commands
 
-- **VPS (root@76.13.109.115):**
+- **VPS (the dedicated server host):**
   - Copied three analysis scripts to `/tmp/claude_*` and ran them read-only on the logs.
   - Ran a `nice -n 19` libm sampler for about a minute.
   - Deleted all four `/tmp/claude_*` files afterwards.
