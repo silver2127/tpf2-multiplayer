@@ -172,3 +172,7 @@ upstream's dedicated-server performance report; runtime code is unchanged.
 The [dev `cf5f8a0e` integration](docs/linux/UPSTREAM_dev_cf5f8a0e.md) makes load-time company
 switches wait for entity queries to answer and reuses live saved player entities.
 Version remains 0.7; loaded-world validation is still outstanding.
+
+The [dev `b4b629a2` integration](docs/linux/UPSTREAM_dev_b4b629a2.md) prevents
+per-frame script state sync from rewinding the town-growth clock. Shared Lua
+and native tests pass; live growth validation remains outstanding. Version remains 0.7.
