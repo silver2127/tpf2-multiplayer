@@ -1,3 +1,4 @@
+<!-- standalone:head -->
 # Big Maps (bigmap/)
 
 Maps larger than Transport Fever 2's New Game menu will build.
@@ -10,6 +11,7 @@ test targets (`-pager-test`, `-codec-test`, ...).
 Every memory and load-time optimization, with its switch and how it works, is
 listed under [Performance optimizations](#performance-optimizations).
 
+<!-- /standalone:head -->
 Experimental [generation performance modes](docs/generation-performance.md)
 add a configurable placement budget and conservative Desert terrain-buffer
 reuse without changing map resolution or octree depth.
@@ -22,10 +24,12 @@ overflow above approximately 185 km separation. See
 [placement-distance.md](docs/placement-distance.md) for the reverse-engineered
 sites and offline validation; an in-game regeneration check is still pending.
 
+<!-- standalone:abi -->
 A native plugin for the **tpf2mp plugin host**. It carries no multiplayer code;
 its one build-time dependency on the rest of the repo is the plugin ABI,
 `native/src/plugin/tpf2mp_plugin.h`.
 
+<!-- /standalone:abi -->
 Target: **Transport Fever 2 build 35924**, in both of its builds: Steam
 (2024-12-11) and GOG (2024-12-12). Every address was measured on both, each site
 is byte-verified before it is patched, and the plugin refuses to patch anything
@@ -496,11 +500,13 @@ stock.
 
 ## Install
 
+<!-- standalone:install -->
 **Install TpF2 Multiplayer** (`TpF2Multiplayer.msi` from the
 [latest release](https://github.com/silver2127/tpf2-multiplayer/releases)): Big
 Maps ships inside it. It finds the Transport Fever 2 folder Steam registered,
 asks you to confirm it, and puts these in place (besides the multiplayer files):
 
+<!-- /standalone:install -->
 | file | what |
 | --- | --- |
 | `alut.dll` | the proxy the game loads in place of its own (the original is kept as `alut_real.dll`) |
@@ -540,6 +546,7 @@ the way it shapes the stock ones. To set a shape yourself, add a
 `octree=1`, and the area within the street-raster budget (`street_raster=1` scales
 the cell to keep it there).
 
+<!-- standalone:coexist -->
 ### The old TpF2 Big Maps installer
 
 Up to 0.5.x Big Maps had its own MSI (`TpF2BigMaps-<version>.msi`), which
@@ -550,6 +557,7 @@ has one owner; the shared components are reference-counted, so nothing is lost
 in between, and the old package's base_mod restore does not run during that
 removal (the new plugin re-patches on its next start).
 
+<!-- /standalone:coexist -->
 ### Virus-scanner findings
 
 The DLLs and the MSI are not code-signed, so any rule of the form *unsigned
@@ -566,15 +574,18 @@ no other process. The one custom action, on full uninstall only, runs
 SHA-256 in such a report with the release assets' digests on the GitHub
 release page; they will not match.
 
+<!-- standalone:uninstall -->
 ### Uninstall
 
-Add/Remove Programs → **TpF2 Big Maps**. Puts the stock `res\config\base_mod.lua`
-back (the plugin's own restore, run through rundll32 before its files go), then
-removes the plugin, its config, and — if TpF2 Multiplayer is not installed — the
-proxy, the plugin host, the Segment Heap value, and restores the stock `alut.dll`. Steam's
-*Verify integrity of game files* also puts the stock `alut.dll` back without
-uninstalling anything; **Repair** from Add/Remove Programs reinstalls the proxy.
+Big Maps goes with TpF2 Multiplayer: Add/Remove Programs → **TpF2 Multiplayer**.
+Before its files go, the plugin's own restore (run through rundll32 while the
+DLL is still there) puts the stock `res\config\base_mod.lua` back; then the
+plugin, its config, the proxy and the plugin host are removed and the stock
+`alut.dll` returns. Steam's *Verify integrity of game files* also puts the
+stock `alut.dll` back without uninstalling anything; **Repair** from
+Add/Remove Programs reinstalls the proxy.
 
+<!-- /standalone:uninstall -->
 ## Build
 
 Needs VS 2022 Build Tools.
@@ -591,34 +602,17 @@ multiplayer repository (`tpf2_pluginhost.dll` + the `alut.dll` proxy), drop
 older build left `<game>\mods\bigmap_density_1` behind, delete it: with it enabled
 a map would be scaled twice.
 
+<!-- standalone:build-msi -->
 ### Building the MSI
 
-```
-tools\vendor_host.ps1 -FromMsi TpF2Multiplayer.msi -Release v0.4.18
-                                      # alut.dll, tpf2_pluginhost.dll, tpf2ca.dll out of the
-                                      # latest TpF2 Multiplayer release MSI; the source goes
-                                      # into installer\vendor\VENDORED.md
-installer\build_msi.ps1 -Validate -AcceptWixEula
-```
+Big Maps is packaged in the TpF2 Multiplayer MSI: the repository's
+`installer\build_msi.ps1` ships `bigmap\out\tpf2_bigmap.dll` and
+`bigmap\cfg\tpf2_bigmap.cfg` (the `BigmapFiles` group in
+`installer/Package.wxs`). The standalone TpF2 Big Maps package is built in
+[tpf2-bigmap](https://github.com/silver2127/tpf2-bigmap), which this folder is
+synced to (`tools/bigmap_sync/`).
 
-The three shared binaries are built in the multiplayer repository and vendored
-here unchanged: both packages must ship the same bytes under the same GUIDs.
-Vendor them from the **latest multiplayer release MSI** before each release. A
-rebuild of the same commit gives different bytes, so an install of one product
-could replace the other's copy. `tools\vendor_host.ps1 -Build` vendors from a
-checkout's build outputs instead (dev only). `build_msi.ps1` refuses to build if
-`PluginHost.wxs` has drifted from the multiplayer copy (line endings aside). WiX v7 asks you to accept its
-[OSMF EULA](https://wixtoolset.org/osmf/); `-AcceptWixEula` passes it
-per-invocation and nothing accepts it for you.
-
-GitHub Actions runs the same script (`.github/workflows/build-msi.yml`): every push to `dev` or `main` and
-every pull request builds `TpF2BigMaps-<version>.msi` and `SHA256SUMS.txt` on a `windows-2022` runner from the
-vendored shared binaries and keeps them as the run's artifact; a `v*` tag (which must equal `installer\VERSION`)
-also creates a draft GitHub release with them attached, ready to be edited and published. The runner has no
-multiplayer checkout beside this one, so the workflow compares `PluginHost.wxs` with the copy at the release
-named in `installer\vendor\VENDORED.md` instead. The workflow passes `-AcceptWixEula`, which is the
-repository owner accepting the WiX terms for those builds.
-
+<!-- /standalone:build-msi -->
 ## Verifying it worked
 
 `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log` shows the hook lines, the
