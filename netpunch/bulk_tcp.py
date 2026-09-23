@@ -51,18 +51,37 @@ class BulkListener:
         self._pending = 0
         self.accepted = self.refused = 0
         self.link_handler = None   # dual_tcp: a "TPF2LINK1 ..." hello is a peer's TCP link, not a transfer
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Linux requires this on BOTH listener and bound dial sockets.
-        # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
-        if sys.platform.startswith("linux"):
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        s.bind((bind, self.port))
-        s.listen(16)
-        s.settimeout(0.5)
+        s = self._listen(socket.AF_INET, bind, self.port)
         self.sock = s
         self.port = s.getsockname()[1]
-        threading.Thread(target=self._accept_loop, name="bulk-accept", daemon=True).start()
+        self.sockets = [s]
+        # Separate sockets preserve IPv4 peer addresses and keep IPv4 working
+        # even on machines without IPv6. Never widen an explicit IPv4 bind.
+        if bind == "0.0.0.0":
+            try:
+                self.sockets.append(self._listen(socket.AF_INET6, "::", self.port))
+            except OSError as e:
+                log(f"[bulk] IPv6 TCP unavailable on tcp/{self.port}: {e}; IPv4 remains available")
+        for listener in self.sockets:
+            threading.Thread(target=self._accept_loop, args=(listener,), name="bulk-accept", daemon=True).start()
+
+    @staticmethod
+    def _listen(family, bind, port):
+        s = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Bound Linux dial sockets need SO_REUSEPORT on both ends.
+            if sys.platform.startswith("linux"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((bind, port))
+            s.listen(16)
+            s.settimeout(0.5)
+            return s
+        except OSError:
+            s.close()
+            raise
 
     @classmethod
     def open(cls, port, log=lambda _: None):
@@ -72,7 +91,8 @@ class BulkListener:
         except OSError as e:
             log(f"[bulk] no TCP listener on {port} ({e}); transfers use UDP only")
             return None
-        log(f"[bulk] TCP transfers accepted on tcp/{lst.port}")
+        families = "IPv4 + IPv6" if len(lst.sockets) > 1 else "IPv4"
+        log(f"[bulk] TCP transfers accepted on tcp/{lst.port} ({families})")
         return lst
 
     def expect(self, sid, role, token, handler):
@@ -88,15 +108,16 @@ class BulkListener:
 
     def close(self):
         self._stop.set()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        for listener in self.sockets:
+            try:
+                listener.close()
+            except OSError:
+                pass
 
-    def _accept_loop(self):
+    def _accept_loop(self, listener):
         while not self._stop.is_set():
             try:
-                c, addr = self.sock.accept()
+                c, addr = listener.accept()
             except socket.timeout:
                 continue
             except OSError:

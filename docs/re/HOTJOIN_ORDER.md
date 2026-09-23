@@ -170,6 +170,69 @@ That one change should give the server's simulation about 1.4x the headroom it
 has now. The order sorts themselves (dispatch plus target insert/erase, ~10% of
 the thread) are the next item down and are inherent to the canon.
 
+### The person target-set order costs 20% of the sim thread (measured 2026-09-23)
+
+The native dedicated server, one player in, the session voting 3x on the
+49,000-tile world: it delivered **2.02x** (its clock advanced 2.02 units a second;
+one unit is one second at 1x), and the engine agreed -- `tpf2_engine_pace.txt`
+read `base=380000`, i.e. it needed 380 ms batches where the nominal is 200, and
+3 x (200/380) = 1.58. Nothing was saturated: 1.7 of 8 cores busy, the frame pacer
+at exactly 30 sleeps a second (good for 6x), `memory.pressure` 0.00. The limit is
+how long one batch takes, and a 15 s `perf` of the simulation thread says where
+that goes:
+
+```
+38.8% [kernel]   25.8% TransportFever2   20.9% libtpf2mp_boot.so   11.2% libc
+10.43% [.] (anonymous namespace)::TargetInsert(unsigned int const*, int const*, void*)
+ 9.90% [.] (anonymous namespace)::TargetErase(unsigned int const*, int const*, void*)
+ 2.82% [.] _int_malloc      2.19% [.] process_vm_readv      1.09% [.] malloc_consolidate
+ 1.88% [k] mt_find   1.39% [k] mod_node_page_state   1.28% [k] __radix_tree_lookup
+```
+
+**FOR THE LINUX PORT: `TargetInsert` and `TargetErase` are 20.3% of the
+simulation thread** -- the boot module that gives the person target sets Windows'
+order ("Windows person target set order: enabled" in the boot log). The world had
+2,258 sim persons at the time, and the pair is called per person per step, so an
+O(n) scan inside either one is O(n^2) a step. Suggestions, cheapest first:
+
+- If a position in the Windows order is found by scanning a vector, add an index
+  (key -> slot) and keep it with the vector: insert and erase become O(1) plus
+  the memmove, and `_int_malloc`/`malloc_consolidate` above (4%) suggests a
+  container that also reallocates per operation -- reserve it once.
+- If the order is only ever *read* in bulk (a traversal at the end of the step),
+  do not maintain it per operation at all: keep the engine's own container and
+  produce the Windows order once, where it is read, as
+  `family_canon.h` was changed to rebuild only the tail after the first displaced
+  node (dev b446547).
+- Time it in the lab the way the rest of the canon is timed, and put the cost in
+  the boot log so the next profile does not have to be a `perf` run on the live
+  server.
+
+**The slow patches are the same two functions.** The server's clock does not run
+evenly: in a 120 s window it advanced at 2.02 units a second overall but twice
+crawled for ~5 s. A capture triggered on the stall itself (watch the dash at
+20 Hz, profile the moment the clock has not moved for 1.6 s) caught two of them,
+and both read the same:
+
+```
+9.70% TargetInsert  8.93% TargetErase  5.31% exe+0xa6139c  4.18% _int_malloc
+10.72% TargetErase  10.52% TargetInsert  3.24% exe+0xa6139c  2.61% process_vm_readv
+```
+
+So there is no separate hitch to chase: the clock slows when the person target
+churn spikes, and the same pair dominates. The libc share beside them (4-6%
+`_int_malloc`, `__libc_malloc2`, `malloc_consolidate`) most likely belongs to the
+same containers, so a fix that stops reallocating per operation takes that too:
+about 25-27% of the thread in total.
+
+The other measured cost on that thread, for scale: the `Readable` probe's
+`process_vm_readv` plus its kernel iovec and radix paths is ~5%, and it replaced a
+`/proc/self/maps` parse that was 32%, so it is already the cheap version. The
+mod's own world hash is NOT a factor at the live cadence: the leader had stamped
+`HASHEVERY every=576` with `hc=3089` in the heartbeat, which is 3.1 s every 576
+game units -- about 1% of wall time at 2x and 2% at 4x. (The 84-unit interval the
+log prints at load is only the starting value, before the cost ladder lands.)
+
 ## Not an order bug: the render clock stepped back (speed hook)
 
 The retained host of the busy-world run with the freed-id sort asserted

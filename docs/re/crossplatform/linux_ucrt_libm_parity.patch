@@ -1,0 +1,1299 @@
+diff --git a/native/linux/CMakeLists.txt b/native/linux/CMakeLists.txt
+index fc1efdc..3331de4 100644
+--- a/native/linux/CMakeLists.txt
++++ b/native/linux/CMakeLists.txt
+@@ -25,12 +25,15 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initi
+ add_link_options(-static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL -Wl,--no-undefined -Wl,-z,now)
+ 
+ find_package(Threads REQUIRED)
++# The UCRT math models must execute exactly the IEEE operations ucrtbase does.
++set_source_files_properties(src/windows_ucrt_math_linux.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
+ 
+ # The loader: LD_PRELOAD target, pulls in the rest.
+ add_library(tpf2mp_boot SHARED src/boot.cpp src/lua_fixed_format_linux.cpp
+             src/destination_rng_linux.cpp src/windows_uniform_int_linux.cpp
+             src/windows_person_seed_linux.cpp src/windows_person_cost_linux.cpp
+             src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
++            src/libm_parity_linux.cpp src/windows_ucrt_math_linux.cpp
+             src/tree_rng_linux.cpp src/animal_rng_linux.cpp src/building_order_linux.cpp
+             src/resident_hash_linux.cpp src/order_canon_linux.cpp src/person_map_order_linux.cpp
+             src/windows_entity_set_order_linux.cpp src/target_order_linux.cpp src/network_person_order_linux.cpp src/network_index_order_linux.cpp
+@@ -192,6 +195,11 @@ if(BUILD_TESTING)
+   target_compile_options(test_engine_parity PRIVATE -UNDEBUG)
+   target_link_libraries(test_engine_parity PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+   add_test(NAME engine_parity COMMAND test_engine_parity)
++  add_executable(test_libm_parity tests/libm_parity_test.cpp src/windows_ucrt_math_linux.cpp)
++  target_include_directories(test_libm_parity PRIVATE ../src src tests)
++  target_compile_options(test_libm_parity PRIVATE -UNDEBUG -O2)
++  target_link_libraries(test_libm_parity PRIVATE ${CMAKE_DL_LIBS} m)
++  add_test(NAME libm_parity COMMAND test_libm_parity)
+   add_executable(test_building_order tests/building_order_test.cpp src/hook_posix.cpp)
+   target_include_directories(test_building_order PRIVATE ../src src)
+   target_compile_options(test_building_order PRIVATE -UNDEBUG)
+diff --git a/native/linux/src/boot.cpp b/native/linux/src/boot.cpp
+index 8cfae57..a9bb0c2 100644
+--- a/native/linux/src/boot.cpp
++++ b/native/linux/src/boot.cpp
+@@ -36,6 +36,7 @@
+ #include "town_seed_linux.h"
+ #include "sim_seed_linux.h"
+ #include "engine_parity_linux.h"
++#include "libm_parity_linux.h"
+ #include "tree_rng_linux.h"
+ #include "animal_rng_linux.h"
+ #include "building_order_linux.h"
+@@ -326,6 +327,11 @@ static void BootInit()
+     Tpf2mpInstallEngineParity(img.base, img.buildId.c_str());
+     Log("[boot] Windows engine/distribution parity: %s\n", Tpf2mpEngineParityStatus());
+ 
++    // Float trigonometry exactly as ucrtbase.dll computes it (town street
++    // developer, TownDeveloper, street geometry): GOT + three atan2 sites.
++    Tpf2mpInstallLibmParity(img.base, img.buildId.c_str());
++    Log("[boot] Windows UCRT float math: %s\n", Tpf2mpLibmParityStatus());
++
+     // dlopen from a constructor is safe with glibc (the loader lock is
+     // recursive), so unlike the Windows proxy there is no loader thread: the
+     // libraries' own constructors start their threads.
+diff --git a/native/linux/src/libm_parity_linux.cpp b/native/linux/src/libm_parity_linux.cpp
+new file mode 100644
+index 0000000..c389e97
+--- /dev/null
++++ b/native/linux/src/libm_parity_linux.cpp
+@@ -0,0 +1,154 @@
++// libm_parity_linux.cpp -- Windows (UCRT) float math for the native game.
++//
++// Evidence (scratchpad/LIBM_STREET_REPORT.md):
++//   * The town street developer (Windows 0x140986070 / native 0x1579a20 and
++//     their callees) and TownDeveloper::Develop feed sinf/cosf/tanf/acosf/
++//     atan2f results into street geometry, angle thresholds and int
++//     truncations. glibc 2.42 and ucrtbase differ in 1.2-1.9% of sinf/cosf/
++//     acosf results and 0.03% of tanf results on game-like inputs.
++//   * GCC resolved ::atan2(float, float) to the double atan2 at three
++//     street developer sites where the Windows functions call atan2f.
++//   * windows_ucrt_math_linux.cpp reproduces ucrtbase.dll bit for bit over
++//     all 2^32 inputs (sinf/cosf/tanf/acosf) and 2^31 atan2f pairs.
++#include "libm_parity_linux.h"
++#include "libm_parity_sites_linux.h"
++#include "windows_ucrt_math_linux.h"
++#include "codewrite_linux.h"
++#include "near_alloc.h"
++#include <dlfcn.h>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++extern "C" __attribute__((visibility("hidden")))
++double Tpf2mpUcrtAtan2FromFloats(double y, double x)
++{
++    // The site converted two floats to double (exact); narrowing is exact too.
++    return (double)Tpf2mpUcrtAtan2f((float)y, (float)x);
++}
++
++namespace {
++constexpr char kLibmBuildId[] = "3a0e156390b0e6f1e372051c24802c8493ae454a";
++char g_status[224] = "off (not initialized)";
++unsigned g_activeSlots = 0, g_activeSites = 0;
++
++struct SlotPlan { Tpf2mpGotSlot slot; void* replacement; uintptr_t original; };
++
++float SinfEntry(float x) { return Tpf2mpUcrtSinf(x); }
++float CosfEntry(float x) { return Tpf2mpUcrtCosf(x); }
++void SincosfEntry(float x, float* s, float* c) { Tpf2mpUcrtSincosf(x, s, c); }
++float TanfEntry(float x) { return Tpf2mpUcrtTanf(x); }
++float AcosfEntry(float x) { return Tpf2mpUcrtAcosf(x); }
++float Atan2fEntry(float y, float x) { return Tpf2mpUcrtAtan2f(y, x); }
++
++SlotPlan g_slots[] = {
++    {kLibmGotSinf, reinterpret_cast<void*>(SinfEntry), 0},
++    {kLibmGotCosf, reinterpret_cast<void*>(CosfEntry), 0},
++    {kLibmGotSincosf, reinterpret_cast<void*>(SincosfEntry), 0},
++    {kLibmGotTanf, reinterpret_cast<void*>(TanfEntry), 0},
++    {kLibmGotAcosf, reinterpret_cast<void*>(AcosfEntry), 0},
++    {kLibmGotAtan2f, reinterpret_cast<void*>(Atan2fEntry), 0},
++};
++constexpr unsigned kSlotCount = sizeof(g_slots) / sizeof(g_slots[0]);
++
++using Writer = int (*)(uintptr_t, const uint8_t*, size_t, int*);
++using Resolver = uintptr_t (*)(const char*, uintptr_t current);
++using CallRedirect = bool (*)(uintptr_t site, uintptr_t expectedCallee, void* target);
++
++// The slot must already hold libm's function of that name: dlsym of the name,
++// or (for a versioned import) an address dladdr attributes to that symbol.
++uintptr_t ResolveLibm(const char* name, uintptr_t current)
++{
++    void* sym = dlsym(RTLD_DEFAULT, name);
++    if (sym && reinterpret_cast<uintptr_t>(sym) == current) return current;
++    Dl_info info{};
++    if (current && dladdr(reinterpret_cast<void*>(current), &info) && info.dli_sname &&
++        std::strcmp(info.dli_sname, name) == 0 && info.dli_fname && std::strstr(info.dli_fname, "libm"))
++        return current;
++    return 0;
++}
++
++void Rollback(uintptr_t base, unsigned slots, Writer write)
++{
++    for (unsigned i = 0; i < kSlotCount; ++i) {
++        if (!(slots & (1u << i))) continue;
++        int error = 0;
++        const uintptr_t orig = g_slots[i].original;
++        write(base + g_slots[i].slot.rva, reinterpret_cast<const uint8_t*>(&orig), sizeof(orig), &error);
++        uintptr_t now;
++        std::memcpy(&now, reinterpret_cast<void*>(base + g_slots[i].slot.rva), sizeof(now));
++        if (now == orig) g_activeSlots &= ~(1u << i);
++    }
++}
++
++bool InstallLibmParityWith(uintptr_t base, const char* buildId, Writer write, Resolver resolve,
++                           CallRedirect redirect)
++{
++    if (g_activeSlots || g_activeSites) {
++        std::snprintf(g_status, sizeof(g_status), "unchanged (active: slots 0x%x, sites 0x%x)",
++                      g_activeSlots, g_activeSites);
++        return false;
++    }
++    if (const char* kill = std::getenv("TPF2MP_LIBM_PARITY"))
++        if (std::strcmp(kill, "0") == 0) { std::strcpy(g_status, "off (TPF2MP_LIBM_PARITY=0)"); return false; }
++    if (!base || !buildId || std::strcmp(buildId, kLibmBuildId) != 0) {
++        std::strcpy(g_status, "off (unverified image)"); return false;
++    }
++    // Verify everything before writing anything.
++    for (auto& s : g_slots) {
++        uintptr_t current;
++        std::memcpy(&current, reinterpret_cast<void*>(base + s.slot.rva), sizeof(current));
++        s.original = resolve(s.slot.name, current);
++        if (!s.original) {
++            std::snprintf(g_status, sizeof(g_status), "off (GOT slot %s at 0x%lx is not libm's)",
++                          s.slot.name, (unsigned long)s.slot.rva);
++            return false;
++        }
++    }
++    for (const auto& site : kLibmAtan2Sites) {
++        if (std::memcmp(reinterpret_cast<void*>(base + site.guardRva), site.guard, site.guardSize) != 0) {
++            std::snprintf(g_status, sizeof(g_status), "off (unverified atan2 site 0x%lx)",
++                          (unsigned long)site.callRva);
++            return false;
++        }
++    }
++    unsigned slots = 0;
++    for (unsigned i = 0; i < kSlotCount; ++i) {
++        int error = 0;
++        const uintptr_t value = reinterpret_cast<uintptr_t>(g_slots[i].replacement);
++        const int r = write(base + g_slots[i].slot.rva, reinterpret_cast<const uint8_t*>(&value),
++                            sizeof(value), &error);
++        slots |= 1u << i;   // a failed writer may have written a prefix
++        g_activeSlots = slots;
++        if (r != TPF2MP_CW_OK) {
++            Rollback(base, slots, write);
++            std::snprintf(g_status, sizeof(g_status), g_activeSlots
++                ? "ERROR: libm parity rollback incomplete (slots 0x%x)" : "off (GOT write %u failed; restored)",
++                g_activeSlots ? g_activeSlots : i);
++            return false;
++        }
++    }
++    // Call sites: a failure here keeps the GOT redirects (they are correct on
++    // their own) and reports which sites stayed on the double atan2.
++    unsigned sites = 0;
++    for (unsigned i = 0; i < kLibmAtan2SiteCount; ++i)
++        if (redirect(base + kLibmAtan2Sites[i].callRva, base + kLibmPltAtan2Rva,
++                     reinterpret_cast<void*>(Tpf2mpUcrtAtan2FromFloats)))
++            sites |= 1u << i;
++    g_activeSites = sites;
++    if (sites == (1u << kLibmAtan2SiteCount) - 1)
++        std::strcpy(g_status, "enabled: UCRT sinf/cosf/sincosf/tanf/acosf/atan2f (GOT) + 3 street developer atan2f sites");
++    else
++        std::snprintf(g_status, sizeof(g_status),
++                      "partial: UCRT sinf/cosf/sincosf/tanf/acosf/atan2f (GOT); atan2 sites 0x%x of 0x%x",
++                      sites, (1u << kLibmAtan2SiteCount) - 1);
++    return true;
++}
++} // namespace
++
++bool Tpf2mpInstallLibmParity(uintptr_t imageBase, const char* buildId)
++{
++    return InstallLibmParityWith(imageBase, buildId, Tpf2mpCodeWriteSelf, ResolveLibm, Tpf2mpRedirectCall);
++}
++
++const char* Tpf2mpLibmParityStatus() { return g_status; }
+diff --git a/native/linux/src/libm_parity_linux.h b/native/linux/src/libm_parity_linux.h
+new file mode 100644
+index 0000000..5f297a9
+--- /dev/null
++++ b/native/linux/src/libm_parity_linux.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include <cstdint>
++
++// Startup only (before game main): make the verified build-35924 native game
++// compute its float trigonometry exactly like the Windows build (ucrtbase.dll,
++// AVX2+FMA paths). Kill switch: TPF2MP_LIBM_PARITY=0.
++//   - the game image's sinf, cosf, sincosf, tanf, acosf and atan2f imports
++//     (.got.plt, bound at load) are pointed at windows_ucrt_math_linux.cpp;
++//   - three street developer call sites where GCC called the DOUBLE atan2 on
++//     float arguments (MSVC calls atan2f there) are redirected to the UCRT
++//     atan2f model through a near stub.
++// Every slot and site is verified (build id, slot value resolves to libm's
++// function of that name, guard bytes around each call) before anything is
++// written; a failure rolls back what was written and leaves the module off.
++bool Tpf2mpInstallLibmParity(uintptr_t imageBase, const char* buildId);
++const char* Tpf2mpLibmParityStatus();
++
++// The call-site replacement: a double-in/double-out atan2 that rounds its
++// (float-valued) arguments back to float and returns the UCRT atan2f result.
++extern "C" double Tpf2mpUcrtAtan2FromFloats(double y, double x);
+diff --git a/native/linux/src/libm_parity_sites_linux.h b/native/linux/src/libm_parity_sites_linux.h
+new file mode 100644
+index 0000000..2c6c295
+--- /dev/null
++++ b/native/linux/src/libm_parity_sites_linux.h
+@@ -0,0 +1,49 @@
++#pragma once
++// Verified sites for libm_parity_linux.cpp, native build 35924
++// (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a).
++#include <cstddef>
++#include <cstdint>
++
++// .got.plt slots (R_X86_64_JUMP_SLOT r_offset). The image is linked with
++// DF_BIND_NOW, so every slot holds the resolved libm address when boot runs;
++// the slots lie in PT_GNU_RELRO (0x59a8700 + 0x9f900) and are written through
++// Tpf2mpCodeWriteSelf.
++struct Tpf2mpGotSlot { uintptr_t rva; const char* name; };
++constexpr Tpf2mpGotSlot kLibmGotSinf{0x5a471b8, "sinf"};
++constexpr Tpf2mpGotSlot kLibmGotCosf{0x5a471c8, "cosf"};
++constexpr Tpf2mpGotSlot kLibmGotSincosf{0x5a470c0, "sincosf"};
++constexpr Tpf2mpGotSlot kLibmGotTanf{0x5a470d8, "tanf"};
++constexpr Tpf2mpGotSlot kLibmGotAcosf{0x5a472b8, "acosf"};
++constexpr Tpf2mpGotSlot kLibmGotAtan2f{0x5a472b0, "atan2f"};
++
++// PLT stub of the DOUBLE atan2 (jmp [rip -> 0x5a46cb0]).
++constexpr uintptr_t kLibmPltAtan2Rva = 0x6dbc60;
++
++// Call sites where GCC resolved ::atan2(float, float) to the double function
++// but MSVC calls atan2f (the Windows functions import atan2f there):
++//   0x1578b3b  CreateAngle2SegMap        Windows 0x140985d53 (in 0x140985ba0)
++//   0x1579031  CheckBranchesRec          Windows 0x1409859d4 (in 0x140985800)
++//   0x157a4ac  CheckBranches (inlined)   Windows atan2f in 0x140985310
++// Each guard is the 8 bytes of float->double conversions before the call,
++// the call itself, and the double->float conversion of the result after it.
++struct Tpf2mpAtan2Site {
++    uintptr_t callRva;
++    uintptr_t guardRva;                 // first guarded byte
++    unsigned char guard[24];
++    size_t guardSize;
++};
++constexpr Tpf2mpAtan2Site kLibmAtan2Sites[] = {
++    // 1578b33 cvtss2sd xmm0,xmm0 ; cvtss2sd xmm1,xmm1 ; call atan2 ; pxor xmm2,xmm2 ; mov edi,0x28 ; cvtsd2ss xmm2,xmm0
++    {0x1578b3b, 0x1578b33,
++     {0xf3,0x0f,0x5a,0xc0, 0xf3,0x0f,0x5a,0xc9, 0xe8,0x20,0x31,0x16,0xff,
++      0x66,0x0f,0xef,0xd2, 0xbf,0x28,0x00,0x00,0x00, 0xf2,0x0f}, 24},
++    // 1579029 cvtss2sd xmm0,xmm0 ; cvtss2sd xmm1,xmm1 ; call atan2 ; mov rax,[rbp-0x90] ; cvtsd2ss xmm0,xmm0
++    {0x1579031, 0x1579029,
++     {0xf3,0x0f,0x5a,0xc0, 0xf3,0x0f,0x5a,0xc9, 0xe8,0x2a,0x2c,0x16,0xff,
++      0x48,0x8b,0x85,0x70,0xff,0xff,0xff, 0xf2,0x0f,0x5a,0xc0}, 24},
++    // 157a4a4 cvtss2sd xmm1,xmm1 ; cvtss2sd xmm0,xmm0 ; call atan2 ; mov rsi,[rbp-0x1a58] ; (mov rax,.. ; pxor ; cvtsd2ss xmm1,xmm0)
++    {0x157a4ac, 0x157a4a4,
++     {0xf3,0x0f,0x5a,0xc9, 0xf3,0x0f,0x5a,0xc0, 0xe8,0xaf,0x17,0x16,0xff,
++      0x48,0x8b,0xb5,0xa8,0xe5,0xff,0xff}, 20},
++};
++constexpr size_t kLibmAtan2SiteCount = sizeof(kLibmAtan2Sites) / sizeof(kLibmAtan2Sites[0]);
+diff --git a/native/linux/src/windows_ucrt_math_linux.cpp b/native/linux/src/windows_ucrt_math_linux.cpp
+new file mode 100644
+index 0000000..6edc376
+--- /dev/null
++++ b/native/linux/src/windows_ucrt_math_linux.cpp
+@@ -0,0 +1,474 @@
++// windows_ucrt_math_linux.cpp -- see windows_ucrt_math_linux.h.
++// Plain C++17; also builds with MSVC for the exhaustive check against
++// ucrtbase.dll. No FMA contraction may be applied to this file.
++#if defined(__GNUC__) && !defined(__clang__)
++#pragma GCC optimize("fp-contract=off")
++#endif
++#if defined(__clang__)
++#pragma clang fp contract(off)
++#endif
++#include "windows_ucrt_math_linux.h"
++#include <cmath>
++#include <cstring>
++#if __has_include(<bit>)
++#include <bit>
++#endif
++#if defined(_MSC_VER)
++#include <intrin.h>
++#endif
++
++namespace {
++
++// std::bit_cast where the library has it: MSVC 14.44 /O2 folds a memcpy of a
++// truncated 64-bit loop counter into a float CONVERSION (found by the
++// exhaustive check), so the Windows check build must not rely on memcpy.
++#if defined(__cpp_lib_bit_cast)
++inline uint32_t FBits(float f) { return std::bit_cast<uint32_t>(f); }
++inline float BitsF(uint32_t u) { return std::bit_cast<float>(u); }
++inline uint64_t DBits(double d) { return std::bit_cast<uint64_t>(d); }
++inline double BitsD(uint64_t u) { return std::bit_cast<double>(u); }
++#else
++inline uint32_t FBits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
++inline float BitsF(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
++inline uint64_t DBits(double d) { uint64_t u; std::memcpy(&u, &d, 8); return u; }
++inline double BitsD(uint64_t u) { double d; std::memcpy(&d, &u, 8); return d; }
++#endif
++
++inline void Mul64(uint64_t a, uint64_t b, uint64_t* lo, uint64_t* hi)
++{
++#if defined(_MSC_VER)
++    *lo = _umul128(a, b, hi);
++#else
++    const unsigned __int128 p = (unsigned __int128)a * b;
++    *lo = (uint64_t)p;
++    *hi = (uint64_t)(p >> 64);
++#endif
++}
++inline int Bsr64(uint64_t v)
++{
++#if defined(_MSC_VER)
++    unsigned long i;
++    _BitScanReverse64(&i, v);
++    return (int)i;
++#else
++    return 63 - __builtin_clzll(v);
++#endif
++}
++
++// ---- constants (bit patterns read from ucrtbase.dll) -------------------------
++const double kC6 = 0x1.5555555555555p-3;          // 1/6 (small-argument sin)
++// sin(r) = r + r^3*((S1 + S2 r^2) + r^4 (S3 + S4 r^2))
++const double kS1 = -0x1.5555555555555p-3;
++const double kS2 = 0x1.1111111111111p-7;
++const double kS3 = -0x1.a01a01a01a01ap-13;
++const double kS4 = 0x1.71de3a556c734p-19;
++// cos(r) = (1 - r^2/2) + r^4*((K1 + K2 r^2) + r^4 (K3 + K4 r^2))
++const double kK1 = 0x1.5555555555555p-5;
++const double kK2 = -0x1.6c16c16c16c16p-10;
++const double kK3 = 0x1.a01a01a01a019p-16;
++const double kK4 = -0x1.27e4fb7789f5cp-22;
++const double kTwoByPi = 0x1.45f306dc9c883p-1;
++const double kPiBy2_1 = 0x1.921fb54400000p+0;
++const double kPiBy2_1Tail = 0x1.0b4611a626331p-34;
++const double kPiBy2_2 = 0x1.0b4611a600000p-34;
++const double kPiBy2_2Tail = 0x1.3198a2e037073p-69;
++const double kPiBy2 = 0x1.921fb54442d18p+0;
++const double kPi = 0x1.921fb54442d18p+1;
++const double kPiBy2Tail = 0x1.1a62633145c07p-54;
++// tan(r) = r + r^3 * (T3 r^2 + T2) / ((T1 r^2 + T0b) r^2 + T0)
++const double kThird = 0x1.5555555555555p-2;
++const double kT3 = -0x1.19dba6efd6aadp-6;
++const double kT2 = 0x1.8a8b0da56cb17p-2;
++const double kT1 = 0x1.2e29003c692d9p-6;
++const double kT0b = -0x1.07266d7b3511bp-1;
++const double kT0 = 0x1.27e84a3e73a2ep+0;
++const double kTwo23 = 0x1.0p+23;
++
++#include "windows_ucrt_math_tables_linux.inc"
++
++inline uint64_t Load64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
++
++// Payne-Hanek reduction of a positive double x >= 2^19, as inlined in sinf
++// (ucrtbase 0xac490) and tanf (0xad568) and in 0xab710 (cosf). Returns the
++// quadrant; *head is the reduced fraction f (x*2/pi minus the nearest integer,
++// in [-1/2, 1/2]) as a double built from the top 53 product bits, *tail the next
++// bits as a second double (used by cosf only).
++int ReduceBits(double x, double* head, double* tail)
++{
++    const uint64_t ux = DBits(x);
++    const int64_t e = (int64_t)(ux >> 52) - 0x3ff;
++    const int64_t off = 0x86 - (e >> 3);
++    const uint64_t m = (ux & 0x000fffffffffffffULL) | (1ULL << 52);
++    uint64_t lo, hi;
++    Mul64(Load64(kTwoByPiBits + off), m, &lo, &hi);
++    uint64_t r8 = lo;
++    const uint64_t carry = hi;
++    Mul64(Load64(kTwoByPiBits + off + 8), m, &lo, &hi);
++    uint64_t r9 = lo + carry;
++    uint64_t r10 = hi + (r9 < lo ? 1 : 0);
++    r10 += Load64(kTwoByPiBits + off + 16) * m;
++    const int e7 = (int)(e & 7);
++    const int cl = 54 - e7;
++    uint64_t q = r10 >> cl;
++    const uint64_t roundBit = (r10 >> (cl - 1)) & 1;
++    uint64_t sign = 0;
++    if (roundBit) { r10 = ~r10; r9 = ~r9; r8 = ~r8; sign = 1ULL << 63; }
++    q = (q + roundBit) & 3;
++    const int keep = e7 + 10;
++    r10 = (r10 << keep) >> keep;
++    uint64_t ex = (uint64_t)(int64_t)(keep - 64);
++    if (r10 == 0) { r10 = r9; r9 = r8; r8 = 0; ex -= 64; }
++    const int msb = Bsr64(r10);
++    ex += (uint64_t)msb;
++    const int c = msb - 52;
++    if (c > 0) {
++        const uint64_t saved = r10;
++        r10 >>= c;
++        r9 >>= c;
++        r9 |= saved << (64 - c);
++    } else if (c < 0) {
++        const int n = -c;
++        const uint64_t a = r9;
++        r10 <<= n;
++        r9 <<= n;
++        r10 |= a >> (64 - n);
++        r9 |= r8 >> (64 - n);
++    }
++    ex += 0x3ff;
++    r10 &= ~(1ULL << 52);
++    r10 |= sign;
++    r10 |= ex << 52;
++    *head = BitsD(r10);
++    if (tail) {
++        // 0xab86e: the next bits of r9, normalised (x86 shift counts are mod 64).
++        const int p2 = r9 ? Bsr64(r9) : 0;
++        const uint64_t sh = (uint64_t)(64 - p2);
++        uint64_t t = r9 << (sh & 63);
++        t >>= 12;
++        const uint64_t tex = ex - (sh + 52);
++        t |= sign;
++        t |= tex << 52;
++        *tail = BitsD(t);
++    }
++    return (int)q;
++}
++
++// sin/cos kernels of the AVX2+FMA paths (Horner with fused multiply-adds).
++inline double SinFma(double r)
++{
++    const double x2 = r * r;
++    double p = std::fma(x2, kS4, kS3);
++    p = std::fma(p, x2, kS2);
++    p = std::fma(p, x2, kS1);
++    const double x3 = r * x2;
++    return std::fma(p, x3, r);
++}
++// cosf's kernel: 1 - r^2/2 rounded before the fused tail.
++inline double CosFmaCosf(double r)
++{
++    const double x2 = r * r;
++    const double head = 1.0 - x2 * 0.5;
++    double p = std::fma(x2, kK4, kK3);
++    p = std::fma(p, x2, kK2);
++    p = std::fma(p, x2, kK1);
++    const double x4 = x2 * x2;
++    return std::fma(p, x4, head);
++}
++// sinf's cosine kernel: 1 - r^2/2 is itself fused.
++inline double CosFmaSinf(double r)
++{
++    const double x2 = r * r;
++    const double head = std::fma(x2, -0.5, 1.0);
++    double p = std::fma(x2, kK4, kK3);
++    p = std::fma(p, x2, kK2);
++    p = std::fma(p, x2, kK1);
++    const double x4 = x2 * x2;
++    return std::fma(p, x4, head);
++}
++
++// Cody-Waite single step with fused reduction (both sinf and cosf AVX paths).
++inline double ReduceFma(double xa, int* region)
++{
++    const double t = std::fma(kTwoByPi, xa, 0.5);
++    const int n = (int)t;                              // cvttpd2dq
++    *region = n & 3;
++    const double dn = (double)n;
++    const double head = std::fma(-dn, kPiBy2_1, xa);
++    const double tail = dn * kPiBy2_1Tail;
++    return head - tail;
++}
++
++inline float NanResult(float x)
++{
++    // UCRT error path: NaN in -> quiet NaN (same payload); +-inf -> default NaN.
++    const uint32_t u = FBits(x);
++    if ((u & 0x7fffffff) > 0x7f800000) return BitsF(u | 0x00400000);
++    return BitsF(0xffc00000u);
++}
++
++const double kPiBy2Hi = 0x1.921fb50000000p+0;          // ucrtbase 0x10bbb0
++const double kPiBy2Lo = 0x1.110b460000000p-26;          // 0x10bbc0
++const double kPiBy2Tail2 = 0x1.1a62633145c06p-54;       // 0x10bbd0
++
++} // namespace
++
++// ---- sinf, AVX2+FMA path (ucrtbase 0xac36d) ---------------------------------
++float Tpf2mpUcrtSinf(float xf)
++{
++    const uint32_t ax = FBits(xf) & 0x7fffffff;
++    if (ax >= 0x7f800000) return NanResult(xf);
++    const double xd = xf;
++    if (ax <= 0x3f490fdb) {
++        if (ax < 0x3c000000) {
++            if (ax < 0x39000000) return xf;
++            const double x3 = (xd * xd) * xd;
++            return (float)std::fma(-x3, kC6, xd);
++        }
++        return (float)SinFma(xd);
++    }
++    const double xa = BitsD(DBits(xd) & 0x7fffffffffffffffULL);
++    double r;
++    int region;
++    if (ax < 0x4b800456) {
++        r = ReduceFma(xa, &region);
++    } else {
++        double f;
++        region = ReduceBits(xa, &f, nullptr);
++        r = f * kPiBy2;
++    }
++    double v = (region & 1) ? CosFmaSinf(r) : SinFma(r);
++    uint64_t flip = 0;
++    if (region < 2) flip ^= 0x8000000000000000ULL;
++    if (!(DBits(xd) >> 63)) flip ^= 0x8000000000000000ULL;
++    v = BitsD(DBits(v) ^ flip);
++    return (float)v;
++}
++
++// ---- cosf, AVX2+FMA path (ucrtbase 0xa7f7d) ---------------------------------
++float Tpf2mpUcrtCosf(float xf)
++{
++    const uint32_t ax = FBits(xf) & 0x7fffffff;
++    if (ax >= 0x7f800000) return NanResult(xf);
++    const double xd = xf;
++    if (ax <= 0x3f490fdb) {
++        if (ax < 0x3c000000) {
++            if (ax < 0x39000000) return 1.0f;
++            return (float)std::fma(-(xd * 0.5), xd, 1.0);
++        }
++        return (float)CosFmaCosf(xd);
++    }
++    const double xa = BitsD(DBits(xd) & 0x7fffffffffffffffULL);
++    double r;
++    int region;
++    if (ax < 0x4f490fdb) {
++        r = ReduceFma(xa, &region);
++    } else {
++        // 0xab710: double-double product of the fraction with pi/2.
++        double f, t;
++        region = ReduceBits(xa, &f, &t);
++        const double fh = BitsD(DBits(f) & 0xfffffffff8000000ULL);
++        const double fl = f - fh;
++        const double big = f * kPiBy2;
++        double lo = fh * kPiBy2Hi;
++        lo = lo - big;
++        lo = std::fma(fl, kPiBy2Hi, lo);
++        lo = std::fma(fh, kPiBy2Lo, lo);
++        lo = std::fma(fl, kPiBy2Lo, lo);
++        double tl = t * kPiBy2;
++        tl = std::fma(f, kPiBy2Tail2, tl);
++        lo = lo + tl;
++        r = big + lo;
++    }
++    double v = (region & 1) ? SinFma(r) : CosFmaCosf(r);
++    if (((region + 1) >> 1) & 1) v = BitsD(DBits(v) ^ 0x8000000000000000ULL);
++    return (float)v;
++}
++
++void Tpf2mpUcrtSincosf(float x, float* s, float* c)
++{
++    *s = Tpf2mpUcrtSinf(x);
++    *c = Tpf2mpUcrtCosf(x);
++}
++
++namespace {
++inline double TanRational(double r)
++{
++    const double x2 = r * r;
++    double num = kT3 * x2;
++    num = num + kT2;
++    double den = kT1 * x2;
++    den = den + kT0b;
++    den = den * x2;
++    den = den + kT0;
++    num = num / den;
++    double t = x2 * r;
++    t = t * num;
++    return r + t;
++}
++} // namespace
++
++float Tpf2mpUcrtTanf(float xf)
++{
++    const uint32_t ax = FBits(xf) & 0x7fffffff;
++    if (ax >= 0x7f800000) return NanResult(xf);
++    const double x5 = xf;
++    if (ax <= 0x3f490fdb) {
++        if (ax < 0x39000000) {
++            if (ax < 0x32000000) return xf;
++            double t = x5 * x5;
++            t = t * x5;
++            t = t * kThird;
++            return (float)(t + x5);
++        }
++        return (float)TanRational(x5);
++    }
++    const uint64_t abits = DBits(x5) & 0x7fffffffffffffffULL;
++    const double xa = BitsD(abits);
++    double r;
++    int region;
++    if ((int64_t)abits < (int64_t)DBits(kTwo23)) {
++        const double t = xa * kTwoByPi + 0.5;
++        const int n = (int)t;
++        region = n & 3;
++        const double dn = (double)n;
++        const double head = xa - dn * kPiBy2_1;
++        const double tail = dn * kPiBy2_1Tail;
++        r = head - tail;
++    } else {
++        double f;
++        region = ReduceBits(xa, &f, nullptr);
++        r = f * kPiBy2;
++    }
++    double v = TanRational(r);
++    if (region & 1) v = -1.0 / v;
++    v = BitsD(DBits(v) ^ (DBits(x5) & 0x8000000000000000ULL));
++    return (float)v;
++}
++
++// ---- acosf, AVX2+FMA path (ucrtbase 0x738ac) --------------------------------
++float Tpf2mpUcrtAcosf(float x)
++{
++    const uint32_t ux = FBits(x);
++    const uint32_t ax = ux & 0x7fffffff;
++    const unsigned e = (ux >> 23) & 0xff;
++    if (ax > 0x7f800000) return BitsF(ux | 0x00400000);
++    if (e < 0x65) return BitsF(0x3fc90fdbu);                  // pi/2
++    if (e >= 0x7f) {
++        if (x == 1.0f) return 0.0f;
++        if (x == -1.0f) return BitsF(0x40490fdbu);            // pi
++        return BitsF(0xffc00000u);
++    }
++    const float a = BitsF(ax);
++    const bool big = e >= 0x7e;                               // |x| >= 0.5
++    float r, s = 0.0f;
++    if (!big) {
++        r = a * a;
++    } else {
++        r = (1.0f - a) * 0.5f;
++        s = std::sqrt(r);
++    }
++    float p = std::fma(-0x1.039cd6p-8f, r, -0x1.b67fc2p-7f);
++    p = std::fma(p, r, -0x1.cf17bap-5f);
++    p = std::fma(p, r, 0x1.7929b8p-3f);
++    const float num = p * r;
++    const float den = std::fma(-0x1.ac3e1ap-1f, r, 0x1.1adf4ap+0f);
++    const float u = num / den;
++    if (!big) {
++        const double d = (double)(u * x);
++        const double t = kPiBy2Tail - d;
++        const double w = (double)x - t;
++        return (float)(kPiBy2 - w);
++    }
++    if (ux >> 31) {
++        const double d1 = (double)(s * u) - kPiBy2Tail;
++        const double v = d1 + (double)s;
++        return (float)(kPi - (v + v));
++    }
++    const float c = BitsF(FBits(s) & 0xffff0000u);
++    const float sc = c + s;
++    const float corr = std::fma(-c, c, r) / sc;
++    float t3 = corr + corr;
++    const float s2 = s + s;
++    t3 = std::fma(u, s2, t3);
++    const float c2 = c + c;
++    return t3 + c2;
++}
++
++// ---- atan2f, SSE2 path (ucrtbase 0x519c0) ------------------------------------
++namespace {
++
++const double kAtanC3 = 0x1.5555555550877p-2;
++const double kAtanP3 = 0x1.5555555555538p-2;
++const double kAtanP5 = 0x1.99999999643a3p-3;
++const double kAtanP7 = 0x1.2492482bd6be1p-3;
++const double kAtanSmall = 0x1.a36e2eb1c432dp-14;      // 0.0001 (ucrtbase 0x102910)
++} // namespace
++
++
++float Tpf2mpUcrtAtan2f(float yf, float xf)
++{
++    const double xd = xf, yd = yf;
++    const uint64_t xb = DBits(xd), yb = DBits(yd);
++    const uint64_t xa = xb & 0x7fffffffffffffffULL, ya = yb & 0x7fffffffffffffffULL;
++    const uint64_t inf = 0x7ff0000000000000ULL;
++    const bool yneg = (yb >> 63) != 0, xneg = (xb >> 63) != 0;
++    const int ediff = (int)((yb >> 52) & 0x7ff) - (int)((xb >> 52) & 0x7ff);
++    if (xa > inf) return BitsF(FBits(xf) | 0x00400000);
++    if (ya > inf) return BitsF(FBits(yf) | 0x00400000);
++    if (ya == 0) {
++        if (xneg) return yneg ? BitsF(0xc0490fdbu) : BitsF(0x40490fdbu);
++        return yf;
++    }
++    if (xa == 0) {
++        if (yneg) return BitsF(0xbfc90fdbu);
++        // +y over +-0 continues and leaves through ediff > 26.
++    }
++    if (ediff > 26) return yneg ? BitsF(0xbfc90fdbu) : BitsF(0x3fc90fdbu);
++    if (ediff < -13 && !xneg) {
++        if (ediff < -150) return yneg ? BitsF(0x80000000u) : 0.0f;
++        if (ediff < -126) return (float)std::ldexp(0x1.0p100 * yd / xd, -100);
++        return (float)(yd / xd);
++    }
++    if (ediff < -26) {   // x < 0 here
++        return yneg ? BitsF(0xc0490fdbu) : BitsF(0x40490fdbu);
++    }
++    if (ya == inf) {
++        if (xa == inf) {
++            if (!xneg) return yneg ? BitsF(0xbf490fdbu) : BitsF(0x3f490fdbu);
++            return yneg ? BitsF(0xc016cbe4u) : BitsF(0x4016cbe4u);
++        }
++    }
++    double den = BitsD(xa), num = BitsD(ya);
++    bool swapped = false;
++    if (num > den) { const double t = den; den = num; num = t; swapped = true; }
++    double u = num / den;
++    double res;
++    if (u > 0.0625) {
++        const int k = (int)(u * 256.0 + 0.5);
++        const double dk = (double)k;
++        const double a = dk * num;
++        const double b = dk * den;
++        const double den256 = den * 256.0;
++        double v = num * 256.0 - b;
++        v = v / (a + den256);
++        res = v + kAtanTable[k - 16];
++        double c = v * v;
++        c = c * v;
++        c = c * kAtanC3;
++        res = res - c;
++    } else if (kAtanSmall > u) {
++        res = u;
++    } else {
++        double u2 = u * u;
++        double p = kAtanP5 - u2 * kAtanP7;
++        p = p * u2;
++        const double u3 = u2 * u;
++        double q = kAtanP3 - p;
++        q = q * u3;
++        res = u - q;
++    }
++    if (swapped) res = kPiBy2 - res;
++    if (xneg) res = kPi - res;
++    if (yneg) res = BitsD(DBits(res) ^ 0x8000000000000000ULL);
++    return (float)res;
++}
+diff --git a/native/linux/src/windows_ucrt_math_linux.h b/native/linux/src/windows_ucrt_math_linux.h
+new file mode 100644
+index 0000000..be4f883
+--- /dev/null
++++ b/native/linux/src/windows_ucrt_math_linux.h
+@@ -0,0 +1,41 @@
++#pragma once
++#include <cstdint>
++
++// Bit-exact models of the Windows UCRT (ucrtbase.dll) float math that the
++// Windows TransportFever2.exe imports (api-ms-win-crt-math-l1-1-0), so the
++// native Linux game can compute exactly what a Windows peer computes.
++//
++// Why: glibc's sinf/cosf/acosf/tanf are more accurate than the UCRT ones and
++// round differently in about 1-2% of calls (measured on game-like inputs);
++// the town street developer and TownDeveloper feed these results into
++// integer truncations and distance/angle thresholds, so one ulp is enough to
++// build a street on one platform and not on the other.
++//
++// Source of truth: ucrtbase.dll 10.0.26100 (the algorithms descend from AMD's
++// open libm; the tables are mathematical constants):
++//   sinf  0xac360 -> 0xac36d (AVX2+FMA)    Taylor sin/cos on |r| <= pi/4,
++//   cosf  0xa7f70 -> 0xa7f7d (AVX2+FMA)    Cody-Waite pi/2 reduction, and a
++//                                          Payne-Hanek reduction for huge |x|
++//   tanf  0xad740 -> 0xad420 (one path)    rational approximation
++//   acosf 0x73890 -> 0x738ac (AVX2+FMA)    single-precision FMA evaluation
++//   atan2f 0x51610 -> 0x519c0 (SSE2)       atan(k/256) table + 3rd-order term
++// ucrtbase picks a path per CPU. Its AVX2+FMA and SSE2 paths DIFFER for sinf
++// (44,232 of 2^32 inputs, mostly |x| >= 2^23), cosf (18,018, incl. tiny |x|)
++// and acosf (about 0.2% of inputs); tanf has one path and atan2f's two agree
++// on 2^31 pairs. The models follow the AVX2+FMA paths, which every Windows
++// CPU with AVX2 and FMA3 takes (a Windows peer without them already differs
++// from other Windows peers).
++//
++// Every function here is checked bit for bit against ucrtbase.dll over all
++// 2^32 inputs (atan2f: 2^31 random pairs plus edge grids) by
++// tests/windows_ucrt_math_check.cpp, which builds on Windows; the Linux test
++// replays golden vectors produced there.
++//
++// Compile with -ffp-contract=off (no FMA contraction): every double/float
++// operation must be the single IEEE operation the UCRT executes.
++float Tpf2mpUcrtSinf(float x);
++float Tpf2mpUcrtCosf(float x);
++void Tpf2mpUcrtSincosf(float x, float* s, float* c);
++float Tpf2mpUcrtTanf(float x);
++float Tpf2mpUcrtAcosf(float x);
++float Tpf2mpUcrtAtan2f(float y, float x);
+diff --git a/native/linux/src/windows_ucrt_math_tables_linux.inc b/native/linux/src/windows_ucrt_math_tables_linux.inc
+new file mode 100644
+index 0000000..605a0a6
+--- /dev/null
++++ b/native/linux/src/windows_ucrt_math_tables_linux.inc
+@@ -0,0 +1,78 @@
++// Generated by scratchpad gen_ucrt_tables.py -- do not edit.
++// floor(2/pi * 2^1202), little endian (the Payne-Hanek reduction reads bytes 0x77..0x96).
++const uint8_t kTwoByPiBits[0xa0] = {
++    0xed,0xf1,0x1b,0xc1,0x0c,0x58,0x21,0x74,0x35,0x7e,0xc4,0x7e,0xed,0xaf,0xa9,0x4b,
++    0x4a,0x29,0xde,0xe7,0x1c,0xf4,0xec,0xc5,0x97,0xaf,0x1f,0xeb,0x9e,0xd4,0xb5,0xa8,
++    0x7f,0x79,0x9a,0xfd,0x18,0x3d,0xdd,0x26,0x2c,0x9f,0x3c,0xfb,0xd9,0xb4,0x7d,0xb4,
++    0x29,0x68,0x2d,0x46,0xbc,0xbc,0x3f,0x60,0x16,0x78,0xff,0x5f,0xe2,0x7f,0xec,0xa0,
++    0xe4,0xf7,0x2e,0x7e,0x11,0x72,0xd2,0xe7,0x4c,0x0d,0xe6,0x58,0x47,0xe6,0x04,0xf9,
++    0x7d,0xd1,0x9a,0xc0,0x71,0xa6,0x13,0x12,0xed,0xba,0xd4,0xd7,0x08,0xa2,0xfb,0x9c,
++    0xa6,0xc4,0x72,0xac,0x77,0xf8,0x73,0x48,0x46,0x27,0xa8,0xbb,0x24,0x19,0x80,0x4b,
++    0x37,0x09,0xe9,0xb8,0x91,0xdc,0x86,0x15,0xef,0x7a,0xaf,0x8e,0x45,0xf9,0x07,0x41,
++    0x0e,0xf1,0x64,0x56,0x8a,0x6d,0x03,0x77,0xd3,0xd4,0x47,0x5f,0x9d,0xf0,0xa7,0x54,
++    0x10,0x39,0xb9,0x0d,0xe6,0x8b,0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
++};
++// RZ(atan(k/256)), k = 16..256 (rounded toward zero).
++const double kAtanTable[241] = {
++    0x1.ff55bb72cfde9p-5, 0x1.0f99ea71d52a6p-4, 0x1.1f86dbf082d58p-4, 0x1.2f719318a4a9ap-4,
++    0x1.3f59f0e7c559dp-4, 0x1.4f3fd677292fbp-4, 0x1.5f2324fd2d7b2p-4, 0x1.6f03bdcea4b0cp-4,
++    0x1.7ee182602f10ep-4, 0x1.8ebc54478fb28p-4, 0x1.9e94153cfdcf1p-4, 0x1.ae68a71c722b8p-4,
++    0x1.be39ebe6f07c3p-4, 0x1.ce07c5c3cca32p-4, 0x1.ddd21701eba6ep-4, 0x1.ed98c2190043ap-4,
++    0x1.fd5ba9aac2f6dp-4, 0x1.068d584212b3dp-3, 0x1.0e6adccf40881p-3, 0x1.1646541060850p-3,
++    0x1.1e1fafb043726p-3, 0x1.25f6e171a535cp-3, 0x1.2dcbdb2fba1ffp-3, 0x1.359e8edeb99a3p-3,
++    0x1.3d6eee8c6626cp-3, 0x1.453cec6092a9ep-3, 0x1.4d087a9da4f17p-3, 0x1.54d18ba11570ap-3,
++    0x1.5c9811e3ec269p-3, 0x1.645bfffb3aa73p-3, 0x1.6c1d4898933d8p-3, 0x1.73dbde8a7d201p-3,
++    0x1.7b97b4bce5b02p-3, 0x1.8350be398ebc7p-3, 0x1.8b06ee2879c28p-3, 0x1.92ba37d050271p-3,
++    0x1.9a6a8e96c8626p-3, 0x1.a217e601081a5p-3, 0x1.a9c231b403279p-3, 0x1.b1696574d780bp-3,
++    0x1.b90d7529260a2p-3, 0x1.c0ae54d768466p-3, 0x1.c84bf8a742e6dp-3, 0x1.cfe654e1d5395p-3,
++    0x1.d77d5df205736p-3, 0x1.df110864c9d9dp-3, 0x1.e6a148e96ec4dp-3, 0x1.ee2e1451d980cp-3,
++    0x1.f5b75f92c80ddp-3, 0x1.fd3d1fc40dbe4p-3, 0x1.025fa510665b5p-2, 0x1.061eea03d6290p-2,
++    0x1.09dc597d86362p-2, 0x1.0d97ee509acb3p-2, 0x1.1151a362431c9p-2, 0x1.150973a9ce546p-2,
++    0x1.18bf5a30bf178p-2, 0x1.1c735212dd883p-2, 0x1.2025567e47c95p-2, 0x1.23d562b381041p-2,
++    0x1.278372057ef45p-2, 0x1.2b2f7fd9b5fe2p-2, 0x1.2ed987a823cfep-2, 0x1.328184fb58951p-2,
++    0x1.362773707ebcbp-2, 0x1.39cb4eb76157bp-2, 0x1.3d6d129271134p-2, 0x1.410cbad6c7d32p-2,
++    0x1.44aa436c2af09p-2, 0x1.4845a84d0c21bp-2, 0x1.4bdee586890e6p-2, 0x1.4f75f73869978p-2,
++    0x1.530ad9951cd49p-2, 0x1.569d88e1b4cd7p-2, 0x1.5a2e0175e0f4ep-2, 0x1.5dbc3fbbe768dp-2,
++    0x1.614840309cfe1p-2, 0x1.64d1ff635c1c5p-2, 0x1.685979f5fa6fdp-2, 0x1.6bdeac9cbd76cp-2,
++    0x1.6f61941e4def0p-2, 0x1.72e22d53aa2a9p-2, 0x1.7660752817501p-2, 0x1.79dc6899118d1p-2,
++    0x1.7d5604b63b3f7p-2, 0x1.80cd46a14b1d0p-2, 0x1.84422b8df95d7p-2, 0x1.87b4b0c1ebedbp-2,
++    0x1.8b24d394a1b25p-2, 0x1.8e92916f5cde8p-2, 0x1.91fde7cd0c662p-2, 0x1.9566d43a34907p-2,
++    0x1.98cd5454d6b18p-2, 0x1.9c3165cc58107p-2, 0x1.9f93066168001p-2, 0x1.a2f233e5e530bp-2,
++    0x1.a64eec3cc23fcp-2, 0x1.a9a92d59e98cfp-2, 0x1.ad00f5422058bp-2, 0x1.b056420ae9343p-2,
++    0x1.b3a911da65c6cp-2, 0x1.b6f962e737efbp-2, 0x1.ba473378624a5p-2, 0x1.bd9281e528191p-2,
++    0x1.c0db4c94ec9efp-2, 0x1.c42191ff11eb6p-2, 0x1.c76550aad71f8p-2, 0x1.caa6872f3631bp-2,
++    0x1.cde53432c1350p-2, 0x1.d121566b7f2adp-2, 0x1.d45aec9ec862bp-2, 0x1.d791f5a1226f4p-2,
++    0x1.dac670561bb4fp-2, 0x1.ddf85bb026974p-2, 0x1.e127b6b0744afp-2, 0x1.e4548066cf51ap-2,
++    0x1.e77eb7f175a34p-2, 0x1.eaa65c7cf28c4p-2, 0x1.edcb6d43f8434p-2, 0x1.f0ede98f393cfp-2,
++    0x1.f40dd0b541417p-2, 0x1.f72b221a4e495p-2, 0x1.fa45dd3029258p-2, 0x1.fd5e0175fdf83p-2,
++    0x1.0039c73c1a40bp-1, 0x1.01c341e82422dp-1, 0x1.034b709250488p-1, 0x1.04d25314342e5p-1,
++    0x1.0657e94db30cfp-1, 0x1.07dc3324e9b38p-1, 0x1.095f30861a58fp-1, 0x1.0ae0e1639866cp-1,
++    0x1.0c6145b5b43dap-1, 0x1.0de05d7aa6f7cp-1, 0x1.0f5e28b67e295p-1, 0x1.10daa77307a0dp-1,
++    0x1.1255d9bfbd2a8p-1, 0x1.13cfbfb1b056ep-1, 0x1.1548596376469p-1, 0x1.16bfa6f5137e1p-1,
++    0x1.1835a88be7c13p-1, 0x1.19aa5e5299f99p-1, 0x1.1b1dc87904284p-1, 0x1.1c8fe7341f64fp-1,
++    0x1.1e00babdefeb3p-1, 0x1.1f7043557138ap-1, 0x1.20de813e823b1p-1, 0x1.224b74c1d192ap-1,
++    0x1.23b71e2cc9e6ap-1, 0x1.25217dd17e501p-1, 0x1.268a940696da6p-1, 0x1.27f261273d1b3p-1,
++    0x1.2958e59308e30p-1, 0x1.2abe21aded073p-1, 0x1.2c2215e024465p-1, 0x1.2d84c2961e48bp-1,
++    0x1.2ee628406cbcap-1, 0x1.30464753b090ap-1, 0x1.31a52048874bep-1, 0x1.3302b39b78856p-1,
++    0x1.345f01cce37bbp-1, 0x1.35ba0b60ecccep-1, 0x1.3713d0df6c503p-1, 0x1.386c52d3db11ep-1,
++    0x1.39c391cd41719p-1, 0x1.3b198e5e2564ap-1, 0x1.3c6e491c78dc4p-1, 0x1.3dc1c2a188504p-1,
++    0x1.3f13fb89e96f4p-1, 0x1.4064f47569f48p-1, 0x1.41b4ae06fea41p-1, 0x1.430328e4b26d5p-1,
++    0x1.445065b795b55p-1, 0x1.459c652badc7fp-1, 0x1.46e727efe4715p-1, 0x1.4830aeb5f7bfdp-1,
++    0x1.4978fa3269ee1p-1, 0x1.4ac00b1c71762p-1, 0x1.4c05e22de94e4p-1, 0x1.4d4a8023414e8p-1,
++    0x1.4e8de5bb6ec04p-1, 0x1.4fd013b7dd17ep-1, 0x1.51110adc5ed81p-1, 0x1.5250cbef1e9fap-1,
++    0x1.538f57b89061ep-1, 0x1.54ccaf0362c8fp-1, 0x1.5608d29c70c34p-1, 0x1.5743c352b33b9p-1,
++    0x1.587d81f732fbap-1, 0x1.59b60f5cfab9dp-1, 0x1.5aed6c5909517p-1, 0x1.5c2399c244260p-1,
++    0x1.5d58987169b18p-1, 0x1.5e8c6941043cfp-1, 0x1.5fbf0d0d5cc49p-1, 0x1.60f084b46e05ep-1,
++    0x1.6220d115d7b8dp-1, 0x1.634ff312d1f3bp-1, 0x1.647deb8e20b8fp-1, 0x1.65aabb6c07b02p-1,
++    0x1.66d663923e086p-1, 0x1.6800e4e7e2857p-1, 0x1.692a40556fb6ap-1, 0x1.6a5276c4b0575p-1,
++    0x1.6b798920b3d98p-1, 0x1.6c9f7855c3198p-1, 0x1.6dc44551553aep-1, 0x1.6ee7f10204aefp-1,
++    0x1.700a7c5784633p-1, 0x1.712be84295198p-1, 0x1.724c35b4fae7bp-1, 0x1.736b65a172dffp-1,
++    0x1.748978fba8e0fp-1, 0x1.75a670b82d8d8p-1, 0x1.76c24dcc6c6c0p-1, 0x1.77dd112ea22c7p-1,
++    0x1.78f6bbd5d315ep-1, 0x1.7a0f4eb9c19a2p-1, 0x1.7b26cad2e50fdp-1, 0x1.7c3d311a6092bp-1,
++    0x1.7d528289fa093p-1, 0x1.7e66c01c114fdp-1, 0x1.7f79eacb97898p-1, 0x1.808c03940694ap-1,
++    0x1.819d0b7158a4cp-1, 0x1.82ad036000005p-1, 0x1.83bbec5cdee22p-1, 0x1.84c9c7653f7eap-1,
++    0x1.85d69576cc2c5p-1, 0x1.86e2578f87ae5p-1, 0x1.87ed0eadc5a2ap-1, 0x1.88f6bbd023118p-1,
++    0x1.89ff5ff57f1f7p-1, 0x1.8b06fc1cf3dfep-1, 0x1.8c0d9145cf49dp-1, 0x1.8d13206f8c4cap-1,
++    0x1.8e17aa99cc05dp-1, 0x1.8f1b30c44f167p-1, 0x1.901db3eeef187p-1, 0x1.911f35199833bp-1,
++    0x1.921fb54442d18p-1,
++};
+diff --git a/native/linux/tests/libm_parity_test.cpp b/native/linux/tests/libm_parity_test.cpp
+new file mode 100644
+index 0000000..1a079ce
+--- /dev/null
++++ b/native/linux/tests/libm_parity_test.cpp
+@@ -0,0 +1,199 @@
++// libm parity: the UCRT float math models against golden hashes produced on
++// Windows from ucrtbase.dll itself (windows_ucrt_math_golden_linux.h), vectors
++// where glibc and ucrtbase measurably differ, and the installer's GOT/call-site
++// verification, write and rollback on a fake image.
++#include "../src/libm_parity_linux.cpp"
++#include "../src/windows_ucrt_math_linux.h"
++#include "windows_ucrt_math_golden_linux.h"
++#include <cassert>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++#if __has_include(<bit>)
++#include <bit>
++#endif
++#if defined(__cpp_lib_bit_cast)
++static uint32_t B(float f) { return std::bit_cast<uint32_t>(f); }
++static float F(uint32_t u) { return std::bit_cast<float>(u); }
++#else
++static uint32_t B(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
++static float F(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
++#endif
++static uint64_t Fnv(uint64_t h, uint32_t v)
++{
++    for (int i = 0; i < 4; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 0x100000001b3ULL; }
++    return h;
++}
++template <class Fn> static uint64_t StrideHash(Fn fn)
++{
++    uint64_t h = 0xcbf29ce484222325ULL;
++    for (uint64_t i = 0; i < (1ULL << 32); i += kUcrtGoldenStride) h = Fnv(h, B(fn(F((uint32_t)i))));
++    return h;
++}
++
++// ucrtbase (Windows) vs glibc 2.42 (the production server) on the same input:
++// taken from the 200k-input libm comparison; the model must give the Windows bits.
++struct Vec { const char* fn; uint32_t x, windows, glibc; };
++static const Vec kVectors[] = {
++    {"sinf", 0xc117f700, 0x3d956bfe, 0x3d956bff}, {"sinf", 0xc01bf5a4, 0xbf25d7d0, 0xbf25d7d1},
++    {"sinf", 0x40be4a4e, 0xbea91c47, 0xbea91c48}, {"sinf", 0x410e0a48, 0x3f05360f, 0x3f05360e},
++    {"cosf", 0xc105e3c7, 0xbefbca0b, 0xbefbca0a}, {"cosf", 0x3fae2998, 0x3e559d7a, 0x3e559d7b},
++    {"cosf", 0xc09ca6bc, 0x3e3a4fd9, 0x3e3a4fda}, {"cosf", 0xc083fa72, 0xbf0e0459, 0xbf0e0458},
++    {"tanf", 0xbf0dd22e, 0xbf1e5cfa, 0xbf1e5cfb}, {"tanf", 0x3f47bbe2, 0x3f7d5b8f, 0x3f7d5b90},
++    {"tanf", 0x3f1087f6, 0x3f22229c, 0x3f22229d}, {"tanf", 0x3f0cf8d0, 0x3f1d310b, 0x3f1d310c},
++    {"acosf", 0xbf50c016, 0x40218da2, 0x40218da3}, {"acosf", 0xbf29e6a2, 0x4012fa26, 0x4012fa27},
++    {"acosf", 0xbf175212, 0x400d0172, 0x400d0173}, {"acosf", 0xbf519524, 0x4021ea04, 0x4021ea05},
++    // Found by the exhaustive Windows check: ucrtbase's AVX2+FMA path differs
++    // from its own SSE2 path here (sinf at 2^23 + 768, cosf of a tiny angle).
++    {"sinf", 0x4b000300, 0xbf580632, 0},
++    {"cosf", 0x3a544395, 0x3f7ffffa, 0},
++};
++
++static float Model(const char* fn, float x)
++{
++    if (!std::strcmp(fn, "sinf")) return Tpf2mpUcrtSinf(x);
++    if (!std::strcmp(fn, "cosf")) return Tpf2mpUcrtCosf(x);
++    if (!std::strcmp(fn, "tanf")) return Tpf2mpUcrtTanf(x);
++    return Tpf2mpUcrtAcosf(x);
++}
++static float Glibc(const char* fn, float x)
++{
++    if (!std::strcmp(fn, "sinf")) return sinf(x);
++    if (!std::strcmp(fn, "cosf")) return cosf(x);
++    if (!std::strcmp(fn, "tanf")) return tanf(x);
++    return acosf(x);
++}
++
++// ---- installer on a fake image ------------------------------------------------
++static int FakeWrite(uintptr_t addr, const uint8_t* bytes, size_t len, int*)
++{
++    std::memcpy(reinterpret_cast<void*>(addr), bytes, len);
++    return TPF2MP_CW_OK;
++}
++static int g_writes = 0, g_failAt = -1;
++static int FailingWrite(uintptr_t addr, const uint8_t* bytes, size_t len, int* e)
++{
++    if (g_writes++ == g_failAt) return TPF2MP_CW_UNAVAILABLE;   // this one write fails, the rollback succeeds
++    return FakeWrite(addr, bytes, len, e);
++}
++static uintptr_t FakeResolve(const char* name, uintptr_t current)
++{
++    return current == 0x1000u + (uintptr_t)std::strlen(name) ? current : 0;   // "libm" address per name
++}
++static std::vector<uintptr_t> g_redirected;
++static bool FakeRedirect(uintptr_t site, uintptr_t callee, void* target)
++{
++    assert(target == reinterpret_cast<void*>(Tpf2mpUcrtAtan2FromFloats));
++    const uint8_t* s = reinterpret_cast<const uint8_t*>(site);
++    int32_t rel; std::memcpy(&rel, s + 1, 4);
++    if (s[0] != 0xe8 || site + 5 + (intptr_t)rel != callee) return false;
++    g_redirected.push_back(site);
++    return true;
++}
++static uintptr_t BuildFakeImage(std::vector<unsigned char>& img)
++{
++    img.assign(0x5a48000, 0);
++    const uintptr_t base = reinterpret_cast<uintptr_t>(img.data());
++    for (const auto& s : g_slots) {
++        const uintptr_t v = 0x1000u + std::strlen(s.slot.name);
++        std::memcpy(&img[s.slot.rva], &v, 8);
++    }
++    for (const auto& site : kLibmAtan2Sites) std::memcpy(&img[site.guardRva], site.guard, site.guardSize);
++    return base;
++}
++static void ResetModule()
++{
++    g_activeSlots = g_activeSites = 0;
++    for (auto& s : g_slots) s.original = 0;
++    g_redirected.clear();
++}
++
++int main()
++{
++    // 1. Golden: the models against ucrtbase.dll's own outputs.
++    struct { const char* name; float (*fn)(float); uint64_t golden; } fns[] = {
++        {"sinf", Tpf2mpUcrtSinf, kUcrtGolden_sinf}, {"cosf", Tpf2mpUcrtCosf, kUcrtGolden_cosf},
++        {"tanf", Tpf2mpUcrtTanf, kUcrtGolden_tanf}, {"acosf", Tpf2mpUcrtAcosf, kUcrtGolden_acosf},
++    };
++    for (const auto& f : fns) {
++        const uint64_t h = StrideHash(f.fn);
++        std::printf("%-6s stride hash 0x%016llx (golden 0x%016llx)\n", f.name, (unsigned long long)h,
++                    (unsigned long long)f.golden);
++        assert(h == f.golden);
++    }
++    {
++        uint64_t h = 0xcbf29ce484222325ULL, s = 0x243f6a8885a308d3ULL;
++        for (int i = 0; i < (1 << 24); ++i) {
++            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
++            h = Fnv(h, B(Tpf2mpUcrtAtan2f(F((uint32_t)s), F((uint32_t)(s >> 32)))));
++        }
++        std::printf("atan2f pair hash 0x%016llx (golden 0x%016llx)\n", (unsigned long long)h,
++                    (unsigned long long)kUcrtGolden_atan2f);
++        assert(h == kUcrtGolden_atan2f);
++    }
++    // 2. Vectors where the platforms differ.
++    unsigned glibcDiffers = 0;
++    for (const auto& v : kVectors) {
++        assert(B(Model(v.fn, F(v.x))) == v.windows);
++        if (v.glibc && B(Glibc(v.fn, F(v.x))) != v.windows) ++glibcDiffers;
++    }
++    std::printf("vectors: model == ucrtbase for all %zu; this libm differs on %u of 16\n",
++                sizeof(kVectors) / sizeof(kVectors[0]), glibcDiffers);
++    // The atan2 call-site replacement narrows exactly.
++    assert(Tpf2mpUcrtAtan2FromFloats((double)1.5f, (double)-2.25f) == (double)Tpf2mpUcrtAtan2f(1.5f, -2.25f));
++    // sincosf is sinf + cosf.
++    for (uint32_t u : {0x3f060a92u, 0x40490fdbu, 0x4b000300u, 0xc2c80000u}) {
++        float s, c; Tpf2mpUcrtSincosf(F(u), &s, &c);
++        assert(B(s) == B(Tpf2mpUcrtSinf(F(u))) && B(c) == B(Tpf2mpUcrtCosf(F(u))));
++    }
++
++    // 3. Installer.
++    std::vector<unsigned char> img;
++    uintptr_t base = BuildFakeImage(img);
++    ResetModule();
++    unsetenv("TPF2MP_LIBM_PARITY");
++    assert(!InstallLibmParityWith(base, "not-the-build", FakeWrite, FakeResolve, FakeRedirect));
++    setenv("TPF2MP_LIBM_PARITY", "0", 1);
++    assert(!InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
++    unsetenv("TPF2MP_LIBM_PARITY");
++    // A foreign slot value refuses everything.
++    { uintptr_t bad = 0x4242; std::memcpy(&img[kLibmGotCosf.rva], &bad, 8); }
++    assert(!InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
++    assert(std::strstr(Tpf2mpLibmParityStatus(), "cosf"));
++    base = BuildFakeImage(img);
++    ResetModule();
++    // A changed guard byte refuses everything, before any write.
++    img[kLibmAtan2Sites[1].guardRva + 2] ^= 1;
++    assert(!InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
++    { uintptr_t v; std::memcpy(&v, &img[kLibmGotSinf.rva], 8); assert(v == 0x1000u + 4); }
++    base = BuildFakeImage(img);
++    ResetModule();
++    // Success: every slot points at the model, every site redirected.
++    assert(InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
++    for (const auto& s : g_slots) {
++        uintptr_t v; std::memcpy(&v, &img[s.slot.rva], 8);
++        assert(v == reinterpret_cast<uintptr_t>(s.replacement));
++    }
++    assert(g_redirected.size() == kLibmAtan2SiteCount);
++    assert(std::strncmp(Tpf2mpLibmParityStatus(), "enabled", 7) == 0);
++    // Installed slots call the models.
++    { uintptr_t v; std::memcpy(&v, &img[kLibmGotAcosf.rva], 8);
++      assert(B(reinterpret_cast<float (*)(float)>(v)(F(0xbf50c016u))) == 0x40218da2u); }
++    // A second install changes nothing.
++    assert(!InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
++    // A failed write rolls back the slots already written.
++    base = BuildFakeImage(img);
++    ResetModule();
++    g_writes = 0; g_failAt = 3;
++    assert(!InstallLibmParityWith(base, kLibmBuildId, FailingWrite, FakeResolve, FakeRedirect));
++    g_failAt = -1;
++    for (const auto& s : g_slots) {
++        uintptr_t v; std::memcpy(&v, &img[s.slot.rva], 8);
++        assert(v == 0x1000u + std::strlen(s.slot.name));
++    }
++    assert(g_activeSlots == 0 && g_redirected.empty());
++    std::printf("libm parity: all checks passed\n");
++    return 0;
++}
+diff --git a/native/linux/tests/windows_ucrt_math_check.cpp b/native/linux/tests/windows_ucrt_math_check.cpp
+new file mode 100644
+index 0000000..7c061fa
+--- /dev/null
++++ b/native/linux/tests/windows_ucrt_math_check.cpp
+@@ -0,0 +1,162 @@
++// windows_ucrt_math_check.cpp -- WINDOWS-ONLY exhaustive check of
++// src/windows_ucrt_math_linux.cpp against the real ucrtbase.dll, and the
++// generator of tests/windows_ucrt_math_golden_linux.h for the Linux test.
++//
++//   cl /std:c++20 /O2 /EHsc /fp:precise tests\windows_ucrt_math_check.cpp
++//      src\windows_ucrt_math_linux.cpp /Fe:ucrtcheck.exe
++//   ucrtcheck.exe [golden-header-path]
++//
++// For each one-argument function every one of the 2^32 float inputs is
++// compared bit for bit (NaN results compared by bits too). atan2f is checked
++// on 2^31 random pairs plus edge grids. The golden header holds, per
++// function, the FNV-1a-64 hash of ucrtbase's outputs over a fixed stride of
++// inputs (atan2f: over 2^24 fixed pseudo-random pairs).
++#include "../src/windows_ucrt_math_linux.h"
++#include <windows.h>
++#include <atomic>
++#include <bit>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <thread>
++#include <vector>
++
++typedef float(__cdecl* F1)(float);
++typedef float(__cdecl* F2)(float, float);
++
++// std::bit_cast: MSVC 14.44 /O2 turns memcpy(float <- (uint32_t)u64 counter)
++// into an int->float conversion.
++static uint32_t B(float f) { return std::bit_cast<uint32_t>(f); }
++static float F(uint32_t u) { return std::bit_cast<float>(u); }
++
++struct Fn1 { const char* name; F1 ref; float (*mine)(float); };
++
++static float MySin(float x) { return Tpf2mpUcrtSinf(x); }
++static float MyCos(float x) { return Tpf2mpUcrtCosf(x); }
++static float MyTan(float x) { return Tpf2mpUcrtTanf(x); }
++static float MyAcos(float x) { return Tpf2mpUcrtAcosf(x); }
++
++static uint64_t Fnv(uint64_t h, uint32_t v)
++{
++    for (int i = 0; i < 4; ++i) { h ^= (v >> (8 * i)) & 0xff; h *= 0x100000001b3ULL; }
++    return h;
++}
++// Stride over all inputs used by the golden hash (prime, ~44M inputs).
++static const uint32_t kStride = 97;
++
++int main(int argc, char** argv)
++{
++    HMODULE u = LoadLibraryA("ucrtbase.dll");
++    if (!u) { std::printf("no ucrtbase\n"); return 2; }
++    Fn1 fns[] = {
++        {"sinf", (F1)GetProcAddress(u, "sinf"), MySin},
++        {"cosf", (F1)GetProcAddress(u, "cosf"), MyCos},
++        {"tanf", (F1)GetProcAddress(u, "tanf"), MyTan},
++        {"acosf", (F1)GetProcAddress(u, "acosf"), MyAcos},
++    };
++    F2 atan2ref = (F2)GetProcAddress(u, "atan2f");
++    const unsigned threads = std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 8;
++    int failures = 0;
++    FILE* golden = argc > 1 ? std::fopen(argv[1], "wb") : nullptr;
++    if (golden) {
++        std::fprintf(golden, "// Generated on Windows by tests/windows_ucrt_math_check.cpp against\n"
++                             "// ucrtbase.dll; do not edit. hash = FNV-1a-64 over the output bits of\n"
++                             "// every input i*%u (i = 0 .. 2^32/%u), 4 bytes little endian each.\n#pragma once\n#include <cstdint>\n", kStride, kStride);
++        std::fprintf(golden, "constexpr uint32_t kUcrtGoldenStride = %u;\n", kStride);
++    }
++    for (const Fn1& f : fns) {
++        std::atomic<uint64_t> bad{0};
++        std::atomic<uint32_t> firstBad{0xffffffffu};
++        std::vector<std::thread> pool;
++        const uint64_t total = 1ULL << 32;
++        for (unsigned t = 0; t < threads; ++t) {
++            pool.emplace_back([&, t] {
++                const uint64_t lo = total * t / threads, hi = total * (t + 1) / threads;
++                uint64_t localBad = 0;
++                for (uint64_t i = lo; i < hi; ++i) {
++                    const float x = F((uint32_t)i);
++                    const uint32_t a = B(f.ref(x)), b = B(f.mine(x));
++                    if (a != b) {
++                        if (!localBad) {
++                            uint32_t cur = firstBad.load();
++                            while ((uint32_t)i < cur && !firstBad.compare_exchange_weak(cur, (uint32_t)i)) {}
++                        }
++                        ++localBad;
++                    }
++                }
++                bad += localBad;
++            });
++        }
++        for (auto& th : pool) th.join();
++        std::printf("%-6s all 2^32 inputs: %llu mismatches", f.name, (unsigned long long)bad.load());
++        if (bad) {
++            const uint32_t i = firstBad.load();
++            std::printf("  first 0x%08x (%.9g): ucrt 0x%08x mine 0x%08x", i, F(i), B(f.ref(F(i))), B(f.mine(F(i))));
++            ++failures;
++        }
++        std::printf("\n");
++        if (golden) {
++            uint64_t h = 0xcbf29ce484222325ULL;
++            for (uint64_t i = 0; i < (1ULL << 32); i += kStride) h = Fnv(h, B(f.ref(F((uint32_t)i))));
++            std::fprintf(golden, "constexpr uint64_t kUcrtGolden_%s = 0x%016llxULL;\n", f.name, (unsigned long long)h);
++        }
++    }
++    // atan2f: random pairs over all bit patterns, plus a grid of edge values.
++    {
++        std::atomic<uint64_t> bad{0};
++        std::atomic<uint64_t> firstPair{~0ULL};
++        std::vector<std::thread> pool;
++        const uint64_t perThread = (1ULL << 31) / threads;
++        for (unsigned t = 0; t < threads; ++t) {
++            pool.emplace_back([&, t] {
++                uint64_t s = 0x9e3779b97f4a7c15ULL * (t + 1);
++                uint64_t localBad = 0;
++                for (uint64_t i = 0; i < perThread; ++i) {
++                    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
++                    uint32_t yb = (uint32_t)s, xb = (uint32_t)(s >> 32);
++                    // Half of the pairs: game-like magnitudes (exponents 0x70..0x90).
++                    if (i & 1) { yb = (yb & 0x807fffff) | ((0x70 + (yb >> 23) % 0x20) << 23);
++                                 xb = (xb & 0x807fffff) | ((0x70 + (xb >> 23) % 0x20) << 23); }
++                    const float y = F(yb), x = F(xb);
++                    if (B(atan2ref(y, x)) != B(Tpf2mpUcrtAtan2f(y, x))) {
++                        if (!localBad) firstPair = ((uint64_t)yb << 32) | xb;
++                        ++localBad;
++                    }
++                }
++                bad += localBad;
++            });
++        }
++        for (auto& th : pool) th.join();
++        const float edge[] = {0.0f, -0.0f, 1.0f, -1.0f, 1e-45f, -1e-45f, 1e-38f, 3e38f, -3e38f,
++                              INFINITY, -INFINITY, NAN, 0.5f, 2.0f, 0.0625f, 1e-4f, 256.0f};
++        uint64_t edgeBad = 0;
++        for (float y : edge) for (float x : edge)
++            if (B(atan2ref(y, x)) != B(Tpf2mpUcrtAtan2f(y, x))) {
++                std::printf("  atan2f edge y=%g x=%g: ucrt 0x%08x mine 0x%08x\n", y, x,
++                            B(atan2ref(y, x)), B(Tpf2mpUcrtAtan2f(y, x)));
++                ++edgeBad;
++            }
++        std::printf("atan2f 2^31 random pairs: %llu mismatches, edge grid: %llu", (unsigned long long)bad.load(),
++                    (unsigned long long)edgeBad);
++        if (bad) {
++            const uint64_t p = firstPair.load();
++            const float y = F((uint32_t)(p >> 32)), x = F((uint32_t)p);
++            std::printf("  e.g. y=0x%08x x=0x%08x ucrt 0x%08x mine 0x%08x", (uint32_t)(p >> 32), (uint32_t)p,
++                        B(atan2ref(y, x)), B(Tpf2mpUcrtAtan2f(y, x)));
++        }
++        std::printf("\n");
++        if (bad || edgeBad) ++failures;
++        if (golden) {
++            uint64_t h = 0xcbf29ce484222325ULL, s = 0x243f6a8885a308d3ULL;
++            for (int i = 0; i < (1 << 24); ++i) {
++                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
++                h = Fnv(h, B(atan2ref(F((uint32_t)s), F((uint32_t)(s >> 32)))));
++            }
++            std::fprintf(golden, "// atan2f: 2^24 xorshift64 pairs from seed 0x243f6a8885a308d3 (y = low, x = high word).\n");
++            std::fprintf(golden, "constexpr uint64_t kUcrtGolden_atan2f = 0x%016llxULL;\n", (unsigned long long)h);
++        }
++    }
++    if (golden) std::fclose(golden);
++    std::printf(failures ? "FAILED (%d functions)\n" : "all bit-identical\n", failures);
++    return failures ? 1 : 0;
++}
+diff --git a/native/linux/tests/windows_ucrt_math_golden_linux.h b/native/linux/tests/windows_ucrt_math_golden_linux.h
+new file mode 100644
+index 0000000..751f669
+--- /dev/null
++++ b/native/linux/tests/windows_ucrt_math_golden_linux.h
+@@ -0,0 +1,12 @@
++// Generated on Windows by tests/windows_ucrt_math_check.cpp against
++// ucrtbase.dll; do not edit. hash = FNV-1a-64 over the output bits of
++// every input i*97 (i = 0 .. 2^32/97), 4 bytes little endian each.
++#pragma once
++#include <cstdint>
++constexpr uint32_t kUcrtGoldenStride = 97;
++constexpr uint64_t kUcrtGolden_sinf = 0xd8a999a22a114357ULL;
++constexpr uint64_t kUcrtGolden_cosf = 0x429f4cb954f63d0eULL;
++constexpr uint64_t kUcrtGolden_tanf = 0xc9febfd84b0d75a6ULL;
++constexpr uint64_t kUcrtGolden_acosf = 0xa5bdb4f8091c8b4fULL;
++// atan2f: 2^24 xorshift64 pairs from seed 0x243f6a8885a308d3 (y = low, x = high word).
++constexpr uint64_t kUcrtGolden_atan2f = 0x1f03a9f1fccae2a3ULL;

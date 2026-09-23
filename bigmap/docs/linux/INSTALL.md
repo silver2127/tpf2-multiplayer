@@ -41,10 +41,15 @@ not eliminate the peak memory needed while loading or generating a world.
 - Experimental lossless terrain compression using Linux userfaultfd, on by default.
 - Byte/build guards and a shared host that coexists with native multiplayer.
 
-Depth 12/13 (1024/2048-tile edges), material compression, terrain copy sharing,
-generation buffer reuse and the remaining renderer optimizations are not ported
-in this build. Do not use the Windows configuration: its depth-13
-setting is rejected explicitly. See PORT.md for evidence and validation limits.
+- Experimental octree depth 12/13 (`octree_depth=12` or `13`), the same root,
+  depth and node-ID scheme as the Windows plugin, so a Linux server can match
+  Windows players' depth. Default remains 11. Offline-validated only; see
+  PORT.md, "Octree depth 12/13". `max_tiles` may then exceed 512, but the
+  diagonal bound above still limits the Linux menu to about 720-tile edges.
+
+Material compression, terrain copy sharing, generation buffer reuse and the
+remaining renderer optimizations are not ported in this build. Do not copy the
+Windows configuration file wholesale. See PORT.md for evidence and validation limits.
 
 ## Sparse density presets
 

@@ -25,12 +25,15 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initi
 add_link_options(-static-libstdc++ -static-libgcc -Wl,--exclude-libs,ALL -Wl,--no-undefined -Wl,-z,now)
 
 find_package(Threads REQUIRED)
+# The UCRT math models must execute exactly the IEEE operations ucrtbase does.
+set_source_files_properties(src/windows_ucrt_math_linux.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-fno-fast-math")
 
 # The loader: LD_PRELOAD target, pulls in the rest.
 add_library(tpf2mp_boot SHARED src/boot.cpp src/lua_fixed_format_linux.cpp
             src/destination_rng_linux.cpp src/windows_uniform_int_linux.cpp
             src/windows_person_seed_linux.cpp src/windows_person_cost_linux.cpp
             src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
+            src/libm_parity_linux.cpp src/windows_ucrt_math_linux.cpp
             src/tree_rng_linux.cpp src/animal_rng_linux.cpp src/building_order_linux.cpp
             src/resident_hash_linux.cpp src/order_canon_linux.cpp src/person_map_order_linux.cpp
             src/windows_entity_set_order_linux.cpp src/target_order_linux.cpp src/network_person_order_linux.cpp src/network_index_order_linux.cpp
@@ -192,6 +195,11 @@ if(BUILD_TESTING)
   target_compile_options(test_engine_parity PRIVATE -UNDEBUG)
   target_link_libraries(test_engine_parity PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
   add_test(NAME engine_parity COMMAND test_engine_parity)
+  add_executable(test_libm_parity tests/libm_parity_test.cpp src/windows_ucrt_math_linux.cpp)
+  target_include_directories(test_libm_parity PRIVATE ../src src tests)
+  target_compile_options(test_libm_parity PRIVATE -UNDEBUG -O2)
+  target_link_libraries(test_libm_parity PRIVATE ${CMAKE_DL_LIBS} m)
+  add_test(NAME libm_parity COMMAND test_libm_parity)
   add_executable(test_building_order tests/building_order_test.cpp src/hook_posix.cpp)
   target_include_directories(test_building_order PRIVATE ../src src)
   target_compile_options(test_building_order PRIVATE -UNDEBUG)

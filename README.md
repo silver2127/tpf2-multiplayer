@@ -181,3 +181,7 @@ The [dev `522a303b` integration](docs/linux/UPSTREAM_dev_522a303b.md) reports th
 lane breakdown and the cost of post-hash broadcast, drift and comparison work.
 Shared Lua regression tests pass; no live performance measurement is claimed.
 Version remains 0.7.
+
+The [dev `bd69b864` integration](docs/linux/UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
+target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
+attempt-budget parity remain unported; the lab launch was blocked before game startup.

@@ -360,6 +360,29 @@ int main()
     lobby::Dispatch(R"({"type":"sync_state","phase":"complete","operation":"operation-1"})");
     assert(!model.recoveryPresent && model.lobbyDone && !model.startPending);
     assert(lobby::RecoveryAction("sync_request")=="Request sent.");
+    {
+        const auto savedModel=model;const auto savedQueue=queue;
+        model.recoveryRequestedAt=0;model.recoveryPhase="detected";model.recoveryPresent=true;
+        assert(RecoveryAction("sync_dismiss").empty() && !model.recoveryPresent);
+        model.recoveryPhase="loading";model.recoveryPresent=true;
+        assert(!RecoveryAction("sync_dismiss").empty() && model.recoveryPresent);
+        model.recoveryPhase="detected";model.isHost=false;
+        assert(RecoveryAction("sync_decline")!="Request sent.");
+        model.isHost=true;assert(RecoveryAction("sync_decline")=="Request sent.");
+        assert(queue.back().line.find("sync_decline")!=std::string::npos);
+        model=savedModel;queue=savedQueue;
+    }
+    // Transfer details survive TCP handshakes, and clear on completion for either role.
+    Dispatch(R"({"type":"transfer","role":"recv","detail":"TCP 20 MiB/s","hint":"Allow TCP port 29471","pct":42})");
+    assert(S().m.transferDetail=="TCP 20 MiB/s" && S().m.transferHint=="Allow TCP port 29471");
+    Dispatch(R"({"type":"transfer","state":"tcp"})");
+    assert(S().m.transferDetail=="TCP 20 MiB/s");
+    Dispatch(R"({"type":"transfer","role":"recv","state":"done","pct":100})");
+    assert(S().m.transferDetail.empty() && S().m.transferHint.empty() && S().m.xfer.empty());
+    g_childPid=123;OnMenuPage(16);assert(g_loadingStagePending);
+    loadPercent=37;StageTick();assert(!g_loadingStagePending && S().stageSent=="loading world 37%");
+    lastStatus="stale transfer";S().stageNext=0;StageTick();assert(lastStatus=="loading world 37%");
+    g_childPid=0;loadPercent=-1;S().stageWatch=false;
     lobby::Dispatch(R"({"type":"mods_refresh"})");assert(modRefreshes==1);
     // Restart selection uses real files and nanosecond mtimes, without a game.
     saveTest=true;

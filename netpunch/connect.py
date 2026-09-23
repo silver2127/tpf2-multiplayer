@@ -481,6 +481,13 @@ def _observe_and_announce(local_port, secret=None, password=None, extra_candidat
     sock_v4 = open_socket(local_port, socket.AF_INET)
     profile = observe(local_port=local_port, sock=sock_v4, do_upnp=True,
                       keep_upnp=True)
+    mapping = profile.get("upnp", {})
+    if mapping.get("tcp_open"):
+        log(f"[bulk] router accepted TCP mapping on tcp/{local_port}; external reachability still needs a connection")
+    else:
+        detail = mapping.get("tcp_detail") or mapping.get("detail") or "no TCP mapping confirmed"
+        log(f"[bulk] no confirmed TCP router mapping on tcp/{local_port}: {detail}; "
+            "trying IPv6, LAN/VPN and the peer's listener as well")
     for k, v in (extra_candidates or {}).items():
         if v:
             profile["candidates"][k] = v
