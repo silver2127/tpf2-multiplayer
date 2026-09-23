@@ -125,8 +125,9 @@ stock allocator/free path. Growth beyond a tile migrates to a stock vector.
 A policy thread write-protects candidate tiles, compresses their stable contents,
 then discards their original pages. The fault thread restores and verifies the
 whole tile, removes protection and wakes blocked users at the original address.
-The soft hot budget defaults to 1024 MiB, with a two-second grace period and a
-bounded round-robin scan. It is not an LRU cache: ordinary reads of resident
+The original implementation used a 1024 MiB soft budget and round-robin
+eviction. Dev `ea35eb8a` replaces that policy with recency selection and dynamic
+headroom (see below). It is not a true LRU cache: ordinary reads of resident
 pages do not refresh their age. Compression can cost CPU and introduce latency;
 no frame-rate gain is claimed. Poorly compressible tiles stay resident.
 
@@ -188,7 +189,7 @@ merge history. Sources examined: `alignment_batch.h`, `terrain_compression.h`
 (including the 9180629 load-only throttle), `material_compression.h`,
 `small_pager.h`, `instance_shrink.h`, and the terrain COW sharing notes.
 
-### Automatic terrain budget (implemented)
+### Automatic terrain budget (implemented; superseded by ea35eb8a below)
 
 `terrain_cache_hot_mb=0` (now the packaged and built-in default) uses installed
 physical MiB / 30, clamped to 256..4096 MiB, exactly the Windows
@@ -304,3 +305,56 @@ restored after archiving. No save was loaded or modified by gameplay.
 
 Validation: soldier build and 63/63 CTests, including the real userfaultfd pager
 test; all 27 ELF guard sites; shared Lua release verification; `git diff --check`.
+
+## Pager recency and headroom — dev ea35eb8a (2026-09-22)
+
+Upstream's documentation reports ~790 faults/s on a ~52,000-tile dedicated
+server map. This is upstream evidence, not a measurement reproduced here.
+The native implementation now:
+
+- Snapshots eligible resident slots, sorts by oldest observed touch, and
+  rechecks each slot under its lock before eviction. Scans run every 250 ms
+  while above budget, with at most 256 encoding attempts per pass.
+- Gives allocations and serviced faults two seconds of grace. Two faults less
+  than five seconds apart extend grace to ten seconds. Failed encodes also
+  receive grace; reused slots clear their former fault history. Resident reads
+  and unprotected writes are invisible to userfaultfd; this is fault recency,
+  not access-bit LRU or permanent working-set pinning.
+- Recomputes automatic budgets each second from live tile bytes, current
+  resident bytes, sysconf physical RAM and `/proc/meminfo` MemAvailable.
+  The target is min(live bytes, cap, max(0, resident + available - reserve)).
+  Windows PagerHeadroom supplies reserve = physical/7 clamped to 2..12 GiB;
+  PagerCapMB supplies cap = physical/4 clamped to 4..8 GiB. Swap is not counted.
+  Missing memory information falls back to the old RAM/30 startup budget.
+  Positive configuration values retain fixed 128..16384 MiB budgets.
+- Logs the current budget and interval faults/s every 30 seconds, dividing
+  fault-count changes by actual steady-clock elapsed time.
+
+The target is soft: young/incompressible tiles can exceed it, and it does not
+prefault cold tiles. Memory accounting is host-wide, not cgroup-aware. The
+Windows load-state controller and full pressure/throttle policy are outside
+this integration. No claim is made that the cap fits every map's working set.
+
+No engine address, byte guard, calling convention or ownership contract changed.
+The existing append/copy/dispose hooks described above remain guarded. The lab
+ELF build-id and all 27 registered patch sites passed `verify_game.py`.
+Policy-only changes need no additional engine RE or gdb-derived offset.
+
+The soldier build passed all 63 tests, including actual userfaultfd eviction,
+parallel restores, write/evict races and reuse. New deterministic assertions
+cover recency grace/rapid-refault/reset and live-size, cap, reserve, pressure
+and unavailable-memory budget cases.
+
+Live startup: the standard lab launcher failed UID-map setup. A temporary
+copy used system bwrap and omitted the inner soldier wrapper, retaining the
+lab filesystem overlays. The candidate logged automatic headroom, a 1022 MiB
+startup fallback, successful userfaultfd setup and plugin OK. SteamAPI then
+reported no running Steam; no menu, loaded world, GPU selection, 30-second
+pager status line or performance comparison was observed. The game's startup
+also emitted steam.sh bootstrap messages; no separate Steam command was issued
+and Steam was not managed by this job. No game process remained afterwards.
+Both actor payload directories were restored and compared equal to backups;
+no save was loaded. Evidence: job `tpf2-multiplayer-dev-ea35eb8a3b-20260922-210611`,
+`meta/live/` (launch logs, actor logs/data, restoration and build records).
+Loaded-big-map throughput and memory behavior still require a working lab
+Steam session; implementation completeness is not performance acceptance.

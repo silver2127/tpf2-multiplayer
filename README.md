@@ -28,6 +28,9 @@ validation remain outstanding; matching versions do not establish gameplay parit
 The [dev `0a35d0a8` integration](docs/linux/UPSTREAM_dev_0a35d0a8.md) enables
 native terrain compression by default and fixes bridge lobby identity; release
 version remains 0.7.
+The [dev `ea35eb8a` integration](docs/linux/UPSTREAM_dev_ea35eb8a.md)
+adds native terrain pager recency, automatic memory headroom and fault-rate
+logging; loaded-big-map performance validation remains outstanding.
 The Windows MSI instructions below apply to the Windows version.
 The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
 retains the Windows autosave-sidecar fix; native terrain sidecars remain unported.

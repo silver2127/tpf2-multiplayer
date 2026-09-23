@@ -311,9 +311,10 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
         // Scope allocation changes to CTerrain's append and detached-copy calls.
         // Dispose is the shared-vector control block's exact native free path.
         auto* candidate=new linux_pager::TerrainPager;
-        const int hot=linux_memory::TerrainHotMB(linux_memory::PhysicalBytes(),H->cfgInt(Section,"terrain_cache_hot_mb",0));
-        H->log("terrain compression: resident budget %d MiB",hot);
-        if(!candidate->Start(1u<<20,size_t(hot)<<20)) {
+        const int configuredHot=H->cfgInt(Section,"terrain_cache_hot_mb",0);
+        const int hot=linux_memory::TerrainHotMB(linux_memory::PhysicalBytes(),configuredHot);
+        H->log("terrain compression: startup resident budget %d MiB (%s)",hot,configuredHot>0?"fixed":"automatic headroom");
+        if(!candidate->Start(1u<<20,size_t(hot)<<20,configuredHot<=0)) {
             delete candidate;H->log("terrain compression unavailable: userfaultfd missing/write-protect support required");
         } else {
             terrainPager=candidate;
@@ -345,7 +346,19 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     if(fastSave)H->log("fast saves: zstd level 1, 64 KiB input buffer; save files may be larger");
     if(terrainPager){
         H->log("terrain compression: Linux userfaultfd, lossless 1 m codec, enabled");
-        std::thread([]{for(;;){std::this_thread::sleep_for(std::chrono::seconds(10));auto s=terrainPager->Get();H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB faults=%llu evictions=%llu refusals=%llu",(unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,s.packed/1048576.,(unsigned long long)s.faults,(unsigned long long)s.evictions,(unsigned long long)s.refusals);}}).detach();
+        std::thread([]{
+            auto previous=std::chrono::steady_clock::now();uint64_t previousFaults=0;
+            for(;;){
+                std::this_thread::sleep_for(std::chrono::seconds(30));
+                const auto now=std::chrono::steady_clock::now();auto s=terrainPager->Get();
+                const double seconds=std::chrono::duration<double>(now-previous).count();
+                H->log("terrain pager: live=%llu resident=%.1f MiB packed=%.1f MiB budget=%.1f MiB faults=%llu faults/s=%.1f evictions=%llu refusals=%llu",
+                    (unsigned long long)s.live,s.resident*linux_pager::TerrainPager::Stride/1048576.,
+                    s.packed/1048576.,s.budget/1048576.,(unsigned long long)s.faults,
+                    (s.faults-previousFaults)/seconds,(unsigned long long)s.evictions,(unsigned long long)s.refusals);
+                previous=now;previousFaults=s.faults;
+            }
+        }).detach();
     }
     H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
     H->log("Experimental port: depth 12/13 and material compression are not enabled");

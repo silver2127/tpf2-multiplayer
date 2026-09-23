@@ -2,6 +2,22 @@
 #include <cassert>
 #include <cstdio>
 int main(){
+    // Deterministic policy boundaries independent of kernel UFFD availability.
+    linux_pager::Recency age;
+    age.Reset(100);assert(!age.Eligible(2099) && age.Eligible(2100));
+    age.Fault(2200);assert(!age.Eligible(4199) && age.Eligible(4200));
+    age.Fault(4300);assert(!age.Eligible(14299) && age.Eligible(14300));
+    age.Fault(15000);assert(age.Eligible(17000));
+    age.Reset(18000);assert(age.lastFault==0 && age.Eligible(20000));
+    constexpr uint64_t GiB=1ull<<30;
+    using linux_memory::TerrainTarget;
+    assert(TerrainTarget(32*GiB,16*GiB,0,12*GiB,GiB)==8*GiB);
+    assert(TerrainTarget(32*GiB,16*GiB,0,2*GiB,GiB)==2*GiB);
+    assert(TerrainTarget(32*GiB,32*GiB/7,6*GiB,12*GiB,GiB)==6*GiB);
+    assert(TerrainTarget(32*GiB,0,GiB,12*GiB,GiB)==0);
+    assert(TerrainTarget(0,16*GiB,0,12*GiB,GiB)==GiB);
+    assert(TerrainTarget(32*GiB,UINT64_MAX,0,12*GiB,GiB)==GiB);
+    assert(TerrainTarget(16*GiB,16*GiB,0,12*GiB,GiB)==4*GiB);
     linux_pager::TerrainPager pager;
     if(!pager.Start(64,0)){puts("SKIP: userfaultfd unavailable");return 77;}
     std::vector<uint16_t*> tiles;
