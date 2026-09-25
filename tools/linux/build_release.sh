@@ -132,12 +132,12 @@ fi
 # (it is in LD_PRELOAD); a library the loader dlopens needs to export nothing.
 if command -v nm >/dev/null 2>&1; then
   for l in "${LIBS[@]}"; do
-    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | sort | paste -sd' ' -)
+    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | LC_ALL=C sort | paste -sd' ' -)
     want=""; [ "$l" != libtpf2mp_boot.so ] || want="__sprintf_chk clock"
     [ "$exports" = "$want" ] || die "$l exports '${exports}', expected '${want}' (see native/linux/exports_*.map)"
   done
   for l in "${PLUGINS[@]}"; do
-    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | sort | paste -sd' ' -)
+    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | LC_ALL=C sort | paste -sd' ' -)
     [ "$exports" = Tpf2mpPluginInit ] || die "$l exports '${exports}', expected 'Tpf2mpPluginInit'"
   done
 else
