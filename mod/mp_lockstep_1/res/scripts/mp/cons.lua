@@ -716,40 +716,81 @@ end
 -- and here it would bulldoze the road beside a level crossing instead of the
 -- rail the player actually removed.
 --
--- One pass per map covering ALL endpoints, rather than a scan per endpoint: a
--- dragged bulldoze removes many edges at once and a scan each would be tens of
--- thousands of component reads. It runs on a player action, never on a tick.
-local function edemoMatchNodes(want)
-	local byKind = {}
-	pcall(function() byKind[0] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
-	pcall(function() byKind[1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
-	local best, bestD = {}, {}
+-- The node index: both edge maps and every node's position, bucketed into
+-- EDEMO_CELL-metre cells, built ONCE and reused by every EDEMO that runs before
+-- the world changes. A dragged bulldoze arrives as one EDEMO per edge, and a
+-- full scan each (both maps, every node's position: tens of thousands of
+-- component reads) froze both games for 12.6 s over 173 EDEMOs on one step
+-- (2026-09-24). Reuse is exact, not approximate: the index lives only for the
+-- current update() tick (the sim cannot move inside one) and is dropped the
+-- moment anything may have edited the network -- this file's own proposal
+-- below, or any other command (execute() in lockstep.lua). So every lookup sees
+-- the same world a fresh scan would, and peers still agree.
+local EDEMO_CELL = 4   -- metres; must be >= the match radius sqrt(K.EDEMO_TOL_SQ)
+local function edemoCellKey(x, y)
+	return (math.floor(x / EDEMO_CELL) + 1048576) * 2097152 + (math.floor(y / EDEMO_CELL) + 1048576)
+end
+
+local function edemoIndex()
+	local ix = CM.edemoCache
+	if ix and ix.tick == CM.ticks then
+		ix.reused = ix.reused + 1
+		return ix
+	end
+	local t0 = os.clock()
+	ix = { tick = CM.ticks, byKind = {}, grid = { [0] = {}, [1] = {} }, reused = 0, nodes = 0 }
+	pcall(function() ix.byKind[0] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+	pcall(function() ix.byKind[1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
 	for kind = 0, 1 do
-		local m = byKind[kind]
+		local m, g = ix.byKind[kind], ix.grid[kind]
 		if m then
 			for nid in pairs(m) do
-				-- fetched at most once per node, and only if some endpoint of
-				-- this kind is still looking
-				local pos = nil
-				for i, w in ipairs(want) do
-					if w[4] == kind then
-						if pos == nil then pos = CM.nodePosXYZ(nid) or false end
-						if pos then
-							local dx, dy = pos[1] - w[1], pos[2] - w[2]
-							local d = dx * dx + dy * dy
-							-- ties broken by the lower id so every peer agrees
-							if d <= K.EDEMO_TOL_SQ and (not bestD[i] or d < bestD[i]
-									or (d == bestD[i] and nid < best[i])) then
-								best[i], bestD[i] = nid, d
-							end
+				local pos = CM.nodePosXYZ(nid)
+				if pos then
+					local key = edemoCellKey(pos[1], pos[2])
+					local cell = g[key]
+					if not cell then cell = {}; g[key] = cell end
+					cell[#cell + 1] = { nid, pos[1], pos[2] }
+					ix.nodes = ix.nodes + 1
+				end
+			end
+		end
+	end
+	ix.buildMs = (os.clock() - t0) * 1000
+	CM.edemoCache = ix
+	return ix
+end
+
+-- Nearest node to each endpoint, within K.EDEMO_TOL_SQ, in that endpoint's own
+-- kind. Only the 3x3 cells around the endpoint can hold a node that close, so
+-- the answer is the full scan's: same candidates, same distance, ties broken by
+-- the lower id so every peer agrees.
+local function edemoMatchNodes(want)
+	local ix = edemoIndex()
+	local best, bestD = {}, {}
+	for i, w in ipairs(want) do
+		local g = ix.grid[w[4]]
+		local cx, cy = math.floor(w[1] / EDEMO_CELL), math.floor(w[2] / EDEMO_CELL)
+		for gx = cx - 1, cx + 1 do
+			for gy = cy - 1, cy + 1 do
+				local cell = g[(gx + 1048576) * 2097152 + (gy + 1048576)]
+				if cell then
+					for _, n in ipairs(cell) do
+						local nid = n[1]
+						local dx, dy = n[2] - w[1], n[3] - w[2]
+						local d = dx * dx + dy * dy
+						if d <= K.EDEMO_TOL_SQ and (not bestD[i] or d < bestD[i]
+								or (d == bestD[i] and nid < best[i])) then
+							best[i], bestD[i] = nid, d
 						end
 					end
 				end
 			end
 		end
 	end
-	return best, byKind
+	return best, ix.byKind, ix
 end
+CM.edemoMatchNodes = edemoMatchNodes   -- for tools/edge_demolition_test.py
 
 function CM.execEdgeDemolish(c)
 	-- NO originator skip. The slice CANCELS the player's bulldoze at
@@ -777,7 +818,10 @@ function CM.execEdgeDemolish(c)
 			want[#want + 1] = { v[1], v[2], v[3], kind }
 			want[#want + 1] = { v[4], v[5], v[6], kind }
 		end
-		local nodes, byKind = edemoMatchNodes(want)
+		local nodes, byKind, ix = edemoMatchNodes(want)
+		if ix.reused == 0 then
+			log(string.format("EDEMO seq=%s: node index built (%d nodes, %.0f ms)", tostring(c.seq), ix.nodes, ix.buildMs or 0))
+		end
 
 		local rmSet, rmList, unmatched = {}, {}, 0
 		for i = 1, #prs do
@@ -877,6 +921,9 @@ function CM.execEdgeDemolish(c)
 			return
 		end
 		local nEdges, nOrph = #rmList, #orphans
+		-- the network is about to change (edges, orphans, graph cleanup merges):
+		-- the next EDEMO must see the new one
+		CM.edemoCache = nil
 		api.cmd.sendCommand(cmd, function(res, ok2)
 			local extra = ""
 			if not ok2 then
