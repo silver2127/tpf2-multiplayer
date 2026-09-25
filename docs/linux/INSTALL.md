@@ -261,12 +261,19 @@ The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the sourc
 
 `tools/linux/build_native.sh` builds and tests the in-tree `bigmap/linux` plugin.
 The release includes `plugins/tpf2_bigmap.so` and its **Linux** configuration;
-`--without tpf2_pluginhost.so` omits plugins. The native defaults cap depth at 11
-and tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
+`--without tpf2_pluginhost.so` omits plugins. The native defaults select depth 11
+and cap tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
 `terrain_cache_compress=0` and restart after SIGBUS; kernel-origin faults on
 evicted pages cannot be served by this pager. Unsupported userfaultfd setup
 keeps stock allocation paths. The Windows
-configuration requests unsupported depth 13 and must not replace the Linux one.
+configuration requests depth 13; keep the packaged Linux configuration
+for its native defaults. Depths 12/13 are available on the verified Steam ELF;
+the Windows GOG fallback does not apply to it. See
+[dev aaae03f8 integration](UPSTREAM_dev_aaae03f8.md).
+Upstream now reports successful depth-13 play, save/reload and multiplayer
+with a native Linux dedicated server; every peer needs the same `octree_depth`.
+See [dev 63a3b8df integration](UPSTREAM_dev_63a3b8df.md) for attribution
+and the distinction from local validation.
 See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
 [current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.
 The installed `bigmap-density-restore` helper restores the plugin's exact density
@@ -336,7 +343,16 @@ lane breakdown and the cost of post-hash broadcast, drift and comparison work.
 Shared Lua regression tests pass; no live performance measurement is claimed.
 Version remains 0.7.
 
-The [dev `12407af7` integration](UPSTREAM_dev_12407af7.md) adds native Windows UCRT float
-math, experimental octree depth 12/13, and indexed person target records.
-Placement-distance saturation and placement-attempt budgets remain unported;
-oversized Windows-created saves still have a placement parity gap.
+The [dev `bd69b864` integration](UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
+target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
+attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+## Town-development diagnostics (dev 0610033)
+
+Set `TPF2MP_TOWN_TRACE=1` in the game's launch environment to write
+`$XDG_DATA_HOME/tpf2mp/data/tpf2_towntrace.txt` (default XDG data home:
+`~/.local/share`). Restart without the variable to disable it. The trace is off
+by default and requires the verified town-seed hook. Compare captures from the
+same session with `python3 tools/town_trace_diff.py NATIVE_TRACE WINDOWS_TRACE`;
+Windows enables its half with `towntrace=1` in `tpf2_slice.cfg`.
+See [integration and validation limits](UPSTREAM_dev_0610033.md).

@@ -96,8 +96,9 @@ struct Player {
 struct SaveRow { std::string path, name; uint64_t modified=0; };
 struct View {
     bool active=false,inGame=false,lobbyReady=false;
+    std::string transferDetail,transferHint;
     std::string recoveryPhase,recoveryDetail,recoveryStep;
-    bool recoveryPresent=false,recoveryRequested=false,readyMine=false;
+    bool recoveryPresent=false,recoveryRequested=false,readyMine=false,worldIo=false;
     int readyCount=0,readyTotal=0;
     uint64_t recoveryVersion=0;
     std::vector<SaveRow> saves;

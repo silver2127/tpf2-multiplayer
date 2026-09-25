@@ -91,7 +91,11 @@ int main(int argc,char** argv) {
         RenderLocked(w,h);CheckHits(w,h);assert(Has(114)&&Has(28)&&Has(35));
         OnHitLocked(114,&post);assert(g_playerPage==0);
         OnHitLocked(84,&post);assert(g_uiState==3);
-        RenderLocked(w,h);assert(Has(83)&&!Has(115));
+        RenderLocked(w,h);CheckHits(w,h);assert(Has(83)&&Has(115)&&Has(9)&&Has(80)&&!Has(28));
+        P().view.recoveryPhase="detected";RenderLocked(w,h);CheckHits(w,h);assert(Has(85)&&Has(80)&&Has(9));
+        P().view.recoveryPhase="loading";P().view.worldIo=true;RenderLocked(w,h);
+        assert(!Has(83)&&!Has(85)&&!Has(80)&&!ChatFocusLocked());
+        P().view.worldIo=false;P().view.recoveryPhase.clear();
         OnHitLocked(83,&post);assert(g_uiState==2);
         P().view.hostSteam=false;RenderLocked(w,h);assert(!Has(51));
         P().view.isHost=false;RenderLocked(w,h);CheckHits(w,h);

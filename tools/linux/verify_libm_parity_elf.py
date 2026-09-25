@@ -1,47 +1,49 @@
 #!/usr/bin/env python3
-"""Read-only verification of UCRT parity guards and ELF import identities."""
+"""Read-only verification of UCRT math GOT imports and street call-site guards.
+Requires pyelftools and capstone; usage: verify_libm_parity_elf.py GAME_ELF.
+"""
 from pathlib import Path
 import re
-import struct
-import subprocess
 import sys
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from elftools.elf.elffile import ELFFile
 
-path = Path(sys.argv[1])
-image = path.read_bytes()
-assert image[:6] == b'\x7fELF\x02\x01'
-assert '3a0e156390b0e6f1e372051c24802c8493ae454a' in subprocess.check_output(['readelf', '-n', path], text=True)
-phoff = struct.unpack_from('<Q', image, 32)[0]
-entsize, count = struct.unpack_from('<HH', image, 54)
-segments = [struct.unpack_from('<IIQQQQQQ', image, phoff+i*entsize) for i in range(count)]
-def read(addr, size):
-    s = next(s for s in segments if s[0] == 1 and s[3] <= addr and addr+size <= s[3]+s[5])
-    offset = s[2]+addr-s[3]
-    return image[offset:offset+size]
-header = (Path(__file__).resolve().parents[2]/'native/linux/src/libm_parity_sites_linux.h').read_text()
-header = re.sub(r'//[^\n]*', '', header)
-relocs = subprocess.check_output(['readelf', '-rW', path], text=True)
-slots = re.findall(r'kLibmGot\w+\{(0x[0-9a-f]+), "(\w+)"\}', header)
-assert len(slots) == 6
-for addr, name in slots:
-    addr = int(addr, 16)
-    assert re.search(rf'^{addr:016x}\s+\S+\s+R_X86_64_JUMP_SLOT\s+\S+\s+{name}@', relocs, re.M)
-    assert any(s[0] == 0x6474e552 and s[3] <= addr and addr+8 <= s[3]+s[6] for s in segments)
-    print(f'PASS {name} import {addr:#x}, RELRO')
-dynamic = subprocess.check_output(['readelf', '-dW', path], text=True)
-assert 'BIND_NOW' in dynamic
-plt = int(re.search(r'kLibmPltAtan2Rva = (0x[0-9a-f]+)', header)[1], 16)
-code = read(plt, 6)
-assert code[:2] == b'\xff\x25'
-slot = plt+6+struct.unpack_from('<i', code, 2)[0]
-assert re.search(rf'^{slot:016x}\s+\S+\s+R_X86_64_JUMP_SLOT\s+\S+\s+atan2@', relocs, re.M)
-sites = re.findall(r'\{(0x[0-9a-f]+), (0x[0-9a-f]+),\s*\{([^}]+)\}, (\d+)\}', header)
-assert len(sites) == 3
-for call, guard, data, size in sites:
-    call, guard, size = int(call,16), int(guard,16), int(size)
-    expected = bytes(int(v,16) for v in re.findall(r'0x[0-9a-f]+',data))
-    assert len(expected) == size and read(guard,size) == expected
-    code = read(call,5)
-    assert code[0] == 0xe8 and call+5+struct.unpack_from('<i',code,1)[0] == plt
-    assert expected[-4:-1] == b'\xf2\x0f\x5a' # full result narrowing instruction
-    print(f'PASS atan2 call {call:#x}, full {size}-byte conversion guard')
-print('PASS: build-id, six resolved imports, RELRO/BIND_NOW, three guarded atan2 calls')
+header = (Path(__file__).resolve().parents[2] / 'native/linux/src/libm_parity_sites_linux.h').read_text()
+with open(sys.argv[1], 'rb') as stream:
+    elf = ELFFile(stream)
+    assert any(n['n_desc'] == '3a0e156390b0e6f1e372051c24802c8493ae454a'
+               for s in elf.iter_segments() if s['p_type'] == 'PT_NOTE'
+               for n in s.iter_notes() if n['n_type'] == 'NT_GNU_BUILD_ID')
+    def read(address, size):
+        segment = next(s for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD'
+                       and s['p_vaddr'] <= address and address + size <= s['p_vaddr'] + s['p_filesz'])
+        stream.seek(segment['p_offset'] + address - segment['p_vaddr'])
+        return stream.read(size)
+    symbols = elf.get_section_by_name('.dynsym')
+    imports = {r['r_offset']: symbols.get_symbol(r['r_info_sym']).name
+               for r in elf.get_section_by_name('.rela.plt').iter_relocations() if r['r_info_type'] == 7}
+    slots = re.findall(r'Tpf2mpGotSlot k\w+\{(0x[0-9a-f]+), "(\w+)"\}', header)
+    assert len(slots) == 6
+    for address, name in slots:
+        assert imports[int(address, 16)] == name
+        print('PASS GOT', address, name)
+    assert any(t.entry.d_tag == 'DT_BIND_NOW' or
+               (t.entry.d_tag == 'DT_FLAGS' and t.entry.d_val & 8)
+               for t in elf.get_section_by_name('.dynamic').iter_tags())
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    sites = re.findall(r'\{(0x[0-9a-f]+), (0x[0-9a-f]+),\s*\{(.*?)\}, (\d+)\}', header, re.S)
+    assert len(sites) == 3
+    for call, guard, body, size in sites:
+        call, guard, size = int(call, 16), int(guard, 16), int(size)
+        expected = bytes(int(v, 16) for v in re.findall(r'0x[0-9a-f]+', body))
+        assert len(expected) == size and read(guard, size) == expected
+        ins = list(md.disasm(read(guard, 48), guard))
+        assert [(i.mnemonic, i.op_str) for i in ins if i.address == call] == [('call', '0x6dbc60')]
+        assert ins[0].mnemonic == ins[1].mnemonic == 'cvtss2sd'
+        assert any(i.mnemonic == 'cvtsd2ss' for i in ins if i.address > call)
+        print(f'PASS street {call:#x}: ' + '; '.join(i.mnemonic + ' ' + i.op_str for i in ins[:7]))
+    plt = read(0x6dbc60, 6)
+    assert plt[:2] == b'\xff\x25'
+    slot = 0x6dbc66 + int.from_bytes(plt[2:], 'little', signed=True)
+    assert imports[slot] == 'atan2'
+    print('PASS double atan2 PLT and eager binding')

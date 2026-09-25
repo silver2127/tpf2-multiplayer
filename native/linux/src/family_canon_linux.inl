@@ -58,7 +58,27 @@ static bool FamilyRange(uintptr_t at, size_t size, bool write = false)
 }
 static bool Readable(const void* p, size_t n) { return FamilyRange(reinterpret_cast<uintptr_t>(p), n); }
 #include "../../src/family_canon.h"
+#include "family_getters_linux.h"
+#include "town_trace_linux.h"
+#include "../../src/town_trace.h"
 static uintptr_t g_familyBase = 0;
+
+// GetNodeList (vtable slot 2) of a family, classified by the generated inventory.
+// MSVC folds every family's getter into one function; GCC keeps one copy per
+// family template (28 node-list copies, 35 no-list copies in build 35924), so a
+// single recognised address left 27 of the 28 node lists unsorted on the native
+// build while every Windows peer sorted all 28 (the server logged `lists=1 ...
+// unknown/refused=61`). Each address is verified byte for byte at install; none
+// is ever called.
+enum FamilyGetterKind { FG_UNKNOWN, FG_LIST, FG_NONE };
+static FamilyGetterKind FamilyGetter(uintptr_t get)
+{
+    if (!g_familyBase || get < g_familyBase) return FG_UNKNOWN;
+    const uintptr_t rva = get - g_familyBase;
+    for (uintptr_t g : kFamilyListGetters) if (g == rva) return FG_LIST;
+    for (uintptr_t g : kFamilyNoListGetters) if (g == rva) return FG_NONE;
+    return FG_UNKNOWN;
+}
 static uint64_t g_familyUs = 0, g_familyMaxUs = 0;
 
 static bool FamilyMappings()
@@ -138,23 +158,36 @@ static void CanonFamilies(uintptr_t engine) noexcept
             node=FamilyWord(node); ++walked;
         }
         if (node || walked != count) { ++c.refused; return; }
+        // Town trace (diagnostic, off by default): the lists as the systems will
+        // see them this iteration, one TF line per 600 TownSystem iterations.
+        int64_t traceTime = -1; int traceEngine = -1;
+        const bool trace = Tpf2mpTownTraceFamiliesDue(engine, &traceTime, &traceEngine);
+        static thread_local std::vector<uint64_t> traceTokens;
+        traceTokens.clear();
         for (auto fam : families) {
             if (!FamilyRange(fam,8)) { ++bad; continue; }
             auto vft=FamilyWord(fam);
             if (!FamilyRange(vft,24)) { ++bad; continue; }
-            auto get=FamilyWord(vft+16);
-            if (get==g_familyBase+0xa914e0) continue;
-            if (get!=g_familyBase+0xa914c0) { ++bad; continue; }
+            const auto kind=FamilyGetter(FamilyWord(vft+16));
+            if (kind==FG_NONE) continue;
+            if (kind!=FG_LIST) { ++bad; continue; }
             auto nl=fam+8;
             if (!FamilyRange(nl,0x40)) { ++bad; continue; }
             const auto v=FamilyWord(nl), first=g_familyBase+0x59ac260;
             if (v<first || v>first+0x80 || (v-first)%0x20) { ++bad; continue; }
             ++lists;
             size_t m=0;
-            auto result=CanonFamilyList(nl,8+4*((v-first)/0x20),scratch,&m);
+            const size_t stride=8+4*((v-first)/0x20);
+            auto result=CanonFamilyList(nl,stride,scratch,&m);
             if (result==FC_REFUSED) ++bad;
             else if (result==FC_REORDERED) { ++changed; moved+=m; }
+            if (trace && result!=FC_REFUSED) {
+                const uintptr_t b=FamilyWord(nl+8), e=FamilyWord(nl+16);
+                const size_t n=b&&e>b?(e-b)/stride:0;
+                traceTokens.push_back((uint64_t(n)<<32)|TownTraceListDigest(reinterpret_cast<const uint8_t*>(b),n,stride));
+            }
         }
+        if (trace) Tpf2mpTownTraceFamilies(traceTime,traceEngine,traceTokens.data(),traceTokens.size());
     } catch (...) { ++bad; } // Allocation failure cannot unwind through the assembly relay.
     if (changed) ++c.reordered;
     if (bad) ++c.refused;

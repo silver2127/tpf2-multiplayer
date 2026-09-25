@@ -329,9 +329,8 @@ def upnp_map(game_port, keep=False):
             result["open"] = "is redirected" in add.stdout.lower() \
                 or add.returncode == 0
             if keep:
-                tcp = subprocess.run(
-                    [exe, "-a", result["lan_ip"] or "", str(game_port), str(game_port), "TCP"],
-                    capture_output=True, text=True, timeout=8)
+                tcp = _upnpc_run(exe,
+                    ["-a", result["lan_ip"] or "", str(game_port), str(game_port), "TCP"])
                 result["tcp_open"] = "is redirected" in tcp.stdout.lower() or tcp.returncode == 0
                 result["tcp_detail"] = None if result["tcp_open"] else "upnpc TCP mapping failed"
             if result["open"] and not keep:

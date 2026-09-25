@@ -134,6 +134,7 @@ struct Model {
     bool separateCompanies = false;
     bool haveCode = false;
     std::string code, you, host, title, modsPrompt;
+    std::string transferDetail,transferHint;
     std::string xfer;          // xfer= for the in-game window
     std::string transportLobby; // session nonce from transport_lobby; reset with Model
     std::string speedReq;      // speed= from "/speed"
@@ -220,6 +221,7 @@ static std::atomic<bool> g_pubStarted{false};   // the public list's thread runs
 static std::atomic<bool> g_autoCopy{false};
 static std::atomic<bool> g_captures{true};
 static std::atomic<bool> g_titleMenu{false};
+static std::atomic<bool> g_loadingStagePending{false};
 static std::atomic<bool> g_gameUiSeen{false};
 static std::atomic<bool> g_logsBusy{false};
 static std::atomic<pid_t> g_childPid{0};
@@ -1128,6 +1130,7 @@ static void MarkSaveShared(const std::string& path)
 }
 static void ReportStage(const std::string& text)
 {
+    Status(text.empty() ? "World loaded. Session running." : text);
     if (text == S().stageSent) return;
     AppendIn("{\"cmd\":\"stage\",\"text\":\"" + JsonEscape(text) + "\"}");
     S().stageSent = text;
@@ -1140,6 +1143,7 @@ static void ArmStageWatch(const std::string& text)
 }
 static void StageTick()
 {
+    if (g_loadingStagePending.exchange(false)) ArmStageWatch("loading world");
     const uint64_t now=NowMs();
     if (!S().stageWatch || now<S().stageNext) return;
     S().stageNext=now+1000;
@@ -1148,7 +1152,7 @@ static void StageTick()
         S().stageSawLoad=true;
         ReportStage("loading world "+std::to_string(pct)+"%"); return;
     }
-    if (!InGame()) { S().stageSawLoad=true; return; }
+    if (!InGame()) { S().stageSawLoad=true; ReportStage("loading world"); return; }
     // A switch's previous world may still be stepping with an old status file.
     if (S().stageArmedInWorld && !S().stageSawLoad && now-S().stageArmedAt<20000) return;
     std::string status;
@@ -1691,17 +1695,27 @@ static void Dispatch(const std::string& line)
         std::string msg, xfer;
         bool setX = false;
         const std::string p = std::to_string(pct) + "%";
-        if (role == "recv") {
-            if (pct >= 0) { msg = "Receiving save\xE2\x80\xA6 " + p; xfer = "receiving " + p; setX = true; }
-        } else if (st == "done") {
-            msg = toRelay ? "Save uploaded to the relay." : "Save sent.";
-            setX = true;
-        } else if (!st.empty()) {
-            setX = true;
-        } else if (pct >= 0) {
-            msg = (toRelay ? "Uploading save to the relay\xE2\x80\xA6 " : "Sending save\xE2\x80\xA6 ") + p;
-            xfer = (toRelay ? "uploading " : "sending ") + p;
-            setX = true;
+        const std::string detail=Cap(OneLine(JStr(ev,"detail")),300);
+        const std::string hint=Cap(OneLine(JStr(ev,"hint")),300);
+        {
+            std::lock_guard<std::mutex> lk(S().mtx);
+            if(st=="done" || (!st.empty() && st!="tcp")) {
+                S().m.transferDetail.clear(); S().m.transferHint.clear();
+            } else if(st.empty() && !detail.empty()) {
+                S().m.transferDetail=detail; S().m.transferHint=hint;
+            }
+        }
+        if(st=="done") {
+            msg=InGame()?"Game running. New players can join this lobby.":"Save transfer complete.";
+            setX=true;
+        } else if(st.empty() && !detail.empty()) {
+            msg=detail; xfer=detail; setX=true;
+        } else if(!st.empty()) {
+            if(st!="tcp")msg=detail;
+            setX=true;
+        } else if(pct>=0) {
+            msg=(role=="recv"?"Receiving save... ":toRelay?"Uploading save to the relay... ":"Sending save... ")+p;
+            xfer=msg;setX=true;
         }
         if (pct >= 100) { xfer.clear(); setX = true; }
         bool isHost;
@@ -2517,12 +2531,18 @@ std::string RecoveryAction(const std::string& command) {
         std::lock_guard<std::mutex> lk(S().mtx);auto& m=S().m;
         if(!m.active||m.dead)return kNotRunning;
         if(m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000)return "Waiting for the lobby...";
-        if(command=="sync_ready") {
+        if(command=="sync_dismiss") {
+            if(!(m.recoveryPhase.empty() || m.recoveryPhase=="manual" || m.recoveryPhase=="detected" || m.recoveryPhase=="unavailable" || m.recoveryPhase=="complete"))return "A world operation is already running.";
+            m.recoveryPresent=false;return {};
+        }
+        if(command=="sync_decline") {
+            if(!m.isHost || m.recoveryPhase!="detected")return "Only the host can decline a detected resync.";
+        } else if(command=="sync_ready") {
             if(m.recoveryPhase!="readiness"||m.readyMine)return "Readiness is already confirmed.";
         } else if(command=="sync_request"||command=="sync_retry") {
             if(!m.isHost)return "Only the host can request a resync.";
             const auto& phase=m.recoveryPhase;
-            if(command=="sync_retry" ? phase!="error" : !(phase.empty()||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))
+            if(command=="sync_retry" ? phase!="error" : !(phase.empty()||phase=="manual"||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))
                 return "A world operation is already running.";
         } else return "Unknown recovery action.";
         m.recoveryRequestedAt=NowMs();m.recoveryDetail.clear();operation=m.recoveryOperation;token=m.readyToken;gen=m.gen;
@@ -2640,8 +2660,10 @@ bool CapturesTyping() { return g_captures.load(std::memory_order_relaxed); }
 
 void Snapshot(View* v)
 {
+    v->worldIo=NativeIo::Busy();
     std::lock_guard<std::mutex> lk(S().mtx);
     const Model& m = S().m;
+    v->transferDetail=m.transferDetail;v->transferHint=m.transferHint;
     v->recoveryPhase=m.recoveryPhase;v->recoveryDetail=m.recoveryDetail;v->recoveryStep=m.recoveryStep;
     v->lobbyReady=m.lobbyReady;v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
     v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
@@ -2761,7 +2783,9 @@ bool OpenLogs()
 
 void OnMenuPage(int page)
 {
+    if (page == 16 && g_childPid.load()) g_loadingStagePending = true;
     if (page == 2) {
+        g_loadingStagePending = false;
         g_titleMenu = true;
         // the title menu exists only when no game runs: forget the last session's
         // CGameUI, or a start at the title menu would look like one in a game

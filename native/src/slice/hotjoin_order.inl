@@ -224,6 +224,12 @@ static void HotJoinStepImpl(uint8_t* engine)
     size_t walked = 0, lists = 0, unknown = 0, reordered = 0, moved = 0, biggest = 0;
     bool broken = !head;
     const bool first = g_hjStepEngines[0] != engine && g_hjStepEngines[1] != engine;
+    // Town trace (diagnostic, off by default): the lists as the systems will see
+    // them this iteration, one TF line per 600 TownSystem iterations.
+    int64_t traceTime = -1; int traceEngine = -1;
+    const bool trace = TownTraceFamiliesWanted(engine, &traceTime, &traceEngine);
+    static uint64_t traceTokens[64];
+    size_t traceCount = 0;
     // (a fault here lands in HotJoinSort's handler; every list is validated
     // before it is touched, so a walk cut short leaves each list whole)
     for (uint8_t* node = head ? *(uint8_t**)head : nullptr; node != head; node = *(uint8_t**)node) {
@@ -243,12 +249,15 @@ static void HotJoinStepImpl(uint8_t* engine)
         const int r = FamilyCanonList(nl, stride, scratch, &m, &why);
         const size_t sz = (size_t)(*(uint8_t**)(nl + 0x10) - *(uint8_t**)(nl + 0x08)) / stride;
         if (sz > biggest) biggest = sz;
+        if (trace && r != FC_REFUSED && traceCount < 64)
+            traceTokens[traceCount++] = ((uint64_t)sz << 32) | TownTraceListDigest(*(uint8_t**)(nl + 0x08), sz, stride);
         if (r == FC_REORDERED) { reordered++; moved += m; }
         else if (r == FC_REFUSED && InterlockedIncrement64(&g_hjStepListRefused) <= 5)
             Log("[hotjoinorder] ERROR: step: a NodeList<%d> of %zu nodes refused (%s) -- left in its own order\n",
                 (int)((stride - 4) / 4), sz, why ? why : "?");
     }
     if (walked != count) broken = true;
+    if (trace) TownTraceFamilies(traceTime, traceEngine, traceTokens, traceCount);
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
     const LONG64 us = (LONG64)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);

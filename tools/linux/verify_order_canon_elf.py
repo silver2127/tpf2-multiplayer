@@ -39,13 +39,24 @@ with Path(sys.argv[1]).open('rb') as stream:
             if (i.mnemonic.startswith('j') or i.mnemonic=='call') and i.operands and i.operands[0].type==X86_OP_IMM:
                 assert not address<i.operands[0].imm<address+steal, (name,i.address)
         print(f'PASS: {name}: {address:#x}, {expected.hex(" ")}, {steal} bytes; base offset {offset}')
-    assert read(0xa914c0,9) == bytes.fromhex('f3 0f 1e fa 48 8d 47 08 c3')
-    assert read(0xa914e0,7) == bytes.fromhex('f3 0f 1e fa 31 c0 c3')
+    getters = (root / 'native/linux/src/family_getters_linux.h').read_text()
+    list_part, none_part = getters.split('kFamilyNoListGetters[] = {')
+    lists = [int(a, 16) for a in re.findall(r'^\s+(0x[0-9a-f]+),', list_part, re.M)]
+    nones = [int(a, 16) for a in re.findall(r'^\s+(0x[0-9a-f]+),', none_part, re.M)]
+    assert (len(lists), len(nones)) == (28, 35) and 0xa914c0 in lists and 0xa914e0 in nones
+    for a in lists: assert read(a, 9) == bytes.fromhex('f3 0f 1e fa 48 8d 47 08 c3'), hex(a)
+    for a in nones: assert read(a, 7) == bytes.fromhex('f3 0f 1e fa 31 c0 c3'), hex(a)
+    # ...and the table is the ELF's complete family inventory (every Family vtable's slot 2).
+    sys.path.insert(0, str(root / 'tools/linux'))
+    import gen_family_getters
+    inventory = gen_family_getters.inventory(sys.argv[1])
+    assert sorted(g for g, k, _, _ in inventory if k == 'list') == sorted(lists)
+    assert sorted(g for g, k, _, _ in inventory if k == 'none') == sorted(nones)
     for n in range(1,6):
         vft=0x59ac260+0x20*(n-1)
         ti=struct.unpack('<Q',read(vft-8,8))[0]
         name=struct.unpack('<Q',read(ti+8,8))[0]
         assert read(name,21).split(b'\0')[0] == f'N3ecs8NodeListILi{n}EEE'.encode()
     assert read(0xa617e8,5) == bytes.fromhex('e8 c3 fd 7e 02')
-    print('PASS: family getters, NodeList<1..5> RTTI/vtables, Step iteration call')
+    print('PASS: family getters (28 node-list + 35 no-list, the complete vtable inventory), NodeList<1..5> RTTI/vtables, Step iteration call')
     print('PASS: build-id, all seven byte guards, instruction boundaries, no interior branches')

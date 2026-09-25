@@ -6,6 +6,11 @@ leaf cells; it does not substitute coarser leaves. Depth 12 uses a root of
 ±131,072 m (1,024-tile / 262.144 km edges). Depth 13 uses ±262,144 m
 (2,048-tile / 524.288 km edges).
 
+**Steam 35924 only.** On the GOG build neither replacement prologue is at a
+verified address, so `octree_depth=12`/`13` degrade to the depth-11 root there:
+the plugin loads instead of refusing, the edge ceiling stays 512 tiles, and the
+log line says which depth was asked for and what went in.
+
 ## Configuration and build
 
 Run `build.bat` to produce `out/tpf2_bigmap.dll`. The build does not deploy.
@@ -14,7 +19,10 @@ In the existing `[tpf2_bigmap]` configuration section, set `octree=1`,
 to the desired dimensions, for example `size7_format0=1280x32` with
 `size_label7=Depth13 test`. Replace existing assignments rather than duplicating
 keys. This example crosses the old root boundary with a relatively narrow map.
-The shipped configuration retains `octree_depth=11` and `max_tiles=512`.
+The shipped `cfg\tpf2_bigmap.cfg` sets `octree_depth=13` and `max_tiles=2048`
+(its size ladder runs 128 to 512 tiles). On the GOG build those two values are
+inert: 12 and 13 fall back to the depth-11 root described below, so the ceiling
+there is 512 tiles.
 
 Depth 12/13 is installed even when the configured menu sizes are small, because
 loading a world does not pass through the menu sizing hook. Keep the setting
@@ -117,14 +125,15 @@ built DLL. It checks:
   depth-10/11 compatibility, explicit size caps and pixel-count boundary cases,
   and 5,120 generated ratio shapes within INT_MAX.
 
-`python tools/test_newgame_menu.py` also passes. No live game, full renderer,
-save/reload or multiplayer validation has been performed. Emulator allocation
-stubs do not validate allocator behavior or concurrency in the running engine.
+`python tools/test_newgame_menu.py` also passes.
 
-Before relying on the patch, generate a fresh narrow map exceeding 1,024 tiles for depth 13,
-build and remove roads and constructions beyond ±131,072 m and in all four
-corners, move vehicles across that boundary, inspect near/far render culling,
-then save and reload repeatedly. Check for duplicate-node repairs, missing
-objects and crashes. Repeat loading a stock world in the same process and
-multiplayer replication with matching builds. Existing damaged saves are not
-repaired by this patch. Depth 14 and higher are explicitly unsupported.
+**Tested in play (2026-09-23): the higher depths work fine.** Large maps at
+depth 13 have been created, played, saved and reloaded on Steam, in single
+player and in multiplayer -- Windows players together with the native Linux
+dedicated server, which gained depths 12/13 the same day
+(`docs/re/crossplatform/OCTREE13_LINUX_REPORT.md` in the multiplayer repo) --
+with no duplicate-node repairs, no assertion and no missing objects. On GOG the
+depth-11 fallback was validated in a running game (a 57 x 57 km map created,
+played and reloaded). Every multiplayer peer needs the same `octree_depth`.
+Existing damaged saves are not repaired by this patch. Depth 14 and higher are
+explicitly unsupported.

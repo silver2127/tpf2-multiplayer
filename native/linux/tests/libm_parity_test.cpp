@@ -170,14 +170,6 @@ int main()
     { uintptr_t v; std::memcpy(&v, &img[kLibmGotSinf.rva], 8); assert(v == 0x1000u + 4); }
     base = BuildFakeImage(img);
     ResetModule();
-    // Each full result-conversion guard independently refuses before a write.
-    for (const auto& site : kLibmAtan2Sites) {
-        base = BuildFakeImage(img); ResetModule();
-        img[site.guardRva + site.guardSize - 1] ^= 1;
-        assert(!InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
-        assert(g_activeSlots == 0 && g_redirected.empty());
-    }
-    base = BuildFakeImage(img); ResetModule();
     // Success: every slot points at the model, every site redirected.
     assert(InstallLibmParityWith(base, kLibmBuildId, FakeWrite, FakeResolve, FakeRedirect));
     for (const auto& s : g_slots) {

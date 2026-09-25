@@ -63,7 +63,7 @@ lossless terrain compression, faster saves and a SIMD terrain min/max scan.
 It is not full Windows 0.4.0 feature parity. Material paging, terrain copy sharing,
 generation buffer reuse, placement budgets, material-index/refinement/alignment
 optimizations still need independent Linux work. Depth 12/13 is ported
-(experimental); see "Octree depth 12/13" below.
+(upstream reports tested in play); see "Octree depth 12/13" below.
 The configured maximum has not been stress-tested; this is an experimental build.
 
 The isolated native game reached New Game with the shared host alone. The
@@ -360,7 +360,9 @@ no save was loaded. Evidence: job `tpf2-multiplayer-dev-ea35eb8a3b-20260922-2106
 Loaded-big-map throughput and memory behavior still require a working lab
 Steam session; implementation completeness is not performance acceptance.
 
-## Octree depth 12/13 (experimental)
+<a id="octree-depth-1213-experimental"></a>
+
+## Octree depth 12/13
 
 Linux counterpart of `bigmap/src/octree_depth12.h` and
 [`../octree-depth12.md`](../octree-depth12.md). Configure `octree=1` and
@@ -368,7 +370,11 @@ Linux counterpart of `bigmap/src/octree_depth12.h` and
 same root (+-2^(depth+5) m: 131,072 m at 12, 262,144 m at 13), the same depth
 and the same compact node-ID scheme as Windows, so a Linux server can run the
 depth Windows players use. Every peer still needs the same depth.
-Offline evidence only: no live load, renderer, save/reload or multiplayer run.
+The original port evidence below is offline. Upstream dev `63a3b8df` reports
+successful depth-13 creation, play, save/reload and multiplayer with Windows
+players and a native Linux dedicated server, with no duplicate-node repairs,
+assertion or missing objects (2026-09-23). These are upstream observations,
+not a local lab result; see the [integration record](../../../docs/linux/UPSTREAM_dev_63a3b8df.md).
 
 ### How the Linux sites were found
 
@@ -469,7 +475,8 @@ applies, so the Linux menu offers at most about 720-tile edges (2048x64 ->
   rollback, the private extents, stub back-links and caps.
 - `verify_game.py` covers the two new sites (29 total).
 
-Not validated: live world generation or load, a world wider than +-131,072 m,
-renderer culling, save/reload, vehicles crossing the old root boundary, and a
-Linux/Windows multiplayer session at depth 12/13. Before relying on it, repeat
-the live checklist in `../octree-depth12.md` on Linux.
+No local live validation was repeated for dev `63a3b8df`; the gameplay results
+above are reported by upstream. The report does not establish coverage of
+every root-boundary, vehicle-crossing or renderer-culling case. Native placement
+distance remains unwidened and the menu diagonal limit above still applies;
+the upstream gameplay report does not remove that implementation gap.

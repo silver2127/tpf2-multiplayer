@@ -590,25 +590,7 @@ static void RenderLocked(int w, int h)
     g_hitCount = 0;
     layer::Rect(0, 0, w, h, MW_BG, TitleMode()?175:MW_BG_A);
     if(MenuPanelMode()) { RenderTitleLocked(w,h); return; }
-    if (g_uiState == 3) {
-        const auto& v=P().view;
-        MwTitle("WORLD SYNC");MwClose(w,4);
-        std::string description;
-        const auto& phase=v.recoveryPhase;
-        if(phase=="readiness")description="Ready players: "+std::to_string(v.readyCount)+" / "+std::to_string(v.readyTotal)+". Confirm when you are ready to reload the shared world.";
-        else if(phase=="complete"||phase.empty())description="The host can ask everyone to get ready to synchronize the shared world.";
-        else if(phase=="detected")description="The worlds need to be synchronized. The host can ask everyone to get ready.";
-        else if(phase=="unavailable")description="World sync is unavailable in this session.";
-        else if(phase=="error")description="World sync stopped at "+v.recoveryStep+". The host can retry when everyone is ready.";
-        else description="World sync: "+phase+". Please wait.";
-        layer::Text(S(25),S(65),w-S(50),S(110),description.c_str(),S(18),MW_TEXT,layer::kWordBreak);
-        layer::Text(S(25),S(185),w-S(50),S(180),v.recoveryDetail.c_str(),S(15),MW_DIM,layer::kWordBreak);
-        if(v.recoveryRequested)layer::Text(S(25),h-S(130),w-S(50),S(35),"Waiting for the lobby...",S(15),MW_DIM,layer::kLeft);
-        else if(phase=="readiness"&&!v.readyMine)MwButton(S(25),h-S(130),S(170),S(35),"I AM READY",82);
-        else if(v.isHost && phase=="error")MwButton(S(25),h-S(130),S(170),S(35),"RETRY SYNC",81);
-        else if(v.isHost && (phase.empty()||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))MwButton(S(25),h-S(130),S(170),S(35),"REQUEST SYNC",80);
-        MwButton(S(25),h-S(75),S(170),S(35),"BACK TO LOBBY",83);MwStatus(w,h);
-    } else if (g_uiState == 2) RenderLobbyLocked(w, h);
+    if (g_uiState == 2) RenderLobbyLocked(w, h);
     else RenderHostJoinLocked(w, h);
 }
 
@@ -689,7 +671,8 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
     }
     switch (id) {
         case 80:case 81:case 82:SetStatusLocked(lobby::RecoveryAction(id==82?"sync_ready":id==81?"sync_retry":"sync_request"));break;
-        case 83:g_uiState=2;break;
+        case 83:if(lobby::RecoveryAction("sync_dismiss").empty())g_uiState=2;break;
+        case 85:SetStatusLocked(lobby::RecoveryAction("sync_decline"));break;
         case 84:g_uiState=3;break;
         case 16: case 17: SetStatusLocked(lobby::AnswerMods(id == 16)); break;
         case 15:
@@ -863,7 +846,7 @@ static void BackspaceLocked()
     if (s) PopCharLocked(s);
 }
 
-static bool ChatFocusLocked() { return g_uiState == 2 && P().view.active; }
+static bool ChatFocusLocked() { return (g_uiState == 2 || g_uiState == 3) && P().view.active && !P().view.worldIo; }
 
 static bool PassKey(SDL_Keycode k)
 {

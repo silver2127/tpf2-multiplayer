@@ -182,7 +182,29 @@ lane breakdown and the cost of post-hash broadcast, drift and comparison work.
 Shared Lua regression tests pass; no live performance measurement is claimed.
 Version remains 0.7.
 
-The [dev `12407af7` integration](docs/linux/UPSTREAM_dev_12407af7.md) adds native Windows UCRT float
-math, experimental octree depth 12/13, and indexed person target records.
-Placement-distance saturation and placement-attempt budgets remain unported;
-oversized Windows-created saves still have a placement parity gap.
+The [dev `bd69b864` integration](docs/linux/UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
+target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
+attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+The [dev `aaae03f8` integration](docs/linux/UPSTREAM_dev_aaae03f8.md) retains
+the Windows GOG octree fallback and batch deployment fixes. Native Steam
+depths 11/12/13 keep their existing verified patches and ceiling checks.
+
+The [dev `7469fce7` integration](docs/linux/UPSTREAM_dev_7469fce7.md) incorporates
+Big Maps Windows GOG documentation; native runtime behavior is unchanged.
+
+The [dev `63a3b8df` integration](docs/linux/UPSTREAM_dev_63a3b8df.md) records
+upstream depth-13 gameplay and native dedicated multiplayer results. Native
+defaults and placement limits remain unchanged; no local live run was repeated.
+
+The [dev `4616c16a` integration](docs/linux/UPSTREAM_dev_4616c16a.md) adds
+upstream's Big Maps performance catalog with native feature/default scope.
+Runtime behavior is unchanged; the listed gains are upstream measurements.
+
+The [dev `c9ac009d` integration](docs/linux/UPSTREAM_dev_c9ac009d.md) retains
+the standalone Big Maps sync and unified Windows MSI documentation while
+preserving native Linux guidance. Runtime behavior is unchanged.
+
+The [dev `0610033` integration](docs/linux/UPSTREAM_dev_0610033.md) fixes native
+family ordering to recognize all 28 node lists and adds the opt-in town trace.
+Static and fixture checks pass; live validation was blocked at lab startup.

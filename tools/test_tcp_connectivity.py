@@ -22,6 +22,20 @@ import lobby
 
 
 class TcpConnectivity(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux bound dial contract")
+    def test_listener_allows_bound_dial_port(self):
+        listener = bulk_tcp.BulkListener(0)
+        self.addCleanup(listener.close)
+        for endpoint in listener.sockets:
+            self.assertEqual(endpoint.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT), 1)
+            dial = socket.socket(endpoint.family, socket.SOCK_STREAM)
+            self.addCleanup(dial.close)
+            dial.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            dial.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if endpoint.family == socket.AF_INET6:
+                dial.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            dial.bind(endpoint.getsockname())
+
     def test_receiver_uses_senders_stream_when_both_ends_dial(self):
         receiver = lobby._ClientSaveReceiver.__new__(lobby._ClientSaveReceiver)
         receiver.sid, receiver.kind, receiver.total_bytes = 7, "save", 6
@@ -119,6 +133,16 @@ class TcpConnectivity(unittest.TestCase):
 
 
 class RouterMapping(unittest.TestCase):
+    def test_cli_tcp_mapping_and_cleanup_use_linux_wrapper(self):
+        calls = []
+        def run(exe, args):
+            calls.append(args)
+            return types.SimpleNamespace(returncode=0, stdout="local lan ip address: 192.0.2.2\n")
+        with patch.dict(sys.modules, {"miniupnpc": None}), patch.object(observe.shutil, "which", return_value="upnpc"), patch.object(observe, "_upnpc_run", side_effect=run):
+            self.assertTrue(observe.upnp_map(23456, keep=True)["tcp_open"])
+            self.assertTrue(observe.upnp_unmap(23456))
+        self.assertEqual([a[-1] for a in calls], ["-l", "UDP", "TCP", "TCP", "UDP"])
+
     def mapping(self, udp, tcp, keep=True):
         calls = []
 

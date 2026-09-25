@@ -220,12 +220,12 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
     const bool sparse=enabled && H->cfgBool(Section,"newgame_density",1);
     if(sparse && !restored){H->log("density restore failed: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;}
     if(!enabled)return TPF2MP_ERR_DISABLED;
-    const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
-    const int depth=octree?H->cfgInt(Section,"octree_depth",11):11;
+    const int depth=H->cfgInt(Section,"octree_depth",11);
     if(!linux_octree::ValidDepth(depth)){H->log("octree_depth must be 11, 12 or 13; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
     cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,linux_octree::EdgeTiles(depth))&~1;
     maxRatio=std::clamp(H->cfgInt(Section,"max_ratio",20),5,20);
     cellBudget=double(std::clamp(H->cfgInt(Section,"cell_budget_millions",1500),1,2000))*1e6;
+    const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
     if(!octree)cap=std::min(cap,256);
     if(!raster)cap=std::min(cap,180); // never offer overflowing generation
     tilesX=H->cfgInt(Section,"tiles_x",0);tilesY=H->cfgInt(Section,"tiles_y",0);

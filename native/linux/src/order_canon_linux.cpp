@@ -1,4 +1,7 @@
 #include "order_canon_linux.h"
+#include "family_getters_linux.h"
+#include "town_trace_linux.h"
+#include "../../src/town_trace.h"
 #include "hook.h"
 #include "codewrite_linux.h"
 #include <algorithm>
@@ -259,13 +262,18 @@ static bool InstallOrderCanon(uintptr_t base, const char* buildId, bool (*instal
         if (std::memcmp(reinterpret_cast<const void*>(base + site.rva), site.bytes, sizeof(site.bytes))) {
             g_canonStatus.store("off (unverified site bytes)"); return false;
         }
-    // GetNodeList's recognized implementations are part of the layout guard.
+    // GetNodeList's recognized implementations are part of the layout guard:
+    // every one of the 63 in family_getters_linux.h, byte for byte.
     const unsigned char getList[] = {0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
     const unsigned char noList[] = {0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
-    if (std::memcmp((void*)(base+0xa914c0),getList,sizeof(getList)) ||
-        std::memcmp((void*)(base+0xa914e0),noList,sizeof(noList))) {
-        g_canonStatus.store("off (unverified family accessors)"); return false;
-    }
+    for (uintptr_t rva : kFamilyListGetters)
+        if (std::memcmp((void*)(base+rva),getList,sizeof(getList))) {
+            g_canonStatus.store("off (unverified family accessors)"); return false;
+        }
+    for (uintptr_t rva : kFamilyNoListGetters)
+        if (std::memcmp((void*)(base+rva),noList,sizeof(noList))) {
+            g_canonStatus.store("off (unverified family accessors)"); return false;
+        }
     g_familyBase = base;
     unsigned installed = 0;
     for (unsigned i = 0; i < kCanonSiteCount; ++i) {

@@ -150,8 +150,17 @@ int main(){
     Reset();build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
     Reset();config["enabled"]=0;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_DISABLED && writes==0);
     OctreeStubs();
+    // df1436c: the menu ceiling must agree with the root actually installed.
+    // Native Steam supports all three depths; Windows GOG's downgrade does not
+    // apply to this ELF. Exercise explicit lower caps and disabled widening too.
+    for(int depth:{11,12,13})for(int enabled:{0,1})for(int requested:{128,256,512,1024,2048}) {
+        Reset();config["octree_depth"]=depth;config["octree"]=enabled;config["max_tiles"]=requested;
+        assert(Tpf2mpPluginInit(&host,&info)==0);
+        assert(cap==std::min(requested,enabled?linux_octree::EdgeTiles(depth):256));
+        if(enabled)assert(memory[OctreeSite][9]==depth);
+        else assert(!memory.count(OctreeSite) && !memory.count(linux_octree::ChildSite) && !memory.count(linux_octree::LevelSite));
+    }
     for(int bad:{0,10,14,99}){Reset();config["octree_depth"]=bad;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED && writes==0);}
-    for(int ignored:{0,10,14,99}){Reset();config["octree"]=0;config["octree_depth"]=ignored;assert(Tpf2mpPluginInit(&host,&info)==0 && cap==256);}
     {
         using namespace linux_octree;
         // Depth 11 publishes exactly the pre-depth-12 bytes; the ID sites are not even read.

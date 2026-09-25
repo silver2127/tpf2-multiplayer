@@ -18,19 +18,11 @@ struct TargetRecord {
     bool invalid;
     Tpf2mpWindowsEntitySet order;
 };
-// Private bookkeeping only: preserve the Windows set history, but avoid a
-// full target-list scan on every person insertion/erasure. No engine layout
-// or allocation/lifetime contract changes. Buckets are allocated with owner.
+// Index private records by target; never change the native map or MSVC order.
+// Fixed buckets need no allocation on lookup and survive churn until owner cleanup.
 constexpr size_t kTargetBuckets = 1024;
-size_t TargetBucket(uint32_t target) noexcept
-{
-    return (uint32_t(target * UINT32_C(2654435761)) >> 22);
-}
-struct TargetOwner {
-    TargetOwner* next; uintptr_t map; bool invalid;
-    TargetRecord* records;
-    TargetRecord* index[kTargetBuckets];
-};
+size_t TargetBucket(uint32_t target) noexcept { return (target * UINT32_C(2654435761)) & (kTargetBuckets - 1); }
+struct TargetOwner { TargetOwner* next; uintptr_t map; bool invalid; TargetRecord* records; TargetRecord* buckets[kTargetBuckets]; };
 pthread_mutex_t g_targetMutex = PTHREAD_MUTEX_INITIALIZER;
 TargetOwner* g_targetOwners = nullptr;
 std::atomic<const char*> g_targetStatus{"off (not initialized)"};
@@ -106,18 +98,13 @@ void ObserveTargetInsert(uintptr_t map, uint32_t target, uint32_t id) noexcept
     while (owner && owner->map != map) owner = owner->next;
     if (!owner) TargetError("ERROR: insertion into an untracked target-map owner");
     else if (!owner->invalid) {
-        auto& bucket = owner->index[TargetBucket(target)];
-        TargetRecord* record = bucket;
+        auto& head = owner->buckets[TargetBucket(target)];
+        TargetRecord* record = head;
         while (record && record->target != target) record = record->hashNext;
         if (!record) {
             record = static_cast<TargetRecord*>(std::calloc(1, sizeof(TargetRecord)));
-            if (record) {
-                record->target = target; record->nativeSet = set;
-                record->hashNext = bucket; bucket = record;
-                record->next = owner->records;
-                if (record->next) record->next->previous = record;
-                owner->records = record;
-            }
+            if (record) { record->target = target; record->nativeSet = set; record->hashNext = head; head = record;
+                record->next = owner->records; if(record->next)record->next->previous=record; owner->records=record; }
             else { owner->invalid = true; TargetError("ERROR: target-set history allocation failed"); }
         }
         if (record && !record->invalid && (!inserted || record->nativeSet != set ||
@@ -137,7 +124,7 @@ void ObserveTargetErase(uintptr_t map, uint32_t target, uint32_t id) noexcept
     while (owner && owner->map != map) owner = owner->next;
     if (!owner) TargetError("ERROR: erase from an untracked target-map owner");
     else if (!owner->invalid) {
-        auto** at = &owner->index[TargetBucket(target)];
+        auto** at = &owner->buckets[TargetBucket(target)];
         while (*at && (*at)->target != target) at = &(*at)->hashNext;
         if (!*at) { owner->invalid = true; TargetError("ERROR: missing target-set erase history"); }
         else {
@@ -147,9 +134,8 @@ void ObserveTargetErase(uintptr_t map, uint32_t target, uint32_t id) noexcept
             }
             if (!record->invalid && !record->order.count) {
                 *at = record->hashNext;
-                if (record->previous) record->previous->next = record->next;
-                else owner->records = record->next;
-                if (record->next) record->next->previous = record->previous;
+                if(record->previous)record->previous->next=record->next;else owner->records=record->next;
+                if(record->next)record->next->previous=record->previous;
                 DeleteTargetRecord(record);
             }
         }

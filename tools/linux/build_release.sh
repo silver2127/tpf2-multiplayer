@@ -235,8 +235,12 @@ install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_582a380.md" "$STAGE/UPSTREAM_dev_
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e63ceefc.md" "$STAGE/UPSTREAM_dev_e63ceefc.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_cf5f8a0e.md" "$STAGE/UPSTREAM_dev_cf5f8a0e.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4b629a2.md" "$STAGE/UPSTREAM_dev_b4b629a2.md"
-install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_12407af7.md" "$STAGE/UPSTREAM_dev_12407af7.md"
-install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_522a303b.md" "$STAGE/UPSTREAM_dev_522a303b.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_bd69b864.md" "$STAGE/UPSTREAM_dev_bd69b864.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_aaae03f8.md" "$STAGE/UPSTREAM_dev_aaae03f8.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_7469fce7.md" "$STAGE/UPSTREAM_dev_7469fce7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_63a3b8df.md" "$STAGE/UPSTREAM_dev_63a3b8df.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4616c16a.md" "$STAGE/UPSTREAM_dev_4616c16a.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c9ac009d.md" "$STAGE/UPSTREAM_dev_c9ac009d.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
@@ -252,7 +256,7 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows 0.7 12407af7c3bb9c5624a34b8b09242f4fbf1eaac0 (pinned Linux origin replay)"
+  echo "Lua: Windows 0.7.0.2 bd69b864737a4c4383c6d73ac8d1dc8fa6f1c8b7 (pinned Linux origin replay)"
   echo "Bundled Big Maps native source: imported 4769cd3; see BIGMAP_PORT.md for limits"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
