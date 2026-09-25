@@ -636,6 +636,9 @@ CM.boot("mp.terrain")
 -- Lives in res/scripts/mp/assets.lua.
 CM.boot("mp.assets")
 local function execute(c)
+	-- any other command may edit the road/rail network: EDEMO's node index
+	-- (cons.lua) is only reused across consecutive bulldozes
+	if c.op ~= "EDEMO" then CM.edemoCache = nil end
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
 	elseif c.op == "FENCE" then CM.execFence(c)

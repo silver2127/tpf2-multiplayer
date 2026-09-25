@@ -208,3 +208,9 @@ preserving native Linux guidance. Runtime behavior is unchanged.
 The [dev `0610033` integration](docs/linux/UPSTREAM_dev_0610033.md) fixes native
 family ordering to recognize all 28 node lists and adds the opt-in town trace.
 Static and fixture checks pass; live validation was blocked at lab startup.
+
+The [dev `e43d01dd` integration](docs/linux/UPSTREAM_dev_e43d01dd.md) carries
+upstream's per-tick EDEMO node index and the stop-replay registration that stops
+a catch-up scan re-shipping replayed signals and stops. Both are shared Lua; the
+native Linux slice already emits the EDEMO and STOPX/STOPXDEL records they rely
+on, so no native change was needed. No local live run was possible.
