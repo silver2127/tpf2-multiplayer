@@ -214,3 +214,13 @@ upstream's per-tick EDEMO node index and the stop-replay registration that stops
 a catch-up scan re-shipping replayed signals and stops. Both are shared Lua; the
 native Linux slice already emits the EDEMO and STOPX/STOPXDEL records they rely
 on, so no native change was needed. No local live run was possible.
+
+The [dev `d8a3ce57` integration](docs/linux/UPSTREAM_dev_d8a3ce57.md) is
+upstream's **release 0.7.0.3** and carries no code. It stamps the native release
+0.7.0.3 (`installer/VERSION`, which `tools/linux/build_release.sh` reads for the
+`.run` installer, and the shared `LOBBY_VERSION` handshake), advances the Lua
+verifier and the release provenance line to this target, and stages the two
+missing integration records. Each Linux claim the notes make -- all 28 sorted
+node lists, the extra RNG sites, Windows float math, `TPF2MP_TOWN_TRACE=1`,
+octree depths 12/13, terrain compression on by default -- was rechecked against
+the unmodified game ELF and passes. No local live run was possible.

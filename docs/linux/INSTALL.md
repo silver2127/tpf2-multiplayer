@@ -356,3 +356,18 @@ by default and requires the verified town-seed hook. Compare captures from the
 same session with `python3 tools/town_trace_diff.py NATIVE_TRACE WINDOWS_TRACE`;
 Windows enables its half with `towntrace=1` in `tpf2_slice.cfg`.
 See [integration and validation limits](UPSTREAM_dev_0610033.md).
+
+## Release 0.7.0.3 (dev d8a3ce57)
+
+Native Linux is at **0.7.0.3**: the `.run` installer, the tarball name, the
+staged `VERSION` file and the `BUILDINFO` header all take it from
+`installer/VERSION`, and the lobby handshake (`LOBBY_VERSION`) matches. Every
+participant, including a dedicated server, needs the same version -- the gate is
+an exact release match and a peer without a version fails closed.
+
+The release carries no new native code: it is the version stamp for the fixes
+the `0610033`, `11a98cc`/`e43d01dd` and earlier integrations already ported. The
+Linux behaviour the release notes promise was rechecked against the unmodified
+build-35924 ELF and passes; the octree depth, town-trace and math-parity notes
+elsewhere in this file still apply unchanged.
+See [integration evidence and validation limits](UPSTREAM_dev_d8a3ce57.md).
