@@ -301,6 +301,7 @@ static void titleLobby(int w,int h,bool recovery=false)
     if(g_modelCsInit) { EnterCriticalSection(&g_modelCs); if(!g_lobbyTitle.empty()) title=wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
     titleHeading(w,world?L"MULTIPLAYER - SESSION":L"MULTIPLAYER - LOBBY",4);
     if(world && !recovery) mwClose(w,4);
+    else if(world && recovery && !g_recoveryWorldIo) mwClose(w,83); // the resync view's x (OnHit 83)
     titleText(pad,S(58),width-S(180),S(28),title.c_str(),14,MW_DIM);
     if(g_haveCode && !recovery) titleAction(w-pad-S(170),S(57),S(170),L"Copy invitation code",7);
     if(recovery) titleRecoverySection(w,h);
