@@ -82,9 +82,9 @@ int wmain(int argc,wchar_t** argv)
         g_flagScale=scale; int w=(int)(780*scale),h=(int)(540*scale);
         g_uiState=1; g_titleTab=0; g_titleServerPage=0; g_gameUi=0;
         strcpy_s(g_flagMaster,"https://example.invalid"); strcpy_s(g_joinCode,"fixture-0");
-        RenderPanelLayer(w,h); check(w,h); assert(hit(3) && hit(110) && hit(111) && hit(40) && hit(113));
+        RenderPanelLayer(w,h); check(w,h); assert(hit(3) && hit(110) && hit(111) && hit(60) && hit(113));
         if(scale==1) snapshot(folder/L"join.bmp",w,h);
-        OnHit(113); RenderPanelLayer(w,h); check(w,h); assert(hit(112) && hit(43) && !hit(44)); // row ids are per page
+        OnHit(113); RenderPanelLayer(w,h); check(w,h); assert(hit(112) && hit(63) && !hit(64)); // row ids are per page
         OnHit(110); assert(!strcmp(g_joinCode,"fixture-0") && !strcmp(g_passCode,"fixture"));
         OnHit(111); RenderPanelLayer(w,h); check(w,h); assert(hit(2) && hit(14) && !hit(3));
         if(scale==1) snapshot(folder/L"host.bmp",w,h);
@@ -163,6 +163,9 @@ int wmain(int argc,wchar_t** argv)
         g_gameUi=1;g_recoveryPresent=1;g_uiState=3;strcpy_s(g_recoveryPhase,"transferring");
         RenderPanelLayer(w,h);check(w,h);assert(hit(83));
         OnHit(83);assert(g_uiState==0 && g_recoveryPresent && g_recoveryHidden);
+        { bool quiet=false; const LONG show=g_showOverlay; g_showOverlay=0;   // hidden: the game shows, no panel
+          assert(!OverlayWanted(quiet)); g_showOverlay=show; }
+        RenderPanelLayer(w,h);assert(g_hitCount==0);                           // page 0 draws nothing clickable
         g_recoveryWorldIo=1;g_uiState=3;RenderPanelLayer(w,h);check(w,h);assert(!hit(83));g_recoveryWorldIo=0;
         // x on a preflight notice dismisses it like Close
         strcpy_s(g_recoveryPhase,"detected");g_uiState=3;RenderPanelLayer(w,h);check(w,h);
@@ -170,21 +173,21 @@ int wmain(int argc,wchar_t** argv)
         g_uiState=3;g_recoveryPresent=0;
         g_stages.clear();g_gameUi=0;g_recoveryPhase[0]=0;
     }
-    // The Join page is taller (660, not 540) and shows 8 public games to a page
+    // The Join page is taller (764, not 540) and shows 12 public games to a page
     // (2026-09-26, user: the server list was "getting quite cramped" at 4).
     g_flagScale=1;g_uiState=1;g_titleTab=0;g_gameUi=0;g_titleServerPage=0;g_joinCode[0]=0;
     strcpy_s(g_flagMaster,"https://example.invalid");
-    g_scExtent={1920,1080};g_panelW=1920;g_panelH=1080;PanelLayout();assert(g_copyH==660);
+    g_scExtent={1920,1080};g_panelW=1920;g_panelH=1080;PanelLayout();assert(g_copyH==764);
     g_titleTab=1;PanelLayout();assert(g_copyH==540);g_titleTab=0;
     g_flagMaster[0]=0;PanelLayout();assert(g_copyH==540);strcpy_s(g_flagMaster,"https://example.invalid");
-    RenderPanelLayer(780,660);check(780,660);
-    for(int r=0;r<8;++r) assert(hit(40+r));
-    assert(hit(113) && !hit(112));
-    snapshot(folder/L"join-browser.bmp",780,660);
-    OnHit(113);RenderPanelLayer(780,660);check(780,660);assert(hit(47) && hit(112) && hit(113));
-    OnHit(40);assert(!strcmp(g_joinCode,"fixture-8"));      // the first row of page 2 is game 9
-    OnHit(113);RenderPanelLayer(780,660);check(780,660);assert(hit(43) && !hit(44) && !hit(113));
-    OnHit(43);assert(!strcmp(g_joinCode,"fixture-19"));
+    RenderPanelLayer(780,764);check(780,764);
+    for(int r=0;r<12;++r) assert(hit(60+r));
+    assert(!hit(72) && hit(113) && !hit(112));
+    snapshot(folder/L"join-browser.bmp",780,764);
+    OnHit(71);assert(!strcmp(g_joinCode,"fixture-11"));     // the last row of page 1 is game 12
+    OnHit(113);RenderPanelLayer(780,764);check(780,764);assert(hit(67) && !hit(68) && hit(112) && !hit(113));
+    OnHit(60);assert(!strcmp(g_joinCode,"fixture-12"));     // the first row of page 2 is game 13
+    OnHit(67);assert(!strcmp(g_joinCode,"fixture-19"));
     g_scExtent={0,0};g_panelW=780;g_panelH=580;g_titleServerPage=0;g_joinCode[0]=0;g_flagMaster[0]=0;
     // Representative two-player previews, separate from the stress fixtures above.
     g_flagScale=1;g_uiState=3;g_gameUi=0;g_isHost=1;g_titlePlayerPage=0;

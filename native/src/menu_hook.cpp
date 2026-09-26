@@ -633,18 +633,6 @@ static std::string utf8Of(const wchar_t* wide)
     std::string u; if (n > 1) { u.resize(n - 1); WideCharToMultiByte(CP_UTF8, 0, wide, -1, &u[0], n, nullptr, nullptr); }
     return u;
 }
-// Chip colour per company id: a hue walk (golden angle) so neighbouring ids differ.
-static COLORREF coColor(int cid)
-{
-    static const COLORREF first[20] = { RGB(230,25,75), RGB(0,130,200), RGB(60,180,75), RGB(245,130,48), RGB(145,30,180), RGB(70,240,240), RGB(240,50,230), RGB(255,225,25), RGB(0,128,128), RGB(170,110,40), RGB(210,245,60), RGB(128,0,0), RGB(0,0,128), RGB(128,128,0), RGB(250,190,212), RGB(220,190,255), RGB(170,255,195), RGB(255,215,180), RGB(128,128,128), RGB(255,250,200) };
-    if (cid >= 1 && cid <= 20) return first[cid - 1];
-    float h = (float)(((cid - 21) * 137.508) - (int)(((cid - 21) * 137.508) / 360.0) * 360.0);   // degrees
-    float sat = 0.62f, val = 0.85f, c = val * sat, x = c * (1.f - fabsf(fmodf(h / 60.f, 2.f) - 1.f)), m = val - c;
-    float r, g, b;
-    if (h < 60) { r = c; g = x; b = 0; } else if (h < 120) { r = x; g = c; b = 0; } else if (h < 180) { r = 0; g = c; b = x; }
-    else if (h < 240) { r = 0; g = x; b = c; } else if (h < 300) { r = x; g = 0; b = c; } else { r = c; g = 0; b = x; }
-    return RGB((int)((r + m) * 255), (int)((g + m) * 255), (int)((b + m) * 255));
-}
 // Origin name for roster index idx (0 = the host): a..z, then aa, ab, ... (702 names).
 static void originName(int idx, char* out)
 {
@@ -1108,8 +1096,8 @@ static volatile LONG g_codeSeen = 0;    // the first code event of this lobby: s
 // publish (see _Publisher in lobby.py); nothing here talks to a host directly.
 struct PubRow { char name[NAME_MAX]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
 // The public list keeps PUB_MAX games (2026-09-26, user: the server list "getting quite
-// cramped"): it was 8, shown 4 to a page.
-static const int PUB_MAX = 32;
+// cramped"): it was 8, shown 4 to a page; 12 to a page now.
+static const int PUB_MAX = 48;
 static PubRow g_pub[PUB_MAX]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
@@ -1237,17 +1225,6 @@ static void mwCheck(int x, int y, const wchar_t* label, bool on, int id)
     addHit(x, y, sz + S(8) + lw, S(30), id, true);
 }
 
-static void mwButton(int x, int y, int w, int h, const wchar_t* label, int id)
-{
-    HFONT f = mkLato(S(13));
-    layerText(x, y, w, h, label, f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    DeleteObject(f); addHit(x, y, w, h, id, true);
-}
-static int mwButtonW(const wchar_t* label) { HFONT f = mkLato(S(13)); int w = textW(label, f) + S(2 * 10); DeleteObject(f); return w; }
-static void mwHeader(int x, int y, int w, const wchar_t* text)
-{
-    HFONT f = mkLato(S(13)); layerText(x, y, w, S(22), text, f, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
-}
 static void mwBody(int x, int y, int w, int h, const wchar_t* text, COLORREF c = MW_TEXT)
 {
     HFONT f = mkLato(S(13)); layerText(x, y, w, h, text, f, c, DT_LEFT | DT_TOP | DT_WORDBREAK); DeleteObject(f);
@@ -1270,13 +1247,6 @@ static void mwClose(int w, int id)
     HFONT f = mkLato(S(20)); layerText(x, y, sz, sz, L"\u00D7", f, MW_TEXT, DT_CENTER | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
     addHit(x, y, sz, sz, id, true);
 }
-static void mwTitle(const wchar_t* t) { HFONT f = mkLato(S(18)); layerText(S(25), S(8), S(400), S(32), t, f, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f); }
-static void mwStatus(int w, int h)
-{
-    char st[256]; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
-    wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-    HFONT f = mkLato(S(12)); layerText(S(25), h - S(34), w - S(50), S(24), wst, f, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(f);
-}
 
 #include "menu_title_panel.inl"
 #include "menu_title_backdrop.inl"
@@ -1286,244 +1256,8 @@ static void RenderPanelLayer(int w, int h)
 {
     g_s = UiScale(); layerBegin(w, h); g_hitCount = 0;
     layerRect(0, 0, w, h, MW_BG, !WorldLoaded() && (g_uiState>=1 && g_uiState<=3) ? 175 : MW_BG_A);
-    int pad = S(25), cy = S(56);
     const LONG page=InterlockedCompareExchange(&g_uiState,0,0);
-    if(RenderTitlePanel(w,h,page)) return;
-    if (page == 2) {
-        // ---------------- LOBBY ----------------
-        if (g_savePicker && g_isHost && !WorldLoaded() && !g_sessionStarted) {
-            mwTitle(L"SELECT SAVE"); mwClose(w, 91);
-            mwBody(pad, cy, w-2*pad, S(40), L"Choose the world to share. Newest saves first, including autosaves.");
-            HFONT font = mkLato(S(14));
-            for (int row=0; row<SAVE_ROWS; ++row) {
-                int i=g_savePage*SAVE_ROWS+row;
-                if (i >= (int)g_lobbySaves.size()) break;
-                const auto& save=g_lobbySaves[i];
-                int y=cy+S(48)+row*S(40);
-                layerRect(pad,y,w-2*pad,S(36),save.path==g_selectedSave ? MW_YOU : RGB(0,0,0),65);
-                layerText(pad+S(10),y,w-2*pad-S(185),S(36),save.name.c_str(),font,MW_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
-                FILETIME local; SYSTEMTIME date; wchar_t stamp[40]=L"";
-                if (FileTimeToLocalFileTime(&save.modified,&local) && FileTimeToSystemTime(&local,&date))
-                    _snwprintf_s(stamp,_TRUNCATE,L"%04u-%02u-%02u %02u:%02u",date.wYear,date.wMonth,date.wDay,date.wHour,date.wMinute);
-                layerText(w-pad-S(170),y,S(160),S(36),stamp,font,MW_DIM,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-                addHit(pad,y,w-2*pad,S(36),100+row,true);
-            }
-            DeleteObject(font);
-            if (g_lobbySaves.empty()) mwBody(pad,cy+S(55),w-2*pad,S(60),L"No saves found. Create and save a world with the Multiplayer mod enabled, then refresh.");
-            int y=h-S(85);
-            mwButton(pad,y,S(110),S(30),L"BACK",91);
-            mwButton(pad+S(125),y,S(110),S(30),L"REFRESH",92);
-            if (g_savePage>0) mwButton(w-pad-S(240),y,S(110),S(30),L"PREVIOUS",93);
-            if ((g_savePage+1)*SAVE_ROWS<(int)g_lobbySaves.size()) mwButton(w-pad-S(110),y,S(110),S(30),L"NEXT",94);
-            mwStatus(w,h);
-            return;
-        }
-        int titleW = S(90);
-        { std::wstring wt = L"LOBBY";
-          if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); if (!g_lobbyTitle.empty()) wt = L"LOBBY  --  " + wideOf(g_lobbyTitle.c_str()); LeaveCriticalSection(&g_modelCs); }
-          mwTitle(wt.c_str()); HFONT ft = mkLato(S(18)); titleW = textW(wt.c_str(), ft) + S(16); DeleteObject(ft); } mwClose(w, 4);
-        if (InterlockedCompareExchange(&g_haveCode, 0, 0)) {
-            // ROOM CODE, DELIBERATELY NOT RENDERED.
-            //
-            // The code IS the credential: anyone who can read it can join
-            // the lobby. On a stream, a screenshot or over a shoulder it is
-            // handed to everyone watching, and unlike a password nobody ever
-            // needs to TYPE it -- the legitimate way to pass it on is the
-            // clipboard, which the click below already does. So the button
-            // shows a placeholder and the code itself only ever leaves via
-            // ClipboardSet.
-            //
-            // The placeholder is a FIXED string, not the real code masked:
-            // sizing the button from the code would leak its length.
-            const wchar_t* wcode = L"\u2022\u2022\u2022  ROOM CODE  \u2022\u2022\u2022";
-            HFONT fm = CreateFontW(-S(14), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Consolas");
-            int cw = textW(wcode, fm) + S(20), cx = S(25) + titleW;
-            layerRect(cx, S(11), cw, S(26), RGB(0, 0, 0), 50);
-            layerText(cx + S(10), S(11), cw, S(26), wcode, fm, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); DeleteObject(fm);
-            HFONT fh = mkLato(S(11)); layerText(cx + cw + S(10), S(11), S(160), S(26), L"click to copy (never shown)", fh, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); DeleteObject(fh);
-            addHit(cx, S(11), cw, S(26), 7, true);
-        }
-        if (g_isHost && !WorldLoaded() && !g_sessionStarted) {
-            int bw=mwButtonW(L"SELECT SAVE");
-            mwButton(pad,cy,bw,S(30),L"SELECT SAVE",90);
-            const wchar_t* name=g_selectedSave.empty() ? L"Choose a save before starting" : wcsrchr(g_selectedSave.c_str(),L'\\');
-            if (!g_selectedSave.empty()) name=name ? name+1 : g_selectedSave.c_str();
-            HFONT font=mkLato(S(14));
-            layerText(pad+bw+S(12),cy,w-2*pad-bw-S(12),S(30),name,font,MW_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
-            DeleteObject(font);
-            cy+=S(44);
-        }
-        int bottom = h - S(44);
-        int listW = S(220), chatX = pad + listW + S(20), chatW = w - chatX - pad;
-        int contentH = bottom - cy - S(12);
-        // players
-        char hdr[48]; int n = 0;
-        if (g_modelCsInit) { EnterCriticalSection(&g_modelCs); n = playerCount(); }
-        snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", n);
-        wchar_t whdr[48]; MultiByteToWideChar(CP_UTF8, 0, hdr, -1, whdr, 48);
-        mwHeader(pad, cy, listW, whdr);
-        HFONT fr = mkLato(S(14)), fs = mkLato(S(11));
-        for (int i = 0; i < n && i < ROSTER_ROWS; i++) {
-            std::wstring wn = wideOf(g_players[i].c_str());
-            bool isYou = g_players[i] == g_you, isHost = g_players[i] == g_host;
-            int ry = cy + S(30) + i * S(26);
-            // company chip: colour + number; left/right-click your own (the host: anyone's) to cycle
-            int cid = g_companies[i] < 1 ? 1 : (g_companies[i] > MAX_COMPANIES ? MAX_COMPANIES : g_companies[i]);
-            layerRect(pad, ry + S(4), S(22), S(16), coColor(cid), 220);
-            wchar_t wc[4]; _snwprintf_s(wc, _TRUNCATE, L"%d", cid);
-            layerText(pad, ry + S(4), S(22), S(16), wc, fs, RGB(0, 0, 0), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            bool amHost = g_you == g_host;
-            if (isYou || amHost) addHit(pad, ry + S(2), S(24), S(20), 20 + i, true);   // chip ids 20..35
-            bool staged = i < (int)g_stages.size() && !g_stages[i].empty();
-            layerText(pad + S(30), ry, listW - (staged ? S(150) : S(80)), S(24), wn.c_str(), fr, isYou ? MW_YOU : MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            if (staged) {   // hot-join progress, dim, in place of the HOST tag (a host has none)
-                std::wstring ws = wideOf(g_stages[i].c_str());
-                layerText(pad + listW - S(120), ry, S(120), S(24), ws.c_str(), fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS, 200);
-            }
-            else if (isHost) layerText(pad + listW - S(50), ry, S(50), S(24), L"HOST", fs, MW_DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE, 180);
-        }
-        { HFONT fl = mkLato(S(11));
-          int shown = n < ROSTER_ROWS ? n : ROSTER_ROWS;
-          if (n > ROSTER_ROWS) { wchar_t more[48]; _snwprintf_s(more, _TRUNCATE, L"+ %d more", n - ROSTER_ROWS);
-              layerText(pad + S(30), cy + S(30) + ROSTER_ROWS * S(26), listW, S(20), more, fl, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE, 180); }
-          int legendY = cy + S(30) + (shown < 8 ? 8 : shown) * S(26) + S(6) + (n > ROSTER_ROWS ? S(22) : 0);
-          if (legendY > bottom - S(44)) legendY = bottom - S(44);
-          layerText(pad, legendY, listW, S(40), InterlockedCompareExchange(&g_sepCompanies, 0, 0)
-                    ? L"Separate companies: each player runs their own. Left-click a chip for the next company, right-click for the previous."
-                    : L"Co-op: everyone runs company 1 together. Left-click a chip for the next company, right-click for the previous.",
-                    fl, MW_DIM, DT_LEFT | DT_TOP | DT_WORDBREAK, 170); DeleteObject(fl); }
-        DeleteObject(fr); DeleteObject(fs);
-        if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
-        // chat
-        int inH = S(30), logH = contentH - inH - S(8);
-        layerRect(chatX, cy, chatW, logH, RGB(0, 0, 0), 50);
-        if (g_modelCsInit) {
-            EnterCriticalSection(&g_modelCs);
-            HFONT fc = mkLato(S(13)); int lh = S(22), maxLines = (logH - S(16)) / lh, cnt = g_chatCount;
-            int first = cnt > maxLines ? cnt - maxLines : 0, ly = cy + S(8);
-            for (int i = first; i < cnt; i++) {
-                wchar_t wl[220]; MultiByteToWideChar(CP_UTF8, 0, g_chatLog[(g_chatHead + i) % 14], -1, wl, 220);
-                layerText(chatX + S(10), ly, chatW - S(20), lh, wl, fc, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE); ly += lh;
-            }
-            DeleteObject(fc); LeaveCriticalSection(&g_modelCs);
-        }
-        mwField(chatX, cy + logH + S(8), chatW, inH, g_chatInput, true, L"Type a message and press Enter", 9);
-        // A running map keeps its transport alive when the panel is hidden.
-        int bw1 = 0;
-        if (!WorldLoaded()) { bw1 = mwButtonW(L"LEAVE"); mwButton(pad, bottom, bw1, S(30), L"LEAVE", 5); }
-        if (InterlockedCompareExchange(&g_isHost, 0, 0)) { int bw2 = mwButtonW(L"START GAME"); mwButton(w - pad - bw2, bottom, bw2, S(30), L"START GAME", 6);
-            int px2 = w - pad - bw2 - S(110);
-            if (g_flagMaster[0]) mwCheck(px2, bottom, L"PUBLIC", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
-            mwCheck(px2 - S(230), bottom, L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50);
-            if (InterlockedCompareExchange(&g_hostSteam, 0, 0))
-                mwCheck(px2 - S(370), bottom, L"CROSS-PLAY", InterlockedCompareExchange(&g_crossplay, 0, 0) != 0, 51); }
-        if(WorldLoaded() && g_isHost) {
-            bw1=mwButtonW(L"RESYNC...");
-            mwButton(pad,bottom,bw1,S(30),L"RESYNC...",87);
-        }
-        // status between them -- or the mod-download question with its YES / NO
-        char st[256]; char mp[300] = ""; if (g_csInit) { EnterCriticalSection(&g_statusCs); strncpy_s(st, g_status, _TRUNCATE); strncpy_s(mp, g_modsPrompt, _TRUNCATE); LeaveCriticalSection(&g_statusCs); } else st[0] = 0;
-        int rightCut = S(160);
-        if (mp[0]) {
-            // Modal: discard background hit targets while consent is pending.
-            g_hitCount=0;
-            int dx=S(90), dy=S(140), dw=w-S(180);
-            layerRect(0,0,w,h,RGB(0,0,0),170);
-            layerRect(dx,dy,dw,S(230),RGB(28,32,38),255);
-            mwHeader(dx+S(20),dy+S(20),dw-S(40),L"REQUIRED MODS");
-            wchar_t prompt[400]; MultiByteToWideChar(CP_UTF8,0,mp,-1,prompt,400);
-            mwBody(dx+S(20),dy+S(55),dw-S(40),S(65),prompt);
-            mwCheck(dx+S(20),dy+S(130),L"Auto-accept mod downloads",g_flagShareMods==1,19);
-            int bwN=mwButtonW(L"CANCEL"), bwY=mwButtonW(L"DOWNLOAD MODS");
-            mwButton(dx+S(20),dy+S(175),bwY,S(32),L"DOWNLOAD MODS",16);
-            mwButton(dx+dw-S(20)-bwN,dy+S(175),bwN,S(32),L"CANCEL",17);
-        }
-        wchar_t wst[256]; MultiByteToWideChar(CP_UTF8, 0, st, -1, wst, 256);
-        // The status sits between LEAVE and the right-hand buttons: a line longer than
-        // that space ends in an ellipsis rather than a hard cut (the mods-round line
-        // with a joiner's name in front ran to the edge, 2026-09-20).
-        HFONT fst = mkLato(S(12)); layerText(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), wst, fst, mp[0] ? MW_TEXT : MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS); DeleteObject(fst);
-    } else {
-        // ---------------- HOST / JOIN ----------------
-        mwTitle(L"MULTIPLAYER"); mwClose(w, 4);
-        { int lb = mwButtonW(L"OPEN LOGS"); mwButton(w - S(65) - lb, S(10), lb, S(28), L"OPEN LOGS", 15); }
-        int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
-        layerRect(pad + colW + S(20), cy, 1, S(130), RGB(255, 255, 255), 40);
-        mwHeader(lx, cy, colW, L"HOST A GAME");
-        mwBody(lx, cy + S(24), colW, S(36), WorldLoaded()
-            ? L"Opens a lobby and saves this world for everyone who joins."
-            : L"Open a lobby, choose a save, then share it with everyone who joins.");
-        // NOT ensureUsername() here: this runs every frame, so emptying the name
-        // field made the next frame roll a new random name before anything could be
-        // typed (2026-09-11). An empty name is filled only on HOST/JOIN or Enter.
-        { char def[NAME_MAX + 48];
-          if (g_username[0]) snprintf(def, sizeof(def), "%s's game  (click to name the lobby)", g_username);
-          else snprintf(def, sizeof(def), "Your game  (click to name the lobby)");
-          wchar_t wd[64]; MultiByteToWideChar(CP_UTF8, 0, def, -1, wd, 64);
-          mwField(lx, cy + S(60), colW, S(30), g_lobbyName, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 4, wd, 14); }
-        { int hb = mwButtonW(L"HOST GAME"); mwButton(lx, cy + S(96), hb, S(30), L"HOST GAME", 2);
-          if (g_flagMaster[0]) mwCheck(lx + hb + S(16), cy + S(96), L"PUBLIC (listed in the browser)", InterlockedCompareExchange(&g_public, 0, 0) != 0, 11);
-          mwCheck(lx, cy + S(128), L"SEPARATE COMPANIES", InterlockedCompareExchange(&g_sepCompanies, 0, 0) != 0, 50);
-          mwCheck(lx + S(200), cy + S(128), L"CROSS-PLAY (players without Steam)", InterlockedCompareExchange(&g_crossplay, 0, 0) != 0, 51); }
-        mwHeader(rx, cy, colW, L"JOIN A GAME");
-        mwBody(rx, cy + S(28), colW, S(24), L"Paste or type the code from your host.");
-        mwField(rx, cy + S(58), colW, S(30), g_joinCode, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 1, L"Click to paste the code", 8);
-        mwButton(rx, cy + S(96), mwButtonW(L"JOIN GAME"), S(30), L"JOIN GAME", 3);
-        mwCheck(rx + S(150), cy + S(98), L"Auto-accept mod downloads", g_flagShareMods==1, 19);
-        // The mod has to be on in the shared save: without it nothing replicates,
-        // and START GAME refuses such a save (2026-09-10). Said up front here.
-        mwBody(rx, cy + S(134), colW, S(20), L"The shared save must have the Multiplayer mod enabled.");
-        // optional password: mixed into the session key, so the host and every
-        // joiner must type the same one. Shown masked.
-        mwHeader(pad, cy + S(162), S(260), L"YOUR NAME");
-        mwField(pad, cy + S(186), S(260), S(30), g_username, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 3, L"Steam name (click to type your own)", 13);
-        mwHeader(pad + S(290), cy + S(162), w - 2 * pad - S(290), L"PASSWORD  --  optional; anyone who has the code can read your IP address");
-        { char masked[40]; int i = 0; for (; i < g_passLen && i < 39; i++) masked[i] = '*'; masked[i] = 0;
-          mwField(pad + S(290), cy + S(186), S(260), S(30), masked, InterlockedCompareExchange(&g_joinFocus, 0, 0) == 2, L"Click to type a password", 10); }
-        // ---- PUBLIC GAMES: the server browser (OpenTTD style) ----
-        if (g_flagMaster[0]) {
-            int ly = cy + S(230); int lw = w - 2 * pad;
-            mwHeader(pad, ly, lw - S(120), L"PUBLIC GAMES  --  click a row, then JOIN GAME");
-            { int rb = mwButtonW(L"REFRESH"); mwButton(w - pad - rb, ly - S(4), rb, S(30), L"REFRESH", 12); }
-            ly += S(26);
-            PubRow rows[8]; int cnt = 0; char note[96] = "";
-            if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); memcpy(rows, g_pub, sizeof(rows)); cnt = g_pubCount; strcpy_s(note, g_pubNote); LeaveCriticalSection(&g_pubCs); }
-            HFONT fr = mkLato(S(13));
-            // HOST takes the room the save name had: the list shows the server TYPE,
-            // one short phrase, never the host's save file name (2026-09-10)
-            int cName = pad + S(10), cType = pad + S(395), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
-            layerText(cName, ly, S(375), S(20), L"HOST", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            layerText(cType, ly, S(120), S(20), L"TYPE", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            layerText(cPl, ly, S(70), S(20), L"PLAYERS", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            layerText(cVer, ly, S(60), S(20), L"VERSION", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            layerText(cAge, ly, S(80), S(20), L"SEEN", fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            ly += S(22);
-            int maxRows = (h - S(40) - ly) / S(24); if (maxRows > 8) maxRows = 8;
-            for (int i = 0; i < cnt && i < maxRows; i++) {
-                const PubRow& r = rows[i]; int rh = S(24);
-                layerRect(pad, ly, lw, rh, RGB(0, 0, 0), (i & 1) ? 35 : 55);
-                wchar_t wn[64], wv[32], wp[32], wa[32];
-                MultiByteToWideChar(CP_UTF8, 0, r.name, -1, wn, 64); MultiByteToWideChar(CP_UTF8, 0, r.version, -1, wv, 32);
-                // a master from before the type field: the relay is known by its game string
-                const wchar_t* wt = (!strcmp(r.type, "relay") || !strcmp(r.type, "dedicated")) ? L"dedicated server" : !strcmp(r.type, "host") ? L"player hosted"
-                                  : !strcmp(r.game, "dedicated relay") ? L"dedicated server" : L"player hosted";
-                if (r.locked) { wchar_t t[64]; _snwprintf_s(t, _TRUNCATE, L"%s  [locked]", wn); wcscpy_s(wn, t); }
-                _snwprintf_s(wp, _TRUNCATE, L"%d / %d", r.players, r.max);
-                if (r.age < 60) wcscpy_s(wa, L"just now"); else _snwprintf_s(wa, _TRUNCATE, L"%d min ago", r.age / 60);
-                layerText(cName, ly, S(375), rh, wn, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                layerText(cType, ly, S(120), rh, wt, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                layerText(cPl, ly, S(70), rh, wp, fr, MW_TEXT, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                layerText(cVer, ly, S(60), rh, wv, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                layerText(cAge, ly, S(80), rh, wa, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-                addHit(pad, ly, lw, rh, 40 + i, true);
-                ly += rh + S(2);
-            }
-            if (cnt == 0) { wchar_t wnote[96]; MultiByteToWideChar(CP_UTF8, 0, note[0] ? note : "Looking for public games…", -1, wnote, 96);
-                            layerText(cName, ly, lw - S(20), S(24), wnote, fr, MW_DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE); }
-            DeleteObject(fr);
-        }
-        mwStatus(w, h);
-    }
+    RenderTitlePanel(w,h,page);   // pages 1-3; any other page draws nothing
 }
 
 static void barrierImage(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to,
@@ -1596,96 +1330,12 @@ static bool BuildPanelImage()
     return true;
 }
 
-// backdrop: a second host-visible linear image the game frame is copied INTO under
-// the button, so the native-look overlay can alpha-blend instead of overwrite.
-static VkImage        g_bdImg = VK_NULL_HANDLE;
-static VkDeviceMemory g_bdMem = VK_NULL_HANDLE;
-static void*          g_bdPtr = nullptr;
-static size_t         g_bdPitch = 0;
-static bool           g_bdBuilt = false, g_bdFail = false;
-static VkImageUsageFlags g_scUsage = 0;   // from myCreateSwapchain: the backdrop copy needs TRANSFER_SRC
-static bool BuildBackdropImage()
-{
-    if (g_bdBuilt) return true; if (g_bdFail) return false;
-    if (g_scUsage && !(g_scUsage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
-        g_bdFail = true;
-        Log("[menu] vk: swapchain has no TRANSFER_SRC (usage=0x%x) -- panel backdrop disabled\n", g_scUsage);
-        return false;
-    }
-    VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    ici.imageType = VK_IMAGE_TYPE_2D; ici.format = g_scFormat;
-    ici.extent = { (uint32_t)g_panelW, (uint32_t)g_panelH, 1 };
-    ici.mipLevels = 1; ici.arrayLayers = 1; ici.samples = VK_SAMPLE_COUNT_1_BIT;
-    ici.tiling = VK_IMAGE_TILING_LINEAR; ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ici.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
-    if (pCreateImage(g_dev, &ici, nullptr, &g_bdImg) != VK_SUCCESS) { g_bdFail = true; Log("[menu] vk: backdrop image create failed\n"); return false; }
-    VkMemoryRequirements mr; pImgMemReq(g_dev, g_bdImg, &mr);
-    bool ok = false;
-    for (uint32_t ti = 0; ti < 32 && !ok; ti++) {
-        if (!(mr.memoryTypeBits & (1u << ti))) continue;
-        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-        mai.allocationSize = mr.size; mai.memoryTypeIndex = ti;
-        VkDeviceMemory m = VK_NULL_HANDLE;
-        if (pAllocMem(g_dev, &mai, nullptr, &m) != VK_SUCCESS) continue;
-        void* ptr = nullptr;
-        if (pMapMem(g_dev, m, 0, VK_WHOLE_SIZE, 0, &ptr) == VK_SUCCESS && ptr) { g_bdMem = m; g_bdPtr = ptr; ok = true; }
-    }
-    if (!ok) { g_bdFail = true; Log("[menu] vk: no mappable memory for backdrop\n"); return false; }
-    pBindImgMem(g_dev, g_bdImg, g_bdMem, 0);
-    VkImageSubresource sub = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
-    VkSubresourceLayout sl; pImgSubLayout(g_dev, g_bdImg, &sub, &sl);
-    g_bdPitch = (size_t)sl.rowPitch;
-    VkCommandBuffer cb = g_cmd[0]; pResetCB(cb, 0);
-    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    pBeginCB(cb, &bi);
-    barrierImage(cb, g_bdImg, VK_IMAGE_LAYOUT_PREINITIALIZED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    pEndCB(cb);
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    if (pResetFences(g_dev, 1, &g_fence) != VK_SUCCESS || pSubmit(g_qFromFam ? g_qFromFam : VK_NULL_HANDLE, 1, &si, g_fence) != VK_SUCCESS) {
-        g_rFail = true; return false;
-    }
-    if (pWaitFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        g_rFail = true;
-        return false;
-    }
-    g_bdBuilt = true;
-    Log("[menu] vk: backdrop image ready pitch=%zu\n", g_bdPitch);
-    return true;
-}
-// Pull the region under the button out of this frame's swapchain image (usage has
-// TRANSFER_SRC) so the CPU can blend the label over it.
-static bool CopyBackdrop(VkQueue q, uint32_t imgIndex)
-{
-    VkCommandBuffer cb = g_cmd[imgIndex]; pResetCB(cb, 0);
-    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO }; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    pBeginCB(cb, &bi);
-    barrierImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT);
-    VkImageCopy region = {};
-    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.srcSubresource.layerCount = 1;
-    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; region.dstSubresource.layerCount = 1;
-    region.srcOffset = { g_panelX, g_panelY, 0 };
-    region.extent = { (uint32_t)g_copyW, (uint32_t)g_copyH, 1 };
-    pCmdCopyImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_bdImg, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    barrierImage(cb, g_scImages[imgIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_READ_BIT, 0);
-    barrierImage(cb, g_bdImg, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    pEndCB(cb);
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO }; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-    if (pResetFences(g_dev, 1, &g_fence) != VK_SUCCESS || pSubmit(q, 1, &si, g_fence) != VK_SUCCESS) {
-        g_rFail = true; return false;
-    }
-    if (pWaitFences(g_dev, 1, &g_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
-        g_rFail = true;
-        return false;
-    }
-    if (pInvalidate) { VkMappedMemoryRange r = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE }; r.memory = g_bdMem; r.size = VK_WHOLE_SIZE; pInvalidate(g_dev, 1, &r); }
-    return true;
-}
 static void PanelLayout()
 {
     g_s = UiScale();
-    // The Join page with the public list is taller: 8 games to a page, not 4.
+    // The Join page with the public list is taller: 12 games to a page, not 4.
     const bool browser = InterlockedCompareExchange(&g_uiState,0,0)==1 && !WorldLoaded() && g_titleTab==0 && g_flagMaster[0];
-    g_copyW = S(780); g_copyH = S(browser ? 660 : 540);
+    g_copyW = S(780); g_copyH = S(browser ? 764 : 540);
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
@@ -2034,8 +1684,9 @@ static void OnHit(int id, int button)
         } else SetStatus(on ? "Cross-play: you will share a classic code that players without Steam can use too."
                             : "Steam only: your Steam ID will be the join code.");
         InterlockedExchange(&g_panelDirty, 1); } break;
-    case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a row of the page shown -> its code goes into the join field
-        int i = g_titleServerPage * g_titleServerPerPage + id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
+    case 60: case 61: case 62: case 63: case 64: case 65: case 66: case 67:   // a public game row on the page shown
+    case 68: case 69: case 70: case 71: {   // -> its code goes into the join field
+        int i = g_titleServerPage * g_titleServerPerPage + id - 60; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
         if (code[0]) { strcpy_s(g_joinCode, code); g_joinLen = (int)strlen(g_joinCode); InterlockedExchange(&g_joinFocus, 1);
                        char st[200]; snprintf(st, sizeof(st), locked ? "%s's game needs its password: type it below, then JOIN GAME." : "%s's code is filled in -- press JOIN GAME.", name); SetStatus(st); }
@@ -2131,7 +1782,9 @@ static bool OverlayWanted(bool& quiet)
         InterlockedExchange(&g_panelDirty, 1);
     }
     quiet = !g_recoveryWorldIo && !NativeIo::Busy();
-    return !NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0) || g_recoveryPresent)
+    // A resync hidden with its x (g_uiState 0) wants no panel: the game shows.
+    return !NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0) || InterlockedCompareExchange(&g_ingameOverlay, 0, 0)
+                           || (g_recoveryPresent && InterlockedCompareExchange(&g_uiState, 0, 0) != 0))
         && (quiet || loadingPanel);
 }
 
@@ -2297,15 +1950,15 @@ static VkResult myCreateSwapchain(VkDevice dev, const VkSwapchainCreateInfoKHR* 
             InterlockedExchange(&g_nullScCount, (LONG)cnt); InterlockedExchange(&g_nullScNext, 0);
             if (NoWsi()) Log("[menu] no-render: swapchain of %u images -- acquire and present are answered here, never by the window system\n", cnt);
         }
-        g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent; g_scUsage = ci->imageUsage;
+        g_scFormat = ci->imageFormat; g_scExtent = ci->imageExtent;
         g_rInit = false; g_rFail = false;   // rebuild on next present
-        // The panel and backdrop images were created against the OLD format and
+        // The panel image was created against the OLD format and
         // size; a graphics-settings change recreates the swapchain and left them
         // stale -- copies between mismatched formats, which is the corrupted
         // button texture reported after changing settings. The old images are
         // not freed (a rare event, and freeing under an in-flight present is the
         // riskier bug); they are simply rebuilt on the next present.
-        g_panelBuilt = false; g_bdBuilt = false; g_bdFail = false;
+        g_panelBuilt = false;
         Log("[menu] swapchain created fmt=%d %ux%u usage=0x%x (TRANSFER_DST=%d)\n",
             (int)ci->imageFormat, ci->imageExtent.width, ci->imageExtent.height,
             ci->imageUsage, (ci->imageUsage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) ? 1 : 0);
