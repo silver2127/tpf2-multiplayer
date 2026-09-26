@@ -21,7 +21,7 @@ Windows functions and where they went:
 | `SyncStart`, `SyncPoll`, the relay leader's periodic upload | `SyncStart`, `SyncPoll`, `RelayPeriodic` |
 | `PubFetchThread`, `PubPoll`, `httpGet` | `PubThread`, `lobby::PublicPoll`; the lobby program fetches |
 | `CollectLogsThread` | `lobby::OpenLogs` (`Tpf2mpArchiveLogsSafe` from `logarchive_linux.h`, then `xdg-open`) |
-| `RenderPanelLayer` state 2, `OnHit`, `LlKeyboard` chat branch | `RenderLobbyLocked`, `OnHitLocked`, `HandleEventLocked` |
+| `RenderPanelLayer` state 2, `OnHit`, `LlKeyboard` chat branch | `RenderTitleLocked`, `OnHitLocked`, `HandleEventLocked` |
 | `ClipboardSet`, `ClipboardGet` | `SDL_SetClipboardText`, `SDL_GetClipboardText` through `dlsym` |
 | `doStartLoad`, `placeSaveNewest`, `newestSave`, `ForceAutosave`, AUTO-LOAD | the menu-game area: `menu_game_linux.h` |
 
@@ -330,6 +330,14 @@ and the log says so once when a player arrives away from the title menu.
 `scale`, `master_url`, `relay_autosave_min` (0-60), `share_mods`
 (`ask`/`always`/`never`), `autoload` (`0`/`1`). `slot` is `menu_linux.cpp`'s;
 `automod` is read by `MenuGame_AutoEnableMod`.
+
+`input_hold=1` restores input blocking during resync/join holds. The default is
+off: game keys, mouse movement, clicks and text reach the game, subject to
+normal panel input capture. Escape remains available with blocking enabled.
+Both modes wait for an existing key/button gesture to finish before accepting
+a hold. This flag is read at startup beside `tpf2_menu.so` and logged in
+`tpf2_menu.log`. Legacy script-event suppression and simulation hold/replay
+protection remain active in both modes.
 
 ## Differences from Windows
 

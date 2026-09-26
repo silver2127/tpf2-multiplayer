@@ -1,0 +1,17 @@
+# build output
+out/
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+
+# logs
+*.log
+
+# installer build output (the MSI is published as a GitHub release asset)
+installer/out/
+
+# Python test caches
+__pycache__/
+*.pyc

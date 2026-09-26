@@ -15,7 +15,15 @@ PHASES = ('holding', 'waiting', 'saving', 'transferring', 'loading', 'checking',
           'releasing', 'complete', 'error', 'aborted')
 ACTIVE = frozenset(PHASES[:-3])
 # Phases whose length does not depend on the world: a fixed wait from entry.
-TIMEOUT = {'holding': 45, 'checking': 60, 'releasing': 30}
+# 'holding' and 'checking' have NO total limit (2026-09-21, the owner: "can you get rid of
+# the timeout"). Both wait for every member's game script to answer, and on the dedicated
+# server that script starts ticking only one to two minutes after its world has loaded:
+# a player joining while the server was still loading was refused after 45 s with
+# "Timed out waiting for all players" every time, and the error record left behind held
+# the server at speed 0. A round still ends when the host leaves (_admit), a member
+# reports a failure, or someone presses abort; a member that leaves is dropped and the
+# rest carry on.
+TIMEOUT = {'releasing': 30}
 # Phases whose length DOES depend on the world -- the engine writing the save,
 # the bytes crossing the wire, every engine loading it -- have no total limit.
 # A 1 GB save to a slow uplink is however long it is. What ends them early is
@@ -86,6 +94,15 @@ class SyncOperation:
         # member. A client that leaves is dropped and the rest carry on; only
         # the host's departure fails the operation.
         self.pending = ()
+        # LIVE JOIN (2026-09-22): in a 'join' round the members in `retain` --
+        # the host and everyone already playing -- keep the world they are
+        # paused in instead of loading the snapshot; only the newcomers load.
+        # Safe only with the engine's person batches in entity-id order
+        # (docs/re/HOTJOIN_ORDER.md): a kept world and its reloaded copy then
+        # decide alike. The paused fingerprints still decide: if they differ,
+        # the round falls back ONCE to everyone loading (retain emptied, fresh
+        # epoch) instead of failing -- nobody is released unverified.
+        self.retain = ()
 
     def _enter(self, phase):
         self.phase = phase
@@ -130,7 +147,7 @@ class SyncOperation:
         return {'operation': self.operation, 'revision': self.revision,
                 'epoch': self.epoch, 'phase': self.phase, 'mode': self.mode,
                 'members': list(self.members), 'host': self.host,
-                'pending': list(self.pending),
+                'pending': list(self.pending), 'retain': list(self.retain),
                 'snapshot': copy.deepcopy(self.snapshot), 'resume_speed': self.resume_speed,
                 'error': copy.deepcopy(self.error)}
 
@@ -138,7 +155,7 @@ class SyncOperation:
         result, self.effects = self.effects, []
         return result
 
-    def request(self, sender, members, mode, confirmed=True):
+    def request(self, sender, members, mode, confirmed=True, retain=()):
         members = tuple(sorted(set(members)))
         if sender not in members or self.host not in members or len(members) < 2:
             return False
@@ -158,6 +175,9 @@ class SyncOperation:
         self.epoch = self.token()
         self.members, self.mode = members, mode
         self.pending = ()
+        # the host must be among them: the snapshot is its world
+        retain = tuple(sorted(set(retain) & set(members))) if mode == 'join' else ()
+        self.retain = retain if self.host in retain else ()
         self.confirmed = confirmed
         self.snapshot = self.resume_speed = self.error = None
         self._enter('holding')
@@ -185,13 +205,14 @@ class SyncOperation:
             self.progress_seen.pop(m, None)
         if gone:
             self.members = tuple(m for m in self.members if m in roster)
+            self.retain = tuple(m for m in self.retain if m in roster)
         self.pending = tuple(m for m in self.pending if m in roster)
         new = sorted(m for m in roster if m not in self.members and m not in self.pending)
         if new:
             if self.phase in ('holding', 'waiting'):
                 self.members = tuple(sorted(set(self.members) | set(new)))
-                if self.phase == 'holding':
-                    self.deadline = self.clock() + TIMEOUT['holding']   # the newcomer's own hold
+                if self.phase in TIMEOUT:
+                    self.deadline = self.clock() + TIMEOUT[self.phase]   # the newcomer's own wait
             else:
                 self.pending = tuple(sorted(set(self.pending) | set(new)))
         return True
@@ -216,8 +237,9 @@ class SyncOperation:
         if self.host not in members or len(members) < 2:
             return False
         # whoever is on the roster now is the round: a member that left is
-        # not awaited, one that arrived meanwhile is in
-        self.members, self.pending = members, ()
+        # not awaited, one that arrived meanwhile is in; a retry is always the
+        # plain round, everyone loading
+        self.members, self.pending, self.retain = members, (), ()
         self.epoch = self.token()
         self.error = None
         self.confirmed = True
@@ -297,7 +319,13 @@ class SyncOperation:
         elif self.phase == 'loading':
             self._enter('checking')
         elif self.phase == 'checking':
-            if len({a['fingerprint'] for a in self.acks.values()}) != 1:
+            if len({a['fingerprint'] for a in self.acks.values()}) != 1 and self.retain:
+                # a kept world differs from the loaded ones: everyone loads the
+                # snapshot they already hold, under a fresh epoch
+                self.retain = ()
+                self.epoch = self.token()
+                self._enter('loading')
+            elif len({a['fingerprint'] for a in self.acks.values()}) != 1:
                 self.fail('World comparison differs after loading')
             else:
                 self._enter('releasing')

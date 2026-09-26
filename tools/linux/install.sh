@@ -158,6 +158,17 @@ for src in "$RELEASE/lib" "$RELEASE/netpunch"; do
   done < <(find "$src" -type l -print0)
 done
 
+# Restore a previous density patch before replacing/removing its helper on upgrade.
+if [ -f "$ROOT/data/bigmap-base-mod.path" ]; then
+  IFS= read -r BIGMAP_BASE < "$ROOT/data/bigmap-base-mod.path"
+  if [ "$TPF2MP_DRY" = 1 ]; then
+    tpf2mp_say "  would restore Big Maps density in $BIGMAP_BASE"
+  else
+    "$ROOT/bigmap-density-restore" "$BIGMAP_BASE" || tpf2mp_die "Big Maps density restore failed; installation kept"
+    rm -f "$ROOT/data/bigmap-base-mod.path"
+  fi
+fi
+
 # ---- files ------------------------------------------------------------------------
 MANIFEST=()
 put_link() {

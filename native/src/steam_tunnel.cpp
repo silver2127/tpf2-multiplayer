@@ -2,7 +2,7 @@
 //
 // Everything Steam-side goes through the flat C API that the game's own
 // steam_api64.dll exports (SteamAPI_ISteamNetworking_*), resolved with
-// GetProcAddress: no SDK headers, no import library, no second SteamAPI_Init.
+// GetProcAddress (Linux: dlsym): ABI headers only, no second SteamAPI_Init.
 // The game initialised Steam long before this thread runs; the accessors
 // return null until then, so the thread simply waits.
 //
@@ -30,11 +30,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <map>
 #include <mutex>
 #include "steam_tunnel.h"
+#include "steam_rate.h"
+#include "../third_party/steam/steamnetworkingtypes.h"
 
 #ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
@@ -49,6 +52,7 @@ using SOCKET = int;
 using SocketLength = socklen_t;
 using DWORD = uint32_t;
 constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
 static int closesocket(SOCKET s) { return close(s); }
 static int WSAGetLastError() { return errno; }
 static uint64_t GetTickCount64() {
@@ -72,6 +76,12 @@ typedef void     (*FnUnregisterCallback)(void* cb);
 typedef const char* (*FnPersonaName)(void* friends);
 typedef bool     (*FnSetConfig)(void* utils, int value, int scope, intptr_t obj, int dataType, const void* arg);
 typedef int      (*FnGetConfig)(void* utils, int value, int scope, intptr_t obj, int* dataType, void* result, size_t* size);
+// ISteamUGC (v016 in the game's DLL): the Workshop, for auto-subscribing a host's mods
+typedef uint64_t (*FnUgcSubscribe)(void* ugc, uint64_t id);
+typedef bool     (*FnUgcDownload)(void* ugc, uint64_t id, bool highPriority);
+typedef uint32_t (*FnUgcState)(void* ugc, uint64_t id);
+typedef bool     (*FnUgcDownloadInfo)(void* ugc, uint64_t id, uint64_t* done, uint64_t* total);
+typedef bool     (*FnUgcInstallInfo)(void* ugc, uint64_t id, uint64_t* sizeOnDisk, char* folder, uint32_t cch, uint32_t* timeStamp);
 
 struct Api {
     FnAccessor networking = nullptr, user = nullptr, friends = nullptr;
@@ -88,6 +98,12 @@ struct Api {
     FnAccessor utils = nullptr;
     FnSetConfig setConfig = nullptr;
     FnGetConfig getConfig = nullptr;
+    FnAccessor ugc = nullptr;
+    FnUgcSubscribe ugcSubscribe = nullptr;
+    FnUgcDownload ugcDownload = nullptr;
+    FnUgcState ugcState = nullptr;
+    FnUgcDownloadInfo ugcDownloadInfo = nullptr;
+    FnUgcInstallInfo ugcInstallInfo = nullptr;
     void* net = nullptr;
 };
 
@@ -168,11 +184,17 @@ struct ConnectFailCb : CallbackBase {
 SessionRequestCb g_reqCb;
 ConnectFailCb g_failCb;
 
+#include "steam_messages.inl"
+
 struct Endpoint {
     SOCKET sock = INVALID_SOCKET;
     uint16_t port = 0;
     DWORD lastSeen = 0;
     uint64_t in = 0, out = 0, reliable = 0;
+    uint64_t inBytes = 0, outBytes = 0, failed = 0, localFailed = 0;
+    uint64_t statsIn = 0, statsOut = 0;
+    DWORD statsAt = 0, bulkAt = 0;
+    bool bulkSeen = false;
 };
 
 bool ResolveApi()
@@ -202,6 +224,12 @@ bool ResolveApi()
     g_api.utils        = (FnAccessor)get("SteamAPI_SteamNetworkingUtils_SteamAPI_v004");
     g_api.setConfig    = (FnSetConfig)get("SteamAPI_ISteamNetworkingUtils_SetConfigValue");
     g_api.getConfig    = (FnGetConfig)get("SteamAPI_ISteamNetworkingUtils_GetConfigValue");
+    g_api.ugc             = (FnAccessor)get("SteamAPI_SteamUGC_v016");
+    g_api.ugcSubscribe    = (FnUgcSubscribe)get("SteamAPI_ISteamUGC_SubscribeItem");
+    g_api.ugcDownload     = (FnUgcDownload)get("SteamAPI_ISteamUGC_DownloadItem");
+    g_api.ugcState        = (FnUgcState)get("SteamAPI_ISteamUGC_GetItemState");
+    g_api.ugcDownloadInfo = (FnUgcDownloadInfo)get("SteamAPI_ISteamUGC_GetItemDownloadInfo");
+    g_api.ugcInstallInfo  = (FnUgcInstallInfo)get("SteamAPI_ISteamUGC_GetItemInstallInfo");
     return g_api.networking && g_api.user && g_api.getSteamId && g_api.send && g_api.avail && g_api.read
         && g_api.accept && g_api.closeSession && g_api.allowRelay && g_api.registerCb;
 }
@@ -224,6 +252,14 @@ SOCKET BindLoopback(const char* ip, uint16_t port, uint16_t* portOut)
     if (s >= FD_SETSIZE || fcntl(s, F_SETFL, O_NONBLOCK) < 0 ||
         fcntl(s, F_SETFD, FD_CLOEXEC) < 0) { closesocket(s); return INVALID_SOCKET; }
 #endif
+    // 16 MB BUFFERS (2026-09-22). The lobby hands a save transfer's whole window to
+    // an endpoint socket in one burst (128 x 32 KB = 4 MB) and Windows' default UDP
+    // receive buffer is 64 KB: loopback drops everything past it without an error,
+    // so a chunk never reached Steam and the transfer stalled on that hole (base
+    // 132/4199, and 15/12781 in 0.6.1.15). Best effort: a refusal leaves the default.
+    int big = 16 * 1024 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char*)&big, sizeof(big));
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&big, sizeof(big));
     return s;
 }
 
@@ -247,6 +283,73 @@ bool KillSwitch()
 #else
     return access((g_dataDir + "tpf2mp_steam_off.txt").c_str(), F_OK) == 0;
 #endif
+}
+
+// THE WORKSHOP (2026-09-22). A joiner that lacks some of the host's Workshop mods
+// subscribes to them through Steam instead of receiving the host's files: the
+// lobby sends "UGC SUB <id> <id> ..." (SubscribeItem, then DownloadItem at high
+// priority, which also starts the download of an item subscribed long ago but not
+// installed) and polls "UGC STATE <id> ..." until Steam says installed. STATE
+// answers one line per id: "<id> <EItemState flags> <bytes done> <bytes total>
+// <install folder>" (the folder last: it can hold spaces). The lobby registers the
+// installed folder with the game (workshop_register) exactly as it does a folder
+// that was on disk already. A bridge without these commands answers "ERR
+// unknown" and the lobby falls back to the host's copy.
+void* UgcIface()
+{
+    if (!g_api.ugc || !g_api.ugcSubscribe || !g_api.ugcDownload || !g_api.ugcState || !g_api.ugcInstallInfo) return nullptr;
+    return g_api.ugc();
+}
+
+std::vector<uint64_t> ParseIds(const std::string& rest)
+{
+    std::vector<uint64_t> ids;
+    const char* p = rest.c_str();
+    while (*p && ids.size() < 256) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        char* end = nullptr;
+        unsigned long long v = strtoull(p, &end, 10);
+        if (end == p) break;
+        if (v) ids.push_back(v);
+        p = end;
+    }
+    return ids;
+}
+
+std::string UgcCommand(const std::string& line)
+{
+    void* ugc = UgcIface();
+    if (!ugc) return "ERR nougc";
+    if (line.compare(0, 8, "UGC SUB ") == 0) {
+        auto ids = ParseIds(line.substr(8));
+        int asked = 0;
+        for (uint64_t id : ids) {
+            if (g_api.ugcSubscribe(ugc, id)) asked++;
+            g_api.ugcDownload(ugc, id, true);
+        }
+        g_log("[steam] workshop: subscribing to %zu item(s) (%d accepted by Steam)\n", ids.size(), asked);
+        char out[48]; snprintf(out, sizeof(out), "OK %d", asked);
+        return out;
+    }
+    if (line.compare(0, 10, "UGC STATE ") == 0) {
+        auto ids = ParseIds(line.substr(10));
+        std::string reply = "STATE\n";
+        std::vector<char> folder(1024);
+        for (uint64_t id : ids) {
+            uint32_t flags = g_api.ugcState(ugc, id);
+            uint64_t done = 0, total = 0, size = 0; uint32_t ts = 0;
+            if (g_api.ugcDownloadInfo) g_api.ugcDownloadInfo(ugc, id, &done, &total);
+            folder[0] = 0;
+            if (!g_api.ugcInstallInfo(ugc, id, &size, folder.data(), (uint32_t)folder.size(), &ts)) folder[0] = 0;
+            for (char* c = folder.data(); *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+            char l[1200]; snprintf(l, sizeof(l), "%llu %u %llu %llu %s\n", (unsigned long long)id, flags,
+                                     (unsigned long long)done, (unsigned long long)total, folder.data());
+            reply += l;
+        }
+        return reply;
+    }
+    return "ERR unknown";
 }
 
 #ifdef _WIN32
@@ -282,19 +385,27 @@ unsigned TunnelThread(void*)
     for (auto& c : persona) if (c == '\n' || c == '\r') c = ' ';
 
     g_api.allowRelay(g_api.net, true);
-    // THE SEND-RATE CAP (2026-09-21). In today's Steam client the legacy P2P API
-    // rides on the SteamNetworkingSockets stack, whose per-connection send rate
-    // defaults to 1 MB/s (k_ESteamNetworkingConfig_SendRateMax) with 512 KB
-    // buffers: a 104 MB save moved at 1 MB/s while the lobby offered 1.6, and the
-    // rest was dropped as over-rate. Raised globally: the lobby's own window is
-    // the pacing after that. Values from steamnetworkingtypes.h; Int32 = 1,
-    // scope Global = 1. Each set is logged with its result; a client whose
-    // legacy path ignores them loses nothing.
+    // Startup-only selection; both peers must match. Never silently fall back.
+#ifdef _WIN32
+    bool legacy = GetFileAttributesW((g_dataDir + L"tpf2mp_steam_legacy.txt").c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
+    bool legacy = access((g_dataDir + "tpf2mp_steam_legacy.txt").c_str(), F_OK) == 0;
+#endif
+
+    // Set defaults before opening a Messages session. Successful setters do
+    // not establish that the legacy P2P path honors these settings.
     if (g_api.utils && g_api.setConfig) {
         void* utils = g_api.utils();
         struct { const char* name; int id; int32_t value; } cfg[] = {
-            { "SendRateMin",    23,  1 * 1024 * 1024 },
-            { "SendRateMax",    24, 16 * 1024 * 1024 },
+            // 10 and 11 (steamnetworkingtypes.h). Until 2026-09-22 these were 23 and 24,
+            // which are IP_AllowWithoutAuth and TimeoutInitial: the rate was never
+            // raised, unauthenticated IP connections were allowed and the initial
+            // timeout was 4.6 hours (the log's "SendRateMax: 10000 ->" was the
+            // 10,000 ms timeout default).
+            // Equal clamps fix the actual rate. Messages adjusts both together
+            // using measured delivery quality; Legacy keeps its fixed setting.
+            { "SendRateMin",    10, legacy ? 16 * 1024 * 1024 : SteamRateController::Initial },
+            { "SendRateMax",    11, legacy ? 16 * 1024 * 1024 : SteamRateController::Initial },
             { "SendBufferSize",  9,  8 * 1024 * 1024 },
             { "RecvBufferSize", 47,  8 * 1024 * 1024 },
         };
@@ -307,11 +418,19 @@ unsigned TunnelThread(void*)
     } else {
         g_log("[steam] no SteamNetworkingUtils in this steam_api64.dll -- the send-rate cap stays at Steam's default\n");
     }
+    g_useMessages = false;
+    if (!legacy && !StartMessages()) {
+        g_log("[steam] Messages v002 unavailable -- transport OFF; select Legacy explicitly to compare\n");
+        return 0;
+    }
+    CallbackBase* requestCb = g_useMessages ? static_cast<CallbackBase*>(&g_messagesRequest) : &g_reqCb;
+    CallbackBase* failCb = g_useMessages ? static_cast<CallbackBase*>(&g_messagesFail) : &g_failCb;
     uint16_t ctlPort = 0;
     SOCKET ctl = BindLoopback("127.0.0.1", 0, &ctlPort);
     if (ctl == INVALID_SOCKET) { g_log("[steam] control socket failed (%d) -- transport off\n", WSAGetLastError()); return 0; }
-    g_api.registerCb(&g_reqCb, CB_SESSION_REQUEST);
-    g_api.registerCb(&g_failCb, CB_CONNECT_FAIL);
+    g_api.registerCb(requestCb, g_useMessages ? 1251 : CB_SESSION_REQUEST);
+    g_api.registerCb(failCb, g_useMessages ? 1252 : CB_CONNECT_FAIL);
+    g_log("[steam] transport=%s (startup selection; both peers must match)\n", g_useMessages ? "Messages" : "Legacy");
     WriteIdentity(g_myId, ctlPort, persona.c_str());
     g_log("[steam] up: id=%llu (%s), control 127.0.0.1:%u, endpoints on %s:%u-%u, relay allowed\n",
           (unsigned long long)g_myId, persona.c_str(), (unsigned)ctlPort, TUNNEL_IP, (unsigned)TUNNEL_PORT_LO, (unsigned)TUNNEL_PORT_HI);
@@ -346,8 +465,13 @@ unsigned TunnelThread(void*)
     };
     auto sendP2P = [&](uint64_t id, const char* data, int len, int channel, Endpoint* e) {
         const int type = (len > (int)UNRELIABLE_MAX) ? SEND_RELIABLE : SEND_UNRELIABLE;
-        if (!g_api.send(g_api.net, id, data, (uint32_t)len, type, channel)) { sendFail++; return; }
-        if (e) { e->out++; if (type == SEND_RELIABLE) e->reliable++; }
+        if (e && (type == SEND_RELIABLE || (len >= 9 && memcmp(data + 5, "NPF1", 4) == 0))) {
+            e->bulkAt = GetTickCount(); e->bulkSeen = true;
+        }
+        if (!g_api.send(g_api.net, id, data, (uint32_t)len, type, channel)) {
+            sendFail++; if (e) e->failed++; return;
+        }
+        if (e) { e->out++; e->outBytes += len; if (type == SEND_RELIABLE) e->reliable++; }
     };
 
     while (!g_stop) {
@@ -370,9 +494,13 @@ unsigned TunnelThread(void*)
                 Endpoint* e = endpointFor(from);
                 if (!e) continue;
                 if (ch == CH_CTL) continue;                       // OPEN: the endpoint now exists, nothing to forward
-                e->in++;
+                e->in++; e->inBytes += got;
+                if (got > UNRELIABLE_MAX || (got >= 9 && memcmp(buf.data() + 5, "NPF1", 4) == 0)) {
+                    e->bulkAt = GetTickCount(); e->bulkSeen = true;
+                }
                 if (!lobby.sin_port) { dropNoLobby++; continue; }
-                sendto(e->sock, buf.data(), (int)got, 0, (sockaddr*)&lobby, sizeof(lobby));
+                if (sendto(e->sock, buf.data(), (int)got, 0, (sockaddr*)&lobby, sizeof(lobby)) == SOCKET_ERROR)
+                    e->localFailed++;
             }
         }
         // ---- outbound: the lobby's datagrams on each endpoint socket, and control
@@ -425,6 +553,8 @@ unsigned TunnelThread(void*)
                         }
                     } else if (sscanf(line.c_str(), "CLOSE %llu", &id) == 1 && id) {
                         closeEndpoint(id, "closed by the lobby"); reply = "OK";
+                    } else if (line.compare(0, 4, "UGC ") == 0) {
+                        reply = UgcCommand(line);
                     } else if (line == "STATUS") {
                         char head[160]; snprintf(head, sizeof(head), "id=%llu endpoints=%zu no_lobby_drops=%llu send_failures=%llu\n",
                                                     (unsigned long long)g_myId, eps.size(), (unsigned long long)dropNoLobby, (unsigned long long)sendFail);
@@ -445,7 +575,27 @@ unsigned TunnelThread(void*)
                 }
             }
         }
+        // Bounded diagnostics for actual bulk activity, including a stalled queue.
+        DWORD statsNow = GetTickCount();
+        for (auto& kv : eps) {
+            auto& e = kv.second;
+            if (!e.statsAt) { e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes; }
+            DWORD dt = statsNow - e.statsAt;
+            if (dt < 5000) continue;
+            if (e.bulkSeen && statsNow - e.bulkAt <= 30000) {
+                P2PSessionState st = {};
+                bool have = g_api.sessionState && g_api.sessionState(g_api.net, kv.first, &st);
+                g_log("[steam-bulk] endpoint=%u in=%lluB out=%lluB rx=%.3fMB/s tx=%.3fMB/s queued=%dB packets=%d send_fail=%llu local_fail=%llu active=%d relay=%d\n",
+                      (unsigned)e.port, (unsigned long long)e.inBytes, (unsigned long long)e.outBytes,
+                      (e.inBytes - e.statsIn) / (dt * 1000.0), (e.outBytes - e.statsOut) / (dt * 1000.0),
+                      have ? st.bytesQueued : -1, have ? st.packetsQueued : -1,
+                      (unsigned long long)e.failed, (unsigned long long)e.localFailed,
+                      have ? st.active : -1, have ? st.usingRelay : -1);
+            }
+            e.statsAt = statsNow; e.statsIn = e.inBytes; e.statsOut = e.outBytes;
+        }
         // ---- idle endpoints
+        if (g_useMessages) UpdateMessagesRate(statsNow);
         DWORD now = GetTickCount();
         if (now - lastSweep > 10000) {
             lastSweep = now;
@@ -456,7 +606,8 @@ unsigned TunnelThread(void*)
     }
     for (auto& kv6 : eps) { closesocket(kv6.second.sock); g_api.closeSession(g_api.net, kv6.first); }
     closesocket(ctl);
-    if (g_api.unregisterCb) { g_api.unregisterCb(&g_reqCb); g_api.unregisterCb(&g_failCb); }
+    if (g_api.unregisterCb) { g_api.unregisterCb(requestCb); g_api.unregisterCb(failCb); }
+    for (auto*& msg : g_messages.pending) { if (msg) msg->Release(); msg = nullptr; }
     WriteIdentity(0, 0, nullptr);
     return 0;
 }

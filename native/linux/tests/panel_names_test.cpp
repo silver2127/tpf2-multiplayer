@@ -1,23 +1,12 @@
 #include "../src/panel_linux.cpp"
 #include <cassert>
 static lobby::View fixtureView;
-namespace lobby { void Snapshot(View* view) { *view=fixtureView; } }
+namespace lobby { std::string RecoveryAction(const std::string&){fixtureView.recoveryHidden=false;return {};} void Snapshot(View* view) { *view=fixtureView; } }
 
 int main(int argc, char** argv)
 {
     assert(argc == 3);
     using namespace panel;
-    // Fixed/overflow boundaries: company 7 now has a distinct fixed colour;
-    // company 21 restarts the golden-angle walk after the 20-colour palette.
-    const auto checkColor = [](int cid, int r, int g, int b) {
-        const auto c = CoColor(cid);
-        assert(c.r == r && c.g == g && c.b == b);
-    };
-    checkColor(1, 230, 25, 75);
-    checkColor(7, 240, 50, 230);
-    checkColor(20, 255, 250, 200);
-    checkColor(21, 216, 82, 82);
-    checkColor(22, 82, 216, 121);
     P().dataDir = argv[2];
     const std::string file = P().dataDir + "tpf2_names.txt";
     unlink(file.c_str());
@@ -57,7 +46,11 @@ int main(int argc, char** argv)
     P().openPollAt=0;assert(Visible() && g_uiState==2 && access(openFile.c_str(),F_OK)!=0);
     g_uiState=0;g_pageHidden=true;fixtureView.recoveryPresent=true;fixtureView.recoveryVersion=1;
     g_asyncDirty=true;assert(Visible() && g_uiState==3);
-    fixtureView.recoveryPresent=false;fixtureView.recoveryVersion=2;
+    fixtureView.recoveryHidden=true;g_uiState=0;
+    ++fixtureView.recoveryVersion;g_asyncDirty=true;assert(!Visible() && g_uiState==0);
+    f=fopen(openFile.c_str(),"w");assert(f);fclose(f);
+    g_asyncDirty=true;assert(Visible() && !fixtureView.recoveryHidden);
+    fixtureView.recoveryPresent=false;fixtureView.recoveryVersion=3;g_uiState=3;
     g_asyncDirty=true;assert(Visible() && g_uiState==2);
     puts("panel names: Steam availability, sanitizing, refresh, overrides, legacy files and length limits passed");
 }

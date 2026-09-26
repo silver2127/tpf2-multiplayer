@@ -18,12 +18,22 @@ four players have been run, on one PC and between PCs on different networks. Rea
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
 This branch also contains a **native Linux build-35924 port**. Its current
-integration includes Windows **release 0.6.1.18** (`a5aeda76`) and a native
+integration includes Windows **release 0.7** plus dev `8c3c02a5` and a native
 dedicated server. See [Linux installation](docs/linux/INSTALL.md),
-[current integration and test evidence](docs/re/linux/PARITY_20260921.md), and
-[dedicated server setup](tools/server/README.md). The integration record
-distinguishes VPS checks from visual and external Steam P2P checks still pending.
+[current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md), and
+[dedicated server setup](tools/server/README.md). Canonical simulation ordering is now on by default (`TPF2MP_ORDER_CANON=0`
+disables it); see the [dev ad3d66e4 integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
+Settings must match Windows peers. Loaded-game lifetime and cross-platform
+validation remain outstanding; matching versions do not establish gameplay parity.
+The [dev `0a35d0a8` integration](docs/linux/UPSTREAM_dev_0a35d0a8.md) enables
+native terrain compression by default and fixes bridge lobby identity; release
+version remains 0.7.
+The [dev `ea35eb8a` integration](docs/linux/UPSTREAM_dev_ea35eb8a.md)
+adds native terrain pager recency, automatic memory headroom and fault-rate
+logging; loaded-big-map performance validation remains outstanding.
 The Windows MSI instructions below apply to the Windows version.
+The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
+retains the Windows autosave-sidecar fix; native terrain sidecars remain unported.
 
 ## How it works
 
@@ -110,8 +120,9 @@ send them yourself if you report a bug. The full text is the
 
 | path | contents |
 |---|---|
-| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host shared with TpF2 Big Maps |
+| `native/` | the DLLs (`build.bat <target>`); `src/plugin/` is the plugin host and its ABI |
 | `native/linux/`, `tools/linux/` | native Linux libraries, tests, Steam Runtime builds and `.run`/tarball packaging |
+| `bigmap/` | Big Maps, shipped in the same Windows MSI and native Linux package; Linux feature limits: [port record](bigmap/docs/linux/PORT.md) |
 | `mod/mp_lockstep_1/` | the game-script mod |
 | `netpunch/` | the lobby (the dedicated server runs it too) and the master server (Python) |
 | `installer/` | the WiX package |
@@ -136,3 +147,97 @@ the rig before they merge, and a field identification counts only when a differe
 Transport Fever 2 installation (`alut.dll`, kept as `alut_real.dll`) and patches game code in memory while the
 game runs. Use it at your own risk and keep backups of your saves. Multiplayer saves are ordinary `.sav` files;
 the mod adds its company assignment to the save's script state.
+
+The [dev `a42dab6c` integration](docs/linux/UPSTREAM_dev_a42dab6c.md)
+keeps hot-join save requests pending while the host world loads, then
+takes the save when the game UI is ready. Version remains 0.7.
+
+The [dev `7cacbaaf` integration](docs/linux/UPSTREAM_dev_7cacbaaf.md)
+removes full mapping-table scans from family guards on Linux 6.11+ and retains
+a faster snapshot fallback for older kernels. Version remains 0.7.
+
+The [dev `2c05099a` integration](docs/linux/UPSTREAM_dev_2c05099a.md) adds the remaining supplied
+Windows RNG seed/distribution/engine compatibility modules, enabled by default.
+`TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
+Static ELF checks and 65 native tests pass; the lab launch was blocked before
+the game started, so cross-platform gameplay validation remains outstanding.
+
+The [dev `582a380` integration](docs/linux/UPSTREAM_dev_582a380.md) makes native dedicated
+restarts prefer a newer autosave of the hosted `mp_shared` world over the
+configured save. Version remains 0.7.
+
+The [dev `e63ceefc` integration](docs/linux/UPSTREAM_dev_e63ceefc.md) retains
+upstream's dedicated-server performance report; runtime code is unchanged.
+
+The [dev `cf5f8a0e` integration](docs/linux/UPSTREAM_dev_cf5f8a0e.md) makes load-time company
+switches wait for entity queries to answer and reuses live saved player entities.
+Version remains 0.7; loaded-world validation is still outstanding.
+
+The [dev `b4b629a2` integration](docs/linux/UPSTREAM_dev_b4b629a2.md) prevents
+per-frame script state sync from rewinding the town-growth clock. Shared Lua
+and native tests pass; live growth validation remains outstanding. Version remains 0.7.
+
+The [dev `522a303b` integration](docs/linux/UPSTREAM_dev_522a303b.md) reports the slowest hash's
+lane breakdown and the cost of post-hash broadcast, drift and comparison work.
+Shared Lua regression tests pass; no live performance measurement is claimed.
+Version remains 0.7.
+
+The [dev `bd69b864` integration](docs/linux/UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
+target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
+attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+The [dev `aaae03f8` integration](docs/linux/UPSTREAM_dev_aaae03f8.md) retains
+the Windows GOG octree fallback and batch deployment fixes. Native Steam
+depths 11/12/13 keep their existing verified patches and ceiling checks.
+
+The [dev `7469fce7` integration](docs/linux/UPSTREAM_dev_7469fce7.md) incorporates
+Big Maps Windows GOG documentation; native runtime behavior is unchanged.
+
+The [dev `63a3b8df` integration](docs/linux/UPSTREAM_dev_63a3b8df.md) records
+upstream depth-13 gameplay and native dedicated multiplayer results. Native
+defaults and placement limits remain unchanged; no local live run was repeated.
+
+The [dev `4616c16a` integration](docs/linux/UPSTREAM_dev_4616c16a.md) adds
+upstream's Big Maps performance catalog with native feature/default scope.
+Runtime behavior is unchanged; the listed gains are upstream measurements.
+
+The [dev `c9ac009d` integration](docs/linux/UPSTREAM_dev_c9ac009d.md) retains
+the standalone Big Maps sync and unified Windows MSI documentation while
+preserving native Linux guidance. Runtime behavior is unchanged.
+
+The [dev `0610033` integration](docs/linux/UPSTREAM_dev_0610033.md) fixes native
+family ordering to recognize all 28 node lists and adds the opt-in town trace.
+Static and fixture checks pass; live validation was blocked at lab startup.
+
+The [dev `e43d01dd` integration](docs/linux/UPSTREAM_dev_e43d01dd.md) carries
+upstream's per-tick EDEMO node index and the stop-replay registration that stops
+a catch-up scan re-shipping replayed signals and stops. Both are shared Lua; the
+native Linux slice already emits the EDEMO and STOPX/STOPXDEL records they rely
+on, so no native change was needed. No local live run was possible.
+
+The [dev `d8a3ce57` integration](docs/linux/UPSTREAM_dev_d8a3ce57.md) is
+upstream's **release 0.7.0.3** and carries no code. It stamps the native release
+0.7.0.3 (`installer/VERSION`, which `tools/linux/build_release.sh` reads for the
+`.run` installer, and the shared `LOBBY_VERSION` handshake), advances the Lua
+verifier and the release provenance line to this target, and stages the two
+missing integration records. Each Linux claim the notes make -- all 28 sorted
+node lists, the extra RNG sites, Windows float math, `TPF2MP_TOWN_TRACE=1`,
+octree depths 12/13, terrain compression on by default -- was rechecked against
+the unmodified game ELF and passes. No local live run was possible.
+
+The [dev `122a0ce9` integration](docs/linux/UPSTREAM_dev_122a0ce9.md) adds the native resync
+view’s in-game x. Closing a running resync hides its view while recovery
+continues; Manage Lobby reopens it. Errors and unanswered Ready requests
+bring it back automatically. Saving/loading suppresses the x.
+
+The [dev `45183ac6` integration](docs/linux/UPSTREAM_dev_45183ac6.md) adds
+native OPEN LOGS version/ELF identities, state/config snapshots and masked
+lobby streams, and retains five archives per kind. Version remains 0.7.0.3.
+
+The [dev `96795a8b` integration](docs/linux/UPSTREAM_dev_96795a8b.md) expands the native public
+browser to eight games per page and up to 32 games, and completes archive
+runtime/boot metadata and standalone collector credential masking.
+
+The [dev `01044521` integration](docs/linux/UPSTREAM_dev_01044521.md) expands the native public
+browser to twelve games per page and up to 48 games, and removes the legacy
+panel renderer. Closing a running resync leaves the game visible.

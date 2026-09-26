@@ -34,14 +34,19 @@
 #include "person_cost_linux.h"
 #include "float_rng_linux.h"
 #include "town_seed_linux.h"
+#include "sim_seed_linux.h"
+#include "engine_parity_linux.h"
+#include "libm_parity_linux.h"
 #include "tree_rng_linux.h"
 #include "animal_rng_linux.h"
 #include "building_order_linux.h"
 #include "resident_hash_linux.h"
 #include "person_map_order_linux.h"
 #include "target_order_linux.h"
+#include "order_canon_linux.h"
 #include "network_person_order_linux.h"
 #include "network_index_order_linux.h"
+#include "town_trace_linux.h"
 
 // GNU build-id of the Steam Linux build 35924 (depot build 16719842). Logged
 // against the running image; the libraries that patch code check it themselves.
@@ -278,8 +283,11 @@ static void BootInit()
 
     // Town development initializes its MT inline instead of calling the person
     // constructor. Correct that verified tag/time seed before the original init.
-    Tpf2mpInstallTownSeed(img.base, img.buildId.c_str());
+    const bool townSeedInstalled = Tpf2mpInstallTownSeed(img.base, img.buildId.c_str());
     Log("[boot] Windows town development seed hashing: %s\n", Tpf2mpTownSeedStatus());
+
+    Tpf2mpInstallSimSeeds(img.base, img.buildId.c_str());
+    Log("[boot] Windows simulation seed hashing: %s\n", Tpf2mpSimSeedStatus());
 
     Tpf2mpInstallTreeRng(img.base, img.buildId.c_str());
     Log("[boot] Windows town tree selection: %s\n", Tpf2mpTreeRngStatus());
@@ -297,6 +305,10 @@ static void BootInit()
     Tpf2mpInstallPersonMapOrder(img.base, img.buildId.c_str());
     Log("[boot] Windows temporary person map order: %s\n", Tpf2mpPersonMapOrderStatus());
 
+    Tpf2mpOrderCanonSetLog(Log);
+    Tpf2mpInstallOrderCanon(img.base, img.buildId.c_str());
+    Log("[boot] Hot join canonical order: %s\n", Tpf2mpOrderCanonStatus());
+
     Tpf2mpTargetOrderSetLog(Log);
     Tpf2mpInstallTargetOrder(img.base, img.buildId.c_str());
     Log("[boot] Windows person target set order: %s\n", Tpf2mpTargetOrderStatus());
@@ -312,6 +324,30 @@ static void BootInit()
     Tpf2mpNetworkIndexOrderSetLog(Log);
     Tpf2mpInstallNetworkIndexOrder(img.base, img.buildId.c_str());
     Log("[boot] Windows persistent person-route index order: %s\n", Tpf2mpNetworkIndexOrderStatus());
+
+    Tpf2mpInstallEngineParity(img.base, img.buildId.c_str());
+    Log("[boot] Windows engine/distribution parity: %s\n", Tpf2mpEngineParityStatus());
+
+    // Float trigonometry exactly as ucrtbase.dll computes it (town street
+    // developer, TownDeveloper, street geometry): GOT + three atan2 sites.
+    Tpf2mpInstallLibmParity(img.base, img.buildId.c_str());
+    Log("[boot] Windows UCRT float math: %s\n", Tpf2mpLibmParityStatus());
+
+    // Diagnostic, off unless TPF2MP_TOWN_TRACE=1: one line per town Develop
+    // call and per-600-iteration node-list digests, for diffing two peers.
+    {
+        char tracePath[4096];
+        const bool dir = Tpf2mpDataDirA(tracePath, sizeof(tracePath));
+        if (dir) strncat(tracePath, "tpf2_towntrace.txt", sizeof(tracePath) - strlen(tracePath) - 1);
+        // The seed hook supplies the trace's clock and context. Do not install
+        // a partial trace when that hook's independent byte guard refused.
+        if (townSeedInstalled) {
+            Tpf2mpInstallTownTrace(img.base, img.buildId.c_str(), dir ? tracePath : nullptr);
+            Log("[boot] Town development trace: %s\n", Tpf2mpTownTraceStatus());
+        } else {
+            Log("[boot] Town development trace: off (town seed hook unavailable)\n");
+        }
+    }
 
     // dlopen from a constructor is safe with glibc (the loader lock is
     // recursive), so unlike the Windows proxy there is no loader thread: the

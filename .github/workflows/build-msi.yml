@@ -80,6 +80,22 @@ jobs:
           dotnet tool install --global wix
           wix --version
 
+      - name: Steam Messages adapter regression
+        run: python tools\steam_messages_test.py
+
+      - name: TCP connectivity regression
+        run: |
+          python tools\test_tcp_connectivity.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools\test_transfer_status.py
+
+      - name: OPEN LOGS archive regression
+        shell: cmd
+        run: |
+          call tools\msvc_env.bat || exit /b 1
+          cl /nologo /std:c++17 /EHsc /I native\src tools\logarchive_test.cpp advapi32.lib /Fe:%RUNNER_TEMP%\logarchive_test.exe /Fo:%RUNNER_TEMP%\logarchive_test.obj || exit /b 1
+          %RUNNER_TEMP%\logarchive_test.exe
+
       - name: Build the MSI
         run: powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate
 
@@ -126,7 +142,11 @@ jobs:
 
           "@
           $notes = "installer/RELEASE-$ver.md"
-          if (Test-Path $notes) { $body += "`n" + [IO.File]::ReadAllText((Resolve-Path $notes)) } else { Write-Host "no $notes -- the generated notes follow the table" }
+          if (Test-Path $notes) {
+            $text = [IO.File]::ReadAllText((Resolve-Path $notes))
+            if ($text.StartsWith('## EXPERIMENTAL')) { $body = $text }
+            else { $body += "`n" + $text }
+          } else { Write-Host "no $notes -- the generated notes follow the table" }
           [IO.File]::WriteAllText((Join-Path (Get-Location) 'installer/out/release_body.md'), $body.Replace("`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
           Get-Content installer/out/release_body.md
 

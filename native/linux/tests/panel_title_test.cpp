@@ -1,0 +1,196 @@
+#include "../src/panel_linux.cpp"
+#include <cassert>
+namespace NativeIo {
+static bool saving=false;
+bool SavingNow(){return saving;}
+}
+static std::string recoveryAction;
+namespace lobby {
+void Snapshot(View* v) { *v=panel::P().view; }
+bool AutoCopyPending(){return false;} bool TakeAutoCopy(std::string*){return false;}
+bool CapturesTyping(){return true;}
+bool Start(const StartRequest&,std::string*){assert(false);return false;}
+void Leave(){assert(false);} std::string SendChat(const std::string&){assert(false);return {};}
+std::string StartGame(){assert(false);return {};}
+void RefreshSaves(){} std::string SelectSave(const std::string&){return {};}
+std::string RecoveryAction(const std::string& s){recoveryAction=s;return {};}
+std::string SetSeparateCompanies(bool){return {};}
+std::string SetCrossplay(bool){return {};}
+std::string SetPublic(bool){return {};}
+std::string AnswerMods(bool){return {};}
+void CycleCompany(int,bool){} bool CopyCode(std::string*){return false;}
+bool PublicRow(int i,PubRow* r){if(i<0 || i>=int(panel::P().pubRows.size()))return false;*r=panel::P().pubRows[i];return true;} void PublicRefresh(){}
+bool OpenLogs(){return false;}
+}
+static bool Has(int id) {
+    using namespace panel;
+    for(int i=0;i<g_hitCount;++i)if(g_hits[i].id==id)return true;
+    return false;
+}
+static void CheckHits(int w,int h) {
+    using namespace panel;
+    for(int i=0;i<g_hitCount;++i) {
+        const auto& a=g_hits[i];assert(a.x>=0&&a.y>=0&&a.x+a.w<=w&&a.y+a.h<=h);
+        for(int j=0;j<i;++j) {
+            const auto& b=g_hits[j];
+            if(a.x<b.x+b.w && b.x<a.x+a.w && a.y<b.y+b.h && b.y<a.y+a.h) {
+                fprintf(stderr,"overlap ids %d/%d scale=%g page=%d\n",a.id,b.id,g_s,g_uiState);
+                assert(false);
+            }
+        }
+    }
+}
+static void Key(SDL_Keycode k,bool down,int mods=0) {
+    using namespace panel;
+    SDL_Event e{};e.type=down?SDL_KEYDOWN:SDL_KEYUP;e.key.keysym.sym=k;e.key.keysym.mod=mods;
+    Post p;assert(HandleEventLocked(&e,&p));
+}
+int main(int argc,char** argv) {
+    using namespace panel;
+    g_initDone=g_fontsOk=true;g_uiState=1;g_lastFrameMs=NowMs();
+    P().username="Player";P().gameDir="/nonexistent/";
+    if(argc>1)layer::AddFont(argv[1]);
+    if(argc>2) {
+        P().gameDir=argv[2];g_s=1;g_titleTab=0;RenderLocked(780,540);
+        if(argc>3) {
+            PrepareTitleBackdrop(1280,720);layer::PlaceOnBackdrop(1280,720,250,90,g_titleBackdrop.data());
+            FILE* f=fopen(argv[3],"wb");assert(f);fprintf(f,"P6\n1280 720\n255\n");
+            const auto* pixels=layer::Pixels();
+            for(int i=0;i<1280*720;++i) { unsigned char rgb[]={pixels[i*4+2],pixels[i*4+1],pixels[i*4]};fwrite(rgb,1,3,f); }
+            fclose(f);
+        }
+    }
+    int w,h;g_flagScale=5;LayoutLocked(1280,720,&w,&h);assert(w<=1280 && h<=720);
+    g_flagScale=0;LayoutLocked(1920,1080,&w,&h);assert(w==780 && h==764);
+    RenderLocked(w,h);assert(Has(110)&&Has(111)&&Has(8)&&!Has(14)&&!Has(3));
+    g_titleTab=1;RenderLocked(w,h);assert(Has(14)&&!Has(8)&&Has(2)&&Has(50)&&Has(51));
+    Key(SDLK_TAB,true);assert(g_focus==3);Key(SDLK_TAB,false);
+    Key(SDLK_TAB,true);assert(g_focus==2);Key(SDLK_TAB,false);
+    Key(SDLK_TAB,true,KMOD_SHIFT);assert(g_focus==3);Key(SDLK_TAB,false);
+    Key(SDLK_ESCAPE,true);assert(g_uiState==0);Key(SDLK_ESCAPE,false);
+    g_uiState=1;g_focus=0;Key(SDLK_RETURN,true);Key(SDLK_RETURN,false);
+    P().view.modsPrompt="Required workshop content";RenderLocked(w,h);
+    assert(Has(16)&&Has(17)&&!Has(2)&&!Has(110));
+    P().view.modsPrompt.clear();g_uiState=2;P().view.isHost=true;P().view.hostSteam=true;
+    for(int i=0;i<16;++i)P().view.players.push_back({"Player "+std::to_string(i),"",i+1,true,false});
+    RenderLocked(w,h);assert(Has(115)&&!Has(114)&&!Has(6)&&Has(51));
+    P().view.lobbyReady=true;g_playerPage=1;RenderLocked(w,h);assert(Has(114)&&!Has(115)&&Has(6)&&Has(28)&&Has(35));
+    P().view.isHost=false;RenderLocked(w,h);assert(!Has(51));
+    P().view.isHost=true;
+    P().savePicker=true;P().view.saves.push_back({"/save/test.sav","Test",0});RenderLocked(w,h);
+    assert(Has(100)&&Has(91)&&!Has(6));
+    // The in-world panel reuses the design without title backdrop/input capture.
+    for(float scale : {0.65f,0.8f,1.f,1.4f,5.f}) {
+        g_flagScale=scale;P().view.inGame=true;g_uiState=2;
+        LayoutLocked(1280,720,&w,&h);assert(w<=1280 && h<=720);
+        P().flagMaster="test";P().view.isHost=true;P().view.hostSteam=true;
+        P().view.active=true;P().savePicker=true;g_playerPage=0;
+        RenderLocked(w,h);CheckHits(w,h);
+        assert(!TitleMode() && Has(84)&&Has(4)&&Has(51)&&Has(50)&&Has(11));
+        assert(!Has(5)&&!Has(6)&&!Has(90)&&!Has(100));
+        Post post;OnHitLocked(115,&post);assert(g_playerPage==1);
+        RenderLocked(w,h);CheckHits(w,h);assert(Has(114)&&Has(28)&&Has(35));
+        OnHitLocked(114,&post);assert(g_playerPage==0);
+        OnHitLocked(84,&post);assert(g_uiState==3);
+        RenderLocked(w,h);CheckHits(w,h);assert(Has(83)&&Has(115)&&Has(9)&&Has(80)&&!Has(28));
+        for(bool world:{false,true})for(const char* phase:{"manual","detected","unavailable","readiness","holding","transferring","loading","error"}) {
+            P().view.inGame=world;P().view.recoveryPhase=phase;
+            RenderLocked(w,h);CheckHits(w,h);assert(Has(87)==world && !Has(4));
+        }
+        P().view.inGame=true;OnHitLocked(87,&post);
+        assert(g_uiState==0 && recoveryAction=="sync_hide");
+        P().view.recoveryPresent=true;
+        assert(!VisibleLocked());RenderLocked(w,h);assert(g_hitCount==0);
+        g_uiState=99;RenderLocked(w,h);assert(g_hitCount==0);
+        P().view.recoveryPresent=false;g_uiState=3;
+        P().view.recoveryPhase="detected";RenderLocked(w,h);CheckHits(w,h);assert(Has(85)&&Has(80)&&Has(9));
+        P().view.recoveryPhase="loading";P().view.worldIo=true;RenderLocked(w,h);
+        assert(!Has(87)&&!Has(83)&&!Has(85)&&!Has(80)&&!ChatFocusLocked());
+        P().view.worldIo=false;P().view.recoveryPhase.clear();
+        OnHitLocked(83,&post);assert(g_uiState==2);
+        P().view.hostSteam=false;RenderLocked(w,h);assert(!Has(51));
+        P().view.isHost=false;RenderLocked(w,h);CheckHits(w,h);
+        assert(Has(4)&&Has(9)&&!Has(84)&&!Has(50)&&!Has(51)&&!Has(11)&&!Has(6));
+        g_uiState=1;RenderLocked(w,h);
+        assert(Has(2)&&Has(4)&&Has(13)&&Has(14)&&Has(51)&&Has(15)&&!Has(3)&&!Has(110));
+        const int tab=g_titleTab;OnHitLocked(110,&post);assert(g_titleTab==tab);
+        CheckHits(w,h);
+        P().view.modsPrompt="Required workshop content";RenderLocked(w,h);
+        assert(Has(16)&&Has(17)&&!Has(2)&&!Has(4));P().view.modsPrompt.clear();
+    }
+    // Public list: page-local hit IDs must never alias company/cross-play IDs.
+    P().view={};g_uiState=1;g_titleTab=0;P().flagMaster="fixture";
+    for(int i=0;i<20;++i) { lobby::PubRow r;r.name="Game "+std::to_string(i+1);r.code="fixture-"+std::to_string(i);P().pubRows.push_back(r); }
+    for(int screenH:{720,1080})for(float scale:{0.65f,0.8f,1.f,1.4f,5.f}) {
+        g_flagScale=scale;g_serverPage=0;
+        LayoutLocked(screenH*16/9,screenH,&w,&h);RenderLocked(w,h);CheckHits(w,h);
+        assert(g_serverPerPage==12 && Has(71) && !Has(72) && !Has(112) && Has(113) && !Has(50) && !Has(51));
+        Post post;OnHitLocked(71,&post);assert(P().joinCode=="fixture-11");
+        OnHitLocked(113,&post);RenderLocked(w,h);CheckHits(w,h);
+        assert(Has(67) && !Has(68) && Has(112) && !Has(113));
+        OnHitLocked(60,&post);assert(P().joinCode=="fixture-12");
+        OnHitLocked(67,&post);assert(P().joinCode=="fixture-19");
+    }
+    g_flagScale=1;g_serverPage=0;LayoutLocked(1920,1080,&w,&h);assert(h==764);
+    g_titleTab=1;LayoutLocked(1920,1080,&w,&h);assert(h==540);g_titleTab=0;
+    P().flagMaster.clear();LayoutLocked(1920,1080,&w,&h);assert(h==540);
+    RenderLocked(780,540);assert(g_serverPerPage==4);Post browserPost;
+    OnHitLocked(113,&browserPost);RenderLocked(780,540);CheckHits(780,540);
+    assert(Has(63) && !Has(64));OnHitLocked(60,&browserPost);assert(P().joinCode=="fixture-4");
+    P().pubRows.clear();RenderLocked(780,540);assert(g_serverPage==0 && !Has(60) && !Has(113));
+    // Exercise the actual SDL filter with the overlay closed. Physical input
+    // must delay a hold even when suppression is disabled by default.
+    g_uiState=0;P().view.active=false;
+    s_SetEventFilter=+[](SDL_EventFilter,void*){};
+    assert(!g_flagInputHold);
+    auto event=[](Uint32 type, SDL_Keycode key=SDLK_a) {
+        SDL_Event e{};e.type=type;
+        if(type==SDL_KEYDOWN || type==SDL_KEYUP) {
+            e.key.keysym.sym=key;e.key.keysym.scancode=SDL_SCANCODE_A;
+        } else if(type==SDL_MOUSEBUTTONDOWN || type==SDL_MOUSEBUTTONUP) e.button.button=SDL_BUTTON_LEFT;
+        return EventFilter(nullptr,&e);
+    };
+    assert(event(SDL_KEYDOWN)==1 && !SetActionsHeld(true));
+    assert(event(SDL_KEYUP)==1 && SetActionsHeld(true));
+    for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
+                  SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})
+        assert(event(type)==1);
+    assert(SetActionsHeld(false));
+    assert(event(SDL_MOUSEBUTTONDOWN)==1 && !SetActionsHeld(true));
+    assert(event(SDL_MOUSEBUTTONUP)==1 && SetActionsHeld(true));
+    auto flag=[](const char* value) {
+        const char* path="panel-input-hold-test.flags";
+        FILE* f=fopen(path,"w");assert(f);fprintf(f,"input_hold=%s\n",value);fclose(f);
+        ReadFlags(path);assert(remove(path)==0);
+    };
+    // Our queued/running save overrides input_hold=0 for the same input
+    // classes, then releases input while the round remains held.
+    NativeIo::saving=true;
+    for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
+                  SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})
+        assert(event(type)==0);
+    assert(event(SDL_KEYDOWN,SDLK_ESCAPE)==1 && event(SDL_KEYUP,SDLK_ESCAPE)==1);
+    assert(event(SDL_QUIT)==1);
+    assert(SetActionsHeld(false) && event(SDL_MOUSEMOTION)==1);
+    assert(SetActionsHeld(true) && event(SDL_MOUSEMOTION)==0);
+    NativeIo::saving=false;
+    assert(event(SDL_MOUSEMOTION)==1);
+    flag("1");assert(g_flagInputHold);
+    for(auto type:{SDL_KEYDOWN,SDL_KEYUP,SDL_MOUSEMOTION,SDL_MOUSEBUTTONDOWN,
+                  SDL_MOUSEBUTTONUP,SDL_MOUSEWHEEL,SDL_TEXTINPUT,SDL_TEXTEDITING})
+        assert(event(type)==0);
+    assert(event(SDL_KEYDOWN,SDLK_ESCAPE)==1 && event(SDL_KEYUP,SDLK_ESCAPE)==1);
+    assert(event(SDL_QUIT)==1);
+    assert(SetActionsHeld(false) && event(SDL_MOUSEMOTION)==1);
+    assert(event(SDL_KEYDOWN)==1 && !SetActionsHeld(true));
+    assert(event(SDL_KEYUP)==1 && SetActionsHeld(true));
+    flag("0");assert(!g_flagInputHold && event(SDL_MOUSEMOTION)==1);
+    flag("1");flag("invalid");assert(!g_flagInputHold); // same opt-in parsing as Windows
+    assert(SetActionsHeld(false));
+    P().view.inGame=false;
+    PrepareTitleBackdrop(8,8);assert(g_titleBackdrop.size()==256);
+    layer::Begin(2,2);layer::Rect(0,0,2,2,layer::rgb(255,0,0),255);
+    layer::PlaceOnBackdrop(8,8,3,4,g_titleBackdrop.data());
+    const auto* px=layer::Pixels();assert(px[(4*8+3)*4+2]==255 && px[0]==65 && layer::Width()==8);
+    puts("title: layout, tab fields, key down/up capture, modal isolation, roster/save paging, readiness, in-world host/client/setup/recovery flows and backdrop placement passed");
+}

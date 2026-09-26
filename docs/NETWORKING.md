@@ -129,6 +129,34 @@ every 250 ms; with more than 512 pending the backlog is dropped; a peer is consi
 10 s of silence. Without a lobby, two games on one machine take 7771 and 7772 and talk to each
 other directly.
 
+## TCP reachability and transfer display
+
+The save-transfer listener accepts IPv4 and IPv6 on the same port. IPv6 failure
+leaves IPv4 available and is logged. At least one participant must be reachable:
+IPv4 usually needs a TCP router mapping (normally UPnP); IPv6 still needs inbound
+firewall permission. A successful UDP mapping does not prove TCP reachability.
+Host TCP mappings are attempted independently of UDP and their result is logged.
+When both participants dial simultaneously, the receiver follows the stream on
+which the sender actually supplies data, avoiding opposite connection choices.
+
+Lobby and resync panels show the transfer route, TCP status, received/total MB
+and current MB/s. Progress updates about once per second. Sender figures count
+receiver-confirmed bytes; receiver figures count unique bytes. Queued bytes and
+retransmissions are not counted as useful throughput. `TCP failed` or
+`TCP unavailable` means Steam/UDP is carrying the transfer; it does not identify
+which router or firewall blocked the connection.
+
+The normal host uses **TCP 29471**. A joiner's local port is selected dynamically;
+`--local-port` or the dedicated-server port setting can change the host port.
+When TCP fails, the lobby chat and resync panel name the actual advertised host
+port to check in the router/firewall. For IPv4, forward that TCP port to the host
+PC if automatic mapping is unavailable. No manual mapping is required when a
+direct path already works; opening both participants' ports is not necessary.
+
+Regression checks: `python tools/test_tcp_connectivity.py`,
+`python tools/test_transfer_status.py` and `python tools/test_steam_tcp.py`.
+These are local socket/simulation tests, not proof of Internet reachability.
+
 ## TCP backup link
 
 Since 2026-09-17 (`netpunch/dual_tcp.py`) every sealed frame between a joiner and the host --
@@ -141,6 +169,11 @@ for a NAT that preserves ports; whichever lands first is the link (`[dual] TCP l
 own UDP socket over loopback with the original sender's address in front, so every consumer sees
 it as an ordinary datagram from the peer, and the seal layer's per-sender replay window drops
 whichever copy comes second. Nothing above the socket changed.
+The joiner's hello carries the name it ASKED for (it dials before the host has named it);
+the host matches the assigned name, then the asked one, telling joiners that asked for the
+same name apart by the connection's address. Matching the assigned name alone closed every
+link of a renamed joiner (`ComradeSilver#2`: two instances on one Steam account, 2026-09-22).
+`tools/test_dual_link_names.py`.
 
 What it is for is written in the log every 10 s per peer: `[dual] bob: udp_first=.. tcp_first=..
 tcp_only=.. (udp lost, tcp covered) udp_only=.. (tcp lost/late); tcp later by p50/p90/max, udp
@@ -282,7 +315,17 @@ status message.
    leaves the lobby. The saved Auto-accept checkbox answers future prompts.
    Mods may download before the initial save, or in a second round after it.
    Hotjoins use the same protocol and current save list.
-   Workshop files go into the multiplayer data folder's `workshop/<id>` directory.
+   **The Workshop first (2026-09-22).** A joiner whose Steam tunnel is up subscribes
+   to the approved Workshop items through Steam instead of asking the host for them:
+   `UGC SUB <id>...` on the tunnel's control port (SubscribeItem + DownloadItem at high
+   priority), then `UGC STATE <id>...` once a second (EItemState flags, bytes, install
+   folder). An installed item is registered like a folder already on disk. The host's
+   round is asked only for local mods and for items Steam did not subscribe to within
+   20 s (hidden, removed, offline) or whose download made no progress for 120 s. A
+   bridge without the commands, no tunnel, the relay and the rig's
+   `ignore_steam_workshop` flag skip Steam. A save round that arrives first ends the
+   Steam phase and the host sends the remainder. `tools/test_workshop_subscribe.py`.
+   Workshop files the host sends go into the multiplayer data folder's `workshop/<id>` directory.
    Local mods use the game's local mod folders. Existing installations are not
    overwritten. Archive paths and unpacked sizes are checked. A fresh registry
    token and native catalogue receipt gate the final acknowledgement: a disk
@@ -418,6 +461,119 @@ installs a VPN or depends on the master server's relay.
   once the tunnel is up; `tpf2mp_steam_off.txt` keeps it off. The tunnel's
   lines in `tpf2_bridge.log` start with `[steam]`; `STATUS` on its control
   port lists every endpoint with Steam's session state (relay in use, errors).
+- **The Steam ID as the join code (2026-09-22).** A host whose tunnel is up
+  shares its SteamID64 as the code, and the lobby is Steam-only: a HELLO
+  that does not come from a tunnel endpoint is not answered (it is logged
+  once every few seconds). A Steam ID is public, so it cannot carry the
+  session secret the classic code does. The joiner gets the secret over the
+  tunnel instead, in a Diffie-Hellman exchange (`steamkey.py`, packet type
+  `X`, RFC 3526 group 14) that the host answers only from tunnel endpoints.
+  The frame key is still `derive_key(secret, password)`, so a lobby password
+  works as before. `connect.steam_code_id` accepts 17 digits in the
+  individual-account range or a pasted `steamcommunity.com/profiles/` URL.
+  **CROSS-PLAY** (`--crossplay` at start, or `{"cmd":"crossplay","on":...}`
+  live) opens the gate and switches the shown and published code to the
+  classic one; the `code` event carries `code`, `steam`, `crossplay` and
+  `cross_code`. A host without a tunnel, a relay-only host and a dedicated
+  server always use the classic code. `tools/test_steam_code.py` covers it.
+- **Saves take TCP first (2026-09-22).** A Steam peer is a loopback endpoint, so
+  over the sealed link each end names its own addresses (`MY_TCP_ADDRS`, from its
+  NAT observation): the host in `fbegin` (`tcp.addrs`), the joiner in `fbegin_ack`
+  (`tcp_addrs`, `tcp_port` of a listener it opens, `tcp_pull` when it dials). The
+  joiner dials the host, the host dials the joiner, and the first stream carries
+  the file. Steam's chunk pump holds meanwhile and starts only when neither
+  connects within `TCP_FIRST_WAIT` (15 s) or both ends have given up (`tcp_gave_up`);
+  a broken stream hands the rest to Steam. `tools/test_steam_tcp.py`.
+  A joiner in through Steam opens that listener at once and maps its TCP port by
+  UPnP, offering the router's WAN IP first (before, it offered only LAN, VPN and
+  6to4 addresses, so a host on another network could never dial it); the mapping
+  is removed when the lobby exits. A failed dial now says why in the log:
+  `timed out (blocked: firewall or no port mapping)` or `refused (nothing listening)`.
 - **Not there:** a dedicated server whose Steam client runs offline (the VPS),
   a game started outside Steam, and a second instance on the same account
   (P2P to one's own SteamID is refused: `DIAL` answers `ERR self`).
+
+### Diagnosing reliable Steam save transfers
+
+The optional 32 KB Steam path starts with 16 chunks in flight and grows on
+acknowledged delivery, up to 128 chunks. Missing-chunk reports alone do not
+requeue that window: Steam already guarantees delivery of messages it accepts.
+After three seconds without contiguous progress, the sender probes the first
+missing chunk. If the receiver reports later chunks already present, up to eight
+holes are repaired together. Repeated stalls back off to eight seconds. A stall
+without evidence of later delivery also reduces the window. Local UDP loss and
+refused Steam sends remain recoverable; the existing no-progress timeout remains.
+
+The 0.6.1.25 experimental release enables the large-chunk path for Steam-only
+transfers so it can be tested without a local flag file. Mixed Steam/CROSS-PLAY
+transfers keep MTU-safe chunks. A reachable direct TCP stream remains preferred.
+
+During large-chunk transfers, `[xfer]` lines in the lobby log report acknowledged
+bytes, unique received bytes, application throughput, in-flight bytes, recovery
+probes and duplicate chunks every five seconds. `[steam-bulk]` lines in the bridge
+log report the endpoint's cumulative bytes, Steam's queued bytes/packets, refused
+sends and local forwarding errors. Its `tx` rate is bytes accepted by the Steam
+API, not confirmed remote delivery; compare it with receiver `[xfer]` progress.
+These lines also cover the default plaintext small save chunks. Endpoint numbers
+identify local sockets without logging session secrets.
+
+Run `python tools/test_steam_backpressure.py` for a deterministic finite-queue,
+rate-limited transport test using the production sender and receiver. It covers
+256 KiB/s, 1 MiB/s and 16 MiB/s links, dropped local datagrams, missing feedback,
+rewind and no-progress timeout. File hashes must match. This simulation does not
+replace a two-computer Steam test. The existing `test_steam_chunks.py` additionally
+checks two receivers with 0%, 8% and 15% injected datagram loss;
+`test_steam_tcp.py` checks both TCP dialing directions and the Steam fallback.
+
+## Experimental Steam transport comparison (0.6.1.26)
+
+The default tunnel uses SteamNetworkingMessages v002 through the game's own
+steam_api64.dll. Vendored Valve headers provide the ABI; no additional Steam
+initialization or networking library is introduced. Both participants must use
+this version and the same mode. A missing Messages API is an explicit failure,
+not an automatic legacy fallback.
+
+For an A/B comparison, close the game on both computers and create
+`%LOCALAPPDATA%/tpf2mp/data/tpf2mp_steam_legacy.txt` on each. Start through the
+launcher and check `transport=Legacy`; remove the file with the game closed to
+return to `transport=Messages`. This startup switch persists across updates.
+Direct TCP still takes priority, so compare only runs whose save uses Steam.
+
+`[steam-messages]` reports Steam's estimated send capacity, recent wire rates,
+ping, pending bytes and sent-but-unacknowledged reliable bytes. These are distinct
+from `[steam-bulk]` tx (bytes accepted by the API) and `[xfer]` acknowledged save
+bytes. Modern packet queue count is unavailable and reported as -1. Mode changes
+require restart; mixed-mode peers cannot communicate.
+
+The measured 0.6.1.25 live run sustained about 0.54 MB/s with zero application
+retries or receiver duplicates. The new API is a test candidate, not a confirmed
+speed fix. Run `python tools/steam_messages_test.py` for the adapter boundary
+regression, and the existing transfer tests for save protocol coverage.
+
+### Local Messages rate candidate on 0.6.1.26
+
+The actual 0.6.1.26 session reported capacity=1048576B/s, ~1.01 MB/s unique
+save bytes and ~4 MB pending, without application retries or duplicates. The
+Valve header comment at SendRateMin/SendRateMax instructs equal values for a
+manually configured rate. SNP_ClampSendRate in the matching Valve source forces
+the rate estimate to that value when the clamps match. Both clamps now use
+16 MiB/s; a high maximum alone did not cause the observed connection to grow
+above its 1 MiB/s minimum. This is a fixed configured rate, not an adaptive
+bandwidth estimate or a promise of measured internet throughput. Diagnostics
+also include local/remote connection quality. Live verification is still needed.
+
+### Adaptive Messages rate (0.6.1.28)
+
+The 16 MiB/s fixed-rate experiment produced high wire traffic but poor remote
+in-order packet delivery and very little unique save progress. Messages now
+starts with equal 1 MiB/s clamps and samples active outgoing peers every five
+seconds. Remote delivery quality below 0.90 halves the rate (floor 256 KiB/s).
+Three samples with quality at least 0.98 and a send backlog permit 25% growth.
+Unknown quality, idle connections and receive-only traffic cannot increase it.
+After congestion the session ceiling is reduced to 75% of the failed rate;
+this prevents repeated aggressive probing of the same bottleneck. Worst peer
+feedback governs the process-wide inherited Steam settings. Both clamps are
+changed together; failed setters attempt to restore the previous pair and log
+failure. Actual reported capacity and unique transfer progress remain the live
+verification, not the configured target. The controller resets on game restart.
+Legacy transport retains its previous fixed configuration.

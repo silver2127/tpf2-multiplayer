@@ -54,6 +54,7 @@
 #include <cmath>
 #include <share.h>
 #include <string>
+#include <algorithm>
 #include <utility>
 #include <vector>
 #include "hook.h"
@@ -189,6 +190,12 @@ static const Factory FACTORIES[] = {
     { 0x9de9e0, 21, 15, "SetGameSpeed",   "speed"   },  // clock buttons only: CaptureSpeedButton
     { 0x9de9b0, 21, 16, "SetDate",          "calendar" },  // editor date picker only: CaptureCalendar
     { 0x9de870, 21, 17, "SetCalendarSpeed", "calendar" },  // editor date speed slider only: CaptureCalendar
+    // The vehicle window's stop/go toggle. Its prologue is byte-for-byte
+    // SendToDepot's (mov rax,rsp / push rdi / sub rsp,0xb70 / mov [rsp+40],-2 =
+    // 20 bytes, checked in the 35924 exe, 2026-09-19): r8 = vehicle, r9 = bool.
+    // A stopped train used to halt on the clicking game only and run on the
+    // peers -- a position desync one stamp later.
+    { 0x9df070, 20, 18, "SetUserStopped", "vehicle" },
 };
 static const int NUM_FACTORIES = (int)(sizeof(FACTORIES) / sizeof(FACTORIES[0]));
 
@@ -329,6 +336,10 @@ static void Log(const char* fmt, ...)
     fflush(g_log);
 }
 
+// One VirtualQuery, about a microsecond: cheap enough to call per validation,
+// which every caller assumes. A port of this must keep that property -- see
+// docs/re/HOTJOIN_ORDER.md for what a /proc/self/maps parse per call cost the
+// Linux server's simulation thread.
 static bool Readable(const void* p, size_t n)
 {
     MEMORY_BASIC_INFORMATION mbi;
@@ -576,4 +587,6 @@ enum VecRead { VEC_UNREADABLE, VEC_EMPTY, VEC_OK };
 #include "slice/ui_tints.inl"   // paused tick, icons for every player, company-colour tints on icons, labels and windows
 #include "slice/sharedstations_install.inl"   // InstallSharedStations (the patch of the gate above)
 #include "slice/moveorder.inl"   // SHIP AND AIRCRAFT CLAIM ORDER (moveorder.h)
+#include "slice/town_trace.inl"   // TOWN DEVELOPMENT TRACE (diagnostic, towntrace=1; ../town_trace.h)
+#include "slice/hotjoin_order.inl"   // HOT-JOIN ORDER: person batches in entity-id order (hotjoin_order.inl)
 #include "slice/init.inl"   // the relay blobs, hook installation, Init and DllMain

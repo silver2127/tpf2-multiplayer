@@ -2,23 +2,66 @@
 // the CommandList::Add hook: cancel, callbacks, stashes, DeferHandler
 
 
-// CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into
-// its second argument, and the caller destroys that handle as soon as Add
-// returns. Cancelling the call leaves the caller's stack slot holding whatever
-// was there before -- and the destructor (exe+0x2357910) reads *handle, checks
-// it against null only, then dereferences handle[1]. A leftover
-// 0xfffffffffffffffe passes the null check and faults reading address 6: the
-// game crashed on a plane's "turn around" while it was flying to a depot
-// (2026-08-30, access violation at exe+0x235791e, rbx = -2). Earlier cancels
-// survived only because that slot happened to hold zero. Zeroing the out handle
-// makes the caller's destructor a no-op.
+// CommandList::Add(list, OUT handle, cmd, ..., callback) writes a handle into its
+// second argument: a std::unique_ptr to a 16-byte {result*, control*} weak
+// reference to the queued command. The caller owns it from there.
+//
+// Cancelling the call leaves the caller's stack slot holding whatever was there
+// before -- and the destructor (exe+0x2357910) reads *handle, checks it against
+// null only, then dereferences handle[1]. A leftover 0xfffffffffffffffe passes the
+// null check and faults reading address 6: the game crashed on a plane's "turn
+// around" while it was flying to a depot (2026-08-30, at exe+0x235791e, rbx = -2).
+// Zeroing it made that destructor a no-op.
+//
+// A NULL handle is not enough for every caller. The NEW LINE button in a VEHICLE's
+// line picker -- the line list a vehicle window shows when you give it a line,
+// UI::LineList (linelist.cpp 0x610380, Add returns to 0x610441) -- COPIES the handle
+// straight after Add (exe+0x23577f0: `mov rdi,[rdx]` then `mov rdx,[rdi]`, no null
+// check) and hands the copy to the UI to release when the command finishes; the
+// release (exe+0x9d3210) reads handle[1] as well. With the handle zeroed the copy
+// faulted reading address 0 -- a player's game died on every press of that button
+// (2026-09-22, crash dump exe+0x235780f, two crashes in four minutes). The Line
+// manager window's own New Line (linemanager.cpp 0x618ff0, Add returns to 0x6190b0)
+// only destroys the handle, which is why that one survived -- pressing it is what
+// the owner's own rig had been doing all along.
+//
+// So hand back a REAL but EMPTY handle: 16 zero bytes from the game's own
+// operator new (exe+0x2bf3a80), which its operator delete (exe+0x2bf3abc) frees.
+// Copying it touches no refcount, releasing it reads the zero control pointer and
+// returns, and destroying it frees the block. The bytes of that allocator are
+// checked against build 35924 once; if they differ (or it returns nothing) the
+// slot is zeroed as before.
+static const uintptr_t RVA_OPERATOR_NEW = 0x2bf3a80;
+static const uint8_t OPERATOR_NEW_BYTES[9] = {0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0xd9};   // push rbx; sub rsp,20; mov rbx,rcx
+static void* GameNew16()
+{
+    static volatile LONG checked = 0;   // 0 unknown, 1 usable, 2 refused
+    typedef void* (__fastcall* NewFn)(size_t);
+    const uintptr_t fn = g_base + RVA_OPERATOR_NEW;
+    LONG state = InterlockedCompareExchange(&checked, 0, 0);
+    if (!state) {
+        state = (g_base && Readable((const void*)fn, sizeof OPERATOR_NEW_BYTES) &&
+                 memcmp((const void*)fn, OPERATOR_NEW_BYTES, sizeof OPERATOR_NEW_BYTES) == 0) ? 1 : 2;
+        InterlockedExchange(&checked, state);
+        if (state == 2) Log("[slice] operator new at %llx is not build 35924's -- cancelled Adds hand back a null handle\n",
+                            (unsigned long long)RVA_OPERATOR_NEW);
+    }
+    if (state != 1) return nullptr;
+    void* p = nullptr;
+    __try {
+        p = ((NewFn)fn)(16);
+        if (p) memset(p, 0, 16);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
+    return p;
+}
 static void ZeroAddResult(uint64_t rdx)
 {
     if (!rdx) return;
+    void* empty = GameNew16();
     __try {
-        *(volatile uint64_t*)rdx = 0;
+        *(volatile uint64_t*)rdx = (uint64_t)empty;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[slice] could not zero the Add out-handle at %llx\n", (unsigned long long)rdx);
+        Log("[slice] could not write the Add out-handle at %llx\n", (unsigned long long)rdx);
     }
 }
 
@@ -387,7 +430,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
             //
             // _Do_call(this, Command const&) -> rcx = r9, rdx = the Command,
             // which is r8 at this call site.
-            // FIRE-AND-FORGET FIRST. SetLine (6) and Reverse (10) are armed
+            // FIRE-AND-FORGET FIRST. SetLine (6), Reverse (10) and SetUserStopped (18) are armed
             // with g_pendingNoCb=1: nothing waits on their callback, and
             // FIRING it here with the command's success byte still 0 makes the
             // UI take its FAILURE branch -- SetLine then pops "unable to find a
@@ -586,7 +629,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         return 0;
     }
 
-    if ((id >= 2 && id <= 10) || id == 13 || id == 14) {
+    if ((id >= 2 && id <= 10) || id == 13 || id == 14 || id == 18) {
         const Factory* f = nullptr;
         for (int i = 0; i < NUM_FACTORIES; i++) if (FACTORIES[i].id == (int)id) f = &FACTORIES[i];
         if (!f) return 0;
@@ -605,6 +648,9 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         //   SellVehicle (3), SendToDepot (5) -- the sell refund moved the
         //                       originator's balance at click time and the
         //                       peers' at the stamp, a coop money-split source.
+        //   SetUserStopped (18) -- the stop/go toggle: applied at click time it
+        //                       halted the train a stamp early on the clicking
+        //                       game only (vehicle drift alarm, 2026-09-19).
         //   UpdateLine (8), DeleteLine (9) -- the new stop list is decoded off
         //                       the command (DecodeLine); CaptureFactory clears
         //                       `cancel` when that decode fails.
@@ -625,7 +671,7 @@ extern "C" uint64_t DeferHandler(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64
         //                       originator's own replay at the stamp instead.
         const bool luaPath = IsScriptCaller(caller);
         const bool strictId = (id == 2 || id == 3 || id == 4 || id == 5 ||
-                               id == 6 || id == 8 || id == 9 || id == 10) ||
+                               id == 6 || id == 8 || id == 9 || id == 10 || id == 18) ||
                               (id == 7 && caller == CALLER_UI_CREATELINE);
         bool cancel = !luaPath && strictId;
         __try {

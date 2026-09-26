@@ -83,6 +83,76 @@ the CPU, at 640x480 and the lowest settings.
 4. `systemctl start tpf2mp-game` -- the watchdog asks Steam to launch the game and
    relaunches it when it exits.
 
+## Where a server's time goes (measured 2026-09-22, native Linux build)
+
+The test server (8 vCPU EPYC under KVM, 31 GiB, 13% steal) with a 49,000-tile Big
+Maps world and two players in, profiled read-only with `perf -t` and `bpftrace`
+while the session ran. Numbers for the native Linux build; under Proton only the allocator differs
+(see `native/src/wine_heap.h`).
+
+- **The simulation thread, a third of it, parses `/proc/self/maps`.** The mod's
+  `Readable()` pointer guard is one `VirtualQuery` on Windows; the port's version
+  reads and `sscanf`s the whole mapping table, and the process has 50,000
+  mappings. 5.6 parses a second, ~57 ms each. This is the server's largest single
+  cost and the port owns it: `docs/re/HOTJOIN_ORDER.md`, "Linux `Readable()`
+  costs a /proc/self/maps parse".
+- **Why 50,000 mappings:** with `dedicated_render=0` no command buffer runs, but
+  the engine still prepares every frame, and lavapipe answers its buffer
+  allocations out of a memfd -- 48,000 live mappings, 1.26 GiB, and 6,450
+  `mmap`/`munmap` pairs a second at 30 frames a second (~290 per frame) on the
+  main thread. That thread sits at ~50% of a core for nobody, and every mapping
+  it adds makes every `mmap`, fault and maps-parse in the process dearer. It also
+  wants `vm.max_map_count` raised (`tools/server/sysctl-tpf2mp.conf`); the
+  default 65,530 is within reach of a world this size. Untried idea, cheap to
+  try: park the dedicated camera zoomed right in over empty terrain once the
+  world is up -- nobody looks through it, and the engine would then prepare
+  almost nothing per frame.
+- **`dedicated_fps` is the ceiling on the clock, not just render work.** The
+  engine consumes one batch per frame, and a batch is 200 ms of simulation, so
+  the frame rate caps the speed: 30 frames a second is 6x, 20 is 4x. Do not lower
+  it below `5 x the fastest speed the session should reach`.
+- **The batch interval pin works; `tpf2_engine_pace.txt` does not report it.**
+  `base=` in that file is the engine's *own* estimate for the next batch, written
+  by `Sync` before the speed hook imposes anything (`native/src/speedhook.cpp`,
+  `ImposeInterval`). `base=400000` means the engine asked for 400 ms because it
+  was behind, not that `pin_batch=1` was ignored -- the imposed value is in
+  `tpf2_bridge.log`: `[speed] target 1.70 over lever 2 -> batch interval 235294
+  us (engine's own 400000 us)`.
+- **The terrain pager's automatic budget is too small for a running world.** With
+  the automatic ~1 GiB it faulted 790 tiles a second and the session ran at half
+  speed; `terrain_cache_hot_mb=6144` brought that to ~1.5 faults a second.
+  `bigmap/docs/terrain-compression.md` has the recency-eviction fix the port
+  needs.
+- **Memory, after that budget: 27.6 GiB resident, 1.2 GiB swapped, and no
+  stalling** -- the cgroup's `memory.pressure` reads 0.00 at every window and the
+  sim thread waited 19 ms in 10 s on disk. Swap is not what costs speed here;
+  `vm.swappiness=10` keeps it that way.
+- **Not worth changing:** glibc tuning (`MALLOC_MMAP_THRESHOLD_` and friends).
+  `_int_malloc` is 1.6% of the sim thread and `brk` never moves; the 29% libc
+  time measured before the pager budget was raised was the pager decoding tiles,
+  not the allocator's shape.
+
+### What the port's fix bought (same server, 22:36 the same evening)
+
+`port/dev b1ac39f` ships both the `Readable()` rewrite (it probes with
+`process_vm_readv` instead of parsing the mapping table) and the MSVC
+random-number parity modules, built in the soldier SDK and installed on the test
+server. Measured again with one player in, 1x, world settled:
+
+- `tpf2_engine_pace.txt` reads **`base=200000`**: the engine's own estimate is the
+  nominal 200 ms a batch again. Before the fix it asked for 240,000 at 1x and
+  400,000 at 2x -- it was 20-100% behind. That is the whole point of the fix.
+- The simulation thread is **12% of a core** at 1x (it was ~80% on-CPU, a third of
+  that in the maps parse). No `/proc/self/maps` open in an 8 s syscall census and
+  no `seq_file` symbols in a 12 s profile; `process_vm_readv` and `RawRead` show
+  at ~0.9% each, which is the new probe doing its job.
+- What is left at the top is **lavapipe's mapping churn**: 6,030 `mmap` and 6,060
+  `munmap` a second, and the TLB-shootdown IPIs they cause
+  (`smp_call_function_many_cond`) are now the single largest kernel cost on every
+  thread. 49,000 mappings still stand. The bullet above is the item to take next.
+- Memory: 27.3 GiB resident, and the load pushed swap use to 3.9 GiB (the
+  alignment pass peaked at 28.8 GiB resident with `memory.pressure` around 2%).
+
 ## Limits
 
 - One Steam account per server, in offline mode; the account must own the game and

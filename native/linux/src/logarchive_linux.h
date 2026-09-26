@@ -64,6 +64,10 @@
 //    "__CRASHDB_DUMP__ " (0x9b3866) and joins "<id>.dmp" (0x9b364f) onto that
 //    folder (0x9b368a, 0x9b36dc path::operator/=).
 //
+// State/config and lobby streams follow the logs (8 MiB tails, always copied).
+// Lobby invitation/password fields are masked in copies. about.txt records the
+// installed version, kernel, time zone and module ELF identities.
+//
 // What goes in: the data folder's *.log (MOVED at start, since the next run
 // writes fresh ones), the lobby folder's *.log ($XDG_DATA_HOME/tpf2mp/netpunch,
 // and <game>/netpunch, the Lua side's fallback), the game's stdout.txt, and the
@@ -107,6 +111,9 @@
 // Header-only so the loader's build stays single-file.
 #pragma once
 #include <dirent.h>
+#include <elf.h>
+#include <fnmatch.h>
+#include <sys/utsname.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/file.h>
@@ -125,8 +132,9 @@
 static const uint64_t TPF2_LOG_TAIL_BYTES    = 32ull << 20;
 static const uint64_t TPF2_DUMP_MAX_BYTES    = 64ull << 20;
 static const uint64_t TPF2_COPY_BUDGET_BYTES = 200ull << 20;
+static const uint64_t TPF2_STATE_TAIL_BYTES  = 8ull << 20;
 static const int      TPF2_DUMPS_PER_RUN     = 3;
-static const int      TPF2_LOG_KEEP          = 2;       // per kind: "previous" runs, "now" copies
+static const int      TPF2_LOG_KEEP          = 5;       // per kind: "previous" runs, "now" copies
 static const int      TPF2_LOG_LOCK_WAIT_MS  = 10000;
 
 struct Tpf2mpLogArchive {
@@ -206,6 +214,112 @@ static inline bool LaCopy(const char* src, const char* dst, uint64_t tailCap, ui
     free(buf);
     if (close(out) != 0) ok = false;
     close(in);
+    return ok;
+}
+
+// Read the ELF identity from bounded PT_NOTE records, without executing a helper.
+// No game addresses or ABI layouts are involved: these are ELF64 file headers.
+static inline void LaBuildId(int fd, char* out, size_t cap)
+{
+    out[0] = 0;
+    Elf64_Ehdr eh = {};
+    struct stat st;
+    if (fstat(fd, &st) || pread(fd, &eh, sizeof(eh), 0) != sizeof(eh) ||
+        memcmp(eh.e_ident, ELFMAG, SELFMAG) || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
+        eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_phentsize != sizeof(Elf64_Phdr) || eh.e_phnum > 1024 ||
+        eh.e_phoff > (uint64_t)st.st_size ||
+        uint64_t(eh.e_phnum) * sizeof(Elf64_Phdr) > uint64_t(st.st_size) - eh.e_phoff) return;
+    for (unsigned i = 0; i < eh.e_phnum; ++i) {
+        Elf64_Phdr ph = {};
+        if (pread(fd, &ph, sizeof(ph), eh.e_phoff + i * sizeof(ph)) != sizeof(ph) ||
+            ph.p_type != PT_NOTE || ph.p_filesz > (1u << 20) || ph.p_offset > uint64_t(st.st_size) ||
+            ph.p_filesz > uint64_t(st.st_size) - ph.p_offset) continue;
+        uint64_t off = 0;
+        while (off + sizeof(Elf64_Nhdr) <= ph.p_filesz) {
+            Elf64_Nhdr n = {};
+            if (pread(fd, &n, sizeof(n), ph.p_offset + off) != sizeof(n)) break;
+            off += sizeof(n);
+            uint64_t ns = (uint64_t(n.n_namesz) + 3) & ~uint64_t(3);
+            uint64_t ds = (uint64_t(n.n_descsz) + 3) & ~uint64_t(3);
+            if (ns + ds > ph.p_filesz - off) break;
+            char name[4], id[64];
+            if (n.n_type == NT_GNU_BUILD_ID && n.n_namesz == 4 && n.n_descsz > 0 &&
+                n.n_descsz <= sizeof(id) && 2 * n.n_descsz + 1 <= cap &&
+                pread(fd, name, 4, ph.p_offset + off) == 4 && !memcmp(name, "GNU\0", 4) &&
+                pread(fd, id, n.n_descsz, ph.p_offset + off + ns) == n.n_descsz) {
+                for (unsigned j = 0; j < n.n_descsz; ++j) snprintf(out + 2*j, 3, "%02x", (unsigned char)id[j]);
+                return;
+            }
+            off += ns + ds;
+        }
+    }
+}
+
+static inline void LaNoteModules(FILE* about, const char* dir, const char* mask, const char* shown)
+{
+    DIR* d = opendir(dir);
+    if (!d) return;
+    while (dirent* e = readdir(d)) {
+        if (fnmatch(mask, e->d_name, 0)) continue;
+        char path[PATH_MAX], id[129] = "", date[64] = "unknown";
+        struct stat st;
+        if (!LaFmt(path, sizeof(path), "%s%s", dir, e->d_name) || !LaIsFile(path, &st)) continue;
+        int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+        if (fd >= 0) { LaBuildId(fd, id, sizeof(id)); close(fd); }
+        struct tm utc = {};
+        if (gmtime_r(&st.st_mtime, &utc)) strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S UTC", &utc);
+        LaNote(about, "  %s/%s: %llu bytes, written %s, GNU build-id %s\n", shown, e->d_name,
+               (unsigned long long)st.st_size, date, id[0] ? id : "unavailable");
+    }
+    closedir(d);
+}
+
+// Redact only copies. Walk JSON string tokens so a quoted key in a message is
+// not mistaken for a key. Escape bytes become stars too, preserving byte count.
+// A tail may start inside a credential: omit its incomplete first line before
+// calling this helper. Failure removes the copy rather than leaving secrets.
+static inline bool LaRedactFile(const char* path, bool truncated = false)
+{
+    FILE* f = fopen(path, "r+be");
+    if (!f) { unlink(path); return false; }
+    struct stat st;
+    bool ok = !fstat(fileno(f), &st) && st.st_size >= 0 && uint64_t(st.st_size) <= TPF2_STATE_TAIL_BYTES;
+    size_t n = ok ? size_t(st.st_size) : 0;
+    char* b = ok ? (char*)malloc(n + 1) : nullptr;
+    ok = b && fread(b, 1, n, f) == n;
+    if (ok) {
+        if (truncated) {
+            for (size_t i = 0; i < n && b[i] != '\n'; ++i) b[i] = ' ';
+        }
+        const char* keys[] = {"code", "cross_code", "steam", "steam_code", "steam_secret", "password", "pass", "passcode", "secret"};
+        for (size_t i = 0; i < n;) {
+            if (b[i++] != '"') continue;
+            size_t start = i;
+            while (i < n && b[i] != '"') { if (b[i] == '\\' && i + 1 < n) ++i; ++i; }
+            size_t end = i;
+            if (i == n) break;
+            ++i;
+            bool secret = false;
+            for (const char* key : keys) if (strlen(key) == end - start && !memcmp(b + start, key, end - start)) secret = true;
+            if (!secret) continue;
+            size_t j = i;
+            auto ws = [&](size_t& k) { while (k < n && (b[k] == ' ' || b[k] == '\t' || b[k] == '\r' || b[k] == '\n')) ++k; };
+            ws(j);
+            if (j == n || b[j++] != ':') continue;
+            ws(j);
+            if (j == n || b[j++] != '"') continue;
+            while (j < n && b[j] != '"') {
+                if (b[j] == '\\' && j + 1 < n) b[j++] = '*';
+                b[j++] = '*';
+            }
+            i = j < n ? j + 1 : j;
+        }
+        rewind(f);
+        ok = fwrite(b, 1, n, f) == n;
+    }
+    free(b);
+    if (fclose(f)) ok = false;
+    if (!ok) unlink(path);
     return ok;
 }
 
@@ -481,6 +595,45 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
                   "netpunch = the lobby folder beside it, game = the Transport Fever 2 folder, "
                   "crash_dump = <Steam>/userdata/<account>/1066780/local/crash_dump.\n\n");
 
+    char install[PATH_MAX] = "", path[PATH_MAX], version[256] = "unknown";
+    Tpf2mpRootDir(install, sizeof(install));
+    // Native installers record their version in the manifest, not the game dir.
+    if (install[0] && LaFmt(path, sizeof(path), "%s/tpf2mp_install.txt", install)) {
+        if (FILE* f = fopen(path, "re")) {
+            char line[512];
+            while (fgets(line, sizeof(line), f)) if (!strncmp(line, "version\t", 8)) {
+                snprintf(version, sizeof(version), "%.255s", line + 8); break;
+            }
+            fclose(f);
+        }
+    }
+    if (!strcmp(version, "unknown") && gameDir && LaFmt(path, sizeof(path), "%stpf2mp_version.txt", gameDir)) {
+        if (FILE* f = fopen(path, "re")) { if (!fgets(version, sizeof(version), f)) strcpy(version, "unknown"); fclose(f); }
+    }
+    version[strcspn(version, "\r\n")] = 0;
+    char zone[80];
+    strftime(zone, sizeof(zone), "%Z (UTC%z)", &lt);
+    struct utsname os = {};
+    uname(&os);
+    LaNote(about, "TpF2 Multiplayer version %s\nLinux %s %s; log time zone %s\nModules on disk\n", version, os.release, os.machine, zone);
+    if (FILE* f = fopen("/etc/os-release", "re")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+            if (!strncmp(line, "PRETTY_NAME=", 12)) { line[strcspn(line, "\r\n")] = 0; LaNote(about, "System %s\n", line + 12); break; }
+        fclose(f);
+    }
+    const char* runtime = getenv("PRESSURE_VESSEL_RUNTIME");
+    if (!runtime) runtime = getenv("STEAM_RUNTIME");
+    if (runtime) LaNote(about, "Steam Runtime %s\n", runtime);
+    if (gameDir && gameDir[0]) LaNoteModules(about, gameDir, "TransportFever2", "game");
+    if (install[0]) {
+        if (LaFmt(path, sizeof(path), "%s/", install)) LaNoteModules(about, path, "*.so", "mod");
+        if (LaFmt(path, sizeof(path), "%s/boot/", install)) LaNoteModules(about, path, "*.so", "mod/boot");
+        if (LaFmt(path, sizeof(path), "%s/plugins/", install)) LaNoteModules(about, path, "*.so", "mod/plugins");
+        if (LaFmt(path, sizeof(path), "%s/netpunch/", install)) LaNoteModules(about, path, "netpunch", "netpunch");
+    }
+    LaNote(about, "\nFiles\n");
+
     // Logs held by another live game are copied: a rename would leave that game
     // writing into this archive.
     const bool moveData = previousSession && moveLogs;
@@ -508,7 +661,7 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
     };
     auto noteCopied = [&](const char* shown, uint64_t size, uint64_t tailCap, const char* why) {
         LaNote(about, "  %-52s %12llu bytes%s%s\n", shown, (unsigned long long)size,
-               tailCap && size > tailCap ? " (only the last 32 MB kept)" : "", why);
+               tailCap && size > tailCap ? (tailCap == TPF2_STATE_TAIL_BYTES ? " (only the last 8 MB kept)" : " (only the last 32 MB kept)") : "", why);
     };
     auto place = [&](const char* src, const char* destName, const char* shown, bool move, uint64_t tailCap) {
         char dst[PATH_MAX];
@@ -543,32 +696,40 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
             noteCopied(shown, (uint64_t)seen.st_size, tailCap, "");
         }
         if (ok) out->files++; else out->skipped++;
+        return ok;
     };
-    auto each = [&](const char* dir, const char* suffix, const char* prefix, const char* shownDir, bool move) {
+    auto each = [&](const char* dir, const char* suffix, const char* prefix, const char* shownDir, bool move, uint64_t cap = TPF2_LOG_TAIL_BYTES, bool redact = false) {
         DIR* d = opendir(dir);
         if (!d) return;
-        const size_t sl = strlen(suffix);
         while (dirent* e = readdir(d)) {
-            const size_t nl = strlen(e->d_name);
-            if (e->d_name[0] == '.' || nl <= sl || strcmp(e->d_name + nl - sl, suffix)) continue;
+            if (e->d_name[0] == '.' || fnmatch(suffix, e->d_name, 0) ||
+                (cap == TPF2_STATE_TAIL_BYTES && (!strncmp(e->d_name, "incoming_save.", 14) ||
+                 !strncmp(e->d_name, "terrain_", 8)))) continue;
             char src[PATH_MAX], dest[PATH_MAX], shown[PATH_MAX];
             struct stat st;
             if (!LaFmt(src, sizeof(src), "%s%s", dir, e->d_name) || !LaIsFile(src, &st)) continue;
             if (!LaFmt(dest, sizeof(dest), "%s%s", prefix, e->d_name)) continue;
             if (!LaFmt(shown, sizeof(shown), "%s/%s", shownDir, e->d_name)) continue;
-            place(src, dest, shown, move, TPF2_LOG_TAIL_BYTES);
+            const bool placed = place(src, dest, shown, move, cap);
+            if (redact && LaFmt(src, sizeof(src), "%s/%s", out->folder, dest)) {
+                if (!placed) { unlink(src); continue; }
+                if (!LaRedactFile(src, uint64_t(st.st_size) > cap)) {
+                    --out->files; ++out->skipped;
+                    LaNote(about, "  %s removed: redaction failed\n", shown);
+                }
+            }
         }
         closedir(d);
     };
 
     // 1. the data folder: loader, bridge, menu, slice, plugin host, company logs
-    each(data, ".log", "", "data", moveData);
+    each(data, "*.log", "", "data", moveData);
     // 2. the lobby: beside the data folder, and the game folder's (the Lua side's fallback)
     char base[PATH_MAX], net[PATH_MAX];
     if (Tpf2mpRootDir(base, sizeof(base)) && LaFmt(net, sizeof(net), "%s/netpunch/", base))
-        each(net, ".log", "netpunch_", "netpunch", false);
+        each(net, "*.log", "netpunch_", "netpunch", false);
     if (gameDir && gameDir[0] && LaFmt(net, sizeof(net), "%snetpunch/", gameDir))
-        each(net, ".log", "game_netpunch_", "game/netpunch", false);
+        each(net, "*.log", "game_netpunch_", "game/netpunch", false);
 
     // 3. the game's own log and crash dumps (the Steam account that ran the game last)
     char best[PATH_MAX];
@@ -622,6 +783,31 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
             }
         }
     }
+    // State is copied after every log/dump, using the remaining copy budget.
+    LaNote(about, "\nState files (the last 8 MB of each)\n");
+    each(data, "*.txt", "state_", "data", false, TPF2_STATE_TAIL_BYTES);
+    each(data, "tpf2*.cfg", "state_", "data", false, TPF2_STATE_TAIL_BYTES);
+    auto config = [&](const char* dir, const char* prefix, const char* shown) {
+        each(dir, "tpf2*.cfg", prefix, shown, false, TPF2_STATE_TAIL_BYTES);
+        each(dir, "tpf2_menu_flags.txt", prefix, shown, false, TPF2_STATE_TAIL_BYTES);
+        each(dir, "tpf2mp_version.txt", prefix, shown, false, TPF2_STATE_TAIL_BYTES);
+    };
+    auto lobbyState = [&](const char* dir, const char* prefix, const char* shown) {
+        each(dir, "*.jsonl", prefix, shown, false, TPF2_STATE_TAIL_BYTES, true);
+        each(dir, "*.json", prefix, shown, false, TPF2_STATE_TAIL_BYTES, true);
+        each(dir, "*.txt", prefix, shown, false, TPF2_STATE_TAIL_BYTES, true);
+    };
+    if (install[0]) {
+        if (LaFmt(path, sizeof(path), "%s/", install)) config(path, "mod_", "mod");
+        if (LaFmt(path, sizeof(path), "%s/plugins/", install)) each(path, "*.cfg", "mod_plugins_", "mod/plugins", false, TPF2_STATE_TAIL_BYTES);
+        if (LaFmt(path, sizeof(path), "%s/netpunch/", install)) lobbyState(path, "netpunch_", "netpunch");
+    }
+    if (gameDir && gameDir[0]) {
+        config(gameDir, "game_", "game");
+        if (LaFmt(path, sizeof(path), "%splugins/", gameDir)) each(path, "*.cfg", "game_plugins_", "game/plugins", false, TPF2_STATE_TAIL_BYTES);
+        if (LaFmt(path, sizeof(path), "%snetpunch/", gameDir)) lobbyState(path, "game_netpunch_", "game/netpunch");
+    }
+    LaNote(about, "  Invitation codes in lobby copies are masked with *; truncated first lines are blanked.\n");
     if (about) fclose(about);
 
     if (out->files == 0) {

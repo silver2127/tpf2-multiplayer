@@ -7,6 +7,7 @@
 -- table, log the instance-tagged logger. Body kept at column 0 on purpose:
 -- tools/luacheck.py's use-before-define checks look at column-0 declarations.
 return function(CM, K, log)
+require("mp/autosig_compat").bind(CM, K, log)
 -- ---------- roadside stops (edge objects) ----------
 --
 -- A small bus or truck stop placed on a street is not a construction. It is an
@@ -18,10 +19,15 @@ return function(CM, K, log)
 -- divergence -- and a line stopping at one could not replicate either ("no
 -- station group within 20 m").
 --
--- The native placement comes through BuildProposal from caller 0x460e0b, which
--- the slice ignores, so the originator keeps its native stop; peers replay it
--- through SimpleStreetProposal.edgeObjectsToAdd, the same API a Lua mod would
--- use to place a signal. The wire carries positions, never ids: the edge by its
+-- The stop / signal / waypoint tool commits through BuildProposal from caller
+-- 0x460e0b. The slice decodes its edge-object record, CANCELS the native build
+-- at CommandList::Add (firing the tool's callback) and writes STOPX; the
+-- bulldozer's removal the same way as STOPXDEL (inject.lua). Both ship WITHOUT
+-- skipOrigin, so every instance, the originator included, applies the change
+-- through CM.nativeStopProposal at the stamp. The poll below (CM.pollStops) is
+-- only the fallback for a build the slice left native (undecodable record, no
+-- live session, a cancel that did not land) and runs once at load and as a
+-- one-shot catch-up scan. The wire carries positions, never ids: the edge by its
 -- two endpoints, the stop by its parameter along that edge and which side.
 CM.knownStop   = {}      -- edge-object entity -> {x, y, model, kind, oneWay, side} while it exists
 CM.stopPrimed  = false
@@ -153,6 +159,41 @@ local function describeStop(eo, eid)
 		end)
 	end)
 	return ok and d.model and d
+end
+
+-- AutoSig's destructive follow-ups identify a signal, not just the nearest
+-- edge object. Never fall back to a neighbouring stop/waypoint or another
+-- company's signal when the captured target has gone or changed.
+function CM.autoSigDescribeTarget(eo, eid, c)
+	if not eo or eo <= 0 or not eid or eid <= 0 then return nil end
+	local d = describeStop(eo, eid)
+	if not d or not d.track or d.kind ~= 2 or (d.stype ~= 0 and d.stype ~= 1) then return nil end
+	if CM.cmEnsure then CM.cmEnsure() end
+	if CM.cmMode == "companies" then
+		local pid = CM.cmCompanyPid[tonumber(c.company)]
+		if not pid then return nil end
+		local owner = CM.cmOwnerOf(eo)
+		if owner and owner ~= pid then return nil end
+	end
+	return {autosigTarget=1, rx=d.x, ry=d.y, rz=d.z, rmodel=CM.escName(d.model), rtype=d.stype,
+		rax=d.ax, ray=d.ay, rbx=d.bx, rby=d.by}
+end
+
+function CM.autoSigResolveTarget(c)
+	local eid = CM.findEdgeByEnds(true, tonumber(c.rax), tonumber(c.ray), tonumber(c.rbx), tonumber(c.rby), 0.25)
+	if not eid then return nil end
+	local objects = CM.objectsOnEdge(eid)
+	if not objects then return nil end
+	local found
+	for _, obj in ipairs(objects) do
+		local d = CM.autoSigDescribeTarget(obj[1], eid, c)
+		if d and d.rmodel == c.rmodel and d.rtype == tonumber(c.rtype)
+			and (d.rx-c.rx)^2 + (d.ry-c.ry)^2 + (d.rz-c.rz)^2 < 0.25^2 then
+			if found then return nil end -- ambiguous: remove neither
+			found = obj[1]
+		end
+	end
+	return found, eid
 end
 
 local function isPlayerStop(eo)
@@ -469,6 +510,43 @@ function CM.sideOnEdge(eid, u, x, y, conv)
 	return geoL, engL
 end
 
+-- Register the edge objects a replay just made, so the next catch-up scan
+-- knows them. The timer poll that used to learn them from CM.expectStop is gone
+-- (2026-09-12): the scan now runs only at load and after a stall or a native
+-- build, long after the 8-unit expectations expired, and it shipped every
+-- signal and stop replayed since the last scan as a NEW STOPADD (measured
+-- 2026-09-24: nine strict signals re-shipped 2000 units after they were built,
+-- on both instances). A peer skips a re-shipped object only while one of the
+-- same model stands within 1 m; otherwise it builds a second one, facing by a
+-- geometric guess. Only objects on the edge between n0 and n1 that are not
+-- already known and not in `skip` (the edge's survivors, which may include a
+-- native object still waiting for its catch-up) are noted. Returns the count.
+function CM.stopNoteReplayed(n0, n1, skip)
+	if not CM.stopPrimed or not n0 or not n1 then return 0 end
+	local m = api.engine.system.streetSystem.getEdgeObject2EdgeMap() or {}
+	local onEdge, noted = {}, 0
+	for eo, eid in pairs(m) do
+		if not CM.knownStop[eo] and not (skip and skip[eo]) then
+			local hit = onEdge[eid]
+			if hit == nil then
+				hit = false
+				pcall(function()
+					local be = api.engine.getComponent(eid, api.type.ComponentType.BASE_EDGE)
+					hit = be ~= nil and ((be.node0 == n0 and be.node1 == n1) or (be.node0 == n1 and be.node1 == n0))
+				end)
+				onEdge[eid] = hit
+			end
+			if hit and isPlayerStop(eo) then
+				local d = describeStop(eo, eid)
+				CM.knownStop[eo] = d and { d.x, d.y, model = d.model, kind = d.kind, oneWay = d.oneWay, side = d.side } or { 0, 0 }
+				if d then CM.expectDrop(CM.expectStop, d.x, d.y) end
+				noted = noted + 1
+			end
+		end
+	end
+	return noted
+end
+
 -- Submit ONE native-shape proposal. add = { eid, u, left, side, model, name,
 -- oneWay, x, y } or nil; remove = { eo, eid, x, y } or nil (either or both).
 -- Returns true when a command went out (onDone(success) follows), else
@@ -479,6 +557,7 @@ function CM.nativeStopProposal(add, remove, why, onDone)
 	if remove and remove.eid ~= (add and add.eid) then edges[#edges + 1] = remove.eid end
 	local sp = api.type.SimpleProposal.new()
 	local survivors = {}
+	local addN0, addN1
 	for k, eid in ipairs(edges) do
 		local owner = CM.frozenOwnerOf(eid)
 		if owner then return false, string.format("edge %d is frozen into construction %d -- refused (DIVERGENCE)", eid, owner) end
@@ -495,7 +574,10 @@ function CM.nativeStopProposal(add, remove, why, onDone)
 				survivors[#survivors + 1] = o[1]
 			end
 		end
-		if add and eid == add.eid then list[#list + 1] = { -1, add.side } end
+		if add and eid == add.eid then
+			list[#list + 1] = { -1, add.side }
+			addN0, addN1 = e.comp.node0, e.comp.node1
+		end
 		e.comp.objects = list
 		sp.streetProposal.edgesToAdd[k] = e
 		sp.streetProposal.edgesToRemove[k] = eid
@@ -541,9 +623,28 @@ function CM.nativeStopProposal(add, remove, why, onDone)
 				if m2[id] then kept = kept + 1 else lost[#lost + 1] = tostring(id) end
 			end
 		end)
-		log(string.format("EXEC %s: %d edge(s)%s%s success=%s%s; survivors kept %d/%d%s", why, #edges,
+		-- Tell the poll what this replay made and removed, on every instance --
+		-- the originator of a strict STOPX/STOPXDEL included. Without it the next
+		-- catch-up scan re-ships them (CM.stopNoteReplayed). AutoSig's planned
+		-- signals ride the same path: they stand on the replayed edge too.
+		local noted = 0
+		if success then
+			if remove then
+				CM.knownStop[remove.eo] = nil
+				CM.expectDrop(CM.expectStopDel, remove.x, remove.y)
+			end
+			if add then
+				local skip = {}
+				for _, id in ipairs(survivors) do skip[id] = true end
+				local okN, n = pcall(CM.stopNoteReplayed, addN0, addN1, skip)
+				if okN then noted = n or 0 else log("stops: could not register the replayed object: " .. tostring(n)) end
+				if noted > 0 then CM.expectDrop(CM.expectStop, add.x, add.y) end
+			end
+		end
+		log(string.format("EXEC %s: %d edge(s)%s%s success=%s%s; survivors kept %d/%d%s%s", why, #edges,
 			add and " +add" or "", remove and (" -rm " .. tostring(remove.eo)) or "", tostring(success), msg,
-			kept, #survivors, #lost > 0 and (" LOST [" .. table.concat(lost, ",") .. "]") or ""))
+			kept, #survivors, #lost > 0 and (" LOST [" .. table.concat(lost, ",") .. "]") or "",
+			noted > 0 and string.format("; %d registered as known", noted) or ""))
 		if onDone then onDone(success, res) end
 	end)
 	return true
@@ -576,10 +677,17 @@ function CM.execStopAdd(c)
 		-- is the SHELTER model, which stands at the kerb -- 6-8 m off the
 		-- centreline of a medium town road -- so the search must be wide: the
 		-- 5 m split tolerance found nothing for five stops in a row (2026-09-02).
-		local eid, u
-		if c.ax and c.bx then eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0) end
+		local eid, u, autoSigTarget
+		if tonumber(c.autosigTarget) == 1 then
+			autoSigTarget, eid = CM.autoSigResolveTarget(c)
+			if not autoSigTarget then
+				log(tag .. ": AutoSig target missing, changed, foreign or ambiguous -- replacement refused")
+				return
+			end
+		elseif c.ax and c.bx then eid = CM.findEdgeByEnds(wantTrack, c.ax, c.ay, c.bx, c.by, 2.0) end
 		if eid then
 			u = CM.uOnEdgeFine(eid, c.x, c.y)
+			if not u and autoSigTarget then return end
 			if not u then eid = nil end
 		end
 		if not eid then eid, u = CM.findEdgeContaining(wantTrack, c.x, c.y, nil, K.STOP_EDGE_EPS) end
@@ -623,10 +731,13 @@ function CM.execStopAdd(c)
 			log(string.format("%s: edge %d: could not read its %d object(s) -- skipped (DIVERGENCE)", tag, eid, n or -1))
 			return
 		end
+		local autoSigObjects = {}
+		for _, obj in ipairs(objs) do autoSigObjects[#autoSigObjects+1] = obj[1] end
 		-- REPLACE: the object the originator's tool removed with this placement
 		local rm = nil
 		if c.rx then
-			local old, oldEid = CM.findStopNear(tonumber(c.rx), tonumber(c.ry), 2.0)
+			local old, oldEid = autoSigTarget, eid
+			if not autoSigTarget then old, oldEid = CM.findStopNear(tonumber(c.rx), tonumber(c.ry), 2.0) end
 			if old then
 				rm = { eo = old, eid = oldEid, x = tonumber(c.rx), y = tonumber(c.ry) }
 				local lines = CM.linesUsingStation(old)
@@ -708,11 +819,15 @@ function CM.execStopAdd(c)
 		end)
 		local okB, why = CM.nativeStopProposal(
 			{ eid = eid, u = u, left = engL, side = side, model = CM.unescName(c.model), name = CM.unescName(c.name),
-			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y, player = ownerPid },
+			  oneWay = tonumber(c.oneWay) == 1, x = c.x, y = c.y, player = ownerPid, autoSig = tonumber(c.autosigFollow) == 1 },
 			rm, string.format("%s origin=%s '%s'", tag, tostring(c.origin), CM.unescName(c.name)),
 			function(success, res)
 				CM.conxBusy = false
 				if success and ownerCid then pcall(CM.stopSettleOwner, c, res, ownerCid, ownerPid) end
+				if success and CM.autoSigAfterSeed then
+					local okAuto, whyAuto = pcall(CM.autoSigAfterSeed, c, {comp.node0, comp.node1}, autoSigObjects, engL)
+					if not okAuto then log("AutoSig planning failed: " .. tostring(whyAuto)) end
+				end
 			end)
 		if okB then sent = true else log(string.format("%s: %s -- skipped", tag, tostring(why))) end
 	end)
@@ -724,9 +839,11 @@ function CM.execStopDel(c)
 	local sent = false
 	local ok, err = pcall(function()
 		local tag = string.format("STOPDEL seq=%s", tostring(c.seq))
-		local best, eid = CM.findStopNear(c.x, c.y, 2.0)
+		local best, eid
+		if tonumber(c.autosigTarget) == 1 then best, eid = CM.autoSigResolveTarget(c)
+		else best, eid = CM.findStopNear(c.x, c.y, 2.0) end
 		if not best then
-			log(string.format("%s: no roadside stop within 2 m of %.1f,%.1f -- skipped", tag, c.x, c.y))
+			log(string.format("%s: no matching editable stop at %.1f,%.1f -- skipped", tag, c.x, c.y))
 			return
 		end
 		local lines = CM.linesUsingStation(best)

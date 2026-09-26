@@ -5,6 +5,7 @@
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
 - The host advertises the save's required mods. Missing mods are offered in a **Download Mods / Cancel** dialog; Cancel leaves the lobby. **Auto-accept mod downloads** in the multiplayer menu saves your choice for future joins and hotjoins. Downloads must be recognised by the game before it loads the save.
+- **Workshop mods come from the Workshop.** When your game runs on Steam, saying yes subscribes you to the missing Workshop mods and Steam downloads them; you stay subscribed afterwards. The host sends only its local (non-Workshop) mods, plus any Workshop item Steam cannot deliver: a hidden or removed item, Steam in offline mode, or a download that stops moving for two minutes. The mods are registered with the running game, so no restart is needed.
 - Deluxe and Early Supporter content are DLC, never transferred. Each player must have the required DLC installed.
   Per-save mod settings need nothing: they travel inside the save. The multiplayer mod itself
   (**Transport Fever 2 Multiplayer**) comes with the installer.
@@ -18,7 +19,8 @@
 
 The title menu gains a **Multiplayer** entry. It opens a panel over the menu:
 
-- **HOST A GAME**: a lobby name, the **HOST GAME** button and a **PUBLIC** checkbox.
+- **HOST A GAME**: a lobby name, the **HOST GAME** button and the **PUBLIC**, **SEPARATE COMPANIES**
+  and **CROSS-PLAY** checkboxes.
 - **JOIN A GAME**: a code field (click it to paste) and **JOIN GAME**.
 - **YOUR NAME** and an optional **PASSWORD**. Your name and lobby name are remembered; the first
   time you get a random two-word name.
@@ -35,6 +37,15 @@ While the panel is open, typing goes into its fields and the game does not see i
    **ROOM CODE** button copies it again). Send it to your friends, or tick **PUBLIC** to list the game.
    With a **password**, the code is locked: it is useless without the password, and a public row
    shows `[locked]`.
+
+   **The code is your Steam ID.** When your game runs on Steam, the code is your 17-digit SteamID64
+   (the number on your Steam profile) and players join you through Steam's networking only: no
+   ports, no IP address in the code. Your friends can also paste your Steam profile link.
+   **CROSS-PLAY** (on the host card, or in the lobby while you host) switches to the classic
+   letters-and-digits code instead. Anyone can join with that one, whether or not they run Steam:
+   GOG copies, Steam in offline mode, or a game started outside Steam. Switching it in the lobby
+   copies the new code, and players already in stay. A game that is not on Steam, and a dedicated
+   server, always use the classic code.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
 4. Click **SELECT SAVE** in the lobby and choose your world. The list includes autosaves,
@@ -162,9 +173,28 @@ to lock yours (switching into a locked company needs its password). A company is
 game's own company window; until then it is named after the player who founded it: "<player>'s
 company", then "<player>'s 2nd company" and so on, whoever plays it now.
 
+### AutoSig2
+
+With AutoSig2 enabled, its existing controls work through multiplayer replay:
+automatic placement with the selected spacing, **Replace** and **Remove**, and
+the **Forward/Backward** direction for those two modes. Place the initial signal
+as usual. Its settings are captured with the click; changing controls while the
+command is in flight does not change that action.
+
+The initial signal and its follow-up actions appear after the lockstep delay.
+Replace/remove follow AutoSig2's route rules, including its branch, station and
+route-length limits. As in AutoSig2, the temporary initial signal is removed in
+these modes. A replacement uses the selected model and one-way setting. Signals
+belonging to another company and waypoints are not editable AutoSig targets;
+a plan containing one is refused. A target changed before replay is skipped,
+never substituted with a nearby object.
+
+AutoSig2 must be installed and enabled separately; this adapter does not bundle
+or edit the Workshop mod. Every participant needs the same multiplayer build.
+
 ## Ports and firewalls
 
-- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code, and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in.
+- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code (it IS the code unless the host ticks **CROSS-PLAY**), and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in; a player without Steam needs the host to tick **CROSS-PLAY**.
 - **Most hosts need no port forwarding.** When a friend joins, both lobbies punch through
   their routers to each other with the help of the master server. The lobby also tries UPnP.
 - If friends still cannot connect, forward UDP 29471 to your PC on your router, or use a

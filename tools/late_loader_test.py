@@ -76,7 +76,9 @@ function newInst(spec)
   K.BARRIER_AHEAD = 8.0
   K.GAP_GRACE_TICKS = 3
   CM.peers, CM.ticks, CM.leader, CM.seqNo, CM.cfgCache, CM.queue = {}, 0, "a", 0, {}, {}
-  CM.cfgFlag = function(key, default) return default end
+  -- loadgate_roster: the pre-0.7 roster hold, now opt-in. The scenarios below
+  -- that wait for the roster run with it on; rosterHold = false is the default.
+  CM.cfgFlag = function(key, default) if key == "loadgate_roster" then return spec.rosterHold ~= false end return default end
   CM.broadcast = function(line) SIM.sent[#SIM.sent + 1] = line end
   CM.rxGaps = function() return SIM.gaps, 0, nil, nil end
   SIM.T = spec.T0
@@ -263,6 +265,28 @@ SIM.fs["mem://b/tpf2_bridge_ctl.txt"] = "players=2\nleader=b\n"
 tick(12, 1000.0)                       # the ctl is re-read every ~10 ticks
 check("the roster shrank to those heard: released", CM.lgReleased is True and CM.lgHolding is False and SIM.lever > 0
       and logged("every roster member is in (a) -- releasing"), f"lever={SIM.lever}")
+
+# ---- 0.7 default (live join): nobody waits for the roster ----
+rt = make()
+CM = rt.eval('newInst({ T0 = 1000.0, savedAt = 1000.0, lever = 2, rosterHold = false, ctl = "players=3\\nleader=b\\n" })')
+tick, sent, logged, SIM = rt.globals().tick, rt.globals().sentMatching, rt.globals().logged, rt.globals().SIM
+tick(3)
+check("default: the leader (a dedicated server) does not wait for members still loading",
+      CM.lgReleased is True and CM.lgHolding is not True and SIM.lever == 2, f"lever={SIM.lever}")
+check("...and says they catch up when they arrive",
+      logged("2 of 2 other roster member(s) still loading (heard: nobody) -- not waiting: they catch up when they arrive"))
+
+rt = make()
+CM = rt.eval('newInst({ T0 = 1000.0, savedAt = 1000.0, lever = 2, rosterHold = false })')
+tick, sent, logged, SIM = rt.globals().tick, rt.globals().sentMatching, rt.globals().logged, rt.globals().SIM
+tick(13)                               # the reason is logged every 12 ticks
+check("default: a joiner still waits for the leader", CM.lgHolding is True and SIM.lever == 0 and logged("the leader (a) has not been heard"))
+tick(2, 1000.0)
+SIM.gaps = 0
+CM.histEndSeen = True
+tick(3, 1000.0)
+check("default: leader heard and history complete -- released although another member is still loading",
+      CM.lgReleased is True and CM.lgHolding is not True and SIM.lever == 2 and logged("not waiting"), f"lever={SIM.lever}")
 
 # ---- the catch-up feed of a live game far behind: bound by progress, never by a clock ----
 rt = make()

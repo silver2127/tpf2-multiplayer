@@ -7,7 +7,7 @@
 
 namespace slice_vehicles {
 constexpr uintptr_t kBuy = 0x15ef3b0, kSell = 0x15ecf00, kReplace = 0x15ef8c0;
-constexpr uintptr_t kDepot = 0x15ec220, kReverse = 0x15ebe00;
+constexpr uintptr_t kDepot = 0x15ec220, kReverse = 0x15ebe00, kStopped = 0x15ebf00;
 
 static bool IntVector(SliceRecord* rec, uintptr_t address, bool requireOne = false)
 {
@@ -145,6 +145,10 @@ static void OnFactory(const SliceFactoryCall& c, void*)
             what = "VDEPOT";
             SliceRecordPrintf(&rec, "VDEPOT %d %d", entity, int(c.rcx & 1));
             break;
+        case kStopped:
+            what = "VSTOP";
+            SliceRecordPrintf(&rec, "VSTOP %d %d", entity, int(c.rcx & 1));
+            break;
         case kReverse:
             what = "VREV";
             SliceRecordPrintf(&rec, "VREV %d", entity);
@@ -173,6 +177,6 @@ static void OnFactory(const SliceFactoryCall& c, void*)
 SLICE_AREA(slice_vehicles_area, "slice-vehicles")
 {
     using namespace slice_vehicles;
-    for (uintptr_t rva : {kBuy, kSell, kReplace, kDepot, kReverse})
+    for (uintptr_t rva : {kBuy, kSell, kReplace, kDepot, kReverse, kStopped})
         SliceOnFactory({"slice-vehicles", rva, OnFactory, nullptr, nullptr, true, 0});
 }

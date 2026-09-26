@@ -49,6 +49,37 @@ function data()
 	local result = { }
 	local a = ssu.makeAdder(result)
 
+	-- Native in-game dashboard: scoped classes leave every stock window alone.
+	-- The engine supplies transparency, local background blur and the window shadow.
+	a("Window!mpDashWindow", { backgroundColor = ssu.makeColor(5, 25, 40, 175) })
+	a("!mpDashBody", { padding = { 0, 14, 10, 14 }, minSize = { 520, -1 } })
+	a("!mpDashBody > BoxLayout", { innerSpacing = { 0, 6 } })
+	a("!mpDashBody TextView", { fontSize = 13 })
+	a("!mpDashBody Button", { padding = { 4, 8, 4, 8 }, backgroundColor = ssu.makeColor(0, 0, 0, 0) })
+	a("!mpDashBody Button:hover", { backgroundColor = ssu.makeColor(255, 255, 255, 35) })
+	a("!mpDashBody Button:active", { backgroundColor = ssu.makeColor(255, 255, 255, 65) })
+	a("!mpDashTabs Button!mpDashTab", {
+		padding = { 4, 8, 4, 8 }, borderWidth = { 0, 0, 2, 0 }, borderColor = ssu.makeColor(255, 255, 255, 0)
+	})
+	a("!mpDashTabs Button!mpDashSelected", { borderColor = ssu.makeColor(255, 255, 255, 210) })
+	a("!mpDashSection", { padding = { 10, 0, 8, 0 }, minSize = { -1, 120 } })
+	a("!mpDashSection BoxLayout", { innerSpacing = { 8, 6 } })
+	a("!mpDashBody TextView!mpDashChatLog", { padding = { 10, 12, 10, 12 }, minSize = { 492, 144 }, backgroundColor = ssu.makeColor(0, 0, 0, 50) })
+	a("!mpDashBody Button!mpDashPrimary", { backgroundColor = ssu.makeColor(45, 90, 120, 180) })
+	a("!mpDashTable", { backgroundColor = ssu.makeColor(0, 0, 0, 40) })
+	a("!mpDashTable TextView", { padding = { 5, 10, 5, 10 } })
+	a("!mpDashFooter", { padding = { 8, 0, 0, 0 }, borderWidth = { 1, 0, 0, 0 }, borderColor = ssu.makeColor(255, 255, 255, 22) })
+	a("!mpDashFooter TextView", { fontSize = 12, color = ssu.makeColor(190, 205, 218) })
+	a("!mpDashBody TextView!mpDashAlert", { padding = { 8, 10, 8, 10 }, backgroundColor = ssu.makeColor(130, 75, 10, 130) })
+
+	a("!mpDashBody TextView", { padding = { 3, 4, 3, 4 } })
+	a("!mpDashTabs TextView", { padding = { 4, 8, 4, 8 }, fontSize = 13 })
+	a("!mpDashShell > BoxLayout", { innerSpacing = { 0, 0 } })
+	a("!mpDashCompact", { padding = { 2, 6, 5, 6 }, minSize = { 220, -1 } })
+	a("!mpDashCompact Button", { padding = { 3, 8, 3, 8 }, backgroundColor = ssu.makeColor(255, 255, 255, 12) })
+	a("!mpDashCompact Button:hover", { backgroundColor = ssu.makeColor(255, 255, 255, 35) })
+	a("!mpDashCompact TextView", { fontSize = 12, padding = { 3, 5, 3, 5 } })
+
 	-- 1. the glyph overlay per carrier (image2 + a white default so untinted = unchanged)
 	for _, c in ipairs(STATION_CARRIERS) do
 		a("StationItem::StationIcon!" .. classFor(c), {

@@ -111,6 +111,8 @@ void Start(const std::string& path,bool ready) {
     if(running.exchange(true))return;
     directory=path; if(!directory.empty()&&directory.back()!='/')directory+='/';
     supported=ready; initial=Read("tpf2_native_request.txt")["id"];
+    if (Read("tpf2_sync_lua.txt")["pid"] == std::to_string(getpid()))
+        Write("tpf2_sync_lua.txt", "");
     try {std::thread(Work).detach();}catch(...){running=false;}
 }
 void SignalShutdown(){running=false;}

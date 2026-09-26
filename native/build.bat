@@ -15,7 +15,8 @@ REM                                      setPlayer on any entity)
 REM   host    tpf2_pluginhost.dll        the plugin host shared with TpF2 Big Maps;
 REM                                      rebuilds alut.dll too (the host adds to what
 REM                                      the proxy loads)
-REM   all     proxy, host, menu, slice -- in that order
+REM   bigmap  bigmap\out\tpf2_bigmap.dll  the Big Maps plugin (bigmap\build.bat)
+REM   all     proxy, host, menu, slice, workshop, bigmap -- in that order
 REM   previews  optional tpf2_previews.dll plugin; not included in all/deployment
 REM
 REM Optional suffix (slice / menu / host): a DLL an instance has loaded stays locked
@@ -35,7 +36,12 @@ if /i "%T%"=="host"  goto run
 if /i "%T%"=="workshop" goto run
 if /i "%T%"=="previews" goto run
 if /i "%T%"=="all"   goto run
-echo usage: build.bat slice^|menu^|proxy^|host^|workshop^|previews^|all [suffix]
+REM Big Maps has its own script (it finds MSVC itself); a suffix is not supported
+if /i "%T%"=="bigmap" (
+    call "%~dp0..\bigmap\build.bat" || exit /b 1
+    exit /b 0
+)
+echo usage: build.bat slice^|menu^|proxy^|host^|workshop^|previews^|bigmap^|all [suffix]
 exit /b 2
 
 :run
@@ -49,6 +55,8 @@ if /i "%T%"=="all" (
     call :menu  || exit /b 1
     call :slice || exit /b 1
     call :workshop || exit /b 1
+    call "%~dp0..\bigmap\build.bat" || exit /b 1
+    cd /d "%~dp0"
     echo BUILD ALL OK
     exit /b 0
 )
@@ -62,7 +70,8 @@ exit /b 0
 ml64 /nologo /c /Fo out\deferrelay_slice.obj src\deferrelay_slice.asm                || exit /b 1
 ml64 /nologo /c /Fo out\trainorderrelay_slice.obj src\trainorderrelay_slice.asm      || exit /b 1
 ml64 /nologo /c /Fo out\moveorderrelay_slice.obj src\moveorderrelay_slice.asm        || exit /b 1
-link /nologo /DLL /OUT:out\tpf2_slice%SFX%.dll out\hook_slice.obj out\slice_hook.obj out\deferrelay_slice.obj out\trainorderrelay_slice.obj out\moveorderrelay_slice.obj || exit /b 1
+ml64 /nologo /c /Fo out\hotjoinrelay_slice.obj src\hotjoinrelay_slice.asm          || exit /b 1
+link /nologo /DLL /OUT:out\tpf2_slice%SFX%.dll out\hook_slice.obj out\slice_hook.obj out\deferrelay_slice.obj out\trainorderrelay_slice.obj out\moveorderrelay_slice.obj out\hotjoinrelay_slice.obj || exit /b 1
 exit /b 0
 
 :workshop
@@ -95,7 +104,7 @@ exit /b 0
 %CC% /c src\setplayer_patch.cpp /Fo:out\setplayer_patch_mp.obj                       || exit /b 1
 ml64 /nologo /c /Fo out\cgamesteprelay_mp.obj src\cgamesteprelay.asm                 || exit /b 1
 ml64 /nologo /c /Fo out\setplayerrelay_mp.obj src\setplayerrelay.asm                 || exit /b 1
-%CC% /c src\bridge_main.cpp /Fo:out\bridge_mp.obj                                    || exit /b 1
+%CC% /c src\bridge_main.cpp /Fo:out\bridge_mp.obj                                    || exit /b 1
 %CC% /c src\steam_tunnel.cpp /Fo:out\steam_tunnel_mp.obj                             || exit /b 1
 link /nologo /DLL /OUT:out\tpf2_bridge_mp.dll out\net_mp.obj out\hook_mp.obj out\speedhook_mp.obj out\setplayer_patch_mp.obj out\setplayerrelay_mp.obj out\cgamesteprelay_mp.obj out\bridge_mp.obj out\steam_tunnel_mp.obj || exit /b 1
 %CC% /LD src\proxy_alut.cpp /Fe:out\alut.dll /Fo:out\proxy_alut.obj                  || exit /b 1

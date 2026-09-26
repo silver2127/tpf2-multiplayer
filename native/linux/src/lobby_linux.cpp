@@ -111,7 +111,7 @@ static const size_t CHAT_LINES = 14;
 static const int QUIT_WAIT_MS = 1500;           // menu_hook.cpp TeardownLobby
 static const int TERM_WAIT_MS = 2000;           // NETPUNCH.md 3.4
 static const uint64_t PUB_EVERY_MS = 10000;     // a third of the master's 30 s TTL
-static const int PUB_ROWS = 8;
+static const int PUB_ROWS = 48;
 static const int PUB_TIMEOUT_MS = 20000;        // the program's own GET gives up after 5 s (name lookup aside)
 // What chat, START GAME, PUBLIC and the mods answer say to a dead lobby
 // (Model::dead), in place of "Lobby is starting...", which would replace the
@@ -130,10 +130,13 @@ struct Model {
     bool saveReady = false;    // joiner: save_ready this session
     bool lobbyDone = false;    // the shared save is placed
     bool relay = false;
+    bool crossplay = false, hostSteam = false;
     bool separateCompanies = false;
     bool haveCode = false;
     std::string code, you, host, title, modsPrompt;
+    std::string transferDetail,transferHint;
     std::string xfer;          // xfer= for the in-game window
+    std::string transportLobby; // session nonce from transport_lobby; reset with Model
     std::string speedReq;      // speed= from "/speed"
     int syncReq = 0;           // sync= from "/sync"
     std::string startSave;     // host: the save START GAME shared
@@ -141,7 +144,7 @@ struct Model {
     std::string selectedSave;
     bool startPending=false;
     std::string recoveryPhase,recoveryDetail,recoveryStep,recoveryOperation,readyToken;
-    bool recoveryPresent=false,readyMine=false;
+    bool recoveryHidden=false,recoveryPresent=false,readyMine=false;
     int readyCount=0,readyTotal=0;
     uint64_t recoveryVersion=0,recoveryRequestedAt=0;
     std::vector<std::string> players, stages;
@@ -218,6 +221,7 @@ static std::atomic<bool> g_pubStarted{false};   // the public list's thread runs
 static std::atomic<bool> g_autoCopy{false};
 static std::atomic<bool> g_captures{true};
 static std::atomic<bool> g_titleMenu{false};
+static std::atomic<bool> g_loadingStagePending{false};
 static std::atomic<bool> g_gameUiSeen{false};
 static std::atomic<bool> g_logsBusy{false};
 static std::atomic<pid_t> g_childPid{0};
@@ -956,7 +960,7 @@ static bool ValidLetter(const std::string& s)
 static void WriteBridgeCtl(bool isHost)
 {
     const unsigned long bpid = ReadBridgePid();
-    std::string letter = "a", leader = "a", speed, xfer;
+    std::string letter = "a", leader = "a", speed, xfer, transportLobby;
     int count, port, sync;
     {
         std::lock_guard<std::mutex> lk(S().mtx);
@@ -976,6 +980,7 @@ static void WriteBridgeCtl(bool isHost)
         }
         count = (int)m.players.size();
         port = m.relayPort ? m.relayPort : (isHost ? GAME_RELAY_PORT_HOST : GAME_RELAY_PORT_JOIN);
+        transportLobby = m.transportLobby;
         speed = m.speedReq;
         sync = m.syncReq;
         xfer = m.xfer;
@@ -983,6 +988,7 @@ static void WriteBridgeCtl(bool isHost)
     }
     std::string content = "instance=" + letter + "\npeer=127.0.0.1:" + std::to_string(port) + "\npid=" + std::to_string(bpid)
                         + "\nplayers=" + std::to_string(count) + "\n";
+    if (!transportLobby.empty()) content += "lobby=" + transportLobby + "\n";
     if (!speed.empty()) content += "speed=" + speed + "\n";
     if (sync) content += "sync=" + std::to_string(sync) + "\n";
     if (!xfer.empty()) content += "xfer=" + xfer + "\n";
@@ -1124,6 +1130,7 @@ static void MarkSaveShared(const std::string& path)
 }
 static void ReportStage(const std::string& text)
 {
+    Status(text.empty() ? "World loaded. Session running." : text);
     if (text == S().stageSent) return;
     AppendIn("{\"cmd\":\"stage\",\"text\":\"" + JsonEscape(text) + "\"}");
     S().stageSent = text;
@@ -1136,6 +1143,7 @@ static void ArmStageWatch(const std::string& text)
 }
 static void StageTick()
 {
+    if (g_loadingStagePending.exchange(false)) ArmStageWatch("loading world");
     const uint64_t now=NowMs();
     if (!S().stageWatch || now<S().stageNext) return;
     S().stageNext=now+1000;
@@ -1144,7 +1152,7 @@ static void StageTick()
         S().stageSawLoad=true;
         ReportStage("loading world "+std::to_string(pct)+"%"); return;
     }
-    if (!InGame()) { S().stageSawLoad=true; return; }
+    if (!InGame()) { S().stageSawLoad=true; ReportStage("loading world"); return; }
     // A switch's previous world may still be stepping with an old status file.
     if (S().stageArmedInWorld && !S().stageSawLoad && now-S().stageArmedAt<20000) return;
     std::string status;
@@ -1241,8 +1249,19 @@ static void SyncPoll()
     PollWorldGen();
     const std::string req = S().cfg.dataDir + "tpf2_sync_save.txt";
     if (Exists(req)) {
-        unlink(req.c_str());
-        SyncStart("sync request (chat or button)");
+        // The lobby asks once when a member joins during the host's load.
+        // Keep the request until the existing game-UI callback reports ready.
+        static bool waitingNoted = false;
+        if (!g_gameUiSeen.load()) {
+            if (!waitingNoted) {
+                waitingNoted = true;
+                Log("[sync] sync request before the game is running -- kept until it is\n");
+            }
+        } else {
+            waitingNoted = false;
+            unlink(req.c_str());
+            SyncStart("sync request (chat or button)");
+        }
     }
     if (!S().syncAskedAt) return;
     std::string cur;
@@ -1590,6 +1609,7 @@ static void Dispatch(const std::string& line)
                 m.recoveryOperation=JStr(ev,"operation");m.recoveryPhase=phase;
                 m.recoveryDetail=OneLine(JStr(ev,"detail"));m.recoveryStep=JStr(ev,"step");
                 m.recoveryPresent=phase!="complete";
+                if(phase=="complete" || phase=="error")m.recoveryHidden=false;
                 if(phase=="complete") {m.lobbyDone=true;m.startPending=false;g_captures=true;}
             } else if(ty=="sync_feedback")m.recoveryDetail=OneLine(JStr(ev,"detail"));
             else if(ty=="sync_ready_state") {
@@ -1597,6 +1617,7 @@ static void Dispatch(const std::string& line)
                     m.recoveryPhase="readiness";m.recoveryPresent=true;m.readyToken=JStr(ev,"token");
                     m.readyCount=JInt(ev,"ready_count",0);m.readyTotal=JInt(ev,"total",0);m.readyMine=JInt(ev,"is_ready",0)!=0;
                     m.recoveryDetail.clear();
+                    if(!m.readyMine)m.recoveryHidden=false;
                 } else if(m.recoveryPhase=="readiness") {
                     m.recoveryPhase=phase=="cancelled"?(JStr(ev,"kind")=="sync_retry"?"error":"detected"):"holding";
                     if(phase=="cancelled")m.recoveryDetail="The player list changed. Request readiness again.";
@@ -1604,6 +1625,7 @@ static void Dispatch(const std::string& line)
             } else {
                 const bool idle=m.recoveryPhase.empty()||m.recoveryPhase=="complete"||m.recoveryPhase=="detected"||m.recoveryPhase=="unavailable";
                 if(idle) {
+                    m.recoveryHidden=false;
                     m.recoveryPhase=phase=="clear"?"":phase;m.recoveryPresent=phase!="clear";
                     m.recoveryDetail.clear();m.recoveryStep.clear();
                 }
@@ -1632,12 +1654,26 @@ static void Dispatch(const std::string& line)
         Status("Room code ready -- move the mouse over the game to copy it.");
         {
             std::lock_guard<std::mutex> lk(S().mtx);
+            S().m.crossplay = JBool(ev, "crossplay", true);
+            S().m.hostSteam = !JStr(ev, "steam").empty();
             S().m.code = cd;
             S().m.haveCode = true;
         }
         g_autoCopy = true;   // the panel copies it on the UI thread, then says so
         Log("[lobby] room code received (%zu chars, not logged)\n", cd.size());
         Dirty();
+    } else if (ty == "transport_lobby") {
+        const std::string epoch = JStr(ev, "epoch");
+        if (epoch.size() != 32 || epoch.find_first_not_of("0123456789abcdef") != std::string::npos) return;
+        bool isHost;
+        {
+            std::lock_guard<std::mutex> lk(S().mtx);
+            S().m.transportLobby = epoch;
+            isHost = S().m.isHost;
+        }
+        // Keep the nonce in Model even if this first write fails. Every later
+        // roster/start/speed rewrite must preserve the same bridge world.
+        WriteBridgeCtl(isHost);
     } else if (ty == "roster") {
         ApplyRoster(ev);
     } else if (ty == "chat") {
@@ -1662,17 +1698,27 @@ static void Dispatch(const std::string& line)
         std::string msg, xfer;
         bool setX = false;
         const std::string p = std::to_string(pct) + "%";
-        if (role == "recv") {
-            if (pct >= 0) { msg = "Receiving save\xE2\x80\xA6 " + p; xfer = "receiving " + p; setX = true; }
-        } else if (st == "done") {
-            msg = toRelay ? "Save uploaded to the relay." : "Save sent.";
-            setX = true;
-        } else if (!st.empty()) {
-            setX = true;
-        } else if (pct >= 0) {
-            msg = (toRelay ? "Uploading save to the relay\xE2\x80\xA6 " : "Sending save\xE2\x80\xA6 ") + p;
-            xfer = (toRelay ? "uploading " : "sending ") + p;
-            setX = true;
+        const std::string detail=Cap(OneLine(JStr(ev,"detail")),300);
+        const std::string hint=Cap(OneLine(JStr(ev,"hint")),300);
+        {
+            std::lock_guard<std::mutex> lk(S().mtx);
+            if(st=="done" || (!st.empty() && st!="tcp")) {
+                S().m.transferDetail.clear(); S().m.transferHint.clear();
+            } else if(st.empty() && !detail.empty()) {
+                S().m.transferDetail=detail; S().m.transferHint=hint;
+            }
+        }
+        if(st=="done") {
+            msg=InGame()?"Game running. New players can join this lobby.":"Save transfer complete.";
+            setX=true;
+        } else if(st.empty() && !detail.empty()) {
+            msg=detail; xfer=detail; setX=true;
+        } else if(!st.empty()) {
+            if(st!="tcp")msg=detail;
+            setX=true;
+        } else if(pct>=0) {
+            msg=(role=="recv"?"Receiving save... ":toRelay?"Uploading save to the relay... ":"Sending save... ")+p;
+            xfer=msg;setX=true;
         }
         if (pct >= 100) { xfer.clear(); setX = true; }
         bool isHost;
@@ -1894,6 +1940,7 @@ static void Launch(const Request& r)
         if (a.localPort > 0) argv.push_back("--local-port=" + std::to_string(a.localPort));
         argv.push_back("--lobby-name=" + a.lobbyName);
         if (a.separateCompanies) argv.push_back("--companies");
+        if (a.crossplay) argv.push_back("--crossplay");
         if (!S().cfg.masterUrl.empty()) {
             argv.push_back("--publish=" + S().cfg.masterUrl);
             if (a.pub) argv.push_back("--public");
@@ -2042,6 +2089,41 @@ static void DedicatedAutosaveTick(uint64_t now, uint64_t worldSince, uint64_t& l
     }
 }
 
+// Restart the placed world when its own autosave is newer than the configured
+// seed. Keep the existing newest-save fallback when that seed is absent.
+static std::string DedicatedStartupSave(const std::string& configured)
+{
+    const std::string directory = MenuGame_SaveDir();
+    std::string save;
+    if (!configured.empty()) {
+        save = directory + "/" + configured + ".sav";
+        if (!Exists(save)) {
+            Log("[dedicated] %s absent; trying newest save\n", save.c_str());
+            save.clear();
+        } else {
+            uint64_t bestTime = MtimeNs(save, nullptr);
+            const std::string seed = save;
+            if (DIR* scan = opendir(directory.c_str())) {
+                while (const dirent* entry = readdir(scan)) {
+                    const std::string name = entry->d_name;
+                    if (name.find("autosave_mp_shared") != 0 || name.size() < 4 ||
+                        name.compare(name.size() - 4, 4, ".sav") != 0) continue;
+                    const std::string candidate = directory + "/" + name;
+                    struct stat st;
+                    if (stat(candidate.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) continue;
+                    const uint64_t modified = MtimeNs(candidate, nullptr);
+                    if (modified > bestTime) { bestTime = modified; save = candidate; }
+                }
+                closedir(scan);
+            }
+            if (save != seed)
+                Log("[dedicated] %s is newer than the configured save -- resuming that world\n", save.c_str());
+        }
+    }
+    if (save.empty()) MenuGame_NewestSave(&save);
+    return save;
+}
+
 static void DedicatedTick()
 {
     const auto& d = S().cfg.dedicated;
@@ -2081,12 +2163,8 @@ static void DedicatedTick()
         if (!ready || MenuGame_Loading() || NativeIo::Busy() || now - menuSince < 45000 ||
             (lastLoad && now - lastLoad < 60000)) return;
         lastLoad = now;
-        std::string save;
-        if (!d.save.empty()) {
-            save = MenuGame_SaveDir() + "/" + d.save + ".sav";
-            if (!Exists(save)) { Log("[dedicated] %s absent; trying newest save\n", save.c_str()); save.clear(); }
-        }
-        if (save.empty() && !MenuGame_NewestSave(&save)) {
+        const std::string save = DedicatedStartupSave(d.save);
+        if (save.empty()) {
             Log("[dedicated] no save to load in %s\n", MenuGame_SaveDir().c_str()); return;
         }
         { std::lock_guard<std::mutex> lk(S().mtx); S().m.startSave = save; }
@@ -2169,6 +2247,31 @@ static void LobbyThread()
 // The lobby program fetches <master_url>/list (NETPUNCH.md 3.6): exit 0 with
 // the body on stdout, or exit 1 with one line saying why ("HTTP 503"). No HTTP
 // or TLS in the game process.
+static bool ParsePublic(const std::string& body, std::vector<PubRow>* rows, std::string* note)
+{
+    Json doc;
+    if (!ParseJson(body, &doc) || doc.type != Json::Obj) { *note = "Server browser unavailable (unreadable list)"; return false; }
+    if (const Json* sv = doc.Get("servers"))
+        for (const Json& o : sv->items) {
+            if ((int)rows->size() >= PUB_ROWS) break;
+            if (o.type != Json::Obj) continue;
+            PubRow row;
+            row.code = JStr(o, "code");
+            if (row.code.empty() || row.code.size() > 255) continue;
+            row.name = Cap(OneLine(JStr(o, "name")), 127);
+            row.game = Cap(OneLine(JStr(o, "game")), 63);
+            row.type = Cap(OneLine(JStr(o, "type")), 15);
+            row.version = Cap(OneLine(JStr(o, "version")), 23);
+            row.players = (int)JInt(o, "players", 0);
+            row.max = (int)JInt(o, "max", 8);
+            row.age = (int)JInt(o, "age", 0);
+            row.locked = JInt(o, "locked", 0) != 0;
+            rows->push_back(row);
+        }
+    if (rows->empty()) *note = "No public games right now.";
+    return true;
+}
+
 static bool FetchPublic(std::vector<PubRow>* rows, std::string* note)
 {
     Program prog;
@@ -2253,27 +2356,7 @@ static bool FetchPublic(std::vector<PubRow>* rows, std::string* note)
         *note = "Server browser unavailable (" + Cap(OneLine(why), 80) + ")";
         return false;
     }
-    Json doc;
-    if (!ParseJson(body, &doc) || doc.type != Json::Obj) { *note = "Server browser unavailable (unreadable list)"; return false; }
-    if (const Json* sv = doc.Get("servers"))
-        for (const Json& o : sv->items) {
-            if ((int)rows->size() >= PUB_ROWS) break;
-            if (o.type != Json::Obj) continue;
-            PubRow row;
-            row.code = JStr(o, "code");
-            if (row.code.empty() || row.code.size() > 255) continue;
-            row.name = Cap(OneLine(JStr(o, "name")), 127);
-            row.game = Cap(OneLine(JStr(o, "game")), 63);
-            row.type = Cap(OneLine(JStr(o, "type")), 15);
-            row.version = Cap(OneLine(JStr(o, "version")), 23);
-            row.players = (int)JInt(o, "players", 0);
-            row.max = (int)JInt(o, "max", 8);
-            row.age = (int)JInt(o, "age", 0);
-            row.locked = JInt(o, "locked", 0) != 0;
-            rows->push_back(row);
-        }
-    if (rows->empty()) *note = "No public games right now.";
-    return true;
+    return ParsePublic(body, rows, note);
 }
 
 static void PubThread()
@@ -2356,7 +2439,11 @@ bool Start(const StartRequest& in, std::string* why)
         r.code = b == std::string::npos ? std::string() : r.code.substr(b, e - b + 1);
         if (r.code.size() < 8) { *why = "Paste or type your host's code in the field first."; return false; }
         // it becomes an argument: a crafted "code" must not smuggle options in
-        if (r.code.size() > 200 || !Base32Code(r.code)) { *why = "That is not a valid code (letters A-Z and digits 2-7 only)."; return false; }
+        while (!r.code.empty() && r.code.back() == '/') r.code.pop_back();
+        for (const std::string prefix : {"https://steamcommunity.com/profiles/", "http://steamcommunity.com/profiles/", "steamcommunity.com/profiles/"})
+            if (r.code.compare(0, prefix.size(), prefix) == 0) { r.code.erase(0, prefix.size()); break; }
+        const bool steamId = r.code.size() == 17 && r.code.find_first_not_of("0123456789") == std::string::npos;
+        if (r.code.size() < 8 || r.code.size() > 200 || (!steamId && !Base32Code(r.code))) { *why = "That is not a valid code (Steam ID or classic base32 code)."; return false; }
     }
     if (r.name.empty()) { *why = "Type a player name first."; return false; }
     if (!g_inited.load()) {
@@ -2372,6 +2459,7 @@ bool Start(const StartRequest& in, std::string* why)
         fresh.active = true;
         fresh.isHost = !r.join;
         fresh.separateCompanies = !r.join && r.separateCompanies;
+        fresh.crossplay = r.crossplay;
         S().m = fresh;
         gen = fresh.gen;
     }
@@ -2449,14 +2537,29 @@ std::string RecoveryAction(const std::string& command) {
     uint64_t gen;std::string operation,token;
     {
         std::lock_guard<std::mutex> lk(S().mtx);auto& m=S().m;
+        // These are local view actions, including while a request is pending.
+        if(command=="sync_show") {m.recoveryHidden=false;return {};}
+        if(command=="sync_hide") {
+            const auto& p=m.recoveryPhase;
+            const bool notice=p.empty()||p=="manual"||p=="detected"||p=="unavailable"||p=="complete";
+            m.recoveryHidden=!notice;
+            if(notice)m.recoveryPresent=false;
+            return {};
+        }
         if(!m.active||m.dead)return kNotRunning;
         if(m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000)return "Waiting for the lobby...";
-        if(command=="sync_ready") {
+        if(command=="sync_dismiss") {
+            if(!(m.recoveryPhase.empty() || m.recoveryPhase=="manual" || m.recoveryPhase=="detected" || m.recoveryPhase=="unavailable" || m.recoveryPhase=="complete"))return "A world operation is already running.";
+            m.recoveryPresent=false;m.recoveryHidden=false;return {};
+        }
+        if(command=="sync_decline") {
+            if(!m.isHost || m.recoveryPhase!="detected")return "Only the host can decline a detected resync.";
+        } else if(command=="sync_ready") {
             if(m.recoveryPhase!="readiness"||m.readyMine)return "Readiness is already confirmed.";
         } else if(command=="sync_request"||command=="sync_retry") {
             if(!m.isHost)return "Only the host can request a resync.";
             const auto& phase=m.recoveryPhase;
-            if(command=="sync_retry" ? phase!="error" : !(phase.empty()||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))
+            if(command=="sync_retry" ? phase!="error" : !(phase.empty()||phase=="manual"||phase=="complete"||phase=="detected"||phase=="waiting"||phase=="aborted"))
                 return "A world operation is already running.";
         } else return "Unknown recovery action.";
         m.recoveryRequestedAt=NowMs();m.recoveryDetail.clear();operation=m.recoveryOperation;token=m.readyToken;gen=m.gen;
@@ -2478,6 +2581,20 @@ std::string SetSeparateCompanies(bool on)
     }
     QueueLine(gen, on ? "{\"cmd\":\"mode\",\"mode\":\"companies\"}" : "{\"cmd\":\"mode\",\"mode\":\"coop\"}");
     return on ? "Separate companies: every player gets their own company." : "Co-op: everyone plays company 1 together.";
+}
+
+std::string SetCrossplay(bool on)
+{
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(S().mtx);
+        if (!S().m.active || !S().m.isHost) return "Only the host can change the cross-play mode.";
+        if (S().m.dead) return kNotRunning;
+        if (!S().m.lobbyReady) return "Lobby is starting...";
+        gen = S().m.gen;
+    }
+    QueueLine(gen, on ? "{\"cmd\":\"crossplay\",\"on\":true}" : "{\"cmd\":\"crossplay\",\"on\":false}");
+    return "Join code switch requested.";
 }
 
 std::string SetPublic(bool on)
@@ -2560,13 +2677,17 @@ bool CapturesTyping() { return g_captures.load(std::memory_order_relaxed); }
 
 void Snapshot(View* v)
 {
+    v->worldIo=NativeIo::Busy();
     std::lock_guard<std::mutex> lk(S().mtx);
     const Model& m = S().m;
+    v->transferDetail=m.transferDetail;v->transferHint=m.transferHint;
     v->recoveryPhase=m.recoveryPhase;v->recoveryDetail=m.recoveryDetail;v->recoveryStep=m.recoveryStep;
-    v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
-    v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
+    v->lobbyReady=m.lobbyReady;v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
+    v->recoveryHidden=m.recoveryHidden;v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
     v->readyMine=m.readyMine;v->readyCount=m.readyCount;v->readyTotal=m.readyTotal;v->recoveryVersion=m.recoveryVersion;
     v->saves=m.saves;v->selectedSave=m.selectedSave;v->startPending=m.startPending;
+    v->crossplay = m.crossplay;
+    v->hostSteam = m.hostSteam;
     v->separateCompanies = m.separateCompanies;
     v->haveCode = m.haveCode;
     v->isHost = m.isHost;
@@ -2679,7 +2800,9 @@ bool OpenLogs()
 
 void OnMenuPage(int page)
 {
+    if (page == 16 && g_childPid.load()) g_loadingStagePending = true;
     if (page == 2) {
+        g_loadingStagePending = false;
         g_titleMenu = true;
         // the title menu exists only when no game runs: forget the last session's
         // CGameUI, or a start at the title menu would look like one in a game

@@ -42,8 +42,11 @@ int main() {
     HANDLE held=CreateFileA(event,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr);
     assert(held!=INVALID_HANDLE_VALUE);
     {std::ofstream f("tpf2_native_request.txt",std::ios::binary);f<<"pid="<<GetCurrentProcessId()<<"\nid=stale\ncmd=pause\n";}
+    // an earlier process's failed recovery, with our pid (Wine reuses it every run)
+    {std::ofstream f("tpf2_sync_lua.txt",std::ios::binary);f<<"operation=d32f09d477f361325ba205f75993bca5\nepoch=e7c4db8731ca28e50d004275be489f7c\nrevision=1\nphase=error\nresume_speed=0\npid="<<GetCurrentProcessId()<<"\n";}
     NativeControl::Start(L".",true);
     Sleep(150); assert(pauses==0);
+    assert(read("tpf2_sync_lua.txt").empty());   // emptied at start: the mod must not hold on it
     {std::ofstream f("tpf2_native_request.txt",std::ios::binary);f<<"pid="<<GetCurrentProcessId()<<"\nid=once\ncmd=pause\n";}
     waitFor([]{return pauses==1;});
     Sleep(300);
@@ -58,7 +61,7 @@ int main() {
     waitFor([&]{return read(event).find("step=paused\nsuccess=1")!=std::string::npos;});
     assert(pauses==1); // completion was repeated, never the engine command
     NativeControl::SignalShutdown(); Sleep(200);
-    puts("PASS: native completion survives Windows sharing violation without repeating engine command");
+    puts("PASS: native completion survives Windows sharing violation without repeating engine command; an earlier process's recovery record is emptied at start");
 }
 '''
 code = code.replace('NATIVE_IO', (root/'native/src/native_io.h').as_posix())

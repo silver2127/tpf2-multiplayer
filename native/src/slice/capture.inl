@@ -104,6 +104,9 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
     } else if (fid == 10) {
         fprintf(f, "VREV %d\n", (int)(int32_t)r8);
         Log("[slice] VREV shipped: vehicle=%d\n", (int)(int32_t)r8);
+    } else if (fid == 18) {
+        fprintf(f, "VSTOP %d %d\n", (int)(int32_t)r8, (int)(r9 & 1));
+        Log("[slice] VSTOP shipped: vehicle=%d stopped=%d\n", (int)(int32_t)r8, (int)(r9 & 1));
     } else if (fid == 13) {
         // SetColor(entity, Vec3f const&): r9 points at three floats, 0..1 each.
         float col[3] = { -1.0f, -1.0f, -1.0f };
@@ -288,7 +291,8 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
     // of this list meant the hook CAPTURED a rename -- '[cap] SetName' is in
     // the log -- and then wrote nothing, so renaming a line looked like a
     // replication failure when it never reached the wire at all.
-    if ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14) {
+    // 18 (SetUserStopped) is SendToDepot's shape and takes its route.
+    if ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14 || f.id == 18) {
         bool luaPath = IsScriptCaller(caller);
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",

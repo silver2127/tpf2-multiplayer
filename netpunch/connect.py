@@ -212,11 +212,49 @@ def encode_profile(profile, secret=None, password=None):
     return base64.b32encode(blob).decode("ascii").rstrip("=")
 
 
+# A JOIN CODE THAT IS A STEAM ID (2026-09-22). A host whose game runs on Steam shows its
+# SteamID64 as the code -- 17 digits, the number on its Steam profile -- and joiners reach
+# it through Steam's networking alone (the bridge's tunnel, steamtunnel.py). The session
+# secret is not in such a code (a Steam ID is public): the joiner gets it from the host
+# over the tunnel by a key exchange (steamkey.py). The classic code stays for everyone
+# else -- a game without Steam, a dedicated server -- and for a host that ticks CROSS-PLAY.
+STEAM_CODE_LEN = 17
+STEAM_ID_BASE = 76561197960265728    # SteamID64 of individual account 0
+
+
+def steam_code_id(code):
+    """The SteamID64 a join code names when the code IS a Steam ID, else None. Spaces
+    and a pasted profile URL's prefix are tolerated."""
+    s = (code or "").strip().rstrip("/")
+    for prefix in ("https://steamcommunity.com/profiles/", "http://steamcommunity.com/profiles/",
+                   "steamcommunity.com/profiles/"):
+        if s.lower().startswith(prefix):
+            s = s[len(prefix):]
+    s = s.replace(" ", "")
+    if len(s) != STEAM_CODE_LEN or not s.isdigit():
+        return None
+    v = int(s)
+    return s if STEAM_ID_BASE < v < STEAM_ID_BASE + (1 << 32) else None
+
+
 def decode_code(code, password=None):
     """base32 code -> profile-like dict with candidates, flags, ts, age, stale.
 
-    Raises ValueError on a malformed code.
+    Raises ValueError on a malformed code. A code that is a Steam ID decodes to a
+    profile with ``steam_only`` set, only the ``steam`` candidate and no secret.
     """
+    sid = steam_code_id(code)
+    if sid:
+        return {
+            "secret": None,
+            "locked": False,
+            "steam_only": True,
+            "candidates": {"lan_v4": None, "public_v4": None, "v6": None, "vpn_v4": None, "vpn2_v4": None, "steam": sid},
+            "flags": {"open": False, "symmetric": False, "cgnat": False, "v6": False},
+            "ts": int(time.time()),
+            "age": 0,
+            "stale": False,
+        }
     code = code.strip().upper()
     pad = "=" * (-len(code) % 8)
     try:
@@ -443,6 +481,13 @@ def _observe_and_announce(local_port, secret=None, password=None, extra_candidat
     sock_v4 = open_socket(local_port, socket.AF_INET)
     profile = observe(local_port=local_port, sock=sock_v4, do_upnp=True,
                       keep_upnp=True)
+    mapping = profile.get("upnp", {})
+    if mapping.get("tcp_open"):
+        log(f"[bulk] router accepted TCP mapping on tcp/{local_port}; external reachability still needs a connection")
+    else:
+        detail = mapping.get("tcp_detail") or mapping.get("detail") or "no TCP mapping confirmed"
+        log(f"[bulk] no confirmed TCP router mapping on tcp/{local_port}: {detail}; "
+            "trying IPv6, LAN/VPN and the peer's listener as well")
     for k, v in (extra_candidates or {}).items():
         if v:
             profile["candidates"][k] = v

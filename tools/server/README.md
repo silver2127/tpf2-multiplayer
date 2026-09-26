@@ -88,6 +88,15 @@ and the relay must move its loopback ports off 7771/7773 so the two do not excha
 frames on the same machine: redeploy the relay with
 `--game-relay-port 7783 --game-local-port 7781` (see `tools/relay_deploy.sh`).
 
+## Kernel limits
+
+`setup_vps.sh` installs `sysctl-tpf2mp.conf` as `/etc/sysctl.d/99-tpf2mp.conf`:
+`vm.max_map_count` (a big world plus the software renderer hold tens of thousands of
+mappings, and the default 65,530 is a crash when reached) and `vm.swappiness=10`. On a
+box set up before this file existed, copy it over and run `sysctl --system`; a
+`sysctl -w` alone is lost at the next reboot. What each limit is for, and where the
+server's time actually goes, is in `docs/DEDICATED_SERVER.md`.
+
 ## Where to look
 
 - `tpf2server status` -- units, the game process, the code, joins and leaves.

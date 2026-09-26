@@ -69,6 +69,16 @@ GAMES=()
 LAUNCH_OPTS=0
 for ROOT in "${ROOTS[@]:+${ROOTS[@]}}"; do
   tpf2mp_say "Removing $(tpf2mp_tilde "$ROOT")..."
+  # Restore only an exact Big Maps density patch before deleting its helper.
+  if [ -f "$ROOT/data/bigmap-base-mod.path" ]; then
+    IFS= read -r BIGMAP_BASE < "$ROOT/data/bigmap-base-mod.path"
+    if [ "$TPF2MP_DRY" = 1 ]; then
+      tpf2mp_say "  would restore Big Maps density in $BIGMAP_BASE"
+    else
+      "$ROOT/bigmap-density-restore" "$BIGMAP_BASE" || tpf2mp_die "Big Maps density restore failed; installation kept"
+      rm -f "$ROOT/data/bigmap-base-mod.path"
+    fi
+  fi
   M=$ROOT/tpf2mp_install.txt
   declare -A LISTED=()
   if [ -f "$M" ]; then

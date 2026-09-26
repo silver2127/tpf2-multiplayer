@@ -18,6 +18,8 @@ constexpr Rgb rgb(int r, int g, int b) { return Rgb{ (uint8_t)r, (uint8_t)g, (ui
 
 // The canvas: w x h, BGRA, straight alpha, cleared to transparent.
 void Begin(int w, int h);
+// Place the current panel on an opaque full-frame BGRA backdrop.
+void PlaceOnBackdrop(int w, int h, int x, int y, const uint8_t* bg);
 int Width();
 int Height();
 const uint8_t* Pixels();

@@ -115,13 +115,17 @@ case " ${LEFT_OUT[*]:-} " in
     PLUGINS+=(tpf2_previews.so)
     [ -f "$BUILD/tpf2_workshop_register.so" ] || die "the build did not produce tpf2_workshop_register.so"
     PLUGINS+=(tpf2_workshop_register.so)
+    if [ -z "$BIGMAP_REPO" ]; then
+      install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+      PLUGINS+=(tpf2_bigmap.so)
+    fi
     ;;
 esac
 if [ -n "$BIGMAP_REPO" ]; then
   case " ${LEFT_OUT[*]:-} " in *" tpf2_pluginhost.so "*) die "Big Maps requires tpf2_pluginhost.so" ;; esac
   case "$BIGMAP_REPO/" in "$STAGE/"*) die "Big Maps source must be outside staging" ;; esac
-  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap"
-  install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap-override"
+  install -m 0755 "$BUILD/bigmap-override/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
   PLUGINS+=(tpf2_bigmap.so)
 fi
 # A symbol the loader exports wins over the game's own for the whole process
@@ -165,9 +169,17 @@ if [ ${#PLUGINS[@]} -gt 0 ]; then
   mkdir -p "$STAGE/lib/plugins"
   for l in "${PLUGINS[@]}"; do install -m 0755 "$BUILD/$l" "$STAGE/lib/plugins/$l"; done
 fi
-if [ -n "$BIGMAP_REPO" ]; then
-  install -m 0644 "$BIGMAP_REPO/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
-fi
+case " ${LEFT_OUT[*]:-} " in
+ *" tpf2_pluginhost.so "*) ;;
+ *)
+  BIGMAP_SOURCE=${BIGMAP_REPO:-$REPO/bigmap}
+  BIGMAP_BUILD=$BUILD/bigmap
+  [ -z "$BIGMAP_REPO" ] || BIGMAP_BUILD=$BUILD/bigmap-override
+  install -m 0755 "$BIGMAP_BUILD/bigmap-density-restore" "$STAGE/lib/bigmap-density-restore"
+  install -m 0644 "$BIGMAP_SOURCE/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
+ ;;
+esac
+install -m 0644 "$REPO/bigmap/docs/linux/PORT.md" "$STAGE/BIGMAP_PORT.md"
 cp -R "$REPO/mod/mp_lockstep_1" "$STAGE/mod/"
 python3 "$REPO/tools/linux/verify_lua_release.py" --mod-dir "$STAGE/mod/mp_lockstep_1"
 NP_BIN=""   # the lobby executable taken, for its date in BUILDINFO
@@ -189,6 +201,18 @@ for s in native_watchdog.py steam_compat.py server.env.example README.md; do
   install -m 0644 "$REPO/tools/server/$s" "$STAGE/server/$s"
 done
 install -m 0644 "$REPO/docs/re/linux/PARITY_20260921.md" "$STAGE/PARITY.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5c6c084b.md" "$STAGE/UPSTREAM_dev_5c6c084b.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4465474.md" "$STAGE/UPSTREAM_dev_b4465474.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ef275a3c.md" "$STAGE/UPSTREAM_dev_ef275a3c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8c3c02a5.md" "$STAGE/UPSTREAM_dev_8c3c02a5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_60d237c5.md" "$STAGE/UPSTREAM_dev_60d237c5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ad3d66e4.md" "$STAGE/UPSTREAM_dev_ad3d66e4.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0115785c.md" "$STAGE/UPSTREAM_dev_0115785c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6e1e4ec7.md" "$STAGE/UPSTREAM_dev_6e1e4ec7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5a9b3ae0.md" "$STAGE/UPSTREAM_dev_5a9b3ae0.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_49b1f277.md" "$STAGE/UPSTREAM_dev_49b1f277.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_1eb30002.md" "$STAGE/UPSTREAM_dev_1eb30002.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b7760259.md" "$STAGE/UPSTREAM_dev_b7760259.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.6.md" "$STAGE/UPSTREAM_0.5.6.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_55e97a48.md" "$STAGE/UPSTREAM_dev_55e97a48.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_3edfbccd.md" "$STAGE/UPSTREAM_dev_3edfbccd.md"
@@ -206,6 +230,24 @@ install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d6db920f.md" "$STAGE/UPSTREAM_dev
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_50d7588b.md" "$STAGE/UPSTREAM_dev_50d7588b.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_66c870cf.md" "$STAGE/UPSTREAM_dev_66c870cf.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b141b123.md" "$STAGE/UPSTREAM_dev_b141b123.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a42dab6c.md" "$STAGE/UPSTREAM_dev_a42dab6c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_582a380.md" "$STAGE/UPSTREAM_dev_582a380.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e63ceefc.md" "$STAGE/UPSTREAM_dev_e63ceefc.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_cf5f8a0e.md" "$STAGE/UPSTREAM_dev_cf5f8a0e.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4b629a2.md" "$STAGE/UPSTREAM_dev_b4b629a2.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_bd69b864.md" "$STAGE/UPSTREAM_dev_bd69b864.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_aaae03f8.md" "$STAGE/UPSTREAM_dev_aaae03f8.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_7469fce7.md" "$STAGE/UPSTREAM_dev_7469fce7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_63a3b8df.md" "$STAGE/UPSTREAM_dev_63a3b8df.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4616c16a.md" "$STAGE/UPSTREAM_dev_4616c16a.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c9ac009d.md" "$STAGE/UPSTREAM_dev_c9ac009d.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0610033.md" "$STAGE/UPSTREAM_dev_0610033.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e43d01dd.md" "$STAGE/UPSTREAM_dev_e43d01dd.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d8a3ce57.md" "$STAGE/UPSTREAM_dev_d8a3ce57.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_96795a8b.md" "$STAGE/UPSTREAM_dev_96795a8b.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_01044521.md" "$STAGE/UPSTREAM_dev_01044521.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_45183ac6.md" "$STAGE/UPSTREAM_dev_45183ac6.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_122a0ce9.md" "$STAGE/UPSTREAM_dev_122a0ce9.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
@@ -221,7 +263,8 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows v0.6.1.18 a5aeda76ed2927229397fe85619d1d13326e46d5 (pinned Linux origin replay)"
+  echo "Lua: Windows 0.7.0.3 010445210f48546dad7da23ad585cd179b9fedeb (pinned Linux origin replay)"
+  echo "Bundled Big Maps native source: imported 4769cd3; see BIGMAP_PORT.md for limits"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"

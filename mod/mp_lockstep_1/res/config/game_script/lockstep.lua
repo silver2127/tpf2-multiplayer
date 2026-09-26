@@ -531,7 +531,7 @@ K.JOURNAL_LOAN = 0
 -- a 30,000,000 loan is several ticks of settling.
 K.LOAN_SETTLE_TICKS = 90
 K.JOURNAL_TRANSFER = 6
-K.STRICT_OPS = { VREV = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
+K.STRICT_OPS = { VREV = true, VSTOP = true, VLINE = true, VSELL = true, VDEPOT = true, VREPL = true, VBUY = true, LCREATE = true, LUPDATE = true, LDELETE = true, LSPARE = true }   -- replay on the originator too, but only when ARMED=1 (the slice cancelled it)
 -- CONX/CONP have no slice cancel (the construction's module params cannot be
 -- read from the proposal); the originator instead deletes its native copy and
 -- replays, gated by c.cancelled rather than ARMED. See execConX.
@@ -636,6 +636,9 @@ CM.boot("mp.terrain")
 -- Lives in res/scripts/mp/assets.lua.
 CM.boot("mp.assets")
 local function execute(c)
+	-- any other command may edit the road/rail network: EDEMO's node index
+	-- (cons.lua) is only reused across consecutive bulldozes
+	if c.op ~= "EDEMO" then CM.edemoCache = nil end
 	if c.op == "CONP" or c.op == "CONX" then CM.execConX(c)
 	elseif c.op == "CONU" then CM.execConU(c)
 	elseif c.op == "FENCE" then CM.execFence(c)
@@ -649,7 +652,7 @@ local function execute(c)
 	elseif c.op == "CONFAIL" then CM.execConFail(c)
 	elseif c.op == "VBUY" then CM.execVBuy(c)
 	elseif c.op == "VREPL" then CM.execVReplace(c)
-	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" then CM.execVehCmd(c)
+	elseif c.op == "VSELL" or c.op == "VDEPOT" or c.op == "VLINE" or c.op == "VREV" or c.op == "VSTOP" then CM.execVehCmd(c)
 	elseif c.op == "STOPADD" or c.op == "STOPDEL" or c.op == "STOPREP" then CM.stopEnqueue(c)
 	elseif c.op == "VNAME" then CM.execSetName(c)
 	elseif c.op == "VCOLOR" then CM.execSetColor(c)
@@ -795,7 +798,11 @@ local function checkHash(now)
 		-- hitch is visible in the log as ms per stamp
 		local dt = (os.clock() - ph0) * 1000
 		local pf = CM.perfHash or { n = 0, sum = 0, max = 0 }
-		pf.n = pf.n + 1; pf.sum = pf.sum + dt; if dt > pf.max then pf.max = dt end
+		pf.n = pf.n + 1; pf.sum = pf.sum + dt
+		-- the split of the DEAREST stamp, not whichever hashed last: on the
+		-- 49,000-tile world the cheap stamps read 1.6 s and the dear ones 8.8 s,
+		-- and it was always a cheap one whose lanes reached the log (2026-09-23)
+		if dt > pf.max then pf.max = dt; CM.hashPartsWorst = CM.hashPartsMs end
 		CM.perfHash = pf
 	end
 	if not sawCrossing then
@@ -813,6 +820,7 @@ local function checkHash(now)
 		CM.pruneOldest(pr.hashes, K.STAMP_KEEP)
 		CM.pruneOldest(pr.details, K.STAMP_KEEP)
 	end
+	local pp0 = os.clock()
 	CM.broadcast(string.format("LSHASH t=%d h=%s d=%s o=%s", stamp, h, detail or "-", K.INSTANCE))
 	pcall(CM.vposShip, stamp)
 	CM.dashLastDetail = detail
@@ -820,6 +828,14 @@ local function checkHash(now)
 	-- One shared comparison, used from here and from the LSHASH handler, so the
 	-- check fires whichever side's hash lands second.
 	CM.compareAt(stamp)
+	do  -- what the stamp costs AFTER the hash: the LSHASH frame, the drift
+		-- positions and the comparison (O(vehicles), O(peers)); the hash timer
+		-- above stops at worldHash and this was never in the PERF line
+		local dp = (os.clock() - pp0) * 1000
+		local pp = CM.perfPost or { n = 0, sum = 0, max = 0 }
+		pp.n = pp.n + 1; pp.sum = pp.sum + dp; if dp > pp.max then pp.max = dp end
+		CM.perfPost = pp
+	end
 	-- what this stamp cost, and on the leader the interval that cost calls for
 	-- (hash.lua CM.hashCostNote, CM.hashCadenceTick)
 	CM.hashCostNote((os.clock() - ph0) * 1000)
@@ -870,7 +886,8 @@ function data()
 			if CM.autoSyncPump(CM.gameTime() or 0) then return end
 			CM.pollEvents()
 			pcall(CM.sampleSimRate)
-			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end   -- companies: vehicles left to follow their lines in a switch
+			if CM.cmVehPending or CM.cmRepairAt then pcall(CM.cmVehRecheck) end
+			if CM.cmSwitchWanted then pcall(CM.cmLoadSwitchTick) end   -- companies: the load-time switch waits for a world that answers   -- companies: vehicles left to follow their lines in a switch
 			if CM.ticks % 60 == 0 or not K.INSTANCE then
 				if not CM.detectInstance() then return end
 				-- a save's company state (load hook) is applied here, on the sim
@@ -1292,13 +1309,14 @@ function data()
 					if #parts > 0 then log("STEPS: " .. table.concat(parts, " | ")) end
 				end)
 				pcall(function()
-					local u, h = CM.perfUpd, CM.perfHash
+					local u, h, pp = CM.perfUpd, CM.perfHash, CM.perfPost
 					if u and u.n > 0 then
-						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps%s",
+						log(string.format("PERF: update avg=%.2f ms max=%.2f ms over %d ticks | hash avg=%.1f ms max=%.1f ms over %d stamps%s%s",
 							u.sum / u.n, u.max, u.n, h and h.n > 0 and h.sum / h.n or 0, h and h.max or 0, h and h.n or 0,
-							CM.hashPartsMs and (" | last hash: " .. CM.hashPartsMs) or ""))
+							pp and pp.n > 0 and string.format(" | after the hash avg=%.1f ms max=%.1f ms", pp.sum / pp.n, pp.max) or "",
+							(CM.hashPartsWorst or CM.hashPartsMs) and (" | dearest hash: " .. (CM.hashPartsWorst or CM.hashPartsMs)) or ""))
 					end
-					CM.perfUpd, CM.perfHash = nil, nil
+					CM.perfUpd, CM.perfHash, CM.perfPost, CM.hashPartsWorst = nil, nil, nil, nil
 				end)
 				log(string.format("alive t=%d peer=%s queued=%d desyncs=%d",
 					math.floor(now), tostring(CM.slowT and math.floor(CM.slowT) or "?"),
@@ -1548,7 +1566,14 @@ function data()
 				-- the GUI state never runs the engine-side identity detection: read
 				-- the identity file here, or every instance's window thinks it is "a"
 				-- (B's "new company" click went into lockstep_inject_a.txt, 2026-09-09)
-				if not K.INSTANCE then pcall(CM.detectInstance) end
+				-- Re-read every ~2 s, not once: the GUI state can start before the
+				-- bridge rewrites the identity file, and then read LAST session's
+				-- letter. A host that had joined as "b" earlier in the day kept
+				-- "B (you)", an empty status, speed "-", and its clicks went into
+				-- lockstep_inject_b.txt, which nothing on that machine reads
+				-- (2026-09-22). detectInstance returns early when unchanged.
+				CM.guiIdentityTick = (CM.guiIdentityTick or 0) + 1
+				if not K.INSTANCE or CM.guiIdentityTick % 4 == 1 then pcall(CM.detectInstance) end
 				local own = K.INSTANCE or "a"
 				local ownKv = readDash(own)
 				local ownWall = ownKv and tonumber(ownKv.wall) or nil
@@ -1612,7 +1637,7 @@ function data()
 					-- Show/hide (2026-09-09): the stats table and the chat block each
 					-- have a toggle; Ctrl+Shift+D still hides the whole window.
 					local function toggleBtn(label, fn)
-						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
+						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new((label:gsub("^%s+", ""):gsub("%s+$", "")):upper()), true)
 						b:onClick(fn)
 						return b
 					end
@@ -1620,8 +1645,9 @@ function data()
 					-- show one at a time. A section's button opens it and closes the
 					-- others; the open section's button closes it. CM.dashTab survives a
 					-- rebuild of the window (false = every section closed).
-					local TABS = { { "lobby", "dashShowLobby" }, { "stats", "dashShowStats" }, { "chat", "dashShowChat" },
-					               { "companies", "dashShowCompanies" }, { "speed", "dashShowSpeed" } }
+					local TABS = { { "lobby", "dashShowLobby", "SESSION" }, { "chat", "dashShowChat", "CHAT" },
+					               { "companies", "dashShowCompanies", "COMPANIES" }, { "speed", "dashShowSpeed", "SPEED" },
+					               { "stats", "dashShowStats", "STATUS" } }
 					if CM.dashTab == nil then CM.dashTab = "chat" end   -- the chat was the section open by default
 					local function applyTabs()
 						for _, t in ipairs(TABS) do CM[t[2]] = (CM.dashTab == t[1]) end
@@ -1633,7 +1659,9 @@ function data()
 						pcall(function() D.coBox:setVisible(CM.dashShowCompanies, false) end)
 						D.speedShown = nil   -- the GUI tick re-applies the speed row
 						for name, label in pairs(D.tabLabels or {}) do
-							pcall(function() label:setText(CM.dashTab == name and ("[ " .. name .. " ]") or ("  " .. name .. "  ")) end)
+							pcall(function() label:setText(name == "lobby" and "SESSION" or name == "stats" and "STATUS" or string.upper(name)) end)
+							local button = D.tabButtons and D.tabButtons[name]
+							if button then pcall(function() button:setStyleClassList(CM.dashTab == name and { "mpDashTab", "mpDashSelected" } or { "mpDashTab" }) end) end
 						end
 					end
 					local function selectTab(name)
@@ -1646,18 +1674,20 @@ function data()
 					-- window's own title-bar "x" (below). Both write the flag the
 					-- menu DLL's Ctrl+Shift+D reads, so the next chord SHOWS it.
 					local function hideDash()
+						if D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
 						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
 						if f then f:write("0\n"); f:close() end
 						D.shown = false
 						if D.win then D.win:setVisible(false, false) end
 					end
 					D.hideDash = hideDash
-					tog:addItem(toggleBtn("  hide (Ctrl+Shift+D to show)  ", hideDash))
-					D.tabLabels = {}
+					-- The native close button and the footer share hideDash; keep tabs uncluttered.
+					D.tabLabels = {}; D.tabButtons = {}
 					for _, t in ipairs(TABS) do
 						local name = t[1]
-						D.tabLabels[name] = api.gui.comp.TextView.new("  " .. name .. "  ")
+						D.tabLabels[name] = api.gui.comp.TextView.new(t[3])
 						local b = api.gui.comp.Button.new(D.tabLabels[name], true)
+						D.tabButtons[name] = b
 						b:onClick(function() selectTab(name) end)
 						tog:addItem(b)
 					end
@@ -1672,7 +1702,7 @@ function data()
 					local lobbyL = api.gui.layout.BoxLayout.new("VERTICAL")
 					D.lobbyText = api.gui.comp.TextView.new("")
 					lobbyL:addItem(D.lobbyText)
-					lobbyL:addItem(toggleBtn("  host / manage lobby  ", function()
+					lobbyL:addItem(toggleBtn("Host / manage session", function()
 						local f, err = io.open(K.BASE .. "tpf2_lobby_open.txt", "w")
 						if f then f:write("open\n"); f:close()
 						else D.lobbyText:setText("Could not open lobby controls: " .. tostring(err)) end
@@ -1749,7 +1779,7 @@ function data()
 					local statsL = api.gui.layout.BoxLayout.new("VERTICAL")
 					statsL:addItem(D.statusText)
 					statsL:addItem(D.ptable)
-					statsL:addItem(toggleBtn("  numbers  ", function()
+					statsL:addItem(toggleBtn("Show / hide details", function()
 						CM.dashShowNumbers = not CM.dashShowNumbers
 						pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
 					end))
@@ -1767,7 +1797,7 @@ function data()
 					-- speed row with its "speed" toggle on 2026-09-11: it only repeated what
 					-- the host's speed buttons already show.
 					local function speedBtn(label, fn)
-						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new(label), true)
+						local b = api.gui.comp.Button.new(api.gui.comp.TextView.new((label:gsub("^%s+", ""):gsub("%s+$", "")):upper()), true)
 						b:onClick(fn)
 						return b
 					end
@@ -1795,8 +1825,9 @@ function data()
 					-- reaches every player through CMNAME (inject.lua). Unnamed, it is
 					-- "<player>'s company" (companies.lua CM.cmNameOf).
 					local mrow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					D.coSwMine = api.gui.comp.TextView.new("  ##  ")
+					D.coSwMine = api.gui.comp.TextView.new("     ")
 					D.coNameText = api.gui.comp.TextView.new("")
+					mrow:addItem(api.gui.comp.TextView.new("Your company"))
 					mrow:addItem(D.coSwMine)
 					mrow:addItem(D.coNameText)
 					local mrowC = api.gui.comp.Component.new("mpCompanyMine")
@@ -1809,12 +1840,14 @@ function data()
 					D.coPickL = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					D.coPick = api.gui.comp.Component.new("mpCompanyPick")
 					D.coPick:setLayout(D.coPickL)
+					crow:addItem(api.gui.comp.TextView.new("Switch company"))
 					crow:addItem(D.coPick)
 					-- the selected company's colour, beside the dropdown (2026-09-16)
-					D.coSwSel = api.gui.comp.TextView.new("  ##  ")
+					D.coSwSel = api.gui.comp.TextView.new("     ")
 					crow:addItem(D.coSwSel)
-					crow:addItem(speedBtn("  switch to it  ", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
-					crow:addItem(speedBtn("  new company  ", function() coRequest("CMNEW") end))
+					local companyActions = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					companyActions:addItem(speedBtn("Switch company", function() if D.coSel then coRequest("CMSWITCH", D.coSel) end end))
+					companyActions:addItem(speedBtn("New company", function() coRequest("CMNEW") end))
 					-- (CMDEL "dissolve into mine" exists in the sim but has no button: too easy to misread, 2026-09-09)
 					D.coNote = api.gui.comp.TextView.new("")
 					-- password: used by "new company" (locks the new one), by "switch"/"dissolve"
@@ -1828,9 +1861,9 @@ function data()
 						pcall(function() D.coPwInput:setMaximumSize(api.gui.util.Size.new(260, 26)) end)
 					end)
 					local prow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					prow:addItem(api.gui.comp.TextView.new("company password: "))
+					-- Password heading sits above the input, leaving room for its action.
 					if D.coPwInput then prow:addItem(D.coPwInput) end
-					prow:addItem(speedBtn("  set on mine  ", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on company " .. D.coMine .. "..."; coRequest("CMPW", D.coMine) end end))
+					prow:addItem(speedBtn("Set password", function() if D.coMine then D.coHint = (coPw() ~= "" and "setting" or "clearing") .. " the password on company " .. D.coMine .. "..."; coRequest("CMPW", D.coMine) end end))
 					local prowC = api.gui.comp.Component.new("mpCompanyPwRow")
 					prowC:setLayout(prow)
 					local crowC = api.gui.comp.Component.new("mpCompanyRow")
@@ -1844,22 +1877,28 @@ function data()
 						if f then f:write("CMOPEN " .. tostring(who) .. " " .. tostring(on) .. string.char(10)); f:close() end
 					end
 					local orow = api.gui.layout.BoxLayout.new("HORIZONTAL")
-					D.coOpenText = api.gui.comp.TextView.new("your stations are open to: -")
-					orow:addItem(D.coOpenText)
-					orow:addItem(api.gui.comp.TextView.new("   "))
+					D.coOpenText = api.gui.comp.TextView.new("Open to: -")
+					-- Keep the permission summary above its actions, avoiding a very wide window.
+					local allAccess = api.gui.layout.BoxLayout.new("HORIZONTAL")
 					orow:addItem(speedBtn("  allow selected  ", function() if D.coSel and D.coSel ~= D.coMine then coOpen(D.coSel, 1) end end))
 					orow:addItem(speedBtn("  deny selected  ", function() if D.coSel and D.coSel ~= D.coMine then coOpen(D.coSel, 0) end end))
-					orow:addItem(speedBtn("  everyone  ", function() coOpen("*", 1) end))
-					orow:addItem(speedBtn("  nobody  ", function() coOpen("*", 0) end))
+					allAccess:addItem(speedBtn("Allow everyone", function() coOpen("*", 1) end))
+					allAccess:addItem(speedBtn("Deny everyone", function() coOpen("*", 0) end))
 					local orowC = api.gui.comp.Component.new("mpCompanyOpenRow")
 					orowC:setLayout(orow)
 					local coL = api.gui.layout.BoxLayout.new("VERTICAL")
-					coL:addItem(mrowC); coL:addItem(crowC); coL:addItem(prowC); coL:addItem(orowC); coL:addItem(D.coNote)
+					coL:addItem(mrowC); coL:addItem(crowC)
+					local actionsC = api.gui.comp.Component.new("mpCompanyActions")
+					actionsC:setLayout(companyActions); coL:addItem(actionsC)
+					coL:addItem(api.gui.comp.TextView.new("Company password")); coL:addItem(prowC)
+					coL:addItem(api.gui.comp.TextView.new("Station access")); coL:addItem(D.coOpenText); coL:addItem(orowC)
+					local allAccessC = api.gui.comp.Component.new("mpCompanyAllAccess")
+					allAccessC:setLayout(allAccess); coL:addItem(allAccessC); coL:addItem(D.coNote)
 					D.coBox = api.gui.comp.Component.new("mpCompanies")
 					D.coBox:setLayout(coL)
 					box:addItem(D.coBox)
 					local chatL = api.gui.layout.BoxLayout.new("VERTICAL")
-					D.chatText = api.gui.comp.TextView.new("chat: (no messages yet)")
+					D.chatText = api.gui.comp.TextView.new("No messages yet.")
 					chatL:addItem(D.chatText)
 					-- The input is CLOSED until the player asks for it (2026-09-12). An
 					-- always-present field kept keyboard focus after a message or a stray
@@ -1876,7 +1915,7 @@ function data()
 						pcall(function() D.input:setMaximumSize(api.gui.util.Size.new(400, 26)) end)
 						pcall(function() D.input:setMaxLength(190) end)
 						local say = api.gui.layout.BoxLayout.new("HORIZONTAL")
-						say:addItem(api.gui.comp.TextView.new("say: "))
+						say:addItem(api.gui.comp.TextView.new("Message"))
 						say:addItem(D.input)
 						D.sayRow = api.gui.comp.Component.new("mpSay")
 						D.sayRow:setLayout(say)
@@ -1921,10 +1960,47 @@ function data()
 					D.chatBox:setLayout(chatL)
 					box:addItem(D.chatBox)
 					pcall(function() D.rawBox:setVisible(CM.dashShowNumbers, false) end)
+					local function style(widget, class)
+						if widget then pcall(function() widget:setStyleClassList({ class }) end) end
+					end
+					style(togC, "mpDashTabs")
+					for _, section in ipairs({ D.lobbyBox, D.statsBox, D.chatBox, D.coBox, D.speedBox }) do style(section, "mpDashSection") end
+					style(D.chatText, "mpDashChatLog")
+					style(D.ptable, "mpDashTable"); style(D.table, "mpDashTable")
+					style(D.alertText, "mpDashAlert")
+					style(D.sayOpenBtn, "mpDashPrimary")
+					local footerL = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					footerL:addItem(api.gui.comp.TextView.new("Ctrl+Shift+D: show / hide"))
+					footerL:addItem(toggleBtn("Collapse", function() D.setCollapsed(true) end))
+					local footer = api.gui.comp.Component.new("mpDashboardFooter")
+					footer:setLayout(footerL); style(footer, "mpDashFooter"); box:addItem(footer)
 					applyTabs()
 					local body = api.gui.comp.Component.new("mpDashboard")
 					body:setLayout(box)
-					D.win = api.gui.comp.Window.new("Multiplayer", body)
+					style(body, "mpDashBody")
+					-- Keep both views attached: hidden content cannot retain chat focus,
+					-- and switching views does not destroy the selected tab or callbacks.
+					local compactL = api.gui.layout.BoxLayout.new("HORIZONTAL")
+					compactL:addItem(toggleBtn("+ Expand", function() D.setCollapsed(false) end))
+					D.compactNote = api.gui.comp.TextView.new("Session")
+					compactL:addItem(D.compactNote)
+					D.compact = api.gui.comp.Component.new("mpDashboardCompact")
+					D.compact:setLayout(compactL); style(D.compact, "mpDashCompact")
+					local shellL = api.gui.layout.BoxLayout.new("VERTICAL")
+					shellL:addItem(D.compact); shellL:addItem(body)
+					local shell = api.gui.comp.Component.new("mpDashboardShell")
+					shell:setLayout(shellL); style(shell, "mpDashShell")
+					D.body = body
+					function D.setCollapsed(collapsed)
+						CM.dashCollapsed = collapsed == true
+						if CM.dashCollapsed and D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
+						D.body:setVisible(not CM.dashCollapsed, false)
+						D.compact:setVisible(CM.dashCollapsed, false)
+						-- Let the engine size the window from its visible layout; never force 1x1.
+					end
+					D.win = api.gui.comp.Window.new("Multiplayer", shell)
+					D.setCollapsed(CM.dashCollapsed)
+					style(D.win, "mpDashWindow")
 					D.win:setPosition(20, 120)
 					-- The title-bar "x" (2026-09-16): a Window has no close behaviour
 					-- of its own, so the button did nothing. Closing is hiding (the
@@ -1955,6 +2031,7 @@ function data()
 					local text = behind and string.format("Your game is %.0f game units behind the others: your actions are off until it catches up.", behind) or ""
 					if text ~= D.alertShown then
 						D.alertShown = text
+						if D.compactNote then D.compactNote:setText(text ~= "" and "Catching up - actions paused" or "Session") end
 						pcall(function() D.alertText:setText(text); D.alertText:setVisible(text ~= "", false) end)
 					end
 				end
@@ -2054,7 +2131,7 @@ function data()
 								for v in code:gmatch("%d+") do ns[#ns + 1] = coName(tonumber(v)) end
 								text = table.concat(ns, ", ")
 							end
-							local line = "your stations are open to: " .. text
+							local line = "Open to: " .. text
 							if line ~= D.coOpenShown then D.coOpenShown = line; pcall(function() D.coOpenText:setText(line) end) end
 						end
 						local note = mine.conote or ""
@@ -2106,6 +2183,7 @@ function data()
 				end
 				if D.shown ~= shown then
 					D.shown = shown
+					if not shown and D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
 					D.win:setVisible(shown, false)
 				end
 			end)

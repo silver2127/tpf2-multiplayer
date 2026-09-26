@@ -21,11 +21,19 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.18, tag `a5aeda76`**, on
+This development tree integrates **Windows 0.7 plus dev `8c3c02a5`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[PARITY_20260921.md](../re/linux/PARITY_20260921.md). Native/Windows frozen join
+[UPSTREAM_dev_8c3c02a5.md](UPSTREAM_dev_8c3c02a5.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
+
+Canonical simulation ordering is on by default since dev `ad3d66e4`.
+`TPF2MP_ORDER_CANON=0` disables it; unset or any other value enables it.
+Simulation settings must match every peer, including Windows players whose
+sorts default on. Native retained-world joins remain opt-in, and matching
+versions alone do not establish gameplay parity. Loaded-game lifetime and
+cross-platform validation remain outstanding; see
+[UPSTREAM_dev_ad3d66e4.md](UPSTREAM_dev_ad3d66e4.md).
 
 The native implementation includes command capture and replay, deterministic
 ordering hooks, company permissions, save selection, load progress, automatic
@@ -174,7 +182,7 @@ the script fallback. Logs are in `<data home>/tpf2mp/data/tpf2mp_host.log`.
   - the lobby's logs;
   - crash dumps written since the last save.
 
-  This also works after a crash: just start the game again. The last 2 are kept. `about.txt` in each
+  This also works after a crash: just start the game again. The last 5 of each kind (startup and OPEN LOGS) are kept. `about.txt` in each
   folder lists what is there, with sizes.
   Create `tpf2mp_keep_logs.txt` in the runtime data folder to keep every archive
   and append mod/lobby logs across starts. Remove it to restore normal retention.
@@ -249,7 +257,34 @@ The lobby builder uses pinned Python and manylinux wheels, checks every bundled 
 
 The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the source tree for implementation coverage and remaining runtime validation; packaging success alone does not establish multiplayer parity.
 
-### Optional Big Maps worktree in development packages
+### Big Maps in the unified package
+
+`tools/linux/build_native.sh` builds and tests the in-tree `bigmap/linux` plugin.
+The release includes `plugins/tpf2_bigmap.so` and its **Linux** configuration;
+`--without tpf2_pluginhost.so` omits plugins. The native defaults select depth 11
+and cap tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
+`terrain_cache_compress=0` and restart after SIGBUS; kernel-origin faults on
+evicted pages cannot be served by this pager. Unsupported userfaultfd setup
+keeps stock allocation paths. The Windows
+configuration requests depth 13; keep the packaged Linux configuration
+for its native defaults. Depths 12/13 are available on the verified Steam ELF;
+the Windows GOG fallback does not apply to it. See
+[dev aaae03f8 integration](UPSTREAM_dev_aaae03f8.md).
+Upstream now reports successful depth-13 play, save/reload and multiplayer
+with a native Linux dedicated server; every peer needs the same `octree_depth`.
+See [dev 63a3b8df integration](UPSTREAM_dev_63a3b8df.md) for attribution
+and the distinction from local validation.
+See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
+[current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.
+The installed `bigmap-density-restore` helper restores the plugin's exact density
+patch before upgrade/uninstall; modified patches are left intact and removal stops.
+Native live join remains opt-in (`tpf2mp_live_join.txt` = `1`); Windows 0.7 defaults on.
+
+The [dev `60d237c5` integration](UPSTREAM_dev_60d237c5.md) retains the Windows
+autosave-sidecar fix. Native Big Maps does not yet capture or restore `.terr`
+sidecars, so this fix does not enable them on Linux.
+
+### Optional Big Maps worktree override in development packages
 
 Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`
 or `tools/linux/auto_install.py` to build and ship that checkout's native
@@ -259,3 +294,99 @@ and installation after all games close. The selected checkout must contain
 `linux/CMakeLists.txt` and `linux/tpf2_bigmap.cfg`. This option never launches
 the game. Automatic recovery and Workshop registration remain unsupported as
 recorded in the integration notes.
+
+## Experimental Steam transport (0.6.1.28)
+
+Messages v002 is the default, resolved from the game's loaded `libsteam_api.so`.
+To compare Legacy, close the game and create `tpf2mp_steam_legacy.txt` in this
+installation's runtime `data/` directory. Remove it with the game closed to
+return to Messages. Both peers must choose the same mode; check `transport=Messages`
+or `transport=Legacy` in the bridge log. An unavailable Messages API disables
+Steam transport without falling back. Direct TCP remains preferred for saves;
+only transfers actually using Steam measure this comparison. No Linux internet
+throughput improvement has been measured for this integration.
+
+Messages now starts with equal 1 MiB/s clamps and adjusts them every five
+seconds using active outgoing peers' remote delivery quality. Legacy retains
+its fixed configuration. Look for [steam-rate] adjustments; configured rates
+are not measured save-transfer throughput. The redesigned Create Game and host
+lobby views expose Cross-play through the existing invitation-code switch.
+
+The [dev `a42dab6c` integration](UPSTREAM_dev_a42dab6c.md)
+keeps hot-join save requests pending while the host world loads, then
+takes the save when the game UI is ready. Version remains 0.7.
+
+### Family guard performance (dev 7cacbaaf)
+
+Linux 6.11+ can validate family memory ranges through `PROCMAP_QUERY` without
+parsing the process mapping table. Older kernels, or environments denying the
+ioctl, retain a fresh buffered snapshot per iteration; very large mapping
+counts can still cost simulation time there. No kernel setting is changed by
+the native libraries. See [integration evidence](UPSTREAM_dev_7cacbaaf.md).
+
+The [dev `2c05099a` integration](UPSTREAM_dev_2c05099a.md) adds the remaining supplied
+Windows RNG seed/distribution/engine compatibility modules, enabled by default.
+`TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
+Static ELF checks and 65 native tests pass; the lab launch was blocked before
+the game started, so cross-platform gameplay validation remains outstanding.
+
+The [dev `582a380` integration](UPSTREAM_dev_582a380.md) makes native dedicated
+restarts prefer a newer autosave of the hosted `mp_shared` world over the
+configured save. Version remains 0.7.
+
+The [dev `cf5f8a0e` integration](UPSTREAM_dev_cf5f8a0e.md) makes load-time company
+switches wait for entity queries to answer and reuses live saved player entities.
+Version remains 0.7; loaded-world validation is still outstanding.
+
+The [dev `522a303b` integration](UPSTREAM_dev_522a303b.md) reports the slowest hash's
+lane breakdown and the cost of post-hash broadcast, drift and comparison work.
+Shared Lua regression tests pass; no live performance measurement is claimed.
+Version remains 0.7.
+
+The [dev `bd69b864` integration](UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
+target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
+attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+## Town-development diagnostics (dev 0610033)
+
+Set `TPF2MP_TOWN_TRACE=1` in the game's launch environment to write
+`$XDG_DATA_HOME/tpf2mp/data/tpf2_towntrace.txt` (default XDG data home:
+`~/.local/share`). Restart without the variable to disable it. The trace is off
+by default and requires the verified town-seed hook. Compare captures from the
+same session with `python3 tools/town_trace_diff.py NATIVE_TRACE WINDOWS_TRACE`;
+Windows enables its half with `towntrace=1` in `tpf2_slice.cfg`.
+See [integration and validation limits](UPSTREAM_dev_0610033.md).
+
+## Release 0.7.0.3 (dev d8a3ce57)
+
+Native Linux is at **0.7.0.3**: the `.run` installer, the tarball name, the
+staged `VERSION` file and the `BUILDINFO` header all take it from
+`installer/VERSION`, and the lobby handshake (`LOBBY_VERSION`) matches. Every
+participant, including a dedicated server, needs the same version -- the gate is
+an exact release match and a peer without a version fails closed.
+
+The release carries no new native code: it is the version stamp for the fixes
+the `0610033`, `11a98cc`/`e43d01dd` and earlier integrations already ported. The
+Linux behaviour the release notes promise was rechecked against the unmodified
+build-35924 ELF and passes; the octree depth, town-trace and math-parity notes
+elsewhere in this file still apply unchanged.
+See [integration evidence and validation limits](UPSTREAM_dev_d8a3ce57.md).
+
+The [dev `122a0ce9` integration](UPSTREAM_dev_122a0ce9.md) adds the native resync
+view’s in-game x. Closing a running resync hides its view while recovery
+continues; Manage Lobby reopens it. Errors and unanswered Ready requests
+bring it back automatically. Saving/loading suppresses the x.
+
+Since [dev 45183ac6](UPSTREAM_dev_45183ac6.md), native OPEN LOGS and startup
+archives include the installed version, kernel/time zone, module GNU build IDs,
+and copied state/config files (last 8 MiB each, after logs). Lobby JSON/JSONL/text
+copies mask invitation/password fields. Saves and terrain dumps are excluded.
+The native menu uses xdg-open and reports the native archive location.
+
+The [dev `96795a8b` integration](UPSTREAM_dev_96795a8b.md) expands the native public
+browser to eight games per page and up to 32 games, and completes archive
+runtime/boot metadata and standalone collector credential masking.
+
+The [dev `01044521` integration](UPSTREAM_dev_01044521.md) expands the native public
+browser to twelve games per page and up to 48 games, and removes the legacy
+panel renderer. Closing a running resync leaves the game visible.

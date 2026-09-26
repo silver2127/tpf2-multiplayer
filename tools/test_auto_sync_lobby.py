@@ -52,6 +52,9 @@ last = names[-1]
 with tempfile.TemporaryDirectory() as temporary:
     root = Path(temporary)
     ios = {name: lobby.LobbyIO(str(root / name)) for name in names}
+    # This suite explicitly covers the frozen-join recovery round. Version
+    # 0.7 defaults to live join, which is a different path with no such round.
+    (root / 'host' / 'tpf2mp_live_join.txt').write_text('0', encoding='utf-8')
     runtimes = {name: EngineStandIn(root / name, root / name, 123, name) for name in ios}
     stop = threading.Event()
     last_stop = threading.Event()
@@ -162,6 +165,10 @@ with tempfile.TemporaryDirectory() as temporary:
             assert all(r.state['phase'] == 'holding' and r.saves == 0 and r.loads == 0 for r in runtimes.values())
             runtimes[last].blocked_phase = None
         wait_for(lambda: all(r.finished for r in runtimes.values()))
+        for io in ios.values():
+            events = [json.loads(line) for line in Path(io.out_path).read_text(encoding='utf-8').splitlines()]
+            assert any(e.get('type') == 'transfer' and e.get('bytes_total', 0) >= 50000
+                       and 'MB/s' in e.get('detail', '') for e in events), 'resync must expose transfer metrics'
         nonce_follows_world()
         first = runtimes['host'].state['operation']
         assert all(r.state['operation'] == first for r in runtimes.values())

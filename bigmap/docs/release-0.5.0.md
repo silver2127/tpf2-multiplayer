@@ -1,0 +1,13 @@
+Big saves load without the memory spike, plus an in-game minimap and travel-time settings.
+
+**This release overwrites existing `plugins/tpf2_bigmap.cfg`, including user edits, on installation, upgrade and repair.** Close the game before installing. It shares the proxy and plugin host with TpF2 Multiplayer 0.6.1; installing either package updates both.
+
+Measured on a 207,360-tile save on a 94 GiB machine with no page file: the game's private memory peak while loading fell from 34 to 36 GiB down to 8.3 GiB, and the "Out of memory" assert that ended those loads is gone.
+
+- **The load-time memory spike is fixed** (`alignment_batch_tiles=512`). On a save load the engine rebuilt the 1 m height cache for the whole map in one terrain alignment update, holding every intermediate block until the end: 3.3 million result vectors and about 10 million work vectors alive at once on a 207,360-tile save. The update now runs in batches of 512 blocks, computing, publishing and freeing per batch, which is the per-frame behaviour the engine already has in play. The game's own tile set is walked read-only and never modified. Details in `docs/alignment-batch.md`.
+- **In-game minimap** (`minimap=1`, off by default). A native-rendered minimap for maps too large for the game's own, with company colours and names when TpF2 Multiplayer is installed.
+- **Travel-time limits** (`travel_time_limit_s`, `cargo_path_time_s`, both `0` = stock). The engine's 20 minute passenger and 100 minute cargo path limits become settings; set them to, say, `6000` to let people and cargo take routes across a very large map.
+- **Terrain pager tuning, all on by default.** Content deduplication of the two engine terrain versions (`terrain_dedup`: measured on a real load, 53% of evictions share an already compressed copy); lazy zero tiles (a fresh tile gets its backing on first touch, not at allocation); an eviction rate that adapts to its measured cost and to gameplay frame stalls, with a per-second cap; a steady-state budget that follows the working set instead of snapping to the hot size after a load; a loading reserve that leaves the engine half of free memory (12 GiB floor) and backs off while the system commit charge is tight; and a retry when the system refuses a section at the commit limit instead of a crash.
+- Groundwork for a terrain sidecar (a save's finished 1 m cache written beside it and served on load) ships inert: nothing writes or reads a sidecar file yet. A compressed small-block pager for the alignment pass (`terrain_blocks`) is kept but off; batching superseded it.
+
+The performance and octree options remain experimental. Report problems with `%LOCALAPPDATA%\tpf2mp\data\tpf2mp_host.log` attached.

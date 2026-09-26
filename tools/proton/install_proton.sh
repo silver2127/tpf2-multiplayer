@@ -238,4 +238,11 @@ done
   printf '\n  },\n  "alut_real": "%s"\n}\n' "$(sha "$game_dir/alut_real.dll")"
 } > "$game_dir/$MANIFEST.tmp" && mv -f "$game_dir/$MANIFEST.tmp" "$game_dir/$MANIFEST"
 say "Installed TpF2 Multiplayer $shipped_version into $game_dir$( [ -n "$backup" ] && printf '%s' " (replaced files kept in $backup)")"
+# The proxy of 0.6.1.19 and newer switches Wine's heap to its lock-free front end at game
+# start (native/src/wine_heap.h); it ships inside alut.dll, so this only reports it.
+if grep -qaF '[proxy] wine heap:' "$game_dir/alut.dll" 2>/dev/null; then
+  say "Wine heap fix: included (faster loads and game speed under Proton; TPF2MP_WINE_HEAP=0 %command% in the game's Steam launch options turns it off)"
+else
+  say "Note: this version predates the Wine heap fix (0.6.1.19): under Proton, loads and high game speeds are slower than they need to be. Install a newer release when you can."
+fi
 say "Start the game: Main menu > Multiplayer. Everyone in a session needs the same version."

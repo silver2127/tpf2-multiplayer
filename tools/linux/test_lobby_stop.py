@@ -47,7 +47,7 @@ def fake_unmap(port):
     note("unmap-done")
     return True
 observe.upnp_unmap = fake_unmap
-def fake_observe(local_port, secret=None, password=None):
+def fake_observe(local_port, secret=None, password=None, extra_candidates=None):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", local_port))
     sock.setblocking(False)
@@ -55,6 +55,7 @@ def fake_observe(local_port, secret=None, password=None):
     time.sleep(float(os.environ.get("OBSERVE_SLEEP", "0")))
     prof = {"candidates": {"lan_v4": None, "public_v4": "127.0.0.1:%d" % sock.getsockname()[1], "v6": None},
             "flags": {"open": True}}
+    prof["candidates"].update(extra_candidates or {})
     note("observe-done")
     return sock, prof, encode_profile(prof, secret=secret, password=password)
 lobby._observe_and_announce = fake_observe
