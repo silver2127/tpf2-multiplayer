@@ -149,7 +149,7 @@ struct Model {
     uint64_t recoveryVersion=0,recoveryRequestedAt=0;
     std::vector<std::string> players, stages;
     std::vector<int> companies;
-    std::vector<std::string> letters;   // relay lobbies: the relay's origin letter per player
+    std::vector<std::string> letters;   // the lobby's sticky origin letter per player ("" if not sent)
     std::deque<std::string> chat;
     long storedAge = -1, storedMax = -1;
     bool joinFreeze = false;   // roster join_freeze: the lobby brings a late joiner in through a world sync; no hot-join save here
@@ -928,13 +928,13 @@ static std::string OriginName(int idx)
     return out;
 }
 
-// The host is 'a', joiners b, c, ... in roster order skipping the host; a relay
-// lobby's letters come from the relay (menu_hook.cpp originLetterFor).
+// The letter the lobby assigned (sticky: a joiner never moves another player to
+// a new letter mid-game). Without one: the host is 'a', joiners b, c, ... in
+// roster order skipping the host (menu_hook.cpp originLetterFor).
 static std::string OriginLetterFor(const Model& m, const std::string& name)
 {
-    if (m.relay)
-        for (size_t i = 0; i < m.players.size(); i++)
-            if (m.players[i] == name && !m.letters[i].empty()) return m.letters[i];
+    for (size_t i = 0; i < m.players.size() && i < m.letters.size(); i++)
+        if (m.players[i] == name && !m.letters[i].empty()) return m.letters[i];
     if (name == m.host) return "a";
     int idx = 0;
     for (const std::string& p : m.players) {
@@ -965,11 +965,10 @@ static void WriteBridgeCtl(bool isHost)
     {
         std::lock_guard<std::mutex> lk(S().mtx);
         const Model& m = S().m;
-        bool fromRelay = false;
-        if (m.relay)
-            for (size_t i = 0; i < m.players.size(); i++)
-                if (m.players[i] == m.you && !m.letters[i].empty()) { letter = m.letters[i]; fromRelay = true; break; }
-        if (!isHost && !fromRelay) {
+        bool fromLobby = false;
+        for (size_t i = 0; i < m.players.size() && i < m.letters.size(); i++)
+            if (m.players[i] == m.you && !m.letters[i].empty()) { letter = m.letters[i]; fromLobby = true; break; }
+        if (!isHost && !fromLobby) {
             int idx = 0;
             for (const std::string& p : m.players) {
                 if (p == m.host) continue;
@@ -1355,11 +1354,10 @@ static void ApplyRoster(const Json& ev)
         m.joinFreeze = JBool(ev, "join_freeze", false);
         m.letters.assign(m.players.size(), std::string());
         if (const Json* lm = ev.Get("letters"))
-            if (m.relay)
-                for (size_t i = 0; i < m.players.size(); i++) {
-                    const Json* l = lm->Get(m.players[i].c_str());
-                    if (l && l->type == Json::Str && ValidLetter(l->s)) m.letters[i] = l->s;
-                }
+            for (size_t i = 0; i < m.players.size(); i++) {
+                const Json* l = lm->Get(m.players[i].c_str());
+                if (l && l->type == Json::Str && ValidLetter(l->s)) m.letters[i] = l->s;
+            }
         // the role comes from the roster, re-evaluated on every one (a host
         // change re-points the bridge; the ctl write is a no-op when nothing changed)
         roleKnown = !m.you.empty() && !m.host.empty();

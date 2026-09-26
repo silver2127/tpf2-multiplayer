@@ -648,7 +648,7 @@ static void originName(int idx, char* out)
 }
 static std::string g_you, g_host, g_lobbyTitle;   // the lobby's name, from the roster; all three are whatever the roster says, any length
 static volatile LONG g_lobbyRelay = 0;   // the host is a relay-only server: "host" in the roster is the LEADER (oldest joiner)
-static std::vector<std::string> g_letters;   // relay lobbies: origin letter per roster entry, assigned by the relay (sticky)
+static std::vector<std::string> g_letters;   // origin letter per roster entry, assigned by the lobby (sticky; "" if not sent)
 static char g_chatLog[14][200]; static int g_chatHead = 0, g_chatCount = 0;
 static char g_chatInput[200] = ""; static int g_chatLen = 0;
 static volatile LONG g_isHost = 0;       // this instance is the lobby host
@@ -3175,17 +3175,19 @@ static void writeBridgeCtl(bool isHost)
     // (a sandboxed second instance reads through to the real dir until it has
     // its own copy) otherwise apply each other's role for a moment.
     unsigned long bpid = readBridgePid();
-    // Letters for N players: the host is 'a'; joiners take b, c, d... in roster
-    // order, skipping the host. Every client derives the same assignment from
-    // the same roster, so nobody has to be told.
+    // Letters for N players come from the lobby, which fixes each player's
+    // letter when they first join. Deriving them from the sorted roster (the
+    // host 'a', joiners b, c, ... by position) renumbered players mid-game when
+    // a joiner's name sorted first, and the worlds desynced (2026-09-26). The
+    // positional rule stays as the fallback for a roster without letters.
     std::string letter = "a";
-    bool fromRelay = false;
-    if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
+    bool fromLobby = false;
+    {
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
-        for (int i = 0; i < playerCount(); i++) if (g_players[i] == g_you && !g_letters[i].empty()) { letter = g_letters[i]; fromRelay = true; break; }
+        for (int i = 0; i < playerCount() && i < (int)g_letters.size(); i++) if (g_players[i] == g_you && !g_letters[i].empty()) { letter = g_letters[i]; fromLobby = true; break; }
         if (g_modelCsInit) LeaveCriticalSection(&g_modelCs);
     }
-    if (!isHost && !fromRelay) {
+    if (!isHost && !fromLobby) {
         int idx = 0;
         if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
         for (int i = 0; i < playerCount(); i++) {
@@ -3241,16 +3243,15 @@ static void writeBridgeCtl(bool isHost)
         path, letter.c_str(), relayPortFor(isHost));
 }
 
-// The origin letter each machine's bridge uses: the host is 'a', joiners take
-// b, c, ... in roster order skipping the host (same rule as writeBridgeCtl).
+// The origin letter each machine's bridge uses: the lobby's sticky letter, else
+// the host is 'a', joiners take b, c, ... in roster order skipping the host
+// (same rule as writeBridgeCtl).
 static std::string originLetterFor(const std::string& name)
 {
     // the critical section is recursive: writeCompanyCfg calls this with it held
     if (g_modelCsInit) EnterCriticalSection(&g_modelCs);
     std::string out;
-    if (InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
-        for (int i = 0; i < playerCount(); i++) if (g_players[i] == name && !g_letters[i].empty()) { out = g_letters[i]; break; }
-    }
+    for (int i = 0; i < playerCount() && i < (int)g_letters.size(); i++) if (g_players[i] == name && !g_letters[i].empty()) { out = g_letters[i]; break; }
     if (out.empty()) {
         if (name == g_host) out = "a";
         else {
@@ -3374,9 +3375,9 @@ static void applyRoster(const char* s)
     g_lobbyTitle = jsonStrS(s, "lobby");
     InterlockedExchange(&g_lobbyRelay, jsonBool(s, "relay", false) ? 1 : 0);
     InterlockedExchange(&g_storedAge, jsonInt(s, "stored_age")); InterlockedExchange(&g_storedMax, jsonInt(s, "stored_max"));
-    // relay lobbies: the relay assigns every player a sticky origin letter
+    // the lobby assigns every player a sticky origin letter
     { const char* lm = strstr(s, "\"letters\"");
-      if (lm && InterlockedCompareExchange(&g_lobbyRelay, 0, 0)) {
+      if (lm) {
           for (int i = 0; i < playerCount(); i++) {
               std::string keyq = "\"" + jsonEscape(g_players[i].c_str()) + "\"";
               const char* k = strstr(lm, keyq.c_str());

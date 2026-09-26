@@ -192,6 +192,18 @@ int main()
     lobby::Json departed;
     assert(lobby::ParseJson(R"({"players":["host","joiner"]})", &departed));
     lobby::ApplyRoster(departed); assert(readLoading().empty());
+    // A game host's roster carries sticky letters too. "aaron" joined last but
+    // sorts first: by roster position bob would become c mid-game (2026-09-26).
+    lobby::Json plain;
+    assert(lobby::ParseJson(R"({"players":["aaron","bob","host"],"host":"host","you":"bob","relay":false,"letters":{"aaron":"c","bob":"b","host":"a"}})", &plain));
+    lobby::ApplyRoster(plain);
+    assert(readNames() == "c=aaron\nb=bob\na=host\n");
+    assert(lobby::OwnLetter() == "b");
+    // Without letters (an older host) the positional rule still applies.
+    lobby::Json unlettered;
+    assert(lobby::ParseJson(R"({"players":["aaron","bob","host"],"host":"host","you":"bob","relay":false})", &unlettered));
+    lobby::ApplyRoster(unlettered);
+    assert(readNames() == "b=aaron\nc=bob\na=host\n");
     // A complete roster over 1 MiB survives the mailbox tail and parser.
     lobby::S().lobbyDir=dir; lobby::S().child.gen=model.gen;
     std::string event="{\"type\":\"roster\",\"players\":[";

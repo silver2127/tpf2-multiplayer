@@ -128,9 +128,9 @@ RELAY-ONLY HOST (a dedicated server without a game)
 ``host --relay-only`` runs this same host loop on a machine with no game: it
 is the star's centre (frames, chat, roster, save fan-out) and the master-server
 announcer, but NOT a player. The oldest connected joiner is the LEADER: the
-roster names it as ``host`` and carries ``relay: true`` plus a sticky
-``letters`` map (name -> origin letter, a for the first joiner ever, never
-reused while the relay lives), so the menu DLL gives the leader the host role
+roster names it as ``host`` and carries ``relay: true``. Every roster carries a
+sticky ``letters`` map (name -> origin letter; a relay gives a to the first
+joiner ever, a game host keeps a; never reused while the lobby lives), so the menu DLL gives the leader the host role
 (START GAME, the hot-join sync save) and every bridge keeps its letter across
 leader changes. The leader UPLOADS its save to the relay (the client-side
 ``start`` command drives a _HostSaveTransfer at the relay); the relay stores it
@@ -3730,7 +3730,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     # 10 s grace and /resume are gone -- simpler; /new stays, until the world is sent).
     # The few seconds let players who arrive together share one transfer instead of two.
     RESUME_GRACE = 3.0
-    letters = {}                            # relay-only: name -> origin letter (sticky)
+    letters = {}                            # name -> origin letter (sticky for the lobby's life)
     letters_path = os.path.join(io.dir, "relay_letters.json")
     chips = {}                              # relay-only: name -> company chip (sticky, like letters)
     chips_path = os.path.join(io.dir, "relay_companies.json")
@@ -3774,18 +3774,33 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return peers[a]["name"] if a is not None else ""
 
     def letter_for(name):
+        """A player's origin letter, fixed the first time the lobby sees them.
+        A game host is 'a'; joiners take the lowest letter never handed out, so
+        nobody is renumbered while the game runs. Letters used to be positions
+        in the sorted roster: a joiner whose name sorted first moved everyone
+        after it to another letter mid-game, and the worlds desynced
+        (2026-09-26)."""
+        if not relay_only and name == host_name:
+            return "a"
         if name not in letters:
             used = set(letters.values())
+            if not relay_only:
+                used.add("a")
             i = 0
             while _origin_letter(i) in used:
                 i += 1
             letters[name] = _origin_letter(i)
-            try:
-                with open(letters_path, "w", encoding="utf-8") as f:
-                    json.dump(letters, f)
-            except OSError:
-                pass
+            if relay_only:
+                try:
+                    with open(letters_path, "w", encoding="utf-8") as f:
+                        json.dump(letters, f)
+                except OSError:
+                    pass
         return letters[name]
+
+    def roster_letters():
+        names = [p["name"] for p in peers.values()] + ([] if relay_only else [host_name])
+        return {n: letter_for(n) for n in names}
 
     HOTJOIN_STORED_MAX = 180.0                # a late joiner is served from the stored world when it is this fresh
     RELAY_MODS_GRACE = 8.0                    # seconds a completed upload waits for the leader's mods round before it goes out
@@ -4028,7 +4043,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                                  "mods_unknown": advertised[1] is None,
                                  "stored_age": stored_age() if relay_only else -1,
                                  "stored_max": int(HOTJOIN_STORED_MAX) if relay_only else -1,
-                                 "letters": {p2["name"]: letter_for(p2["name"]) for p2 in peers.values()} if relay_only else None,
+                                 "letters": roster_letters(),
                                  "started": bool(p.get("started")),
                                  "start_save": start_save[0],
                                  "profiles": profiles, "links": links,
@@ -4048,7 +4063,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         io.emit({"type": "roster", "players": players,
                  "you": host_name, "host": leader_name(), "lobby": lobby_name,
                  "relay": relay_only, "companies": roster_companies(), "stages": roster_stages(),
-                 "mode": mode[0], "join_freeze": freeze})
+                 "letters": roster_letters(), "mode": mode[0], "join_freeze": freeze})
         io.write_state(state="connected", code=code, players=players,
                        you=host_name, host=leader_name(), started=started[0],
                        lobby=lobby_name, companies=roster_companies(), mode=mode[0])
@@ -4251,8 +4266,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             else:
                 log(f"[host] frozen join NOT possible for {peers[addr]['name']!r} "
                     f"({'its version has no resync' if recovery_protocol != 4 else recovery_unavailable_reason()}) -- the menu's hot-join save serves it")
-        if relay_only:
-            letter_for(peers[addr]["name"])
+        letter_for(peers[addr]["name"])          # fixed now, in join order
         _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "recovery": 4 if recovery_supported() else 0,
@@ -6396,7 +6410,10 @@ def _dial_loopback(port, host_port, timeout):
 def selftest():
     HP, P1, P2, P3 = 29520, 29521, 29522, 29523
     names = {"host": "alice", "j1": "bob", "j2": "carol"}
-    late_name = "dave"                        # joins AFTER the start (case d)
+    # joins AFTER the start (case d). The name sorts before every other player:
+    # letters were once positions in the sorted roster, and such a joiner
+    # renumbered the players already in the game (2026-09-26).
+    late_name = "aaron"
     expected = sorted(names.values())
     base = tempfile.mkdtemp(prefix="lobby_selftest_")
     dirs = {k: os.path.join(base, k) for k in list(names) + ["j3"]}
@@ -6452,6 +6469,33 @@ def selftest():
             print("[selftest] FAIL (a): all three not in every roster")
         else:
             print(f"[selftest] OK (a): every roster = {expected}")
+
+        # (a3) every roster carries the same letters: the host a, the joiners
+        #      b and c (in join order), each once
+        def roster_letters_of(k):
+            r = _latest_roster(ios[k].out_path) or {}
+            return r.get("letters") or {}
+
+        first_letters = {}
+
+        def letters_agree():
+            ls = [roster_letters_of(k) for k in names]
+            if any(l != ls[0] for l in ls) or set(ls[0]) != set(expected):
+                return False
+            first_letters.clear()
+            first_letters.update(ls[0])
+            return True
+
+        if not _wait_until(letters_agree, timeout=12):
+            ok = False
+            print(f"[selftest] FAIL (a3): letters differ or are incomplete: "
+                  f"{ {k: roster_letters_of(k) for k in names} }")
+        elif (first_letters[names["host"]] != "a"
+              or sorted([first_letters[names["j1"]], first_letters[names["j2"]]]) != ["b", "c"]):
+            ok = False
+            print(f"[selftest] FAIL (a3): unexpected letters {first_letters}")
+        else:
+            print(f"[selftest] OK (a3): every roster has letters {first_letters}")
 
         # (a1) bob picks company 2: every roster carries companies {bob: 2}
         with open(ios["j1"].in_path, "a", encoding="utf-8") as f:
@@ -6552,6 +6596,21 @@ def selftest():
                 else:
                     print("[selftest] OK (d): late joiner told 'game already "
                           "started', not started, in roster")
+
+                # (d1) the late joiner takes a new letter; nobody already in
+                #      the game changes letter, although its name sorts first
+                want = dict(first_letters, **{late_name: "d"})
+
+                def letters_kept():
+                    return all(roster_letters_of(k) == want for k in names)
+
+                if not first_letters or not _wait_until(letters_kept, timeout=12):
+                    ok = False
+                    print(f"[selftest] FAIL (d1): letters after the late join: "
+                          f"{ {k: roster_letters_of(k) for k in names} } (want {want})")
+                else:
+                    print(f"[selftest] OK (d1): late joiner {late_name} got d, "
+                          f"the others kept theirs: {want}")
 
         # (e) the stale incoming_save.sav in j1's io dir was deleted on startup
         if os.path.exists(stale):
