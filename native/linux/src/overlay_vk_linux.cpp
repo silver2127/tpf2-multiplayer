@@ -259,10 +259,19 @@ struct HoverState { int x = 0, y = 0, w = 0, h = 0; bool pressed = false; };
 static HoverState g_lastHover;
 static int g_composedW = 0, g_composedH = 0;
 
+// The panel is composed in ordinary memory and then copied row by row into the
+// mapped image. That mapping can be device memory (NVIDIA hands out VRAM behind
+// the BAR, uncached): reading it back byte by byte took ~2 s for a 3456x2160
+// title screen, longer than the 500 ms refresh, so the game froze.
+static std::vector<unsigned char> g_composeBuf;
+
 static void Compose(int w, int h, const HoverState& hover)
 {
+    const size_t rowBytes = (size_t)w * 4;
+    g_composeBuf.resize(rowBytes * h);
+    unsigned char* const buf = g_composeBuf.data();
     for (int y = 0; y < h; ++y) {
-        auto* d = static_cast<unsigned char*>(g_panelPtr) + y * g_panelPitch;
+        auto* d = buf + (size_t)y * rowBytes;
         for (int x = 0; x < w; ++x, d += 4) {
             d[0] = g_rgbaOrder ? 5 : 40; d[1] = 25;
             d[2] = g_rgbaOrder ? 40 : 5; d[3] = 255;
@@ -277,7 +286,7 @@ static void Compose(int w, int h, const HoverState& hover)
     const unsigned char* lp = layer::Pixels();
     if (layer::Width() == w && layer::Height() == h) {
         for (int y = 0; y < h; y++) {
-            unsigned char* d = static_cast<unsigned char*>(g_panelPtr) + (size_t)y * g_panelPitch; const unsigned char* l = lp + (size_t)y * w * 4;
+            unsigned char* d = buf + (size_t)y * rowBytes; const unsigned char* l = lp + (size_t)y * w * 4;
             for (int x = 0; x < w; x++, d += 4, l += 4) {
                 const int a = l[3];
                 if (!a) continue;
@@ -287,6 +296,8 @@ static void Compose(int w, int h, const HoverState& hover)
             }
         }
     }
+    for (int y = 0; y < h; ++y)
+        memcpy(static_cast<unsigned char*>(g_panelPtr) + (size_t)y * g_panelPitch, buf + (size_t)y * rowBytes, rowBytes);
 }
 
 static bool DrawPanel(VkQueue q, uint32_t imgIndex, uint32_t waitCount=0, const VkSemaphore* waits=nullptr)
