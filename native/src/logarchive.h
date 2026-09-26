@@ -17,6 +17,17 @@
 // about.txt names the files without the user's paths: these folders get sent in
 // bug reports.
 //
+// And, since 2026-09-26 (a joiner whose bridge never saw the host: the logs had
+// no version, no bridge control file and none of the lobby's message stream, so
+// the cause could not be named): about.txt opens with the installed version,
+// the game's and our DLLs' build stamps, Windows and the time zone; then come
+// the data folder's state files (*.txt: the bridge control file, the lockstep
+// capture, event and inject streams, resync and dash state -- COPIED, never
+// moved: the game reads them), the game folder's version, cfg and flag files,
+// and the lobby's message stream and state (netpunch\*.jsonl, *.json, *.txt;
+// never the incoming save). State files keep their last TPF2_STATE_TAIL_BYTES
+// each and come after the logs, so they never take the logs' copy budget.
+//
 // Built for a game that crashes a lot, because that is when the logs matter:
 //  - it must never stop the game starting: the entry point is SEH-guarded
 //    (Tpf2mpArchiveLogsSafe), and every step that fails is noted and skipped;
@@ -39,6 +50,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <wchar.h>
+#include <initializer_list>
 #include "datadir.h"
 
 #pragma comment(lib, "advapi32.lib")
@@ -47,7 +59,8 @@ static const ULONGLONG TPF2_LOG_TAIL_BYTES    = 32ull << 20;
 static const ULONGLONG TPF2_DUMP_MAX_BYTES    = 64ull << 20;
 static const ULONGLONG TPF2_COPY_BUDGET_BYTES = 200ull << 20;
 static const int       TPF2_DUMPS_PER_RUN     = 3;
-static const int       TPF2_LOG_KEEP          = 2;   // per kind: "previous" runs, "now" copies
+static const ULONGLONG TPF2_STATE_TAIL_BYTES  = 8ull << 20;   // each state/stream file (lockstep streams grow)
+static const int       TPF2_LOG_KEEP          = 5;   // per kind: "previous" runs, "now" copies (testers restart often)
 
 struct Tpf2mpLogArchive {
     wchar_t folder[MAX_PATH];   // the folder written (empty when nothing was found)
@@ -59,7 +72,8 @@ struct Tpf2mpLogArchive {
 // Copies src to dst while another process may still be writing it. A file over
 // the cap keeps its tail: the end of a log is what a bug report needs.
 // *copied is the number of bytes written.
-static inline bool LaCopyShared(const wchar_t* src, const wchar_t* dst, ULONGLONG* copied)
+static inline bool LaCopyShared(const wchar_t* src, const wchar_t* dst, ULONGLONG* copied,
+                                ULONGLONG tail = TPF2_LOG_TAIL_BYTES)
 {
     *copied = 0;
     HANDLE in = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -67,9 +81,9 @@ static inline bool LaCopyShared(const wchar_t* src, const wchar_t* dst, ULONGLON
     if (in == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size = {};
     GetFileSizeEx(in, &size);
-    if ((ULONGLONG)size.QuadPart > TPF2_LOG_TAIL_BYTES) {
+    if ((ULONGLONG)size.QuadPart > tail) {
         LARGE_INTEGER off;
-        off.QuadPart = size.QuadPart - (LONGLONG)TPF2_LOG_TAIL_BYTES;
+        off.QuadPart = size.QuadPart - (LONGLONG)tail;
         SetFilePointerEx(in, off, nullptr, FILE_BEGIN);
     }
     HANDLE out = CreateFileW(dst, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -100,6 +114,83 @@ static inline void LaNote(FILE* f, const wchar_t* fmt, ...)
     va_end(ap);
     char u[3072];
     if (WideCharToMultiByte(CP_UTF8, 0, w, -1, u, sizeof(u), nullptr, nullptr) > 0) { fputs(u, f); fflush(f); }
+}
+
+// The first line of a small text file (a version stamp), or empty.
+static inline void LaFirstLine(const wchar_t* path, char* out, size_t cch)
+{
+    out[0] = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD got = 0;
+    if (ReadFile(h, out, (DWORD)(cch - 1), &got, nullptr)) out[got] = 0;
+    CloseHandle(h);
+    for (char* c = out; *c; ++c) if (*c == '\r' || *c == '\n') { *c = 0; break; }
+}
+
+// A module's identity for about.txt: size, last-written time and the PE link
+// stamp (which build it is, even when two installs share a version number).
+static inline void LaNoteModule(FILE* about, const wchar_t* path, const wchar_t* shown)
+{
+    WIN32_FILE_ATTRIBUTE_DATA ad;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &ad)) return;
+    SYSTEMTIME ut;
+    FileTimeToSystemTime(&ad.ftLastWriteTime, &ut);
+    DWORD link = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        IMAGE_DOS_HEADER dos = {};
+        DWORD got = 0;
+        if (ReadFile(h, &dos, sizeof(dos), &got, nullptr) && got == sizeof(dos) && dos.e_magic == IMAGE_DOS_SIGNATURE) {
+            LARGE_INTEGER off;
+            off.QuadPart = dos.e_lfanew + 8;   // Signature(4) Machine(2) NumberOfSections(2), then TimeDateStamp
+            if (SetFilePointerEx(h, off, nullptr, FILE_BEGIN)) ReadFile(h, &link, sizeof(link), &got, nullptr);
+        }
+        CloseHandle(h);
+    }
+    LaNote(about, L"  %-38s %10llu bytes  written %04u-%02u-%02u %02u:%02u UTC  link stamp %08lx\r\n", shown,
+           ((ULONGLONG)ad.nFileSizeHigh << 32) | ad.nFileSizeLow, ut.wYear, ut.wMonth, ut.wDay, ut.wHour, ut.wMinute, link);
+}
+
+// UNDER PROTON (2026-09-26, user: "make sure open logs works on proton"): the
+// same DLLs run in a Wine prefix. Wine's ntdll exports wine_get_version; its
+// kernel32 converts a prefix path to the host's (wine_get_unix_file_name), which
+// is the path a Linux player can open. Steam in the prefix is Proton's stub:
+// the real Steam, and with it the game's userdata, is on the host, named by
+// STEAM_COMPAT_CLIENT_INSTALL_PATH and reached through drive Z: (the host's /).
+static inline const char* LaWineVersion()
+{
+    typedef const char* (__cdecl *WineVersionFn)();
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    WineVersionFn f = nt ? (WineVersionFn)GetProcAddress(nt, "wine_get_version") : nullptr;
+    return f ? f() : nullptr;
+}
+// The host's path of a prefix path (UTF-8), or false outside Wine.
+static inline bool LaUnixPath(const wchar_t* win, char* out, size_t cch)
+{
+    out[0] = 0;
+    typedef char* (__cdecl *UnixNameFn)(const wchar_t*);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    UnixNameFn f = k32 ? (UnixNameFn)GetProcAddress(k32, "wine_get_unix_file_name") : nullptr;
+    char* u = f ? f(win) : nullptr;
+    if (!u) return false;
+    strncpy_s(out, cch, u, _TRUNCATE);
+    HeapFree(GetProcessHeap(), 0, u);
+    return out[0] != 0;
+}
+// Proton's host Steam as a prefix path (Z:\home\...\Steam\), or empty.
+static inline void LaHostSteamRoot(wchar_t* out, DWORD cch)
+{
+    out[0] = 0;
+    wchar_t host[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"STEAM_COMPAT_CLIENT_INSTALL_PATH", host, MAX_PATH);
+    if (!n || n >= MAX_PATH || host[0] != L'/') return;
+    _snwprintf_s(out, cch, _TRUNCATE, L"Z:%s", host);
+    for (wchar_t* p = out; *p; ++p) if (*p == L'/') *p = L'\\';
+    size_t len = wcslen(out);
+    if (len && out[len - 1] != L'\\' && len + 1 < cch) { out[len] = L'\\'; out[len + 1] = 0; }
 }
 
 // Steam's install folder with a trailing backslash, or empty.
@@ -148,6 +239,48 @@ static inline void LaRemoveArchive(const wchar_t* dir)
         FindClose(h);
     }
     RemoveDirectoryW(dir);
+}
+
+// The lobby's message stream and state carry the invitation codes (a code is
+// enough to join): the copies get every string value of these keys masked with
+// '*', in place, so the lines keep their length and stay valid JSON.
+static inline void LaRedactFile(const wchar_t* path)
+{
+    static const char* const keys[] = { "\"code\"", "\"cross_code\"", "\"steam\"", "\"steam_code\"",
+        "\"steam_secret\"", "\"password\"", "\"pass\"", "\"passcode\"", "\"secret\"" };
+    HANDLE h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size = {};
+    if (!GetFileSizeEx(h, &size) || size.QuadPart <= 0 || (ULONGLONG)size.QuadPart > TPF2_STATE_TAIL_BYTES) { CloseHandle(h); return; }
+    const DWORD n = (DWORD)size.QuadPart;
+    char* buf = (char*)HeapAlloc(GetProcessHeap(), 0, n);
+    DWORD got = 0;
+    if (buf && ReadFile(h, buf, n, &got, nullptr) && got == n) {
+        bool changed = false;
+        for (const char* key : keys) {
+            const size_t kl = strlen(key);
+            for (DWORD i = 0; i + kl < n; ++i) {
+                if (memcmp(buf + i, key, kl)) continue;
+                DWORD j = i + (DWORD)kl;
+                while (j < n && (buf[j] == ' ' || buf[j] == '\t')) ++j;
+                if (j >= n || buf[j] != ':') continue;
+                ++j;
+                while (j < n && (buf[j] == ' ' || buf[j] == '\t')) ++j;
+                if (j >= n || buf[j] != '"') continue;   // only a string value: a bool or number is no secret
+                for (++j; j < n && buf[j] != '"' && buf[j] != '\n'; ++j) {
+                    if (buf[j] == '\\' && j + 1 < n) { buf[j] = '*'; ++j; }
+                    buf[j] = '*';
+                    changed = true;
+                }
+                i = j;
+            }
+        }
+        LARGE_INTEGER zero = {};
+        DWORD put = 0;
+        if (changed && SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) WriteFile(h, buf, n, &put, nullptr);
+    }
+    if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    CloseHandle(h);
 }
 
 // previousSession: run at process start; moves the data folder's logs.
@@ -221,27 +354,77 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
            previousSession ? L"the previous run, saved when the game started again" : L"the running game, copied from the menu");
     LaNote(about, L"Paths below are relative: data = %%LOCALAPPDATA%%\\tpf2mp\\data, game = the Transport Fever 2 folder.\r\n\r\n");
 
+    // What was running: every log line is read against a version and a clock.
+    {
+        TIME_ZONE_INFORMATION tz;
+        DWORD tzr = GetTimeZoneInformation(&tz);
+        LONG bias = tz.Bias + (tzr == TIME_ZONE_ID_DAYLIGHT ? tz.DaylightBias : tzr == TIME_ZONE_ID_STANDARD ? tz.StandardBias : 0);
+        LONG mag = bias < 0 ? -bias : bias;
+        LaNote(about, L"Versions (log times are local time, UTC%c%02ld:%02ld)\r\n", bias > 0 ? L'-' : L'+', mag / 60, mag % 60);
+        char ver[64] = "";
+        if (gameDir && gameDir[0]) {
+            wchar_t p[MAX_PATH];
+            _snwprintf_s(p, _TRUNCATE, L"%stpf2mp_version.txt", gameDir);
+            LaFirstLine(p, ver, sizeof(ver));
+        }
+        LaNote(about, L"  %-38s %hs\r\n", L"TpF2 Multiplayer", ver[0] ? ver : "unknown (no tpf2mp_version.txt)");
+        typedef LONG (WINAPI *RtlGetVersionFn)(OSVERSIONINFOW*);
+        OSVERSIONINFOW os = {};
+        os.dwOSVersionInfoSize = sizeof(os);
+        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+        RtlGetVersionFn rgv = nt ? (RtlGetVersionFn)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+        if (rgv && rgv(&os) == 0)
+            LaNote(about, L"  %-38s %lu.%lu build %lu\r\n", L"Windows", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
+        if (const char* wine = LaWineVersion()) {
+            typedef void (__cdecl *HostVersionFn)(const char**, const char**);
+            HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+            HostVersionFn hv = nt ? (HostVersionFn)GetProcAddress(nt, "wine_get_host_version") : nullptr;
+            const char *sys = "", *rel = "";
+            if (hv) hv(&sys, &rel);
+            wchar_t tool[MAX_PATH] = L"";
+            GetEnvironmentVariableW(L"STEAM_COMPAT_TOOL_PATHS", tool, MAX_PATH);
+            wchar_t* colon = wcschr(tool, L':');   // the first tool is Proton itself
+            if (colon) *colon = 0;
+            const wchar_t* name = wcsrchr(tool, L'/');
+            LaNote(about, L"  %-38s Wine %hs on %hs %hs%s%s\r\n", L"Proton", wine, sys ? sys : "", rel ? rel : "",
+                   name ? L", tool " : L"", name ? name + 1 : L"");
+        }
+        if (gameDir && gameDir[0]) {
+            static const wchar_t* const mods[] = { L"TransportFever2.exe", L"tpf2_menu.dll", L"tpf2_bridge_mp.dll",
+                L"tpf2_slice.dll", L"tpf2_pluginhost.dll", L"alut.dll", L"plugins\\tpf2_bigmap.dll",
+                L"plugins\\tpf2_previews.dll", L"plugins\\tpf2_workshop_register.dll", L"netpunch\\netpunch.exe" };
+            for (const wchar_t* m : mods) {
+                wchar_t p[MAX_PATH];
+                _snwprintf_s(p, _TRUNCATE, L"%s%s", gameDir, m);
+                LaNoteModule(about, p, m);
+            }
+        }
+        LaNote(about, L"\r\nFiles\r\n");
+    }
+
     ULONGLONG budget = TPF2_COPY_BUDGET_BYTES;
-    auto copyNoted = [&](const wchar_t* src, const wchar_t* dst, const wchar_t* shown, const wchar_t* why) -> bool {
+    auto copyNoted = [&](const wchar_t* src, const wchar_t* dst, const wchar_t* shown, const wchar_t* why,
+                         ULONGLONG tail) -> bool {
         WIN32_FILE_ATTRIBUTE_DATA ad;
         ULONGLONG size = GetFileAttributesExW(src, GetFileExInfoStandard, &ad)
                          ? ((ULONGLONG)ad.nFileSizeHigh << 32) | ad.nFileSizeLow : 0;
-        ULONGLONG need = size > TPF2_LOG_TAIL_BYTES ? TPF2_LOG_TAIL_BYTES : size;
+        ULONGLONG need = size > tail ? tail : size;
         if (need > budget) {
             LaNote(about, L"  %-52s skipped: this archive's copy budget is used up\r\n", shown);
             return false;
         }
         ULONGLONG copied = 0;
-        bool ok = LaCopyShared(src, dst, &copied);
+        bool ok = LaCopyShared(src, dst, &copied, tail);
         budget -= copied < budget ? copied : budget;
         if (ok)
             LaNote(about, L"  %-52s %12llu bytes%s%s\r\n", shown, size,
-                   size > TPF2_LOG_TAIL_BYTES ? L" (only the last 32 MB kept)" : L"", why);
+                   size <= tail ? L"" : tail == TPF2_LOG_TAIL_BYTES ? L" (only the last 32 MB kept)" : L" (only the last 8 MB kept)", why);
         else
             LaNote(about, L"  %-52s could not be read\r\n", shown);
         return ok;
     };
-    auto place = [&](const wchar_t* src, const wchar_t* destName, const wchar_t* shown, bool move) {
+    auto place = [&](const wchar_t* src, const wchar_t* destName, const wchar_t* shown, bool move,
+                     ULONGLONG tail = TPF2_LOG_TAIL_BYTES) {
         wchar_t dst[MAX_PATH];
         _snwprintf_s(dst, _TRUNCATE, L"%s\\%s", out->folder, destName);
         bool ok = false;
@@ -253,13 +436,14 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
             if (ok) LaNote(about, L"  %-52s %12llu bytes\r\n", shown, size);
             // Still held open: a game that crashed and is not gone yet, or another
             // running instance. Copy it, or the next run's DLLs recreate it empty.
-            else ok = copyNoted(src, dst, shown, L" (in use: copied)");
+            else ok = copyNoted(src, dst, shown, L" (in use: copied)", tail);
         } else {
-            ok = copyNoted(src, dst, shown, L"");
+            ok = copyNoted(src, dst, shown, L"", tail);
         }
         if (ok) out->files++; else out->skipped++;
     };
-    auto each = [&](const wchar_t* dir, const wchar_t* mask, const wchar_t* prefix, const wchar_t* shownDir, bool move) {
+    auto each = [&](const wchar_t* dir, const wchar_t* mask, const wchar_t* prefix, const wchar_t* shownDir, bool move,
+                    ULONGLONG tail = TPF2_LOG_TAIL_BYTES) {
         wchar_t pat[MAX_PATH];
         _snwprintf_s(pat, _TRUNCATE, L"%s%s", dir, mask);
         WIN32_FIND_DATAW fd;
@@ -271,7 +455,7 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
             _snwprintf_s(src, _TRUNCATE, L"%s%s", dir, fd.cFileName);
             _snwprintf_s(dest, _TRUNCATE, L"%s%s", prefix, fd.cFileName);
             _snwprintf_s(shown, _TRUNCATE, L"%s\\%s", shownDir, fd.cFileName);
-            place(src, dest, shown, move);
+            place(src, dest, shown, move, tail);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     };
@@ -293,18 +477,21 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
     // 3. the game's own log and crash dumps (the Steam user that ran the game last)
     wchar_t steam[MAX_PATH];
     LaSteamRoot(steam, MAX_PATH);
+    wchar_t hostSteam[MAX_PATH];
+    LaHostSteamRoot(hostSteam, MAX_PATH);   // Proton: the host's Steam, where the game's userdata is
     wchar_t best[MAX_PATH] = L"";
-    if (steam[0]) {
+    FILETIME bestT = {};
+    for (const wchar_t* root : { (const wchar_t*)steam, (const wchar_t*)hostSteam }) {
+        if (!root[0]) continue;
         wchar_t pat[MAX_PATH];
-        FILETIME bestT = {};
-        _snwprintf_s(pat, _TRUNCATE, L"%suserdata\\*", steam);
+        _snwprintf_s(pat, _TRUNCATE, L"%suserdata\\*", root);
         WIN32_FIND_DATAW fd;
         HANDLE h = FindFirstFileW(pat, &fd);
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.') continue;
                 wchar_t cd[MAX_PATH], so[MAX_PATH];
-                _snwprintf_s(cd, _TRUNCATE, L"%suserdata\\%s\\1066780\\local\\crash_dump\\", steam, fd.cFileName);
+                _snwprintf_s(cd, _TRUNCATE, L"%suserdata\\%s\\1066780\\local\\crash_dump\\", root, fd.cFileName);
                 _snwprintf_s(so, _TRUNCATE, L"%sstdout.txt", cd);
                 WIN32_FILE_ATTRIBUTE_DATA ad;
                 if (GetFileAttributesExW(so, GetFileExInfoStandard, &ad) && CompareFileTime(&ad.ftLastWriteTime, &bestT) > 0) {
@@ -395,6 +582,38 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const wchar_t* gameDi
             _snwprintf_s(src, _TRUNCATE, L"%s%s\\game_stdout.txt", out->root, newest);
             place(src, L"previous_run_game_stdout.txt", L"game log of the previous run (from the newest -previous archive)", false);
         }
+    }
+    // 5. state: what each side believed, beside what it logged. Last, so a big
+    // lockstep stream never takes the logs' share of the copy budget.
+    LaNote(about, L"\r\nState files (the last 8 MB of each)\r\n");
+    each(data, L"*.txt", L"state_", L"data", false, TPF2_STATE_TAIL_BYTES);
+    if (gameDir && gameDir[0]) {
+        wchar_t net[MAX_PATH], plug[MAX_PATH];
+        _snwprintf_s(net, _TRUNCATE, L"%snetpunch\\", gameDir);
+        _snwprintf_s(plug, _TRUNCATE, L"%splugins\\", gameDir);
+        each(gameDir, L"tpf2mp_version.txt", L"game_", L"game", false, TPF2_STATE_TAIL_BYTES);
+        each(gameDir, L"tpf2*.cfg", L"game_", L"game", false, TPF2_STATE_TAIL_BYTES);
+        each(gameDir, L"tpf2_menu_flags.txt", L"game_", L"game", false, TPF2_STATE_TAIL_BYTES);
+        each(plug, L"*.cfg", L"game_plugins_", L"game\\plugins", false, TPF2_STATE_TAIL_BYTES);
+        // the menu <-> lobby message stream and the lobby's own state; never incoming_save.*
+        each(net, L"*.jsonl", L"game_netpunch_", L"game\\netpunch", false, TPF2_STATE_TAIL_BYTES);
+        each(net, L"*.json", L"game_netpunch_", L"game\\netpunch", false, TPF2_STATE_TAIL_BYTES);
+        each(net, L"*.txt", L"game_netpunch_", L"game\\netpunch", false, TPF2_STATE_TAIL_BYTES);
+        static const wchar_t* const redact[] = { L"game_netpunch_*.json*", L"game_netpunch_*.txt" };
+        for (const wchar_t* mask : redact) {
+            wchar_t pat[MAX_PATH];
+            _snwprintf_s(pat, _TRUNCATE, L"%s\\%s", out->folder, mask);
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileW(pat, &fd);
+            if (h == INVALID_HANDLE_VALUE) continue;
+            do {
+                wchar_t f[MAX_PATH];
+                _snwprintf_s(f, _TRUNCATE, L"%s\\%s", out->folder, fd.cFileName);
+                LaRedactFile(f);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        LaNote(about, L"  (invitation codes in the lobby files above are masked with *)\r\n");
     }
     if (about) fclose(about);
 
