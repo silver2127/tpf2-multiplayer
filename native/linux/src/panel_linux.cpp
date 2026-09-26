@@ -94,7 +94,7 @@ static float g_s = 1.f;                              // UI scale
 // id: 2 HOST, 3 JOIN, 4 close, 5 LEAVE (and the lobby's close), 6 START GAME,
 // 7 copy code, 8 code field, 9 chat field, 10 password, 11 PUBLIC, 12 REFRESH,
 // 13 player name, 14 lobby name, 15 OPEN LOGS, 16 YES, 17 NO, 20..35 company
-// chips, 40..47 public games (menu_hook.cpp struct Hit).
+// chips, 60..71 public games (menu_hook.cpp struct Hit).
 struct Hit { int x, y, w, h, id; bool btn; };
 static Hit g_hits[64];
 static int g_hitCount = 0;
@@ -296,16 +296,6 @@ static void AddHit(int x, int y, int w, int h, int id, bool btn = false)
     if (g_hitCount < 64) g_hits[g_hitCount++] = Hit{ x, y, w, h, id, btn };
 }
 
-static void MwButton(int x, int y, int w, int h, const char* label, int id)
-{
-    layer::Text(x, y, w, h, label, S(13), MW_TEXT, layer::kCenter | layer::kVCenter);
-    AddHit(x, y, w, h, id, true);
-}
-static int MwButtonW(const char* label) { return layer::TextWidth(label, S(13)) + S(2 * 10); }
-static void MwHeader(int x, int y, int w, const char* text)
-{
-    layer::Text(x, y, w, S(22), text, S(13), MW_DIM, layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
-}
 static void MwBody(int x, int y, int w, int h, const char* text, Rgb c = MW_TEXT)
 {
     layer::Text(x, y, w, h, text, S(13), c, layer::kLeft | layer::kWordBreak);
@@ -359,228 +349,6 @@ static void MwStatus(int w, int h)
     layer::Text(S(25), h - S(34), w - S(50), S(24), P().status.c_str(), S(12), MW_DIM, layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
 }
 
-// Company chips: 20 Trubetskoy colours, then the shared golden-angle hue walk.
-static Rgb CoColor(int cid)
-{
-    static const Rgb first[20] = { rgb(230,25,75), rgb(0,130,200), rgb(60,180,75), rgb(245,130,48), rgb(145,30,180), rgb(70,240,240), rgb(240,50,230), rgb(255,225,25), rgb(0,128,128), rgb(170,110,40), rgb(210,245,60), rgb(128,0,0), rgb(0,0,128), rgb(128,128,0), rgb(250,190,212), rgb(220,190,255), rgb(170,255,195), rgb(255,215,180), rgb(128,128,128), rgb(255,250,200) };
-    if (cid >= 1 && cid <= 20) return first[cid - 1];
-    const float h = (float)(((cid - 21) * 137.508) - (int)(((cid - 21) * 137.508) / 360.0) * 360.0);
-    const float sat = 0.62f, val = 0.85f, c = val * sat, x = c * (1.f - std::fabs(std::fmod(h / 60.f, 2.f) - 1.f)), m = val - c;
-    float r, g, b;
-    if (h < 60) { r = c; g = x; b = 0; } else if (h < 120) { r = x; g = c; b = 0; } else if (h < 180) { r = 0; g = c; b = x; }
-    else if (h < 240) { r = 0; g = x; b = c; } else if (h < 300) { r = x; g = 0; b = c; } else { r = c; g = 0; b = x; }
-    return rgb((int)((r + m) * 255), (int)((g + m) * 255), (int)((b + m) * 255));
-}
-
-// ---- LOBBY (menu_hook.cpp RenderPanelLayer, g_uiState == 2) ----------------------------------
-static void RenderLobbyLocked(int w, int h)
-{
-    const lobby::View& v = P().view;
-    const int pad = S(25), cy = S(v.isHost && !v.lobbyDone ? 98 : 56);
-    if(P().savePicker && v.isHost && !v.lobbyDone) {
-        MwTitle("CHOOSE A SAVE");MwClose(w,91);
-        const int pages=std::max(1,int((v.saves.size()+7)/8));
-        P().savePage=std::min(P().savePage,pages-1);
-        for(int i=0;i<8;++i) {
-            const int index=P().savePage*8+i;
-            if(index>=int(v.saves.size()))break;
-            const auto& row=v.saves[index];const int y=S(56+i*42);
-            layer::Rect(pad,y,w-2*pad,S(36),row.path==v.selectedSave?MW_YOU:rgb(0,0,0),65);
-            layer::Text(pad+S(10),y,w-2*pad-S(20),S(36),row.name.c_str(),S(14),MW_TEXT,
-                        layer::kLeft|layer::kVCenter|layer::kEndEllipsis);
-            AddHit(pad,y,w-2*pad,S(36),100+i,true);
-        }
-        if(v.saves.empty())MwBody(pad,S(65),w-2*pad,S(60),"No saves found. Save a world in the game, then refresh this list.");
-        MwButton(pad,h-S(52),S(100),S(30),"REFRESH",92);
-        MwButton(w-pad-S(220),h-S(52),S(100),S(30),"PREVIOUS",93);
-        MwButton(w-pad-S(100),h-S(52),S(100),S(30),"NEXT",94);
-        MwStatus(w,h);return;
-    }
-    const std::string title = v.title.empty() ? std::string("LOBBY") : "LOBBY  --  " + v.title;
-    MwTitle(title.c_str(), 300);
-    int titleW = layer::TextWidth(title.c_str(), S(18)) + S(16);
-    if (titleW > S(316)) titleW = S(316);
-    MwClose(w, v.inGame ? 4 : 5);
-    if(v.isHost && !v.lobbyDone) {
-        const auto at=v.selectedSave.find_last_of('/');
-        const std::string selected=v.selectedSave.empty()?"Choose a save before starting":v.selectedSave.substr(at==std::string::npos?0:at+1);
-        layer::Text(pad,S(55),w-2*pad-S(160),S(30),selected.c_str(),S(13),MW_TEXT,layer::kLeft|layer::kVCenter|layer::kEndEllipsis);
-        MwButton(w-pad-S(145),S(55),S(145),S(30),"CHOOSE SAVE",90);
-    }
-    if (v.haveCode) {
-        // ROOM CODE, DELIBERATELY NOT RENDERED (menu_hook.cpp): the code is the
-        // credential, and the clipboard is the only way it leaves. A fixed
-        // placeholder, so not even its length shows.
-        static const char kPlaceholder[] = "\xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2  ROOM CODE  \xE2\x80\xA2\xE2\x80\xA2\xE2\x80\xA2";
-        const int cw = layer::TextWidth(kPlaceholder, S(14)) + S(20), cx = S(25) + titleW;
-        layer::Rect(cx, S(11), cw, S(26), rgb(0, 0, 0), 50);
-        layer::Text(cx + S(10), S(11), cw, S(26), kPlaceholder, S(14), MW_TEXT, layer::kLeft | layer::kVCenter);
-        layer::Text(cx + cw + S(10), S(11), S(160), S(26), "click to copy (never shown)", S(11), MW_DIM, layer::kLeft | layer::kVCenter, 180);
-        AddHit(cx, S(11), cw, S(26), 7, true);
-    }
-    const int bottom = h - S(44);
-    const int listW = S(220), chatX = pad + listW + S(20), chatW = w - chatX - pad;
-    const int contentH = bottom - cy - S(12);
-
-    // players, each with a company chip: click your own (the host: anyone's) to cycle it
-    const int n = (int)v.players.size();
-    char hdr[48];
-    snprintf(hdr, sizeof(hdr), "PLAYERS (%d)", n);
-    MwHeader(pad, cy, listW, hdr);
-    int rowsMax = (bottom - S(6) - (cy + S(30))) / S(26);
-    if (rowsMax > ROSTER_ROWS) rowsMax = ROSTER_ROWS;
-    if (rowsMax < 1) rowsMax = 1;
-    const int rows = n < rowsMax ? n : rowsMax;
-    for (int i = 0; i < rows; i++) {
-        const lobby::Player& p = v.players[(size_t)i];
-        const int ry = cy + S(30) + i * S(26);
-        layer::Rect(pad, ry + S(4), S(22), S(16), CoColor(p.company), 220);
-        char num[8];
-        snprintf(num, sizeof(num), "%d", p.company);
-        layer::Text(pad, ry + S(4), S(22), S(16), num, S(11), rgb(0, 0, 0), layer::kCenter | layer::kVCenter);
-        if (p.you || v.youAreHost) AddHit(pad, ry + S(2), S(24), S(20), 20 + i, true);
-        layer::Text(pad + S(30), ry, listW - S(80), S(24), (p.stage.empty() ? p.name : p.name + "  (" + p.stage + ")").c_str(), S(14), p.you ? MW_YOU : MW_TEXT,
-                    layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
-        if (p.host) layer::Text(pad + listW - S(50), ry, S(50), S(24), "HOST", S(11), MW_DIM, layer::kRight | layer::kVCenter, 180);
-    }
-    if (n > rowsMax) {
-        char more[48];
-        snprintf(more, sizeof(more), "+ %d more", n - rowsMax);
-        layer::Text(pad + S(30), cy + S(30) + rowsMax * S(26), listW, S(20), more, S(11), MW_DIM, layer::kLeft | layer::kVCenter, 180);
-    }
-    int legendY = cy + S(30) + (rows < 8 ? 8 : rows) * S(26) + S(6) + (n > rowsMax ? S(22) : 0);
-    if (legendY > bottom - S(44)) legendY = bottom - S(44);
-    layer::Text(pad, legendY, listW, S(40),
-                P().view.separateCompanies
-                    ? "Separate companies: each player runs their own. Left-click a chip for the next company, right-click for the previous."
-                    : "Co-op: everyone runs company 1 together. Left-click a chip for the next company, right-click for the previous.",
-                S(11), MW_DIM, layer::kLeft | layer::kWordBreak, 170);
-
-    // chat
-    const int inH = S(30), logH = contentH - inH - S(8);
-    layer::Rect(chatX, cy, chatW, logH, rgb(0, 0, 0), 50);
-    const int lh = S(22), maxLines = (logH - S(16)) / lh, cnt = (int)v.chat.size();
-    int ly = cy + S(8);
-    for (int i = cnt > maxLines ? cnt - maxLines : 0; i < cnt; i++) {
-        layer::Text(chatX + S(10), ly, chatW - S(20), lh, v.chat[(size_t)i].c_str(), S(13), MW_TEXT,
-                    layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
-        ly += lh;
-    }
-    MwField(chatX, cy + logH + S(8), chatW, inH, P().chatInput, v.active, "Type a message and press Enter", 9);
-
-    // LEAVE left, START GAME right (the host), the status or the mods question between
-    const int bw1 = MwButtonW("LEAVE");
-    MwButton(pad, bottom, bw1, S(30), "LEAVE", 5);
-    int rightCut = S(160);
-    if (v.inGame) {
-        MwButton(w-pad-S(155),bottom,S(155),S(30),"WORLD SYNC",84);
-    } else if (v.isHost) {
-        const int bw2 = MwButtonW("START GAME");
-        MwButton(w - pad - bw2, bottom, bw2, S(30), "START GAME", 6);
-        if (!P().flagMaster.empty()) MwCheck(w - pad - bw2 - S(110), bottom, "PUBLIC", g_public, 11);
-        MwCheck(w - pad - bw2 - S(340), bottom, "SEPARATE COMPANIES", P().view.separateCompanies, 50);
-        if (P().view.hostSteam) MwCheck(w - pad - bw2 - S(475), bottom, "CROSS-PLAY", P().view.crossplay, 51);
-        const int need = bw2 + S(360);
-        if (need > rightCut) rightCut = need;
-    }
-    const char* st = P().status.c_str();
-    Rgb stColor = MW_DIM;
-    if (!v.modsPrompt.empty()) {
-        st = v.modsPrompt.c_str();
-        stColor = MW_TEXT;
-        const int bwN = MwButtonW("NO"), bwY = MwButtonW("YES");
-        MwButton(w - pad - bwN, bottom, bwN, S(30), "NO", 17);
-        MwButton(w - pad - bwN - S(8) - bwY, bottom, bwY, S(30), "YES", 16);
-        rightCut = bwN + bwY + S(30);
-    }
-    layer::Text(pad + bw1 + S(20), bottom, w - 2 * pad - bw1 - rightCut, S(30), st, S(12), stColor,
-                layer::kLeft | layer::kVCenter | layer::kEndEllipsis);
-}
-
-// ---- HOST / JOIN (menu_hook.cpp RenderPanelLayer, the else branch) -----------------------------------
-static void RenderHostJoinLocked(int w, int h)
-{
-    const int pad = S(25), cy = S(56);
-    const bool master = !P().flagMaster.empty();
-    MwTitle("MULTIPLAYER");
-    MwClose(w, 4);
-    { const int lb = MwButtonW("OPEN LOGS"); MwButton(w - S(65) - lb, S(10), lb, S(28), "OPEN LOGS", 15); }
-    const int colW = (w - 2 * pad - S(40)) / 2, lx = pad, rx = pad + colW + S(40);
-    layer::Rect(pad + colW + S(20), cy, 1, S(130), MW_TEXT, 40);
-    MwHeader(lx, cy, colW, "HOST A GAME");
-    MwBody(lx, cy + S(24), colW, S(36), "Open a lobby, choose a save, and share it with everyone who joins.");
-    {
-        // not EnsureUsername here: an emptied name field would roll a new name
-        // on the next frame, before anything could be typed
-        const std::string def = P().username.empty() ? std::string("Your game  (click to name the lobby)")
-                                                     : P().username + "'s game  (click to name the lobby)";
-        MwField(lx, cy + S(60), colW, S(30), P().lobbyName, g_focus == 4, def.c_str(), 14);
-    }
-    {
-        const int hb = MwButtonW("HOST GAME");
-        MwButton(lx, cy + S(96), hb, S(30), "HOST GAME", 2);
-        if (master) MwCheck(lx + hb + S(16), cy + S(96), "PUBLIC (listed in the browser)", g_public, 11);
-        MwCheck(lx, cy + S(128), "SEPARATE COMPANIES", g_separateCompanies, 50);
-        MwCheck(lx + S(200), cy + S(128), "CROSS-PLAY", g_crossplay, 51);
-    }
-    MwHeader(rx, cy, colW, "JOIN A GAME");
-    MwBody(rx, cy + S(28), colW, S(24), "Paste or type the code from your host.");
-    MwField(rx, cy + S(58), colW, S(30), P().joinCode, g_focus == 1, "Click to paste the code", 8);
-    MwButton(rx, cy + S(96), MwButtonW("JOIN GAME"), S(30), "JOIN GAME", 3);
-    MwBody(rx, cy + S(134), colW, S(20),
-           "The shared save must have the Multiplayer mod enabled.");
-    MwHeader(pad, cy + S(192), S(260), "YOUR NAME");
-    MwField(pad, cy + S(216), S(260), S(30), P().username, g_focus == 3, "Steam name (click to type your own)", 13);
-    MwHeader(pad + S(290), cy + S(192), w - 2 * pad - S(290),
-             "PASSWORD  --  optional; anyone who has the code can read your IP address");
-    MwField(pad + S(290), cy + S(216), S(260), S(30), std::string(P().passCode.size(), '*'), g_focus == 2,
-            "Click to type a password", 10);
-
-    if (master) {
-        // PUBLIC GAMES: the server browser. A click drops the row's code into the join field.
-        int ly = cy + S(260);
-        const int lw = w - 2 * pad;
-        MwHeader(pad, ly, lw - S(120), "PUBLIC GAMES  --  click a row, then JOIN GAME");
-        { const int rb = MwButtonW("REFRESH"); MwButton(w - pad - rb, ly - S(4), rb, S(30), "REFRESH", 12); }
-        ly += S(26);
-        const int cName = pad + S(10), cType = pad + S(395), cPl = pad + S(520), cVer = pad + S(600), cAge = pad + S(670);
-        const unsigned one = layer::kLeft | layer::kVCenter;
-        layer::Text(cName, ly, S(375), S(20), "HOST", S(13), MW_DIM, one);
-        layer::Text(cType, ly, S(120), S(20), "TYPE", S(13), MW_DIM, one);
-        layer::Text(cPl, ly, S(70), S(20), "PLAYERS", S(13), MW_DIM, one);
-        layer::Text(cVer, ly, S(60), S(20), "VERSION", S(13), MW_DIM, one);
-        layer::Text(cAge, ly, S(80), S(20), "SEEN", S(13), MW_DIM, one);
-        ly += S(22);
-        const int rh = S(24);
-        int maxRows = (h - S(40) - ly) / (rh + S(2));
-        if (maxRows > 8) maxRows = 8;
-        const std::vector<lobby::PubRow>& rowsV = P().pubRows;
-        for (int i = 0; i < (int)rowsV.size() && i < maxRows; i++) {
-            const lobby::PubRow& r = rowsV[(size_t)i];
-            layer::Rect(pad, ly, lw, rh, rgb(0, 0, 0), (i & 1) ? 35 : 55);
-            // a master from before the type field: the relay is known by its game string
-            const char* type = r.type == "relay" ? "dedicated server" : r.type == "host" ? "player hosted"
-                             : r.game == "dedicated relay" ? "dedicated server" : "player hosted";
-            const std::string name = r.locked ? r.name + "  [locked]" : r.name;
-            char pl[32], age[32];
-            snprintf(pl, sizeof(pl), "%d / %d", r.players, r.max);
-            if (r.age < 60) snprintf(age, sizeof(age), "just now");
-            else snprintf(age, sizeof(age), "%d min ago", r.age / 60);
-            layer::Text(cName, ly, S(375), rh, name.c_str(), S(13), MW_TEXT, one | layer::kEndEllipsis);
-            layer::Text(cType, ly, S(120), rh, type, S(13), MW_DIM, one | layer::kEndEllipsis);
-            layer::Text(cPl, ly, S(70), rh, pl, S(13), MW_TEXT, one);
-            layer::Text(cVer, ly, S(60), rh, r.version.c_str(), S(13), MW_DIM, one | layer::kEndEllipsis);
-            layer::Text(cAge, ly, S(80), rh, age, S(13), MW_DIM, one);
-            AddHit(pad, ly, lw, rh, 40 + i, true);
-            ly += rh + S(2);
-        }
-        if (rowsV.empty())
-            layer::Text(cName, ly, lw - S(20), S(24), P().pubNote.empty() ? "Looking for public games\xE2\x80\xA6" : P().pubNote.c_str(),
-                        S(13), MW_DIM, one | layer::kEndEllipsis);
-    }
-    MwStatus(w, h);
-}
-
 #include "menu_title_linux.inl"
 #include "menu_backdrop_linux.inl"
 
@@ -589,15 +357,13 @@ static void RenderLocked(int w, int h)
     layer::Begin(w, h);
     g_hitCount = 0;
     layer::Rect(0, 0, w, h, MW_BG, TitleMode()?175:MW_BG_A);
-    if(MenuPanelMode()) { RenderTitleLocked(w,h); return; }
-    if (g_uiState == 2) RenderLobbyLocked(w, h);
-    else RenderHostJoinLocked(w, h);
+    if(MenuPanelMode()) RenderTitleLocked(w,h); // closed/unknown pages have no controls
 }
 
 static void LayoutLocked(int screenW, int screenH, int* w, int* h)
 {
     const bool browser=g_uiState==1 && !P().view.inGame && g_titleTab==0 && !P().flagMaster.empty();
-    const int height=browser ? 660 : 540;
+    const int height=browser ? 764 : 540;
     g_s = std::min(UiScale(screenH),std::min(screenW/800.f,screenH/float(height+20)));
     *w = S(780);
     *h = S(height);
@@ -740,9 +506,9 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
                     if(why.empty()){P().savePicker=false;SetStatusLocked("Save selected. Checking required mods.");}
                     else SetStatusLocked(why);
                 }
-            } else if (id >= 40 && id < 48) {
+            } else if (id >= 60 && id < 72) {
                 lobby::PubRow r;
-                if (lobby::PublicRow(g_serverPage * g_serverPerPage + id - 40, &r)) {
+                if (lobby::PublicRow(g_serverPage * g_serverPerPage + id - 60, &r)) {
                     P().joinCode = r.code;
                     g_focus = 1;
                     SetStatusLocked(r.locked ? r.name + "'s game needs its password: type it below, then JOIN GAME."

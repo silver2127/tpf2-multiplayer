@@ -21,7 +21,7 @@ Windows functions and where they went:
 | `SyncStart`, `SyncPoll`, the relay leader's periodic upload | `SyncStart`, `SyncPoll`, `RelayPeriodic` |
 | `PubFetchThread`, `PubPoll`, `httpGet` | `PubThread`, `lobby::PublicPoll`; the lobby program fetches |
 | `CollectLogsThread` | `lobby::OpenLogs` (`Tpf2mpArchiveLogsSafe` from `logarchive_linux.h`, then `xdg-open`) |
-| `RenderPanelLayer` state 2, `OnHit`, `LlKeyboard` chat branch | `RenderLobbyLocked`, `OnHitLocked`, `HandleEventLocked` |
+| `RenderPanelLayer` state 2, `OnHit`, `LlKeyboard` chat branch | `RenderTitleLocked`, `OnHitLocked`, `HandleEventLocked` |
 | `ClipboardSet`, `ClipboardGet` | `SDL_SetClipboardText`, `SDL_GetClipboardText` through `dlsym` |
 | `doStartLoad`, `placeSaveNewest`, `newestSave`, `ForceAutosave`, AUTO-LOAD | the menu-game area: `menu_game_linux.h` |
 

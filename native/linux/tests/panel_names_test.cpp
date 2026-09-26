@@ -7,17 +7,6 @@ int main(int argc, char** argv)
 {
     assert(argc == 3);
     using namespace panel;
-    // Fixed/overflow boundaries: company 7 now has a distinct fixed colour;
-    // company 21 restarts the golden-angle walk after the 20-colour palette.
-    const auto checkColor = [](int cid, int r, int g, int b) {
-        const auto c = CoColor(cid);
-        assert(c.r == r && c.g == g && c.b == b);
-    };
-    checkColor(1, 230, 25, 75);
-    checkColor(7, 240, 50, 230);
-    checkColor(20, 255, 250, 200);
-    checkColor(21, 216, 82, 82);
-    checkColor(22, 82, 216, 121);
     P().dataDir = argv[2];
     const std::string file = P().dataDir + "tpf2_names.txt";
     unlink(file.c_str());

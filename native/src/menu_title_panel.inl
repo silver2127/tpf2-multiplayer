@@ -4,7 +4,7 @@
 // This is still the mod's renderer, not an engine-owned widget tree.
 static int g_titleTab = 0; // join / host
 static int g_titleServerPage = 0;
-static int g_titleServerPerPage = 4;   // rows on a page of the public list, as last drawn (hit ids 40+row)
+static int g_titleServerPerPage = 4;   // rows on a page of the public list, as last drawn (hit ids 60+row)
 static int g_titlePlayerPage = 0;
 static int TitleNextFocus(int focus,bool backwards)
 {
@@ -97,7 +97,7 @@ static void titleBrowser(int w,int h)
     wchar_t heading[40]; if(count) _snwprintf_s(heading,_TRUNCATE,L"Public games (%d)",count); else wcscpy_s(heading,L"Public games");
     titleText(pad,S(278),width-S(260),S(30),heading,16);
     titleAction(w-pad-S(250),S(278),S(75),L"Refresh",12);
-    const int perPage=(std::max)(1,(std::min)(8,(h-S(425))/S(28)));
+    const int perPage=(std::max)(1,(std::min)(12,(h-S(425))/S(28)));
     g_titleServerPerPage=perPage;
     g_titleServerPage=(std::min)(g_titleServerPage,(std::max)(0,(count-1)/perPage));
     titleAction(w-pad-S(165),S(278),S(80),L"Previous",112,g_titleServerPage>0);
@@ -125,7 +125,7 @@ static void titleBrowser(int w,int h)
         wchar_t age[32];
         if(r.age<60) wcscpy_s(age,L"Just now"); else _snwprintf_s(age,_TRUNCATE,L"%d min ago",r.age/60);
         titleText(ageX,y,S(75),S(26),age,12,MW_DIM);
-        addHit(pad,y,width,S(26),40+row,true);
+        addHit(pad,y,width,S(26),60+row,true);
     }
     if(!count) titleText(pad+S(10),S(349),width-S(20),S(28),wideOf(note[0]?note:"Looking for public games...").c_str(),14,MW_DIM);
 }

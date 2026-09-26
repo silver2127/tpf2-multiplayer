@@ -386,3 +386,7 @@ The native menu uses xdg-open and reports the native archive location.
 The [dev `96795a8b` integration](UPSTREAM_dev_96795a8b.md) expands the native public
 browser to eight games per page and up to 32 games, and completes archive
 runtime/boot metadata and standalone collector credential masking.
+
+The [dev `01044521` integration](UPSTREAM_dev_01044521.md) expands the native public
+browser to twelve games per page and up to 48 games, and removes the legacy
+panel renderer. Closing a running resync leaves the game visible.

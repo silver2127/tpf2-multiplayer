@@ -237,3 +237,7 @@ lobby streams, and retains five archives per kind. Version remains 0.7.0.3.
 The [dev `96795a8b` integration](docs/linux/UPSTREAM_dev_96795a8b.md) expands the native public
 browser to eight games per page and up to 32 games, and completes archive
 runtime/boot metadata and standalone collector credential masking.
+
+The [dev `01044521` integration](docs/linux/UPSTREAM_dev_01044521.md) expands the native public
+browser to twelve games per page and up to 48 games, and removes the legacy
+panel renderer. Closing a running resync leaves the game visible.

@@ -63,12 +63,13 @@ static void RenderTitleLocked(int w,int h) {
             const int count=int(P().pubRows.size());
             TitleText(pad,S(278),width-S(250),S(30),count ? "Public games ("+std::to_string(count)+")" : "Public games",16);
             TitleAction(w-pad-S(250),S(278),S(80),"REFRESH",12);
-            const int per=std::max(1,std::min(8,(h-S(425))/S(28)));
+            // Scale complete coordinates so rounding cannot lose the twelfth row.
+            int per=12;while(per>1 && S(425+per*28)>h)--per;
             g_serverPerPage=per;
             g_serverPage=std::min(g_serverPage,std::max(0,(count-1)/per));
             TitleAction(w-pad-S(170),S(278),S(85),"PREVIOUS",112,g_serverPage>0);
             TitleAction(w-pad-S(85),S(278),S(85),"NEXT",113,(g_serverPage+1)*per<count);
-            layer::Rect(pad,S(310),width,S(35)+per*S(28),rgb(0,0,0),50);
+            layer::Rect(pad,S(310),width,S(35+per*28),rgb(0,0,0),50);
             TitleText(pad+S(10),S(313),S(330),S(24),"Game",13,MW_DIM);
             TitleText(pad+S(350),S(313),S(130),S(24),"Type",13,MW_DIM);
             TitleText(pad+S(485),S(313),S(75),S(24),"Players",13,MW_DIM);
@@ -76,14 +77,14 @@ static void RenderTitleLocked(int w,int h) {
             TitleText(pad+S(650),S(313),S(75),S(24),"Seen",13,MW_DIM);
             for(int row=0;row<per;++row) {
                 const int i=g_serverPage*per+row;if(i>=count)break;
-                const auto& r=P().pubRows[i];const int y=S(341)+row*S(28);
+                const auto& r=P().pubRows[i];const int y=S(341+row*28);
                 if(P().joinCode==r.code)layer::Rect(pad,y,width,S(26),MW_TEXT,85);
                 TitleText(pad+S(10),y,S(320),S(26),r.name+(r.locked?" [password]":""),13);
                 TitleText(pad+S(350),y,S(130),S(26),r.type=="relay"||r.type=="dedicated"?"Dedicated":"Player hosted",13,MW_DIM);
                 TitleText(pad+S(485),y,S(75),S(26),std::to_string(r.players)+" / "+std::to_string(r.max),13);
                 TitleText(pad+S(570),y,S(75),S(26),r.version,13,MW_DIM);
                 TitleText(pad+S(650),y,S(75),S(26),r.age<60?"Just now":std::to_string(r.age/60)+" min ago",12,MW_DIM);
-                AddHit(pad,y,width,S(26),40+row,true);
+                AddHit(pad,y,width,S(26),60+row,true);
             }
             if(!count)TitleText(pad+S(10),S(349),width-S(20),S(28),P().pubNote.empty()?"No public games":P().pubNote,14,MW_DIM);
         }

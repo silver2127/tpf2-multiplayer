@@ -111,7 +111,7 @@ static const size_t CHAT_LINES = 14;
 static const int QUIT_WAIT_MS = 1500;           // menu_hook.cpp TeardownLobby
 static const int TERM_WAIT_MS = 2000;           // NETPUNCH.md 3.4
 static const uint64_t PUB_EVERY_MS = 10000;     // a third of the master's 30 s TTL
-static const int PUB_ROWS = 32;
+static const int PUB_ROWS = 48;
 static const int PUB_TIMEOUT_MS = 20000;        // the program's own GET gives up after 5 s (name lookup aside)
 // What chat, START GAME, PUBLIC and the mods answer say to a dead lobby
 // (Model::dead), in place of "Lobby is starting...", which would replace the
