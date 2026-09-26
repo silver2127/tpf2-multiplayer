@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
     setenv("HOME", root.c_str(), 1); setenv("XDG_DATA_HOME", xdg.c_str(), 1);
     setenv("TPF2MP_DATADIR", data.c_str(), 1);
     unsetenv("STEAM_COMPAT_CLIENT_INSTALL_PATH");
+    setenv("PRESSURE_VESSEL_RUNTIME", "fixture-soldier", 1);
     put(mod/"tpf2mp_install.txt", "version\t0.7.0.3\ngame\t/private/path\n");
     put(data/"tpf2_bridge.log", "bridge\n");
     put(data/"terrain_trace.log", "terrain diagnostics\n");
@@ -33,6 +34,8 @@ int main(int argc, char** argv) {
     put(game/"tpf2mp_version.txt", "fallback\n");
     fs::copy_file("/proc/self/exe", game/"TransportFever2");
     fs::copy_file("/proc/self/exe", mod/"tpf2_menu.so");
+    fs::create_directories(mod/"boot");
+    fs::copy_file("/proc/self/exe", mod/"boot/libtpf2mp_boot.so");
     fs::copy_file("/proc/self/exe", mod/"plugins/test.so");
     fs::copy_file("/proc/self/exe", net/"netpunch");
     const std::string state="{\"code\":\"ABC\\\"DEF\",\"cross_code\": \"JOIN\",\"steam\":\"7654\",\"password\":\"hidden\",\"players\":[\"A\"],\"crossplay\":true,\"type\":\"code\"}\n";
@@ -47,6 +50,8 @@ int main(int argc, char** argv) {
     assert(Tpf2mpArchiveLogsSafe(false, gameDir.c_str(), &a));
     fs::path out=a.folder;
     auto about=get(out/"about.txt");
+    assert(about.find("Steam Runtime fixture-soldier")!=std::string::npos);
+    assert(about.find("System ")!=std::string::npos && about.find("mod/boot/libtpf2mp_boot.so")!=std::string::npos);
     assert(about.find("version 0.7.0.3")!=std::string::npos && about.find("Linux")!=std::string::npos && about.find("UTC")!=std::string::npos);
     assert(about.find("GNU build-id unavailable")==std::string::npos);
     assert(about.find("mod/plugins/test.so")!=std::string::npos && about.find("netpunch/netpunch")!=std::string::npos);

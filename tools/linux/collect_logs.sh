@@ -211,6 +211,15 @@ RUNNING=$(pgrep -xc TransportFever2 2>/dev/null || true)
   echo "XDG_DATA_HOME (this shell): ${XDG_DATA_HOME:-}"
 } 2>/dev/null | sed "s|$TPF2MP_REAL_HOME|~|g" >"$STAGE/system.txt"
 
+# The lobby's message stream and state carry the invitation codes, and a code is
+# enough to join: every string value of these keys is masked before packing
+# (2026-09-26, as the in-game OPEN LOGS does).
+MASK_KEYS='code|cross_code|steam|steam_code|steam_secret|password|pass|passcode|secret'
+while IFS= read -r -d '' f; do
+  sed -E -i "s/(\"($MASK_KEYS)\"[[:space:]]*:[[:space:]]*\")([^\"\\\\]|\\\\.)*\"/\\1<masked>\"/g" "$f" 2>/dev/null
+done < <(find "$STAGE" -type f \( -name '*.json' -o -name '*.jsonl' -o -name '*.txt' \) -print0)
+note "invitation codes in the lobby files are masked"
+
 # ---- 5. the archive ----------------------------------------------------------------------
 if [ -z "$OUT" ]; then
   OUT=$(xdg-user-dir DOWNLOAD 2>/dev/null || true)

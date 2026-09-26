@@ -596,9 +596,11 @@ static void RenderLocked(int w, int h)
 
 static void LayoutLocked(int screenW, int screenH, int* w, int* h)
 {
-    g_s = std::min(UiScale(screenH),std::min(screenW/800.f,screenH/560.f));
+    const bool browser=g_uiState==1 && !P().view.inGame && g_titleTab==0 && !P().flagMaster.empty();
+    const int height=browser ? 660 : 540;
+    g_s = std::min(UiScale(screenH),std::min(screenW/800.f,screenH/float(height+20)));
     *w = S(780);
-    *h = S(540);
+    *h = S(height);
     if (*w > screenW) *w = screenW;
     if (*h > screenH) *h = screenH;
 }
@@ -740,7 +742,7 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
                 }
             } else if (id >= 40 && id < 48) {
                 lobby::PubRow r;
-                if (lobby::PublicRow(id - 40, &r)) {
+                if (lobby::PublicRow(g_serverPage * g_serverPerPage + id - 40, &r)) {
                     P().joinCode = r.code;
                     g_focus = 1;
                     SetStatusLocked(r.locked ? r.name + "'s game needs its password: type it below, then JOIN GAME."

@@ -382,3 +382,7 @@ archives include the installed version, kernel/time zone, module GNU build IDs,
 and copied state/config files (last 8 MiB each, after logs). Lobby JSON/JSONL/text
 copies mask invitation/password fields. Saves and terrain dumps are excluded.
 The native menu uses xdg-open and reports the native archive location.
+
+The [dev `96795a8b` integration](UPSTREAM_dev_96795a8b.md) expands the native public
+browser to eight games per page and up to 32 games, and completes archive
+runtime/boot metadata and standalone collector credential masking.

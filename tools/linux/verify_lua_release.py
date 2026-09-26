@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the cumulative Linux Lua integration: Windows release 0.7.0.3 (dev 45183ac6)."""
+"""Verify the cumulative Linux Lua integration: Windows release 0.7.0.3 (dev 96795a8b)."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 REPO = Path(__file__).resolve().parents[2]
-REFERENCE = "45183ac61ae40ca5b598c93c73435927164e79f6"
+REFERENCE = "96795a8b487991275256c739e08903bd6a524f17"
 INCOMING = REFERENCE
 INCOMING_FILES = set()
 PREFIX = "mod/mp_lockstep_1/"

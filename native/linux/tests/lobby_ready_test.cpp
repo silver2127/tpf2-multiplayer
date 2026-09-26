@@ -41,6 +41,12 @@ static void Write(const std::string& path, const std::string& body)
 int main()
 {
     using namespace lobby;
+    std::string list="{\"servers\":[";
+    for(int i=0;i<40;++i) { if(i)list+=",";list+="{\"code\":\"fixture-"+std::to_string(i)+"\",\"name\":\"Game\"}"; }
+    list+="]}";std::vector<PubRow> publicRows;std::string publicNote;
+    assert(ParsePublic(list,&publicRows,&publicNote));
+    assert(publicRows.size()==32 && publicRows.back().code=="fixture-31");
+    publicRows.clear();assert(!ParsePublic("invalid",&publicRows,&publicNote));
     S().m.active=true; g_childPid=123; g_gameUiSeen=false;
     OnMenuPage(2); assert(S().m.active && S().q.empty()); // waiting joiner
     OnGameUiFrame(); OnMenuPage(16); assert(S().m.active && S().q.empty()); // switch

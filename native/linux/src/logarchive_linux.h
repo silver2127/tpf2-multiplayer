@@ -616,9 +616,19 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir, 
     struct utsname os = {};
     uname(&os);
     LaNote(about, "TpF2 Multiplayer version %s\nLinux %s %s; log time zone %s\nModules on disk\n", version, os.release, os.machine, zone);
+    if (FILE* f = fopen("/etc/os-release", "re")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+            if (!strncmp(line, "PRETTY_NAME=", 12)) { line[strcspn(line, "\r\n")] = 0; LaNote(about, "System %s\n", line + 12); break; }
+        fclose(f);
+    }
+    const char* runtime = getenv("PRESSURE_VESSEL_RUNTIME");
+    if (!runtime) runtime = getenv("STEAM_RUNTIME");
+    if (runtime) LaNote(about, "Steam Runtime %s\n", runtime);
     if (gameDir && gameDir[0]) LaNoteModules(about, gameDir, "TransportFever2", "game");
     if (install[0]) {
         if (LaFmt(path, sizeof(path), "%s/", install)) LaNoteModules(about, path, "*.so", "mod");
+        if (LaFmt(path, sizeof(path), "%s/boot/", install)) LaNoteModules(about, path, "*.so", "mod/boot");
         if (LaFmt(path, sizeof(path), "%s/plugins/", install)) LaNoteModules(about, path, "*.so", "mod/plugins");
         if (LaFmt(path, sizeof(path), "%s/netpunch/", install)) LaNoteModules(about, path, "netpunch", "netpunch");
     }

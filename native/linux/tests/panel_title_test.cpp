@@ -19,7 +19,7 @@ std::string SetCrossplay(bool){return {};}
 std::string SetPublic(bool){return {};}
 std::string AnswerMods(bool){return {};}
 void CycleCompany(int,bool){} bool CopyCode(std::string*){return false;}
-bool PublicRow(int,PubRow*){return false;} void PublicRefresh(){}
+bool PublicRow(int i,PubRow* r){if(i<0 || i>=int(panel::P().pubRows.size()))return false;*r=panel::P().pubRows[i];return true;} void PublicRefresh(){}
 bool OpenLogs(){return false;}
 }
 static bool Has(int id) {
@@ -61,7 +61,7 @@ int main(int argc,char** argv) {
         }
     }
     int w,h;g_flagScale=5;LayoutLocked(1280,720,&w,&h);assert(w<=1280 && h<=720);
-    g_flagScale=0;LayoutLocked(1920,1080,&w,&h);assert(w==780 && h==540);
+    g_flagScale=0;LayoutLocked(1920,1080,&w,&h);assert(w==780 && h==660);
     RenderLocked(w,h);assert(Has(110)&&Has(111)&&Has(8)&&!Has(14)&&!Has(3));
     g_titleTab=1;RenderLocked(w,h);assert(Has(14)&&!Has(8)&&Has(2)&&Has(50)&&Has(51));
     Key(SDLK_TAB,true);assert(g_focus==3);Key(SDLK_TAB,false);
@@ -114,6 +114,25 @@ int main(int argc,char** argv) {
         P().view.modsPrompt="Required workshop content";RenderLocked(w,h);
         assert(Has(16)&&Has(17)&&!Has(2)&&!Has(4));P().view.modsPrompt.clear();
     }
+    // Public list: page-local hit IDs must never alias company/cross-play IDs.
+    P().view={};g_uiState=1;g_titleTab=0;P().flagMaster="fixture";
+    for(int i=0;i<20;++i) { lobby::PubRow r;r.name="Game "+std::to_string(i+1);r.code="fixture-"+std::to_string(i);P().pubRows.push_back(r); }
+    for(float scale:{0.65f,0.8f,1.f,1.4f,5.f}) {
+        g_flagScale=scale;g_serverPage=0;
+        LayoutLocked(1920,1080,&w,&h);RenderLocked(w,h);CheckHits(w,h);
+        assert(g_serverPerPage==8 && Has(47) && !Has(112) && Has(113) && !Has(50) && !Has(51));
+        Post post;OnHitLocked(113,&post);RenderLocked(w,h);CheckHits(w,h);
+        OnHitLocked(40,&post);assert(P().joinCode=="fixture-8");
+        OnHitLocked(113,&post);RenderLocked(w,h);CheckHits(w,h);
+        assert(Has(43) && !Has(44) && !Has(113));OnHitLocked(43,&post);assert(P().joinCode=="fixture-19");
+    }
+    g_flagScale=1;g_serverPage=0;LayoutLocked(1920,1080,&w,&h);assert(h==660);
+    g_titleTab=1;LayoutLocked(1920,1080,&w,&h);assert(h==540);g_titleTab=0;
+    P().flagMaster.clear();LayoutLocked(1920,1080,&w,&h);assert(h==540);
+    RenderLocked(780,540);assert(g_serverPerPage==4);Post browserPost;
+    OnHitLocked(113,&browserPost);RenderLocked(780,540);CheckHits(780,540);
+    assert(Has(43) && !Has(44));OnHitLocked(40,&browserPost);assert(P().joinCode=="fixture-4");
+    P().pubRows.clear();RenderLocked(780,540);assert(g_serverPage==0 && !Has(40) && !Has(113));
     // Exercise the actual SDL filter with the overlay closed. Physical input
     // must delay a hold even when suppression is disabled by default.
     g_uiState=0;P().view.active=false;

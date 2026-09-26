@@ -233,3 +233,7 @@ bring it back automatically. Saving/loading suppresses the x.
 The [dev `45183ac6` integration](docs/linux/UPSTREAM_dev_45183ac6.md) adds
 native OPEN LOGS version/ELF identities, state/config snapshots and masked
 lobby streams, and retains five archives per kind. Version remains 0.7.0.3.
+
+The [dev `96795a8b` integration](docs/linux/UPSTREAM_dev_96795a8b.md) expands the native public
+browser to eight games per page and up to 32 games, and completes archive
+runtime/boot metadata and standalone collector credential masking.

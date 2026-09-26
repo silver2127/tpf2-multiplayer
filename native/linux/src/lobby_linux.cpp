@@ -111,7 +111,7 @@ static const size_t CHAT_LINES = 14;
 static const int QUIT_WAIT_MS = 1500;           // menu_hook.cpp TeardownLobby
 static const int TERM_WAIT_MS = 2000;           // NETPUNCH.md 3.4
 static const uint64_t PUB_EVERY_MS = 10000;     // a third of the master's 30 s TTL
-static const int PUB_ROWS = 8;
+static const int PUB_ROWS = 32;
 static const int PUB_TIMEOUT_MS = 20000;        // the program's own GET gives up after 5 s (name lookup aside)
 // What chat, START GAME, PUBLIC and the mods answer say to a dead lobby
 // (Model::dead), in place of "Lobby is starting...", which would replace the
@@ -2247,6 +2247,31 @@ static void LobbyThread()
 // The lobby program fetches <master_url>/list (NETPUNCH.md 3.6): exit 0 with
 // the body on stdout, or exit 1 with one line saying why ("HTTP 503"). No HTTP
 // or TLS in the game process.
+static bool ParsePublic(const std::string& body, std::vector<PubRow>* rows, std::string* note)
+{
+    Json doc;
+    if (!ParseJson(body, &doc) || doc.type != Json::Obj) { *note = "Server browser unavailable (unreadable list)"; return false; }
+    if (const Json* sv = doc.Get("servers"))
+        for (const Json& o : sv->items) {
+            if ((int)rows->size() >= PUB_ROWS) break;
+            if (o.type != Json::Obj) continue;
+            PubRow row;
+            row.code = JStr(o, "code");
+            if (row.code.empty() || row.code.size() > 255) continue;
+            row.name = Cap(OneLine(JStr(o, "name")), 127);
+            row.game = Cap(OneLine(JStr(o, "game")), 63);
+            row.type = Cap(OneLine(JStr(o, "type")), 15);
+            row.version = Cap(OneLine(JStr(o, "version")), 23);
+            row.players = (int)JInt(o, "players", 0);
+            row.max = (int)JInt(o, "max", 8);
+            row.age = (int)JInt(o, "age", 0);
+            row.locked = JInt(o, "locked", 0) != 0;
+            rows->push_back(row);
+        }
+    if (rows->empty()) *note = "No public games right now.";
+    return true;
+}
+
 static bool FetchPublic(std::vector<PubRow>* rows, std::string* note)
 {
     Program prog;
@@ -2331,27 +2356,7 @@ static bool FetchPublic(std::vector<PubRow>* rows, std::string* note)
         *note = "Server browser unavailable (" + Cap(OneLine(why), 80) + ")";
         return false;
     }
-    Json doc;
-    if (!ParseJson(body, &doc) || doc.type != Json::Obj) { *note = "Server browser unavailable (unreadable list)"; return false; }
-    if (const Json* sv = doc.Get("servers"))
-        for (const Json& o : sv->items) {
-            if ((int)rows->size() >= PUB_ROWS) break;
-            if (o.type != Json::Obj) continue;
-            PubRow row;
-            row.code = JStr(o, "code");
-            if (row.code.empty() || row.code.size() > 255) continue;
-            row.name = Cap(OneLine(JStr(o, "name")), 127);
-            row.game = Cap(OneLine(JStr(o, "game")), 63);
-            row.type = Cap(OneLine(JStr(o, "type")), 15);
-            row.version = Cap(OneLine(JStr(o, "version")), 23);
-            row.players = (int)JInt(o, "players", 0);
-            row.max = (int)JInt(o, "max", 8);
-            row.age = (int)JInt(o, "age", 0);
-            row.locked = JInt(o, "locked", 0) != 0;
-            rows->push_back(row);
-        }
-    if (rows->empty()) *note = "No public games right now.";
-    return true;
+    return ParsePublic(body, rows, note);
 }
 
 static void PubThread()

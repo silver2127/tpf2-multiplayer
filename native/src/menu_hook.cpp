@@ -1107,7 +1107,10 @@ static volatile LONG g_codeSeen = 0;    // the first code event of this lobby: s
 // drops the row's code into the join field. The list is what hosts chose to
 // publish (see _Publisher in lobby.py); nothing here talks to a host directly.
 struct PubRow { char name[NAME_MAX]; char code[256]; char game[64]; char type[16]; char version[24]; int players, max, age; bool locked; };
-static PubRow g_pub[8]; static int g_pubCount = 0; static char g_pubNote[96] = "";
+// The public list keeps PUB_MAX games (2026-09-26, user: the server list "getting quite
+// cramped"): it was 8, shown 4 to a page.
+static const int PUB_MAX = 32;
+static PubRow g_pub[PUB_MAX]; static int g_pubCount = 0; static char g_pubNote[96] = "";
 static CRITICAL_SECTION g_pubCs; static bool g_pubCsInit = false;
 static volatile LONG g_pubBusy = 0; static ULONGLONG g_pubLast = 0; static volatile LONG g_pubForce = 0;
 static const ULONGLONG PUB_EVERY = 10000;   // 10 s, a third of the master TTL (30 s)
@@ -1182,15 +1185,15 @@ static bool httpGet(const char* url, char* out, int n)
 }
 static DWORD WINAPI PubFetchThread(LPVOID)
 {
-    static char body[32768];
+    static char body[65536];
     char url[300]; snprintf(url, sizeof(url), "%s/list", g_flagMaster);
     bool ok = httpGet(url, body, sizeof(body));
-    PubRow rows[8]; int cnt = 0; char note[96] = "";
+    PubRow rows[PUB_MAX]; int cnt = 0; char note[96] = "";
     if (!ok) snprintf(note, sizeof(note), "Server browser unavailable (%s)", body[0] ? body : "no response");
     else {
         const char* p = strstr(body, "\"servers\"");
         if (p) p = strchr(p, '[');
-        while (p && cnt < 8) {
+        while (p && cnt < PUB_MAX) {
             const char* o = strchr(p, '{'); if (!o) break;
             // find the object's closing brace, skipping quoted text
             const char* e = o + 1; bool q = false;
@@ -1680,7 +1683,9 @@ static bool CopyBackdrop(VkQueue q, uint32_t imgIndex)
 static void PanelLayout()
 {
     g_s = UiScale();
-    g_copyW = S(780); g_copyH = S(540);
+    // The Join page with the public list is taller: 8 games to a page, not 4.
+    const bool browser = InterlockedCompareExchange(&g_uiState,0,0)==1 && !WorldLoaded() && g_titleTab==0 && g_flagMaster[0];
+    g_copyW = S(780); g_copyH = S(browser ? 660 : 540);
     if (g_copyW > g_panelW) g_copyW = g_panelW; if (g_copyH > g_panelH) g_copyH = g_panelH;
     g_panelX = ((int)g_scExtent.width - g_copyW) / 2;
     g_panelY = ((int)g_scExtent.height - g_copyH) / 2;
@@ -2029,8 +2034,8 @@ static void OnHit(int id, int button)
         } else SetStatus(on ? "Cross-play: you will share a classic code that players without Steam can use too."
                             : "Steam only: your Steam ID will be the join code.");
         InterlockedExchange(&g_panelDirty, 1); } break;
-    case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a public game row -> its code goes into the join field
-        int i = id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
+    case 40: case 41: case 42: case 43: case 44: case 45: case 46: case 47: {   // a row of the page shown -> its code goes into the join field
+        int i = g_titleServerPage * g_titleServerPerPage + id - 40; char code[256] = ""; char name[NAME_MAX] = ""; bool locked = false;
         if (g_pubCsInit) { EnterCriticalSection(&g_pubCs); if (i < g_pubCount) { strcpy_s(code, g_pub[i].code); strcpy_s(name, g_pub[i].name); locked = g_pub[i].locked; } LeaveCriticalSection(&g_pubCs); }
         if (code[0]) { strcpy_s(g_joinCode, code); g_joinLen = (int)strlen(g_joinCode); InterlockedExchange(&g_joinFocus, 1);
                        char st[200]; snprintf(st, sizeof(st), locked ? "%s's game needs its password: type it below, then JOIN GAME." : "%s's code is filled in -- press JOIN GAME.", name); SetStatus(st); }
