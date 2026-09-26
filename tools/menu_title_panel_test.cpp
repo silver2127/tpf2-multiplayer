@@ -150,6 +150,7 @@ int wmain(int argc,wchar_t** argv)
                 assert(hit(86)==!strcmp(phase,"readiness"));
                 assert(hit(88)==(host && !strcmp(phase,"detected")));
                 assert(!hit(5) && !hit(6) && hit(9) && !hit(20) && !hit(50));
+                assert(hit(83)==world && !hit(4)); // the resync view's x, in game only
                 if(scale==1 && host && world && (!strcmp(phase,"manual") || !strcmp(phase,"loading") || !strcmp(phase,"error")))
                     snapshot(folder/(std::string("resync-")+phase+".bmp"),w,h);
                 g_recoveryRequestedAt=1; RenderPanelLayer(w,h); check(w,h);
@@ -158,6 +159,15 @@ int wmain(int argc,wchar_t** argv)
         }
         strcpy_s(g_recoveryPhase,"readiness");g_recoveryRequestedAt=0;g_readyMine=true;
         RenderPanelLayer(w,h);check(w,h);assert(!hit(86));
+        // x during a running resync hides the view and keeps the resync; saving/loading draws no x
+        g_gameUi=1;g_recoveryPresent=1;g_uiState=3;strcpy_s(g_recoveryPhase,"transferring");
+        RenderPanelLayer(w,h);check(w,h);assert(hit(83));
+        OnHit(83);assert(g_uiState==0 && g_recoveryPresent && g_recoveryHidden);
+        g_recoveryWorldIo=1;g_uiState=3;RenderPanelLayer(w,h);check(w,h);assert(!hit(83));g_recoveryWorldIo=0;
+        // x on a preflight notice dismisses it like Close
+        strcpy_s(g_recoveryPhase,"detected");g_uiState=3;RenderPanelLayer(w,h);check(w,h);
+        OnHit(83);assert(g_uiState==0 && !g_recoveryPresent && !g_recoveryHidden);
+        g_uiState=3;g_recoveryPresent=0;
         g_stages.clear();g_gameUi=0;g_recoveryPhase[0]=0;
     }
     // Representative two-player previews, separate from the stress fixtures above.

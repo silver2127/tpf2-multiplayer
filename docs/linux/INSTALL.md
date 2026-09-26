@@ -371,3 +371,8 @@ Linux behaviour the release notes promise was rechecked against the unmodified
 build-35924 ELF and passes; the octree depth, town-trace and math-parity notes
 elsewhere in this file still apply unchanged.
 See [integration evidence and validation limits](UPSTREAM_dev_d8a3ce57.md).
+
+The [dev `122a0ce9` integration](UPSTREAM_dev_122a0ce9.md) adds the native resync
+view’s in-game x. Closing a running resync hides its view while recovery
+continues; Manage Lobby reopens it. Errors and unanswered Ready requests
+bring it back automatically. Saving/loading suppresses the x.

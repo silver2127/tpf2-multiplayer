@@ -21,6 +21,7 @@ static void RenderTitleLocked(int w,int h) {
     const bool recovery=g_uiState==3 || (g_uiState==2 && v.recoveryPresent);
     MwTitle(world?(g_uiState==1?"MULTIPLAYER - HOST SESSION":"MULTIPLAYER - SESSION"):g_uiState==1?"MULTIPLAYER":P().savePicker?"CHOOSE A SAVEGAME":"MULTIPLAYER - LOBBY");
     if(world && !recovery) MwClose(w,4);
+    else if(world && recovery && !v.worldIo) MwClose(w,87); // 83 remains Back to lobby
     if(g_uiState==1 && world) {
         const int fx=pad+S(270),fw=width-S(270);
         TitleText(pad,S(63),width,S(28),"Invite players to the world you are currently playing.",14,MW_DIM);

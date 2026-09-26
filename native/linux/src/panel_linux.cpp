@@ -673,7 +673,10 @@ static void OnHitLocked(int id, Post* post, bool previous = false)
         case 80:case 81:case 82:SetStatusLocked(lobby::RecoveryAction(id==82?"sync_ready":id==81?"sync_retry":"sync_request"));break;
         case 83:if(lobby::RecoveryAction("sync_dismiss").empty())g_uiState=2;break;
         case 85:SetStatusLocked(lobby::RecoveryAction("sync_decline"));break;
-        case 84:g_uiState=3;break;
+        case 87:
+            if(P().view.worldIo)return;
+            lobby::RecoveryAction("sync_hide");g_uiState=0;g_focus=0;break;
+        case 84:lobby::RecoveryAction("sync_show");g_uiState=3;break;
         case 16: case 17: SetStatusLocked(lobby::AnswerMods(id == 16)); break;
         case 15:
             // the gathering's own verdict comes after this line: its status waits for this lock
@@ -1190,12 +1193,13 @@ static void PollOpenLocked()
         P().openPollAt=now;lobby::Snapshot(&P().view);
         const auto path=P().dataDir+"tpf2_lobby_open.txt";
         if(!unlink(path.c_str()) && P().view.inGame) {
+            lobby::RecoveryAction("sync_show");P().view.recoveryHidden=false;
             g_uiState=P().view.active?2:1;g_pageHidden=false;g_dirty=true;
         }
         if(P().recoverySeen!=P().view.recoveryVersion) {
             P().recoverySeen=P().view.recoveryVersion;
-            if(P().view.recoveryPresent){g_uiState=3;g_pageHidden=false;}
-            else if(g_uiState==3){g_uiState=2;g_pageHidden=false;}
+            if(P().view.recoveryPresent && !P().view.recoveryHidden){g_uiState=3;g_pageHidden=false;}
+            else if(!P().view.recoveryPresent && g_uiState==3){g_uiState=2;g_pageHidden=false;}
             g_dirty=true;
         }
     }

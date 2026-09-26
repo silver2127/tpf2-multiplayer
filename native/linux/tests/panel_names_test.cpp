@@ -1,7 +1,7 @@
 #include "../src/panel_linux.cpp"
 #include <cassert>
 static lobby::View fixtureView;
-namespace lobby { void Snapshot(View* view) { *view=fixtureView; } }
+namespace lobby { std::string RecoveryAction(const std::string&){fixtureView.recoveryHidden=false;return {};} void Snapshot(View* view) { *view=fixtureView; } }
 
 int main(int argc, char** argv)
 {
@@ -57,7 +57,11 @@ int main(int argc, char** argv)
     P().openPollAt=0;assert(Visible() && g_uiState==2 && access(openFile.c_str(),F_OK)!=0);
     g_uiState=0;g_pageHidden=true;fixtureView.recoveryPresent=true;fixtureView.recoveryVersion=1;
     g_asyncDirty=true;assert(Visible() && g_uiState==3);
-    fixtureView.recoveryPresent=false;fixtureView.recoveryVersion=2;
+    fixtureView.recoveryHidden=true;g_uiState=0;
+    ++fixtureView.recoveryVersion;g_asyncDirty=true;assert(!Visible() && g_uiState==0);
+    f=fopen(openFile.c_str(),"w");assert(f);fclose(f);
+    g_asyncDirty=true;assert(Visible() && !fixtureView.recoveryHidden);
+    fixtureView.recoveryPresent=false;fixtureView.recoveryVersion=3;g_uiState=3;
     g_asyncDirty=true;assert(Visible() && g_uiState==2);
     puts("panel names: Steam availability, sanitizing, refresh, overrides, legacy files and length limits passed");
 }

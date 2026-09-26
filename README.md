@@ -224,3 +224,8 @@ missing integration records. Each Linux claim the notes make -- all 28 sorted
 node lists, the extra RNG sites, Windows float math, `TPF2MP_TOWN_TRACE=1`,
 octree depths 12/13, terrain compression on by default -- was rechecked against
 the unmodified game ELF and passes. No local live run was possible.
+
+The [dev `122a0ce9` integration](docs/linux/UPSTREAM_dev_122a0ce9.md) adds the native resync
+view’s in-game x. Closing a running resync hides its view while recovery
+continues; Manage Lobby reopens it. Errors and unanswered Ready requests
+bring it back automatically. Saving/loading suppresses the x.

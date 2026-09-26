@@ -339,6 +339,34 @@ int main()
     assert(lobby::S().q.back().line.find("advertise_mods")!=std::string::npos);
     model.startPending=true;assert(!lobby::SelectSave(dir+"chosen.sav").empty());
     assert(unlink((dir+"empty.sav").c_str())==0 && rmdir((dir+"directory.sav").c_str())==0);
+    // Closing is local: periodic wire progress cannot reopen a hidden resync.
+    {
+        const auto saved=model;const auto queued=queue.size();
+        lobby::Dispatch(R"({"type":"sync_state","phase":"transferring","operation":"hide-test"})");
+        model.recoveryRequestedAt=NowMs();
+        assert(lobby::RecoveryAction("sync_hide").empty());
+        for(int i=0;i<3;++i)lobby::Dispatch(R"({"type":"sync_state","phase":"transferring","operation":"hide-test"})");
+        lobby::Snapshot(&view);assert(view.recoveryHidden && view.recoveryPresent);
+        assert(model.recoveryOperation=="hide-test" && queue.size()==queued);
+        lobby::RecoveryAction("sync_show");assert(!model.recoveryHidden);
+        for(const char* event:{
+            R"({"type":"sync_state","phase":"error"})",
+            R"({"type":"sync_ready_state","phase":"waiting","is_ready":0})",
+            R"({"type":"sync_state","phase":"complete"})",
+            R"({"type":"sync_prompt","phase":"clear"})",
+            R"({"type":"sync_prompt","phase":"detected"})"}) {
+            model.recoveryHidden=true;lobby::Dispatch(event);assert(!model.recoveryHidden);
+        }
+        lobby::Dispatch(R"({"type":"sync_ready_state","phase":"waiting","is_ready":1})");
+        lobby::RecoveryAction("sync_hide");
+        lobby::Dispatch(R"({"type":"sync_ready_state","phase":"waiting","is_ready":1})");
+        assert(model.recoveryHidden && model.recoveryPresent);
+        for(const char* phase:{"manual","detected","unavailable"}) {
+            model.recoveryPhase=phase;model.recoveryPresent=true;model.recoveryRequestedAt=NowMs();
+            lobby::RecoveryAction("sync_hide");assert(!model.recoveryHidden && !model.recoveryPresent);
+        }
+        assert(queue.size()==queued);model=saved;
+    }
     // Recovery controls follow actual wire events, retain the readiness token,
     // reject duplicate/non-host requests, and allow another sync after success.
     model.active=true;model.dead=false;model.isHost=true;

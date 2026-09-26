@@ -144,7 +144,7 @@ struct Model {
     std::string selectedSave;
     bool startPending=false;
     std::string recoveryPhase,recoveryDetail,recoveryStep,recoveryOperation,readyToken;
-    bool recoveryPresent=false,readyMine=false;
+    bool recoveryHidden=false,recoveryPresent=false,readyMine=false;
     int readyCount=0,readyTotal=0;
     uint64_t recoveryVersion=0,recoveryRequestedAt=0;
     std::vector<std::string> players, stages;
@@ -1609,6 +1609,7 @@ static void Dispatch(const std::string& line)
                 m.recoveryOperation=JStr(ev,"operation");m.recoveryPhase=phase;
                 m.recoveryDetail=OneLine(JStr(ev,"detail"));m.recoveryStep=JStr(ev,"step");
                 m.recoveryPresent=phase!="complete";
+                if(phase=="complete" || phase=="error")m.recoveryHidden=false;
                 if(phase=="complete") {m.lobbyDone=true;m.startPending=false;g_captures=true;}
             } else if(ty=="sync_feedback")m.recoveryDetail=OneLine(JStr(ev,"detail"));
             else if(ty=="sync_ready_state") {
@@ -1616,6 +1617,7 @@ static void Dispatch(const std::string& line)
                     m.recoveryPhase="readiness";m.recoveryPresent=true;m.readyToken=JStr(ev,"token");
                     m.readyCount=JInt(ev,"ready_count",0);m.readyTotal=JInt(ev,"total",0);m.readyMine=JInt(ev,"is_ready",0)!=0;
                     m.recoveryDetail.clear();
+                    if(!m.readyMine)m.recoveryHidden=false;
                 } else if(m.recoveryPhase=="readiness") {
                     m.recoveryPhase=phase=="cancelled"?(JStr(ev,"kind")=="sync_retry"?"error":"detected"):"holding";
                     if(phase=="cancelled")m.recoveryDetail="The player list changed. Request readiness again.";
@@ -1623,6 +1625,7 @@ static void Dispatch(const std::string& line)
             } else {
                 const bool idle=m.recoveryPhase.empty()||m.recoveryPhase=="complete"||m.recoveryPhase=="detected"||m.recoveryPhase=="unavailable";
                 if(idle) {
+                    m.recoveryHidden=false;
                     m.recoveryPhase=phase=="clear"?"":phase;m.recoveryPresent=phase!="clear";
                     m.recoveryDetail.clear();m.recoveryStep.clear();
                 }
@@ -2529,11 +2532,20 @@ std::string RecoveryAction(const std::string& command) {
     uint64_t gen;std::string operation,token;
     {
         std::lock_guard<std::mutex> lk(S().mtx);auto& m=S().m;
+        // These are local view actions, including while a request is pending.
+        if(command=="sync_show") {m.recoveryHidden=false;return {};}
+        if(command=="sync_hide") {
+            const auto& p=m.recoveryPhase;
+            const bool notice=p.empty()||p=="manual"||p=="detected"||p=="unavailable"||p=="complete";
+            m.recoveryHidden=!notice;
+            if(notice)m.recoveryPresent=false;
+            return {};
+        }
         if(!m.active||m.dead)return kNotRunning;
         if(m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000)return "Waiting for the lobby...";
         if(command=="sync_dismiss") {
             if(!(m.recoveryPhase.empty() || m.recoveryPhase=="manual" || m.recoveryPhase=="detected" || m.recoveryPhase=="unavailable" || m.recoveryPhase=="complete"))return "A world operation is already running.";
-            m.recoveryPresent=false;return {};
+            m.recoveryPresent=false;m.recoveryHidden=false;return {};
         }
         if(command=="sync_decline") {
             if(!m.isHost || m.recoveryPhase!="detected")return "Only the host can decline a detected resync.";
@@ -2666,7 +2678,7 @@ void Snapshot(View* v)
     v->transferDetail=m.transferDetail;v->transferHint=m.transferHint;
     v->recoveryPhase=m.recoveryPhase;v->recoveryDetail=m.recoveryDetail;v->recoveryStep=m.recoveryStep;
     v->lobbyReady=m.lobbyReady;v->active=m.active&&!m.dead;v->inGame=g_gameUiSeen.load();
-    v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
+    v->recoveryHidden=m.recoveryHidden;v->recoveryPresent=m.recoveryPresent;v->recoveryRequested=m.recoveryRequestedAt && NowMs()-m.recoveryRequestedAt<5000;
     v->readyMine=m.readyMine;v->readyCount=m.readyCount;v->readyTotal=m.readyTotal;v->recoveryVersion=m.recoveryVersion;
     v->saves=m.saves;v->selectedSave=m.selectedSave;v->startPending=m.startPending;
     v->crossplay = m.crossplay;

@@ -4,6 +4,7 @@ namespace NativeIo {
 static bool saving=false;
 bool SavingNow(){return saving;}
 }
+static std::string recoveryAction;
 namespace lobby {
 void Snapshot(View* v) { *v=panel::P().view; }
 bool AutoCopyPending(){return false;} bool TakeAutoCopy(std::string*){return false;}
@@ -12,7 +13,7 @@ bool Start(const StartRequest&,std::string*){assert(false);return false;}
 void Leave(){assert(false);} std::string SendChat(const std::string&){assert(false);return {};}
 std::string StartGame(){assert(false);return {};}
 void RefreshSaves(){} std::string SelectSave(const std::string&){return {};}
-std::string RecoveryAction(const std::string&){return {};}
+std::string RecoveryAction(const std::string& s){recoveryAction=s;return {};}
 std::string SetSeparateCompanies(bool){return {};}
 std::string SetCrossplay(bool){return {};}
 std::string SetPublic(bool){return {};}
@@ -92,9 +93,15 @@ int main(int argc,char** argv) {
         OnHitLocked(114,&post);assert(g_playerPage==0);
         OnHitLocked(84,&post);assert(g_uiState==3);
         RenderLocked(w,h);CheckHits(w,h);assert(Has(83)&&Has(115)&&Has(9)&&Has(80)&&!Has(28));
+        for(bool world:{false,true})for(const char* phase:{"manual","detected","unavailable","readiness","holding","transferring","loading","error"}) {
+            P().view.inGame=world;P().view.recoveryPhase=phase;
+            RenderLocked(w,h);CheckHits(w,h);assert(Has(87)==world && !Has(4));
+        }
+        P().view.inGame=true;OnHitLocked(87,&post);
+        assert(g_uiState==0 && recoveryAction=="sync_hide");g_uiState=3;
         P().view.recoveryPhase="detected";RenderLocked(w,h);CheckHits(w,h);assert(Has(85)&&Has(80)&&Has(9));
         P().view.recoveryPhase="loading";P().view.worldIo=true;RenderLocked(w,h);
-        assert(!Has(83)&&!Has(85)&&!Has(80)&&!ChatFocusLocked());
+        assert(!Has(87)&&!Has(83)&&!Has(85)&&!Has(80)&&!ChatFocusLocked());
         P().view.worldIo=false;P().view.recoveryPhase.clear();
         OnHitLocked(83,&post);assert(g_uiState==2);
         P().view.hostSteam=false;RenderLocked(w,h);assert(!Has(51));

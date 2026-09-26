@@ -527,6 +527,12 @@ static bool InitRender(VkSwapchainKHR sc)
 // ---- multiplayer panel state ----
 static volatile LONG g_recoveryPresent = 0;
 static volatile LONG g_recoveryWorldIo = 0;
+// THE RESYNC VIEW'S x (2026-09-26, user: "add a x button that works to the resync
+// menu"). It hides the view; the resync goes on and Manage lobby shows it again.
+// The host repeats sync_state every 0.25 s and each one used to reopen the view,
+// so while this is set only a step that needs the player (a failed resync, a
+// Ready not yet given) brings it back. Cleared when the resync ends.
+static volatile LONG g_recoveryHidden = 0;
 // THE PANEL STAYS UP WHILE A WORLD LOADS (2026-09-18, user): with a lobby running,
 // the loading screen (CreatePage 16) keeps the lobby view -- the roster with what
 // every player is doing (receiving the save N%, loading world N%, catching up).
@@ -1921,7 +1927,7 @@ static void OnHit(int id, int button)
             strcpy_s(g_recoveryPhase,"manual");
             g_recoveryDetail[0]=0;
         }
-        InterlockedExchange(&g_recoveryPresent,1);
+        InterlockedExchange(&g_recoveryPresent,1); InterlockedExchange(&g_recoveryHidden,0);
         InterlockedExchange(&g_uiState,3);
         InterlockedExchange(&g_panelDirty,1);
         LeaveCriticalSection(&g_modelCs);
@@ -1950,6 +1956,14 @@ static void OnHit(int id, int button)
         }
     } break;
     case 4: InterlockedExchange(&g_ingameOverlay, 0); InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1); break; // collapse
+    case 83: // The resync view's x: a preflight notice is dismissed (85); a held resync only hides its view.
+        EnterCriticalSection(&g_modelCs);
+        if(!strcmp(g_recoveryPhase,"unavailable") || !strcmp(g_recoveryPhase,"manual") || !strcmp(g_recoveryPhase,"detected")) {
+            InterlockedExchange(&g_recoveryPresent,0); InterlockedExchange(&g_recoveryHidden,0);
+        } else InterlockedExchange(&g_recoveryHidden,1);
+        LeaveCriticalSection(&g_modelCs);
+        InterlockedExchange(&g_ingameOverlay, 0); InterlockedExchange(&g_uiState, 0); InterlockedExchange(&g_panelDirty, 1);
+        break;
     case 2: StartLobby(0); break;   // HOST  -> lobby (host)
     case 3: if (WorldLoaded()) SetStatus("Return to the main menu to join another world."); else StartLobby(1); break;
     case 5: if (!WorldLoaded()) LeaveLobby(); break;                // title-menu LEAVE only
@@ -2788,7 +2802,7 @@ static void PollLobbyOpen()
     wchar_t path[MAX_PATH]; _snwprintf_s(path, _TRUNCATE, L"%stpf2_lobby_open.txt", g_dataDirW);
     if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return;
     if (!DeleteFileW(path) || !WorldLoaded()) return;
-    InterlockedExchange(&g_ingameOverlay, 1);
+    InterlockedExchange(&g_ingameOverlay, 1); InterlockedExchange(&g_recoveryHidden, 0);
     bool running = LobbyRunning();
     InterlockedExchange(&g_uiState, running ? 2 : 1);
     if (running) SetStatus("Game running. New players can join this lobby.");
@@ -3984,12 +3998,12 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 strcpy_s(g_recoveryPhase,phase);
                                 g_recoveryDetail[0]=g_recoveryFailedStep[0]=0;
                                 g_recoveryRequestedAt=0;
-                                InterlockedExchange(&g_recoveryPresent,1);
+                                InterlockedExchange(&g_recoveryPresent,1); InterlockedExchange(&g_recoveryHidden,0);
                                 InterlockedExchange(&g_uiState,3);
                                 InterlockedExchange(&g_panelDirty,1);
                             } else if(idle && !strcmp(phase,"clear")) {
                                 g_recoveryPhase[0]=0;
-                                InterlockedExchange(&g_recoveryPresent,0);
+                                InterlockedExchange(&g_recoveryPresent,0); InterlockedExchange(&g_recoveryHidden,0);
                                 if(g_uiState==3) InterlockedExchange(&g_uiState,0);
                                 InterlockedExchange(&g_panelDirty,1);
                             }
@@ -4013,7 +4027,9 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                 g_readyCount=pubInt(rem,"ready_count",0); g_readyTotal=pubInt(rem,"total",0);
                                 g_readyMine=pubInt(rem,"is_ready",0)!=0;
                                 g_recoveryDetail[0]=0;
-                                InterlockedExchange(&g_recoveryPresent,1); InterlockedExchange(&g_uiState,3);
+                                InterlockedExchange(&g_recoveryPresent,1);
+                                if(!g_readyMine) InterlockedExchange(&g_recoveryHidden,0);
+                                if(!InterlockedCompareExchange(&g_recoveryHidden,0,0)) InterlockedExchange(&g_uiState,3);
                             } else if(!strcmp(g_recoveryPhase,"readiness")) {
                                 if(!strcmp(phase,"cancelled")) {
                                     strcpy_s(g_recoveryPhase,!strcmp(kind,"sync_retry") ? "error" : "detected");
@@ -4041,7 +4057,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                             // Keep the same panel from the desync notice through recovery.
                             // Native input remains usable while game widgets are held.
                             if(!strcmp(phase,"complete")) {
-                                InterlockedExchange(&g_recoveryPresent,0);
+                                InterlockedExchange(&g_recoveryPresent,0); InterlockedExchange(&g_recoveryHidden,0);
                                 InterlockedExchange(&g_lobbyDone,1);
                                 // Back to the LOBBY VIEW when the panel is open (2026-09-18, user:
                                 // "keep the lobby view up after we load into the game"): the loading
@@ -4053,7 +4069,9 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                                     InterlockedExchange(&g_uiState, open ? 2 : 0);
                                 }
                             } else {
-                                InterlockedExchange(&g_uiState,3);
+                                // x-hidden: stay hidden unless the resync failed (the host retries, everyone waits)
+                                if(!strcmp(phase,"error")) InterlockedExchange(&g_recoveryHidden,0);
+                                if(!InterlockedCompareExchange(&g_recoveryHidden,0,0)) InterlockedExchange(&g_uiState,3);
                             }
                             InterlockedExchange(&g_panelDirty,1);
                         }
