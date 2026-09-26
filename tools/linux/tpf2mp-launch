@@ -6,7 +6,10 @@ if [ $# -eq 0 ]; then
   exit 2
 fi
 root=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
-boot=$root/libtpf2mp_boot.so
+# Steam's container (pressure-vessel) bind-mounts the folder of every
+# LD_PRELOAD library read-only. Preloading the copy in boot/ keeps that lock off
+# $root, whose data/ the mod must write (logs, lobby and command-hook state).
+boot=$root/boot/libtpf2mp_boot.so
 case "$boot" in *[[:space:]:]*) echo "Loader path contains unsupported whitespace or colon: $boot" >&2; exit 1 ;; esac
 if [ ! -f "$boot" ]; then
   echo "Multiplayer loader is missing: $boot. Run the installer again." >&2

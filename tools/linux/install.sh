@@ -74,7 +74,18 @@ if [ -n "$GAME" ]; then
   [ -n "$KIND" ] || KIND=$(tpf2mp_steam_kind "$GAME")
 else
   mapfile -t FOUND < <(tpf2mp_find_games)
-  [ ${#FOUND[@]} -gt 0 ] || tpf2mp_die "Transport Fever 2 was not found in any Steam library; pass --game <folder>"
+  if [ ${#FOUND[@]} -eq 0 ]; then
+    # Steam installs the Windows build instead when the game is set to run
+    # through Proton: that folder has TransportFever2.exe and no TransportFever2.
+    while IFS= read -r root; do
+      while IFS= read -r lib; do
+        win=$lib/steamapps/common/Transport\ Fever\ 2
+        [ -f "$win/TransportFever2.exe" ] && [ ! -f "$win/TransportFever2" ] || continue
+        tpf2mp_die "$(tpf2mp_tilde "$win") is the Windows version of Transport Fever 2 (run through Proton); this release needs the native Linux version. In Steam: right-click Transport Fever 2 > Properties > Compatibility, untick \"Force the use of a specific Steam Play compatibility tool\", let Steam download the Linux version, then run the installer again"
+      done < <(tpf2mp_library_paths "$root")
+    done < <(tpf2mp_steam_roots)
+    tpf2mp_die "Transport Fever 2 was not found in any Steam library; pass --game <folder>"
+  fi
   best=-1
   for row in "${FOUND[@]}"; do
     IFS=$'\t' read -r k s g <<<"$row"
@@ -200,6 +211,10 @@ tpf2mp_say "Installing the libraries..."
 put_tree "$RELEASE/lib" "$ROOT"
 tpf2mp_put "$RELEASE/tpf2mp-launch" "$ROOT/tpf2mp-launch" 0755
 MANIFEST+=("file"$'\t'"$ROOT/tpf2mp-launch")
+# tpf2mp-launch preloads this copy: the container locks the preloaded library's
+# folder read-only, and boot/ holds nothing the mod writes.
+tpf2mp_put "$RELEASE/lib/libtpf2mp_boot.so" "$ROOT/boot/libtpf2mp_boot.so" 0755
+MANIFEST+=("file"$'\t'"$ROOT/boot/libtpf2mp_boot.so")
 if [ -d "$RELEASE/netpunch" ]; then
   tpf2mp_say "Installing the lobby..."
   put_tree "$RELEASE/netpunch" "$ROOT/netpunch"

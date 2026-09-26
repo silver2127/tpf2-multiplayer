@@ -99,12 +99,12 @@ for ROOT in "${ROOTS[@]:+${ROOTS[@]}}"; do
     do_rm "$M"
   fi
   # and the known names a manifest does not list: boot.cpp would load a leftover
-  for n in libtpf2mp_boot.so tpf2_bridge_mp.so tpf2_menu.so tpf2_slice.so tpf2_pluginhost.so plugins/tpf2_previews.so tpf2mp-launch netpunch/netpunch; do
+  for n in libtpf2mp_boot.so boot/libtpf2mp_boot.so tpf2_bridge_mp.so tpf2_menu.so tpf2_slice.so tpf2_pluginhost.so plugins/tpf2_previews.so tpf2mp-launch netpunch/netpunch; do
     [ -z "${LISTED[$ROOT/$n]:-}" ] || continue
     [ ! -e "$ROOT/$n" ] || do_rm "$ROOT/$n"
   done
   if [ "$TPF2MP_DRY" = 0 ]; then
-    rmdir "$ROOT/netpunch" "$ROOT/plugins" 2>/dev/null || true
+    rmdir "$ROOT/netpunch" "$ROOT/plugins" "$ROOT/boot" 2>/dev/null || true
   fi
   if [ $PURGE = 1 ]; then do_rmtree "$ROOT"; fi
 done

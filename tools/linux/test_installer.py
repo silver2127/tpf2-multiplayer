@@ -99,7 +99,8 @@ with tempfile.TemporaryDirectory(prefix="tpf2mp-installer-test-") as temp:
     # Execute the wrapper with a harmless program and inspect exactly its child env.
     output = run([installed / "tpf2mp-launch", "/usr/bin/env"], env)
     assert f"XDG_DATA_HOME={data_home}\n" in output
-    assert f"LD_PRELOAD={installed}/libtpf2mp_boot.so" in output
+    # boot/ alone: the container mounts the preloaded library's folder read-only.
+    assert f"LD_PRELOAD={installed}/boot/libtpf2mp_boot.so" in output
     # Upgrade must delete formerly shipped files while preserving runtime/user data.
     (installed / "old-library.so").write_text("old")
     (installed / "old-alias.so").symlink_to("old-library.so")
