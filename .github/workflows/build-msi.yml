@@ -89,6 +89,13 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python tools\test_transfer_status.py
 
+      - name: OPEN LOGS archive regression
+        shell: cmd
+        run: |
+          call tools\msvc_env.bat || exit /b 1
+          cl /nologo /std:c++17 /EHsc /I native\src tools\logarchive_test.cpp advapi32.lib /Fe:%RUNNER_TEMP%\logarchive_test.exe /Fo:%RUNNER_TEMP%\logarchive_test.obj || exit /b 1
+          %RUNNER_TEMP%\logarchive_test.exe
+
       - name: Build the MSI
         run: powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate
 

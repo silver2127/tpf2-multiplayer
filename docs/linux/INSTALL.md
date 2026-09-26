@@ -182,7 +182,7 @@ the script fallback. Logs are in `<data home>/tpf2mp/data/tpf2mp_host.log`.
   - the lobby's logs;
   - crash dumps written since the last save.
 
-  This also works after a crash: just start the game again. The last 2 are kept. `about.txt` in each
+  This also works after a crash: just start the game again. The last 5 of each kind (startup and OPEN LOGS) are kept. `about.txt` in each
   folder lists what is there, with sizes.
   Create `tpf2mp_keep_logs.txt` in the runtime data folder to keep every archive
   and append mod/lobby logs across starts. Remove it to restore normal retention.
@@ -376,3 +376,9 @@ The [dev `122a0ce9` integration](UPSTREAM_dev_122a0ce9.md) adds the native resyn
 view’s in-game x. Closing a running resync hides its view while recovery
 continues; Manage Lobby reopens it. Errors and unanswered Ready requests
 bring it back automatically. Saving/loading suppresses the x.
+
+Since [dev 45183ac6](UPSTREAM_dev_45183ac6.md), native OPEN LOGS and startup
+archives include the installed version, kernel/time zone, module GNU build IDs,
+and copied state/config files (last 8 MiB each, after logs). Lobby JSON/JSONL/text
+copies mask invitation/password fields. Saves and terrain dumps are excluded.
+The native menu uses xdg-open and reports the native archive location.

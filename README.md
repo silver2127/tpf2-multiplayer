@@ -229,3 +229,7 @@ The [dev `122a0ce9` integration](docs/linux/UPSTREAM_dev_122a0ce9.md) adds the n
 view’s in-game x. Closing a running resync hides its view while recovery
 continues; Manage Lobby reopens it. Errors and unanswered Ready requests
 bring it back automatically. Saving/loading suppresses the x.
+
+The [dev `45183ac6` integration](docs/linux/UPSTREAM_dev_45183ac6.md) adds
+native OPEN LOGS version/ELF identities, state/config snapshots and masked
+lobby streams, and retains five archives per kind. Version remains 0.7.0.3.

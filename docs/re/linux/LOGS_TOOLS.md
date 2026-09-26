@@ -103,3 +103,28 @@ namespace.
 - The Flatpak Steam paths (`~/.var/app/com.valvesoftware.Steam/...`): no Flatpak Steam here.
 - What the game does after `"... Process seems to be still running"` (the control flow after
   0x9b12d0 was not followed).
+
+## dev 45183ac6: archive metadata and state (2026-09-26)
+
+This integration changes mod-owned file collection only. Existing game log
+locations and constructor ordering above are unchanged; no new game offsets,
+patch bytes or SysV calling conventions are introduced.
+
+The Windows PE link stamp maps to GNU ELF build IDs on native Linux.
+`LaBuildId` reads ELF64 little-endian program headers and bounded `PT_NOTE`
+records, selecting `NT_GNU_BUILD_ID` with the `GNU\0` owner. It bounds the
+program-header table and note spans against file size, caps note segments at
+1 MiB and IDs at 64 bytes, and reports unavailable for unsupported/malformed
+files. It does not execute the game or map game objects.
+
+The native archive regression executable's read-only identity mode was run on
+`~/.local/share/tpf2mp-lab/native/game/TransportFever2`; it returned
+`3a0e156390b0e6f1e372051c24802c8493ae454a`, identical to `readelf -n`.
+Native version discovery follows `tools/linux/install.sh`'s
+`tpf2mp_install.txt` version field. Lobby state discovery follows
+`LobbyFolder` / `XdgNetDir` in `lobby_linux.cpp`; the game-folder fallback is
+also collected. These are source-level contracts, not inferred game layouts.
+
+The lab launch failed before game execution (`bwrap: setting up uid map:
+Permission denied`). Thus no live startup/archive/UI result is claimed.
+See [integration and tests](../../linux/UPSTREAM_dev_45183ac6.md).

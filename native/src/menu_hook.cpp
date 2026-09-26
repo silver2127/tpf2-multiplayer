@@ -1825,8 +1825,16 @@ static DWORD WINAPI CollectLogsThread(LPVOID)
     Tpf2mpLogArchive a;
     bool ok = Tpf2mpArchiveLogsSafe(false, ourDirW(), &a);
     Log("[menu] OPEN LOGS: %d file(s) copied, %d unreadable\n", a.files, a.skipped);
+    // Under Proton explorer.exe is Wine's own file manager inside the prefix: the
+    // folder goes to the desktop's instead (winebrowser -> xdg-open), and the
+    // status names the host path, since %LOCALAPPDATA% means nothing there.
+    char unixPath[MAX_PATH * 3] = "";
+    const bool wine = LaWineVersion() != nullptr;
+    if (wine) LaUnixPath(ok ? a.folder : a.root, unixPath, sizeof(unixPath));
+    if (wine) Log("[menu] OPEN LOGS: under Wine %s; the folder is %s\n", LaWineVersion(), unixPath[0] ? unixPath : "(no host path)");
     wchar_t cmd[MAX_PATH * 2 + 40];
-    if (ok) _snwprintf_s(cmd, _TRUNCATE, L"explorer.exe /select,\"%s\"", a.folder);
+    if (wine) _snwprintf_s(cmd, _TRUNCATE, L"winebrowser.exe \"%s\"", ok ? a.folder : a.root);
+    else if (ok) _snwprintf_s(cmd, _TRUNCATE, L"explorer.exe /select,\"%s\"", a.folder);
     else    _snwprintf_s(cmd, _TRUNCATE, L"explorer.exe \"%s\"", a.root);
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -1834,6 +1842,11 @@ static DWORD WINAPI CollectLogsThread(LPVOID)
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
     }
+    if (wine && ok && unixPath[0]) {
+        char status[sizeof(unixPath) + 80];
+        snprintf(status, sizeof(status), "Logs gathered in %s. Send the newest folders with a bug report.", unixPath);
+        SetStatus(status);
+    } else
     SetStatus(ok ? "Logs gathered in %LOCALAPPDATA%\\tpf2mp\\logs (opened in Explorer). Send the newest folders with a bug report."
                  : "No logs were found to gather.");
     InterlockedExchange(&g_logsBusy, 0);
