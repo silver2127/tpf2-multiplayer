@@ -1,5 +1,9 @@
 # TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
+The [dev `721ac61f` integration](docs/linux/UPSTREAM_dev_721ac61f.md) moves save reading, hashing and mod
+discovery to a lobby worker. Joiners wait 30 seconds for a silent host; mesh
+routing still bypasses it after 12 seconds. Shared lobby; release remains **0.7.1.3**.
+
 The [dev `262353d7` integration](docs/linux/UPSTREAM_dev_262353d7.md) merges
 housekeeping and correctness fixes for replay, vehicle/line identity, lobby transfers,
 and network input handling. Native bridge epoch handling and kill-switch readers

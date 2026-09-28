@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'netpunch'))
 import lobby
@@ -89,6 +90,8 @@ class FreshSave(unittest.TestCase):
                 else:
                     wait(lambda: any('pushing it again' in x for x in logs), 'a recent save goes out as before')
                     self.assertFalse(any('fresh save' in x for x in logs))
+                    wait(lambda: lobby._has_start(ios['late'].out_path, save=True), 'the late joiner starts')
+                return logs
             finally:
                 stop.set()
                 for c in conns:
@@ -96,6 +99,38 @@ class FreshSave(unittest.TestCase):
                 for w in workers:
                     w.join(5)
                 sock.close()
+
+    def test_a_slow_save_read_does_not_stall_the_lobby(self):
+        """Reading and hashing the save runs on a worker (2026-09-28: the dedicated
+        server stood 12.9 s doing it on the loop, and two joiners gave up on it)."""
+        real = lobby._read_save_files
+
+        def slow(path):
+            time.sleep(3.0)                    # a machine short of memory
+            return real(path)
+        lobby._read_save_files = slow
+        try:
+            logs = self.scenario(age=10)
+        finally:
+            lobby._read_save_files = real
+        self.assertFalse([x for x in logs if 'the lobby stood' in x], 'the host loop stood while the save was read')
+
+    def test_a_slow_mod_scan_does_not_stall_the_lobby(self):
+        """Save mod discovery must stay on the worker too, including on Linux."""
+        real = lobby.modshare.save_mod_list
+        worker_calls = []
+
+        def slow(path, log=None):
+            if threading.current_thread().name == 'save-read':
+                worker_calls.append(path)
+            time.sleep(3.0)
+            return real(path, log)
+
+        with mock.patch.object(lobby.modshare, 'save_mod_list', side_effect=slow):
+            logs = self.scenario(age=10)
+        self.assertGreaterEqual(len(worker_calls), 2, 'initial and late-join save preparation')
+        self.assertFalse([x for x in logs if 'the lobby stood' in x],
+                         'the host loop stood while discovering save mods')
 
     def test_an_old_save_is_taken_again(self):
         self.scenario(age=600)

@@ -226,7 +226,10 @@ TCP_CONNECT_RETRY = 0.5                    # seconds between those attempts
 MODS_RATE_WINDOW = 5                       # the status line's MB/s is over this many landed batches
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
-HOST_GONE_AFTER = 12.0  # joiner declares the host dead after this much silence
+HOST_GONE_AFTER = 30.0  # joiner declares the host dead after this much silence
+# (12 s until 2026-09-28: a dedicated server that had just loaded its world stood
+# 12.9 s preparing a save under memory pressure, and two joiners gave up on it)
+HOST_QUIET_AFTER = 12.0  # ...but routes around a host this quiet (the mesh)
 CHAT_BURST = 3          # copies of a chat/start packet (best-effort redundancy;
                         # clients de-dupe by cid, so extras are harmless)
 
@@ -1623,6 +1626,67 @@ def _merge_sender_stage(current, text, pct):
     if m and int(m.group(1)) >= pct:
         return None
     return text
+
+
+class _PreparingTransfer:
+    """Stands in the host's transfer slot while a worker thread reads and hashes
+    the save (2026-09-28). Everything that asks "is a transfer running?" sees
+    one, its targets count as mid-transfer for the keepalive, and nothing is
+    sent yet. The loop swaps in the real _HostSaveTransfer when the worker is
+    done, or drops the result if this one was cleared meanwhile."""
+    kind = "save"
+
+    def __init__(self, sid, targets):
+        self.sid = sid
+        self.peers = {a: {"name": n, "addr": a, "state": "active"} for a, n in targets}
+
+    def pump(self, now):
+        pass
+
+    def all_resolved(self):
+        return all(p["state"] != "active" for p in self.peers.values())
+
+    def awaiting_answers(self, now):
+        return False
+
+    def on_peer_dropped(self, addr):
+        p = self.peers.get(addr)
+        if p and p["state"] == "active":
+            p["state"] = "dropped"
+
+    def on_begin_ack(self, addr, msg):
+        pass
+
+    on_fack = on_fdone = on_tcp_gave_up = on_mods_answer = on_begin_ack
+
+    def done_addrs(self):
+        return []
+
+    def done_count(self):
+        return 0
+
+    def failed_names(self):
+        return []
+
+    def mod_needs(self):
+        return {}
+
+    def live_targets(self):
+        return [(a, p["name"]) for a, p in self.peers.items() if p["state"] == "active"]
+
+
+def _prepare_save(save_path):
+    """WORKER THREAD: (blob, files_meta, overall sha, mods, notes) of a save to
+    push, or an OSError/ValueError. Off the host loop: on the dedicated server
+    this took 12.9 s once, under memory pressure, and nobody was answered."""
+    try:
+        blob, files_meta = _read_save_files(save_path)
+        sha = hashlib.sha256(blob).hexdigest()
+    except (OSError, ValueError) as e:
+        return e
+    notes = []
+    mods = modshare.save_mod_list(save_path, notes.append)
+    return blob, files_meta, sha, mods, notes
 
 
 class _HostSaveTransfer:
@@ -4141,6 +4205,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     transfer = [None]                       # the active _HostSaveTransfer, or None
     terr_streams = []                       # the terrain sidecars streaming to joiners after a START (kind "terr"), each with .terr_key
     terr_jobs = queue.Queue()               # (sid, path, targets, (blob, sha) | None) from the sidecar reader thread
+    save_jobs = queue.Queue()               # (placeholder, path, _prepare_save result) from the save reader thread
     unplaced_feedback = set()               # (addr, sid) of facks/fdones the transfer could not place, logged once each
     upload = [None]                         # relay-only: the leader's save coming in
     pending_resume = [None]                 # relay-only: (leader addr, when) -- the stored world goes out then
@@ -5089,13 +5154,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                      "detail": "no players to share with -- wait for a player "
                                "to join, then press START GAME"})
             return
-        try:
-            blob, files_meta = _read_save_files(save_path)
-        except (OSError, ValueError) as e:
-            io.emit({"type": "status", "state": "failed",
-                     "detail": f"save transfer failed: {e}"})
-            log(f"[host] save read failed: {e}")
-            return
         sid = int(time.time() * 1000) & 0xFFFFFFFF
         if relay_only:
             la = leader_addr()
@@ -5120,7 +5178,32 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
-        mods = modshare.save_mod_list(save_path, log)        # None = could not read it (NOT "none")
+        # the read and the hashes run on a worker; the slot holds a placeholder
+        placeholder = _PreparingTransfer(sid, targets)
+        transfer[0] = placeholder
+        threading.Thread(target=lambda: save_jobs.put((placeholder, save_path, _prepare_save(save_path))),
+                         name="save-read", daemon=True).start()
+
+    def finish_save_transfer(placeholder, save_path, prepared):
+        """The loop's half of begin_save_transfer, once the worker has the save."""
+        if transfer[0] is not placeholder:
+            log(f"[host] the save read for sid={placeholder.sid} finished after its transfer was cleared -- dropped")
+            return
+        transfer[0] = None
+        if isinstance(prepared, Exception):
+            io.emit({"type": "status", "state": "failed",
+                     "detail": f"save transfer failed: {prepared}"})
+            log(f"[host] save read failed: {prepared}")
+            return
+        blob, files_meta, sha, mods, notes = prepared
+        for line in notes:
+            log(line)
+        targets = [(a, n) for a, n in placeholder.live_targets() if a in peers]
+        if not targets:
+            log("[host] every target left while the save was read -- not starting")
+            return
+        sid = placeholder.sid
+        # None = could not read it (NOT "none")
         if not relay_only and not _host_mods_check(save_path, mods, io, log):
             return                                           # refused: the host's own game could not load it (status + chat name the mods)
         advertised[:]=[save_path,mods]
@@ -5143,7 +5226,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
                 + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
-                                        io, log, mods=mods, stage_cb=sender_stage)
+                                        io, log, mods=mods, stage_cb=sender_stage, overall_sha=sha)
 
     def begin_world_switch(save_path):
         """A WORLD SWITCH: the host loaded a different world while the session
@@ -5868,6 +5951,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # receiving the same file is not sent it again; one receiving
             # another file moves to the new stream (a new load of its own).
             try:
+                finish_save_transfer(*save_jobs.get_nowait())
+            except queue.Empty:
+                pass
+            try:
                 sid_t, path_t, targets_t, read_t = terr_jobs.get_nowait()
             except queue.Empty:
                 read_t = None
@@ -6180,7 +6267,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     def mesh_relay_via(dest):
         """Who forwards our envelope to ``dest``: the host if it is alive, else
         any direct peer that reports a direct link to ``dest``."""
-        if conn.last_seen_age() < host_gone_after:
+        if conn.last_seen_age() < min(host_gone_after, HOST_QUIET_AFTER):
             return conn.peer
         for nm in mesh.direct_names():
             if dest in roster_links[0].get(nm, []):
