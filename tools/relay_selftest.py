@@ -132,7 +132,6 @@ try:
     assert wait(lambda: any(e.get("type") == "start" and e.get("save") is True for e in events(dd)), 30), "dave no start"
     assert open(os.path.join(dd, "incoming_save.sav"), "rb").read() == open(save, "rb").read(), "resumed save differs"
     # ---- game frames both ways through the relay (the leader is a joiner like any other)
-    import socket
     ed = d("erin"); run(["join", code, "--name", "Erin", "--local-port", "0", "--game-relay-port", str(ERIN_RELAY), "--game-local-port", str(ERIN_LOCAL)], ed, "erin")
     assert wait(lambda: any(e.get("type") == "roster" and "Erin" in e.get("players", []) for e in events(dd)), 40), "erin not in roster"
     time.sleep(3)

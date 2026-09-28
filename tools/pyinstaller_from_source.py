@@ -29,7 +29,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import urllib.request
 
 VERSION = "6.22.2"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

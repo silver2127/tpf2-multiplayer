@@ -42,7 +42,7 @@ end}}
 assert(load(SOURCE,"@vehicles.lua"))()(CM,K,function(s) logs[#logs+1]=s end)
 -- Configuration decoding is covered elsewhere; exercise actual depot resolution,
 -- strict-origin replay, command submission and callback here.
-buildVehConfig=function() return {},1 end
+CM.buildVehConfig=function() return {},1 end
 local H={CM=CM}
 function H.add(id,file,x,y,child,near)
   world[id]={fileName=file,transf={[13]=x,[14]=y},depots=child and {child} or {}}

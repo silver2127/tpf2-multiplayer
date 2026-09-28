@@ -1,5 +1,10 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `262353d7` integration](UPSTREAM_dev_262353d7.md) merges
+housekeeping and correctness fixes for replay, vehicle/line identity, lobby transfers,
+and network input handling. Native bridge epoch handling and kill-switch readers
+are covered by Linux regressions; release remains **0.7.1.3**.
+
 The [dev `528294b1` integration](UPSTREAM_dev_528294b1.md) asks for a
 fresh host save when a late joiner would receive one over two minutes old,
 with fallback if no new save arrives. Host-loop stalls no longer count as

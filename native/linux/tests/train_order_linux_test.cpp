@@ -36,6 +36,27 @@ asm(".text\n.type Fixture,@function\nFixture:\n.cfi_startproc\n"
 
 int main()
 {
+    char flagRoot[] = "/tmp/tpf2mp-order-root.XXXXXX";
+    char flagData[] = "/tmp/tpf2mp-order-data.XXXXXX";
+    assert(mkdtemp(flagRoot) && mkdtemp(flagData));
+    const auto rootFlags = std::string(flagRoot) + "/tpf2_menu_flags.txt";
+    const auto dataFlags = std::string(flagData) + "/tpf2_menu_flags.txt";
+    auto writeFlags = [](const std::string& path, const char* text) {
+        FILE* f = fopen(path.c_str(), "w"); assert(f);
+        assert(fputs(text, f) >= 0); assert(fclose(f) == 0);
+    };
+    assert(!SliceFlagOff(flagRoot, flagData, "trainorder"));
+    writeFlags(dataFlags, "trainorder=0\nroadspace=0\n");
+    assert(SliceFlagOff(flagRoot, flagData, "trainorder"));
+    assert(SliceFlagOff(flagRoot, flagData, "roadspace"));
+    writeFlags(rootFlags, "trainorder=1\n");
+    assert(!SliceFlagOff(flagRoot, flagData, "trainorder"));
+    assert(!SliceFlagOff(flagRoot, flagData, "roadspace"));
+    writeFlags(rootFlags, "trainorder=0 # prefix semantics retained\n");
+    assert(SliceFlagOff(flagRoot, flagData, "trainorder"));
+    assert(!SliceFlagOff(flagRoot, flagData, "roadspace"));
+    assert(unlink(rootFlags.c_str()) == 0 && unlink(dataFlags.c_str()) == 0);
+    assert(rmdir(flagRoot) == 0 && rmdir(flagData) == 0);
     assert(SliceReadInit());
     constexpr int type = 2;
     std::vector<uint8_t> world(0xb0), pool(0xf0), self(0x50);

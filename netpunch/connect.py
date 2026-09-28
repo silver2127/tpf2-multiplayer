@@ -47,9 +47,7 @@ import argparse
 import base64
 import hashlib
 import hmac
-import ipaddress
 import json
-import os
 import socket
 import struct
 import sys
@@ -128,8 +126,19 @@ SECRET_LEN = 12
 # --------------------------------------------------------------------------- #
 # small utilities
 # --------------------------------------------------------------------------- #
+LOG_SINK = [None]      # the lobby points this at its _log (IP redaction, merged log)
+
+
 def log(msg):
-    """Diagnostics -> stderr (stdout is reserved for the CODE= line)."""
+    """Diagnostics -> stderr (stdout is reserved for the CODE= line).
+
+    The lobby runs race() and _observe_and_announce() from here; their lines
+    ('[race] WON on v4 via <public ip:port>', '[observe] candidates=...') went
+    out unredacted and never reached the host's merged log until the lobby
+    set LOG_SINK."""
+    if LOG_SINK[0] is not None:
+        LOG_SINK[0](msg)
+        return
     print(msg, file=sys.stderr, flush=True)
 
 

@@ -11,6 +11,10 @@
 // thread the game runs SteamAPI_RunCallbacks on; they only call the accept
 // function (the API is thread-safe) and push to a queue for the log.
 #ifdef _WIN32
+// Winsock's fd_set holds 64 sockets by default and FD_SET silently ignores the
+// rest; the select below watches up to 64 endpoints PLUS the control socket, so
+// the 64th endpoint was never polled. Must come before winsock2.h.
+#define FD_SETSIZE 128
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>

@@ -8,7 +8,6 @@ BaseGetVertices. Requires lupa, pefile and capstone.
 """
 import ctypes as C
 import math
-import shutil
 import struct
 import subprocess
 import tempfile

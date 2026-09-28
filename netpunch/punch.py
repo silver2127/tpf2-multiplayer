@@ -250,7 +250,11 @@ class Connection:
                         self.connected.set()
                         self.log(f"[{self.name}] CONNECTED to {addr[0]}:{addr[1]}")
             elif ptype == TYPE_CONNECTED:
-                authenticated = True
+                # CONNECTED carries no proof. Once connected in a sealed session it
+                # may not move the peer: one spoofed datagram used to redirect every
+                # later sealed frame to its sender.
+                authenticated = (self.cipher is None or not self.connected.is_set()
+                                 or addr == self.peer)
                 # Peer says it's done; make sure we've flagged ourselves too.
                 if not self.connected.is_set():
                     self.connected.set()
@@ -291,8 +295,13 @@ class Connection:
                 # "any bulk frame": every control message (join, roster, chat,
                 # start) is JSON and stays sealed, so no unauthenticated frame
                 # can ever be parsed as one.
-                if self.cipher is None or payload.startswith(CHUNK_PREFIX):
+                # In a sealed session the carve-outs are DELIVERED but prove
+                # nothing, so they never move the peer (the lock below): a plain
+                # frame from anywhere used to redirect the session to its sender.
+                if self.cipher is None:
                     authenticated = True
+                    self._inbox.put(payload)
+                elif payload.startswith(CHUNK_PREFIX):
                     self._inbox.put(payload)
                 elif payload.startswith(b'{"t": "reject"'):
                     # Re-verify it is ACTUALLY a reject before admitting it. A
@@ -305,7 +314,6 @@ class Connection:
                     except (ValueError, UnicodeDecodeError):
                         _obj = None
                     if isinstance(_obj, dict) and _obj.get("t") == "reject":
-                        authenticated = True
                         self._inbox.put(payload)
 
             if authenticated:

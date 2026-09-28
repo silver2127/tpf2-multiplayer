@@ -15,6 +15,7 @@
 #include <cstring>
 #include "roadspace.h"
 #include "trainorder.h"
+#include "flags_linux.h"
 #include "moveorder.h"
 #include <atomic>
 #include <chrono>
@@ -27,20 +28,6 @@
 namespace {
 uintptr_t movementBase;
 std::string movementData;
-bool FlagOff(const char* root, const char* data, const char* key)
-{
-    for (const char* dir : {root, data}) {
-        if (!dir || !*dir) continue;
-        std::string path = std::string(dir) + "/tpf2_menu_flags.txt";
-        FILE* f = fopen(path.c_str(), "r");
-        if (!f) continue;
-        char line[256]; bool off = false;
-        const std::string setting = std::string(key) + "=0";
-        while (fgets(line, sizeof(line), f)) if (!strncmp(line, setting.c_str(), setting.size())) off = true;
-        fclose(f); return off;
-    }
-    return false;
-}
 template<class T, size_t N> bool Check(uintptr_t base, const T (&checks)[N])
 {
     for (const auto& c : checks) {
@@ -353,12 +340,12 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
     if (!SliceEcsAnchored(base))
         SliceLog("[company-ui] the engine's component walk is unavailable on this image: "
                  "the icon tint and the company rename stay off\n");
-    if (!FlagOff(root,data,"showicons")) {
+    if (!SliceFlagOff(root,data,"showicons")) {
         const bool ready=Check(base,kIconChecks) && ApplyUiPatches(base,iconPatches);
         SliceLog("[showicons] %s: four Linux owner branches\n",ready ? "installed" : "OFF");
         ok &= ready;
     }
-    if (!FlagOff(root,data,"foreignwindows")) {
+    if (!SliceFlagOff(root,data,"foreignwindows")) {
         const bool ready=Check(base,kForeignWindowChecks) && ApplyUiPatches(base,foreignWindowPatches);
         SliceLog("[foreignwindows] %s: native command barrier and Lua foreign edit guard retained\n",ready ? "installed" : "OFF");
         ok &= ready;
@@ -373,7 +360,7 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
 }
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)
 {
-    if (FlagOff(root,data,"pausedtick")) {
+    if (SliceFlagOff(root,data,"pausedtick")) {
         SliceLog("[pausedtick] OFF (pausedtick=0)\n"); return true;
     }
     if (!Check(base,kPausedChecks)) return false;
@@ -430,7 +417,7 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
     movementBase=base; movementData=data ? data : "";
     bool ok=InstallPausedTick(base,root,data);
     ok &= InstallCompanyUi(base,root,data);
-    if (!FlagOff(root,data,"roadspace")) {
+    if (!SliceFlagOff(root,data,"roadspace")) {
         void* unusedPlainA=nullptr; void* unusedPlainB=nullptr;
         SliceRoadResumeA=base+0x2e558eb; SliceRoadResumeB=base+0x2e55988;
         const bool ready=Check(base,kRoadChecks) &&
@@ -458,7 +445,7 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
     }
     uintptr_t name=0; char text[sizeof("N3ecs9component4NameE")];
     namesOk &= SliceReadT(base+0x5a02608,&name) && SliceRead(name,text,sizeof(text)) && !memcmp(text,"N3ecs9component4NameE",sizeof(text));
-    if (FlagOff(root,data,"roadentries")) {
+    if (SliceFlagOff(root,data,"roadentries")) {
         SliceLog("[roadentries] OFF (roadentries=0 in tpf2_menu_flags.txt) -- a road edge's vehicle entries keep the engine's arrival/load order\n");
     } else {
         roadEntriesOriginal=reinterpret_cast<EdgeAddFn>(base+0x2e58f70);
@@ -468,15 +455,15 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
             ready ? "installed" : "OFF");
         ok &= ready;
     }
-    if (!FlagOff(root,data,"shiporder")) {
+    if (!SliceFlagOff(root,data,"shiporder")) {
         const bool ready=namesOk && Check(base,kShipChecks) && InstallHook(base+0x16d75c0,reinterpret_cast<void*>(&ShipHook),8,&moveOriginal[0]);
         SliceLog("[shiporder] %s (measurement only)\n",ready ? "installed" : "OFF"); ok &= ready;
     }
-    if (!FlagOff(root,data,"airorder")) {
+    if (!SliceFlagOff(root,data,"airorder")) {
         const bool ready=namesOk && Check(base,kAirChecks) && InstallHook(base+0x16692e0,reinterpret_cast<void*>(&AirHook),8,&moveOriginal[1]);
         SliceLog("[airorder] %s (measurement only)\n",ready ? "installed" : "OFF"); ok &= ready;
     }
-    if (!FlagOff(root,data,"sharedstations")) {
+    if (!SliceFlagOff(root,data,"sharedstations")) {
         void* unused=nullptr; SliceStationResume=base+0x10c03c9;
         const bool ready=Check(base,kStationsChecks) && InstallHook(base+0x10c03c0,reinterpret_cast<void*>(&SliceStationRelay),9,&unused);
         SliceLog("[sharedstations] %s (companies mode only)\n",ready ? "installed" : "OFF"); ok &= ready;

@@ -1,6 +1,6 @@
 # Append a Lua file as one EVAL line to the lab pair's inject files.
 # usage: hj_eval.py chunk.lua [lab|peer|both]
-import sys, re
+import sys
 from pathlib import Path
 r = Path('/opt/tpf2mp-linux-parity-20260921')
 src = Path(sys.argv[1]).read_text()

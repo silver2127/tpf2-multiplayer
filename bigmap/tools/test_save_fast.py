@@ -1,6 +1,5 @@
 """Verify targeted save patches, failure/rollback behavior and original operands."""
 import ctypes as C
-import struct
 from pathlib import Path
 import pefile
 from unicorn import Uc,UC_ARCH_X86,UC_MODE_64

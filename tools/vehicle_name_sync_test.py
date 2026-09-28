@@ -79,7 +79,8 @@ api.engine = setmetatable({
 }, { __index = function() return sink() end })
 local sent = {}
 api.cmd = {
-  make = { setName = function(id, name) return { what = "setName", id = id, name = name } end },
+  make = { setName = function(id, name) return { what = "setName", id = id, name = name } end,
+           sellVehicle = function(id) return { what = "sell", id = id } end },
   sendCommand = function(cmd, cb) sent[#sent + 1] = cmd; if cb then cb({}, true) end end,
 }
 game = { interface = setmetatable({ getEntities = function() return {} end },
@@ -108,6 +109,8 @@ local log = function(s) logs[#logs + 1] = s end
 assert(load(VEH_SRC, "@vehicles.lua"))()(CM, K, log)
 local H = { CM = CM }
 function H.park(id, pt, name) WORLD[id] = true; PARKED[id] = true; PT[id] = pt; if name then NAMES[id] = { name = name } end end
+function H.unpark(id) WORLD[id] = nil; PARKED[id] = nil end
+function H.sell(key) CM.execVehCmd({ op = "VSELL", origin = "b", seq = 77, at = T, keys = key }) end
 function H.parkedBuy() CM.parkedBuys[#CM.parkedBuys + 1] = { depot = 900, args = {}, since = T } end
 function H.tick() T = T + 1; CM.ticks = CM.ticks + 1; CM.primeVehKeys(); CM.shipParkedBuys(); CM.pollVehKeys() end
 function H.vehId(key) return CM.vehIdForKey(key) end
@@ -213,6 +216,18 @@ h.parkedBuy()
 h.tick(); h.tick()
 h.setName("a", "a:7", "Zug%207", 1)
 check("originator: its own VNAME (skipOrigin=1) sends nothing", h.nsent() == 0 and h.nretry() == 0)
+
+# --- a sold vehicle's id is reused by the next buy: that buy still binds --------------
+h = runtime("a", 6)
+h.park(42, 1000, "Bus 1"); h.parkedBuy(); h.tick(); h.tick()
+check("id reuse: a:7 bound to 42", h.vehId("a:7") == 42, str(h.vehId("a:7")))
+h.sell("a:7"); h.unpark(42)
+check("id reuse: the sale forgets a:7", h.vehId("a:7") is None, str(h.vehId("a:7")))
+h.park(42, 2000, "Bus 2"); h.parkedBuy()
+for _ in range(10):
+    h.tick()
+check("id reuse: the next buy binds to the reused id 42", h.vehId("a:9") == 42, str(h.vehId("a:9")))
+check("id reuse: ...and is not dropped", h.count("never produced a vehicle") == 0)
 
 print()
 if fails:

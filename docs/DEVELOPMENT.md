@@ -45,6 +45,10 @@ A DLL loaded by a running game is locked and relinking it fails with LNK1104. A 
 (`build.bat slice 2` makes `tpf2_slice2.dll`); only unsuffixed names ship, and `deploy_shipping.ps1`
 warns when a suffixed build is newer than the one it copies.
 
+`rebuild.bat` at the repository root does the usual loop in one go: `native\build.bat all`, then
+`tools\deploy_shipping.ps1`, then `tools\version_gate_test.py` and `tools\test_rto_resilience.py`,
+stopping at the first failure.
+
 The lobby is frozen with PyInstaller ([netpunch/README.md](../netpunch/README.md#freezing)); the MSI is
 built by `installer\build_msi.ps1` ([installer/README.md](../installer/README.md#building-the-msi)).
 

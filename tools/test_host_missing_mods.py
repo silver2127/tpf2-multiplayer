@@ -13,6 +13,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'netpunch'))
 import lobby                                                 # noqa: E402
 
+SAVE = os.path.join(os.sep, 's', 'world.sav')   # this platform's paths: the lobby runs on Windows and Linux
+
 
 class FakeIo:
     def __init__(self):
@@ -33,18 +35,18 @@ class HostMissingMods(unittest.TestCase):
 
     def test_all_here_starts(self):
         mods = [("*1954591986", 1), ("_urbangames_deluxe_pack", 1)]
-        self.assertTrue(lobby._host_mods_check(os.path.join("s", "world.sav"), mods, self.io, self.log, self.lookup))
+        self.assertTrue(lobby._host_mods_check(SAVE, mods, self.io, self.log, self.lookup))
         self.assertEqual(self.io.events, [])
 
     def test_unknown_list_starts(self):
-        self.assertTrue(lobby._host_mods_check(os.path.join("s", "world.sav"), None, self.io, self.log, self.lookup))
-        self.assertTrue(lobby._host_mods_check(os.path.join("s", "world.sav"), [], self.io, self.log, self.lookup))
+        self.assertTrue(lobby._host_mods_check(SAVE, None, self.io, self.log, self.lookup))
+        self.assertTrue(lobby._host_mods_check(SAVE, [], self.io, self.log, self.lookup))
         self.assertEqual(self.io.events, [])
 
     def test_missing_refuses_and_names_them(self):
         mods = [("*1954591986", 1), ("*2916150031", 1), ("*1911374498", 1)]
         self.assertEqual(lobby._host_missing_mods(mods, self.lookup), [("*2916150031", 1), ("*1911374498", 1)])
-        self.assertFalse(lobby._host_mods_check(os.path.join("s", "world.sav"), mods, self.io, self.log, self.lookup))
+        self.assertFalse(lobby._host_mods_check(SAVE, mods, self.io, self.log, self.lookup))
         kinds = [e["type"] for e in self.io.events]
         self.assertEqual(kinds, ["status", "chat"])
         status, chat = self.io.events
@@ -57,7 +59,7 @@ class HostMissingMods(unittest.TestCase):
     def test_chat_once_a_minute_status_every_time(self):
         mods = [("*2916150031", 1)]
         for _ in range(3):
-            self.assertFalse(lobby._host_mods_check(os.path.join("s", "world.sav"), mods, self.io, self.log, self.lookup))
+            self.assertFalse(lobby._host_mods_check(SAVE, mods, self.io, self.log, self.lookup))
         self.assertEqual([e["type"] for e in self.io.events], ["status", "chat", "status", "status"])
 
     def test_long_list_is_cut(self):

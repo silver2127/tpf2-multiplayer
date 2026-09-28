@@ -52,13 +52,15 @@ earlier versions were removed on 2026-09-20.
 Bound to localhost; nginx proxies https://<host>/tpf2mp/ to it. Stdlib only, one
 file, runs as a systemd service (see the deploy step in tools/masterserver_deploy.sh).
 """
-import argparse, io, json, os, re, secrets, select, socket, sys, time, threading, zipfile
+import argparse, json, re, secrets, select, socket, sys, time, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TTL = 30.0           # seconds an entry lives without a fresh announce (lobbies announce every 10 s)
 MAX_BODY = 4096
 MAX_ENTRIES = 500
-FIELDS = ("id", "name", "code", "players", "max", "game", "type", "version", "locked")
+# No "id": it is the lobby's own handle for /announce and /leave, and listing it
+# let anyone delist every lobby or re-announce one under another code.
+FIELDS = ("name", "code", "players", "max", "game", "type", "version", "locked")
 # The list shows what KIND of server a row is, never the host's save name
 # (2026-09-10): a save's file name ("multi Balage", "autosave 3") read as
 # nonsense and was not even the world START GAME ends up sharing.
@@ -97,25 +99,45 @@ def _s(v, n):
     return str(v)[:n] if v is not None else ""
 
 
-def _safe(v, n):
-    return re.sub(r"[^A-Za-z0-9._-]", "_", str(v or ""))[:n] or "x"
+def _int(v, default, lo=0, hi=10000):
+    """A client's number, or ``default`` when it is not one; clamped to lo..hi.
+    int() on a client's text raised inside the handler (a logged traceback and
+    a dropped connection instead of a 400)."""
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _knock_refusal_locked(tag, ip, now):
+    """Prune, then -> None when a knock from ``ip`` for ``tag`` may be stored, else
+    an (http status, error) pair. Call with _knock_lock held."""
+    for k in list(_knocks):
+        _knocks[k] = [e for e in _knocks[k] if now - e[0] < KNOCK_TTL]
+        if not _knocks[k]:
+            del _knocks[k]
+    for k in list(_knock_by_ip):
+        _knock_by_ip[k] = [t for t in _knock_by_ip[k] if now - t < 60]
+        if not _knock_by_ip[k]:
+            del _knock_by_ip[k]
+    if len(_knock_by_ip.get(ip, ())) >= KNOCK_PER_IP_MIN:
+        return 429, "too many knocks"
+    if tag not in _knocks and len(_knocks) >= KNOCK_MAX_TAGS:
+        return 503, "full"
+    return None
+
+
+def _knock_refusal(tag, ip, now):
+    with _knock_lock:
+        return _knock_refusal_locked(tag, ip, now)
 
 
 def _knock_post(tag, blob, ip, now, relay=None):
     """-> None when stored, else an (http status, error) pair."""
     with _knock_lock:
-        for k in list(_knocks):
-            _knocks[k] = [e for e in _knocks[k] if now - e[0] < KNOCK_TTL]
-            if not _knocks[k]:
-                del _knocks[k]
-        for k in list(_knock_by_ip):
-            _knock_by_ip[k] = [t for t in _knock_by_ip[k] if now - t < 60]
-            if not _knock_by_ip[k]:
-                del _knock_by_ip[k]
-        if len(_knock_by_ip.get(ip, ())) >= KNOCK_PER_IP_MIN:
-            return 429, "too many knocks"
-        if tag not in _knocks and len(_knocks) >= KNOCK_MAX_TAGS:
-            return 503, "full"
+        err = _knock_refusal_locked(tag, ip, now)
+        if err:
+            return err
         _knock_by_ip.setdefault(ip, []).append(now)
         lst = _knocks.setdefault(tag, [])
         lst.append((now, blob, relay))
@@ -434,7 +456,7 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length") or 0)
+        n = _int(self.headers.get("Content-Length") or 0, 0, 0, MAX_BODY + 1)
         if n <= 0 or n > MAX_BODY:
             return None
         try:
@@ -491,6 +513,12 @@ class H(BaseHTTPRequestHandler):
                 nonce = str(d.get("j") or "")
                 if not _NONCE_RE.match(nonce):
                     return self._send(400, {"error": "bad nonce"})
+                # the rate limit BEFORE a port is taken: a refused knock kept its
+                # port, so one client could hold every relay port (150 knocks from
+                # one IP: 60 refused with 429, all 100 ports held)
+                err = _knock_refusal(tag, ip, now)
+                if err:
+                    return self._send(err[0], {"error": err[1]})
                 relay = _relay_alloc(tag, nonce, now)
                 if relay is None:
                     return self._send(503, {"error": "relay full"})
@@ -518,8 +546,8 @@ class H(BaseHTTPRequestHandler):
                 "id": sid,
                 "name": _s(d.get("name"), 40) or "unnamed",
                 "code": code,
-                "players": int(d.get("players") or 0),
-                "max": int(d.get("max") or 8),
+                "players": _int(d.get("players") or 0, 0),
+                "max": _int(d.get("max") or 8, 8),
                 "type": kind,
                 # "game" carries the type's label: 0.4.11-and-older panels show
                 # this field, so they list the type too instead of a save name

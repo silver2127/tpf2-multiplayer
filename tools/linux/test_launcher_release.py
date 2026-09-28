@@ -6,6 +6,7 @@ import importlib.util
 import io
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -153,12 +154,12 @@ class LauncherReleaseTest(unittest.TestCase):
         self.assertEqual(self.writes, [])
 
     def test_mod_still_requires_linux_directory_before_credentials(self):
-        with patch.object(publisher.sys, "argv", ["publish_release.py", "v0.7.0.6"]):
+        with patch.object(sys, "argv", ["publish_release.py", "v0.7.0.6"]):
             with self.assertRaisesRegex(SystemExit, "needs --linux-dir"):
                 publisher.main()
 
     def test_launcher_cli_needs_no_linux_payload(self):
-        with patch.object(publisher.sys, "argv", ["publish_release.py", "launcher"]), \
+        with patch.object(sys, "argv", ["publish_release.py", "launcher"]), \
              patch.object(publisher, "token", return_value="offline"), \
              patch.object(publisher, "GitHub", return_value=self.gh):
             publisher.main()
@@ -195,7 +196,7 @@ class VersionReleaseTest(unittest.TestCase):
         self.enterContext(patch.object(publisher, 'token', return_value='offline'))
         self.enterContext(patch.object(publisher, 'GitHub', return_value=self.gh))
         self.enterContext(patch.object(publisher.urllib.request, 'urlopen', side_effect=AssertionError('network')))
-        self.sleep = self.enterContext(patch.object(publisher.time, 'sleep'))
+        self.sleep = self.enterContext(patch('time.sleep'))   # the publisher must never wait
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
 
     @staticmethod
@@ -230,7 +231,7 @@ class VersionReleaseTest(unittest.TestCase):
         argv = ['publish_release.py', 'v' + self.version, '--linux-dir', str(self.root),
                 '--payload-dir', str(self.root), '--windows-launcher', str(self.root / publisher.WINDOWS_NAME),
                 '--linux-launcher', str(self.root / publisher.LINUX_NAME), *flags]
-        with patch.object(publisher.sys, 'argv', argv):
+        with patch.object(sys, 'argv', argv):
             publisher.main()
 
     def test_native_files_on_both_install_releases_and_page_published_last(self):
@@ -411,7 +412,7 @@ class PageReleaseTest(LauncherReleaseTest):
                 self.assertEqual(self.writes, [])
 
     def test_page_cli_needs_no_linux_directory(self):
-        with patch.object(publisher.sys, 'argv', ['publish_release.py', 'page', 'v0.7.0.5']), \
+        with patch.object(sys, 'argv', ['publish_release.py', 'page', 'v0.7.0.5']), \
              patch.object(publisher, 'token', return_value='offline'), \
              patch.object(publisher, 'GitHub', return_value=self.gh), \
              patch.object(publisher, 'page_release') as run:

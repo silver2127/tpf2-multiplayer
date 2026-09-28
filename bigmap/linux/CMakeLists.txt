@@ -59,6 +59,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_generator PRIVATE stdc++fs)
   add_test(NAME generator_memory COMMAND test_generator)
   add_library(test_generator_text SHARED tests/generator_test.cpp)
+  # main() is compiled here too (unused); without -UNDEBUG its asserts vanish and warn.
+  target_compile_options(test_generator_text PRIVATE -UNDEBUG)
   target_link_libraries(test_generator_text PRIVATE stdc++fs)
 endif()
 

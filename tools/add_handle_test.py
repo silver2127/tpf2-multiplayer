@@ -22,7 +22,6 @@ Checked against the supported exe, so a drifting RVA fails here and not in someo
 """
 from pathlib import Path
 import re
-import struct
 import sys
 
 import pefile

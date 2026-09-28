@@ -15,7 +15,7 @@ import re
 import struct
 import sys
 from pathlib import Path
-from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE, UC_PROT_ALL
+from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE
 from unicorn.x86_const import *
 
 ROOT = Path(__file__).resolve().parents[2]

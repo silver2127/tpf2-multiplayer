@@ -12,7 +12,7 @@ static void CaptureLog(const char* format, ...) {
 }
 
 struct TestMessage : SteamNetworkingMessage_t {
-    TestMessage() { memset(static_cast<SteamNetworkingMessage_t*>(this), 0, sizeof(SteamNetworkingMessage_t)); }
+    TestMessage() { memset(static_cast<void*>(static_cast<SteamNetworkingMessage_t*>(this)), 0, sizeof(SteamNetworkingMessage_t)); }
 };
 static int released = 0, flagsSeen = -1, resultCode = 1;
 static SteamNetworkingMessage_t* incoming = nullptr;

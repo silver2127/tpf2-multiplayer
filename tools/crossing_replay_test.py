@@ -366,6 +366,21 @@ function test_same_network_companion(isTrack)
   if isTrack then assert(e.trackEdge.trackType==1 and e.trackEdge.catenary==false,'track bridge took the new track props')
   else assert(e.streetEdge.streetType==24,'road bridge took the new road type: '..tostring(e.streetEdge.streetType)) end
 end
+
+-- A new track across an existing track mid-span splits it (a plain junction), and
+-- a peer following the originator's plan (xh) splits it the same way: the link
+-- plan looked up street edges only, so a planned rail-over-rail split was skipped.
+function test_rail_over_rail(planned)
+  reset()
+  node(101,0,-20,0);node(102,0,20,0);edge(201,101,102,1)
+  local c={etype=1,pts='-20,0,0,20,0,0',links='1,2',fv='1,2'}
+  local sp
+  if planned then sp=execute(c) else
+    c.origin='b';c.seq=8;c.at=100;c.cat=1;c.ttype=0;c.stype=15
+    CM.execPolyline(c,false); sp=proposals[1].sp.streetProposal end
+  assert(#sp.edgesToRemove==1 and #sp.edgesToAdd==4,
+    string.format('rail over rail (planned=%s): removed %d, added %d edges', tostring(planned), #sp.edgesToRemove, #sp.edgesToAdd))
+end
 ''')
 
 if __name__ == "__main__":
@@ -410,3 +425,6 @@ if __name__ == "__main__":
     lua.globals().test_signal_split(False)
     lua.globals().test_signal_split(True)
     print('PASS: rail switch split retains signals on both halves, including reversed edge orientation')
+    lua.globals().test_rail_over_rail(False)
+    lua.globals().test_rail_over_rail(True)
+    print("PASS: a track across a track splits it, derived locally and from the originator's plan")

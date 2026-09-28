@@ -486,8 +486,6 @@ function CM.speedRequest()
 		players = tonumber(body:match("players=(%d+)"))
 		local xf = body:match("xfer=([^\r\n]*)")
 		CM.xferInfo = (xf and xf ~= "" and xf ~= "-") and xf or nil
-		local xf = body:match("xfer=([^\r\n]*)")
-		CM.xferInfo = (xf and xf ~= "" and xf ~= "-") and xf or nil
 		local ld = body:match("leader=(%a+)")
 		if ld and ld ~= CM.leader then
 			CM.leader = ld

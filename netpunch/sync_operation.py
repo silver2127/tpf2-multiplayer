@@ -321,10 +321,13 @@ class SyncOperation:
         elif self.phase == 'checking':
             if len({a['fingerprint'] for a in self.acks.values()}) != 1 and self.retain:
                 # a kept world differs from the loaded ones: everyone loads the
-                # snapshot they already hold, under a fresh epoch
+                # snapshot they already hold, under a fresh epoch. Through
+                # 'transferring': the save file is named after the epoch
+                # (mp_<epoch[:12]>.sav), so going straight to 'loading' asked every
+                # member to load a file that was never written under the new name
                 self.retain = ()
                 self.epoch = self.token()
-                self._enter('loading')
+                self._enter('transferring')
             elif len({a['fingerprint'] for a in self.acks.values()}) != 1:
                 self.fail('World comparison differs after loading')
             else:

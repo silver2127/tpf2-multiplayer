@@ -1,5 +1,10 @@
 # TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
+The [dev `262353d7` integration](docs/linux/UPSTREAM_dev_262353d7.md) merges
+housekeeping and correctness fixes for replay, vehicle/line identity, lobby transfers,
+and network input handling. Native bridge epoch handling and kill-switch readers
+are covered by Linux regressions; release remains **0.7.1.3**.
+
 The [dev `528294b1` integration](docs/linux/UPSTREAM_dev_528294b1.md) asks for a
 fresh host save when a late joiner would receive one over two minutes old,
 with fallback if no new save arrives. Host-loop stalls no longer count as
@@ -54,25 +59,26 @@ It is unofficial, reverse-engineered without the engine's source, and **experime
 four players have been run, on one PC and between PCs on different networks. Read
 [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
 
-This branch also contains a **native Linux build-35924 port**. Its current
-integration includes Windows **release 0.7** plus dev `8c3c02a5` and a native
-dedicated server. See [Linux installation](docs/linux/INSTALL.md),
-[current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md), and
-[dedicated server setup](docs/HOSTING_A_SERVER.md). Canonical simulation ordering is now on by default (`TPF2MP_ORDER_CANON=0`
-disables it); see the [dev ad3d66e4 integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
-Settings must match Windows peers. Loaded-game lifetime and cross-platform
-validation remain outstanding; matching versions do not establish gameplay parity.
-The [dev `0a35d0a8` integration](docs/linux/UPSTREAM_dev_0a35d0a8.md) enables
-native terrain compression by default and fixes bridge lobby identity; release
-version remains 0.7.
-The [dev `ea35eb8a` integration](docs/linux/UPSTREAM_dev_ea35eb8a.md)
-adds native terrain pager recency, automatic memory headroom and fault-rate
-logging; loaded-big-map performance validation remains outstanding.
-The Windows MSI instructions below apply to the Windows version.
-The subsequent [dev `60d237c5` integration](docs/linux/UPSTREAM_dev_60d237c5.md)
-retains the Windows autosave-sidecar fix; native terrain sidecars were introduced experimentally, default off, in
-[dev `2b4fd093`](docs/linux/UPSTREAM_dev_2b4fd093.md), then enabled by default in
-[dev `71549cff`](docs/linux/UPSTREAM_dev_71549cff.md). Live lifetime validation remains outstanding.
+This branch also contains a **native Linux build-35924 port**, with a native dedicated server. Its
+current integration includes Windows **release 0.7** plus dev `8c3c02a5`:
+[Linux installation](docs/linux/INSTALL.md) ·
+[current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md) ·
+[dedicated server setup](docs/HOSTING_A_SERVER.md). The Windows MSI instructions below apply to the
+Windows version.
+
+- Settings must match Windows peers. Loaded-game lifetime and cross-platform validation remain
+  outstanding; matching versions do not establish gameplay parity.
+- Canonical simulation ordering is on by default (`TPF2MP_ORDER_CANON=0` disables it); see the
+  [dev `ad3d66e4` integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
+- Native terrain compression is on by default, and bridge lobby identity is fixed; the release
+  version remains 0.7 ([dev `0a35d0a8`](docs/linux/UPSTREAM_dev_0a35d0a8.md)).
+- The native terrain pager has recency, automatic memory headroom and fault-rate logging;
+  loaded-big-map performance validation remains outstanding
+  ([dev `ea35eb8a`](docs/linux/UPSTREAM_dev_ea35eb8a.md)).
+- The Windows autosave-sidecar fix is retained
+  ([dev `60d237c5`](docs/linux/UPSTREAM_dev_60d237c5.md)); native terrain sidecars are available
+  experimentally in [dev `2b4fd093`](docs/linux/UPSTREAM_dev_2b4fd093.md), then enabled by default
+  in [dev `71549cff`](docs/linux/UPSTREAM_dev_71549cff.md). Live lifetime validation remains outstanding.
 
 ## How it works
 

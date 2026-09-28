@@ -1,6 +1,5 @@
 """Native dimensions/labels and original combo loop in Unicorn. No game writes."""
 import ctypes as C
-import math
 import struct
 from pathlib import Path
 import pefile

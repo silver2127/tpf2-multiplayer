@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Isolated Lua5.2 diagnostics tests; never read or modify a running game."""
 import copy
-import json
 from pathlib import Path
 import shutil
 import subprocess

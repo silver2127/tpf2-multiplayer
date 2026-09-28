@@ -348,7 +348,8 @@ static size_t         g_panelPitch = 0;       // row bytes
 static int            g_panelW = 780, g_panelH = 580;   // image alloc = max (lobby)
 static int            g_copyW = 300, g_copyH = 60;        // region actually shown/copied
 static bool           g_panelBuilt = false;
-static char           g_code[128] = "";                   // host/own code to display
+static char           g_code[256] = "";                   // host/own code to display (>= the lobby event's cd[160]:
+                                                            // strcpy_s does not truncate, it ends the process)
 static volatile LONG  g_haveCode = 0;
 static wchar_t        g_startSaveW[600] = L"";             // host: the .sav it chose to share
 // Picker state belongs to the presentation thread; g_startSaveW is the transfer snapshot.
@@ -1118,7 +1119,7 @@ static bool pubStr(const char* obj, const char* key, char* out, int n)
     if (*p != '"') return false;
     p++; int j = 0;
     while (*p && *p != '"' && j < n - 1) {
-        if (*p == '\\' && p[1]) { p++; if (*p == 'n' || *p == 't') { p++; continue; } if (*p == 'u') { p += 5; out[j++] = '?'; continue; } }
+        if (*p == '\\' && p[1]) { p++; if (*p == 'n' || *p == 't') { p++; continue; } if (*p == 'u') { p++; for (int h = 0; h < 4 && *p; h++) p++; out[j++] = '?'; continue; } }   // a cut-off \u must not step over the NUL
         out[j++] = *p++;
     }
     out[j] = 0; return true;
@@ -1190,7 +1191,7 @@ static DWORD WINAPI PubFetchThread(LPVOID)
             const char* o = strchr(p, '{'); if (!o) break;
             // find the object's closing brace, skipping quoted text
             const char* e = o + 1; bool q = false;
-            for (; *e; e++) { if (*e == '\\' && q) { e++; continue; } if (*e == '"') q = !q; else if (*e == '}' && !q) break; }
+            for (; *e; e++) { if (*e == '\\' && q) { if (!e[1]) break; e++; continue; } if (*e == '"') q = !q; else if (*e == '}' && !q) break; }
             if (!*e) break;
             char obj[1024]; int L = (int)(e - o + 1); if (L > 1023) L = 1023; memcpy(obj, o, L); obj[L] = 0;
             PubRow& r = rows[cnt]; memset(&r, 0, sizeof(r));
@@ -2256,7 +2257,11 @@ static bool ClipboardGet(char* out, int outsz)
     out[0] = 0; if (!OpenClipboard(nullptr)) return false;
     HANDLE h = GetClipboardData(CF_UNICODETEXT); bool ok = false;
     if (h) { wchar_t* p = (wchar_t*)GlobalLock(h);
-             if (p) { WideCharToMultiByte(CP_UTF8, 0, p, -1, out, outsz, nullptr, nullptr); ok = out[0] != 0; GlobalUnlock(h); } }
+             // too long for out: the call fails having filled it with no terminator,
+             // and callers then read past the buffer -- count that as nothing
+             if (p) { int n = WideCharToMultiByte(CP_UTF8, 0, p, -1, out, outsz, nullptr, nullptr);
+                      if (n <= 0) out[0] = 0;
+                      out[outsz - 1] = 0; ok = out[0] != 0; GlobalUnlock(h); } }
     CloseClipboard(); return ok;
 }
 static bool ReadFileText(const wchar_t* path, char* buf, int sz)
@@ -3580,7 +3585,7 @@ static void QuitLobbyProc(HANDLE proc, int waitMs)
     }
 }
 
-struct LobbyArg { int join; char code[160]; char name[NAME_MAX]; char password[40]; int pub; int sep; int xplay; char lobby[NAME_MAX]; };
+struct LobbyArg { int join; char code[256]; char name[NAME_MAX]; char password[40]; int pub; int sep; int xplay; char lobby[NAME_MAX]; };
 
 static DWORD WINAPI LobbyThread(LPVOID param)
 {
@@ -3618,7 +3623,7 @@ static DWORD WINAPI LobbyThread(LPVOID param)
                  g_dataDirW, ourDirW(), g_dataDirW, g_dataDirW);
     wchar_t wpass[96] = L"";
     if (a->password[0]) { wchar_t wp[40]; MultiByteToWideChar(CP_UTF8, 0, a->password, -1, wp, 40); _snwprintf_s(wpass, _TRUNCATE, L" --password %s", wp); }
-    if (a->join) { wchar_t wc[200]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 200);
+    if (a->join) { wchar_t wc[256]; MultiByteToWideChar(CP_UTF8, 0, a->code, -1, wc, 256);
                    _snwprintf_s(cmd, _TRUNCATE, L"%s join %s --name \"%s\" --local-port 0 --game-relay-port %d --game-local-port %d %s%s",
                                 base, wc, wname, relayPort, bridgePort, fwd, wpass); }
     else {

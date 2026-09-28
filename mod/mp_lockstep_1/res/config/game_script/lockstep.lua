@@ -245,34 +245,6 @@ function CM.hashEveryFor(edges)
 	return K.HASH_EVERY_GAMETIME * mult
 end
 
--- COST-AWARE POLL CADENCE. The capture-side polls scan the whole world
--- (getEntities over every construction, every roadside stop) on a fixed tick
--- cadence, so their cost grows with the map while their frequency does not --
--- measured update() averaging 30-84 ms per tick with spikes over a second.
---
--- Unlike the hash these are LOCAL: a poll only notices what the player did HERE
--- and ships it with a stamp fixed at capture, so slowing one delays the capture
--- slightly and changes nothing about when peers apply it. Per-instance
--- adaptation is therefore safe.
-CM.pollCost = {}
-function CM.pollDue(name, baseEvery)
-	local c = CM.pollCost[name]
-	local every = baseEvery
-	if c and c > 20 then
-		local mult = math.floor(c / 20) + 1
-		if mult > 8 then mult = 8 end
-		every = baseEvery * mult
-	end
-	return (CM.ticks % every) == 0
-end
-function CM.pollTimed(name, fn)
-	local t0 = os.clock()
-	fn()
-	local ms = (os.clock() - t0) * 1000
-	-- rolling, so one slow scan does not pin the cadence open forever
-	CM.pollCost[name] = ((CM.pollCost[name] or ms) * 3 + ms) / 4
-end
-
 CM.ticks        = 0
 CM.eventsOffset = -1
 CM.injectOffset = -1
@@ -715,6 +687,7 @@ function CM.groundAt(x, y)
 	pcall(function() z = game.interface.getHeight({ x, y }) or 0 end)
 	return z or 0
 end
+LS.groundAt = CM.groundAt   -- the LS export above ran before this was defined
 
 -- ---------- command reliability (NACK + resend), encode/decode, scheduleLocal, onLine, pollEvents ----------
 -- Lives in res/scripts/mp/net.lua.

@@ -1206,8 +1206,8 @@ function CM.pollInject()
 						end
 					end
 					-- a vehicle or line that came out of the save: primed, not registered.
-					-- Lines first -- forgetVehicle does not clear primedVeh, so a stale
-					-- vehicle id could otherwise shadow a live line (review, 2026-08-31).
+					-- Lines first (review, 2026-08-31: a stale primedVeh id shadowed a live
+					-- line; forgetVehicle now clears it, the order still costs nothing).
 					if not key and CM.primedLines[id] then
 						key = CM.lineKeyFor(id); if key then kind = "line" end
 					end

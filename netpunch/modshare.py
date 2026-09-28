@@ -47,6 +47,13 @@ import hashlib
 import uuid
 import threading
 import re
+import zlib
+
+# What reading a peer's zip can raise: an entry flagged encrypted is a RuntimeError,
+# an unknown compression method NotImplementedError, a corrupt or short stream
+# zlib.error / EOFError. Caught as a failed install; they used to escape, fail the
+# whole batch (valid mods too) and leave *.mp_incoming folders behind.
+ZIP_ERRORS = (OSError, ValueError, zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error, EOFError)
 
 TF2_APPID = "1066780"
 MP_MOD_ID = "mp_lockstep"                 # ours: shipped by the installer, never sent
@@ -838,7 +845,7 @@ def install_mod_zip(data, mod_id, version, log=None, progress=None):
             raise ValueError("no mod.lua at the top of the zip")
         os.rename(tmp, target)
         return "installed", target
-    except (OSError, ValueError, zipfile.BadZipFile) as e:
+    except ZIP_ERRORS as e:
         log(f"[mods] install of {mod_id}_{version} failed: {e}")
         shutil.rmtree(tmp, ignore_errors=True)
         return "failed", None
@@ -922,7 +929,7 @@ def install_mod_zips(items, log=None, progress=None, threads=4):
                 if free is not None and declared > free:
                     raise ValueError(f"mod unpacks to {declared} B but only {free} B are free")
                 log(f"[mods] unpacking {label}: {len(entries)} entries, {declared} B")
-            except (OSError, ValueError, zipfile.BadZipFile) as e:
+            except ZIP_ERRORS as e:
                 log(f"[mods] install of {label} failed: {e}")
                 shutil.rmtree(tmp, ignore_errors=True)
                 results[label] = ("failed", None)
@@ -936,7 +943,7 @@ def install_mod_zips(items, log=None, progress=None, threads=4):
             for f in futures:
                 try:
                     f.result()
-                except (OSError, ValueError, zipfile.BadZipFile) as e:
+                except ZIP_ERRORS as e:
                     err = err or e
             if err is None and not os.path.isfile(os.path.join(tmp, "mod.lua")):
                 err = ValueError("no mod.lua at the top of the zip")

@@ -338,8 +338,12 @@ function CM.pollStops()
 								local lk = CM.lineKeyFor(lid)
 								local snap = lk and CM.lineSnapshot(lid)
 								if snap then
+									-- armed=0: the engine already re-pointed this line here, so the
+									-- originator skips it (execLine); without it the originator
+									-- re-applied the list, and without alts every instance lost the
+									-- line's alternative terminals (execLineReadback ships both)
 									CM.scheduleLocal("LUPDATE", { key = lk, name = snap.name, color = snap.color, wait = snap.wait,
-									                           stops = snap.stops, skipOrigin = 1 })
+									                           stops = snap.stops, alts = snap.alts, skipOrigin = 1, armed = 0 })
 									log(string.format("stops: line %s re-shipped after the replace -> LUPDATE", lk))
 								end
 							end

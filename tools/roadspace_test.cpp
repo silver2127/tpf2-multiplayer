@@ -23,8 +23,6 @@
 #include <random>
 #include <vector>
 
-static bool Readable(const void* p, size_t n) { return p != nullptr || n == 0; }
-static void Log(const char*, ...) {}
 #include "../native/src/roadspace.h"
 
 static float Ordered(const std::vector<float>& t, RoadSpaceAcc* acc = nullptr)
@@ -191,6 +189,7 @@ int main()
         auto t0 = std::chrono::steady_clock::now();
         for (int r = 0; r < reps; r++) sink = Ordered(t);
         auto t1 = std::chrono::steady_clock::now();
+        (void)sink;
         const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count() / reps;
         printf("COST %3d terms: %.0f ns per GetUsedSpace (sort + double sum only)\n", n, ns);
     }

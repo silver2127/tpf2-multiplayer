@@ -60,6 +60,19 @@ int main(int argc, char** argv)
     assert(ParsePublic(list,&publicRows,&publicNote));
     assert(publicRows.size()==48 && publicRows.back().code=="fixture-47");
     publicRows.clear();assert(!ParsePublic("invalid",&publicRows,&publicNote));
+    // Truncated escape sequences formerly overread the Windows public list.
+    for (const std::string tail : {"\\", "\\u", "\\u0", "\\u00", "\\u000"}) {
+        publicRows.clear();
+        assert(!ParsePublic("{\"servers\":[{\"name\":\"" + tail, &publicRows, &publicNote));
+        assert(publicRows.empty());
+    }
+    for (size_t length : {size_t(159), size_t(255), size_t(256)}) {
+        const std::string code(length, 'A');
+        publicRows.clear();
+        assert(ParsePublic("{\"servers\":[{\"code\":\"" + code + "\"}]}", &publicRows, &publicNote));
+        if (length <= 255) assert(publicRows.size() == 1 && publicRows[0].code == code);
+        else assert(publicRows.empty());
+    }
     S().m.active=true; g_childPid=123; g_gameUiSeen=false;
     OnMenuPage(2); assert(S().m.active && S().q.empty()); // waiting joiner
     OnGameUiFrame(); OnMenuPage(16); assert(S().m.active && S().q.empty()); // switch
