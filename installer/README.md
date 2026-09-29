@@ -38,11 +38,12 @@ Two more checks on the same page look for other mods that change the game native
 - **A replaced `alut.dll`** blocks the install. With `alut_real.dll` present, that file must be the game's
   own `alut.dll` (compared by SHA-256); without it, `alut.dll` itself must be. Anything else is another
   mod's proxy, and two proxies of one file cannot both load, so the game would not start.
-- **Native DLLs in mods** only warn, and the player chooses. The page lists every DLL beside the exe that
+- **Native DLLs in mods** only warn, and the player chooses. An extra wizard page after the folder page
+  (`Tpf2ModDllsDlg`) lists every DLL beside the exe that
   build 35924 does not ship (`.asi` files too), and one line per mod folder that contains a DLL: in the
   game's `mods` folder, in each Steam user's `userdata\<id>\1066780\local\mods`, and in the Workshop
   content of the library the game is in. CommonAPI2, for example, loads `bin\CommonAPI2Native.dll` from its
-  mod folder. **No** (the default) keeps the wizard on the folder page. The scan cannot tell whether a mod
+  mod folder. **Next** installs anyway, **Back** returns to the folder page. The scan cannot tell whether a mod
   is enabled in a save, so a subscribed but unused mod is listed too. A silent install writes the list to
   its log and carries on.
 
