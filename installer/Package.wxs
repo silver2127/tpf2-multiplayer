@@ -246,6 +246,28 @@
           <Publish Event="EndDialog" Value="Return" />
         </Control>
       </Dialog>
+      <!-- Mods with native DLLs (CheckGameDir fills TPF2_MODDLLS_MSG). A wizard
+           page, not a spawned Yes/No box: after a SpawnDialog returns, the
+           installer runs none of the Next button's later events (measured
+           2026-09-29), so a Yes there could never move the wizard on. Next
+           installs anyway, Back returns to the folder page. -->
+      <Dialog Id="Tpf2ModDllsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Mods with native DLLs" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="These mods may break multiplayer." />
+        <Control Id="Message" Type="Text" X="20" Y="52" Width="330" Height="180" NoPrefix="yes" Text="[TPF2_MODDLLS_MSG]" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back">
+          <Publish Event="NewDialog" Value="InstallDirDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Text="&amp;Next">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
       <DialogRef Id="DiskCostDlg" />
       <DialogRef Id="ErrorDlg" />
       <DialogRef Id="FatalError" />
@@ -270,7 +292,8 @@
       <!-- the refusal's reason: CheckGameDir cannot show a message box from here -->
       <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="GameDirProblemDlg" Order="3" Condition="TPF2_GAMEDIR_OK = &quot;0&quot; AND TPF2_GAMEDIR_MSG" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="5" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="Tpf2ModDllsDlg" Order="5" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot; AND TPF2_MODDLLS_MSG" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="6" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot; AND NOT TPF2_MODDLLS_MSG" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
 
