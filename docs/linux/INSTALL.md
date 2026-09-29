@@ -1,5 +1,10 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `c4754f26` integration](UPSTREAM_dev_c4754f26.md) retains the Windows
+installer’s folder-refusal dialog. Native Linux already prints the reason to
+stderr and exits with an error; four installer regressions cover that behavior.
+Release remains **0.7.1.3**.
+
 The [dev `721ac61f` integration](UPSTREAM_dev_721ac61f.md) moves save reading, hashing and mod
 discovery to a lobby worker. Joiners wait 30 seconds for a silent host; mesh
 routing still bypasses it after 12 seconds. Shared lobby; release remains **0.7.1.3**.

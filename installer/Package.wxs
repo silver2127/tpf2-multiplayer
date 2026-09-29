@@ -237,6 +237,15 @@
       <Property Id="ARPNOMODIFY" Value="1" />
 
       <DialogRef Id="BrowseDlg" />
+
+      <!-- Why the folder page will not go on (CheckGameDir fills TPF2_GAMEDIR_MSG). -->
+      <Dialog Id="GameDirProblemDlg" Width="340" Height="190" Title="[ProductName] Setup">
+        <Control Id="Title" Type="Text" X="15" Y="12" Width="310" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}This folder cannot be used" />
+        <Control Id="Message" Type="Text" X="15" Y="32" Width="310" Height="120" NoPrefix="yes" Text="[TPF2_GAMEDIR_MSG]" />
+        <Control Id="OK" Type="PushButton" X="265" Y="160" Width="60" Height="17" Default="yes" Cancel="yes" Text="OK">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
       <DialogRef Id="DiskCostDlg" />
       <DialogRef Id="ErrorDlg" />
       <DialogRef Id="FatalError" />
@@ -258,8 +267,10 @@
       <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="DoAction" Value="CheckGameDir" Order="2" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <!-- the refusal's reason: CheckGameDir cannot show a message box from here -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="GameDirProblemDlg" Order="3" Condition="TPF2_GAMEDIR_OK = &quot;0&quot; AND TPF2_GAMEDIR_MSG" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="5" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
 

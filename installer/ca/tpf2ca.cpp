@@ -533,13 +533,34 @@ extern "C" __declspec(dllexport) UINT __stdcall FindGameDir(MSIHANDLE h)
     return ERROR_SUCCESS;
 }
 
+// `tmpl` with [1] replaced by `arg` and line breaks a dialog's Text control shows.
+static std::wstring DialogText(const std::wstring& tmpl, const std::wstring& arg)
+{
+    std::wstring out;
+    for (size_t i = 0; i < tmpl.size(); i++) {
+        if (tmpl.compare(i, 3, L"[1]") == 0) { out += arg; i += 2; }
+        else if (tmpl[i] == L'\n') out += L"\r\n";
+        else out += tmpl[i];
+    }
+    return out;
+}
+
 extern "C" __declspec(dllexport) UINT __stdcall CheckGameDir(MSIHANDLE h)
 {
     std::wstring dir;
     const wchar_t* problem = GameDirProblem(h, &dir, L"CheckGameDir");
     bool ok = problem == nullptr;
+    // THE REASON, ON SCREEN (2026-09-29): run by the folder page's Next button
+    // (a DoAction control event), this action cannot show a message box --
+    // Windows Installer does not display MsiProcessMessage boxes for such
+    // actions, the call returns 0 -- so a refused folder left Next doing
+    // nothing, silently, and a player saw the wizard "brick" on the folder
+    // page. The text now goes to TPF2_GAMEDIR_MSG, which the wizard shows in
+    // GameDirProblemDlg; only when the box really was shown is it left empty.
+    MsiSetPropertyW(h, L"TPF2_GAMEDIR_MSG", L"");
     if (problem) {
-        Say(h, (INSTALLMESSAGE)(INSTALLMESSAGE_WARNING | MB_OK | MB_ICONWARNING), problem, dir);
+        int shown = Say(h, (INSTALLMESSAGE)(INSTALLMESSAGE_WARNING | MB_OK | MB_ICONWARNING), problem, dir);
+        if (shown <= 0) MsiSetPropertyW(h, L"TPF2_GAMEDIR_MSG", DialogText(problem, dir).c_str());
     } else {
         // Mod DLLs do not block: the player decides. Declining keeps the wizard
         // on the folder page like any other refusal.
