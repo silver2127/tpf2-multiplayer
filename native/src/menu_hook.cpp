@@ -2483,11 +2483,19 @@ extern "C" {
     void* g_gameUiTramp = nullptr;
     void  GameUiRelay();
     volatile uint64_t g_gameUi = 0;                 // UI::CGameUI 'this', per frame
+    volatile uint64_t g_gameUiTick = 0;             // GetTickCount64 at the last CGameUI update, 0 outside a world
     void GameUiSeen(uint64_t rcx) {
         if (!g_gameUi && rcx) InterlockedExchange(&g_hostMenuLoad, 0);   // a NEW world is up: a switch in flight is over
         g_gameUi = rcx;
+        g_gameUiTick = GetTickCount64();
     }
 }
+// tpf2_bigmap's pagers read the last gameplay frame through this: a fresh frame
+// ends the load's allowance (and its commit throttle, which sleeps each terrain
+// fault up to 2 s), and gaps between frames feed the eviction rate. Without it
+// the pager fell back to a 3-minute tail and a host under a tight commit charge
+// sat at "loading world 99%" at 2 frames a second for that long (2026-10-02).
+extern "C" __declspec(dllexport) uint64_t Tpf2mpLastGameUiTick() { return g_gameUiTick; }
 // tpf2_slice.dll reads the CGameUI through this (its game-state provider at
 // +0x450 is how the slice builds a MovePathUtilContext for the line platform
 // assignment at replay). 0 between worlds.
@@ -4567,6 +4575,7 @@ static void MyCreatePage(uint64_t thisp, int page)
             else InterlockedExchange(&g_leaveOnMenu, 1);
         }
         g_gameUi = 0;
+        g_gameUiTick = 0;
         InterlockedExchange(&g_ingameOverlay, 0);
         InterlockedExchange(&g_loadingPanel, 0);
         // Keep recovery reachable at the title menu after a failed load.
