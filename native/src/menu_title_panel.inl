@@ -60,7 +60,7 @@ static void titleAction(int x, int y, int w, const wchar_t *label, int id,
     addHit(x, y, w, S(32), id, true);
 }
 #ifndef TPF2MP_VERSION_STR
-#define TPF2MP_VERSION_STR L"0.7.1.3"
+#define TPF2MP_VERSION_STR L"0.7.1.4"
 #endif
 
 static void titleHeading(int w, const wchar_t *label, int closeId) {
