@@ -19,8 +19,9 @@
 //                     neither Steam build 35924 nor, when the package asks for
 //                     it with TPF2_ALLOW_GOG=1, the GOG build of that same
 //                     version (so: another store, a patched exe, a game
-//                     update), or an alut.dll another mod replaced. Asks
-//                     whether to go on when mods ship native DLLs. Never fails.
+//                     update), or an alut.dll another mod replaced. When mods
+//                     ship native DLLs, puts their list in TPF2_MODDLLS_MSG for
+//                     the wizard's warning page. Never fails.
 //   RequireGameDir    immediate, execute sequence (covers /qn installs).
 //                     Fails the install with a clear message on the same test.
 //   PreserveStockAlut deferred, before InstallFiles, when alut.dll is being
@@ -209,7 +210,8 @@ const wchar_t* MOD_DLLS_MSG =
     L"These native DLLs belong neither to Transport Fever 2 nor to this product:\n\n[1]\n\n"
     L"Mods that load their own DLLs (CommonAPI2, for example) change the game underneath the game "
     L"script, and this product does not expect that: it can fail to start, refuse commands or fall out "
-    L"of sync. Remove or disable them before relying on it.\n\nInstall anyway?";
+    L"of sync. Remove or disable them before relying on it.\n\nClick Next to install anyway, or Back to "
+    L"choose another folder.";
 
 bool EqualsNoCase(const std::wstring& a, const wchar_t* b) { return _wcsicmp(a.c_str(), b) == 0; }
 
@@ -558,12 +560,17 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckGameDir(MSIHANDLE h)
     // page. The text now goes to TPF2_GAMEDIR_MSG, which the wizard shows in
     // GameDirProblemDlg; only when the box really was shown is it left empty.
     MsiSetPropertyW(h, L"TPF2_GAMEDIR_MSG", L"");
+    MsiSetPropertyW(h, L"TPF2_MODDLLS_MSG", L"");
     if (problem) {
         int shown = Say(h, (INSTALLMESSAGE)(INSTALLMESSAGE_WARNING | MB_OK | MB_ICONWARNING), problem, dir);
         if (shown <= 0) MsiSetPropertyW(h, L"TPF2_GAMEDIR_MSG", DialogText(problem, dir).c_str());
     } else {
-        // Mod DLLs do not block: the player decides. Declining keeps the wizard
-        // on the folder page like any other refusal.
+        // Mod DLLs do not block: the player decides, on the wizard's
+        // Tpf2ModDllsDlg page (TPF2_MODDLLS_MSG). A Yes/No box from here was
+        // never shown either (see above), so the install went on unwarned; and
+        // a spawned Yes/No dialog cannot move the wizard on, because after a
+        // SpawnDialog returns the installer runs none of the Next button's
+        // later events (measured 2026-09-29).
         size_t count = 0;
         std::vector<std::wstring> lines = ForeignDllLines(dir, &count);
         if (!lines.empty()) {
@@ -573,12 +580,7 @@ extern "C" __declspec(dllexport) UINT __stdcall CheckGameDir(MSIHANDLE h)
                 if (i < 12) list += L"  " + lines[i] + L"\n";
             }
             if (lines.size() > 12) list += L"  ... and " + std::to_wstring(lines.size() - 12) + L" more\n";
-            int answer = Say(h, (INSTALLMESSAGE)(INSTALLMESSAGE_WARNING | MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2),
-                             MOD_DLLS_MSG, list);
-            if (answer == IDNO) {
-                ok = false;
-                Log(h, L"CheckGameDir: declined because of " + std::to_wstring(count) + L" foreign DLL(s)");
-            }
+            MsiSetPropertyW(h, L"TPF2_MODDLLS_MSG", DialogText(MOD_DLLS_MSG, list).c_str());
         }
     }
     MsiSetPropertyW(h, L"TPF2_GAMEDIR_OK", ok ? L"1" : L"0");

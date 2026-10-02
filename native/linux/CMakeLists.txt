@@ -104,12 +104,14 @@ target_link_options(tpf2_workshop_register PRIVATE -Wl,--version-script=${CMAKE_
 set_property(TARGET tpf2_workshop_register APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/exports_plugin.map)
 
 # Dynamic exports: the loader exports clock() and caller-gated __sprintf_chk;
-# the libraries it loads export
-# nothing. Visibility flags cannot do this alone -- libstdc++'s headers force
+# the menu exports the gameplay tick; other loaded libraries export nothing.
+# Visibility flags cannot do this alone -- libstdc++'s headers force
 # default visibility on the std templates they instantiate in our objects.
 target_link_options(tpf2mp_boot PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_boot.map)
 set_property(TARGET tpf2mp_boot APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/exports_boot.map)
-foreach(t tpf2_bridge_mp tpf2_menu tpf2_slice tpf2_pluginhost)
+target_link_options(tpf2_menu PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_menu.map)
+set_property(TARGET tpf2_menu APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/exports_menu.map)
+foreach(t tpf2_bridge_mp tpf2_slice tpf2_pluginhost)
   target_link_options(${t} PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports_none.map)
   set_property(TARGET ${t} APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/exports_none.map)
 endforeach()

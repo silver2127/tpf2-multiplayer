@@ -13,6 +13,7 @@ void OnMenuPage(int) {}
 bool OverlayInstall(uintptr_t, Tpf2mpLogFn) { return false; }
 bool MenuGame_Install(uintptr_t, Tpf2mpLogFn) { return false; }
 void MenuGame_AutoEnableMod(Tpf2mpLogFn) {}
+void MenuGame_ObserveMenu(void*) {}
 bool InstallHook(uintptr_t, void*, int, void**) { return false; }
 int PrologueSteal(const unsigned char*, int) { return 0; }
 
@@ -79,8 +80,15 @@ static void CheckSlotFile(const char* path, const char* content, int want)
     assert(ReadMenuSlot(path) == want);
 }
 
+static void Page(void*, int) {}
 int main()
 {
+    g_createPageTramp = reinterpret_cast<void*>(&Page);
+    game_ui_tick::last = 1234;
+    CreatePageDetour(nullptr, 16);
+    assert(game_ui_tick::last == 1234);
+    CreatePageDetour(nullptr, 2);
+    assert(game_ui_tick::last == 0);
     char path[] = "/tmp/tpf2mp-menu-slot-XXXXXX";
     const int fd = mkstemp(path);
     assert(fd >= 0);
