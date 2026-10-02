@@ -185,12 +185,17 @@ class RuntimeTests(unittest.TestCase):
         ack = self.runtime.tick()
         self.assertTrue(ack['kept'])
         self.assertEqual(ack['digest'], self.snapshot.digest)
-        # the fallback (retain emptied): the same member loads like everyone
+        # the fallback (retain emptied): the same member loads like everyone,
+        # the snapshot installed again under the fresh epoch's name first
         self.state.update(retain=[], epoch='c' * 32)
+        self.phase('transferring')
+        self.runtime.tick()
         self.phase('loading')
         self.write('epoch_ready', epoch=self.state['epoch'], ok=1)
         self.runtime.tick()
-        self.assertEqual(read_fields(self.root / 'tpf2_native_request.txt')['cmd'], 'load')
+        req = read_fields(self.root / 'tpf2_native_request.txt')
+        self.assertEqual(req['cmd'], 'load')
+        self.assertTrue((self.root / (req['name'] + '.sav')).exists(), req['name'])
 
     def test_a_newcomer_in_a_live_join_loads(self):
         self.runtime = SyncParticipant(self.root, self.root, 123, 'late')

@@ -1615,7 +1615,10 @@ static void GameUiUpdateDetour(void* ui, int64_t t, int64_t dt)
     if (t_forceCall.active) SettleUnwoundForce(ui, here);
     const bool current = *(const uintptr_t*)ui == g_base + RVA_GAMEUI_VTABLE &&
                          *(void* const*)(g_base + RVA_G_GAMEUI) == ui;
-    if (current) { g_loadAccepted = false; panel::OnGameUiFrame(); }
+    if (current) {
+        game_ui_tick::last.store(NowMs(), std::memory_order_relaxed);
+        g_loadAccepted = false; panel::OnGameUiFrame();
+    }
     if (!current || !OnFrameStep(here)) {
         g_gameUiUpdate(ui, t, dt);
         return;
@@ -1800,4 +1803,9 @@ bool MenuGame_Install(uintptr_t gameBase, Tpf2mpLogFn log)
         }
     }
     return result == 1;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t Tpf2mpLastGameUiTick()
+{
+    return game_ui_tick::last.load(std::memory_order_relaxed);
 }

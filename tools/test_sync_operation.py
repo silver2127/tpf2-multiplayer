@@ -327,10 +327,14 @@ class OperationTests(unittest.TestCase):
         epoch = self.op.epoch
         self.ack('host'); self.ack('client')
         self.ack('late', fingerprint='loaded-world')
-        self.assertEqual(self.op.phase, 'loading')
+        # through 'transferring': the save is named after the new epoch, and
+        # only that phase installs it under that name
+        self.assertEqual(self.op.phase, 'transferring')
         self.assertEqual(self.op.retain, ())
         self.assertNotEqual(self.op.epoch, epoch)
         self.assertEqual(self.op.view()['retain'], [])
+        self.all3()                                             # installed under the new epoch
+        self.assertEqual(self.op.phase, 'loading')
         self.all3()                                             # everyone loaded
         self.assertEqual(self.op.phase, 'checking')
         self.ack('host'); self.ack('client')

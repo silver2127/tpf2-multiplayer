@@ -109,7 +109,7 @@ static inline uint32_t TrainOrderNext(uint32_t* s)
 // get the same answer for the same bytes, and anything that consults a locale
 // is a machine setting, not lockstep state. Two names that differ only outside
 // ASCII compare by their raw bytes, which is fine: it is still a total order.
-static int TrainOrderNameCmp(const TrainOrderKey& a, const TrainOrderKey& b)
+static inline int TrainOrderNameCmp(const TrainOrderKey& a, const TrainOrderKey& b)
 {
     const uint32_t n = a.len < b.len ? a.len : b.len;
     for (uint32_t i = 0; i < n; i++) {
@@ -124,7 +124,7 @@ static int TrainOrderNameCmp(const TrainOrderKey& a, const TrainOrderKey& b)
 
 // idx[] holds positions; `less` compares two positions.
 template <class Less>
-static void TrainOrderHeapSort(int32_t* idx, int64_t n, Less less)
+static inline void TrainOrderHeapSort(int32_t* idx, int64_t n, Less less)
 {
     auto sift = [&](int64_t root, int64_t hi) {
         for (;;) {
@@ -148,7 +148,7 @@ static void TrainOrderHeapSort(int32_t* idx, int64_t n, Less less)
 // keys[idx[k]] is the train that reserves k-th once this returns. Refuses (and
 // leaves idx untouched) on anything it does not recognise: the engine's own
 // order then stands, which is always better than a half-sorted array.
-static TrainOrderOutcome TrainOrderArrange(int32_t* idx, int64_t n, TrainOrderKey* keys, uint32_t seed)
+static inline TrainOrderOutcome TrainOrderArrange(int32_t* idx, int64_t n, TrainOrderKey* keys, uint32_t seed)
 {
     TrainOrderOutcome out = { nullptr, false, false, 0 };
     if (!idx || n < 0 || n > TRAINORDER_MAX_N) { out.refused = "bad count"; return out; }
@@ -204,7 +204,7 @@ static TrainOrderOutcome TrainOrderArrange(int32_t* idx, int64_t n, TrainOrderKe
 // in the same order; a difference is only a hint, because the ids themselves can
 // legitimately differ in VALUE between peers (see slice_hook.cpp, "WHAT THIS
 // ASSUMES"). Walked only for the lines that are actually logged.
-static uint32_t TrainOrderIdHash(const int32_t* idx, int64_t n, const uint8_t* recs)
+static inline uint32_t TrainOrderIdHash(const int32_t* idx, int64_t n, const uint8_t* recs)
 {
     uint32_t h = 2166136261u;
     for (int64_t i = 0; i < n; i++) {

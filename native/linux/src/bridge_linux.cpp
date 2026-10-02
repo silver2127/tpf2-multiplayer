@@ -113,6 +113,8 @@ static void SetTailPath(const std::string& p)
     std::lock_guard<std::mutex> lk(S().tailMtx);
     if (S().tailPath == p) return;
     S().tailPath = p;
+    // a new path is not a world reset (see bridge_main.cpp SetTailPath)
+    S().tailFromZero = false;
     S().tailGen++;
 }
 

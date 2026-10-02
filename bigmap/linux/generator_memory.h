@@ -56,8 +56,11 @@ inline int Index(const char* path) {
     }
     return -1;
 }
+// A deleter type, not decltype(&std::fclose): newer glibc declares fclose with
+// attributes a template argument drops (-Wignored-attributes, an error under -Werror).
+struct FileCloser { void operator()(FILE* f) const { std::fclose(f); } };
 inline FILE* Copy(const char* path) {
-    std::unique_ptr<FILE,decltype(&std::fclose)> source(std::fopen(path,"rb"),std::fclose);
+    std::unique_ptr<FILE,FileCloser> source(std::fopen(path,"rb"));
     FILE* src=source.get();
     if(!src)return nullptr;
     struct stat original{};

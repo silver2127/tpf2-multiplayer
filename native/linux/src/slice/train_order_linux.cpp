@@ -10,6 +10,7 @@
 #include <chrono>
 #include <atomic>
 #include "trainorder.h"
+#include "flags_linux.h"
 
 namespace {
 uintptr_t gameBase;
@@ -202,22 +203,7 @@ bool Arrange(int32_t* begin, int32_t* end, uintptr_t self, uintptr_t world,
     } catch (...) { return false; } // only our own allocations; no foreign calls
 }
 
-bool Disabled(const char* root, const char* data)
-{
-    for (const char* dir : {root, data}) {
-        if (!dir || !*dir) continue;
-        char path[4096];
-        const int len = snprintf(path, sizeof(path), "%s/tpf2_menu_flags.txt", dir);
-        if (len < 0 || size_t(len) >= sizeof(path)) continue;
-        FILE* f = fopen(path, "r");
-        if (!f) continue;
-        char line[256]; bool off = false;
-        while (fgets(line, sizeof(line), f)) if (!strncmp(line, "trainorder=0", 12)) off = true;
-        fclose(f);
-        return off; // root file takes precedence, just like Windows
-    }
-    return false;
-}
+
 }
 
 // The relay tail-jumps here, retaining the game's original return address and
@@ -268,7 +254,7 @@ asm(".text\n.hidden SliceTrainOrderRelay\n.type SliceTrainOrderRelay,@function\n
 
 bool SliceInstallTrainOrder(uintptr_t base, const char* rootDir, const char* dataDir)
 {
-    if (Disabled(rootDir, dataDir)) {
+    if (SliceFlagOff(rootDir, dataDir, "trainorder")) {
         SliceLog("[trainorder] OFF (trainorder=0); engine registration-order shuffle retained\n");
         return true;
     }

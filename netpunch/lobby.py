@@ -186,12 +186,14 @@ import time
 from punch import (
     DEFAULT_PORT, TYPE_HELLO, TYPE_ACK, TYPE_CONNECTED, TYPE_KEEPALIVE,
     TYPE_DATA, TYPE_EDATA, TYPE_ADATA, TYPE_KEYX, TOKEN_LEN, _pack, _unpack, open_socket,
+    CHUNK_PREFIX,
 )
 from seal import Sealer, derive_key, SECRET_LEN
 import modshare                     # share the mods a save needs (mod zips ride the save transfer)
 import steamtunnel                  # Steam's own networking as a transport (native/src/steam_tunnel.cpp), 2026-09-21
 import steamkey                     # the session secret over Steam when the join code is only a Steam ID, 2026-09-22
 # Reuse the code exchange + the connect race + observe/announce.
+import connect
 from connect import decode_code, race, _observe_and_announce, encode_profile, _targets_v4, parse_hostport
 from mesh import MeshNode
 
@@ -224,7 +226,10 @@ TCP_CONNECT_RETRY = 0.5                    # seconds between those attempts
 MODS_RATE_WINDOW = 5                       # the status line's MB/s is over this many landed batches
 ROSTER_HEAL = 2.0       # host re-sends the roster this often (UDP self-heal +
                         # doubles as a host -> joiner keepalive)
-HOST_GONE_AFTER = 12.0  # joiner declares the host dead after this much silence
+HOST_GONE_AFTER = 30.0  # joiner declares the host dead after this much silence
+# (12 s until 2026-09-28: a dedicated server that had just loaded its world stood
+# 12.9 s preparing a save under memory pressure, and two joiners gave up on it)
+HOST_QUIET_AFTER = 12.0  # ...but routes around a host this quiet (the mesh)
 CHAT_BURST = 3          # copies of a chat/start packet (best-effort redundancy;
                         # clients de-dupe by cid, so extras are harmless)
 
@@ -278,8 +283,9 @@ CHUNK_DATA = 1350           # bytes of file data per chunk (1200 until 2026-09-1
                             # NP1 frame(5) + chunk header(12) + 1200 = 1217 bytes,
                             # under the 1280 IPv6 min-MTU and 1500 v4 MTU (even
                             # through PPPoE/VPN overhead) -- no fragmentation.
-CHUNK_MAGIC = b"NPF1"       # 4-byte tag: a DATA payload starting with this is a
-                            # binary chunk, not a JSON lobby message ('{' != 'N').
+CHUNK_MAGIC = CHUNK_PREFIX  # b"NPF1": a DATA payload starting with this is a binary
+                            # chunk, not a JSON lobby message ('{' != 'N'). punch.py's
+                            # sealed-session carve-out matches the same prefix.
 # Chunks a peer may have in flight. LOCALITY-DEPENDENT, for the same reason the
 # chunk size is, and getting this wrong is worse than getting the chunk size
 # wrong: the window is how much UNACKNOWLEDGED data we are willing to blast
@@ -457,7 +463,7 @@ DUAL = [None]
 def _tcp_backup_on(io_dir):
     try:
         with open(os.path.join(io_dir, "tpf2mp_tcp_backup.txt"), "r", encoding="utf-8") as f:
-            return f.read().strip() not in ("0", "off", "no")
+            return f.read().strip().lower() not in ("0", "off", "no")   # "OFF" too, like _live_join_on
     except OSError:
         return True
 
@@ -480,7 +486,8 @@ def _live_join_on(io_dir):
 
 def _dual_hello(name):
     """The hello a peer proves itself with: its name, sealed with the session key."""
-    return dual_tcp.hello_bytes(name, SEAL[0].seal(name.encode("utf-8", "replace")))
+    name = dual_tcp.link_name(name)
+    return dual_tcp.hello_bytes(name, SEAL[0].seal(name.encode("utf-8")))
 
 
 def _dual_hello_ok(line, cipher):
@@ -509,16 +516,19 @@ def _match_link_hello(peers, name, addr, has_link):
         items = list(peers.items())
     except RuntimeError:                       # the host loop changed the roster meanwhile
         return None, "the roster changed -- retrying"
-    for key in ("name", "asked"):
-        cands = [a for a, p in items if isinstance(p, dict) and p.get(key) == name and not has_link(a)]
-        if len(cands) > 1:
-            same = [a for a in cands if isinstance(a, tuple) and tuple(a[:2]) == tuple(addr[:2])] \
-                or [a for a in cands if isinstance(a, tuple) and a[0] == addr[0]]
-            cands = same
-        if len(cands) == 1:
-            return cands[0], None
-        if cands:
-            return None, f"{len(cands)} joiners asked for that name from {addr[0]}"
+    # One pass over the assigned AND the asked names. Assigned first, asked second
+    # used to return a single assigned-name match without looking at the address:
+    # 'bob' and 'bob#2' (asked 'bob') both without a link, a hello 'bob' from
+    # bob#2's address went to bob, and bob's own hello then matched bob#2.
+    cands = [a for a, p in items if isinstance(p, dict) and not has_link(a)
+             and (p.get("name") == name or p.get("asked") == name)]
+    if len(cands) > 1:
+        cands = [a for a in cands if isinstance(a, tuple) and tuple(a[:2]) == tuple(addr[:2])] \
+            or [a for a in cands if isinstance(a, tuple) and a[0] == addr[0]]
+    if len(cands) == 1:
+        return cands[0], None
+    if cands:
+        return None, f"{len(cands)} joiners asked for that name from {addr[0]}"
     return None, "no joiner by that name without a link"
 
 
@@ -695,7 +705,7 @@ def redact(text):
         return text
 
     def mask(m):
-        head, tail = m.group(1), m.group(2)
+        head = m.group(1)
         if head.startswith(("127.", "10.", "192.168.")) or head.startswith("169.254."):
             return m.group(0)
         if head.startswith("172."):
@@ -721,6 +731,9 @@ def _log(msg):
             sink(line)
         except Exception:          # noqa: BLE001 -- logging must never raise
             pass
+
+
+connect.LOG_SINK[0] = _log     # connect.py's race/observe lines: redacted and merged like ours
 
 
 # --------------------------------------------------------------------------- #
@@ -1055,6 +1068,8 @@ FRAG_MAGIC = b"F"           # '{' JSON, 'N' chunk, 'g' game, 'r' relay envelope,
 FRAG_HEADER = struct.Struct("!III")
 FRAG_DATA = 1300            # payload bytes per fragment: 1300 + 13 + seal 24 + NP1 5
                             # = 1342, under the 1400 B VPN MTU (see CHUNK_DATA)
+FRAG_MAX_COUNT = 8192       # fragments one message may have (~10 MB): a peer claiming 2^32 kept one
+                            # entry growing for as long as it sent (each piece refreshed its TTL)
 FRAG_TTL = 15.0             # a message none of whose fragments arrived for this long is abandoned
 FRAG_PENDING_PER_ADDR = 64  # partial messages kept per sender: a garbage guard, not a
                             # message limit (a sender's fragments go out back to back,
@@ -1087,7 +1102,7 @@ class _Reassembler:
         if len(frame) < 1 + FRAG_HEADER.size:
             return None
         fid, index, count = FRAG_HEADER.unpack_from(frame, 1)
-        if count == 0 or index >= count:
+        if count == 0 or index >= count or count > FRAG_MAX_COUNT:
             return None
         key = (addr, fid)
         entry = self.pending.get(key)
@@ -1613,6 +1628,67 @@ def _merge_sender_stage(current, text, pct):
     return text
 
 
+class _PreparingTransfer:
+    """Stands in the host's transfer slot while a worker thread reads and hashes
+    the save (2026-09-28). Everything that asks "is a transfer running?" sees
+    one, its targets count as mid-transfer for the keepalive, and nothing is
+    sent yet. The loop swaps in the real _HostSaveTransfer when the worker is
+    done, or drops the result if this one was cleared meanwhile."""
+    kind = "save"
+
+    def __init__(self, sid, targets):
+        self.sid = sid
+        self.peers = {a: {"name": n, "addr": a, "state": "active"} for a, n in targets}
+
+    def pump(self, now):
+        pass
+
+    def all_resolved(self):
+        return all(p["state"] != "active" for p in self.peers.values())
+
+    def awaiting_answers(self, now):
+        return False
+
+    def on_peer_dropped(self, addr):
+        p = self.peers.get(addr)
+        if p and p["state"] == "active":
+            p["state"] = "dropped"
+
+    def on_begin_ack(self, addr, msg):
+        pass
+
+    on_fack = on_fdone = on_tcp_gave_up = on_mods_answer = on_begin_ack
+
+    def done_addrs(self):
+        return []
+
+    def done_count(self):
+        return 0
+
+    def failed_names(self):
+        return []
+
+    def mod_needs(self):
+        return {}
+
+    def live_targets(self):
+        return [(a, p["name"]) for a, p in self.peers.items() if p["state"] == "active"]
+
+
+def _prepare_save(save_path):
+    """WORKER THREAD: (blob, files_meta, overall sha, mods, notes) of a save to
+    push, or an OSError/ValueError. Off the host loop: on the dedicated server
+    this took 12.9 s once, under memory pressure, and nobody was answered."""
+    try:
+        blob, files_meta = _read_save_files(save_path)
+        sha = hashlib.sha256(blob).hexdigest()
+    except (OSError, ValueError) as e:
+        return e
+    notes = []
+    mods = modshare.save_mod_list(save_path, notes.append)
+    return blob, files_meta, sha, mods, notes
+
+
 class _HostSaveTransfer:
     """Reliable host -> all-joiners file push, PUMPED from the host's main loop.
 
@@ -2010,7 +2086,13 @@ class _HostSaveTransfer:
             if now - p.get("verify_said", 0.0) >= 10.0:
                 p["verify_said"] = now
                 self.log(f"[host] {p['name']} has the whole {self.kind}; verifying/unpacking, {mark if mark is not None else '?'} B so far")
-        elif base < p["base"]:
+        elif base < p["base"] and base == 0:
+            # Only a base of 0 is a restart: the receiver never moves its base
+            # back anywhere else. A smaller base above 0 is an older fack that
+            # arrived late (a TCP copy landing after a newer UDP one); treating it
+            # as a restart re-streamed up to a whole window and reset the Steam
+            # window to its start. It is ignored.
+            #
             # REWIND: the receiver restarted from scratch (hash mismatch ->
             # whole-file re-request). Without this the host would filter every
             # re-reported hole as "below base" and never resend -- the peer
@@ -2912,7 +2994,7 @@ class _ClientSaveReceiver:
 
     def _pipe_pull(self, ip, port, pair, sid, token):
         """A thread: dial the master's pipe, say the usual hello, read the stream."""
-        self.log(f"[client] the host's transfer is slow -- meeting it at the master's TCP pipe")
+        self.log("[client] the host's transfer is slow -- meeting it at the master's TCP pipe")
         errs = []
         sock = bulk_tcp.pipe_connect(ip, port, pair, "J", errors=errs)
         if sock is None:
@@ -3117,7 +3199,7 @@ class _ClientSaveReceiver:
                     # a registration: the on-disk folders are catalogued; what is
                     # not here at all is still to be downloaded (need, prompt, round)
                     self.mods_satisfied = not self.need
-                    self.log(f"[client] the game registered the mods already on this PC"
+                    self.log("[client] the game registered the mods already on this PC"
                              + ("" if self.mods_satisfied else f"; {len(self.need)} still to download"))
                     if self.mods_satisfied:
                         self.io.emit({"type": "mods_ready", "failed": [], "registered": len(check)})
@@ -3686,7 +3768,7 @@ def _clear_stale_incoming(directory, log=_log):
 # --------------------------------------------------------------------------- #
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
-LOBBY_VERSION = "0.7.1.3"
+LOBBY_VERSION = "0.7.1.4"
 
 
 def version_rejection(remote):
@@ -3749,7 +3831,6 @@ class _Publisher:
             return r.status
 
     def _run(self):
-        import urllib.error
         announced = False
         while not self._stop.is_set():
             try:
@@ -3826,8 +3907,10 @@ def _rv_sealer(secret, password):
 def _steam_tunnel(args):
     """The Steam tunnel client for this lobby (steamtunnel.py): a no-op object
     without a data dir, the kill switch, or a bridge whose Steam is not up."""
-    d = getattr(args, "sync_runtime_dir", None) or os.environ.get("TPF2MP_DATADIR") \
-        or os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "tpf2mp", "data")
+    # modshare.data_dir(): the platform's data folder. The hand-written fallback
+    # here gave ~/tpf2mp/data on Linux (no LOCALAPPDATA), not the real one.
+    d = getattr(args, "sync_runtime_dir", None) or modshare.data_dir() \
+        or os.path.join(os.path.expanduser("~"), "tpf2mp", "data")
     t = steamtunnel.SteamTunnel(d, _log, wait=1.0)   # the bridge wrote the identity long before HOST/JOIN; 1 s covers a game still starting
     if not t.available:
         _log("[steam] no Steam transport (no tunnel identity in the data folder)")
@@ -4122,6 +4205,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
     transfer = [None]                       # the active _HostSaveTransfer, or None
     terr_streams = []                       # the terrain sidecars streaming to joiners after a START (kind "terr"), each with .terr_key
     terr_jobs = queue.Queue()               # (sid, path, targets, (blob, sha) | None) from the sidecar reader thread
+    save_jobs = queue.Queue()               # (placeholder, path, _prepare_save result) from the save reader thread
     unplaced_feedback = set()               # (addr, sid) of facks/fdones the transfer could not place, logged once each
     upload = [None]                         # relay-only: the leader's save coming in
     pending_resume = [None]                 # relay-only: (leader addr, when) -- the stored world goes out then
@@ -4625,8 +4709,21 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return
         late = False
         if addr in peers:                                   # rename in place
+            old_name = peers[addr]["name"]
             peers[addr]["name"] = _dedupe(name, all_names(exclude_addr=addr))
             peers[addr]["asked"] = name
+            # The origin letter goes with the player, not the name: letter_for keys
+            # by name, so a rename handed out a NEW letter mid-game -- the
+            # renumbering letter_for exists to prevent (2026-09-26).
+            new_name = peers[addr]["name"]
+            if new_name != old_name and old_name in letters and new_name not in letters:
+                letters[new_name] = letters.pop(old_name)
+                if relay_only:
+                    try:
+                        with open(letters_path, "w", encoding="utf-8") as f:
+                            json.dump(letters, f)
+                    except OSError:
+                        pass
             if profile:
                 peers[addr]["profile"] = profile
             peers[addr]["mesh"] = bool(is_mesh)
@@ -4752,6 +4849,16 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         return n
 
     def handle_data(addr, payload):
+        # One malformed message must not end the lobby: the serve loop only has
+        # try/finally around it, so an exception here (a peer's "name": 5, "lines": 5,
+        # a fack "base": "x", a relay fbegin "total_bytes": -1) closed the lobby for
+        # everyone. run_client guards handle_msg the same way.
+        try:
+            _handle_data(addr, payload)
+        except Exception as e:
+            log(f"[host] message from {addr[0]}:{addr[1]} dropped: {e!r}")
+
+    def _handle_data(addr, payload):
         if payload[:1] == MESH_RELAY_MAGIC:
             # A relay envelope: for us -> deliver the inner frame; for another
             # joiner -> forward verbatim (the host is the default relay).
@@ -5047,13 +5154,6 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                      "detail": "no players to share with -- wait for a player "
                                "to join, then press START GAME"})
             return
-        try:
-            blob, files_meta = _read_save_files(save_path)
-        except (OSError, ValueError) as e:
-            io.emit({"type": "status", "state": "failed",
-                     "detail": f"save transfer failed: {e}"})
-            log(f"[host] save read failed: {e}")
-            return
         sid = int(time.time() * 1000) & 0xFFFFFFFF
         if relay_only:
             la = leader_addr()
@@ -5078,7 +5178,32 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             if not targets:
                 log("[host] start(save): everyone already has this save -- nothing to push")
                 return
-        mods = modshare.save_mod_list(save_path, log)        # None = could not read it (NOT "none")
+        # the read and the hashes run on a worker; the slot holds a placeholder
+        placeholder = _PreparingTransfer(sid, targets)
+        transfer[0] = placeholder
+        threading.Thread(target=lambda: save_jobs.put((placeholder, save_path, _prepare_save(save_path))),
+                         name="save-read", daemon=True).start()
+
+    def finish_save_transfer(placeholder, save_path, prepared):
+        """The loop's half of begin_save_transfer, once the worker has the save."""
+        if transfer[0] is not placeholder:
+            log(f"[host] the save read for sid={placeholder.sid} finished after its transfer was cleared -- dropped")
+            return
+        transfer[0] = None
+        if isinstance(prepared, Exception):
+            io.emit({"type": "status", "state": "failed",
+                     "detail": f"save transfer failed: {prepared}"})
+            log(f"[host] save read failed: {prepared}")
+            return
+        blob, files_meta, sha, mods, notes = prepared
+        for line in notes:
+            log(line)
+        targets = [(a, n) for a, n in placeholder.live_targets() if a in peers]
+        if not targets:
+            log("[host] every target left while the save was read -- not starting")
+            return
+        sid = placeholder.sid
+        # None = could not read it (NOT "none")
         if not relay_only and not _host_mods_check(save_path, mods, io, log):
             return                                           # refused: the host's own game could not load it (status + chat name the mods)
         advertised[:]=[save_path,mods]
@@ -5101,7 +5226,7 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             log(f"[host] the save needs {len(mods)} mod(s) besides ours: "
                 + ", ".join(modshare.mod_folder_name(m, v) for m, v in mods))
         transfer[0] = _HostSaveTransfer(sock, sid, blob, files_meta, targets,
-                                        io, log, mods=mods, stage_cb=sender_stage)
+                                        io, log, mods=mods, stage_cb=sender_stage, overall_sha=sha)
 
     def begin_world_switch(save_path):
         """A WORLD SWITCH: the host loaded a different world while the session
@@ -5826,6 +5951,10 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             # receiving the same file is not sent it again; one receiving
             # another file moves to the new stream (a new load of its own).
             try:
+                finish_save_transfer(*save_jobs.get_nowait())
+            except queue.Empty:
+                pass
+            try:
                 sid_t, path_t, targets_t, read_t = terr_jobs.get_nowait()
             except queue.Empty:
                 read_t = None
@@ -6138,7 +6267,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     def mesh_relay_via(dest):
         """Who forwards our envelope to ``dest``: the host if it is alive, else
         any direct peer that reports a direct link to ``dest``."""
-        if conn.last_seen_age() < host_gone_after:
+        if conn.last_seen_age() < min(host_gone_after, HOST_QUIET_AFTER):
             return conn.peer
         for nm in mesh.direct_names():
             if dest in roster_links[0].get(nm, []):
@@ -6303,6 +6432,10 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
         if t == "welcome":
             receiver.on_manifest(m.get("mods", []), m.get("mods_unknown"))
             assigned[0] = m.get("you", desired[0])
+            # the TCP stream hello must carry the name the host GAVE us: a second
+            # 'bob' renamed 'bob#2' still said 'bob', and the host bound its stream
+            # to the first bob's record (_peer_for_stream matches by name)
+            receiver.my_name = assigned[0]
             host_name[0] = m.get("host")
             is_relay[0] = bool(m.get("relay"))
             if recovery:
@@ -6467,7 +6600,6 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
     last_ping = 0.0
     last_dual_tick = [0.0]
     join_sent_at = time.time()
-    welcomed = [False]
     try:
         while not stop.is_set():
             if not version_checked[0] and time.time() - join_sent_at > 15.0:
@@ -7090,7 +7222,7 @@ def selftest():
                 print(f"[selftest]   {k} has chat: {got}")
             print("[selftest] FAIL (b): chat did not reach all three")
         else:
-            print(f"[selftest] OK (b): chat reached host + both joiners")
+            print("[selftest] OK (b): chat reached host + both joiners")
 
         # (c) a legacy (no-save) START from the host -> everyone emits
         #     {"type":"start","save":false}
@@ -7595,7 +7727,7 @@ def _run_transfer_mods(tag):
     modshare.catalogue=lambda: ("test-catalogue",{("mod_zz","1"),("mod_have","1")})
     real = (modshare.save_mod_list, modshare.find_mod, modshare.installed_mod, modshare.install_target)
     on_disk_real, modshare.on_disk_mod = modshare.on_disk_mod, lambda m, v: src.get(m) if m == "mod_have" else None
-    share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # off by default; this test is the round itself
+    share_was, SHARE_MODS[0] = SHARE_MODS[0], True          # on by default; forced on here since this test is the round itself
     modshare.save_mod_list = lambda p, log=None: [("mod_zz", 1), ("mod_have", 1)]
     modshare.find_mod = lambda m, v: src.get(m)                       # the host has both
     modshare.installed_mod = lambda m, v: src.get(m) if m == "mod_have" else None   # joiners lack mod_zz
@@ -8418,7 +8550,9 @@ def print_public_list(master_url, timeout=PUBLIC_LIST_TIMEOUT):
     url = str(master_url).rstrip("/") + "/list"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "tpf2mp-lobby/" + LOBBY_VERSION})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        # the same TLS roots as every other master request (_http_json): without
+        # them a Windows lacking ISRG Root X2 saw the list fail as "expired"
+        with urllib.request.urlopen(req, timeout=timeout, context=_master_ssl_context()) as r:
             status, body = r.status, r.read()
         if status == 200:
             rc, out = 0, body if body.endswith(b"\n") else body + b"\n"
@@ -8661,9 +8795,9 @@ def main(argv=None):
                          "host's merged lobby_peers.log (repeatable; e.g. the "
                          "bridge log)")
     ap.add_argument("--share-mods", action="store_true",
-                    help="host: send joiners the mods the shared save needs (off by default)")
+                    help="host: send joiners the mods the shared save needs (the default; kept for old launchers)")
     ap.add_argument("--no-share-mods", action="store_true",
-                    help="host: do not send joiners the mods the shared save needs (the default)")
+                    help="host: do not send joiners the mods the shared save needs")
     ap.add_argument("--no-mesh", action="store_true",
                     help="joiner: do not punch other joiners directly; keep "
                          "every frame on the host relay (the pre-mesh star)")

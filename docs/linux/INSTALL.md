@@ -1,5 +1,25 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `4487d7cd` integration](UPSTREAM_dev_4487d7cd.md) advances the
+native package, lobby handshake and panel to **0.7.1.4**. All peers must update.
+The menu library now exports a monotonic gameplay-update timestamp, cleared
+at the title menu. The Windows MSI warning-page fix is retained. Native Linux
+uses a different terrain paging policy; no new loading-speed result is claimed.
+
+The [dev `c4754f26` integration](UPSTREAM_dev_c4754f26.md) retains the Windows
+installer’s folder-refusal dialog. Native Linux already prints the reason to
+stderr and exits with an error; four installer regressions cover that behavior.
+Release remains **0.7.1.3**.
+
+The [dev `721ac61f` integration](UPSTREAM_dev_721ac61f.md) moves save reading, hashing and mod
+discovery to a lobby worker. Joiners wait 30 seconds for a silent host; mesh
+routing still bypasses it after 12 seconds. Shared lobby; release remains **0.7.1.3**.
+
+The [dev `262353d7` integration](UPSTREAM_dev_262353d7.md) merges
+housekeeping and correctness fixes for replay, vehicle/line identity, lobby transfers,
+and network input handling. Native bridge epoch handling and kill-switch readers
+are covered by Linux regressions; release remains **0.7.1.3**.
+
 The [dev `528294b1` integration](UPSTREAM_dev_528294b1.md) asks for a
 fresh host save when a late joiner would receive one over two minutes old,
 with fallback if no new save arrives. Host-loop stalls no longer count as
@@ -18,8 +38,8 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.3**, Windows dev `a813ea9f`; see the
-[integration and validation record](UPSTREAM_dev_a813ea9f.md). All peers, including dedicated
+Current release integration: **0.7.1.4**, Windows dev `4487d7cd`; see the
+[integration and validation record](UPSTREAM_dev_4487d7cd.md). All peers, including dedicated
 servers, must update. Existing native Sandbox town-tool capture, minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.

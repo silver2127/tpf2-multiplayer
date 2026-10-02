@@ -125,7 +125,7 @@ if [ "$uninstall" = 1 ]; then
     if [ -f "$game_dir/$rel" ]; then say "  remove $rel"; [ "$dry_run" = 1 ] || rm -f "$game_dir/$rel"; fi
   done
   if [ "$dry_run" != 1 ]; then
-    rm -rf "$game_dir/$MOD"; rmdir "$game_dir/netpunch" 2>/dev/null || true; rm -f "$game_dir/$MANIFEST"
+    rm -rf "${game_dir:?}/${MOD:?}"; rmdir "$game_dir/netpunch" 2>/dev/null || true; rm -f "$game_dir/$MANIFEST"
   fi
   say "Done. The prefix links and $BACKUPS/ are left in place."
   exit 0

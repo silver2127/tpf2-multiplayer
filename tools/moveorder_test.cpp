@@ -25,8 +25,6 @@
 #include <string>
 #include <vector>
 
-static bool Readable(const void* p, size_t n) { return p != nullptr || n == 0; }
-static void Log(const char*, ...) {}
 #include "../native/src/trainorder.h"
 #include "../native/src/moveorder.h"
 

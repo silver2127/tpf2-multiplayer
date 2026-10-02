@@ -11,7 +11,6 @@ Build the DLL first: build.bat
 import ctypes as C
 import random
 import struct
-import sys
 import time
 from pathlib import Path
 import capstone
@@ -197,7 +196,6 @@ def main():
             lo, hi = rmin * stride + cmin, rmax * stride + cmax
         else:
             lo = hi = 0
-        n_out = hi - lo + 1 + 32
         if alias:   # output region starts inside the source samples
             start_in = max(0, 16 - lo)
             out_index = start_in + rng.randrange(0, max(1, n_in // 2)) - lo

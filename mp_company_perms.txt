@@ -1,4 +1,0 @@
-pid 7 1
-pid 8 2
-open 1 *
-open 2 *

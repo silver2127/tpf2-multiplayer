@@ -12,7 +12,7 @@ yet loaded inside the real game.
 |---|---|
 | `native/linux/src/plugin/host_linux.cpp` | the host |
 | `native/linux/src/plugin/cfg_linux.h`, `cfg_linux.cpp` | the `tpf2mp.cfg` parser: `cfg.cpp`'s rules, UTF-8 paths |
-| `native/linux/src/plugin/codewrite_linux.h` | writes into the process's memory through `/proc/self/mem`, with no page protection change ([page races](#page-protection-races)) |
+| `native/linux/src/plugin/codewrite_linux.h` | writes into the process's memory through `/proc/self/mem`, with no page protection change ([page races](#code-writes-and-page-protections)) |
 | `native/linux/src/hook_posix.cpp` | `installHook` (the same file the bridge and menu link) |
 | `native/linux/src/plugin/sample_plugin_linux.cpp` | `tpf2mp_sample.so`, an example plugin that patches nothing |
 
@@ -40,7 +40,7 @@ What that means for a plugin:
   table does not block, because nothing in the table takes that lock.
 - **The game's subsystems do not exist yet**, as the header already says.
 - **Other libraries patch the game at the same moment**, from their own threads: see
-  [page races](#page-protection-races).
+  [page races](#code-writes-and-page-protections).
 
 ## Code writes and page protections
 
@@ -282,7 +282,7 @@ game are never touched.
     on the page-protection fallback, and the log says so.
   - `race`: a thread flips a page's protection while the host patches it 3000 times; no fault, and every patch
     goes through `/proc/self/mem`. `test/race_demo.sh` runs the same with the fallback forced
-    ([page races](#page-protection-races)).
+    ([page races](#code-writes-and-page-protections)).
   - `slow`: a plugin sleeping 11 s in init is named once by the watchdog, and only it.
   - `dep`: a library whose `Tpf2mpPluginInit` is its dependency's is not called; the dependency is called once,
     under its own name.

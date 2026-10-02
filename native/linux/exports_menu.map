@@ -1,0 +1,5 @@
+/* Read via dlsym on the RTLD_LOCAL menu handle; hide all C++ internals. */
+{
+  global: Tpf2mpLastGameUiTick;
+  local: *;
+};

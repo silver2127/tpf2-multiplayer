@@ -11,6 +11,7 @@
 // lock held; the verdicts of a load or a save reach panel::SetStatus from the
 // game's UI thread or from a thread of this file's own.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include "panel.h"   // using Tpf2mpLogFn = void (*)(const char* fmt, ...);
@@ -67,3 +68,8 @@ void MenuGame_ObserveLoads(MenuGameLoadObserver observer);
 void MenuGame_ObserveMenu(void* menu);
 // -1 unavailable; otherwise floored 0..100 from the verified ProgressMonitor.
 int MenuGame_LoadPercent();
+
+// Milliseconds on CLOCK_MONOTONIC; zero until a current game UI updates,
+// and again at title page 2. No game object escapes to reader threads.
+namespace game_ui_tick { inline std::atomic<uint64_t> last{0}; }
+extern "C" __attribute__((visibility("default"))) uint64_t Tpf2mpLastGameUiTick();

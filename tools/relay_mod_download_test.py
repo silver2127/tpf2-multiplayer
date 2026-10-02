@@ -1,5 +1,5 @@
 """Real UDP relay upload -> mod cache -> initial join and hotjoin, no game processes."""
-import json, os, socket, sys, tempfile, threading, time
+import json, socket, sys, tempfile, threading, time
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'netpunch'))

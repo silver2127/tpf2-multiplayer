@@ -497,6 +497,12 @@ local function encodeCmd(c)
 end
 
 local function decodeCmd(line)
+	-- A history-feed line is the original line + " hist=1 hfor=X" (CM.histPump).
+	-- Take that tag off first: params is the greedy tail, and it swallowed the tag,
+	-- so a joiner refused every CONX/CONP/CONU/FENCE of its catch-up (params no longer
+	-- parsed) and every other instance re-queued the feed line as a live command.
+	local body, hfor = line:match("^(.-) hist=1 hfor=(%a+)$")
+	if body then line = body end
 	local c = {
 		op     = line:match("op=(%u+)"),
 		at     = tonumber(line:match("at=([%-%d%.]+)")),
@@ -504,6 +510,7 @@ local function decodeCmd(line)
 		seq    = tonumber(line:match("seq=(%d+)")),
 	}
 	if not (c.op and c.at and c.origin and c.seq) then return nil end
+	if body then c.hist = 1; c.hfor = hfor end
 	-- params is the greedy tail; strip it before scanning bare key=value tokens
 	local head = line
 	local p = line:match("params=(.+)$")

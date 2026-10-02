@@ -1330,7 +1330,9 @@ function CM.execPolyline(c, planOnly)
 					end
 					for _, told in ipairs(planBT == 0 and usePlanH[k] or {}) do
 						if told.kind == "N" then
-							local n = CM.findNodeNear(false, told[1], told[2], 1.5)
+							-- street first, then track: crossingsFor plans rail-over-rail
+							-- junctions too (as the vertex plan above already allows)
+							local n = CM.findNodeNear(false, told[1], told[2], 1.5) or CM.findNodeNear(true, told[1], told[2], 1.5)
 							local npz = n and CM.nodePosXYZ(n)
 							if not n then
 								CM.cmLog(string.format("PLAN: link %d crossing node %.1f,%.1f absent here -- skipped", k, told[1], told[2]))
@@ -1341,6 +1343,7 @@ function CM.execPolyline(c, planOnly)
 							end
 						elseif told.kind == "S" then
 							local eid = CM.findEdgeByEnds(false, told[4], told[5], told[6], told[7])
+							         or CM.findEdgeByEnds(true, told[4], told[5], told[6], told[7])
 							if eid then
 								local ru = CM.uOnEdge(eid, told[1], told[2])
 								local ez = ru and CM.edgeZAt(eid, ru)

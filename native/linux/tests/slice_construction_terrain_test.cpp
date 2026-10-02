@@ -214,6 +214,21 @@ void Codecs()
     }
     Terrain bad = SampleTerrain(); bad.height.rect[2] = -1; CHECK(!EncodeTerrain(bad, &bytes));
     bad = SampleTerrain(); bad.bits++; CHECK(!EncodeTerrain(bad, &bytes));
+    // Windows dev 262353d: width*height*8 could overflow. Linux must
+    // reject the same tiny malicious frame before any proposal is installed.
+    Terrain huge = SampleTerrain(), parsedHuge;
+    huge.height.rect = {0, 0, INT32_MAX, INT32_MAX};
+    huge.height.data.clear();
+    CHECK(!EncodeTerrain(huge, &bytes));
+    Terrain emptyHeight = SampleTerrain();
+    emptyHeight.height.rect = {0, 0, 0, 0}; emptyHeight.height.data.clear();
+    CHECK(EncodeTerrain(emptyHeight, &bytes));
+    Put(bytes.data(), 8 + 8, int32_t(1 << 30));
+    Put(bytes.data(), 8 + 12, int32_t(1 << 30));
+    CHECK(!DecodeTerrain(bytes, &parsedHuge));
+    Put(bytes.data(), 8 + 8, INT32_MAX);
+    Put(bytes.data(), 8 + 12, INT32_MAX);
+    CHECK(!DecodeTerrain(bytes, &parsedHuge));
     Assets a; a.groups.resize(1); a.originalRemovals = 2; a.removals = {12};
     Model model; model.model = "tree.mdl"; model.extra = "tag"; for (int i = 0; i < 16; i += 5) model.matrix[i] = 1;
     a.groups[0].push_back(model);

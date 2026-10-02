@@ -164,7 +164,17 @@ class BulkListener:
                 c.settimeout(None)
                 with self._lock:
                     self._pending -= 1
-                self.link_handler(c, addr, line)
+                # guarded here, like the bulk handler below: an OSError/ValueError
+                # from it reached the except below and took _pending down twice,
+                # below zero, loosening the PENDING_MAX cap
+                try:
+                    self.link_handler(c, addr, line)
+                except Exception as e:               # noqa: BLE001
+                    self.log(f"[bulk] link handler error for {addr[0]}: {e!r}")
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
                 return
             parts = line.strip().split(b" ", 4)
             if len(parts) < 4 or parts[0] != BULK_MAGIC:

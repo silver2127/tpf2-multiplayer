@@ -58,6 +58,12 @@ int main() {
     ApplyControl("epoch=" + std::string(32, 'c') + "\n");
     assert(ReadSmallFile(S().dataDir + "tpf2_epoch_ready.txt", text));
     assert(text.find("\nok=0\n") != std::string::npos);
+    // After a reset, a new instance letter's capture file is not read from 0: only
+    // the reset truncated a file, and the new one keeps earlier sessions' lines.
+    ApplyControl("epoch=" + std::string(32, 'd') + "\n");
+    assert(S().tailFromZero);
+    SetTailPath(CapturePathFor("c"));
+    assert(!S().tailFromZero);
     Net_Shutdown(); fclose(S().events); S().events = nullptr;
     std::filesystem::remove_all(temporary);
     puts("PASS: bridge epoch reset, owner PID, local files, readiness, idempotence and failed reset");

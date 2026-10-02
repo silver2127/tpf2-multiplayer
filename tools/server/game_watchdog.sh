@@ -24,7 +24,7 @@ APPID=1066780
 : "${DISPLAY:=:9}"
 export DISPLAY
 STEAM=/usr/games/steam
-GAME_DIR=$(ls -d "$HOME"/.steam/steam/steamapps/common/"Transport Fever 2" 2>/dev/null | head -1)
+GAME_DIR=$(ls -d "$HOME/.steam/steam/steamapps/common/Transport Fever 2" 2>/dev/null | head -1)
 MENU_LOG="$GAME_DIR/tpf2_menu.log"
 STALL_SECONDS=${STALL_SECONDS:-180}
 started=0

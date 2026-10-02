@@ -120,6 +120,10 @@ static void SetTailPath(const std::wstring& p)
     std::lock_guard<std::mutex> lk(g_tailMtx);
     if (g_tailPath == p) return;
     g_tailPath = p;
+    // a new path is not a world reset: only the reset truncated a file, so a
+    // capture file this instance letter used before keeps every earlier session's
+    // lines -- reading it from 0 re-broadcast them all under the current epoch
+    g_tailFromZero = false;
     g_tailGen++;
 }
 

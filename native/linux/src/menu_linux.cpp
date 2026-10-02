@@ -241,6 +241,7 @@ static void CreatePageDetour(void* menu, int page)
 {
     MenuGame_ObserveMenu(menu);
     ((CreatePageFn)g_createPageTramp)(menu, page);
+    if (page == 2) game_ui_tick::last.store(0, std::memory_order_relaxed);
     panel::OnMenuPage(page);
 }
 

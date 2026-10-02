@@ -275,7 +275,10 @@ function CM.stopsSigEqual(a, b)
 			local recs = {}
 			for rec in tostring(s or ""):gmatch("[^;]+") do
 				local f = {}
-				for v in rec:gsub("%^[^~]*", ""):gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
+				-- the fields without the ^cargo and ~waypoints suffixes (as buildLineObject
+				-- reads them): the waypoints stayed glued to the last field, which then
+				-- read as nil, so a stop list with waypoints never matched within 2 m
+				for v in (rec:match("^[^~%^]+") or rec):gmatch("[^,]+") do f[#f + 1] = tonumber(v) end
 				f.cargo = rec:match("%^([^~]*)") or ""
 				recs[#recs + 1] = f
 			end

@@ -476,7 +476,9 @@ static bool InjectTerrainFromFile(uint64_t r8)
         memcpy(kd, tail + 0x50, 16);
         memcpy(&bits, tail + 0x78, 8);
         if (hd[2] < 0 || hd[3] < 0 || md[2] < 0 || md[3] < 0 || kd[2] < 0 || kd[3] < 0 ||
-            (uint64_t)hd[2] * (uint64_t)hd[3] * 8 != n[0] ||
+            // n[0] / 8, not the product * 8: that wrapped past 2^64 for dimensions near
+            // 2^31, so a peer's payload could pass with a tiny heights vector
+            n[0] % 8 != 0 || (uint64_t)hd[2] * (uint64_t)hd[3] != n[0] / 8 ||
             (uint64_t)md[2] * (uint64_t)md[3] != n[1] ||
             (uint64_t)kd[2] * (uint64_t)kd[3] != bits || n[2] != ((bits + 31) / 32) * 4) {
             Log("[terrain-inject] grid sizes do not match their data (heights %dx%d/%lluB, material %dx%d/%lluB, "

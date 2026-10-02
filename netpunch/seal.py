@@ -163,7 +163,9 @@ class Sealer:
             high, bits = w
             if ctr > high:
                 shift = ctr - high
-                w[0], w[1] = ctr, ((bits << shift) | 1) & ((1 << WINDOW) - 1)
+                # a jump past the window keeps no old bits; shifting first built
+                # an integer of up to 2^32 bits (~512 MB) before the mask
+                w[0], w[1] = ctr, 1 if shift >= WINDOW else ((bits << shift) | 1) & ((1 << WINDOW) - 1)
                 return True
             back = high - ctr
             if back >= WINDOW or (bits >> back) & 1:
