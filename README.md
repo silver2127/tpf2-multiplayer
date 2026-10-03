@@ -1,5 +1,11 @@
 # TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
+The [dev `192ecd4d` integration](docs/linux/UPSTREAM_dev_192ecd4d.md) advances the
+native package, lobby handshake and panel to **0.7.1.5**. Completed save and
+terrain transfers release the host loop’s temporary references each pass.
+The CrossOver loader-hook fix is retained; Linux already uses guarded Vulkan
+dispatcher slots. All peers, including dedicated servers, must update.
+
 The [dev `a459ff1c` integration](docs/linux/UPSTREAM_dev_a459ff1c.md) fixes
 Linux release packaging to accept the menu’s existing `Tpf2mpLastGameUiTick`
 export. Release remains **0.7.1.4**; gameplay code is unchanged.
@@ -42,8 +48,8 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.4**, Windows dev `4487d7cd`; see the
-[integration and validation record](docs/linux/UPSTREAM_dev_4487d7cd.md). All peers, including dedicated
+Current release integration: **0.7.1.5**, Windows dev `192ecd4d`; see the
+[integration and validation record](docs/linux/UPSTREAM_dev_192ecd4d.md). All peers, including dedicated
 servers, must update. Existing native Sandbox town-tool capture, minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
