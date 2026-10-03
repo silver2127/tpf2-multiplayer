@@ -4752,13 +4752,23 @@ static DWORD WINAPI Init(LPVOID)
                     // half and the game died at device creation, before its
                     // first frame, with nothing in stdout.txt (2026-09-10).
                     int steal = PrologueSteal((const unsigned char*)gdpaReal, 14);
+                    // RIP-RELATIVE PROLOGUE (2026-10-03): Wine's loader (CrossOver on
+                    // macOS) opens with test byte [rip+x],8 inside the first 14
+                    // bytes, so the plain decoder refused it and a Mac player clicked
+                    // the Multiplayer button with no panel ever appearing. That
+                    // prologue goes through PrologueStealRip/InstallHookRip, which
+                    // re-aim the copied displacement from a trampoline within 2 GB.
+                    int fix[4] = {0}, nfix = 0;
+                    if (steal <= 0) steal = PrologueStealRip((const unsigned char*)gdpaReal, 14, fix, 4, &nfix);
                     if (steal <= 0) {
                         Log("[menu] vkGetDeviceProcAddr prologue not decodable -- overlay NOT hooked (the game keeps running without the in-game panel)\n");
-                    } else if (InstallHook((uintptr_t)gdpaReal, (void*)&myGdpa, steal, &gt)) {
+                    } else if (nfix ? InstallHookRip((uintptr_t)gdpaReal, (void*)&myGdpa, steal, fix, nfix, &gt)
+                                    : InstallHook((uintptr_t)gdpaReal, (void*)&myGdpa, steal, &gt)) {
                         g_origGdpa = (PFN_vkGetDeviceProcAddr)gt;
-                        Log("[menu] hooked vkGetDeviceProcAddr real=%p steal=%d\n", gdpaReal, steal);
+                        Log("[menu] hooked vkGetDeviceProcAddr real=%p steal=%d%s\n", gdpaReal, steal,
+                            nfix ? " (RIP-relative prologue relocated)" : "");
                     } else {
-                        Log("[menu] InstallHook on gdpa FAILED\n");
+                        Log("[menu] InstallHook on gdpa FAILED%s\n", nfix ? " (no trampoline within 2 GB, or a displacement out of range)" : "");
                     }
                 }
             } else {
