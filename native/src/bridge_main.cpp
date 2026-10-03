@@ -23,6 +23,7 @@
 #include <cstring>
 #include <string>
 #include <mutex>
+#include <atomic>
 #include <fcntl.h>
 #include <io.h>
 #include "net.h"
@@ -93,7 +94,7 @@ static std::wstring g_dataDir;
 // and pushing lines at a socket that was being closed underneath them. Nothing
 // waits on them (that would need the loader lock we are holding); this only
 // stops them doing more work.
-static volatile bool g_stopping = false;
+static std::atomic<bool> g_stopping{false};
 
 // Mutable runtime identity/peer, owned by the control-file poller. The
 // initial values come from the port election; the control file may change
@@ -119,6 +120,10 @@ static void SetTailPath(const std::wstring& p)
     std::lock_guard<std::mutex> lk(g_tailMtx);
     if (g_tailPath == p) return;
     g_tailPath = p;
+    // a new path is not a world reset: only the reset truncated a file, so a
+    // capture file this instance letter used before keeps every earlier session's
+    // lines -- reading it from 0 re-broadcast them all under the current epoch
+    g_tailFromZero = false;
     g_tailGen++;
 }
 
@@ -171,8 +176,9 @@ static void WriteIdentity(const std::string& inst, bool warnMismatch)
         }
     }
 
-    HANDLE ih = CreateFileW(idPath.c_str(), GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+    std::wstring tmpPath = idPath + L".tmp";
+    HANDLE ih = CreateFileW(tmpPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ, nullptr, CREATE_ALWAYS,
         FILE_ATTRIBUTE_NORMAL, nullptr);
     if (ih != INVALID_HANDLE_VALUE) {
         // line 1 = instance (all the mod reads); line 2 = owning pid, so a
@@ -196,7 +202,12 @@ static void WriteIdentity(const std::string& inst, bool warnMismatch)
         }
         DWORD written;
         WriteFile(ih, buf, (DWORD)n, &written, nullptr);
+        FlushFileBuffers(ih);
         CloseHandle(ih);
+        if (!MoveFileExW(tmpPath.c_str(), idPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            CopyFileW(tmpPath.c_str(), idPath.c_str(), FALSE);
+            DeleteFileW(tmpPath.c_str());
+        }
     } else {
         Log("[m5] identity file write FAILED (%lu)\n", GetLastError());
     }

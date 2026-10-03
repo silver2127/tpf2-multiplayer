@@ -66,6 +66,50 @@ k32.GetThreadContext.argtypes = [W.HANDLE, C.c_void_p]
 
 NL = chr(10)
 
+# ---- STACKS (--stack-at): who calls a hot function ---------------------------
+# RIP names a leaf; a leaf like a std::map teardown (0x1400c43d0 on the save
+# load, 2026-09-28) is called from hundreds of places. When a sample lands in
+# one of the --stack-at functions, the thread (still suspended) is unwound with
+# dbghelp's StackWalk64, which reads the target's own .pdata unwind data, and
+# the chain of calling exe functions is counted.
+dbghelp = C.WinDLL('dbghelp', use_last_error=True)
+PROCESS_QUERY_INFORMATION, PROCESS_VM_READ = 0x0400, 0x0010
+CONTEXT_FULL = 0x00100000 | 0x1 | 0x2 | 0x8
+k32.OpenProcess.restype = W.HANDLE
+k32.OpenProcess.argtypes = [W.DWORD, W.BOOL, W.DWORD]
+dbghelp.SymInitialize.argtypes = [W.HANDLE, C.c_char_p, W.BOOL]
+dbghelp.SymFunctionTableAccess64.restype = C.c_void_p
+dbghelp.SymGetModuleBase64.restype = C.c_uint64
+STACKWALK_ARGS = [W.DWORD, W.HANDLE, W.HANDLE, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p]
+dbghelp.StackWalk64.argtypes = STACKWALK_ARGS
+dbghelp.StackWalk64.restype = W.BOOL
+FT_ACCESS = C.cast(dbghelp.SymFunctionTableAccess64, C.c_void_p).value
+MOD_BASE = C.cast(dbghelp.SymGetModuleBase64, C.c_void_p).value
+
+
+def walk(hproc, hthread, ctx_src, limit=24):
+    """Return addresses of the suspended thread whose CONTEXT is at ctx_src."""
+    ctx = (C.c_char * (CONTEXT_SIZE + 16))()
+    c = (C.addressof(ctx) + 15) & ~15
+    C.memmove(c, ctx_src, CONTEXT_SIZE)
+    frame = (C.c_char * 512)()
+    f = C.addressof(frame)
+    rip = C.c_uint64.from_address(c + RIP_OFF).value
+    rsp = C.c_uint64.from_address(c + 0x98).value
+    rbp = C.c_uint64.from_address(c + 0xA0).value
+    for off, val in ((0, rip), (32, rbp), (48, rsp)):   # AddrPC, AddrFrame, AddrStack
+        C.c_uint64.from_address(f + off).value = val
+        C.c_uint32.from_address(f + off + 12).value = 3   # AddrModeFlat
+    out = []
+    for _ in range(limit):
+        if not dbghelp.StackWalk64(0x8664, hproc, hthread, f, c, None, FT_ACCESS, MOD_BASE, None):
+            break
+        pc = C.c_uint64.from_address(f).value
+        if not pc:
+            break
+        out.append(pc)
+    return out
+
 
 class MODULEENTRY32(C.Structure):
     _fields_ = [("dwSize", W.DWORD), ("a", W.DWORD), ("b", W.DWORD), ("c", W.DWORD),
@@ -78,6 +122,29 @@ class THREADENTRY32(C.Structure):
     _fields_ = [("dwSize", W.DWORD), ("cntUsage", W.DWORD), ("th32ThreadID", W.DWORD),
                 ("th32OwnerProcessID", W.DWORD), ("tpBasePri", C.c_long),
                 ("tpDeltaPri", C.c_long), ("dwFlags", W.DWORD)]
+
+
+def load_map(path):
+    """(module name, sorted [(rva, symbol)]) from an MSVC linker map (/MAP), for
+    naming samples inside a plugin DLL instead of lumping them by module."""
+    base, syms = None, []
+    with open(path, encoding='latin-1') as f:
+        for line in f:
+            if 'Preferred load address is' in line:
+                base = int(line.split()[-1], 16)
+                continue
+            parts = line.split()
+            if base is None or len(parts) < 4 or ':' not in parts[0] or len(parts[2]) != 16:
+                continue
+            try:
+                va = int(parts[2], 16)
+            except ValueError:
+                continue
+            if va >= base:
+                syms.append((va - base, parts[1]))
+    syms.sort()
+    import os
+    return os.path.basename(path).rsplit('.', 1)[0].lower() + '.dll', syms
 
 
 def modules(pid):
@@ -157,7 +224,17 @@ class ProcState:
         self.by_tid = collections.defaultdict(collections.Counter)
         self.win_tid = collections.Counter()
         self.win_by_tid = collections.defaultdict(collections.Counter)
+        self.win_wait_by_tid = collections.defaultdict(collections.Counter)   # what each thread WAITED on, this window
+        self.threads_shown = 3    # --threads
+        self.window_s = 30.0      # --window, for the "cores busy" line
         self.interval = 0.02      # overwritten from argv so CPU-s are honest
+        self.maps = {}            # module name (lower) -> ([rva], [symbol]) from --map
+        self.stack_at = set()     # --stack-at: exe function keys ('exe!0x...') to unwind from
+        self.chains = collections.Counter()
+        self.win_chains = collections.Counter()
+        self.hproc = None
+        self.follow = set()       # --follow: exe function keys whose thread is then walked on EVERY sample
+        self.followed = set()     # the tids found that way
 
     def refresh(self):
         for tid in threads(self.pid):
@@ -185,7 +262,15 @@ class ProcState:
             if len(m):
                 return 'exe!0x%x' % (self.exe_ib + int(m[0]['b'])), False
             return 'exe!<no pdata>', False
-        return next((n for lo, hi, n in self.mods if lo <= rip < hi), '<unmapped>'), False
+        mod = next(((lo, n) for lo, hi, n in self.mods if lo <= rip < hi), None)
+        if mod is None:
+            return '<unmapped>', False
+        syms = self.maps.get(mod[1].lower())
+        if syms:
+            i = bisect.bisect_right(syms[0], rip - mod[0]) - 1
+            if i >= 0:
+                return '%s!%s' % (mod[1], syms[1][i][:90]), False
+        return mod[1], False
 
     def sample(self, ctx):
         for tid, h in list(self.handles.items()):
@@ -195,15 +280,29 @@ class ProcState:
                 k32.CloseHandle(h)
                 del self.handles[tid]
                 continue
+            if self.stack_at:
+                C.c_uint32.from_address(ctx + FLAGS_OFF).value = CONTEXT_FULL
             ok = k32.GetThreadContext(h, C.c_void_p(ctx))
+            key, is_wait = (None, False)
+            if ok:
+                key, is_wait = self.classify(C.c_uint64.from_address(ctx + RIP_OFF).value)
+                if key in self.follow and tid not in self.followed:
+                    self.followed.add(tid)
+                    print('      following tid %d (sampled in %s)' % (tid, key), flush=True)
+                if (key in self.stack_at or tid in self.followed) and self.hproc:
+                    frames = walk(self.hproc, h, ctx)
+                    chain = [self.classify(pc)[0] for pc in frames[1:]]
+                    chain = [k for k in chain if k.startswith('exe!')][:5 if tid in self.followed else 6]
+                    self.chains[(key,) + tuple(chain)] += 1
+                    self.win_chains[(key,) + tuple(chain)] += 1
             k32.ResumeThread(h)
             if not ok:
                 continue
-            key, is_wait = self.classify(C.c_uint64.from_address(ctx + RIP_OFF).value)
             if is_wait:
                 self.waits[key] += 1
                 self.winw[key] += 1
                 self.tid_wait[tid] += 1
+                self.win_wait_by_tid[tid][key] += 1
             else:
                 self.hist[key] += 1
                 self.win[key] += 1
@@ -231,16 +330,31 @@ class ProcState:
         # repaint thread rather than the one doing the load. Window-local counts
         # answer "which thread is on the critical path RIGHT NOW".
         if self.win_tid:
+            # SPINNERS: a thread at ~100% in one module all window (the UI's
+            # win32u loops) crowds the load's threads out of a top-3 list and
+            # says nothing about the load. Listed once, then skipped.
+            spin = [t for t, n in self.win_tid.items()
+                    if n >= 0.9 * self.window_s / self.interval and self.win_by_tid[t].most_common(1)[0][1] >= 0.95 * n]
+            rest = sum(n for t, n in self.win_tid.items() if t not in spin)
+            print('      -- %d spinner thread(s) skipped; the rest: %.1f CPU-s = %.1f cores busy --'
+                  % (len(spin), rest * self.interval, rest * self.interval / max(self.window_s, 1e-9)), flush=True)
             print('      -- busiest threads THIS window --', flush=True)
-            for tid, n in self.win_tid.most_common(3):
-                own = self.win_by_tid[tid].most_common(3)
+            shown = [(t, n) for t, n in self.win_tid.most_common() if t not in spin][:self.threads_shown]
+            for tid, n in shown:
+                own = self.win_by_tid[tid].most_common(4)
                 detail = ', '.join('%s %.0f%%' % (k, 100.0 * c / max(n, 1)) for k, c in own)
-                print('      tid %-7d %5d working (%5.1f CPU-s)  %s'
-                      % (tid, n, n * self.interval, detail), flush=True)
+                waited = sum(self.win_wait_by_tid[tid].values())
+                wdetail = ', '.join('%s %d' % (k.split('+')[0], c) for k, c in self.win_wait_by_tid[tid].most_common(2))
+                print('      tid %-7d %5d working (%5.1f CPU-s) %5d waiting  %s%s'
+                      % (tid, n, n * self.interval, waited, detail, ('  | waits: ' + wdetail) if waited else ''), flush=True)
+        for chain, n in self.win_chains.most_common(6):
+            print('      stack %5d  %s' % (n, ' <- '.join(chain)), flush=True)
+        self.win_chains.clear()
         self.win.clear()
         self.winw.clear()
         self.win_tid.clear()
         self.win_by_tid.clear()
+        self.win_wait_by_tid.clear()
 
     def dump_total(self, top=20, interval=0.02, per_thread=3):
         b = sum(self.hist.values())
@@ -293,6 +407,10 @@ def main():
     ap.add_argument('--seconds', type=float, default=120.0)
     ap.add_argument('--interval', type=float, default=0.02)
     ap.add_argument('--window', type=float, default=30.0, help='seconds per delta snapshot')
+    ap.add_argument('--threads', type=int, default=3, help='busiest threads listed per window (UI spinners skipped)')
+    ap.add_argument('--map', action='append', default=[], help='MSVC linker map of a plugin DLL (repeatable): names its samples')
+    ap.add_argument('--stack-at', default='', help='comma-separated exe function addresses (0x140...): unwind samples that land in them')
+    ap.add_argument('--follow', default='', help='comma-separated exe function addresses: the thread first sampled in one is unwound on every sample from then on')
     a = ap.parse_args()
 
     exe_ib, exe_fn = pdata(EXE_PATH)
@@ -327,6 +445,20 @@ def main():
     states = [ProcState(p, exe_ib, exe_fn, exports, exp_addrs) for p in pids]
     for st in states:
         st.interval = a.interval
+        st.threads_shown = a.threads
+        st.window_s = a.window
+        if a.follow:
+            st.follow = {'exe!0x%x' % int(x, 16) for x in a.follow.split(',') if x}
+            a.stack_at = a.stack_at or a.follow
+        if a.stack_at:
+            st.stack_at = {'exe!0x%x' % int(x, 16) for x in a.stack_at.split(',') if x}
+            st.hproc = k32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, st.pid)
+            if not st.hproc or not dbghelp.SymInitialize(st.hproc, None, True):
+                print('stack walking unavailable (OpenProcess/SymInitialize failed)', flush=True)
+                st.stack_at = set()
+        for mp in a.map:
+            name, syms = load_map(mp)
+            st.maps[name] = ([r for r, _ in syms], [n for _, n in syms])
     raw_ctx = (C.c_char * (CONTEXT_SIZE + 16))()
     ctx = (C.addressof(raw_ctx) + 15) & ~15
 

@@ -13,6 +13,7 @@ does not).
 | [PROPOSALS.md](PROPOSALS.md) | the proposal structure (nodes, segments, construction entities, parameters), templates, refusal rules, level crossings, stops and signals, the terraform and paint grids |
 | [GAME_LOOP_AND_UI.md](GAME_LOOP_AND_UI.md) | threads, sim pacing and game speed, forcing a save, loading a save, the title menu |
 | [SCRIPT_API.md](SCRIPT_API.md) | how the game-script Lua API actually behaves: crashes `pcall` cannot catch, vehicles, lines, constructions, GUI vs engine state |
+| [SANDBOX.md](SANDBOX.md) | Sandbox mode: its tools and commands, the `TownInfo` script type, town creation measured deterministic, where the cargo needs come from |
 
 ## Conventions
 

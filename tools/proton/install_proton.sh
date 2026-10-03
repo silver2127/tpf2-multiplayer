@@ -22,6 +22,8 @@ if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -eu
 
 REPO="silver2127/tpf2-multiplayer"
+# the install files: this repository from 0.7.0.6 on, REPO's own releases before it
+PACKAGES_REPO="silver2127/tpf2-multiplayer-packages"
 APP_ID="1066780"
 GAME_FOLDER="Transport Fever 2"
 FILES_ASSET="TpF2Multiplayer-files.zip"
@@ -123,7 +125,7 @@ if [ "$uninstall" = 1 ]; then
     if [ -f "$game_dir/$rel" ]; then say "  remove $rel"; [ "$dry_run" = 1 ] || rm -f "$game_dir/$rel"; fi
   done
   if [ "$dry_run" != 1 ]; then
-    rm -rf "$game_dir/$MOD"; rmdir "$game_dir/netpunch" 2>/dev/null || true; rm -f "$game_dir/$MANIFEST"
+    rm -rf "${game_dir:?}/${MOD:?}"; rmdir "$game_dir/netpunch" 2>/dev/null || true; rm -f "$game_dir/$MANIFEST"
   fi
   say "Done. The prefix links and $BACKUPS/ are left in place."
   exit 0
@@ -144,11 +146,16 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/tpf2mp-install.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 if [ -z "$files_zip" ]; then
   need curl
-  if [ -n "$version" ]; then base="https://github.com/$REPO/releases/download/v$version"; tag="v$version"
-  else base="https://github.com/$REPO/releases/latest/download"; tag="latest"; fi
+  if [ -n "$version" ]; then tag="v$version"; else tag="latest"; fi
   cache="${XDG_CACHE_HOME:-$HOME/.cache}/tpf2mp/$tag"; mkdir -p "$cache"
   say "Downloading $FILES_ASSET ($tag)..."
-  curl -fsSL --retry 3 -o "$cache/$SUMS_ASSET" "$base/$SUMS_ASSET" || fail "could not download $base/$SUMS_ASSET (no such release, or no network)"
+  base=""
+  for repo in "$PACKAGES_REPO" "$REPO"; do
+    if [ -n "$version" ]; then try="https://github.com/$repo/releases/download/v$version"
+    else try="https://github.com/$repo/releases/latest/download"; fi
+    if curl -fsSL --retry 3 -o "$cache/$SUMS_ASSET" "$try/$SUMS_ASSET" 2>/dev/null; then base="$try"; break; fi
+  done
+  [ -n "$base" ] || fail "could not download $SUMS_ASSET for $tag (no such release, or no network)"
   if [ -t 1 ]; then progress="--progress-bar"; else progress="-sS"; fi     # a bar on a terminal, silence in a log
   curl -fL --retry 3 $progress -o "$cache/$FILES_ASSET" "$base/$FILES_ASSET" || fail "could not download $base/$FILES_ASSET"
   # tr: a sums file written on Windows ends its lines in \r\n, and "name$" would never match
@@ -238,4 +245,11 @@ done
   printf '\n  },\n  "alut_real": "%s"\n}\n' "$(sha "$game_dir/alut_real.dll")"
 } > "$game_dir/$MANIFEST.tmp" && mv -f "$game_dir/$MANIFEST.tmp" "$game_dir/$MANIFEST"
 say "Installed TpF2 Multiplayer $shipped_version into $game_dir$( [ -n "$backup" ] && printf '%s' " (replaced files kept in $backup)")"
+# The proxy of 0.6.1.19 and newer switches Wine's heap to its lock-free front end at game
+# start (native/src/wine_heap.h); it ships inside alut.dll, so this only reports it.
+if grep -qaF '[proxy] wine heap:' "$game_dir/alut.dll" 2>/dev/null; then
+  say "Wine heap fix: included (faster loads and game speed under Proton; TPF2MP_WINE_HEAP=0 %command% in the game's Steam launch options turns it off)"
+else
+  say "Note: this version predates the Wine heap fix (0.6.1.19): under Proton, loads and high game speeds are slower than they need to be. Install a newer release when you can."
+fi
 say "Start the game: Main menu > Multiplayer. Everyone in a session needs the same version."

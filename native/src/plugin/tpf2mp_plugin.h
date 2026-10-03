@@ -85,7 +85,8 @@ typedef struct Tpf2mpHost {
     int (*verifyBytes)(uintptr_t rva, const uint8_t* expected, uint32_t len);
 
     // ---- patching ----
-    // 14-byte absolute-jump detour + trampoline. `stealBytes` must be >= 14 and
+    // 14-byte absolute-jump detour + trampoline. `stealBytes` must be >= 14 (the
+    // Linux host also takes 5..13 with a near jump to a nearby trampoline) and
     // must land on an instruction boundary; the stolen bytes must not be
     // RIP-relative (they are relocated verbatim). Returns 1 on success and
     // writes the trampoline to *trampolineOut.

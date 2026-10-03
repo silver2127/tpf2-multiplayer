@@ -13,6 +13,7 @@
 // A detection limit only: one stroke commits before its grid passes 300,000
 // cells (2.4 MB of heights), so a larger span means a bad read.
 static const uint64_t TERRAIN_MAX_BYTES = 64ull << 20;
+#include "tplz.h"
 static long g_terrainSeq = 0;
 
 struct TerrainGrid { int32_t x0, y0, w, h; uint64_t begin; uint64_t bytes; };
@@ -38,6 +39,14 @@ static uint64_t Fnv1a64(const uint8_t* p, uint64_t n)
     for (uint64_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h;
 }
+
+// WIRE VERSION 2 (2026-09-26): the version-1 TPTG blob, LZ-compressed and framed
+// by tplz.h. A paint stroke ships its whole bounding box, mostly 0xff ("unchanged")
+// and an all-zero mask: 270-840 KB raw, measured, about 30x smaller packed. Every
+// stroke used to reach a relayed peer after its stamp and hold the whole session
+// back; the players' own placements waited behind it. A blob that does not shrink
+// ships as version 1, which every reader still takes.
+static uint64_t g_terrainRawLen = 0;   // the stashed edit before packing, for the log
 
 // A terrain edit crosses the wire as base64 text: the inject line, the LSCMD
 // token and the peer's inject file are all text, and base64 has no space and no
@@ -269,15 +278,19 @@ static bool LogTerrainProposal(uint64_t r8, uint64_t r9)
         } else if (!onlyTerrain) {
             Log("[terrain] #%ld carries streets or constructions as well -- NOT replicated as terrain\n", seq);
         } else {
-            char* b64 = Base64Encode(blob, blobLen);
+            uint64_t wireLen = blobLen;
+            uint8_t* packed = TplzPack(blob, blobLen, &wireLen);
+            char* b64 = Base64Encode(packed ? packed : blob, wireLen);
+            free(packed);
             if (b64) {
                 free(g_terrainB64);
-                g_terrainB64 = b64; g_terrainBlobLen = blobLen; g_terrainStashSeq = seq;
+                g_terrainB64 = b64; g_terrainBlobLen = wireLen; g_terrainRawLen = blobLen; g_terrainStashSeq = seq;
                 // paint only: material and mask, no heights (see the factory branch)
                 g_terrainIsPaint = (hg.bytes == 0 && mg.bytes != 0);
                 stashed = true;
-                Log("[terrain] #%ld stashed for the wire: %lluB edit, %lluB of base64\n",
-                    seq, (unsigned long long)blobLen, (unsigned long long)strlen(b64));
+                Log("[terrain] #%ld stashed for the wire: %lluB edit, %lluB %s, %lluB of base64\n",
+                    seq, (unsigned long long)blobLen, (unsigned long long)wireLen,
+                    wireLen < blobLen ? "packed" : "unpacked (it does not shrink)", (unsigned long long)strlen(b64));
             } else {
                 Log("[terrain] #%ld base64 encode failed -- the edit runs here only, NOT replicated\n", seq);
             }
@@ -345,7 +358,7 @@ static void WriteInjectTerrain(bool armed)
         fputc('\n', f);
         fclose(f);
         Log("[terrain] #%ld shipped: %lluB edit, %lluB of base64 (%s)\n", g_terrainStashSeq,
-            (unsigned long long)g_terrainBlobLen, (unsigned long long)strlen(b64),
+            (unsigned long long)g_terrainRawLen, (unsigned long long)strlen(b64),
             armed ? "cancelled here, every instance applies it at the stamp" : "ran natively here, the peers apply it at the stamp");
     } else {
         Log("[terrain] #%ld cannot open %s -- the edit is on this instance only, NOT replicated\n", g_terrainStashSeq, p);
@@ -406,7 +419,8 @@ static bool InjectTerrainFromFile(uint64_t r8)
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
     const long minLen = 8 + 0x80 + 0x70 + 24;
-    uint8_t* buf = (len >= minLen && (uint64_t)len <= TERRAIN_MAX_BYTES) ? (uint8_t*)malloc((size_t)len) : nullptr;
+    // a packed edit (wire version 2) can be far shorter than an unpacked one's header
+    uint8_t* buf = (len >= 24 && (uint64_t)len <= TERRAIN_MAX_BYTES) ? (uint8_t*)malloc((size_t)len) : nullptr;
     bool got = buf && fread(buf, 1, (size_t)len, f) == (size_t)len;
     fclose(f);
     DeleteFileA(path);
@@ -419,8 +433,19 @@ static bool InjectTerrainFromFile(uint64_t r8)
         free(buf);
         buf = raw;
         used = (long)rawLen;
-        got = raw && used >= minLen;
+        got = raw && used >= 24;
     }
+    if (got && TplzIsPacked(buf, (uint64_t)used)) {
+        uint64_t rawLen = 0;
+        const char* why = "";
+        uint8_t* raw = TplzUnpack(buf, (uint64_t)used, TERRAIN_MAX_BYTES, &rawLen, &why);
+        free(buf);
+        buf = raw;
+        if (!raw) Log("[terrain-inject] packed edit (%ld B) not unpacked: %s -- left alone\n", used, why);
+        used = raw ? (long)rawLen : 0;
+        got = raw != nullptr;
+    }
+    got = got && used >= minLen;
     if (!got) {
         free(buf);
         Log("[terrain-inject] inject file too short, too long or unreadable (%ld B) -- left alone\n", len);
@@ -451,7 +476,9 @@ static bool InjectTerrainFromFile(uint64_t r8)
         memcpy(kd, tail + 0x50, 16);
         memcpy(&bits, tail + 0x78, 8);
         if (hd[2] < 0 || hd[3] < 0 || md[2] < 0 || md[3] < 0 || kd[2] < 0 || kd[3] < 0 ||
-            (uint64_t)hd[2] * (uint64_t)hd[3] * 8 != n[0] ||
+            // n[0] / 8, not the product * 8: that wrapped past 2^64 for dimensions near
+            // 2^31, so a peer's payload could pass with a tiny heights vector
+            n[0] % 8 != 0 || (uint64_t)hd[2] * (uint64_t)hd[3] != n[0] / 8 ||
             (uint64_t)md[2] * (uint64_t)md[3] != n[1] ||
             (uint64_t)kd[2] * (uint64_t)kd[3] != bits || n[2] != ((bits + 31) / 32) * 4) {
             Log("[terrain-inject] grid sizes do not match their data (heights %dx%d/%lluB, material %dx%d/%lluB, "

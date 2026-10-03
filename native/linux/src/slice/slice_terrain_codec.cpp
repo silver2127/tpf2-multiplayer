@@ -1,8 +1,10 @@
-// Platform-neutral TPTG/TPAS v1 codecs; Windows wire format is unchanged.
+// Canonical TPTG v1, packed TPTG v2 and TPAS codecs shared with Windows.
 #include "slice_terrain_assets.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include "slice/tplz.h"
 
 namespace slice_terrain_assets {
 namespace {
@@ -143,6 +145,30 @@ bool DecodeTerrain(const std::vector<uint8_t>& bytes, Terrain* out)
         if (!r.take(grid->data.data(), n)) return false;
     }
     return r.pos == bytes.size() && ValidTerrain(*out);
+}
+bool EncodeTerrainWire(const Terrain& terrain, std::vector<uint8_t>* out, size_t* rawBytes)
+{
+    if (!EncodeTerrain(terrain, out)) return false;
+    // Match the Windows reader's limit, including the canonical header.
+    if (out->size() > MaxBytes) { out->clear(); return false; }
+    if (rawBytes) *rawBytes = out->size();
+    uint64_t size = out->size();
+    std::unique_ptr<uint8_t, decltype(&free)> packed(TplzPack(out->data(), size, &size), &free);
+    if (packed) out->assign(packed.get(), packed.get() + size);
+    return true;
+}
+bool DecodeTerrainWire(const std::vector<uint8_t>& bytes, Terrain* out)
+{
+    *out = {};
+    if (bytes.size() > MaxBytes) return false;
+    if (!TplzIsPacked(bytes.data(), bytes.size())) return DecodeTerrain(bytes, out);
+    uint64_t size = 0;
+    const char* why = "";
+    std::unique_ptr<uint8_t, decltype(&free)> raw(
+        TplzUnpack(bytes.data(), bytes.size(), MaxBytes, &size, &why), &free);
+    if (!raw) return false;
+    // Decode exactly one frame; nested frames cannot bypass v1 validation.
+    return DecodeTerrain(std::vector<uint8_t>(raw.get(), raw.get() + size), out);
 }
 bool EncodeAssets(const Assets& assets, std::vector<uint8_t>* out)
 {

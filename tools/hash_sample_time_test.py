@@ -68,7 +68,10 @@ function newGame(letter, startClock)
   CM.vposShip = function(stamp) g.sent[#g.sent + 1] = "vpos:" .. stamp end
   CM.scheduleLocal = function() end
   CM.hashCadenceTick = function() end
-  CM.broadcast = function(line) g.sent[#g.sent + 1] = line end
+  CM.broadcast = function(line)
+    g.sent[#g.sent + 1] = line
+    g.clock = g.clock + (g.postSeconds or 0)
+  end
   CM.compareAt = function(stamp) g.compared[#g.compared + 1] = stamp end
   CM.myHashes, CM.myDetails, CM.comparedAt, CM.vposDone = {}, {}, {}, {}
   local function log(msg) g.logs[#g.logs + 1] = tostring(msg) end
@@ -76,7 +79,8 @@ function newGame(letter, startClock)
   local fakeOs = { clock = function() return g.clock end }
   -- a distinct hash per sample, so a published one can be told from another's
   local function worldHash(now)
-    g.clock = g.clock + 0.05
+    g.clock = g.clock + (g.hashSeconds or 0.05)
+    CM.hashPartsMs = g.hashSplit or "test split"
     g.n = g.n + 1
     return string.format("h%s@%.1f", letter, now), string.format("v0,c0:c,e1:e,z:z,p0@%.1f:p,r0:x/y,m:-,l:-,t:%d,n:%d", now, 100, 5)
   end
@@ -238,6 +242,43 @@ check('with a peer heard mid-interval, the next crossings are sampled and publis
       laterPub == '36,48', repr(laterPub))
 check('the interval the peer arrived in is not published (entered, not crossed)', '24' not in laterPub.split(','))
 check('and it says the hash is on', saidOn)
+
+print('== performance window keeps the slowest split and times published post-hash work')
+L.execute(r'''
+local g = newGame("a", 0)
+g.hashSeconds, g.hashSplit = 8, "expensive lanes"
+g.checkHash(0) -- loaded interval: hash measured, nothing published
+assert(g.CM.perfHash.n == 1 and g.CM.perfHash.max == 8000)
+assert(g.CM.perfPost == nil)
+g.hashSeconds, g.hashSplit, g.postSeconds = 1, "cheap lanes", 0.25
+g.checkHash(12)
+g.postSeconds = 0.5
+g.checkHash(24)
+assert(g.CM.hashPartsMs == "cheap lanes")
+assert(g.CM.hashPartsWorst == "expensive lanes")
+assert(g.CM.perfHash.n == 3 and g.CM.perfHash.sum == 10000)
+assert(g.CM.perfHash.max == 8000)
+assert(g.CM.perfPost.n == 2 and g.CM.perfPost.sum == 750)
+assert(g.CM.perfPost.max == 500)
+perfGame = g
+''')
+# Execute the production reporting block too: text and reset are part of the change.
+report = cut(LOCKSTEP, r'(local u, h, pp = CM\.perfUpd, CM\.perfHash, CM\.perfPost.*?CM\.perfUpd, CM\.perfHash, CM\.perfPost, CM\.hashPartsWorst = nil, nil, nil, nil)', 'PERF report')
+G.REPORT_SRC = report
+L.execute(r'''
+local cm = perfGame.CM
+cm.perfUpd = { n = 2, sum = 10, max = 6 }
+local lines = {}
+local report = assert(load("local CM, log = ...\n" .. REPORT_SRC))
+report(cm, function(s) lines[#lines + 1] = s end)
+assert(lines[1]:find("after the hash avg=375.0 ms max=500.0 ms", 1, true))
+assert(lines[1]:find("dearest hash: expensive lanes", 1, true))
+assert(cm.perfUpd == nil and cm.perfHash == nil and cm.perfPost == nil and cm.hashPartsWorst == nil)
+perfGame.hashSeconds, perfGame.hashSplit = 0.5, "next window"
+perfGame.checkHash(36)
+assert(cm.perfHash.n == 1 and cm.perfHash.max == 500)
+assert(cm.hashPartsWorst == "next window" and cm.perfPost.n == 1)
+''')
 
 print()
 if fails:

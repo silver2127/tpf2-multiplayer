@@ -1,6 +1,7 @@
 #include <cassert>
 #include <sys/mman.h>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <array>
 #include <algorithm>
 #include "slice/slice_core_internal.h"
@@ -57,6 +58,60 @@ static void ForeignCallback() { FilteredHook(0,0,0); }
 int main(int argc,char** argv)
 {
     assert(SliceReadInit());
+    const int selectedReadMechanism=SliceReadMechanism();
+    for (int mechanism : {kSliceReadVm,kSliceReadPipe}) {
+        char why[256];
+        assert(SliceReadSelfTest(mechanism,why,sizeof(why)));
+        SliceReadSelect(mechanism);
+        // SliceReadable batches its page probes: ranges across the 256-page batch, and a
+        // hole on either side of it, give the page-at-a-time answer
+        const size_t pg=size_t(sysconf(_SC_PAGESIZE)), pages=600;
+        uint8_t* m=static_cast<uint8_t*>(mmap(nullptr,pg*pages,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+        assert(m!=MAP_FAILED);
+        const uintptr_t b=uintptr_t(m);
+        assert(SliceReadable(b+5,pg*pages-10));
+        assert(SliceReadable(b+pg*256-1,2));                  // the batch edge
+        assert(SliceReadable(b+pg*3,pg));                     // exactly one page
+        assert(mprotect(m+pg*300,pg,PROT_NONE)==0);           // in the second batch
+        assert(!SliceReadable(b+5,pg*pages-10));
+        assert(!SliceReadable(b+pg*299+pg-1,2));
+        assert(SliceReadable(b,pg*300));                      // stops just short of the hole
+        assert(SliceReadable(b+pg*301,pg*299));
+        assert(mprotect(m+pg*10,pg,PROT_NONE)==0);            // in the first batch
+        assert(!SliceReadable(b,pg*20));
+        assert(SliceReadable(b+pg*11,pg*289));
+        {   // SliceReadMany: a batch with holes in it answers item by item
+            m[pg*5]=7; m[pg*400]=9;
+            uint8_t o[6]{};
+            SliceReadItem items[6]={{b+pg*5,&o[0],1,false},{b+pg*10,&o[1],1,false},{b+pg*400,&o[2],1,false},
+                                    {0x10,&o[3],1,false},{b+pg*300-1,&o[4],2,false},{b,&o[5],0,false}};
+            SliceReadMany(items,6);
+            assert(items[0].ok && o[0]==7 && !items[1].ok && items[2].ok && o[2]==9);
+            assert(!items[3].ok && !items[4].ok && items[5].ok);
+            std::vector<SliceReadItem> lots(700);                   // across three batches
+            std::vector<uint8_t> got(700);
+            for (size_t i=0;i<lots.size();++i) lots[i]={b+pg*(400+i%150)+i,&got[i],1,false};
+            SliceReadMany(lots.data(),lots.size());
+            for (auto& it : lots) assert(it.ok);
+        }
+        SliceVec v{}; uintptr_t hdr[3]={b,b+pg*20,b+pg*20};
+        assert(!SliceReadStdVector(uintptr_t(hdr),4,SIZE_MAX,&v) && !v.begin && !v.count);
+        assert(SliceReadStdVectorShape(uintptr_t(hdr),4,SIZE_MAX,&v) && v.begin==b && v.count==pg*5);
+        assert(mprotect(m,pg*pages,PROT_READ|PROT_WRITE)==0);
+        for (size_t hole : {size_t(255),size_t(256),size_t(599)}) {
+            assert(mprotect(m+pg*hole,pg,PROT_NONE)==0);
+            assert(!SliceReadable(b+5,pg*pages-10));
+            assert(SliceReadable(b,pg*hole));
+            assert(mprotect(m+pg*hole,pg,PROT_READ|PROT_WRITE)==0);
+        }
+        assert(SliceReadable(b,pg*256));
+        assert(SliceReadable(b,pg*512));
+        assert(SliceReadable(0,0));
+        assert(!SliceReadable(0,1));
+        assert(!SliceReadable(UINTPTR_MAX-3,8));
+        munmap(m,pg*pages);
+    }
+    SliceReadSelect(selectedReadMechanism);
     std::vector<uint8_t> self(0x60);
     // Observers copy their inputs; no writes to the family, even on refusal.
     std::vector<std::array<int32_t,5>> nodes{{9,0,0,0,0},{3,0,0,0,0}};
@@ -150,6 +205,26 @@ int main(int argc,char** argv)
         assert(!RoadEdgeData(uintptr_t(mgr.data()),(uint64_t(2)<<32)|1));   // past datas
         assert(!RoadEdgeData(uintptr_t(mgr.data()),2));                     // past indices
         assert(!RoadEdgeData(uintptr_t(mgr.data()),uint64_t(0xffffffffu)));
+        // Unrelated unreadable pages in the world vectors must not block a
+        // valid selected edge; an unreadable selected element must still refuse.
+        const size_t pg=size_t(sysconf(_SC_PAGESIZE));
+        auto* sparse=static_cast<uint8_t*>(mmap(nullptr,pg*4,PROT_READ|PROT_WRITE,
+            MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+        assert(sparse!=MAP_FAILED);
+        const uintptr_t sb=uintptr_t(sparse);
+        int32_t group=0; memcpy(sparse,&group,4);
+        vec(sparse+pg*2,uintptr_t(edgeData),uintptr_t(edgeData)+32);
+        vec(mgr.data()+0x30,sb,sb+pg*2);
+        vec(mgr.data()+0x48,sb+pg*2,sb+pg*2+(pg*2/72)*72);
+        assert(mprotect(sparse+pg,pg,PROT_NONE)==0);
+        assert(mprotect(sparse+pg*3,pg,PROT_NONE)==0);
+        assert(RoadEdgeData(uintptr_t(mgr.data()),0)==uintptr_t(edgeData));
+        assert(!RoadEdgeData(uintptr_t(mgr.data()),pg/4));
+        group=int32_t((pg+71)/72); memcpy(sparse,&group,4);
+        assert(!RoadEdgeData(uintptr_t(mgr.data()),0));
+        assert(munmap(sparse,pg*4)==0);
+        vec(mgr.data()+0x30,uintptr_t(indices.data()),uintptr_t(indices.data()+2));
+        vec(mgr.data()+0x48,uintptr_t(groups.data()),uintptr_t(groups.data()+groups.size()));
         // world: entity slots at +98 (24-byte vectors of {type,slot}), pools at +80, flat data at pool+b8
         const int type=2;
         std::string names[2]={"bus a","Bus B"};

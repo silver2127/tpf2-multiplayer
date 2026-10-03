@@ -1,0 +1,1229 @@
+diff --git a/docs/re/HOTJOIN_ORDER.md b/docs/re/HOTJOIN_ORDER.md
+index cbbf660..2285185 100644
+--- a/docs/re/HOTJOIN_ORDER.md
++++ b/docs/re/HOTJOIN_ORDER.md
+@@ -324,6 +324,48 @@ engines of every peer, whatever history they have.
+   (`f3 0f 1e fa 55 48 89 e5 41 57 41 56 41 55 41 54`, rdi = the engine), same
+   walk over the libstdc++ family map; family_canon.h is portable.
+ 
++### Native: GCC keeps one GetNodeList per family (fixed 2026-09-23)
++
++The native step canon recognised a family's node list by ONE getter address,
++`0xa914c0` (`endbr64; lea rax,[rdi+8]; ret`), and a list-less family by
++`0xa914e0`. That is the Windows design, where MSVC's identical-code folding
++makes every `ComponentGroupFamily<...>::GetNodeList` one function (0xba990).
++GCC does not fold them: build 35924 has **28** node-list getters and **35**
++no-list getters, one per family template instantiation
++(`tools/linux/gen_family_getters.py` lists them from the ELF's own vtables).
++Only PersonCapacity used `0xa914c0` and only VehicleOrder `0xa914e0`, so every
++native peer since 0.7 sorted 1 of its 28 node lists and refused the other 61
++families -- Town, TownBuilding, Construction, BaseEdge, TownConnection,
++SimBuilding, StockList, Station, the vehicle families -- while every Windows
++peer sorted all 28. The production server logged it at every iteration:
++
++```
++[order-canon] step engine=... families=63/63 lists=1 reordered=0 moved=0 unknown/refused=61
++```
++
++(Windows: `63 families, 28 node lists ..., 0 not understood`.) The native
++lists therefore stayed in load/history order while the Windows lists were in
++entity order: the TownSystem staggers town `i` of its node list to
++`t % 120 == (i % 30) * 4` and hands every town of a tick one mt19937 seeded
++from `t`, so a list in another order develops towns at other ticks with other
++draws (the native load order is not entity order: the one list it did sort,
++PersonCapacity, needed ~5,300 nodes moved at the first iteration after every
++load). Every native session since 0.7 split in town growth within one to
++three hash stamps of each join (for example 390 and 475 game units after the
++joiner's load on 2026-09-23), in several towns at once; the
++0.6.1.28-native sessions, which had no step canon on either side, held
++(1,800 units and 36 new street edges, 2026-09-22).
++
++Fix: `native/linux/src/family_getters_linux.h`, generated from the ELF,
++lists all 63 getters; install verifies each byte for byte; the canon
++classifies a family by that table and still calls none of them.
++`tests/family_canon_elf_test.cpp` (manual, needs the game ELF) maps the real
++image, applies its relocations, gives an engine the binary's own 63 family
++vtables with unsorted lists and runs one iteration: 28 lists sorted, 0
++refused; with the old check it prints the server's `lists=1 ...
++unknown/refused=61`. After deployment the server's log must read
++`lists=28 ... unknown/refused=0`.
++
+ ## Not covered yet
+ 
+ Order-sensitive consumers the lab world did not exercise (it has two vehicles
+diff --git a/docs/re/linux/DEV_0115785C.md b/docs/re/linux/DEV_0115785C.md
+index 8c5b1df..9f60cf8 100644
+--- a/docs/re/linux/DEV_0115785C.md
++++ b/docs/re/linux/DEV_0115785C.md
+@@ -47,6 +47,12 @@ The installer checks all seven sites before patching and rolls back on failure.
+   family+8. No-list getter `0xa914e0`: `f3 0f 1e fa 31 c0 c3`, returns null.
+   Both byte strings are checked at installation. Unknown getters are refused;
+   no foreign virtual function is called by the canonicalizer.
++  **Correction (2026-09-23):** these are only the PersonCapacity and
++  VehicleOrder copies. GCC emits one getter per family (28 + 35 in this
++  build), so this check left 27 of 28 node lists unsorted in production
++  (`lists=1 ... unknown/refused=61`). The canon now uses the complete
++  inventory in `family_getters_linux.h`; see HOTJOIN_ORDER.md, "Native: GCC
++  keeps one GetNodeList per family".
+ - NodeList vtable address points are `0x59ac260 + 0x20*(N-1)`, N=1..5.
+   RTTI at vptr-8 names type_info at `0x5a032e0 + 0x18*(N-1)`; its name
+   points to `0x3f9ee60 + 0x20*(N-1)`, `N3ecs8NodeListILiNEEE` (N substituted).
+diff --git a/native/linux/CMakeLists.txt b/native/linux/CMakeLists.txt
+index 3331de4..8d9e3f8 100644
+--- a/native/linux/CMakeLists.txt
++++ b/native/linux/CMakeLists.txt
+@@ -32,7 +32,7 @@ set_source_files_properties(src/windows_ucrt_math_linux.cpp PROPERTIES COMPILE_O
+ add_library(tpf2mp_boot SHARED src/boot.cpp src/lua_fixed_format_linux.cpp
+             src/destination_rng_linux.cpp src/windows_uniform_int_linux.cpp
+             src/windows_person_seed_linux.cpp src/windows_person_cost_linux.cpp
+-            src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
++            src/person_cost_linux.cpp src/float_rng_linux.cpp src/town_seed_linux.cpp src/town_trace_linux.cpp src/sim_seed_linux.cpp src/engine_parity_linux.cpp src/windows_msvc_random_linux.cpp
+             src/libm_parity_linux.cpp src/windows_ucrt_math_linux.cpp
+             src/tree_rng_linux.cpp src/animal_rng_linux.cpp src/building_order_linux.cpp
+             src/resident_hash_linux.cpp src/order_canon_linux.cpp src/person_map_order_linux.cpp
+@@ -171,7 +171,7 @@ if(BUILD_TESTING)
+   target_include_directories(test_float_rng PRIVATE src)
+   target_compile_options(test_float_rng PRIVATE -UNDEBUG)
+   add_test(NAME float_rng COMMAND test_float_rng)
+-  add_executable(test_town_seed tests/town_seed_test.cpp src/windows_person_seed_linux.cpp src/hook_posix.cpp)
++  add_executable(test_town_seed tests/town_seed_test.cpp src/windows_person_seed_linux.cpp src/town_trace_linux.cpp src/hook_posix.cpp)
+   target_include_directories(test_town_seed PRIVATE ../src src)
+   target_compile_options(test_town_seed PRIVATE -UNDEBUG)
+   add_test(NAME town_seed COMMAND test_town_seed)
+@@ -209,11 +209,16 @@ if(BUILD_TESTING)
+   target_compile_options(test_resident_hash PRIVATE -UNDEBUG)
+   target_link_libraries(test_resident_hash PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+   add_test(NAME resident_hash COMMAND test_resident_hash $<TARGET_FILE:slice_test_foreign>)
+-  add_executable(test_order_canon tests/order_canon_test.cpp src/hook_posix.cpp)
++  add_executable(test_order_canon tests/order_canon_test.cpp src/town_trace_linux.cpp src/hook_posix.cpp)
+   target_include_directories(test_order_canon PRIVATE ../src src)
+   target_compile_options(test_order_canon PRIVATE -UNDEBUG -fno-omit-frame-pointer)
+   target_link_libraries(test_order_canon PRIVATE Threads::Threads)
+   add_test(NAME order_canon COMMAND test_order_canon)
++  add_executable(test_town_trace tests/town_trace_test.cpp src/town_trace_linux.cpp)
++  target_include_directories(test_town_trace PRIVATE ../src src)
++  target_compile_options(test_town_trace PRIVATE -UNDEBUG)
++  target_link_libraries(test_town_trace PRIVATE Threads::Threads)
++  add_test(NAME town_trace COMMAND test_town_trace)
+   add_executable(test_family_canon ../../tools/family_canon_test.cpp)
+   add_test(NAME family_canon COMMAND test_family_canon)
+   add_executable(test_person_map_order tests/person_map_order_test.cpp src/hook_posix.cpp)
+diff --git a/native/linux/src/boot.cpp b/native/linux/src/boot.cpp
+index a9bb0c2..4e0f37b 100644
+--- a/native/linux/src/boot.cpp
++++ b/native/linux/src/boot.cpp
+@@ -46,6 +46,7 @@
+ #include "order_canon_linux.h"
+ #include "network_person_order_linux.h"
+ #include "network_index_order_linux.h"
++#include "town_trace_linux.h"
+ 
+ // GNU build-id of the Steam Linux build 35924 (depot build 16719842). Logged
+ // against the running image; the libraries that patch code check it themselves.
+@@ -332,6 +333,16 @@ static void BootInit()
+     Tpf2mpInstallLibmParity(img.base, img.buildId.c_str());
+     Log("[boot] Windows UCRT float math: %s\n", Tpf2mpLibmParityStatus());
+ 
++    // Diagnostic, off unless TPF2MP_TOWN_TRACE=1: one line per town Develop
++    // call and per-600-iteration node-list digests, for diffing two peers.
++    {
++        char tracePath[4096];
++        const bool dir = Tpf2mpDataDirA(tracePath, sizeof(tracePath));
++        if (dir) strncat(tracePath, "tpf2_towntrace.txt", sizeof(tracePath) - strlen(tracePath) - 1);
++        Tpf2mpInstallTownTrace(img.base, img.buildId.c_str(), dir ? tracePath : nullptr);
++        Log("[boot] Town development trace: %s\n", Tpf2mpTownTraceStatus());
++    }
++
+     // dlopen from a constructor is safe with glibc (the loader lock is
+     // recursive), so unlike the Windows proxy there is no loader thread: the
+     // libraries' own constructors start their threads.
+diff --git a/native/linux/src/family_canon_linux.inl b/native/linux/src/family_canon_linux.inl
+index 1c58e72..f67d04d 100644
+--- a/native/linux/src/family_canon_linux.inl
++++ b/native/linux/src/family_canon_linux.inl
+@@ -58,7 +58,27 @@ static bool FamilyRange(uintptr_t at, size_t size, bool write = false)
+ }
+ static bool Readable(const void* p, size_t n) { return FamilyRange(reinterpret_cast<uintptr_t>(p), n); }
+ #include "../../src/family_canon.h"
++#include "family_getters_linux.h"
++#include "town_trace_linux.h"
++#include "../../src/town_trace.h"
+ static uintptr_t g_familyBase = 0;
++
++// GetNodeList (vtable slot 2) of a family, classified by the generated inventory.
++// MSVC folds every family's getter into one function; GCC keeps one copy per
++// family template (28 node-list copies, 35 no-list copies in build 35924), so a
++// single recognised address left 27 of the 28 node lists unsorted on the native
++// build while every Windows peer sorted all 28 (the server logged `lists=1 ...
++// unknown/refused=61`). Each address is verified byte for byte at install; none
++// is ever called.
++enum FamilyGetterKind { FG_UNKNOWN, FG_LIST, FG_NONE };
++static FamilyGetterKind FamilyGetter(uintptr_t get)
++{
++    if (!g_familyBase || get < g_familyBase) return FG_UNKNOWN;
++    const uintptr_t rva = get - g_familyBase;
++    for (uintptr_t g : kFamilyListGetters) if (g == rva) return FG_LIST;
++    for (uintptr_t g : kFamilyNoListGetters) if (g == rva) return FG_NONE;
++    return FG_UNKNOWN;
++}
+ static uint64_t g_familyUs = 0, g_familyMaxUs = 0;
+ 
+ static bool FamilyMappings()
+@@ -138,23 +158,36 @@ static void CanonFamilies(uintptr_t engine) noexcept
+             node=FamilyWord(node); ++walked;
+         }
+         if (node || walked != count) { ++c.refused; return; }
++        // Town trace (diagnostic, off by default): the lists as the systems will
++        // see them this iteration, one TF line per 600 TownSystem iterations.
++        int64_t traceTime = -1; int traceEngine = -1;
++        const bool trace = Tpf2mpTownTraceFamiliesDue(engine, &traceTime, &traceEngine);
++        static thread_local std::vector<uint64_t> traceTokens;
++        traceTokens.clear();
+         for (auto fam : families) {
+             if (!FamilyRange(fam,8)) { ++bad; continue; }
+             auto vft=FamilyWord(fam);
+             if (!FamilyRange(vft,24)) { ++bad; continue; }
+-            auto get=FamilyWord(vft+16);
+-            if (get==g_familyBase+0xa914e0) continue;
+-            if (get!=g_familyBase+0xa914c0) { ++bad; continue; }
++            const auto kind=FamilyGetter(FamilyWord(vft+16));
++            if (kind==FG_NONE) continue;
++            if (kind!=FG_LIST) { ++bad; continue; }
+             auto nl=fam+8;
+             if (!FamilyRange(nl,0x40)) { ++bad; continue; }
+             const auto v=FamilyWord(nl), first=g_familyBase+0x59ac260;
+             if (v<first || v>first+0x80 || (v-first)%0x20) { ++bad; continue; }
+             ++lists;
+             size_t m=0;
+-            auto result=CanonFamilyList(nl,8+4*((v-first)/0x20),scratch,&m);
++            const size_t stride=8+4*((v-first)/0x20);
++            auto result=CanonFamilyList(nl,stride,scratch,&m);
+             if (result==FC_REFUSED) ++bad;
+             else if (result==FC_REORDERED) { ++changed; moved+=m; }
++            if (trace && result!=FC_REFUSED) {
++                const uintptr_t b=FamilyWord(nl+8), e=FamilyWord(nl+16);
++                const size_t n=b&&e>b?(e-b)/stride:0;
++                traceTokens.push_back((uint64_t(n)<<32)|TownTraceListDigest(reinterpret_cast<const uint8_t*>(b),n,stride));
++            }
+         }
++        if (trace) Tpf2mpTownTraceFamilies(traceTime,traceEngine,traceTokens.data(),traceTokens.size());
+     } catch (...) { ++bad; } // Allocation failure cannot unwind through the assembly relay.
+     if (changed) ++c.reordered;
+     if (bad) ++c.refused;
+diff --git a/native/linux/src/family_getters_linux.h b/native/linux/src/family_getters_linux.h
+new file mode 100644
+index 0000000..63d955c
+--- /dev/null
++++ b/native/linux/src/family_getters_linux.h
+@@ -0,0 +1,85 @@
++// GENERATED by tools/linux/gen_family_getters.py from the build-35924 ELF
++// (GNU build-id 3a0e156390b0e6f1e372051c24802c8493ae454a). Do not edit by hand.
++//
++// Every ECS family GetNodeList implementation (vtable slot 2). GCC keeps one
++// copy per family template instantiation where MSVC folds them into one, so
++// the native family canon must recognise each copy. Install verifies every
++// entry byte for byte; the canon calls none of them.
++#pragma once
++#include <cstdint>
++
++// `endbr64; lea rax,[rdi+8]; ret` -- the family holds a node list at +8.
++static constexpr uintptr_t kFamilyListGetters[] = {
++    0xa914c0,  // vtable 0x59ad080 N3ecs21ComponentGroupFamily1INS_9component14PersonCapacityEEE
++    0xa914d0,  // vtable 0x59ad040 N3ecs21ComponentGroupFamily1INS_9component8ScaffoldEEE
++    0xa91510,  // vtable 0x59acfc0 N3ecs21ComponentGroupFamily5INS_9component11RoadVehicleENS1_8MovePathENS1_17ModelInstanceListENS1_14BoundingVolumeENS1_12VehicleOrderEEE
++    0xa91580,  // vtable 0x59acf00 N3ecs21ComponentGroupFamily1INS_9component8BaseEdgeEEE
++    0xa91590,  // vtable 0x59acec0 N3ecs21ComponentGroupFamily1INS_9component14TownConnectionEEE
++    0xa91600,  // vtable 0x59ace00 N3ecs21ComponentGroupFamily1INS_9component9StockListEEE
++    0xa916d0,  // vtable 0x59accc0 N3ecs21ComponentGroupFamily1INS_9component16SimEntityAtStockEEE
++    0xa916e0,  // vtable 0x59acc80 N3ecs21ComponentGroupFamily1INS_9component19SimEntityAtBuildingEEE
++    0xa916f0,  // vtable 0x59acc40 N3ecs21ComponentGroupFamily1INS_9component11SimBuildingEEE
++    0xa917c0,  // vtable 0x59acb00 N3ecs21ComponentGroupFamily1INS_9component12TownBuildingEEE
++    0xa917d0,  // vtable 0x59acac0 N3ecs21ComponentGroupFamily1INS_9component4TownEEE
++    0xa91840,  // vtable 0x59aca00 N3ecs21ComponentGroupFamily4INS_9component11ModelPersonENS1_17ModelInstanceListENS1_14BoundingVolumeENS1_12VehicleOrderEEE
++    0xa91850,  // vtable 0x59ac9c0 N3ecs21ComponentGroupFamily4INS_9component4ShipENS1_16MovePathAircraftENS1_17ModelInstanceListENS1_14BoundingVolumeEEE
++    0xa91860,  // vtable 0x59ac980 N3ecs21ComponentGroupFamily4INS_9component8AircraftENS1_16MovePathAircraftENS1_17ModelInstanceListENS1_14BoundingVolumeEEE
++    0xa91870,  // vtable 0x59ac940 N3ecs21ComponentGroupFamily2INS_9component5TrainENS1_8MovePathEEE
++    0xa91880,  // vtable 0x59ac900 N3ecs21ComponentGroupFamily5INS_9component4TramENS1_8MovePathENS1_17ModelInstanceListENS1_14BoundingVolumeENS1_12VehicleOrderEEE
++    0xa91890,  // vtable 0x59ac8c0 N3ecs21ComponentGroupFamily4INS_9component11RoadVehicleENS1_8MovePathENS1_17ModelInstanceListENS1_14BoundingVolumeEEE
++    0xa918a0,  // vtable 0x59ac880 N3ecs21ComponentGroupFamily1INS_9component16TransportVehicleEEE
++    0xa918e0,  // vtable 0x59ac800 N3ecs21ComponentGroupFamily1INS_9component12StationGroupEEE
++    0xa918f0,  // vtable 0x59ac7c0 N3ecs21ComponentGroupFamily1INS_9component7StationEEE
++    0xa91900,  // vtable 0x59ac780 N3ecs21ComponentGroupFamily1INS_9component7AccountEEE
++    0xa91910,  // vtable 0x59ac740 N3ecs21ComponentGroupFamily1INS_9component12VehicleDepotEEE
++    0xa91920,  // vtable 0x59ac700 N3ecs21ComponentGroupFamily1INS_9component10SignalListEEE
++    0xa91930,  // vtable 0x59ac6c0 N3ecs21ComponentGroupFamily1INS_9component16RailroadCrossingEEE
++    0xa91940,  // vtable 0x59ac680 N3ecs21ComponentGroupFamily2INS_9component20BaseNodeTrafficLightENS1_17ModelInstanceListEEE
++    0xa91980,  // vtable 0x59ac600 N3ecs21ComponentGroupFamily1INS_9component16TransportNetworkEEE
++    0xa91990,  // vtable 0x59ac5c0 N3ecs21ComponentGroupFamily3INS_9component6AnimalENS1_17ModelInstanceListENS1_14BoundingVolumeEEE
++    0xa919a0,  // vtable 0x59ac580 N3ecs21ComponentGroupFamily1INS_9component12ConstructionEEE
++};
++
++// `endbr64; xor eax,eax; ret` -- the family has no node list.
++static constexpr uintptr_t kFamilyNoListGetters[] = {
++    0xa90720,  // vtable 0x59ac220 N3ecs23AllEntitiesFamilyNoListE
++    0xa91370,  // vtable 0x59ad240 N3ecs27ComponentGroupFamilyNoList1INS_9component14ParticleSystemEEE
++    0xa913a0,  // vtable 0x59ad200 N3ecs27ComponentGroupFamilyNoList2INS_9component8GameTimeENS1_9GameSpeedEEE
++    0xa913d0,  // vtable 0x59ad1c0 N3ecs27ComponentGroupFamilyNoList1INS_9component12EmissionGridEEE
++    0xa91400,  // vtable 0x59ad180 N3ecs27ComponentGroupFamilyNoList2INS_9component11TerrainTileENS1_20TerrainTileHeightmapEEE
++    0xa91430,  // vtable 0x59ad140 N3ecs27ComponentGroupFamilyNoList2INS_9component11TerrainTileENS1_16TerrainTileBrushEEE
++    0xa91460,  // vtable 0x59ad100 N3ecs27ComponentGroupFamilyNoList1INS_9component7TerrainEEE
++    0xa91490,  // vtable 0x59ad0c0 N3ecs27ComponentGroupFamilyNoList1INS_9component16TransportHistoryEEE
++    0xa914e0,  // vtable 0x59ad000 N3ecs27ComponentGroupFamilyNoList1INS_9component12VehicleOrderEEE
++    0xa91520,  // vtable 0x59acf80 N3ecs29OrComponentGroupFamilyNoList2INS_9component7StationENS1_12VehicleDepotEEE
++    0xa91550,  // vtable 0x59acf40 N3ecs27ComponentGroupFamilyNoList1INS_9component16MovePathAircraftEEE
++    0xa915a0,  // vtable 0x59ace80 N3ecs27ComponentGroupFamilyNoList1INS_9component10RunwayListEEE
++    0xa915d0,  // vtable 0x59ace40 N3ecs27ComponentGroupFamilyNoList1INS_9component4NameEEE
++    0xa91610,  // vtable 0x59acdc0 N3ecs27ComponentGroupFamilyNoList1INS_9component13SimEntityIdleEEE
++    0xa91640,  // vtable 0x59acd80 N3ecs27ComponentGroupFamilyNoList1INS_9component18SimPersonAtVehicleEEE
++    0xa91670,  // vtable 0x59acd40 N3ecs27ComponentGroupFamilyNoList1INS_9component18SimEntityAtVehicleEEE
++    0xa916a0,  // vtable 0x59acd00 N3ecs27ComponentGroupFamilyNoList1INS_9component19SimEntityAtTerminalEEE
++    0xa91700,  // vtable 0x59acc00 N3ecs27ComponentGroupFamilyNoList1INS_9component18SimCargoAtTerminalEEE
++    0xa91730,  // vtable 0x59acbc0 N3ecs27ComponentGroupFamilyNoList1INS_9component19SimPersonAtTerminalEEE
++    0xa91760,  // vtable 0x59acb80 N3ecs27ComponentGroupFamilyNoList1INS_9component9SimPersonEEE
++    0xa91790,  // vtable 0x59acb40 N3ecs27ComponentGroupFamilyNoList1INS_9component8SimCargoEEE
++    0xa917e0,  // vtable 0x59aca80 N3ecs27ComponentGroupFamilyNoList1INS_9component20TerrainAlignmentListEEE
++    0xa91810,  // vtable 0x59aca40 N3ecs27ComponentGroupFamilyNoList1INS_9component6ParcelEEE
++    0xa918b0,  // vtable 0x59ac840 N3ecs27ComponentGroupFamilyNoList1INS_9component4LineEEE
++    0xa91950,  // vtable 0x59ac640 N3ecs27ComponentGroupFamilyNoList1INS_9component9TpNetLinkEEE
++    0xa919b0,  // vtable 0x59ac540 N3ecs27ComponentGroupFamilyNoList1INS_9component17BaseParallelStripEEE
++    0xa919e0,  // vtable 0x59ac500 N3ecs29OrComponentGroupFamilyNoList2INS_9component7StationENS1_16TransportNetworkEEE
++    0xa91a10,  // vtable 0x59ac4c0 N3ecs29OrComponentGroupFamilyNoList2INS_9component8BaseNodeENS1_8BaseEdgeEEE
++    0xa91a40,  // vtable 0x59ac480 N3ecs27ComponentGroupFamilyNoList2INS_9component14BoundingVolumeENS1_6AnimalEEE
++    0xa91a70,  // vtable 0x59ac440 N3ecs27ComponentGroupFamilyNoList2INS_9component14BoundingVolumeENS1_17ModelInstanceListEEE
++    0xa91aa0,  // vtable 0x59ac400 N3ecs27ComponentGroupFamilyNoList2INS_9component14BoundingVolumeENS1_7LotListEEE
++    0xa91ad0,  // vtable 0x59ac3c0 N3ecs27ComponentGroupFamilyNoList1INS_9component9WaterMeshEEE
++    0xa91b00,  // vtable 0x59ac380 N3ecs27ComponentGroupFamilyNoList1INS_9component9ShapeListEEE
++    0xa91b30,  // vtable 0x59ac340 N3ecs27ComponentGroupFamilyNoList1INS_9component17ModelInstanceListEEE
++    0xa91b60,  // vtable 0x59ac300 N3ecs27ComponentGroupFamilyNoList1INS_9component14BoundingVolumeEEE
++};
++
++static constexpr unsigned kFamilyListGetterCount = 28;
++static constexpr unsigned kFamilyNoListGetterCount = 35;
++static_assert(sizeof(kFamilyListGetters) / sizeof(kFamilyListGetters[0]) == kFamilyListGetterCount);
++static_assert(sizeof(kFamilyNoListGetters) / sizeof(kFamilyNoListGetters[0]) == kFamilyNoListGetterCount);
+diff --git a/native/linux/src/order_canon_linux.cpp b/native/linux/src/order_canon_linux.cpp
+index 53c8323..c5695c1 100644
+--- a/native/linux/src/order_canon_linux.cpp
++++ b/native/linux/src/order_canon_linux.cpp
+@@ -1,4 +1,7 @@
+ #include "order_canon_linux.h"
++#include "family_getters_linux.h"
++#include "town_trace_linux.h"
++#include "../../src/town_trace.h"
+ #include "hook.h"
+ #include "codewrite_linux.h"
+ #include <algorithm>
+@@ -259,13 +262,18 @@ static bool InstallOrderCanon(uintptr_t base, const char* buildId, bool (*instal
+         if (std::memcmp(reinterpret_cast<const void*>(base + site.rva), site.bytes, sizeof(site.bytes))) {
+             g_canonStatus.store("off (unverified site bytes)"); return false;
+         }
+-    // GetNodeList's recognized implementations are part of the layout guard.
++    // GetNodeList's recognized implementations are part of the layout guard:
++    // every one of the 63 in family_getters_linux.h, byte for byte.
+     const unsigned char getList[] = {0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
+     const unsigned char noList[] = {0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
+-    if (std::memcmp((void*)(base+0xa914c0),getList,sizeof(getList)) ||
+-        std::memcmp((void*)(base+0xa914e0),noList,sizeof(noList))) {
+-        g_canonStatus.store("off (unverified family accessors)"); return false;
+-    }
++    for (uintptr_t rva : kFamilyListGetters)
++        if (std::memcmp((void*)(base+rva),getList,sizeof(getList))) {
++            g_canonStatus.store("off (unverified family accessors)"); return false;
++        }
++    for (uintptr_t rva : kFamilyNoListGetters)
++        if (std::memcmp((void*)(base+rva),noList,sizeof(noList))) {
++            g_canonStatus.store("off (unverified family accessors)"); return false;
++        }
+     g_familyBase = base;
+     unsigned installed = 0;
+     for (unsigned i = 0; i < kCanonSiteCount; ++i) {
+diff --git a/native/linux/src/town_seed_linux.cpp b/native/linux/src/town_seed_linux.cpp
+index 5473801..d9bbccb 100644
+--- a/native/linux/src/town_seed_linux.cpp
++++ b/native/linux/src/town_seed_linux.cpp
+@@ -1,4 +1,5 @@
+ #include "town_seed_linux.h"
++#include "town_trace_linux.h"
+ #include "windows_person_seed_linux.h"
+ #include "hook.h"
+ #include <cstddef>
+@@ -54,12 +55,15 @@ static_assert(offsetof(TownRegisters, rdx) == 96);
+ const char* g_townStatus = "off (not initialized)";
+ bool g_townInstalled = false;
+ 
++// Invert native identity hash-combine(tag21,time) modulo 2^32.
++// GetTime's int32 bits survive exactly; do not read the clock again.
++uint32_t TownTimeOf(uint32_t nativeSeed)
++{
++    return (nativeSeed ^ UINT32_C(0x9e3779ce)) - UINT32_C(0x53a3cbac);
++}
+ uint32_t WindowsTownSeed(uint32_t nativeSeed)
+ {
+-    // Invert native identity hash-combine(tag21,time) modulo 2^32.
+-    // GetTime's int32 bits survive exactly; do not read the clock again.
+-    const uint32_t time = (nativeSeed ^ UINT32_C(0x9e3779ce)) - UINT32_C(0x53a3cbac);
+-    return Tpf2mpWindowsTimeSeed(21, time);
++    return Tpf2mpWindowsTimeSeed(21, TownTimeOf(nativeSeed));
+ }
+ }
+ 
+@@ -71,8 +75,16 @@ extern "C" __attribute__((visibility("hidden"), noinline))
+ void Tpf2mpTownSeedDispatch(TownRegisters* registers)
+ {
+     // Preserve all upper bits too: only the four-byte seed store is changed.
++    const uint32_t nativeSeed = uint32_t(registers->rdx);
+     registers->rdx = (registers->rdx & UINT64_C(0xffffffff00000000))
+-        | WindowsTownSeed(uint32_t(registers->rdx));
++        | WindowsTownSeed(nativeSeed);
++    // The town trace (diagnostic, off by default) takes the tick's clock and the
++    // update's context ([rbp-0xbf8], the TownSystem update's first argument) here.
++    if (tpf2mp_town_trace::on.load(std::memory_order_relaxed)) {
++        uintptr_t context = 0;
++        std::memcpy(&context, reinterpret_cast<const void*>(registers->rbp - 0xbf8), sizeof(context));
++        Tpf2mpTownTraceTick(TownTimeOf(nativeSeed), context);
++    }
+ }
+ 
+ namespace {
+diff --git a/native/linux/src/town_trace_linux.cpp b/native/linux/src/town_trace_linux.cpp
+new file mode 100644
+index 0000000..a662700
+--- /dev/null
++++ b/native/linux/src/town_trace_linux.cpp
+@@ -0,0 +1,160 @@
++// Town development trace, native build 35924 (see town_trace_linux.h and
++// native/src/town_trace.h). Diagnostic only; off unless TPF2MP_TOWN_TRACE=1.
++#include "town_trace_linux.h"
++#include "near_alloc.h"
++#include "../../src/town_trace.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++namespace {
++constexpr char kTraceBuildId[] = "3a0e156390b0e6f1e372051c24802c8493ae454a";
++constexpr uintptr_t kDevelopRva = 0x14f5b80;      // TownDeveloper::Develop
++constexpr uintptr_t kCallRva = 0x1747917;         // its call in the TownSystem update 0x1746790
++constexpr uintptr_t kGuardRva = 0x17478d8;
++// The argument setup and the call (this = [ctx+0x40], rsi = engine, edx = town,
++// ecx = false, r8 = &mt, r9 = std::optional<float>, pushed IProgressMonitor* 0).
++constexpr unsigned char kGuard[] = {
++    0x48,0x8b,0x85,0x08,0xf4,0xff,0xff,                    // mov rax,[rbp-0xbf8]
++    0x48,0x83,0xec,0x08,                                   // sub rsp,8
++    0x31,0xc9,                                             // xor ecx,ecx
++    0x44,0x89,0xea,                                        // mov edx,r13d
++    0x48,0xbe,0xff,0xff,0xff,0xff,0x00,0xff,0xff,0xff,     // movabs rsi,0xffffff00ffffffff
++    0x48,0x21,0xb5,0xc8,0xf3,0xff,0xff,                    // and [rbp-0xc38],rsi
++    0x4c,0x8b,0x85,0xa8,0xf3,0xff,0xff,                    // mov r8,[rbp-0xc58]
++    0x48,0x8b,0x78,0x40,                                   // mov rdi,[rax+0x40]
++    0x48,0x8b,0x85,0xc8,0xf3,0xff,0xff,                    // mov rax,[rbp-0xc38]
++    0x6a,0x00,                                             // push 0
++    0x48,0x8b,0xb5,0x18,0xf4,0xff,0xff,                    // mov rsi,[rbp-0xbe8]
++    0x49,0x89,0xc1,                                        // mov r9,rax
++    0xe8,0x64,0xe2,0xda,0xff,                              // call 0x14f5b80
++    0x58, 0x5a,                                            // pop rax; pop rdx
++};
++static_assert(kGuardRva + sizeof(kGuard) == 0x174791e);
++static_assert(kCallRva - kGuardRva == 0x3f);
++
++std::atomic<const char*> g_status{"off (not initialized)"};
++Tpf2mpTownDevelopFn g_original = nullptr;
++std::mutex g_mutex;                     // the file, the engine table, the TF windows
++FILE* g_file = nullptr;
++unsigned g_unflushed = 0;
++TownTraceEngines g_engines;
++int64_t g_familyWindow[4] = {-1, -1, -1, -1};
++std::atomic<int64_t> g_lastTime{-1};
++
++struct Tick {
++    int64_t time = -1;
++    uintptr_t begin = 0;
++    size_t count = 0;
++    uint32_t list = 0;
++    bool listOk = false;
++};
++thread_local Tick t_tick;
++
++void Write(const char* line, int len, bool flush)
++{
++    if (len <= 0) return;
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (!g_file) return;
++    fwrite(line, 1, size_t(len), g_file);
++    if (flush || ++g_unflushed >= 64) { fflush(g_file); g_unflushed = 0; }
++}
++}
++
++void Tpf2mpTownTraceTick(uint32_t time, uintptr_t context)
++{
++    if (!tpf2mp_town_trace::on.load(std::memory_order_relaxed)) return;
++    Tick tick;
++    tick.time = int32_t(time);
++    // context+8 -> the Town node vector {begin, end}; nodes are {entity, index}.
++    uintptr_t vec = 0, b = 0, e = 0;
++    if (context) std::memcpy(&vec, reinterpret_cast<const void*>(context + 8), 8);
++    if (vec) { std::memcpy(&b, reinterpret_cast<const void*>(vec), 8); std::memcpy(&e, reinterpret_cast<const void*>(vec + 8), 8); }
++    if (b && e >= b && !((e - b) % 8) && (e - b) / 8 < (size_t(1) << 20)) {
++        tick.begin = b; tick.count = (e - b) / 8;
++        tick.list = TownTraceListDigest(reinterpret_cast<const uint8_t*>(b), tick.count, 8);
++        tick.listOk = true;
++    }
++    t_tick = tick;
++    g_lastTime.store(tick.time, std::memory_order_relaxed);
++}
++
++void Tpf2mpTownTraceDevelop(void* self, void* engine, uint32_t town, bool flag, void* mt, uint64_t opt, void* progress)
++{
++    TownTraceDevelop d{};
++    d.time = t_tick.time;
++    d.town = int32_t(town);
++    d.index = -1; d.count = -1;
++    if (t_tick.listOk) {
++        d.count = int(t_tick.count);
++        d.list = t_tick.list;
++        d.index = TownTraceIndexOf(reinterpret_cast<const uint8_t*>(t_tick.begin), t_tick.count, 8, int32_t(town));
++    }
++    d.mt0 = mt ? TownTraceFnv64(mt, TOWN_TRACE_MT_BYTES) : 0;
++    g_original(self, engine, town, flag, mt, opt, progress);
++    d.mt1 = mt ? TownTraceFnv64(mt, TOWN_TRACE_MT_BYTES) : 0;
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        d.engine = g_engines.IndexOf(reinterpret_cast<uintptr_t>(engine));
++    }
++    char line[256];
++    Write(line, TownTraceFormatTT(line, sizeof(line), d), false);
++}
++
++bool Tpf2mpTownTraceFamiliesDue(uintptr_t engine, int64_t* time, int* engineIndex)
++{
++    if (!tpf2mp_town_trace::on.load(std::memory_order_relaxed)) return false;
++    std::lock_guard<std::mutex> lock(g_mutex);
++    *time = g_lastTime.load(std::memory_order_relaxed);
++    *engineIndex = g_engines.IndexOf(engine);
++    return TownTraceFamiliesDue(*time, *engineIndex, g_familyWindow, 4);
++}
++
++void Tpf2mpTownTraceFamilies(int64_t time, int engineIndex, uint64_t* tokens, size_t count)
++{
++    char line[2048];
++    Write(line, TownTraceFormatTF(line, sizeof(line), time, engineIndex, tokens, count), true);
++}
++
++void Tpf2mpTownTraceSetOriginal(Tpf2mpTownDevelopFn original) { g_original = original; }
++void Tpf2mpTownTraceFlush() { std::lock_guard<std::mutex> lock(g_mutex); if (g_file) fflush(g_file); }
++void Tpf2mpTownTraceOpenForTest(const char* path)
++{
++    std::lock_guard<std::mutex> lock(g_mutex);
++    if (g_file) fclose(g_file);
++    g_file = fopen(path, "w");
++    g_engines = TownTraceEngines{};
++    for (auto& w : g_familyWindow) w = -1;
++    tpf2mp_town_trace::on.store(g_file != nullptr);
++}
++
++bool Tpf2mpInstallTownTrace(uintptr_t base, const char* buildId, const char* path)
++{
++    const char* env = std::getenv("TPF2MP_TOWN_TRACE");
++    if (!env || std::strcmp(env, "1")) { g_status.store("off (set TPF2MP_TOWN_TRACE=1 to trace town development)"); return false; }
++    if (tpf2mp_town_trace::on.load()) { g_status.store("enabled (already installed)"); return false; }
++    if (!base || !buildId || std::strcmp(buildId, kTraceBuildId)) { g_status.store("off (unverified image)"); return false; }
++    if (std::memcmp(reinterpret_cast<const void*>(base + kGuardRva), kGuard, sizeof(kGuard))) {
++        g_status.store("off (unverified TownSystem Develop call)"); return false;
++    }
++    FILE* f = path ? fopen(path, "a") : nullptr;
++    if (!f) { g_status.store("off (trace file not writable)"); return false; }
++    {
++        std::lock_guard<std::mutex> lock(g_mutex);
++        g_file = f;
++        fprintf(g_file, "# town trace, native build 35924, format 1\n");
++        fflush(g_file);
++    }
++    g_original = reinterpret_cast<Tpf2mpTownDevelopFn>(base + kDevelopRva);
++    tpf2mp_town_trace::on.store(true);
++    if (!Tpf2mpRedirectCall(base + kCallRva, base + kDevelopRva, reinterpret_cast<void*>(&Tpf2mpTownTraceDevelop))) {
++        tpf2mp_town_trace::on.store(false);
++        g_status.store("off (Develop call not redirected; unchanged)");
++        return false;
++    }
++    g_status.store("enabled (TT per Develop call, TF per 600 iterations)");
++    return true;
++}
++
++const char* Tpf2mpTownTraceStatus() { return g_status.load(); }
+diff --git a/native/linux/src/town_trace_linux.h b/native/linux/src/town_trace_linux.h
+new file mode 100644
+index 0000000..a7de17e
+--- /dev/null
++++ b/native/linux/src/town_trace_linux.h
+@@ -0,0 +1,29 @@
++#pragma once
++#include <cstdint>
++#include <cstddef>
++#include <atomic>
++// Town development trace (native build 35924). A diagnostic, OFF by default:
++// TPF2MP_TOWN_TRACE=1 installs it, anything else leaves the game untouched
++// (no hook, no file). Line format and meaning: native/src/town_trace.h; the
++// Windows slice writes the same lines (towntrace=1 in tpf2_slice.cfg), and
++// tools/town_trace_diff.py names the first line two peers disagree on.
++//
++// Sites: the TownSystem update's `call TownDeveloper::Develop` (0x1747917) is
++// pointed at a logging wrapper; the tick's clock and the update's context come
++// from the town seed hook (town_seed_linux.cpp), and the node-list digests
++// from the per-iteration family sort (family_canon_linux.inl).
++namespace tpf2mp_town_trace { inline std::atomic<bool> on{false}; }
++bool Tpf2mpInstallTownTrace(uintptr_t imageBase, const char* buildId, const char* path);
++const char* Tpf2mpTownTraceStatus();
++// TownSystem update, before its generator is seeded: the tick's GameTime+0x34
++// and the update's context (context+8 -> the Town node vector).
++void Tpf2mpTownTraceTick(uint32_t time, uintptr_t context);
++// Per-iteration family sort: whether this engine owes a TF line now, and the line.
++bool Tpf2mpTownTraceFamiliesDue(uintptr_t engine, int64_t* time, int* engineIndex);
++void Tpf2mpTownTraceFamilies(int64_t time, int engineIndex, uint64_t* tokens, size_t count);
++// Test seam: the Develop wrapper with an explicit original.
++using Tpf2mpTownDevelopFn = void (*)(void*, void*, uint32_t, bool, void*, uint64_t, void*);
++void Tpf2mpTownTraceSetOriginal(Tpf2mpTownDevelopFn original);
++void Tpf2mpTownTraceDevelop(void* self, void* engine, uint32_t town, bool flag, void* mt, uint64_t opt, void* progress);
++void Tpf2mpTownTraceOpenForTest(const char* path);
++void Tpf2mpTownTraceFlush();
+diff --git a/native/linux/tests/family_canon_elf_test.cpp b/native/linux/tests/family_canon_elf_test.cpp
+new file mode 100644
+index 0000000..5c932d0
+--- /dev/null
++++ b/native/linux/tests/family_canon_elf_test.cpp
+@@ -0,0 +1,159 @@
++// Manual check against the REAL build-35924 ELF (not a CTest: it needs the
++// game file).  test_family_canon_elf /path/to/TransportFever2
++//
++// Maps the ELF's PT_LOADs at a fresh base, applies its R_X86_64_RELATIVE
++// relocations (so the family vtables hold real function addresses), installs
++// the order canon and the town trace as boot.cpp does, then builds an engine
++// whose 63 families use the binary's OWN 63 family vtables -- every
++// ComponentGroupFamily<...> the game instantiates -- each with an unsorted node
++// list, and runs one per-iteration family sort. Before the getter inventory
++// the sort recognised 1 of the 28 node lists (the live server's
++// `lists=1 ... unknown/refused=61`); it must now sort all 28 and refuse none.
++// Nothing in the mapped image is executed.
++#include "../src/order_canon_linux.cpp"
++#include <elf.h>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#include <cassert>
++#include <array>
++#include <cstdarg>
++#include <cstdio>
++#include <string>
++#include <vector>
++
++static std::string g_logged;
++static void CaptureLog(const char* fmt, ...)
++{
++    char b[1024]; va_list ap; va_start(ap, fmt); vsnprintf(b, sizeof(b), fmt, ap); va_end(ap);
++    g_logged += b;
++}
++
++int main(int argc, char** argv)
++{
++    if (argc < 2) { fprintf(stderr, "usage: %s GAME_ELF\n", argv[0]); return 2; }
++    const int fd = open(argv[1], O_RDONLY);
++    if (fd < 0) { perror("open"); return 2; }
++    Elf64_Ehdr eh; assert(pread(fd, &eh, sizeof eh, 0) == sizeof eh);
++    std::vector<Elf64_Phdr> ph(eh.e_phnum);
++    assert(pread(fd, ph.data(), sizeof(Elf64_Phdr) * eh.e_phnum, eh.e_phoff) == ssize_t(sizeof(Elf64_Phdr) * eh.e_phnum));
++    uint64_t hi = 0; const Elf64_Phdr* dyn = nullptr;
++    for (auto& p : ph) {
++        if (p.p_type == PT_LOAD && p.p_vaddr + p.p_memsz > hi) hi = p.p_vaddr + p.p_memsz;
++        if (p.p_type == PT_DYNAMIC) dyn = &p;
++    }
++    hi = (hi + 0xfff) & ~0xfffull;
++    auto* image = static_cast<uint8_t*>(mmap(nullptr, hi, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    assert(image != MAP_FAILED && dyn);
++    for (auto& p : ph) if (p.p_type == PT_LOAD) assert(pread(fd, image + p.p_vaddr, p.p_filesz, p.p_offset) == ssize_t(p.p_filesz));
++    const uintptr_t base = reinterpret_cast<uintptr_t>(image);
++    // RELATIVE relocations: *(base+off) = base+addend.
++    uint64_t rela = 0, relasz = 0;
++    for (auto* d = reinterpret_cast<Elf64_Dyn*>(image + dyn->p_vaddr); d->d_tag != DT_NULL; ++d) {
++        if (d->d_tag == DT_RELA) rela = d->d_un.d_ptr;
++        if (d->d_tag == DT_RELASZ) relasz = d->d_un.d_val;
++    }
++    assert(rela && relasz);
++    std::vector<std::pair<uint64_t, uint64_t>> relative;
++    for (auto* r = reinterpret_cast<Elf64_Rela*>(image + rela); r < reinterpret_cast<Elf64_Rela*>(image + rela + relasz); ++r)
++        if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
++            const uint64_t v = base + r->r_addend;
++            memcpy(image + r->r_offset, &v, 8);
++            relative.emplace_back(r->r_offset, r->r_addend);
++        }
++    const char* id = "3a0e156390b0e6f1e372051c24802c8493ae454a";
++    // Install as boot.cpp does: the canon verifies all 63 getters in this image.
++    Tpf2mpOrderCanonSetLog(CaptureLog);
++    unsetenv("TPF2MP_ORDER_CANON");
++    const bool canon = Tpf2mpInstallOrderCanon(base, id);
++    printf("order canon: %s  %s\n", canon ? "OK  " : "FAIL", Tpf2mpOrderCanonStatus());
++    assert(canon);
++    char tracePath[] = "/tmp/family_canon_elf_traceXXXXXX";
++    const int tfd = mkstemp(tracePath); assert(tfd >= 0); close(tfd);
++    setenv("TPF2MP_TOWN_TRACE", "1", 1);
++    const bool trace = Tpf2mpInstallTownTrace(base, id, tracePath);
++    printf("town trace:  %s  %s\n", trace ? "OK  " : "FAIL", Tpf2mpTownTraceStatus());
++    assert(trace);
++    // The Develop call now reaches the wrapper through a near stub.
++    int32_t rel; memcpy(&rel, image + 0x1747918, 4);
++    const uint8_t* stub = image + 0x174791c + rel;
++    uintptr_t target; memcpy(&target, stub + 2, 8);
++    assert(image[0x1747917] == 0xe8 && target == reinterpret_cast<uintptr_t>(&Tpf2mpTownTraceDevelop));
++    unlink(tracePath);
++
++    // The binary's own family vtables: a vptr whose slot 2 is an inventoried getter.
++    struct Fam { uintptr_t vptr; bool list; };
++    std::vector<Fam> fams;
++    for (auto& [off, addend] : relative) {
++        (void)addend;
++        const uintptr_t vptr = base + off + 8;               // [off] = typeinfo, [off+8] = slot 0
++        if (off + 32 > hi) continue;
++        uintptr_t slot2; memcpy(&slot2, reinterpret_cast<void*>(vptr + 16), 8);
++        uintptr_t ti; memcpy(&ti, image + off, 8);
++        if (ti < base || ti >= base + hi) continue;
++        uintptr_t name; memcpy(&name, reinterpret_cast<void*>(ti + 8), 8);
++        if (name < base || name >= base + hi || strncmp(reinterpret_cast<const char*>(name), "N3ecs", 5) ||
++            !strstr(reinterpret_cast<const char*>(name), "Family") || !strcmp(reinterpret_cast<const char*>(name), "N3ecs7IFamilyE"))
++            continue;
++        // Classified by the getter's own code, independently of the inventory.
++        static const unsigned char getList[] = {0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
++        static const unsigned char noList[] = {0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
++        if (slot2 < base || slot2 + 16 > base + hi) continue;
++        const bool isList = !memcmp(reinterpret_cast<void*>(slot2), getList, sizeof(getList));
++        const bool isNone = !memcmp(reinterpret_cast<void*>(slot2), noList, sizeof(noList));
++        if (!isList && !isNone) continue;
++        fams.push_back({vptr, isList});
++    }
++    size_t nl = 0, nn = 0, legacy = 0;
++    for (auto& f : fams) {
++        (f.list ? nl : nn)++;
++        uintptr_t slot2; memcpy(&slot2, reinterpret_cast<void*>(f.vptr + 16), 8);
++        if (slot2 == base + 0xa914c0) ++legacy;
++    }
++    printf("family vtables in the image: %zu with a node list, %zu without; the single address the old canon knew covers %zu\n",
++           nl, nn, legacy);
++    assert(nl == 28 && nn == 35 && legacy == 1);
++    size_t inventoried = 0;
++    for (auto& f : fams) { uintptr_t g; memcpy(&g, reinterpret_cast<void*>(f.vptr + 16), 8); inventoried += FamilyGetter(g) == (f.list ? FG_LIST : FG_NONE); }
++    printf("of those, the canon's getter inventory recognises %zu\n", inventoried);
++
++    // An engine holding all 63, each list three nodes out of order (width 1).
++    struct Obj { uintptr_t words[9]; std::vector<int32_t> nodes; int8_t ctrl[8]; int32_t slots[16]; };
++    std::vector<Obj> objs(fams.size());
++    std::vector<std::array<uintptr_t, 3>> chain(fams.size());
++    for (size_t i = 0; i < fams.size(); ++i) {
++        auto& o = objs[i];
++        o.nodes = {int32_t(900 + i), 0, int32_t(100 + i), 1, int32_t(500 + i), 2};
++        const int8_t ctrl[] = {0, 1, 2, -128, -128, -128, -128, -128};
++        memcpy(o.ctrl, ctrl, sizeof(ctrl));
++        const int32_t slots[] = {int32_t(900 + i), 0, int32_t(100 + i), 1, int32_t(500 + i), 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
++        memcpy(o.slots, slots, sizeof(slots));
++        const uintptr_t nb = reinterpret_cast<uintptr_t>(o.nodes.data()), ne = nb + o.nodes.size() * 4;
++        const uintptr_t w[9] = {fams[i].vptr, base + 0x59ac260, nb, ne, ne,
++                                reinterpret_cast<uintptr_t>(o.ctrl), reinterpret_cast<uintptr_t>(o.slots), 3, 7};
++        memcpy(o.words, w, sizeof(w));
++        chain[i] = {i + 1 < fams.size() ? reinterpret_cast<uintptr_t>(chain[i + 1].data()) : 0, 0,
++                    reinterpret_cast<uintptr_t>(o.words)};
++    }
++    for (size_t i = 0; i + 1 < fams.size(); ++i) chain[i][0] = reinterpret_cast<uintptr_t>(chain[i + 1].data());
++    std::array<uintptr_t, 64> engine{};
++    engine[0x170 / 8] = reinterpret_cast<uintptr_t>(chain[0].data());
++    engine[0x178 / 8] = fams.size();
++    g_logged.clear();
++    CanonFamilies(reinterpret_cast<uintptr_t>(engine.data()));
++    printf("%s", g_logged.c_str());
++    size_t sorted = 0, untouched = 0;
++    for (size_t i = 0; i < fams.size(); ++i) {
++        const auto& n = objs[i].nodes;
++        const bool s = n[0] == int32_t(100 + i) && n[2] == int32_t(500 + i) && n[4] == int32_t(900 + i);
++        const bool u = n[0] == int32_t(900 + i) && n[2] == int32_t(100 + i) && n[4] == int32_t(500 + i);
++        assert(fams[i].list ? s : u);
++        sorted += s; untouched += u;
++    }
++    printf("one iteration: %zu node lists put in entity order, %zu no-list families left alone\n", sorted, untouched);
++    assert(sorted == 28 && untouched == 35);
++    assert(g_logged.find("families=63/63 lists=28 reordered=28") != std::string::npos);
++    assert(g_logged.find("unknown/refused=0") != std::string::npos);
++    printf("PASS: the real image's 63 families: 28 node lists sorted, 0 refused (was 1 sorted, 61 refused)\n");
++    return 0;
++}
+diff --git a/native/linux/tests/order_canon_test.cpp b/native/linux/tests/order_canon_test.cpp
+index 0a9c6b8..44e0c7b 100644
+--- a/native/linux/tests/order_canon_test.cpp
++++ b/native/linux/tests/order_canon_test.cpp
+@@ -112,7 +112,8 @@ static void Restore(uintptr_t base) {
+     g_canonReady=false;
+     const unsigned char get[]={0xf3,0x0f,0x1e,0xfa,0x48,0x8d,0x47,0x08,0xc3};
+     const unsigned char none[]={0xf3,0x0f,0x1e,0xfa,0x31,0xc0,0xc3};
+-    Write(base+0xa914c0,get,sizeof(get)); Write(base+0xa914e0,none,sizeof(none));
++    for(uintptr_t rva:kFamilyListGetters) Write(base+rva,get,sizeof(get));
++    for(uintptr_t rva:kFamilyNoListGetters) Write(base+rva,none,sizeof(none));
+     for(const auto& s:kCanonSites)Write(base+s.rva,s.bytes,sizeof(s.bytes));
+ }
+ struct Node { uintptr_t next; int32_t key; int32_t payload; };
+@@ -151,10 +152,69 @@ static void FreedIdTests() {
+     CanonSort(5,0,owner);
+     assert(g_canonCounters[5].reordered==reordered); // sorted batch stays put
+ }
++// One family, width n, keys 9,2,5: returns true when CanonFamilies put it in
++// entity order (and repaired the index), false when it left it untouched.
++static bool CanonOneFamily(uintptr_t base, uintptr_t getter, unsigned n) {
++    std::array<uintptr_t,80> engine{};
++    uintptr_t vtable[]={0,0,getter};
++    const size_t stride=n+1;
++    std::vector<int32_t> nodes(3*stride);
++    const int32_t keys[]={9,2,5};
++    for(size_t i=0;i<3;++i) {
++        nodes[i*stride]=keys[i];
++        for(size_t j=1;j<stride;++j) nodes[i*stride+j]=keys[i]*100+j;
++    }
++    int8_t ctrl[]={0,1,2,-128,-128,-128,-128};
++    int32_t slots[]={9,0,2,1,5,2,0,0,0,0,0,0,0,0};
++    uintptr_t family[]={reinterpret_cast<uintptr_t>(vtable),base+0x59ac260+0x20*(n-1),
++        reinterpret_cast<uintptr_t>(nodes.data()),reinterpret_cast<uintptr_t>(nodes.data()+nodes.size()),
++        reinterpret_cast<uintptr_t>(nodes.data()+nodes.size()),reinterpret_cast<uintptr_t>(ctrl),
++        reinterpret_cast<uintptr_t>(slots),3,7};
++    uintptr_t node[]={0,0,reinterpret_cast<uintptr_t>(family)};
++    engine[0x170/8]=reinterpret_cast<uintptr_t>(node); engine[0x178/8]=1;
++    const auto original=nodes;
++    CanonFamilies(reinterpret_cast<uintptr_t>(engine.data()));
++    if(nodes==original) { assert(slots[1]==0 && slots[3]==1 && slots[5]==2); return false; }
++    assert(nodes[0]==2 && nodes[stride]==5 && nodes[2*stride]==9);
++    for(size_t i=0;i<3;++i) for(size_t j=1;j<stride;++j)
++        assert(nodes[i*stride+j]==nodes[i*stride]*100+int(j));
++    assert(slots[1]==2 && slots[3]==0 && slots[5]==1);
++    return true;
++}
++// Every node-list getter of the inventory is recognised, not only the first one:
++// build 35924 has 28 distinct copies (GCC does not fold them as MSVC does), and
++// with only 0xa914c0 recognised the native server sorted 1 of 28 lists
++// (Town, TownBuilding, Construction, BaseEdge, ... stayed in history order).
++static void GetterInventoryTests(uintptr_t base) {
++    g_familyBase=base;
++    static_assert(kFamilyListGetterCount==28 && kFamilyNoListGetterCount==35);
++    for(uintptr_t rva:kFamilyListGetters)
++        for(unsigned n=1;n<=5;++n) {
++            const auto refused=g_canonCounters[6].refused.load();
++            assert(CanonOneFamily(base,base+rva,n));
++            assert(g_canonCounters[6].refused==refused);
++        }
++    // Town's family (0xa917d0) and TownBuilding's (0xa917c0) specifically: the
++    // town stagger (node index % 30) and the town building walk read them.
++    assert(FamilyGetter(base+0xa917d0)==FG_LIST && FamilyGetter(base+0xa917c0)==FG_LIST);
++    // A no-list family is skipped: not sorted, not counted as refused.
++    for(uintptr_t rva:kFamilyNoListGetters) {
++        const auto refused=g_canonCounters[6].refused.load();
++        assert(!CanonOneFamily(base,base+rva,1));
++        assert(g_canonCounters[6].refused==refused);
++    }
++    // Anything else is refused and left untouched: an unknown address, the
++    // middle of a known getter, a getter of another image.
++    for(uintptr_t get:{base+0xa914c4,base+0xa914c8,base+0x1234,uintptr_t(0xa914c0),uintptr_t(0)}) {
++        const auto refused=g_canonCounters[6].refused.load();
++        assert(!CanonOneFamily(base,get,1));
++        assert(g_canonCounters[6].refused==refused+1);
++    }
++}
+ static void FamilyTests(uintptr_t base) {
+     g_familyBase=base;
+     std::array<uintptr_t,80> engine{};
+-    uintptr_t vtable[]={0,0,base+0xa914c0};
++    uintptr_t vtable[]={0,0,base+0xa917d0};   // ecs::ComponentGroupFamily1<Town>
+     for(unsigned n=1;n<=5;++n) {
+         const size_t stride=n+1;
+         std::vector<int32_t> nodes(3*stride);
+@@ -255,11 +315,19 @@ int main() {
+         assert(!InstallOrderCanon(base,kCanonBuildId,FailHook));
+         for(const auto& s:kCanonSites)assert(!memcmp(reinterpret_cast<void*>(base+s.rva),s.bytes,16));
+     }
+-    for(auto accessor : {0xa914c0,0xa914e0}) {
+-        Restore(base); const unsigned char bad=0xcc; Write(base+accessor,&bad,1);
++    // Every inventoried getter is part of the install guard, not only the first two.
++    std::vector<uintptr_t> accessors(std::begin(kFamilyListGetters),std::end(kFamilyListGetters));
++    accessors.insert(accessors.end(),std::begin(kFamilyNoListGetters),std::end(kFamilyNoListGetters));
++    for(auto accessor : accessors) for(unsigned at : {0u,4u,6u}) {
++        Restore(base); unsigned char byte; memcpy(&byte,reinterpret_cast<void*>(base+accessor+at),1);
++        byte^=0x40; Write(base+accessor+at,&byte,1);
+         assert(!Tpf2mpInstallOrderCanon(base,kCanonBuildId));
++        assert(!strcmp(g_canonStatus.load(),"off (unverified family accessors)"));
++        for(const auto& s:kCanonSites)assert(!memcmp(reinterpret_cast<void*>(base+s.rva),s.bytes,16));
+     }
++    Restore(base);
+     FamilyTests(base);
++    GetterInventoryTests(base);
+     auto* code=static_cast<unsigned char*>(mmap(nullptr,4096,PROT_READ|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));assert(code!=MAP_FAILED);
+     std::mt19937_64 rng(35924);
+     for(unsigned site=0;site<kCanonSiteCount;++site)for(unsigned alignment=0;alignment<2;++alignment) {
+diff --git a/native/linux/tests/town_trace_test.cpp b/native/linux/tests/town_trace_test.cpp
+new file mode 100644
+index 0000000..211f38d
+--- /dev/null
++++ b/native/linux/tests/town_trace_test.cpp
+@@ -0,0 +1,178 @@
++// Town development trace: the shared formatting, the Develop wrapper, the
++// family lines, and the installer's refusals, in a private fake image.
++#include "../src/town_trace_linux.h"
++#include "../../src/town_trace.h"
++#include "../src/codewrite_linux.h"
++#include <cassert>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <sys/mman.h>
++#include <unistd.h>
++
++static std::string ReadAll(const char* path)
++{
++    std::string s;
++    if (FILE* f = fopen(path, "rb")) {
++        char b[4096]; size_t n;
++        while ((n = fread(b, 1, sizeof(b), f)) > 0) s.append(b, n);
++        fclose(f);
++    }
++    return s;
++}
++
++static void HeaderTests()
++{
++    // FNV-1a reference values.
++    assert(TownTraceFnv32("", 0) == 0x811c9dc5u);
++    assert(TownTraceFnv32("a", 1) == 0xe40c292cu);
++    assert(TownTraceFnv64("a", 1) == 0xaf63dc4c8601ec8cull);
++    // List digest covers the entity only, in order.
++    const int32_t a[] = {5, 100, 7, 200, 9, 300};
++    const int32_t b[] = {5, 111, 7, 222, 9, 333};
++    const int32_t c[] = {7, 200, 5, 100, 9, 300};
++    const auto* pa = reinterpret_cast<const uint8_t*>(a);
++    assert(TownTraceListDigest(pa, 3, 8) == TownTraceListDigest(reinterpret_cast<const uint8_t*>(b), 3, 8));
++    assert(TownTraceListDigest(pa, 3, 8) != TownTraceListDigest(reinterpret_cast<const uint8_t*>(c), 3, 8));
++    assert(TownTraceIndexOf(pa, 3, 8, 7) == 1 && TownTraceIndexOf(pa, 3, 8, 9) == 2 && TownTraceIndexOf(pa, 3, 8, 8) == -1);
++    // Engines by first appearance.
++    TownTraceEngines e;
++    assert(e.IndexOf(0x1000) == 0 && e.IndexOf(0x2000) == 1 && e.IndexOf(0x1000) == 0);
++    // TT format is fixed: tools/town_trace_diff.py parses it.
++    TownTraceDevelop d{65515, 4242, 17, 422, 0x1234abcdu, 0x1111222233334444ull, 0x5555666677778888ull, 1};
++    char line[256];
++    TownTraceFormatTT(line, sizeof(line), d);
++    assert(!strcmp(line, "TT t=65515 town=4242 i=17 n=422 list=1234abcd mt0=1111222233334444 mt1=5555666677778888 e=1\n"));
++    // TF tokens are sorted, so family map order does not matter.
++    uint64_t t1[] = {(3ull << 32) | 0xbu, (1ull << 32) | 0xau, (3ull << 32) | 0x1u};
++    uint64_t t2[] = {(3ull << 32) | 0x1u, (3ull << 32) | 0xbu, (1ull << 32) | 0xau};
++    char l1[256], l2[256];
++    TownTraceFormatTF(l1, sizeof(l1), 1200, 0, t1, 3);
++    TownTraceFormatTF(l2, sizeof(l2), 1200, 0, t2, 3);
++    assert(!strcmp(l1, l2) && !strcmp(l1, "TF t=1200 e=0 lists=3 1:0000000a 3:00000001 3:0000000b\n"));
++    // Cadence: once per engine per 600-iteration window.
++    int64_t last[4] = {-1, -1, -1, -1};
++    assert(TownTraceFamiliesDue(600, 0, last, 4) && !TownTraceFamiliesDue(1199, 0, last, 4));
++    assert(TownTraceFamiliesDue(1199, 1, last, 4) && TownTraceFamiliesDue(1200, 0, last, 4));
++    assert(!TownTraceFamiliesDue(-1, 0, last, 4) && !TownTraceFamiliesDue(5000, 7, last, 4));
++}
++
++// A stand-in for TownDeveloper::Develop: records its arguments, advances the
++// "generator" by one word.
++static struct { void *self, *engine, *mt, *progress; uint32_t town; bool flag; uint64_t opt; int calls; } g_seen;
++static void FakeDevelop(void* self, void* engine, uint32_t town, bool flag, void* mt, uint64_t opt, void* progress)
++{
++    g_seen = {self, engine, mt, progress, town, flag, opt, g_seen.calls + 1};
++    reinterpret_cast<uint32_t*>(mt)[5] ^= 0xdeadbeef;
++}
++
++static void WrapperTests()
++{
++    char path[] = "/tmp/town_trace_testXXXXXX";
++    const int fd = mkstemp(path); assert(fd >= 0); close(fd);
++    Tpf2mpTownTraceOpenForTest(path);
++    Tpf2mpTownTraceSetOriginal(FakeDevelop);
++    // The TownSystem context: +8 -> {begin, end} of {entity, index} nodes.
++    int32_t nodes[] = {11, 0, 22, 1, 33, 2, 44, 3};
++    uintptr_t vec[3] = {reinterpret_cast<uintptr_t>(nodes), reinterpret_cast<uintptr_t>(nodes + 8), reinterpret_cast<uintptr_t>(nodes + 8)};
++    uintptr_t ctx[8] = {0, reinterpret_cast<uintptr_t>(vec)};
++    Tpf2mpTownTraceTick(1234, reinterpret_cast<uintptr_t>(ctx));
++    std::vector<uint8_t> mt(TOWN_TRACE_MT_BYTES, 7);
++    const uint64_t before = TownTraceFnv64(mt.data(), mt.size());
++    int self, engine, progress;
++    Tpf2mpTownTraceDevelop(&self, &engine, 33, true, mt.data(), 0x0000000100000000ull, &progress);
++    const uint64_t after = TownTraceFnv64(mt.data(), mt.size());
++    // Arguments reach the original unchanged, exactly once.
++    assert(g_seen.calls == 1 && g_seen.self == &self && g_seen.engine == &engine && g_seen.town == 33 &&
++           g_seen.flag && g_seen.mt == mt.data() && g_seen.opt == 0x0000000100000000ull && g_seen.progress == &progress);
++    // A different engine, a town not in the list, then the family line.
++    int engine2;
++    Tpf2mpTownTraceDevelop(&self, &engine2, 55, false, mt.data(), 0, nullptr);
++    int64_t time = 0; int index = -1;
++    assert(Tpf2mpTownTraceFamiliesDue(reinterpret_cast<uintptr_t>(&engine), &time, &index) && time == 1234 && index == 0);
++    assert(!Tpf2mpTownTraceFamiliesDue(reinterpret_cast<uintptr_t>(&engine), &time, &index));
++    uint64_t tokens[] = {(4ull << 32) | 0x77u, (1ull << 32) | 0x66u};
++    Tpf2mpTownTraceFamilies(time, index, tokens, 2);
++    Tpf2mpTownTraceFlush();
++    const uint32_t list = TownTraceListDigest(reinterpret_cast<const uint8_t*>(nodes), 4, 8);
++    char expect[1024];
++    snprintf(expect, sizeof(expect),
++             "TT t=1234 town=33 i=2 n=4 list=%08x mt0=%016llx mt1=%016llx e=0\n"
++             "TT t=1234 town=55 i=-1 n=4 list=%08x mt0=%016llx mt1=%016llx e=1\n"
++             "TF t=1234 e=0 lists=2 1:00000066 4:00000077\n",
++             list, (unsigned long long)before, (unsigned long long)after,
++             list, (unsigned long long)after, (unsigned long long)TownTraceFnv64(mt.data(), mt.size()));
++    const std::string got = ReadAll(path);
++    if (got != expect) { fprintf(stderr, "got:\n%s\nexpected:\n%s\n", got.c_str(), expect); assert(false); }
++    // A context the trace cannot read as a node vector: still one line, index unknown.
++    uintptr_t badVec[3] = {reinterpret_cast<uintptr_t>(nodes) + 4, reinterpret_cast<uintptr_t>(nodes), 0};
++    ctx[1] = reinterpret_cast<uintptr_t>(badVec);
++    Tpf2mpTownTraceTick(1238, reinterpret_cast<uintptr_t>(ctx));
++    Tpf2mpTownTraceDevelop(&self, &engine, 33, false, mt.data(), 0, nullptr);
++    Tpf2mpTownTraceFlush();
++    assert(ReadAll(path).find("TT t=1238 town=33 i=-1 n=-1 list=00000000") != std::string::npos);
++    unlink(path);
++}
++
++static void InstallTests()
++{
++    // A private image big enough for the call site; the guard is written in.
++    const size_t size = 0x1748000;
++    auto* image = static_cast<uint8_t*>(mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
++    assert(image != MAP_FAILED);
++    const uintptr_t base = reinterpret_cast<uintptr_t>(image);
++    const unsigned char guard[] = {
++        0x48,0x8b,0x85,0x08,0xf4,0xff,0xff, 0x48,0x83,0xec,0x08, 0x31,0xc9, 0x44,0x89,0xea,
++        0x48,0xbe,0xff,0xff,0xff,0xff,0x00,0xff,0xff,0xff, 0x48,0x21,0xb5,0xc8,0xf3,0xff,0xff,
++        0x4c,0x8b,0x85,0xa8,0xf3,0xff,0xff, 0x48,0x8b,0x78,0x40, 0x48,0x8b,0x85,0xc8,0xf3,0xff,0xff,
++        0x6a,0x00, 0x48,0x8b,0xb5,0x18,0xf4,0xff,0xff, 0x49,0x89,0xc1, 0xe8,0x64,0xe2,0xda,0xff, 0x58,0x5a};
++    memcpy(image + 0x17478d8, guard, sizeof(guard));
++    assert(!mprotect(image, size, PROT_READ | PROT_EXEC));
++    const char* id = "3a0e156390b0e6f1e372051c24802c8493ae454a";
++    char path[] = "/tmp/town_trace_installXXXXXX";
++    const int fd = mkstemp(path); assert(fd >= 0); close(fd);
++    tpf2mp_town_trace::on.store(false);
++    // Off unless exactly "1": nothing written.
++    for (const char* v : {static_cast<const char*>(nullptr), "", "0", "true", "11"}) {
++        if (v) setenv("TPF2MP_TOWN_TRACE", v, 1); else unsetenv("TPF2MP_TOWN_TRACE");
++        assert(!Tpf2mpInstallTownTrace(base, id, path));
++        assert(!strncmp(Tpf2mpTownTraceStatus(), "off (set TPF2MP_TOWN_TRACE=1", 28));
++        assert(!memcmp(image + 0x17478d8, guard, sizeof(guard)) && !tpf2mp_town_trace::on.load());
++    }
++    setenv("TPF2MP_TOWN_TRACE", "1", 1);
++    assert(!Tpf2mpInstallTownTrace(base, "wrong", path) && !strcmp(Tpf2mpTownTraceStatus(), "off (unverified image)"));
++    // Any guard byte changed: refused, untouched.
++    for (size_t at : {size_t(0), size_t(20), sizeof(guard) - 3}) {
++        uint8_t x = image[0x17478d8 + at] ^ 1; int err = 0;
++        assert(Tpf2mpCodeWriteSelf(base + 0x17478d8 + at, &x, 1, &err) == TPF2MP_CW_OK);
++        assert(!Tpf2mpInstallTownTrace(base, id, path) && !strcmp(Tpf2mpTownTraceStatus(), "off (unverified TownSystem Develop call)"));
++        x ^= 1; assert(Tpf2mpCodeWriteSelf(base + 0x17478d8 + at, &x, 1, &err) == TPF2MP_CW_OK);
++        assert(!tpf2mp_town_trace::on.load());
++    }
++    assert(!Tpf2mpInstallTownTrace(base, id, "/nonexistent-dir/trace.txt") && !strcmp(Tpf2mpTownTraceStatus(), "off (trace file not writable)"));
++    // Installed: the call now reaches a near stub that jumps to the wrapper.
++    assert(Tpf2mpInstallTownTrace(base, id, path));
++    assert(tpf2mp_town_trace::on.load() && !strncmp(Tpf2mpTownTraceStatus(), "enabled", 7));
++    assert(image[0x1747917] == 0xe8);
++    int32_t rel; memcpy(&rel, image + 0x1747918, 4);
++    const uint8_t* stub = image + 0x174791c + rel;
++    uintptr_t target; memcpy(&target, stub + 2, 8);
++    assert(stub[0] == 0x48 && stub[1] == 0xb8 && stub[10] == 0xff && stub[11] == 0xe0);
++    assert(target == reinterpret_cast<uintptr_t>(&Tpf2mpTownTraceDevelop));
++    // The rest of the guard is as it was.
++    assert(!memcmp(image + 0x17478d8, guard, 0x3f + 1) && !memcmp(image + 0x174791c, guard + 0x44, 2));
++    assert(!Tpf2mpInstallTownTrace(base, id, path) && !strcmp(Tpf2mpTownTraceStatus(), "enabled (already installed)"));
++    assert(ReadAll(path).rfind("# town trace, native build 35924, format 1\n", 0) == 0);
++    unlink(path);
++}
++
++int main()
++{
++    HeaderTests();
++    WrapperTests();
++    InstallTests();
++    printf("town trace: formats, Develop wrapper pass-through, family lines, install guard/refusals passed\n");
++    return 0;
++}
+diff --git a/tools/linux/gen_family_getters.py b/tools/linux/gen_family_getters.py
+new file mode 100644
+index 0000000..a433dea
+--- /dev/null
++++ b/tools/linux/gen_family_getters.py
+@@ -0,0 +1,147 @@
++#!/usr/bin/env python3
++"""Inventory every ECS family's GetNodeList implementation in the native ELF.
++
++MSVC folds identical functions (/OPT:ICF), so on Windows every
++ComponentGroupFamily<...>::GetNodeList is ONE function (0xba990, `lea rax,[rcx+8]`)
++and every no-list family shares another (0xbdff0). GCC does not fold them: build
++35924 has 28 separate copies of `endbr64; lea rax,[rdi+8]; ret` and 35 of
++`endbr64; xor eax,eax; ret`, one per family template instantiation. The native
++family canon recognised only the first of each (0xa914c0 PersonCapacity,
++0xa914e0 VehicleOrder) and refused the other 61 families, so on the native build
++27 of the 28 node lists were never put in entity order (live server log:
++`families=63/63 lists=1 ... unknown/refused=61`).
++
++Usage:
++  gen_family_getters.py GAME_ELF            print the inventory
++  gen_family_getters.py GAME_ELF --header   write native/linux/src/family_getters_linux.h
++  gen_family_getters.py GAME_ELF --check    verify that header against the ELF (exit 1 on mismatch)
++
++Requires pyelftools. Read-only on the ELF.
++"""
++from pathlib import Path
++import re
++import sys
++from elftools.elf.elffile import ELFFile
++from elftools.elf.relocation import RelocationSection
++
++BUILD_ID = '3a0e156390b0e6f1e372051c24802c8493ae454a'
++GET_LIST = bytes.fromhex('f30f1efa488d4708c3')   # endbr64; lea rax,[rdi+8]; ret
++GET_NONE = bytes.fromhex('f30f1efa31c0c3')       # endbr64; xor eax,eax; ret
++ROOT = Path(__file__).resolve().parents[2]
++HEADER = ROOT / 'native/linux/src/family_getters_linux.h'
++
++
++def inventory(path):
++    with open(path, 'rb') as stream:
++        elf = ELFFile(stream)
++        assert any(n['n_desc'] == BUILD_ID for s in elf.iter_segments() if s['p_type'] == 'PT_NOTE'
++                   for n in s.iter_notes() if n['n_type'] == 'NT_GNU_BUILD_ID'), 'not build 35924'
++        loads = [s for s in elf.iter_segments() if s['p_type'] == 'PT_LOAD']
++        stream.seek(0)
++        blob = stream.read()
++
++        def read(addr, size):
++            for s in loads:
++                if s['p_vaddr'] <= addr and addr + size <= s['p_vaddr'] + s['p_filesz']:
++                    o = s['p_offset'] + addr - s['p_vaddr']
++                    return blob[o:o + size]
++            return None
++
++        relative = {}
++        for sec in elf.iter_sections():
++            if isinstance(sec, RelocationSection):
++                for r in sec.iter_relocations():
++                    if r['r_info_type'] == 8:   # R_X86_64_RELATIVE
++                        relative[r['r_offset']] = r['r_addend']
++
++        def ptr(addr):
++            if addr in relative:
++                return relative[addr]
++            b = read(addr, 8)
++            return int.from_bytes(b, 'little') if b else None
++
++        def cstr(addr):
++            b = read(addr, 256)
++            return b.split(b'\0')[0].decode('latin1') if b else None
++
++        rows = []
++        for slot, typeinfo in relative.items():
++            name_ptr = ptr(typeinfo + 8) if typeinfo else None
++            name = cstr(name_ptr) if name_ptr else None
++            # A family class: ecs::...Family... but not the abstract ecs::IFamily.
++            if not name or not name.startswith('N3ecs') or 'Family' not in name or name == 'N3ecs7IFamilyE':
++                continue
++            vptr = slot + 8
++            getter = ptr(vptr + 16)             # SysV slot 2: GetNodeList
++            code = read(getter, 16) if getter else None
++            if code is None:
++                continue
++            if code.startswith(GET_LIST):
++                kind = 'list'
++            elif code.startswith(GET_NONE):
++                kind = 'none'
++            else:
++                continue
++            rows.append((getter, kind, vptr, name))
++    rows.sort()
++    return rows
++
++
++def render(rows):
++    lists = [r for r in rows if r[1] == 'list']
++    nones = [r for r in rows if r[1] == 'none']
++    out = ['// GENERATED by tools/linux/gen_family_getters.py from the build-35924 ELF',
++           '// (GNU build-id ' + BUILD_ID + '). Do not edit by hand.',
++           '//',
++           '// Every ECS family GetNodeList implementation (vtable slot 2). GCC keeps one',
++           '// copy per family template instantiation where MSVC folds them into one, so',
++           '// the native family canon must recognise each copy. Install verifies every',
++           '// entry byte for byte; the canon calls none of them.',
++           '#pragma once',
++           '#include <cstdint>',
++           '',
++           '// `endbr64; lea rax,[rdi+8]; ret` -- the family holds a node list at +8.',
++           'static constexpr uintptr_t kFamilyListGetters[] = {']
++    for getter, _, vptr, name in lists:
++        out.append('    0x%x,  // vtable 0x%x %s' % (getter, vptr, name))
++    out += ['};', '',
++            '// `endbr64; xor eax,eax; ret` -- the family has no node list.',
++            'static constexpr uintptr_t kFamilyNoListGetters[] = {']
++    for getter, _, vptr, name in nones:
++        out.append('    0x%x,  // vtable 0x%x %s' % (getter, vptr, name))
++    out += ['};', '',
++            'static constexpr unsigned kFamilyListGetterCount = %d;' % len(lists),
++            'static constexpr unsigned kFamilyNoListGetterCount = %d;' % len(nones),
++            'static_assert(sizeof(kFamilyListGetters) / sizeof(kFamilyListGetters[0]) == kFamilyListGetterCount);',
++            'static_assert(sizeof(kFamilyNoListGetters) / sizeof(kFamilyNoListGetters[0]) == kFamilyNoListGetterCount);',
++            '']
++    return '\n'.join(out)
++
++
++def main():
++    rows = inventory(sys.argv[1])
++    lists = sum(1 for r in rows if r[1] == 'list')
++    nones = sum(1 for r in rows if r[1] == 'none')
++    # Windows counts the same world: 63 families, 28 node lists.
++    assert (lists, nones) == (28, 35), (lists, nones)
++    assert len({r[0] for r in rows}) == len(rows), 'a getter is shared: the table would be ambiguous'
++    if '--header' in sys.argv:
++        HEADER.write_text(render(rows), newline='\n')
++        print('wrote', HEADER)
++    elif '--check' in sys.argv:
++        have = HEADER.read_text()
++        if have != render(rows):
++            print('FAIL: %s does not match the ELF inventory' % HEADER)
++            sys.exit(1)
++        listed = [int(x, 16) for x in re.findall(r'^\s+(0x[0-9a-f]+),', have, re.M)]
++        assert len(listed) == 63
++        print('PASS: family getters: %d node-list and %d no-list implementations, each a distinct function, '
++              'match %s' % (lists, nones, HEADER.name))
++    else:
++        for getter, kind, vptr, name in rows:
++            print('%#x %-4s vtable %#x %s' % (getter, kind, vptr, name))
++        print('%d list, %d none' % (lists, nones))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/linux/verify_order_canon_elf.py b/tools/linux/verify_order_canon_elf.py
+index 6546248..330f60f 100644
+--- a/tools/linux/verify_order_canon_elf.py
++++ b/tools/linux/verify_order_canon_elf.py
+@@ -39,13 +39,24 @@ with Path(sys.argv[1]).open('rb') as stream:
+             if (i.mnemonic.startswith('j') or i.mnemonic=='call') and i.operands and i.operands[0].type==X86_OP_IMM:
+                 assert not address<i.operands[0].imm<address+steal, (name,i.address)
+         print(f'PASS: {name}: {address:#x}, {expected.hex(" ")}, {steal} bytes; base offset {offset}')
+-    assert read(0xa914c0,9) == bytes.fromhex('f3 0f 1e fa 48 8d 47 08 c3')
+-    assert read(0xa914e0,7) == bytes.fromhex('f3 0f 1e fa 31 c0 c3')
++    getters = (root / 'native/linux/src/family_getters_linux.h').read_text()
++    list_part, none_part = getters.split('kFamilyNoListGetters[] = {')
++    lists = [int(a, 16) for a in re.findall(r'^\s+(0x[0-9a-f]+),', list_part, re.M)]
++    nones = [int(a, 16) for a in re.findall(r'^\s+(0x[0-9a-f]+),', none_part, re.M)]
++    assert (len(lists), len(nones)) == (28, 35) and 0xa914c0 in lists and 0xa914e0 in nones
++    for a in lists: assert read(a, 9) == bytes.fromhex('f3 0f 1e fa 48 8d 47 08 c3'), hex(a)
++    for a in nones: assert read(a, 7) == bytes.fromhex('f3 0f 1e fa 31 c0 c3'), hex(a)
++    # ...and the table is the ELF's complete family inventory (every Family vtable's slot 2).
++    sys.path.insert(0, str(root / 'tools/linux'))
++    import gen_family_getters
++    inventory = gen_family_getters.inventory(sys.argv[1])
++    assert sorted(g for g, k, _, _ in inventory if k == 'list') == sorted(lists)
++    assert sorted(g for g, k, _, _ in inventory if k == 'none') == sorted(nones)
+     for n in range(1,6):
+         vft=0x59ac260+0x20*(n-1)
+         ti=struct.unpack('<Q',read(vft-8,8))[0]
+         name=struct.unpack('<Q',read(ti+8,8))[0]
+         assert read(name,21).split(b'\0')[0] == f'N3ecs8NodeListILi{n}EEE'.encode()
+     assert read(0xa617e8,5) == bytes.fromhex('e8 c3 fd 7e 02')
+-    print('PASS: family getters, NodeList<1..5> RTTI/vtables, Step iteration call')
++    print('PASS: family getters (28 node-list + 35 no-list, the complete vtable inventory), NodeList<1..5> RTTI/vtables, Step iteration call')
+     print('PASS: build-id, all seven byte guards, instruction boundaries, no interior branches')

@@ -225,5 +225,33 @@ a.ticks = a.ticks + 1
 a.paceV2(G.NOW)
 check('the host\'s pause: session speed 0, the votes still listed', a.effSpeed == 0 and G.lastSent() == 'LSEFF v=0 vt=a:4*,b:1,c:2')
 
+print('== recovery from below 1x')
+G.SPEED = 1
+G.FS = lua.table()
+a, k = G.newCM('a')
+a.peerSeen, a.myCeiling, a.lastSetSpeed, a.paceApplied = True, 4, 1, True
+a.effSpeed, a.ticks = 0.25, 100
+G.heard(a, 'b')
+a.paceV2(G.NOW)
+check('a 4x request from 0.25x first ramps to 0.3x', abs(a.effSpeed - 0.3) < 1e-9)
+check('ramped speed reaches the native speed file', G.FS['mem://a/tpf2_speed.txt'] == '0.3000\n')
+for t in range(101, 110):
+    a.ticks = t
+    a.paceV2(G.NOW)
+check('no further step before ten ticks', abs(a.effSpeed - 0.3) < 1e-9)
+a.ticks = 110
+a.paceV2(G.NOW)
+check('next recovery step after ten ticks', abs(a.effSpeed - 0.35) < 1e-9)
+a.effSpeed, a.ticks = 1, 111
+a.paceV2(G.NOW)
+check('from 1x the requested 4x applies immediately', a.effSpeed == 4)
+a.effSpeed, a.myCeiling, a.ticks = 0.5, 0.25, 112
+a.paceV2(G.NOW)
+check('slowing below 1x applies immediately', a.effSpeed == 0.25)
+a.speedButton(0, 'toggle')
+a.ticks = 113
+a.paceV2(G.NOW)
+check('pausing during a ramp applies immediately', a.effSpeed == 0)
+
 print('SPEED VOTES:', 'all checks passed' if failures == 0 else '%d check(s) failed' % failures)
 raise SystemExit(1 if failures else 0)

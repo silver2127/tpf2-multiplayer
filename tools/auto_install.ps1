@@ -28,19 +28,16 @@ $Overlay = "C:\Sandbox\$env:USERNAME\$Box\drive\C\" + ($Game -replace '^[A-Za-z]
 
 # what is built from what: target -> (output, source globs)
 $Targets = @(
-    @{ name = 'proxy'; out = 'native\out\tpf2_bridge_mp.dll'; src = @('native\src\net.cpp', 'native\src\net.h', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\speedhook.*', 'native\src\setplayer_patch.*', 'native\src\cgamesteprelay.asm', 'native\src\setplayerrelay.asm', 'native\src\bridge_main.cpp', 'native\src\steam_tunnel.*', 'native\src\proxy_alut.cpp', 'native\src\datadir.h', 'native\src\logarchive.*') },
+    @{ name = 'proxy'; out = 'native\out\tpf2_bridge_mp.dll'; src = @('native\src\net.cpp', 'native\src\net.h', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\speedhook.*', 'native\src\setplayer_patch.*', 'native\src\cgamesteprelay.asm', 'native\src\setplayerrelay.asm', 'native\src\bridge_main.cpp', 'native\src\steam_tunnel.*', 'native\src\proxy_alut.cpp', 'native\src\datadir.h', 'native\src\wine_heap.h', 'native\src\logarchive.*') },
     @{ name = 'menu';  out = 'native\out\tpf2_menu.dll';      src = @('native\src\menu_hook.cpp', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\native_io.*', 'native\src\native_control.*', 'native\src\gameuirelay.asm', 'native\src\logarchive.*', 'native\src\datadir.h') },
     @{ name = 'slice'; out = 'native\out\tpf2_slice.dll';     src = @('native\src\slice_hook.cpp', 'native\src\slice\*.inl', 'native\src\hook.cpp', 'native\src\hook.h', 'native\src\deferrelay_slice.asm', 'native\src\station_weld.h', 'native\src\datadir.h') },
     @{ name = 'host';  out = 'native\out\tpf2_pluginhost.dll'; src = @('native\src\plugin\*', 'native\src\hook.cpp', 'native\src\hook.h') }
 )
-# native plugins built in their own sibling checkouts; deploy_shipping.ps1 ships them into
-# <game>\plugins. From a worktree (<main>\.claude\worktrees\<name>) the siblings sit next
-# to the main checkout. A plugin rebuilt on its own must trigger an install too.
-$SiblingRoot = Split-Path $Repo -Parent
-if ($Repo -match '^(.*)\\\.claude\\worktrees\\[^\\]+$') { $SiblingRoot = Split-Path $Matches[1] -Parent }
+# native plugins with their own build script in this repo; deploy_shipping.ps1 ships them
+# into <game>\plugins. A plugin rebuilt on its own must trigger an install too.
 $Plugins = @(
-    @{ name = 'bigmap'; repo = (Join-Path $SiblingRoot 'tpf2-bigmap'); out = 'out\tpf2_bigmap.dll'; ok = 'BUILD BIGMAP OK'
-       src = @('src\*', 'mod\minimap\*', 'tools\embed_lua.ps1', 'build.bat') }
+    @{ name = 'bigmap'; repo = (Join-Path $Repo 'bigmap'); out = 'out\tpf2_bigmap.dll'; ok = 'BUILD BIGMAP OK'
+       src = @('src\*', 'mod\minimap\*', 'tools\embed_lua.ps1', 'build.bat', '..\native\src\plugin\tpf2mp_plugin.h') }
 )
 
 # Mods to REMOVE from the game folder and every box overlay at the next install:

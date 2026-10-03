@@ -93,11 +93,11 @@ function CM.cursorsInFile(me) return K.BASE .. "tpf2mp_cursors_in_" .. tostring(
 -- otherwise one colour per player from the same palette by letter: a red, b blue,
 -- c green, d yellow, ...
 function CM.cursorColor(o)
-	local cid = (CM.cmMode == "companies") and CM.cmOriginCompany and CM.cmOriginCompany[o]
+	local cid = (CM.cmMode == "companies") and CM.cmCompanyOfOrigin and CM.cmCompanyOfOrigin(o)
 	if cid then return CM.cmCompanyColor(cid) end
 	local s, idx = tostring(o), 0
 	for i = 1, #s do idx = idx * 26 + (s:byte(i) - 96) end
-	return CM.cmCompanyColor(math.max(1, idx))
+	return CM.cmPaletteColor(math.max(1, idx))
 end
 
 -- The colour a circle is drawn in: the player's colour at full brightness (same hue

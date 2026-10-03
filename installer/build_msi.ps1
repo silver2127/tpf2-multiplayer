@@ -9,6 +9,7 @@ Steps, in order (each one stops the script on failure):
      native\build.bat host   -> native\out\tpf2_pluginhost.dll
      native\build.bat menu   -> native\out\tpf2_menu.dll
      native\build.bat slice  -> native\out\tpf2_slice.dll
+     native\build.bat bigmap -> bigmap\out\tpf2_bigmap.dll (Big Maps; its cfg is bigmap\cfg)
      A DLL that a running game has loaded stays locked, so linking to the plain
      name fails with LNK1104. The menu and slice targets take a name suffix: on a
      failure the script retries with one, copies the result over the plain name
@@ -156,7 +157,14 @@ if ($SkipBuild) {
     Say "running build.bat workshop"
     $rc = Run-Bat $build "workshop"
     if ($rc -ne 0) { Fail "build.bat workshop failed (exit $rc)" }
+    # Big Maps (bigmap\build.bat, through native\build.bat bigmap)
+    Say "running build.bat bigmap"
+    $rc = Run-Bat $build "bigmap"
+    if ($rc -ne 0) { Fail "build.bat bigmap failed (exit $rc). If it was LNK1104, close the game (it holds tpf2_bigmap.dll) and rerun." }
 }
+$bigmapDll = Join-Path $Repo "bigmap\out\tpf2_bigmap.dll"
+$bigmapCfg = Join-Path $Repo "bigmap\cfg\tpf2_bigmap.cfg"
+foreach ($f in @($bigmapDll, $bigmapCfg)) { if (-not (Test-Path $f)) { Fail "missing: $f" } }
 $proxyDll = Join-Path $BridgeOut "alut.dll"
 $hostDll  = Join-Path $BridgeOut "tpf2_pluginhost.dll"
 foreach ($f in @($proxyDll, $hostDll, (Join-Path $BridgeOut "tpf2_bridge_mp.dll"), $menuDll, $sliceDll, (Join-Path $BridgeOut "tpf2_previews.dll"), (Join-Path $BridgeOut "tpf2_workshop_register.dll"))) {
@@ -225,6 +233,8 @@ $wixArgs = @("build") + $eula + @(
     "-d", "SliceDll=$sliceDll",
     "-d", "NetpunchDir=$netDir",
     "-d", "CaDll=$caDll",
+    "-d", "BigmapDll=$bigmapDll",
+    "-d", "BigmapCfg=$bigmapCfg",
     "-o", $Msi,
     (Join-Path $Installer "Package.wxs"),
     (Join-Path $Installer "PluginHost.wxs")

@@ -32,7 +32,7 @@ int main() {
     sockaddr_in bridge=endpoint; bridge.sin_port=htons(Net_LocalPort());
     const std::string zero(32,'0'), first(32,'1'), second(32,'2');
     auto send=[&](const std::string& epoch,uint32_t seq,const char* line,uint32_t ack=NO_ACK,int chunk=0,int chunks=1) {
-        Packet p{}; p.h.magic=MAGIC; memcpy(p.h.world,epoch.data(),32);
+        Packet p{}; p.h.cumAck=NO_ACK; p.h.magic=MAGIC; memcpy(p.h.world,epoch.data(),32);
         p.h.session=77; p.h.ackSession=g_session; p.h.seq=seq; p.h.ack=ack;
         p.h.type=line ? 1 : 0; p.ev.chunkIdx=(uint16_t)chunk; p.ev.chunkCount=(uint16_t)chunks;
         if(line) strcpy_s(p.ev.text,line);

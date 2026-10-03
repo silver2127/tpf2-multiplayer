@@ -18,7 +18,7 @@ def runtime(letter="a", vid=70, lid=80):
 local sent, callbacks, logs = {}, {}, {}
 local count, successAt, now = 3, 1, 100
 local CM = {ticks=0, seqNo=0}
-local K = {INSTANCE=LETTER,STRICT_OPS={VLINE=true,VDEPOT=true,VSELL=true},VLINE_RETRY_STEPS=5,BIND_GUARD_STEPS=10}
+local K = {INSTANCE=LETTER,STRICT_OPS={VLINE=true,VDEPOT=true,VSELL=true,VSTOP=true},VLINE_RETRY_STEPS=5,BIND_GUARD_STEPS=10}
 function CM.gameTime() return now end
 function CM.stepOf(t) return math.floor(t*5+0.5) end
 function CM.lineIdFor(key) return LID end
@@ -28,9 +28,10 @@ end},cmd={make={
   setLine=function(v,l,s) assert(v==VID and l==LID); return {stop=s} end,
   sendToDepot=function(v) return {depot=true} end,
   sellVehicle=function(v) return {sell=true} end,
+  setUserStopped=function(v,stopped) assert(v==VID); assert(type(stopped)=="boolean"); return {userStopped=stopped} end,
 },sendCommand=function(cmd,cb)
-  sent[#sent+1]={stop=cmd.stop,step=now*5}
-  callbacks[#callbacks+1]=function() cb({},cmd.stop==successAt or cmd.depot or cmd.sell or false) end
+  sent[#sent+1]={stop=cmd.stop,step=now*5,userStopped=cmd.userStopped}
+  callbacks[#callbacks+1]=function() cb({},cmd.stop==successAt or cmd.depot or cmd.sell or cmd.userStopped~=nil or false) end
 end}}
 assert(load(SOURCE,"@vehicles.lua"))()(CM,K,function(s) logs[#logs+1]=s end)
 CM.primedVeh[VID]=true
@@ -44,6 +45,8 @@ function H.retry()
   local q=CM.retryQueue or {}; CM.retryQueue={}; for _,c in ipairs(q) do now=c.notBeforeStep/5; CM.execVehCmd(c) end
 end
 function H.cancel(op) CM.execVehCmd({op=op,origin="a",seq=9,at=100,armed=1,key="s:"..VID,keys="s:"..VID}) end
+function H.vstop(origin,stopped,armed) CM.execVehCmd({op="VSTOP",origin=origin,seq=11,at=100,armed=armed,key="s:"..VID,stopped=stopped}) end
+function H.userStopped(i) return sent[i].userStopped end
 function H.clone() CM.queueCloneAssign({origin="a",seq=1,at=100,cline="a:3"},"s:"..VID) end
 function H.clock(t) now=t end
 function H.count(n) count=n end
@@ -116,6 +119,18 @@ def run():
     assert [h.stop(i) for i in [1,2]]==[0,1]
     assert [h.step(i) for i in [1,2]]==[510,515]
     print("ok  clones use automatic selection after the binding guard")
+
+    # VSTOP: a peer applies the shipped state; the originator replays only when
+    # the slice cancelled its click (armed=1), never twice when it ran natively.
+    h=runtime(); h.vstop("b",1,1)
+    assert h.nsent()==1 and h.userStopped(1) is True, h.logs()
+    h.vstop("b",0,1)
+    assert h.nsent()==2 and h.userStopped(2) is False
+    h=runtime(); h.vstop("a",1,1)
+    assert h.nsent()==1 and h.userStopped(1) is True, h.logs()
+    h=runtime(); h.vstop("a",1,0)
+    assert h.nsent()==0, h.logs()
+    print("ok  VSTOP carries the absolute stop state; strict originator replay, native one skipped")
 
 
 if __name__ == "__main__":

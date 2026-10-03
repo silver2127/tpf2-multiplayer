@@ -40,6 +40,8 @@ bool Hover(int* x, int* y, int* w, int* h, bool* pressed);
 // presented frame, when SDL and the window certainly exist. Idempotent.
 void InstallInput();
 bool SetActionsHeld(bool held);
+// SDL scancode, negative mouse button, or zero when no gesture is active.
+int ActiveGestureKey();
 
 // The status line under the panel (and the lobby page's). Any thread; takes the
 // panel's lock, so never from inside a panel or lobby call. For the menu-game

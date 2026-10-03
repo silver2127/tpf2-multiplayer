@@ -49,13 +49,102 @@ struct LineAlt  { int32_t station, terminal; };                   // StationTerm
 struct LineWp   { int32_t entity, index; };                        // transport::SignalId
 // waits are the engine's floats, any value it holds (the cargo-wait slider goes
 // past the 36000 s this once refused, natively on the host only -- 2026-09-16)
-struct LineStop { int32_t sg, station, terminal, loadMode; float minWait, maxWait; int nAlt; std::vector<LineAlt> alt; int nWp; std::vector<LineWp> wp; };
+// The stop's cargo filter, Line::Stop::stopConfig at stop+0x50 (2026-09-26: "cargo
+// filters are not working" -- the replayed update never carried it, so every
+// instance, the clicker included, lost the filter the moment it was set). The Lua
+// type, probed live: load, unload and maxLoad are lists of numbers. In memory
+// (MEASURED 2026-09-26 from a live edit's raw bytes: a one-word vector at +0x50 and
+// the count 30 at +0x68): load and unload are std::vector<bool> -- a vector of
+// 32-bit words plus a bit count, 0x20 bytes -- one flag per cargo type, at +0x50 and
+// +0x70; maxLoad a std::vector<float> at +0x90, ending at the stop's 0xa8. Each is
+// checked on every read (well-formed, at most 1024 cargo types, finite non-negative
+// loads); a stop that fails ships without its filter, its raw bytes in the log. On
+// the wire the flags are 0/1 numbers, one per cargo type, as the Lua lists hold them.
+struct LineStop { int32_t sg, station, terminal, loadMode; float minWait, maxWait; int nAlt; std::vector<LineAlt> alt; int nWp; std::vector<LineWp> wp;
+                  bool cfgOk; std::vector<int32_t> cfgLoad, cfgUnload; std::vector<float> cfgMax; };
 static const uint64_t LINE_ANY_SPAN = ~0ull;   // ReadVec's cap, not used as one
 static char g_lineDecodeWhy[200] = "";
 #define LINE_REFUSE(...) do { _snprintf_s(g_lineDecodeWhy, sizeof(g_lineDecodeWhy), _TRUNCATE, __VA_ARGS__); return false; } while (0)
 struct LineDecode { float wait; int n; std::vector<LineStop> st; };
 static LineDecode g_lineDecode;
 static bool       g_lineDecodeOk = false;
+
+static bool ReadCfgVec(const uint8_t* at, std::vector<uint32_t>* out)
+{
+    uint64_t vb = 0, ve = 0, vc = 0;
+    memcpy(&vb, at, 8); memcpy(&ve, at + 8, 8); memcpy(&vc, at + 16, 8);
+    out->clear();
+    if (vb == 0 && ve == 0 && vc == 0) return true;
+    if (ve < vb || vc < ve || (ve - vb) % 4 || (ve - vb) > 4 * 1024 || !IsHeapPtr(vb)) return false;
+    if (ve == vb) return true;
+    if (!Readable((void*)vb, (size_t)(ve - vb))) return false;
+    out->resize((size_t)((ve - vb) / 4));
+    memcpy(out->data(), (void*)vb, (size_t)(ve - vb));
+    return true;
+}
+// std::vector<bool> (MSVC): a vector<uint32_t> of words, then size_t bits
+static bool ReadCfgBits(const uint8_t* at, std::vector<uint32_t>* out)
+{
+    std::vector<uint32_t> words;
+    if (!ReadCfgVec(at, &words)) return false;
+    uint64_t bits = 0;
+    memcpy(&bits, at + 0x18, 8);
+    if (bits > 1024 || bits > (uint64_t)words.size() * 32) return false;
+    out->clear();
+    for (uint64_t i = 0; i < bits; i++) out->push_back((words[(size_t)(i >> 5)] >> (i & 31)) & 1u);
+    return true;
+}
+static void DecodeStopCargo(const uint8_t* b, int stopNo, LineStop* t)
+{
+    std::vector<uint32_t> ld, ul, mx;
+    t->cfgOk = false;
+    t->cfgLoad.clear(); t->cfgUnload.clear(); t->cfgMax.clear();
+    bool ok = ReadCfgBits(b + 0x50, &ld) && ReadCfgBits(b + 0x70, &ul) && ReadCfgVec(b + 0x90, &mx);
+    for (uint32_t v : mx) { float f; memcpy(&f, &v, 4); if (!(f >= 0.f) || f > 1e30f) ok = false; }
+    if (!ok) {
+        static LONG warned = 0;
+        if (InterlockedIncrement(&warned) <= 8) {
+            char hex[0x58 * 3 + 1]; int o = 0;
+            for (int i = 0; i < 0x58; i++) o += snprintf(hex + o, sizeof(hex) - o, "%02x%s", b[0x50 + i], (i % 8 == 7) ? " " : "");
+            Log("[slice] line stop %d: cargo filter at +0x50 not three well-formed vectors -- shipped WITHOUT its filter; raw +0x50: %s\n", stopNo, hex);
+        }
+        return;
+    }
+    for (uint32_t v : ld) t->cfgLoad.push_back((int32_t)v);
+    for (uint32_t v : ul) t->cfgUnload.push_back((int32_t)v);
+    for (uint32_t v : mx) { float f; memcpy(&f, &v, 4); t->cfgMax.push_back(f); }
+    t->cfgOk = true;
+    if (!ld.empty() || !ul.empty() || !mx.empty()) {
+        static LONG shown = 0;
+        if (InterlockedIncrement(&shown) <= 16) {
+            char s[600]; int o = 0;
+            o += snprintf(s + o, sizeof(s) - o, "load=[");
+            for (size_t i = 0; i < t->cfgLoad.size() && o < 180; i++) o += snprintf(s + o, sizeof(s) - o, "%s%d", i ? "," : "", t->cfgLoad[i]);
+            o += snprintf(s + o, sizeof(s) - o, "] unload=[");
+            for (size_t i = 0; i < t->cfgUnload.size() && o < 360; i++) o += snprintf(s + o, sizeof(s) - o, "%s%d", i ? "," : "", t->cfgUnload[i]);
+            o += snprintf(s + o, sizeof(s) - o, "] maxLoad=[");
+            for (size_t i = 0; i < t->cfgMax.size() && o < 540; i++) o += snprintf(s + o, sizeof(s) - o, "%s%g", i ? "," : "", t->cfgMax[i]);
+            Log("[slice] line stop %d cargo filter: %s]\n", stopNo, s);
+        }
+    }
+}
+// " cfg=<stop>:<load>|<unload>|<maxLoad>,..." for the stops with a filter; each list
+// "_"-joined (cargo indices as integers, loads as %.9g)
+static void WriteLineCargo(FILE* f, const LineDecode& d)
+{
+    bool first = true;
+    for (int i = 0; i < d.n; i++) {
+        const LineStop& t = d.st[i];
+        if (!t.cfgOk || (t.cfgLoad.empty() && t.cfgUnload.empty() && t.cfgMax.empty())) continue;
+        fprintf(f, "%s%d:", first ? " cfg=" : ",", i + 1);
+        first = false;
+        for (size_t k = 0; k < t.cfgLoad.size(); k++) fprintf(f, "%s%d", k ? "_" : "", t.cfgLoad[k]);
+        fputc('|', f);
+        for (size_t k = 0; k < t.cfgUnload.size(); k++) fprintf(f, "%s%d", k ? "_" : "", t.cfgUnload[k]);
+        fputc('|', f);
+        for (size_t k = 0; k < t.cfgMax.size(); k++) fprintf(f, "%s%.9g", k ? "_" : "", t.cfgMax[k]);
+    }
+}
 
 static void WriteLineWaypoints(FILE* f, const LineDecode& d)
 {
@@ -143,6 +232,7 @@ static bool DecodeLineAt(uint64_t line, uint64_t vecOff, LineDecode* out)
             memcpy(&t.wp[w], (void*)(wb + w * 8), 8);
             if (t.wp[w].entity <= 0 || t.wp[w].index < 0) LINE_REFUSE("stop %d waypoint %d: entity=%d index=%d", i + 1, w + 1, t.wp[w].entity, t.wp[w].index);
         }
+        DecodeStopCargo(b, i + 1, &t);
     }
     return true;
 }
@@ -409,6 +499,113 @@ static void ApplyLineAssignAtReplay(uint64_t engine, int32_t entity, uint64_t li
     }
     Log("[lineassign] LUPDATE replay line=%d flag=%ld seq=%ld: platforms assigned at the stamp, %d stop(s), changed:%s\n",
         (int)lid, flag, seq, okA ? after.n : -1, summary[0] ? summary : " none");
+}
+
+// CARGO FILTERS AT THE REPLAY (2026-09-26). The Lua API reads a stop's stopConfig
+// but cannot set it: measured live on a fresh Line.Stop, `sc.load = v` with v
+// holding [1,0,1] left sc.load empty, and a replayed update always arrived without
+// its filter. So the slice writes it into the Line the Lua passes to
+// make.updateLine, as it runs the platform assignment there: the Lua writes
+// lockstep_lcargo_<x>.txt ("<line> <seq> <stop>:<load>|<unload>|<maxLoad> ...", the
+// lists "_"-joined: 0/1 per cargo type, maxLoad as numbers) right before the call.
+// Layout as DecodeStopCargo reads it: vector<bool> load at stop+0x50 (words, bit
+// count at +0x68), unload at +0x70 (+0x88), vector<float> maxLoad at +0x90. The
+// words and the floats go in through the game's own vector<uint32> copy
+// constructor (0x125480, terrain_assets.inl's RVA_VECCOPY_4), so the game's
+// allocator owns them. Only an EMPTY list is filled -- the Lua's rebuilt stops
+// always are -- so nothing is overwritten or leaked.
+static const uintptr_t RVA_VECCOPY_U32 = 0x125480;
+static long g_lcargoSeen = 0;
+using VecCopyU32Fn = uint64_t* (*)(uint64_t* dst, const uint64_t* src, uint64_t, uint64_t);
+static bool CargoVecEmpty(const uint8_t* at)
+{
+    uint64_t v[3]; memcpy(v, at, 24);
+    return v[0] == 0 && v[1] == 0 && v[2] == 0;
+}
+static void CargoVecFill(uint8_t* at, const std::vector<uint32_t>& vals)
+{
+    if (vals.empty()) return;
+    uint64_t src[3] = { (uint64_t)vals.data(), (uint64_t)(vals.data() + vals.size()), (uint64_t)(vals.data() + vals.size()) };
+    ((VecCopyU32Fn)(g_base + RVA_VECCOPY_U32))((uint64_t*)at, src, 0, 0);
+}
+static bool CargoParseList(const char* s, const char* end, bool asFloat, std::vector<uint32_t>* out)
+{
+    out->clear();
+    while (s < end) {
+        char* stop = nullptr;
+        if (asFloat) {
+            float f = strtof(s, &stop);
+            if (stop == s || !(f >= 0.f) || f > 1e30f) return false;
+            uint32_t u; memcpy(&u, &f, 4); out->push_back(u);
+        } else {
+            long v = strtol(s, &stop, 10);
+            if (stop == s || (v != 0 && v != 1)) return false;
+            out->push_back((uint32_t)v);
+        }
+        s = stop;
+        if (s < end && *s == '_') s++;
+        else if (s < end) return false;
+        if (out->size() > 1024) return false;
+    }
+    return true;
+}
+static void ApplyLineCargoAtReplay(int32_t entity, uint64_t line)
+{
+    ReadInstance();
+    if (!g_instance[0]) return;
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_lcargo_%s.txt", g_dataDir, g_instance);
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &fa) || fa.nFileSizeLow == 0) return;
+    FILETIME nowFt; GetSystemTimeAsFileTime(&nowFt);
+    const uint64_t wrote = ((uint64_t)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+    const uint64_t now = ((uint64_t)nowFt.dwHighDateTime << 32) | nowFt.dwLowDateTime;
+    if (now > wrote && now - wrote > 5ULL * 10000000ULL) return;
+    FILE* f = _fsopen(p, "r", _SH_DENYNO);
+    if (!f) return;
+    static char buf[65536];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    long lid = 0, seq = 0; int used = 0;
+    if (sscanf(buf, "%ld %ld%n", &lid, &seq, &used) != 2 || lid != (long)entity || seq == g_lcargoSeen) return;
+    g_lcargoSeen = seq;
+    uint64_t sb = 0;
+    const uint64_t span = ReadVec(line, &sb, LINE_ANY_SPAN);
+    if (!span || span % 0xa8) { Log("[lcargo] line=%ld: the Line's stops are unreadable -- replayed WITHOUT its cargo filters\n", lid); return; }
+    const int nStops = (int)(span / 0xa8);
+    int applied = 0, refused = 0;
+    char* s = buf + used;
+    while (*s) {
+        while (*s == ' ' || *s == '\r' || *s == '\n') s++;
+        if (!*s) break;
+        char* tokEnd = s; while (*tokEnd && *tokEnd != ' ' && *tokEnd != '\r' && *tokEnd != '\n') tokEnd++;
+        char* colon = (char*)memchr(s, ':', tokEnd - s);
+        char* bar1 = colon ? (char*)memchr(colon, '|', tokEnd - colon) : nullptr;
+        char* bar2 = bar1 ? (char*)memchr(bar1 + 1, '|', tokEnd - bar1 - 1) : nullptr;
+        const int stopNo = atoi(s);
+        std::vector<uint32_t> ld, ul, mx;
+        const bool ok = colon && bar1 && bar2 && stopNo >= 1 && stopNo <= nStops
+            && CargoParseList(colon + 1, bar1, false, &ld) && CargoParseList(bar1 + 1, bar2, false, &ul)
+            && CargoParseList(bar2 + 1, tokEnd, true, &mx);
+        uint8_t* stop = ok ? (uint8_t*)(sb + (uint64_t)(stopNo - 1) * 0xa8) : nullptr;
+        if (!ok || !CargoVecEmpty(stop + 0x50) || !CargoVecEmpty(stop + 0x70) || !CargoVecEmpty(stop + 0x90)) {
+            refused++;
+        } else {
+            auto words = [](const std::vector<uint32_t>& bits) {
+                std::vector<uint32_t> w((bits.size() + 31) / 32, 0u);
+                for (size_t i = 0; i < bits.size(); i++) if (bits[i]) w[i >> 5] |= 1u << (i & 31);
+                return w;
+            };
+            CargoVecFill(stop + 0x50, words(ld)); *(uint64_t*)(stop + 0x68) = ld.size();
+            CargoVecFill(stop + 0x70, words(ul)); *(uint64_t*)(stop + 0x88) = ul.size();
+            CargoVecFill(stop + 0x90, mx);
+            applied++;
+        }
+        s = tokEnd;
+    }
+    Log("[lcargo] LUPDATE replay line=%ld seq=%ld: cargo filters written into %d stop(s)%s\n", lid, seq, applied,
+        refused ? " -- some REFUSED (bad record, or a list not empty)" : "");
 }
 
 static void InstallLineAssign()
@@ -784,4 +981,4 @@ static void WriteInjectBuyLine(int32_t line)
     fprintf(f, "VBUYLINE %d\n", line);
     fclose(f);
     Log("[slice] VBUYLINE shipped: the cancelled buy was a clone onto line %d\n", line);
-}
+}

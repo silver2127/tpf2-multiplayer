@@ -177,6 +177,15 @@ static void CheckHistory()
     const int32_t unused = -1; const uint32_t id = 99;
     TargetInsert(&id,&unused,&map); TargetErase(&id,&unused,&map);
     assert(Walk(map,20835).size() == 2);
+    // Many independent target records, including hash collisions, retain exact
+    // per-target histories and can be erased/recreated without stale entries.
+    for(uint32_t t=50000;t<53000;++t) { Add(map,t,t+1);Add(map,t,t+2); }
+    for(uint32_t t=50000;t<53000;++t) {
+        const auto before=Walk(map,t);assert(before.size()==2);
+        Erase(map,t,t+1);assert(Walk(map,t)==std::vector<uint32_t>{t+2});
+        Erase(map,t,t+2);Add(map,t,t+3);assert(Walk(map,t)==std::vector<uint32_t>{t+3});
+        Erase(map,t,t+3);
+    }
     FakeOuter nested; nested.Bind(); Add(nested,20835,1); Add(nested,20835,2);
     assert(Walk(nested,20835) == std::vector<uint32_t>({1,2}));
     TargetClearOwner(&nested); assert(Walk(map,20835).size() == 2);

@@ -89,6 +89,47 @@ def _blank_noncode(src: str) -> str:
     return "".join(out)
 
 
+_LONG_OPEN = re.compile(r"\[(=*)\[")
+
+
+def _blank_long_brackets(src: str) -> str:
+    """Replace long strings and long comments ([[ ]], [==[ ]==], --[[ ]]) with
+    spaces, keeping newlines, and leave everything else as it is.
+
+    Prose in a long string is not code: the Workshop signpost's description
+    (`[[ ... the host's save ... ]]`) read as an apostrophe opening a quoted
+    string that never closed.
+    """
+    out = list(src)
+    i, n, q = 0, len(src), None
+    while i < n:
+        c = src[i]
+        if q is not None:                        # inside a quoted string
+            if c == "\\":
+                i += 1
+            elif c == q or c == "\n":
+                q = None
+            i += 1
+            continue
+        m = _LONG_OPEN.match(src, i + 2 if src.startswith("--", i) else i)
+        if m and (src.startswith("--", i) or m.start() == i):
+            end = src.find("]" + m.group(1) + "]", m.end())
+            end = n if end < 0 else end + len(m.group(1)) + 2
+            for k in range(i, end):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = end
+            continue
+        if src.startswith("--", i):              # line comment
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c in "\"'":
+            q = c
+        i += 1
+    return "".join(out)
+
+
 def check_unterminated_strings(path: pathlib.Path, src: str) -> bool:
     """Flag a quoted string with a raw newline inside it.
 
@@ -98,6 +139,7 @@ def check_unterminated_strings(path: pathlib.Path, src: str) -> bool:
     as `f:write("go` + newline + `")`, luacheck said ok, and the game died with
     `mptest.lua:1362: unfinished string near '"go'`.
     """
+    src = _blank_long_brackets(src)
     bad = []
     for lineno, line in enumerate(src.split("\n"), start=1):
         # walk the line, skipping comments, tracking quote state

@@ -24,12 +24,26 @@ Wire: the connecting side writes one hello line, `TPF2BULK1 <role> <sid>
 the file bytes, in order from offset 0, nothing else. The token is 16
 random bytes the sender put in its fbegin (sealed like every control
 message), so an unrelated connection cannot claim or feed a transfer.
+
+THE MASTER'S PIPE (2026-09-26, the user: "have the relay act as a fallback for
+slow transfers"). When neither end can reach the other on TCP, both dial the
+master server's pipe port instead -- outbound, so any NAT lets them -- and
+say `TPF2PIPE1 <pair> <H|J>\\n`, pair being 32 hex digits the host drew and
+named to the joiner in a sealed message. The master answers `PAIRED\\n` to both
+once both are there and then copies bytes between them, nothing else. On
+the paired socket the joiner says the hello above and the host answers it
+(accept_hello), exactly as over a direct connection.
 """
 import socket
+import sys
 import threading
 import time
+import weakref
 
 BULK_MAGIC = b"TPF2BULK1"
+PIPE_MAGIC = b"TPF2PIPE1"
+PIPE_PAIRED = b"PAIRED\n"
+PIPE_WAIT = 45.0             # how long one end waits at the master for the other
 HELLO_TIMEOUT = 5.0          # a connection that has not said hello by then is dropped
 CONNECT_TIMEOUT = 3.0        # a host not reachable on TCP costs this once, then UDP
 SEND_BLOCK = 1 << 20         # sendall() slices
@@ -44,20 +58,43 @@ class BulkListener:
     def __init__(self, port, log=lambda _: None, bind="0.0.0.0"):
         self.port = int(port)
         self.log = log
-        self._expect = {}        # (sid, role) -> (token, handler)
+        self._expect = {}        # (sid, role) -> (token, handler ref): see expect()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._pending = 0
         self.accepted = self.refused = 0
         self.link_handler = None   # dual_tcp: a "TPF2LINK1 ..." hello is a peer's TCP link, not a transfer
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((bind, self.port))
-        s.listen(16)
-        s.settimeout(0.5)
+        s = self._listen(socket.AF_INET, bind, self.port)
         self.sock = s
         self.port = s.getsockname()[1]
-        threading.Thread(target=self._accept_loop, name="bulk-accept", daemon=True).start()
+        self.sockets = [s]
+        # Separate sockets preserve IPv4 peer addresses and keep IPv4 working
+        # even on machines without IPv6. Never widen an explicit IPv4 bind.
+        if bind == "0.0.0.0":
+            try:
+                self.sockets.append(self._listen(socket.AF_INET6, "::", self.port))
+            except OSError as e:
+                log(f"[bulk] IPv6 TCP unavailable on tcp/{self.port}: {e}; IPv4 remains available")
+        for listener in self.sockets:
+            threading.Thread(target=self._accept_loop, args=(listener,), name="bulk-accept", daemon=True).start()
+
+    @staticmethod
+    def _listen(family, bind, port):
+        s = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Bound Linux dial sockets need SO_REUSEPORT on both ends.
+            if sys.platform.startswith("linux"):
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            if family == socket.AF_INET6:
+                s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            s.bind((bind, port))
+            s.listen(16)
+            s.settimeout(0.5)
+            return s
+        except OSError:
+            s.close()
+            raise
 
     @classmethod
     def open(cls, port, log=lambda _: None):
@@ -67,14 +104,24 @@ class BulkListener:
         except OSError as e:
             log(f"[bulk] no TCP listener on {port} ({e}); transfers use UDP only")
             return None
-        log(f"[bulk] TCP transfers accepted on tcp/{lst.port}")
+        families = "IPv4 + IPv6" if len(lst.sockets) > 1 else "IPv4"
+        log(f"[bulk] TCP transfers accepted on tcp/{lst.port} ({families})")
         return lst
 
     def expect(self, sid, role, token, handler):
         """Accept a hello for (sid, role) carrying ``token``; ``handler(sock,
-        addr, name)`` then owns the socket on the accept thread's helper."""
+        addr, name)`` then owns the socket on the accept thread's helper.
+
+        A bound method is held WEAKLY: the registration ends when its transfer
+        is dropped. Held strongly (until 0.7.1.2) every transfer the lobby ever
+        made stayed alive here with its whole file -- nothing calls forget() --
+        and the dedicated server's lobby grew to 11.7 GB in 12 hours: nine
+        600 MB terrain files and eleven 380 MB saves (2026-09-28)."""
+        ref = weakref.WeakMethod(handler) if hasattr(handler, "__self__") else (lambda h=handler: h)
         with self._lock:
-            self._expect[(int(sid), role)] = (str(token), handler)
+            for key in [k for k, v in self._expect.items() if v[1]() is None]:
+                del self._expect[key]
+            self._expect[(int(sid), role)] = (str(token), ref)
 
     def forget(self, sid):
         with self._lock:
@@ -83,15 +130,16 @@ class BulkListener:
 
     def close(self):
         self._stop.set()
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        for listener in self.sockets:
+            try:
+                listener.close()
+            except OSError:
+                pass
 
-    def _accept_loop(self):
+    def _accept_loop(self, listener):
         while not self._stop.is_set():
             try:
-                c, addr = self.sock.accept()
+                c, addr = listener.accept()
             except socket.timeout:
                 continue
             except OSError:
@@ -116,7 +164,17 @@ class BulkListener:
                 c.settimeout(None)
                 with self._lock:
                     self._pending -= 1
-                self.link_handler(c, addr, line)
+                # guarded here, like the bulk handler below: an OSError/ValueError
+                # from it reached the except below and took _pending down twice,
+                # below zero, loosening the PENDING_MAX cap
+                try:
+                    self.link_handler(c, addr, line)
+                except Exception as e:               # noqa: BLE001
+                    self.log(f"[bulk] link handler error for {addr[0]}: {e!r}")
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
                 return
             parts = line.strip().split(b" ", 4)
             if len(parts) < 4 or parts[0] != BULK_MAGIC:
@@ -125,7 +183,8 @@ class BulkListener:
             name = parts[4].decode("utf-8", "replace") if len(parts) > 4 else ""
             with self._lock:
                 want = self._expect.get((sid, role))
-            if not want or want[0] != token:
+            handler = want[1]() if want else None
+            if handler is None or want[0] != token:
                 raise ValueError("unknown transfer or wrong token")
             c.sendall(b"OK\n")
             c.settimeout(None)
@@ -143,7 +202,7 @@ class BulkListener:
         with self._lock:
             self._pending -= 1
         try:
-            want[1](c, addr, name)
+            handler(c, addr, name)
         except Exception as e:                       # noqa: BLE001 -- a handler bug must not kill the thread pool
             self.log(f"[bulk] handler error for sid={sid} {role}: {e!r}")
             try:
@@ -152,9 +211,92 @@ class BulkListener:
                 pass
 
 
-def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT):
+def _why(e):
+    """A connect failure in words: a timeout means something dropped the SYN (a
+    firewall or a router without a mapping), a refusal that nothing listens."""
+    if isinstance(e, socket.timeout):
+        return "timed out (blocked: firewall or no port mapping)"
+    if isinstance(e, ConnectionRefusedError):
+        return "refused (nothing listening on that port)"
+    return f"{type(e).__name__}: {e}"
+
+
+def _read_exact(c, n):
+    got = b""
+    while len(got) < n:
+        piece = c.recv(n - len(got))
+        if not piece:
+            break
+        got += piece
+    return got
+
+
+def say_hello(c, role, sid, token, name="", timeout=CONNECT_TIMEOUT):
+    """On a connected socket: the hello and the listener's OK. True when the
+    stream may start."""
+    c.sendall(BULK_MAGIC + b" " + role.encode() + b" " + str(int(sid)).encode() + b" " + str(token).encode()
+              + b" " + name.encode("utf-8", "replace")[:64] + b"\n")
+    c.settimeout(timeout)
+    ok = _read_exact(c, 3)           # never more: the stream follows at once (see bulk_connect)
+    if ok != b"OK\n":
+        return False
+    c.settimeout(None)
+    return True
+
+
+def accept_hello(c, role, sid, token, timeout=HELLO_TIMEOUT):
+    """The listener's side on a socket we did not accept (the master's pipe):
+    read one hello line, check role, sid and token, answer OK. The name it
+    gave, or None."""
+    c.settimeout(timeout)
+    line = b""
+    while not line.endswith(b"\n") and len(line) < 256:
+        piece = c.recv(1)            # byte by byte: nothing past the line is ours to take
+        if not piece:
+            return None
+        line += piece
+    parts = line.strip().split(b" ", 4)
+    try:
+        if len(parts) < 4 or parts[0] != BULK_MAGIC or parts[1].decode("ascii") != role \
+                or int(parts[2]) != int(sid) or parts[3].decode("ascii") != str(token):
+            return None
+    except (ValueError, UnicodeDecodeError):
+        return None
+    c.sendall(b"OK\n")
+    c.settimeout(None)
+    return parts[4].decode("utf-8", "replace") if len(parts) > 4 else ""
+
+
+def pipe_connect(host, port, pair, role, wait=PIPE_WAIT, errors=None):
+    """Dial the master's pipe and wait there for the other end. The paired
+    socket, or None."""
+    c = None
+    try:
+        c = socket.create_connection((host, int(port)), timeout=CONNECT_TIMEOUT)
+        c.sendall(PIPE_MAGIC + b" " + str(pair).encode("ascii") + b" " + role.encode("ascii") + b"\n")
+        c.settimeout(wait)
+        if _read_exact(c, len(PIPE_PAIRED)) != PIPE_PAIRED:
+            c.close()
+            if errors is not None:
+                errors.append(f"{host}: the other end never came to the pipe")
+            return None
+        c.settimeout(None)
+        return c
+    except (OSError, UnicodeEncodeError) as e:
+        if c is not None:
+            try:
+                c.close()
+            except OSError:
+                pass
+        if errors is not None:
+            errors.append(f"{host}: {_why(e) if not isinstance(e, socket.timeout) else 'the other end never came to the pipe'}")
+        return None
+
+
+def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT, errors=None):
     """Connect to a listener and say hello. A socket ready for the stream, or
-    None (the caller falls back to UDP)."""
+    None (the caller falls back to UDP). ``errors``, a list, gets one
+    'host: why' line per failure (the logs said only "no TCP stream")."""
     try:
         c = socket.create_connection((host, int(port)), timeout=timeout)
         c.sendall(BULK_MAGIC + b" " + role.encode() + b" " + str(int(sid)).encode() + b" " + str(token).encode()
@@ -174,10 +316,14 @@ def bulk_connect(host, port, role, sid, token, name="", timeout=CONNECT_TIMEOUT)
             ok += piece
         if ok != b"OK\n":
             c.close()
+            if errors is not None:
+                errors.append(f"{host}: connected, but the listener refused the hello")
             return None
         c.settimeout(None)
         return c
-    except (OSError, UnicodeEncodeError):
+    except (OSError, UnicodeEncodeError) as e:
+        if errors is not None:
+            errors.append(f"{host}: {_why(e)}")
         return None
 
 
@@ -248,5 +394,20 @@ if __name__ == "__main__":
     assert stream_recv(c, len(blob), got.extend)
     log(f"received {rate_text(len(got), time.perf_counter() - t)}; equal={bytes(got) == blob}")
     assert bulk_connect("127.0.0.1", lst.port, "recv", 7, "wrong", "me") is None
+
+    class Transfer:                      # a transfer registers a bound method, which must not keep it alive
+        def __init__(self):
+            self.blob = bytearray(1 << 20)
+
+        def serve(self, c, addr, name):
+            stream_send(c, self.blob)
+    t = Transfer()
+    lst.expect(8, "recv", "tok8", t.serve)
+    gone = weakref.ref(t)
+    del t
+    assert gone() is None, "the listener kept a dropped transfer alive"
+    assert bulk_connect("127.0.0.1", lst.port, "recv", 8, "tok8", "me") is None
+    lst.expect(9, "recv", "tok9", serve)
+    assert (8, "recv") not in lst._expect, "a dead registration was not pruned"
     lst.close()
     print("bulk_tcp self-check OK")

@@ -6,6 +6,7 @@
 #include <cstring>
 #include <sys/mman.h>
 #include <vector>
+#include <thread>
 #include "slice/slice_core_internal.h"
 #include "../src/slice/ecs_linux.h"
 #include "../src/slice/ecs_checks_linux.h"
@@ -276,7 +277,7 @@ int main()
     assert(applied[1].second == "mpWinCo200");
     // every company id the stylesheet defines stays inside the local buffer,
     // so the string never owns heap the game would have to free
-    for (int cid = 1; cid <= 200; ++cid) {
+    for (int cid = 1; cid <= 999; ++cid) {
         char text[32];
         snprintf(text, sizeof(text), "%s%d", ClassPrefix(), cid);
         assert(strlen(text) < sizeof(GStr::buf));
@@ -316,6 +317,41 @@ int main()
     assert(drawnLabel[0]==0 && drawnLabel[1]==130/255.f && drawnLabel[2]==200/255.f);
     SliceTintLabelDraw(nullptr,nullptr,gray,91,27,&town);assert(!memcmp(drawnLabel,gray,16));
     assert(CompanyOfPid(-2)==0);
+    // Rewritten registry: company id, style class and exact RGB are distinct.
+    // Let the real two-second cache refresh, including the local player field.
+    auto perms = [&](const char* rows) {
+        FILE* f=fopen((tintData+"/mp_company_perms.txt").c_str(),"w");assert(f);
+        fputs(rows,f);fclose(f);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2050));
+    };
+    perms("pid 19427 2 326 123456\npid 7 3 0 FFFFFF\npid 8 4 1000 1000000\npid 9 5 201\npid 10 6 202 000000\nme 19427\n");
+    assert(CompanyOfPid(19427)==326 && CompanyRgbOfPid(19427)==0x123456);
+    assert(CompanyOfPid(7)==3 && CompanyRgbOfPid(7)==0xffffff);
+    assert(CompanyOfPid(8)==4 && CompanyRgbOfPid(8)==-1);
+    assert(CompanyOfPid(9)==201 && CompanyRgbOfPid(9)==-1);
+    assert(CompanyOfPid(10)==202 && CompanyRgbOfPid(10)==0);
+    assert(CompanyOfPid(999)==0 && CompanyRgbOfPid(999)==-1);
+    assert(CompanyMePid()==19427 && WindowCompany(entity)==0);
+    AppendClass(&widget,CompanyOfPid(19427));
+    assert(applied.back().second=="mpWinCo326");
+    plainBuffer[2]=plainBuffer[1];colorBuffer[2]=colorBuffer[1];
+    rect=SliceTintVehicleDraw(nullptr,reinterpret_cast<void*>(123),2,&entity,w.Engine(),10,20,30,40);
+    assert(rect.position==0x12345678 && rect.size==0xabcdef01);
+    for(int i=0;i<6;++i){
+        const auto* v=reinterpret_cast<const DrawVertex*>(coloredVertices)+i;
+        assert(v->rgba[0]==0x12/255.f && v->rgba[1]==0x34/255.f && v->rgba[2]==0x56/255.f && v->rgba[3]==1);
+        assert(v->xy[0]==i && v->uv[0]==float(i)/6);
+    }
+    SliceTintLabelDraw(nullptr,nullptr,gray,91,27,&entity);
+    assert(drawnLabel[0]==0x12/255.f && drawnLabel[1]==0x34/255.f && drawnLabel[2]==0x56/255.f);
+    // After a hotseat switch, me overrides the lobby's obsolete company id.
+    {FILE* f=fopen((tintData+"/mp_company_cfg.txt").c_str(),"w");assert(f);fputs("companies\n326\n",f);fclose(f);}
+    perms("pid 19427 2 326 123456\nme 7\n");
+    assert(CompanyMePid()==7 && WindowCompany(entity)==326);
+    perms("pid 19427 2\n");
+    assert(CompanyMePid()==-1 && CompanyRgbOfPid(19427)==-1);
+    assert(WindowCompany(entity)==2); // legacy lobby fallback still works
+    unlink((tintData+"/mp_company_cfg.txt").c_str());
     unlink((tintData+"/mp_company_perms.txt").c_str());rmdir(temporary);tintData.clear();
 
     // ---- who slice-lines may rename --------------------------------------

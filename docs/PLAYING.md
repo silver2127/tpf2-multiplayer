@@ -5,6 +5,7 @@
 - Everyone needs Windows, the Steam version of Transport Fever 2 and the **same version** of
   `TpF2Multiplayer.msi` installed (see the [README](../README.md#install)).
 - The host advertises the save's required mods. Missing mods are offered in a **Download Mods / Cancel** dialog; Cancel leaves the lobby. **Auto-accept mod downloads** in the multiplayer menu saves your choice for future joins and hotjoins. Downloads must be recognised by the game before it loads the save.
+- **Workshop mods come from the Workshop.** When your game runs on Steam, saying yes subscribes you to the missing Workshop mods and Steam downloads them; you stay subscribed afterwards. The host sends only its local (non-Workshop) mods, plus any Workshop item Steam cannot deliver: a hidden or removed item, Steam in offline mode, or a download that stops moving for two minutes. The mods are registered with the running game, so no restart is needed.
 - Deluxe and Early Supporter content are DLC, never transferred. Each player must have the required DLC installed.
   Per-save mod settings need nothing: they travel inside the save. The multiplayer mod itself
   (**Transport Fever 2 Multiplayer**) comes with the installer.
@@ -18,7 +19,8 @@
 
 The title menu gains a **Multiplayer** entry. It opens a panel over the menu:
 
-- **HOST A GAME**: a lobby name, the **HOST GAME** button and a **PUBLIC** checkbox.
+- **HOST A GAME**: a lobby name, the **HOST GAME** button and the **PUBLIC**, **SEPARATE COMPANIES**
+  and **CROSS-PLAY** checkboxes.
 - **JOIN A GAME**: a code field (click it to paste) and **JOIN GAME**.
 - **YOUR NAME** and an optional **PASSWORD**. Your name and lobby name are remembered; the first
   time you get a random two-word name.
@@ -35,6 +37,15 @@ While the panel is open, typing goes into its fields and the game does not see i
    **ROOM CODE** button copies it again). Send it to your friends, or tick **PUBLIC** to list the game.
    With a **password**, the code is locked: it is useless without the password, and a public row
    shows `[locked]`.
+
+   **The code is your Steam ID.** When your game runs on Steam, the code is your 17-digit SteamID64
+   (the number on your Steam profile) and players join you through Steam's networking only: no
+   ports, no IP address in the code. Your friends can also paste your Steam profile link.
+   **CROSS-PLAY** (on the host card, or in the lobby while you host) switches to the classic
+   letters-and-digits code instead. Anyone can join with that one, whether or not they run Steam:
+   GOG copies, Steam in offline mode, or a game started outside Steam. Switching it in the lobby
+   copies the new code, and players already in stay. A game that is not on Steam, and a dedicated
+   server, always use the classic code.
 3. Wait for everyone to appear under **PLAYERS**. Chat works here. Each player has a company chip;
    see [Companies](#companies).
 4. Click **SELECT SAVE** in the lobby and choose your world. The list includes autosaves,
@@ -69,6 +80,10 @@ save to you, you load it, and your game fast-forwards through what happened sinc
 see [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ## Playing on a dedicated relay
+
+(A **dedicated server** is different: a full game that keeps a world running by itself, listed
+as a dedicated server too, and joined like any hosted game. To run one of your own, see
+[HOSTING_A_SERVER.md](HOSTING_A_SERVER.md).)
 
 A relay is a lobby on a server with no game of its own. Nobody needs an open port, and it keeps
 the latest world between sessions. The project runs a public one, which appears in the PUBLIC GAMES
@@ -155,16 +170,62 @@ and that company pays for them. Another company cannot bulldoze them, or replace
 own stop on the same side of the road; the game tells you whose stop it is. Stops placed before this
 version keep whatever owner each game gave them.
 
-In game, the **companies** section of the Multiplayer window shows your company's colour and
-name. Pick a company from the dropdown and **switch to it** to play that company instead of yours,
-**new company** to start a fresh one, and use the **company password** field with **set on mine**
-to lock yours (switching into a locked company needs its password). A company is named in the
-game's own company window; until then it is named after the player who founded it: "<player>'s
-company", then "<player>'s 2nd company" and so on, whoever plays it now.
+In game, the **companies** tab of the Multiplayer window lists every company with its colour,
+who plays it and whether it is locked; yours is first. Click a company to select it:
+
+- **Switch to it** plays that company instead of yours (a locked company asks for its password
+  first). Several players may play one company together.
+- **Delete...** deletes it: choose which company takes over everything it owns, its money and its
+  loan, then **Delete**. Or choose **Nobody**: its vehicles are sold, its lines, buildings, roads and
+  tracks removed and its money and loan dropped; that asks for a second click (**Delete everything**).
+  What the game will not remove (a station another company's line still serves) goes to your company.
+  Nobody may be playing the company, and a locked one needs its password. When the company taking
+  over already has a headquarters, the deleted company's is removed; otherwise it takes it over.
+- **Allow** / **Deny** decides whether its vehicles may stop at your stations.
+
+Every company starts the way the first one did: the first company has the new game's starting
+money, and every company founded later gets a loan of the same size (which it pays back like any
+loan). **New company** opens a form: a name, a colour, whether the company's new vehicles are painted in
+its colour, and an optional password. **Your company settings** renames your company, changes its
+colour, turns the vehicle paint on or off (turning it on repaints the company's vehicles), sets or
+removes the password, and opens or closes your stations to everyone. The game's own company window
+renames the company too. An unnamed company is named after the player who founded it:
+"<player>'s company", then "<player>'s 2nd company" and so on.
+
+Colours are free to choose. The colour picker shows 24 hues; pick one, then one of its five shades
+or a grey below. **Exact #RRGGBB** takes any colour typed as a hex code (for example `#1E90FF`).
+A colour that looks too much like another company's is marked with a dash and refused, so every
+company stays recognisable. Vehicles, vehicle icons and the Big Maps minimap show the exact colour;
+station icons and other companies' windows show the closest of the picker's colours.
+
+Your game remembers who plays which company by player (your Steam account, or your lobby name
+without Steam), not by lobby position, so a saved game gives everyone their own company back
+whoever hosts it. A save from before this version is handed out once as players join: the host
+gets the company they played, everyone else theirs where it is clear; the companies tab says so,
+and anyone who got the wrong one can switch to theirs.
+
+### AutoSig2
+
+With AutoSig2 enabled, its existing controls work through multiplayer replay:
+automatic placement with the selected spacing, **Replace** and **Remove**, and
+the **Forward/Backward** direction for those two modes. Place the initial signal
+as usual. Its settings are captured with the click; changing controls while the
+command is in flight does not change that action.
+
+The initial signal and its follow-up actions appear after the lockstep delay.
+Replace/remove follow AutoSig2's route rules, including its branch, station and
+route-length limits. As in AutoSig2, the temporary initial signal is removed in
+these modes. A replacement uses the selected model and one-way setting. Signals
+belonging to another company and waypoints are not editable AutoSig targets;
+a plan containing one is refused. A target changed before replay is skipped,
+never substituted with a nearby object.
+
+AutoSig2 must be installed and enabled separately; this adapter does not bundle
+or edit the Workshop mod. Every participant needs the same multiplayer build.
 
 ## Ports and firewalls
 
-- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code, and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in.
+- **Steam carries the connection when nothing else does.** Since 0.6.1.15 the mod also connects through Steam's own networking (the same thing Steam games use for invites): the host's SteamID is in the code (it IS the code unless the host ticks **CROSS-PLAY**), and Steam punches through or relays on its own. Both players must be running the game through Steam, logged in; a player without Steam needs the host to tick **CROSS-PLAY**.
 - **Most hosts need no port forwarding.** When a friend joins, both lobbies punch through
   their routers to each other with the help of the master server. The lobby also tries UPnP.
 - If friends still cannot connect, forward UDP 29471 to your PC on your router, or use a

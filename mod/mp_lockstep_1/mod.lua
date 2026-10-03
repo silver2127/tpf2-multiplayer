@@ -24,6 +24,9 @@ nothing is cancelled or replayed.
 				if name == "snowball_fences_callback.lua" or name:match("/snowball_fences_callback%.lua$") then
 					return require("mp/fences_compat").wrap(script)
 				end
+				if name == "autosig2.lua" or name:match("/autosig2%.lua$") then
+					return require("mp/autosig_compat").wrap(script)
+				end
 				if name ~= "natural_town_growth.lua" and not name:match("/natural_town_growth%.lua$") then
 					return script
 				end

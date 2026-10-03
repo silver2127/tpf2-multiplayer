@@ -1,7 +1,7 @@
 """Download counts of every GitHub release asset -- the only place GitHub keeps
 them is the API; the release pages show none.
 
-    python tools\\release_stats.py                 # tpf2-multiplayer
+    python tools\\release_stats.py                 # tpf2-multiplayer and its packages (0.7.0.6 on)
     python tools\\release_stats.py silver2127/tpf2-bigmap
     python tools\\release_stats.py --all           # every asset, not only the MSIs
 
@@ -13,11 +13,16 @@ import urllib.request
 
 
 def main(argv):
-    repo = "silver2127/tpf2-multiplayer"
+    repos = [a for a in argv[1:] if "/" in a]
+    if not repos:
+        # from 0.7.0.6 the MSI is downloaded from the packages repository, the launchers from the mod's releases
+        repos = ["silver2127/tpf2-multiplayer", "silver2127/tpf2-multiplayer-packages"]
+    for repo in repos:
+        report(repo, argv)
+
+
+def report(repo, argv):
     show_all = "--all" in argv
-    for a in argv[1:]:
-        if "/" in a:
-            repo = a
     releases = []
     page = 1
     while True:

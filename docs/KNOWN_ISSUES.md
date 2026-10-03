@@ -21,6 +21,13 @@ something here is fixed, the release note says so and the entry goes.
 
 ## Native side
 
+- **The OpenGL renderer is new and untested in a game** *(2026-09-21)*. Until then the Multiplayer
+  window drew only on Vulkan: on OpenGL the MULTIPLAYER button opened a window that never
+  appeared, and the lobby's per-frame work never ran (reported: "my son's multiplayer button
+  ... doesn't click"). The menu DLL now also hooks SDL2's `SwapBuffers` import and draws the
+  same panel with a framebuffer blit (`native/src/gl_overlay.h`, tested offline by
+  `tools/test_gl_overlay.py`). `tpf2_menu.log` says `OpenGL: hooked SDL2's SwapBuffers import`
+  at start and `OpenGL overlay off: <why>` if the driver refuses it; Vulkan is unchanged.
 - **After a crash, the restarted game can lose its instance letter.** The slice reads
   `tpf2_instance.txt` at attach; when the file still names the crashed process (the bridge
   rewrites it a moment later), the slice refuses the letter and logs `identity file pid=... !=
@@ -64,8 +71,10 @@ something here is fixed, the release note says so and the entry goes.
 
 ## Replication gaps
 
-- Not replicated: vehicle stop/start, manual departure, "depart now" and maintenance targets;
+- Not replicated: manual departure, "depart now" and maintenance targets;
   map editor and scenario commands. [REPLICATION.md](REPLICATION.md#not-replicated).
+- **Sandbox mode: only placing a town is shared** *(2026-09-27)*. The town tool's placement is replicated (TOWNC, [re/SANDBOX.md](re/SANDBOX.md)); demolishing a town, the town and industry controls, and industry placement are not, or not yet tested: using them desyncs the session until a resync.
+- **A held line-editor callback never reaches the replay** *(measured 2026-09-27)*. STRICT LINE CREATION hands the editor's held callback to the originator's createLine replay at its Add, recognised as the first Add from sendCommand's call site on the claiming thread. A game-script command is added later on another thread (made on one tid, added on another, logged while building the town replay), so that match never happens; the spare line covers the usual case, and a create without a spare leaves the editor without its new line selected.
 - **A stop's load settings are not carried by line replays** *(from the code, 2026-09-20)*.
   Each line stop has a `stopConfig` (unload only, maximum load) that the line decoder does not
   read and the replay does not set, so a replayed line edit resets those settings on every

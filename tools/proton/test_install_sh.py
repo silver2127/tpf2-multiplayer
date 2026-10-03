@@ -24,7 +24,7 @@ SCRIPT = HERE / "install_proton.sh"
 BUILD_TIMESTAMP, BUILD_IMAGE_SIZE = 0x675abcc6, 0x046ce000
 STOCK_ALUT = b"stock alut for tests\n"
 PAYLOAD = {
-    "alut.dll": b"proxy v1", "tpf2_pluginhost.dll": b"host v1", "tpf2_bridge_mp.dll": b"bridge v1",
+    "alut.dll": b"proxy v1 [proxy] wine heap: %d heap(s)", "tpf2_pluginhost.dll": b"host v1", "tpf2_bridge_mp.dll": b"bridge v1",
     "tpf2_menu.dll": b"menu v1", "tpf2_slice.dll": b"slice v1", "tpf2_slice.cfg": b"shipped cfg\n",
     "tpf2mp_version.txt": b"0.6\n", "netpunch/netpunch.exe": b"not a bundle",
     "plugins/tpf2_previews.dll": b"previews v1", "plugins/tpf2_workshop_register.dll": b"workshop v1",
@@ -100,6 +100,7 @@ def main():
         # 2. the install
         out = run(["--files-zip", str(payload)] + links, tmp, env)
         assert "Installed TpF2 Multiplayer 0.6" in out, out
+        assert "Wine heap fix: included" in out and "TPF2MP_WINE_HEAP=0" in out, out
         assert (game / "alut_real.dll").read_bytes() == STOCK_ALUT
         for name, data in PAYLOAD.items():
             if name in ("tpf2mp.cfg",):

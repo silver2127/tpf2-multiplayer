@@ -63,6 +63,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
+            WriteLineCargo(f, d);
             const int32_t spare = (int32_t)InterlockedCompareExchange(&g_lcSpareId, 0, 0);
             if (spare) fprintf(f, " spare=%d", spare);
             fprintf(f, " name=%s\n", g_lcDecode.nameEnc.c_str());
@@ -85,6 +86,7 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
                     fprintf(f, " %d %d", d.st[i].alt[a].station, d.st[i].alt[a].terminal);
             }
             WriteLineWaypoints(f, d);
+            WriteLineCargo(f, d);
             if (g_lineAsgTag >= 0) fprintf(f, " asg=%d", g_lineAsgTag);
             fprintf(f, "\n");
             if (d.n > 0)
@@ -104,6 +106,9 @@ static bool WriteInjectVehicleCmd(int fid, uint64_t r8, uint64_t r9, uint64_t st
     } else if (fid == 10) {
         fprintf(f, "VREV %d\n", (int)(int32_t)r8);
         Log("[slice] VREV shipped: vehicle=%d\n", (int)(int32_t)r8);
+    } else if (fid == 18) {
+        fprintf(f, "VSTOP %d %d\n", (int)(int32_t)r8, (int)(r9 & 1));
+        Log("[slice] VSTOP shipped: vehicle=%d stopped=%d\n", (int)(int32_t)r8, (int)(r9 & 1));
     } else if (fid == 13) {
         // SetColor(entity, Vec3f const&): r9 points at three floats, 0..1 each.
         float col[3] = { -1.0f, -1.0f, -1.0f };
@@ -264,6 +269,175 @@ static void CaptureCalendar(uint64_t id, uint64_t rcx, uint64_t rdx, uint64_t ca
         what, value, (unsigned long long)caller);
 }
 
+// SANDBOX TOWNS, probe stage (docs/re/SANDBOX.md). CreateTowns (id 19) is
+// logged, never cancelled: its argument layout is not known yet. Each argument
+// that points at readable memory is dumped, and a std::vector found there has
+// its elements dumped too -- the TownInfo list, whose values (name, position,
+// three capacities, cargo needs per land use) are known from the script API.
+static void LogBytes(const char* tag, uint64_t p, unsigned n)
+{
+    if (!IsHeapPtr(p) || !Readable((void*)p, n)) { Log("[towncap] %s %llx: not readable\n", tag, (unsigned long long)p); return; }
+    const uint8_t* b = (const uint8_t*)p;
+    for (unsigned off = 0; off < n; off += 32) {
+        char hex[3 * 32 + 1]; int k = 0;
+        for (unsigned i = 0; i < 32 && off + i < n; i++) k += snprintf(hex + k, sizeof(hex) - k, "%02x ", b[off + i]);
+        Log("[towncap] %s +%03x: %s\n", tag, off, hex);
+    }
+}
+
+static void ProbeCreateTowns(uint64_t rdx, uint64_t r8, uint64_t r9, uint64_t st0)
+{
+    const uint64_t args[4] = { rdx, r8, r9, st0 };
+    const char* names[4] = { "rdx", "r8", "r9", "st0" };
+    for (int a = 0; a < 4; a++) {
+        LogBytes(names[a], args[a], 0x40);
+        // a std::vector<TownInfo> is { begin, end, capacity }
+        if (!IsHeapPtr(args[a]) || !Readable((void*)args[a], 24)) continue;
+        uint64_t v[3]; memcpy(v, (void*)args[a], 24);
+        if (!IsHeapPtr(v[0]) || v[1] < v[0] || v[2] < v[1] || v[1] - v[0] > 0x2000) continue;
+        Log("[towncap] %s is a vector: %llu bytes\n", names[a], (unsigned long long)(v[1] - v[0]));
+        LogBytes("elems", v[0], (unsigned)(v[1] - v[0] > 0x200 ? 0x200 : v[1] - v[0]));
+        // the elements' own vectors (the cargo needs), wherever they sit
+        for (uint64_t off = 0; off + 24 <= v[1] - v[0] && off < 0x200; off += 8) {
+            uint64_t w[3]; memcpy(w, (void*)(v[0] + off), 24);
+            if (IsHeapPtr(w[0]) && w[1] >= w[0] && w[2] >= w[1] && w[1] - w[0] > 0 && w[1] - w[0] <= 0x100
+                && Readable((void*)w[0], (size_t)(w[1] - w[0]))) {
+                char tag[24]; snprintf(tag, sizeof(tag), "elems+%03llx->", (unsigned long long)off);
+                LogBytes(tag, w[0], (unsigned)(w[1] - w[0]));
+            }
+        }
+    }
+}
+
+// SANDBOX TOWNS (docs/re/SANDBOX.md). make_cmd::CreateTowns takes rdx -> the
+// std::vector<TownInfo> the town tool built; one TownInfo is 0x90 bytes
+// (measured 2026-09-27 against a town whose values the script API read back):
+//   +0x00 std::string name (the tool leaves it empty: the engine names the town,
+//         the same name on every game)
+//   +0x20 float x, +0x24 float y
+//   +0x28 int32 initialLandUseCapacities[3]   (residential, commercial, industrial)
+//   +0x34 4 bytes the tool leaves uninitialised
+//   +0x38, +0x50, +0x68 std::vector<int32> landUse2CargoNeeds[3] (cargo type ids)
+//   +0x80 16 bytes the tool leaves uninitialised
+// The tool picks the cargo needs; the engine does not fill empty ones and they do
+// not shape the town, so the capture ships them whole. Town creation from the same
+// command at the same step is deterministic -- layout, entity id and name -- so
+// every game, the placer included, replays the shipped TOWNC through
+// api.cmd.make.createTowns at the stamp.
+static const uintptr_t CALLER_TOWNBUILDER = 0x470959;   // UI::TownBuilder's commit (measured)
+static const unsigned TOWNINFO_SIZE = 0x90;
+struct TownRec { std::string name; float x, y; int32_t cap[3]; std::vector<int32_t> needs[3]; };
+
+static bool DecodeTowns(uint64_t vec, std::vector<TownRec>* out)
+{
+    out->clear();
+    if (!IsHeapPtr(vec) || !Readable((void*)vec, 24)) { Log("[towncap] town list not readable\n"); return false; }
+    uint64_t v[3]; memcpy(v, (void*)vec, 24);
+    const uint64_t span = v[1] - v[0];
+    if (!IsHeapPtr(v[0]) || v[1] < v[0] || v[2] < v[1] || span == 0 || span % TOWNINFO_SIZE || span / TOWNINFO_SIZE > 16) {
+        Log("[towncap] town list %llx..%llx is not a vector of TownInfo (%u bytes each)\n",
+            (unsigned long long)v[0], (unsigned long long)v[1], TOWNINFO_SIZE);
+        return false;
+    }
+    if (!Readable((void*)v[0], (size_t)span)) { Log("[towncap] town list elements not readable\n"); return false; }
+    for (uint64_t e = v[0]; e < v[1]; e += TOWNINFO_SIZE) {
+        TownRec t;
+        if (!ReadStdString(e, &t.name, "TOWNC name")) return false;
+        memcpy(&t.x, (void*)(e + 0x20), 4);
+        memcpy(&t.y, (void*)(e + 0x24), 4);
+        memcpy(t.cap, (void*)(e + 0x28), 12);
+        if (!_finite(t.x) || !_finite(t.y) || fabsf(t.x) > 1e6f || fabsf(t.y) > 1e6f) {
+            Log("[towncap] town position %g,%g is not a map position\n", t.x, t.y);
+            return false;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (t.cap[i] < 0 || t.cap[i] > 1000000) { Log("[towncap] capacity %d out of range\n", t.cap[i]); return false; }
+            if (!ReadIntVec(e + 0x38 + 0x18 * i, &t.needs[i], "TOWNC needs") || t.needs[i].size() > 64) return false;
+        }
+        out->push_back(t);
+    }
+    return true;
+}
+
+// One line per town: TOWNC <x,y> <cap1> <cap2> <cap3> <needs1> <needs2> <needs3> <name>
+// The position is one %.9g field (float-exact, and a string on the wire, as
+// VCOLOR's rgb is); a needs list is comma-joined or "-"; the name is
+// percent-encoded, or "-" when the tool left it to the engine.
+static bool WriteInjectTowns(const std::vector<TownRec>& towns)
+{
+    ReadInstance();
+    if (!g_instance[0]) { Log("[slice] no instance letter -- cannot inject\n"); return false; }
+    char p[MAX_PATH];
+    snprintf(p, sizeof(p), "%slockstep_inject_%s.txt", g_dataDir, g_instance);
+    FILE* f = _fsopen(p, "a", _SH_DENYNO);
+    if (!f) { Log("[slice] cannot open %s\n", p); return false; }
+    for (const TownRec& t : towns) {
+        fprintf(f, "TOWNC %.9g,%.9g %d %d %d", t.x, t.y, t.cap[0], t.cap[1], t.cap[2]);
+        for (int i = 0; i < 3; i++) {
+            if (t.needs[i].empty()) { fprintf(f, " -"); continue; }
+            for (size_t k = 0; k < t.needs[i].size(); k++) fprintf(f, "%s%d", k ? "," : " ", t.needs[i][k]);
+        }
+        fprintf(f, " %s\n", t.name.empty() ? "-" : PercentEncode(t.name).c_str());
+        Log("[towncap] TOWNC shipped: %.9g,%.9g capacities %d/%d/%d, needs %d/%d/%d, name %s\n",
+            t.x, t.y, t.cap[0], t.cap[1], t.cap[2], (int)t.needs[0].size(), (int)t.needs[1].size(),
+            (int)t.needs[2].size(), t.name.empty() ? "(the engine's)" : t.name.c_str());
+    }
+    fclose(f);
+    return true;
+}
+
+// __try cannot live beside the std::vector, so the faulting calls are wrapped
+static bool DecodeTownsSafe(uint64_t rdx, std::vector<TownRec>* out)
+{ __try { return DecodeTowns(rdx, out); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+static bool WriteInjectTownsSafe(const std::vector<TownRec>* towns)
+{ __try { return WriteInjectTowns(*towns); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
+static void ProbeCreateTownsSafe(uint64_t rdx, uint64_t r8, uint64_t r9, uint64_t st0)
+{ __try { ProbeCreateTowns(rdx, r8, r9, st0); } __except (EXCEPTION_EXECUTE_HANDLER) { Log("[towncap] probe fault -- ignored\n"); } }
+
+static void CaptureTowns(uint64_t rcx, uint64_t rdx, uint64_t r8, uint64_t r9, uint64_t st0,
+                         uint64_t caller, bool cancel)
+{
+    // Only the town tool's own click is a player's action; the replay comes
+    // back through api.cmd.make.createTowns from another return address.
+    if (caller != CALLER_TOWNBUILDER) {
+        Log("[towncap] CreateTowns from caller %llx (not the town tool) -- a replay or a script, runs natively\n",
+            (unsigned long long)caller);
+        return;
+    }
+    std::vector<TownRec> towns;
+    bool decoded = false;
+    decoded = DecodeTownsSafe(rdx, &towns);
+    if (!decoded) {
+        // never cancel what could not be shipped: the town is built here only,
+        // and the next world check says so
+        Log("[towncap] CreateTowns: the town list did not decode -- NOT cancelled, built on this game only\n");
+        ProbeCreateTownsSafe(rdx, r8, r9, st0);
+        return;
+    }
+    const bool armed = cancel && SessionLive();
+    WriteArmed(armed);
+    bool shipped = false;
+    shipped = WriteInjectTownsSafe(&towns);
+    if (!shipped) {
+        if (armed) WriteArmed(false);   // take back the ARMED 1 that has no line behind it
+        Log("[towncap] CreateTowns: nothing shipped -- NOT cancelled, built on this game only\n");
+        return;
+    }
+    if (cancel && SessionLive()) {
+        // fire-and-forget: the town tool does not wait for the result
+        InterlockedExchange64(&g_pendingCmd, (LONG64)rcx);
+        // The tool WAITS on its callback (the "building town" bar): fired at the cancel,
+        // as the build tools' are, so the tool is free at once and the town appears at the
+        // stamp on every game (measured on two instances, 2026-09-27: no message, no desync).
+        InterlockedExchange(&g_pendingNoCb, 0);
+        InterlockedExchange(&g_pendingStashCb, 0);
+        InterlockedExchange(&g_pendingHonour, 1);
+        Log("[slice] armed cancel: CreateTowns cmd=%llx (%d town(s)) -- every game builds them at the stamp\n",
+            (unsigned long long)rcx, (int)towns.size());
+    }
+    return;
+}
+
 static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_t r8,
                            uint64_t r9, uint64_t calleeRsp, uint64_t caller, bool cancel)
 {
@@ -278,6 +452,18 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         (unsigned long long)st[0], (unsigned long long)st[1], (unsigned long long)st[2],
         (unsigned long long)st[3], (unsigned long long)st[4], (unsigned long long)st[5]);
 
+    if (f.id == 19) {
+        CaptureTowns(rcx, rdx, r8, r9, st[0], caller, cancel);
+        return;
+    }
+
+    if (f.id == 20) {
+        // RemoveTown, probe stage: logged with its argument bytes, runs natively
+        __try { ProbeCreateTowns(rdx, r8, r9, st[0]); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { Log("[towncap] RemoveTown probe fault -- ignored\n"); }
+        return;
+    }
+
     // Sell / Replace / SendToDepot / SetLine. The scripting layer's wrappers (our
     // own replays on the peer) live in one block, 0xcec000..0xcf2000 (ced378 =
     // buildProposal, cee710 = SetVehicleManualDeparture, ceefae = buyVehicle);
@@ -288,7 +474,8 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
     // of this list meant the hook CAPTURED a rename -- '[cap] SetName' is in
     // the log -- and then wrote nothing, so renaming a line looked like a
     // replication failure when it never reached the wire at all.
-    if ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14) {
+    // 18 (SetUserStopped) is SendToDepot's shape and takes its route.
+    if ((f.id >= 3 && f.id <= 10) || f.id == 13 || f.id == 14 || f.id == 18) {
         bool luaPath = IsScriptCaller(caller);
         if (luaPath) {
             Log("[slice] %s from the Lua path (caller=%llx) -- a replay, not shipped\n",
@@ -301,6 +488,9 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
                 // the platform assignment the click ran, re-run here on the rebuilt list (LINE PLATFORM ASSIGNMENT AT REPLAY)
                 __try { ApplyLineAssignAtReplay(rdx, (int32_t)r8, r9); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { Log("[lineassign] LUPDATE replay: fault in the assignment -- the list is applied as shipped\n"); }
+                // the stops' cargo filters, which the Lua API cannot set (CARGO FILTERS AT THE REPLAY)
+                __try { ApplyLineCargoAtReplay((int32_t)r8, r9); }
+                __except (EXCEPTION_EXECUTE_HANDLER) { Log("[lcargo] LUPDATE replay: fault writing the cargo filters -- the list is applied without them\n"); }
             }
         } else {
             // UpdateLine: decode the Line FIRST. A cancel is only honest when
@@ -415,4 +605,4 @@ static void CaptureFactory(const Factory& f, uint64_t rcx, uint64_t rdx, uint64_
         Log("[slice] %s: no live session -- left alone, the game handles it\n", f.name);
     }
 }
-
+

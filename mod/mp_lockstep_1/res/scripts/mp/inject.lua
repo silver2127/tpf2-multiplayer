@@ -33,10 +33,12 @@ function CM.soloDrop(line)
 	end
 end
 
--- FAR BEHIND, THE PLAYER'S ACTIONS ARE OFF (2026-09-15). A command's stamp pays at
--- most CM.MAX_LEAD (15 units) of lead over the fastest game (CM.scheduleLocal). A
--- game further behind than that would stamp its player's actions into the other
--- games' past, where they apply late: a desync. So past K.ACTIONS_OFF_BEHIND the
+-- FAR BEHIND, THE PLAYER'S ACTIONS ARE OFF (2026-09-15). A game further behind the
+-- fastest one than CM.MAX_LEAD (15 units) used to stamp its player's actions into
+-- the other games' past, where they applied late: a desync. Since 2026-09-26 every
+-- stamp lands in the fastest game's future however far behind we are (CM.scheduleLocal),
+-- so this gate is about the wait, not the desync: a click there would land only once
+-- this game has caught up. So past K.ACTIONS_OFF_BEHIND the
 -- player's actions are off until the game is back within K.ACTIONS_ON_BEHIND
 -- (CM.actionsBlockTick, every tick):
 --   * dropped: a capture whose native command the slice CANCELLED -- ARMED 1 ahead
@@ -55,10 +57,11 @@ end
 K.ACTIONS_OFF_BEHIND = CM.MAX_LEAD or 15
 K.ACTIONS_ON_BEHIND = 2
 K.ACTIONS_OFF_ALWAYS = { CONXP = true, CONUP = true, CDEMO = true, SETDATE = true, CALSPEED = true,
-                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true }
+                         CMNEW = true, CMSWITCH = true, CMDEL = true, CMPW = true, CMNAME = true, CMOPEN = true,
+                         CMCOLOR = true }
 K.ACTIONS_OFF_ARMED = { ROADE = true, VBUY = true, VREPL = true, VSELL = true, VDEPOT = true, VLINE = true,
-                        VREV = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
-                        STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true }
+                        VREV = true, VSTOP = true, LUPDATE = true, LDELETE = true, VNAME = true, VCOLOR = true,
+                        STOPX = true, STOPXDEL = true, TERRAINCAP = true, ASSETCAP = true, TOWNC = true }
 CM.actionsOff = false
 CM.actionsHeld = {}   -- LCREATEX lines waiting for this game to catch up
 CM.behindBy = 0
@@ -102,6 +105,10 @@ end
 
 function CM.pollInject()
 	if not K.INJECT_FILE then return end
+	-- Companies: until this game's CMJOIN has landed (and its switch is done) no
+	-- machine knows which company our actions are for. The lines stay in the file
+	-- and are read once it has (companies.lua CM.cmHoldActions).
+	if CM.cmHoldActions and CM.cmHoldActions() then return end
 	local data, newOff = CM.readFrom(K.INJECT_FILE, CM.injectOffset)
 	CM.injectOffset = newOff
 	local carry = CM.injectCarry
@@ -193,45 +200,18 @@ function CM.pollInject()
 			-- A capture whose local build was CANCELLED must always be replayed,
 			-- peer or no peer -- dropping it deletes the player's own work.
 			if not CM.peerSeen and (CM.lastArmed or 0) == 0
-			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" and o ~= "CMOPEN" then
+			   and o ~= "EVAL" and o ~= "HEAL" and o ~= "DROPNEXT" and o ~= "SPEEDBTN" and o ~= "SPEEDSET" and o ~= "SETDATE" and o ~= "CALSPEED" and o ~= "CMNEW" and o ~= "CMSWITCH" and o ~= "CMDEL" and o ~= "CMPW" and o ~= "CMNAME" and o ~= "CMOPEN" and o ~= "CMCOLOR" then
 				CM.soloDrop(line)
 				return
 			end
 
 			-- ROADN n x0 y0 x1 y1 ...   (written by slice_hook from a captured
 			-- player build; carries every tessellated node)
-			if o == "CMNEW" or o == "CMSWITCH" or o == "CMDEL" or o == "CMPW" then
-				-- the in-game company row (GUI state) asked for a company command:
-				--   CMNEW [password]   CMSWITCH cid [password]   CMDEL cid [password]   CMPW cid [password]
-				-- the clear text stays here; only its salted hash goes on the wire
-				local cid, pwAt = tonumber(w[2]), 3
-				if o == "CMNEW" then cid = CM.cmNextId(); pwAt = 2 end
-				local pw = table.concat(w, " ", pwAt)
-				-- not while somebody is still loading in (companies.lua CM.cmLoadingPlayers)
-				local loading = (o ~= "CMPW" and CM.cmLoadingPlayers) and CM.cmLoadingPlayers() or {}
-				if #loading > 0 then
-					CM.cmNote(CM.cmLoadingNote(loading))
-					log("company: " .. o .. " refused -- " .. CM.cmLoadingNote(loading))
-				elseif cid then
-					CM.scheduleLocal(o, { cid = cid, sw = (o == "CMNEW") and 1 or nil, pw = CM.cmHashPw(cid, pw) or "-" })
-					log("company: requested " .. o .. " " .. cid .. (pw ~= "" and " [with password]" or ""))
-				end
-			elseif o == "CMOPEN" then
-				-- CMOPEN who on   -- who = * or a company id; on = 1/0: who may stop at MY stations
-				local who, on = tostring(w[2] or "*"), tonumber(w[3]) == 1 and 1 or 0
-				CM.cmEnsure()
-				if CM.cmMyCompany and (who == "*" or tonumber(who)) then
-					CM.scheduleLocal("CMOPEN", { cid = CM.cmMyCompany, who = who, on = on })
-					log(string.format("company: requested CMOPEN %s %d (company %d's stations)", who, on, CM.cmMyCompany))
-				end
-			elseif o == "CMNAME" then
-				-- CMNAME cid the company's name...   (spaces allowed; travels percent-escaped)
-				local cid = tonumber(w[2])
-				local name = table.concat(w, " ", 3)
-				if cid then
-					CM.scheduleLocal("CMNAME", { cid = cid, name = CM.escName(name) })
-					log(string.format("company: requested CMNAME %d %q", cid, name))
-				end
+			if o == "CMNEW" or o == "CMSWITCH" or o == "CMDEL" or o == "CMPW" or o == "CMNAME" or o == "CMCOLOR" or o == "CMOPEN" then
+				-- the Multiplayer window's COMPANIES tab (GUI state) asked for a company
+				-- change: companies.lua CM.cmRequest checks it, hashes any password (the
+				-- clear text stays here) and schedules the command
+				CM.cmRequest(w)
 			elseif o == "HEAL" then
 				-- Manual repair: rejoin a road at x,y if a scar from a replayed
 				-- split is all that is left there. Same rules as the sweep.
@@ -828,6 +808,7 @@ function CM.pollInject()
 						pcall(CM.cmNote, string.format("That side of the road holds company %s's stop -- you cannot replace it", tostring(takenCid or "?")))
 						return
 					end
+					if CM.autoSigCapture then CM.autoSigCapture(fields) end
 					CM.scheduleLocal("STOPADD", fields)
 					log(string.format("STOPX: cancelled %s '%s' on edge %d u=%.3f engine-left=%s geo-left=%s side=%d%s -> STOPADD (strict, every instance replays)",
 						model, name, eid, u, tostring(engLeft), tostring(geoLeft), wside, oneWay and " one-way" or ""))
@@ -1225,8 +1206,8 @@ function CM.pollInject()
 						end
 					end
 					-- a vehicle or line that came out of the save: primed, not registered.
-					-- Lines first -- forgetVehicle does not clear primedVeh, so a stale
-					-- vehicle id could otherwise shadow a live line (review, 2026-08-31).
+					-- Lines first (review, 2026-08-31: a stale primedVeh id shadowed a live
+					-- line; forgetVehicle now clears it, the order still costs nothing).
 					if not key and CM.primedLines[id] then
 						key = CM.lineKeyFor(id); if key then kind = "line" end
 					end
@@ -1281,6 +1262,17 @@ function CM.pollInject()
 					CM.scheduleLocal("VREV", { key = k, armed = CM.lastArmed or 0 })
 				end
 
+			elseif o == "TOWNC" and #w >= 9 then
+				-- Sandbox mode's town tool (mp/sandbox.lua). ARMED 1: the slice cancelled
+				-- the placement and every game, this one included, builds the town at the
+				-- stamp. The fields go on as the slice wrote them: pos stays text (float-
+				-- exact), and "name" is the key the codec never turns into a number.
+				local armed = CM.lastArmed or 0
+				log(string.format("TOWNC: town at %s capacities %s/%s/%s%s", tostring(w[2]), tostring(w[3]),
+					tostring(w[4]), tostring(w[5]), armed == 1 and " (strict)" or ""))
+				CM.scheduleLocal("TOWNC", { pos = w[2], c1 = tonumber(w[3]) or -1, c2 = tonumber(w[4]) or -1,
+					c3 = tonumber(w[5]) or -1, n1 = w[6], n2 = w[7], n3 = w[8], name = w[9], armed = armed })
+
 			elseif o == "VDEPOT" and #w >= 3 then
 				local id, sell = tonumber(w[2]), tonumber(w[3]) or 0
 				local k = id and CM.vehKeyFor(id)
@@ -1291,6 +1283,20 @@ function CM.pollInject()
 					-- armed=1: the slice cancelled it and the originator
 					-- replays at the stamp too; 0: it ran natively, peers only.
 					CM.scheduleLocal("VDEPOT", { key = k, sell = sell, armed = armed })
+				end
+
+			elseif o == "VSTOP" and #w >= 3 then
+				-- The vehicle window's stop/go toggle (SetUserStopped). Strict like
+				-- VDEPOT: the slice cancels the click and every instance, the
+				-- originator included, applies it at the stamp. Left local, the
+				-- train stopped here and kept running on the peers (2026-09-19).
+				local id, stopped = tonumber(w[2]), tonumber(w[3]) or 0
+				local k = id and CM.vehKeyFor(id)
+				if k and CM.injForeignEdit("VSTOP", id) then k = nil end
+				if k then
+					local armed = CM.lastArmed or 0
+					log(string.format("VSTOP: %s stopped=%d%s", k, stopped, armed == 1 and " (strict)" or ""))
+					CM.scheduleLocal("VSTOP", { key = k, stopped = stopped, armed = armed })
 				end
 
 			elseif o == "VLINE" and #w >= 4 and CM.injForeignEdit("VLINE", tonumber(w[2])) then
@@ -1339,6 +1345,7 @@ function CM.pollInject()
 						.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 					alts[#alts + 1] = table.concat(al, "/")
 				end
+				if not bad and CM.lineCaptureCargo then CM.lineCaptureCargo(line, stops) end
 				if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
 				if armed ~= 1 then
 					CM.pendingLineCreates[#CM.pendingLineCreates + 1] = { since = CM.gameTime() or 0 }
@@ -1437,6 +1444,7 @@ function CM.pollInject()
 								.. (sx and string.format(",%.1f,%.1f", sx, sy) or "")
 							alts[#alts + 1] = table.concat(al, "/")
 						end
+						if not bad and CM.lineCaptureCargo then CM.lineCaptureCargo(line, stops) end
 						if not bad and CM.lineCaptureWaypoints then CM.lineCaptureWaypoints(line, stops) end
 						-- asg=<0|1>: this click ran the editor's platform assignment (a station or
 						-- waypoint added); every instance re-runs it on the replayed list at the

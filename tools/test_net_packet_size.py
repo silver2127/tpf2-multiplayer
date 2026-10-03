@@ -31,7 +31,7 @@ int main() {
     _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
     _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
-    assert(sizeof(Header)==57 && HEAD==62 && sizeof(Packet)==1086);
+    assert(sizeof(Header)==73 && HEAD==78 && sizeof(Packet)==978);
     assert(EnsureWsa());
     SOCKET peer=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
     sockaddr_in endpoint{}; endpoint.sin_family=AF_INET; endpoint.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -80,7 +80,7 @@ int main() {
         sizes[p.h.seq]=n; texts[p.h.seq]=p.ev.text;
     }
     assert(sizes[0]==HEAD+6 && texts[0]=="hello");
-    assert(sizes[1]==HEAD+1024 && sizes[2]==HEAD+1024 && sizes[3]==HEAD+455);
+    assert(sizes[1]==HEAD+900 && sizes[2]==HEAD+900 && sizes[3]==HEAD+703);
     assert(texts[1]+texts[2]+texts[3]==big);
 
     // RECEIVING: a trimmed event, then a full-size one as protocol 4 sized every event

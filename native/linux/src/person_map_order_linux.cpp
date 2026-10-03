@@ -1,6 +1,8 @@
 #include "person_map_order_linux.h"
+#include "order_canon_linux.h"
 #include "hook.h"
 #include "codewrite_linux.h"
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -73,11 +75,26 @@ bool AddNode(OrderedMap& map, uint32_t key, uintptr_t gameNode)
 }
 
 constexpr size_t kInfoMapCount = 5, kNativeMapSize = 0x38;
+// HOT-JOIN ORDER (2026-09-22): the apply walks these maps with one shared
+// fixed-seed generator and frees ids in walk order, and the Windows order this
+// module reproduces is insertion history -- a host that kept its world and a
+// joiner that loaded it disagree (lab, busy world, ~120 units after a live
+// join). By default (unless TPF2MP_ORDER_CANON=0), a sealed owner is walked in ascending key
+// order instead, as Windows does (slice/hotjoin_order.inl). The sorted arrays
+// sit beside the records, which stay intact for the validation and FindNode.
+struct SortedEntry { uint32_t key; uintptr_t gameNode; };
+bool CanonicalMaps()
+{
+    static const bool on = [] { const char* v = std::getenv("TPF2MP_ORDER_CANON"); return !v || std::strcmp(v, "0"); }();
+    return on && tpf2mp_order_detail::active.load(std::memory_order_acquire);
+}
 struct MapOwner {
     MapOwner* next;
     uintptr_t data, owner;
     bool invalid, sealed;
     OrderedMap maps[kInfoMapCount];
+    SortedEntry* sorted[kInfoMapCount];
+    size_t sortedCount[kInfoMapCount];
 };
 // The original allocation/deleter, rather than an address timeout or thread
 // identity, bounds each record. A mutex supports nested and transferred owners.
@@ -93,6 +110,7 @@ void MapError(const char* message)
     if (!log) return;
     const char* failures[] = {
         "ERROR: person-map allocation reused without its verified deleter",
+        "ERROR: canonical person-map allocation failed",
         "ERROR: person-map lifetime capture failed",
         "ERROR: person-map insertion capture failed",
         "ERROR: incomplete person-map capture; native traversal retained"
@@ -110,6 +128,7 @@ uint32_t ReadKey(uintptr_t node) { uint32_t k; std::memcpy(&k, reinterpret_cast<
 void DeleteOwner(MapOwner* owner)
 {
     for (auto& map : owner->maps) ClearMap(map);
+    for (auto* s : owner->sorted) std::free(s);
     std::free(owner);
 }
 void ForgetMaps(uintptr_t data)
@@ -170,6 +189,33 @@ void SealOwner(MapOwner& owner)
         if (visited != map.count) owner.invalid = true;
     }
     if (owner.invalid) MapError("ERROR: incomplete person-map capture; native traversal retained");
+    if (owner.invalid || !CanonicalMaps()) return;
+    for (size_t i = 0; i < kInfoMapCount; ++i) {
+        const size_t n = owner.maps[i].count;
+        if (!n) continue;
+        auto* s = static_cast<SortedEntry*>(std::malloc(n * sizeof(SortedEntry)));
+        if (!s) {   // no canonical walk for this owner at all: all five maps or none
+            for (size_t j = 0; j < i; ++j) { std::free(owner.sorted[j]); owner.sorted[j] = nullptr; owner.sortedCount[j] = 0; }
+            MapError("ERROR: canonical person-map allocation failed");
+            return;
+        }
+        size_t k = 0;
+        for (auto* p = owner.maps[i].first; p && k < n; p = p->next) s[k++] = { p->key, p->gameNode };
+        std::sort(s, s + k, [](const SortedEntry& a, const SortedEntry& b) { return a.key < b.key; });
+        owner.sorted[i] = s; owner.sortedCount[i] = k;
+    }
+}
+// ascending-key successor of `node` in a sealed canonical owner, or `fallback`
+bool SortedNext(MapOwner& owner, size_t index, uintptr_t node, uintptr_t* out)
+{
+    const SortedEntry* s = owner.sorted[index];
+    const size_t n = owner.sortedCount[index];
+    if (!s) return false;
+    const uint32_t key = ReadKey(node);
+    const SortedEntry* at = std::lower_bound(s, s + n, key, [](const SortedEntry& e, uint32_t k) { return e.key < k; });
+    if (at == s + n || at->key != key || at->gameNode != node) return false;
+    *out = at + 1 < s + n ? at[1].gameNode : 0;
+    return true;
 }
 uintptr_t FirstMapNode(uintptr_t data, size_t index)
 {
@@ -177,7 +223,10 @@ uintptr_t FirstMapNode(uintptr_t data, size_t index)
     pthread_mutex_lock(&g_mapMutex);
     for (auto* owner = g_mapOwners; owner; owner = owner->next) if (owner->data == data) {
         SealOwner(*owner);
-        if (!owner->invalid) result = owner->maps[index].first ? owner->maps[index].first->gameNode : 0;
+        if (!owner->invalid) {
+            if (owner->sorted[index]) result = owner->sortedCount[index] ? owner->sorted[index][0].gameNode : 0;
+            else result = owner->maps[index].first ? owner->maps[index].first->gameNode : 0;
+        }
         break;
     }
     pthread_mutex_unlock(&g_mapMutex); return result;
@@ -188,6 +237,7 @@ uintptr_t NextMapNode(uintptr_t node, size_t index)
     pthread_mutex_lock(&g_mapMutex);
     for (auto* owner = g_mapOwners; owner; owner = owner->next) {
         if (!owner->sealed || owner->invalid) continue;
+        if (SortedNext(*owner, index, node, &result)) break;
         auto* found = FindNode(owner->maps[index], ReadKey(node));
         if (found && found->gameNode == node) { result = found->next ? found->next->gameNode : 0; break; }
     }

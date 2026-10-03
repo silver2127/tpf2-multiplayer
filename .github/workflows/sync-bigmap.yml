@@ -1,0 +1,48 @@
+# Mirrors bigmap/ into the standalone silver2127/tpf2-bigmap repository, so Big
+# Maps stays downloadable on its own. Every push to dev that touches Big Maps
+# (bigmap/, the plugin ABI header or the sync itself) replays the new commits onto
+# tpf2-bigmap's dev with tools/bigmap_sync/sync.py. A rerun is a no-op: the
+# script reads the last mirrored commit from the standalone history.
+#
+# Auth: BIGMAP_SYNC_DEPLOY_KEY is the private half of a write deploy key on
+# tpf2-bigmap (and nothing else).
+name: Sync Big Maps
+
+on:
+  push:
+    branches: [dev]
+    paths: ['bigmap/**', 'native/src/plugin/tpf2mp_plugin.h', 'tools/bigmap_sync/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bigmap-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          path: mp
+
+      - name: Clone tpf2-bigmap
+        env:
+          DEPLOY_KEY: ${{ secrets.BIGMAP_SYNC_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/bigmap_sync
+          chmod 600 ~/.ssh/bigmap_sync
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/bigmap_sync -o IdentitiesOnly=yes"
+          git clone -b dev git@github.com:silver2127/tpf2-bigmap.git sa
+
+      - name: Replay bigmap/ commits
+        run: |
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/bigmap_sync -o IdentitiesOnly=yes"
+          python3 mp/tools/bigmap_sync/sync.py --mp mp --sa sa --rev HEAD --push

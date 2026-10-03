@@ -79,6 +79,16 @@ with tempfile.TemporaryDirectory() as temporary:
     workers = [threading.Thread(target=lobby.run_host, args=(sock, 'host', ios['host']),
                                 kwargs=dict(stop=stop, log=host_log.append))]
     connections = []
+    # Record sender proposals before the merge can discard them. On a fast
+    # Linux loopback the joiner can win every receiving-stage update.
+    sender_proposals = []
+    original_merge = lobby._merge_sender_stage
+
+    def observe_sender(current, text, pct):
+        sender_proposals.append((text, pct))
+        return original_merge(current, text, pct)
+
+    lobby._merge_sender_stage = observe_sender
     workers[0].start()
 
     def command(who, **fields):
@@ -130,13 +140,22 @@ with tempfile.TemporaryDirectory() as temporary:
         # On loopback the whole file is in flight at once (SEND_WINDOW_LOCAL), so
         # the sender's own view jumps from 0 to the end and its end step usually
         # loses to the joiner's own 100% (the merge rule); the 10% steps in
-        # between are the joiner's reports. What the sender must do is open the
-        # sequence with 0% before any joiner report, and never go backwards.
-        check('the host log shows the sender opening the roster at 0% and never regressing',
-              bool(pcts) and pcts[0] == 0 and pcts == sorted(pcts), str(pcts))
-        check('the sender\'s first word came before any joiner report',
-              bool(sender_lines()) and 'receiving save 0%' in sender_lines()[0], (sender_lines() or ['none'])[0])
+        # between are the joiner's reports. The sender must propose 0% first
+        # and never go backwards; the joiner's reports may reach the host first.
+        # The joiner's own "receiving save 0%" can reach the host before the
+        # sender's: the merge rule then keeps the joiner's (at least as far
+        # along) and the sender's 0% is never logged. Either way the roster
+        # opens at 0% -- that is what the players see (flaked 3 in 5 runs on
+        # 2026-09-27 when this required the sender to win the race).
         history = stage_history('client1')
+        opened = [s for s in history if s]
+        check('the roster opens at "receiving save 0%" and the sender never regresses',
+              pcts == sorted(pcts) and bool(opened) and opened[0] == 'receiving save 0%',
+              f'{pcts} | {" | ".join(history)}')
+        proposed_pcts = [pct for _, pct in sender_proposals if pct is not None]
+        check('the sender proposes 0% first and never regresses, even when the joiner wins the merge',
+              bool(proposed_pcts) and proposed_pcts[0] == 0
+              and proposed_pcts == sorted(proposed_pcts), str(sender_proposals))
         check('the roster went through receiving stages to "save received, loading"',
               any(s.startswith('receiving save ') for s in history) and history[-1] == 'save received, loading',
               ' | '.join(history))
@@ -161,6 +180,7 @@ with tempfile.TemporaryDirectory() as temporary:
         check('the host clears its stage', wait_for(lambda: 'host' not in roster().get('stages', {}), 'the host clear'))
 
     finally:
+        lobby._merge_sender_stage = original_merge
         stop.set()
         for worker in workers:
             worker.join(10)

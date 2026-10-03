@@ -20,11 +20,30 @@ import sys
 LINK = re.compile(r'\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)')
 HEAD = re.compile(r'^#+\s+(.*?)\s*#*\s*$', re.M)
 PATH = re.compile(r'(?<![\w/.:-])((?:tools|docs|native/src|netpunch|installer|mod/mp_lockstep_1|\.github/workflows)[/\\][\w./\\-]*\.(?:py|ps1|sh|cpp|h|asm|bat|lua|md|yml|wxs|txt|inl))\b')
+ANCHOR = re.compile(r'<a\s+(?:id|name)="([^"]+)"')
+CODE = re.compile(r'```.*?```|`(?:[^`\n]|\n(?![ \t]*\n))+`', re.S)   # a code span may wrap, not cross a paragraph
 SKIP_DIRS = ('.git', 'out', 'node_modules', '.local-test', 'dist', 'build', 'linux_port')   # linux_port: the porter's prompts describe the linux-native branch
+# Big Maps is mirrored to its own repository (tools/bigmap_sync), so its documents
+# (and the README fragments the sync splices in) name paths from bigmap/, not from here.
+SUBPROJECTS = {'bigmap/': 'bigmap', 'tools/bigmap_sync/readme/': 'bigmap'}
+# Paths that exist only in the standalone Big Maps repository (tools/bigmap_sync/sync.py OWNED).
+STANDALONE_OWNED = ('installer/', 'tools/vendor_host.ps1', 'tools/test_config_msi.py', 'tools/test_coexist.ps1')
+# Named on purpose although they are not in this tree: records of what a past commit
+# changed, files the software writes at run time, and files deliberately never added.
+IGNORE = {
+    ('bigmap/docs/terrain-lodtess.md', 'tools/test_terrain_lodtess.py'),       # "deliberately not added"
+    ('bigmap/docs/linux/PORT.md', 'tools/linux/build.sh'),                     # the standalone repo's Linux build
+    ('bigmap/docs/linux/PORT.md', 'tools/linux/package.sh'),
+    ('docs/linux/NETPUNCH.md', 'netpunch/desynclogs.py'),                      # port record, file since removed
+    ('docs/linux/UPSTREAM_dev_d129fab7.md', 'netpunch/player_stats.py'),       # integration record
+    ('docs/linux/UPSTREAM_dev_d129fab7.md', 'tools/test_player_stats.py'),
+    ('docs/linux/UPSTREAM_dev_b5dade06.md', 'tools/company_name_test.py'),    # historical integration; since removed
+    ('installer/RELEASE-0.7.md', 'netpunch/tpf2mp_live_join.txt'),            # written at run time
+}
 
 
 def slug(h):
-    h = re.sub(r'[`*_]', '', h.strip().lower())
+    h = re.sub(r'[`*]', '', h.strip().lower())   # GitHub keeps underscores
     h = re.sub(r'[^\w\- ]', '', h)
     return h.replace(' ', '-')
 
@@ -41,14 +60,28 @@ def all_md(root):
     return sorted(out)
 
 
+def path_exists(doc, path):
+    """A path named in `doc` exists from the repository root, or from the root
+    of the subproject `doc` belongs to."""
+    if os.path.exists(path) or (doc, path) in IGNORE:
+        return True
+    for prefix, base in SUBPROJECTS.items():
+        if doc.startswith(prefix) and (os.path.exists(os.path.join(base, path))
+                                       or path.startswith(STANDALONE_OWNED)):
+            return True
+    return False
+
+
 def main(argv):
-    root = os.path.abspath(os.getcwd())
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    os.chdir(root)
     docs = ['README.md'] if '--readme' in argv else all_md(root)
     text, heads = {}, {}
     for p in all_md(root):
         with open(p, encoding='utf-8', errors='replace') as f:
             text[p] = f.read()
-        heads[p] = {slug(m.group(1)) for m in HEAD.finditer(text[p])}
+        heads[p] = {slug(m.group(1)) for m in HEAD.finditer(text[p])} | \
+                   {m.group(1).lower() for m in ANCHOR.finditer(text[p])}
 
     dead_links, dead_anchors, dead_paths, linked = [], [], [], set()
     queue, done = list(docs), set()
@@ -57,7 +90,9 @@ def main(argv):
         if p in done or p not in text:
             continue
         done.add(p)
-        for label, target in LINK.finditer(text[p]) and [(m.group(1), m.group(2)) for m in LINK.finditer(text[p])]:
+        prose = CODE.sub('', text[p])   # a [x](y) inside code is code, not a link
+        for m in LINK.finditer(prose):
+            label, target = m.group(1), m.group(2)
             if target.startswith(('http://', 'https://', 'mailto:')):
                 continue
             file, _, anchor = target.partition('#')
@@ -73,7 +108,7 @@ def main(argv):
                 dead_anchors.append((p, label, target))
         for m in PATH.finditer(text[p]):
             path = norm(m.group(1))
-            if not os.path.exists(path):
+            if not path_exists(p, path):
                 dead_paths.append((p, m.group(1)))
 
     def show(title, rows, fmt):

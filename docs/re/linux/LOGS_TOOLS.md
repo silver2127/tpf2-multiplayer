@@ -103,3 +103,69 @@ namespace.
 - The Flatpak Steam paths (`~/.var/app/com.valvesoftware.Steam/...`): no Flatpak Steam here.
 - What the game does after `"... Process seems to be still running"` (the control flow after
   0x9b12d0 was not followed).
+
+## dev 45183ac6: archive metadata and state (2026-09-26)
+
+This integration changes mod-owned file collection only. Existing game log
+locations and constructor ordering above are unchanged; no new game offsets,
+patch bytes or SysV calling conventions are introduced.
+
+The Windows PE link stamp maps to GNU ELF build IDs on native Linux.
+`LaBuildId` reads ELF64 little-endian program headers and bounded `PT_NOTE`
+records, selecting `NT_GNU_BUILD_ID` with the `GNU\0` owner. It bounds the
+program-header table and note spans against file size, caps note segments at
+1 MiB and IDs at 64 bytes, and reports unavailable for unsupported/malformed
+files. It does not execute the game or map game objects.
+
+The native archive regression executable's read-only identity mode was run on
+`~/.local/share/tpf2mp-lab/native/game/TransportFever2`; it returned
+`3a0e156390b0e6f1e372051c24802c8493ae454a`, identical to `readelf -n`.
+Native version discovery follows `tools/linux/install.sh`'s
+`tpf2mp_install.txt` version field. Lobby state discovery follows
+`LobbyFolder` / `XdgNetDir` in `lobby_linux.cpp`; the game-folder fallback is
+also collected. These are source-level contracts, not inferred game layouts.
+
+The lab launch failed before game execution (`bwrap: setting up uid map:
+Permission denied`). Thus no live startup/archive/UI result is claimed.
+See [integration and tests](../../linux/UPSTREAM_dev_45183ac6.md).
+
+## dev 616191b1: previous-run crash recovery (2026-09-26)
+
+The native archiver now copies the newest startup archive's `game_stdout.txt`
+and every regular `crash_*` file into OPEN LOGS as `previous_run_*`. This is
+needed because the startup archive's modification time already excludes the
+crashed run's original dump from the next "since last archive" scan.
+The previous-run log step was also missing on native Linux and is included.
+
+Selection uses the existing `LaArchiveKind` parser and archive-name order,
+including same-second numeric suffixes. It tracks the newest previous archive
+independently of the bounded retention list. Copies use the existing POSIX
+collector and 200 MiB aggregate budget, before state files. Dumps are copied
+whole (tail cap zero); the source archive is retained. Startup archives do not
+recursively carry previous archives. Linux does not generate Windows's
+per-dump stdout companion, but any archived `crash_*` companion is preserved.
+
+No game location, offset, hook, patch bytes, calling convention or lifetime
+contract changes. No new ELF analysis or live ABI probe is needed. The native
+filesystem regression exercises a startup containing a synthetic >32 MiB
+dump, then OPEN LOGS while the original dump is excluded by timestamp. This
+is fixture evidence, not an observed game crash or UI interaction.
+See [integration and validation](../../linux/UPSTREAM_dev_616191b1.md).
+
+## dev bef70213: previous-run mod logs (2026-09-26)
+
+OPEN LOGS also copies `*.log` from the same newest startup archive, using
+`previous_run_` names. This uses the existing POSIX collector with copying
+(not moving), its regular-file checks, 32 MiB log-tail limit and shared
+200 MiB budget, before state collection. Startup already archives data logs
+and prefixed lobby logs, so no new discovery path is needed. The standalone
+collector already includes `*.log` from saved runs and needs no change.
+
+The native filesystem regression now distinguishes a dead run's host log
+from its restarted replacement, checks bridge/terrain/lobby logs, retains
+the source, and confirms newest-startup selection and no recursive startup
+collection. It fails against the preceding native implementation and passes
+with this change. These are synthetic filesystem observations, not a live
+crash. No engine address, bytes, ABI, offset or lifetime contract changes;
+no additional ELF or live reverse engineering is required.
+See [integration record](../../linux/UPSTREAM_dev_bef70213.md).

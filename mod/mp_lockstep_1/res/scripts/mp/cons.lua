@@ -203,6 +203,7 @@ function CM.conKey(x, y) return string.format("%.1f/%.1f", x, y) end
 -- a new id at an already-known position is an edit, never a new build.
 CM.consByKey    = {}   -- conKey -> { id=, file=, params=<ser string> }
 local expectedEdit = {}   -- conKey -> true: our own replayed edit is about to replace the entity
+CM.expectedEditOwner = {} -- conKey -> the company that owned the edited building (companies mode)
 CM.primeQueue   = {}   -- ids from the first poll, classified a few per tick
 
 -- Is the entity the table names still THAT construction? Entity ids are
@@ -281,7 +282,24 @@ function CM.execConU(c)
 		end
 		params.seed = nil
 		local key = CM.conKey(x, y)
+		-- COMPANIES: A BUILDING IS ITS OWNER'S TO CHANGE (2026-09-27). A company's
+		-- headquarters was upgraded by another company's player, and the edit landed
+		-- on every machine. The command's company (decided at the stamp) must own the
+		-- building; ownership by company is the same everywhere, so every machine
+		-- refuses alike. The owner is remembered: upgradeConstruction REPLACES the
+		-- entity, and the replacement lands owned by our human player.
+		local ownerCid = nil
+		if CM.cmMode == "companies" then
+			ownerCid = CM.cmCompanyOfPid and CM.cmCompanyOfPid(CM.cmOwnerOf(rec.id)) or nil
+			local by = tonumber(c.company)
+			if ownerCid and by and ownerCid ~= by then
+				log(string.format("CONU seq=%s: %s at %.1f,%.1f belongs to company %d, not %d -- refused", tostring(c.seq), tostring(c.file), x, y, ownerCid, by))
+				if CM.cmLog then CM.cmLog(string.format("CM: CONU seq=%s from %s refused: the building belongs to co%d (sender co%d)", tostring(c.seq), tostring(c.origin), ownerCid, by)) end
+				return
+			end
+		end
 		expectedEdit[key] = true
+		CM.expectedEditOwner[key] = ownerCid
 		local uok, uerr = pcall(game.interface.upgradeConstruction, rec.id, c.file, params)
 		log(string.format("EXEC CONU seq=%s origin=%s at=%s file=%s target=%d ok=%s%s",
 			tostring(c.seq), tostring(c.origin), tostring(c.at), tostring(c.file), rec.id,
@@ -716,40 +734,81 @@ end
 -- and here it would bulldoze the road beside a level crossing instead of the
 -- rail the player actually removed.
 --
--- One pass per map covering ALL endpoints, rather than a scan per endpoint: a
--- dragged bulldoze removes many edges at once and a scan each would be tens of
--- thousands of component reads. It runs on a player action, never on a tick.
-local function edemoMatchNodes(want)
-	local byKind = {}
-	pcall(function() byKind[0] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
-	pcall(function() byKind[1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
-	local best, bestD = {}, {}
+-- The node index: both edge maps and every node's position, bucketed into
+-- EDEMO_CELL-metre cells, built ONCE and reused by every EDEMO that runs before
+-- the world changes. A dragged bulldoze arrives as one EDEMO per edge, and a
+-- full scan each (both maps, every node's position: tens of thousands of
+-- component reads) froze both games for 12.6 s over 173 EDEMOs on one step
+-- (2026-09-24). Reuse is exact, not approximate: the index lives only for the
+-- current update() tick (the sim cannot move inside one) and is dropped the
+-- moment anything may have edited the network -- this file's own proposal
+-- below, or any other command (execute() in lockstep.lua). So every lookup sees
+-- the same world a fresh scan would, and peers still agree.
+local EDEMO_CELL = 4   -- metres; must be >= the match radius sqrt(K.EDEMO_TOL_SQ)
+local function edemoCellKey(x, y)
+	return (math.floor(x / EDEMO_CELL) + 1048576) * 2097152 + (math.floor(y / EDEMO_CELL) + 1048576)
+end
+
+local function edemoIndex()
+	local ix = CM.edemoCache
+	if ix and ix.tick == CM.ticks then
+		ix.reused = ix.reused + 1
+		return ix
+	end
+	local t0 = os.clock()
+	ix = { tick = CM.ticks, byKind = {}, grid = { [0] = {}, [1] = {} }, reused = 0, nodes = 0 }
+	pcall(function() ix.byKind[0] = api.engine.system.streetSystem.getNode2StreetEdgeMap() end)
+	pcall(function() ix.byKind[1] = api.engine.system.streetSystem.getNode2TrackEdgeMap() end)
 	for kind = 0, 1 do
-		local m = byKind[kind]
+		local m, g = ix.byKind[kind], ix.grid[kind]
 		if m then
 			for nid in pairs(m) do
-				-- fetched at most once per node, and only if some endpoint of
-				-- this kind is still looking
-				local pos = nil
-				for i, w in ipairs(want) do
-					if w[4] == kind then
-						if pos == nil then pos = CM.nodePosXYZ(nid) or false end
-						if pos then
-							local dx, dy = pos[1] - w[1], pos[2] - w[2]
-							local d = dx * dx + dy * dy
-							-- ties broken by the lower id so every peer agrees
-							if d <= K.EDEMO_TOL_SQ and (not bestD[i] or d < bestD[i]
-									or (d == bestD[i] and nid < best[i])) then
-								best[i], bestD[i] = nid, d
-							end
+				local pos = CM.nodePosXYZ(nid)
+				if pos then
+					local key = edemoCellKey(pos[1], pos[2])
+					local cell = g[key]
+					if not cell then cell = {}; g[key] = cell end
+					cell[#cell + 1] = { nid, pos[1], pos[2] }
+					ix.nodes = ix.nodes + 1
+				end
+			end
+		end
+	end
+	ix.buildMs = (os.clock() - t0) * 1000
+	CM.edemoCache = ix
+	return ix
+end
+
+-- Nearest node to each endpoint, within K.EDEMO_TOL_SQ, in that endpoint's own
+-- kind. Only the 3x3 cells around the endpoint can hold a node that close, so
+-- the answer is the full scan's: same candidates, same distance, ties broken by
+-- the lower id so every peer agrees.
+local function edemoMatchNodes(want)
+	local ix = edemoIndex()
+	local best, bestD = {}, {}
+	for i, w in ipairs(want) do
+		local g = ix.grid[w[4]]
+		local cx, cy = math.floor(w[1] / EDEMO_CELL), math.floor(w[2] / EDEMO_CELL)
+		for gx = cx - 1, cx + 1 do
+			for gy = cy - 1, cy + 1 do
+				local cell = g[(gx + 1048576) * 2097152 + (gy + 1048576)]
+				if cell then
+					for _, n in ipairs(cell) do
+						local nid = n[1]
+						local dx, dy = n[2] - w[1], n[3] - w[2]
+						local d = dx * dx + dy * dy
+						if d <= K.EDEMO_TOL_SQ and (not bestD[i] or d < bestD[i]
+								or (d == bestD[i] and nid < best[i])) then
+							best[i], bestD[i] = nid, d
 						end
 					end
 				end
 			end
 		end
 	end
-	return best, byKind
+	return best, ix.byKind, ix
 end
+CM.edemoMatchNodes = edemoMatchNodes   -- for tools/edge_demolition_test.py
 
 function CM.execEdgeDemolish(c)
 	-- NO originator skip. The slice CANCELS the player's bulldoze at
@@ -777,7 +836,10 @@ function CM.execEdgeDemolish(c)
 			want[#want + 1] = { v[1], v[2], v[3], kind }
 			want[#want + 1] = { v[4], v[5], v[6], kind }
 		end
-		local nodes, byKind = edemoMatchNodes(want)
+		local nodes, byKind, ix = edemoMatchNodes(want)
+		if ix.reused == 0 then
+			log(string.format("EDEMO seq=%s: node index built (%d nodes, %.0f ms)", tostring(c.seq), ix.nodes, ix.buildMs or 0))
+		end
 
 		local rmSet, rmList, unmatched = {}, {}, 0
 		for i = 1, #prs do
@@ -877,6 +939,9 @@ function CM.execEdgeDemolish(c)
 			return
 		end
 		local nEdges, nOrph = #rmList, #orphans
+		-- the network is about to change (edges, orphans, graph cleanup merges):
+		-- the next EDEMO must see the new one
+		CM.edemoCache = nil
 		api.cmd.sendCommand(cmd, function(res, ok2)
 			local extra = ""
 			if not ok2 then
@@ -1501,6 +1566,10 @@ local function landReplayed(id, fn, key, pstr)
 		CM.expectedSince[key] = nil
 		noteCon(id, fn, key, pstr)
 		log(string.format("con: replayed edit landed as id %d", id))
+		-- the replacement landed owned by our player: back to the company that owned it
+		local oc = CM.expectedEditOwner[key]
+		CM.expectedEditOwner[key] = nil
+		if oc and oc ~= CM.cmMyCompany then pcall(function() CM.cmReassignConstruction(id, oc) end) end
 		return true
 	end
 	return false
@@ -1700,72 +1769,137 @@ function CM.constructionAt(x, y, maxDist)
 	return found
 end
 
-function CM.pollConstructionRemovals()
-	local ok, err = pcall(function()
-		for key, rec in pairs(CM.consByKey) do
-			if conStillThere(rec) then
+-- One tracked construction, checked for a demolish. Two consecutive misses a few ticks
+-- apart make a demolish, so a one-frame remove/re-add gap is not read as one.
+local function removalCheck(key, rec)
+	if conStillThere(rec) then
+		demolishMiss[key] = nil
+	else
+		local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
+		local x, y = tonumber(kx), tonumber(ky)
+		-- An upgrade replacement stands ON the spot (the key is rounded to
+		-- 0.1 m); a neighbour 6 m away is not it -- a bulldozed fence
+		-- segment's record lived on because the next segment was in reach.
+		if x and CM.constructionAt(x, y, 1) then
+			-- something is still there: an upgrade replacement; let
+			-- pollNewConstructions re-adopt it. Not a demolish.
+			demolishMiss[key] = nil
+		else
+			demolishMiss[key] = (demolishMiss[key] or 0) + 1
+			if demolishMiss[key] >= 2 then
 				demolishMiss[key] = nil
-			else
-				local kx, ky = tostring(key):match("^(%-?[%d%.]+)/(%-?[%d%.]+)$")
-				local x, y = tonumber(kx), tonumber(ky)
-				-- An upgrade replacement stands ON the spot (the key is rounded to
-				-- 0.1 m); a neighbour 6 m away is not it -- a bulldozed fence
-				-- segment's record lived on because the next segment was in reach.
-				if x and CM.constructionAt(x, y, 1) then
-					-- something is still there: an upgrade replacement; let
-					-- pollNewConstructions re-adopt it. Not a demolish.
-					demolishMiss[key] = nil
+				if expectedEdit[key] or CM.expectedCons[key] then
+					-- upgrade/replay in flight -- but a STALE flag here
+					-- silently suppresses a real demolish forever
+					-- (suspected one-off 2026-08-29: bulldoze logged by
+					-- the hook, mod said nothing). Tripwire it.
+					log(string.format("con: %s is gone but edit/replay flags block the demolish (edit=%s cons=%s) -- will re-check",
+						key, tostring(expectedEdit[key] ~= nil), tostring(CM.expectedCons[key] ~= nil)))
+				elseif CM.expectedDemolish[key] then
+					CM.expectedDemolish[key] = nil
+					CM.consByKey[key] = nil
+					log(string.format("con: %s bulldozed by replay -- not echoed", key))
 				else
-					demolishMiss[key] = (demolishMiss[key] or 0) + 1
-					if demolishMiss[key] >= 2 then
-						demolishMiss[key] = nil
-						if expectedEdit[key] or CM.expectedCons[key] then
-							-- upgrade/replay in flight -- but a STALE flag here
-							-- silently suppresses a real demolish forever
-							-- (suspected one-off 2026-08-29: bulldoze logged by
-							-- the hook, mod said nothing). Tripwire it.
-							log(string.format("con: %s is gone but edit/replay flags block the demolish (edit=%s cons=%s) -- will re-check",
-								key, tostring(expectedEdit[key] ~= nil), tostring(CM.expectedCons[key] ~= nil)))
-						elseif CM.expectedDemolish[key] then
-							CM.expectedDemolish[key] = nil
-							CM.consByKey[key] = nil
-							log(string.format("con: %s bulldozed by replay -- not echoed", key))
-						else
-							CM.consByKey[key] = nil
-							if x and y then
-								-- no re-arm here: execDemolish re-arms on every instance at the
-								-- DEMOLISH's stamp (the originator's skip path included)
-								CM.scheduleLocal("DEMOLISH", { x = x, y = y })
-								log(string.format("con: DEMOLISH captured at %.1f,%.1f (%s)", x, y, tostring(rec.file)))
-							else
-								log("con: a construction vanished but its position is unknown (key=" .. tostring(key) .. ")")
-							end
-						end
+					CM.consByKey[key] = nil
+					if x and y then
+						-- no re-arm here: execDemolish re-arms on every instance at the
+						-- DEMOLISH's stamp (the originator's skip path included)
+						CM.scheduleLocal("DEMOLISH", { x = x, y = y })
+						log(string.format("con: DEMOLISH captured at %.1f,%.1f (%s)", x, y, tostring(rec.file)))
+					else
+						log("con: a construction vanished but its position is unknown (key=" .. tostring(key) .. ")")
 					end
 				end
 			end
 		end
+	end
+end
+
+-- One tracked construction, checked for an in-place edit: the safety net for a
+-- change the slice did not capture (its CONUP covers a player's module edits).
+local function editCheck(key, rec)
+	if conStillThere(rec) then
+		local e = game.interface.getEntity(rec.id)
+		local pstr = (e and e.params) and CM.ser(e.params) or "{}"
+		if pstr ~= rec.params then
+			local foreign, fcid = false, nil
+			if not expectedEdit[key] and CM.cmMode == "companies" and CM.cmForeignOwner then
+				foreign, fcid = CM.cmForeignOwner(rec.id)
+			end
+			if expectedEdit[key] then
+				rec.params = pstr
+				expectedEdit[key] = nil      -- our own replay changed it in place
+			elseif foreign then
+				-- ANOTHER COMPANY'S BUILDING, changed here (2026-09-27: a
+				-- headquarters' window upgraded a foreign HQ). Every other machine
+				-- would refuse the edit (execConU), so it does not ship: it is
+				-- undone here, back to the params everyone else still has.
+				local old = CM.deserParams(rec.params)
+				if old then
+					old.seed = nil
+					expectedEdit[key] = true
+					CM.expectedEditOwner[key] = fcid
+					local rok = pcall(game.interface.upgradeConstruction, rec.id, rec.file, old)
+					if not rok then expectedEdit[key] = nil; CM.expectedEditOwner[key] = nil end
+					log(string.format("con: edit of %s at %s belongs to company %s -- undone here, not shipped (ok=%s)", rec.file, key, tostring(fcid), tostring(rok)))
+				end
+				if CM.cmNote then CM.cmNote("that building belongs to " .. (fcid and CM.cmNameOf(fcid) or "another company") .. ": your change was undone") end
+			else
+				rec.params = pstr
+				shipEdit(rec.file, key, pstr)
+			end
+		end
+	end
+end
+
+-- Every tracked construction at once (a catch-up, and the offline tests).
+function CM.pollConstructionRemovals()
+	local ok, err = pcall(function()
+		for key, rec in pairs(CM.consByKey) do removalCheck(key, rec) end
 	end)
 	if not ok then log("con removal poll error: " .. tostring(err)) end
 end
 
 function CM.scanConstructionEdits()
 	local ok, err = pcall(function()
-		for key, rec in pairs(CM.consByKey) do
-			if conStillThere(rec) then
-				local e = game.interface.getEntity(rec.id)
-				local pstr = (e and e.params) and CM.ser(e.params) or "{}"
-				if pstr ~= rec.params then
-					rec.params = pstr
-					if expectedEdit[key] then
-						expectedEdit[key] = nil      -- our own replay changed it in place
-					else
-						shipEdit(rec.file, key, pstr)
-					end
-				end
-			end
-		end
+		for key, rec in pairs(CM.consByKey) do editCheck(key, rec) end
 	end)
 	if not ok then log("con edit scan error: " .. tostring(err)) end
 end
+
+-- SPREAD OVER THEIR CYCLE (2026-09-23). update() ran each check over EVERY
+-- tracked construction in one tick: on a live 409-construction map the edit scan
+-- (an entity read and a params serialization each) froze the simulation for
+-- ~525 ms every 30 ticks, and the removal poll took ~21 ms every 3rd tick --
+-- 23 of the update's 24 ms on average (PERF lanes, 2026-09-24). Now a cycle
+-- takes a snapshot of the keys and works through ceil(n / every) of them per
+-- tick, so every construction is still checked once per cycle of the same
+-- length -- the same checks, the same cadence per construction, in slices. A
+-- construction added mid-cycle joins the next one; one removed is skipped; a
+-- record replaced under its key is checked as it is now. Each check has its own
+-- pcall, so one unreadable construction no longer ends the pass for the rest.
+local function sliced(every, check, what)
+	local cycle, pos, per = {}, 1, 0
+	return function()
+		if pos > #cycle then
+			cycle, pos = {}, 1
+			for key in pairs(CM.consByKey) do cycle[#cycle + 1] = key end
+			table.sort(cycle)
+			per = math.ceil(#cycle / every)
+		end
+		local stop = math.min(#cycle, pos + per - 1)
+		local from = pos
+		pos = stop + 1
+		for i = from, stop do
+			local key = cycle[i]
+			local rec = CM.consByKey[key]
+			if rec then
+				local ok, err = pcall(check, key, rec)
+				if not ok then log("con " .. what .. " error at " .. tostring(key) .. ": " .. tostring(err)) end
+			end
+		end
+	end
+end
+CM.pollConstructionRemovalsSlice = sliced(K.REMOVAL_POLL_EVERY, removalCheck, "removal poll")
+CM.scanConstructionEditsSlice = sliced(K.CON_EDIT_SCAN_EVERY, editCheck, "edit scan")
 end

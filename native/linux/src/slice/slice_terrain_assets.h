@@ -26,6 +26,9 @@ std::string Base64(const std::vector<uint8_t>& data);
 bool Unbase64(const std::string& text, std::vector<uint8_t>* out);
 bool EncodeTerrain(const Terrain& terrain, std::vector<uint8_t>* out);
 bool DecodeTerrain(const std::vector<uint8_t>& bytes, Terrain* out);
+// Wire v2 wraps the canonical v1 blob; nonshrinking edits remain v1.
+bool EncodeTerrainWire(const Terrain& terrain, std::vector<uint8_t>* out, size_t* rawBytes = nullptr);
+bool DecodeTerrainWire(const std::vector<uint8_t>& bytes, Terrain* out);
 bool EncodeAssets(const Assets& assets, std::vector<uint8_t>* out);
 bool DecodeAssets(const std::vector<uint8_t>& bytes, Assets* out);
 bool ParseAssetsFile(const std::string& text, Assets* out);

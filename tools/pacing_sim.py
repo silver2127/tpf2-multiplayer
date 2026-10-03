@@ -364,6 +364,16 @@ SCENARIOS = {
     'slow_joiner_leaves': '''{ ticks = 2400,
         insts = { {letter="a", T0=2000, lever=4, ceil=4, start=1}, {letter="b", T0=2000, lever=4, start=1, hw=2} },
         stalls = { {who="b", tick=1200, ticks=100000} } }''',
+    # THE HOST LEAVES (2026-09-27 report: "if the host leaves the game the peers never find out and they
+    # get stuck on the slowest speed"). A 4x session of three; the host stops for good at tick 300.
+    'leader_leaves': '''{ ticks = 1500,
+        insts = { {letter="a", T0=3000, lever=4, ceil=4, start=1}, {letter="b", T0=3000, lever=4, start=1},
+                  {letter="c", T0=3000, lever=4, start=1} },
+        stalls = { {who="a", tick=300, ticks=100000} } }''',
+    # ...and with only the two of them: nobody fresh is left to pace against
+    'leader_leaves_two': '''{ ticks = 1500,
+        insts = { {letter="a", T0=3000, lever=4, ceil=4, start=1}, {letter="b", T0=3000, lever=4, start=1} },
+        stalls = { {who="a", tick=300, ticks=100000} } }''',
     # AUTOSAVE (2026-09-10 live: joiners 5-7.6 behind after "Saving...: 3.4-4 s"). Everyone saves at the
     # same game date, but not for as long: the leader 3 s, a sandboxed joiner 6.7 s, another 3.5 s. At 2x.
     'autosave_joiner_2x': '''{ ticks = 700,
@@ -582,6 +592,17 @@ def main():
                        ('b stays within 4 of the leader from tick 1800', st['max_behind'] <= 4.0)]
         elif name == 'slow_joiner_leaves':
             checks += [('the session climbs back to the votes once b is gone', m['effEnd'] >= 3.9)]
+        elif name in ('leader_leaves', 'leader_leaves_two'):
+            # the leader stops at tick 300. While it could be only frozen (an autosave) the joiners hold
+            # back; once it is gone they run the session speed again, alone or not. With a third player
+            # still heard (leader_leaves) the controller already goes neutral once the host is stale
+            # (25 ticks): that path predates the fix and the hold check applies to the pair only
+            back = [l for l in logs if ' b: PACE: speed -> 4 ' in l and int(l.split()[0]) > 300]
+            early = [l for l in back if int(l.split()[0]) < 300 + 100]
+            end_e = series['b'][max(series['b'])]
+            checks += [('b is back at the session speed after the host is gone', bool(back)),
+                       ('...not while the host could still be only frozen (not before tick 400)', not early or name == 'leader_leaves'),
+                       ('b ran on at 4x, not a quarter of it (end > 700 ahead of the frozen host)', end_e > 700)]
         for label, ok in checks:
             failures += 0 if ok else 1
             print('  %s  %s' % ('OK  ' if ok else 'FAIL', label))

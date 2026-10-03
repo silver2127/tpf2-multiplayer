@@ -1,0 +1,34 @@
+# Announces a new stable release on Discord: tools/release_webhook.py posts the
+# version's title, link and changes to the webhook in the RELEASE_WEBHOOK_URL
+# repository secret. `released` fires when a release is published as a full
+# release or a pre-release is promoted to one; drafts and pre-releases (the
+# experimental versions) never start it. Of the releases one version publishes
+# (tools/publish_release.py) only the page v<version> is announced: the update
+# files <version> and launcher-v* are skipped by the script.
+#
+# Releases published with the workflow token start no workflow, so this relies on
+# the release being published by a person (publish_release.py --publish, or the
+# Publish button), as it is today.
+name: Release webhook
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    if: ${{ !github.event.release.prerelease && !github.event.release.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools/release_webhook.py
+          sparse-checkout-cone-mode: false
+      - name: Post to Discord
+        env:
+          RELEASE_WEBHOOK_URL: ${{ secrets.RELEASE_WEBHOOK_URL }}
+        run: python3 tools/release_webhook.py "$GITHUB_EVENT_PATH"

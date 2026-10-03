@@ -1,10 +1,11 @@
-"""Company changes wait for everyone to load in (2026-09-16).
+"""Company changes wait for everyone to load in (2026-09-16; registry 2026-09-27).
 
 The menu DLL writes mp_loading.txt ("letter=name=stage" per player still
 receiving the save, loading the world or catching up). companies.lua reads it;
-inject.lua refuses to ship CMNEW / CMSWITCH / CMDEL while it is not empty (CMPW
-still goes), with a note naming who is loading; the dashboard's buttons say the
-same. This runs the real reader and the real inject branch, on Lua 5.2.
+the request path (CM.cmRequest, fed by inject.lua) refuses to ship CMNEW /
+CMSWITCH / CMDEL while it is not empty (CMPW still goes), with a note naming who
+is loading; the COMPANIES tab says the same. This runs the real reader and the
+real request path, on Lua 5.2.
 
     python tools/company_loading_gate_test.py
 """
@@ -18,8 +19,7 @@ MP = os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp")
 COMPANIES = open(os.path.join(MP, "companies.lua"), encoding="utf-8").read()
 SHARED = open(os.path.join(MP, "shared_infra.lua"), encoding="utf-8").read()
 INJECT = open(os.path.join(MP, "inject.lua"), encoding="utf-8", errors="replace").read()
-LOCKSTEP = open(os.path.join(REPO, "mod", "mp_lockstep_1", "res", "config", "game_script", "lockstep.lua"),
-                encoding="utf-8", errors="replace").read()
+GUI = open(os.path.join(MP, "companies_gui.lua"), encoding="utf-8", errors="replace").read()
 MENU = open(os.path.join(REPO, "native", "src", "menu_hook.cpp"), encoding="utf-8", errors="replace").read()
 
 fails = []
@@ -31,37 +31,25 @@ def check(name, cond, extra=""):
         fails.append(name)
 
 
-# the inject branch, lifted by its anchors: from the company-command test to the end of its block
-start = INJECT.index('if o == "CMNEW" or o == "CMSWITCH" or o == "CMDEL" or o == "CMPW" then')
-end = INJECT.index('elseif o == "CMOPEN" then', start)
-branch = INJECT[start:end]
-
 with tempfile.TemporaryDirectory() as td:
     base = td.replace("\\", "/") + "/"
+    with open(base + "tpf2_instance.txt", "w") as f:
+        f.write("a\nentity_owner_v1=1\n")
     L = lupa.LuaRuntime(unpack_returned_tuples=True)
     L.globals().SRC = COMPANIES
     L.globals().SHARED = SHARED
-    L.globals().BRANCH = branch
     L.globals().BASE = base
     T = L.execute(r'''
 local function sink() return setmetatable({}, { __index = function() return sink() end, __call = function() return sink() end }) end
 api = sink(); game = sink()
 package.preload["mp.shared_infra"] = function() return assert(load(SHARED, "@shared_infra.lua"))() end
-local K = setmetatable({ INSTANCE = "a", BASE = BASE }, { __index = function() return nil end })
-local CM = setmetatable({ ticks = 0 }, { __index = function() return function() return nil end end })
+local K = { INSTANCE = "a", BASE = BASE, IDENTITY_FILE = BASE .. "tpf2_instance.txt" }
+local CM = { ticks = 0, peerSeen = true, escName = function(s) return s end, unescName = function(s) return s end }
 assert(load(SRC, "@companies.lua"))()(CM, K, function() end)
-local notes, scheduled, logs = {}, {}, {}
+CM.cmBooted, CM.cmJoined = true, true
+local notes, scheduled = {}, {}
 CM.cmNote = function(s) notes[#notes + 1] = s end
 CM.scheduleLocal = function(op, c) scheduled[#scheduled + 1] = op .. " " .. tostring(c.cid) end
-CM.cmNextId = function() return 9 end
-CM.cmHashPw = function() return nil end
-local function request(line)
-  local w = {}
-  for tok in line:gmatch("%S+") do w[#w + 1] = tok end
-  local o = w[1]
-  local run = assert(load("local CM, K, w, o, log = ...\n" .. BRANCH .. "\nend", "@inject-branch"))
-  run(CM, K, w, o, function(s) logs[#logs + 1] = s end)
-end
 local T = {}
 function T.loading(text)
   local f = assert(io.open(BASE .. "mp_loading.txt", "w")); f:write(text); f:close()
@@ -73,7 +61,12 @@ function T.note(text)
   local f = assert(io.open(BASE .. "mp_loading.txt", "w")); f:write(text); f:close()
   return CM.cmLoadingNote(CM.cmLoadingPlayers())
 end
-function T.request(line) request(line); return (scheduled[#scheduled] or "-") .. " / " .. (notes[#notes] or "-") end
+function T.request(line)
+  local w = {}
+  for tok in line:gmatch("%S+") do w[#w + 1] = tok end
+  CM.cmRequest(w)
+  return (scheduled[#scheduled] or "-") .. " / " .. (notes[#notes] or "-")
+end
 function T.reset() scheduled, notes = {}, {} end
 function T.missing() os.remove(BASE .. "mp_loading.txt"); return #CM.cmLoadingPlayers() end
 function T.count() return #scheduled end
@@ -94,10 +87,10 @@ return T
     r = T.request("CMSWITCH 2")
     check("a switch is refused while bob loads (nothing scheduled, a note says why)",
           r == "- / company changes wait until bob has loaded in", r)
-    r = T.request("CMNEW")
+    r = T.request("CMNEW 3 1 Acme")
     check("so is a new company", r.startswith("- /"), r)
-    r = T.request("CMDEL 3")
-    check("and a dissolve", r.startswith("- /"), r)
+    r = T.request("CMDEL 3 1")
+    check("and a delete", r.startswith("- /"), r)
     r = T.request("CMPW 1 secret")
     check("a password change still goes", r.startswith("CMPW 1 /"), r)
     T.reset()
@@ -105,10 +98,11 @@ return T
     r = T.request("CMSWITCH 2")
     check("once everyone is in, the switch ships", r.startswith("CMSWITCH 2 /") and T.count() == 1, r)
 
+check("inject.lua hands the tab's requests to CM.cmRequest", "CM.cmRequest(w)" in INJECT)
 check("the menu DLL writes mp_loading.txt from the roster stages",
       'L"%smp_loading.txt"' in MENU and "if (g_stages[i].empty()) continue;" in MENU)
-check("the dashboard's company buttons check it and show the note",
-      "CM.cmLoadingPlayers()" in LOCKSTEP and "D.coLoadingNote" in LOCKSTEP)
+check("the COMPANIES tab checks it and shows the note",
+      "CM.cmLoadingPlayers()" in GUI and "D.coLoadingNote" in GUI)
 
 print("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")
 raise SystemExit(1 if fails else 0)

@@ -354,7 +354,12 @@ static int ApiInstallHook(uintptr_t target, void* detour, int stealBytes, void**
 {
     const char* who = PrefixFor((uintptr_t)__builtin_return_address(0));
     const unsigned long at = (unsigned long)target;
-    if (!target || !detour || !trampolineOut || stealBytes < 14 || stealBytes > 32) {
+    // 5..13 bytes: the shared writer (hook_posix.cpp) places a near jump to a
+    // trampoline allocated within +-2 GiB. The native terrain sidecar's AddTile
+    // hook needs 13 -- the 14th byte starts a RIP-relative lea -- and the
+    // 14-byte floor this API had refused it (0.7.1.2 on the dedicated server:
+    // "installHook(..., steal 13) refused", sidecar off).
+    if (!target || !detour || !trampolineOut || stealBytes < 5 || stealBytes > 32) {
         LogRaw("[%s] installHook(%#lx, steal %d) refused: bad arguments\n", who, at, stealBytes);
         return 0;
     }
@@ -748,7 +753,10 @@ static void LoadPlugins(const std::vector<std::string>& dirs)
 }
 
 // ---------------------------------------------------------------------------
+// The unit fixture calls the API without loading plugins or touching user data.
+#ifndef TPF2MP_PLUGINHOST_TEST
 __attribute__((constructor))
+#endif
 static void HostLoad()
 {
     Host& h = H();

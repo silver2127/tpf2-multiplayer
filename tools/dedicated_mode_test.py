@@ -47,6 +47,10 @@ check("no lobby -> host one (StartLobby(0)) with the flags' names", "StartLobby(
 check("a world without a lobby is left alone (the moment after a crash to the menu)", "if (world) return;" in tick)
 check("lobby up, no world -> the configured save, else the newest, through the shared-save autoload",
       "newestSave(path, 600)" in tick and "doStartLoad(path)" in tick and "MarkSaveShared();" in tick)
+check("a restart resumes this server's newest autosave when it is newer than the configured save",
+      "newestOwnAutosave(res, 600, &rt) && rt > ct" in tick and "wcscpy_s(path, res);" in tick)
+check("that autosave scan matches only the world this server placed (autosave_mp_shared*)",
+      'L"%s\\\\autosave_mp_shared*.sav", SAVE_DIR' in MENU)
 check("no load while one is pending or the native side is busy",
       "InterlockedCompareExchange(&g_autoLoadPending, 0, 0) || NativeIo::Busy()" in tick)
 check("world up -> the game's own autosave every dedicated_autosave_min, never during a native operation",
@@ -59,7 +63,8 @@ check("dedicated_render=0: vkQueueSubmit is intercepted and its command buffers 
 check("  ... the fence and semaphores still reach the real submit (a straight copy of each VkSubmitInfo)", bool(sub) and "copy[i] = pSubmits[i];" in sub.group(0))
 check("  ... hooked through the device proc-addr interceptor", 'if (strcmp(name, "vkQueueSubmit") == 0) {' in MENU and "return (PFN_vkVoidFunction)mySubmit;" in MENU)
 check("  ... query results read as zero, available at once", "static VkResult VKAPI_CALL myQueryResults(" in MENU and 'strcmp(name, "vkGetQueryPoolResults") == 0' in MENU)
-check("  ... the panel is not drawn while not rendering", "if (!NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0)" in MENU)
+# the draw gate is OverlayWanted, shared by the Vulkan and OpenGL paths since 2026-09-21
+check("  ... the panel is not drawn while not rendering", "return !NoRender() && (InterlockedCompareExchange(&g_showOverlay, 0, 0)" in MENU)
 check("  ... the swapchain is never acquired from or presented to: acquire answered here (round robin + empty signal submit)",
       "static VkResult NullAcquire(VkSemaphore sem, VkFence fence, uint32_t* pIndex)" in MENU
       and 'strcmp(name, "vkAcquireNextImageKHR") == 0' in MENU and 'strcmp(name, "vkAcquireNextImage2KHR") == 0' in MENU)
@@ -72,8 +77,11 @@ check("  ... on by default in dedicated mode, dedicated_render=1 turns drawing b
       "static int   g_flagDedRender = 0;" in MENU and "if (g_flagDedicated && !g_flagDedRender) InterlockedExchange(&g_noRender, 1);" in MENU)
 check("the host command line carries --dedicated", 'if (g_flagDedicated) wcscat_s(wpub, L" --dedicated");' in MENU)
 check("and --local-port from dedicated_port (a box that also runs the relay)", 'L" --local-port %d", g_flagDedPort' in MENU)
+# the list is drawn by the title panel since the legacy renderer went (2026-09-26)
+PANEL = open(os.path.join(REPO, "native", "src", "menu_title_panel.inl"), encoding="utf-8", errors="replace").read()
 check("the public list labels a dedicated game a dedicated server",
-      '(!strcmp(r.type, "relay") || !strcmp(r.type, "dedicated")) ? L"dedicated server"' in MENU)
+      'bool dedicated = !strcmp(r.type, "relay") || !strcmp(r.type, "dedicated")' in PANEL
+      and 'dedicated ? L"Dedicated" : L"Player hosted"' in PANEL)
 
 # ---- the lobby and the master
 check("lobby.py takes --dedicated", 'ap.add_argument("--dedicated", action="store_true"' in LOBBY)
@@ -209,6 +217,37 @@ return T
     check("a found speed 2 stands", T.CM.dedicatedResumeSpeed(2) == 2)
     T.CM.dedicated = False
     check("not dedicated: whatever was found, 0 included", T.CM.dedicatedResumeSpeed(0) == 0)
+    # PLAYERS JOINING (2026-09-28): alone and a joiner on the way -> paused until they are in;
+    # players in and somebody joining -> 1x at most; a stuck joiner stops counting after the hold
+    open(os.path.join(td, "mp_dedicated.txt"), "w").write("dedicated=1\nempty_speed=1\n")
+    T.CM.dedCfgAt = None; T.CM.ticks = 5000; T.CM.dedPaused = False; T.CM.dedJoinN = None; T.CM.dedJoining = None
+    T.CM.voteSpeed = L.eval("function() return 3 end"); T.CM.rosterPlayers = 1; T.setSpeed(2)
+    L.execute("CM_PEERS = {}"); T.CM.peers = L.globals().CM_PEERS
+    held, s = T.tick(1, False, False)
+    check("joining: alone, the world runs at the empty speed (1x)", held is True and s == 1)
+    T.CM.rosterPlayers = 2
+    n = len(T.speeds)
+    held, s = T.tick(1, True, False)
+    check("joining: a player in the lobby of an empty server -> paused at once",
+          held is True and s == 0 and T.speeds[n + 1] == "0:dedicated server: a player is joining, paused until they are in", str(T.speeds[n + 1]))
+    T.CM.peers.b = L.eval("{ at = 1e9, cu = true }")
+    held, s = T.tick(30, True, False)
+    check("joining: their game runs and catches up (cu=1) -> still paused", held is True and s == 0)
+    T.CM.peers.b.cu = False
+    held, s = T.tick(1, True, False)
+    check("joining: caught up -> the players' speed", held is False and s == 3 and T.CM.dedJoining is False)
+    T.CM.rosterPlayers = 3
+    T.CM.isLeader = L.eval("function() return true end"); T.CM.effSpeed = 3
+    L.execute("CM_SENT = {}"); T.CM.broadcast = L.eval("function(l) CM_SENT[#CM_SENT + 1] = l end")
+    T.CM.lseffLine = L.eval("function(v) return 'LSEFF v=' .. v end")
+    T.CM.voteSpeed = L.eval("function() return 1 end")   # what voteSpeed gives while capped (tested below)
+    held, s = T.tick(1, True, False)
+    check("joining: a second player joins while one plays -> not paused, the cap is on and LSEFF goes out",
+          held is False and T.CM.dedJoining is True and L.eval("CM_SENT[#CM_SENT]") == "LSEFF v=1")
+    held, s = T.tick(6000 + 5, True, False)
+    check("joining: a joiner that never arrives stops holding the session back after the hold", T.CM.dedJoining is False)
+    T.CM.rosterPlayers = 2; T.CM.peers.b = None
+    T.CM.dedicated = False
 
 # ---- the autosave hold (2026-09-21) and the clock's own button, on Lua 5.2
 with tempfile.TemporaryDirectory() as td:
@@ -301,6 +340,32 @@ return T
     T.CM.dedCfgAt = None; T.CM.lgHolding = True
     T.CM.speedButton(3, "button")
     check("an ordinary game's button still reaches the load-gate rule (lgPress)", T.CM.lgPress == 3 and T.CM.dedicated is False)
+
+# ---- voteSpeed: the 1x cap while a player joins a dedicated server (2026-09-28)
+mv = re.search(r"^function CM\.voteSpeed\(\)\n.*?\n^end\n", PACING, re.S | re.M)
+check("voteSpeed is found", mv is not None)
+if mv:
+    L = lupa.LuaRuntime(unpack_returned_tuples=True)
+    L.globals().SRC = mv.group(0)
+    V = L.execute(r'''
+local K = { VOTE_MIN = 0.25, VOTE_MAX = 4.5 }
+local CM = {}
+CM.votesCounted = function() return { { letter = "a", v = 4, own = true }, { letter = "b", v = 3 } } end
+assert(load("local CM, K = ...\n" .. SRC, "@vote"))(CM, K)
+return CM
+''')
+    v = V.voteSpeed()
+    check("voteSpeed: the votes' mean without a joiner (3.5)", (v[0] if isinstance(v, tuple) else v) == 3.5)
+    V.dedJoining = True
+    v = V.voteSpeed()
+    check("voteSpeed: 1x while a player joins", (v[0] if isinstance(v, tuple) else v) == 1)
+    V.votesCounted = L.eval("function() return { { letter = 'a', v = 0.5, own = true } } end")
+    v = V.voteSpeed()
+    check("voteSpeed: joining cap preserves votes below 1x", v[0] == 0.5)
+    V.votesCounted = L.eval("function() return { { letter = 'a', v = 4, own = true } } end")
+    V.dedJoining = False
+    v = V.voteSpeed()
+    check("voteSpeed: full voted speed returns after joining", v[0] == 4)
 
 if fails:
     raise SystemExit("FAIL: " + ", ".join(fails))

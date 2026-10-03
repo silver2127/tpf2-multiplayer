@@ -21,7 +21,7 @@ Windows functions and where they went:
 | `SyncStart`, `SyncPoll`, the relay leader's periodic upload | `SyncStart`, `SyncPoll`, `RelayPeriodic` |
 | `PubFetchThread`, `PubPoll`, `httpGet` | `PubThread`, `lobby::PublicPoll`; the lobby program fetches |
 | `CollectLogsThread` | `lobby::OpenLogs` (`Tpf2mpArchiveLogsSafe` from `logarchive_linux.h`, then `xdg-open`) |
-| `RenderPanelLayer` state 2, `OnHit`, `LlKeyboard` chat branch | `RenderLobbyLocked`, `OnHitLocked`, `HandleEventLocked` |
+| `RenderPanelLayer` state 2, `OnHit`, `LlKeyboard` chat branch | `RenderTitleLocked`, `OnHitLocked`, `HandleEventLocked` |
 | `ClipboardSet`, `ClipboardGet` | `SDL_SetClipboardText`, `SDL_GetClipboardText` through `dlsym` |
 | `doStartLoad`, `placeSaveNewest`, `newestSave`, `ForceAutosave`, AUTO-LOAD | the menu-game area: `menu_game_linux.h` |
 
@@ -331,6 +331,14 @@ and the log says so once when a player arrives away from the title menu.
 (`ask`/`always`/`never`), `autoload` (`0`/`1`). `slot` is `menu_linux.cpp`'s;
 `automod` is read by `MenuGame_AutoEnableMod`.
 
+`input_hold=1` restores input blocking during resync/join holds. The default is
+off: game keys, mouse movement, clicks and text reach the game, subject to
+normal panel input capture. Escape remains available with blocking enabled.
+Both modes wait for an existing key/button gesture to finish before accepting
+a hold. This flag is read at startup beside `tpf2_menu.so` and logged in
+`tpf2_menu.log`. Legacy script-event suppression and simulation hold/replay
+protection remain active in both modes.
+
 ## Differences from Windows
 
 - No job object: an own session, `PR_SET_PDEATHSIG` and `--parent-pid`; stopping
@@ -384,3 +392,24 @@ Threads are refused by lowering the soft `RLIMIT_NPROC` to 1 around the call
 (`pthread_create` then fails with `EAGAIN` for a user with other processes).
 Renders of both pages are written as images next to each run and were looked at.
 Every scenario also runs under AddressSanitizer and UndefinedBehaviorSanitizer.
+
+## Bridge prerequisite (dev ba1fa26e)
+
+`lobby::BridgeProblem` walks glibc's loaded-object list with `dl_iterate_phdr`
+and requires the exact basename `tpf2_bridge_mp.so`, including `RTLD_LOCAL`
+objects. It never opens a library or trusts a stale bridge status file.
+The host/join setup page and in-world Host Session disable their launch
+actions and show an amber warning. `Start` refuses before changing lobby state
+or queuing work, including dedicated requests; the existing readiness check
+rechecks the bridge on the worker before launch and before sharing a save.
+
+Linux deliberately uses one accurate “not loaded” message for missing and
+failed-load cases; `boot.cpp` already records the attempted path and precise
+loader error in `tpf2_proxy.log`. The menu logs the refusal once. This is a
+module-presence check, as on Windows, not a bridge connectivity/health check.
+
+The `lobby_ready` CTest loads a constructor-free fixture named
+`tpf2_bridge_mp.so` with `RTLD_LOCAL`, unloads it and checks presence again.
+Host/join/dedicated refusals leave the model and request queue unchanged.
+`panel_title` checks disabled hit targets in both title and world setup and
+status propagation for direct starts; its bridge result is stubbed.

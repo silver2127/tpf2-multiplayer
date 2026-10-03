@@ -47,7 +47,7 @@ def fake_unmap(port):
     note("unmap-done")
     return True
 observe.upnp_unmap = fake_unmap
-def fake_observe(local_port, secret=None, password=None):
+def fake_observe(local_port, secret=None, password=None, extra_candidates=None):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", local_port))
     sock.setblocking(False)
@@ -55,6 +55,7 @@ def fake_observe(local_port, secret=None, password=None):
     time.sleep(float(os.environ.get("OBSERVE_SLEEP", "0")))
     prof = {"candidates": {"lan_v4": None, "public_v4": "127.0.0.1:%d" % sock.getsockname()[1], "v6": None},
             "flags": {"open": True}}
+    prof["candidates"].update(extra_candidates or {})
     note("observe-done")
     return sock, prof, encode_profile(prof, secret=secret, password=password)
 lobby._observe_and_announce = fake_observe
@@ -85,6 +86,9 @@ class Master(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         # Release .22 added rendezvous polling. A stalled poll must not consume
         # the launcher's shutdown budget before /leave and UPnP cleanup run.
+        # Pipe discovery also stalls here; readiness requires that it started.
+        if self.path == "/slow/pipe":
+            events.append(("pipe-start", time.time()))
         if self.path.startswith("/slow/"):
             events.append(("poll-start", time.time()))
             time.sleep(6)
@@ -169,7 +173,7 @@ print(f"      exit {took:.2f} s after SIGTERM (includes the 0.5 s stand-in unmap
 # (i) quit, then SIGTERM 1.5 s later, while /leave is slow
 events.clear()
 p, d = start("i", ["--publish", MURL, "--public", "--lobby-name", "stop test"])
-ready = wait_until(lambda: "lobby ready" in text(d, "lobby_out.jsonl") and any(e[0] == "/announce" for e in events) and any(e[0] == "poll-start" for e in events), 20)
+ready = wait_until(lambda: "lobby ready" in text(d, "lobby_out.jsonl") and any(e[0] == "/announce" for e in events) and any(e[0] == "poll-start" for e in events) and any(e[0] == "pipe-start" for e in events), 20)
 check("(i) the lobby is up and announced", ready, (text(d, "proc.log")[-600:], events))
 with open(os.path.join(d, "lobby_in.jsonl"), "a") as f:
     f.write(json.dumps({"cmd": "quit"}) + "\n")
@@ -192,7 +196,7 @@ print(f"      quit -> exit {te - tq:.2f} s; SIGTERM -> exit {te - tt:.2f} s")
 # (j) SIGTERM while running, a second one 1 s later
 events.clear()
 p, d = start("j", ["--publish", MURL, "--public"])
-ready = wait_until(lambda: "lobby ready" in text(d, "lobby_out.jsonl") and any(e[0] == "/announce" for e in events) and any(e[0] == "poll-start" for e in events), 20)
+ready = wait_until(lambda: "lobby ready" in text(d, "lobby_out.jsonl") and any(e[0] == "/announce" for e in events) and any(e[0] == "poll-start" for e in events) and any(e[0] == "pipe-start" for e in events), 20)
 check("(j) the lobby is up and announced", ready, (text(d, "proc.log")[-600:], events))
 tt = time.time()
 os.killpg(p.pid, signal.SIGTERM)

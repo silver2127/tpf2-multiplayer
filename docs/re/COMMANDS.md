@@ -250,7 +250,7 @@ against every hooked factory.
 | `0x9ded80` | SetSimBuildingClosureTimeStamp | funcsig | `setSimBuildingClosureTimeStamp(building, t)` | 20 | |
 | `0x9dee80` | SetSimBuildingManualDevelopment | funcsig | `setSimBuildingManualDevelopment(building, manual)` | 20 | |
 | `0x9def80` | SetTownInfo | position | `setTownInfo(town, capacities)` * | 20 | |
-| `0x9df070` | SetUserStopped | funcsig | `setUserStopped(vehicle, stopped)` | 20 | |
+| `0x9df070` | SetUserStopped | funcsig | `setUserStopped(vehicle, stopped)` | 20 | 18 |
 | `0x9df170` | SetVehicleManualDeparture | funcsig | `setVehicleManualDeparture(vehicle, manual)` | 20 | |
 | `0x9df270` | SetVehicleShouldDepart | position | `setVehicleShouldDepart(vehicle)` | 20 | |
 | `0x9df340` | SetVehicleTargetMaintenanceState | funcsig | `setVehicleTargetMaintenanceState(vehicle, value)` | 20 | 12 |

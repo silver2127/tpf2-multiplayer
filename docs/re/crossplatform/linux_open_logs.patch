@@ -1,0 +1,398 @@
+diff --git a/native/linux/CMakeLists.txt b/native/linux/CMakeLists.txt
+index 19388bf..13f6561 100644
+--- a/native/linux/CMakeLists.txt
++++ b/native/linux/CMakeLists.txt
+@@ -118,6 +118,9 @@ if(BUILD_TESTING)
+   add_executable(test_workshop_catalogue tests/workshop_catalogue_test.cpp)
+   target_compile_options(test_workshop_catalogue PRIVATE -UNDEBUG)
+   add_test(NAME workshop_catalogue COMMAND test_workshop_catalogue)
++  add_executable(test_logarchive tests/logarchive_test.cpp)
++  target_compile_options(test_logarchive PRIVATE -UNDEBUG)
++  add_test(NAME logarchive COMMAND test_logarchive)
+   add_executable(test_bridge_epoch tests/bridge_epoch_test.cpp src/net_posix.cpp)
+   target_include_directories(test_bridge_epoch PRIVATE ../src)
+   target_compile_options(test_bridge_epoch PRIVATE -UNDEBUG -Wno-unused-function)
+diff --git a/native/linux/src/logarchive_linux.h b/native/linux/src/logarchive_linux.h
+index 101a209..f8f49fc 100644
+--- a/native/linux/src/logarchive_linux.h
++++ b/native/linux/src/logarchive_linux.h
+@@ -110,6 +110,7 @@
+ #include <fcntl.h>
+ #include <limits.h>
+ #include <sys/file.h>
++#include <sys/utsname.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -120,13 +121,15 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <ctime>
++#include <initializer_list>
+ #include "datadir_linux.h"
+ 
+ static const uint64_t TPF2_LOG_TAIL_BYTES    = 32ull << 20;
+ static const uint64_t TPF2_DUMP_MAX_BYTES    = 64ull << 20;
+ static const uint64_t TPF2_COPY_BUDGET_BYTES = 200ull << 20;
+ static const int      TPF2_DUMPS_PER_RUN     = 3;
+-static const int      TPF2_LOG_KEEP          = 2;       // per kind: "previous" runs, "now" copies
++static const uint64_t TPF2_STATE_TAIL_BYTES  = 8ull << 20;   // each state/stream file (lockstep streams grow)
++static const int      TPF2_LOG_KEEP          = 5;       // per kind: "previous" runs, "now" copies (testers restart often)
+ static const int      TPF2_LOG_LOCK_WAIT_MS  = 10000;
+ 
+ struct Tpf2mpLogArchive {
+@@ -239,6 +242,71 @@ static inline void LaRemoveArchive(const char* dir)
+     rmdir(dir);
+ }
+ 
++// MORE IN EVERY ARCHIVE (2026-09-26, Windows dev 45183ac, user: "make sure that
++// the logs that open logs collects in the future is more comprehensive"): a
++// joiner whose bridge never saw the host left logs with no version, no bridge
++// control file and none of the lobby's message stream. about.txt now opens with
++// the installed version, the system and the libraries; the state files follow
++// the logs (below), and the lobby's copies have their invitation codes masked.
++
++// The value of a "key<TAB>value" line of a small file (tpf2mp_install.txt), or empty.
++static inline void LaTabValue(const char* path, const char* key, char* out, size_t cch)
++{
++    out[0] = 0;
++    FILE* f = fopen(path, "rbe");
++    if (!f) return;
++    char line[512];
++    const size_t kl = strlen(key);
++    while (fgets(line, sizeof(line), f)) {
++        if (strncmp(line, key, kl) || line[kl] != '\t') continue;
++        size_t len = strcspn(line + kl + 1, "\r\n");
++        if (len >= cch) len = cch - 1;
++        memcpy(out, line + kl + 1, len);
++        out[len] = 0;
++        break;
++    }
++    fclose(f);
++}
++
++// The lobby's message stream and state carry the invitation codes (a code is
++// enough to join): every string value of these keys is masked with '*' in
++// place, so the lines keep their length and stay valid JSON.
++static inline void LaRedactFile(const char* path)
++{
++    static const char* const keys[] = { "\"code\"", "\"cross_code\"", "\"steam\"", "\"steam_code\"",
++        "\"steam_secret\"", "\"password\"", "\"pass\"", "\"passcode\"", "\"secret\"" };
++    int fd = open(path, O_RDWR | O_CLOEXEC);
++    if (fd < 0) return;
++    struct stat st;
++    if (fstat(fd, &st) != 0 || st.st_size <= 0 || (uint64_t)st.st_size > TPF2_STATE_TAIL_BYTES) { close(fd); return; }
++    const size_t n = (size_t)st.st_size;
++    char* buf = (char*)malloc(n);
++    if (buf && pread(fd, buf, n, 0) == (ssize_t)n) {
++        bool changed = false;
++        for (const char* key : keys) {
++            const size_t kl = strlen(key);
++            for (size_t i = 0; i + kl < n; ++i) {
++                if (memcmp(buf + i, key, kl)) continue;
++                size_t j = i + kl;
++                while (j < n && (buf[j] == ' ' || buf[j] == '\t')) ++j;
++                if (j >= n || buf[j] != ':') continue;
++                ++j;
++                while (j < n && (buf[j] == ' ' || buf[j] == '\t')) ++j;
++                if (j >= n || buf[j] != '"') continue;   // only a string value: a bool or number is no secret
++                for (++j; j < n && buf[j] != '"' && buf[j] != '\n'; ++j) {
++                    if (buf[j] == '\\' && j + 1 < n) { buf[j] = '*'; ++j; }
++                    buf[j] = '*';
++                    changed = true;
++                }
++                i = j;
++            }
++        }
++        if (changed && pwrite(fd, buf, n, 0) != (ssize_t)n) { /* the copy stays as it was */ }
++    }
++    free(buf);
++    close(fd);
++}
++
+ // The logs root (trailing slash, created 0700) and the data folder (trailing
+ // slash). The root sits beside data/ in $XDG_DATA_HOME/tpf2mp; with only
+ // TPF2MP_DATADIR to go on, inside the data folder.
+@@ -481,6 +549,60 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir,
+                   "netpunch = the lobby folder beside it, game = the Transport Fever 2 folder, "
+                   "crash_dump = <Steam>/userdata/<account>/1066780/local/crash_dump.\n\n");
+ 
++    // What was running: every log line is read against a version and a clock.
++    char installRoot[PATH_MAX] = "";
++    Tpf2mpRootDir(installRoot, sizeof(installRoot));
++    {
++        char off[8];
++        strftime(off, sizeof(off), "%z", &lt);
++        LaNote(about, "Versions (log times are local time, UTC%s)\n", off);
++        char ver[64] = "", manifest[PATH_MAX];
++        if (installRoot[0] && LaFmt(manifest, sizeof(manifest), "%s/tpf2mp_install.txt", installRoot))
++            LaTabValue(manifest, "version", ver, sizeof(ver));
++        LaNote(about, "  %-38s %s\n", "TpF2 Multiplayer", ver[0] ? ver : "unknown (no tpf2mp_install.txt)");
++        struct utsname un;
++        if (uname(&un) == 0) LaNote(about, "  %-38s %s %s %s\n", "Kernel", un.sysname, un.release, un.machine);
++        if (FILE* os = fopen("/etc/os-release", "rbe")) {
++            char line[256];
++            while (fgets(line, sizeof(line), os))
++                if (!strncmp(line, "PRETTY_NAME=", 12)) { line[strcspn(line, "\r\n")] = 0; LaNote(about, "  %-38s %s\n", "System", line + 12); break; }
++            fclose(os);
++        }
++        const char* rt = getenv("PRESSURE_VESSEL_RUNTIME");
++        if (!rt) rt = getenv("STEAM_RUNTIME");
++        if (rt) LaNote(about, "  %-38s %s\n", "Steam Runtime", rt);
++        // the game and each library: size and date tell builds apart
++        auto module = [&](const char* path, const char* shown) {
++            struct stat st;
++            if (!LaIsFile(path, &st)) return;
++            struct tm ut = {};
++            gmtime_r(&st.st_mtim.tv_sec, &ut);
++            char w[32];
++            strftime(w, sizeof(w), "%Y-%m-%d %H:%M", &ut);
++            LaNote(about, "  %-38s %10llu bytes  written %s UTC\n", shown, (unsigned long long)st.st_size, w);
++        };
++        char path[PATH_MAX];
++        if (gameDir && gameDir[0] && LaFmt(path, sizeof(path), "%sTransportFever2", gameDir)) module(path, "TransportFever2");
++        if (installRoot[0]) {
++            for (const char* sub : { "", "boot/", "plugins/" }) {
++                char dir[PATH_MAX];
++                if (!LaFmt(dir, sizeof(dir), "%s/%s", installRoot, sub)) continue;
++                DIR* d = opendir(dir);
++                if (!d) continue;
++                while (dirent* e = readdir(d)) {
++                    const size_t nl = strlen(e->d_name);
++                    if (e->d_name[0] == '.' || nl < 4 || strcmp(e->d_name + nl - 3, ".so")) continue;
++                    char shown[PATH_MAX];
++                    if (LaFmt(path, sizeof(path), "%s%s", dir, e->d_name) && LaFmt(shown, sizeof(shown), "%s%s", sub, e->d_name))
++                        module(path, shown);
++                }
++                closedir(d);
++            }
++            if (LaFmt(path, sizeof(path), "%s/netpunch/netpunch", installRoot)) module(path, "netpunch/netpunch");
++        }
++        LaNote(about, "\nFiles\n");
++    }
++
+     // Logs held by another live game are copied: a rename would leave that game
+     // writing into this archive.
+     const bool moveData = previousSession && moveLogs;
+@@ -508,7 +630,8 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir,
+     };
+     auto noteCopied = [&](const char* shown, uint64_t size, uint64_t tailCap, const char* why) {
+         LaNote(about, "  %-52s %12llu bytes%s%s\n", shown, (unsigned long long)size,
+-               tailCap && size > tailCap ? " (only the last 32 MB kept)" : "", why);
++               !tailCap || size <= tailCap ? "" : tailCap == TPF2_LOG_TAIL_BYTES ? " (only the last 32 MB kept)"
++                                                                                  : " (only the last 8 MB kept)", why);
+     };
+     auto place = [&](const char* src, const char* destName, const char* shown, bool move, uint64_t tailCap) {
+         char dst[PATH_MAX];
+@@ -544,7 +667,8 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir,
+         }
+         if (ok) out->files++; else out->skipped++;
+     };
+-    auto each = [&](const char* dir, const char* suffix, const char* prefix, const char* shownDir, bool move) {
++    auto each = [&](const char* dir, const char* suffix, const char* prefix, const char* shownDir, bool move,
++                    uint64_t tail = TPF2_LOG_TAIL_BYTES) {
+         DIR* d = opendir(dir);
+         if (!d) return;
+         const size_t sl = strlen(suffix);
+@@ -556,7 +680,7 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir,
+             if (!LaFmt(src, sizeof(src), "%s%s", dir, e->d_name) || !LaIsFile(src, &st)) continue;
+             if (!LaFmt(dest, sizeof(dest), "%s%s", prefix, e->d_name)) continue;
+             if (!LaFmt(shown, sizeof(shown), "%s/%s", shownDir, e->d_name)) continue;
+-            place(src, dest, shown, move, TPF2_LOG_TAIL_BYTES);
++            place(src, dest, shown, move, tail);
+         }
+         closedir(d);
+     };
+@@ -622,6 +746,41 @@ static inline bool Tpf2mpArchiveLogs(bool previousSession, const char* gameDir,
+             }
+         }
+     }
++    // 5. state: what each side believed, beside what it logged. Last, so a big
++    // lockstep stream never takes the logs' share of the copy budget.
++    LaNote(about, "\nState files (the last 8 MB of each)\n");
++    each(data, ".txt", "state_", "data", false, TPF2_STATE_TAIL_BYTES);
++    if (installRoot[0]) {
++        char dir[PATH_MAX];
++        char manifest[PATH_MAX];
++        if (LaFmt(manifest, sizeof(manifest), "%s/tpf2mp_install.txt", installRoot) && access(manifest, F_OK) == 0)
++            place(manifest, "tpf2mp_install.txt", "install/tpf2mp_install.txt", false, TPF2_STATE_TAIL_BYTES);
++        if (LaFmt(dir, sizeof(dir), "%s/plugins/", installRoot)) each(dir, ".cfg", "plugins_", "install/plugins", false, TPF2_STATE_TAIL_BYTES);
++    }
++    // the menu <-> lobby message stream and the lobby's own state; never incoming_save.*
++    for (int w = 0; w < 2; ++w) {
++        char dir[PATH_MAX];
++        const char* prefix = w == 0 ? "netpunch_" : "game_netpunch_";
++        if (w == 0 ? !(installRoot[0] && LaFmt(dir, sizeof(dir), "%s/netpunch/", installRoot))
++                   : !(gameDir && gameDir[0] && LaFmt(dir, sizeof(dir), "%snetpunch/", gameDir))) continue;
++        const char* shownDir = w == 0 ? "netpunch" : "game/netpunch";
++        each(dir, ".jsonl", prefix, shownDir, false, TPF2_STATE_TAIL_BYTES);
++        each(dir, ".json", prefix, shownDir, false, TPF2_STATE_TAIL_BYTES);
++        each(dir, ".txt", prefix, shownDir, false, TPF2_STATE_TAIL_BYTES);
++    }
++    if (DIR* d = opendir(out->folder)) {
++        while (dirent* e = readdir(d)) {
++            const char* nm = e->d_name;
++            const size_t nl = strlen(nm);
++            const bool lobby = !strncmp(nm, "netpunch_", 9) || !strncmp(nm, "game_netpunch_", 14);
++            const bool text = (nl > 5 && !strcmp(nm + nl - 5, ".json")) || (nl > 6 && !strcmp(nm + nl - 6, ".jsonl")) ||
++                              (nl > 4 && !strcmp(nm + nl - 4, ".txt"));
++            char p[PATH_MAX];
++            if (lobby && text && LaFmt(p, sizeof(p), "%s/%s", out->folder, nm)) LaRedactFile(p);
++        }
++        closedir(d);
++    }
++    LaNote(about, "  (invitation codes in the lobby files above are masked with *)\n");
+     if (about) fclose(about);
+ 
+     if (out->files == 0) {
+diff --git a/native/linux/tests/logarchive_test.cpp b/native/linux/tests/logarchive_test.cpp
+new file mode 100644
+index 0000000..7836a76
+--- /dev/null
++++ b/native/linux/tests/logarchive_test.cpp
+@@ -0,0 +1,125 @@
++// Offline: OPEN LOGS on Linux (src/logarchive_linux.h) against a fake install
++// ($XDG_DATA_HOME/tpf2mp with data/, plugins/, netpunch/) and a fake game
++// folder. Checks what a bug report needs is there (versions, state files, the
++// lobby's message stream), what must stay out stays out (the incoming save),
++// invitation codes are masked, state files are copied and not moved, and each
++// kind keeps TPF2_LOG_KEEP archives.
++#include "../src/logarchive_linux.h"
++#include <cassert>
++#include <cstdio>
++#include <string>
++#include <fstream>
++#include <sstream>
++
++static void put(const std::string& path, const std::string& text)
++{
++    std::ofstream f(path, std::ios::binary);
++    f << text;
++    assert(f.good());
++}
++static std::string get(const std::string& path)
++{
++    std::ifstream f(path, std::ios::binary);
++    std::stringstream ss;
++    ss << f.rdbuf();
++    return ss.str();
++}
++static bool exists(const std::string& path) { return access(path.c_str(), F_OK) == 0; }
++static int countKind(const std::string& logs, const char* kind)
++{
++    int n = 0;
++    if (DIR* d = opendir(logs.c_str())) {
++        while (dirent* e = readdir(d)) if (LaArchiveKind(e->d_name) >= 0 && strstr(e->d_name, kind)) n++;
++        closedir(d);
++    }
++    return n;
++}
++
++int main()
++{
++    char tmpl[] = "/tmp/tpf2mp-logarchive-test-XXXXXX";
++    assert(mkdtemp(tmpl));
++    const std::string t = tmpl, xdg = t + "/xdg", root = xdg + "/tpf2mp", data = root + "/data/", game = t + "/game/";
++    for (const std::string& d : { xdg, root, root + "/data", root + "/plugins", root + "/netpunch", root + "/boot",
++                                  t + "/game", game + "netpunch", t + "/home" })
++        assert(mkdir(d.c_str(), 0700) == 0);
++    setenv("XDG_DATA_HOME", xdg.c_str(), 1);
++    setenv("HOME", (t + "/home").c_str(), 1);   // no real Steam, no real crash dumps
++    unsetenv("TPF2MP_DATADIR");
++
++    // the install and its data folder
++    put(root + "/tpf2mp_install.txt", "# TpF2 Multiplayer install manifest\nversion\t0.7.0.3\ninstalled\t2026-09-26\n");
++    put(root + "/tpf2_menu.so", "ELF menu");
++    put(root + "/boot/libtpf2mp_boot.so", "ELF boot");
++    put(root + "/plugins/tpf2_bigmap.cfg", "octree_depth=13\n");
++    put(data + "tpf2_bridge.log", "[m5] bridge init\n");
++    put(data + "tpf2_bridge_ctl.txt", "instance=b\npeer=127.0.0.1:7774\nlobby=0123456789abcdef0123456789abcdef\n");
++    std::string stream(9u << 20, 'x');
++    stream.replace(0, 5, "FIRST");
++    stream.replace(stream.size() - 4, 4, "LAST");
++    put(data + "lockstep_inject_a.txt", stream);
++    // the lobby, beside the data folder
++    const std::string state = "{\"session\": \"94d4\", \"code\": \"7FVLP7EIYCUAB\\\"X\", \"players\": [\"A\"], \"mode\": \"coop\"}";
++    put(root + "/netpunch/lobby_state.json", state);
++    const std::string outLine = "{\"type\": \"code\", \"code\": \"7FVLP7EI\", \"steam\": \"76561198\", \"crossplay\": true, \"cross_code\": \"7FVLP7EI\"}\n"
++                                "{\"type\": \"roster\", \"players\": [\"A\", \"B\"]}\n";
++    put(root + "/netpunch/lobby_out.jsonl", outLine);
++    put(root + "/netpunch/lobby_proc.log", "[join] connected\n");
++    put(root + "/netpunch/incoming_save.sav", "a save");
++    put(game + "TransportFever2", "ELF game");
++
++    // six older copies: only TPF2_LOG_KEEP of that kind may remain
++    const std::string logs = root + "/logs/";
++    assert(mkdir(logs.c_str(), 0700) == 0);
++    for (int i = 0; i < 6; i++) {
++        const std::string d = logs + "2020010" + std::to_string(i) + "-000000-now";
++        assert(mkdir(d.c_str(), 0700) == 0);
++        put(d + "/about.txt", "old");
++    }
++
++    Tpf2mpLogArchive a;
++    assert(Tpf2mpArchiveLogsSafe(false, game.c_str(), &a) && a.folder[0]);
++    const std::string f = std::string(a.folder) + "/";
++    const std::string about = get(f + "about.txt");
++    printf("%s\n", about.c_str());
++
++    assert(about.find("TpF2 Multiplayer") != std::string::npos && about.find("0.7.0.3") != std::string::npos);
++    assert(about.find("Kernel") != std::string::npos && about.find("UTC") != std::string::npos);
++    assert(about.find("tpf2_menu.so") != std::string::npos && about.find("boot/libtpf2mp_boot.so") != std::string::npos);
++    assert(about.find("TransportFever2") != std::string::npos && about.find("masked") != std::string::npos);
++    // logs as before
++    assert(exists(f + "tpf2_bridge.log") && exists(f + "netpunch_lobby_proc.log"));
++    // state: copied (still in the data folder), the tail of a big stream
++    assert(get(f + "state_tpf2_bridge_ctl.txt").find("lobby=0123") != std::string::npos);
++    assert(exists(data + "tpf2_bridge_ctl.txt"));
++    const std::string tail = get(f + "state_lockstep_inject_a.txt");
++    assert(tail.size() == (8u << 20) && tail.substr(tail.size() - 4) == "LAST" && tail.find("FIRST") == std::string::npos);
++    assert(about.find("only the last 8 MB kept") != std::string::npos);
++    // the install manifest and the plugin configuration
++    assert(get(f + "tpf2mp_install.txt").find("version\t0.7.0.3") != std::string::npos);
++    assert(exists(f + "plugins_tpf2_bigmap.cfg"));
++    // never the save
++    assert(!exists(f + "netpunch_incoming_save.sav"));
++    // the lobby's files: codes masked, same length, everything else intact
++    const std::string st = get(f + "netpunch_lobby_state.json");
++    assert(st.size() == state.size() && st.find("7FVLP7") == std::string::npos);
++    assert(st.find("\"code\": \"****************\"") != std::string::npos && st.find("\"mode\": \"coop\"") != std::string::npos);
++    const std::string ol = get(f + "netpunch_lobby_out.jsonl");
++    assert(ol.size() == outLine.size() && ol.find("7FVLP7") == std::string::npos && ol.find("76561198") == std::string::npos);
++    assert(ol.find("\"type\": \"code\"") != std::string::npos && ol.find("\"crossplay\": true") != std::string::npos);
++    assert(ol.find("\"players\": [\"A\", \"B\"]") != std::string::npos);
++    assert(get(root + "/netpunch/lobby_state.json") == state);   // the original is untouched
++    // retention: the five newest copies, this one included
++    assert(countKind(logs, "-now") == TPF2_LOG_KEEP);
++
++    // a start-of-run archive moves the logs but only copies the state
++    put(data + "tpf2_slice.log", "[slice] up\n");
++    Tpf2mpLogArchive b;
++    assert(Tpf2mpArchiveLogsSafe(true, game.c_str(), &b) && b.folder[0]);
++    assert(!exists(data + "tpf2_slice.log") && exists(std::string(b.folder) + "/tpf2_slice.log"));
++    assert(exists(data + "tpf2_bridge_ctl.txt") && exists(std::string(b.folder) + "/state_tpf2_bridge_ctl.txt"));
++
++    printf("PASS: versions, state files (copied, 8 MB tail), install manifest and plugin cfg, lobby stream with codes masked, "
++           "no save, keep %d\n", TPF2_LOG_KEEP);
++    return 0;
++}
+diff --git a/tools/linux/collect_logs.sh b/tools/linux/collect_logs.sh
+index 1ed8b97..e0a9568 100755
+--- a/tools/linux/collect_logs.sh
++++ b/tools/linux/collect_logs.sh
+@@ -211,6 +211,15 @@ RUNNING=$(pgrep -xc TransportFever2 2>/dev/null || true)
+   echo "XDG_DATA_HOME (this shell): ${XDG_DATA_HOME:-}"
+ } 2>/dev/null | sed "s|$TPF2MP_REAL_HOME|~|g" >"$STAGE/system.txt"
+ 
++# The lobby's message stream and state carry the invitation codes, and a code is
++# enough to join: every string value of these keys is masked before packing
++# (2026-09-26, as the in-game OPEN LOGS does).
++MASK_KEYS='code|cross_code|steam|steam_code|steam_secret|password|pass|passcode|secret'
++while IFS= read -r -d '' f; do
++  sed -E -i "s/(\"($MASK_KEYS)\"[[:space:]]*:[[:space:]]*\")([^\"\\\\]|\\\\.)*\"/\\1<masked>\"/g" "$f" 2>/dev/null
++done < <(find "$STAGE" -type f \( -name '*.json' -o -name '*.jsonl' -o -name '*.txt' \) -print0)
++note "invitation codes in the lobby files are masked"
++
+ # ---- 5. the archive ----------------------------------------------------------------------
+ if [ -z "$OUT" ]; then
+   OUT=$(xdg-user-dir DOWNLOAD 2>/dev/null || true)

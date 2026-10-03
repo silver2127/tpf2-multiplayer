@@ -34,14 +34,6 @@ def off_to_va(off):
     return None
 
 def va_to_off(va):
-    rva = va - BASE
-    for rva, rawptr, rawsize in sec.values():
-        if rva <= rva < rva + rawsize:
-            return rawptr + (rva - rva) + (rva and (rva - rva))  # placeholder, fixed below
-    return None
-
-# fix va_to_off (kept simple):
-def va_to_off(va):
     r = va - BASE
     for rva, rawptr, rawsize in sec.values():
         if rva <= r < rva + rawsize:

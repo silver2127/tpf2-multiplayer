@@ -1,5 +1,71 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `192ecd4d` integration](UPSTREAM_dev_192ecd4d.md) advances the
+native package, lobby handshake and panel to **0.7.1.5**. Completed save and
+terrain transfers release the host loop’s temporary references each pass.
+The CrossOver loader-hook fix is retained; Linux already uses guarded Vulkan
+dispatcher slots. All peers, including dedicated servers, must update.
+
+The [dev `a459ff1c` integration](UPSTREAM_dev_a459ff1c.md) fixes
+Linux release packaging to accept the menu’s existing `Tpf2mpLastGameUiTick`
+export. Release remains **0.7.1.4**; gameplay code is unchanged.
+
+The [dev `4487d7cd` integration](UPSTREAM_dev_4487d7cd.md) advances the
+native package, lobby handshake and panel to **0.7.1.4**. All peers must update.
+The menu library now exports a monotonic gameplay-update timestamp, cleared
+at the title menu. The Windows MSI warning-page fix is retained. Native Linux
+uses a different terrain paging policy; no new loading-speed result is claimed.
+
+The [dev `c4754f26` integration](UPSTREAM_dev_c4754f26.md) retains the Windows
+installer’s folder-refusal dialog. Native Linux already prints the reason to
+stderr and exits with an error; four installer regressions cover that behavior.
+Release remains **0.7.1.3**.
+
+The [dev `721ac61f` integration](UPSTREAM_dev_721ac61f.md) moves save reading, hashing and mod
+discovery to a lobby worker. Joiners wait 30 seconds for a silent host; mesh
+routing still bypasses it after 12 seconds. Shared lobby; release remains **0.7.1.3**.
+
+The [dev `262353d7` integration](UPSTREAM_dev_262353d7.md) merges
+housekeeping and correctness fixes for replay, vehicle/line identity, lobby transfers,
+and network input handling. Native bridge epoch handling and kill-switch readers
+are covered by Linux regressions; release remains **0.7.1.3**.
+
+The [dev `528294b1` integration](UPSTREAM_dev_528294b1.md) asks for a
+fresh host save when a late joiner would receive one over two minutes old,
+with fallback if no new save arrives. Host-loop stalls no longer count as
+peer silence. Shared lobby; release remains 0.7.1.2.
+
+The [dev `304a4e28` integration](UPSTREAM_dev_304a4e28.md) adds catch-up progress
+logging about every 20 seconds: remaining gap, closing rate, local and session
+rates, and an ETA when the gap is closing. Shared Lua; release remains 0.7.1.2.
+
+The [dev `86f806df` integration](UPSTREAM_dev_86f806df.md) keeps
+terrain streams running across later STARTs, avoiding replacement while a
+joiner reads the same sidecar. Shared Linux/Windows lobby; release 0.7.1.2.
+
+The [dev `effa7243` integration](UPSTREAM_dev_effa7243.md) prevents
+repeat save transfers while a joining player’s mods are packing, queued or
+being delivered. The shared lobby fix applies to native Linux and Windows;
+release remains 0.7.1.2.
+
+Current release integration: **0.7.1.5**, Windows dev `192ecd4d`; see the
+[integration and validation record](UPSTREAM_dev_192ecd4d.md). All peers, including dedicated
+servers, must update. Existing native Sandbox town-tool capture, minimap and
+cargo-filter limitations remain. Upstream performance measurements were not
+repeated locally; matching release numbers do not establish gameplay parity.
+Completed TCP transfers no longer stay in lobby memory through listener
+registrations; active transfers retain their handlers until they finish.
+Catching-up peers retain recently heard leader clocks when stamping commands
+and defer spare-line requests until catch-up completes.
+Dedicated servers pause while players join an otherwise empty server, and cap
+the voted speed at 1x while someone joins existing players. A joiner stops
+holding the session after about 20 minutes without a change in joining count.
+Below 1x, command delay follows session speed with a ramp margin; recovery
+from a slow session rises in steps, and excess delay falls faster.
+Native terrain sidecars are on by default from 0.7.1.2 (the user's decision;
+first game use: the project's dedicated server; `terrain_sidecar=0` turns them
+off). Material-index acceleration remains unported.
+
 This release is for the **native Linux version** of Transport Fever 2 on Steam. If you run the
 Windows version through Proton, it does not apply.
 
@@ -21,11 +87,19 @@ to the old libraries, or no scripts at all, can break that session.
 
 ## Install
 
-This development tree integrates **Windows 0.6.1.18, tag `a5aeda76`**, on
+This development tree integrates **Windows 0.7 plus dev `8c3c02a5`**, on
 top of Linux merge PR #5. The integration and live-test record is
-[PARITY_20260921.md](../re/linux/PARITY_20260921.md). Native/Windows frozen join
+[UPSTREAM_dev_8c3c02a5.md](UPSTREAM_dev_8c3c02a5.md). Earlier Native/Windows frozen join
 and company-command replay were exercised on the VPS; see that record for
 desktop visual checks and external Steam P2P checks still outstanding.
+
+Canonical simulation ordering is on by default since dev `ad3d66e4`.
+`TPF2MP_ORDER_CANON=0` disables it; unset or any other value enables it.
+Simulation settings must match every peer, including Windows players whose
+sorts default on. Native retained-world joins remain opt-in, and matching
+versions alone do not establish gameplay parity. Loaded-game lifetime and
+cross-platform validation remain outstanding; see
+[UPSTREAM_dev_ad3d66e4.md](UPSTREAM_dev_ad3d66e4.md).
 
 The native implementation includes command capture and replay, deterministic
 ordering hooks, company permissions, save selection, load progress, automatic
@@ -59,7 +133,26 @@ Returning to the title menu leaves the lobby. Use the Linux installer for
 updates. Installation also removes the obsolete `mods/m3_determinism_1` probe,
 with removal shown in `--dry-run`.
 
-Download the `.run` installer, then run:
+From 0.7.0.6 onward, download `tpf2mp-linux-<version>-native.run` and
+`tpf2mp-linux-<version>-native.sha256` from the matching tag in
+[tpf2-multiplayer-packages](https://github.com/silver2127/tpf2-multiplayer-packages/releases).
+The same install files also live on the mod repository's `<version>` release
+(without `v`). The `v<version>` page carries the two launchers and is marked
+Latest. Existing versions can be migrated with `page v<version>` (upstream
+applied this to 0.7.0.5): install files are copied to the packages repository
+and `<version>` before being removed from `v<version>`. `--replace-page` is
+no longer supported. Launchers up to 1.2.0 must be updated first, since they
+expect the MSI on `v<version>`. See [the current release layout](UPSTREAM_dev_8e0a0c00.md).
+Verify the `.run` entry in the checksum file before running it:
+
+```sh
+sha256sum --check --ignore-missing tpf2mp-linux-<version>-native.sha256
+bash tpf2mp-linux-<version>-native.run
+```
+
+The `-native.tar.gz` contains the same `tpf2mp-linux-<version>/` directory.
+Local builds also retain the original filenames used below. Download or build
+the `.run` installer, then run:
 
 ```sh
 bash tpf2mp-linux-<version>.run
@@ -174,7 +267,7 @@ the script fallback. Logs are in `<data home>/tpf2mp/data/tpf2mp_host.log`.
   - the lobby's logs;
   - crash dumps written since the last save.
 
-  This also works after a crash: just start the game again. The last 2 are kept. `about.txt` in each
+  This also works after a crash: just start the game again. The last 5 of each kind (startup and OPEN LOGS) are kept. `about.txt` in each
   folder lists what is there, with sizes.
   Create `tpf2mp_keep_logs.txt` in the runtime data folder to keep every archive
   and append mod/lobby logs across starts. Remove it to restore normal retention.
@@ -247,9 +340,50 @@ The script:
 
 The lobby builder uses pinned Python and manylinux wheels, checks every bundled ELF dependency against glibc 2.31, and supports `--test` for its five local network/transfer tests. Native build provenance, source commit, included libraries and lobby checksum are recorded in `BUILDINFO`.
 
+The builder also emits byte-identical `-native.run` and `-native.tar.gz` copies
+and a `-native.sha256` listing those two filenames. These are the inputs to
+`tools/publish_release.py --linux-dir dist/linux`; no manual renaming is needed.
+The existing filenames and archive root remain available to local tooling.
+See [the release-layout integration](UPSTREAM_dev_4e1e486c.md).
+
+Launcher-only updates use `python3 tools/publish_release.py launcher`
+(default: draft; `--publish` publishes). They need no `--linux-dir` and use
+`launcher-v<version>` tags with `make_latest=false`; Latest remains the
+`v<version>` launcher page. Launcher-only updates no longer delete or re-create
+a mod release. Mod releases require `--linux-dir`, upload native files to both
+install-file releases, and publish `<version>` before the `v<version>` launcher
+page. See [the release-layout integration](UPSTREAM_dev_8e0a0c00.md).
+
 The version defaults to `installer/VERSION`. See `RESUME_STATUS.md` in the source tree for implementation coverage and remaining runtime validation; packaging success alone does not establish multiplayer parity.
 
-### Optional Big Maps worktree in development packages
+### Big Maps in the unified package
+
+`tools/linux/build_native.sh` builds and tests the in-tree `bigmap/linux` plugin.
+The release includes `plugins/tpf2_bigmap.so` and its **Linux** configuration;
+`--without tpf2_pluginhost.so` omits plugins. The native defaults select depth 11
+and cap tiles at 512 (510 on square maps), with terrain paging on by default (missing key also enables it). Set
+`terrain_cache_compress=0` and restart after SIGBUS; kernel-origin faults on
+evicted pages cannot be served by this pager. Unsupported userfaultfd setup
+keeps stock allocation paths. The Windows
+configuration requests depth 13; keep the packaged Linux configuration
+for its native defaults. Depths 12/13 are available on the verified Steam ELF;
+the Windows GOG fallback does not apply to it. See
+[dev aaae03f8 integration](UPSTREAM_dev_aaae03f8.md).
+Upstream now reports successful depth-13 play, save/reload and multiplayer
+with a native Linux dedicated server; every peer needs the same `octree_depth`.
+See [dev 63a3b8df integration](UPSTREAM_dev_63a3b8df.md) for attribution
+and the distinction from local validation.
+See [Big Maps scope and evidence](../../bigmap/docs/linux/PORT.md) and the
+[current integration](UPSTREAM_dev_8c3c02a5.md) for remaining Windows features.
+The installed `bigmap-density-restore` helper restores the plugin's exact density
+patch before upgrade/uninstall; modified patches are left intact and removal stops.
+Native live join remains opt-in (`tpf2mp_live_join.txt` = `1`); Windows 0.7 defaults on.
+
+The [dev `60d237c5` integration](UPSTREAM_dev_60d237c5.md) retains the Windows
+autosave-sidecar fix. Native Big Maps does not yet capture or restore `.terr`
+sidecars, so this fix does not enable them on Linux.
+
+### Optional Big Maps worktree override in development packages
 
 Pass `--bigmap-repo /path/to/tpf2-bigmap` to `tools/linux/build_release.sh`
 or `tools/linux/auto_install.py` to build and ship that checkout's native
@@ -259,3 +393,355 @@ and installation after all games close. The selected checkout must contain
 `linux/CMakeLists.txt` and `linux/tpf2_bigmap.cfg`. This option never launches
 the game. Automatic recovery and Workshop registration remain unsupported as
 recorded in the integration notes.
+
+## Experimental Steam transport (0.6.1.28)
+
+Messages v002 is the default, resolved from the game's loaded `libsteam_api.so`.
+To compare Legacy, close the game and create `tpf2mp_steam_legacy.txt` in this
+installation's runtime `data/` directory. Remove it with the game closed to
+return to Messages. Both peers must choose the same mode; check `transport=Messages`
+or `transport=Legacy` in the bridge log. An unavailable Messages API disables
+Steam transport without falling back. Direct TCP remains preferred for saves;
+only transfers actually using Steam measure this comparison. No Linux internet
+throughput improvement has been measured for this integration.
+
+Messages now starts with equal 1 MiB/s clamps and adjusts them every five
+seconds using active outgoing peers' remote delivery quality. Legacy retains
+its fixed configuration. Look for [steam-rate] adjustments; configured rates
+are not measured save-transfer throughput. The redesigned Create Game and host
+lobby views expose Cross-play through the existing invitation-code switch.
+
+The [dev `a42dab6c` integration](UPSTREAM_dev_a42dab6c.md)
+keeps hot-join save requests pending while the host world loads, then
+takes the save when the game UI is ready. Version remains 0.7.
+
+### Family guard performance (dev 7cacbaaf)
+
+Linux 6.11+ can validate family memory ranges through `PROCMAP_QUERY` without
+parsing the process mapping table. Older kernels, or environments denying the
+ioctl, retain a fresh buffered snapshot per iteration; very large mapping
+counts can still cost simulation time there. No kernel setting is changed by
+the native libraries. See [integration evidence](UPSTREAM_dev_7cacbaaf.md).
+
+The [dev `2c05099a` integration](UPSTREAM_dev_2c05099a.md) adds the remaining supplied
+Windows RNG seed/distribution/engine compatibility modules, enabled by default.
+`TPF2MP_SIM_SEED=0` and `TPF2MP_ENGINE_PARITY=0` disable them for diagnosis.
+Static ELF checks and 65 native tests pass; the lab launch was blocked before
+the game started, so cross-platform gameplay validation remains outstanding.
+
+The [dev `582a380` integration](UPSTREAM_dev_582a380.md) makes native dedicated
+restarts prefer a newer autosave of the hosted `mp_shared` world over the
+configured save. Version remains 0.7.
+
+The [dev `cf5f8a0e` integration](UPSTREAM_dev_cf5f8a0e.md) makes load-time company
+switches wait for entity queries to answer and reuses live saved player entities.
+Version remains 0.7; loaded-world validation is still outstanding.
+
+The [dev `522a303b` integration](UPSTREAM_dev_522a303b.md) reports the slowest hash's
+lane breakdown and the cost of post-hash broadcast, drift and comparison work.
+Shared Lua regression tests pass; no live performance measurement is claimed.
+Version remains 0.7.
+
+The [dev `bd69b864` integration](UPSTREAM_dev_bd69b864.md) adds native UCRT math parity, octree depth 12/13,
+target-record indexing and the 0.7.0.2 TCP/resync UI. Placement-distance and
+attempt-budget parity remain unported; the lab launch was blocked before game startup.
+
+## Town-development diagnostics (dev 0610033)
+
+Set `TPF2MP_TOWN_TRACE=1` in the game's launch environment to write
+`$XDG_DATA_HOME/tpf2mp/data/tpf2_towntrace.txt` (default XDG data home:
+`~/.local/share`). Restart without the variable to disable it. The trace is off
+by default and requires the verified town-seed hook. Compare captures from the
+same session with `python3 tools/town_trace_diff.py NATIVE_TRACE WINDOWS_TRACE`;
+Windows enables its half with `towntrace=1` in `tpf2_slice.cfg`.
+See [integration and validation limits](UPSTREAM_dev_0610033.md).
+
+## Release 0.7.0.3 (dev d8a3ce57)
+
+Native Linux is at **0.7.0.3**: the `.run` installer, the tarball name, the
+staged `VERSION` file and the `BUILDINFO` header all take it from
+`installer/VERSION`, and the lobby handshake (`LOBBY_VERSION`) matches. Every
+participant, including a dedicated server, needs the same version -- the gate is
+an exact release match and a peer without a version fails closed.
+
+The release carries no new native code: it is the version stamp for the fixes
+the `0610033`, `11a98cc`/`e43d01dd` and earlier integrations already ported. The
+Linux behaviour the release notes promise was rechecked against the unmodified
+build-35924 ELF and passes; the octree depth, town-trace and math-parity notes
+elsewhere in this file still apply unchanged.
+See [integration evidence and validation limits](UPSTREAM_dev_d8a3ce57.md).
+
+The [dev `122a0ce9` integration](UPSTREAM_dev_122a0ce9.md) adds the native resync
+view’s in-game x. Closing a running resync hides its view while recovery
+continues; Manage Lobby reopens it. Errors and unanswered Ready requests
+bring it back automatically. Saving/loading suppresses the x.
+
+Since [dev 45183ac6](UPSTREAM_dev_45183ac6.md), native OPEN LOGS and startup
+archives include the installed version, kernel/time zone, module GNU build IDs,
+and copied state/config files (last 8 MiB each, after logs). Lobby JSON/JSONL/text
+copies mask invitation/password fields. Saves and terrain dumps are excluded.
+The native menu uses xdg-open and reports the native archive location.
+
+The [dev `96795a8b` integration](UPSTREAM_dev_96795a8b.md) expands the native public
+browser to eight games per page and up to 32 games, and completes archive
+runtime/boot metadata and standalone collector credential masking.
+
+The [dev `01044521` integration](UPSTREAM_dev_01044521.md) expands the native public
+browser to twelve games per page and up to 48 games, and removes the legacy
+panel renderer. Closing a running resync leaves the game visible.
+
+The [release 0.7.0.4 integration](UPSTREAM_dev_e86d5552.md) advances the native package
+and shared lobby handshake to **0.7.0.4**. All peers, including dedicated
+servers, must update. This release stamps the previously integrated hot-join,
+menu and log fixes; existing native feature and live-validation limits remain.
+
+The [dev `c74a7b4e` integration](UPSTREAM_dev_c74a7b4e.md) fixes
+TCP save routing after joining through the master's UDP relay: the joiner tries
+the host's advertised addresses, or continues on UDP when none are available.
+The shared lobby implements this on Linux and Windows; version remains 0.7.0.4.
+
+The [dev `f6e47ef9` integration](UPSTREAM_dev_f6e47ef9.md) adds
+the master's TCP pipe fallback for slow save/mod transfers, shared by Linux
+and Windows. Native shutdown cleanup is preserved; version remains 0.7.0.4.
+
+The [release 0.7.0.5 integration](UPSTREAM_dev_f67726f8.md) advances
+the native package and shared lobby handshake to **0.7.0.5**, stamping the
+previously integrated relay address fix and TCP pipe fallback. All peers,
+including dedicated servers, must update. Existing native feature and
+live-validation limits remain unchanged.
+
+## Bridge missing or failed to load
+
+The [dev ba1fa26e integration](UPSTREAM_dev_ba1fa26e.md) disables hosting and
+joining when `tpf2_bridge_mp.so` is not loaded in the game process. The menu
+shows an amber explanation. Reinstall the native package and restart the game;
+check `data/tpf2_proxy.log` for the attempted path and the `dlopen` error.
+Having the file on disk or an old `tpf2_instance.txt` does not establish a load.
+
+The [dev `2f65bae3` integration](UPSTREAM_dev_2f65bae3.md) adds compressed terrain edits
+with checksum validation to native capture and replay. Every peer needs this
+build; the unchanged 0.7.0.5 version handshake does not detect older terrain
+readers. Uncompressed version-1 edits remain readable.
+
+The [dev `616191b1` integration](UPSTREAM_dev_616191b1.md) makes native OPEN LOGS
+include the newest startup archive’s game log and `crash_*` files as
+`previous_run_*`, so a restart does not hide the crashed run’s dumps.
+Copies remain subject to the archive budget. Version remains 0.7.0.5.
+
+The [dev `363c38cc` integration](UPSTREAM_dev_363c38cc.md) retains the Windows
+terrain-sidecar concurrent-release fix. Native sidecar capture/serving remains
+unported; native pager and alignment batching behavior is unchanged.
+
+The [dev `ceee11b1` integration](UPSTREAM_dev_ceee11b1.md) wraps native lobby
+chat to its measured width, including long links, and retains the newest
+messages that fit. In-game Lua chat uses a 52-byte default wrap width.
+Version remains 0.7.0.5; live rendering validation remains outstanding.
+
+The [dev `0047c19f` integration](UPSTREAM_dev_0047c19f.md) adds shared cargo-filter
+wire/replay support but leaves native filter capture unported. Linux line
+edits can still lose stop filters. Version remains 0.7.0.5; no loaded-game
+cargo-filter parity has been demonstrated.
+
+The [dev `06188ea5` integration](UPSTREAM_dev_06188ea5.md) keeps
+command stamps ahead of the fastest peer while a joiner catches up, with a
+600-unit sanity cutoff. Shared Lua tests cover the change; no live multiplayer
+result is claimed. Version remains 0.7.0.5.
+
+The [dev `f9d34252` integration](UPSTREAM_dev_f9d34252.md) retains Windows’
+corrected packed cargo-flag reader and tests shared numeric flag transport.
+Native Linux cargo capture remains unported: static layout evidence was
+rechecked, but the lab failed before startup. Linux line edits can still
+lose stop filters. Version remains 0.7.0.5.
+
+The [dev `bef70213` integration](UPSTREAM_dev_bef70213.md) makes native OPEN LOGS
+include the newest startup archive’s mod `*.log` files as `previous_run_*`,
+so the crashed run’s host, terrain and bridge diagnostics accompany its dumps.
+Version remains 0.7.0.5.
+
+The [dev `ad36a976` integration](UPSTREAM_dev_ad36a976.md) replaces Lua cargo-filter
+setters with a native replay request. The Windows writer is retained; the
+Linux writer remains unported after static RE and a lab startup failure.
+Native cargo capture and replay can still lose stop filters. This supersedes
+the earlier `4ccdde5d` mock-based replay claim. Version remains 0.7.0.5.
+
+The [release 0.7.0.6 integration](UPSTREAM_dev_4e857780.md) advances the native package
+and shared lobby handshake to **0.7.0.6**. All peers, including dedicated
+servers, must update. This commit only stamps earlier changes: native cargo
+filter capture/replay and terrain-sidecar capture/serving remain unported.
+The upstream cargo-filter and repeated-load validation does not establish
+native Linux support; existing gameplay-validation limits still apply.
+
+The [dev `4617fb6f` integration](UPSTREAM_dev_4617fb6f.md) advances
+native Linux to **0.7.0.7 / FPT6**, retains commands owed to quiet members,
+adds adaptive retransmission and pacing fixes, and displays the version in
+the native panel. All peers must update. Direct installers now accompany
+the launchers on the version page. Existing native feature limits remain.
+
+## Fantasia generator buffer reuse
+
+The native Big Maps plugin now applies buffer reuse automatically when a
+Fantasia map has area above 8193² heightmap samples (128 x 128 tiles,
+32 x 32 km). Generator dimensions are `64 * tiles + 1` samples. Enable the normal Fantasia
+Workshop mod; no additional low-memory mod is needed. `generator_memory=1`
+is the default in the `[tpf2_bigmap]` configuration section; set it to `0`
+and restart to disable it. Fantasia's files remain unchanged.
+
+If you installed the earlier `tpf2_bigmap_fantasia_low_memory_1` stand-in,
+disable it in the mod list before using the normal Fantasia generator. The
+old installer and stand-in files were retired upstream. Check the plugin log
+for `generator memory: ... served with buffer reuse`. See
+[integration evidence](UPSTREAM_dev_5d73f324.md); native rendered terrain and
+peak memory still need live validation.
+
+`generator_memory_budget_pct=50` lets Fantasia spend half of available RAM on
+buffers to preserve generation parallelism; values above 90 are capped, and
+0 (or negative) requests the fewest buffers. Linux samples `MemAvailable`
+at each generator open, additionally capped by `CommitLimit - Committed_AS`
+when `vm.overcommit_memory=2`. Failed queries fall back to the fewest buffers.
+This is a buffer scheduling budget, not a hard limit on game memory: values
+alive together may require more buffers. Stock generators retain their
+fewest-buffer path, and maps at/below 128 x 128 tiles remain unchanged.
+
+The [dev `cc0981bb` integration](UPSTREAM_dev_cc0981bb.md) adds the dedicated-server
+archive and hosting guide, spreads shared construction checks across updates,
+and ports the resync hold fix to Linux: no ten-second deadline, game-local
+SDL gesture diagnostics, and focus-loss cleanup. Version remains 0.7.0.7.
+Offline regression tests cover these changes; no new live gameplay result is claimed.
+
+The [dev `3cc80874` integration](UPSTREAM_dev_3cc80874.md) records upstream merging
+the completed Linux ports through `cc0981bb` back into Windows history. Its
+source tree is identical to the previous Linux integration; runtime behavior
+and version 0.7.0.7 are unchanged. Lua now matches upstream without exceptions.
+
+The [dev `d9196011` integration](UPSTREAM_dev_d9196011.md) preserves
+the release tag when publishing and checks the returned tag afterward, failing
+loudly on a mismatch. This shared tooling change leaves native runtime behavior
+and version 0.7.0.7 unchanged. Publication checks are tested offline.
+
+The [dev `24b8f636` integration](UPSTREAM_dev_24b8f636.md) guards shared Fences compatibility
+loading so a missing or failing module disables multiplayer without aborting
+game loading. Offline Lua and native tests pass; no live gameplay result is
+claimed. Version remains 0.7.0.7.
+
+The [dev `ea15a156` integration](UPSTREAM_dev_ea15a156.md) batches native guarded page
+reads and avoids scanning whole-world vectors for a single road edge. Name
+slot pairs are copied in one guarded read. Version remains 0.7.0.7; local
+validation uses memory fixtures and ELF checks, with no in-game timing claim.
+
+Native dedicated servers now default to descriptor-set recycling when
+`dedicated_render=0`; `dedicated_recycle_sets=0` disables it. Ordinary rendered
+sessions do not use it. See [dev 84058da7](UPSTREAM_dev_84058da7.md) for the
+verified dispatcher correction and live-test limitations.
+
+### Integration through dev f0212c87
+
+[Integration and test record](UPSTREAM_dev_f0212c87.md). Release remains 0.7.0.7.
+The shared multiplayer toolbar button is included with both icon resolutions.
+Native Sandbox town-tool capture and the minimap (including climate colors and
+M shortcut) remain unported; do not place towns with the native Sandbox tool
+in multiplayer sessions. Shared TOWNC replay is present but cross-platform town
+determinism was not tested live.
+
+The native save compressor defaults to four libzstd workers (limited by CPU
+count); `save_threads=0` disables it, or use 1..16 to choose a worker count.
+It falls back to the game's compressor when byte checks or system libzstd support
+fail. The Steam polling hook defaults to a 2 ms interval while busy;
+`steam_poll_ms=0` disables it, and positive values clamp at 100 ms. The existing
+200 ms idle wait is retained. These settings use `tpf2_menu_flags.txt` in the
+native module root, falling back to its data folder when the root file is absent.
+Restart the game after changing these startup flags. Local lab startup was blocked;
+no live saving speedup, polling cost or toolbar appearance is claimed.
+
+The [dev `ac3b4be3` integration](UPSTREAM_dev_ac3b4be3.md) records
+upstream merging the completed Linux ports through `412aeb8e` back into Windows
+history. Its source tree matches the preceding Linux integration; runtime
+behavior and release **0.7.1.1** are unchanged.
+
+The [dev `bde31323` integration](UPSTREAM_dev_bde31323.md) brings the
+company registry rewrite, rebuilt COMPANIES tab and native free-color tints.
+Release remains 0.7.1.1. Native and shared regression tests pass; the lab launch
+was blocked before game startup, so live gameplay validation remains outstanding.
+
+The [dev `0871bfa6` integration](UPSTREAM_dev_0871bfa6.md) retains Windows' complete-sidecar
+alignment bypass. Native Linux sidecar serving and this bypass remain unported;
+Linux continues its existing alignment path. Static publication metadata was
+verified, but the lab failed before startup, preventing live lifetime proof.
+
+The [dev `c8dd5157` integration](UPSTREAM_dev_c8dd5157.md) adds Linux offline coverage for
+threaded terrain-sidecar encoding and POSIX file handling. Native game-side
+capture/serving remains unported; `terrain_sidecar_threads` has no native
+runtime effect. No native save-time improvement is claimed.
+
+The [dev `fdfb79e8` integration](UPSTREAM_dev_fdfb79e8.md) retains
+Windows range tracking for multiple terrain versions. Native sidecar serving
+and alignment bypass remain unported after fresh static analysis and a lab
+startup failure; native alignment behavior is unchanged.
+
+The [dev `2b4fd093` integration](UPSTREAM_dev_2b4fd093.md) adds experimental
+native terrain sidecar capture/serving and a complete-grid alignment bypass.
+This supersedes the historical implementation-absence statements above.
+`terrain_sidecar=0` remains the native default because live terrain lifetime and
+load completion are unverified. `terrain_sidecar=1` enables lab trials, with
+`terrain_sidecar_write=1` and `terrain_sidecar_threads=0` (automatic, at most 8).
+The current lab fails before game startup; no save/load speedup is claimed.
+
+The [dev `5b817efb` integration](UPSTREAM_dev_5b817efb.md) keeps a terrain sidecar
+while another served terrain version awaits its pass. Each version skips only
+once; a pass that runs releases the file. Native sidecars remain experimental
+and default off. Live validation was blocked before game startup.
+
+The [dev `926b9a2c` integration](UPSTREAM_dev_926b9a2c.md) sorts vehicles at a stop and
+unload queues by entity ID on native Linux. All peers need these changes;
+release remains 0.7.1.1. Static ELF and native regressions pass; the lab
+failed before game startup, so live join validation remains outstanding.
+
+The [dev `9602a389` integration](UPSTREAM_dev_9602a389.md) adds experimental
+terrain streaming. `terrain_stream=1` (default) reads the host's growing sidecar
+only when `terrain_sidecar=1` is explicitly enabled. `terrain_stream=0` disables
+stream reading, not lobby sending. Native sidecars remain off by default;
+live terrain ownership and lifetime validation are still outstanding.
+
+The [dev `40e12f76` integration](UPSTREAM_dev_40e12f76.md)
+adds `terrain_sidecar_read_local=0` for stream-only testing when both peers can
+see the host's save folder. The default is 1; native sidecars remain experimental
+and require `terrain_sidecar=1`. With local reads and `terrain_stream` both off,
+the normal terrain computation runs. This switch does not disable sidecar writes.
+
+The [dev `b6d73041` integration](UPSTREAM_dev_7e3d3bfa.md) retains Windows’
+4 GiB maximum automatic free-commit threshold and `commit_tight_mb` override.
+Native terrain paging continues to use `MemAvailable`; this Windows setting
+has no native effect. Release remains 0.7.1.1.
+
+The [dev `7e3d3bfa` integration](UPSTREAM_dev_7e3d3bfa.md) retains the Windows material-index
+optimization and DLL-map profiler support. Native material-index acceleration
+remains unported: the Linux selection loop is inlined, and the lab failed
+before startup, preventing buffer-lifetime proof. Release remains 0.7.1.1.
+
+The [dev `8066c58f` integration](UPSTREAM_dev_8066c58f.md) retains the default-off Windows
+material-index measurement probe. Native `material_index_probe` remains
+unported after static investigation and a lab startup failure; Linux produces
+no `material_probe.txt`. Windows measurements do not establish native tile
+hashes or compression sizes. Release remains 0.7.1.1.
+
+The [dev `65302e5d` integration](UPSTREAM_dev_65302e5d.md)
+adds native parallel sidecar decoding at the alignment pass and retains the
+file for both terrain versions. Sidecars remain experimental and off by default;
+fixture tests pass, but the lab could not start for live validation.
+
+The [dev `a2e47f2c` integration](UPSTREAM_dev_a2e47f2c.md) adds Windows-only
+profiling diagnostics; it changes no native installation, settings or runtime
+behavior. See the [tooling scope](../re/linux/DEV_A2E47F2C.md) before using
+these tools with native Linux captures.
+
+The [dev `7bace802` integration](UPSTREAM_dev_7bace802.md) retains Windows load-speed
+findings, including the rejected material-index chunk-size experiment. These
+are upstream measurements; native runtime behavior and release 0.7.1.1 are unchanged.
+
+The [dev `0eb9eea2` integration](UPSTREAM_dev_0eb9eea2.md) lowers Windows’ automatic
+free-commit threshold to 2..3 GiB (unknown RAM: 3 GiB). Native terrain paging
+retains its existing `MemAvailable` policy; `commit_tight_mb` has no native
+effect. Release remains 0.7.1.1.
+
+The [dev `a896a1cb` integration](UPSTREAM_dev_a896a1cb.md) fixes the native plugin host’s
+rejection of 5–13-byte hooks, including the terrain sidecar’s 13-byte AddTile
+hook. Release remains 0.7.1.2; local lab startup was blocked before the game ran.

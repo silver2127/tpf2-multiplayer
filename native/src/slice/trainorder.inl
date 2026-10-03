@@ -384,30 +384,14 @@ static bool PatchJump(uintptr_t at, void* to, int len)
     return true;
 }
 
-// Kill switch: `trainorder=0` in tpf2_menu_flags.txt, the same file (and the
-// same dumb prefix match) the menu dll reads its own switches from. Looked up
-// next to this dll first, then in the data dir.
-static bool FlagsSayNoTrainOrder()
-{
-    for (int i = 0; i < 2; i++) {
-        const char* dir = i == 0 ? g_dllDir : g_dataDir;
-        if (!dir[0]) continue;
-        char p[MAX_PATH];
-        snprintf(p, sizeof(p), "%stpf2_menu_flags.txt", dir);
-        FILE* f = _fsopen(p, "r", _SH_DENYNO);
-        if (!f) continue;
-        char line[256]; bool off = false;
-        while (fgets(line, sizeof(line), f))
-            if (!strncmp(line, "trainorder=0", 12)) off = true;
-        fclose(f);
-        return off;
-    }
-    return false;
-}
+// Kill switch: `trainorder=0` in tpf2_menu_flags.txt -- FlagsSayOff (roadspace.inl,
+// included after this file), which read it with the same lookup; this file had
+// its own copy of that reader.
+static bool FlagsSayOff(const char* key);
 
 static void InstallTrainOrder()
 {
-    if (FlagsSayNoTrainOrder()) {
+    if (FlagsSayOff("trainorder")) {
         Log("[trainorder] OFF (trainorder=0 in tpf2_menu_flags.txt) -- trains keep the "
             "engine's registration-order shuffle, which two peers can disagree about\n");
         return;

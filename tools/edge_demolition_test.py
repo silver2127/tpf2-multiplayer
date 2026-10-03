@@ -83,5 +83,89 @@ run('0,0,0,10,0,0,1;0,0,0,10,0,0,1');check({11},{1,2})
 reset();run('0,0,0,10,0,0,1');assert(#sent==0)
 reset();node(1,0,0);node(2,10,0);edge(11,1,2,1,{{999,0.5}})
 run('0,0,0,10,0,0,1');assert(#sent==0)
+
+-- A dragged bulldoze = many EDEMOs on one tick. The node index is built once
+-- and reused while nothing changes the network, and rebuilt after a removal.
+local fetches=0
+local gs,gt=api.engine.system.streetSystem.getNode2StreetEdgeMap,api.engine.system.streetSystem.getNode2TrackEdgeMap
+api.engine.system.streetSystem.getNode2StreetEdgeMap=function() fetches=fetches+1;return gs() end
+-- the engine applies a sent removal before the next command: mirror that
+local function applying(cmd)
+ sent[#sent+1]=cmd
+ local sp=cmd.sp.streetProposal
+ for _,e in ipairs(sp.edgesToRemove) do
+  local r=edges[e];edges[e]=nil
+  for _,n in ipairs({r.node0,r.node1}) do
+   local l=maps[r.kind][n] or {}
+   for i=#l,1,-1 do if l[i]==e then table.remove(l,i) end end
+  end
+ end
+ for _,n in ipairs(sp.nodesToRemove) do nodes[n]=nil;maps[0][n]=nil;maps[1][n]=nil end
+end
+local plainSend=api.cmd.sendCommand
+api.cmd.sendCommand=applying
+reset();CM.ticks=7
+node(1,0,0);node(2,10,0);node(3,20,0);edge(11,1,2,0);edge(12,2,3,0)
+for i=1,5 do run('100,100,0,110,100,0,0') end            -- nothing there: no send
+assert(fetches==1,'five no-op EDEMOs on one tick must share one index, fetched '..fetches)
+run('0,0,0,10,0,0,0');assert(#sent==1 and fetches==1)   -- removes 11 + orphan 1
+run('10,0,0,20,0,0,0');assert(fetches==2,'a removal must drop the index')
+-- stale data would still list edge 11 at node 2 and keep it; the fresh index frees it
+local sp=sent[2].sp.streetProposal
+assert(#sp.edgesToRemove==1 and sp.edgesToRemove[1]==12)
+local freed={};for _,n in ipairs(sp.nodesToRemove) do freed[n]=true end
+assert(freed[2] and freed[3] and #sp.nodesToRemove==2,'node 2 lost its last edge: must go with it')
+CM.ticks=8;run('100,100,0,110,100,0,0');assert(fetches==3,'a new tick must rebuild')
+api.engine.system.streetSystem.getNode2StreetEdgeMap=gs
+
+-- The cell index answers exactly what the full scan did: dense random nodes
+-- (many within the 1 m radius of each other, equal distances, negative
+-- coordinates across cell edges), compared against the old nested loop.
+api.cmd.sendCommand=plainSend
+local function brute(want)
+ local best,bestD={},{}
+ for kind=0,1 do
+  for nid in pairs(maps[kind]) do
+   local p=nodes[nid].position
+   for i,w in ipairs(want) do
+    if w[4]==kind then
+     local dx,dy=p.x-w[1],p.y-w[2];local d=dx*dx+dy*dy
+     if d<=1.0 and (not bestD[i] or d<bestD[i] or (d==bestD[i] and nid<best[i])) then best[i],bestD[i]=nid,d end
+    end
+   end
+  end
+ end
+ return best
+end
+math.randomseed(20260924)
+for trial=1,40 do
+ reset();CM.ticks=trial
+ local ids={}
+ for id=1,120 do
+  -- quarter-metre lattice: exact ties and exact 1 m distances happen
+  node(id,math.random(-24,24)*0.25-8,math.random(-24,24)*0.25+4);ids[#ids+1]=id
+ end
+ for e=1,90 do
+  local a,b=ids[math.random(#ids)],ids[math.random(#ids)]
+  if a~=b then edge(1000+e,a,b,math.random(0,1)) end
+ end
+ for k=1,6 do
+  local recs,want={},{}
+  for r=1,math.random(1,5) do
+   local x0,y0=math.random(-26,26)*0.25-8,math.random(-26,26)*0.25+4
+   local x1,y1=math.random(-26,26)*0.25-8,math.random(-26,26)*0.25+4
+   local kind=math.random(0,1)
+   recs[#recs+1]=string.format('%g,%g,0,%g,%g,0,%d',x0,y0,x1,y1,kind)
+   want[#want+1]={x0,y0,0,kind};want[#want+1]={x1,y1,0,kind}
+  end
+  local expect=brute(want)
+  local got=CM.edemoMatchNodes(want)   -- the index is reused across k: nothing is sent here
+  for i=1,#want do
+   assert(got[i]==expect[i],string.format('trial %d want %d: cell index %s, full scan %s',trial,i,tostring(got[i]),tostring(expect[i])))
+  end
+ end
+ assert(CM.edemoCache.reused==5,'six lookups on one tick share one index')
+end
 ''')
-print("PASS: crossing demolition cleanup, inverse kind, parallel stubs, orphans, duplicates, absent/protected edges")
+print("PASS: crossing demolition cleanup, inverse kind, parallel stubs, orphans, duplicates, absent/protected edges, "
+      "one node index per bulldoze burst (rebuilt after a removal and on a new tick), cell index == full scan")

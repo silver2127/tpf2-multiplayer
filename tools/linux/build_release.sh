@@ -8,8 +8,8 @@
 # 1. Configures and builds native/linux in a build folder of its own (default
 #    native/linux/out-release; native/linux/out is the developers' folder and is
 #    refused), then checks each library's dynamic exports: the loader exports
-#    clock and the gated Lua formatter interposer, the libraries it loads
-#    nothing (exports_*.map). Every library
+#    clock and the gated Lua formatter interposer, the menu exports its gameplay
+#    timestamp, and other loaded libraries export nothing (exports_*.map). Every library
 #    boot.cpp loads is required: libtpf2mp_boot.so tpf2_bridge_mp.so
 #    tpf2_menu.so tpf2_slice.so tpf2_pluginhost.so. --without tpf2_slice.so or
 #    --without tpf2_pluginhost.so (repeatable) leaves one out on purpose, and
@@ -28,6 +28,7 @@
 #      mod/mp_lockstep_1/
 #      netpunch/netpunch
 #    and packs it as <out>/tpf2mp-linux-<version>.tar.gz (default out: dist/linux).
+#    Also emits -native.run/.tar.gz/.sha256 for tools/publish_release.py.
 set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BUILD=$REPO/native/linux/out-release
@@ -115,25 +116,32 @@ case " ${LEFT_OUT[*]:-} " in
     PLUGINS+=(tpf2_previews.so)
     [ -f "$BUILD/tpf2_workshop_register.so" ] || die "the build did not produce tpf2_workshop_register.so"
     PLUGINS+=(tpf2_workshop_register.so)
+    if [ -z "$BIGMAP_REPO" ]; then
+      install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+      PLUGINS+=(tpf2_bigmap.so)
+    fi
     ;;
 esac
 if [ -n "$BIGMAP_REPO" ]; then
   case " ${LEFT_OUT[*]:-} " in *" tpf2_pluginhost.so "*) die "Big Maps requires tpf2_pluginhost.so" ;; esac
   case "$BIGMAP_REPO/" in "$STAGE/"*) die "Big Maps source must be outside staging" ;; esac
-  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap"
-  install -m 0755 "$BUILD/bigmap/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
+  bash "$REPO/tools/linux/build_bigmap.sh" "$BIGMAP_REPO" "$BUILD/bigmap-override"
+  install -m 0755 "$BUILD/bigmap-override/tpf2_bigmap.so" "$BUILD/tpf2_bigmap.so"
   PLUGINS+=(tpf2_bigmap.so)
 fi
 # A symbol the loader exports wins over the game's own for the whole process
-# (it is in LD_PRELOAD); a library the loader dlopens needs to export nothing.
+# (it is in LD_PRELOAD); dlopened libraries expose only their explicit C APIs.
 if command -v nm >/dev/null 2>&1; then
   for l in "${LIBS[@]}"; do
-    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | sort | paste -sd' ' -)
+    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | LC_ALL=C sort | paste -sd' ' -)
     want=""; [ "$l" != libtpf2mp_boot.so ] || want="__sprintf_chk clock"
+    # The menu exports the gameplay frame stamp tpf2_bigmap reads through dlsym
+    # (Tpf2mpLastGameUiTick) once the port links it with exports_menu.map.
+    [ "$l" != tpf2_menu.so ] || [ ! -f "$REPO/native/linux/exports_menu.map" ] || want="Tpf2mpLastGameUiTick"
     [ "$exports" = "$want" ] || die "$l exports '${exports}', expected '${want}' (see native/linux/exports_*.map)"
   done
   for l in "${PLUGINS[@]}"; do
-    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | sort | paste -sd' ' -)
+    exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | LC_ALL=C sort | paste -sd' ' -)
     [ "$exports" = Tpf2mpPluginInit ] || die "$l exports '${exports}', expected 'Tpf2mpPluginInit'"
   done
 else
@@ -165,9 +173,17 @@ if [ ${#PLUGINS[@]} -gt 0 ]; then
   mkdir -p "$STAGE/lib/plugins"
   for l in "${PLUGINS[@]}"; do install -m 0755 "$BUILD/$l" "$STAGE/lib/plugins/$l"; done
 fi
-if [ -n "$BIGMAP_REPO" ]; then
-  install -m 0644 "$BIGMAP_REPO/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
-fi
+case " ${LEFT_OUT[*]:-} " in
+ *" tpf2_pluginhost.so "*) ;;
+ *)
+  BIGMAP_SOURCE=${BIGMAP_REPO:-$REPO/bigmap}
+  BIGMAP_BUILD=$BUILD/bigmap
+  [ -z "$BIGMAP_REPO" ] || BIGMAP_BUILD=$BUILD/bigmap-override
+  install -m 0755 "$BIGMAP_BUILD/bigmap-density-restore" "$STAGE/lib/bigmap-density-restore"
+  install -m 0644 "$BIGMAP_SOURCE/linux/tpf2_bigmap.cfg" "$STAGE/lib/plugins/tpf2_bigmap.cfg"
+ ;;
+esac
+install -m 0644 "$REPO/bigmap/docs/linux/PORT.md" "$STAGE/BIGMAP_PORT.md"
 cp -R "$REPO/mod/mp_lockstep_1" "$STAGE/mod/"
 python3 "$REPO/tools/linux/verify_lua_release.py" --mod-dir "$STAGE/mod/mp_lockstep_1"
 NP_BIN=""   # the lobby executable taken, for its date in BUILDINFO
@@ -189,6 +205,18 @@ for s in native_watchdog.py steam_compat.py server.env.example README.md; do
   install -m 0644 "$REPO/tools/server/$s" "$STAGE/server/$s"
 done
 install -m 0644 "$REPO/docs/re/linux/PARITY_20260921.md" "$STAGE/PARITY.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5c6c084b.md" "$STAGE/UPSTREAM_dev_5c6c084b.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4465474.md" "$STAGE/UPSTREAM_dev_b4465474.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ef275a3c.md" "$STAGE/UPSTREAM_dev_ef275a3c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8c3c02a5.md" "$STAGE/UPSTREAM_dev_8c3c02a5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_60d237c5.md" "$STAGE/UPSTREAM_dev_60d237c5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ad3d66e4.md" "$STAGE/UPSTREAM_dev_ad3d66e4.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0115785c.md" "$STAGE/UPSTREAM_dev_0115785c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6e1e4ec7.md" "$STAGE/UPSTREAM_dev_6e1e4ec7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5a9b3ae0.md" "$STAGE/UPSTREAM_dev_5a9b3ae0.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_49b1f277.md" "$STAGE/UPSTREAM_dev_49b1f277.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_1eb30002.md" "$STAGE/UPSTREAM_dev_1eb30002.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b7760259.md" "$STAGE/UPSTREAM_dev_b7760259.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_0.5.6.md" "$STAGE/UPSTREAM_0.5.6.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_55e97a48.md" "$STAGE/UPSTREAM_dev_55e97a48.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_3edfbccd.md" "$STAGE/UPSTREAM_dev_3edfbccd.md"
@@ -206,6 +234,96 @@ install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d6db920f.md" "$STAGE/UPSTREAM_dev
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_50d7588b.md" "$STAGE/UPSTREAM_dev_50d7588b.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_66c870cf.md" "$STAGE/UPSTREAM_dev_66c870cf.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b141b123.md" "$STAGE/UPSTREAM_dev_b141b123.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a42dab6c.md" "$STAGE/UPSTREAM_dev_a42dab6c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_582a380.md" "$STAGE/UPSTREAM_dev_582a380.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e63ceefc.md" "$STAGE/UPSTREAM_dev_e63ceefc.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_cf5f8a0e.md" "$STAGE/UPSTREAM_dev_cf5f8a0e.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b4b629a2.md" "$STAGE/UPSTREAM_dev_b4b629a2.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_bd69b864.md" "$STAGE/UPSTREAM_dev_bd69b864.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_aaae03f8.md" "$STAGE/UPSTREAM_dev_aaae03f8.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_7469fce7.md" "$STAGE/UPSTREAM_dev_7469fce7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_63a3b8df.md" "$STAGE/UPSTREAM_dev_63a3b8df.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4616c16a.md" "$STAGE/UPSTREAM_dev_4616c16a.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c9ac009d.md" "$STAGE/UPSTREAM_dev_c9ac009d.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0610033.md" "$STAGE/UPSTREAM_dev_0610033.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e43d01dd.md" "$STAGE/UPSTREAM_dev_e43d01dd.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d8a3ce57.md" "$STAGE/UPSTREAM_dev_d8a3ce57.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_96795a8b.md" "$STAGE/UPSTREAM_dev_96795a8b.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4e1e486c.md" "$STAGE/UPSTREAM_dev_4e1e486c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e12ed657.md" "$STAGE/UPSTREAM_dev_e12ed657.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_2f65bae3.md" "$STAGE/UPSTREAM_dev_2f65bae3.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_616191b1.md" "$STAGE/UPSTREAM_dev_616191b1.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_363c38cc.md" "$STAGE/UPSTREAM_dev_363c38cc.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8978635d.md" "$STAGE/UPSTREAM_dev_8978635d.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e2957841.md" "$STAGE/UPSTREAM_dev_e2957841.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_9abb2af1.md" "$STAGE/UPSTREAM_dev_9abb2af1.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8e0a0c00.md" "$STAGE/UPSTREAM_dev_8e0a0c00.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_f9d34252.md" "$STAGE/UPSTREAM_dev_f9d34252.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_bef70213.md" "$STAGE/UPSTREAM_dev_bef70213.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4ccdde5d.md" "$STAGE/UPSTREAM_dev_4ccdde5d.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ad36a976.md" "$STAGE/UPSTREAM_dev_ad36a976.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_06188ea5.md" "$STAGE/UPSTREAM_dev_06188ea5.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0047c19f.md" "$STAGE/UPSTREAM_dev_0047c19f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ceee11b1.md" "$STAGE/UPSTREAM_dev_ceee11b1.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ba1fa26e.md" "$STAGE/UPSTREAM_dev_ba1fa26e.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_f67726f8.md" "$STAGE/UPSTREAM_dev_f67726f8.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_f6e47ef9.md" "$STAGE/UPSTREAM_dev_f6e47ef9.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c74a7b4e.md" "$STAGE/UPSTREAM_dev_c74a7b4e.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e86d5552.md" "$STAGE/UPSTREAM_dev_e86d5552.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_01044521.md" "$STAGE/UPSTREAM_dev_01044521.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_45183ac6.md" "$STAGE/UPSTREAM_dev_45183ac6.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_122a0ce9.md" "$STAGE/UPSTREAM_dev_122a0ce9.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4617fb6f.md" "$STAGE/UPSTREAM_dev_4617fb6f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ba95f609.md" "$STAGE/UPSTREAM_dev_ba95f609.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4e857780.md" "$STAGE/UPSTREAM_dev_4e857780.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5d73f324.md" "$STAGE/UPSTREAM_dev_5d73f324.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_cc0981bb.md" "$STAGE/UPSTREAM_dev_cc0981bb.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ea15a156.md" "$STAGE/UPSTREAM_dev_ea15a156.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_24b8f636.md" "$STAGE/UPSTREAM_dev_24b8f636.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d9196011.md" "$STAGE/UPSTREAM_dev_d9196011.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_3cc80874.md" "$STAGE/UPSTREAM_dev_3cc80874.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_6584fd03.md" "$STAGE/UPSTREAM_dev_6584fd03.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_f0212c87.md" "$STAGE/UPSTREAM_dev_f0212c87.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_7111aefb.md" "$STAGE/UPSTREAM_dev_7111aefb.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_568e7ea7.md" "$STAGE/UPSTREAM_dev_568e7ea7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d3f199f9.md" "$STAGE/UPSTREAM_dev_d3f199f9.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_893be145.md" "$STAGE/UPSTREAM_dev_893be145.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d4a11297.md" "$STAGE/UPSTREAM_dev_d4a11297.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_412aeb8e.md" "$STAGE/UPSTREAM_dev_412aeb8e.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_ac3b4be3.md" "$STAGE/UPSTREAM_dev_ac3b4be3.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_bde31323.md" "$STAGE/UPSTREAM_dev_bde31323.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_2b8505c7.md" "$STAGE/UPSTREAM_dev_2b8505c7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0871bfa6.md" "$STAGE/UPSTREAM_dev_0871bfa6.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c8dd5157.md" "$STAGE/UPSTREAM_dev_c8dd5157.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_fdfb79e8.md" "$STAGE/UPSTREAM_dev_fdfb79e8.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_2b4fd093.md" "$STAGE/UPSTREAM_dev_2b4fd093.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_926b9a2c.md" "$STAGE/UPSTREAM_dev_926b9a2c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_5b817efb.md" "$STAGE/UPSTREAM_dev_5b817efb.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_9602a389.md" "$STAGE/UPSTREAM_dev_9602a389.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_40e12f76.md" "$STAGE/UPSTREAM_dev_40e12f76.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_d8c98ccb.md" "$STAGE/UPSTREAM_dev_d8c98ccb.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_b6d73041.md" "$STAGE/UPSTREAM_dev_b6d73041.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_7e3d3bfa.md" "$STAGE/UPSTREAM_dev_7e3d3bfa.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_8066c58f.md" "$STAGE/UPSTREAM_dev_8066c58f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_65302e5d.md" "$STAGE/UPSTREAM_dev_65302e5d.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a2e47f2c.md" "$STAGE/UPSTREAM_dev_a2e47f2c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_7bace802.md" "$STAGE/UPSTREAM_dev_7bace802.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_0eb9eea2.md" "$STAGE/UPSTREAM_dev_0eb9eea2.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_10c327a7.md" "$STAGE/UPSTREAM_dev_10c327a7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a896a1cb.md" "$STAGE/UPSTREAM_dev_a896a1cb.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_e516c9bc.md" "$STAGE/UPSTREAM_dev_e516c9bc.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_30eba2da.md" "$STAGE/UPSTREAM_dev_30eba2da.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a40180f2.md" "$STAGE/UPSTREAM_dev_a40180f2.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_effa7243.md" "$STAGE/UPSTREAM_dev_effa7243.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_304a4e28.md" "$STAGE/UPSTREAM_dev_304a4e28.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_528294b1.md" "$STAGE/UPSTREAM_dev_528294b1.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_86f806df.md" "$STAGE/UPSTREAM_dev_86f806df.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_262353d7.md" "$STAGE/UPSTREAM_dev_262353d7.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_721ac61f.md" "$STAGE/UPSTREAM_dev_721ac61f.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4487d7cd.md" "$STAGE/UPSTREAM_dev_4487d7cd.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c4754f26.md" "$STAGE/UPSTREAM_dev_c4754f26.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a459ff1c.md" "$STAGE/UPSTREAM_dev_a459ff1c.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_192ecd4d.md" "$STAGE/UPSTREAM_dev_192ecd4d.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
@@ -221,7 +339,8 @@ CXX=$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "$BUILD/CMakeCache.txt" | head -
     echo "compiler: ${CXX:-?} inside soldier SDK (version below)"
   fi
   echo "game:     Transport Fever 2, Steam Linux build 35924 (build-id 3a0e156390b0e6f1e372051c24802c8493ae454a)"
-  echo "Lua: Windows v0.6.1.18 a5aeda76ed2927229397fe85619d1d13326e46d5 (pinned Linux origin replay)"
+  echo "Lua: Windows dev 192ecd4d (192ecd4d275e542ee8844bc88e067bdc03032365), release 0.7.1.5 (exact upstream, including Linux origin replay)"
+  echo "Bundled Big Maps native source: imported 4769cd3; see BIGMAP_PORT.md for limits"
   if [ -n "$BIGMAP_REPO" ]; then echo "Big Maps: $BIGMAP_REPO $(git -C "$BIGMAP_REPO" rev-parse HEAD) (working tree built)"; fi
   echo "libraries: ${LIBS[*]}"
   echo "plugins: ${PLUGINS[*]:-none}"
@@ -245,3 +364,10 @@ cat "$REPO/tools/linux/self_extract.sh" "$OUT/$NAME.tar.gz" > "$OUT/$NAME.run"
 chmod 0755 "$OUT/$NAME.run"
 say "== done: $OUT/$NAME.tar.gz ($(du -h "$OUT/$NAME.tar.gz" | cut -f1))"
 say "== installer: $OUT/$NAME.run"
+
+# Stable native package names consumed by the shared release publisher. Keep the
+# original names and archive root for local installers and auto_install.py.
+cp "$OUT/$NAME.tar.gz" "$OUT/$NAME-native.tar.gz"
+cp "$OUT/$NAME.run" "$OUT/$NAME-native.run"
+(cd "$OUT" && sha256sum "$NAME-native.run" "$NAME-native.tar.gz") >"$OUT/$NAME-native.sha256"
+say "== packages assets: $OUT/$NAME-native.{run,tar.gz,sha256}"

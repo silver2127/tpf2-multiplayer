@@ -1,3 +1,13 @@
+## Dev 6584fd03: Fantasia plugin routing
+
+Native Big Maps now embeds and applies the shared buffer-reuse pass without
+a separate mod, through the verified fopen PLT route. See
+[the integration record](UPSTREAM_dev_6584fd03.md) and
+[RE evidence](../re/linux/DEV_6584FD03.md). Lab startup was blocked by the uid-map
+permission error; generated terrain and peak memory remain unobserved.
+
+Current incremental integration: [dev 0620342e / 0.6.1.28](UPSTREAM_dev_0620342e.md): adaptive Steam rate and redesigned-menu Cross-play. No new inherited gameplay gaps closed; lab launch blocked by uid-map permission.
+
 ## Current integration: release 0.6.1.18 (2026-09-21)
 
 See [the current integration and VPS test record](../re/linux/PARITY_20260921.md)
@@ -1053,3 +1063,8 @@ and the detailed binary maps under `docs/re/linux/`.
 Recovery evidence remains in the original Claude session directory. The
 pre-merge tracked Linux diff was backed up to
 `/tmp/tpf2mp-pre-0.4.22-linux.patch`; the named pre-merge stash was retained.
+
+The [dev `926b9a2c` integration](UPSTREAM_dev_926b9a2c.md) sorts vehicles at a stop and
+unload queues by entity ID on native Linux. All peers need these changes;
+release remains 0.7.1.1. Static ELF and native regressions pass; the lab
+failed before game startup, so live join validation remains outstanding.

@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
     const std::string zero(32,'0');
     auto send=[&](int sender,const std::string& epoch,uint32_t seq,const char* text,
                   uint32_t ack=NO_ACK,int chunk=0,int chunks=1,uint32_t target=0) {
-        Packet p{}; p.h.magic=MAGIC; memcpy(p.h.world,epoch.data(),32);
+        Packet p{}; p.h.cumAck=NO_ACK; p.h.magic=MAGIC; memcpy(p.h.world,epoch.data(),32);
         p.h.session=1000+sender; p.h.ackSession=target ? target : g_session;
         p.h.seq=seq; p.h.ack=ack; p.h.ackBits=0xffffffff; p.h.type=text ? 1 : 0;
         p.ev.chunkIdx=(uint16_t)chunk; p.ev.chunkCount=(uint16_t)chunks;

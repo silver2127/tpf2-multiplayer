@@ -31,9 +31,25 @@ $src  = Join-Path $repo "mod\$Mod"
 
 if (-not (Test-Path $src)) { Write-Error "source not found: $src"; exit 1 }
 
-$targets = @(
-    "C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\mods\$Mod"
+$targets = [System.Collections.Generic.List[string]]::new()
+$targets.Add("C:\Program Files (x86)\Steam\steamapps\common\Transport Fever 2\mods\$Mod")
+$vdfCandidates = @(
+    "C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf",
+    "C:\Program Files (x86)\Steam\config\libraryfolders.vdf"
 )
+foreach ($vdf in $vdfCandidates) {
+    if (Test-Path $vdf) {
+        $content = Get-Content $vdf -Raw
+        $allMatches = [regex]::Matches($content, '"path"\s+"([^"]+)"')
+        foreach ($m in $allMatches) {
+            $lib = $m.Groups[1].Value.Replace("\\", "\")
+            $modDir = Join-Path $lib "steamapps\common\Transport Fever 2\mods\$Mod"
+            if (-not $targets.Contains($modDir)) {
+                $targets.Add($modDir)
+            }
+        }
+    }
+}
 # Refuse to leave a per-user copy behind: it shadows the game-folder mod under a
 # different id ('!<mod>') and poisons every save made on this machine.
 $userCopy = "$((Get-ChildItem "C:\Program Files (x86)\Steam\userdata" -Directory | Where-Object { Test-Path (Join-Path $_.FullName "1066780") } | Select-Object -First 1).FullName)\1066780\local\mods\$Mod"

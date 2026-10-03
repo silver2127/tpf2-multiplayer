@@ -14,7 +14,7 @@ Checks, against the shipped Steam Linux build 35924:
   * that the Player, PlayerOwned and StationGroup typeinfo pointers the engine
     walk resolves type indices with really name those components;
   * that the source still spells the kill switch, the install gates and the
-    company-rename gate that slice-lines uses.
+    origin-replayed name capture that slice-lines uses.
 """
 from pathlib import Path
 import re
@@ -94,6 +94,20 @@ with open(sys.argv[1], 'rb') as stream:
         name = relocs[rva + 8]
         assert read(name, len(want)) == want, hex(rva)
 
+    draw = (root / 'native/linux/src/slice/company_draw_checks_linux.h').read_text()
+    draw_checks = re.findall(r'\{(0x[0-9a-f]+), (\d+), "([^"\n]+)"\}', draw)
+    assert len(draw_checks) == 24, len(draw_checks)
+    for address, size, data in draw_checks:
+        expected = bytes(int(x, 16) for x in re.findall(r'\\x([0-9a-f]{2})', data))
+        assert len(expected) == int(size)
+        assert read(int(address, 16), int(size)) == expected, address
+    for site, target in ((0x138bcd8, 0x1385ec0), (0x138c08d, 0x1385ec0),
+                         (0x138c359, 0x1385ec0), (0x138c4dd, 0x1385ec0),
+                         (0x1389559, 0x1383570)):
+        ins = next(md.disasm(read(site, 5), site))
+        assert ins.mnemonic == 'call' and ins.operands[0].imm == target
+    print('PASS: 24 draw byte spans, four vehicle calls and station-label call')
+
 # 6. the source still says what this file verifies
 assert 'FlagSays("stationicon", "0")' in tint
 assert 'RVA_ADD_STYLE_CLASS = 0x30550d0' in tint
@@ -103,11 +117,11 @@ assert 'SLICE_TI_PLAYER       = 0x5a025f0' in ecs
 assert 'Anchored(base, kTintContextChecks)' in tint
 movement = (root / 'native/linux/src/slice/movement_linux.cpp').read_text()
 assert 'SliceInstallCompanyTint(base, root, data)' in movement
-# the company rename: only an entity with a Player component may be shipped
+# Name capture is now generic; shared Lua classifies company renames.
 lines = (root / 'native/linux/src/slice/slice_lines.cpp').read_text()
-assert 'SliceEcsIsCompany(c.rsi, entity)' in lines
-assert 'VNAME %d %s' in lines and 'PercentEncode(name)' in lines
+assert 'valid = entity >= 0 && EncodeName(&rec,c.rcx)' in lines
+assert 'VNAME %d ' in lines and ' replayOrigin=1' in lines
 
 print('PASS: build-id, 13 complete anchor spans, 11+5 addStyleClass calls, '
       '2 context calls, no interior branch target, Player/PlayerOwned/StationGroup RTTI, '
-      'company-rename gate')
+      'origin-replayed name capture')

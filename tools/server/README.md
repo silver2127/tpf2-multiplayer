@@ -2,7 +2,8 @@
 
 Run either the native Linux game or the Windows game under Proton, with a Linux
 Steam client and a virtual display; the mod's `dedicated=1` mode does the hosting.
-Steam can run offline after installation and authentication. Design and limits:
+Steam can run offline after installation and authentication. The step-by-step guide
+for operators: [docs/HOSTING_A_SERVER.md](../../docs/HOSTING_A_SERVER.md). Design and limits:
 [docs/DEDICATED_SERVER.md](../../docs/DEDICATED_SERVER.md). The first box is the
 project's VPS (76.13.109.115), which also runs the relay and the master server.
 
@@ -13,6 +14,7 @@ project's VPS (76.13.109.115), which also runs the relay and the master server.
 | `game_watchdog.sh` | the `tpf2mp-game` unit: asks Steam to launch the game and again whenever it is gone |
 | `tpf2server` | `status`, `install` (the mod, via the release's `install_proton.sh`), `configure` (flags + a headless `settings.lua` from `server.env`), `start/stop/restart`, `logs`, `code`, `say` |
 | `server.env.example` | the settings |
+| `build_package.py` | the release asset TpF2Multiplayer-Server-Linux.tar.gz: these files and the guide, unpacked to `tpf2mp-server/` (the Build MSI workflow runs it) |
 
 ## Runbook
 
@@ -87,6 +89,15 @@ The dedicated server's lobby needs its own port (`LOBBY_PORT`, default 29472 her
 and the relay must move its loopback ports off 7771/7773 so the two do not exchange
 frames on the same machine: redeploy the relay with
 `--game-relay-port 7783 --game-local-port 7781` (see `tools/relay_deploy.sh`).
+
+## Kernel limits
+
+`setup_vps.sh` installs `sysctl-tpf2mp.conf` as `/etc/sysctl.d/99-tpf2mp.conf`:
+`vm.max_map_count` (a big world plus the software renderer hold tens of thousands of
+mappings, and the default 65,530 is a crash when reached) and `vm.swappiness=10`. On a
+box set up before this file existed, copy it over and run `sysctl --system`; a
+`sysctl -w` alone is lost at the next reboot. What each limit is for, and where the
+server's time actually goes, is in `docs/DEDICATED_SERVER.md`.
 
 ## Where to look
 
