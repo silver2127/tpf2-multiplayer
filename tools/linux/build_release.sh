@@ -135,6 +135,9 @@ if command -v nm >/dev/null 2>&1; then
   for l in "${LIBS[@]}"; do
     exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | LC_ALL=C sort | paste -sd' ' -)
     want=""; [ "$l" != libtpf2mp_boot.so ] || want="__sprintf_chk clock"
+    # The menu exports the gameplay frame stamp tpf2_bigmap reads through dlsym
+    # (Tpf2mpLastGameUiTick) once the port links it with exports_menu.map.
+    [ "$l" != tpf2_menu.so ] || [ ! -f "$REPO/native/linux/exports_menu.map" ] || want="Tpf2mpLastGameUiTick"
     [ "$exports" = "$want" ] || die "$l exports '${exports}', expected '${want}' (see native/linux/exports_*.map)"
   done
   for l in "${PLUGINS[@]}"; do
