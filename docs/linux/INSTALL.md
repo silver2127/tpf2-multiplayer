@@ -1,5 +1,9 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `a459ff1c` integration](UPSTREAM_dev_a459ff1c.md) fixes
+Linux release packaging to accept the menu’s existing `Tpf2mpLastGameUiTick`
+export. Release remains **0.7.1.4**; gameplay code is unchanged.
+
 The [dev `4487d7cd` integration](UPSTREAM_dev_4487d7cd.md) advances the
 native package, lobby handshake and panel to **0.7.1.4**. All peers must update.
 The menu library now exports a monotonic gameplay-update timestamp, cleared
