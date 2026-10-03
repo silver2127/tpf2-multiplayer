@@ -8,8 +8,8 @@
 # 1. Configures and builds native/linux in a build folder of its own (default
 #    native/linux/out-release; native/linux/out is the developers' folder and is
 #    refused), then checks each library's dynamic exports: the loader exports
-#    clock and the gated Lua formatter interposer, the libraries it loads
-#    nothing (exports_*.map). Every library
+#    clock and the gated Lua formatter interposer, the menu exports its gameplay
+#    timestamp, and other loaded libraries export nothing (exports_*.map). Every library
 #    boot.cpp loads is required: libtpf2mp_boot.so tpf2_bridge_mp.so
 #    tpf2_menu.so tpf2_slice.so tpf2_pluginhost.so. --without tpf2_slice.so or
 #    --without tpf2_pluginhost.so (repeatable) leaves one out on purpose, and
@@ -130,11 +130,14 @@ if [ -n "$BIGMAP_REPO" ]; then
   PLUGINS+=(tpf2_bigmap.so)
 fi
 # A symbol the loader exports wins over the game's own for the whole process
-# (it is in LD_PRELOAD); a library the loader dlopens needs to export nothing.
+# (it is in LD_PRELOAD); dlopened libraries expose only their explicit C APIs.
 if command -v nm >/dev/null 2>&1; then
   for l in "${LIBS[@]}"; do
     exports=$(nm -D --defined-only "$BUILD/$l" | awk '{print $NF}' | LC_ALL=C sort | paste -sd' ' -)
     want=""; [ "$l" != libtpf2mp_boot.so ] || want="__sprintf_chk clock"
+    # The menu exports the gameplay frame stamp tpf2_bigmap reads through dlsym
+    # (Tpf2mpLastGameUiTick) once the port links it with exports_menu.map.
+    [ "$l" != tpf2_menu.so ] || [ ! -f "$REPO/native/linux/exports_menu.map" ] || want="Tpf2mpLastGameUiTick"
     [ "$exports" = "$want" ] || die "$l exports '${exports}', expected '${want}' (see native/linux/exports_*.map)"
   done
   for l in "${PLUGINS[@]}"; do
@@ -319,6 +322,7 @@ install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_262353d7.md" "$STAGE/UPSTREAM_dev
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_721ac61f.md" "$STAGE/UPSTREAM_dev_721ac61f.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_4487d7cd.md" "$STAGE/UPSTREAM_dev_4487d7cd.md"
 install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_c4754f26.md" "$STAGE/UPSTREAM_dev_c4754f26.md"
+install -m 0644 "$REPO/docs/linux/UPSTREAM_dev_a459ff1c.md" "$STAGE/UPSTREAM_dev_a459ff1c.md"
 for f in LICENSE THIRD_PARTY_NOTICES.md; do [ ! -f "$REPO/$f" ] || install -m 0644 "$REPO/$f" "$STAGE/$f"; done
 printf '%s\n' "$VERSION" >"$STAGE/VERSION"
 
