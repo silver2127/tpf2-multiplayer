@@ -6063,6 +6063,11 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                     io.emit({"type": "status", "state": "failed",
                              "detail": f"save transfer failed: {e}"})
                     transfer[0] = None
+            # A finished transfer must not outlive this pass: these loop names held
+            # the last save (~400 MB) and terrain file (~600 MB) until the next
+            # transfer replaced them -- 1 GB on a dedicated server short of memory
+            # (2026-09-28).
+            xfer = tx = None
     except KeyboardInterrupt:
         pass
     finally:
