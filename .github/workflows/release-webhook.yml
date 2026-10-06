@@ -1,6 +1,7 @@
 # Announces a new stable release on Discord: tools/release_webhook.py posts the
 # version's title, link and changes to the webhook in the RELEASE_WEBHOOK_URL
-# repository secret. `released` fires when a release is published as a full
+# repository secret, pinging the role in the RELEASE_WEBHOOK_ROLE_ID repository
+# variable when it is set. `released` fires when a release is published as a full
 # release or a pre-release is promoted to one; drafts and pre-releases (the
 # experimental versions) never start it. Of the releases one version publishes
 # (tools/publish_release.py) only the page v<version> is announced: the update
@@ -31,4 +32,5 @@ jobs:
       - name: Post to Discord
         env:
           RELEASE_WEBHOOK_URL: ${{ secrets.RELEASE_WEBHOOK_URL }}
+          RELEASE_WEBHOOK_ROLE_ID: ${{ vars.RELEASE_WEBHOOK_ROLE_ID }}
         run: python3 tools/release_webhook.py "$GITHUB_EVENT_PATH"
