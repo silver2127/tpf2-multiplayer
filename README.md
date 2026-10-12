@@ -1,72 +1,5 @@
 # TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
-The [dev `192ecd4d` integration](docs/linux/UPSTREAM_dev_192ecd4d.md) advances the
-native package, lobby handshake and panel to **0.7.1.5**. Completed save and
-terrain transfers release the host loop’s temporary references each pass.
-The CrossOver loader-hook fix is retained; Linux already uses guarded Vulkan
-dispatcher slots. All peers, including dedicated servers, must update.
-
-The [dev `a459ff1c` integration](docs/linux/UPSTREAM_dev_a459ff1c.md) fixes
-Linux release packaging to accept the menu’s existing `Tpf2mpLastGameUiTick`
-export. Release remains **0.7.1.4**; gameplay code is unchanged.
-
-The [dev `4487d7cd` integration](docs/linux/UPSTREAM_dev_4487d7cd.md) advances the
-native package, lobby handshake and panel to **0.7.1.4**. All peers must update.
-The menu library now exports a monotonic gameplay-update timestamp, cleared
-at the title menu. The Windows MSI warning-page fix is retained. Native Linux
-uses a different terrain paging policy; no new loading-speed result is claimed.
-
-The [dev `c4754f26` integration](docs/linux/UPSTREAM_dev_c4754f26.md) retains the Windows
-installer’s folder-refusal dialog. Native Linux already prints the reason to
-stderr and exits with an error; four installer regressions cover that behavior.
-Release remains **0.7.1.3**.
-
-The [dev `721ac61f` integration](docs/linux/UPSTREAM_dev_721ac61f.md) moves save reading, hashing and mod
-discovery to a lobby worker. Joiners wait 30 seconds for a silent host; mesh
-routing still bypasses it after 12 seconds. Shared lobby; release remains **0.7.1.3**.
-
-The [dev `262353d7` integration](docs/linux/UPSTREAM_dev_262353d7.md) merges
-housekeeping and correctness fixes for replay, vehicle/line identity, lobby transfers,
-and network input handling. Native bridge epoch handling and kill-switch readers
-are covered by Linux regressions; release remains **0.7.1.3**.
-
-The [dev `528294b1` integration](docs/linux/UPSTREAM_dev_528294b1.md) asks for a
-fresh host save when a late joiner would receive one over two minutes old,
-with fallback if no new save arrives. Host-loop stalls no longer count as
-peer silence. Shared lobby; release remains 0.7.1.2.
-
-The [dev `304a4e28` integration](docs/linux/UPSTREAM_dev_304a4e28.md) adds catch-up progress
-logging about every 20 seconds: remaining gap, closing rate, local and session
-rates, and an ETA when the gap is closing. Shared Lua; release remains 0.7.1.2.
-
-The [dev `86f806df` integration](docs/linux/UPSTREAM_dev_86f806df.md) keeps
-terrain streams running across later STARTs, avoiding replacement while a
-joiner reads the same sidecar. Shared Linux/Windows lobby; release 0.7.1.2.
-
-The [dev `effa7243` integration](docs/linux/UPSTREAM_dev_effa7243.md) prevents
-repeat save transfers while a joining player’s mods are packing, queued or
-being delivered. The shared lobby fix applies to native Linux and Windows;
-release remains 0.7.1.2.
-
-Current release integration: **0.7.1.5**, Windows dev `192ecd4d`; see the
-[integration and validation record](docs/linux/UPSTREAM_dev_192ecd4d.md). All peers, including dedicated
-servers, must update. Existing native Sandbox town-tool capture, minimap and
-cargo-filter limitations remain. Upstream performance measurements were not
-repeated locally; matching release numbers do not establish gameplay parity.
-Completed TCP transfers no longer stay in lobby memory through listener
-registrations; active transfers retain their handlers until they finish.
-Catching-up peers retain recently heard leader clocks when stamping commands
-and defer spare-line requests until catch-up completes.
-Dedicated servers pause while players join an otherwise empty server, and cap
-the voted speed at 1x while someone joins existing players. A joiner stops
-holding the session after about 20 minutes without a change in joining count.
-Below 1x, command delay follows session speed with a ramp margin; recovery
-from a slow session rises in steps, and excess delay falls faster.
-Native terrain sidecars are on by default from dev `71549cff` in 0.7.1.2;
-`terrain_sidecar=0` disables them. Live ownership and load-completion checks
-remain outstanding; material-index acceleration remains unported. Enabling
-sidecars does not establish new native performance results.
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Website: [silver2127.github.io/tpf2-multiplayer](https://silver2127.github.io/tpf2-multiplayer/)** ·
@@ -79,31 +12,6 @@ sidecars does not establish new native performance results.
 world at the same time: the roads, track, stations, depots, vehicles and lines one player makes
 appear for everyone, applied at the same moment of the simulation on every machine. Play one shared
 company together, or separate companies with their own money on the same map.
-
-It is unofficial, reverse-engineered without the engine's source, and **experimental**. Sessions of up to
-four players have been run, on one PC and between PCs on different networks. Read
-[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) before relying on it.
-
-This branch also contains a **native Linux build-35924 port**, with a native dedicated server. Its
-current integration includes Windows **release 0.7** plus dev `8c3c02a5`:
-[Linux installation](docs/linux/INSTALL.md) ·
-[current integration and test evidence](docs/linux/UPSTREAM_dev_8c3c02a5.md) ·
-[dedicated server setup](docs/HOSTING_A_SERVER.md). The Windows MSI instructions below apply to the
-Windows version.
-
-- Settings must match Windows peers. Loaded-game lifetime and cross-platform validation remain
-  outstanding; matching versions do not establish gameplay parity.
-- Canonical simulation ordering is on by default (`TPF2MP_ORDER_CANON=0` disables it); see the
-  [dev `ad3d66e4` integration](docs/linux/UPSTREAM_dev_ad3d66e4.md).
-- Native terrain compression is on by default, and bridge lobby identity is fixed; the release
-  version remains 0.7 ([dev `0a35d0a8`](docs/linux/UPSTREAM_dev_0a35d0a8.md)).
-- The native terrain pager has recency, automatic memory headroom and fault-rate logging;
-  loaded-big-map performance validation remains outstanding
-  ([dev `ea35eb8a`](docs/linux/UPSTREAM_dev_ea35eb8a.md)).
-- The Windows autosave-sidecar fix is retained
-  ([dev `60d237c5`](docs/linux/UPSTREAM_dev_60d237c5.md)); native terrain sidecars are available
-  experimentally in [dev `2b4fd093`](docs/linux/UPSTREAM_dev_2b4fd093.md), then enabled by default
-  in [dev `71549cff`](docs/linux/UPSTREAM_dev_71549cff.md). Live lifetime validation remains outstanding.
 
 ## How it works
 
