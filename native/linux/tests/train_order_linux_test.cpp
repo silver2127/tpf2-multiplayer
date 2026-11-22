@@ -1,4 +1,5 @@
 #include <cassert>
+#include <unistd.h>
 #include <array>
 #include <algorithm>
 #include "slice/slice_core_internal.h"
@@ -35,6 +36,27 @@ asm(".text\n.type Fixture,@function\nFixture:\n.cfi_startproc\n"
 
 int main()
 {
+    char flagRoot[] = "/tmp/tpf2mp-order-root.XXXXXX";
+    char flagData[] = "/tmp/tpf2mp-order-data.XXXXXX";
+    assert(mkdtemp(flagRoot) && mkdtemp(flagData));
+    const auto rootFlags = std::string(flagRoot) + "/tpf2_menu_flags.txt";
+    const auto dataFlags = std::string(flagData) + "/tpf2_menu_flags.txt";
+    auto writeFlags = [](const std::string& path, const char* text) {
+        FILE* f = fopen(path.c_str(), "w"); assert(f);
+        assert(fputs(text, f) >= 0); assert(fclose(f) == 0);
+    };
+    assert(!SliceFlagOff(flagRoot, flagData, "trainorder"));
+    writeFlags(dataFlags, "trainorder=0\nroadspace=0\n");
+    assert(SliceFlagOff(flagRoot, flagData, "trainorder"));
+    assert(SliceFlagOff(flagRoot, flagData, "roadspace"));
+    writeFlags(rootFlags, "trainorder=1\n");
+    assert(!SliceFlagOff(flagRoot, flagData, "trainorder"));
+    assert(!SliceFlagOff(flagRoot, flagData, "roadspace"));
+    writeFlags(rootFlags, "trainorder=0 # prefix semantics retained\n");
+    assert(SliceFlagOff(flagRoot, flagData, "trainorder"));
+    assert(!SliceFlagOff(flagRoot, flagData, "roadspace"));
+    assert(unlink(rootFlags.c_str()) == 0 && unlink(dataFlags.c_str()) == 0);
+    assert(rmdir(flagRoot) == 0 && rmdir(flagData) == 0);
     assert(SliceReadInit());
     constexpr int type = 2;
     std::vector<uint8_t> world(0xb0), pool(0xf0), self(0x50);
@@ -58,6 +80,63 @@ int main()
     assert(NameComponent(w, 3, type) == 0);
     assert(NameComponent(w, -1, type) == 0);
     assert(NameComponent(w, 0, -1) == 0);
+    // The batched copy must find a late pair and honor its fixed scratch cap.
+    entities[0].assign(4096, Pair{7, 0});
+    entities[0].back() = {type, 0};
+    assert(NameComponent(w, 0, type) == uintptr_t(&flat[0]));
+    entities[0].push_back({type, 0});
+    assert(NameComponent(w, 0, type) == 0);
+    entities[0].clear();
+    assert(NameComponent(w, 0, type) == 0); // no stale thread-local pairs
+    entities[0] = {{type, 0}};
+    // A matching first pair cannot hide an unreadable tail in the bulk read.
+    const size_t pg = size_t(sysconf(_SC_PAGESIZE));
+    auto* m = static_cast<uint8_t*>(mmap(nullptr, pg*2, PROT_READ|PROT_WRITE,
+                                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0));
+    assert(m != MAP_FAILED);
+    Pair match{type, 0}; memcpy(m+pg-8, &match, 8);
+    uintptr_t header[]{uintptr_t(m+pg-8), uintptr_t(m+pg+8), uintptr_t(m+pg+8)};
+    Put(world, 0x98, uintptr_t(header));
+    assert(mprotect(m+pg, pg, PROT_NONE) == 0);
+    assert(NameComponent(w, 0, type) == 0);
+    assert(munmap(m, pg*2) == 0);
+    Put(world, 0x98, uintptr_t(entities.data()));
+    // SliceEntityNames gives each id what NameComponent + SliceReadStdString give it alone
+    auto oneByOne = [&](int t, const std::vector<int32_t>& ids) {
+        std::vector<std::string> out;
+        for (int32_t id : ids) {
+            char text[TRAINORDER_NAME_MAX + 1]; size_t len = 0;
+            const uintptr_t c = NameComponent(w, id, t);
+            out.push_back(c && SliceReadStdString(c, text, sizeof(text), &len, TRAINORDER_NAME_MAX) ? std::string(text, len) : "");
+        }
+        return out;
+    };
+    auto sameNames = [&](int t, const std::vector<int32_t>& ids) {
+        std::vector<std::string> batch{"stale", "stale"};
+        SliceEntityNames(w, t, ids.data(), ids.size(), &batch);
+        assert(batch == oneByOne(t, ids));
+        return batch;
+    };
+    {
+        const std::vector<int32_t> ids{4, 0, -1, 2, 3, 1, 0, 2};
+        const auto names = sameNames(type, ids);
+        assert(names[0] == std::string(100, 'b') && names[1] == "Zulu" && names[2].empty() &&
+               names[3] == "ALPHA" && names[4].empty() && names[5] == "alpha");
+        sameNames(-1, ids);
+        std::vector<std::string> none{"x"};
+        SliceEntityNames(0, type, ids.data(), ids.size(), &none);
+        assert(none.size() == ids.size() && std::all_of(none.begin(), none.end(), [](const std::string& s) { return s.empty(); }));
+        pages[0] = 0;                                   // the page is gone: the paged name only
+        assert(sameNames(type, ids)[3].empty());
+        pages[0] = uintptr_t(page.data());
+        const std::string saved = flat[1];
+        flat[1].assign(TRAINORDER_NAME_MAX + 1, 'x');   // over the length cap
+        assert(sameNames(type, ids)[5].empty());
+        flat[1] = saved;
+        std::vector<int32_t> many;                      // past one SliceReadMany batch
+        for (int i = 0; i < 700; ++i) many.push_back(i % 6 - 1);
+        sameNames(type, many);
+    }
     std::vector<std::array<int32_t, 3>> records{{0,0,0}, {1,0,0}, {2,0,0}, {3,0,0}, {4,0,0}};
     Put(self, 8, uintptr_t(&records));
     const uintptr_t s = uintptr_t(self.data());
@@ -81,6 +160,11 @@ int main()
     // Read failure means an empty name, as on Windows; no crash on inaccessible text.
     Put(pool, 0xb8, uintptr_t(1));
     assert(Arrange(untouched, untouched + 5, s, w, type, 1));
+    {   // unreadable flat data: those names empty, the paged one still read
+        const std::vector<int32_t> ids{0, 2, 1};
+        const auto names = sameNames(type, ids);
+        assert(names[0].empty() && names[1] == "ALPHA" && names[2].empty());
+    }
     entities[0] = {{type, -1}};
     assert(NameComponent(w, 0, type) == 0);
     assert(!SliceInstallTrainOrder(0, "", "")); // no readable verified site => no patch

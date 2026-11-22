@@ -1,4 +1,5 @@
 #include "town_seed_linux.h"
+#include "town_trace_linux.h"
 #include "windows_person_seed_linux.h"
 #include "hook.h"
 #include <cstddef>
@@ -54,12 +55,15 @@ static_assert(offsetof(TownRegisters, rdx) == 96);
 const char* g_townStatus = "off (not initialized)";
 bool g_townInstalled = false;
 
+// Invert native identity hash-combine(tag21,time) modulo 2^32.
+// GetTime's int32 bits survive exactly; do not read the clock again.
+uint32_t TownTimeOf(uint32_t nativeSeed)
+{
+    return (nativeSeed ^ UINT32_C(0x9e3779ce)) - UINT32_C(0x53a3cbac);
+}
 uint32_t WindowsTownSeed(uint32_t nativeSeed)
 {
-    // Invert native identity hash-combine(tag21,time) modulo 2^32.
-    // GetTime's int32 bits survive exactly; do not read the clock again.
-    const uint32_t time = (nativeSeed ^ UINT32_C(0x9e3779ce)) - UINT32_C(0x53a3cbac);
-    return Tpf2mpWindowsTimeSeed(21, time);
+    return Tpf2mpWindowsTimeSeed(21, TownTimeOf(nativeSeed));
 }
 }
 
@@ -71,8 +75,16 @@ extern "C" __attribute__((visibility("hidden"), noinline))
 void Tpf2mpTownSeedDispatch(TownRegisters* registers)
 {
     // Preserve all upper bits too: only the four-byte seed store is changed.
+    const uint32_t nativeSeed = uint32_t(registers->rdx);
     registers->rdx = (registers->rdx & UINT64_C(0xffffffff00000000))
-        | WindowsTownSeed(uint32_t(registers->rdx));
+        | WindowsTownSeed(nativeSeed);
+    // The town trace (diagnostic, off by default) takes the tick's clock and the
+    // update's context ([rbp-0xbf8], the TownSystem update's first argument) here.
+    if (tpf2mp_town_trace::on.load(std::memory_order_relaxed)) {
+        uintptr_t context = 0;
+        std::memcpy(&context, reinterpret_cast<const void*>(registers->rbp - 0xbf8), sizeof(context));
+        Tpf2mpTownTraceTick(TownTimeOf(nativeSeed), context);
+    }
 }
 
 namespace {

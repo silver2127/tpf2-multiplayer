@@ -23,7 +23,10 @@
   game's own alut.dll, and the Segment Heap switch all live in PluginHost.wxs:
   they are SHARED with the TpF2 Big Maps package under fixed component GUIDs so
   the two products can be installed in either order and uninstalled in either
-  order. That file is duplicated byte-for-byte in both repositories.
+  order. Big Maps now lives in this repository (bigmap/) and ships in this
+  package: plugins\tpf2_bigmap.dll + plugins\tpf2_bigmap.cfg. An installed
+  TpF2 Big Maps product is removed by this one (its UpgradeCode is listed
+  below), so the plugin has one owner.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
 
@@ -32,12 +35,14 @@
   <?ifndef ProductVersion ?><?define ProductVersion = "0.1.0" ?><?endif?>
   <?ifndef BridgeOut ?><?define BridgeOut = "..\native\out" ?><?endif?>
   <?ifndef ProxyDll ?><?define ProxyDll = "$(BridgeOut)\alut.dll" ?><?endif?>
-  <?ifndef HostDll ?><?define HostDll = "$(BridgeOut)	pf2_pluginhost.dll" ?><?endif?>
+  <?ifndef HostDll ?><?define HostDll = "$(BridgeOut)\tpf2_pluginhost.dll" ?><?endif?>
   <?ifndef BridgeDll ?><?define BridgeDll = "$(BridgeOut)\tpf2_bridge_mp.dll" ?><?endif?>
   <?ifndef MenuDll ?><?define MenuDll = "$(BridgeOut)\tpf2_menu.dll" ?><?endif?>
   <?ifndef SliceDll ?><?define SliceDll = "$(BridgeOut)\tpf2_slice.dll" ?><?endif?>
   <?ifndef NetpunchDir ?><?define NetpunchDir = "..\netpunch\dist\netpunch" ?><?endif?>
   <?ifndef ModSource ?><?define ModSource = "..\mod\mp_lockstep_1" ?><?endif?>
+  <?ifndef BigmapDll ?><?define BigmapDll = "..\bigmap\out\tpf2_bigmap.dll" ?><?endif?>
+  <?ifndef BigmapCfg ?><?define BigmapCfg = "..\bigmap\cfg\tpf2_bigmap.cfg" ?><?endif?>
   <?ifndef CaDll ?><?define CaDll = "out\tpf2ca.dll" ?><?endif?>
 
   <Package Name="TpF2 Multiplayer"
@@ -57,6 +62,16 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of [ProductName] is already installed. Uninstall it first." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- The separate TpF2 Big Maps package (its UpgradeCode): this package ships
+         the same plugin now, so an installed Big Maps is removed with the old
+         Multiplayer (RemoveExistingProducts, scheduled by MajorUpgrade). Its own
+         base_mod restore is skipped then (it runs only on a plain uninstall),
+         and the shared proxy/host components are refcounted (PluginHost.wxs). -->
+    <Upgrade Id="C11917C5-F0E7-4C55-BC89-789B33A0B731">
+      <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes" Maximum="255.0.0" IncludeMaximum="no"
+                      Property="TPF2_OLD_BIGMAPS" MigrateFeatures="no" />
+    </Upgrade>
 
     <!-- Repair stays available on purpose: Steam's "verify integrity" puts the
          stock alut.dll back over the proxy, and a Repair reinstalls it. -->
@@ -112,9 +127,26 @@
       <ComponentGroupRef Id="GameFolderFiles" />
       <ComponentGroupRef Id="NetpunchFiles" />
       <ComponentGroupRef Id="ModFiles" />
+      <ComponentGroupRef Id="BigmapFiles" />
     </Feature>
 
-    <!-- Custom actions and their sequencing: PluginHost.wxs. -->
+    <!-- Custom actions and their sequencing: PluginHost.wxs, plus the one below. -->
+
+    <!-- Big Maps patches res\config\base_mod.lua at game start (the New Game
+         density levels). That file is not installed, so on a full uninstall (not
+         an upgrade: the new plugin re-patches on its next start) the plugin's own
+         restore runs first, through 64-bit rundll32, while its DLL is still on
+         disk. Return="ignore": a stock or missing file never blocks an uninstall. -->
+    <CustomAction Id="RestoreStockBaseMod"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="&quot;[System64Folder]rundll32.exe&quot; &quot;[PreviewPluginsFolder]tpf2_bigmap.dll&quot;,BigmapRestoreStockBaseMod"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="RestoreStockBaseMod" Before="RemoveFiles"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
 
     <!-- ===== UI ===== -->
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
@@ -163,6 +195,17 @@
       </Component>
     </ComponentGroup>
 
+    <!-- Big Maps (bigmap/). The cfg is versioned so a modified or unversioned
+         copy is replaced on install, upgrade and repair (the tuned settings). -->
+    <ComponentGroup Id="BigmapFiles" Directory="PreviewPluginsFolder">
+      <Component Id="BigmapDll">
+        <File Id="tpf2_bigmap.dll" Name="tpf2_bigmap.dll" Source="$(BigmapDll)" KeyPath="yes" />
+      </Component>
+      <Component Id="BigmapCfg">
+        <File Id="tpf2_bigmap.cfg" Name="tpf2_bigmap.cfg" Source="$(BigmapCfg)" DefaultVersion="$(ProductVersion)" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
     <!-- The Lua mod, whole tree, one component per file. -->
     <!-- Segment Heap opt-in: PluginHost.wxs (shared component). The
          measurements behind it are in README.md, "Segment Heap". -->
@@ -194,6 +237,37 @@
       <Property Id="ARPNOMODIFY" Value="1" />
 
       <DialogRef Id="BrowseDlg" />
+
+      <!-- Why the folder page will not go on (CheckGameDir fills TPF2_GAMEDIR_MSG). -->
+      <Dialog Id="GameDirProblemDlg" Width="340" Height="190" Title="[ProductName] Setup">
+        <Control Id="Title" Type="Text" X="15" Y="12" Width="310" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}This folder cannot be used" />
+        <Control Id="Message" Type="Text" X="15" Y="32" Width="310" Height="120" NoPrefix="yes" Text="[TPF2_GAMEDIR_MSG]" />
+        <Control Id="OK" Type="PushButton" X="265" Y="160" Width="60" Height="17" Default="yes" Cancel="yes" Text="OK">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+      <!-- Mods with native DLLs (CheckGameDir fills TPF2_MODDLLS_MSG). A wizard
+           page, not a spawned Yes/No box: after a SpawnDialog returns, the
+           installer runs none of the Next button's later events (measured
+           2026-09-29), so a Yes there could never move the wizard on. Next
+           installs anyway, Back returns to the folder page. -->
+      <Dialog Id="Tpf2ModDllsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes" Text="{\WixUI_Font_Title}Mods with native DLLs" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes" Text="These mods may break multiplayer." />
+        <Control Id="Message" Type="Text" X="20" Y="52" Width="330" Height="180" NoPrefix="yes" Text="[TPF2_MODDLLS_MSG]" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="&amp;Back">
+          <Publish Event="NewDialog" Value="InstallDirDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Text="&amp;Next">
+          <Publish Event="NewDialog" Value="VerifyReadyDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Default="yes" Cancel="yes" Text="Cancel">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
       <DialogRef Id="DiskCostDlg" />
       <DialogRef Id="ErrorDlg" />
       <DialogRef Id="FatalError" />
@@ -215,8 +289,11 @@
       <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LicenseAgreementDlg" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="Next" Event="DoAction" Value="CheckGameDir" Order="2" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
-      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <!-- the refusal's reason: CheckGameDir cannot show a message box from here -->
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SpawnDialog" Value="GameDirProblemDlg" Order="3" Condition="TPF2_GAMEDIR_OK = &quot;0&quot; AND TPF2_GAMEDIR_MSG" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="4" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot;" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="Tpf2ModDllsDlg" Order="5" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot; AND TPF2_MODDLLS_MSG" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="6" Condition="TPF2_GAMEDIR_OK &lt;&gt; &quot;0&quot; AND NOT TPF2_MODDLLS_MSG" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
       <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
 

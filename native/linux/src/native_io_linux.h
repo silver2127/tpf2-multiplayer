@@ -11,7 +11,11 @@ bool Poll(Event&);
 bool HasWorld();
 bool Busy();
 bool Loading();
+// Conservative, nonblocking input gate: true also when the state mutex is busy.
+bool SavingNow();
 bool SetActionsHeld(bool);
+// SDL scancode, or negative SDL mouse button; zero means no active gesture.
+int ActiveGestureKey();
 void WorkThreads(unsigned&, unsigned&);
 }
 namespace NativeControl {

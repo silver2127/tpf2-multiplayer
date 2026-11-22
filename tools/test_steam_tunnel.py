@@ -53,8 +53,10 @@ with tempfile.TemporaryDirectory() as td:
     check("the kill switch makes the client unavailable", not t.available and t.id is None and t.dial("1") is None)
     os.remove(os.path.join(td, "tpf2mp_steam_off.txt"))
 
-check("is_tunnel_addr", is_tunnel_addr((TUNNEL_IP, 62100)) and is_tunnel_addr((TUNNEL_IP, 62199)) and not is_tunnel_addr(("127.0.0.1", 29471))
-      and not is_tunnel_addr(("10.0.0.1", 62100)) and not is_tunnel_addr(None))
+check("is_tunnel_addr", is_tunnel_addr((TUNNEL_IP, 42100)) and is_tunnel_addr((TUNNEL_IP, 42199))
+      and is_tunnel_addr((TUNNEL_IP, 62100)) and is_tunnel_addr((TUNNEL_IP, 62199))
+      and not is_tunnel_addr(("127.0.0.1", 29471))
+      and not is_tunnel_addr(("10.0.0.1", 42100)) and not is_tunnel_addr(None))
 
 # ---- two fake tunnels: control protocol and delivery
 with tempfile.TemporaryDirectory() as ta, tempfile.TemporaryDirectory() as tb:
@@ -123,14 +125,18 @@ with tempfile.TemporaryDirectory() as ta, tempfile.TemporaryDirectory() as tb:
 
 # ---- the save transfer's view of a tunnel peer: not loopback
 pick, win = lobby._HostSaveTransfer._pick_chunk, lobby._HostSaveTransfer._pick_window
-check("a tunnel peer gets Steam-sized chunks, whoever else is there",
-      pick([((TUNNEL_IP, 62100), "bob")]) == lobby.CHUNK_STEAM
-      and pick([(("127.0.0.1", 29521), "carol"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM
-      and pick([(("198.51.100.7", 29471), "dave"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM)
+big = lobby.CHUNK_STEAM if lobby.STEAM_BIG_CHUNKS else lobby.CHUNK_STEAM_MIXED
+check("tunnel peers (and loopback ones) get the Steam chunk (big only while STEAM_BIG_CHUNKS is on)",
+      pick([((TUNNEL_IP, 62100), "bob")]) == big
+      and pick([(("127.0.0.1", 29521), "carol"), ((TUNNEL_IP, 62105), "bob")]) == big)
+check("a tunnel peer beside an internet peer: the small size that fits both",
+      pick([(("198.51.100.7", 29471), "dave"), ((TUNNEL_IP, 62105), "bob")]) == lobby.CHUNK_STEAM_MIXED
+      and lobby.CHUNK_STEAM_MIXED + 17 + 28 < 1200 and win(lobby.CHUNK_STEAM_MIXED) == lobby.SEND_WINDOW_REMOTE)
 check("loopback-only stays local, an internet peer stays internet-safe",
       pick([(("127.0.0.1", 29521), "carol")]) == lobby.CHUNK_LOCAL and pick([(("198.51.100.7", 29471), "dave")]) == lobby.CHUNK_DATA)
-check("Steam chunks use the remote window and fit the unreliable limit",
-      win(lobby.CHUNK_STEAM) == lobby.SEND_WINDOW_REMOTE and lobby.CHUNK_STEAM + 17 + 28 < 1200)
+check("big Steam chunks: a byte-bounded window under Steam's 8 MB send buffer, one loopback datagram each",
+      win(lobby.CHUNK_STEAM) == lobby.SEND_WINDOW_STEAM and lobby.CHUNK_STEAM * lobby.SEND_WINDOW_STEAM <= 4 * 1024 * 1024
+      and lobby.CHUNK_STEAM + 17 + 28 + 64 < 65507)
 
 # ---- the C++ half, by anchor
 src = open(os.path.join(ROOT, "native", "src", "steam_tunnel.cpp"), encoding="utf-8").read()
@@ -140,11 +146,13 @@ check("the tunnel resolves the legacy P2P API from the game's own steam_api64.dl
       'GetModuleHandleW(L"steam_api64.dll")' in src and '"SteamAPI_SteamNetworking_v006"' in src and '"SteamAPI_ISteamNetworking_SendP2PPacket"' in src)
 check("relay through Valve is allowed and sessions are accepted from the callback", "g_api.allowRelay(g_api.net, true);" in src and "CB_SESSION_REQUEST = 1202" in src and "g_api.accept(g_api.net, id)" in src)
 check("packets over 1,200 bytes go reliable", "UNRELIABLE_MAX = 1200" in src and "SEND_RELIABLE : SEND_UNRELIABLE" in src)
-check("endpoints live on 127.0.0.1 ports 62100-62199 and the identity file is tpf2_steam.txt",
-      'TUNNEL_PORT_LO = 62100, TUNNEL_PORT_HI = 62199' in src and 'L"tpf2_steam.txt"' in src and list(steamtunnel.TUNNEL_PORTS) == list(range(62100, 62200)))
+check("endpoints live on 127.0.0.1 ports 42100-42199/62100-62199 and the identity file is tpf2_steam.txt",
+      'TUNNEL_PORT_LO = 42100, TUNNEL_PORT_HI = 42199' in src and 'L"tpf2_steam.txt"' in src and 42100 in steamtunnel.TUNNEL_PORTS and 62100 in steamtunnel.TUNNEL_PORTS)
 check("the kill switch", 'L"tpf2mp_steam_off.txt"' in src)
-check("Steam's send-rate cap and buffers are raised (SendRateMax 24, SendBufferSize 9, RecvBufferSize 47)",
-      '{ "SendRateMax",    24,' in src and '{ "SendBufferSize",  9,' in src and '{ "RecvBufferSize", 47,' in src
+check("Steam's send rate and buffers are raised by the right ids (SendRateMin 10, SendRateMax 11, SendBufferSize 9, RecvBufferSize 47; "
+      "23/24 are IP_AllowWithoutAuth/TimeoutInitial and must not be touched)",
+      '{ "SendRateMin",    10,' in src and '{ "SendRateMax",    11,' in src
+      and '{ "SendRateMin",    23,' not in src and '{ "SendRateMax",    24,' not in src and '{ "SendBufferSize",  9,' in src and '{ "RecvBufferSize", 47,' in src
       and '"SteamAPI_ISteamNetworkingUtils_SetConfigValue"' in src)
 check("the bridge starts it after its identity is written", "SteamTunnel_Start(g_dataDir, Log);" in bridge and bridge.index("SteamTunnel_Start") > bridge.index("SetPlayerPatch_Install(Log);"))
 check("build.bat compiles and links it into the bridge", "src\\steam_tunnel.cpp" in bat and "out\\steam_tunnel_mp.obj ||" in bat)

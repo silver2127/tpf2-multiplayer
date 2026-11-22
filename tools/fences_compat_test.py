@@ -102,7 +102,7 @@ assert(not CM.fencesCapture('asset/unrelated.con',{},'{}',0))
 assert(not CM.fencesCapture('asset/snowball_fence_hedges.con',{},'{}',1))
 -- Actual network codec transports complete geometry; peer ids stay local.
 local NET=assert(io.open(MP..'/mp/net.lua')):read('*a')
-local codec=NET:sub(assert(NET:find('local function encodeCmd(c)',1,true)),assert(NET:find('function CM.scheduleLocal(op, args)',1,true))-1)
+local codec="local K = {}\n"..NET:sub(assert(NET:find('local function encodeCmd(c)',1,true)),assert(NET:find('function CM.scheduleLocal(op, args)',1,true))-1)
 local enc,dec=assert(load(codec..'\nreturn encodeCmd,decodeCmd'))()
 local wire=enc(commands[1]);local command=dec(wire)
 if CAPTURE then local f=assert(io.open(CAPTURE,'w'));f:write('return '..CM.ser(commands[1]));f:close() end

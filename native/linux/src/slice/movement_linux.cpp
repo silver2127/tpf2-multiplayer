@@ -15,6 +15,7 @@
 #include <cstring>
 #include "roadspace.h"
 #include "trainorder.h"
+#include "flags_linux.h"
 #include "moveorder.h"
 #include <atomic>
 #include <chrono>
@@ -27,20 +28,6 @@
 namespace {
 uintptr_t movementBase;
 std::string movementData;
-bool FlagOff(const char* root, const char* data, const char* key)
-{
-    for (const char* dir : {root, data}) {
-        if (!dir || !*dir) continue;
-        std::string path = std::string(dir) + "/tpf2_menu_flags.txt";
-        FILE* f = fopen(path.c_str(), "r");
-        if (!f) continue;
-        char line[256]; bool off = false;
-        const std::string setting = std::string(key) + "=0";
-        while (fgets(line, sizeof(line), f)) if (!strncmp(line, setting.c_str(), setting.size())) off = true;
-        fclose(f); return off;
-    }
-    return false;
-}
 template<class T, size_t N> bool Check(uintptr_t base, const T (&checks)[N])
 {
     for (const auto& c : checks) {
@@ -167,24 +154,36 @@ uintptr_t RoadEdgeData(uintptr_t mgr, uint64_t edge)
 {
     const int32_t id0=int32_t(uint32_t(edge)), id1=int32_t(uint32_t(edge>>32));
     if (!mgr || id0<0 || id1<0) return 0;
+    // Shape checks only: the two whole-world vectors run to megabytes, and a page walk
+    // of them on every Add was 1,000 syscalls (2026-09-27). The element is read guarded.
+    // The two headers are adjacent (+30, +48): one read. EdgeData's own vector is
+    // checked by shape too; its element is the next thing read, guarded.
     SliceVec indices{}, groups{}, datas{};
+    uint64_t heads[6];
     int32_t group=-1;
-    if (!SliceReadStdVector(mgr+0x30,4,1u<<26,&indices) || size_t(id0)>=indices.count ||
+    if (!SliceRead(mgr+0x30,heads,sizeof(heads)) ||
+        !SliceStdVectorFromHeader(mgr+0x30,heads,4,1u<<26,&indices) || size_t(id0)>=indices.count ||
         !SliceReadT(indices.begin+size_t(id0)*4,&group) || group<0) return 0;
-    if (!SliceReadStdVector(mgr+0x48,72,1u<<24,&groups) || size_t(group)>=groups.count) return 0;
-    if (!SliceReadStdVector(groups.begin+size_t(group)*72,32,1u<<24,&datas) || size_t(id1)>=datas.count) return 0;
+    if (!SliceStdVectorFromHeader(mgr+0x48,heads+3,72,1u<<24,&groups) || size_t(group)>=groups.count) return 0;
+    if (!SliceReadStdVectorShape(groups.begin+size_t(group)*72,32,1u<<24,&datas) || size_t(id1)>=datas.count) return 0;
     return datas.begin+size_t(id1)*32;
 }
 enum RoadSortResult { RoadUnchanged, RoadSorted, RoadRefused };
-RoadSortResult RoadEntriesSortAt(uintptr_t world, uintptr_t mgr, uint64_t edge, int type) noexcept
+constexpr int kNameTypeLater=-2;   // resolve NameType(world) only when there is something to sort
+// Most Adds leave an edge with one vehicle: everything before the n<2 return is
+// paid on every Add, so it is four guarded reads and no engine call. The entries'
+// bytes are read whole below, which is their readability check.
+// Not noexcept: NameType is an engine call, and what it throws passes through as before.
+RoadSortResult RoadEntriesSortAt(uintptr_t world, uintptr_t mgr, uint64_t edge, int type)
 {
     const uintptr_t ed=RoadEdgeData(mgr,edge);
     if (!ed) return RoadUnchanged;
     SliceVec entries{};
-    if (!SliceReadStdVector(ed+8,ROADENTRY_SIZE,1u<<24,&entries)) return RoadRefused;
+    if (!SliceReadStdVectorShape(ed+8,ROADENTRY_SIZE,1u<<24,&entries)) return RoadRefused;
     const size_t n=entries.count;
     if (n<2) return RoadUnchanged;
     if (n>ROADENTRIES_MAX) return RoadRefused;
+    if (type==kNameTypeLater) type=world ? NameType(world) : -1;
     try {
         thread_local std::vector<uint8_t> recs;
         thread_local std::vector<TrainOrderKey> keys;
@@ -192,14 +191,11 @@ RoadSortResult RoadEntriesSortAt(uintptr_t world, uintptr_t mgr, uint64_t edge, 
         thread_local std::vector<int32_t> order;
         recs.resize(n*ROADENTRY_SIZE); keys.resize(n); names.resize(n); order.resize(n);
         if (!SliceRead(entries.begin,recs.data(),recs.size())) return RoadRefused;
-        for (size_t i=0;i<n;++i) {
-            int32_t id=0; memcpy(&id,recs.data()+i*ROADENTRY_SIZE,4);
-            char text[TRAINORDER_NAME_MAX+1]; size_t len=0;
-            const uintptr_t comp=world ? SliceNameComponent(world,id,type) : 0;
-            if (comp && SliceReadStdString(comp,text,sizeof(text),&len,TRAINORDER_NAME_MAX)) names[i].assign(text,len);
-            else names[i].clear();
-            keys[i]={names[i].data(),uint32_t(names[i].size()),id,0}; order[i]=int32_t(i);
-        }
+        thread_local std::vector<int32_t> ids;
+        ids.resize(n);
+        for (size_t i=0;i<n;++i) memcpy(&ids[i],recs.data()+i*ROADENTRY_SIZE,4);
+        SliceEntityNames(world,type,ids.data(),n,&names);   // a few syscalls per edge, not ~8 per vehicle
+        for (size_t i=0;i<n;++i) { keys[i]={names[i].data(),uint32_t(names[i].size()),ids[i],0}; order[i]=int32_t(i); }
         // insertion sort, as Windows: stable, the same order for the same keys
         for (size_t i=1;i<n;++i) {
             const int32_t t=order[i]; size_t j=i;
@@ -344,12 +340,12 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
     if (!SliceEcsAnchored(base))
         SliceLog("[company-ui] the engine's component walk is unavailable on this image: "
                  "the icon tint and the company rename stay off\n");
-    if (!FlagOff(root,data,"showicons")) {
+    if (!SliceFlagOff(root,data,"showicons")) {
         const bool ready=Check(base,kIconChecks) && ApplyUiPatches(base,iconPatches);
         SliceLog("[showicons] %s: four Linux owner branches\n",ready ? "installed" : "OFF");
         ok &= ready;
     }
-    if (!FlagOff(root,data,"foreignwindows")) {
+    if (!SliceFlagOff(root,data,"foreignwindows")) {
         const bool ready=Check(base,kForeignWindowChecks) && ApplyUiPatches(base,foreignWindowPatches);
         SliceLog("[foreignwindows] %s: native command barrier and Lua foreign edit guard retained\n",ready ? "installed" : "OFF");
         ok &= ready;
@@ -364,7 +360,7 @@ bool InstallCompanyUi(uintptr_t base,const char* root,const char* data)
 }
 bool InstallPausedTick(uintptr_t base, const char* root, const char* data)
 {
-    if (FlagOff(root,data,"pausedtick")) {
+    if (SliceFlagOff(root,data,"pausedtick")) {
         SliceLog("[pausedtick] OFF (pausedtick=0)\n"); return true;
     }
     if (!Check(base,kPausedChecks)) return false;
@@ -401,7 +397,7 @@ void SliceRoadEntriesAdd(uintptr_t mgr,uint64_t edge,uint32_t forward,int32_t en
     roadEntriesOriginal(mgr,edge,forward,entity,comp,bounds);
     ++reCalls;
     if (!world || !mgr) return;
-    const RoadSortResult r=RoadEntriesSortAt(world,mgr,edge,NameType(world));
+    const RoadSortResult r=RoadEntriesSortAt(world,mgr,edge,kNameTypeLater);
     if (r==RoadSorted) ++reSorted;
     else if (r==RoadRefused) ++reRefused;
 }
@@ -421,7 +417,7 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
     movementBase=base; movementData=data ? data : "";
     bool ok=InstallPausedTick(base,root,data);
     ok &= InstallCompanyUi(base,root,data);
-    if (!FlagOff(root,data,"roadspace")) {
+    if (!SliceFlagOff(root,data,"roadspace")) {
         void* unusedPlainA=nullptr; void* unusedPlainB=nullptr;
         SliceRoadResumeA=base+0x2e558eb; SliceRoadResumeB=base+0x2e55988;
         const bool ready=Check(base,kRoadChecks) &&
@@ -449,7 +445,7 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
     }
     uintptr_t name=0; char text[sizeof("N3ecs9component4NameE")];
     namesOk &= SliceReadT(base+0x5a02608,&name) && SliceRead(name,text,sizeof(text)) && !memcmp(text,"N3ecs9component4NameE",sizeof(text));
-    if (FlagOff(root,data,"roadentries")) {
+    if (SliceFlagOff(root,data,"roadentries")) {
         SliceLog("[roadentries] OFF (roadentries=0 in tpf2_menu_flags.txt) -- a road edge's vehicle entries keep the engine's arrival/load order\n");
     } else {
         roadEntriesOriginal=reinterpret_cast<EdgeAddFn>(base+0x2e58f70);
@@ -459,15 +455,15 @@ bool SliceInstallMovement(uintptr_t base,const char* root,const char* data)
             ready ? "installed" : "OFF");
         ok &= ready;
     }
-    if (!FlagOff(root,data,"shiporder")) {
+    if (!SliceFlagOff(root,data,"shiporder")) {
         const bool ready=namesOk && Check(base,kShipChecks) && InstallHook(base+0x16d75c0,reinterpret_cast<void*>(&ShipHook),8,&moveOriginal[0]);
         SliceLog("[shiporder] %s (measurement only)\n",ready ? "installed" : "OFF"); ok &= ready;
     }
-    if (!FlagOff(root,data,"airorder")) {
+    if (!SliceFlagOff(root,data,"airorder")) {
         const bool ready=namesOk && Check(base,kAirChecks) && InstallHook(base+0x16692e0,reinterpret_cast<void*>(&AirHook),8,&moveOriginal[1]);
         SliceLog("[airorder] %s (measurement only)\n",ready ? "installed" : "OFF"); ok &= ready;
     }
-    if (!FlagOff(root,data,"sharedstations")) {
+    if (!SliceFlagOff(root,data,"sharedstations")) {
         void* unused=nullptr; SliceStationResume=base+0x10c03c9;
         const bool ready=Check(base,kStationsChecks) && InstallHook(base+0x10c03c0,reinterpret_cast<void*>(&SliceStationRelay),9,&unused);
         SliceLog("[sharedstations] %s (companies mode only)\n",ready ? "installed" : "OFF"); ok &= ready;

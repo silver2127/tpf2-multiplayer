@@ -17,8 +17,11 @@ class LobbyPanel(unittest.TestCase):
         source = (ROOT / "mod/mp_lockstep_1/res/config/game_script/lockstep.lua").read_text()
         # Compile the entire script, then exercise its actual button callback.
         lua.execute("assert(load(...))", source)
-        start = source.index('lobbyL:addItem(toggleBtn("  host / manage lobby  "')
+        start = source.index('lobbyL:addItem(toggleBtn("Host / manage session"')
         end = source.index("end))", start) + len("end))")
+        of = source.index("function CM.openFile(path, mode)")
+        lua.execute("CM = {}")
+        lua.execute(source[of:source.index("\nend\n", of) + 5])   # the callback opens through CM.openFile
         lua.execute('''
             lobbyL = {addItem = function(_, button) openLobby = button end}
             function toggleBtn(_, callback) return callback end

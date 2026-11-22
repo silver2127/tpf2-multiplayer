@@ -6,7 +6,7 @@
 # rip-relative references to it, and use .pdata to get the enclosing function.
 # Then print the other strings each candidate touches -- that is effectively
 # the function's name tag.
-import os, bisect, sys
+import os, bisect
 import numpy as np
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_64

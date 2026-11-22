@@ -2,6 +2,7 @@
 // transfer/failure tests. Optional argv[1] supplies the verified game ELF ctor.
 #include "slice/slice_construction.h"
 #include "slice/slice_terrain_assets.h"
+#include "slice/tplz.h"
 #include "slice/slice_core_internal.h"
 #include <array>
 #include <cassert>
@@ -144,6 +145,48 @@ Terrain SampleTerrain(uint64_t bits = 65)
     t.mask.rect = t.material.rect; t.bits = bits; t.mask.data.assign(((bits + 31) / 32) * 4, 0xff);
     return t;
 }
+void TerrainWire()
+{
+    Terrain t = SampleTerrain(639 * 559), parsed;
+    std::vector<uint8_t> raw, wire, again;
+    CHECK(EncodeTerrain(t, &raw));
+    size_t rawBytes = 0;
+    CHECK(EncodeTerrainWire(t, &wire, &rawBytes));
+    CHECK(rawBytes == raw.size() && wire.size() * 20 < raw.size());
+    CHECK(TplzIsPacked(wire.data(), wire.size()));
+    // Linux capture is readable by the unchanged Windows codec, byte for byte.
+    uint64_t size = 0; const char* why = "";
+    uint8_t* unpacked = TplzUnpack(wire.data(), wire.size(), MaxBytes, &size, &why);
+    CHECK(unpacked && size == raw.size() && !memcmp(unpacked, raw.data(), size));
+    free(unpacked);
+    // Windows frames and legacy v1 both reach the Linux grid conversion.
+    uint8_t* packed = TplzPack(raw.data(), raw.size(), &size);
+    CHECK(packed);
+    std::vector<uint8_t> windows(packed, packed + size); free(packed);
+    CHECK(DecodeTerrainWire(windows, &parsed));
+    CHECK(EncodeTerrain(parsed, &again) && again == raw);
+    CHECK(DecodeTerrainWire(raw, &parsed));
+    CHECK(Unbase64(Base64(wire), &again) && DecodeTerrainWire(again, &parsed));
+    // A short packed frame must not be rejected by the old v1 header minimum.
+    CHECK(EncodeTerrainWire(SampleTerrain(), &again) && again.size() < 272);
+    CHECK(DecodeTerrainWire(again, &parsed));
+    for (size_t cut = 0; cut < wire.size(); ++cut)
+        CHECK(!DecodeTerrainWire(std::vector<uint8_t>(wire.begin(), wire.begin() + cut), &parsed));
+    again = wire; again[16] ^= 1; CHECK(!DecodeTerrainWire(again, &parsed));
+    again = wire; Put(again.data(), 8, uint64_t(MaxBytes) + 1); CHECK(!DecodeTerrainWire(again, &parsed));
+    again = wire; Put(again.data(), 8, uint64_t(0)); CHECK(!DecodeTerrainWire(again, &parsed));
+    again = wire; again.push_back(0); CHECK(!DecodeTerrainWire(again, &parsed));
+    // Valid checksum cannot make invalid grid lengths or nested frames valid.
+    again = raw; Put(again.data(), 8 + 0x78, uint64_t(t.bits + 1));
+    packed = TplzPack(again.data(), again.size(), &size); CHECK(packed);
+    windows.assign(packed, packed + size); free(packed);
+    CHECK(!DecodeTerrainWire(windows, &parsed));
+    std::vector<uint8_t> nested(24 + TplzBound(wire.size()));
+    memcpy(nested.data(), "TPTG\2\0\0\0", 8);
+    Put(nested.data(), 8, uint64_t(wire.size())); Put(nested.data(), 16, TplzFnv(wire.data(), wire.size()));
+    nested.resize(24 + TplzCompress(wire.data(), wire.size(), nested.data() + 24));
+    CHECK(!DecodeTerrainWire(nested, &parsed));
+}
 void Codecs()
 {
     std::vector<uint8_t> bytes, raw;
@@ -171,6 +214,21 @@ void Codecs()
     }
     Terrain bad = SampleTerrain(); bad.height.rect[2] = -1; CHECK(!EncodeTerrain(bad, &bytes));
     bad = SampleTerrain(); bad.bits++; CHECK(!EncodeTerrain(bad, &bytes));
+    // Windows dev 262353d: width*height*8 could overflow. Linux must
+    // reject the same tiny malicious frame before any proposal is installed.
+    Terrain huge = SampleTerrain(), parsedHuge;
+    huge.height.rect = {0, 0, INT32_MAX, INT32_MAX};
+    huge.height.data.clear();
+    CHECK(!EncodeTerrain(huge, &bytes));
+    Terrain emptyHeight = SampleTerrain();
+    emptyHeight.height.rect = {0, 0, 0, 0}; emptyHeight.height.data.clear();
+    CHECK(EncodeTerrain(emptyHeight, &bytes));
+    Put(bytes.data(), 8 + 8, int32_t(1 << 30));
+    Put(bytes.data(), 8 + 12, int32_t(1 << 30));
+    CHECK(!DecodeTerrain(bytes, &parsedHuge));
+    Put(bytes.data(), 8 + 8, INT32_MAX);
+    Put(bytes.data(), 8 + 12, INT32_MAX);
+    CHECK(!DecodeTerrain(bytes, &parsedHuge));
     Assets a; a.groups.resize(1); a.originalRemovals = 2; a.removals = {12};
     Model model; model.model = "tree.mdl"; model.extra = "tag"; for (int i = 0; i < 16; i += 5) model.matrix[i] = 1;
     a.groups[0].push_back(model);
@@ -586,7 +644,13 @@ void Integration()
 
     // Exercise the real initialized dynamic nothrow allocator and actual game
     // ctor through the Lua file-carrier route, with no injected memory callbacks.
-    p = {}; Terrain terrain = SampleTerrain(); std::vector<uint8_t> raw; CHECK(EncodeTerrain(terrain, &raw));
+    p = {}; Terrain terrain = SampleTerrain(); std::vector<uint8_t> raw; CHECK(EncodeTerrainWire(terrain, &raw));
+    // Corrupt packed payload is consumed without touching the empty carrier.
+    auto corrupt = raw; corrupt[16] ^= 1;
+    PutFile(dir + "terrain_inject_A.bin", Base64(corrupt));
+    c.retRva = 0x1971333; c.rdx = uintptr_t(p.data()); c.script = true;
+    th(c, nullptr); CHECK(CarrierEmpty(uintptr_t(p.data())));
+    CHECK(access((dir + "terrain_inject_A.bin").c_str(), F_OK) != 0);
     PutFile(dir + "terrain_inject_A.bin", Base64(raw));
     c.retRva = 0x1971333; c.rdx = uintptr_t(p.data()); c.script = true;
     th(c, nullptr); CHECK(access((dir + "terrain_inject_A.bin").c_str(), F_OK) != 0);
@@ -603,6 +667,15 @@ void Integration()
     CHECK(arm.prepareCancel(add, nullptr));
     arm.landed(&add, SliceOutcome::CancelledFired, nullptr); armed = false;
     CHECK(tool[0xd0] == 1);
+    const std::string captured = ReadFile(dir + "lockstep_inject_A.txt");
+    const size_t cap = captured.rfind("TERRAINCAP "); CHECK(cap != std::string::npos);
+    const size_t payload = captured.find(' ', cap + 11); CHECK(payload != std::string::npos);
+    const size_t end = captured.find('\n', payload);
+    std::vector<uint8_t> captureWire;
+    CHECK(Unbase64(captured.substr(payload + 1, end - payload - 1), &captureWire));
+    CHECK(TplzIsPacked(captureWire.data(), captureWire.size()));
+    CHECK(std::stoull(captured.substr(cap + 11)) == captureWire.size());
+    CHECK(DecodeTerrainWire(captureWire, &result) && result.bits == terrain.bits);
     Bytes<0x3c0> empty{}; SliceFactoryCall marker = c; marker.retRva = 0x1971333; marker.rdx = uintptr_t(empty.data()); marker.script = true;
     std::thread other([&] { th(marker, nullptr); SliceTerrainPollHeldTools(); }); other.join();
     CHECK(tool[0xd0] == 1); SliceTerrainPollHeldTools(); CHECK(tool[0xd0] == 0);
@@ -639,7 +712,7 @@ void Integration()
 int main(int argc, char** argv)
 {
     CHECK(SliceReadInit());
-    Construction(); Codecs(); Installation(FakeCtor); MergeTemplates();
+    Construction(); Codecs(); TerrainWire(); Installation(FakeCtor); MergeTemplates();
     if (argc > 1) { Installation(CtorFromElf(argv[1])); Integration(); munmap(elfImage, elfSize); dlclose(runtimeHandle); }
     puts("construction/terrain/assets: codecs, malformed inputs, guarded reads, ABI ownership and all allocation failures passed");
 }

@@ -52,6 +52,7 @@ TYPE_ACK = b"A"                      # payload = the token we just received
 TYPE_CONNECTED = b"C"               # payload = our token (informational)
 TYPE_KEEPALIVE = b"K"              # payload = our token
 TYPE_DATA = b"D"                     # payload = application bytes
+TYPE_KEYX = b"X"                     # payload = a Steam-code key exchange message (steamkey.py)
 TYPE_EDATA = b"E"                    # payload = sealed application bytes (seal.py)
 # The 4-byte tag a save chunk starts with (lobby.CHUNK_MAGIC). Duplicated here
 # rather than imported because punch.py is the lower layer -- lobby imports it,
@@ -234,31 +235,39 @@ class Connection:
             if ptype is None:
                 continue  # not one of ours -- ignore stray UDP
 
-            # Lock onto the most-recent source (survives NAT re-mapping).
-            self.peer = addr
-            self._last_seen = now
-
+            authenticated = False
             if ptype == TYPE_HELLO:
                 # Echo THEIR token so they can confirm us.
                 self._send_to(TYPE_ACK, payload, addr)
+                if not self.connected.is_set():
+                    authenticated = True
             elif ptype == TYPE_ACK:
-                if payload == self.token and not self.connected.is_set():
-                    # Proof the peer heard us -> we're connected.
-                    self._send_to(TYPE_CONNECTED, self.token, addr)
-                    self.connected.set()
-                    self.log(f"[{self.name}] CONNECTED to {addr[0]}:{addr[1]}")
+                if payload == self.token:
+                    authenticated = True
+                    if not self.connected.is_set():
+                        # Proof the peer heard us -> we're connected.
+                        self._send_to(TYPE_CONNECTED, self.token, addr)
+                        self.connected.set()
+                        self.log(f"[{self.name}] CONNECTED to {addr[0]}:{addr[1]}")
             elif ptype == TYPE_CONNECTED:
+                # CONNECTED carries no proof. Once connected in a sealed session it
+                # may not move the peer: one spoofed datagram used to redirect every
+                # later sealed frame to its sender.
+                authenticated = (self.cipher is None or not self.connected.is_set()
+                                 or addr == self.peer)
                 # Peer says it's done; make sure we've flagged ourselves too.
                 if not self.connected.is_set():
                     self.connected.set()
                     self.log(f"[{self.name}] CONNECTED (peer-driven) "
                              f"{addr[0]}:{addr[1]}")
             elif ptype == TYPE_KEEPALIVE:
-                pass  # last_seen already refreshed above
+                if payload == self.token or self.cipher is None or self.peer == addr:
+                    authenticated = True
             elif ptype == TYPE_EDATA:
                 if self.cipher is not None:
                     plain = self.cipher.open(payload)
                     if plain is not None:
+                        authenticated = True
                         self._inbox.put(plain)
             elif ptype == TYPE_ADATA:
                 # Authenticated, not encrypted. Only accepted in a sealed
@@ -267,6 +276,7 @@ class Connection:
                 if self.cipher is not None:
                     plain = self.cipher.unsign(payload)
                     if plain is not None:
+                        authenticated = True
                         self._inbox.put(plain)
             elif ptype == TYPE_DATA:
                 # A sealed session refuses plaintext, with exactly two carve-outs
@@ -285,7 +295,13 @@ class Connection:
                 # "any bulk frame": every control message (join, roster, chat,
                 # start) is JSON and stays sealed, so no unauthenticated frame
                 # can ever be parsed as one.
-                if self.cipher is None or payload.startswith(CHUNK_PREFIX):
+                # In a sealed session the carve-outs are DELIVERED but prove
+                # nothing, so they never move the peer (the lock below): a plain
+                # frame from anywhere used to redirect the session to its sender.
+                if self.cipher is None:
+                    authenticated = True
+                    self._inbox.put(payload)
+                elif payload.startswith(CHUNK_PREFIX):
                     self._inbox.put(payload)
                 elif payload.startswith(b'{"t": "reject"'):
                     # Re-verify it is ACTUALLY a reject before admitting it. A
@@ -299,6 +315,11 @@ class Connection:
                         _obj = None
                     if isinstance(_obj, dict) and _obj.get("t") == "reject":
                         self._inbox.put(payload)
+
+            if authenticated:
+                # Lock onto the authenticated source (survives NAT re-mapping).
+                self.peer = addr
+                self._last_seen = now
 
     # -- public API -------------------------------------------------------- #
     def wait(self, timeout=None) -> bool:

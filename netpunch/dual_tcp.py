@@ -33,6 +33,7 @@ session (a plaintext frame has no nonce to dedup on).
 """
 import queue
 import socket
+import sys
 import struct
 import threading
 import time
@@ -310,17 +311,29 @@ class DualSocket:
 
 
 # -- establishing a link ---------------------------------------------------------
+def link_name(name):
+    """The name as a hello carries it: at most 64 UTF-8 bytes, cut on a character
+    boundary. The sealed copy must be of this same string, or the check fails."""
+    return name.encode("utf-8", "replace")[:64].decode("utf-8", "ignore")
+
+
 def hello_bytes(name, sealed_name):
-    return LINK_MAGIC + b" " + name.encode("utf-8", "replace")[:64] + b" " + sealed_name.hex().encode() + b"\n"
+    return LINK_MAGIC + b" " + link_name(name).encode("utf-8") + b" " + sealed_name.hex().encode() + b"\n"
 
 
 def parse_hello(line):
-    """(name, sealed bytes) from a hello line, or (None, None)."""
-    parts = line.strip().split(b" ", 2)
-    if len(parts) != 3 or parts[0] != LINK_MAGIC:
+    """(name, sealed bytes) from a hello line, or (None, None).
+
+    The name may contain spaces (Steam persona names often do), so the sealed
+    hex is the LAST field, not the third."""
+    line = line.strip()
+    if not line.startswith(LINK_MAGIC + b" "):
+        return None, None
+    name, sep, hexed = line[len(LINK_MAGIC) + 1:].rpartition(b" ")
+    if not sep or not name:
         return None, None
     try:
-        return parts[1].decode("utf-8", "replace"), bytes.fromhex(parts[2].decode("ascii"))
+        return name.decode("utf-8", "replace"), bytes.fromhex(hexed.decode("ascii"))
     except ValueError:
         return None, None
 
@@ -337,6 +350,10 @@ def dial(target, local_port, hello, log, stop=None, listen_too=True, for_seconds
         try:
             lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            # Linux requires this on BOTH listener and bound dial sockets.
+            # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
+            if sys.platform.startswith("linux"):
+                lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             lst.bind(("0.0.0.0", local_port))
             lst.listen(4)
             lst.settimeout(0.2)
@@ -348,6 +365,10 @@ def dial(target, local_port, hello, log, stop=None, listen_too=True, for_seconds
             c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                # Linux requires this on BOTH listener and bound dial sockets.
+                # SO_REUSEADDR alone makes each dial fail with EADDRINUSE.
+                if sys.platform.startswith("linux"):
+                    c.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 c.bind(("0.0.0.0", local_port))
                 c.settimeout(DIAL_EVERY)
                 c.connect(target)

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Exercise native supervision with real child processes, without a game."""
-import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 import native_watchdog as watchdog

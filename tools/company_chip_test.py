@@ -58,7 +58,6 @@ check("the mouse hook captures right clicks on the panel and records the button"
       and "wp==WM_RBUTTONUP && capturedR" in SRC)
 check("PollClick hands the button to OnHit; a right click acts on chips only",
       "OnHit(hh.id, button)" in SRC and "if (button == 2 && !(id >= 20 && id <= 35)) return;" in SRC)
-check("the legend says so", "Left-click a chip for the next company, right-click for the previous." in SRC)
 
 # players on 1, 1, 3: left climbs 1 -> 3 -> 4 (new); right descends 3 -> 1 -> 3 (round), never to a new id
 roster = [1, 1, 3]

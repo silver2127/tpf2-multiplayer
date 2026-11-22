@@ -74,11 +74,42 @@ static int __fastcall Handler(void* gameTime)
     return real;
 }
 
-// CGame::Step, main thread, once per render frame, BEFORE the "is a batch
-// due" test. Sync (inside Step) rewrites guiFrameTime from measurements every
-// batch, so the override is re-applied here each frame: a value we did not
-// write is the engine's fresh estimate and becomes the new base.
+// THE INTERVAL CHANGES ONLY AT A BATCH BOUNDARY (2026-09-22). CGame::Step
+// accumulates totalTime, calls Sync for each due batch (Sync rewrites
+// guiFrameTime from its measurements), then clamps totalTime and computes the
+// render alpha = (totalTime - lastSync) / guiFrameTime -- all in the same frame,
+// with whatever Sync just wrote. The override used to be re-imposed at the
+// NEXT frame's Step entry: the batch's first frame interpolated with the
+// engine's estimate, the second with ours, and when ours was the larger (the
+// dedicated server's 200 ms pin over a faster estimate, a pacing change) alpha
+// fell and the render clock stepped BACKWARDS. A ship wake started on the first
+// frame then had its oldest point in the future: the retained host of a live
+// join asserted in ShipFoamRenderer.cpp:137 `startAge >= 0` (native lab,
+// 2026-09-22). Vanilla never changes guiFrameTime inside a batch. So the
+// override is imposed right after Sync returns (the call at RVA_SYNC_CALL is
+// redirected to SyncWrap), before Step reads the field again, and nowhere else.
+static const uintptr_t RVA_SYNC_CALL = 0x118ee6;    // CGame::Step: call CGame::Sync (0x119140) in the batch loop
+static const uintptr_t RVA_SYNC      = 0x119140;    // CGame::Sync(this, fn&) -> bool
+typedef bool (*SyncFn)(void* cgame, void* fn);
+static SyncFn g_realSync = nullptr;
+static void ImposeInterval(uint64_t cgame);
+static bool SyncWrap(void* cgame, void* fn)
+{
+    const bool ok = g_realSync(cgame, fn);
+    if (ok) ImposeInterval((uint64_t)cgame);
+    return ok;
+}
+
+// CGame::Step, main thread, once per render frame. Nothing is written here any
+// more (see above); the relay stays so the frame count keeps its meaning.
 extern "C" void CGameStepSeen(uint64_t cgame)
+{
+    (void)cgame;
+}
+
+// Right after Sync: the field holds the engine's fresh estimate for the batch
+// about to be interpolated. Record it as the base and impose ours, if any.
+static void ImposeInterval(uint64_t cgame)
 {
     if (!cgame) return;
     uint64_t mdata = *(uint64_t*)(cgame + OFF_MDATA);
@@ -86,7 +117,7 @@ extern "C" void CGameStepSeen(uint64_t cgame)
     volatile LONG* field = (volatile LONG*)(mdata + OFF_GUIFRAMETIME);
     LONG cur = *field;
     if (cur <= 0) return;
-    if (cur != g_lastWritten) g_engineBase = cur;      // the engine spoke since we last wrote
+    g_engineBase = cur;                                // Sync always writes its estimate
     const double target = g_target;
     const int lever = g_lever;
     const LONG pin = g_pinUs;
@@ -97,8 +128,7 @@ extern "C" void CGameStepSeen(uint64_t cgame)
             g_lastWritten = pin; g_applied = pin;
             return;
         }
-        if (g_lastWritten && cur == g_lastWritten) { *field = g_engineBase; g_applied = g_engineBase; }
-        g_lastWritten = 0;
+        g_lastWritten = 0; g_applied = cur;            // the engine's own estimate stands
         return;
     }
     double m = target / (double)lever;                 // desired rate over the engine's own
@@ -107,7 +137,7 @@ extern "C" void CGameStepSeen(uint64_t cgame)
     if (want < 20000) want = 20000;                    // never below 20 ms per batch
     if (want != cur) { *field = want; }
     g_lastWritten = want; g_applied = want;
-    if (++g_logEvery >= 600) {                         // ~10 s at 60 fps
+    if (++g_logEvery >= 50) {                          // once per 50 batches (~10 s at 200 ms)
         g_logEvery = 0;
         g_log("[speed] target %.2f over lever %d -> batch interval %ld us (engine's own %ld us)\n",
               target, lever, want, (long)g_engineBase);
@@ -192,8 +222,36 @@ bool SpeedHook_Install(SpeedLogFn log)
         log("[speed] InstallHook FAILED on CGame::Step -- fractional speed unavailable\n");
         return false;
     }
-    log("[speed] hooked GetSpeed at GameSim::Step (%llx, %llx) and CGame::Step (%llx): fractional speed scales the batch interval; target off\n",
-        (unsigned long long)RVA_SITE_PAUSE, (unsigned long long)RVA_SITE_COUNT, (unsigned long long)RVA_CGAME_STEP);
+    // Sync's one call in Step's batch loop -> SyncWrap (the interval is imposed there, see above)
+    {
+        const uintptr_t site = g_base + RVA_SYNC_CALL;
+        uint8_t cur[5]; memcpy(cur, (void*)site, 5);
+        int32_t rel; memcpy(&rel, cur + 1, 4);
+        if (cur[0] != 0xE8 || site + 5 + rel != g_base + RVA_SYNC) {
+            log("[speed] the call at %llx is not CGame::Sync -- the batch interval is left to the engine\n",
+                (unsigned long long)RVA_SYNC_CALL);
+            return false;
+        }
+        void* sstub = AllocNear(g_base);
+        if (!sstub) { log("[speed] no executable page for the Sync stub -- the batch interval is left to the engine\n"); return false; }
+        uint8_t scode[12] = { 0x48, 0xB8, 0,0,0,0,0,0,0,0, 0xFF, 0xE0 };   // mov rax, SyncWrap ; jmp rax
+        uintptr_t w = (uintptr_t)&SyncWrap;
+        memcpy(scode + 2, &w, 8);
+        memcpy(sstub, scode, 12);
+        FlushInstructionCache(GetCurrentProcess(), sstub, 12);
+        g_realSync = (SyncFn)(g_base + RVA_SYNC);
+        intptr_t d = (intptr_t)sstub - (intptr_t)(site + 5);
+        if (d > INT32_MAX || d < INT32_MIN) { log("[speed] Sync stub out of rel32 range -- the batch interval is left to the engine\n"); return false; }
+        int32_t rel2 = (int32_t)d;
+        DWORD old;
+        if (!VirtualProtect((void*)site, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+        memcpy((void*)(site + 1), &rel2, 4);
+        VirtualProtect((void*)site, 5, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), (void*)site, 5);
+    }
+    log("[speed] hooked GetSpeed at GameSim::Step (%llx, %llx) and CGame::Step (%llx): fractional speed scales the batch interval, imposed after CGame::Sync (%llx) only; target off\n",
+        (unsigned long long)RVA_SITE_PAUSE, (unsigned long long)RVA_SITE_COUNT, (unsigned long long)RVA_CGAME_STEP,
+        (unsigned long long)RVA_SYNC_CALL);
     return true;
 }
 

@@ -184,6 +184,16 @@ def main():
             for r in rows:
                 f.write(r + "\n")
 
+    print("== catch-up defers automatic spare requests")
+    H.CM.catchingUp2 = True
+    H.tick(1)
+    check("catching up: no LSPARE or retry timestamp", H.nsched() == 0 and H.CM.spareAskedAt is None)
+    H.CM.catchingUp2 = False
+    H.CM.lgFetch = "waiting"
+    H.tick(1)
+    check("fetch pending: no LSPARE or retry timestamp", H.nsched() == 0 and H.CM.spareAskedAt is None)
+    H.CM.lgFetch = "done"
+
     print("== asking for a spare")
     H.tick(1)
     check("no spare: one LSPARE scheduled", H.nsched() == 1 and H.op(1) == "LSPARE", H.logs()[-200:])

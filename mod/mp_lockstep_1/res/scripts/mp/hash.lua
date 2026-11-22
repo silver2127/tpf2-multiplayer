@@ -18,15 +18,54 @@ return function(CM, K, log)
 -- detector is the worst possible failure.
 local M1, A1 = 2147483647, 48271
 local M2, A2 = 2147483629, 40692
-local function hashStr(s)
-	local h1, h2 = 2166136261 % M1, 2166136261 % M2
-	for i = 1, #s do
-		local b = s:byte(i)
+-- The same per-byte step as ever, (h * A + b) % M on both lanes, byte by byte
+-- in order -- only fetched eight bytes per string.byte call, which is most of
+-- what a byte loop in the interpreter costs (2026-09-23). Identical output for
+-- every input; tools/hash_stream_test.py checks it against the old loop.
+local sbyte = string.byte
+local function hashFeed(h1, h2, s)
+	local n, i = #s, 1
+	while i + 7 <= n do
+		local b1, b2, b3, b4, b5, b6, b7, b8 = sbyte(s, i, i + 7)
+		h1 = (h1 * A1 + b1) % M1; h2 = (h2 * A2 + b1) % M2
+		h1 = (h1 * A1 + b2) % M1; h2 = (h2 * A2 + b2) % M2
+		h1 = (h1 * A1 + b3) % M1; h2 = (h2 * A2 + b3) % M2
+		h1 = (h1 * A1 + b4) % M1; h2 = (h2 * A2 + b4) % M2
+		h1 = (h1 * A1 + b5) % M1; h2 = (h2 * A2 + b5) % M2
+		h1 = (h1 * A1 + b6) % M1; h2 = (h2 * A2 + b6) % M2
+		h1 = (h1 * A1 + b7) % M1; h2 = (h2 * A2 + b7) % M2
+		h1 = (h1 * A1 + b8) % M1; h2 = (h2 * A2 + b8) % M2
+		i = i + 8
+	end
+	while i <= n do
+		local b = sbyte(s, i)
 		h1 = (h1 * A1 + b) % M1
 		h2 = (h2 * A2 + b) % M2
+		i = i + 1
+	end
+	return h1, h2
+end
+local function hashStr(s)
+	local h1, h2 = hashFeed(2166136261 % M1, 2166136261 % M2, s)
+	return string.format("%010d-%010d", h1, h2)
+end
+-- hashStr(table.concat(list, sep)), without building the joined string: the
+-- edge lane alone joined ~1.5 MB on a 27k-edge map just to walk it once. The
+-- bytes fed are exactly the joined string's, separators included; a value
+-- table.concat would refuse is refused here too.
+local function hashList(list, sep)
+	local h1, h2 = 2166136261 % M1, 2166136261 % M2
+	for i = 1, #list do
+		local v = list[i]
+		local tv = type(v)
+		if tv == "number" then v = tostring(v)
+		elseif tv ~= "string" then error("hashList: invalid value (a " .. tv .. ") at index " .. i) end
+		if i > 1 then h1, h2 = hashFeed(h1, h2, sep) end
+		h1, h2 = hashFeed(h1, h2, v)
 	end
 	return string.format("%010d-%010d", h1, h2)
 end
+CM.hashStr, CM.hashList = hashStr, hashList   -- for tools/hash_stream_test.py
 
 local function num(x)
 	if type(x) == "number" then return string.format("%.17g", x) end
@@ -776,8 +815,8 @@ local function worldHash(now)
 		log(string.format("hash cadence: every %d game units (%d edges)", CM.hashEvery, #edges))
 	end
 
-	local hc = hashStr(table.concat(cons, "|"))
-	local he = hashStr(table.concat(egeo, "|"))
+	local hc = hashList(cons, "|")
+	local he = hashList(egeo, "|")
 	-- The verdict hash covers ONLY the components lockstep controls.
 	local verdict = hashStr("v" .. nv .. "|" .. hc .. "|" .. he)
 	-- p: is the vehicle-position lane. #vpos can be less than nv when a vehicle
@@ -804,6 +843,22 @@ local function worldHash(now)
 		end)
 	end
 	CM.dashMoney, CM.dashLoan = mBal, mLoan
+	-- k: every COMPANY's balance and loan (companies mode, 2026-09-27), by company
+	-- id -- each machine reads its own entity for each company, so honest machines
+	-- agree. A company's wallet going apart on one machine (a switch that minted
+	-- or lost money there, a cost moved twice) used to show only when a player
+	-- noticed; net.lua logs it when the lane differs. Detail-only.
+	local kLane = "-"
+	if CM.cmMode == "companies" and CM.cmIds then
+		pcall(function()
+			local parts = {}
+			for _, cid in ipairs(CM.cmIds()) do
+				local b, l = CM.cmWallet(CM.cmCompanyPid[cid])
+				parts[#parts + 1] = string.format("%d=%d/%d", cid, math.floor((b or 0) + 0.5), math.floor((l or 0) + 0.5))
+			end
+			if #parts > 0 then kLane = table.concat(parts, ";") end
+		end)
+	end
 	-- PEOPLE COUNT LANE (n:). The people sim is deterministic in lockstep, so
 	-- two instances at the same stamp must agree on how many sim persons
 	-- exist. They did not: a depot placed over town buildings left one
@@ -826,14 +881,14 @@ local function worldHash(now)
 	-- net.lua matches a lane by its leading letters, and a two-letter name would
 	-- be found inside itself by the single-letter lanes it contains.
 	local rLane = string.format("r%d:%s/%s", #tnById,
-		hashStr(table.concat(tnById, "|")), hashStr(table.concat(tnSorted, "|")))
+		hashList(tnById, "|"), hashList(tnSorted, "|"))
 	if not tnCarrier and #tnById > 0 and not warnedNoCarrier then
 		warnedNoCarrier = true
 		log("train-name lane: no vehicle reported a carrier -- the r lane covers EVERY vehicle, not just trains")
 	end
-	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,%s,m:%s,l:%s,t:%d,n:%d",
-		nv, #cons, hc, #egeo, he, hashStr(table.concat(egeoZ, "|")),
-		#vpos, now or -1, hashStr(table.concat(vpos, "|")), rLane, mBal, mLoan, nt, np)
+	local detail = string.format("v%d,c%d:%s,e%d:%s,z:%s,p%d@%.1f:%s,%s,m:%s,l:%s,t:%d,n:%d,k:%s",
+		nv, #cons, hc, #egeo, he, hashList(egeoZ, "|"),
+		#vpos, now or -1, hashList(vpos, "|"), rLane, mBal, mLoan, nt, np, kLane)
 	return verdict, detail
 end
 

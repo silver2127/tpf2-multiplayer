@@ -268,6 +268,7 @@ class ModList(unittest.TestCase):
         self.assertEqual(out[at:at + len(anchor)], anchor)
 
     def test_registry_has_no_count_cap(self):
+        modshare.set_registry_scope(None)
         with tempfile.TemporaryDirectory() as td, patch.object(modshare, "data_dir", return_value=td):
             for i in range(300):
                 d = os.path.join(td, "workshop", str(1000000 + i))
@@ -442,7 +443,24 @@ class MidTransfer(unittest.TestCase):
                          sorted([addr, other]))
         # and run_host's loop is that sweep, over both transfer slots
         self.assertIn("_keepalive_sweep(peers, now, drop_after", inspect.getsource(lobby.run_host))
-        self.assertIn("(transfer[0], recovery.transfer if recovery else None)", inspect.getsource(lobby.run_host))
+        self.assertIn("(transfer[0], recovery.transfer if recovery else None, *terr_streams)", inspect.getsource(lobby.run_host))
+
+    def test_a_stall_of_the_host_loop_is_not_the_peers_silence(self):
+        """The dedicated server's lobby stood 19 s reading a save while the machine
+        swapped; the peers' pings were lost meanwhile and the sweep dropped every
+        player as silent (2026-09-28). The loop's own stall is credited to them."""
+        self.assertEqual(lobby._loop_stall(100.0, 100.3, 0.2), 0.0, "an ordinary turn")
+        self.assertEqual(lobby._loop_stall(100.0, 102.0, 0.2), 0.0, "under LOOP_STALL")
+        stall = lobby._loop_stall(100.0, 119.2, 0.2)
+        self.assertAlmostEqual(stall, 19.0)
+        peers = {("1.2.3.4", 1): {"name": "a", "last": 101.0}, ("1.2.3.4", 2): {"name": "b", "last": 115.0}}
+        now = 119.2 + lobby.DROP_AFTER - 1
+        self.assertEqual(len(lobby._keepalive_sweep(peers, now, lobby.DROP_AFTER, (None,), lambda s: None)), 2,
+                         "without the credit both would go")
+        for p in peers.values():
+            p["last"] = min(119.2, p["last"] + stall)
+        self.assertEqual(lobby._keepalive_sweep(peers, now, lobby.DROP_AFTER, (None,), lambda s: None), [])
+        self.assertIn("_loop_stall(loop_prev[0], now, timeout)", inspect.getsource(lobby.run_host))
 
     def test_a_verifier_whose_count_stops_moving_times_out(self):
         """A joiner that has every chunk reports its verify/write count in

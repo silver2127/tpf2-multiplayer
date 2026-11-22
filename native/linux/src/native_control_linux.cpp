@@ -69,10 +69,9 @@ std::string Liveness() {
     return "\ncpu_ui="+std::to_string(Cpu(ui))+"\ncpu_command="+std::to_string(Cpu(command))+
         "\nio_read="+std::to_string(read)+"\nio_write="+std::to_string(written);
 }
-uint64_t Now() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 void Work() {
     const auto pid=std::to_string(getpid());
-    std::string last=initial,pending,event,eventId; uint64_t deadline=0;
+    std::string last=initial,pending,event,eventId;
     auto emit=[&](const NativeIo::Event& e) {
         eventId=e.operation;
         event="pid="+pid+"\nid="+Clean(e.operation)+"\nstep="+e.step+
@@ -87,14 +86,14 @@ void Work() {
                 if(r["cmd"]=="save")ok=NativeIo::Save(last,r["name"]);
                 else if(r["cmd"]=="load")ok=NativeIo::Load(last,r["name"]);
                 else if(r["cmd"]=="pause")ok=NativeIo::PauseAndDrain(last);
-                else if(r["cmd"]=="hold") {pending=last;deadline=Now()+10000;ok=true;}
+                else if(r["cmd"]=="hold") {pending=last;ok=true;}
                 else if(r["cmd"]=="release") {immediate=true;ok=NativeIo::SetActionsHeld(false);}
             }
             if(!ok||immediate)emit({last,immediate?"held":"request",ok?"":"Native request refused",ok});
         }
         if(!pending.empty()) {
-            const bool held=NativeIo::SetActionsHeld(true);
-            if(held||Now()>=deadline) {emit({pending,"held",held?"":"Input gesture did not finish",held});pending.clear();}
+            // Wait for release, or cancellation by a newer request; no total deadline.
+            if(NativeIo::SetActionsHeld(true)) {emit({pending,"held","",true});pending.clear();}
         }
         NativeIo::Event e;
         while(NativeIo::Poll(e))if(e.operation==last)emit(e);
@@ -102,7 +101,7 @@ void Work() {
         Write("tpf2_native_status.txt","pid="+pid+"\nsupported="+(supported?"1":"0")+
               "\nhas_world="+(NativeIo::HasWorld()?"1":"0")+"\nbusy="+(NativeIo::Busy()?"1":"0")+
               "\nlast_request="+Clean(last)+"\nlast_event="+Clean(eventId)+
-              "\nevent_published="+(published?"1":"0")+Liveness()+"\n");
+              "\nevent_published="+(published?"1":"0")+"\nhold_key="+std::to_string(pending.empty()?0:NativeIo::ActiveGestureKey())+Liveness()+"\n");
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
@@ -111,6 +110,8 @@ void Start(const std::string& path,bool ready) {
     if(running.exchange(true))return;
     directory=path; if(!directory.empty()&&directory.back()!='/')directory+='/';
     supported=ready; initial=Read("tpf2_native_request.txt")["id"];
+    if (Read("tpf2_sync_lua.txt")["pid"] == std::to_string(getpid()))
+        Write("tpf2_sync_lua.txt", "");
     try {std::thread(Work).detach();}catch(...){running=false;}
 }
 void SignalShutdown(){running=false;}

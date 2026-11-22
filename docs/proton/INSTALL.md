@@ -68,6 +68,33 @@ Replaced files are kept in `<game>/.tpf2mp-proton-backups/<timestamp>/`, and
 proxy and plugin host stay when another product, such as TpF2 Big Maps, still
 uses them).
 
+## The Wine heap fix
+
+From 0.6.1.19 the proxy (`alut.dll`) does one more thing when it runs under Wine: before the
+game starts, it switches the heap's 1 KB to 32 KB size classes over to Wine's lock-free
+front end. Nothing in the installer does this; it is part of the DLL, so installing or
+updating the mod is all it takes, and the installer's last lines say whether the version
+you installed has it (`--verify` says so too).
+
+Why it matters: Wine only turns that front end on for a size class while more than 4 MiB
+of it is alive at once. The game's simulation allocates and frees small buffers all the
+time with few alive, so it never qualified, and every such allocation took a lock and
+searched a long list of free blocks. Measured on the dedicated server (Proton 9, a
+119 MB world): a quarter of the game's CPU and 79% of the simulation thread went to that
+one search, and the session could not hold 2x. The rule is the same in Proton 9, Proton
+10 and upstream Wine, so choosing another Proton version does not change it. Windows is
+not affected (the MSI's Segment Heap switch covers it there).
+
+The start-up step costs about 90,000 allocations and a few tens of milliseconds, once,
+and leaves a line in `tpf2_proxy.log`:
+
+```
+[proxy] wine heap: 1 heap(s), 80 bin(s) switched to the front end with 90522 allocations in 47 ms
+```
+
+To turn it off for a comparison, set the game's Steam launch options to
+`TPF2MP_WINE_HEAP=0 %command%`.
+
 ## The lobby repair
 
 `netpunch.exe` is a PyInstaller bundle. The miniupnpc DLL inside it (UPnP port

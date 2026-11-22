@@ -117,14 +117,19 @@ static const uintptr_t RVA_GET_PLAYEROWNED  = 0x472900;   // GetComponentPtr<Pla
 static const uint8_t ICON_DRAW_EXPECT[5] = { 0xE8, 0xD8, 0xD2, 0xFF, 0xFF };
 static bool g_iconColorOn = false;
 
-// pid -> company id, from mp_company_perms.txt ("pid <playerEntity> <companyId>"),
-// cached 2 s. 0 = unknown (coop, or a pid with no company). Its own cache, so it
-// never disturbs SharedStationsPermitted's.
-static int IconCompanyOfPid(int pid)
+// pid -> the company's TINT: the style class its colour draws (!mpCoN / !mpWinCoN,
+// 1..TINT_CLASSES), from mp_company_perms.txt ("pid <playerEntity> <companyId>
+// [<class> [<RRGGBB>]]"), else its company id; cached 2 s. 0 = unknown (coop, or a
+// pid with no company). The 5th field is the company's EXACT colour (free choice,
+// 2026-09-27): *rgbOut gets it (0xRRGGBB), or -1 when the file has none -- the
+// vehicle icons draw it, the classes only come close. Its own cache, so it never
+// disturbs SharedStationsPermitted's.
+static const int TINT_CLASSES = 999;   // the style sheet defines 1..326; room to grow
+static int IconCompanyOfPid(int pid, int* rgbOut = nullptr)
 {
     static ULONGLONG last = 0;
     static int n = 0;
-    static int pids[256], cids[256];
+    static int pids[256], cids[256], rgbs[256];
     const ULONGLONG now = GetTickCount64();
     if (!last || now - last >= 2000) {
         last = now;
@@ -136,14 +141,24 @@ static int IconCompanyOfPid(int pid)
             if (f) {
                 char line[160];
                 while (fgets(line, sizeof(line), f)) {
-                    int a = 0, b = 0;
-                    if (sscanf(line, "pid %d %d", &a, &b) == 2 && n < 256) { pids[n] = a; cids[n] = b; n++; }
+                    // "pid <player> <company> [<class> [<RRGGBB>]]": the class the company's
+                    // colour draws (2026-09-27); a file without it tints by company id
+                    int a = 0, b = 0, c = 0;
+                    unsigned int rgb = 0;
+                    const int got = sscanf(line, "pid %d %d %d %x", &a, &b, &c, &rgb);
+                    if (got >= 2 && n < 256) {
+                        pids[n] = a;
+                        cids[n] = (got >= 3 && c >= 1 && c <= TINT_CLASSES) ? c : b;
+                        rgbs[n] = (got == 4 && rgb <= 0xFFFFFF) ? (int)rgb : -1;
+                        n++;
+                    }
                 }
                 fclose(f);
             }
         }
     }
-    for (int i = 0; i < n; i++) if (pids[i] == pid) return cids[i];
+    if (rgbOut) *rgbOut = -1;
+    for (int i = 0; i < n; i++) if (pids[i] == pid) { if (rgbOut) *rgbOut = rgbs[i]; return cids[i]; }
     return 0;
 }
 
@@ -205,9 +220,12 @@ extern "C" const float* IconTintForEntity(void* engine, const int* entity, int l
         // its owner == local skip). `local` is still cached above for WindowTint.
         (void)local;
         if (owner < 0) return nullptr;
-        const int cid = IconCompanyOfPid(owner);
+        int rgb = -1;
+        const int cid = IconCompanyOfPid(owner, &rgb);
         if (cid <= 0) return nullptr;
-        IconCompanyColor(cid, rgba);
+        if (rgb >= 0) {   // the exact colour the company chose
+            rgba[0] = ((rgb >> 16) & 0xFF) / 255.0f; rgba[1] = ((rgb >> 8) & 0xFF) / 255.0f; rgba[2] = (rgb & 0xFF) / 255.0f;
+        } else IconCompanyColor(cid, rgba);
         rgba[3] = 1.0f;
         return rgba;
     }
@@ -1045,4 +1063,4 @@ static void InstallStationIconColor()
     g_stnIconColorOn = true;
     Log("[stationicon] installed: HUD station/depot icons washed the owner's company colour "
         "(hook at rva=%llx)\n", (unsigned long long)RVA_ICON_STN_HOOK);
-}
+}

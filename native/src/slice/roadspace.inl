@@ -108,7 +108,7 @@ static bool PatchJumpNear(uintptr_t at, void* detour, int steal, void** trampoli
 }
 
 // `<key>=0` in tpf2_menu_flags.txt, the same file (and the same dumb prefix
-// match) the menu dll and FlagsSayNoTrainOrder read. Next to this dll first,
+// match) the menu dll reads; trainorder.inl uses it too. Next to this dll first,
 // then the data dir.
 static bool FlagsSayOff(const char* key)
 {

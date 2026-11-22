@@ -14,7 +14,8 @@ import lupa.lua52 as lupa
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = open(os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp", "assets.lua"), encoding="utf-8").read()
 NET = open(os.path.join(REPO, "mod", "mp_lockstep_1", "res", "scripts", "mp", "net.lua"), encoding="utf-8").read()
-codec = "return function()\n" + NET[NET.index("local function encodeCmd"):NET.index("function CM.scheduleLocal")] + "\nreturn encodeCmd, decodeCmd\nend"
+# the slice runs on its own: K is the module's constant table (net.lua sets K.LEAD_SANE inside it)
+codec = "return function()\nlocal K = {}\n" + NET[NET.index("local function encodeCmd"):NET.index("function CM.scheduleLocal")] + "\nreturn encodeCmd, decodeCmd\nend"
 
 L = lupa.LuaRuntime(unpack_returned_tuples=True)
 enc, dec = L.execute(codec)()

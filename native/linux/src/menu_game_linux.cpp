@@ -963,7 +963,7 @@ static bool InstallGate(uintptr_t base)
 
 // ---- AUTO-LOAD [AL-06..18] ------------------------------------------------------------------------
 static std::atomic<bool>     g_autoloadOn{false};
-static std::atomic<bool>     g_loadAccepted{false};
+static std::atomic<uint64_t> g_loadAccepted{0};
 static UpdateFn              g_menuUpdate = nullptr;   // the original, published before the swap
 static std::atomic<bool> g_modRefresh{false};
 static std::atomic<uint64_t> g_alPending{0};           // the request waiting for a menu frame; 0 = none
@@ -1397,7 +1397,7 @@ static void AutoloadTick(void* menu)
     }
     t_alInFlight = 0;
     if (ctx.result == 1) {
-        g_loadAccepted = true;
+        g_loadAccepted = NowMs();
         Log("[autoload] StartSavegame(%s) started the load\n", name);
     } else if (ctx.result == 0) {
         Log("[autoload] StartSavegame(%s) refused (mods, or a load already starting) -- the player loads it by hand\n", name);
@@ -1462,7 +1462,12 @@ void MenuGame_RequestAutoload(const std::string& placedName)
 }
 
 void MenuGame_RequestModRefresh() {g_modRefresh=true;}
-bool MenuGame_Loading() { return g_alPending.load() != 0 || g_loadAccepted.load() || NativeIo::Loading(); }
+bool MenuGame_Loading() {
+    auto since = g_loadAccepted.load();
+    if (since && NowMs() - since >= 30ull * 60 * 1000 && g_loadAccepted.compare_exchange_strong(since, 0))
+        Log("[autoload] accepted load produced no world for 30 minutes; allowing retry\n");
+    return g_alPending.load() != 0 || g_loadAccepted.load() != 0 || NativeIo::Loading();
+}
 
 // ---- HOT JOIN [HJ-03..07] -------------------------------------------------------------------------
 static std::atomic<bool>  g_forceOn{false};
@@ -1610,7 +1615,10 @@ static void GameUiUpdateDetour(void* ui, int64_t t, int64_t dt)
     if (t_forceCall.active) SettleUnwoundForce(ui, here);
     const bool current = *(const uintptr_t*)ui == g_base + RVA_GAMEUI_VTABLE &&
                          *(void* const*)(g_base + RVA_G_GAMEUI) == ui;
-    if (current) { g_loadAccepted = false; panel::OnGameUiFrame(); }
+    if (current) {
+        game_ui_tick::last.store(NowMs(), std::memory_order_relaxed);
+        g_loadAccepted = false; panel::OnGameUiFrame();
+    }
     if (!current || !OnFrameStep(here)) {
         g_gameUiUpdate(ui, t, dt);
         return;
@@ -1795,4 +1803,9 @@ bool MenuGame_Install(uintptr_t gameBase, Tpf2mpLogFn log)
         }
     }
     return result == 1;
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t Tpf2mpLastGameUiTick()
+{
+    return game_ui_tick::last.load(std::memory_order_relaxed);
 }

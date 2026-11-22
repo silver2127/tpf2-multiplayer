@@ -1124,3 +1124,40 @@ Names marked INFERRED are explained in §4.3.
 | `0x15eb8d0` | unnamed | 0x22 | 18 | `f3 0f 1e fa 55 48 89 e5 41 54 53 4c 8d a5 90 f2 ff ff` | 1 | `0x1951063` |
 | `0x15eb980` | unnamed | 0x23 | 18 | `f3 0f 1e fa 55 48 89 e5 41 54 53 4c 8d a5 90 f2 ff ff` | 0 | `0x197023e` |
 | `0x15eba20` | unnamed | 0x24 | 18 | `f3 0f 1e fa 55 48 89 e5 41 54 53 4c 8d a5 90 f2 ff ff` | 0 | - |
+
+## Guarded-read batching — dev ea15a156 (2026-09-27)
+
+This integration changes host-side reads only. No game address, patch byte,
+SysV signature, libstdc++ layout or ownership contract changes. Existing
+movement and train-order ELF verifiers were rerun against the lab build 35924
+and passed (11 movement spans and 16 train-order runtime checks).
+
+`SliceReadable` probes one byte per intersecting page in batches of at most
+256 iovecs when the initialized backend is `process_vm_readv`. It accepts
+only an exact byte count and retries interrupted calls. The pipe backend
+retains its page-by-page behavior. As before, this is a readability probe,
+not a lifetime guarantee or an atomic snapshot.
+
+`SliceReadStdVectorShape` retains header, stride, ordering, count and span
+checks but does not probe the payload. `SliceReadStdVector` additionally
+checks the payload and clears its result on failure. RoadEdgeData uses shape
+checks for the manager's index/group vectors, then guarded reads of the
+selected index and data-vector header; its selected data vector still gets
+the full readability check. Unrelated unreadable pages no longer refuse a
+valid edge. Layout evidence remains in [DEV_23419163.md](DEV_23419163.md).
+
+NameComponent copies at most 4096 eight-byte slot pairs to thread-local
+storage in one guarded read and scans only the returned count. A short read
+refuses the entire lookup, even if a matching pair precedes the hole. Flat
+and paged Name layouts remain those in [TRAIN_ORDER.md](TRAIN_ORDER.md).
+
+Off-game tests explicitly exercise both read backends across 600 pages,
+exact 256/512-page lengths, unaligned ranges and holes at pages 10, 255, 256,
+300 and 599; they also check overflow, empty reads, shape-only versus full
+validation, inaccessible selected road elements, a valid edge with unrelated
+holes, the 4096-pair name boundary, empty-after-populated scratch storage and
+a matching name pair followed by an unreadable tail. These are synthetic
+mappings in the soldier test process, not observations of a loaded game.
+No new live RE contract is introduced and no game was launched for this
+integration. The upstream dedicated-server performance figures were not
+remeasured here.

@@ -50,10 +50,11 @@ void Init(const Config& cfg, Tpf2mpLogFn log, StatusFn status, DirtyFn dirty);
 // ---- the lobby ----------------------------------------------------------------------
 struct StartRequest {
     bool join = false;
-    std::string code;        // join: the host's code, base32 only (it becomes an argument)
+    std::string code;        // join: classic base32 code, Steam ID or numeric profile URL
     std::string name;        // --name
     std::string password;    // --password, when not empty
     std::string lobbyName;   // host: --lobby-name
+    bool crossplay = false;
     bool separateCompanies = false; // host: --companies
     bool pub = false;        // host: --public
     bool dedicated = false;
@@ -63,6 +64,8 @@ struct StartRequest {
 // Checks the request and hands the launch to the lobby thread, which stops a
 // lobby still running first. False, with the text for the status line, when
 // nothing was started.
+// nullptr only when the native bridge is loaded in this process. Never loads it.
+const char* BridgeProblem();
 bool Start(const StartRequest& req, std::string* why);
 void Leave();                                    // quit; after 1.5 s SIGTERM; after 2 s more SIGKILL
 
@@ -75,6 +78,7 @@ void RefreshSaves();                             // enumerate on the lobby worke
 std::string SelectSave(const std::string& path);
 std::string RecoveryAction(const std::string& command);
 std::string SetSeparateCompanies(bool on);
+std::string SetCrossplay(bool on);
 std::string SetPublic(bool on);                  // host: list or delist the running lobby
 std::string AnswerMods(bool yes);                // YES / NO to the mods question
 void CycleCompany(int rosterIndex, bool previous = false);              // a company chip was clicked
@@ -93,14 +97,17 @@ struct Player {
 };
 struct SaveRow { std::string path, name; uint64_t modified=0; };
 struct View {
-    bool active=false,inGame=false;
+    bool active=false,inGame=false,lobbyReady=false;
+    std::string transferDetail,transferHint;
     std::string recoveryPhase,recoveryDetail,recoveryStep;
-    bool recoveryPresent=false,recoveryRequested=false,readyMine=false;
+    bool recoveryHidden=false,recoveryPresent=false,recoveryRequested=false,readyMine=false,worldIo=false;
     int readyCount=0,readyTotal=0;
     uint64_t recoveryVersion=0;
     std::vector<SaveRow> saves;
     std::string selectedSave;
     bool startPending=false;
+    bool crossplay = false;
+    bool hostSteam = false;
     bool separateCompanies = false;
     bool haveCode = false;
     bool isHost = false;          // START GAME: the host, or a relay lobby's leader

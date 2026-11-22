@@ -4,7 +4,7 @@ Loads the real mod/.../scripts/mp/net.lua into a lupa.lua52 runtime with a stub 
 and a settable os.clock, then drives:
   - CM.rttNote: RFC 6298 smoothing, absurd samples rejected
   - CM.execDelayTick: the delay from the worst fresh peer, the step grid, min/max,
-    rising at once and falling one step after K.DELAY_DOWN_TICKS, pinned mode
+    rising at once and falling halfway after K.DELAY_DOWN_TICKS, pinned mode
   - LSTICK parsing through CM.pollEvents: ms= stored, our echo e= becomes a round trip
   - CM.scheduleLocal: the stamp uses the current delay and an LSHI follows the LSCMD
   - CM.gapHoldNeed / CM.gapHoldTick: hold for a missing command due soon, not for one
@@ -262,6 +262,38 @@ check("DROPNEXT: the LSCMD is not sent, the LSHI is", not any(x.startswith("LSCM
 check("DROPNEXT: kept for resend and cleared after one command", h.CM.sentRing[2] is not None and h.CM.dropNextCmd is None)
 
 
+# ---- far-behind joiner stamps (Windows dev 06188ea5) ----
+for gap in (-5, 0, 5, 15, 33, 63, 600, 600.01, 202690):
+    for op in ("SPEED", "CON"):
+        L, h = runtime()
+        h.setNow(50.0)
+        h.CM.execDelayCur = 0.8
+        h.CM.peerBounds = L.eval("function() return nil, %r end" % (50 + gap))
+        h.CM.scheduleLocal(op, L.table_from({}))
+        c = h.CM.queue[1]
+        lead = 15 if gap > 600 else max(0, gap)
+        expected = 50 + lead + 0.8
+        check(f"{op} gap={gap}: expected future stamp", abs(c.at - expected) < 1e-9)
+        if 0 <= gap <= 600:
+            check(f"{op} gap={gap}: ahead of fastest peer", c.at > 50 + gap)
+        stamp = f"at={c.at:.4f}"
+        sent = lua_list(h.sent())
+        check(f"{op} gap={gap}: queue, wire, announcement and resend agree",
+              stamp in h.CM.sentRing[1] and
+              any(x.startswith("LSHI ") and stamp in x for x in sent) and
+              abs(h.CM.lastSchedAt - c.at) < 1e-9)
+        check(f"{op} gap={gap}: foreign clock diagnostic only above cutoff",
+              ("not this world's clock" in h.logs()) == (gap > 600))
+
+# Projection includes a simulation step; extra delay still follows the full lead.
+L, h = runtime()
+h.CM.peerBounds = L.eval("function() return nil, 83 end")
+h.CM.projectedPeerMax = L.eval("function() return 113 end")
+h.CM.scheduleLocal("CON", L.table_from({"delay": 0.4}))
+check("projected fastest clock plus step, base and explicit delay",
+      abs(h.CM.queue[1].at - 114.0) < 1e-9)
+
+
 # ---- gap hold ----
 def rx(h, missing_age=2, stamp2=None, stamp3=None, nack=0):
     CMh = h.CM
@@ -378,6 +410,28 @@ peer(h, "b", 300, 40)
 tick(h)
 # one way 240 ms + one tick 190 ms = 430 ms at 3.6 u/s = 1.548 -> 1.6 (was 1.0 without the repeat)
 check("speed 4: 300+-40 ms plus one tick for the repeat -> 1.6 units", abs(h.CM.execDelayCur - 1.6) < 1e-9, h.CM.execDelayCur)
+
+# Below 1x the same slow link needs fewer simulation units, including ramp margin.
+for speed, rate, expected in ((0.25, 0, 0.6), (0.5, 0, 1.0),
+                              (0, 0, 1.2), (1, 0, 1.2),
+                              (0.25, 1.8, 2.2)):
+    L, h = runtime()
+    h.CM.effSpeed, h.CM.simRate = speed, rate
+    peer(h, "b", 1500, 400)  # 1.2 seconds one way including slack
+    tick(h)
+    check(f"speed {speed}, measured rate {rate}: delay {expected}",
+          abs(h.CM.execDelayCur - expected) < 1e-9, h.CM.execDelayCur)
+
+L, h = runtime()
+h.CM.effSpeed, h.CM.simRate, h.CM.execDelayCur = 0.25, 0.225, 1.6
+peer(h, "b", 1500, 400)
+tick(h)
+tick(h, h.K.DELAY_DOWN_TICKS - 1)
+check("slow-session delay retains the full down hysteresis", abs(h.CM.execDelayCur - 1.6) < 1e-9)
+tick(h)
+check("first reduction covers half the gap on the step grid", abs(h.CM.execDelayCur - 1.2) < 1e-9, h.CM.execDelayCur)
+tick(h, 3 * h.K.DELAY_DOWN_TICKS)
+check("delay converges to the slow-session requirement", abs(h.CM.execDelayCur - 0.6) < 1e-9, h.CM.execDelayCur)
 
 print("FAILED: " + ", ".join(fails) if fails else "ALL OK")
 sys.exit(1 if fails else 0)

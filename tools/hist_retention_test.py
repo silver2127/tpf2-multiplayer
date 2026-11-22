@@ -347,6 +347,20 @@ check("runs are announced by origin then seq, numerically (5..6 before 30..31)",
       runs == ["LSHIST for=c o=b from=5 to=6", "LSHIST for=c o=b from=30 to=31"], str(runs))
 
 # ---- wiring ----
+# ---- a history-feed line keeps its params (histPump appends " hist=1 hfor=X") ----
+L, h = runtime("c", False)
+CM = h.CM
+L.execute("return function(CM) CM.cmReadConfig=function() CM.cmOriginCompany={} end; CM.lateCount=0; CM.recovered=0 end")(CM)
+h.feed("LSCMD op=CONU at=60.0000 origin=b seq=1 file=x.con x=1.0000 y=2.0000 params={a=1} hist=1 hfor=c")
+q = CM.queue[1]
+check("a fed command with params reaches the joiner whole (hist, hfor, params)",
+      q is not None and q.hist == 1 and q.hfor == "c" and q.params == "{a=1}", repr(q and (q.hist, q.hfor, q.params)))
+L, h = runtime("d", False)
+CM = h.CM
+L.execute("return function(CM) CM.cmReadConfig=function() CM.cmOriginCompany={} end; CM.lateCount=0; CM.recovered=0 end")(CM)
+h.feed("LSCMD op=CONU at=60.0000 origin=b seq=1 file=x.con params={a=1} hist=1 hfor=c")
+check("...and another instance does not queue someone else's catch-up", CM.queue[1] is None)
+
 lockstep = open(LOCKSTEP, encoding="utf-8").read()
 net = open(NET, encoding="utf-8").read()
 pacing = open(PACING, encoding="utf-8").read()

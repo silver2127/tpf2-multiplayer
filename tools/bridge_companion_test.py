@@ -143,7 +143,7 @@ if __name__ == '__main__':
     L.globals().runUpgradeShape()
     print('PASS: an upgrade-shaped capture keeps its own span explicit')
     net = (Path(__file__).resolve().parents[1] / 'mod/mp_lockstep_1/res/scripts/mp/net.lua').read_text(encoding='utf-8')
-    codec = net[net.index('local function encodeCmd(c)'):net.index('function CM.scheduleLocal(op, args)')]
+    codec = "local K = {}\n" + net[net.index('local function encodeCmd(c)'):net.index('function CM.scheduleLocal(op, args)')]
     encode, decode = L.execute(codec + '\nreturn encodeCmd, decodeCmd')
     for owner in ('3921', '-1'):
         command = L.globals().runUpgradeShape(owner)

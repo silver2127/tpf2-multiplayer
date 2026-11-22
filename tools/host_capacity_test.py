@@ -109,7 +109,21 @@ return T
     e, at = T.run(1, 0, 0, 0, 0)
     check("eff 0 (paused): untouched", e == 0 and at is None)
 
+    # A HOST WHOSE ENGINE STRETCHES EVERY SPEED ALIKE (live, 2026-09-22): 77% of the
+    # steps at any lever, 172 of 225 at 3x and 116 of 150 at 2x. Capping only lost speed.
+    T.CM.hostCap = None; T.CM.capStretched = 0; T.CM.capWin = None; T.CM.capFrom = None; T.CM.capOffUntil = None
+    e, at = T.run(3 * W + 3, 4, 3, 3 * 0.767, 3)
+    check("stretched at 3x (2.3x achieved): capped at 2 as before", e == 2 and at == 2, f"{e} {at}")
+    e, at = T.run(W + 2, 4, 2, 2 * 0.773, 2)
+    check("the 2x cap made the host slower (1.55x vs 2.3x): lifted at the first window, back to the votes",
+          e == 4 and at is None and T.CM.hostCap is None, f"{e} {at} {T.CM.hostCap}")
+    check("  ... logged once", T.logged("made the host slower") == 1)
+    e, at = T.run(5 * W, 4, 4, 4 * 0.77, 4)
+    check("stretched at 4x afterwards: no cap for K.CAP_OFF_S", e == 4 and at is None, f"{e} {at}")
+    e, at = T.run(T.K.CAP_OFF_S, 4, 4, 4 * 0.77, 4)
+    check("after K.CAP_OFF_S the cap may act again (and is lifted again if it costs speed)", at in (None, 3), f"{e} {at}")
+
 if fails:
     print("FAIL:", len(fails), "check(s):", "; ".join(fails))
     raise SystemExit(1)
-print("PASS: the session speed is capped at the steps the host actually makes, whole numbers, one step up after an unstretched minute; pauses, holds and speed changes restart the window")
+print("PASS: the session speed is capped at the steps the host actually makes, whole numbers, one step up after an unstretched minute, lifted when it costs speed; pauses, holds and speed changes restart the window")

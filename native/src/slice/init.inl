@@ -145,6 +145,14 @@ static DWORD WINAPI Init(LPVOID)
     // every peer from the first step.
     InstallRoadSpace();
     InstallRoadEntries();
+    InstallSteamPoll();
+    InstallSaveZstd();
+    // Person batches in entity-id order, so a host that keeps its world at a hot
+    // join and the joiner that loads its save decide alike ("HOT-JOIN ORDER").
+    InstallHotJoinOrder();
+    // Diagnostic only, off unless towntrace=1 in tpf2_slice.cfg ("TOWN
+    // DEVELOPMENT TRACE"): one line per town Develop call, for diffing peers.
+    InstallTownTrace();
     InstallMoveOrder(g_shipChan, "shiporder", RVA_SHIP_UPDATE2, MOVEORDER_EXPECT_SHIP,
                      sizeof(MOVEORDER_EXPECT_SHIP), (void*)&ShipOrderRelay,
                      &g_shipOrderResume, "ship");
@@ -176,6 +184,7 @@ static DWORD WINAPI Init(LPVOID)
 
     for (;;) {
         Sleep(15000);
+        SaveZstdLogAlive();
         Log("[slice] alive: captured=%ld cancelled=%ld addHits=%ld\n",
             g_captured, g_suppressed, g_addSeen);
         if (g_trainOrderOn)

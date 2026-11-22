@@ -1,0 +1,42 @@
+{
+  "sample_count": 1024,
+  "sample_sha256": "b63b04205662c4bfaaf6320087f7edad8f51d8bb9aaf741fbdd620c4b1374b38",
+  "total_tiles": 64980,
+  "raw_cache_gib": 7.994219698011875,
+  "constant_samples": 0,
+  "unique_samples": 1024,
+  "results": [
+    {
+      "mode": "raw",
+      "ratio": 0.2710723126130789,
+      "projected_payload_gib": 2.1670116210771084,
+      "encode_us_per_tile": 297.5854492177632,
+      "decode_us_per_tile": 161.7481445350677,
+      "exact_roundtrip": true
+    },
+    {
+      "mode": "shuffle",
+      "ratio": 0.24178500378270298,
+      "projected_payload_gib": 1.93288243992356,
+      "encode_us_per_tile": 236.5522460934244,
+      "decode_us_per_tile": 270.9679687527,
+      "exact_roundtrip": true
+    },
+    {
+      "mode": "delta",
+      "ratio": 0.16183197825903875,
+      "projected_payload_gib": 1.293720388366637,
+      "encode_us_per_tile": 425.5152343759505,
+      "decode_us_per_tile": 426.8334960926268,
+      "exact_roundtrip": true
+    },
+    {
+      "mode": "delta-shuffle",
+      "ratio": 0.15712985103862284,
+      "projected_payload_gib": 1.2561305503186304,
+      "encode_us_per_tile": 436.7006835934717,
+      "decode_us_per_tile": 618.5807617242745,
+      "exact_roundtrip": true
+    }
+  ]
+}

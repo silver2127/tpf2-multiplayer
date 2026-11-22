@@ -101,13 +101,6 @@ struct Edge { int32_t node0, node1; float t0[3], t1[3]; int32_t btype, bidx; int
 // refusal is never mistaken for one.
 static const uint64_t PROPOSAL_SANITY_BYTES = 1ull << 30;
 
-static void LogBadSpan(const char* what, uint64_t at, uint64_t span, uint64_t rec)
-{
-    Log("[slice] %s vector at %llx spans %llu B -- %s, not decoded\n", what,
-        (unsigned long long)at, (unsigned long long)span,
-        span % rec ? "not whole records" : "past the misread-pointer bound");
-}
-
 // Every edge record the vector holds, however many: a long road drag or a
 // station upgrade re-adding all its internal track is one proposal, and the
 // 0x20000-byte span (1,092 edges) plus the callers' fixed arrays this once had

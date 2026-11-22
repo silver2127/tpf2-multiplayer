@@ -4,8 +4,9 @@
 namespace dedicated {
 struct Settings {
     bool enabled = false, publicGame = true, companies = false;
-    bool render = false, pinBatch = true, noWsi = false;
+    bool render = false, pinBatch = true, noWsi = false, recycleSets = true;
     int autosaveMinutes = 10, emptySpeed = 1, port = 0, fps = 30;
+    int loadDelaySeconds = 45;
     std::string save, lobby = "Dedicated Server", name = "Server", password;
 };
 Settings Read(const std::string& path);

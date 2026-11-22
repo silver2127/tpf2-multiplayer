@@ -113,35 +113,62 @@ const char* ClassPrefix()
     return cached;
 }
 
-// ---- pid -> company id, from the mod's mp_company_perms.txt ----------------
-// Its own two-second cache, so it never disturbs the station-permission one.
-int CompanyOfPid(int pid)
+// ---- pid -> company tint, from the mod's mp_company_perms.txt --------------
+// "pid <player> <company> [<class> [<RRGGBB>]]": the tint is the style class the
+// company's colour draws (2026-09-27), else its id; the 5th field is its exact
+// colour (free choice), which the vehicle icons draw. "me <player>" names this game's own
+// player entity (the window wash is for other companies only). Its own
+// two-second cache, so it never disturbs the station-permission one.
+static std::mutex permsMutex;
+static int permsCount = 0, permsMe = -1;
+static int permsPids[256], permsTints[256], permsRgbs[256];
+static void ReadPermsLocked()
 {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
     static std::chrono::steady_clock::time_point last;
-    static int count = 0;
-    static int pids[256], cids[256];
     const auto now = std::chrono::steady_clock::now();
-    if (last.time_since_epoch().count() == 0 || now - last >= std::chrono::seconds(2)) {
-        last = now;
-        count = 0;
-        if (!tintData.empty()) {
-            FILE* f = fopen((tintData + "/mp_company_perms.txt").c_str(), "r");
-            if (f) {
-                char line[160];
-                while (fgets(line, sizeof(line), f)) {
-                    int a = 0, b = 0;
-                    if (sscanf(line, "pid %d %d", &a, &b) == 2 && count < 256) {
-                        pids[count] = a; cids[count] = b; count++;
-                    }
-                }
-                fclose(f);
-            }
+    if (last.time_since_epoch().count() != 0 && now - last < std::chrono::seconds(2)) return;
+    last = now;
+    permsCount = 0; permsMe = -1;
+    if (tintData.empty()) return;
+    FILE* f = fopen((tintData + "/mp_company_perms.txt").c_str(), "r");
+    if (!f) return;
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        int a = 0, b = 0, c = 0;
+        unsigned int rgb = 0;
+        const int got = sscanf(line, "pid %d %d %d %x", &a, &b, &c, &rgb);
+        if (got >= 2 && permsCount < 256) {
+            permsPids[permsCount] = a;
+            permsTints[permsCount] = (got >= 3 && c >= 1 && c <= 999) ? c : b;
+            permsRgbs[permsCount] = (got == 4 && rgb <= 0xFFFFFFu) ? static_cast<int>(rgb) : -1;
+            permsCount++;
+        } else if (sscanf(line, "me %d", &a) == 1) {
+            permsMe = a;
         }
     }
-    for (int i = 0; i < count; ++i) if (pids[i] == pid) return cids[i];
+    fclose(f);
+}
+int CompanyOfPid(int pid)
+{
+    std::lock_guard<std::mutex> lock(permsMutex);
+    ReadPermsLocked();
+    for (int i = 0; i < permsCount; ++i) if (permsPids[i] == pid) return permsTints[i];
     return 0;   // coop, or a player with no company: no wash
+}
+// the company's exact colour as 0xRRGGBB, -1 when the file names none
+int CompanyRgbOfPid(int pid)
+{
+    std::lock_guard<std::mutex> lock(permsMutex);
+    ReadPermsLocked();
+    for (int i = 0; i < permsCount; ++i) if (permsPids[i] == pid) return permsRgbs[i];
+    return -1;
+}
+// this game's own player entity, -1 when the mod has not said
+int CompanyMePid()
+{
+    std::lock_guard<std::mutex> lock(permsMutex);
+    ReadPermsLocked();
+    return permsMe;
 }
 
 // ---- the icon being built --------------------------------------------------
@@ -288,8 +315,12 @@ int WindowCompany(int entity)
     const int owner=SliceEcsOwner(engine,entity);
     if(owner<0)return 0;
     const int company=CompanyOfPid(owner);if(company<=0)return 0;
-    // The lobby writes mode and our company on the first two lines. A wash
-    // identifies a foreign company's window; our own company stays unchanged.
+    // A wash identifies a foreign company's window; our own stays unchanged. The
+    // mod names our player entity ("me" in the perms file); the lobby's company
+    // number went stale after an in-game switch. Without it (an older mod), the
+    // lobby file's mode and number decide as before.
+    const int me=CompanyMePid();
+    if(me>=0)return owner!=me ? company:0;
     FILE* f=fopen((tintData+"/mp_company_cfg.txt").c_str(),"r");
     if(!f)return 0;
     char mode[32]{};int mine=0;

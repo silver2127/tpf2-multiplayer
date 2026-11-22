@@ -249,6 +249,30 @@ if conn:
     conn.close()
 stop2.set(); th2.join(timeout=3); rv_host.close()
 
+# ---- 6. a refused knock takes no relay port; bad numbers get a 400, not a traceback ----
+with masterserver._knock_lock:
+    masterserver._knock_by_ip.clear()
+per_ip, masterserver.KNOCK_PER_IP_MIN = masterserver.KNOCK_PER_IP_MIN, 3
+ports_before = len(masterserver._allocs)
+codes = [post_json({"s": "e" * 24, "blob": "QUJD", "relay": 1, "j": "%08x" % (0xf00 + i)})[0] for i in range(10)]
+masterserver.KNOCK_PER_IP_MIN = per_ip
+check("a relay flood from one address: only the knocks it may post take a port",
+      codes.count(200) == 3 and len(masterserver._allocs) - ports_before == 3, f"{codes} ports +{len(masterserver._allocs) - ports_before}")
+req = urllib.request.Request(URL + "/announce", data=json.dumps({"id": "x1", "code": "C", "players": "many", "max": [1]}).encode(),
+                             headers={"Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=3) as r:
+        ann = r.status
+except urllib.error.HTTPError as e:
+    ann = e.code
+except OSError as e:
+    ann = repr(e)
+check("an announce with non-numeric players/max is answered", ann == 200, str(ann))
+with urllib.request.urlopen(URL + "/list", timeout=3) as r:
+    rows = json.loads(r.read())["servers"]
+check("the list shows the row but not its id (anyone could /leave or re-announce it)",
+      any(row.get("code") == "C" for row in rows) and not any("id" in row for row in rows), str(rows[:1]))
+
 srv.shutdown()
 print("FAILED: " + ", ".join(fails) if fails else "ALL OK")
 sys.exit(1 if fails else 0)

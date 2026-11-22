@@ -14,7 +14,7 @@ one without SbieDll.dll), or pass --pid.
 
     python tools\re\memwatch.py --out C:\path\memwatch.txt
 """
-import argparse, ctypes as C, ctypes.wintypes as W, os, sys, time, collections
+import argparse, ctypes as C, ctypes.wintypes as W, sys, time, collections
 
 k32 = C.windll.kernel32
 psapi = C.windll.psapi

@@ -127,7 +127,7 @@ local CM = { consByKey = {}, ticks = 10 }
 local K = { INSTANCE = "a", STRICT_OPS = { VBUY = true } }
 function CM.autoLoadFlags(words, n) return words end
 assert(load(VEH_SRC, "@vehicles.lua"))()(CM, K, function() end)
-local ok, cfg = pcall(buildVehConfig, { parts = PARTS, at = 100 })
+local ok, cfg = pcall(CM.buildVehConfig, { parts = PARTS, at = 100 })
 if not ok then return { err = tostring(cfg) } end
 local out = {}
 for i, tvp in ipairs(cfg.vehicles) do out[i] = tvp.part.reversed and 1 or 0 end

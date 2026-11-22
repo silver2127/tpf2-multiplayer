@@ -3,6 +3,7 @@
 #include "../src/target_order_linux.cpp"
 #include "../src/network_person_order_linux.cpp"
 #include <cassert>
+#include <initializer_list>
 #include <dlfcn.h>
 #include <thread>
 

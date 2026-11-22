@@ -118,6 +118,10 @@ bool SliceReadsOk();
 bool SliceRead(uintptr_t addr, void* out, size_t n);           // all n bytes, or false
 bool SliceReadable(uintptr_t addr, size_t n);                  // every page of the range is readable
 template <class T> inline bool SliceReadT(uintptr_t addr, T* out) { return SliceRead(addr, out, sizeof(T)); }
+// Many independent guarded reads, one process_vm_readv for up to 256 of them when
+// every one is readable. `ok` is each item's own SliceRead answer.
+struct SliceReadItem { uintptr_t addr; void* out; size_t n; bool ok; };
+void SliceReadMany(SliceReadItem* items, size_t count);
 
 // libstdc++ containers as the game lays them out (C-STL-1..4; our own libstdc++
 // has the same layout, which is what the off-game tests check against).
@@ -143,6 +147,11 @@ inline bool SliceReadStdString(uintptr_t obj, std::string* out)
 // number of `stride`, count <= maxCount and the element range readable.
 struct SliceVec { uintptr_t begin; size_t count; };
 bool SliceReadStdVector(uintptr_t obj, size_t stride, size_t maxCount, SliceVec* out);
+// The same checks without the readability pass, for a caller that reads one element
+// of a large vector through a guarded read anyway.
+bool SliceReadStdVectorShape(uintptr_t obj, size_t stride, size_t maxCount, SliceVec* out);
+// The shape checks on a header {begin, end, cap} already read from obj.
+bool SliceStdVectorFromHeader(uintptr_t obj, const uint64_t v[3], size_t stride, size_t maxCount, SliceVec* out);
 // std::map / std::set (_Rb_tree): header at obj+8, node_count at obj+0x28; a node
 // is {color, parent +8, left +0x10, right +0x18, value +0x20}. Visits values in key
 // order. Fails (after visiting what it reached) on an unreadable link, a count

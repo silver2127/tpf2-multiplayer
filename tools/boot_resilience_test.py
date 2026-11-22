@@ -90,6 +90,37 @@ check("module load failure: stdout names the module and says it is off",
       "require('mp.hash') failed" in r.out and "is OFF for this game" in r.out, r.out[-400:])
 check("module load failure: later modules are not attempted", "loading mp.io" not in r.out)
 
+
+# Reach the Fences adapter with other module factories stubbed. Exercise the
+# real game-script boot guard, including Linux's loader-provided environment.
+check("earlier boot failure skips Fences", "loading mp.fences_compat" not in r.out)
+for label, behavior, reason in (
+    ("missing module", "error('fences unavailable')", "fences unavailable"),
+    ("wrong export", "return false", "returned a boolean without bind"),
+    ("missing bind", "return {}", "returned a table without bind"),
+    ("invalid bind", "return {bind=true}", "without bind"),
+    ("bind error", "return {bind=function() error('fences bind failed') end}", "fences bind failed"),
+):
+    r = run(r'''
+local getenv = function(k)
+    if k == "LOCALAPPDATA" then return "/fixture/.local/share" end
+    if k == "TPF2MP_DATADIR" then return "/fixture/.local/share/tpf2mp/data/" end
+end
+os.getenv = getenv
+require = function(name)
+    if name == "mp/fences_compat" then
+''' + behavior + r'''
+    end
+    return function() return {} end
+end
+''')
+    check("Fences " + label + ": chunk completes with empty game script",
+          r.ok and r.hasData and r.dataType == "table" and r.dataFields == 0, r.err)
+    check("Fences " + label + ": diagnostic identifies failure",
+          "loading mp.fences_compat" in r.out and reason in r.out
+          and "is OFF for this game" in r.out, r.out[-400:])
+    check("Fences " + label + ": later modules skipped", "loading mp.stats" not in r.out)
+
 print()
 if fails:
     print(f"{len(fails)} FAILED")

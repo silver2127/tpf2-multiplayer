@@ -9,7 +9,7 @@ sdk=${TPF2MP_SDK_ROOT:-$HOME/.cache/tpf2mp/soldier-2.0.20260805.254767/root}
 mkdir -p "$build"
 printf '{ global: Tpf2mpPluginInit; local: *; };\n' > "$build/exports.map"
 bwrap --die-with-parent --unshare-pid --unshare-net --ro-bind "$sdk" / --proc /proc --dev /dev --tmpfs /tmp \
-  --ro-bind "$source_repo" /work --bind "$build" /build --chdir /work \
+  --ro-bind "$(dirname "$source_repo")" /work --bind "$build" /build --chdir "/work/$(basename "$source_repo")" \
   --setenv PATH /usr/bin:/bin --unsetenv LD_PRELOAD --unsetenv LD_LIBRARY_PATH \
   /bin/bash -ec 'cmake -S linux -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MODULE_LINKER_FLAGS=-Wl,--version-script=/build/exports.map; cmake --build /build --parallel 4; cd /build; ctest --output-on-failure'
 [ -f "$build/tpf2_bigmap.so" ]

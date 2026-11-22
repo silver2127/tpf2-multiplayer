@@ -2,6 +2,7 @@
 // network requests, save reads or game calls may occur in these tests.
 #include "../src/lobby_linux.cpp"
 #include <cassert>
+#include <dlfcn.h>
 
 static std::string fixtureSaveDir;
 static bool allowPlace=false;
@@ -38,9 +39,40 @@ static void Write(const std::string& path, const std::string& body)
     assert(fclose(f)==0);
 }
 
-int main()
+int main(int argc, char** argv)
 {
     using namespace lobby;
+    assert(argc==2 && BridgeProblem());
+    // File exists but has not been loaded: every entry path still refuses.
+    assert(access(argv[1],R_OK)==0);
+    for(bool join:{false,true})for(bool dedicated:{false,true}) {
+        StartRequest r;r.join=join;r.dedicated=dedicated;r.name="Fixture";r.code="ABCDEFGH";
+        std::string why;const auto gen=S().m.gen;
+        assert(!Start(r,&why) && why.find("tpf2_bridge_mp.so")!=std::string::npos);
+        assert(!S().m.active && S().m.gen==gen && S().q.empty());
+    }
+    void* bridge=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);assert(bridge && !BridgeProblem());
+    assert(dlclose(bridge)==0 && BridgeProblem());
+    bridge=dlopen(argv[1],RTLD_NOW|RTLD_LOCAL);assert(bridge && !BridgeProblem());
+    std::string list="{\"servers\":[";
+    for(int i=0;i<60;++i) { if(i)list+=",";list+="{\"code\":\"fixture-"+std::to_string(i)+"\",\"name\":\"Game\"}"; }
+    list+="]}";std::vector<PubRow> publicRows;std::string publicNote;
+    assert(ParsePublic(list,&publicRows,&publicNote));
+    assert(publicRows.size()==48 && publicRows.back().code=="fixture-47");
+    publicRows.clear();assert(!ParsePublic("invalid",&publicRows,&publicNote));
+    // Truncated escape sequences formerly overread the Windows public list.
+    for (const std::string tail : {"\\", "\\u", "\\u0", "\\u00", "\\u000"}) {
+        publicRows.clear();
+        assert(!ParsePublic("{\"servers\":[{\"name\":\"" + tail, &publicRows, &publicNote));
+        assert(publicRows.empty());
+    }
+    for (size_t length : {size_t(159), size_t(255), size_t(256)}) {
+        const std::string code(length, 'A');
+        publicRows.clear();
+        assert(ParsePublic("{\"servers\":[{\"code\":\"" + code + "\"}]}", &publicRows, &publicNote));
+        if (length <= 255) assert(publicRows.size() == 1 && publicRows[0].code == code);
+        else assert(publicRows.empty());
+    }
     S().m.active=true; g_childPid=123; g_gameUiSeen=false;
     OnMenuPage(2); assert(S().m.active && S().q.empty()); // waiting joiner
     OnGameUiFrame(); OnMenuPage(16); assert(S().m.active && S().q.empty()); // switch
@@ -75,6 +107,36 @@ int main()
     assert(unlink(path.c_str())==0);
 
     lobby::S().cfg.dataDir=dir;
+    // Nonce before the first successful ctl write, subsequent rewrites,
+    // malformed events and a fresh session all use the actual dispatcher.
+    S().child.gen=S().m.gen;
+    const std::string nonce(32, 'a'), nextNonce(32, 'b');
+    auto nonceEvent=[](const std::string& value) {
+        Dispatch("{\"type\":\"transport_lobby\",\"epoch\":\""+value+"\"}");
+    };
+    S().cfg.dataDir=dir+"missing/";
+    nonceEvent(nonce);
+    assert(S().m.transportLobby==nonce && S().ctlLast.empty());
+    S().cfg.dataDir=dir;
+    WriteBridgeCtl(true);
+    std::string ctl;
+    auto checkNonce=[&](const std::string& value) {
+        assert(ReadSmallFile(dir+"tpf2_bridge_ctl.txt", &ctl));
+        assert(ctl.find("lobby="+value+"\n")!=std::string::npos);
+    };
+    checkNonce(nonce);
+    S().m.speedReq="2"; WriteBridgeCtl(false); checkNonce(nonce);
+    for(const auto& bad : {std::string(), std::string(31,'a'), std::string(33,'a'),
+                          std::string(32,'A'), std::string(31,'a')+"\n"}) {
+        nonceEvent(bad); checkNonce(nonce);
+    }
+    nonceEvent(nextNonce); checkNonce(nextNonce);
+    nonceEvent(nextNonce); checkNonce(nextNonce);
+    ++S().m.gen; nonceEvent(nonce); checkNonce(nextNonce); // stale child
+    S().m=Model{}; S().child.gen=S().m.gen;
+    WriteBridgeCtl(true);
+    assert(ReadSmallFile(dir+"tpf2_bridge_ctl.txt", &ctl) && ctl.find("lobby=")==std::string::npos);
+
     lobby::g_inited=true; // Do not start the real worker or server browser.
     lobby::StartRequest request;
     request.name="Readiness test";
@@ -86,6 +148,22 @@ int main()
         assert(!why.empty() && lobby::S().q.empty() && lobby::S().m.gen==previous);
     }
     assert(SlicePublishReady(dir.c_str(),true));
+    for (const std::string code : {"76561198000000001", "https://steamcommunity.com/profiles/76561198000000001/"}) {
+        request.join=true;request.code=code;
+        assert(lobby::Start(request,&why));
+        assert(lobby::S().q.back().start.code=="76561198000000001");
+        lobby::S().q.clear();
+    }
+    for (const std::string code : {"https://steamcommunity.com/profiles/", "76561198000000001 --flag"}) {
+        request.join=true;request.code=code;
+        assert(!lobby::Start(request,&why) && lobby::S().q.empty());
+    }
+    lobby::S().child.gen=lobby::S().m.gen;
+    lobby::Dispatch("{\"type\":\"code\",\"code\":\"76561198000000001\",\"steam\":\"76561198000000001\",\"crossplay\":false}");
+    assert(lobby::S().m.hostSteam && !lobby::S().m.crossplay && lobby::S().q.empty());
+    lobby::Dispatch("{\"type\":\"code\",\"code\":\"ABCDEFGH\",\"steam\":\"76561198000000001\",\"crossplay\":true}");
+    assert(lobby::S().m.crossplay && lobby::S().m.code=="ABCDEFGH" && lobby::S().q.empty());
+    request.code="ABCDEFGH";
     for (bool join : {false, true}) {
         request.join=join; request.separateCompanies=true;
         assert(lobby::Start(request,&why));
@@ -142,6 +220,16 @@ int main()
     rosterLoading(R"json({"third":"catching up (12 s behind)"})json");
     assert(readLoading() == "b=third=catching up (12 s behind)\n");
     rosterLoading("{}"); assert(readLoading().empty());
+    // Windows regression: empty objects must not find names in later objects.
+    {
+        lobby::Json bounded;
+        assert(lobby::ParseJson(R"({"players":["host","joiner","third"],"host":"host","you":"joiner","relay":true,"stages":{},"companies":{},"letters":{"host":"z","joiner":"ac","third":"b"}})", &bounded));
+        lobby::ApplyRoster(bounded);
+        assert(readLoading().empty());
+        assert(model.companies == std::vector<int>({1,1,1}));
+        assert(model.letters == std::vector<std::string>({"z","ac","b"}));
+    }
+
     rosterLoading(R"({"third":"loading world"})");
     lobby::Json departed;
     assert(lobby::ParseJson(R"({"players":["host","joiner"]})", &departed));
@@ -259,6 +347,19 @@ int main()
     lobby::ApplyRoster(roster);
     assert(lobby::ReadSmallFile(dir+"mp_company_cfg.txt", &companyConfig));
     assert(companyConfig == "companies\n2\n1,2\na=1,b=2\n");
+    // Ordinary lobbies honor sticky letters even when a new name sorts first.
+    {
+        const auto saved = model;
+        assert(lobby::ParseJson(R"({"players":["aaron","host","joiner"],"you":"joiner","host":"host","mode":"companies","letters":{"aaron":"c","host":"a","joiner":"b"},"companies":{"aaron":3,"host":1,"joiner":2}})", &roster));
+        lobby::ApplyRoster(roster);
+        assert(!model.relay && OriginLetterFor(model,"joiner")=="b");
+        assert(OriginLetterFor(model,"aaron")=="c");
+        assert(ReadSmallFile(dir+"tpf2_bridge_ctl.txt", &ctl));
+        assert(ctl.find("instance=b\n")!=std::string::npos);
+        assert(ReadSmallFile(dir+"mp_company_cfg.txt", &companyConfig));
+        assert(companyConfig.find("c=3,a=1,b=2")!=std::string::npos);
+        model=saved;
+    }
     // A world switch consumes its transfer once and queues the engine's load.
     model.players={"host","joiner"}; model.companies={1,2}; model.you="joiner";
     model.isHost=false; model.saveReady=true; allowPlace=true;
@@ -293,6 +394,34 @@ int main()
     assert(lobby::S().q.back().line.find("advertise_mods")!=std::string::npos);
     model.startPending=true;assert(!lobby::SelectSave(dir+"chosen.sav").empty());
     assert(unlink((dir+"empty.sav").c_str())==0 && rmdir((dir+"directory.sav").c_str())==0);
+    // Closing is local: periodic wire progress cannot reopen a hidden resync.
+    {
+        const auto saved=model;const auto queued=queue.size();
+        lobby::Dispatch(R"({"type":"sync_state","phase":"transferring","operation":"hide-test"})");
+        model.recoveryRequestedAt=NowMs();
+        assert(lobby::RecoveryAction("sync_hide").empty());
+        for(int i=0;i<3;++i)lobby::Dispatch(R"({"type":"sync_state","phase":"transferring","operation":"hide-test"})");
+        lobby::Snapshot(&view);assert(view.recoveryHidden && view.recoveryPresent);
+        assert(model.recoveryOperation=="hide-test" && queue.size()==queued);
+        lobby::RecoveryAction("sync_show");assert(!model.recoveryHidden);
+        for(const char* event:{
+            R"({"type":"sync_state","phase":"error"})",
+            R"({"type":"sync_ready_state","phase":"waiting","is_ready":0})",
+            R"({"type":"sync_state","phase":"complete"})",
+            R"({"type":"sync_prompt","phase":"clear"})",
+            R"({"type":"sync_prompt","phase":"detected"})"}) {
+            model.recoveryHidden=true;lobby::Dispatch(event);assert(!model.recoveryHidden);
+        }
+        lobby::Dispatch(R"({"type":"sync_ready_state","phase":"waiting","is_ready":1})");
+        lobby::RecoveryAction("sync_hide");
+        lobby::Dispatch(R"({"type":"sync_ready_state","phase":"waiting","is_ready":1})");
+        assert(model.recoveryHidden && model.recoveryPresent);
+        for(const char* phase:{"manual","detected","unavailable"}) {
+            model.recoveryPhase=phase;model.recoveryPresent=true;model.recoveryRequestedAt=NowMs();
+            lobby::RecoveryAction("sync_hide");assert(!model.recoveryHidden && !model.recoveryPresent);
+        }
+        assert(queue.size()==queued);model=saved;
+    }
     // Recovery controls follow actual wire events, retain the readiness token,
     // reject duplicate/non-host requests, and allow another sync after success.
     model.active=true;model.dead=false;model.isHost=true;
@@ -314,7 +443,69 @@ int main()
     lobby::Dispatch(R"({"type":"sync_state","phase":"complete","operation":"operation-1"})");
     assert(!model.recoveryPresent && model.lobbyDone && !model.startPending);
     assert(lobby::RecoveryAction("sync_request")=="Request sent.");
+    {
+        const auto savedModel=model;const auto savedQueue=queue;
+        model.recoveryRequestedAt=0;model.recoveryPhase="detected";model.recoveryPresent=true;
+        assert(RecoveryAction("sync_dismiss").empty() && !model.recoveryPresent);
+        model.recoveryPhase="loading";model.recoveryPresent=true;
+        assert(!RecoveryAction("sync_dismiss").empty() && model.recoveryPresent);
+        model.recoveryPhase="detected";model.isHost=false;
+        assert(RecoveryAction("sync_decline")!="Request sent.");
+        model.isHost=true;assert(RecoveryAction("sync_decline")=="Request sent.");
+        assert(queue.back().line.find("sync_decline")!=std::string::npos);
+        model=savedModel;queue=savedQueue;
+    }
+    // Transfer details survive TCP handshakes, and clear on completion for either role.
+    Dispatch(R"({"type":"transfer","role":"recv","detail":"TCP 20 MiB/s","hint":"Allow TCP port 29471","pct":42})");
+    assert(S().m.transferDetail=="TCP 20 MiB/s" && S().m.transferHint=="Allow TCP port 29471");
+    Dispatch(R"({"type":"transfer","state":"tcp"})");
+    assert(S().m.transferDetail=="TCP 20 MiB/s");
+    Dispatch(R"({"type":"transfer","role":"recv","state":"done","pct":100})");
+    assert(S().m.transferDetail.empty() && S().m.transferHint.empty() && S().m.xfer.empty());
+    g_childPid=123;OnMenuPage(16);assert(g_loadingStagePending);
+    loadPercent=37;StageTick();assert(!g_loadingStagePending && S().stageSent=="loading world 37%");
+    lastStatus="stale transfer";S().stageNext=0;StageTick();assert(lastStatus=="loading world 37%");
+    g_childPid=0;loadPercent=-1;S().stageWatch=false;
     lobby::Dispatch(R"({"type":"mods_refresh"})");assert(modRefreshes==1);
+    // Restart selection uses real files and nanosecond mtimes, without a game.
+    saveTest=true;
+    const std::string restartDir = dir+"restart";
+    assert(mkdir(restartDir.c_str(), 0700)==0);
+    fixtureSaveDir=restartDir;
+    auto dated = [&](const char* name, long ns) {
+        const std::string file=restartDir+"/"+name;
+        Write(file,"save");
+        const timespec times[2]={{100,ns},{100,ns}};
+        assert(utimensat(AT_FDCWD,file.c_str(),times,0)==0);
+    };
+    newestSave.clear();
+    assert(DedicatedStartupSave("missing").empty());
+    dated("seed.sav",100);
+    assert(DedicatedStartupSave("seed")==restartDir+"/seed.sav");
+    dated("autosave_mp_shared_old.sav",90);
+    dated("autosave_mp_shared_equal.sav",100);
+    dated("autosave_unrelated.sav",900);
+    dated("mp_shared.sav",900);
+    dated("autosave_mp_shared_new.sav.lua",900);
+    dated("prefix_autosave_mp_shared.sav",900);
+    assert(mkdir((restartDir+"/autosave_mp_shared_dir.sav").c_str(),0700)==0);
+    assert(DedicatedStartupSave("seed")==restartDir+"/seed.sav");
+    dated("autosave_mp_shared_new.sav",101);
+    dated("autosave_mp_shared_newest.sav",102);
+    assert(DedicatedStartupSave("seed")==restartDir+"/autosave_mp_shared_newest.sav");
+    dated("seed.sav",103);
+    assert(DedicatedStartupSave("seed")==restartDir+"/seed.sav");
+    newestSave=restartDir+"/autosave_unrelated.sav";
+    assert(DedicatedStartupSave("missing")==newestSave);
+    assert(DedicatedStartupSave("")==newestSave);
+    for (const char* name : {"seed.sav", "autosave_mp_shared_old.sav",
+         "autosave_mp_shared_equal.sav", "autosave_unrelated.sav", "mp_shared.sav",
+         "autosave_mp_shared_new.sav.lua", "prefix_autosave_mp_shared.sav",
+         "autosave_mp_shared_new.sav", "autosave_mp_shared_newest.sav"})
+        assert(unlink((restartDir+"/"+name).c_str())==0);
+    assert(rmdir((restartDir+"/autosave_mp_shared_dir.sav").c_str())==0);
+    assert(rmdir(restartDir.c_str())==0);
+    fixtureSaveDir=dir; newestSave.clear();
     // Dedicated saves request a session hold, wait for its ack, then release
     // only after a newer save is stable. Recovery and failure paths also run.
     saveTest=true; S().cfg.dedicated.autosaveMinutes=1;
@@ -345,6 +536,53 @@ int main()
     DedicatedAutosaveTick(352000,1,lastSave); assert(DedSave().phase==0);
     assert(ReadSmallFile(dir+"tpf2_ded_autosave_done.txt",&marker) && marker=="timeout\n");
     for (const auto& name : {"new-auto.sav","tpf2_ded_autosave.txt","tpf2_ded_autosave_ack.txt","tpf2_ded_autosave_done.txt"}) unlink((dir+name).c_str());
+    // Live join: roster growth takes the existing autosave path; the dedicated
+    // waiting-member request uses that same watcher even without roster growth.
+    saveTest=true; forceAllowed=true; newestSave.clear(); nativeBusy=false;
+    S().syncAskedAt=0; S().sharedSave.clear();
+    model.isHost=true; model.lastCount=1; model.lobbyReady=true;
+    g_gameUiSeen=true; g_titleMenu=false;
+    Json live;
+    assert(ParseJson(R"({"players":["host","late"],"host":"host","you":"host","join_freeze":false})", &live));
+    const int beforeLive=savesForced;
+    ApplyRoster(live);
+    assert(!model.joinFreeze && savesForced==beforeLive+1 && S().syncAskedAt);
+    ApplyRoster(live); assert(savesForced==beforeLive+1);
+    S().syncAskedAt=0;
+    // The lobby's age-based refresh must bypass hot-join cached-save reuse,
+    // even when the simulation has barely advanced since the last share.
+    S().sharedSave=dir+"chosen.sav";
+    S().sharedUnpaused=S().unpausedMs;
+    Write(dir+"lobby_in.jsonl", "");
+    Write(dir+"tpf2_sync_save.txt", "fresh save\n");
+    OnMenuPage(2); // No world yet: the request must survive repeated polls.
+    for (int i=0; i<3; ++i) {
+        SyncPoll();
+        assert(Exists(dir+"tpf2_sync_save.txt"));
+        assert(savesForced==beforeLive+1 && !S().syncAskedAt);
+    }
+    OnMenuPage(16); // Loading page alone is not readiness.
+    SyncPoll();
+    assert(Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+1);
+    OnGameUiFrame();
+    SyncPoll();
+    assert(!Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+2 && S().syncAskedAt);
+    std::string refreshCommands;
+    assert(ReadSmallFile(dir+"lobby_in.jsonl", &refreshCommands));
+    assert(refreshCommands.find("\"cmd\":\"sync_taking\"")!=std::string::npos);
+    assert(refreshCommands.find("\"cmd\":\"start\"")==std::string::npos);
+    SyncPoll(); assert(savesForced==beforeLive+2);
+    Write(dir+"tpf2_sync_save.txt", "another joiner\n");
+    SyncPoll(); // The pending save still serves every joiner.
+    assert(!Exists(dir+"tpf2_sync_save.txt") && savesForced==beforeLive+2);
+    newestSave=dir+"live-auto.sav"; Write(newestSave,"live world");
+    SyncPoll(); SyncPoll();
+    assert(!S().syncAskedAt && S().sharedSave==newestSave);
+    std::string liveCommands;
+    assert(ReadSmallFile(dir+"lobby_in.jsonl", &liveCommands));
+    assert(liveCommands.find("\"cmd\":\"start\",\"save\":\""+newestSave+"\"")!=std::string::npos);
+    assert(!Exists(dir+"tpf2_native_request.txt"));
+    unlink(newestSave.c_str()); unlink((dir+"tpf2_sync_sent.txt").c_str());
     unlink((dir+"chosen.sav").c_str()); unlink((dir+"mp_company_cfg.txt").c_str());
     for (const auto& name : {"lobby_out.jsonl", "lobby_in.jsonl", "tpf2_bridge_ctl.txt"}) unlink((dir+name).c_str());
     unlink((dir+"lockstep_dash_"+letter+".txt").c_str());

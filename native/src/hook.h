@@ -24,3 +24,14 @@ bool InstallHook(uintptr_t target, void* detour, int stealBytes, void** trampoli
 // not ship: vulkan-1.dll comes with the graphics driver, and a fixed 15
 // split an instruction on a friend's loader (2026-09-10).
 int PrologueSteal(const unsigned char* code, int minBytes);
+
+// The same, but a RIP-relative memory operand is accepted: the offset (from
+// `code`) of each such instruction's disp32 goes to `fixups` (at most
+// `maxFixups`; their count to *nFixups). InstallHookRip copies the prologue
+// into a trampoline allocated within +-2 GB of the target and re-aims those
+// displacements at the same addresses. For a DLL whose prologue we do not
+// control: Wine's vkGetDeviceProcAddr opens with test byte [rip+x],8, and the
+// overlay was never hooked under CrossOver on macOS (2026-10-03).
+int PrologueStealRip(const unsigned char* code, int minBytes, int* fixups, int maxFixups, int* nFixups);
+bool InstallHookRip(uintptr_t target, void* detour, int stealBytes, const int* fixups, int nFixups,
+                    void** trampolineOut);

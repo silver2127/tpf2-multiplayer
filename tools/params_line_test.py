@@ -8,7 +8,7 @@ lua = LuaRuntime(unpack_returned_tuples=True)
 lua.globals().CONS = (scripts / 'cons.lua').read_text(encoding='utf-8')
 net = (scripts / 'net.lua').read_text(encoding='utf-8')
 lua.globals().NET = net
-lua.globals().CODEC = net[net.index('local function encodeCmd(c)'):net.index('function CM.scheduleLocal(op, args)')]
+lua.globals().CODEC = "local K = {}\n" + net[net.index('local function encodeCmd(c)'):net.index('function CM.scheduleLocal(op, args)')]
 lua.execute(r'''
 local logs = {}
 local CM = {ticks=1, queue={}, cmOriginCompany={}}

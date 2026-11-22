@@ -80,6 +80,6 @@ assert stn + 5 + rel == stn_t, f"station label call resolves to {stn + 5 + rel:x
 
 # style sheet class
 ss = (repo / "mod/mp_lockstep_1/res/config/style_sheet/mp_lockstep.lua").read_text(encoding="utf-8")
-assert '"!mpWinCo"' in ss and "0.30" in ss, "style sheet missing the !mpWinCoN translucent class"
+assert '"Window!mpWinCo"' in ss and "0.30" in ss, "style sheet missing the !mpWinCoN translucent class"
 
 print(f"windowcolor bytes: ok -- bind {bind:x} (9-byte push+sub prologue), station label call {stn:x} -> {stn_t:x}, !mpWinCoN defined")

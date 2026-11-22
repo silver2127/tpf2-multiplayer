@@ -10,6 +10,7 @@
 #include <chrono>
 #include <atomic>
 #include "trainorder.h"
+#include "flags_linux.h"
 
 namespace {
 uintptr_t gameBase;
@@ -30,10 +31,13 @@ uintptr_t NameComponent(uintptr_t world, int32_t id, int type)
         !SliceReadT(world + 0x80, &pools) || !pools ||
         !SliceReadT(pools + size_t(type) * 8, &pool) || !pool) return 0;
     SliceVec slots{};
-    if (!SliceReadStdVector(entities + size_t(id) * 24, 8, 4096, &slots)) return 0;
+    if (!SliceReadStdVectorShape(entities + size_t(id) * 24, 8, 4096, &slots)) return 0;
+    // All pairs in one guarded read, not one per pair (every road Add names each
+    // vehicle on the edge; 2026-09-27).
+    static thread_local int32_t pairs[4096][2];
+    if (slots.count && !SliceRead(slots.begin, pairs, slots.count * 8)) return 0;
     for (size_t i = 0; i < slots.count; ++i) {
-        int32_t pair[2];
-        if (!SliceRead(slots.begin + i * 8, pair, sizeof(pair))) return 0;
+        const int32_t* pair = pairs[i];
         if (pair[0] != type) continue;
         if (pair[1] < 0) return 0;
         uintptr_t data = 0;
@@ -53,6 +57,99 @@ uintptr_t NameComponent(uintptr_t world, int32_t id, int type)
 } // namespace
 uintptr_t SliceNameComponent(uintptr_t world, int32_t id, int type)
 { return NameComponent(world, id, type); }
+
+// NameComponent + SliceReadStdString(.., TRAINORDER_NAME_MAX) for every id, a level
+// at a time: each level is one SliceReadMany, so an edge of n vehicles costs a few
+// syscalls instead of ~8n (the road sort was 13% of the server's sim thread,
+// 2026-09-27). The world's pointers are read once; they do not move during the
+// engine call this runs inside. A name is empty exactly where the one-at-a-time
+// path fails.
+void SliceEntityNames(uintptr_t world, int type, const int32_t* ids, size_t n, std::vector<std::string>* names)
+{
+    names->resize(n);
+    for (auto& s : *names) s.clear();
+    if (!world || type < 0 || !n) return;
+    uintptr_t entities = 0, pools = 0, pool = 0;
+    if (!SliceReadT(world + 0x98, &entities) || !entities ||
+        !SliceReadT(world + 0x80, &pools) || !pools ||
+        !SliceReadT(pools + size_t(type) * 8, &pool) || !pool) return;
+    thread_local std::vector<SliceReadItem> items;
+    thread_local std::vector<uint64_t> headers;      // 3 words per entry
+    thread_local std::vector<SliceVec> slots;
+    thread_local std::vector<size_t> pairAt;          // entry -> first pair in `pairs`
+    thread_local std::vector<int32_t> pairs;
+    thread_local std::vector<uintptr_t> comp;
+    thread_local std::vector<char> text;              // TRAINORDER_NAME_MAX + 1 per entry
+    items.resize(n); headers.assign(n * 3, 0); slots.assign(n, SliceVec{}); comp.assign(n, 0);
+    // 1. each entity's slot vector header
+    for (size_t i = 0; i < n; ++i)
+        items[i] = { ids[i] < 0 ? 0 : entities + size_t(ids[i]) * 24, &headers[i * 3], ids[i] < 0 ? 0u : 24u, false };
+    SliceReadMany(items.data(), n);
+    size_t total = 0;
+    pairAt.assign(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (ids[i] < 0 || !items[i].ok ||
+            !SliceStdVectorFromHeader(items[i].addr, &headers[i * 3], 8, 4096, &slots[i])) { slots[i] = {}; continue; }
+        pairAt[i] = total; total += slots[i].count * 2;
+    }
+    // 2. their {type, slot} pairs
+    pairs.assign(total, 0);
+    for (size_t i = 0; i < n; ++i)
+        items[i] = { slots[i].begin, pairs.data() + pairAt[i], slots[i].count * 8, false };
+    SliceReadMany(items.data(), n);
+    uintptr_t data = 0, pages = 0;
+    bool dataRead = false, dataOk = false, pagesRead = false, pagesOk = false;
+    thread_local std::vector<uint32_t> paged;         // entries whose data pointer is on a page
+    paged.clear();
+    for (size_t i = 0; i < n; ++i) {
+        if (!slots[i].count || !items[i].ok) continue;
+        for (size_t k = 0; k < slots[i].count; ++k) {
+            const int32_t* pair = &pairs[pairAt[i] + k * 2];
+            if (pair[0] != type) continue;
+            if (pair[1] < 0) break;
+            if (pair[1] < 0x40000000) {
+                if (!dataRead) { dataRead = true; dataOk = SliceReadT(pool + 0xb8, &data) && data; }
+                if (dataOk) comp[i] = data + size_t(pair[1]) * 32;
+            } else {
+                if (!pagesRead) { pagesRead = true; pagesOk = SliceReadT(pool + 0xd0, &pages) && pages; }
+                if (pagesOk) { comp[i] = uint32_t(pair[1]) - 0x40000000u; paged.push_back(uint32_t(i)); }
+            }
+            break;
+        }
+    }
+    // 2b. the page each paged entry's data sits on
+    if (!paged.empty()) {
+        thread_local std::vector<uintptr_t> pageData;
+        pageData.assign(paged.size(), 0);
+        for (size_t j = 0; j < paged.size(); ++j)
+            items[j] = { pages + size_t(comp[paged[j]] / 32) * 16, &pageData[j], 8, false };
+        SliceReadMany(items.data(), paged.size());
+        for (size_t j = 0; j < paged.size(); ++j) {
+            const size_t i = paged[j];
+            comp[i] = items[j].ok && pageData[j] ? pageData[j] + size_t(comp[i] % 32) * 32 : 0;
+        }
+    }
+    // 3. the std::string headers {p, len, capacity}
+    headers.assign(n * 3, 0);
+    for (size_t i = 0; i < n; ++i) items[i] = { comp[i], &headers[i * 3], comp[i] ? 24u : 0u, false };
+    SliceReadMany(items.data(), n);
+    // 4. the bytes, with their terminator
+    const size_t cap = TRAINORDER_NAME_MAX + 1;
+    if (text.size() < n * cap) text.resize(n * cap);   // each read brings its own terminator
+    for (size_t i = 0; i < n; ++i) {
+        const uintptr_t obj = comp[i], p = headers[i * 3];
+        const size_t len = size_t(headers[i * 3 + 1]);
+        bool shape = obj && items[i].ok && len <= TRAINORDER_NAME_MAX && len < cap;
+        if (shape) shape = p == obj + 16 ? len <= 15 : (p && headers[i * 3 + 2] >= len);
+        items[i] = { shape ? p : 0, &text[i * cap], shape ? len + 1 : 0, false };
+    }
+    SliceReadMany(items.data(), n);
+    for (size_t i = 0; i < n; ++i) {
+        if (!items[i].n || !items[i].ok) continue;
+        const size_t len = items[i].n - 1;
+        if (text[i * cap + len] == 0) (*names)[i].assign(&text[i * cap], len);
+    }
+}
 namespace {
 
 // All allocation and sorting is private. Refusal leaves the engine array
@@ -106,22 +203,7 @@ bool Arrange(int32_t* begin, int32_t* end, uintptr_t self, uintptr_t world,
     } catch (...) { return false; } // only our own allocations; no foreign calls
 }
 
-bool Disabled(const char* root, const char* data)
-{
-    for (const char* dir : {root, data}) {
-        if (!dir || !*dir) continue;
-        char path[4096];
-        const int len = snprintf(path, sizeof(path), "%s/tpf2_menu_flags.txt", dir);
-        if (len < 0 || size_t(len) >= sizeof(path)) continue;
-        FILE* f = fopen(path, "r");
-        if (!f) continue;
-        char line[256]; bool off = false;
-        while (fgets(line, sizeof(line), f)) if (!strncmp(line, "trainorder=0", 12)) off = true;
-        fclose(f);
-        return off; // root file takes precedence, just like Windows
-    }
-    return false;
-}
+
 }
 
 // The relay tail-jumps here, retaining the game's original return address and
@@ -172,7 +254,7 @@ asm(".text\n.hidden SliceTrainOrderRelay\n.type SliceTrainOrderRelay,@function\n
 
 bool SliceInstallTrainOrder(uintptr_t base, const char* rootDir, const char* dataDir)
 {
-    if (Disabled(rootDir, dataDir)) {
+    if (SliceFlagOff(rootDir, dataDir, "trainorder")) {
         SliceLog("[trainorder] OFF (trainorder=0); engine registration-order shuffle retained\n");
         return true;
     }

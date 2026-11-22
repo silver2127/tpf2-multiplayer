@@ -165,20 +165,44 @@ Game frames are best-effort in the lobby layer. Above it:
 
 Players can play one shared company (co-op, the default) or separate companies on the same map.
 
-- **Assignment.** Each player picks a company chip in the lobby. At START the menu DLL writes
-  `mp_company_cfg.txt`: the mode (`companies` when more than one chip is in use), this player's
-  company, the roster, and the letter-to-company map. The map is authoritative: an incoming
-  command's company is taken from it, not from the sender.
-- **Engine players.** Each other company is a real engine player (`game.interface.addPlayer`) with
-  its own wallet. Commands carry their company; builds are reassigned to the company's player
-  (`setPlayer`, and locked against other companies' bulldozers), their cost is moved with journal
-  entries, vehicles are bought as the company's player, new lines and loans are attributed to it.
-- **In game.** The Multiplayer window's companies block can create a company, switch to another
-  (with an optional password, compared as a salted hash), and set a password. `CMNEW`, `CMSWITCH`,
-  `CMPW` and `CMDEL` apply at the stamp on every instance. Switching swaps the owned entities and
-  wallets between the human player and the company's engine player on your machine.
-- **Saved state.** The mode, roster, letter map, passwords and engine player ids ride in the save
-  (the mod's `save()`/`load()`), so a reloaded session keeps its companies.
+`res/scripts/mp/companies.lua` keeps ONE registry every machine agrees on (rewritten 2026-09-27;
+the header of that file has the rules).
+
+- **The registry** knows every company (name, colour, vehicle paint, password hash, station access,
+  founder), which player belongs to which company, and which lobby letter each player has in this
+  session. Only company commands change it, at their stamp, in stamp order, from registry state
+  alone -- never from a local file, a heartbeat or a wallet reading.
+- **Players, not letters.** A player is its SteamID64 (the bridge's `tpf2_steam.txt`), else its
+  lobby name. Each game announces itself once it is live with `CMJOIN key name want lm` (`want` and
+  `lm` are its lobby chip and mode from `mp_company_cfg.txt`); the stamp decides its company: the
+  one it belonged to, else (an older save) one claimed from the save, else a new company or, when
+  its chip matches another present player's, that player's. Until its own `CMJOIN` has landed a
+  game holds its actions (the inject file is left unread). A player who left the lobby is let go
+  with `CMLEAVE`.
+- **Attribution at the stamp.** `execute` asks `CM.cmAttribute`: a command's company is its
+  origin player's company in the registry at that stamp. The sender's own stamp is only the
+  fallback for an origin that has not joined.
+- **Engine players.** Each company is an engine player entity; entity ids are per machine
+  (`CM.cmCompanyPid`). Company 1 of a new world is the world's own player (the starting money);
+  other companies are `addPlayer()` entities. The company this machine plays is its human entity;
+  a switch swaps assets and wallets between the two (the hotseat). Builds, purchases, lines and
+  loans are attributed to the company's player; costs paid by the local player are moved with
+  journal entries.
+- **In game.** The COMPANIES tab (`companies_gui.lua`, GUI state) reads the sim's `co=` dash lines
+  and writes requests into the inject file; `CM.cmRequest` hashes passwords and schedules
+  `CMNEW`, `CMSWITCH`, `CMDEL` (with the company that takes over), `CMNAME`, `CMCOLOR` (colour,
+  vehicle paint), `CMPW` and `CMOPEN`. A company's id is chosen at the stamp.
+- **Colours.** A company's colour is one number: 1..200 a palette index (older saves), or
+  `CM_RGB` (0x1000000) + 0xRRGGBB for a colour picked freely. The paint, the vehicle icons (the
+  perms file's RRGGBB) and the minimap draw it exactly. Station icons and foreign windows are
+  styled by class, and classes are fixed when the game starts: they draw the nearest of 326
+  (`!mpCo1..326`: the palette, then the picker's 24 hues x 5 shades and 6 greys, built alike in
+  `companies.lua` and the style sheet, checked by `tools/company_color_test.py`). A colour
+  closer than `CM_COLOR_NEAR` (redmean distance) to another company's is refused at the stamp.
+- **Saved state.** The registry (v2) and this machine's entity map ride in the save. Letters are
+  kept only when the lobby still puts the same player on them (a hot join). A v1 save is migrated:
+  its companies as they were, its players claimed as they join (the host takes the save's own
+  company).
 
 ## Files
 
@@ -197,7 +221,10 @@ All runtime files are in the data folder, `%LOCALAPPDATA%\tpf2mp\data\` (the env
 | `tpf2mp_dash.txt` | menu (Ctrl+Shift+D) | mod's window | show or hide the window |
 | `tpf2_speed.txt` | mod | bridge | fractional speed target |
 | `tpf2_sync_save.txt`, `tpf2_sync_sent.txt` | mod / menu | menu / mod | the hot-join save handshake |
-| `mp_company_cfg.txt` | menu, at START | mod | company assignment |
+| `mp_company_cfg.txt` | menu, at START | mod | the lobby's mode and this player's company chip (what its `CMJOIN` asks for) |
+| `mp_company_perms.txt` | mod | slice | `pid <entity> <company> <style class> <RRGGBB>` per company, `me <entity>`, `open <company> <*|-|ids>`: the tints and the station gate |
+| `mp_company_map.txt` | mod | other mods (Big Maps minimap) | `me=<company>`, then `<company>=<entity>=<name>=<style class>=<RRGGBB>` |
+| `tpf2_steam.txt` | bridge | mod | this machine's SteamID64: the player key in `CMJOIN` |
 | `mp_company_<L>.log` | mod | people | companies, crossing and plan decisions |
 | `tpf2_bridge.log` | bridge | people; forwarded to the host's merged lobby log | connection events and every line sent and received (first 200 characters) |
 | `tpf2_slice.log` | slice | people | captures, decodes, cancels |

@@ -18,7 +18,6 @@ rxHistRange/nackScan/rxGaps/histServe through that sequence and checks:
     python tools/live_catchup_gap_test.py
 """
 import os
-import sys
 
 # The harness (runtime/check/lua_list) lives in hist_retention_test.py, whose module body
 # runs its own checks and ends with SystemExit: take its definitions only.

@@ -255,7 +255,35 @@ void AbiTests(uintptr_t base,unsigned char* code) {
     std::printf("person map: %zu real-shim GP/XMM/flags/MXCSR/RSP checks passed\n",checked);
 }
 int main(){
+    // Each child evaluates the cached startup environment independently.
+    for (const char* value : {static_cast<const char*>(nullptr), "", "1", "0", "00", "false"}) {
+        const pid_t child=fork(); assert(child>=0);
+        if (!child) {
+            if(value) setenv("TPF2MP_ORDER_CANON",value,1); else unsetenv("TPF2MP_ORDER_CANON");
+            tpf2mp_order_detail::active=false; assert(!CanonicalMaps());
+            tpf2mp_order_detail::active=true;
+            assert(CanonicalMaps()==(!value || std::strcmp(value,"0")));
+            if (CanonicalMaps()) {
+                FakeData d; d.Begin();
+                for(auto id:{9u,2u,8u,1u,5u}) d.Add(0,id);
+                assert((Walk(d,0)==std::vector<uint32_t>{1,2,5,8,9}));
+            }
+            tpf2mp_order_detail::active=false; assert(!CanonicalMaps());
+            _exit(0);
+        }
+        int status=0; assert(waitpid(child,&status,0)==child);
+        assert(WIFEXITED(status) && WEXITSTATUS(status)==0);
+    }
+    setenv("TPF2MP_ORDER_CANON","1",1);
+    tpf2mp_order_detail::active=true;
     ModelTests();LifetimeTests();assert(!g_mapOwners);
+    for(size_t group=0;group<5;++group) {
+        FakeData d;d.Begin();
+        for(auto id:{9u,2u,8u,1u,5u})d.Add(group,id);
+        const auto original=d.nodes;
+        assert((Walk(d,group)==std::vector<uint32_t>{1,2,5,8,9}));
+        assert(d.nodes==original); // sorted sidecar does not mutate bucket/list structure
+    }
     const size_t size=0x2e80000;void* image=mmap(nullptr,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(image!=MAP_FAILED);
     const auto base=reinterpret_cast<uintptr_t>(image);RestoreImage(base);assert(!mprotect(image,size,PROT_READ|PROT_EXEC));
     InstallerTests(base);void* code=mmap(nullptr,4096,PROT_READ|PROT_EXEC,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(code!=MAP_FAILED);

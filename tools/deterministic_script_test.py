@@ -66,11 +66,14 @@ print('PASS: globals restored and same-step reload does not repeat update')
 
 # Test generic wrapper behavior independently of NTG's reseeding on town creation.
 a.execute('''
-    local draws = {}
+    local draws, loads = {}, 0
     local basic = {
         update=function() draws[#draws+1] = math.random(1,1000000) end,
         save=function() return {value=42} end,
-        load=function(s) assert(s.value == 42 and s.__tpf2mp_deterministic_v1 == nil) end,
+        load=function(s)
+            loads = loads + 1
+            assert(s.value == 42 and s.__tpf2mp_deterministic_v1 == nil)
+        end,
         guiUpdate=function() return os.time() end,
     }
     local x = compat.wrap(basic, 'test')
@@ -85,8 +88,40 @@ a.execute('''
     -- A different script cannot consume this one's saved random stream.
     local z = compat.wrap(basic, 'other')
     sim=1002; z.update(); z.update()
-    y.load(saved); sim=1001; y.update()
+    -- a real reload puts the world's clock back first (the save's time)
+    sim=1000; y.load(saved); sim=1001; y.update()
     assert(draws[#draws] == expected)
+    -- NEVER A REWIND: an older state arriving while this world runs on (the
+    -- engine's per-frame sync from its other script copy) is ignored ...
+    sim=1005; y.update()
+    local ahead = y.save().__tpf2mp_deterministic_v1
+    local loadsBefore = loads
+    y.load(saved)                                   -- clock 1000, ours 1005, the world at 1005
+    local after = y.save().__tpf2mp_deterministic_v1
+    assert(after.lastUpdate == ahead.lastUpdate and after.seed == ahead.seed)
+    assert(loads == loadsBefore)                     -- payload did not roll back either
+    -- Same clock, different RNG: bypass the exact-echo shortcut as another
+    -- engine copy would, and exercise the equality boundary of the guard.
+    local sameTick = y.save()
+    sameTick.__tpf2mp_deterministic_v1.seed = ahead.seed == 1 and 2 or 1
+    y.load(sameTick)
+    assert(loads == loadsBefore)
+    assert(y.save().__tpf2mp_deterministic_v1.seed == ahead.seed)
+    sim=1006; y.update()
+    local n = #draws
+    sim=1006; y.update()
+    assert(#draws == n)                              -- 1006 ran once: the stale load did not rewind the grid
+    -- ... and a NEWER state (the other copy ran ahead) is still taken
+    local w = compat.wrap(basic, 'test')
+    sim=1010; w.update()
+    local newer = w.save()                           -- clock 1010
+    y.load(newer)
+    assert(loads == loadsBefore + 1)
+    local restored = y.save().__tpf2mp_deterministic_v1
+    assert(restored.lastUpdate == 1010 and restored.seed == newer.__tpf2mp_deterministic_v1.seed)
+    local before = #draws
+    sim=1010; y.update()
+    assert(#draws == before)                         -- 1010 already done by the newer state
     local broken = compat.wrap({update=function() error('intentional failure') end}, 'broken')
     assert(not pcall(broken.update))
     assert(math.random == originalRandom and os.time == originalTime)

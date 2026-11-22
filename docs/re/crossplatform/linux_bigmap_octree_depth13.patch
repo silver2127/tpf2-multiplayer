@@ -1,0 +1,871 @@
+diff --git a/bigmap/docs/linux/INSTALL.md b/bigmap/docs/linux/INSTALL.md
+index ff69e9d..8febe67 100644
+--- a/bigmap/docs/linux/INSTALL.md
++++ b/bigmap/docs/linux/INSTALL.md
+@@ -41,10 +41,15 @@ not eliminate the peak memory needed while loading or generating a world.
+ - Experimental lossless terrain compression using Linux userfaultfd, on by default.
+ - Byte/build guards and a shared host that coexists with native multiplayer.
+ 
+-Depth 12/13 (1024/2048-tile edges), material compression, terrain copy sharing,
+-generation buffer reuse and the remaining renderer optimizations are not ported
+-in this build. Do not use the Windows configuration: its depth-13
+-setting is rejected explicitly. See PORT.md for evidence and validation limits.
++- Experimental octree depth 12/13 (`octree_depth=12` or `13`), the same root,
++  depth and node-ID scheme as the Windows plugin, so a Linux server can match
++  Windows players' depth. Default remains 11. Offline-validated only; see
++  PORT.md, "Octree depth 12/13". `max_tiles` may then exceed 512, but the
++  diagonal bound above still limits the Linux menu to about 720-tile edges.
++
++Material compression, terrain copy sharing, generation buffer reuse and the
++remaining renderer optimizations are not ported in this build. Do not copy the
++Windows configuration file wholesale. See PORT.md for evidence and validation limits.
+ 
+ ## Sparse density presets
+ 
+diff --git a/bigmap/docs/linux/PORT.md b/bigmap/docs/linux/PORT.md
+index a5dfa80..50aa8be 100644
+--- a/bigmap/docs/linux/PORT.md
++++ b/bigmap/docs/linux/PORT.md
+@@ -62,7 +62,8 @@ The Linux port covers large-map creation through depth 11, sparse density preset
+ lossless terrain compression, faster saves and a SIMD terrain min/max scan.
+ It is not full Windows 0.4.0 feature parity. Material paging, terrain copy sharing,
+ generation buffer reuse, placement budgets, material-index/refinement/alignment
+-optimizations and depth-12/13 hooks still need independent Linux work.
++optimizations still need independent Linux work. Depth 12/13 is ported
++(experimental); see "Octree depth 12/13" below.
+ The configured maximum has not been stress-tested; this is an experimental build.
+ 
+ The isolated native game reached New Game with the shared host alone. The
+@@ -295,7 +296,7 @@ RSS load peak was observed.
+ | Terrain COW/dedup | Existing native detached allocation cf7783 and control disposal cf7bb0 reviewed; detached-copy hardware probe armed, never hit | identical live tile pairs, write privatization, full lifetime |
+ | Small pager | Windows variable blocks contrasted with native CreateTileBlock da3010 and 88-byte gathered records; software breakpoint armed in first GDB attempt, startup trap prevented reaching it | variable allocation/free ownership and useful size distribution |
+ | Instance shrink | Windows thin/fat relocation constraints reviewed; native a85590 anchored by ModelInstanceList replica-copy assertion; hardware probe armed, never hit | actual publication/move site and embedded-vector ownership; replica copy is not publication |
+-| Depth 12/13 | Kept gated on preceding work; existing a84234 depth-11 site inspected in live mapped image, first software probe never reached | preceding memory work and wider placement contracts |
++| Depth 12/13 | Kept gated on preceding work at the time; existing a84234 depth-11 site inspected in live mapped image, first software probe never reached. Since ported offline, see "Octree depth 12/13" | live load, renderer, save/reload, multiplayer |
+ 
+ The supplied pristine save was only `mp_multi_company.sav` (~34 MiB);
+ NewMPSAVE was absent. No map could be loaded or generated, and no two-instance
+@@ -358,3 +359,117 @@ no save was loaded. Evidence: job `tpf2-multiplayer-dev-ea35eb8a3b-20260922-2106
+ `meta/live/` (launch logs, actor logs/data, restoration and build records).
+ Loaded-big-map throughput and memory behavior still require a working lab
+ Steam session; implementation completeness is not performance acceptance.
++
++## Octree depth 12/13 (experimental)
++
++Linux counterpart of `bigmap/src/octree_depth12.h` and
++[`../octree-depth12.md`](../octree-depth12.md). Configure `octree=1` and
++`octree_depth=12` or `13`; the default stays 11. The Linux plugin writes the
++same root (+-2^(depth+5) m: 131,072 m at 12, 262,144 m at 13), the same depth
++and the same compact node-ID scheme as Windows, so a Linux server can run the
++depth Windows players use. Every peer still needs the same depth.
++Offline evidence only: no live load, renderer, save/reload or multiplayer run.
++
++### How the Linux sites were found
++
++The ELF is stripped of game symbols, but asserts keep `__PRETTY_FUNCTION__`
++strings. Every string mentioning `Octree` was cross-referenced (RIP-relative
++displacements) to the functions using it, then matched to the Windows sites by
++role, call graph and instruction shape. Function bounds come from `.eh_frame_hdr`.
++
++| Windows (Steam 35924) | Linux RVA | Match evidence | Patched |
++| --- | --- | --- | --- |
++| `0x2304f8` root/depth site (>128-tile tier) | `0xa84234` | already ported for depth 11: `movss xmm0,[rip+0x3407c48]` (32768.0f); `mov esi,0xa`; `call 0x16a6580` | yes, depth 12/13 value |
++| `0xa51b00` `Octree::Resize` | `0x16a6580` | assert `void Octree<Data>::Resize(const Box3&, int) [with Data = ecs::OctreeSystemNode]` / `m_root == nullptr`; stores bounds at +8..+0x1c, depth at +0x20, root at +0x28; no maximum-depth test | no |
++| `0xa50c20` find node (starts the descent) | callers `0x16a7e4e`, `0x16a9935`, `0x16a9bff` | each passes `esi=0` (no parent), `edx=0` (ID 0), `r9d=[octree+0x20]` (depth), the root box and `&octree->root` | no |
++| `0xa507e0` recursive descent | `0x16aa040` (loop) | the only function allocating `0xa8`-byte nodes that also computes `lea r13d,[r15+r13*8+1]` (child = 8*parent+1+octant); stores the ID at node+8, parent at +0, loose box at +0xc..+0x20, children (0x40-byte array) at +0xa0. GCC inlined the recursion into a loop; stop test `extent > 0.5*width`, as Windows | yes, child step `0x16aa190` |
++| `0x853d10` skip query / inlined `CalcOctreeLevel(int)` `0x853d30` | `0x13ec500` / loop `0x13ec528..0x13ec555` | assert `int {anonymous}::CalcOctreeLevel(int)` in `OctreeSkipManager.cpp` (only xref); `test esi,esi; js assert`, then the 32-bit threshold loop; level in `r14d`. A scan of all of `.text` for short backward loops using `shl ...,3`/`*8` with `add` and `cmp` finds this one loop only | yes, `0x13ec530` |
++| `0xa503e0` level from box width and depth | `0x16a6620` | identical shape: `[rdi+0x20]-1`, `[rdi+0x14]-[rdi+8]`, `1<<cl` divide loop | no |
++| `0x852940` skip-manager level vector | `0x13ee4b0` -> `0x13f09b0` | calls `0x16a6620` at `0x13ef65e`/`0x13ef9d5`, then `0x13f09b0` resizes the 24-byte-element vector to level+1; the query `0x13ec500` compares the level against that vector's size before indexing | no |
++| `0xa4ffa0` `DoesNodeChange` (movement) | `0x16a6690` | assert `bool ecs::OctreeSystem::DoesNodeChange(...)`; compares the node's loose box only, never the ID | no |
++| `0xa50fb0` remove / `RemoveNodeFromParent` | `0x16a9400` | asserts `RemoveNodeFromParent()` and `ecs::OctreeSystem::Remove(...)`; unlinks by scanning the parent's eight child pointers (+0xa0, 0x40 bytes) | no |
++| `0xa51c00` `VisitStaticNodes` | `0x16a6a70` | assert `VisitStaticNodes(ecs::Entity, std::vector<int>&)`; pushes `[node+8]` up the parent chain into `vector<int>`; only callers `0x13ecb90`, `0x13ed960` (skip manager) | no |
++| renderer skip use / visit (`0x2c1260`, `0x2bd590`) | `CRenderer::NewUpdate` lambdas (`0xc4e3d0`, `0xc5efe0`, ...) | typed as `unordered_set<int>` / `vector<int>` in their mangled names; 32-bit IDs, no level arithmetic | no |
++| heightmap INT_MAX bound (menu) | `Fits`/`Bound`/`Shape` | already present; Linux additionally keeps the heightmap-pixel diagonal squared below INT_MAX (placement distance not widened on Linux) | no change |
++
++The magic numbers 0x49249249/0x09249249 occur in `.text` only inside
++division-by-7 and `vector::max_size` constants, not as level thresholds.
++
++### Patched bytes
++
++Child step, `0x16aa190` (20 bytes; reached by fall-through and from
++`0x16aa488`/`0x16aa4cb`, no branch lands inside it):
++
++    478d6cef01   lea r13d,[r15+r13*8+1]
++    4d63ff       movsxd r15,r15d
++    4889c6       mov rsi,rax
++    4a8d1cfa     lea rbx,[rdx+r15*8]
++    e9e8feffff   jmp 0x16aa08c            ; loop head: rax=[rbx], allocate if null
++
++becomes `jmp [rip+0]; dq stub` plus six NOPs. The stub replays the three stock
++moves, then chooses `r13d` exactly as Windows `Depth12Id`: parent ID (read from
++`[rax+8]`) below 0x09249249 -> stock `8*r13d+1+octant`; parent in level 10
++(<= 0x49249248) -> bank 0, parent in 0x50000000..0x5fffffff -> bank 1, anything
++else or `r9d < 1` -> `ud2`; an existing child keeps its stored ID; otherwise
++`lock xadd` on the bank counter (starting 0x4fffffff / 0x5fffffff), `ud2` on
++reaching 0x60000000 / 0x70000000. It returns to `0x16aa08c` by absolute jump.
++Registers: `edi` (the loop's "created" flag), `r8`, `r9`, `r12`, `r14` and all
++XMM registers are untouched; it uses `rcx`, `rdx`, `r10`, `r11` and flags, all
++dead at the loop head (the next use of each is a write or a call).
++
++Level decoder, `0x13ec530` (37 bytes, after `test esi,esi; js assert`):
++
++    4989d4 41be00000000 b901000000 ba01000000   mov r12,rdx; r14d=0; ecx=1; edx=1
++    7410 0f1f00                                 je +16 (flags of the test); nop
++    c1e203 4183c601 01d1 39ce 7df3              shl edx,3; inc r14d; add ecx,edx; cmp; jge
++
++becomes `jmp [rip+0]; dq stub` plus NOPs. The stub: `esi >= 0x50000000`
++(unsigned) -> `mov r12,rdx; r14d=(esi>>28)+6`; otherwise `test esi,esi` (to
++recreate the flags the copied `je` reads) and the 37 stock bytes unchanged,
++then jump back to `0x13ec555`. `ecx`/`edx` and flags are dead there.
++
++Root: the existing site gets `patch[9]=depth` and a private float
++`2^(depth+5)`; at depth 11 it is exactly the previous 65536/11 patch.
++
++### Installation contract
++
++Invalid `octree_depth` (anything but 11..13) -> `TPF2MP_ERR_FAILED`, nothing
++written. Depth 14+ is unsupported, as on Windows. There is no Linux GOG build;
++the host's build-id check is the equivalent refusal (`TPF2MP_ERR_BUILD`, no
++writes). At depth 12/13 both ID sites are verified before the root; any
++mismatch refuses the depth with nothing written (`TPF2MP_ERR_BUILD`). Patches
++are published child, level, root: the root/depth change is last. A failed
++write rolls back every site, including both ID sites. At depth 11 the ID sites
++are neither read nor written, so the published bytes are unchanged.
++`octree=0` ignores the depth, as on Windows. `max_tiles` is capped at
++512/1024/2048 for depth 11/12/13; the Linux heightmap diagonal bound still
++applies, so the Linux menu offers at most about 720-tile edges (2048x64 ->
++720x64, square 510x512).
++
++### Validation
++
++- `tools/linux/test_octree_depth_elf.py GAME_ELF` (Unicorn; read-only): checks
++  the build-id and all three sites, that each ID site's bytes occur once in
++  `.text`, then runs the ORIGINAL Linux descent loop `0x16aa040` with the
++  header's site patch and stub (only operator new stubbed) and the original
++  decoder `0x13ec528..0x13ec555`. Depth 13 creates 1,620 nodes and depth 12
++  1,462 from 158 positions each -- the same counts as the Windows emulation --
++  with unique positive IDs, decoded level equal to the parent-chain level,
++  128 m tight / 256 m loose leaves, internal level-11 nodes (512 m loose) for
++  200 m objects, and reinsertion keeping node identity. The unpatched stock
++  overflow is reproduced; levels 0..10 keep their stock IDs; at depths 10 and
++  11 the patched loop produces IDs identical to the stock loop. Decoder
++  boundaries match stock for levels 0..10 and give 11/12 for both compact banks.
++  Mutating the stub's stock branch or the decoder's `+6` makes it fail.
++- `test_bigmap` (CTest) runs both stubs natively through the loop's register
++  contract (`tests/town_stub.S` harness) against a C++ copy of Windows
++  `Depth12Id`, including counter state, existing children, exhaustion and
++  refusals (forked child must die with SIGILL), and checks the installer:
++  refused depths, mismatches at each site, build refusal, root-last order,
++  rollback, the private extents, stub back-links and caps.
++- `verify_game.py` covers the two new sites (29 total).
++
++Not validated: live world generation or load, a world wider than +-131,072 m,
++renderer culling, save/reload, vehicles crossing the old root boundary, and a
++Linux/Windows multiplayer session at depth 12/13. Before relying on it, repeat
++the live checklist in `../octree-depth12.md` on Linux.
+diff --git a/bigmap/linux/bigmap_linux.cpp b/bigmap/linux/bigmap_linux.cpp
+index c28209d..88565b9 100644
+--- a/bigmap/linux/bigmap_linux.cpp
++++ b/bigmap/linux/bigmap_linux.cpp
+@@ -13,6 +13,7 @@
+ #include "terrain_pager.h"
+ #include "alignment_batch.h"
+ #include "memory_budget.h"
++#include "octree_depth.h"
+ 
+ extern "C" void TerrainMinMaxBridge();
+ extern "C" void* bigmap_minmax_return;
+@@ -28,6 +29,9 @@ constexpr uint8_t SizeBytes[] = {0x55,0x48,0x89,0xe5,0x41,0x55,0x41,0x89,0xf5,0x
+ constexpr uint8_t OctreeBytes[] = {0xf3,0x0f,0x10,0x05,0x48,0x7c,0x40,0x03,0xbe,0x0a,0,0,0};
+ constexpr uint8_t RatioLoop[] = {0x83,0xfb,0x05};
+ constexpr uint8_t RatioGate[] = {0x83,0xfb,0x02};
++// Compact-ID counters for depth 12/13 (level 11, level 12). Only the child
++// stub writes them, with lock xadd; never reset or recycled in-process.
++alignas(8) uint32_t octreeNext[2]={linux_octree::CounterStart[0],linux_octree::CounterStart[1]};
+ using SizeFn = uint64_t (*)(int,int,void*);
+ using RasterFn = void (*)(void*,const float*,float);
+ using ComboFn = void* (*)(const void*,void*,int,void*,int);
+@@ -217,8 +221,8 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
+     if(sparse && !restored){H->log("density restore failed: %s",densityWhy.c_str());return TPF2MP_ERR_FAILED;}
+     if(!enabled)return TPF2MP_ERR_DISABLED;
+     const int depth=H->cfgInt(Section,"octree_depth",11);
+-    if(depth!=11){H->log("Linux currently requires octree_depth=11; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
+-    cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,512)&~1;
++    if(!linux_octree::ValidDepth(depth)){H->log("octree_depth must be 11, 12 or 13; refusing unsupported depth %d",depth);return TPF2MP_ERR_FAILED;}
++    cap=std::clamp(H->cfgInt(Section,"max_tiles",512),2,linux_octree::EdgeTiles(depth))&~1;
+     maxRatio=std::clamp(H->cfgInt(Section,"max_ratio",20),5,20);
+     cellBudget=double(std::clamp(H->cfgInt(Section,"cell_budget_millions",1500),1,2000))*1e6;
+     const bool octree=H->cfgBool(Section,"octree",1),raster=H->cfgBool(Section,"street_raster",1);
+@@ -247,11 +251,24 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
+     auto* page=static_cast<uint8_t*>(Near(H->moduleBase()+SizeRva));if(!page)return TPF2MP_ERR_FAILED;
+     uint8_t* stub=page;
+     // A relocated constant keeps the stock instruction shape and register ABI.
+-    const float extent=65536.f;std::memcpy(page+4000,&extent,4);
++    const float extent=linux_octree::RootHalfExtent(octree?depth:11);std::memcpy(page+4000,&extent,4);
++    if(octree && depth>=12) {
++        // Preflight both ID sites before the root; they are published first and
++        // the root/depth change last. Any mismatch refuses with nothing written.
++        using namespace linux_octree;
++        uint8_t child[sizeof(ChildBytes)],level[sizeof(LevelBytes)];
++        BuildLevelStub(page+1024,H->moduleBase()+LevelBack);
++        BuildChildStub(page+1280,H->moduleBase()+ChildBack,octreeNext);
++        SitePatch(level,sizeof(level),uintptr_t(page+1024));
++        SitePatch(child,sizeof(child),uintptr_t(page+1280));
++        if(!Plan(ChildSite,ChildBytes,child,sizeof(child)) || !Plan(LevelSite,LevelBytes,level,sizeof(level))) {
++            H->log("octree: depth %d byte mismatch; refused, nothing patched",depth);return TPF2MP_ERR_BUILD;
++        }
++    }
+     if(octree) {
+         uint8_t patch[13];std::memcpy(patch,OctreeBytes,13);
+         int32_t rel=int32_t(uintptr_t(page+4000)-(H->moduleBase()+OctreeSite+8));
+-        std::memcpy(patch+4,&rel,4);patch[9]=11;
++        std::memcpy(patch+4,&rel,4);patch[9]=uint8_t(depth);
+         if(!Plan(OctreeSite,OctreeBytes,patch,13))return TPF2MP_ERR_BUILD;
+     }
+     if(raster)for(auto call:RasterCalls)if(!PlanCall(call,RasterRva,reinterpret_cast<void*>(Raster),stub))return TPF2MP_ERR_BUILD;
+@@ -360,7 +377,9 @@ int Tpf2mpPluginInit(const Tpf2mpHost* host,Tpf2mpPluginInfo* info) {
+             }
+         }).detach();
+     }
+-    H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?11:10,rows,maxRatio);
+-    H->log("Experimental port: depth 12/13 and material compression are not enabled");
++    H->log("Linux map controls active: %d-tile edge cap, depth %d, %d added sizes, ratios 1:1..1:%d",cap,octree?depth:10,rows,maxRatio);
++    if(octree && depth>=12)H->log("octree: EXPERIMENTAL depth %d, root +-%.0f m, 128 m leaves; %d-tile edge capacity; compact IDs enabled",
++        depth,double(linux_octree::RootHalfExtent(depth)),linux_octree::EdgeTiles(depth));
++    H->log("Experimental port: material compression is not enabled");
+     return TPF2MP_OK;
+ }
+diff --git a/bigmap/linux/octree_depth.h b/bigmap/linux/octree_depth.h
+new file mode 100644
+index 0000000..524bd22
+--- /dev/null
++++ b/bigmap/linux/octree_depth.h
+@@ -0,0 +1,126 @@
++// Experimental octree depth 12/13 for the native Linux Steam build 35924.
++// Linux counterpart of bigmap/src/octree_depth12.h; the same ID scheme, the
++// same refusals and the same root/depth values. See docs/linux/PORT.md,
++// "Octree depth 12/13", for the byte-verified sites and how they were matched.
++//
++// Depth counts the root. Stock child IDs are 8*parent+1+octant in int32; level
++// 10 ends at 0x49249248, so level 11 overflows. Levels 0..10 keep their stock
++// IDs. New level-11 nodes take 0x50000000..0x5fffffff and level-12 nodes
++// 0x60000000..0x6fffffff from two monotonically increasing process counters
++// (never recycled, exhaustion fails fast). The renderer's level decoder reads
++// the high nibble plus six for those ranges.
++//
++// Unlike Windows, the Linux compiler inlined the recursive descent into one
++// loop (0x16aa040), so there is no call to detour. The child-ID step of that
++// loop is replaced instead: the ID of every child of a level-10-or-deeper node
++// is chosen from the PARENT NODE's stored ID, never from the loop's overflowed
++// running index. Shallower children keep the stock arithmetic.
++// Tests read the arrays below by name (tools/linux/test_octree_depth_elf.py).
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++
++namespace linux_octree {
++constexpr uintptr_t ChildSite=0x16aa190, ChildBack=0x16aa08c;
++constexpr uintptr_t LevelSite=0x13ec530, LevelBack=0x13ec555;
++
++// Descent loop, child step (only entered with a parent node in rax):
++//   lea r13d,[r15+r13*8+1]; movsxd r15,r15d; mov rsi,rax;
++//   lea rbx,[rdx+r15*8]; jmp 0x16aa08c
++constexpr uint8_t ChildBytes[20]={0x47,0x8d,0x6c,0xef,0x01,0x4d,0x63,0xff,0x48,0x89,0xc6,
++    0x4a,0x8d,0x1c,0xfa,0xe9,0xe8,0xfe,0xff,0xff};
++// Inlined CalcOctreeLevel(int) in the skip query 0x13ec500, after its
++// `test esi,esi; js assert` (the loop's je reads that test's flags):
++//   mov r12,rdx; mov r14d,0; mov ecx,1; mov edx,1; je +16; nop;
++//   loop: shl edx,3; add r14d,1; add ecx,edx; cmp esi,ecx; jge loop
++constexpr uint8_t LevelBytes[37]={0x49,0x89,0xd4,0x41,0xbe,0x00,0x00,0x00,0x00,0xb9,0x01,
++    0x00,0x00,0x00,0xba,0x01,0x00,0x00,0x00,0x74,0x10,0x0f,0x1f,0x00,0xc1,0xe2,0x03,0x41,
++    0x83,0xc6,0x01,0x01,0xd1,0x39,0xce,0x7d,0xf3};
++
++// Entered by absolute jump from ChildSite. In: rax parent node, r13d running
++// index, r15d octant, rdx child array, r9d remaining depth of the child, edi
++// the loop's "created" flag (preserved). Dead here: rcx, rdx after use, r10,
++// r11, flags. Out: r13d child ID, rsi parent, rbx child slot, as stock.
++constexpr size_t ChildStubCounters=0x4d, ChildStubBack=0x89;
++constexpr uint8_t ChildStub[145]={
++    0x4d,0x63,0xff,                          // 00 movsxd r15,r15d          (stock)
++    0x48,0x89,0xc6,                          // 03 mov rsi,rax              (stock)
++    0x4a,0x8d,0x1c,0xfa,                     // 06 lea rbx,[rdx+r15*8]      (stock)
++    0x8b,0x50,0x08,                          // 0a mov edx,[rax+8]          parent ID
++    0x81,0xfa,0x49,0x92,0x24,0x09,           // 0d cmp edx,0x09249249       parent below level 10?
++    0x7c,0x67,                               // 13 jl stock
++    0x31,0xc9,                               // 15 xor ecx,ecx              bank 0: level 11
++    0x81,0xfa,0x48,0x92,0x24,0x49,           // 17 cmp edx,0x49249248
++    0x7e,0x15,                               // 1d jle have
++    0x81,0xfa,0x00,0x00,0x00,0x50,           // 1f cmp edx,0x50000000
++    0x7c,0x60,                               // 25 jl fail
++    0x81,0xfa,0xff,0xff,0xff,0x5f,           // 27 cmp edx,0x5fffffff
++    0x7f,0x58,                               // 2d jg fail
++    0xb9,0x01,0x00,0x00,0x00,                // 2f mov ecx,1                bank 1: level 12
++    0x45,0x85,0xc9,                          // 34 have: test r9d,r9d
++    0x7e,0x4e,                               // 37 jle fail
++    0x48,0x8b,0x13,                          // 39 mov rdx,[rbx]            existing child?
++    0x48,0x85,0xd2,                          // 3c test rdx,rdx
++    0x74,0x0a,                               // 3f je fresh
++    0x44,0x8b,0x6a,0x08,                     // 41 mov r13d,[rdx+8]         keep its ID
++    0xff,0x25,0x3e,0x00,0x00,0x00,           // 45 jmp [back]
++    0x49,0xba,0,0,0,0,0,0,0,0,               // 4b fresh: movabs r10,counters
++    0x41,0xbb,0x01,0x00,0x00,0x00,           // 55 mov r11d,1
++    0xf0,0x45,0x0f,0xc1,0x1c,0x8a,           // 5b lock xadd [r10+rcx*4],r11d
++    0x41,0x83,0xc3,0x01,                     // 61 add r11d,1               new value
++    0xc1,0xe1,0x1c,                          // 65 shl ecx,28
++    0x81,0xc1,0x00,0x00,0x00,0x60,           // 68 add ecx,0x60000000       bank limit
++    0x41,0x39,0xcb,                          // 6e cmp r11d,ecx
++    0x73,0x14,                               // 71 jae fail                 exhausted
++    0x45,0x89,0xdd,                          // 73 mov r13d,r11d
++    0xff,0x25,0x0d,0x00,0x00,0x00,           // 76 jmp [back]
++    0x47,0x8d,0x6c,0xef,0x01,                // 7c stock: lea r13d,[r15+r13*8+1]
++    0xff,0x25,0x02,0x00,0x00,0x00,           // 81 jmp [back]
++    0x0f,0x0b,                               // 87 fail: ud2 (never publish a bad ID)
++    0,0,0,0,0,0,0,0};                        // 89 back
++
++// Entered by absolute jump from LevelSite with esi >= 0 (the stock js already
++// ran). Compact IDs decode as (id>>28)+6; everything else runs the stock bytes
++// after re-creating the flags their je reads. ecx/edx are dead after the loop.
++constexpr size_t LevelStubBack=0x49;
++constexpr uint8_t LevelStub[81]={
++    0x81,0xfe,0x00,0x00,0x00,0x50,           // 00 cmp esi,0x50000000
++    0x72,0x14,                               // 06 jb stock
++    0x49,0x89,0xd4,                          // 08 mov r12,rdx              (stock)
++    0x41,0x89,0xf6,                          // 0b mov r14d,esi
++    0x41,0xc1,0xee,0x1c,                     // 0e shr r14d,28
++    0x41,0x83,0xc6,0x06,                     // 12 add r14d,6               5 -> 11, 6 -> 12
++    0xff,0x25,0x2d,0x00,0x00,0x00,           // 16 jmp [back]
++    0x85,0xf6,                               // 1c stock: test esi,esi
++    0x49,0x89,0xd4,0x41,0xbe,0x00,0x00,0x00,0x00,0xb9,0x01,0x00,0x00,0x00,0xba,0x01,0x00,
++    0x00,0x00,0x74,0x10,0x0f,0x1f,0x00,0xc1,0xe2,0x03,0x41,0x83,0xc6,0x01,0x01,0xd1,0x39,
++    0xce,0x7d,0xf3,                          // 1e LevelBytes, unchanged (relative branches stay inside)
++    0xff,0x25,0x00,0x00,0x00,0x00,           // 43 jmp [back]
++    0,0,0,0,0,0,0,0};                        // 49 back
++static_assert(sizeof(ChildBytes)>=14 && sizeof(LevelBytes)>=14,"absolute jump fits");
++
++constexpr uint32_t CounterStart[2]={0x4fffffff,0x5fffffff};
++inline bool ValidDepth(int depth){return depth>=11 && depth<=13;}
++inline int EdgeTiles(int depth){return depth==13?2048:depth==12?1024:512;}
++// Same root as Windows: +-2^(depth+5) m, so 128 m leaves at every depth.
++inline float RootHalfExtent(int depth){return float(uint32_t(1)<<(depth+5));}
++
++inline void AbsoluteJump(uint8_t* p,uintptr_t dest){
++    p[0]=0xff;p[1]=0x25;std::memset(p+2,0,4);std::memcpy(p+6,&dest,8);
++}
++inline size_t BuildChildStub(uint8_t* dst,uintptr_t back,uint32_t* counters){
++    const uint64_t at=uintptr_t(counters);
++    std::memcpy(dst,ChildStub,sizeof(ChildStub));
++    std::memcpy(dst+ChildStubCounters,&at,8);std::memcpy(dst+ChildStubBack,&back,8);
++    return sizeof(ChildStub);
++}
++inline size_t BuildLevelStub(uint8_t* dst,uintptr_t back){
++    std::memcpy(dst,LevelStub,sizeof(LevelStub));std::memcpy(dst+LevelStubBack,&back,8);
++    return sizeof(LevelStub);
++}
++// Site bytes: an absolute jump to the stub, NOP padding (never executed).
++inline void SitePatch(uint8_t* out,size_t len,uintptr_t stub){
++    std::memset(out,0x90,len);AbsoluteJump(out,stub);
++}
++}
+diff --git a/bigmap/linux/sites.json b/bigmap/linux/sites.json
+index 58e43db..63d3ac1 100644
+--- a/bigmap/linux/sites.json
++++ b/bigmap/linux/sites.json
+@@ -3,6 +3,8 @@
+   "sites": {
+     "0x11232c0": "554889e541554189f541545389fb4883ec58",
+     "0xa84234": "f30f1005487c4003be0a000000",
++    "0x16aa190": "478d6cef014d63ff4889c64a8d1cfae9e8feffff",
++    "0x13ec530": "4989d441be00000000b901000000ba0100000074100f1f00c1e2034183c60101d139ce7df3",
+     "0x1149945": "e856aaff01",
+     "0x1149ae7": "e8d4db2d00",
+     "0x1149bf4": "83fb05",
+diff --git a/bigmap/linux/tests/bigmap_test.cpp b/bigmap/linux/tests/bigmap_test.cpp
+index 8c4f08e..a887de1 100644
+--- a/bigmap/linux/tests/bigmap_test.cpp
++++ b/bigmap/linux/tests/bigmap_test.cpp
+@@ -4,9 +4,13 @@
+ #include <string>
+ #include <vector>
+ #include <cstdarg>
++#include <csignal>
++#include <sys/wait.h>
++#include <unistd.h>
+ static std::map<std::string,int> config;
+ static std::map<uintptr_t,std::vector<uint8_t>> memory;
+ static int writes, failWrite, mismatch;
++static std::vector<uintptr_t> order;
+ static uintptr_t mismatchSite;
+ static bool build=true;
+ static int Int(const char*,const char* key,int fallback){auto it=config.find(key);return it==config.end()?fallback:it->second;}
+@@ -27,16 +31,93 @@ static int Verify(uintptr_t rva,const uint8_t* bytes,uint32_t n){
+ }
+ static int PatchBytes(uintptr_t rva,const uint8_t* bytes,uint32_t n){
+     if(++writes==failWrite)return 0;
+-    memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
++    order.push_back(rva);memory[rva]=std::vector<uint8_t>(bytes,bytes+n);return 1;
+ }
+ static uint64_t Stock(int size,int format,void*){assert(size<7 && format<5);return Pack(96,96);}
+ static int Hook(uintptr_t,void*,int n,void** out){assert(n==18);++writes;*out=reinterpret_cast<void*>(Stock);return 1;}
+ static const char* Data(){return "/tmp/";}
+ static Tpf2mpHost host={sizeof(host),1,Log,Int,Bool,Str,Base,Build,Verify,Hook,PatchBytes,Data};
+-static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;mismatchSite=0;}
++static void Reset(){config.clear();config["newgame_density"]=0;config["save_fast"]=0;config["terrain_minmax_fast"]=0;memory.clear();order.clear();writes=failWrite=mismatch=0;rows=claimCount=patchCount=0;stockRows=7;build=true;mismatchSite=0;}
+ extern "C" float TestTown(void*,int);
+ extern "C" uint32_t TestMinMaxBridge(const uint16_t*,const uint16_t*);
+ extern "C" uint32_t BigmapMinMax(const uint16_t*,const uint16_t*);
++extern "C" int TestOctreeLevel(const void* entry,int id);
++extern "C" int TestOctreeChild(const void* entry,void* parent,void** children,int octant,int running,int remaining,void*** slot);
++extern "C" char TestOctreeLevelReturn[],TestOctreeChildReturn[];
++
++// Windows Depth12Id (bigmap/src/octree_depth12.h), the behaviour to reproduce.
++// -1 stands for __fastfail: the Linux stub must stop with SIGILL instead.
++static int64_t WindowsId(int incoming,int parentId,int remaining,int existingId,bool exists,uint32_t* next){
++    if(parentId<0x09249249)return incoming;
++    const int bank=parentId<=0x49249248?0:(parentId>=0x50000000 && parentId<=0x5fffffff?1:-1);
++    if(bank<0 || remaining<1)return -1;
++    if(exists)return existingId;
++    const uint32_t id=++next[bank];
++    if(id>=(bank==0?0x60000000u:0x70000000u))return -1;
++    return int32_t(id);
++}
++struct Node { void* parent; int32_t id; uint8_t rest[0xa8-12]; };
++
++static void OctreeStubs(){
++    using namespace linux_octree;
++    auto* page=static_cast<uint8_t*>(mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
++    assert(page!=MAP_FAILED);
++    static uint32_t counters[2];
++    assert(BuildLevelStub(page,uintptr_t(TestOctreeLevelReturn))==81);
++    assert(BuildChildStub(page+256,uintptr_t(TestOctreeChildReturn),counters)==145);
++    assert(!std::memcmp(LevelStub+0x1e,LevelBytes,sizeof(LevelBytes)));
++    assert(!std::memcmp(ChildStub+0x7c,ChildBytes,5) && !std::memcmp(ChildStub,ChildBytes+5,10));
++    assert(mprotect(page,4096,PROT_READ|PROT_EXEC)==0);
++    // Decoder: stock levels 0..10 at every boundary, then both compact banks.
++    for(int level=0;level<11;++level) {
++        int64_t first=0,width=1;for(int i=0;i<level;++i){first+=width;width*=8;}
++        for(int64_t id:{first,first+width-1,first+width/2})assert(TestOctreeLevel(page,int(id))==level);
++    }
++    for(int id:{0x50000000,0x50000001,0x5fffffff})assert(TestOctreeLevel(page,id)==11);
++    for(int id:{0x60000000,0x60000001,0x6fffffff})assert(TestOctreeLevel(page,id)==12);
++    // Child step: same choices as the Windows allocator, same counter states.
++    uint32_t model[2];
++    auto run=[&](int running,int parentId,int remaining,int existing,bool exists,int octant) {
++        Node parent{},child{};parent.id=parentId;child.id=existing;
++        void* children[8]={};if(exists)children[octant]=&child;
++        void** slot=nullptr;
++        const int incoming=int(uint32_t(running)*8u+1u+uint32_t(octant));
++        const uint32_t before[2]={model[0],model[1]};
++        const int64_t want=WindowsId(incoming,parentId,remaining,existing,exists,model);
++        if(want<0) {
++            model[0]=before[0];model[1]=before[1]; // the process died; nothing was published
++            const pid_t pid=fork();assert(pid>=0);
++            if(!pid){TestOctreeChild(page+256,&parent,children,octant,running,remaining,&slot);_exit(0);}
++            int status=0;assert(waitpid(pid,&status,0)==pid);
++            assert(WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
++            return;
++        }
++        const int got=TestOctreeChild(page+256,&parent,children,octant,running,remaining,&slot);
++        assert(got==want && slot==&children[octant]);
++        assert(counters[0]==model[0] && counters[1]==model[1]);
++    };
++    counters[0]=model[0]=CounterStart[0];counters[1]=model[1]=CounterStart[1];
++    for(int octant=0;octant<8;++octant)for(int p:{0,1,8,0x01249249,0x09249248})run(p,p,3,0,false,octant); // stock
++    run(0x09249249,0x09249249,2,0,false,0);            // first level-11 ID
++    assert(counters[0]==0x50000000);
++    run(0x09249249,0x09249249,2,0x50000000,true,0);    // revisit keeps it
++    run(-5,0x49249248,1,0,false,7);                    // overflowed running index ignored
++    run(-5,0x50000000,1,0,false,3);                    // level-12 bank
++    run(-5,0x5fffffff,1,0x60000000,true,3);
++    assert(counters[0]==0x50000001 && counters[1]==0x60000000);
++    run(-5,0x60000000,1,0,false,0);                    // below level 12: refused
++    run(-5,0x4fffffff,1,0,false,0);                    // outside both banks
++    run(-5,0x09249249,0,0,false,0);                    // no remaining depth
++    counters[0]=model[0]=0x5fffffff;run(-5,0x09249249,1,0,false,0); // bank 0 exhausted
++    counters[1]=model[1]=0x6fffffff;run(-5,0x50000000,1,0,false,0); // bank 1 exhausted
++    counters[0]=model[0]=0x5ffffffe;run(-5,0x09249249,1,0,false,1); // last level-11 ID
++    assert(counters[0]==0x5fffffff);
++    munmap(page,4096);
++}
++static uintptr_t JumpTarget(uintptr_t rva){
++    auto& b=memory[rva];assert(b.size()>=14 && b[0]==0xff && b[1]==0x25);
++    uintptr_t at;std::memcpy(&at,b.data()+6,8);return at;
++}
+ int main(){
+     std::vector<uint16_t> heights(66049);
+     uint32_t rng=1;for(auto& h:heights){rng=rng*1664525+1013904223;h=uint16_t(rng>>16);}
+@@ -68,7 +149,51 @@ int main(){
+     assert(Tpf2mpPluginInit(nullptr,&info)==TPF2MP_ERR_ABI);
+     Reset();build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
+     Reset();config["enabled"]=0;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_DISABLED && writes==0);
+-    Reset();config["octree_depth"]=13;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED && writes==0);
++    OctreeStubs();
++    for(int bad:{0,10,14,99}){Reset();config["octree_depth"]=bad;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED && writes==0);}
++    {
++        using namespace linux_octree;
++        // Depth 11 publishes exactly the pre-depth-12 bytes; the ID sites are not even read.
++        Reset();mismatchSite=ChildSite;assert(Tpf2mpPluginInit(&host,&info)==0 && cap==512);
++        assert(!memory.count(ChildSite) && !memory.count(LevelSite));
++        assert(memory[OctreeSite][9]==11 && order.front()==OctreeSite);
++        for(int depth:{12,13}) {
++            Reset();config["octree_depth"]=depth;assert(Tpf2mpPluginInit(&host,&info)==0 && cap==512);
++            assert(order[0]==ChildSite && order[1]==LevelSite && order[2]==OctreeSite); // root last
++            auto& root=memory[OctreeSite];assert(root.size()==13 && root[9]==depth);
++            int32_t rel;std::memcpy(&rel,root.data()+4,4);float half;
++            std::memcpy(&half,reinterpret_cast<void*>(Base()+OctreeSite+8+intptr_t(rel)),4);
++            assert(half==float(1<<(depth+5)));
++            const uintptr_t level=JumpTarget(LevelSite),child=JumpTarget(ChildSite);
++            uintptr_t back;std::memcpy(&back,reinterpret_cast<void*>(level+LevelStubBack),8);assert(back==Base()+LevelBack);
++            std::memcpy(&back,reinterpret_cast<void*>(child+ChildStubBack),8);assert(back==Base()+ChildBack);
++            uintptr_t next;std::memcpy(&next,reinterpret_cast<void*>(child+ChildStubCounters),8);assert(next==uintptr_t(octreeNext));
++            assert(!std::memcmp(reinterpret_cast<void*>(level),LevelStub,LevelStubBack));
++            assert(!std::memcmp(reinterpret_cast<void*>(child),ChildStub,ChildStubCounters));
++            for(size_t i=14;i<memory[ChildSite].size();++i)assert(memory[ChildSite][i]==0x90);
++            Reset();config["octree_depth"]=depth;config["max_tiles"]=4096;
++            assert(Tpf2mpPluginInit(&host,&info)==0 && cap==EdgeTiles(depth));
++            // Any ID-site mismatch refuses the depth with nothing written.
++            for(uintptr_t site:{ChildSite,LevelSite,OctreeSite}) {
++                Reset();config["octree_depth"]=depth;mismatchSite=site;
++                assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
++            }
++            Reset();config["octree_depth"]=depth;build=false;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
++            // A failed root write rolls the ID sites back too.
++            Reset();config["octree_depth"]=depth;failWrite=4;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_FAILED);
++            assert(memory[ChildSite]==std::vector<uint8_t>(ChildBytes,ChildBytes+sizeof(ChildBytes)));
++            assert(memory[LevelSite]==std::vector<uint8_t>(LevelBytes,LevelBytes+sizeof(LevelBytes)));
++            assert(memory[OctreeSite]==std::vector<uint8_t>(OctreeBytes,OctreeBytes+sizeof(OctreeBytes)));
++            Reset();config["octree_depth"]=depth;config["octree"]=0;
++            assert(Tpf2mpPluginInit(&host,&info)==0 && cap==256 && !memory.count(ChildSite) && !memory.count(OctreeSite));
++        }
++        Reset();config["max_tiles"]=4096;assert(Tpf2mpPluginInit(&host,&info)==0 && cap==512);
++        // Heightmap and placement-distance bounds still bind past 512 tiles.
++        Reset();config["octree_depth"]=13;config["max_tiles"]=2048;assert(Tpf2mpPluginInit(&host,&info)==0);
++        int bx=2048,by=64;Bound(bx,by);assert(bx==720 && by==64 && Fits(bx,by));
++        bx=2048;by=2048;Bound(bx,by);assert(bx==510 && by==512);
++        for(int f=0;f<20;++f){uint64_t v=Shape(2048,f);int sx=uint32_t(v),sy=uint32_t(v>>32);assert(sy==sx*(f+1) && Fits(sx,sy) && sy<=2048);}
++    }
+     Reset();mismatch=1;assert(Tpf2mpPluginInit(&host,&info)==TPF2MP_ERR_BUILD && writes==0);
+     Reset();assert(Tpf2mpPluginInit(&host,&info)==0 && rows==9 && cap==512);
+     assert(Size(6,0,nullptr)==Pack(96,96));
+@@ -97,5 +222,5 @@ int main(){
+     uint32_t buffer;std::memcpy(&buffer,memory[0xc7c3a0].data()+1,4);assert(buffer==65536);
+     std::memcpy(&buffer,memory[0xc7c3aa].data()+5,4);assert(buffer==65536);
+     std::memcpy(&buffer,memory[0xc7b6b1].data()+5,4);assert(buffer==65536);
+-    puts("PASS: map sizing, ratios, raster overflow, guards, safe caps and rollback");
++    puts("PASS: map sizing, ratios, raster overflow, guards, safe caps, rollback and octree depth 12/13 stubs");
+ }
+diff --git a/bigmap/linux/tests/town_stub.S b/bigmap/linux/tests/town_stub.S
+index 93cb1f6..de0bb7f 100644
+--- a/bigmap/linux/tests/town_stub.S
++++ b/bigmap/linux/tests/town_stub.S
+@@ -29,4 +29,61 @@ TestMinMaxBridge:
+  pop %rbx
+  pop %rbp
+  ret
++# int TestOctreeLevel(entry, id): the skip query's register contract
++# (esi = id, rdx = live value later moved to r12); returns r14d, or -1 if
++# r12 was not the stock `mov r12,rdx`.
++.globl TestOctreeLevel
++.type TestOctreeLevel,@function
++TestOctreeLevel:
++ push %r12
++ push %r14
++ mov $0x1234,%edx
++ test %esi,%esi
++ jmp *%rdi
++.globl TestOctreeLevelReturn
++TestOctreeLevelReturn:
++ mov %r14d,%eax
++ cmp $0x1234,%r12
++ je 1f
++ mov $-1,%eax
++1:
++ pop %r14
++ pop %r12
++ ret
++# int TestOctreeChild(entry, parent, children, octant, running, remaining, slot*):
++# the descent loop's child-step contract (rax parent, rdx child array,
++# r15d octant, r13d running index, r9d remaining, edi created flag).
++# Returns r13d and stores rbx to *slot; -2 if rsi/edi broke the contract.
++.globl TestOctreeChild
++.type TestOctreeChild,@function
++TestOctreeChild:
++ push %rbx
++ push %r12
++ push %r13
++ push %r15
++ mov 40(%rsp),%r12
++ push %rsi
++ mov %rdi,%r11
++ mov %rsi,%rax
++ mov %ecx,%r15d
++ mov %r8d,%r13d
++ mov $0x77,%edi
++ jmp *%r11
++.globl TestOctreeChildReturn
++TestOctreeChildReturn:
++ pop %rcx
++ mov %rbx,(%r12)
++ mov %r13d,%eax
++ cmp %rcx,%rsi
++ jne 2f
++ cmp $0x77,%edi
++ je 3f
++2:
++ mov $-2,%eax
++3:
++ pop %r15
++ pop %r13
++ pop %r12
++ pop %rbx
++ ret
+ .section .note.GNU-stack,"",@progbits
+diff --git a/bigmap/linux/tpf2_bigmap.cfg b/bigmap/linux/tpf2_bigmap.cfg
+index 6b4e6bf..cf90f73 100644
+--- a/bigmap/linux/tpf2_bigmap.cfg
++++ b/bigmap/linux/tpf2_bigmap.cfg
+@@ -7,6 +7,8 @@ max_tiles=512
+ street_raster=1
+ cell_budget_millions=1500
+ octree=1
++# 11 = stock-ID depth, 512-tile edges. Experimental 12/13 match the Windows
++# plugin (1024/2048-tile edges); every peer must use the same depth.
+ octree_depth=11
+ # Exact terrain scan and faster zstd saves (save files may be larger).
+ terrain_minmax_fast=1
+diff --git a/bigmap/tools/linux/test_octree_depth_elf.py b/bigmap/tools/linux/test_octree_depth_elf.py
+new file mode 100644
+index 0000000..94151e6
+--- /dev/null
++++ b/bigmap/tools/linux/test_octree_depth_elf.py
+@@ -0,0 +1,230 @@
++#!/usr/bin/env python3
++"""Offline depth-12/13 emulation against the native Linux game ELF (read-only).
++
++Usage: test_octree_depth_elf.py GAME_ELF      (requires: pip install unicorn)
++
++Runs the ORIGINAL Linux machine code of the octree descent loop (0x16aa040)
++and of the renderer's inlined CalcOctreeLevel (0x13ec528..0x13ec555) in
++Unicorn, with the site patches and stubs taken byte-for-byte from
++linux/octree_depth.h. Only operator new is stubbed. This validates insertion,
++IDs and the decoder; it is not a running renderer or a live game.
++"""
++import itertools
++import random
++import re
++import struct
++import sys
++from pathlib import Path
++from unicorn import Uc, UC_ARCH_X86, UC_MODE_64, UC_HOOK_CODE, UC_PROT_ALL
++from unicorn.x86_const import *
++
++ROOT = Path(__file__).resolve().parents[2]
++HEADER = (ROOT / 'linux/octree_depth.h').read_text()
++BUILD_ID = '3a0e156390b0e6f1e372051c24802c8493ae454a'
++BASE = 0x100000000
++DESCEND, ALLOC = 0x16aa040, 0x6dbce0
++NEVER = {0x16a6180: 'node destructor', 0x16a6300: 'child-array destructor'}
++ROOT_SITE, ROOT_BYTES = 0xa84234, bytes.fromhex('f30f1005487c4003be0a000000')
++LEVEL_ENTRY = 0x13ec528
++HEAP, STACK, STUB, STOP = 0x20000000, 0x30000000, 0x40000000, 0x50000000
++
++
++def array(name):
++    m = re.search(r'constexpr uint8_t %s\[\d+\]=\{(.*?)\};' % name, HEADER, re.S)
++    body = re.sub(r'//[^\n]*', '', m.group(1))
++    return bytes(int(v, 0) for v in re.findall(r'0x[0-9a-fA-F]+|\d+', body))
++
++
++def const(name):
++    return int(re.search(r'\b%s=(0x[0-9a-fA-F]+|\d+)' % name, HEADER).group(1), 0)
++
++
++def load(path):
++    b = Path(path).read_bytes()
++    assert b[:6] == b'\x7fELF\x02\x01' and struct.unpack_from('<H', b, 16)[0] == 3
++    phoff = struct.unpack_from('<Q', b, 32)[0]
++    size, count = struct.unpack_from('<HH', b, 54)
++    image, ident = None, None
++    for i in range(count):
++        kind, _, off, va, _, filesz, _, _ = struct.unpack_from('<IIQQQQQQ', b, phoff + i * size)
++        if kind == 1 and va == 0:
++            image = b[off:off + filesz]
++        if kind == 4:
++            end = off + filesz
++            while off + 12 <= end:
++                namesz, descsz, ntype = struct.unpack_from('<III', b, off); off += 12
++                name = b[off:off + namesz]; off += (namesz + 3) & ~3
++                desc = b[off:off + descsz]; off += (descsz + 3) & ~3
++                if name == b'GNU\0' and ntype == 3: ident = desc.hex()
++    assert ident == BUILD_ID, 'unsupported game build'
++    return image
++
++
++def main():
++    image = load(sys.argv[1])
++    child_site, child_back = const('ChildSite'), const('ChildBack')
++    level_site, level_back = const('LevelSite'), const('LevelBack')
++    child_bytes, level_bytes = array('ChildBytes'), array('LevelBytes')
++    child_stub, level_stub = array('ChildStub'), array('LevelStub')
++    counters_at, child_back_at = const('ChildStubCounters'), const('ChildStubBack')
++    level_back_at = const('LevelStubBack')
++    assert len(child_stub) == 145 and len(level_stub) == 81
++    assert image[child_site:child_site + 20] == child_bytes
++    assert image[level_site:level_site + 37] == level_bytes
++    assert image[ROOT_SITE:ROOT_SITE + 13] == ROOT_BYTES
++    text = image[0x6de300:0x6de300 + 0x37adaa5]
++    assert text.count(level_bytes) == 1 and text.count(child_bytes) == 1
++    # Preceding context: test esi,esi; js <assert>; and the descent's octant tail.
++    assert image[LEVEL_ENTRY:level_site] == bytes.fromhex('85f60f882e010000')
++    assert level_stub[0x1c:0x1e] == b'\x85\xf6' and level_stub[0x1e:0x43] == level_bytes
++    assert child_stub[0x7c:0x81] == child_bytes[:5] and child_stub[:10] == child_bytes[5:15]
++    # Stock jmp at the end of the child step really returns to the loop head.
++    assert child_site + 20 + struct.unpack_from('<i', child_bytes, 16)[0] == child_back
++
++    def site_patch(length, stub):
++        return b'\xff\x25\0\0\0\0' + struct.pack('<Q', stub) + b'\x90' * (length - 14)
++
++    # ---- renderer level decoder -------------------------------------------
++    def decode(index, patched=True):
++        u = Uc(UC_ARCH_X86, UC_MODE_64)
++        page = (BASE + LEVEL_ENTRY) & ~0xfff
++        u.mem_map(page, 0x2000)
++        u.mem_write(page, image[page - BASE:page - BASE + 0x2000])
++        u.mem_map(STUB, 0x1000)
++        stub = bytearray(level_stub)
++        struct.pack_into('<Q', stub, level_back_at, BASE + level_back)
++        u.mem_write(STUB, bytes(stub))
++        if patched:
++            u.mem_write(BASE + level_site, site_patch(37, STUB))
++        u.reg_write(UC_X86_REG_RSI, index & 0xffffffff)
++        u.reg_write(UC_X86_REG_RDX, 0x1234)
++        u.emu_start(BASE + LEVEL_ENTRY, BASE + level_back, count=600)
++        if u.reg_read(UC_X86_REG_RIP) != BASE + level_back:
++            return None  # stock never terminates past level 10
++        assert u.reg_read(UC_X86_REG_R12) == 0x1234
++        return u.reg_read(UC_X86_REG_R14) & 0xffffffff
++
++    for level in range(11):
++        first = (8 ** level - 1) // 7
++        last = (8 ** (level + 1) - 1) // 7 - 1
++        for index in {first, last, (first + last) // 2}:
++            assert decode(index) == decode(index, False) == level, (level, index)
++    for index in [0x50000000, 0x50000001, 0x5fffffff]:
++        assert decode(index) == 11 and decode(index, False) is None
++    for index in [0x60000000, 0x60000001, 0x6fffffff]:
++        assert decode(index) == 12
++
++    # ---- original descent loop ---------------------------------------------
++    def world(depth, patched, points=None, extents=(0,)):
++        u = Uc(UC_ARCH_X86, UC_MODE_64)
++        u.mem_map(BASE, (len(image) + 0xfff) & ~0xfff)
++        u.mem_write(BASE, image)
++        for area, size in [(HEAP, 64 << 20), (STACK, 1 << 20), (STUB, 0x1000), (STOP, 0x1000)]:
++            u.mem_map(area, size)
++        counters = STUB + 0x800
++        u.mem_write(counters, struct.pack('<II', 0x4fffffff, 0x5fffffff))
++        stub = bytearray(child_stub)
++        struct.pack_into('<Q', stub, counters_at, counters)
++        struct.pack_into('<Q', stub, child_back_at, BASE + child_back)
++        u.mem_write(STUB, bytes(stub))
++        if patched:
++            u.mem_write(BASE + child_site, site_patch(20, STUB))
++        allocated = []
++        nxt = [HEAP + 0x1000]
++
++        def readq(p): return struct.unpack('<Q', u.mem_read(p, 8))[0]
++        def readi(p): return struct.unpack('<i', u.mem_read(p, 4))[0]
++
++        def hook(u, address, size, _):
++            if address == BASE + ALLOC:
++                n = u.reg_read(UC_X86_REG_RDI)
++                assert n in (0xa8, 0x40), hex(n)
++                result = nxt[0]; nxt[0] += (n + 15) & ~15
++                if n == 0xa8: allocated.append(result)
++                sp = u.reg_read(UC_X86_REG_RSP)
++                u.reg_write(UC_X86_REG_RAX, result)
++                u.reg_write(UC_X86_REG_RIP, readq(sp))
++                u.reg_write(UC_X86_REG_RSP, sp + 8)
++            else:
++                raise AssertionError(NEVER[address - BASE] + ' reached')
++        for address in [ALLOC] + list(NEVER):
++            u.hook_add(UC_HOOK_CODE, hook, begin=BASE + address, end=BASE + address)
++        half = 2.0 ** (depth + 5)
++        root_slot, center, extent = HEAP, HEAP + 0x40, HEAP + 0x60
++
++        def insert(point, object_extent=0):
++            sp = STACK + 0x80000
++            u.mem_write(center, struct.pack('<3f', *point))
++            u.mem_write(extent, struct.pack('<3f', *([object_extent] * 3)))
++            u.mem_write(sp, struct.pack('<Q', STOP))
++            u.mem_write(sp + 8, struct.pack('<6f', *([-half] * 3 + [half] * 3)))
++            u.mem_write(sp + 0x20, struct.pack('<Q', root_slot))
++            for reg, value in [(UC_X86_REG_RSP, sp), (UC_X86_REG_RDI, HEAP + 0x100),
++                               (UC_X86_REG_RSI, 0), (UC_X86_REG_RDX, 0),
++                               (UC_X86_REG_RCX, center), (UC_X86_REG_R8, extent),
++                               (UC_X86_REG_R9, depth)]:
++                u.reg_write(reg, value)
++            u.emu_start(BASE + DESCEND, STOP, count=100000)
++            assert u.reg_read(UC_X86_REG_RIP) == STOP
++            node = u.reg_read(UC_X86_REG_RAX)
++            loose = struct.unpack('<6f', u.mem_read(node + 0xc, 24))
++            want = 512 if object_extent == 200 else 256
++            assert all(abs(loose[i + 3] - loose[i] - want) < 0.01 for i in range(3)), loose
++            assert all(loose[i] <= point[i] <= loose[i + 3] for i in range(3))
++            return node, readi(node + 8)
++
++        if points is None:
++            points = list(itertools.product([-half + 72, 72.], repeat=3)) if depth >= 12 else [(-10., 20., 30.)]
++            if depth >= 12:
++                rng = random.Random(35924)
++                points += [tuple(rng.uniform(-half + 1, half - 1) for _ in range(3)) for _ in range(150)]
++        leaves = [insert(p) for p in points]
++        for p, leaf in zip(points, leaves):
++            assert insert(p) == leaf, 'reinsertion changed leaf identity'
++        if 200 in extents:
++            for p, leaf in zip(points, leaves):
++                internal = insert(p, 200)
++                assert internal[0] == readq(leaf[0])
++                assert 0x50000000 <= internal[1] < 0x60000000
++                assert 0x60000000 <= leaf[1] < 0x70000000
++                assert insert(p) == leaf
++        ids = [readi(n + 8) for n in allocated]
++        levels = []
++        for n in allocated:
++            level, parent = 0, readq(n)
++            while parent:
++                level += 1; parent = readq(parent)
++            levels.append(level)
++        return ids, levels, points, len(allocated)
++
++    def check(ids, levels):
++        assert len(ids) == len(set(ids)), 'node ID collision'
++        assert all(0 <= v <= 0x7fffffff for v in ids)
++        for value, level in zip(ids, levels):
++            assert decode(value) == level, (hex(value), level)
++
++    counts = {}
++    for depth in (13, 12):
++        ids, levels, points, counts[depth] = world(depth, True, extents=(0, 200) if depth == 13 else (0,))
++        check(ids, levels)
++        stock_ids, stock_levels, _, _ = world(depth, False, points)
++        assert len(stock_ids) != len(set(stock_ids)) or any(v < 0 for v in stock_ids), \
++            'stock overflow not reproduced'
++        # Levels 0..10 keep their stock IDs.
++        shallow = sorted(v for v, l in zip(ids, levels) if l <= 10)
++        assert shallow == sorted(v for v, l in zip(stock_ids, stock_levels) if l <= 10)
++    rng = random.Random(11)
++    for depth in (11, 10):
++        pts = [tuple(rng.uniform(-2.0 ** (depth + 5) + 1, 2.0 ** (depth + 5) - 1) for _ in range(3))
++               for _ in range(60)]
++        patched = world(depth, True, pts)
++        stock = world(depth, False, pts)
++        assert patched[:2] == stock[:2], 'depth %d changed by the child stub' % depth
++        check(*patched[:2])
++    print('PASS: Linux ELF sites; decoder boundaries; %d depth-13 and %d depth-12 original-code nodes; '
++          'stock overflow reproduced; internal/leaf ID reuse; depth-10/11 IDs identical to stock'
++          % (counts[13], counts[12]))
++
++
++if __name__ == '__main__':
++    main()

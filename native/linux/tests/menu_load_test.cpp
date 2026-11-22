@@ -1,12 +1,36 @@
 #include "../src/menu_game_linux.cpp"
 #include <cassert>
+namespace panel { void OnGameUiFrame() {} bool SetActionsHeld(bool) { return false; } }
 static unsigned calls=0;
 static bool allow=true;
 static std::string observed;
 static uint8_t Original(void*,void*,void*) { ++calls; return allow; }
 static void Observer(const char* name) { observed=name; }
+static void Update(void*, int64_t, int64_t) { ++calls; }
 int main()
 {
+    // Exercise the real update detour with a synthetic global current-UI slot.
+    assert(Tpf2mpLastGameUiTick() == 0);
+    uintptr_t ui = 0;
+    void* current = &ui;
+    g_base = reinterpret_cast<uintptr_t>(&current) - RVA_G_GAMEUI;
+    g_gameUiUpdate = &Update;
+    GameUiUpdateDetour(&ui, 0, 0); // wrong vtable
+    assert(Tpf2mpLastGameUiTick() == 0 && calls == 1);
+    ui = g_base + RVA_GAMEUI_VTABLE;
+    current = nullptr;
+    GameUiUpdateDetour(&ui, 0, 0); // not the current game
+    assert(Tpf2mpLastGameUiTick() == 0 && calls == 2);
+    current = &ui;
+    auto before = NowMs();
+    GameUiUpdateDetour(&ui, 0, 0);
+    assert(Tpf2mpLastGameUiTick() >= before && Tpf2mpLastGameUiTick() <= NowMs());
+    auto first = Tpf2mpLastGameUiTick();
+    usleep(2000);
+    GameUiUpdateDetour(&ui, 0, 0);
+    assert(Tpf2mpLastGameUiTick() > first && calls == 4);
+    game_ui_tick::last = 0;
+    g_base = 0; calls = 0;
     // Synthetic objects only: never execute the ELF. Reject absent pointers,
     // wrong vtables, unreadable memory and non-finite/out-of-range floats.
     alignas(8) unsigned char menu[0x4a0]{}, bar[0x448]{}, monitor[16]{};

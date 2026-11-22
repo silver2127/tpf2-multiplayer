@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <string>
 
-#define NET_CHUNK_TEXT 1024
+#define NET_CHUNK_TEXT 900   // MTU-safe: max wire packet = 73 (Header) + 5 (NetEvent hdr) + 900 = 978 B < 1200
 
 #pragma pack(push, 1)
 struct NetEvent {

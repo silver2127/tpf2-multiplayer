@@ -497,6 +497,12 @@ local function encodeCmd(c)
 end
 
 local function decodeCmd(line)
+	-- A history-feed line is the original line + " hist=1 hfor=X" (CM.histPump).
+	-- Take that tag off first: params is the greedy tail, and it swallowed the tag,
+	-- so a joiner refused every CONX/CONP/CONU/FENCE of its catch-up (params no longer
+	-- parsed) and every other instance re-queued the feed line as a live command.
+	local body, hfor = line:match("^(.-) hist=1 hfor=(%a+)$")
+	if body then line = body end
 	local c = {
 		op     = line:match("op=(%u+)"),
 		at     = tonumber(line:match("at=([%-%d%.]+)")),
@@ -504,6 +510,7 @@ local function decodeCmd(line)
 		seq    = tonumber(line:match("seq=(%d+)")),
 	}
 	if not (c.op and c.at and c.origin and c.seq) then return nil end
+	if body then c.hist = 1; c.hfor = hfor end
 	-- params is the greedy tail; strip it before scanning bare key=value tokens
 	local head = line
 	local p = line:match("params=(.+)$")
@@ -518,6 +525,9 @@ local function decodeCmd(line)
 	end
 	return c
 end
+
+-- a peer clock this far ahead of ours is not this world's (CM.scheduleLocal)
+K.LEAD_SANE = 600
 
 function CM.scheduleLocal(op, args)
 	if CM.resyncHold then return end
@@ -548,10 +558,23 @@ function CM.scheduleLocal(op, args)
 		if lead < 0 then lead = 0 end
 		-- Capping this at the barrier's threshold (5 units then) was wrong: a live
 		-- session was seen 9.2 units apart, and a command stamped 5.6 out then
-		-- still landed in the peer's past and was applied out of step. Cap high
-		-- enough to cover the gaps seen in practice; the delay is felt by the
-		-- player, so it is not unbounded either.
-		if lead > CM.MAX_LEAD then lead = CM.MAX_LEAD end
+		-- still landed in the peer's past and was applied out of step.
+		-- NOT CAPPED AT MAX_LEAD EITHER (2026-09-26): a joiner catching up 63 units
+		-- behind the host stamped a speed vote and its company's headquarters 15
+		-- out; both reached the host 26-33 units late, were applied out of step,
+		-- and the towns grew apart (desyncs at t=31824 and t=31968 in a player's
+		-- logs). The player-action gate (inject.lua ACTIONS OFF) does not cover
+		-- what the mod itself schedules. A stamp in any peer's past is a desync;
+		-- one far in our own future only waits, and a game this far behind runs
+		-- at catch-up speed. Only a clock beyond K.LEAD_SANE is ignored: that peer
+		-- is not in this world (a forked clock at 202,740 was seen), and waiting
+		-- for it would hold every command forever.
+		if lead > K.LEAD_SANE then
+			log(string.format("stamp: the fastest peer is %.1f ahead (over %d) -- not this world's clock; stamping %.1f out", lead, K.LEAD_SANE, CM.MAX_LEAD))
+			lead = CM.MAX_LEAD
+		elseif lead > CM.MAX_LEAD then
+			log(string.format("stamp: this game is %.1f behind -- stamped in the peer's future anyway; it runs here once we catch up", lead))
+		end
 	end
 	-- the measured delay (CM.execDelayTick), or K.EXEC_DELAY when pinned or not yet measured
 	local base = CM.execDelayCur or K.EXEC_DELAY
@@ -699,6 +722,27 @@ function CM.compareOne(stamp, origin, theirs, dt)
 	-- silently. Compare them here on EVERY stamp and log only when the GAP
 	-- CHANGES, so each event that widens or closes the split is timestamped --
 	-- which is what tells a stop-cost asymmetry from a vehicle-income one.
+	-- COMPANY WALLETS (k:, companies mode): every company's balance/loan as each
+	-- machine sees it. Logged when the difference changes, company by company.
+	do
+		local dm = CM.myDetails[stamp]
+		local ka = dm and dm:match(",k:([^,]*)")
+		local kb = dt and dt:match(",k:([^,]*)")
+		if ka and kb and ka ~= "-" and kb ~= "-" then
+			local theirs = {}
+			for cid, v in kb:gmatch("(%d+)=([^;]+)") do theirs[cid] = v end
+			local diff = {}
+			for cid, v in ka:gmatch("(%d+)=([^;]+)") do
+				if theirs[cid] and theirs[cid] ~= v then diff[#diff + 1] = "co" .. cid .. " " .. v .. " vs " .. theirs[cid] end
+			end
+			local text = table.concat(diff, ", ")
+			CM.walletGap = CM.walletGap or {}
+			if CM.walletGap[origin] ~= text then
+				CM.walletGap[origin] = text
+				log(string.format("$$ COMPANY WALLETS t=%d vs %s: %s", stamp, origin, text ~= "" and text or "agree again"))
+			end
+		end
+	end
 	do
 		local dm = CM.myDetails[stamp]
 		if dm and dt then
@@ -864,10 +908,30 @@ end
 -- are is also what turns the player's actions off (inject.lua CM.actionsBlockTick).
 -- Not defined above scheduleLocal: tools/bridge_companion_test.py cuts the wire
 -- codec out of this file as the text between encodeCmd and scheduleLocal.
+-- RECENT IN WALL TIME, NOT ONLY IN TICKS (2026-09-27). "Fresh" above means heard
+-- within K.PEER_STALE_TICKS of OUR ticks, and a game catching up at 4x burns those
+-- four times as fast: the leader's last heartbeat read stale about a second after
+-- it arrived, this returned nil, the action gate took that as "0.0 behind" and
+-- turned actions back on 35 units behind the leader, and the automatic LSPARE was
+-- stamped with no lead at all -- 13.6 on the joiner, 48.2 on the leader, a line
+-- created at two different times, and the towns grew apart from it (desync at
+-- t=864 on the project's server). So a peer heard within K.PEER_CLOCK_RECENT_SEC of
+-- os.clock still counts, projected forward like projectedPeerMax (at most 5 s of
+-- it): a stamp in any peer's past is a desync, one a little in its future waits.
+K.PEER_CLOCK_RECENT_SEC = K.PEER_CLOCK_RECENT_SEC or 15
 function CM.fastestPeerClock()
 	local _, fastT = CM.peerBounds()
 	local projT = CM.projectedPeerMax and CM.projectedPeerMax() or nil
 	if projT and (not fastT or projT + K.SIM_STEP > fastT) then fastT = projT + K.SIM_STEP end
+	local clk, rate = os.clock(), CM.simRate or 0
+	for _, pr in pairs(CM.peers or {}) do
+		local base = pr.step and (pr.step * K.SIM_STEP) or pr.time
+		local age = pr.clk and (clk - pr.clk)
+		if base and age and age >= 0 and age <= (K.PEER_CLOCK_RECENT_SEC or 15) then
+			local pt = base + (rate > 0 and math.min(age, 5) * rate or 0) + K.SIM_STEP
+			if not fastT or pt > fastT then fastT = pt end
+		end
+	end
 	return fastT
 end
 
@@ -957,7 +1021,16 @@ function CM.execDelayTick()
 	CM.tickClk = clk
 	if not CM.execDelayAuto then CM.execDelayCur = K.EXEC_DELAY; return end
 	-- a held or paused game measures a sim rate near 0: never let that shrink the delay
-	local rate = math.max(CM.simRate or 0, (CM.effSpeed or 1) * 0.9, 0.9)
+	-- BELOW 1x (2026-09-28, the user: "can we reduce the delay at slower speeds?"):
+	-- the 0.9 floor sized a 0.25x session's delay for 1x -- 1.6 units, ~7 s of wall
+	-- time before a build appeared while the governor held a joiner's catch-up.
+	-- A running session under 1x is sized by its own speed, times
+	-- K.DELAY_RAMP_MARGIN: the leader raises a speed under 1x at most
+	-- K.SPEED_RAMP per K.SPEED_RAMP_TICKS (pacing.lua), so a command in flight
+	-- still lands before its stamp. Paused, or at 1x and over: as before.
+	local e = CM.effSpeed or 1
+	local floor = (e > 0 and e < 1) and math.max(0.1, e * 0.9 * (K.DELAY_RAMP_MARGIN or 1.6)) or 0.9
+	local rate = math.max(CM.simRate or 0, e * 0.9, floor)
 	local worstMs, who
 	for o, pr in pairs(CM.peers) do
 		if pr.srtt and (pr.rttN or 0) >= K.RTT_MIN_SAMPLES and pr.at and (CM.ticks - pr.at) <= K.PEER_STALE_TICKS then
@@ -989,7 +1062,10 @@ function CM.execDelayTick()
 	elseif want < cur - 1e-6 and (not raw or raw <= cur - K.SIM_STEP - K.DELAY_DOWN_MARGIN) then
 		CM.execDelayLowSince = CM.execDelayLowSince or CM.ticks
 		if CM.ticks - CM.execDelayLowSince >= K.DELAY_DOWN_TICKS then
-			local nxt = snapStep(math.max(want, cur - K.SIM_STEP))
+			-- half the way down per step (at least one sim step): a session slowed to
+			-- 0.25x waited ~30 s for 1.6 -> 0.4 at one step per K.DELAY_DOWN_TICKS.
+			-- Lowering is always safe; only a stamp that is too near can be late.
+			local nxt = snapStep(math.max(want, cur - math.max(K.SIM_STEP, (cur - want) / 2)))
 			log(string.format("EXEC_DELAY auto: %.1f -> %.1f (%s)", cur, nxt, why))
 			cur, CM.execDelayLowSince = nxt, CM.ticks
 		end
@@ -1348,15 +1424,8 @@ local function onLine(line)
 			end
 			-- our own command coming back off the wire; already queued
 			if c.origin ~= K.INSTANCE then
-				-- companies mode: the lobby's assignment wins over the sender's stamp
-				if CM.cmOriginCompany == nil then CM.cmReadConfig() end
-				local lc = CM.cmMode == "companies" and CM.cmOriginCompany and CM.cmOriginCompany[c.origin]
-				if lc then
-					if c.company and tonumber(c.company) ~= lc then
-						CM.cmLog(string.format("CM: origin %s claimed company %s but the lobby assigned %d -- overriding", tostring(c.origin), tostring(c.company), lc))
-					end
-					c.company = lc
-				end
+				-- (companies: a command's company is decided at its stamp, from the
+				-- registry -- CM.cmAttribute in execute -- not when it arrives)
 				-- ONE COPY IN THE QUEUE (2026-09-16). A command now arrives up to three
 				-- times (scheduleLocal's copies, a NACK resend, the history feed). The
 				-- apply loop deduplicates at EXECUTION, but its pre-pass hands every

@@ -1,0 +1,25 @@
+{
+  "source": "autosave_New Game_2007-01-14.sav",
+  "python_zstandard": "0.25.0",
+  "zstd": [
+    1,
+    5,
+    7
+  ],
+  "results": [
+    {
+      "level": 3,
+      "compression_seconds": 18.81120289926912,
+      "compressed_bytes": 1426467668,
+      "uncompressed_bytes": 2562832617,
+      "sha256": "eeac3e73f29bd96e9bc1055449221f8f929b503051de28a19cd9a86ca558f320"
+    },
+    {
+      "level": 1,
+      "compression_seconds": 6.750041899511416,
+      "compressed_bytes": 1558070429,
+      "uncompressed_bytes": 2562832617,
+      "sha256": "eeac3e73f29bd96e9bc1055449221f8f929b503051de28a19cd9a86ca558f320"
+    }
+  ]
+}

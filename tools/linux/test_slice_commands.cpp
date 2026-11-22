@@ -284,6 +284,11 @@ static void TestVehicles()
     assert(!Add(fn));assert(writes.empty());writeFails=false;
     c=Call(slice_vehicles::kReverse);c.rdx=44;c.script=true;Capture(c);assert(writes.empty());
     c.script=false;live=false;Capture(c);assert(!armed && writes.empty());live=true;
+    for (unsigned stop : {0u, 1u}) {
+        c=Call(slice_vehicles::kStopped);c.rdx=44;c.rcx=stop;Capture(c);
+        assert(armed && writes[0]=="ARMED 1\nVSTOP 44 "+std::to_string(stop)+"\n");Add();
+        c=Call(slice_vehicles::kStopped);c.script=true;Capture(c);assert(!armed && writes.empty());
+    }
     std::vector<int> sell{1,5,99}; c=Call(slice_vehicles::kSell);c.rdx=uintptr_t(&sell);Capture(c);
     assert(armed && writes[0]=="ARMED 1\nVSELL 3 1 5 99\n");Add();
     c=Call(slice_vehicles::kBuy);c.rcx=81;c.r8=uintptr_t(&cfg);Capture(c);
@@ -554,7 +559,7 @@ int main(int argc, char** argv)
     TestSpareGeneration();
     testDataDir=argc>2 ? argv[2] : "/tmp/";
     slice_vehicles_area_SliceRegister();slice_lines_area_SliceRegister();slice_time_area_SliceRegister();
-    assert(handlers.size()==14 && hooks.size()==3 && hooks[2].steal==14 && hooks[2].expectedLen==27);
+    assert(handlers.size()==15 && hooks.size()==3 && hooks[2].steal==14 && hooks[2].expectedLen==27);
     TestVehicles();TestLines();TestStrictCreates();TestTime();
     if (argc > 1) {
         void* foreign = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL); assert(foreign);

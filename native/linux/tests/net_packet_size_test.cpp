@@ -23,7 +23,7 @@ static void waitFor(std::function<bool()> predicate) {
 static bool alive() { bool yes; Net_Stats(nullptr,nullptr,nullptr,&yes,nullptr); return yes; }
 static const int HEAD=(int)(sizeof(Header)+offsetof(NetEvent,text));
 int main() {
-    assert(sizeof(Header)==57 && HEAD==62 && sizeof(Packet)==1086);
+    assert(sizeof(Header)==73 && HEAD==78 && sizeof(Packet)==978);
 
     int peer=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
     sockaddr_in endpoint{}; endpoint.sin_family=AF_INET; endpoint.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -32,9 +32,9 @@ int main() {
     assert(Net_Init(0,"127.0.0.1",ntohs(endpoint.sin_port),delivered));
     sockaddr_in bridge=endpoint; bridge.sin_port=htons(Net_LocalPort());
     const std::string zero(32,'0');
-    // a datagram from this test's peer (session 77): `bytes` long, or sized as a protocol-5 sender sizes it
+    // a datagram from this test's peer (session 77): `bytes` long, or sized as a protocol-6 sender sizes it
     auto send=[&](uint32_t seq,const char* line,int bytes=0,uint32_t magic=MAGIC) {
-        Packet p{}; p.h.magic=magic; memcpy(p.h.world,zero.data(),32);
+        Packet p{}; p.h.cumAck=NO_ACK; p.h.magic=magic; memcpy(p.h.world,zero.data(),32);
         p.h.session=77; p.h.ackSession=g_session; p.h.seq=seq; p.h.ack=NO_ACK;
         p.h.type=line ? 1 : 0; p.ev.type=1; p.ev.chunkIdx=0; p.ev.chunkCount=1;
         if(line) strcpy_s(p.ev.text,line);
@@ -72,7 +72,7 @@ int main() {
         sizes[p.h.seq]=n; texts[p.h.seq]=p.ev.text;
     }
     assert(sizes[0]==HEAD+6 && texts[0]=="hello");
-    assert(sizes[1]==HEAD+1024 && sizes[2]==HEAD+1024 && sizes[3]==HEAD+455);
+    assert(sizes[1]==HEAD+900 && sizes[2]==HEAD+900 && sizes[3]==HEAD+703);
     assert(texts[1]+texts[2]+texts[3]==big);
 
     // RECEIVING: a trimmed event, then a full-size one as protocol 4 sized every event
@@ -84,6 +84,7 @@ int main() {
     send(2,"truncated",HEAD+5);
     send(2,"",HEAD);
     send(2,"old magic",0,0x34545046);
+    send(2,"old FPT5 magic",0,0x35545046);
     TestSleep(250); assert(count()==2);
     send(2,"whole");
     waitFor([]{return count()==3;}); assert(nth(2)=="whole");

@@ -35,12 +35,14 @@ Settings Read(const std::string& path) {
         else if (key == "dedicated_companies" && Number(value, 0, 1, &n)) s.companies = n;
         else if (key == "dedicated_render" && Number(value, 0, 1, &n)) s.render = n;
         else if (key == "dedicated_nowsi" && Number(value, 0, 1, &n)) s.noWsi = n;
+        else if (key == "dedicated_recycle_sets" && Number(value, 0, 1, &n)) s.recycleSets = n;
         else if (key == "dedicated_pin_batch" && Number(value, 0, 1, &n)) s.pinBatch = n;
         else if (key == "dedicated_autosave_min" && Number(value, 0, 600, &n)) s.autosaveMinutes = n;
         else if (key == "dedicated_empty_speed" && Number(value, 0, 4, &n)) s.emptySpeed = n;
         else if (key == "dedicated_pause_empty" && Number(value, 0, 1, &n) && n) s.emptySpeed = 0;
         else if (key == "dedicated_port" && Number(value, 0, 65535, &n)) s.port = n;
         else if (key == "dedicated_fps" && Number(value, 1, 240, &n)) s.fps = n;
+        else if (key == "dedicated_load_delay_sec" && Number(value, 8, 120, &n)) s.loadDelaySeconds = n;
         else if (key == "dedicated_save" && value.size() < 64 &&
                  value.find_first_of("/\\\r\n") == std::string::npos &&
                  (value.empty() || value[0] != '.')) s.save = value;

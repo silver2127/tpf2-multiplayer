@@ -39,6 +39,7 @@
 
 #include "datadir.h"
 #include "logarchive.h"
+#include "wine_heap.h"
 
 // Resolve a shipped file by name: %LOCALAPPDATA%\tpf2mp\<name> when that file
 // exists, otherwise next to THIS proxy dll (the game dir). There is no third
@@ -81,6 +82,14 @@ static void Log(const char* fmt, ...)
 // built -- the exe has not even reached its entry point yet.
 static DWORD WINAPI LoadBridge(LPVOID)
 {
+    // Under Wine/Proton only: switch the heap's 1-32 KB bins to the lock-free front
+    // end before the game allocates (wine_heap.h: the simulation thread spent 79% of
+    // its time in Wine's free-list search on the dedicated server).
+    {
+        const Tpf2mpWineHeapResult wh = Tpf2mpWineHeapWarmup();
+        if (wh.ran) Log("[proxy] wine heap: %d heap(s), %d bin(s) switched to the front end with %ld allocations in %lu ms%s\n",
+                        wh.heaps, wh.bins, wh.allocations, wh.ms, wh.wine ? "" : " (forced: not Wine)");
+    }
     wchar_t bridgePath[MAX_PATH], menuPath[MAX_PATH], slicePath[MAX_PATH], hostPath[MAX_PATH];
     resolveShipped(L"tpf2_bridge_mp.dll",  bridgePath, MAX_PATH);
     resolveShipped(L"tpf2_menu.dll",       menuPath,   MAX_PATH);

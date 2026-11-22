@@ -16,11 +16,11 @@ def dumps_for(lines, c, off):
     """All dumps of vector at r8+off for side c, in log order."""
     tag = "DV%d_%03x_" % (c, off)
     pat = re.compile(r"\[gt\] " + re.escape(tag) + r"0\.(\d+)\+([0-9a-f]{3}):([0-9a-f]+)")
-    dumps, cur, curk = [], {}, None
+    dumps, cur = [], {}
     for ln in lines:
         m = pat.search(ln)
         if not m: continue
-        k, o = int(m.group(1)), int(m.group(2), 16)
+        o = int(m.group(2), 16)
         if o == 0 and cur: dumps.append(cur); cur = {}
         cur[o] = bytes.fromhex(m.group(3))
     if cur: dumps.append(cur)

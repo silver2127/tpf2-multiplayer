@@ -673,3 +673,28 @@ image base + RVA). On any mismatch, leave both carriers and both captures OFF an
   as `PROPOSALS.md` describes for terraform, is to be observed (MEASURE).
 - **Live check.** Every PROVEN layout still needs a check against a real terraform, paint and asset
   stroke in the running game (MEASURE stage).
+
+
+## Dev 2f65bae3 wire compression
+
+This integration changes serialization only; all engine sites, SysV arguments,
+grid offsets, mask conversion, allocator ownership and byte gates above are
+unchanged. Linux `EncodeTerrainWire` wraps the synthesized v1 blob with the
+same `native/src/slice/tplz.h` that Windows includes. `DecodeTerrainWire`
+unwraps at most one frame before calling the existing v1 decoder. Neither
+path packs or decompresses game memory in place.
+
+The packed header is `TPTG`, little-endian u32 version 2, u64 raw length,
+u64 checksum, followed by the shared LZ stream. The checksum deliberately
+uses upstream `TplzFnv` verbatim (including its initial value), rather than
+substituting another FNV implementation. A nonshrinking edit remains v1.
+Native send and receive enforce the Windows 64 MiB limit including the raw
+header. This wire compression is separate from Big Maps' terrain memory pager.
+
+The existing offline ELF fixture passed against the lab ELF, including its
+constructor hash and initialization gates. New handler checks demonstrated
+corrupt-v2 rejection with an empty carrier preserved, valid-v2 installation,
+and v2 capture with the correct TERRAINCAP length. No addresses or ABI facts
+were newly inferred, and no live game was launched. This does not resolve the
+prior live gameplay questions in section 10. Full test commands, results and
+limits: [integration record](../../linux/UPSTREAM_dev_2f65bae3.md).

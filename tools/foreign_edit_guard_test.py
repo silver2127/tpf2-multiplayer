@@ -3,7 +3,7 @@
 Read-only foreign windows (slice foreignwindows) let a player click another company's
 vehicle/station window, whose native controls have no owner gate. inject.lua's capture
 must refuse to replicate an edit of a foreign entity, on the originator, so the control
-is a no-op. This drives the real CM.pollInject over VNAME/VCOLOR/VREV/VDEPOT/VLINE/VSELL/
+is a no-op. This drives the real CM.pollInject over VNAME/VCOLOR/VREV/VSTOP/VDEPOT/VLINE/VSELL/
 LUPDATE lines and checks: a foreign target ships nothing; an own target ships as before;
 a VSELL batch drops only the foreign ids.
 
@@ -109,6 +109,16 @@ H.feed("VDEPOT 600 1")
 check("foreign VDEPOT is not shipped", H.count() == 0)
 H.feed("VDEPOT 500 1")
 check("own VDEPOT ships", H.ops() == "VDEPOT", H.ops())
+H.clear()
+H.feed("VSTOP 600 1")
+check("foreign VSTOP is not shipped", H.count() == 0)
+H.feed("VSTOP 500 1")
+last = H.last()
+check("own VSTOP ships with key and state", H.ops() == "VSTOP" and last.args.key == "a:5" and last.args.stopped == 1,
+      H.ops() + " " + str(last and last.args and (last.args.key, last.args.stopped)))
+H.clear()
+H.feed("VSTOP 510 0")
+check("own VSTOP go ships stopped=0", H.last().args.stopped == 0)
 H.clear()
 H.feed("VLINE 600 12 0")
 check("foreign VLINE is not shipped", H.count() == 0)

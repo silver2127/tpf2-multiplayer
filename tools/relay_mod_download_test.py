@@ -1,5 +1,5 @@
 """Real UDP relay upload -> mod cache -> initial join and hotjoin, no game processes."""
-import json, os, socket, sys, tempfile, threading, time
+import json, socket, sys, tempfile, threading, time
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'netpunch'))
@@ -7,7 +7,7 @@ import lobby as l
 def who(): return threading.current_thread().name.split('/')[0]   # the player: its loop thread, or that thread's save-finalize worker
 import modshare as m
 
-def main(batch_bytes=None, workshop=1):
+def main(batch_bytes=None, workshop=1, slow_pack=0.0):
     if batch_bytes is not None:
         l.MODS_BATCH_BYTES = batch_bytes
     with tempfile.TemporaryDirectory() as temp:
@@ -32,8 +32,13 @@ def main(batch_bytes=None, workshop=1):
             conns.append(c)
             t=threading.Thread(target=l.run_client,name=name,args=(c,name,io),kwargs={'stop':stop},daemon=True);t.start();threads.append(t)
         with patch.object(m,'save_mod_list',return_value=mods), patch.object(m,'find_mod',return_value=str(src)), patch.object(m,'installed_mod',side_effect=installed), patch.object(m,'on_disk_mod',side_effect=installed), patch.object(m,'install_target',side_effect=lambda mid,v:str(root/who()/'mods'/m.mod_folder_name(mid,v).replace("*","workshop_"))), patch.object(m,'request_catalogue',side_effect=lambda extra=None:who()), patch.object(m,'write_registry',side_effect=lambda token=None,extra=None:who()), patch.object(m,'catalogue',side_effect=catalogue):
-            server=l.LobbyIO(str(root/'relay'))
-            t=threading.Thread(target=l.run_host,args=(hs,'relay',server),kwargs={'relay_only':True,'stop':stop},daemon=True);t.start();threads.append(t)
+            server=l.LobbyIO(str(root/'relay'));host_log=[]
+            real_bytes=m.folder_bytes
+            def folder_bytes(f):
+                time.sleep(slow_pack)   # a real mod takes seconds to size and pack: the lobby's pipe is free meanwhile
+                return real_bytes(f)
+            m.folder_bytes=folder_bytes
+            t=threading.Thread(target=l.run_host,args=(hs,'relay',server),kwargs={'relay_only':True,'stop':stop,'log':host_log.append},daemon=True);t.start();threads.append(t)
             try:
                 connect('leader');connect('joiner')
                 assert l._wait_until(lambda:len((l._latest_roster(ios['leader'].out_path) or {}).get('players',[]))==2,10),'roster'
@@ -49,6 +54,10 @@ def main(batch_bytes=None, workshop=1):
                 assert len(list(cache.glob('*.zip')))==workshop,'DLC must not enter cache'
                 connect('late')
                 assert l._wait_until(lambda:ready('late'),25),'relay hotjoin mod download'
+                # ONE push for the late joiner: while its mods were packing, the host
+                # pushed the whole save to it again every round (2026-09-28)
+                pushes=[x for x in host_log if 'waiting for the save -- pushing it again' in x]
+                assert len(pushes)==1,f'the save went to the late joiner {len(pushes)} times'
                 for name in ('joiner','late'):
                     events=l._read_events(ios[name].out_path)
                     registered=next(i for i,e in enumerate(events) if e.get('type')=='mods_ready')
@@ -64,9 +73,12 @@ def main(batch_bytes=None, workshop=1):
                 else:
                     print('PASS: relay caches one mod, excludes DLC, initial join and hotjoin register before start')
             finally:
+                m.folder_bytes=real_bytes
                 stop.set()
                 for c in conns:c.close()
                 for t in threads:t.join(3)
 if __name__=='__main__':
     main()
     main(batch_bytes=1, workshop=3)
+    main(slow_pack=2.5)
+    print('PASS: a late joiner whose mods take seconds to pack gets the save once')

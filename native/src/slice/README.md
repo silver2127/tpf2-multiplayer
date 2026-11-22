@@ -27,6 +27,7 @@ forward declaration.
 | `ui_tints.inl` | paused tick, icons for every player, company-colour tints on icons, labels and windows |
 | `sharedstations_install.inl` | InstallSharedStations (the patch of the gate above) |
 | `moveorder.inl` | SHIP AND AIRCRAFT CLAIM ORDER (moveorder.h) |
+| `town_trace.inl` | TOWN DEVELOPMENT TRACE: a diagnostic, off unless `towntrace=1` (../town_trace.h) |
 | `init.inl` | the relay blobs, hook installation, Init and DllMain |
 
 Tests that read the source by text anchors (`tools/*_bytes_test.py` and

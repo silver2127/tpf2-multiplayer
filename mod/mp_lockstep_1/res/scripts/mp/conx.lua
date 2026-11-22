@@ -261,6 +261,14 @@ CM.execConX = function(c)
 			api.type.Vec4f.new(t[9], t[10], t[11], t[12]),
 			api.type.Vec4f.new(t[13], t[14], t[15], t[16]))
 		ce.playerEntity = api.engine.util.getPlayer()
+		-- ONE HEADQUARTERS PER COMPANY (2026-09-27): a player has one headquarters,
+		-- so another company's HQ built as OUR player would be our player's second
+		-- one. It is built as that company's own player entity from the start (it
+		-- then also pays for it; the cost settle below finds nothing to move).
+		if CM.cmMode == "companies" and c.company and tostring(c.file):find("headquarter", 1, true) then
+			local hqPid = CM.cmCompanyPid and CM.cmCompanyPid[tonumber(c.company)]
+			if hqPid then ce.playerEntity = hqPid end
+		end
 		-- The name goes IN the proposal. Measured (probe P9, 2026-08-28): with
 		-- ce.name set, the apply gives the construction AND its child entities
 		-- (VEHICLE_DEPOT / stations) their NAME and PLAYER_OWNED -- exactly a

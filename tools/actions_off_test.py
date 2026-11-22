@@ -1,8 +1,8 @@
 """A game far behind the others turns its player's actions off, on Lua 5.2, no game.
 
-A command's stamp pays at most CM.MAX_LEAD (15 units) of lead over the fastest game, so a game
-further behind than that would stamp its player's actions into the other games' past. Since
-2026-09-15 inject.lua drops those actions until the game is back within 2 units.
+Since 2026-09-26 commands pay the fastest peer's full sane lead. The action gate
+remains to avoid clicks waiting through a long catch-up: since 2026-09-15 it drops
+player actions until the game is back within 2 units.
 
 This runs the real inject.lua (CM.actionsBlockTick and CM.pollInject) and the real
 CM.fastestPeerClock cut out of net.lua against stubbed captures:
@@ -78,6 +78,21 @@ print('== the fastest clock a stamp has to clear')
 check('the projected peer, plus a step of margin', abs(G.fastest(100, 101) - 101.2) < 1e-9)
 check('the heartbeat reading when projection is behind it', G.fastest(100, 99) == 100)
 check('no fresh peer: none', G.fastest(None, None) is None)
+# 2026-09-27: a leader stale by OUR ticks (a joiner catching up at 4x) but heard a
+# second ago in wall time still counts, projected (at most 5 s), plus a step
+L.execute(r'''
+function fastestRecent(age, rate, t)
+  local C, KK = { peers = { a = { time = t, clk = os.clock() - age } }, simRate = rate }, { SIM_STEP = 0.2 }
+  C.peerBounds = function() return nil, nil end
+  assert(load("local CM, K = ...\n" .. FASTEST_SRC .. "\nreturn CM.fastestPeerClock", "@fastestPeerClock"))(C, KK)
+  return C.fastestPeerClock()
+end
+''')
+got = G.fastestRecent(1.0, 4.0, 48.0)
+check('a leader stale by ticks but heard 1 s ago still counts (projected)', got is not None and abs(got - (48.0 + 4.0 + 0.2)) < 0.05, got)
+got = G.fastestRecent(9.0, 4.0, 48.0)
+check('projection capped at 5 s of age', got is not None and abs(got - (48.0 + 20.0 + 0.2)) < 0.05, got)
+check('a peer silent past the window: none', G.fastestRecent(30.0, 4.0, 48.0) is None)
 
 print('== in step: actions replicate')
 G.tick(1000, 1001)

@@ -19,6 +19,8 @@ install -m 0644 /tmp/masterserver.py /opt/tpf2mp/masterserver.py
 IP=$(ip -4 route get 1.1.1.1 | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }')
 [ -n "$IP" ] || { echo "cannot find this machine's public IPv4"; exit 2; }
 if command -v ufw >/dev/null 2>&1; then ufw allow 29600:29699/udp >/dev/null && echo "ufw: udp/29600-29699 open (relay fallback)"; fi
+# the TCP pipe for slow save transfers (masterserver.py PIPE): both ends dial it
+if command -v ufw >/dev/null 2>&1; then ufw allow 29700/tcp >/dev/null && echo "ufw: tcp/29700 open (transfer pipe)"; fi
 id -u tpf2mp >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin tpf2mp
 cat > /etc/systemd/system/tpf2mp-master.service <<EOF
 [Unit]
@@ -27,7 +29,7 @@ After=network.target
 
 [Service]
 User=tpf2mp
-ExecStart=/usr/bin/python3 /opt/tpf2mp/masterserver.py 8471 --relay-ip $IP --relay-ports 29600-29699
+ExecStart=/usr/bin/python3 /opt/tpf2mp/masterserver.py 8471 --relay-ip $IP --relay-ports 29600-29699 --pipe-port 29700
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
@@ -98,6 +100,7 @@ fi
 write_site tls
 sleep 1
 curl -fsS http://127.0.0.1:8471/health; echo
+curl -fsS http://127.0.0.1:8471/pipe; echo
 # --resolve: on this machine the name is 127.0.1.1, where nothing listens on 443
 curl -fsS --resolve "$NAME:443:$IP" "https://$NAME/tpf2mp/health"; echo
 systemctl is-active tpf2mp-master

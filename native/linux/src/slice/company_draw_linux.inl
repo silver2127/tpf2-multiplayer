@@ -43,7 +43,10 @@ bool EntityColor(uintptr_t engine,const int* entity,float* rgba)
         const int owner=SliceEcsOwner(engine,id);
         const int company=owner>=0?CompanyOfPid(owner):0;
         if(company<=0)return false;
-        CompanyRgb(company,rgba);rgba[3]=1;return true;
+        const int rgb=CompanyRgbOfPid(owner);   // the exact colour the company chose, if any
+        if(rgb>=0){rgba[0]=((rgb>>16)&0xFF)/255.f;rgba[1]=((rgb>>8)&0xFF)/255.f;rgba[2]=(rgb&0xFF)/255.f;}
+        else CompanyRgb(company,rgba);
+        rgba[3]=1;return true;
     } catch(...) { ++refused;return false; }
 }
 

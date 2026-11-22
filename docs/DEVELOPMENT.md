@@ -45,6 +45,10 @@ A DLL loaded by a running game is locked and relinking it fails with LNK1104. A 
 (`build.bat slice 2` makes `tpf2_slice2.dll`); only unsuffixed names ship, and `deploy_shipping.ps1`
 warns when a suffixed build is newer than the one it copies.
 
+`rebuild.bat` at the repository root does the usual loop in one go: `native\build.bat all`, then
+`tools\deploy_shipping.ps1`, then `tools\version_gate_test.py` and `tools\test_rto_resilience.py`,
+stopping at the first failure.
+
 The lobby is frozen with PyInstaller ([netpunch/README.md](../netpunch/README.md#freezing)); the MSI is
 built by `installer\build_msi.ps1` ([installer/README.md](../installer/README.md#building-the-msi)).
 
@@ -194,18 +198,36 @@ installing the new MSI (or running the Proton installer again): there is no in-g
    run time, which four engines called a trojan even with the compiled stub; a plain program beside its libraries is
    what their rules treat as normal. The Proton repair patches the plain miniupnpc DLL in that folder.
 2. `powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1 -AcceptWixEula -Validate`.
-3. Tag the commit `v<version>`. The workflow builds, attaches the assets below and drafts the release with Push the tag before fast-forwarding `main` to it: the workflow builds on tags and on `main`, and a `main` push whose commit a tag already built is skipped, so a release costs one build. Nothing builds on `dev`.
-   a **Download** table first (direct links per platform, built from the tag) followed by
-   `installer/RELEASE-<version>.md` when that file exists, then GitHub's generated list of pull
-   requests; review the draft and publish. The Proton installers are pinned to the tag by the
-   workflow. By hand, the same `installer\out` files as GitHub release assets:
-   `TpF2Multiplayer.msi`,
+3. Tag the commit `v<version>`. Push the tag before fast-forwarding `main` to it: the workflow builds on tags and on
+   `main`, and a `main` push whose commit a tag already built is skipped, so a release costs one build. Nothing
+   builds on `dev`. The tag run builds the install files (below) as a workflow artifact and drafts the release
+   with a **Download** table of the two launchers (linked on the `v<version>` page), followed by `installer/RELEASE-<version>.md` when that file
+   exists, then GitHub's generated list of pull requests. The Proton installers are pinned to the tag by the
+   workflow.
+   **Since 0.7.0.6 a version's page `v<version>` shows the two launchers only** (the user, 2026-09-26: releases
+   should "only show 2 things to download the linux launcher and the windows launcher", "two launcher on the
+   original page"): `TpF2Multiplayer-Launcher-Windows-Setup.exe` and `TpF2Multiplayer-Launcher-Linux.AppImage`
+   (tearded/tpf-multiplayer-launcher's newest release, under names that never change, so
+   `releases/latest/download/<name>` always works), marked Latest. The install files go to the release with the
+   same tag in [tpf2-multiplayer-packages](https://github.com/silver2127/tpf2-multiplayer-packages), where
+   launchers from 1.3.0, the Linux launcher and `install_proton.sh`/`.py` download them, and to a release
+   `<version>` tagged without the `v` (the update files; launchers from 1.3.0 skip it). Launchers up to 1.2.0 look
+   for the MSI on `v<version>` and cannot install such a version: their players update the launcher first.
+   Complete a version with
+   `python tools/publish_release.py v<version> --linux-dir <folder with tpf2mp-linux-<version>-native.*> --publish`
+   (`--dry-run` first; `--no-linux-launcher` until tearded's launcher has a Linux build); it refuses a release
+   that is already published. `python tools/publish_release.py page v<version> --publish` moves a version
+   published with its files on `v<version>` to this layout (done for 0.7.0.5). A launcher update between mod
+   versions gets a release of its own: `python tools/publish_release.py launcher --publish` makes
+   `launcher-v<launcher version>` with the same two files, not marked Latest. The workflow builds only `v*` tags.
+   The install files: `TpF2Multiplayer.msi`,
    `TpF2Multiplayer-files.zip` (the MSI's files as an archive: Proton and manual installs), a
-   `SHA256SUMS.txt` listing them, `tools/proton/install.py` uploaded as `install_proton.py` with its
-   `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release page
-   installs that release), and `tools/proton/install_proton.sh` uploaded as `install_proton.sh` with its
+   `SHA256SUMS.txt` listing them, `tools/proton/install.py` as `install_proton.py` with its
+   `DEFAULT_VERSION = None` line changed to the release version (so a copy taken from that release
+   installs that release), `tools/proton/install_proton.sh` as `install_proton.sh` with its
    `DEFAULT_VERSION=""` line set the same way (the no-Python installer; `tools/proton/test_install_sh.py`
-   tests it offline). `build_msi.ps1` repairs the lobby for Wine before packaging
+   tests it offline), and the native Linux package `tpf2mp-linux-<version>-native.run`/`.tar.gz`/`.sha256`
+   (`tools/linux/build_release.sh`). `build_msi.ps1` repairs the lobby for Wine before packaging
    ([proton/INSTALL.md](proton/INSTALL.md)).
 4. If the lobby changed, redeploy the relay with `sh tools/relay_deploy.sh` (it refuses while players are
    connected) and the master server with `sh tools/masterserver_deploy.sh`

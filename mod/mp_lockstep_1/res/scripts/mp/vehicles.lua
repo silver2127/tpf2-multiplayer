@@ -112,7 +112,7 @@ function CM.vehIdForKey(key) return vehIdFor(key) end   -- the drift check names
 -- so the host's a:8 was s:189156 on the joiner (measured 2026-09-16, hot join
 -- from the host's 954.6 save: both VPOS logs paired that vehicle '(nearest)',
 -- and every later host command naming a:8 -- VLINE, VSELL, VREPL, VNAME,
--- VCOLOR, VDEPOT, VREV -- would have been "unknown vehicle key" there). The
+-- VCOLOR, VDEPOT, VREV, VSTOP -- would have been "unknown vehicle key" there). The
 -- registry rides in the save: a save-loaded entity has the same id on every
 -- instance that loads the file (measured repeatedly), so entityId -> key is
 -- valid wherever the file loads. The highest seq minted per origin rides along
@@ -317,6 +317,24 @@ function CM.drainVehCap()
 	end
 end
 
+-- DIAGNOSTICS, OFF BY DEFAULT (2026-09-23). watchDepartures and watchTrains
+-- below only LOG: nothing they read feeds a command, the queue, the hash or a
+-- key. They ran on every update anyway -- a depot query, a MOVE_PATH read per
+-- train, and every 300 ticks a read of EVERY vehicle on the map -- which is
+-- where a big map's steady update cost and its once-a-window hitch sat.
+-- `watch_trains=1` in tpf2_slice.cfg turns both on again (within ~5 s) for
+-- the next desync hunt; switching off drops their state, so switching on
+-- again starts clean instead of logging stale departures.
+function CM.vehWatchOn()
+	local on = CM.cfgFlag("watch_trains", false)
+	if not on and CM.vehWatchWasOn then
+		CM.depotSince = nil
+		CM.trainWatch = { list = {}, last = {}, at = -1e9, off = false }
+	end
+	CM.vehWatchWasOn = on
+	return on
+end
+
 -- Resolve pending purchase keys: the depot's vehicle that is not yet known.
 -- Which STEP each keyed vehicle leaves its depot on, logged on every instance:
 -- two clones bought 0.8 s apart onto one line left the same depot in opposite
@@ -419,6 +437,44 @@ function CM.watchTrains()
 	end
 end
 
+-- THE NAME A BUY GETS IS LOCAL (2026-09-19). No instance names a bought vehicle:
+-- the engine does, from ITS OWN language file and ITS OWN per-type counter
+-- ("Train 7" on an English game, "Zug 7" on a German one; a different number
+-- when a buy failed on one side). Under strict replay every instance creates
+-- the vehicle itself, so nothing on the wire ever carried a name, and the
+-- native reservation-order patch (slice_hook.cpp, "TRAIN RESERVATION ORDER")
+-- ranks trains BY NAME: two peers whose copies of one train are named
+-- differently send it through a junction in a different order. The r lane of
+-- the world hash saw exactly that after every train purchase between an
+-- English and a German game (logs of 2026-09-18: "DESYNC (train names)" a
+-- stamp after each new train left its depot, geometry equal throughout).
+--
+-- So the ORIGINATOR's copy is the name. Once its key binds here, the name the
+-- engine gave it travels as a VNAME with the buy's key -- the same command a
+-- player's rename already uses -- and every peer renames its copy. A peer whose
+-- key is not bound yet retries on the step grid (CM.execSetName). The
+-- originator itself skips the apply: it already holds that name, and a
+-- make.setName is never echoed by the slice. Clones and company buys take the
+-- same path, as they bind through the same poll.
+local function shipVehicleName(key, vid)
+	local o = tostring(key):match("^(%a+):")
+	if o ~= K.INSTANCE then return end
+	local nm = nil
+	pcall(function()
+		local nc = api.engine.getComponent(vid, api.type.ComponentType.NAME)
+		if nc and nc.name ~= nil then nm = tostring(nc.name) end
+	end)
+	if not nm or nm == "" then
+		log(string.format("VNAME: vehicle %s (%d) has no name to share -- the peers keep their own", key, vid))
+		return
+	end
+	local esc = CM.escName and CM.escName(nm)
+		or (nm:gsub("[^%w%-%._~]", function(c) return string.format("%%%02X", c:byte()) end))
+	CM.scheduleLocal("VNAME", { kind = "veh", key = key, name = esc, skipOrigin = 1 })
+	log(string.format("VNAME: vehicle %s = %s (the engine's name here, shipped so every peer's copy is named the same)", key, esc))
+end
+CM.shipVehicleName = shipVehicleName
+
 function CM.pollVehKeys()
 	if #pendingVehKeys == 0 then return end
 	local now = CM.gameTime()
@@ -467,6 +523,7 @@ function CM.pollVehKeys()
 		end
 		if #fresh >= 1 then
 			registerVehKey(p.key, fresh[1])
+			shipVehicleName(p.key, fresh[1])
 			-- companies mode: a remote company's purchase landed on our player;
 			-- hand the vehicle over and move the cost (balance delta since apply).
 			if p.company and CM.cmMode == "companies" then
@@ -499,6 +556,12 @@ function forgetVehicle(vid)
 	local key = CM.vehKeyOf[vid]
 	if key then vehIdOf[key] = nil; vehKeysGen = vehKeysGen + 1 end
 	CM.vehKeyOf[vid] = nil
+	-- ...and neither must "known": the next vehicle to reuse the id was skipped by
+	-- pollVehKeys and the bind hint, so its buy was dropped and it never got a key
+	-- (CM.forgetLine does the same for lines). primedVeh too, or a save vehicle's
+	-- "s:<id>" went on resolving to whatever now has that id.
+	knownVeh[vid] = nil
+	CM.primedVeh[vid] = nil
 end
 
 local function expectVehicle(key, depotChild, company, hint, bal0)
@@ -630,11 +693,27 @@ end
 
 function CM.execSetName(c)
 	if tonumber(c.skipOrigin or 0) == 1 and c.origin == K.INSTANCE then return end
+	-- A vehicle name whose key is not bound yet (the buy it follows is still
+	-- draining, or its VBUY arrived behind this) retries on the same step grid
+	-- and budget as a company paint: the buy's own name ships right behind the
+	-- buy (shipVehicleName), and a batch of buys binds slower than that.
+	if tostring(c.kind or "") == "veh" and c.key and not targetFor("veh", tostring(c.key)) then
+		c.tries = (c.tries or 0) + 1
+		if c.tries <= (K.VCOLOR_RETRY_MAX or 50) then
+			c.notBeforeStep = (c.notBeforeStep or CM.stepOf(c.at)) + K.VLINE_RETRY_STEPS
+			CM.retryQueue = CM.retryQueue or {}
+			CM.retryQueue[#CM.retryQueue + 1] = c
+			if c.tries == 1 or c.tries == 10 then
+				log(string.format("VNAME seq=%s: vehicle key %s not bound yet -- retry %d (step %d)", tostring(c.seq), tostring(c.key), c.tries, c.notBeforeStep))
+			end
+			return
+		end
+	end
 	local ok, err = pcall(function()
 		local id = targetFor(tostring(c.kind or ""), tostring(c.key or ""))
 		if not id then
-			log(string.format("VNAME seq=%s: no local %s for key %s -- skipped",
-				tostring(c.seq), tostring(c.kind), tostring(c.key)))
+			log(string.format("VNAME seq=%s: no local %s for key %s -- skipped%s",
+				tostring(c.seq), tostring(c.kind), tostring(c.key), (c.tries or 0) > 0 and string.format(" after %d retries", c.tries) or ""))
 			return
 		end
 		local name = CM.unescName(tostring(c.name or ""))
@@ -760,6 +839,10 @@ function CM.execVehCmd(c)
 		elseif c.op == "VREV" then
 			local id = resolve(c.key)
 			if id then cmds[#cmds + 1] = { api.cmd.make.reverseVehicle(id), "reverse " .. tostring(c.key) } end
+		elseif c.op == "VSTOP" then
+			-- the stop/go toggle: an absolute state, so a duplicate is harmless
+			local id = resolve(c.key)
+			if id then cmds[#cmds + 1] = { api.cmd.make.setUserStopped(id, tonumber(c.stopped) == 1), "setUserStopped " .. tostring(c.key) } end
 		elseif c.op == "VLINE" then
 			local id = resolve(c.key)
 			local line = CM.lineIdFor(c.line)
@@ -907,12 +990,13 @@ end
 -- plus a vehicleGroups list), so they decode it with the same code: a second copy of
 -- this would drift the moment one op learned about a new field, and a wrong
 -- config is a wrong vehicle in a depot -- an uncatchable native assert away.
--- A global (not a `local function`): the chunk is at Lua 5.1's 200-local limit.
+-- A CM field (not a `local function`): the chunk is at Lua 5.1's 200-local limit.
+-- It was a global, leaking into the game-script state other mods share.
 --
 -- RAISES on a part this peer cannot build (unknown model, malformed spec). Both
 -- callers run it inside their pcall, so the command is logged and skipped
 -- instead of half-applied.
-function buildVehConfig(c)
+function CM.buildVehConfig(c)
 	local config = api.type.TransportVehicleConfig.new()
 	local u = 0
 	for spec in tostring(c.parts or ""):gmatch("[^;]+") do
@@ -1092,7 +1176,7 @@ function CM.execVBuy(c)
 			log(string.format("EXEC VBUY seq=%s: construction %d has no depot child -- vehicle NOT bought", tostring(c.seq), depot))
 			return
 		end
-		local config, u = buildVehConfig(c)
+		local config, u = CM.buildVehConfig(c)
 		local seq, origin, at = c.seq, c.origin, c.at
 		-- COMPANIES MODE: buy AS the originating company (2026-09-09). The first
 		-- argument of buyVehicle is the player entity; passing our own and then
@@ -1191,7 +1275,7 @@ function CM.execVReplace(c)
 				tostring(c.seq), key))
 			return
 		end
-		local config, u = buildVehConfig(c)
+		local config, u = CM.buildVehConfig(c)
 		local seq, origin, at = c.seq, c.origin, c.at
 		local okM, cmd = pcall(function() return api.cmd.make.replaceVehicle(veh, config) end)
 		if not okM or not cmd then

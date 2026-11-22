@@ -42,7 +42,7 @@ int main() {
     const uint32_t OLD=77, NEW=78;   // the joiner's process before and after its restart
     auto send=[&](uint32_t session,const std::string& epoch,uint32_t seq,const char* line,
                   uint32_t ack=NO_ACK,uint32_t bits=0,int chunk=0,int chunks=1) {
-        Packet p{}; p.h.magic=MAGIC; memcpy(p.h.world,epoch.data(),32);
+        Packet p{}; p.h.cumAck=NO_ACK; p.h.magic=MAGIC; memcpy(p.h.world,epoch.data(),32);
         p.h.session=session; p.h.ackSession=g_session; p.h.seq=seq; p.h.ack=ack; p.h.ackBits=bits;
         p.h.type=line ? 1 : 0; p.ev.chunkIdx=(uint16_t)chunk; p.ev.chunkCount=(uint16_t)chunks;
         if(line) strcpy_s(p.ev.text,line);
@@ -108,7 +108,8 @@ int main() {
     send(NEW,world,11,nullptr,0,0xffffffff);  // floor 11: 8 and 9 are gone, 10 is ours
     waitFor([]{return count()==5;});
     assert(lastLine()=="stashed-ten");
-    assert(loggedLines("retains nothing before seq 11 and we waited for 8: 1 stashed packet(s) delivered, 2 went by")==1);
+    // Delivery occurs before AdvanceFloor logs; wait for the receive thread.
+    waitFor([]{return loggedLines("retains nothing before seq 11 and we waited for 8: 1 stashed packet(s) delivered, 2 went by")==1;});
     send(NEW,world,11,"after-skip"); waitFor([]{return count()==6;});
     send(NEW,world,12,"head-",NO_ACK,0,0,2);  // chunk 0 of 2, in order: assembling
     send(NEW,world,14,"-x",NO_ACK,0,1,2);     // chunk 1 of 2 at 14: stashed across a hole at 13

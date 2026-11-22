@@ -69,6 +69,16 @@ GAMES=()
 LAUNCH_OPTS=0
 for ROOT in "${ROOTS[@]:+${ROOTS[@]}}"; do
   tpf2mp_say "Removing $(tpf2mp_tilde "$ROOT")..."
+  # Restore only an exact Big Maps density patch before deleting its helper.
+  if [ -f "$ROOT/data/bigmap-base-mod.path" ]; then
+    IFS= read -r BIGMAP_BASE < "$ROOT/data/bigmap-base-mod.path"
+    if [ "$TPF2MP_DRY" = 1 ]; then
+      tpf2mp_say "  would restore Big Maps density in $BIGMAP_BASE"
+    else
+      "$ROOT/bigmap-density-restore" "$BIGMAP_BASE" || tpf2mp_die "Big Maps density restore failed; installation kept"
+      rm -f "$ROOT/data/bigmap-base-mod.path"
+    fi
+  fi
   M=$ROOT/tpf2mp_install.txt
   declare -A LISTED=()
   if [ -f "$M" ]; then
@@ -89,12 +99,12 @@ for ROOT in "${ROOTS[@]:+${ROOTS[@]}}"; do
     do_rm "$M"
   fi
   # and the known names a manifest does not list: boot.cpp would load a leftover
-  for n in libtpf2mp_boot.so tpf2_bridge_mp.so tpf2_menu.so tpf2_slice.so tpf2_pluginhost.so plugins/tpf2_previews.so tpf2mp-launch netpunch/netpunch; do
+  for n in libtpf2mp_boot.so boot/libtpf2mp_boot.so tpf2_bridge_mp.so tpf2_menu.so tpf2_slice.so tpf2_pluginhost.so plugins/tpf2_previews.so tpf2mp-launch netpunch/netpunch; do
     [ -z "${LISTED[$ROOT/$n]:-}" ] || continue
     [ ! -e "$ROOT/$n" ] || do_rm "$ROOT/$n"
   done
   if [ "$TPF2MP_DRY" = 0 ]; then
-    rmdir "$ROOT/netpunch" "$ROOT/plugins" 2>/dev/null || true
+    rmdir "$ROOT/netpunch" "$ROOT/plugins" "$ROOT/boot" 2>/dev/null || true
   fi
   if [ $PURGE = 1 ]; then do_rmtree "$ROOT"; fi
 done

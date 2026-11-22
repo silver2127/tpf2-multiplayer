@@ -89,7 +89,6 @@ void event(const NativeIo::Event& value) {
 DWORD WINAPI work(void*) {
     std::string last = initialRequest;
     std::string pendingHold;
-    ULONGLONG holdDeadline=0;
     const auto pid=std::to_string(GetCurrentProcessId());
     while(running.load()) {
         auto request=read(L"tpf2_native_request.txt");
@@ -105,16 +104,20 @@ DWORD WINAPI work(void*) {
                 else if(cmd=="hold") {
                     // Wait for the initiating click/gesture to finish naturally.
                     // No synthetic release and no abandoned engine callback.
-                    pendingHold=last; holdDeadline=GetTickCount64()+10000; ok=true;
+                    // No deadline either: 'holding' has no total limit on the
+                    // host (sync_operation.TIMEOUT), and a key held a little
+                    // longer -- push-to-talk while talking -- failed the whole
+                    // round after 10 s (2026-09-27). The status names the key;
+                    // abort or a newer request ends the wait.
+                    pendingHold=last; ok=true;
                 }
                 else if(cmd=="release") { pendingHold.clear(); immediate=true; ok=NativeIo::SetActionsHeld(false); }
             }
             if(!ok || immediate) event({last,immediate?"held":"request",ok?"":"Native request refused",ok});
         }
         if(!pendingHold.empty()) {
-            const bool held=NativeIo::SetActionsHeld(true);
-            if(held || GetTickCount64()>=holdDeadline) {
-                event({pendingHold,"held",held?"":"Input gesture did not finish",held});
+            if(NativeIo::SetActionsHeld(true)) {
+                event({pendingHold,"held","",true});
                 pendingHold.clear();
             }
         }
@@ -126,7 +129,8 @@ DWORD WINAPI work(void*) {
         const bool published=latestEvent.empty() || write(L"tpf2_native_event.txt",latestEvent);
         write(L"tpf2_native_status.txt","pid="+pid+"\nsupported="+(supported?"1":"0")+
             "\nhas_world="+(NativeIo::HasWorld()?"1":"0")+"\nbusy="+(NativeIo::Busy()?"1":"0")+
-            "\nlast_request="+last+"\nlast_event="+latestEventId+"\nevent_published="+(published?"1":"0")+liveness()+"\n");
+            "\nlast_request="+last+"\nlast_event="+latestEventId+"\nevent_published="+(published?"1":"0")+
+            "\nhold_key="+std::to_string(pendingHold.empty() ? 0 : NativeIo::ActiveGestureKey())+liveness()+"\n");
         Sleep(100);
     }
     return 0;
@@ -140,6 +144,20 @@ void Start(const std::wstring& path,bool ready) {
     // Ignore a mailbox left by an earlier process, even if Windows reused its
     // PID. Capture this before starting the worker so a fresh request cannot race it.
     initialRequest=read(L"tpf2_native_request.txt")["id"];
+    // The same for the mod's recovery record. No lobby of THIS process exists yet (the
+    // menu starts one only later, on HOST/JOIN) and no game script runs before a world
+    // loads, so a tpf2_sync_lua.txt carrying our pid can only be an earlier process's.
+    // Under Wine the pid is the same small number on every run of the game, and the
+    // mod honoured such a record: the dedicated server, restarted after a recovery had
+    // failed (phase=error, "Timed out waiting for all players", resume_speed=0), came
+    // back held at speed 0 for good, twice (2026-09-21). Emptied, not deleted: the
+    // mod reads an empty file as no record. Another live game's record (another pid)
+    // is left alone.
+    {
+        const auto stale=read(L"tpf2_sync_lua.txt");
+        const auto it=stale.find("pid");
+        if(it!=stale.end() && it->second==std::to_string(GetCurrentProcessId())) write(L"tpf2_sync_lua.txt","");
+    }
     HANDLE thread=CreateThread(nullptr,0,work,nullptr,0,nullptr);
     if(thread) CloseHandle(thread); else running=false;
 }

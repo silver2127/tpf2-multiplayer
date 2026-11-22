@@ -241,6 +241,7 @@ static void CreatePageDetour(void* menu, int page)
 {
     MenuGame_ObserveMenu(menu);
     ((CreatePageFn)g_createPageTramp)(menu, page);
+    if (page == 2) game_ui_tick::last.store(0, std::memory_order_relaxed);
     panel::OnMenuPage(page);
 }
 
@@ -285,6 +286,8 @@ static void Init()
     // First the overlay: the game builds its Vulkan device a few seconds in,
     // and the redirect has to be in place before that call runs.
     OverlayInstall(g_base, Log);
+    extern bool OverlayGlInstall(uintptr_t, Tpf2mpLogFn);
+    OverlayGlInstall(g_base, Log);
     MenuGame_Install(g_base, Log);
 
     if (!Prologue(RVA_CREATEPAGE, CREATEPAGE_EXPECTED, sizeof(CREATEPAGE_EXPECTED), STEAL_CREATEPAGE) ||

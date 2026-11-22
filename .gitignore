@@ -28,6 +28,7 @@ netpunch/*_out.txt
 netpunch/*_err.txt
 netpunch/netpunch_status.txt
 netpunch/incoming_save.*
+mp_company_perms.txt
 tools/shots/
 *.log
 *.lastsession

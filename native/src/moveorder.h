@@ -58,7 +58,7 @@ static inline int32_t MoveOrderRecId(const uint8_t* recs, int32_t pos)
 // built, i.e. the engine's own node order, so "changed" means exactly "the
 // engine is not already claiming in name order". Refuses -- and leaves idx
 // alone -- on anything it does not recognise.
-static MoveOrderOutcome MoveOrderRank(int32_t* idx, int64_t n, TrainOrderKey* keys)
+static inline MoveOrderOutcome MoveOrderRank(int32_t* idx, int64_t n, TrainOrderKey* keys)
 {
     MoveOrderOutcome out = { nullptr, false, false, 0 };
     if (!idx || n < 0 || n > MOVEORDER_MAX_N) { out.refused = "bad count"; return out; }

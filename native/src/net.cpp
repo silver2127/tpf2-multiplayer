@@ -7,29 +7,56 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <atomic>
 #include <queue>
 #include <set>
 #include <string>
 
 #pragma comment(lib, "ws2_32.lib")
 
-// protocol 4: process + world-scoped ACKs. Protocol 5 (2026-09-15): an event
-// datagram is only as long as its text ("FPT5"); every one used to be a full
-// 1,086 bytes. A protocol-4 bridge would drop the short events by size, so the
-// magic moves with it and a stale DLL fails loudly instead.
-static const uint32_t MAGIC = 0x35545046;
-static const int RESEND_MS = 250;
+// protocol 4: process + world-scoped ACKs. Protocol 5: variable-length events.
+// Protocol 6 (2026-09-26): cumulative ACK (cumAck), 64-bit SACK bitmap, and
+// transport timestamp echoing (sendTs / echoTs).
+static const uint32_t MAGIC = 0x36545046; // "FPT6"
+static const int MIN_RESEND_MS = 40;        // Min RTO clamp for low-latency/LAN links
+static const int MAX_RESEND_MS = 1000;      // Max RTO clamp
+static const int INITIAL_RESEND_MS = 200;   // Initial RTO estimate
+static const size_t MAX_OUT_QUEUE = 2048;   // Hard cap on outbound event queue (NET-02)
+
+// Per-stream RTT and adaptive RTO estimator using Jacobson/Karels algorithm.
+struct RttEstimator {
+    float srtt = 100.0f;
+    float rttvar = 50.0f;
+    uint32_t rto = (uint32_t)INITIAL_RESEND_MS;
+    uint32_t minRttObserved = UINT32_MAX;
+
+    void NoteSample(uint32_t rttMs) {
+        if (rttMs < minRttObserved) minRttObserved = rttMs;
+        float diff = (float)rttMs - srtt;
+        srtt += 0.125f * diff;
+        rttvar += 0.25f * (std::abs(diff) - rttvar);
+        uint32_t computed = (uint32_t)(srtt + 4.0f * rttvar);
+        rto = (std::max)((uint32_t)MIN_RESEND_MS, (std::min)(computed, (uint32_t)MAX_RESEND_MS));
+    }
+
+    void Backoff() {
+        rto = (std::min)(rto * 2, (uint32_t)(MAX_RESEND_MS * 2));
+    }
+};
 
 #pragma pack(push, 1)
 struct Header {
     uint32_t magic;
-    char world[32];     // exact operation epoch, checked BEFORE liveness or ACKs
-    uint32_t session;   // sender instance id, selects its independent stream
-    uint32_t ackSession; // an ACK is valid only for this sender epoch
+    char     world[32];      // exact operation epoch, checked BEFORE liveness or ACKs
+    uint32_t session;        // sender instance id, selects its independent stream
+    uint32_t ackSession;     // an ACK is valid only for this sender epoch
     uint32_t seq;
-    uint32_t ack;
-    uint32_t ackBits;
-    uint8_t  type;      // 0 = keepalive/ack-only, 1 = event
+    uint32_t ack;            // highest received sequence (selective ACK baseline)
+    uint32_t cumAck;         // highest contiguous in-order sequence delivered (ACK-02)
+    uint64_t ackBits;        // 64-bit selective ACK bitmask (ACK-02)
+    uint32_t sendTs;         // sender's millisecond timestamp (JIT-01)
+    uint32_t echoTs;         // echo of recipient's latest sendTs (JIT-01)
+    uint8_t  type;           // 0 = keepalive/ack-only, 1 = event
 };
 struct Packet {
     Header   h;
@@ -43,18 +70,20 @@ static SOCKET g_sock = INVALID_SOCKET;
 static sockaddr_in g_peer{};
 static std::mutex g_peerMtx;
 static bool g_peerSet = false;
-static volatile bool g_loopbackOnly = true;
+static std::atomic<bool> g_loopbackOnly{true};
 static uint64_t g_droppedStrangers = 0;
 static uint16_t g_localPort = 0;   // set once in Net_Init, after a successful bind
 static void (*g_deliver)(const char*) = nullptr;
 
 static HANDLE g_thread = nullptr;
-static volatile bool g_running = false;
+static std::atomic<bool> g_running{false};
 
 static uint32_t g_nextSeq = 0;
 static uint32_t g_session = 0;          // our id (set at init)
 static std::map<uint32_t, Packet> g_pending;        // sent, awaiting ack
 static std::map<uint32_t, uint64_t> g_lastSent;     // seq -> last send time
+static std::map<uint32_t, uint64_t> g_firstSentTime; // seq -> first send time (for RTT sample)
+static std::map<uint32_t, uint16_t> g_sendCount;     // seq -> number of transmissions (Karn's algorithm)
 static std::queue<NetEvent> g_outQueue;
 static std::mutex g_mtx;
 static std::mutex g_epochMtx; // outer lock: net iteration vs coordinated reset
@@ -70,10 +99,12 @@ struct PeerStream {
     bool assembling = false;
     uint32_t expectedSeq = 0;
     uint32_t lastReceivedSeq = NO_ACK;
-    uint32_t receivedBits = 0;
+    uint64_t receivedBits = 0;  // 64-bit selective ACK bitmap
     uint64_t lastRecvMs = 0;    // its last admitted packet; silence this long evicts it
     std::map<uint32_t, Packet> early;
     std::string rxAccum;
+    RttEstimator rtt;
+    uint32_t lastRemoteSendTs = 0; // echoed back in p.h.echoTs (JIT-01)
 };
 static std::map<uint32_t, PeerStream> g_streams; // protected by g_epochMtx
 // A broadcast remains pending until EVERY recipient present at send time ACKs.
@@ -151,7 +182,11 @@ static void SendRaw(uint32_t seq, uint32_t type, const NetEvent* ev,
     p.h.ackSession = ackSession;
     p.h.seq = seq;
     p.h.ack = stream ? stream->lastReceivedSeq : NO_ACK;
+    p.h.cumAck = (stream && stream->sequenceReady && stream->expectedSeq > 0)
+                 ? (stream->expectedSeq - 1) : NO_ACK;
     p.h.ackBits = stream ? stream->receivedBits : 0;
+    p.h.sendTs = (uint32_t)GetTickCount64();
+    p.h.echoTs = stream ? stream->lastRemoteSendTs : 0;
     p.h.type = (uint8_t)type;
     if (ev) p.ev = *ev;
     sockaddr_in peer;
@@ -171,21 +206,47 @@ static void SendRaw(uint32_t seq, uint32_t type, const NetEvent* ev,
     sendto(g_sock, (const char*)&p, (int)size, 0, (sockaddr*)&peer, sizeof(peer));
 }
 
-static void ProcessAck(uint32_t sender, uint32_t ack, uint32_t bits)
+static void ProcessAck(uint32_t sender, uint32_t ack, uint32_t cumAck, uint64_t bits)
 {
-    if (ack == NO_ACK) return;
+    if (ack == NO_ACK && cumAck == NO_ACK) return;
     std::lock_guard<std::mutex> lk(g_mtx);
+    const uint64_t now = GetTickCount64();
     for (auto it = g_pending.begin(); it != g_pending.end();) {
         uint32_t s = it->first;
-        bool acked = (s == ack) ||
-                     (s < ack && ack - s <= 32 && (bits & (1u << (ack - s - 1))));
+        bool acked = false;
+        // Cumulative ACK: everything <= cumAck is delivered in order
+        if (cumAck != NO_ACK && s <= cumAck) {
+            acked = true;
+        } else if (ack != NO_ACK) {
+            if (s == ack) {
+                acked = true;
+            } else if (s < ack && ack - s <= 64 && (bits & (1ULL << (ack - s - 1)))) {
+                acked = true;
+            }
+        }
         // find, never operator[]: a pending packet without an awaiting set
         // must not be released by whoever happens to ACK something else.
         auto waiting = g_awaiting.find(s);
-        if (acked && waiting != g_awaiting.end()) waiting->second.erase(sender);
+        if (acked && waiting != g_awaiting.end()) {
+            waiting->second.erase(sender);
+            // Karn's algorithm: sample RTT only on first-transmission ACKs
+            auto scIt = g_sendCount.find(s);
+            auto fsIt = g_firstSentTime.find(s);
+            if (scIt != g_sendCount.end() && scIt->second == 1 && fsIt != g_firstSentTime.end()) {
+                if (now >= fsIt->second) {
+                    uint32_t sample = (uint32_t)(now - fsIt->second);
+                    auto sIt = g_streams.find(sender);
+                    if (sIt != g_streams.end()) {
+                        sIt->second.rtt.NoteSample(sample);
+                    }
+                }
+            }
+        }
         if (waiting != g_awaiting.end() && waiting->second.empty()) {
             g_awaiting.erase(waiting);
             g_lastSent.erase(s);
+            g_firstSentTime.erase(s);
+            g_sendCount.erase(s);
             it = g_pending.erase(it);
         } else { ++it; }
     }
@@ -213,18 +274,10 @@ static void Reassemble(PeerStream& stream, const NetEvent& ev)
 // Bound reordering to the selective-ACK window. Missing packets beyond
 // that bitmap are never implicitly acknowledged; sends also retain a window
 // behind the oldest outstanding sequence.
-static const uint32_t EARLY_WINDOW = 32;
+static const uint32_t EARLY_WINDOW = 64;
 
-// Record that `s` arrived, in a bitmap the sender can actually read.
-//
-// This used to be `stream.receivedBits = (stream.receivedBits << 1) | 1` on each in-order
-// delivery -- i.e. permanently all-ones -- and it was not touched at all for a
-// packet stashed in stream.early. An out-of-order packet was therefore never
-// acknowledged, so it stayed in the sender's g_pending and the WHOLE stash was
-// retransmitted every RESEND_MS until the hole finally filled.
-//
-// Bit k of ackBits means "seq (ack - k - 1) was received", which is the layout
-// ProcessAck has always decoded.
+// Record that `s` arrived, in a 64-bit bitmap the sender can actually read.
+// Bit k of ackBits means "seq (ack - k - 1) was received".
 static void NoteReceived(PeerStream& stream, uint32_t s)
 {
     if (stream.lastReceivedSeq == NO_ACK) {
@@ -236,14 +289,14 @@ static void NoteReceived(PeerStream& stream, uint32_t s)
     if (s > stream.lastReceivedSeq) {
         uint32_t shift = s - stream.lastReceivedSeq;
         // the old high-water mark moves down to bit (shift-1); anything that
-        // falls past bit 31 leaves the window and is simply no longer reported
-        if (shift > 32)       stream.receivedBits = 0;
-        else if (shift == 32) stream.receivedBits = 1u << 31;   // 1u<<32 is UB
-        else                  stream.receivedBits = (stream.receivedBits << shift) | (1u << (shift - 1));
+        // falls past bit 63 leaves the window and is no longer reported
+        if (shift > 64)       stream.receivedBits = 0;
+        else if (shift == 64) stream.receivedBits = 1ULL << 63;   // 1ULL<<64 is UB
+        else                  stream.receivedBits = (stream.receivedBits << shift) | (1ULL << (shift - 1));
         stream.lastReceivedSeq = s;
     } else {
         uint32_t back = stream.lastReceivedSeq - s;             // >= 1
-        if (back <= 32) stream.receivedBits |= (1u << (back - 1));
+        if (back <= 64) stream.receivedBits |= (1ULL << (back - 1));
     }
 }
 
@@ -346,31 +399,54 @@ static DWORD WINAPI NetThread(LPVOID)
                     while (!g_outQueue.empty()) g_outQueue.pop();
                     break;
                 }
-                // Selective acknowledgements cover only 32 earlier packets.
+                // Selective acknowledgements cover 64 earlier packets.
                 // Never advance beyond an unacknowledged gap's visibility.
-                if (!g_pending.empty() && g_nextSeq - g_pending.begin()->first > 32) break;
+                if (!g_pending.empty() && g_nextSeq - g_pending.begin()->first > 64) break;
                 ev = g_outQueue.front();
                 g_outQueue.pop();
-            uint32_t seq = g_nextSeq++;
-            Packet p{};
-            p.h.magic = MAGIC; p.h.seq = seq; p.h.type = 1; p.ev = ev;
+                uint32_t seq = g_nextSeq++;
+                Packet p{};
+                p.h.magic = MAGIC; p.h.seq = seq; p.h.type = 1; p.ev = ev;
                 g_pending[seq] = p;
                 for (const auto& peer : g_streams) g_awaiting[seq].insert(peer.first);
-                g_lastSent[seq] = GetTickCount64();
-            SendRaw(seq, 1, &ev);
+                const uint64_t nowSend = GetTickCount64();
+                g_lastSent[seq] = nowSend;
+                g_firstSentTime[seq] = nowSend;
+                g_sendCount[seq] = 1;
+                SendRaw(seq, 1, &ev);
             }
         }
-        // 2. resend unacked (sent-time tracked alongside)
+        // 2. resend unacked with dynamic adaptive RTO & backoff
         {
             std::lock_guard<std::mutex> lk(g_mtx);
-            // Outstanding packets survive timeouts; the flush window above
-            // bounds retransmissions without making holes in the stream.
+            const uint64_t now = GetTickCount64();
+            // each peer's RTO doubles ONCE per pass that resent to it, not once
+            // per packet: with N packets in flight it used to double N times in
+            // one pass and sit at the cap (follow-up to PR #12)
+            std::set<uint32_t> backedOff;
             for (auto& kv : g_pending) {
                 uint64_t& last = g_lastSent[kv.first];
-                if ((int)(GetTickCount64() - last) > RESEND_MS) {
-                    last = GetTickCount64();
+                uint32_t effectiveRto = INITIAL_RESEND_MS;
+                auto wIt = g_awaiting.find(kv.first);
+                if (wIt != g_awaiting.end() && !wIt->second.empty()) {
+                    for (uint32_t peerId : wIt->second) {
+                        auto stIt = g_streams.find(peerId);
+                        if (stIt != g_streams.end()) {
+                            effectiveRto = (std::max)(effectiveRto, stIt->second.rtt.rto);
+                        }
+                    }
+                }
+                if ((int)(now - last) > (int)effectiveRto) {
+                    last = now;
+                    g_sendCount[kv.first]++;
+                    if (wIt != g_awaiting.end())
+                        for (uint32_t peerId : wIt->second) backedOff.insert(peerId);
                     SendRaw(kv.first, 1, &kv.second.ev);
                 }
+            }
+            for (uint32_t peerId : backedOff) {
+                auto stIt = g_streams.find(peerId);
+                if (stIt != g_streams.end()) stIt->second.rtt.Backoff();
             }
         }
 
@@ -390,11 +466,14 @@ static DWORD WINAPI NetThread(LPVOID)
         }
 
         // 2c. eviction: a member that has sent nothing for the peer timeout --
-        // not even the keepalive it owes every 500 ms -- is out of the cohort.
-        // Its process is gone (a crash, or a game restart that came back under
-        // a new session id) or its link is. Every broadcast that still waits
-        // for it is released to the members that did acknowledge; if it speaks
-        // again it is admitted afresh and told the current floor.
+        // not even the keepalive it owes every 500 ms -- is out of the cohort,
+        // and every broadcast that still waits for it is released to the members
+        // that did acknowledge. NOT SOONER (2026-09-26, follow-up to PR #12): a
+        // member quiet for 2 s used to have its packets released while it was
+        // still in the cohort -- a load, an autosave or a terrain replay is often
+        // longer than that (12.8 s seen in a player's logs) -- and when it spoke
+        // again those commands were gone for good: a silent desync. It keeps
+        // being resent to until it answers or is evicted.
         {
             static uint64_t lastPass = 0;
             uint64_t now = GetTickCount64();
@@ -409,6 +488,8 @@ static DWORD WINAPI NetThread(LPVOID)
                        (unsigned long long)(now - lastPass));
             }
             lastPass = now;
+
+
             bool evicted = false;
             size_t releasedAll = 0;
             for (auto it = g_streams.begin(); it != g_streams.end();) {
@@ -418,8 +499,12 @@ static DWORD WINAPI NetThread(LPVOID)
                 for (auto a = g_awaiting.begin(); a != g_awaiting.end();) {
                     a->second.erase(gone);
                     if (a->second.empty()) {
-                        g_pending.erase(a->first); g_lastSent.erase(a->first);
-                        a = g_awaiting.erase(a); ++released;
+                        g_pending.erase(a->first);
+                        g_lastSent.erase(a->first);
+                        g_firstSentTime.erase(a->first);
+                        g_sendCount.erase(a->first);
+                        a = g_awaiting.erase(a);
+                        ++released;
                     } else ++a;
                 }
                 it = g_streams.erase(it);
@@ -435,7 +520,11 @@ static DWORD WINAPI NetThread(LPVOID)
             // delivered in one burst is exactly what that rule exists against.
             if (evicted && g_streams.empty()) {
                 const size_t dropped = releasedAll + g_pending.size() + g_outQueue.size();
-                g_pending.clear(); g_lastSent.clear(); g_awaiting.clear();
+                g_pending.clear();
+                g_lastSent.clear();
+                g_firstSentTime.clear();
+                g_sendCount.clear();
+                g_awaiting.clear();
                 while (!g_outQueue.empty()) g_outQueue.pop();
                 g_droppedNoPeer += dropped;
                 g_peerEverSeen = false; g_lastRecvMs = 0;
@@ -503,13 +592,21 @@ static DWORD WINAPI NetThread(LPVOID)
                     NetLog("[net] session %08x joins world %.8s.. -- %zu member(s) in the cohort\n",
                            p.h.session, g_worldEpoch.c_str(), g_streams.size());
                 }
+                if (p.h.sendTs != 0) {
+                    found->second.lastRemoteSendTs = p.h.sendTs;
+                }
+                // echoTs travels (FPT6) but is not an RTT sample: it echoes the
+                // peer's LATEST sendTs whenever the peer next happens to send,
+                // up to a 500 ms keepalive later, so it read high and pushed the
+                // RTO up. RTT comes from first-transmission ACKs (ProcessAck,
+                // Karn's rule). (follow-up to PR #12)
                 found->second.lastRecvMs = GetTickCount64();
                 {
                     std::lock_guard<std::mutex> lk(g_mtx);
                     g_lastRecvMs = found->second.lastRecvMs;
                     g_peerEverSeen = true;
                 }
-                if (p.h.ackSession == g_session) ProcessAck(p.h.session, p.h.ack, p.h.ackBits);
+                if (p.h.ackSession == g_session) ProcessAck(p.h.session, p.h.ack, p.h.cumAck, p.h.ackBits);
                 // Only an ACK/keepalive advertises the oldest retained packet.
                 // A reordered data packet is not a safe initial sequence floor.
                 // Do not ACK data before discovery: the sender must retry it.
@@ -532,7 +629,7 @@ static DWORD WINAPI NetThread(LPVOID)
     return 0;
 }
 
-static bool g_wsaUp = false;
+static std::atomic<bool> g_wsaUp{false};
 
 static bool EnsureWsa()
 {
@@ -661,6 +758,20 @@ void Net_QueueLine(const char* line, const char* expectedWorld)
     // connects later starts from a transferred save, so a replay of everything
     // that happened before it existed would be wrong as well as expensive.
     if (!g_peerEverSeen) { g_droppedNoPeer++; return; }
+    // MAX_OUT_QUEUE is a warning, not a limit (follow-up to PR #12): dropping
+    // chunks lost whole commands, or half of one, on every game at once. The
+    // queue is bounded anyway: a member that stops answering is evicted at the
+    // peer timeout, and with nobody left the queue is cleared (NetThread 2c).
+    static bool warned = false;
+    if (g_outQueue.size() + chunks > MAX_OUT_QUEUE) {
+        if (!warned) {
+            warned = true;
+            NetLog("[net] outbound queue over %zu chunk(s) -- a member is not keeping up; everything stays queued\n",
+                   MAX_OUT_QUEUE);
+        }
+    } else {
+        warned = false;
+    }
     for (size_t i = 0; i < chunks; ++i) {
         NetEvent ev{};
         ev.type = 1;
@@ -682,30 +793,33 @@ std::string Net_WorldEpoch() {
 bool Net_SetWorldEpoch(const char* epoch,void (*resetLocal)(const char*)) {
     if(!epoch || strlen(epoch)!=32 || strspn(epoch,"0123456789abcdef")!=32 ||
        strspn(epoch,"0")==32) return false;
-    std::lock_guard<std::mutex> epochLock(g_epochMtx);
-    if(g_worldEpoch==epoch) return true;
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        g_worldEpoch=epoch;
-        g_nextSeq=0;
-        const uint64_t now = GetTickCount64();
-        for (auto& peer : g_streams) {
-            peer.second = PeerStream{};
-            // Coordinated resets really do start at zero, even if the first
-            // keepalive arrives ahead of a missing/reordered packet zero.
-            peer.second.sequenceReady = true;
-            peer.second.lastRecvMs = now;   // the silence clock restarts with the world
+        std::lock_guard<std::mutex> epochLock(g_epochMtx);
+        if(g_worldEpoch==epoch) return true;
+        {
+            std::lock_guard<std::mutex> lock(g_mtx);
+            g_worldEpoch=epoch;
+            g_nextSeq=0;
+            const uint64_t now = GetTickCount64();
+            for (auto& peer : g_streams) {
+                peer.second = PeerStream{};
+                // Coordinated resets really do start at zero, even if the first
+                // keepalive arrives ahead of a missing/reordered packet zero.
+                peer.second.sequenceReady = true;
+                peer.second.lastRecvMs = now;   // the silence clock restarts with the world
+            }
+            g_pending.clear(); g_lastSent.clear(); g_firstSentTime.clear(); g_sendCount.clear(); g_awaiting.clear();
+            while(!g_outQueue.empty()) g_outQueue.pop();
+            g_lastRecvMs=0; g_peerEverSeen=false;
+            g_worldNoted.clear();
+            // The established members keep their streams (they start at zero
+            // together). Anyone else who presents this epoch is admitted on
+            // arrival: it can only have it from the same operation. A member that
+            // never speaks in the new world leaves the cohort by the timeout.
         }
-        g_pending.clear(); g_lastSent.clear(); g_awaiting.clear();
-        while(!g_outQueue.empty()) g_outQueue.pop();
-        g_lastRecvMs=0; g_peerEverSeen=false;
-        g_worldNoted.clear();
-        // The established members keep their streams (they start at zero
-        // together). Anyone else who presents this epoch is admitted on
-        // arrival: it can only have it from the same operation. A member that
-        // never speaks in the new world leaves the cohort by the timeout.
+        NetLog("[net] world %.8s.. -- %zu member(s) carried over\n", epoch, g_streams.size());
     }
-    NetLog("[net] world %.8s.. -- %zu member(s) carried over\n", epoch, g_streams.size());
+    // Task 1.1 (CON-01): call resetLocal AFTER releasing g_epochMtx to eliminate lock inversion deadlock
     if(resetLocal) resetLocal(epoch);
     return true;
 }
@@ -716,33 +830,38 @@ bool Net_BeginLobby(const char* epoch, const char* ip, int port,
                     void (*resetLocal)(const char*)) {
     if(!epoch || strlen(epoch)!=32 || strspn(epoch,"0123456789abcdef")!=32 ||
        strspn(epoch,"0")==32) return false;
-    std::lock_guard<std::mutex> epochLock(g_epochMtx);
     if(!Net_SetPeer(ip,port)) return false;
-    if(g_lobbyEpoch==epoch) return true;
-    // The lobby's nonce has caught up with the world we already run: after a
-    // resync the host lobby advertises the resync epoch, so a player who joins
-    // later starts in it instead of in a lobby nonce nobody else is in any more.
-    // The members that did the resync are here already; keep every stream.
-    if(g_worldEpoch==epoch) {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        g_lobbyEpoch=epoch;
-        NetLog("[net] lobby nonce now names our world %.8s.. -- nothing resets\n", epoch);
-        return true;
-    }
+    bool needsReset = false;
     {
-        std::lock_guard<std::mutex> lock(g_mtx);
-        g_lobbyEpoch=epoch;
-        g_worldEpoch=epoch;
-        if(++g_session==0) ++g_session;
-        g_nextSeq=0;
-        g_streams.clear(); g_awaiting.clear();
-        g_pending.clear(); g_lastSent.clear();
-        while(!g_outQueue.empty()) g_outQueue.pop();
-        g_lastRecvMs=0; g_peerEverSeen=false;
-        g_worldNoted.clear();
+        std::lock_guard<std::mutex> epochLock(g_epochMtx);
+        if(g_lobbyEpoch==epoch) return true;
+        // The lobby's nonce has caught up with the world we already run: after a
+        // resync the host lobby advertises the resync epoch, so a player who joins
+        // later starts in it instead of in a lobby nonce nobody else is in any more.
+        // The members that did the resync are here already; keep every stream.
+        if(g_worldEpoch==epoch) {
+            std::lock_guard<std::mutex> lock(g_mtx);
+            g_lobbyEpoch=epoch;
+            NetLog("[net] lobby nonce now names our world %.8s.. -- nothing resets\n", epoch);
+            return true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mtx);
+            g_lobbyEpoch=epoch;
+            g_worldEpoch=epoch;
+            if(++g_session==0) ++g_session;
+            g_nextSeq=0;
+            g_streams.clear(); g_awaiting.clear();
+            g_pending.clear(); g_lastSent.clear(); g_firstSentTime.clear(); g_sendCount.clear();
+            while(!g_outQueue.empty()) g_outQueue.pop();
+            g_lastRecvMs=0; g_peerEverSeen=false;
+            g_worldNoted.clear();
+        }
+        NetLog("[net] lobby %.8s.. -- new cohort, our session is now %08x\n", epoch, g_session);
+        needsReset = true;
     }
-    NetLog("[net] lobby %.8s.. -- new cohort, our session is now %08x\n", epoch, g_session);
-    if(resetLocal) resetLocal(epoch);
+    // Task 1.1 (CON-01): call resetLocal AFTER releasing g_epochMtx
+    if(needsReset && resetLocal) resetLocal(epoch);
     return true;
 }
 
@@ -808,6 +927,8 @@ void Net_Shutdown()
         std::lock_guard<std::mutex> lk(g_mtx);
         g_pending.clear();
         g_lastSent.clear();
+        g_firstSentTime.clear();
+        g_sendCount.clear();
         g_streams.clear();
         g_awaiting.clear();
         g_worldNoted.clear();

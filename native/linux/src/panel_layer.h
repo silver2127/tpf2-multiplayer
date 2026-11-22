@@ -18,6 +18,8 @@ constexpr Rgb rgb(int r, int g, int b) { return Rgb{ (uint8_t)r, (uint8_t)g, (ui
 
 // The canvas: w x h, BGRA, straight alpha, cleared to transparent.
 void Begin(int w, int h);
+// Place the current panel on an opaque full-frame BGRA backdrop.
+void PlaceOnBackdrop(int w, int h, int x, int y, const uint8_t* bg);
 int Width();
 int Height();
 const uint8_t* Pixels();
@@ -40,6 +42,9 @@ bool HaveFont();
 
 // Width of a single line in pixels at `px` (the em height, as CreateFontW(-px)).
 int TextWidth(const char* utf8, int px);
+
+// Height using exactly the same line breaks and metrics as kWordBreak drawing.
+int WrappedTextHeight(const char* utf8, int w, int px);
 
 // Draw into the box [x, x+w) x [y, y+h), clipped to it like DrawTextW.
 void Text(int x, int y, int w, int h, const char* utf8, int px, Rgb c, unsigned flags, int alpha = 255);

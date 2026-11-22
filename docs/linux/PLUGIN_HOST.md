@@ -12,7 +12,7 @@ yet loaded inside the real game.
 |---|---|
 | `native/linux/src/plugin/host_linux.cpp` | the host |
 | `native/linux/src/plugin/cfg_linux.h`, `cfg_linux.cpp` | the `tpf2mp.cfg` parser: `cfg.cpp`'s rules, UTF-8 paths |
-| `native/linux/src/plugin/codewrite_linux.h` | writes into the process's memory through `/proc/self/mem`, with no page protection change ([page races](#page-protection-races)) |
+| `native/linux/src/plugin/codewrite_linux.h` | writes into the process's memory through `/proc/self/mem`, with no page protection change ([page races](#code-writes-and-page-protections)) |
 | `native/linux/src/hook_posix.cpp` | `installHook` (the same file the bridge and menu link) |
 | `native/linux/src/plugin/sample_plugin_linux.cpp` | `tpf2mp_sample.so`, an example plugin that patches nothing |
 
@@ -40,7 +40,7 @@ What that means for a plugin:
   table does not block, because nothing in the table takes that lock.
 - **The game's subsystems do not exist yet**, as the header already says.
 - **Other libraries patch the game at the same moment**, from their own threads: see
-  [page races](#page-protection-races).
+  [page races](#code-writes-and-page-protections).
 
 ## Code writes and page protections
 
@@ -102,7 +102,7 @@ loading any plugin.
 | `moduleBase` | The executable's load address when `/proc/self/exe` is named `TransportFever2`, else 0. |
 | `buildOk` | 1 when `moduleBase` is set and the GNU build-id is build 35924's (`game_image.h`). |
 | `verifyBytes` | Returns 0 unless every byte lies inside the executable's `PT_LOAD` extent (RVA 0 to 0x5bd912a for build 35924) and is mapped readable in `/proc/self/maps`. If that file cannot be read, the host logs `/proc/self/maps unreadable (<reason>) -- verifyBytes, patchBytes and installHook refuse` once. Without that line the plugin's "wrong game build" would be the only trace. |
-| `installHook` | Takes an absolute address and accepts 14..32 stolen bytes. Refuses invalid arguments, unreadable/non-executable spans and cuts known to split an instruction. Unsupported decoder instructions are logged and remain the plugin author's responsibility. The trampoline is published before the jump; all game-code writes use the shared `/proc/self/mem` writer. Check the return value, not only the trampoline pointer. |
+| `installHook` | Takes an absolute address and accepts 5..32 stolen bytes (5..13 use a rel32 jump to a nearby absolute-jump stub; 14..32 use an absolute jump). Refuses invalid arguments, unreadable/non-executable spans and cuts known to split an instruction. Unsupported decoder instructions are logged and remain the plugin author's responsibility. The trampoline is published before the jump; all game-code writes use the shared `/proc/self/mem` writer. Check the return value, not only the trampoline pointer. |
 | `patchBytes` | Uses the same image/mapping range checks as `verifyBytes`, then the shared writer. Reads back the result; short writes attempt restoration and fail. Kernel refusal fails without changing page protections. Call `verifyBytes` first to establish the expected original bytes. |
 | `dataDir` | Ends in `/`. |
 
@@ -282,7 +282,7 @@ game are never touched.
     on the page-protection fallback, and the log says so.
   - `race`: a thread flips a page's protection while the host patches it 3000 times; no fault, and every patch
     goes through `/proc/self/mem`. `test/race_demo.sh` runs the same with the fallback forced
-    ([page races](#page-protection-races)).
+    ([page races](#code-writes-and-page-protections)).
   - `slow`: a plugin sleeping 11 s in init is named once by the watchdog, and only it.
   - `dep`: a library whose `Tpf2mpPluginInit` is its dependency's is not called; the dependency is called once,
     under its own name.
@@ -313,3 +313,8 @@ The earlier scratch harness results above document the original host review. Cas
 - A full Windows/Linux multiplayer session, including late join, resync and save transfer.
 
 The real-game startup test loaded the host and installed the native game hooks successfully. It did not establish these broader behaviors.
+
+The [a896a1cb integration](UPSTREAM_dev_a896a1cb.md) removes the host’s old
+14-byte minimum. `plugin_host_hooks` exercises the actual host API and shared
+writer for every length 5..32, including trampoline execution past a
+RIP-relative continuation, and refusal of invalid lengths and instruction cuts.

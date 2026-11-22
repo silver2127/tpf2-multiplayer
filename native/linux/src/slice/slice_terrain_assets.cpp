@@ -420,7 +420,7 @@ void Replay(const SliceFactoryCall& c)
     if (status) {
         if (status > 0) unlink(path.c_str());
         Terrain terrain; std::vector<uint8_t> raw;
-        const bool ok = status > 0 && Unbase64(text, &raw) && DecodeTerrain(raw, &terrain) &&
+        const bool ok = status > 0 && Unbase64(text, &raw) && DecodeTerrainWire(raw, &terrain) &&
                         InstallTerrain(c.rdx, terrain, gameMemory);
         SliceLog("[terrain-assets] terrain carrier %s\n", ok ? "filled" : "rejected");
         return;
@@ -443,8 +443,11 @@ void Capture(const SliceFactoryCall& c)
     try {
         Terrain terrain;
         if (ReadTerrain(c.rdx, &terrain)) {
-            if (!EncodeTerrain(terrain, &raw)) return;
+            size_t rawBytes = 0;
+            if (!EncodeTerrainWire(terrain, &raw, &rawBytes)) return;
             std::string encoded = Base64(raw);
+            SliceLog("[terrain-assets] stashed: %zuB edit, %zuB wire, %zuB base64\n",
+                     rawBytes, raw.size(), encoded.size());
             SliceRecordPrintf(&rec, "TERRAINCAP %zu ", raw.size());
             SliceRecordAppend(&rec, encoded.data(), encoded.size()); SliceRecordAppend(&rec, "\n", 1);
         } else {
