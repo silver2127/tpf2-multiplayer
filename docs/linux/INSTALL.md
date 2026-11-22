@@ -1,9 +1,10 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
-The [dev `b6e6e33a` integration](UPSTREAM_dev_b6e6e33a.md) advances
-the native package, title panel and shared lobby to **0.7.1.6**. All peers,
-including dedicated servers, must update. This commit adds release metadata;
-the panel I/O, recovery roster and startup grace fixes were integrated earlier.
+The [dev `847f2563` integration](UPSTREAM_dev_847f2563.md) keeps
+package and title-panel version **0.7.1.6**, with lobby protocol **0.7.1.5**.
+Players and servers on 0.7.1.5 and 0.7.1.6 can play together and update at
+their own pace. The lobby log and public server list report 0.7.1.5.
+The recovery-hold fix takes effect when the host updates to 0.7.1.6.
 
 The [dev `f4d3df01` integration](UPSTREAM_dev_f4d3df01.md) adds
 configurable native dedicated startup grace (8–120 seconds, default 45) and
@@ -65,9 +66,10 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.6**, Windows dev `b6e6e33a`; see the
-[integration and validation record](UPSTREAM_dev_b6e6e33a.md). All peers, including dedicated
-servers, must update. Existing native Sandbox town-tool capture, minimap and
+Current release integration: **0.7.1.6**, Windows dev `847f2563`; see the
+[integration and validation record](UPSTREAM_dev_847f2563.md). Lobby protocol
+0.7.1.5 is shared with the previous release; servers can update independently. Existing native Sandbox town-tool capture,
+minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
 Completed TCP transfers no longer stay in lobby memory through listener
