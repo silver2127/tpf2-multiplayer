@@ -14,6 +14,15 @@ import lobby
 
 
 class VersionGateTest(unittest.TestCase):
+    def test_0716_keeps_the_0715_lobby(self):
+        # 0.7.1.6 changed nothing on the wire or in the world, so it keeps the 0.7.1.5
+        # lobby version: a 0.7.1.5 dedicated server and 0.7.1.6 players play together
+        # until the server updates. Bump LOBBY_VERSION with the next protocol change.
+        self.assertEqual((pathlib.Path(__file__).resolve().parents[1] /
+                          "installer/VERSION").read_text().strip(), "0.7.1.6")
+        self.assertEqual(lobby.LOBBY_VERSION, "0.7.1.5")
+        self.assertIsNone(lobby.version_rejection("0.7.1.5"))
+
     def test_host_admission(self):
         for relay_only in (False, True):
             with self.subTest(relay_only=relay_only), tempfile.TemporaryDirectory() as root:
@@ -29,7 +38,7 @@ class VersionGateTest(unittest.TestCase):
                 try:
                     conn = lobby._dial_loopback(0, port, 5)
                     self.assertIsNotNone(conn)
-                    for version in (None, "0.4.22", "0.7.0.3", "0.7.0.4", "0.7.0.5", "0.7.0.6", "0.7.0.7", "0.7.1", "0.7.1.1", "0.7.1.2", "0.7.1.3", "0.7.1.4", "99.0.0", 23, {}, lobby.LOBBY_VERSION):
+                    for version in (None, "0.4.22", "0.7.0.3", "0.7.0.4", "0.7.0.5", "0.7.0.6", "0.7.0.7", "0.7.1", "0.7.1.1", "0.7.1.2", "0.7.1.3", "0.7.1.4", "0.7.1.6", "99.0.0", 23, {}, lobby.LOBBY_VERSION):
                         msg = {"t": "join", "name": "tester"}
                         if version is not None:
                             msg["version"] = version
@@ -61,7 +70,7 @@ class VersionGateTest(unittest.TestCase):
 
     def test_client_rejects_before_processing_game_or_save(self):
         for kind in ("welcome", "roster"):
-            for version in (None, "0.4.22", "0.7.0.4", "0.7.0.5", "0.7.0.6", "0.7.0.7", "0.7.1", "0.7.1.1", "0.7.1.2", "0.7.1.3", "0.7.1.4", "99.0.0", [], False):
+            for version in (None, "0.4.22", "0.7.0.4", "0.7.0.5", "0.7.0.6", "0.7.0.7", "0.7.1", "0.7.1.1", "0.7.1.2", "0.7.1.3", "0.7.1.4", "0.7.1.6", "99.0.0", [], False):
                 with self.subTest(kind=kind, version=version), tempfile.TemporaryDirectory() as root:
                     greeting = {"t": kind, "version": version, "host": "host",
                                 "you": "tester", "players": ["host", "tester"], "started": True}

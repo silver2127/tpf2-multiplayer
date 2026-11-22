@@ -1,5 +1,29 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `d60f4cba` integration](UPSTREAM_dev_d60f4cba.md) corrects
+0.7.1.6 release notes to use published release **0.7.1.4** as the baseline.
+0.7.1.5 was not published separately. Players and servers on 0.7.1.4 must
+update; an existing 0.7.1.5 install remains compatible with 0.7.1.6.
+This integration changes documentation only.
+
+The [dev `847f2563` integration](UPSTREAM_dev_847f2563.md) keeps
+package and title-panel version **0.7.1.6**, with lobby protocol **0.7.1.5**.
+Players and servers on 0.7.1.5 and 0.7.1.6 can play together and update at
+their own pace. The lobby log and public server list report 0.7.1.5.
+The recovery-hold fix takes effect when the host updates to 0.7.1.6.
+
+The [dev `f4d3df01` integration](UPSTREAM_dev_f4d3df01.md) adds
+configurable native dedicated startup grace (8–120 seconds, default 45) and
+fixes stale roster checks during recovery holds. Set `LOAD_DELAY_SEC` in the
+server environment and run `tpf2server configure`, or set
+`dedicated_load_delay_sec` in the native menu flags. Host reload remains required;
+retained-world trial files are research evidence only. Release remains **0.7.1.5**.
+
+The [dev `63916f00` integration](UPSTREAM_dev_63916f00.md) protects
+the shared in-game panel from throwing file opens and retains optional release
+webhook role mentions. Native UTF-8 directory tests cover the shared resolver.
+Release remains **0.7.1.5**.
+
 The [dev `192ecd4d` integration](UPSTREAM_dev_192ecd4d.md) advances the
 native package, lobby handshake and panel to **0.7.1.5**. Completed save and
 terrain transfers release the host loop’s temporary references each pass.
@@ -48,9 +72,10 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.5**, Windows dev `192ecd4d`; see the
-[integration and validation record](UPSTREAM_dev_192ecd4d.md). All peers, including dedicated
-servers, must update. Existing native Sandbox town-tool capture, minimap and
+Current release integration: **0.7.1.6**, Windows dev `d60f4cba`; see the
+[integration and validation record](UPSTREAM_dev_d60f4cba.md). Lobby protocol
+0.7.1.5 is shared with unpublished 0.7.1.5 installs; 0.7.1.4 servers must update. Existing native Sandbox town-tool capture,
+minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
 Completed TCP transfers no longer stay in lobby memory through listener

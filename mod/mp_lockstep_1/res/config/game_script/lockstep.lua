@@ -139,6 +139,28 @@ end
 print("[ls-boot] data folder " .. (K.BASE:gsub("[\128-\255]", "?")) .. " (" .. tostring(CM.baseSource) .. ")")
 K.IDENTITY_FILE = K.BASE .. "tpf2_instance.txt"
 
+-- AN io.open THAT CANNOT THROW (2026-11-21). The game's io.open converts its path
+-- from UTF-8 to wide characters and THROWS on bytes that are not UTF-8
+-- (native/src/datadir.h), and the error value is the half-built file handle:
+-- "file (0000000000000000)". A path built from os.getenv is ANSI bytes, which is
+-- exactly that for a Windows user name with accents. One such open in the in-game
+-- panel's refresh aborted the whole refresh, every time, and the pcall around it
+-- said nothing: no window, no chat, no companies tab, while the title-screen menu
+-- worked (a player's 0.7.1.4, 2026-11-14). This returns nil and a reason instead,
+-- like a missing file, and says so once per path.
+function CM.openFile(path, mode)
+	local ok, f, err = pcall(io.open, path, mode or "r")
+	if ok then return f, err end
+	CM.openFileLogged = CM.openFileLogged or {}
+	local key = tostring(path)
+	if not CM.openFileLogged[key] then
+		CM.openFileLogged[key] = true
+		print("[ls-io] io.open threw for " .. (key:gsub("[\128-\255]", "?")) .. ": "
+			.. (tostring(f):gsub("[\128-\255]", "?")) .. " -- treated as no file")
+	end
+	return nil, "io.open threw: " .. tostring(f)
+end
+
 K.INSTANCE  = nil
 K.PEER      = nil
 -- (was: local K.CAPTURE_FILE, K.EVENTS_FILE, K.INJECT_FILE) -- fields of K now, nil until set
@@ -881,7 +903,7 @@ print("[ls-boot] all modules loaded")
 CM.MP_BUTTON_ICON = "ui/button/mp_multiplayer@2x.tga"   -- tools/make_mp_button_icon.py
 CM.MP_BUTTON_TRIES = 600   -- frames to wait for the toolbar
 function CM.dashSetShown(shown)
-	local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
+	local f = CM.openFile(K.BASE .. "tpf2mp_dash.txt", "w")
 	if f then f:write(shown and "1\n" or "0\n"); f:close() end
 	local D = CM.dash
 	if D and D.win then
@@ -1464,7 +1486,7 @@ function data()
 			-- 300 ticks (the chat and the players' requests still arrive through it).
 			if CM.dedicatedGui == nil and guiTick >= 30 then
 				CM.dedicatedGui = false
-				local f = io.open(K.BASE .. "mp_dedicated.txt", "r")
+				local f = CM.openFile(K.BASE .. "mp_dedicated.txt", "r")
 				if f then
 					local body = f:read("*a") or ""
 					f:close()
@@ -1488,7 +1510,7 @@ function data()
 				-- blanks the file, or four seconds pass.
 				if guiTick % 3 == 0 then
 					pcall(function()
-						local f = io.open(K.BASE .. "lockstep_lfire_req.txt", "r")
+						local f = CM.openFile(K.BASE .. "lockstep_lfire_req.txt", "r")
 						if not f then return end
 						local body = f:read("*a") or ""
 						f:close()
@@ -1498,7 +1520,7 @@ function data()
 						local nowC = os.clock()
 						if not CM.guiFireSince or CM.guiFireLid ~= lid then CM.guiFireSince, CM.guiFireLid, CM.guiFireOwned = nowC, lid, nil end
 						local function blank(name)
-							local w = io.open(K.BASE .. name, "w")
+							local w = CM.openFile(K.BASE .. name, "w")
 							if w then w:close() end
 						end
 						if nowC - CM.guiFireSince > 4 then
@@ -1517,7 +1539,7 @@ function data()
 							CM.guiFireOwned = guiTick
 							return   -- one more frame for the UI's tables to follow the ownership
 						end
-						local g = io.open(K.BASE .. "lockstep_lfire.txt", "r")
+						local g = CM.openFile(K.BASE .. "lockstep_lfire.txt", "r")
 						local go = g and (g:read("*a") or "") or ""
 						if g then g:close() end
 						if go == "" and CM.guiFireGone then
@@ -1527,7 +1549,7 @@ function data()
 							return
 						end
 						if go == "" then
-							local w = io.open(K.BASE .. "lockstep_lfire.txt", "w")
+							local w = CM.openFile(K.BASE .. "lockstep_lfire.txt", "w")
 							if w then w:write(tostring(lid)); w:close() end
 							CM.guiFireGone = true
 						end
@@ -1542,7 +1564,9 @@ function data()
 				if not CM.recoveryGuiHeld() then pcall(CM.previewGuiTick) end
 				if guiTick % 30 ~= 0 then return end
 			end
-			pcall(function()
+			-- The refresh's error is logged, once per distinct message: a silent pcall here
+			-- hid a refresh that failed every time for one player (CM.openFile, 2026-11-21).
+			local okDash, errDash = pcall(function()
 				-- NATIVE WIDGETS. The GUI Lua state has the game's own widget set
 				-- (Window, Table, TextView, BoxLayout), so the dashboard is built
 				-- from those rather than one text blob: a metrics table with a
@@ -1552,14 +1576,24 @@ function data()
 				-- 15 ticks by the game-script state.
 				-- The lobby's folder: the per-user one when a lobby has run there, else the
 				-- game folder's. Never fall back to an older inbox while a lobby is still starting.
+				-- A Windows user name with accents: LOCALAPPDATA comes back as ANSI bytes,
+				-- which the game's io.open cannot take (CM.openFile). The data folder the
+				-- DLLs published is the same tree as an ASCII short path (datadir.h), and
+				-- the lobby's folder is its sibling, so that path is used instead.
 				function CM.netDir()
 					if CM.netDirCached then return CM.netDirCached end
 					local cands = {}
 					local ok, la = pcall(os.getenv, "LOCALAPPDATA")
-					if ok and la then cands[#cands + 1] = la .. "/tpf2mp/netpunch" end
+					if ok and type(la) == "string" and la ~= "" then
+						if la:find("[\128-\255]") and K.BASE and K.BASE:find("/tpf2mp/data/$") then
+							cands[#cands + 1] = (K.BASE:gsub("data/$", "netpunch"))
+						else
+							cands[#cands + 1] = la .. "/tpf2mp/netpunch"
+						end
+					end
 					cands[#cands + 1] = "netpunch"
 					for _, d in ipairs(cands) do
-						local f = io.open(d .. "/lobby_out.jsonl", "r")
+						local f = CM.openFile(d .. "/lobby_out.jsonl", "r")
 						if f then f:close(); CM.netDirCached = d; return d end
 					end
 					-- A map can load before the host creates its first lobby.
@@ -1568,7 +1602,7 @@ function data()
 				function CM.chatSend(text)
 					local d = CM.netDir()
 					if not d then return false end
-					local f = io.open(d .. "/lobby_in.jsonl", "a")
+					local f = CM.openFile(d .. "/lobby_in.jsonl", "a")
 					if not f then return false end
 					local esc = tostring(text):gsub("\\", "\\\\"):gsub('"', '\\"')
 					f:write('{"cmd":"chat","text":"' .. esc .. '"}' .. string.char(10))
@@ -1582,7 +1616,7 @@ function data()
 				function CM.chatTail(n)
 					local d = CM.netDir()
 					if not d then return CM.chatLines end
-					local f = io.open(d .. "/lobby_out.jsonl", "rb")
+					local f = CM.openFile(d .. "/lobby_out.jsonl", "rb")
 					if not f then return CM.chatLines end
 					local size = f:seek("end") or 0
 					if CM.chatOff == nil or CM.chatOff > size then
@@ -1633,11 +1667,14 @@ function data()
 					end
 					return out
 				end
+				-- The other candidate folders include LOCALAPPDATA's, raw ANSI bytes: with an
+				-- accented user name, opening a peer's (absent) file there threw, and that
+				-- happened on every refresh, before the window was ever built (2026-11-21).
 				local function readDash(inst)
 					local bases = { K.BASE }
 					for _, p in ipairs(CM.baseCandidates or {}) do if p ~= K.BASE then bases[#bases + 1] = p end end
 					for _, base in ipairs(bases) do
-						local f = io.open(base .. "lockstep_dash_" .. inst .. ".txt", "r")
+						local f = CM.openFile(base .. "lockstep_dash_" .. inst .. ".txt", "r")
 						if f then
 							local kv, ev = {}, {}
 							for line in f:lines() do
@@ -1771,7 +1808,7 @@ function data()
 					-- menu DLL's Ctrl+Shift+D reads, so the next chord SHOWS it.
 					local function hideDash()
 						if D.chatOpen and CM.chatCloseInput then CM.chatCloseInput() end
-						local f = io.open(K.BASE .. "tpf2mp_dash.txt", "w")
+						local f = CM.openFile(K.BASE .. "tpf2mp_dash.txt", "w")
 						if f then f:write("0\n"); f:close() end
 						D.shown = false
 						if D.win then D.win:setVisible(false, false) end
@@ -1800,7 +1837,7 @@ function data()
 					D.lobbyText = api.gui.comp.TextView.new("")
 					lobbyL:addItem(D.lobbyText)
 					lobbyL:addItem(toggleBtn("Host / manage session", function()
-						local f, err = io.open(K.BASE .. "tpf2_lobby_open.txt", "w")
+						local f, err = CM.openFile(K.BASE .. "tpf2_lobby_open.txt", "w")
 						if f then f:write("open\n"); f:close()
 						else D.lobbyText:setText("Could not open lobby controls: " .. tostring(err)) end
 					end))
@@ -1825,7 +1862,7 @@ function data()
 					local function speedVote(v)
 						v = math.max(0.25, math.min(4.5, math.floor(v * 4 + 0.5) / 4))
 						D.speedAsked, D.speedAskedAt = v, os.time()
-						local f = io.open(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
+						local f = CM.openFile(K.BASE .. "lockstep_inject_" .. (K.INSTANCE or "a") .. ".txt", "a")
 						if f then f:write(string.format("SPEEDSET %g", v) .. string.char(10)); f:close() end
 						pcall(function() D.speedText:setText(string.format("your vote: %gx -- the session speed follows in a moment   ", v)) end)
 					end
@@ -2040,7 +2077,7 @@ function data()
 				end
 				if CM.dashShowLobby and D.lobbyText and CM.lobbyPanelPage then
 					local dir = CM.netDir()
-					local f = dir and io.open(dir .. "/lobby_panel.txt", "r")
+					local f = dir and CM.openFile(dir .. "/lobby_panel.txt", "r")
 					local body = ""
 					if f then body = f:read(65536) or ""; f:close() end
 					local text, page, pages = CM.lobbyPanelPage(body, CM.lobbyPage)
@@ -2095,7 +2132,7 @@ function data()
 				-- one-byte file; no file means shown. Recovery uses its own native
 				-- panel and does not override the dashboard visibility preference.
 				local shown = true
-				local ff = io.open(K.BASE .. "tpf2mp_dash.txt", "r")
+				local ff = CM.openFile(K.BASE .. "tpf2mp_dash.txt", "r")
 				if ff then
 					local v = ff:read("*l"); ff:close()
 					shown = (v ~= "0")
@@ -2107,6 +2144,13 @@ function data()
 				end
 				CM.mpButtonSync(shown)
 			end)
+			if not okDash then
+				local why = (tostring(errDash):gsub("[\128-\255]", "?"))
+				if why ~= CM.dashErrLast then
+					CM.dashErrLast = why
+					print("[ls-gui] multiplayer panel refresh failed: " .. why)
+				end
+			end
 		end,
 	}
 end

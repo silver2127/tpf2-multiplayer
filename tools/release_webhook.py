@@ -4,6 +4,9 @@
     python tools/release_webhook.py EVENT_JSON            posts to $RELEASE_WEBHOOK_URL
     python tools/release_webhook.py EVENT_JSON --dry-run  prints the payload instead
 
+With $RELEASE_WEBHOOK_ROLE_ID set (repository variable) the message starts with
+that role's mention and pings it; Discord mentions a role by ID, not by name.
+
 Run by .github/workflows/release-webhook.yml on `release: released` with the event
 file GitHub hands the job ($GITHUB_EVENT_PATH). One version publishes several
 releases (tools/publish_release.py): the page v<version> (the one players see,
@@ -27,6 +30,7 @@ STABLE_TAG = re.compile(r"^v\d+(\.\d+)+$")
 EMBED_DESCRIPTION_MAX = 4096   # Discord's limit for an embed description
 EMBED_TITLE_MAX = 256
 COLOR = 0x2E7D32
+ROLE_ID = re.compile(r"^\d{15,25}$")
 
 
 def is_stable(release):
@@ -70,15 +74,18 @@ def clip(text, limit, tail):
     return cut.rstrip() + tail
 
 
-def payload(release):
+def payload(release, role_id=None):
     url = release["html_url"]
     title = headline(release.get("body")) or release.get("name") or release["tag_name"]
     text = changes(release.get("body"))
     more = f"\n\n[Full release notes and downloads]({url})"
     description = clip(text, EMBED_DESCRIPTION_MAX - len(more), "\n...") + more
+    content = f"**New stable release: {release['tag_name']}** -- update with **Update & play** in the launcher."
+    if role_id:
+        content = f"<@&{role_id}> {content}"
     return {
         "username": "TpF2 Multiplayer",
-        "content": f"**New stable release: {release['tag_name']}** -- update with **Update & play** in the launcher.",
+        "content": content,
         "embeds": [{
             "title": clip(title, EMBED_TITLE_MAX, "..."),
             "url": url,
@@ -86,7 +93,7 @@ def payload(release):
             "color": COLOR,
             "timestamp": release.get("published_at"),
         }],
-        "allowed_mentions": {"parse": []},
+        "allowed_mentions": {"parse": [], "roles": [role_id] if role_id else []},
     }
 
 
@@ -113,7 +120,10 @@ def main():
     if why:
         print(f"{release.get('tag_name')}: not announced, {why}")
         return
-    data = payload(release)
+    role_id = os.environ.get("RELEASE_WEBHOOK_ROLE_ID", "").strip()
+    if role_id and not ROLE_ID.match(role_id):
+        sys.exit(f"RELEASE_WEBHOOK_ROLE_ID {role_id!r} is not a Discord role ID (digits only)")
+    data = payload(release, role_id or None)
     if args.dry_run:
         print(json.dumps(data, indent=2, ensure_ascii=False))
         return
