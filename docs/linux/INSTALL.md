@@ -1,5 +1,11 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `d60f4cba` integration](UPSTREAM_dev_d60f4cba.md) corrects
+0.7.1.6 release notes to use published release **0.7.1.4** as the baseline.
+0.7.1.5 was not published separately. Players and servers on 0.7.1.4 must
+update; an existing 0.7.1.5 install remains compatible with 0.7.1.6.
+This integration changes documentation only.
+
 The [dev `847f2563` integration](UPSTREAM_dev_847f2563.md) keeps
 package and title-panel version **0.7.1.6**, with lobby protocol **0.7.1.5**.
 Players and servers on 0.7.1.5 and 0.7.1.6 can play together and update at
@@ -66,9 +72,9 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.6**, Windows dev `847f2563`; see the
-[integration and validation record](UPSTREAM_dev_847f2563.md). Lobby protocol
-0.7.1.5 is shared with the previous release; servers can update independently. Existing native Sandbox town-tool capture,
+Current release integration: **0.7.1.6**, Windows dev `d60f4cba`; see the
+[integration and validation record](UPSTREAM_dev_d60f4cba.md). Lobby protocol
+0.7.1.5 is shared with unpublished 0.7.1.5 installs; 0.7.1.4 servers must update. Existing native Sandbox town-tool capture,
 minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
