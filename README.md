@@ -1,5 +1,12 @@
 # TpF2 Multiplayer — Transport Fever 2 multiplayer mod
 
+The [dev `f4d3df01` integration](docs/linux/UPSTREAM_dev_f4d3df01.md) adds
+configurable native dedicated startup grace (8–120 seconds, default 45) and
+fixes stale roster checks during recovery holds. Set `LOAD_DELAY_SEC` in the
+server environment and run `tpf2server configure`, or set
+`dedicated_load_delay_sec` in the native menu flags. Host reload remains required;
+retained-world trial files are research evidence only. Release remains **0.7.1.5**.
+
 The [dev `63916f00` integration](docs/linux/UPSTREAM_dev_63916f00.md) protects
 the shared in-game panel from throwing file opens and retains optional release
 webhook role mentions. Native UTF-8 directory tests cover the shared resolver.
@@ -53,8 +60,8 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.5**, Windows dev `63916f00`; see the
-[integration and validation record](docs/linux/UPSTREAM_dev_63916f00.md). All peers, including dedicated
+Current release integration: **0.7.1.5**, Windows dev `f4d3df01`; see the
+[integration and validation record](docs/linux/UPSTREAM_dev_f4d3df01.md). All peers, including dedicated
 servers, must update. Existing native Sandbox town-tool capture, minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
