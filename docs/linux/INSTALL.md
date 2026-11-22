@@ -1,5 +1,10 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `b6e6e33a` integration](UPSTREAM_dev_b6e6e33a.md) advances
+the native package, title panel and shared lobby to **0.7.1.6**. All peers,
+including dedicated servers, must update. This commit adds release metadata;
+the panel I/O, recovery roster and startup grace fixes were integrated earlier.
+
 The [dev `f4d3df01` integration](UPSTREAM_dev_f4d3df01.md) adds
 configurable native dedicated startup grace (8–120 seconds, default 45) and
 fixes stale roster checks during recovery holds. Set `LOAD_DELAY_SEC` in the
@@ -60,8 +65,8 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.5**, Windows dev `f4d3df01`; see the
-[integration and validation record](UPSTREAM_dev_f4d3df01.md). All peers, including dedicated
+Current release integration: **0.7.1.6**, Windows dev `b6e6e33a`; see the
+[integration and validation record](UPSTREAM_dev_b6e6e33a.md). All peers, including dedicated
 servers, must update. Existing native Sandbox town-tool capture, minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
