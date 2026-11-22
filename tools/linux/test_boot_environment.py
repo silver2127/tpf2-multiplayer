@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the real Linux preload constructor with unchanged Windows .22 Lua."""
+"""Exercise the real Linux preload constructor with shared Windows/Linux Lua."""
 import argparse
 import os
 from pathlib import Path
@@ -29,7 +29,7 @@ def main():
         shutil.copy2(args.boot, lib)
         probe = root / "TransportFever2"
         shutil.copy2(args.probe, probe)
-        for case in ("home", "xdg", "override", "snap", "unicode", "relative-xdg"):
+        for case in ("home", "xdg", "override", "snap", "unicode", "unicode-xdg", "relative-xdg"):
             folder = root / case
             folder.mkdir()
             env = os.environ.copy()
@@ -40,8 +40,8 @@ def main():
                 home = folder / "snap/steam/common"
             home.mkdir(parents=True)
             env["HOME"] = str(home)
-            if case in ("xdg", "override"):
-                env["XDG_DATA_HOME"] = str(folder / "xdg data")
+            if case in ("xdg", "override", "unicode-xdg"):
+                env["XDG_DATA_HOME"] = str(folder / ("données partagées" if case == "unicode-xdg" else "xdg data"))
             elif case == "relative-xdg":
                 env["XDG_DATA_HOME"] = "relative-is-not-an-XDG-root"
             xdg = env.get("XDG_DATA_HOME", "")
@@ -53,8 +53,8 @@ def main():
             env["LOCALAPPDATA"] = "/incorrect/inherited/windows/path"
             env["LD_PRELOAD"] = str(lib)
             # The real bridge writes identity before a world loads. Include it
-            # for overrides/Unicode, matching .22's first-proven-candidate rule.
-            if case in ("override", "unicode"):
+            # for overrides/Unicode, matching the shared resolver's first-proven-candidate rule.
+            if case in ("override", "unicode", "unicode-xdg"):
                 Path(data).mkdir(parents=True)
                 (Path(data) / "tpf2_instance.txt").write_text("A\npid=1\n")
             net = str(Path(local) / "tpf2mp/netpunch")
@@ -73,7 +73,7 @@ def main():
         check = 'assert(os.getenv("LOCALAPPDATA")=="keep" and os.getenv("TPF2MP_DATADIR")=="keep-too"); assert(os.getenv("LD_PRELOAD"))'
         subprocess.run([str(other), lua, "-e", check], cwd=root, env=env, check=True)
         assert not (root / "untouched").exists()
-    print("boot environment: six Linux path cases and non-game passthrough passed")
+    print("boot environment: seven Linux path cases and non-game passthrough passed")
 
 
 if __name__ == "__main__":

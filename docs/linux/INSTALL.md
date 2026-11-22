@@ -1,5 +1,10 @@
 # TpF2 Multiplayer on Linux: install, uninstall, logs
 
+The [dev `63916f00` integration](UPSTREAM_dev_63916f00.md) protects
+the shared in-game panel from throwing file opens and retains optional release
+webhook role mentions. Native UTF-8 directory tests cover the shared resolver.
+Release remains **0.7.1.5**.
+
 The [dev `192ecd4d` integration](UPSTREAM_dev_192ecd4d.md) advances the
 native package, lobby handshake and panel to **0.7.1.5**. Completed save and
 terrain transfers release the host loop’s temporary references each pass.
@@ -48,8 +53,8 @@ repeat save transfers while a joining player’s mods are packing, queued or
 being delivered. The shared lobby fix applies to native Linux and Windows;
 release remains 0.7.1.2.
 
-Current release integration: **0.7.1.5**, Windows dev `192ecd4d`; see the
-[integration and validation record](UPSTREAM_dev_192ecd4d.md). All peers, including dedicated
+Current release integration: **0.7.1.5**, Windows dev `63916f00`; see the
+[integration and validation record](UPSTREAM_dev_63916f00.md). All peers, including dedicated
 servers, must update. Existing native Sandbox town-tool capture, minimap and
 cargo-filter limitations remain. Upstream performance measurements were not
 repeated locally; matching release numbers do not establish gameplay parity.
