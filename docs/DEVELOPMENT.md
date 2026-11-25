@@ -186,8 +186,10 @@ pads `0.6` to `0.6.0` for the package only) and ignores a fourth when it compare
 installing the new MSI (or running the Proton installer again): there is no in-game updater since 0.6.1.11
 (removed 2026-09-20 -- mod-hosting sites do not allow a mod that downloads and installs its own updates).
 
-1. Bump `installer/VERSION` and `LOBBY_VERSION` in `netpunch/lobby.py` (the version shown in the public
-   game list).
+1. Bump `installer/VERSION` and `RELEASE_VERSION` in `netpunch/lobby.py` (`tools/version_gate_test.py`
+   checks they match), and `LOBBY_VERSION` when the release changes the protocol or the world (it is the
+   version shown in the public game list). The version-mismatch message names releases, so a release that
+   keeps `LOBBY_VERSION` still tells its players the version they installed.
    The lobby is frozen with a PyInstaller whose bootloader was compiled on the building machine
    (`tools/pyinstaller_from_source.py`, run by `build_msi.ps1` and the workflow): the stock stub is the
    same bytes in every PyInstaller download and antivirus engines keep signatures for it (two VirusTotal
