@@ -14,13 +14,15 @@ import lobby
 
 
 class VersionGateTest(unittest.TestCase):
-    def test_0716_keeps_the_0715_lobby(self):
-        # 0.7.1.6 changed nothing on the wire or in the world, so it keeps the 0.7.1.5
-        # lobby version: a 0.7.1.5 dedicated server and 0.7.1.6 players play together
-        # until the server updates. Bump LOBBY_VERSION with the next protocol change.
+    def test_0717_keeps_the_0715_lobby(self):
+        # 0.7.1.6 and 0.7.1.7 changed nothing on the wire or in the world, so they keep
+        # the 0.7.1.5 lobby version: a 0.7.1.6 dedicated server or native Linux player
+        # (0.7.1.7 has no Linux build) and 0.7.1.7 players play together. The "release"
+        # field 0.7.1.7 adds is informational. Bump LOBBY_VERSION with the next protocol change.
         self.assertEqual(lobby.LOBBY_VERSION, "0.7.1.5")
         self.assertIsNone(lobby.version_rejection("0.7.1.5"))
         self.assertIsNone(lobby.version_rejection("0.7.1.5", "0.7.1.6"))
+        self.assertIsNone(lobby.version_rejection("0.7.1.5", "0.7.1.7"))
 
     def test_release_version_is_the_installer_version(self):
         # The mismatch message names this; a release bump that forgets it fails here.

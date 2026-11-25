@@ -56,6 +56,9 @@ WHAT IT DOES for a version, in order (each step checks, nothing is published hal
   6. with --publish: <version> (never Latest), then v<version> (Latest unless a
      pre-release).
 Without a Linux launcher yet, --no-linux-launcher publishes the Windows one alone.
+A Windows and Proton version (2026-11-25, 0.7.1.7: no time for the Linux build) takes
+--no-native-linux instead of --linux-dir: no native package anywhere, no row linking one;
+only for a version that keeps LOBBY_VERSION, so the last native release still plays with it.
 
 PAGE: a version published with its files on v<version> (0.7.0.5 and older) gets
 this layout: the files copied to the packages release and to <version>, checked,
@@ -351,17 +354,23 @@ def launcher_release(gh, args):
 
 
 # the direct installers the version's page carries beside the launchers
-def page_direct(version):
-    return ["TpF2Multiplayer.msi", "install_proton.sh", f"tpf2mp-linux-{version}-native.run", SERVER_NAME]
+def page_direct(version, native=True):
+    return ["TpF2Multiplayer.msi", "install_proton.sh"] + ([f"tpf2mp-linux-{version}-native.run"] if native else []) + [SERVER_NAME]
 
 
-def launcher_table(tag, files_url, linux_launcher=True):
-    """The page's Download section: the launchers, then the direct installers."""
+def launcher_table(tag, files_url, linux_launcher=True, native=True):
+    """The page's Download section: the launchers, then the direct installers.
+    native=False is a Windows and Proton release (--no-native-linux): no native
+    Linux package, so no row that links one; its notes say what native players run."""
     base = f"https://github.com/{REPO}/releases/download/{tag}"
     version = tag.lstrip("v")
     run = f"tpf2mp-linux-{version}-native.run"
-    linux = (f"| **Linux / Steam Deck** (the native game or Proton) | **[{LINUX_NAME}]({base}/{LINUX_NAME})** -- make it executable, run it, then **Update & play** |\n"
+    linux = ((f"| **Linux / Steam Deck** (the native game or Proton) | **[{LINUX_NAME}]({base}/{LINUX_NAME})** -- make it executable, run it, then **Update & play** |\n"
+              if native else
+              f"| **Linux / Steam Deck**, the Windows game under Proton | **[{LINUX_NAME}]({base}/{LINUX_NAME})** -- make it executable, run it, then **Update & play** |\n")
              if linux_launcher else "")
+    native_row = (f"| **Linux**, the native game | [{run}]({base}/{run}) -- close the game, `bash {run}` |\n" if native else
+                  "| **Linux**, the native game | no native package in this version: see the notes below |\n")
     return ("## Download\n\n| You play on | Get this one file |\n| --- | --- |\n"
             f"| **Windows** (Steam, game build 35924) | **[{WINDOWS_NAME}]({base}/{WINDOWS_NAME})** -- install it, then **Update & play** |\n"
             + linux +
@@ -369,17 +378,17 @@ def launcher_table(tag, files_url, linux_launcher=True):
             "| You play on | Get this one file |\n| --- | --- |\n"
             f"| **Windows** | [TpF2Multiplayer.msi]({base}/TpF2Multiplayer.msi) -- close the game, run it |\n"
             f"| **Linux / Steam Deck**, the Windows game under Proton | [install_proton.sh]({base}/install_proton.sh) -- run it with sh; it fetches the rest itself |\n"
-            f"| **Linux**, the native game | [{run}]({base}/{run}) -- close the game, `bash {run}` |\n"
+            + native_row +
             f"| **A dedicated server** on Linux or a VPS | [{SERVER_NAME}]({base}/{SERVER_NAME}) -- unpack it, `sudo sh tpf2mp-server/setup_vps.sh`; "
             f"the guide: [HOSTING_A_SERVER.md](https://github.com/{REPO}/blob/main/docs/HOSTING_A_SERVER.md). A Windows server is the MSI above |\n\n"
-            f"The files zip, the Linux .tar.gz, install_proton.py and the checksums are in [the update files]({files_url}). "
+            f"The files zip{', the Linux .tar.gz' if native else ''}, install_proton.py and the checksums are in [the update files]({files_url}). "
             "The two *Source code* archives at the bottom are the repository, not the mod. Everyone in a session needs the same version.\n")
 
 
-def download_section(body, tag, files_url, linux_launcher=True):
+def download_section(body, tag, files_url, linux_launcher=True, native=True):
     """body with its "## Download" section (up to the next "## ") replaced by launcher_table."""
     rest = body.split("\n## ", 1)[1] if body.startswith("## Download") and "\n## " in body else None
-    table = launcher_table(tag, files_url, linux_launcher)
+    table = launcher_table(tag, files_url, linux_launcher, native)
     return table + "\n## " + rest if rest is not None else table + "\n" + body
 
 
@@ -506,6 +515,10 @@ def main():
     ap.add_argument("--windows-launcher", help="a launcher Setup.exe instead of tearded's newest release")
     ap.add_argument("--linux-launcher", help="a Linux launcher AppImage instead of tearded's newest release")
     ap.add_argument("--no-linux-launcher", action="store_true", help="publish without a Linux launcher (none released yet)")
+    ap.add_argument("--no-native-linux", action="store_true",
+                    help="a Windows and Proton release without the native Linux package (no --linux-dir); "
+                         "the Linux launcher then tells native players this version has none. Only for a "
+                         "version that keeps LOBBY_VERSION, so the previous native release still plays with it")
     ap.add_argument("--publish", action="store_true", help="publish the draft at the end (default: leave it a draft)")
     ap.add_argument("--dry-run", action="store_true", help="check everything, change nothing on GitHub")
     args = ap.parse_args()
@@ -515,8 +528,11 @@ def main():
         return page_release(GitHub(token(), args.dry_run), args)
     if not re.fullmatch(r"v\d+\.\d+(\.\d+){0,2}", args.tag):
         fail("the tag looks like v0.7.0.6, or is 'launcher'")
-    if not args.linux_dir:
-        fail("a mod version needs --linux-dir")
+    if args.no_native_linux and args.linux_dir:
+        fail("--no-native-linux publishes no native package: drop --linux-dir")
+    if not args.linux_dir and not args.no_native_linux:
+        fail("a mod version needs --linux-dir (or --no-native-linux for a Windows and Proton release)")
+    native = not args.no_native_linux
     version = args.tag[1:]
     gh = GitHub(token(), args.dry_run)
 
@@ -536,17 +552,18 @@ def main():
     with tempfile.TemporaryDirectory(prefix="tpf2mp-publish-") as tmp:
         tmp = Path(tmp)
         folder = Path(args.payload_dir) if args.payload_dir else payload_from_ci(gh, args.tag, tmp)
-        files = check_payload(folder, version) + linux_files(args.linux_dir, version)
+        files = check_payload(folder, version) + (linux_files(args.linux_dir, version) if native else [])
         say(f"install files: {len(files)} checked")
         chosen = launchers(gh, args, tmp)
         packages_release(gh, args.tag, version, mod["prerelease"], files)
         copy = copy_release(gh, args.tag, version, mod["prerelease"], mod.get("target_commitish") or "main",
                             notes_of(body), files, args.dry_run)
-        direct = [f for f in files if f.name in page_direct(version)]
+        direct = [f for f in files if f.name in page_direct(version, native)]
         say(f"{args.tag} launchers and direct installers:")
         upload(gh, mod, [p for p, _ in chosen] + direct, [n for _, n in chosen] + [p.name for p in direct])
         only(gh, mod, {n for _, n in chosen} | {p.name for p in direct}, args.tag)
-    body = download_section(body, args.tag, f"https://github.com/{REPO}/releases/tag/{version}", not args.no_linux_launcher)
+    body = download_section(body, args.tag, f"https://github.com/{REPO}/releases/tag/{version}",
+                            not args.no_linux_launcher, native)
     if body != mod.get("body"):
         gh.write(f"update {args.tag}'s notes", "PATCH", f"/repos/{REPO}/releases/{mod['id']}", body={"body": body})
     if args.publish:

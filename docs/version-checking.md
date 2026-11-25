@@ -2,7 +2,7 @@
 
 Starting with 0.4.23, lobby admission requires an exact `LOBBY_VERSION` match.
 The join request, welcome, and periodic roster carry `LOBBY_VERSION` as
-`version` and, from the release after 0.7.1.6, the release (`RELEASE_VERSION`,
+`version` and, from 0.7.1.7, the release (`RELEASE_VERSION`,
 equal to `installer/VERSION`) as `release`. A release that changes nothing on
 the wire keeps `LOBBY_VERSION` (0.7.1.6 speaks 0.7.1.5), so the gate compares
 `version` while the mismatch message names releases: "you have 0.7.1.6; the

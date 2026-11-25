@@ -3774,7 +3774,7 @@ LOBBY_VERSION = "0.7.1.5"
 # a mismatch message names releases: a 0.7.1.6 player told "you have 0.7.1.5"
 # thought the message was wrong and missed that the OTHER side was out of date.
 # The join, welcome and roster carry it as "release"; the gate stays LOBBY_VERSION.
-RELEASE_VERSION = "0.7.1.6"
+RELEASE_VERSION = "0.7.1.7"
 VERSION_MISMATCH = "Multiplayer version mismatch"
 
 
