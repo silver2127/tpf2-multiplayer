@@ -14,14 +14,43 @@ import lobby
 
 
 class VersionGateTest(unittest.TestCase):
-    def test_0716_keeps_the_0715_lobby(self):
-        # 0.7.1.6 changed nothing on the wire or in the world, so it keeps the 0.7.1.5
-        # lobby version: a 0.7.1.5 dedicated server and 0.7.1.6 players play together
-        # until the server updates. Bump LOBBY_VERSION with the next protocol change.
-        self.assertEqual((pathlib.Path(__file__).resolve().parents[1] /
-                          "installer/VERSION").read_text().strip(), "0.7.1.6")
+    def test_0717_keeps_the_0715_lobby(self):
+        # 0.7.1.6 and 0.7.1.7 changed nothing on the wire or in the world, so they keep
+        # the 0.7.1.5 lobby version: a 0.7.1.6 dedicated server or native Linux player
+        # (0.7.1.7 has no Linux build) and 0.7.1.7 players play together. The "release"
+        # field 0.7.1.7 adds is informational. Bump LOBBY_VERSION with the next protocol change.
         self.assertEqual(lobby.LOBBY_VERSION, "0.7.1.5")
         self.assertIsNone(lobby.version_rejection("0.7.1.5"))
+        self.assertIsNone(lobby.version_rejection("0.7.1.5", "0.7.1.6"))
+        self.assertIsNone(lobby.version_rejection("0.7.1.5", "0.7.1.7"))
+
+    def test_release_version_is_the_installer_version(self):
+        # The mismatch message names this; a release bump that forgets it fails here.
+        installer = pathlib.Path(__file__).resolve().parents[1] / "installer" / "VERSION"
+        self.assertEqual(lobby.RELEASE_VERSION, installer.read_text().strip())
+
+    def test_mismatch_names_releases(self):
+        # A 0.7.1.6 player was told "you have 0.7.1.5" and took the message for the bug.
+        reason = lobby.version_rejection("0.7.1.4")
+        self.assertIn(f"you have {lobby.RELEASE_VERSION};", reason)
+        self.assertIn("the other side has 0.7.1.4.", reason)
+        self.assertNotIn(f"you have {lobby.LOBBY_VERSION};", reason)
+        # a newer peer names its release, which can differ from its lobby version
+        self.assertIn("the other side has 0.7.2.1.", lobby.version_rejection("0.7.2", "0.7.2.1"))
+        self.assertIn("the other side has unknown (older build).", lobby.version_rejection(None))
+        self.assertIn("the other side has 0.7.1.3.", lobby.version_rejection("0.7.1.3", 7))
+        # 0.7.1.6 sends lobby 0.7.1.5 and no release; 0.7.1.5 was never published
+        self.assertEqual(lobby.version_label("0.7.1.5"), "0.7.1.6")
+        self.assertEqual(lobby.version_label("0.7.1.5", "0.7.1.5"), "0.7.1.5")
+
+    def test_old_hosts_reject_names_this_release(self):
+        # The exact text a 0.7.1.4 host sends a joiner whose lobby version is 0.7.1.5.
+        old = ("Multiplayer version mismatch: you have 0.7.1.5; the host has "
+               "0.7.1.4. Install the same multiplayer version on both sides.")
+        self.assertEqual(lobby.own_release_in_reject(old),
+                         old.replace("you have 0.7.1.5;", f"you have {lobby.RELEASE_VERSION};"))
+        for other in ("wrong password", "lobby full", None, 5):
+            self.assertEqual(lobby.own_release_in_reject(other), other)
 
     def test_host_admission(self):
         for relay_only in (False, True):
@@ -56,9 +85,13 @@ class VersionGateTest(unittest.TestCase):
                         if version == lobby.LOBBY_VERSION:
                             self.assertEqual(response["t"], "welcome")
                             self.assertEqual(response["version"], lobby.LOBBY_VERSION)
+                            self.assertEqual(response["release"], lobby.RELEASE_VERSION)
                         else:
                             self.assertEqual(response["t"], "reject")
                             self.assertIn("version mismatch", response["reason"])
+                            self.assertIn(f"the host has {lobby.RELEASE_VERSION}.", response["reason"])
+                            if isinstance(version, str):
+                                self.assertIn(f"you have {version};", response["reason"])
                             roster = lobby._latest_roster(io.out_path)
                             self.assertNotIn("tester", (roster or {}).get("players", []))
                 finally:
@@ -96,10 +129,30 @@ class VersionGateTest(unittest.TestCase):
                     self.assertFalse(any(e["type"] in ("start", "roster", "save_ready") for e in events))
                     self.assertFalse(any(e.get("state") == "connected" for e in events))
                     self.assertIn("version mismatch", events[-1]["detail"])
+                    self.assertIn(f"you have {lobby.RELEASE_VERSION};", events[-1]["detail"])
                     self.assertEqual(json.loads(pathlib.Path(io.state_path).read_text())["state"], "failed")
                     self.assertTrue(conn.closed)
                     self.assertTrue(any(m.get("t") == "leave" for m in conn.sent))
                     self.assertEqual(conn.sent[0]["version"], lobby.LOBBY_VERSION)
+                    self.assertEqual(conn.sent[0]["release"], lobby.RELEASE_VERSION)
+
+    def test_client_shows_its_release_in_an_old_hosts_reject(self):
+        old = ("Multiplayer version mismatch: you have 0.7.1.5; the host has "
+               "0.7.1.4. Install the same multiplayer version on both sides.")
+        with tempfile.TemporaryDirectory() as root:
+            class Connection:
+                def __init__(self):
+                    self.messages = collections.deque([json.dumps({"t": "reject", "reason": old}).encode()])
+                    self.sent = []
+                def send(self, raw): self.sent.append(json.loads(raw))
+                def recv(self, timeout=0): return self.messages.popleft() if self.messages else None
+                def last_seen_age(self): return 0
+                def close(self): pass
+            io = lobby.LobbyIO(root)
+            lobby.run_client(Connection(), "tester", io, log=lambda _: None)
+            detail = lobby._read_events(io.out_path)[-1]["detail"]
+            self.assertIn(f"you have {lobby.RELEASE_VERSION}; the host has 0.7.1.4.", detail)
+            self.assertEqual(json.loads(pathlib.Path(io.state_path).read_text())["detail"], detail)
 
 
 if __name__ == "__main__":

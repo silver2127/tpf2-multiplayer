@@ -302,6 +302,34 @@ class VersionReleaseTest(unittest.TestCase):
         self.assertNotIn(publisher.LINUX_NAME, page['body'])
         self.assertIn(f'{publisher.PACKAGES_REPO}/releases/download/v0.7.0.6/install_proton.sh', page['body'])
 
+    def run_without_native(self, *flags):
+        argv = ['publish_release.py', 'v' + self.version, '--no-native-linux',
+                '--payload-dir', str(self.root), '--windows-launcher', str(self.root / publisher.WINDOWS_NAME),
+                '--linux-launcher', str(self.root / publisher.LINUX_NAME), *flags]
+        with patch.object(sys, 'argv', argv):
+            publisher.main()
+
+    def test_no_native_linux_publishes_windows_and_proton_only(self):
+        # 0.7.1.7 (2026-11-25): no Linux build; native players stay on 0.7.1.6
+        self.run_without_native('--publish')
+        uploaded = [url.split('?name=')[1] for method, url, kw in self.writes if '?name=' in url]
+        self.assertFalse([n for n in uploaded if '-native.' in n], uploaded)
+        for name in publisher.PAYLOAD:
+            self.assertIn(name, uploaded)
+        page_uploads = {url.split('?name=')[1] for method, url, kw in self.writes if '/upload/1?' in url}
+        self.assertEqual(page_uploads, {publisher.WINDOWS_NAME, publisher.LINUX_NAME,
+                                        *publisher.page_direct(self.version, native=False)})
+        page = next(kw['body'] for method, url, kw in self.writes
+                    if method == 'PATCH' and url.endswith('/releases/1') and 'body' in kw['body'])
+        self.assertNotIn('-native.run', page['body'])
+        self.assertIn('no native package in this version', page['body'])
+        self.assertIn('the Windows game under Proton | **[' + publisher.LINUX_NAME, page['body'])
+
+    def test_no_native_linux_refuses_a_linux_dir(self):
+        with self.assertRaisesRegex(SystemExit, 'drop --linux-dir'):
+            self.run_version('--no-native-linux')
+        self.assertEqual(self.writes, [])
+
 
 class PageReleaseTest(LauncherReleaseTest):
     def prepare(self):

@@ -3769,15 +3769,46 @@ def _clear_stale_incoming(directory, log=_log):
 # PUBLISH: the OpenTTD-style public list (netpunch/masterserver.py)
 # --------------------------------------------------------------------------- #
 LOBBY_VERSION = "0.7.1.5"
+# The release this lobby ships in (installer/VERSION). A release that changes
+# nothing on the wire keeps LOBBY_VERSION (0.7.1.6 still speaks 0.7.1.5), so
+# a mismatch message names releases: a 0.7.1.6 player told "you have 0.7.1.5"
+# thought the message was wrong and missed that the OTHER side was out of date.
+# The join, welcome and roster carry it as "release"; the gate stays LOBBY_VERSION.
+RELEASE_VERSION = "0.7.1.7"
+VERSION_MISMATCH = "Multiplayer version mismatch"
 
 
-def version_rejection(remote):
-    """Exact release match; legacy peers without a version fail closed."""
+# Builds up to 0.7.1.6 send no "release". Up to 0.7.1.4 the lobby version was
+# the release; lobby 0.7.1.5 is 0.7.1.6 (0.7.1.5 itself was never published).
+_RELEASE_OF_LOBBY = {"0.7.1.5": "0.7.1.6"}
+
+
+def version_label(version, release=None):
+    """The release a peer runs, for a person to read."""
+    if isinstance(release, str) and release:
+        return release[:64]
+    if isinstance(version, str) and version:
+        return _RELEASE_OF_LOBBY.get(version, version[:64])
+    return "unknown (older build)"
+
+
+def version_rejection(remote, remote_release=None):
+    """Exact lobby-version match; legacy peers without a version fail closed."""
     if isinstance(remote, str) and remote == LOBBY_VERSION:
         return None
-    label = remote[:64] if isinstance(remote, str) and remote else "unknown (older build)"
-    return (f"Multiplayer version mismatch: you have {LOBBY_VERSION}; "
-            f"the other side has {label}. Install the same multiplayer version on both sides.")
+    return (f"{VERSION_MISMATCH}: you have {RELEASE_VERSION}; "
+            f"the other side has {version_label(remote, remote_release)}. "
+            "Install the same multiplayer version on both sides.")
+
+
+def own_release_in_reject(reason):
+    """A host from before 0.7.1.6 writes the joiner's lobby version into its
+    mismatch reject ("you have 0.7.1.5; the host has 0.7.1.4"). Name this
+    release instead, so the player sees the version they installed."""
+    if (isinstance(reason, str) and reason.startswith(VERSION_MISMATCH)
+            and RELEASE_VERSION != LOBBY_VERSION):
+        return reason.replace(f"you have {LOBBY_VERSION};", f"you have {RELEASE_VERSION};", 1)
+    return reason
 
 
 PUBLISH_EVERY = 10.0        # the master drops a row 30 s after its last announce
@@ -4526,7 +4557,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
         links = {p["name"]: p.get("links", []) for p in peers.values()}
         companies = roster_companies()
         for a, p in list(peers.items()):
-            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "transport_lobby": transport_lobby, "players": players, "recovery": 4 if recovery_supported() else 0,
+            _send_data(sock, a, {"t": "roster", "version": LOBBY_VERSION, "release": RELEASE_VERSION,
+                                 "transport_lobby": transport_lobby, "players": players, "recovery": 4 if recovery_supported() else 0,
                                  "host": leader_name(), "lobby": lobby_name,
                                  "relay": relay_only, "mods": advertised[1],
                                  "mods_unknown": advertised[1] is None,
@@ -4681,13 +4713,14 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                          name="terr-read", daemon=True).start()
 
     # ---- inbound lobby messages -------------------------------------------- #
-    def do_join(addr, name, profile=None, is_mesh=False, version=None, recovery_protocol=0):
-        reason = version_rejection(version)
+    def do_join(addr, name, profile=None, is_mesh=False, version=None, recovery_protocol=0,
+                release=None):
+        reason = version_rejection(version, release)
         if reason:
             # Phrase the error from the joining player's perspective.
-            remote = version[:64] if isinstance(version, str) and version else "unknown (older build)"
-            reason = (f"Multiplayer version mismatch: you have {remote}; the host has "
-                      f"{LOBBY_VERSION}. Install the same multiplayer version on both sides.")
+            remote = version_label(version, release)
+            reason = (f"{VERSION_MISMATCH}: you have {remote}; the host has "
+                      f"{RELEASE_VERSION}. Install the same multiplayer version on both sides.")
             _send_data(sock, addr, {"t": "reject", "reason": reason})
             if addr in peers:
                 del peers[addr]
@@ -4793,7 +4826,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
                 log(f"[host] frozen join NOT possible for {peers[addr]['name']!r} "
                     f"({'its version has no resync' if recovery_protocol != 4 else recovery_unavailable_reason()}) -- the menu's hot-join save serves it")
         letter_for(peers[addr]["name"])          # fixed now, in join order
-        _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "transport_lobby": transport_lobby,
+        _send_data(sock, addr, {"t": "welcome", "version": LOBBY_VERSION, "release": RELEASE_VERSION,
+                                "transport_lobby": transport_lobby,
                                 "you": peers[addr]["name"], "host": leader_name(),
                                 "recovery": 4 if recovery_supported() else 0,
                                 "lobby": lobby_name, "relay": relay_only, "mods": advertised[1],
@@ -4964,7 +4998,8 @@ def run_host(sock, my_name, io, code=None, stop=None, drop_after=DROP_AFTER,
             return
         if t == "join":
             do_join(addr, msg.get("name", "player"), msg.get("profile"),
-                    msg.get("mesh", False), msg.get("version"), msg.get("recovery", 0))
+                    msg.get("mesh", False), msg.get("version"), msg.get("recovery", 0),
+                    msg.get("release"))
             if addr in peers:
                 peers[addr]["batches"] = bool(msg.get("batches"))   # a client from 0.6.1.7 on takes a mods round in batches
                 peers[addr]["terr"] = bool(msg.get("terrain_stream"))  # a client from 0.7.2 on takes the terrain stream
@@ -6366,7 +6401,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             if not isinstance(greeting, dict):
                 return
             if greeting.get("t") in ("welcome", "roster"):
-                reason = version_rejection(greeting.get("version"))
+                reason = version_rejection(greeting.get("version"), greeting.get("release"))
                 if reason:
                     send({"t": "leave"})
                     io.emit({"type": "status", "state": "failed", "detail": reason})
@@ -6499,9 +6534,9 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                      "detail": str(m.get("detail", ""))})
             log(f"[client] host says: {m.get('detail', '')}")
         elif t == "reject":
-            io.emit({"type": "status", "state": "failed",
-                     "detail": m.get("reason", "rejected")})
-            io.write_state(state="failed", detail=m.get("reason", "rejected"), started=False)
+            reason = own_release_in_reject(m.get("reason", "rejected"))
+            io.emit({"type": "status", "state": "failed", "detail": reason})
+            io.write_state(state="failed", detail=reason, started=False)
             stop.set()
         elif t == "bye":
             io.emit({"type": "status", "state": "failed",
@@ -6532,7 +6567,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
             send({"t": "mode", "mode": str(cmd.get("mode", ""))})
         elif c == "name":
             desired[0] = str(cmd.get("name", "player"))
-            m2 = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0,
+            m2 = {"t": "join", "version": LOBBY_VERSION, "release": RELEASE_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0,
                   "terrain_stream": 1}
             if profile_code:
                 m2["profile"] = profile_code
@@ -6596,7 +6631,7 @@ def run_client(conn, my_name, io, stop=None, host_gone_after=HOST_GONE_AFTER,
                                         daemon=True)
         relay_thread.start()
 
-    join_msg = {"t": "join", "version": LOBBY_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0,
+    join_msg = {"t": "join", "version": LOBBY_VERSION, "release": RELEASE_VERSION, "name": desired[0], "mesh": mesh is not None, "recovery": 4 if recovery else 0,
                 "batches": 1,          # this client takes a mods round in batches (0.6.1.7)
                 "terrain_stream": 1}   # and the host's terrain sidecar while it loads (0.7.2)
     if profile_code:
